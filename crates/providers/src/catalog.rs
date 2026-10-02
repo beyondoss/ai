@@ -35,9 +35,9 @@
 //! Candidates in a row may disagree on the endpoint (Messages vs Chat Completions). The gateway
 //! translates the original client body onto **this candidate's** path each attempt, so Claude can
 //! fail onto an OpenAI-compat host without sending a Messages body at Chat Completions.
-//! GPT rows also list a parallel [`ModelRoute::responses`] arm (OpenAI `/v1/responses`) used when
-//! the inbound path is Responses **and** the body uses session state; Chat Completions / Messages
-//! inbound, and `store: false` one-shot Responses, still walk [`ModelRoute::candidates`].
+//! GPT rows also list a parallel [`ModelRoute::responses`] arm (OpenAI `/v1/responses`) that every
+//! inbound Responses request walks, `store: false` one-shots included; Chat Completions / Messages
+//! inbound walk [`ModelRoute::candidates`].
 //! `/{provider}/…` never translates.
 //!
 //! # Maintenance
@@ -49,6 +49,15 @@
 //! it, then add it, **with a list price**. A wrong route does not fail loudly — it routes to a 404
 //! that looks like the client's fault. A missing price used to fail the same way in the other
 //! direction: `GET /v1/models` named the model and a consumer priced it at zero.
+//!
+//! A row whose primary is a direct vendor also needs an entry in `verify/catalog_truth.toml`: the
+//! vendor's published price and card values with the URL they came from (or a reasoned entry in
+//! its `unverified` list). `catalog_matches_vendor_truth` holds the table to that file, and a
+//! retired or non-serverless id recorded there can never come back as a candidate. A scheduled
+//! retirement (`retires`) fails `no_catalog_row_outlives_its_retirement` on its date, and the live
+//! cells `CAT-16::raw::*` (`crates/verify/tests/catalog_live.rs`) check every candidate against its
+//! vendor's own listing and deprecation notices, and every first-party release in a carried family
+//! against the table, so neither a retirement nor a new model goes unnoticed.
 
 use crate::{ProviderId, WireFormat};
 
@@ -80,21 +89,22 @@ pub struct ModelRoute {
     pub model: &'static str,
     /// The API shape the *primary* speaks, and the shape a bare `/v1` client is assumed to send.
     /// Failover candidates may speak a different endpoint; the gateway translates the original
-    /// client body onto each candidate's path. Inbound `/v1/responses` without session state is
-    /// translated onto Chat Completions or Messages according to this field for the primary, then
-    /// per candidate. Session-state Responses walks [`Self::responses`] instead.
+    /// client body onto each candidate's path. Inbound `/v1/responses` on a row without a
+    /// [`Self::responses`] arm is translated (a one-shot only) onto Chat Completions or Messages
+    /// according to this field for the primary, then per candidate; a row with one walks it.
     /// `/{provider}/…` never translates.
     pub wire: WireFormat,
     /// Preference order: `[0]` is primary, the rest are failover candidates. Non-empty, at most
     /// [`MAX_CANDIDATES`], no provider repeated. Chat Completions / Messages inbound, and one-shot
-    /// Responses (`store: false`) that may still translate onto Chat Completions, walk this list.
+    /// Responses on a row with no [`Self::responses`] arm, walk this list.
     pub candidates: &'static [Candidate],
-    /// OpenAI `/v1/responses` arms. Walked when the inbound path is Responses **and** the body uses
-    /// session state (`previous_response_id` set, or `store` not explicitly `false`). Empty on
-    /// Claude rows — those have no OpenAI store, so session-state Responses is a 400, not a hollow
-    /// Messages call. Same-endpoint: byte relay (`store` / `previous_response_id` / `include` /
-    /// `truncation` pass through). A Responses 5xx may walk another entry here; it must not walk
-    /// onto [`Self::candidates`] while session fields are in play.
+    /// OpenAI `/v1/responses` arms. Walked by every inbound Responses request when non-empty,
+    /// `store: false` one-shots included, so Responses-only fields and tools are never lost to a
+    /// translation. Empty on Claude rows — those have no OpenAI store, so session-state Responses
+    /// (`previous_response_id`, or an explicit `store: true`) is a 400, not a hollow Messages call.
+    /// Same-endpoint: byte relay (`store` / `previous_response_id` / `include` / `truncation` /
+    /// tools pass through). A Responses 5xx may walk another entry here; it never walks onto
+    /// [`Self::candidates`].
     pub responses: &'static [Candidate],
     /// Standard public list price for this model. See [`ListPrice`].
     pub price: ListPrice,
@@ -105,12 +115,42 @@ pub struct ModelRoute {
 /// The model facts `GET /v1/models` publishes beside the price, so a client can size a prompt,
 /// cap its output and pick a model by what it accepts and supports.
 ///
-/// Generated on 2026-09-30, like [`ListPrice`]. Claude rows come from Anthropic's `GET /v1/models`
-/// when it still lists them. Every other row, and the retired Claude snapshots, come from
-/// OpenRouter's public card for the row's OpenRouter candidate: `context_length`,
-/// `top_provider.max_completion_tokens`, `architecture.input_modalities`, and
-/// `supported_parameters`. A row whose primary is another vendor (Groq, Fireworks, …) may serve a
-/// smaller window than the model card; the card describes the model, not one deployment.
+/// Sourcing, checked 2026-10-01 against the primary vendor's docs (`verify/catalog_truth.toml`
+/// records each checked value and its URL; a test holds this table to it):
+///
+/// - `context_window` and `max_output_tokens` are the limits **every** candidate of the row
+///   enforces: the smallest, so a request sized from the card is accepted wherever the walk lands
+///   (failover and TTFT ranking may serve any of them). They start from the **primary** vendor's
+///   model docs and come down where a limit is lower in practice. OpenAI's GPT-5 family counts the
+///   output inside the published window and caps input at the window less the 128K max output
+///   (272,000 of 400,000; 922,000 of 1,050,000; the API says "Input tokens exceed the configured
+///   limit of 272000 tokens"). A failover host that serves a smaller window sets the row's, and so does a
+///   primary that refuses below its vendor's figure (Together's Qwen3.8 2.4T A95B, 1,010,000).
+///   `verify/catalog_truth.toml` records the vendor's figure and, beside it, the lower `input_limit` / `output_limit` with its evidence. One limit per row
+///   rather than one per candidate: the gateway does not count prompt tokens, so it could not
+///   choose between candidates by window anyway, and a client only ever sees the row.
+/// - Where the vendor publishes no max output, a figure that was a fraction of the window
+///   (OpenRouter's 0.9x / 0.8x filler) is not kept: the row lists [`UNPUBLISHED_MAX_OUTPUT`]
+///   instead. A max output that is not such a fraction is kept.
+/// - `input` and `features` list what the vendor lists **and every candidate serves on the
+///   endpoint the catalog sends it to**. A bit the vendor's model page does not name (structured
+///   outputs on the former `gpt-4` row) is removed; so is one a candidate's endpoint refuses (function calling on
+///   `grok-4.20-multi-agent`, which xAI gates behind beta access; tools on
+///   `meta-llama/llama-4-scout`, which no OpenRouter host serves), and one no candidate enforces
+///   (structured outputs on Kimi K2.6, Kimi K2.7 Code and Qwen3.6 Plus, whose hosts accept a JSON
+///   schema and answer outside it). A bit one failover candidate
+///   refuses but the gateway can steer around is kept, and a request using it skips that
+///   candidate: structured outputs on Bedrock and OpenRouter's `z-ai/glm-5.2`
+///   ([`serves_structured_outputs`]), file input on
+///   OpenRouter's `x-ai/grok-build-0.1` ([`serves_file_input`]). One the page omits but every
+///   candidate serves is listed (function calling on the former `gpt-4` row, the snapshot that
+///   introduced it). The gateway refuses image input on a row whose card omits it, rather than let
+///   a candidate ignore the image (o3-mini did) or answer 500 (gpt-4 did).
+/// - `created` and `owned_by` are the vendor's own listing (OpenAI's and xAI's `/v1/models`),
+///   never the day OpenRouter listed the model.
+/// - Anything the vendor does not publish still comes from OpenRouter's public card for the row's
+///   candidate (`context_length`, `top_provider.max_completion_tokens`,
+///   `architecture.input_modalities`, `supported_parameters`), fetched 2026-09-30.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModelCard {
     /// Human-readable name, e.g. `Claude Sonnet 5.5`.
@@ -119,15 +159,40 @@ pub struct ModelCard {
     pub owned_by: &'static str,
     /// Release time, Unix seconds.
     pub created: u64,
-    /// Most input tokens one request may carry.
+    /// Most input tokens one request may carry, on every candidate of the row.
     pub context_window: u32,
-    /// Most output tokens one request may ask for. Zero on an embeddings row, which generates none.
+    /// Most output tokens one request may ask for, on every candidate of the row. Zero on an
+    /// embeddings row, which generates none. Where the vendor publishes no max output this is
+    /// [`UNPUBLISHED_MAX_OUTPUT`] and [`Self::max_output_published`] is false: a figure to size
+    /// requests by, never a limit to enforce. The gateway caps a request's output limit at
+    /// [`Self::output_cap`].
     pub max_output_tokens: u32,
+    /// Whether [`Self::max_output_tokens`] is the vendor's published limit.
+    pub max_output_published: bool,
     /// `IN_*` bits: what a request may contain.
     pub input: u8,
     /// Capability bits: [`TOOLS`], [`REASONING`], [`STRUCTURED_OUTPUTS`].
     pub features: u8,
 }
+
+impl ModelCard {
+    /// The output limit the gateway may enforce: the vendor's published maximum, `None` where it
+    /// publishes none (the card's [`UNPUBLISHED_MAX_OUTPUT`] is a placeholder, and a request past
+    /// it may well be served) and on an embeddings row.
+    pub const fn output_cap(&self) -> Option<u32> {
+        if self.max_output_published && self.max_output_tokens > 0 {
+            Some(self.max_output_tokens)
+        } else {
+            None
+        }
+    }
+}
+
+/// The max output a card lists when the primary vendor publishes none: a conservative figure, not
+/// a vendor limit, so it is never enforced ([`ModelCard::output_cap`]). A client that sizes `max_tokens` from the card stays under every host's real
+/// cap; one that asks for more may still be accepted. It replaced OpenRouter's derived
+/// 0.9x / 0.8x-of-window values, which advertised outputs as large as the whole prompt budget.
+pub const UNPUBLISHED_MAX_OUTPUT: u32 = 32_768;
 
 pub const IN_TEXT: u8 = 1;
 pub const IN_IMAGE: u8 = 1 << 1;
@@ -171,8 +236,32 @@ const fn card(
         created,
         context_window,
         max_output_tokens,
+        max_output_published: true,
         input,
         features,
+    }
+}
+
+/// A card whose vendor publishes no max output: it lists [`UNPUBLISHED_MAX_OUTPUT`], unenforced.
+const fn card_unpublished_output(
+    name: &'static str,
+    owned_by: &'static str,
+    created: u64,
+    context_window: u32,
+    input: u8,
+    features: u8,
+) -> ModelCard {
+    ModelCard {
+        max_output_published: false,
+        ..card(
+            name,
+            owned_by,
+            created,
+            context_window,
+            UNPUBLISHED_MAX_OUTPUT,
+            input,
+            features,
+        )
     }
 }
 
@@ -183,10 +272,36 @@ const fn card(
 /// standard card only — not batch, not fast mode, not a long-context override, and not the 1-hour
 /// Claude cache write (2× input). `cache_write` here is the 5-minute / default write rate.
 ///
-/// Taken from OpenRouter's public `https://openrouter.ai/api/v1/models` card on 2026-09-30, which
-/// matched Anthropic's first-party table on every Claude row. `claude-3-haiku`, `claude-opus-4` and
-/// `gpt-5.2-chat` were removed on 2026-09-30: no provider serves them any more (the catalog smoke
-/// reported 404s from every candidate).
+/// The rate is the **primary candidate's** vendor standard published rate, checked 2026-10-01 and
+/// recorded with its source URL in `verify/catalog_truth.toml` (a test holds this table to it).
+/// Not batch or flex, and not OpenRouter's cheapest host. Where a vendor tiers the rate, the row
+/// lists the standard tier and says so in a comment: DeepSeek's peak rate (off-peak is half),
+/// xAI's < 200k-prompt tier, OpenAI's ≤ 272K-input tier. A promotional rate is not a list rate:
+/// gpt-5.6-sol lists OpenAI's standard $4 / $20, which OpenAI bills the pool key, while OpenRouter
+/// passes on OpenAI's announced half-price promotion (`[[promo]]` in the truth file). A row whose
+/// primary is OpenRouter lists its maker's own published rate where there is one (Moonshot's Kimi,
+/// Z.ai's GLM, OpenAI's ids OpenRouter serves alone), never OpenRouter's
+/// cheapest host; only a row whose maker publishes none (open weights; OpenAI ids its pricing page
+/// no longer lists) uses OpenRouter's public `https://openrouter.ai/api/v1/models` card.
+///
+/// `claude-3-haiku`, `claude-opus-4` and `gpt-5.2-chat` were removed on 2026-09-30: no provider
+/// serves them any more (the catalog smoke reported 404s from every candidate). `deepseek-chat`,
+/// `deepseek-reasoner` and `mistral-nemo` were removed on 2026-10-01: their vendors retired them,
+/// and the fallbacks served a different model under the name. Later that day `claude-opus-4-1`,
+/// `claude-sonnet-4`, `gpt-5.1-codex`, `-codex-max`, `-codex-mini` and `gpt-5.2-codex` went the
+/// same way (retired by Anthropic and OpenAI; OpenRouter still served them from Bedrock and
+/// Azure: D181), and `minimaxai/minimax-m2.7`, whose one candidate (OpenRouter) sends every
+/// forced tool call and JSON-schema request to hosts that answer 410 Gone (D182). The seven Mistral rows
+/// (`mistral-large-latest`, `mistral-medium-latest`, `mistral-small-latest`, `ministral-3b-latest`,
+/// `ministral-8b-latest`, `ministral-14b-latest`, `codestral-latest`) were removed the same day by
+/// owner decision (D156): with no Mistral pool key their only reachable candidate was OpenRouter,
+/// whose sole host for each is Mistral on OpenRouter's shared upstream pool, which refused most
+/// requests with 429. They come back with `AI_POOL_KEY_MISTRAL`: `ProviderId::Mistral` and its
+/// spec are kept, so each row is again `compat_chat(ProviderId::Mistral, ..)` plus its
+/// `verify/catalog_truth.toml` entry (the 2026-10-01 audit has the vendor facts). `gpt-4`,
+/// `gpt-4-turbo`, `gpt-4.1-nano`, `o1`, `o1-pro`, `o3-mini` and `o4-mini` were removed the same day
+/// by owner decision (D243), ahead of OpenAI's 2026-10-23 shutdown; a request for one is a 404 like
+/// any unknown model.
 ///
 /// A card that omits `cache_read` or `cache_write` is filled with the **input** rate: no discount,
 /// no write premium. Omission is not $0. A consumer that subtracted cache tokens and then multiplied
@@ -220,6 +335,134 @@ const fn price(
         cache_read,
         cache_write,
     }
+}
+
+/// Candidates that accept a JSON-schema output constraint but do not enforce it, on a row whose
+/// card advertises [`STRUCTURED_OUTPUTS`] because another candidate does. OpenRouter's
+/// `z-ai/glm-5.2` spreads the request over hosts, and one that lists `structured_outputs` in its
+/// endpoint's `supported_parameters` (DigitalOcean) answers `{\n{\n  "answer": 391\n}`, which is
+/// not JSON (measured 2026-10-01; Together's `zai-org/GLM-5.2` holds the schema). A
+/// structured-output request leaves such a candidate out of its walk. A row where no candidate
+/// enforces the schema does not advertise it instead (`verify/catalog_truth.toml`
+/// `[[schema_unenforced]]` records each measurement).
+const REFUSES_STRUCTURED_OUTPUTS: &[(ProviderId, &str)] =
+    &[(ProviderId::OpenRouter, "z-ai/glm-5.2")];
+
+/// Whether a candidate honors a JSON-schema output constraint (`response_format` `json_schema`,
+/// Messages `output_config.format`, Responses `text.format`). Amazon Bedrock's Anthropic Messages
+/// surface does not: it answers `output_config.format` (and the beta `output_format`) with 400
+/// "Extra inputs are not permitted" on Opus 4.8 and a 404 "The model doesn't exist or doesn't
+/// support this API" on Haiku 4.5 (measured 2026-10-01), so a structured-output request on a row
+/// whose card advertises [`STRUCTURED_OUTPUTS`] must not be served there. Nor may one listed in
+/// [`REFUSES_STRUCTURED_OUTPUTS`], which answers without holding the schema. The gateway drops
+/// such a candidate from that request's walk.
+pub fn serves_structured_outputs(c: &Candidate) -> bool {
+    !matches!(c.provider, ProviderId::Bedrock)
+        && !REFUSES_STRUCTURED_OUTPUTS
+            .iter()
+            .any(|&(p, m)| p == c.provider && m == c.upstream_model)
+}
+
+/// Candidates that refuse file (PDF) input on a row whose card advertises it. OpenRouter routes
+/// `x-ai/grok-build-0.1` to no file-capable endpoint: 404 "No endpoints found that support file
+/// input" (measured 2026-10-01; its `x-ai/grok-4.20`, `grok-4.3`, `grok-4.5` and `grok-4.6` read
+/// the same PDF). A request carrying a file part leaves such a candidate out of its walk.
+const REFUSES_FILE_INPUT: &[(ProviderId, &str)] =
+    &[(ProviderId::OpenRouter, "x-ai/grok-build-0.1")];
+
+/// Whether a candidate reads a file (PDF) part: Chat Completions `file`, Messages `document`,
+/// Responses `input_file`. See [`REFUSES_FILE_INPUT`].
+pub fn serves_file_input(c: &Candidate) -> bool {
+    !REFUSES_FILE_INPUT
+        .iter()
+        .any(|&(p, m)| p == c.provider && m == c.upstream_model)
+}
+
+/// Candidates that answer only streams. Together serves these Qwen models only with
+/// `"stream": true`; a request without it is a 400 `streaming_required` ("This model only supports
+/// streaming", measured 2026-10-01 on every Together id in the table: these four, no others). For a
+/// client that did not ask for a stream, the gateway asks such a candidate for one and assembles it
+/// into the client's ordinary JSON answer (D147). Each is on a Chat Completions path, the wire the
+/// assembly reads.
+const STREAM_ONLY: &[(ProviderId, &str)] = &[
+    (ProviderId::Together, "Qwen/Qwen3.6-Plus"),
+    (ProviderId::Together, "Qwen/Qwen3.7-Plus"),
+    (ProviderId::Together, "Qwen/Qwen3.7-Max"),
+    (ProviderId::Together, "Qwen/Qwen3.8-Flash"),
+];
+
+/// Whether a candidate answers only streams. See [`STREAM_ONLY`].
+pub fn stream_only(c: &Candidate) -> bool {
+    STREAM_ONLY
+        .iter()
+        .any(|&(p, m)| p == c.provider && m == c.upstream_model)
+}
+
+/// What a candidate's default thinking does to a tool request, and so when the gateway asks it not
+/// to think (`"reasoning": {"enabled": false}`, Together's documented switch for hybrid models and
+/// OpenRouter's unified one; both backends here are Alibaba's).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolThinking {
+    /// Thinks and calls tools, forced or not.
+    Free,
+    /// Refuses a forced `tool_choice` (`"required"` or a named function) while thinking: 400 "The
+    /// tool_choice parameter does not support being set to required or object in thinking mode"
+    /// (D172). A forced request goes with thinking off, whatever reasoning the client asked for,
+    /// since thinking on is a certain 400 on every candidate of the row.
+    OffWhenForced,
+    /// As [`Self::OffWhenForced`], and while thinking it sometimes writes a tool call as content
+    /// text ("call\n{\"name\": \"get_weather\", ...}") with no `tool_calls` (D171). A request
+    /// offering tools goes with thinking off unless the client asked for reasoning itself
+    /// (`reasoning_effort` or `reasoning`), which it then gets as asked.
+    OffWithTools,
+}
+
+/// Candidates whose thinking and tools conflict. Measured 2026-10-01: forced `tool_choice` is a 400
+/// on Qwen3.7 Plus and Qwen3.8 Flash at Together and at OpenRouter (Alibaba), not on Qwen3.6 Plus or
+/// Qwen3.7 Max; with thinking off all four call the tool. With `auto` and thinking on, Qwen3.7 Plus
+/// answered a tool call as text 5 of 32 times at Together and 4 of 32 at OpenRouter (so skipping
+/// either candidate would not help), 0 of 48 with thinking off; Qwen3.8 Flash, 3.7 Max and 3.6 Plus
+/// 0 of 16 each.
+const TOOL_THINKING: &[(ProviderId, &str, ToolThinking)] = &[
+    (
+        ProviderId::Together,
+        "Qwen/Qwen3.7-Plus",
+        ToolThinking::OffWithTools,
+    ),
+    (
+        ProviderId::OpenRouter,
+        "qwen/qwen3.7-plus",
+        ToolThinking::OffWithTools,
+    ),
+    (
+        ProviderId::Together,
+        "Qwen/Qwen3.8-Flash",
+        ToolThinking::OffWhenForced,
+    ),
+    (
+        ProviderId::OpenRouter,
+        "qwen/qwen3.8-flash",
+        ToolThinking::OffWhenForced,
+    ),
+];
+
+/// See [`ToolThinking`] and [`TOOL_THINKING`].
+pub fn tool_thinking(c: &Candidate) -> ToolThinking {
+    TOOL_THINKING
+        .iter()
+        .find(|&&(p, m, _)| p == c.provider && m == c.upstream_model)
+        .map_or(ToolThinking::Free, |&(_, _, t)| t)
+}
+
+/// Whether a candidate's Chat Completions reads the `developer` role as OpenAI defines it. OpenAI
+/// does, and OpenRouter maps it per upstream itself (measured on Qwen3.8 Flash, Kimi K2.6 and GLM
+/// 5.2: each followed a developer instruction). Other Chat hosts are sent `system`, which every
+/// model honors: Together's Qwen backend refuses `developer` with a 400 ("developer is not one of
+/// ['system', 'assistant', 'user', 'tool', 'function']"), and its Kimi K3, DeepSeek V4 Pro and GLM
+/// 5.2 accept it but did not follow it (2026-10-01, D173). For a model that is not OpenAI's,
+/// `developer` is the system role by another name.
+pub const fn reads_developer_role(c: &Candidate) -> bool {
+    matches!(c.provider, ProviderId::OpenAi | ProviderId::OpenRouter)
 }
 
 /// Upper bound on candidates per row, so the gateway can track which are usable in a single `u8`
@@ -304,11 +547,15 @@ const fn claude_bedrock(
 }
 
 /// OpenAI-native primary, OpenRouter Chat Completions failover. Same Chat Completions mount on
-/// OpenAI-native primary, OpenRouter Chat Completions failover. Same Chat Completions mount on
 /// both sides (`/v1` vs `/api/v1`). The matching Responses arm lives on [`ModelRoute::responses`]
 /// rather than here: mixing `/v1/chat/completions` and `/v1/responses` in one walk would break
-/// `stream_options.include_usage` injection. `store: false` one-shot inbound Responses still
-/// translates onto this Chat Completions row.
+/// `stream_options.include_usage` injection. Every inbound Responses request on such a row,
+/// `store: false` one-shots included, walks that arm as a byte relay; only Chat Completions and
+/// Messages clients walk these candidates.
+///
+/// Not for GPT-5.4 and later: OpenAI's Chat Completions refuses function tools with any reasoning
+/// effort on those families (and GPT-5.6 / GPT-6 reason by default), so they use
+/// [`openai_responses_first`].
 const fn openai_chat(native: &'static str, openrouter: &'static str) -> [Candidate; 2] {
     [
         Candidate {
@@ -342,9 +589,11 @@ const fn openai_embeddings(native: &'static str, openrouter: &'static str) -> [C
     ]
 }
 
-/// OpenRouter Chat Completions as the only candidate: models whose first-party API no longer serves
-/// them to our keys (retired at Anthropic, or unavailable on OpenAI's API) but OpenRouter still
-/// does. Live-verified 2026-09-30 by `catalog_rows_are_servable`.
+/// OpenRouter Chat Completions as the only candidate: models whose first-party API does not serve
+/// them to our keys (unavailable on OpenAI's API, or reserved for Enterprise or dedicated
+/// deployments at Groq, Fireworks or Together) but OpenRouter does. Not a home for a model its
+/// maker retired: that row is removed (`verify/catalog_truth.toml` `[[retired]]`).
+/// Live-verified 2026-09-30 by `catalog_rows_are_servable`.
 const fn openrouter_only(openrouter: &'static str) -> [Candidate; 1] {
     [Candidate {
         provider: ProviderId::OpenRouter,
@@ -354,8 +603,11 @@ const fn openrouter_only(openrouter: &'static str) -> [Candidate; 1] {
 }
 
 /// OpenAI's `/v1/responses` first, then OpenRouter Chat Completions: models OpenAI serves only on
-/// the Responses API (the `-pro` and later `-codex` ids 404 on Chat Completions). A Chat Completions
-/// or Messages client is translated onto Responses for the first candidate.
+/// the Responses API (the `-pro` and later `-codex` ids 404 on Chat Completions), and GPT-5.4 and
+/// later, whose Chat Completions answers function tools with any reasoning effort with a 400
+/// ("Function tools with reasoning_effort are not supported … use /v1/responses"; GPT-5.6 and
+/// GPT-6 Astra reason by default, so every tool call failed there). A Chat Completions or Messages
+/// client is translated onto Responses for the first candidate.
 const fn openai_responses_first(native: &'static str, openrouter: &'static str) -> [Candidate; 2] {
     [
         Candidate {
@@ -408,26 +660,30 @@ const fn compat_chat(
     ]
 }
 
-const fn xai(native: &'static str, openrouter: &'static str) -> [Candidate; 2] {
-    compat_chat(ProviderId::XAi, native, "/v1/chat/completions", openrouter)
-}
-
-const fn deepseek(native: &'static str, openrouter: &'static str) -> [Candidate; 2] {
-    compat_chat(
-        ProviderId::DeepSeek,
-        native,
-        "/v1/chat/completions",
-        openrouter,
-    )
-}
-
-const fn mistral(native: &'static str, openrouter: &'static str) -> [Candidate; 2] {
-    compat_chat(
-        ProviderId::Mistral,
-        native,
-        "/v1/chat/completions",
-        openrouter,
-    )
+/// xAI's `/v1/responses`, then OpenRouter Chat Completions: every Grok row. xAI serves its
+/// multi-agent models on Responses only (Chat Completions answers 400 "Multi Agent requests are not
+/// allowed on chat completions"), reads PDFs on Responses only (Chat Completions answers 400 "File
+/// content is not supported on /v1/chat/completions. Please use /v1/responses instead."), and calls
+/// Chat Completions "Deprecated" ([migration guide]). A Chat Completions or Messages client is
+/// translated onto Responses for the first candidate, as for [`openai_responses_first`], with
+/// `store: false` unless it asked to store: xAI stores every response for 30 days by default. There
+/// is no Responses arm (`previous_response_id` would name xAI's store, which no failover shares), so
+/// a Responses client's one-shot is relayed to xAI with `store: false` too.
+///
+/// [migration guide]: https://docs.x.ai/developers/model-capabilities/text/comparison.md
+const fn xai_responses_first(native: &'static str, openrouter: &'static str) -> [Candidate; 2] {
+    [
+        Candidate {
+            provider: ProviderId::XAi,
+            upstream_model: native,
+            path: "/v1/responses",
+        },
+        Candidate {
+            provider: ProviderId::OpenRouter,
+            upstream_model: openrouter,
+            path: "/api/v1/chat/completions",
+        },
+    ]
 }
 
 const fn groq(native: &'static str, openrouter: &'static str) -> [Candidate; 2] {
@@ -448,68 +704,65 @@ const fn together(native: &'static str, openrouter: &'static str) -> [Candidate;
     )
 }
 
-const fn fireworks(native: &'static str, openrouter: &'static str) -> [Candidate; 2] {
-    compat_chat(
-        ProviderId::Fireworks,
-        native,
-        "/inference/v1/chat/completions",
-        openrouter,
-    )
-}
-
-/// Groq + Together + Fireworks + OpenRouter for the same Llama 3.3 70B instruct. Canonical name is
-/// the Groq id people send; the other three are that vendor's own spelling of the same model.
-const fn llama_3_3() -> [Candidate; 4] {
+/// DeepSeek V4 Pro, then Together's and OpenRouter's copies of the **same snapshot**
+/// (`DeepSeek-V4-Pro-0813`; OpenRouter's `deepseek/deepseek-v4-pro-0813`, Hugging Face id
+/// `deepseek-ai/DeepSeek-V4-Pro-0813`). OpenRouter's bare `deepseek/deepseek-v4-pro` is the older
+/// 0423 snapshot, so it is not a failover for this row: a fallback must serve the model the row
+/// names, not a neighbour.
+const fn deepseek_v4_pro() -> [Candidate; 3] {
     [
         Candidate {
-            provider: ProviderId::Groq,
-            upstream_model: "llama-3.3-70b-versatile",
-            path: "/openai/v1/chat/completions",
-        },
-        Candidate {
-            provider: ProviderId::Together,
-            upstream_model: "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+            provider: ProviderId::DeepSeek,
+            upstream_model: "deepseek-v4-pro",
             path: "/v1/chat/completions",
         },
         Candidate {
-            provider: ProviderId::Fireworks,
-            upstream_model: "accounts/fireworks/models/llama-v3p3-70b-instruct",
-            path: "/inference/v1/chat/completions",
+            provider: ProviderId::Together,
+            upstream_model: "deepseek-ai/DeepSeek-V4-Pro-0813",
+            path: "/v1/chat/completions",
         },
         Candidate {
             provider: ProviderId::OpenRouter,
-            upstream_model: "meta-llama/llama-3.3-70b-instruct",
+            upstream_model: "deepseek/deepseek-v4-pro-0813",
             path: "/api/v1/chat/completions",
         },
     ]
 }
 
-/// Groq + Together + OpenRouter for GPT-OSS 20B. Same shared id on every host; Fireworks was not
-/// live-verified for the 20B spelling the way 120B was.
-const fn gpt_oss_20b() -> [Candidate; 3] {
+/// DeepSeek V4.1 Flash, then Together's serverless copy (`deepseek-ai/DeepSeek-V4.1-Flash`, at
+/// DeepSeek's peak rate, images read), then OpenRouter's (`deepseek/deepseek-v4.1-flash`, Hugging
+/// Face id `deepseek-ai/DeepSeek-V4.1-Flash`). A direct pool provider goes before OpenRouter's
+/// shared host spread, as on the Kimi K3 and MiniMax M3 rows.
+const fn deepseek_flash() -> [Candidate; 3] {
     [
         Candidate {
-            provider: ProviderId::Groq,
-            upstream_model: "openai/gpt-oss-20b",
-            path: "/openai/v1/chat/completions",
+            provider: ProviderId::DeepSeek,
+            upstream_model: "deepseek-flash",
+            path: "/v1/chat/completions",
         },
         Candidate {
             provider: ProviderId::Together,
-            upstream_model: "openai/gpt-oss-20b",
+            upstream_model: "deepseek-ai/DeepSeek-V4.1-Flash",
             path: "/v1/chat/completions",
         },
         Candidate {
             provider: ProviderId::OpenRouter,
-            upstream_model: "openai/gpt-oss-20b",
+            upstream_model: "deepseek/deepseek-v4.1-flash",
             path: "/api/v1/chat/completions",
         },
     ]
 }
 
-/// Groq + Together + Fireworks + OpenRouter for GPT-OSS 120B. Catalog name is the shared
-/// `openai/gpt-oss-120b` Groq/Together/OpenRouter id; Fireworks keeps its own spelling as an alias.
+/// Groq + Together + Fireworks for GPT-OSS 120B. Catalog name is the shared
+/// `openai/gpt-oss-120b` Groq/Together id; Fireworks keeps its own spelling as an alias.
 /// Cerebras's bare `gpt-oss-120b` is not listed — `for_model_id` prefix-matches `gpt-` to OpenAI.
-const fn gpt_oss_120b() -> [Candidate; 4] {
+///
+/// No OpenRouter candidate: OpenRouter spreads `openai/gpt-oss-120b` across hosts, and one of them
+/// (CoreWeave) answers any forced `tool_choice` (a named function or `required`) with a 200 whose
+/// `finish_reason` is `error` and whose message is empty (measured 2026-10-01: two of three forced
+/// calls), so the row's advertised tools failed whenever the walk reached it. Three hosts that
+/// serve the same weights remain.
+const fn gpt_oss_120b() -> [Candidate; 3] {
     [
         Candidate {
             provider: ProviderId::Groq,
@@ -525,11 +778,6 @@ const fn gpt_oss_120b() -> [Candidate; 4] {
             provider: ProviderId::Fireworks,
             upstream_model: "accounts/fireworks/models/gpt-oss-120b",
             path: "/inference/v1/chat/completions",
-        },
-        Candidate {
-            provider: ProviderId::OpenRouter,
-            upstream_model: "openai/gpt-oss-120b",
-            path: "/api/v1/chat/completions",
         },
     ]
 }
@@ -550,27 +798,6 @@ const fn kimi_k3() -> [Candidate; 3] {
         Candidate {
             provider: ProviderId::OpenRouter,
             upstream_model: "moonshotai/kimi-k3",
-            path: "/api/v1/chat/completions",
-        },
-    ]
-}
-
-/// Together + Fireworks + OpenRouter for GLM-5.2. Fireworks spells the version separator as `p`.
-const fn glm_5_2() -> [Candidate; 3] {
-    [
-        Candidate {
-            provider: ProviderId::Together,
-            upstream_model: "zai-org/GLM-5.2",
-            path: "/v1/chat/completions",
-        },
-        Candidate {
-            provider: ProviderId::Fireworks,
-            upstream_model: "accounts/fireworks/models/glm-5p2",
-            path: "/inference/v1/chat/completions",
-        },
-        Candidate {
-            provider: ProviderId::OpenRouter,
-            upstream_model: "z-ai/glm-5.2",
             path: "/api/v1/chat/completions",
         },
     ]
@@ -600,7 +827,7 @@ const fn minimax_m3() -> [Candidate; 3] {
 /// Every routable model, **sorted by `model`** — [`for_model`] binary-searches it.
 ///
 /// Native ids are the providers' own published aliases (Anthropic Models overview, OpenAI
-/// Models catalog, xAI / DeepSeek / Mistral / Groq / Together / Fireworks catalogs, 2026-09-19).
+/// Models catalog, xAI / DeepSeek / Groq / Together / Fireworks catalogs, 2026-09-19).
 /// OpenRouter spellings were taken from the live `https://openrouter.ai/api/v1/models` list the
 /// same day (446 models). `catalog_rows_are_servable` re-verifies each pair against the real
 /// providers whenever the keys are present.
@@ -671,22 +898,6 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
             64_000,
             IN_TEXT | IN_IMAGE | IN_FILE,
             TOOLS | REASONING | STRUCTURED_OUTPUTS,
-        ),
-    },
-    ModelRoute {
-        model: "claude-opus-4-1",
-        wire: WireFormat::OpenAi,
-        candidates: &openrouter_only("anthropic/claude-opus-4.1"), // retired at Anthropic
-        responses: &[],
-        price: price("15", "75", "1.5", "18.75"),
-        card: card(
-            "Claude Opus 4.1",
-            "anthropic",
-            1754411591,
-            200_000,
-            32_000,
-            IN_TEXT | IN_IMAGE | IN_FILE,
-            TOOLS | REASONING,
         ),
     },
     ModelRoute {
@@ -790,22 +1001,6 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         ),
     },
     ModelRoute {
-        model: "claude-sonnet-4",
-        wire: WireFormat::OpenAi,
-        candidates: &openrouter_only("anthropic/claude-sonnet-4"), // retired at Anthropic
-        responses: &[],
-        price: price("3", "15", "0.3", "3.75"),
-        card: card(
-            "Claude Sonnet 4",
-            "anthropic",
-            1747930371,
-            200_000,
-            64_000,
-            IN_TEXT | IN_IMAGE | IN_FILE,
-            TOOLS | REASONING,
-        ),
-    },
-    ModelRoute {
         model: "claude-sonnet-4-5",
         wire: WireFormat::Anthropic,
         candidates: &claude("claude-sonnet-4-5", "anthropic/claude-sonnet-4.5"),
@@ -815,7 +1010,7 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
             "Claude Sonnet 4.5",
             "anthropic",
             1759104000,
-            1_000_000,
+            200_000,
             64_000,
             IN_TEXT | IN_IMAGE | IN_FILE,
             TOOLS | REASONING | STRUCTURED_OUTPUTS,
@@ -869,98 +1064,54 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
             TOOLS | REASONING | STRUCTURED_OUTPUTS,
         ),
     },
-    // Mistral `-latest` aliases (GA only). Magistral and Devstral are retired as of 2026-09;
-    // a guessed still-served alias 404s and looks like the client's fault.
-    ModelRoute {
-        model: "codestral-latest",
-        wire: WireFormat::OpenAi,
-        candidates: &mistral("codestral-latest", "mistralai/codestral-2508"),
-        responses: &[],
-        price: price("0.3", "0.9", "0.03", "0.3"), // cache_write unpublished; equals input
-        card: card(
-            "Codestral 2508",
-            "mistralai",
-            1754079630,
-            256_000,
-            204_800,
-            IN_TEXT | IN_FILE,
-            TOOLS | STRUCTURED_OUTPUTS,
-        ),
-    },
-    // DeepSeek. Official current names are `deepseek-flash` / `deepseek-v4-pro`. `deepseek-chat`
-    // and `deepseek-reasoner` are the ids stock SDKs still send; OpenRouter still lists the chat
-    // slug. Reasoner's OpenRouter arm is `deepseek/deepseek-r1` — they never published
-    // `deepseek/deepseek-reasoner`.
-    ModelRoute {
-        model: "deepseek-chat",
-        wire: WireFormat::OpenAi,
-        candidates: &deepseek("deepseek-chat", "deepseek/deepseek-chat"),
-        responses: &[],
-        price: price("0.2574", "1.0287", "0.2574", "0.2574"), // no separate cache card; both rates equal input
-        card: card(
-            "DeepSeek V3",
-            "deepseek",
-            1735241320,
-            163_840,
-            16_000,
-            IN_TEXT,
-            TOOLS | STRUCTURED_OUTPUTS,
-        ),
-    },
+    // DeepSeek. The only served names are `deepseek-flash` (V4.1-Flash) and `deepseek-v4-pro`
+    // (V4-Pro-0813). `deepseek-chat` and `deepseek-reasoner` were retired 2026-07-24 and their rows
+    // removed: the native id 404s, and the OpenRouter slugs they fell back to are V3 and R1, so the
+    // row would have served a different model under the name.
+    //
+    // DeepSeek prices peak hours (01:00–04:00 and 06:00–10:00 UTC, Mon–Fri) at 2x off-peak. One
+    // list price cannot say that, so these rows list the peak (standard) rate and over-list
+    // off-peak traffic 2x.
     ModelRoute {
         model: "deepseek-flash",
         wire: WireFormat::OpenAi,
-        candidates: &deepseek("deepseek-flash", "deepseek/deepseek-v4.1-flash"),
+        candidates: &deepseek_flash(),
         responses: &[],
-        price: price("0.3", "1.2", "0.006", "0.3"), // cache_write unpublished; equals input
+        price: price("0.3", "1.2", "0.006", "0.3"), // peak rate (off-peak is half); cache_write unpublished, equals input
         card: card(
             "DeepSeek V4.1 Flash",
             "deepseek",
             1789021285,
             1_048_576,
-            943_718,
+            384_000,
             IN_TEXT | IN_IMAGE,
             TOOLS | REASONING | STRUCTURED_OUTPUTS,
         ),
     },
     ModelRoute {
-        model: "deepseek-reasoner",
-        wire: WireFormat::OpenAi,
-        candidates: &deepseek("deepseek-reasoner", "deepseek/deepseek-r1"),
-        responses: &[],
-        price: price("0.7", "2.5", "0.7", "0.7"), // no separate cache card; both rates equal input
-        card: card(
-            "R1",
-            "deepseek",
-            1737381095,
-            64_000,
-            16_000,
-            IN_TEXT,
-            TOOLS | REASONING,
-        ),
-    },
-    ModelRoute {
         model: "deepseek-v4-pro",
         wire: WireFormat::OpenAi,
-        candidates: &deepseek("deepseek-v4-pro", "deepseek/deepseek-v4-pro"),
+        candidates: &deepseek_v4_pro(),
         responses: &[],
-        price: price("0.95526", "1.91052", "0.079605", "0.95526"), // cache_write unpublished; equals input
+        price: price("1.32", "3.96", "0.044", "1.32"), // peak rate (off-peak is half); cache_write unpublished, equals input
         card: card(
-            "DeepSeek V4 Pro 0423",
+            "DeepSeek V4 Pro 0813",
             "deepseek",
-            1777000679,
+            1786579200,
             1_048_576,
             384_000,
             IN_TEXT,
             TOOLS | REASONING | STRUCTURED_OUTPUTS,
         ),
     },
-    // Gemma 4 on Together (vision table, `google/gemma-4-31B-it`) with OpenRouter failover.
-    // Not a Gemini dialect — Chat Completions like every other third-party row.
+    // Gemma 4 on OpenRouter. Together lists `google/gemma-4-31B-it` with a price but answers a
+    // serverless key 400 model_not_available ("Unable to access non-serverless model"), and its
+    // serverless models table omits it, so it is not a candidate. Google sells no Gemma API, so the
+    // price is OpenRouter's (the only host). Not a Gemini dialect: Chat Completions.
     ModelRoute {
         model: "google/gemma-4-31b-it",
         wire: WireFormat::OpenAi,
-        candidates: &together("google/gemma-4-31B-it", "google/gemma-4-31b-it"),
+        candidates: &openrouter_only("google/gemma-4-31b-it"), // Together: not serverless
         responses: &[],
         price: price("0.09", "0.34", "0.05", "0.09"), // cache_write unpublished; equals input
         card: card(
@@ -975,40 +1126,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
     },
     // The same shape on the OpenAI wire, where the two mounts differ as well (`/v1` vs `/api/v1`).
     // Flagships first in the *id* sort: 4.x, then 5 / 5.4 / 5.5 / 5.6, then 6 Astra, then o-series.
-    // `responses` is the arm used when inbound is `/v1/responses` with session state; Chat
-    // Completions / Messages inbound still walks `candidates`.
-    ModelRoute {
-        model: "gpt-4",
-        wire: WireFormat::OpenAi,
-        candidates: &openai_chat("gpt-4", "openai/gpt-4"),
-        responses: &openai_responses("gpt-4"),
-        price: price("30", "60", "30", "30"), // no separate cache card; both rates equal input
-        card: card(
-            "GPT-4",
-            "openai",
-            1685232000,
-            8_191,
-            4_096,
-            IN_TEXT,
-            TOOLS | STRUCTURED_OUTPUTS,
-        ),
-    },
-    ModelRoute {
-        model: "gpt-4-turbo",
-        wire: WireFormat::OpenAi,
-        candidates: &openai_chat("gpt-4-turbo", "openai/gpt-4-turbo"),
-        responses: &openai_responses("gpt-4-turbo"),
-        price: price("10", "30", "10", "10"), // no separate cache card; both rates equal input
-        card: card(
-            "GPT-4 Turbo",
-            "openai",
-            1712620800,
-            128_000,
-            4_096,
-            IN_TEXT | IN_IMAGE,
-            TOOLS | STRUCTURED_OUTPUTS,
-        ),
-    },
+    // `responses` is the arm every inbound `/v1/responses` walks; Chat Completions / Messages
+    // inbound walks `candidates`. From GPT-5.4 on, `candidates` reach OpenAI over Responses too
+    // (`openai_responses_first`): OpenAI's Chat Completions refuses function tools with reasoning
+    // on those families. GPT-5-family cards list OpenAI's input cap (the window less the max
+    // output), which is what the API enforces, not the window.
+    //
+    // OpenAI bills prompts over 272K input tokens at 2x input and 1.5x output on gpt-5.4, gpt-5.4-pro,
+    // gpt-5.5, gpt-5.5-pro, gpt-5.6-* and gpt-6-astra. These rows list the base tier only; such a
+    // request is under-listed. A cache-write rate is published only for gpt-6-astra and gpt-5.6-*.
     ModelRoute {
         model: "gpt-4.1",
         wire: WireFormat::OpenAi,
@@ -1018,7 +1144,7 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         card: card(
             "GPT-4.1",
             "openai",
-            1744651385,
+            1744316542,
             1_047_576,
             32_768,
             IN_TEXT | IN_IMAGE | IN_FILE,
@@ -1034,23 +1160,7 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         card: card(
             "GPT-4.1 Mini",
             "openai",
-            1744651381,
-            1_047_576,
-            32_768,
-            IN_TEXT | IN_IMAGE | IN_FILE,
-            TOOLS | STRUCTURED_OUTPUTS,
-        ),
-    },
-    ModelRoute {
-        model: "gpt-4.1-nano",
-        wire: WireFormat::OpenAi,
-        candidates: &openai_chat("gpt-4.1-nano", "openai/gpt-4.1-nano"),
-        responses: &openai_responses("gpt-4.1-nano"),
-        price: price("0.1", "0.4", "0.025", "0.1"), // cache_write unpublished; equals input
-        card: card(
-            "GPT-4.1 Nano",
-            "openai",
-            1744651369,
+            1744318173,
             1_047_576,
             32_768,
             IN_TEXT | IN_IMAGE | IN_FILE,
@@ -1066,7 +1176,7 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         card: card(
             "GPT-4o",
             "openai",
-            1715558400,
+            1715367049,
             128_000,
             16_384,
             IN_TEXT | IN_IMAGE | IN_FILE,
@@ -1082,7 +1192,7 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         card: card(
             "GPT-4o-mini",
             "openai",
-            1721260800,
+            1721172741,
             128_000,
             16_384,
             IN_TEXT | IN_IMAGE | IN_FILE,
@@ -1098,8 +1208,8 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         card: card(
             "GPT-5",
             "openai",
-            1754587413,
-            400_000,
+            1754425777,
+            272_000,
             128_000,
             IN_TEXT | IN_IMAGE | IN_FILE,
             TOOLS | REASONING | STRUCTURED_OUTPUTS,
@@ -1114,8 +1224,8 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         card: card(
             "GPT-5 Mini",
             "openai",
-            1754587407,
-            400_000,
+            1754425928,
+            272_000,
             128_000,
             IN_TEXT | IN_IMAGE | IN_FILE,
             TOOLS | REASONING | STRUCTURED_OUTPUTS,
@@ -1130,8 +1240,8 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         card: card(
             "GPT-5 Nano",
             "openai",
-            1754587402,
-            400_000,
+            1754426384,
+            272_000,
             128_000,
             IN_TEXT | IN_IMAGE | IN_FILE,
             TOOLS | REASONING | STRUCTURED_OUTPUTS,
@@ -1146,9 +1256,9 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         card: card(
             "GPT-5 Pro",
             "openai",
-            1759776663,
-            400_000,
+            1759469822,
             128_000,
+            272_000,
             IN_TEXT | IN_IMAGE | IN_FILE,
             TOOLS | REASONING | STRUCTURED_OUTPUTS,
         ),
@@ -1162,58 +1272,10 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         card: card(
             "GPT-5.1",
             "openai",
-            1763060305,
-            400_000,
+            1762800673,
+            272_000,
             128_000,
             IN_TEXT | IN_IMAGE | IN_FILE,
-            TOOLS | REASONING | STRUCTURED_OUTPUTS,
-        ),
-    },
-    ModelRoute {
-        model: "gpt-5.1-codex",
-        wire: WireFormat::OpenAi,
-        candidates: &openrouter_only("openai/gpt-5.1-codex"), // not served to our OpenAI key
-        responses: &[],
-        price: price("1.25", "10", "0.13", "1.25"), // cache_write unpublished; equals input
-        card: card(
-            "GPT-5.1-Codex",
-            "openai",
-            1763060298,
-            400_000,
-            128_000,
-            IN_TEXT | IN_IMAGE,
-            TOOLS | REASONING | STRUCTURED_OUTPUTS,
-        ),
-    },
-    ModelRoute {
-        model: "gpt-5.1-codex-max",
-        wire: WireFormat::OpenAi,
-        candidates: &openrouter_only("openai/gpt-5.1-codex-max"), // not served to our OpenAI key
-        responses: &[],
-        price: price("1.25", "10", "0.125", "1.25"), // cache_write unpublished; equals input
-        card: card(
-            "GPT-5.1-Codex-Max",
-            "openai",
-            1764878934,
-            400_000,
-            128_000,
-            IN_TEXT | IN_IMAGE,
-            TOOLS | REASONING | STRUCTURED_OUTPUTS,
-        ),
-    },
-    ModelRoute {
-        model: "gpt-5.1-codex-mini",
-        wire: WireFormat::OpenAi,
-        candidates: &openrouter_only("openai/gpt-5.1-codex-mini"), // not served to our OpenAI key
-        responses: &[],
-        price: price("0.25", "2", "0.03", "0.25"), // cache_write unpublished; equals input
-        card: card(
-            "GPT-5.1-Codex-Mini",
-            "openai",
-            1763057820,
-            400_000,
-            128_000,
-            IN_TEXT | IN_IMAGE,
             TOOLS | REASONING | STRUCTURED_OUTPUTS,
         ),
     },
@@ -1226,26 +1288,10 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         card: card(
             "GPT-5.2",
             "openai",
-            1765389775,
-            400_000,
+            1765313051,
+            272_000,
             128_000,
             IN_TEXT | IN_IMAGE | IN_FILE,
-            TOOLS | REASONING | STRUCTURED_OUTPUTS,
-        ),
-    },
-    ModelRoute {
-        model: "gpt-5.2-codex",
-        wire: WireFormat::OpenAi,
-        candidates: &openrouter_only("openai/gpt-5.2-codex"), // not served to our OpenAI key
-        responses: &[],
-        price: price("1.75", "14", "0.175", "1.75"), // cache_write unpublished; equals input
-        card: card(
-            "GPT-5.2-Codex",
-            "openai",
-            1768409315,
-            400_000,
-            128_000,
-            IN_TEXT | IN_IMAGE,
             TOOLS | REASONING | STRUCTURED_OUTPUTS,
         ),
     },
@@ -1258,11 +1304,11 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         card: card(
             "GPT-5.2 Pro",
             "openai",
-            1765389780,
-            400_000,
+            1765343983,
+            272_000,
             128_000,
             IN_TEXT | IN_IMAGE | IN_FILE,
-            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+            TOOLS | REASONING,
         ),
     },
     ModelRoute {
@@ -1274,8 +1320,8 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         card: card(
             "GPT-5.3-Codex",
             "openai",
-            1771959164,
-            400_000,
+            1770537915,
+            272_000,
             128_000,
             IN_TEXT | IN_IMAGE | IN_FILE,
             TOOLS | REASONING | STRUCTURED_OUTPUTS,
@@ -1284,14 +1330,14 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
     ModelRoute {
         model: "gpt-5.4",
         wire: WireFormat::OpenAi,
-        candidates: &openai_chat("gpt-5.4", "openai/gpt-5.4"),
+        candidates: &openai_responses_first("gpt-5.4", "openai/gpt-5.4"),
         responses: &openai_responses("gpt-5.4"),
         price: price("2.5", "15", "0.25", "2.5"), // cache_write unpublished; equals input
         card: card(
             "GPT-5.4",
             "openai",
-            1772734352,
-            1_050_000,
+            1772691852,
+            922_000,
             128_000,
             IN_TEXT | IN_IMAGE | IN_FILE,
             TOOLS | REASONING | STRUCTURED_OUTPUTS,
@@ -1300,14 +1346,14 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
     ModelRoute {
         model: "gpt-5.4-mini",
         wire: WireFormat::OpenAi,
-        candidates: &openai_chat("gpt-5.4-mini", "openai/gpt-5.4-mini"),
+        candidates: &openai_responses_first("gpt-5.4-mini", "openai/gpt-5.4-mini"),
         responses: &openai_responses("gpt-5.4-mini"),
         price: price("0.75", "4.5", "0.075", "0.75"), // cache_write unpublished; equals input
         card: card(
             "GPT-5.4 Mini",
             "openai",
-            1773748178,
-            400_000,
+            1773451123,
+            272_000,
             128_000,
             IN_TEXT | IN_IMAGE | IN_FILE,
             TOOLS | REASONING | STRUCTURED_OUTPUTS,
@@ -1316,14 +1362,14 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
     ModelRoute {
         model: "gpt-5.4-nano",
         wire: WireFormat::OpenAi,
-        candidates: &openai_chat("gpt-5.4-nano", "openai/gpt-5.4-nano"),
+        candidates: &openai_responses_first("gpt-5.4-nano", "openai/gpt-5.4-nano"),
         responses: &openai_responses("gpt-5.4-nano"),
         price: price("0.2", "1.25", "0.02", "0.2"), // cache_write unpublished; equals input
         card: card(
             "GPT-5.4 Nano",
             "openai",
-            1773748187,
-            400_000,
+            1773450870,
+            272_000,
             128_000,
             IN_TEXT | IN_IMAGE | IN_FILE,
             TOOLS | REASONING | STRUCTURED_OUTPUTS,
@@ -1338,24 +1384,24 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         card: card(
             "GPT-5.4 Pro",
             "openai",
-            1772734366,
-            1_050_000,
+            1772659601,
+            922_000,
             128_000,
             IN_TEXT | IN_IMAGE | IN_FILE,
-            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+            TOOLS | REASONING,
         ),
     },
     ModelRoute {
         model: "gpt-5.5",
         wire: WireFormat::OpenAi,
-        candidates: &openai_chat("gpt-5.5", "openai/gpt-5.5"),
+        candidates: &openai_responses_first("gpt-5.5", "openai/gpt-5.5"),
         responses: &openai_responses("gpt-5.5"),
         price: price("5", "30", "0.5", "5"), // cache_write unpublished; equals input
         card: card(
             "GPT-5.5",
             "openai",
-            1777051893,
-            1_050_000,
+            1776824847,
+            922_000,
             128_000,
             IN_TEXT | IN_IMAGE | IN_FILE,
             TOOLS | REASONING | STRUCTURED_OUTPUTS,
@@ -1370,8 +1416,8 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         card: card(
             "GPT-5.5 Pro",
             "openai",
-            1777051896,
-            1_050_000,
+            1776894349,
+            922_000,
             128_000,
             IN_TEXT | IN_IMAGE | IN_FILE,
             TOOLS | REASONING | STRUCTURED_OUTPUTS,
@@ -1380,14 +1426,14 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
     ModelRoute {
         model: "gpt-5.6-luna",
         wire: WireFormat::OpenAi,
-        candidates: &openai_chat("gpt-5.6-luna", "openai/gpt-5.6-luna"),
+        candidates: &openai_responses_first("gpt-5.6-luna", "openai/gpt-5.6-luna"),
         responses: &openai_responses("gpt-5.6-luna"),
         price: price("0.2", "1.2", "0.02", "0.25"),
         card: card(
             "GPT-5.6 Luna",
             "openai",
-            1783590864,
-            1_050_000,
+            1782228658,
+            922_000,
             128_000,
             IN_TEXT | IN_IMAGE | IN_FILE,
             TOOLS | REASONING | STRUCTURED_OUTPUTS,
@@ -1403,7 +1449,7 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
             "GPT-5.6 Luna Pro",
             "openai",
             1783590867,
-            1_050_000,
+            922_000,
             128_000,
             IN_TEXT | IN_IMAGE | IN_FILE,
             TOOLS | REASONING | STRUCTURED_OUTPUTS,
@@ -1412,14 +1458,14 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
     ModelRoute {
         model: "gpt-5.6-sol",
         wire: WireFormat::OpenAi,
-        candidates: &openai_chat("gpt-5.6-sol", "openai/gpt-5.6-sol"),
+        candidates: &openai_responses_first("gpt-5.6-sol", "openai/gpt-5.6-sol"),
         responses: &openai_responses("gpt-5.6-sol"),
-        price: price("2", "10", "0.2", "2.5"),
+        price: price("4", "20", "0.4", "5"), // OpenAI standard tier, not the Batch/Flex row
         card: card(
             "GPT-5.6 Sol",
             "openai",
-            1783590850,
-            1_050_000,
+            1782228018,
+            922_000,
             128_000,
             IN_TEXT | IN_IMAGE | IN_FILE,
             TOOLS | REASONING | STRUCTURED_OUTPUTS,
@@ -1435,7 +1481,7 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
             "GPT-5.6 Sol Pro",
             "openai",
             1783590854,
-            1_050_000,
+            922_000,
             128_000,
             IN_TEXT | IN_IMAGE | IN_FILE,
             TOOLS | REASONING | STRUCTURED_OUTPUTS,
@@ -1444,14 +1490,14 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
     ModelRoute {
         model: "gpt-5.6-terra",
         wire: WireFormat::OpenAi,
-        candidates: &openai_chat("gpt-5.6-terra", "openai/gpt-5.6-terra"),
+        candidates: &openai_responses_first("gpt-5.6-terra", "openai/gpt-5.6-terra"),
         responses: &openai_responses("gpt-5.6-terra"),
         price: price("2", "12", "0.2", "2.5"),
         card: card(
             "GPT-5.6 Terra",
             "openai",
-            1783590857,
-            1_050_000,
+            1782228459,
+            922_000,
             128_000,
             IN_TEXT | IN_IMAGE | IN_FILE,
             TOOLS | REASONING | STRUCTURED_OUTPUTS,
@@ -1467,7 +1513,7 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
             "GPT-5.6 Terra Pro",
             "openai",
             1783590861,
-            1_050_000,
+            922_000,
             128_000,
             IN_TEXT | IN_IMAGE | IN_FILE,
             TOOLS | REASONING | STRUCTURED_OUTPUTS,
@@ -1476,14 +1522,14 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
     ModelRoute {
         model: "gpt-6-astra",
         wire: WireFormat::OpenAi,
-        candidates: &openai_chat("gpt-6-astra", "openai/gpt-6-astra"),
+        candidates: &openai_responses_first("gpt-6-astra", "openai/gpt-6-astra"),
         responses: &openai_responses("gpt-6-astra"),
         price: price("10", "50", "1", "12.5"),
         card: card(
             "GPT-6 Astra",
             "openai",
-            1788552838,
-            1_050_000,
+            1787853604,
+            922_000,
             128_000,
             IN_TEXT | IN_IMAGE | IN_FILE,
             TOOLS | REASONING | STRUCTURED_OUTPUTS,
@@ -1499,27 +1545,129 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
             "GPT-6 Astra Pro",
             "openai",
             1788552835,
-            1_050_000,
+            922_000,
+            128_000,
+            IN_TEXT | IN_IMAGE | IN_FILE,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
+    },
+    ModelRoute {
+        model: "gpt-6-luna",
+        wire: WireFormat::OpenAi,
+        candidates: &openai_responses_first("gpt-6-luna", "openai/gpt-6-luna"),
+        responses: &openai_responses("gpt-6-luna"),
+        price: price("0.1", "0.5", "0.01", "0.125"),
+        card: card(
+            "GPT-6 Luna",
+            "openai",
+            1789406102,
+            922_000,
+            128_000,
+            IN_TEXT | IN_IMAGE | IN_FILE,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
+    },
+    ModelRoute {
+        model: "gpt-6-luna-pro",
+        wire: WireFormat::OpenAi,
+        candidates: &openrouter_only("openai/gpt-6-luna-pro"), // not served to our OpenAI key
+        responses: &[],
+        price: price("0.1", "0.5", "0.01", "0.125"),
+        card: card(
+            "GPT-6 Luna Pro",
+            "openai",
+            1790100791,
+            922_000,
+            128_000,
+            IN_TEXT | IN_IMAGE | IN_FILE,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
+    },
+    ModelRoute {
+        model: "gpt-6-sol",
+        wire: WireFormat::OpenAi,
+        candidates: &openai_responses_first("gpt-6-sol", "openai/gpt-6-sol"),
+        responses: &openai_responses("gpt-6-sol"),
+        price: price("2", "10", "0.2", "2.5"),
+        card: card(
+            "GPT-6 Sol",
+            "openai",
+            1789405937,
+            922_000,
+            128_000,
+            IN_TEXT | IN_IMAGE | IN_FILE,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
+    },
+    ModelRoute {
+        model: "gpt-6-sol-pro",
+        wire: WireFormat::OpenAi,
+        candidates: &openrouter_only("openai/gpt-6-sol-pro"), // not served to our OpenAI key
+        responses: &[],
+        price: price("2", "10", "0.2", "2.5"),
+        card: card(
+            "GPT-6 Sol Pro",
+            "openai",
+            1790100781,
+            922_000,
+            128_000,
+            IN_TEXT | IN_IMAGE | IN_FILE,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
+    },
+    ModelRoute {
+        model: "gpt-6.1-sol",
+        wire: WireFormat::OpenAi,
+        candidates: &openai_responses_first("gpt-6.1-sol", "openai/gpt-6.1-sol"),
+        responses: &openai_responses("gpt-6.1-sol"),
+        price: price("2", "10", "0.1", "2.5"),
+        card: card(
+            "GPT-6.1 Sol",
+            "openai",
+            1790552874,
+            922_000,
+            128_000,
+            IN_TEXT | IN_IMAGE | IN_FILE,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
+    },
+    ModelRoute {
+        model: "gpt-6.1-sol-pro",
+        wire: WireFormat::OpenAi,
+        candidates: &openrouter_only("openai/gpt-6.1-sol-pro"), // not served to our OpenAI key
+        responses: &[],
+        price: price("2", "10", "0.1", "2.5"),
+        card: card(
+            "GPT-6.1 Sol Pro",
+            "openai",
+            1790702886,
+            922_000,
             128_000,
             IN_TEXT | IN_IMAGE | IN_FILE,
             TOOLS | REASONING | STRUCTURED_OUTPUTS,
         ),
     },
     // xAI Grok. Native ids from the 2026-09-17 xAI models table plus `grok-4.20-multi-agent`
-    // (OpenRouter `x-ai/grok-4.20-multi-agent`, 2026-09-19). No Responses arm — session state
-    // is OpenAI's store.
+    // (OpenRouter `x-ai/grok-4.20-multi-agent`, 2026-09-19). Every row reaches xAI over
+    // `/v1/responses` (`xai_responses_first`): multi-agent is Responses-only at xAI, and xAI reads
+    // PDFs there only. No Responses arm — xAI's store is not OpenAI's, and no failover shares it.
+    // OpenRouter's `x-ai/grok-build-0.1` reads no PDF, so a file request skips it
+    // (`serves_file_input`).
+    //
+    // xAI bills a prompt of 200k tokens or more at 2x input, cache and output for the whole request.
+    // These rows list the < 200k tier; such a request is under-listed by half. xAI publishes no max
+    // output, so every Grok row uses `UNPUBLISHED_MAX_OUTPUT`.
     ModelRoute {
         model: "grok-4.20",
         wire: WireFormat::OpenAi,
-        candidates: &xai("grok-4.20", "x-ai/grok-4.20"),
+        candidates: &xai_responses_first("grok-4.20", "x-ai/grok-4.20"),
         responses: &[],
         price: price("1.25", "2.5", "0.2", "1.25"), // cache_write unpublished; equals input
-        card: card(
+        card: card_unpublished_output(
             "Grok 4.20",
-            "x-ai",
-            1774979019,
-            2_000_000,
-            1_800_000,
+            "xai",
+            1773014400,
+            1_000_000,
             IN_TEXT | IN_IMAGE | IN_FILE,
             TOOLS | REASONING | STRUCTURED_OUTPUTS,
         ),
@@ -1527,15 +1675,14 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
     ModelRoute {
         model: "grok-4.20-multi-agent",
         wire: WireFormat::OpenAi,
-        candidates: &xai("grok-4.20-multi-agent", "x-ai/grok-4.20-multi-agent"),
+        candidates: &xai_responses_first("grok-4.20-multi-agent", "x-ai/grok-4.20-multi-agent"),
         responses: &[],
         price: price("1.25", "2.5", "0.2", "1.25"), // cache_write unpublished; equals input
-        card: card(
+        card: card_unpublished_output(
             "Grok 4.20 Multi-Agent",
-            "x-ai",
-            1774979158,
-            2_000_000,
-            1_800_000,
+            "xai",
+            1773014400,
+            1_000_000,
             IN_TEXT | IN_IMAGE | IN_FILE,
             REASONING | STRUCTURED_OUTPUTS,
         ),
@@ -1543,15 +1690,14 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
     ModelRoute {
         model: "grok-4.3",
         wire: WireFormat::OpenAi,
-        candidates: &xai("grok-4.3", "x-ai/grok-4.3"),
+        candidates: &xai_responses_first("grok-4.3", "x-ai/grok-4.3"),
         responses: &[],
         price: price("1.25", "2.5", "0.2", "1.25"), // cache_write unpublished; equals input
-        card: card(
+        card: card_unpublished_output(
             "Grok 4.3",
-            "x-ai",
-            1777591821,
+            "xai",
+            1776384000,
             1_000_000,
-            900_000,
             IN_TEXT | IN_IMAGE | IN_FILE,
             TOOLS | REASONING | STRUCTURED_OUTPUTS,
         ),
@@ -1559,15 +1705,14 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
     ModelRoute {
         model: "grok-4.5",
         wire: WireFormat::OpenAi,
-        candidates: &xai("grok-4.5", "x-ai/grok-4.5"),
+        candidates: &xai_responses_first("grok-4.5", "x-ai/grok-4.5"),
         responses: &[],
         price: price("2", "6", "0.3", "2"), // cache_write unpublished; equals input
-        card: card(
+        card: card_unpublished_output(
             "Grok 4.5",
-            "x-ai",
-            1783523154,
+            "xai",
+            1782691200,
             500_000,
-            450_000,
             IN_TEXT | IN_IMAGE | IN_FILE,
             TOOLS | REASONING | STRUCTURED_OUTPUTS,
         ),
@@ -1575,15 +1720,29 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
     ModelRoute {
         model: "grok-4.6",
         wire: WireFormat::OpenAi,
-        candidates: &xai("grok-4.6", "x-ai/grok-4.6"),
+        candidates: &xai_responses_first("grok-4.6", "x-ai/grok-4.6"),
         responses: &[],
         price: price("2", "6", "0.5", "2"), // cache_write unpublished; equals input
-        card: card(
+        card: card_unpublished_output(
             "Grok 4.6",
-            "x-ai",
-            1786548957,
+            "xai",
+            1785974400,
             500_000,
-            450_000,
+            IN_TEXT | IN_IMAGE | IN_FILE,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
+    },
+    ModelRoute {
+        model: "grok-4.7",
+        wire: WireFormat::OpenAi,
+        candidates: &xai_responses_first("grok-4.7", "x-ai/grok-4.7"),
+        responses: &[],
+        price: price("2", "6", "0.5", "2"), // cache_write unpublished; equals input
+        card: card_unpublished_output(
+            "Grok 4.7",
+            "xai",
+            1788307200,
+            500_000,
             IN_TEXT | IN_IMAGE | IN_FILE,
             TOOLS | REASONING | STRUCTURED_OUTPUTS,
         ),
@@ -1591,36 +1750,38 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
     ModelRoute {
         model: "grok-build-0.1",
         wire: WireFormat::OpenAi,
-        candidates: &xai("grok-build-0.1", "x-ai/grok-build-0.1"),
+        candidates: &xai_responses_first("grok-build-0.1", "x-ai/grok-build-0.1"),
         responses: &[],
         price: price("1", "2", "0.2", "1"), // cache_write unpublished; equals input
-        card: card(
+        card: card_unpublished_output(
             "Grok Build 0.1",
-            "x-ai",
-            1779298123,
+            "xai",
+            1776297600,
             256_000,
-            230_400,
             IN_TEXT | IN_IMAGE | IN_FILE,
             TOOLS | REASONING | STRUCTURED_OUTPUTS,
         ),
     },
     // Groq / Together / Fireworks llama + qwen + open-weight ids people send. No Meta row, so
-    // primary is the host whose id is the catalog name (Groq for the short llama-3.x ids,
-    // Fireworks for Llama 4, Together for Qwen / Kimi / GLM / MiniMax / Gemma / Inkling).
-    // OpenRouter (or Groq/Fireworks) is failover. Llama 3.3 and GPT-OSS 120B name every host
-    // we already route them on.
+    // primary is a host that serves the model to a standard serverless key: Groq for GPT-OSS and
+    // Qwen3.8 27B, Together for Llama 3.3 / Qwen / Kimi / GLM / MiniMax / Inkling. A candidate the
+    // host reserves for Enterprise or dedicated deployments is not listed (Groq
+    // `llama-3.1-8b-instant` and `llama-3.3-70b-versatile`; Fireworks Llama 4, Kimi K2.6, GLM 5.1,
+    // GLM 5.2 and Llama 3.3; Together Kimi K2.7 Code, GPT-OSS 20B, Gemma 4 31B and Qwen2.5 7B
+    // Turbo): it fails over on every request. Rows left with only OpenRouter are
+    // `openrouter_only`, and keep their names so existing clients still resolve. Groq caches only
+    // GPT-OSS; Together publishes no cache-write rate, so those rates equal input.
     ModelRoute {
         model: "llama-3.1-8b-instant",
         wire: WireFormat::OpenAi,
-        candidates: &groq("llama-3.1-8b-instant", "meta-llama/llama-3.1-8b-instruct"),
+        candidates: &openrouter_only("meta-llama/llama-3.1-8b-instruct"), // Groq: Enterprise-only
         responses: &[],
         price: price("0.05", "0.08", "0.025", "0.05"), // cache_write unpublished; equals input
-        card: card(
+        card: card_unpublished_output(
             "Llama 3.1 8B Instruct",
             "meta-llama",
             1721692800,
             131_072,
-            117_964,
             IN_TEXT,
             TOOLS | STRUCTURED_OUTPUTS,
         ),
@@ -1628,9 +1789,12 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
     ModelRoute {
         model: "llama-3.3-70b-versatile",
         wire: WireFormat::OpenAi,
-        candidates: &llama_3_3(),
+        candidates: &together(
+            "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+            "meta-llama/llama-3.3-70b-instruct",
+        ),
         responses: &[],
-        price: price("0.1", "0.32", "0.1", "0.1"), // no separate cache card; both rates equal input
+        price: price("1.04", "1.04", "1.04", "1.04"), // no published cache rates; both equal input
         card: card(
             "Llama 3.3 70B Instruct",
             "meta-llama",
@@ -1644,10 +1808,7 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
     ModelRoute {
         model: "meta-llama/llama-4-maverick",
         wire: WireFormat::OpenAi,
-        candidates: &fireworks(
-            "accounts/fireworks/models/llama4-maverick-instruct-basic",
-            "meta-llama/llama-4-maverick",
-        ),
+        candidates: &openrouter_only("meta-llama/llama-4-maverick"), // Fireworks: not serverless
         responses: &[],
         price: price("0.1875", "0.6525", "0.1875", "0.1875"), // no separate cache card; both rates equal input
         card: card(
@@ -1663,20 +1824,17 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
     ModelRoute {
         model: "meta-llama/llama-4-scout",
         wire: WireFormat::OpenAi,
-        candidates: &fireworks(
-            "accounts/fireworks/models/llama4-scout-instruct-basic",
-            "meta-llama/llama-4-scout",
-        ),
+        candidates: &openrouter_only("meta-llama/llama-4-scout"), // Fireworks: not serverless
         responses: &[],
         price: price("0.1", "0.3", "0.1", "0.1"), // no separate cache card; both rates equal input
         card: card(
             "Llama 4 Scout",
             "meta-llama",
             1743881519,
-            1_310_720,
+            1_048_576,
             16_384,
             IN_TEXT | IN_IMAGE,
-            TOOLS | STRUCTURED_OUTPUTS,
+            STRUCTURED_OUTPUTS,
         ),
     },
     ModelRoute {
@@ -1685,12 +1843,11 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &together("meta-models/Muse-Glimmer-30B", "meta/muse-glimmer-30b"),
         responses: &[],
         price: price("0.35", "1.5", "0.04", "0.35"), // cache_write unpublished; equals input
-        card: card(
+        card: card_unpublished_output(
             "Muse Glimmer 30B",
             "meta",
             1786302394,
             131_072,
-            117_964,
             IN_TEXT | IN_IMAGE,
             TOOLS | REASONING | STRUCTURED_OUTPUTS,
         ),
@@ -1701,177 +1858,43 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &minimax_m3(),
         responses: &[],
         price: price("0.3", "1.2", "0.06", "0.3"), // cache_write unpublished; equals input
-        card: card(
+        card: card_unpublished_output(
             "MiniMax M3",
             "minimax",
             1780245374,
-            1_048_576,
-            512_000,
+            524_288,
             IN_TEXT | IN_IMAGE | IN_VIDEO,
-            TOOLS | REASONING | STRUCTURED_OUTPUTS,
-        ),
-    },
-    ModelRoute {
-        model: "minimaxai/minimax-m2.7",
-        wire: WireFormat::OpenAi,
-        candidates: &groq("minimaxai/minimax-m2.7", "minimax/minimax-m2.7"),
-        responses: &[],
-        price: price("0.21", "0.84", "0.042", "0.21"), // cache_write unpublished; equals input
-        card: card(
-            "MiniMax M2.7",
-            "minimax",
-            1773836697,
-            204_800,
-            176_947,
-            IN_TEXT,
-            TOOLS | REASONING | STRUCTURED_OUTPUTS,
-        ),
-    },
-    ModelRoute {
-        model: "ministral-14b-latest",
-        wire: WireFormat::OpenAi,
-        candidates: &mistral("ministral-14b-latest", "mistralai/ministral-14b-2512"),
-        responses: &[],
-        price: price("0.2", "0.2", "0.02", "0.2"), // cache_write unpublished; equals input
-        card: card(
-            "Ministral 3 14B 2512",
-            "mistralai",
-            1764681735,
-            262_144,
-            209_715,
-            IN_TEXT | IN_IMAGE,
-            TOOLS | STRUCTURED_OUTPUTS,
-        ),
-    },
-    ModelRoute {
-        model: "ministral-3b-latest",
-        wire: WireFormat::OpenAi,
-        candidates: &mistral("ministral-3b-latest", "mistralai/ministral-3b-2512"),
-        responses: &[],
-        price: price("0.1", "0.1", "0.01", "0.1"), // cache_write unpublished; equals input
-        card: card(
-            "Ministral 3 3B 2512",
-            "mistralai",
-            1764681560,
-            131_072,
-            104_857,
-            IN_TEXT | IN_IMAGE,
-            TOOLS | STRUCTURED_OUTPUTS,
-        ),
-    },
-    ModelRoute {
-        model: "ministral-8b-latest",
-        wire: WireFormat::OpenAi,
-        candidates: &mistral("ministral-8b-latest", "mistralai/ministral-8b-2512"),
-        responses: &[],
-        price: price("0.15", "0.15", "0.015", "0.15"), // cache_write unpublished; equals input
-        card: card(
-            "Ministral 3 8B 2512",
-            "mistralai",
-            1764681654,
-            262_144,
-            209_715,
-            IN_TEXT | IN_IMAGE,
-            TOOLS | STRUCTURED_OUTPUTS,
-        ),
-    },
-    ModelRoute {
-        model: "mistral-large-latest",
-        wire: WireFormat::OpenAi,
-        candidates: &mistral("mistral-large-latest", "mistralai/mistral-large-2512"),
-        responses: &[],
-        price: price("0.5", "1.5", "0.05", "0.5"), // cache_write unpublished; equals input
-        card: card(
-            "Mistral Large 3 2512",
-            "mistralai",
-            1764624472,
-            262_144,
-            209_715,
-            IN_TEXT | IN_IMAGE | IN_FILE,
-            TOOLS | STRUCTURED_OUTPUTS,
-        ),
-    },
-    ModelRoute {
-        model: "mistral-medium-latest",
-        wire: WireFormat::OpenAi,
-        candidates: &mistral("mistral-medium-latest", "mistralai/mistral-medium-3-5"),
-        responses: &[],
-        price: price("1.5", "7.5", "1.5", "1.5"), // no separate cache card; both rates equal input
-        card: card(
-            "Mistral Medium 3.5",
-            "mistralai",
-            1777570439,
-            262_144,
-            209_715,
-            IN_TEXT | IN_IMAGE | IN_FILE,
-            TOOLS | REASONING | STRUCTURED_OUTPUTS,
-        ),
-    },
-    ModelRoute {
-        model: "mistral-nemo",
-        wire: WireFormat::OpenAi,
-        candidates: &mistral("mistral-nemo", "mistralai/mistral-nemo"),
-        responses: &[],
-        price: price("0.019", "0.03", "0.019", "0.019"), // no separate cache card; both rates equal input
-        card: card(
-            "Mistral Nemo",
-            "mistralai",
-            1721347200,
-            131_072,
-            16_384,
-            IN_TEXT,
-            TOOLS | STRUCTURED_OUTPUTS,
-        ),
-    },
-    ModelRoute {
-        model: "mistral-small-latest",
-        wire: WireFormat::OpenAi,
-        candidates: &mistral("mistral-small-latest", "mistralai/mistral-small-2603"),
-        responses: &[],
-        price: price("0.15", "0.6", "0.015", "0.15"), // cache_write unpublished; equals input
-        card: card(
-            "Mistral Small 4",
-            "mistralai",
-            1773695685,
-            262_144,
-            209_715,
-            IN_TEXT | IN_IMAGE,
             TOOLS | REASONING | STRUCTURED_OUTPUTS,
         ),
     },
     ModelRoute {
         model: "moonshotai/kimi-k2.6",
         wire: WireFormat::OpenAi,
-        candidates: &fireworks(
-            "accounts/fireworks/models/kimi-k2p6",
-            "moonshotai/kimi-k2.6",
-        ),
+        candidates: &openrouter_only("moonshotai/kimi-k2.6"), // Fireworks: serverless deprecated
         responses: &[],
-        price: price("0.65", "3.41", "0.15", "0.65"), // cache_write unpublished; equals input
-        card: card(
+        price: price("0.95", "4", "0.16", "0.95"), // Moonshot's own rate; cache_write unpublished, equals input
+        card: card_unpublished_output(
             "Kimi K2.6",
             "moonshotai",
             1776699402,
             262_144,
-            235_929,
             IN_TEXT | IN_IMAGE,
-            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+            TOOLS | REASONING, // structured outputs unenforced: D155
         ),
     },
     ModelRoute {
         model: "moonshotai/kimi-k2.7-code",
         wire: WireFormat::OpenAi,
-        candidates: &together("moonshotai/Kimi-K2.7-Code", "moonshotai/kimi-k2.7-code"),
+        candidates: &openrouter_only("moonshotai/kimi-k2.7-code"), // Together: dedicated only
         responses: &[],
-        price: price("0.6562", "3.3", "0.18", "0.6562"), // cache_write unpublished; equals input
-        card: card(
+        price: price("0.95", "4", "0.19", "0.95"), // Moonshot's own rate; cache_write unpublished, equals input
+        card: card_unpublished_output(
             "Kimi K2.7 Code",
             "moonshotai",
             1781266361,
             262_144,
-            235_929,
             IN_TEXT | IN_IMAGE,
-            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+            TOOLS | REASONING, // structured outputs unenforced: D155
         ),
     },
     ModelRoute {
@@ -1880,46 +1903,13 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &kimi_k3(),
         responses: &[],
         price: price("3", "15", "0.3", "3"), // cache_write unpublished; equals input
-        card: card(
+        card: card_unpublished_output(
             "Kimi K3",
             "moonshotai",
             1784215858,
             1_048_576,
-            943_718,
             IN_TEXT | IN_IMAGE | IN_VIDEO,
             TOOLS | REASONING | STRUCTURED_OUTPUTS,
-        ),
-    },
-    ModelRoute {
-        model: "o1",
-        wire: WireFormat::OpenAi,
-        candidates: &openai_chat("o1", "openai/o1"),
-        responses: &openai_responses("o1"),
-        price: price("15", "60", "7.5", "15"), // cache_write unpublished; equals input
-        card: card(
-            "o1",
-            "openai",
-            1734459999,
-            200_000,
-            100_000,
-            IN_TEXT | IN_IMAGE | IN_FILE,
-            TOOLS | REASONING | STRUCTURED_OUTPUTS,
-        ),
-    },
-    ModelRoute {
-        model: "o1-pro",
-        wire: WireFormat::OpenAi,
-        candidates: &openai_responses_first("o1-pro", "openai/o1-pro"),
-        responses: &openai_responses("o1-pro"),
-        price: price("150", "600", "150", "150"), // no separate cache card; both rates equal input
-        card: card(
-            "o1-pro",
-            "openai",
-            1742423211,
-            200_000,
-            100_000,
-            IN_TEXT | IN_IMAGE | IN_FILE,
-            REASONING | STRUCTURED_OUTPUTS,
         ),
     },
     ModelRoute {
@@ -1931,26 +1921,10 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         card: card(
             "o3",
             "openai",
-            1744823457,
+            1744225308,
             200_000,
             100_000,
             IN_TEXT | IN_IMAGE | IN_FILE,
-            TOOLS | REASONING | STRUCTURED_OUTPUTS,
-        ),
-    },
-    ModelRoute {
-        model: "o3-mini",
-        wire: WireFormat::OpenAi,
-        candidates: &openai_chat("o3-mini", "openai/o3-mini"),
-        responses: &openai_responses("o3-mini"),
-        price: price("1.1", "4.4", "0.55", "1.1"), // cache_write unpublished; equals input
-        card: card(
-            "o3 Mini",
-            "openai",
-            1738351721,
-            200_000,
-            100_000,
-            IN_TEXT | IN_FILE,
             TOOLS | REASONING | STRUCTURED_OUTPUTS,
         ),
     },
@@ -1971,33 +1945,17 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         ),
     },
     ModelRoute {
-        model: "o4-mini",
-        wire: WireFormat::OpenAi,
-        candidates: &openai_chat("o4-mini", "openai/o4-mini"),
-        responses: &openai_responses("o4-mini"),
-        price: price("1.1", "4.4", "0.275", "1.1"), // cache_write unpublished; equals input
-        card: card(
-            "o4 Mini",
-            "openai",
-            1744820942,
-            200_000,
-            100_000,
-            IN_TEXT | IN_IMAGE | IN_FILE,
-            TOOLS | REASONING | STRUCTURED_OUTPUTS,
-        ),
-    },
-    ModelRoute {
         model: "openai/gpt-oss-120b",
         wire: WireFormat::OpenAi,
         candidates: &gpt_oss_120b(),
         responses: &[],
-        price: price("0.037", "0.17", "0.037", "0.037"), // no separate cache card; both rates equal input
+        price: price("0.15", "0.6", "0.075", "0.15"), // cache_write unpublished; equals input
         card: card(
             "gpt-oss-120b",
             "openai",
             1754414231,
             131_072,
-            117_964,
+            65_536,
             IN_TEXT,
             TOOLS | REASONING | STRUCTURED_OUTPUTS,
         ),
@@ -2005,15 +1963,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
     ModelRoute {
         model: "openai/gpt-oss-20b",
         wire: WireFormat::OpenAi,
-        candidates: &gpt_oss_20b(),
+        candidates: &groq("openai/gpt-oss-20b", "openai/gpt-oss-20b"),
         responses: &[],
-        price: price("0.018", "0.09", "0.009", "0.018"), // cache_write unpublished; equals input
+        price: price("0.075", "0.3", "0.0375", "0.075"), // cache_write unpublished; equals input
         card: card(
             "gpt-oss-20b",
             "openai",
             1754414229,
             131_072,
-            32_768,
+            65_536,
             IN_TEXT,
             TOOLS | REASONING | STRUCTURED_OUTPUTS,
         ),
@@ -2040,18 +1998,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
     ModelRoute {
         model: "qwen/qwen-2.5-7b-instruct",
         wire: WireFormat::OpenAi,
-        candidates: &together(
-            "Qwen/Qwen2.5-7B-Instruct-Turbo",
-            "qwen/qwen-2.5-7b-instruct",
-        ),
+        candidates: &openrouter_only("qwen/qwen-2.5-7b-instruct"), // Together: not serverless
         responses: &[],
-        price: price("0.1", "0.2", "0.1", "0.1"), // no separate cache card; both rates equal input
+        price: price("0.1", "0.2", "0.1", "0.1"), // OpenRouter's (the only host); no cache rates, both equal input
         card: card(
             "Qwen2.5 7B Instruct",
             "qwen",
             1729036800,
             32_768,
-            29_491,
+            8_192,
             IN_TEXT,
             TOOLS | STRUCTURED_OUTPUTS,
         ),
@@ -2061,7 +2016,7 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         wire: WireFormat::OpenAi,
         candidates: &together("Qwen/Qwen3.5-9B", "qwen/qwen3.5-9b"),
         responses: &[],
-        price: price("0.1", "0.15", "0.1", "0.1"), // no separate cache card; both rates equal input
+        price: price("0.17", "0.25", "0.17", "0.17"), // no published cache rates; both equal input
         card: card(
             "Qwen3.5-9B",
             "qwen",
@@ -2077,7 +2032,7 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         wire: WireFormat::OpenAi,
         candidates: &together("Qwen/Qwen3.6-Plus", "qwen/qwen3.6-plus"),
         responses: &[],
-        price: price("0.325", "1.95", "0.325", "0.40625"), // cache_read unpublished; equals input
+        price: price("0.5", "3", "0.5", "0.5"), // no published cache rates; both equal input
         card: card(
             "Qwen3.6 Plus",
             "qwen",
@@ -2085,7 +2040,7 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
             1_000_000,
             65_536,
             IN_TEXT | IN_IMAGE | IN_VIDEO,
-            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+            TOOLS | REASONING, // structured outputs unenforced: D155
         ),
     },
     ModelRoute {
@@ -2093,7 +2048,7 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         wire: WireFormat::OpenAi,
         candidates: &together("Qwen/Qwen3.7-Max", "qwen/qwen3.7-max"),
         responses: &[],
-        price: price("1.475", "4.425", "0.295", "1.84375"),
+        price: price("2.5", "7.5", "0.5", "2.5"), // Alibaba International = Together /v1/models (D241). cache_write unpublished; equals input
         card: card(
             "Qwen3.7 Max",
             "qwen",
@@ -2109,7 +2064,7 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         wire: WireFormat::OpenAi,
         candidates: &together("Qwen/Qwen3.7-Plus", "qwen/qwen3.7-plus"),
         responses: &[],
-        price: price("0.32", "1.28", "0.064", "0.4"),
+        price: price("0.32", "1.28", "0.32", "0.32"), // no published cache rates; both equal input
         card: card(
             "Qwen3.7 Plus",
             "qwen",
@@ -2125,12 +2080,12 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         wire: WireFormat::OpenAi,
         candidates: &together("Qwen/Qwen3.8-2.4T-A95B", "qwen/qwen3.8-2.4t-a95b"),
         responses: &[],
-        price: price("2", "6", "0.25", "2"), // cache_write unpublished; equals input
+        price: price("2", "6", "0.25", "2"), // cached: pricing page $0.25, docs table $0.50. cache_write unpublished; equals input
         card: card(
             "Qwen3.8 2.4T A95B",
             "qwen",
             1786551702,
-            1_048_576,
+            1_010_000,
             131_072,
             IN_TEXT,
             TOOLS | REASONING | STRUCTURED_OUTPUTS,
@@ -2141,13 +2096,13 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         wire: WireFormat::OpenAi,
         candidates: &groq("qwen/qwen3.8-27b", "qwen/qwen3.8-27b"),
         responses: &[],
-        price: price("0.42", "3", "0.085", "0.42"), // cache_write unpublished; equals input
+        price: price("0.8", "4", "0.8", "0.8"), // Groq lists no prompt caching for this model; both equal input
         card: card(
             "Qwen3.8 27B",
             "qwen",
             1786722910,
-            1_000_000,
             131_072,
+            16_384,
             IN_TEXT | IN_IMAGE | IN_VIDEO,
             TOOLS | REASONING | STRUCTURED_OUTPUTS,
         ),
@@ -2157,7 +2112,7 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         wire: WireFormat::OpenAi,
         candidates: &together("Qwen/Qwen3.8-Flash", "qwen/qwen3.8-flash"),
         responses: &[],
-        price: price("0.15", "0.47", "0.016", "0.2"),
+        price: price("0.15", "0.47", "0.15", "0.15"), // Alibaba International = Together /v1/models (D241); no cache rates, both equal input
         card: card(
             "Qwen3.8 Flash",
             "qwen",
@@ -2180,7 +2135,7 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         card: card(
             "Text Embedding 3 Large",
             "openai",
-            1761862866,
+            1705953180,
             8_192,
             0,
             IN_TEXT,
@@ -2196,7 +2151,7 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         card: card(
             "Text Embedding 3 Small",
             "openai",
-            1761857455,
+            1705948997,
             8_192,
             0,
             IN_TEXT,
@@ -2209,12 +2164,11 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &together("thinkingmachines/Inkling", "thinkingmachines/inkling"),
         responses: &[],
         price: price("1", "4.05", "0.17", "1"), // cache_write unpublished; equals input
-        card: card(
+        card: card_unpublished_output(
             "Inkling",
             "thinkingmachines",
             1784325956,
             524_288,
-            471_859,
             IN_TEXT | IN_IMAGE | IN_AUDIO,
             TOOLS | REASONING,
         ),
@@ -2222,9 +2176,9 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
     ModelRoute {
         model: "z-ai/glm-5.1",
         wire: WireFormat::OpenAi,
-        candidates: &fireworks("accounts/fireworks/models/glm-5p1", "z-ai/glm-5.1"),
+        candidates: &openrouter_only("z-ai/glm-5.1"), // Fireworks: not serverless
         responses: &[],
-        price: price("1.4", "4.4", "0.26", "1.4"), // cache_write unpublished; equals input
+        price: price("1.4", "4.4", "0.26", "1.4"), // Z.ai's own rate; cache_write unpublished, equals input
         card: card(
             "GLM 5.1",
             "z-ai",
@@ -2238,15 +2192,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
     ModelRoute {
         model: "z-ai/glm-5.2",
         wire: WireFormat::OpenAi,
-        candidates: &glm_5_2(),
+        // Fireworks' glm-5p2: serverless ended 2026-09-25 (on-demand deployments only).
+        candidates: &together("zai-org/GLM-5.2", "z-ai/glm-5.2"),
         responses: &[],
-        price: price("0.1739", "3.99", "0.1391", "0.1739"), // cache_write unpublished; equals input
-        card: card(
+        price: price("1.4", "4.4", "0.26", "1.4"), // cache_write unpublished; equals input
+        card: card_unpublished_output(
             "GLM 5.2",
             "z-ai",
             1781631930,
-            1_048_576,
-            943_718,
+            1_048_575,
             IN_TEXT,
             TOOLS | REASONING | STRUCTURED_OUTPUTS,
         ),
@@ -2257,12 +2211,11 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &together("zai-org/GLM-5.3", "z-ai/glm-5.3"),
         responses: &[],
         price: price("1.4", "4.4", "0.26", "1.4"), // cache_write unpublished; equals input
-        card: card(
+        card: card_unpublished_output(
             "GLM 5.3",
             "z-ai",
             1787086655,
-            1_048_576,
-            943_718,
+            1_048_575,
             IN_TEXT,
             TOOLS | REASONING | STRUCTURED_OUTPUTS,
         ),
@@ -2273,14 +2226,14 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &together("zai-org/GLM-5.3-Flash", "z-ai/glm-5.3-flash"),
         responses: &[],
         price: price("0.15", "0.5", "0.03", "0.15"), // cache_write unpublished; equals input
-        card: card(
+        card: card_unpublished_output(
             "GLM 5.3 Flash",
             "z-ai",
             1787752741,
-            1_048_576,
-            943_717,
+            1_048_575,
             IN_TEXT | IN_IMAGE | IN_VIDEO,
-            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+            // No tools: neither candidate calls one reliably (D197).
+            REASONING | STRUCTURED_OUTPUTS,
         ),
     },
 ];
@@ -2360,7 +2313,11 @@ pub fn models_list_json() -> &'static str {
             if embeddings {
                 out.push_str("null");
             } else {
-                let _ = write!(out, "{}", c.max_output_tokens);
+                let _ = write!(
+                    out,
+                    "{},\"max_output_published\":{}",
+                    c.max_output_tokens, c.max_output_published
+                );
             }
             out.push_str(",\"input_modalities\":");
             names(&mut out, c.input, &INPUT_NAMES);
@@ -2395,11 +2352,19 @@ mod tests {
 
     /// Product floor: managed `/v1` should list a full current generation, not a handful of
     /// flagships. Count is the guard; new rows still have to pass the uniqueness / wire tests below.
+    ///
+    /// The floor was 100 until 2026-10-01, when three retired models (`deepseek-chat`,
+    /// `deepseek-reasoner`, `mistral-nemo`) left the table. A row must never serve a different model
+    /// under its name, so the floor came down rather than padding the table with rows to meet it.
+    /// It came down again, to 90, when the seven Mistral rows left (D156): a row nobody can be
+    /// served on is not a row. It came down to 80 when the seven OpenAI rows due to shut down on
+    /// 2026-10-23 left early by owner decision (D243): 91 rows became 84, and the floor follows the
+    /// table rather than the table being padded to meet it.
     #[test]
-    fn catalog_lists_at_least_100_models() {
+    fn catalog_lists_at_least_80_models() {
         assert!(
-            MODEL_ROUTES.len() >= 100,
-            "MODEL_ROUTES has {} rows; keep the managed catalog at 100+",
+            MODEL_ROUTES.len() >= 80,
+            "MODEL_ROUTES has {} rows; keep the managed catalog at 80+",
             MODEL_ROUTES.len(),
         );
     }
@@ -2634,6 +2599,7 @@ mod tests {
         }
     }
 
+    /// claim: CAT-10
     #[test]
     fn for_model_finds_every_row() {
         for route in MODEL_ROUTES {
@@ -2646,6 +2612,7 @@ mod tests {
         }
     }
 
+    /// claim: CAT-10
     #[test]
     fn for_model_is_case_insensitive() {
         assert_eq!(
@@ -2654,6 +2621,7 @@ mod tests {
         );
     }
 
+    /// claim: CAT-10
     #[test]
     fn for_model_is_none_for_unknown_ids() {
         for unknown in ["", "gpt-4o-min", "gpt-4o-mini-x", "claude", "nonesuch"] {
@@ -2667,6 +2635,7 @@ mod tests {
 
     /// A candidate's upstream id is an alias for its row, not a second product. OpenRouter slugs
     /// and Bedrock inference-profile ids must resolve to the same row as the canonical name.
+    /// claim: CAT-10
     #[test]
     fn for_model_accepts_candidate_spellings_as_aliases() {
         assert_eq!(
@@ -2723,6 +2692,7 @@ mod tests {
         }
     }
 
+    /// claim: E4
     #[test]
     fn models_list_json_describes_every_row() {
         let v: serde_json::Value = serde_json::from_str(models_list_json()).expect("valid JSON");
@@ -2757,6 +2727,7 @@ mod tests {
                 assert!(caps.is_empty(), "{m}");
             } else {
                 assert_eq!(m["max_output_tokens"], c.max_output_tokens);
+                assert_eq!(m["max_output_published"], c.max_output_published, "{m}");
                 assert_eq!(m["output_modalities"], serde_json::json!(["text"]));
                 assert_eq!(m["endpoints"].as_array().unwrap().len(), 3);
             }
@@ -2764,8 +2735,9 @@ mod tests {
     }
 
     /// The card is what a client sizes requests by: a zero window or output cap would make every
-    /// request look oversized, and an output cap above the window is not a real card. Names go into
-    /// the list unescaped.
+    /// request look oversized. An output cap may exceed the input cap where the vendor's window
+    /// holds both (gpt-5-pro: 128K in, 272K out of 400K), but not the whole of any window we list.
+    /// Names go into the list unescaped.
     #[test]
     fn every_route_has_a_plausible_card() {
         for r in MODEL_ROUTES {
@@ -2784,9 +2756,10 @@ mod tests {
                 r.model
             );
             assert!(
-                c.max_output_tokens <= c.context_window,
-                "{} output over window",
-                r.model
+                c.max_output_tokens <= 400_000,
+                "{} output {} over any vendor window it shares",
+                r.model,
+                c.max_output_tokens
             );
             assert!(c.input & IN_TEXT != 0, "{} reads no text", r.model);
             assert!(
@@ -3033,6 +3006,20 @@ mod tests {
                 "openai/gpt-5.6-sol",
             ),
             (
+                "gpt-6.1-sol",
+                WireFormat::OpenAi,
+                ProviderId::OpenAi,
+                "gpt-6.1-sol",
+                "openai/gpt-6.1-sol",
+            ),
+            (
+                "grok-4.7",
+                WireFormat::OpenAi,
+                ProviderId::XAi,
+                "grok-4.7",
+                "x-ai/grok-4.7",
+            ),
+            (
                 "grok-4.6",
                 WireFormat::OpenAi,
                 ProviderId::XAi,
@@ -3040,25 +3027,11 @@ mod tests {
                 "x-ai/grok-4.6",
             ),
             (
-                "deepseek-chat",
-                WireFormat::OpenAi,
-                ProviderId::DeepSeek,
-                "deepseek-chat",
-                "deepseek/deepseek-chat",
-            ),
-            (
-                "mistral-large-latest",
-                WireFormat::OpenAi,
-                ProviderId::Mistral,
-                "mistral-large-latest",
-                "mistralai/mistral-large-2512",
-            ),
-            (
-                "llama-3.1-8b-instant",
+                "qwen/qwen3.8-27b",
                 WireFormat::OpenAi,
                 ProviderId::Groq,
-                "llama-3.1-8b-instant",
-                "meta-llama/llama-3.1-8b-instruct",
+                "qwen/qwen3.8-27b",
+                "qwen/qwen3.8-27b",
             ),
         ];
         for (name, wire, primary, native, openrouter) in cases {
@@ -3074,17 +3047,22 @@ mod tests {
         }
     }
 
-    /// GPT-OSS 120B is the other four-host row. Catalog name is the shared Groq/Together/OpenRouter
-    /// id; Fireworks keeps `accounts/fireworks/models/gpt-oss-120b` as an alias.
+    /// GPT-OSS 120B is served by Groq, Together and Fireworks. Catalog name is the shared
+    /// Groq/Together id; Fireworks keeps `accounts/fireworks/models/gpt-oss-120b` as an alias. No
+    /// OpenRouter candidate: one of its hosts answers forced tool calls with an empty
+    /// `finish_reason: "error"` 200. Llama 4 Scout advertises no tools: no OpenRouter host serves
+    /// them ("Filter by Tool Compatibility removed deepinfra/fp8, novita/bf16").
+    /// claim: CAT-6
+    /// defect: D115
     #[test]
-    fn gpt_oss_120b_names_groq_together_fireworks_and_openrouter() {
+    fn advertised_tools_have_a_tool_capable_candidate() {
         assert!(
             for_model("openai/gpt-oss-120b").is_some(),
             "openai/gpt-oss-120b must be in the catalog"
         );
         if let Some(row) = for_model("openai/gpt-oss-120b") {
             assert_eq!(row.wire, WireFormat::OpenAi);
-            assert_eq!(row.candidates.len(), 4);
+            assert_eq!(row.candidates.len(), 3);
             assert_eq!(row.candidates[0].provider, ProviderId::Groq);
             assert_eq!(row.candidates[1].provider, ProviderId::Together);
             assert_eq!(row.candidates[2].provider, ProviderId::Fireworks);
@@ -3092,12 +3070,45 @@ mod tests {
                 row.candidates[2].upstream_model,
                 "accounts/fireworks/models/gpt-oss-120b"
             );
-            assert_eq!(row.candidates[3].provider, ProviderId::OpenRouter);
+            assert!(
+                row.candidates
+                    .iter()
+                    .all(|c| c.provider != ProviderId::OpenRouter)
+            );
             assert_eq!(
                 for_model("accounts/fireworks/models/gpt-oss-120b").map(|r| r.model),
                 Some("openai/gpt-oss-120b"),
             );
         }
+        let scout = for_model("meta-llama/llama-4-scout");
+        assert!(scout.is_some_and(|r| r.card.features & TOOLS == 0));
+        assert!(scout.is_some_and(|r| r.card.features & STRUCTURED_OUTPUTS != 0));
+    }
+
+    /// GLM 5.3 Flash advertises no tools: forced `get_weather` calls came back with junk in the
+    /// `city` argument (invented coordinates and weather readings, or no `city` at all) 9 of 100
+    /// times direct to Together, the row's primary, and 9 of 60 through OpenRouter (every bad one
+    /// served by its Together host), thinking on or off (2026-10-01, `verify/catalog_truth.toml`).
+    /// The sweep's own failure was a repetition loop cut off at the token cap. With no reliable candidate, steering a tool request away
+    /// from one would not help, so a tool request is refused instead of answered with bad
+    /// arguments. GLM 5.3, on the same two hosts, answered 20 of 20 cleanly and keeps them.
+    /// claim: CAT-6
+    /// defect: D197
+    #[test]
+    fn glm_5_3_flash_advertises_no_tools() {
+        let flash = for_model("z-ai/glm-5.3-flash").map(|r| r.card.features);
+        assert!(
+            flash.is_some_and(|f| f & TOOLS == 0),
+            "glm-5.3-flash: tools"
+        );
+        assert!(
+            flash.is_some_and(
+                |f| f & (REASONING | STRUCTURED_OUTPUTS) == REASONING | STRUCTURED_OUTPUTS
+            ),
+            "glm-5.3-flash keeps reasoning and structured outputs"
+        );
+        let glm = for_model("z-ai/glm-5.3").map(|r| r.card.features);
+        assert!(glm.is_some_and(|f| f & TOOLS != 0), "glm-5.3 keeps tools");
     }
 
     #[test]
@@ -3119,64 +3130,68 @@ mod tests {
         }
     }
 
+    /// MiniMax M3 is served by Together, Fireworks and OpenRouter. GLM 5.2 is Together and
+    /// OpenRouter: Fireworks ended `glm-5p2` serverless on 2026-09-25 (its model page FAQ), so a
+    /// serverless key can no longer reach it (`verify/catalog_truth.toml` `[[not_serverless]]`).
     #[test]
     fn glm_5_2_and_minimax_m3_name_together_fireworks_and_openrouter() {
-        for (name, together_id, fireworks_id, openrouter) in [
-            (
-                "z-ai/glm-5.2",
-                "zai-org/GLM-5.2",
-                "accounts/fireworks/models/glm-5p2",
-                "z-ai/glm-5.2",
-            ),
-            (
-                "minimax/minimax-m3",
-                "MiniMaxAI/MiniMax-M3",
-                "accounts/fireworks/models/minimax-m3",
-                "minimax/minimax-m3",
-            ),
-        ] {
-            assert!(for_model(name).is_some(), "{name} must be in the catalog");
-            if let Some(row) = for_model(name) {
-                assert_eq!(row.candidates.len(), 3, "{name}");
-                assert_eq!(row.candidates[0].provider, ProviderId::Together, "{name}");
-                assert_eq!(row.candidates[0].upstream_model, together_id, "{name}");
-                assert_eq!(row.candidates[1].provider, ProviderId::Fireworks, "{name}");
-                assert_eq!(row.candidates[1].upstream_model, fireworks_id, "{name}");
-                assert_eq!(row.candidates[2].provider, ProviderId::OpenRouter, "{name}");
-                assert_eq!(row.candidates[2].upstream_model, openrouter, "{name}");
-            }
+        let m3 = for_model("minimax/minimax-m3");
+        assert!(m3.is_some(), "minimax/minimax-m3 must be in the catalog");
+        if let Some(row) = m3 {
+            let ids: Vec<_> = row
+                .candidates
+                .iter()
+                .map(|c| (c.provider, c.upstream_model))
+                .collect();
+            assert_eq!(
+                ids,
+                [
+                    (ProviderId::Together, "MiniMaxAI/MiniMax-M3"),
+                    (
+                        ProviderId::Fireworks,
+                        "accounts/fireworks/models/minimax-m3"
+                    ),
+                    (ProviderId::OpenRouter, "minimax/minimax-m3"),
+                ]
+            );
+        }
+        let glm = for_model("z-ai/glm-5.2");
+        assert!(glm.is_some(), "z-ai/glm-5.2 must be in the catalog");
+        if let Some(row) = glm {
+            let ids: Vec<_> = row
+                .candidates
+                .iter()
+                .map(|c| (c.provider, c.upstream_model))
+                .collect();
+            assert_eq!(
+                ids,
+                [
+                    (ProviderId::Together, "zai-org/GLM-5.2"),
+                    (ProviderId::OpenRouter, "z-ai/glm-5.2"),
+                ]
+            );
         }
     }
 
-    /// Llama 3.3 is the one row that names every host we already route it on. Groq's id is the
-    /// catalog name; Together / Fireworks / OpenRouter keep their own spellings as aliases.
+    /// Llama 3.3 is served by Together and OpenRouter. Groq's `llama-3.3-70b-versatile` is
+    /// Enterprise-only and Fireworks' copy is not serverless, so neither is a candidate. The Groq id
+    /// stays the catalog name so clients that send it still resolve.
     #[test]
-    fn llama_3_3_names_groq_together_fireworks_and_openrouter() {
+    fn llama_3_3_names_together_and_openrouter() {
+        let row = for_model("llama-3.3-70b-versatile");
         assert!(
-            for_model("llama-3.3-70b-versatile").is_some(),
+            row.is_some(),
             "llama-3.3-70b-versatile must be in the catalog"
         );
-        if let Some(row) = for_model("llama-3.3-70b-versatile") {
+        if let Some(row) = row {
             assert_eq!(row.wire, WireFormat::OpenAi);
-            assert_eq!(row.candidates.len(), 4);
-            assert_eq!(row.candidates[0].provider, ProviderId::Groq);
-            assert_eq!(row.candidates[0].path, "/openai/v1/chat/completions");
-            assert_eq!(row.candidates[1].provider, ProviderId::Together);
+            assert_eq!(row.candidates.len(), 2);
+            assert_eq!(row.candidates[0].provider, ProviderId::Together);
             assert_eq!(
-                row.candidates[1].upstream_model,
+                row.candidates[0].upstream_model,
                 "meta-llama/Llama-3.3-70B-Instruct-Turbo"
             );
-            assert_eq!(row.candidates[2].provider, ProviderId::Fireworks);
-            assert_eq!(
-                row.candidates[2].upstream_model,
-                "accounts/fireworks/models/llama-v3p3-70b-instruct"
-            );
-            assert_eq!(row.candidates[2].path, "/inference/v1/chat/completions");
-            assert_eq!(row.candidates[3].provider, ProviderId::OpenRouter);
-            assert_eq!(
-                for_model("accounts/fireworks/models/llama-v3p3-70b-instruct").map(|r| r.model),
-                Some("llama-3.3-70b-versatile"),
-            );
+            assert_eq!(row.candidates[1].provider, ProviderId::OpenRouter);
             assert_eq!(
                 for_model("meta-llama/Llama-3.3-70B-Instruct-Turbo").map(|r| r.model),
                 Some("llama-3.3-70b-versatile"),
@@ -3184,7 +3199,7 @@ mod tests {
         }
     }
 
-    /// GPT / o-series only. Other OpenAI-wire rows (Grok, DeepSeek, Mistral, llama, qwen) have no
+    /// GPT / o-series only. Other OpenAI-wire rows (Grok, DeepSeek, llama, qwen, Kimi) have no
     /// OpenAI store, so a Responses session-state walk must not list an arm.
     #[test]
     fn gpt_rows_carry_an_openai_responses_arm() {
@@ -3301,6 +3316,1041 @@ mod tests {
                     first.path,
                     c.path
                 );
+            }
+        }
+    }
+
+    // --- Vendor truth (`verify/catalog_truth.toml`) ------------------------------------------
+
+    fn truth() -> toml::Table {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../verify/catalog_truth.toml"
+        );
+        let raw = std::fs::read_to_string(path).expect("read verify/catalog_truth.toml");
+        raw.parse::<toml::Table>()
+            .expect("verify/catalog_truth.toml parses")
+    }
+
+    fn truth_array<'a>(t: &'a toml::Table, key: &str) -> &'a [toml::Value] {
+        t.get(key)
+            .and_then(toml::Value::as_array)
+            .map_or(&[], Vec::as_slice)
+    }
+
+    /// A USD decimal (`"0.30"`, `"12.5"`) as micro-dollars, so `"0.30"` equals `"0.3"`.
+    fn usd_micros(raw: &str) -> u64 {
+        let (whole, frac) = raw.split_once('.').unwrap_or((raw, ""));
+        assert!(frac.len() <= 6, "{raw}: more than 6 decimal places");
+        let frac = format!("{frac:0<6}");
+        whole.parse::<u64>().expect(raw) * 1_000_000 + frac.parse::<u64>().expect(raw)
+    }
+
+    fn exact_row(model: &str) -> Option<&'static ModelRoute> {
+        MODEL_ROUTES.iter().find(|r| r.model == model)
+    }
+
+    fn bits_of(names: &[toml::Value], table: &[(u8, &str)], model: &str) -> u8 {
+        names.iter().fold(0, |acc, n| {
+            let n = n.as_str().expect("bit names are strings");
+            let bit = table.iter().find(|(_, s)| *s == n).map(|(b, _)| *b);
+            assert!(bit.is_some(), "{model}: unknown bit name {n:?}");
+            acc | bit.unwrap_or(0)
+        })
+    }
+
+    /// Every list price and card size the primary vendor publishes, as recorded with its source URL
+    /// in `verify/catalog_truth.toml`, equals the catalog row. A rate the vendor does not publish is
+    /// the input rate (the `ListPrice` rule). And no direct-vendor row escapes the check: each has a
+    /// recorded entry, or an `unverified` entry that says why not.
+    /// claim: CAT-7, CAT-3, CAT-4
+    /// defect: D60
+    #[test]
+    fn catalog_matches_vendor_truth() {
+        let t = truth();
+        let mut recorded = std::collections::BTreeSet::new();
+        for entry in truth_array(&t, "row") {
+            let model = entry["model"].as_str().expect("row.model");
+            assert!(recorded.insert(model), "{model}: recorded twice");
+            let sources = truth_array(entry.as_table().expect("row is a table"), "source");
+            assert!(
+                !sources.is_empty()
+                    && sources
+                        .iter()
+                        .all(|s| s.as_str().is_some_and(|s| s.starts_with("https://"))),
+                "{model}: needs https source URLs"
+            );
+            assert!(
+                entry.get("date").and_then(toml::Value::as_str).is_some(),
+                "{model}: needs a date"
+            );
+            let row = exact_row(model);
+            assert!(row.is_some(), "{model}: recorded but not a catalog row");
+            let Some(row) = row else { continue };
+            // An OpenRouter-primary row is recorded only from its maker's own pages.
+            assert!(
+                sources
+                    .iter()
+                    .all(|s| s.as_str().is_some_and(|s| !s.contains("openrouter.ai"))),
+                "{model}: vendor truth never comes from OpenRouter"
+            );
+            let p = row.price;
+            let rate = |k: &str| entry.get(k).and_then(toml::Value::as_str).map(usd_micros);
+            for (k, ours) in [
+                ("input", p.input),
+                ("output", p.output),
+                ("cache_read", p.cache_read),
+                ("cache_write", p.cache_write),
+            ] {
+                if let Some(vendor) = rate(k) {
+                    assert_eq!(usd_micros(ours), vendor, "{model} {k}: ours {ours}");
+                } else if k.starts_with("cache") && rate("input").is_some() {
+                    assert_eq!(
+                        usd_micros(ours),
+                        usd_micros(p.input),
+                        "{model} {k}: unpublished, so it must equal input"
+                    );
+                }
+            }
+            let int = |k: &str| entry.get(k).and_then(toml::Value::as_integer);
+            // The card states the limit every candidate enforces: the vendor's figure, or the
+            // lower one recorded beside it with its evidence.
+            for (published, limit, card) in [
+                (
+                    "context_window",
+                    "input_limit",
+                    i64::from(row.card.context_window),
+                ),
+                (
+                    "max_output_tokens",
+                    "output_limit",
+                    i64::from(row.card.max_output_tokens),
+                ),
+            ] {
+                if let Some(l) = int(limit) {
+                    assert!(
+                        entry
+                            .get("limit_evidence")
+                            .and_then(toml::Value::as_str)
+                            .is_some_and(|e| !e.trim().is_empty()),
+                        "{model}: {limit} needs limit_evidence"
+                    );
+                    assert!(
+                        int(published).is_none_or(|v| l < v),
+                        "{model}: {limit} {l} is not below {published}"
+                    );
+                    assert_eq!(card, l, "{model} card {published} must be its {limit}");
+                } else if let Some(v) = int(published) {
+                    assert_eq!(card, v, "{model} {published}");
+                }
+            }
+            if let Some(v) = int("created") {
+                assert_eq!(
+                    i64::try_from(row.card.created).ok(),
+                    Some(v),
+                    "{model} created"
+                );
+            }
+            if let Some(v) = entry.get("owned_by").and_then(toml::Value::as_str) {
+                assert_eq!(row.card.owned_by, v, "{model} owned_by");
+            }
+        }
+        let mut unverified = std::collections::BTreeSet::new();
+        for u in truth_array(&t, "unverified") {
+            let model = u["model"].as_str().expect("unverified.model");
+            let reason = u.get("reason").and_then(toml::Value::as_str).unwrap_or("");
+            assert!(
+                !reason.trim().is_empty(),
+                "{model}: unverified needs a reason"
+            );
+            assert!(
+                exact_row(model).is_some(),
+                "{model}: unverified but not a row"
+            );
+            assert!(
+                !recorded.contains(model),
+                "{model}: both recorded and unverified"
+            );
+            unverified.insert(model);
+        }
+        for r in MODEL_ROUTES {
+            if r.candidates[0].provider == ProviderId::OpenRouter {
+                continue;
+            }
+            assert!(
+                recorded.contains(r.model) || unverified.contains(r.model),
+                "{}: direct-vendor primary with no entry in verify/catalog_truth.toml",
+                r.model
+            );
+        }
+    }
+
+    /// Today's date as `YYYY-MM-DD` (UTC), for the `retires` dates in `verify/catalog_truth.toml`.
+    fn today() -> String {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        civil(i64::try_from(secs / 86_400).unwrap_or(0))
+    }
+
+    /// Days since 1970-01-01 → `YYYY-MM-DD` (Howard Hinnant's `civil_from_days`).
+    fn civil(days: i64) -> String {
+        let z = days + 719_468;
+        let era = z.div_euclid(146_097);
+        let doe = z.rem_euclid(146_097);
+        let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        let y = yoe + era * 400 + i64::from(m <= 2);
+        format!("{y:04}-{m:02}-{d:02}")
+    }
+
+    #[test]
+    fn civil_dates_are_correct() {
+        assert_eq!(civil(0), "1970-01-01");
+        assert_eq!(civil(20_727), "2026-10-01");
+        assert_eq!(civil(11_016), "2000-02-29");
+    }
+
+    fn is_iso_date(s: &str) -> bool {
+        let b = s.as_bytes();
+        b.len() == 10
+            && b[4] == b'-'
+            && b[7] == b'-'
+            && b.iter()
+                .enumerate()
+                .all(|(i, c)| i == 4 || i == 7 || c.is_ascii_digit())
+    }
+
+    /// One `[[retired]]` entry: the row (`model`) and/or the candidate (`provider`, `id`) it names,
+    /// and its date: `retired` (past) or `retires` (scheduled).
+    struct Retirement<'a> {
+        model: Option<&'a str>,
+        candidate: Option<(&'a str, &'a str)>,
+        retired: Option<&'a str>,
+        retires: Option<&'a str>,
+    }
+
+    impl Retirement<'_> {
+        /// Whether this entry names the row or one of its candidates (or the row's own id as a
+        /// candidate spelling: a re-added `claude-opus-4-1` with an Anthropic candidate).
+        fn touches(&self, r: &ModelRoute) -> bool {
+            self.model == Some(r.model)
+                || r.candidates.iter().chain(r.responses).any(|c| {
+                    self.candidate == Some((by_id(c.provider).name, c.upstream_model))
+                        || self.model == Some(c.upstream_model)
+                })
+        }
+    }
+
+    fn retirements(t: &toml::Table) -> Vec<Retirement<'_>> {
+        truth_array(t, "retired")
+            .iter()
+            .map(|e| {
+                let field = |k: &str| e.get(k).and_then(toml::Value::as_str);
+                Retirement {
+                    model: field("model"),
+                    candidate: field("provider").zip(field("id")),
+                    retired: field("retired"),
+                    retires: field("retires"),
+                }
+            })
+            .collect()
+    }
+
+    /// Every `[[retired]]`, `[[not_serverless]]` and `[[not_carried]]` entry is well formed: a
+    /// source URL, a known provider, and for a retirement exactly one ISO date (`retired` or
+    /// `retires`) and a row or a candidate it names. No candidate (or Responses arm) names an id
+    /// its vendor does not serve to a standard serverless key: such a candidate fails over on
+    /// every request.
+    /// claim: CAT-1, CAT-2, CAT-16
+    /// defect: D61, D108, D181
+    #[test]
+    fn no_candidate_is_retired_or_not_serverless() {
+        let t = truth();
+        let known = |p: &str| gateway_providers().any(|g| g.name == p);
+        for list in ["retired", "not_serverless", "not_carried"] {
+            for e in truth_array(&t, list) {
+                let field = |k: &str| e.get(k).and_then(toml::Value::as_str);
+                let label = format!(
+                    "{list} {}/{}",
+                    field("provider").or(field("model")).unwrap_or("?"),
+                    field("id").unwrap_or("")
+                );
+                assert!(
+                    field("source").is_some_and(|s| s.starts_with("https://")),
+                    "{label}: needs a source URL"
+                );
+                if let Some(p) = field("provider") {
+                    assert!(known(p), "{label}: unknown provider");
+                    assert!(field("id").is_some(), "{label}: a provider needs an id");
+                }
+                match list {
+                    "retired" => {
+                        assert!(
+                            field("model").is_some() || field("id").is_some(),
+                            "{label}: names neither a row nor a candidate"
+                        );
+                        let dates: Vec<_> = ["retired", "retires"]
+                            .into_iter()
+                            .filter_map(field)
+                            .collect();
+                        assert!(
+                            dates.len() == 1 && is_iso_date(dates[0]),
+                            "{label}: needs exactly one of retired / retires, as YYYY-MM-DD"
+                        );
+                        assert!(field("note").is_some(), "{label}: needs a note");
+                    }
+                    "not_carried" => {
+                        assert!(field("reason").is_some(), "{label}: needs a reason");
+                        let (p, id) = (field("provider").unwrap_or(""), field("id").unwrap_or(""));
+                        assert!(
+                            for_model(id).is_none()
+                                && !MODEL_ROUTES.iter().any(|r| {
+                                    r.candidates.iter().chain(r.responses).any(|c| {
+                                        by_id(c.provider).name == p && c.upstream_model == id
+                                    })
+                                }),
+                            "{label}: is in the catalog, so it is carried"
+                        );
+                    }
+                    _ => {
+                        assert!(field("provider").is_some(), "{label}: needs a provider");
+                    }
+                }
+            }
+        }
+        let dead: std::collections::BTreeSet<(&str, &str)> = truth_array(&t, "not_serverless")
+            .iter()
+            .filter_map(|e| {
+                let field = |k: &str| e.get(k).and_then(toml::Value::as_str);
+                field("provider").zip(field("id"))
+            })
+            .collect();
+        assert!(
+            !dead.is_empty(),
+            "the truth file lists no not_serverless ids"
+        );
+        for r in MODEL_ROUTES {
+            for c in r.candidates.iter().chain(r.responses) {
+                let key = (by_id(c.provider).name, c.upstream_model);
+                assert!(
+                    !dead.contains(&key),
+                    "{}: candidate {}/{} is not serverless",
+                    r.model,
+                    key.0,
+                    key.1
+                );
+            }
+        }
+    }
+
+    /// Every catalog row is absent from `[[retired]]` or carries a future `retires` date: a model
+    /// its vendor retired (`retired`) can't be re-added, as a row name or as a candidate, and a row
+    /// whose retirement date has come fails here until it is removed, so the vendor's 404 never
+    /// reaches a customer under our name. A client's request for a retired row is a 404, never a
+    /// remap to the vendor's successor. The seven OpenAI rows due 2026-10-23 left early by owner
+    /// decision (D243), recorded `retired` with that date: no row, candidate or Responses arm names
+    /// them, here or as OpenRouter's `openai/` slug. That took gpt-4's card with it, so the D111
+    /// (max output leaves room for a prompt in its 8,192 window) and D113 (the card lists the tools
+    /// every candidate serves) checks have no row left to hold.
+    /// claim: CAT-1, CAT-2, CAT-16
+    /// defect: D111, D113, D181, D243
+    #[test]
+    fn no_catalog_row_outlives_its_retirement() {
+        let t = truth();
+        let today = today();
+        let all = retirements(&t);
+        assert!(
+            all.iter().any(|e| e.retired.is_some()) && all.iter().any(|e| e.retires.is_some()),
+            "the truth file records no retirement"
+        );
+        for r in MODEL_ROUTES {
+            for e in all.iter().filter(|e| e.touches(r)) {
+                let what = e
+                    .candidate
+                    .map_or_else(|| r.model.to_owned(), |(p, id)| format!("{p}/{id}"));
+                assert!(
+                    e.retired.is_none(),
+                    "{}: {what} was retired on {}",
+                    r.model,
+                    e.retired.unwrap_or_default()
+                );
+                let day = e.retires.unwrap_or_default();
+                assert!(
+                    day > today.as_str(),
+                    "{}: {what} retires {day} (today is {today}): remove it from the catalog and \
+                     record the entry as retired",
+                    r.model
+                );
+            }
+        }
+        // The rows retired on 2026-10-01 (D181), and the seven OpenAI rows removed that day ahead
+        // of their 2026-10-23 shutdown (D243), stay out under their names.
+        for gone in [
+            "claude-opus-4-1",
+            "claude-sonnet-4",
+            "gpt-5.1-codex",
+            "gpt-5.1-codex-max",
+            "gpt-5.1-codex-mini",
+            "gpt-5.2-codex",
+            "gpt-4",
+            "gpt-4-turbo",
+            "gpt-4.1-nano",
+            "o1",
+            "o1-pro",
+            "o3-mini",
+            "o4-mini",
+        ] {
+            assert!(
+                MODEL_ROUTES.iter().all(|r| r.model != gone),
+                "{gone} is retired"
+            );
+            assert!(
+                all.iter()
+                    .any(|e| e.model == Some(gone) && e.retired.is_some()),
+                "{gone}: no [[retired]] entry"
+            );
+            let slug = format!("openai/{gone}");
+            assert!(
+                MODEL_ROUTES.iter().all(|r| r
+                    .candidates
+                    .iter()
+                    .chain(r.responses)
+                    .all(|c| c.upstream_model != gone && c.upstream_model != slug)),
+                "{gone} is still a candidate"
+            );
+        }
+    }
+
+    /// No row rests on OpenRouter's shared Mistral pool (D156). With no Mistral pool key, a Mistral
+    /// row's only reachable candidate was OpenRouter, whose sole host for every Mistral id is
+    /// Mistral on OpenRouter's own upstream key: a limit every OpenRouter customer draws on, which
+    /// refused 8 of 10 quiet-minute calls on `mistral-large-2512`. The owner removed the rows
+    /// rather than list models we cannot serve. The general rule (no row depends solely on an
+    /// OpenRouter host we hold no direct key for) is not expressible from this table: it knows
+    /// neither which pool keys a deployment holds nor how many hosts OpenRouter has behind a slug.
+    /// So this pins the instance: the seven rows are gone, no candidate names Mistral or an
+    /// OpenRouter `mistralai/` slug, and the provider stays defined so `AI_POOL_KEY_MISTRAL` can
+    /// bring the rows back.
+    /// claim: CAT-1
+    /// defect: D156
+    #[test]
+    fn no_row_rests_on_openrouters_shared_mistral_pool() {
+        for gone in [
+            "mistral-large-latest",
+            "mistral-medium-latest",
+            "mistral-small-latest",
+            "ministral-3b-latest",
+            "ministral-8b-latest",
+            "ministral-14b-latest",
+            "codestral-latest",
+        ] {
+            assert!(for_model(gone).is_none(), "{gone} needs a Mistral pool key");
+        }
+        for r in MODEL_ROUTES {
+            for c in r.candidates.iter().chain(r.responses) {
+                assert_ne!(c.provider, ProviderId::Mistral, "{}", r.model);
+                assert!(
+                    !c.upstream_model.starts_with("mistralai/"),
+                    "{}: {} is OpenRouter's shared Mistral pool",
+                    r.model,
+                    c.upstream_model
+                );
+            }
+        }
+        assert_eq!(by_id(ProviderId::Mistral).env_var, Some("MISTRAL_API_KEY"));
+    }
+
+    /// MiniMax M2.7 is not a row (D182). Its one candidate was OpenRouter (Groq's copy is
+    /// Enterprise-only, Together's is not serverless, and there is no MiniMax pool key), and
+    /// OpenRouter routes every forced tool call and every JSON-schema request for it to Mara or
+    /// SambaNova, which answer 410 Gone (6 of 6 forced calls, 2026-10-01; their endpoints are at 0%
+    /// uptime), so two capabilities its card listed failed on every request. MiniMax M3, carried
+    /// on Together, Fireworks and OpenRouter, is the maker's current model. Bring M2.7 back with a
+    /// MiniMax key (MiniMax sells it).
+    /// claim: CAT-6, CAT-16
+    /// defect: D182
+    #[test]
+    fn minimax_m2_7_is_not_served_through_dead_openrouter_hosts() {
+        assert!(for_model("minimaxai/minimax-m2.7").is_none());
+        assert!(for_model("minimax/minimax-m2.7").is_none());
+        assert!(for_model("minimax/minimax-m3").is_some());
+    }
+
+    /// Each DeepSeek row's failovers serve the same snapshot: V4-Pro-0813 on Together and on
+    /// OpenRouter (`deepseek/deepseek-v4-pro-0813`, not the bare slug, which is 0423), and
+    /// V4.1-Flash on Together and OpenRouter. The rows whose fallbacks served V3 and R1 under
+    /// DeepSeek's retired names are gone.
+    /// claim: CAT-2
+    /// defect: D18
+    #[test]
+    fn deepseek_rows_fail_over_to_the_same_snapshot() {
+        for (model, card, want) in [
+            (
+                "deepseek-v4-pro",
+                "DeepSeek V4 Pro 0813",
+                [
+                    (ProviderId::DeepSeek, "deepseek-v4-pro"),
+                    (ProviderId::Together, "deepseek-ai/DeepSeek-V4-Pro-0813"),
+                    (ProviderId::OpenRouter, "deepseek/deepseek-v4-pro-0813"),
+                ],
+            ),
+            (
+                "deepseek-flash",
+                "DeepSeek V4.1 Flash",
+                [
+                    (ProviderId::DeepSeek, "deepseek-flash"),
+                    (ProviderId::Together, "deepseek-ai/DeepSeek-V4.1-Flash"),
+                    (ProviderId::OpenRouter, "deepseek/deepseek-v4.1-flash"),
+                ],
+            ),
+        ] {
+            let row = for_model(model);
+            assert!(row.is_some(), "{model} must be in the catalog");
+            if let Some(row) = row {
+                let got: Vec<_> = row
+                    .candidates
+                    .iter()
+                    .map(|c| (c.provider, c.upstream_model))
+                    .collect();
+                assert_eq!(got, want, "{model}");
+                assert_eq!(row.card.name, card, "{model}");
+            }
+        }
+        for gone in ["deepseek-chat", "deepseek-reasoner", "mistral-nemo"] {
+            assert!(for_model(gone).is_none(), "{gone} is retired at its vendor");
+        }
+    }
+
+    /// The D19 examples: a direct-vendor primary is priced at that vendor's standard rate, not
+    /// OpenRouter's cheapest host and not an off-peak or base-model rate.
+    /// claim: CAT-7
+    /// defect: D19
+    #[test]
+    fn direct_primaries_are_priced_at_their_vendor_rate() {
+        for (model, primary, want) in [
+            // Together's Llama 3.3 70B Turbo (Groq's id is Enterprise-only); was 0.1 / 0.32.
+            (
+                "llama-3.3-70b-versatile",
+                ProviderId::Together,
+                ("1.04", "1.04", "1.04"),
+            ),
+            // DeepSeek's peak rate; was 0.95526 / 1.91052, matching neither tier.
+            (
+                "deepseek-v4-pro",
+                ProviderId::DeepSeek,
+                ("1.32", "3.96", "0.044"),
+            ),
+            // Groq's own rates; were OpenRouter's cheapest host (0.018 / 0.09, 0.037 / 0.17).
+            (
+                "openai/gpt-oss-20b",
+                ProviderId::Groq,
+                ("0.075", "0.3", "0.0375"),
+            ),
+            (
+                "openai/gpt-oss-120b",
+                ProviderId::Groq,
+                ("0.15", "0.6", "0.075"),
+            ),
+        ] {
+            let row = for_model(model);
+            assert!(row.is_some(), "{model}");
+            if let Some(row) = row {
+                assert_eq!(row.candidates[0].provider, primary, "{model}");
+                let p = row.price;
+                assert_eq!((p.input, p.output, p.cache_read), want, "{model}");
+            }
+        }
+    }
+
+    /// Input and capability bits agree with what the primary vendor lists, wherever the truth file
+    /// records it: a bit the vendor does not list is not advertised, and one it does list is.
+    /// claim: CAT-6
+    /// defect: D62
+    #[test]
+    fn capability_bits_match_vendor_truth() {
+        let t = truth();
+        let mut checked = 0;
+        for entry in truth_array(&t, "row") {
+            let model = entry["model"].as_str().expect("row.model");
+            let Some(row) = exact_row(model) else {
+                continue;
+            };
+            let e = entry.as_table().expect("row is a table");
+            for (key, table, have, present) in [
+                ("input_present", &INPUT_NAMES[..], row.card.input, true),
+                ("input_absent", &INPUT_NAMES[..], row.card.input, false),
+                (
+                    "features_present",
+                    &FEATURE_NAMES[..],
+                    row.card.features,
+                    true,
+                ),
+                (
+                    "features_absent",
+                    &FEATURE_NAMES[..],
+                    row.card.features,
+                    false,
+                ),
+            ] {
+                let names = truth_array(e, key);
+                if names.is_empty() {
+                    continue;
+                }
+                checked += 1;
+                let bits = bits_of(names, table, model);
+                if present {
+                    assert_eq!(have & bits, bits, "{model}: {key} {names:?}");
+                } else {
+                    assert_eq!(have & bits, 0, "{model}: {key} {names:?}");
+                }
+            }
+        }
+        assert!(checked > 0, "the truth file records no capability bits");
+    }
+
+    /// The D54 cards: the pro rows claim no structured outputs (gpt-4 and gpt-4-turbo did too, until
+    /// their rows left: D243), deepseek-flash keeps image input (DeepSeek lists vision; D54's
+    /// suspicion was wrong), and no row advertises a max output that is OpenRouter's
+    /// 0.9x / 0.8x-of-window filler.
+    /// claim: CAT-6, CAT-4
+    /// defect: D54
+    #[test]
+    fn suspect_cards_are_corrected() {
+        for m in ["gpt-5.2-pro", "gpt-5.4-pro"] {
+            let f = for_model(m).map(|r| r.card.features);
+            assert!(f.is_some_and(|f| f & STRUCTURED_OUTPUTS == 0), "{m}");
+        }
+        let flash = for_model("deepseek-flash").map(|r| r.card);
+        assert!(
+            flash.is_some_and(|c| c.input & IN_IMAGE != 0),
+            "deepseek-flash reads images"
+        );
+        assert!(
+            flash.is_some_and(|c| c.max_output_tokens == 384_000),
+            "deepseek-flash max output"
+        );
+        for r in MODEL_ROUTES {
+            let ctx = u64::from(r.card.context_window);
+            let max = u64::from(r.card.max_output_tokens);
+            for (num, den) in [(9, 10), (8, 10)] {
+                assert!(
+                    max.abs_diff(ctx * num / den) > 1,
+                    "{}: max output {max} is {num}/{den} of the {ctx} window",
+                    r.model
+                );
+            }
+        }
+    }
+
+    /// OpenAI's GPT-5 family caps input at the window less the max output, and says so ("Input
+    /// tokens exceed the configured limit of 272000 tokens"): a card that listed the whole window
+    /// sent clients sizing prompts from `/v1/models` into a 400 between the two numbers. Every
+    /// GPT-5-family row served by OpenAI (directly or through OpenRouter) states the cap.
+    /// claim: CAT-3
+    /// defect: D104
+    #[test]
+    fn gpt5_cards_state_openais_input_cap() {
+        for r in MODEL_ROUTES {
+            let Some(rest) = r.model.strip_prefix("gpt-") else {
+                continue;
+            };
+            if !(rest.starts_with('5') || rest.starts_with('6')) {
+                continue;
+            }
+            let c = r.card;
+            assert!(
+                matches!(c.context_window, 128_000 | 272_000 | 922_000),
+                "{}: context_window {} is not OpenAI's input cap",
+                r.model,
+                c.context_window
+            );
+            assert!(
+                matches!(
+                    u64::from(c.context_window) + u64::from(c.max_output_tokens),
+                    400_000 | 1_050_000
+                ),
+                "{}: input cap {} plus max output {} is not OpenAI's window",
+                r.model,
+                c.context_window,
+                c.max_output_tokens
+            );
+        }
+    }
+
+    /// A failover host that serves a smaller window than the primary sets the row's card: the
+    /// walk may land there, and a prompt sized to the larger figure would be refused.
+    /// claim: CAT-3
+    /// defect: D110
+    #[test]
+    fn cards_state_a_failover_hosts_smaller_window() {
+        // The measured window (Together's 400 at 1,010,000) sets the card. Ministral 3B, whose
+        // OpenRouter failover served 131,072 of Mistral's 262,144, left with the Mistral rows
+        // (D156).
+        assert_eq!(
+            for_model("qwen/qwen3.8-2.4t-a95b").map(|r| r.card.context_window),
+            Some(1_010_000)
+        );
+    }
+
+    /// xAI serves multi-agent models on Responses only, and refuses their client-side tools
+    /// without beta access: the row's xAI candidate is a Responses path and the card has no tools.
+    /// claim: CAT-1, CAT-6
+    /// defect: D105
+    #[test]
+    fn multi_agent_reaches_xai_over_responses() {
+        let row = for_model("grok-4.20-multi-agent");
+        assert!(row.is_some());
+        if let Some(row) = row {
+            assert_eq!(row.candidates[0].provider, ProviderId::XAi);
+            assert_eq!(row.candidates[0].path, "/v1/responses");
+            assert_eq!(endpoint_of_path(row.candidates[0].path), "responses");
+            assert!(row.responses.is_empty(), "xAI's store is not OpenAI's");
+            assert_eq!(row.card.features & TOOLS, 0);
+        }
+    }
+
+    /// xAI's Chat Completions answers file content with 400 "File content is not supported on
+    /// /v1/chat/completions. Please use /v1/responses instead.", so every grok row reaches xAI over
+    /// Responses, and its card lists the file input xAI reads there. A failover candidate that reads
+    /// no PDF (OpenRouter's `x-ai/grok-build-0.1`) is the only one `serves_file_input` refuses.
+    /// claim: CAT-5
+    /// defect: D106
+    #[test]
+    fn grok_rows_read_files_over_xai_responses() {
+        let mut grok = 0;
+        for r in MODEL_ROUTES {
+            for c in r
+                .candidates
+                .iter()
+                .filter(|c| c.provider == ProviderId::XAi)
+            {
+                grok += 1;
+                assert_eq!(c.path, "/v1/responses", "{}", r.model);
+                assert!(
+                    r.responses.is_empty(),
+                    "{}: xAI's store is not OpenAI's",
+                    r.model
+                );
+                assert_ne!(r.card.input & IN_FILE, 0, "{}", r.model);
+                assert!(serves_file_input(c), "{}", r.model);
+            }
+        }
+        assert!(grok >= 6, "only {grok} grok rows reach xAI");
+        let build = for_model("grok-build-0.1").map(|r| r.candidates);
+        assert_eq!(
+            build.map(|c| c.iter().map(serves_file_input).collect::<Vec<_>>()),
+            Some(vec![true, false]),
+            "OpenRouter's grok-build-0.1 reads no PDF"
+        );
+    }
+
+    /// Qwen3.7 Plus (thinking garbles tool calls, refuses a forced one) and Qwen3.8 Flash (refuses
+    /// a forced one) on both their candidates, and no other candidate in the catalog.
+    /// claim: T1
+    /// defect: D171, D172
+    #[test]
+    fn qwen_candidates_whose_thinking_breaks_tools() {
+        use ToolThinking::{Free, OffWhenForced, OffWithTools};
+        for (model, want) in [
+            ("qwen/qwen3.7-plus", OffWithTools),
+            ("qwen/qwen3.8-flash", OffWhenForced),
+            ("qwen/qwen3.6-plus", Free),
+            ("qwen/qwen3.7-max", Free),
+        ] {
+            let row = for_model(model);
+            assert!(row.is_some(), "{model}");
+            if let Some(r) = row {
+                assert_eq!(r.candidates.len(), 2, "{model}");
+                for c in r.candidates {
+                    assert_eq!(tool_thinking(c), want, "{model} {:?}", c.provider);
+                }
+                assert_ne!(r.card.features & TOOLS, 0, "{model} keeps tools");
+            }
+        }
+        let marked = MODEL_ROUTES
+            .iter()
+            .flat_map(|r| r.candidates)
+            .filter(|c| tool_thinking(c) != Free)
+            .count();
+        assert_eq!(marked, 4);
+    }
+
+    /// `developer` is read as OpenAI defines it only by OpenAI and OpenRouter (which maps it per
+    /// upstream); every other Chat host is sent `system`.
+    /// claim: TRN-16
+    /// defect: D173
+    #[test]
+    fn only_openai_and_openrouter_read_the_developer_role() {
+        for r in MODEL_ROUTES {
+            for c in r.candidates.iter().chain(r.responses) {
+                assert_eq!(
+                    reads_developer_role(c),
+                    matches!(c.provider, ProviderId::OpenAi | ProviderId::OpenRouter),
+                    "{}",
+                    r.model
+                );
+            }
+        }
+    }
+
+    /// Together's stream-only Qwen ids are exactly the four primaries measured, each a candidate
+    /// on a Chat Completions path (the wire the gateway assembles a stream from), and nothing else
+    /// is stream-only: their OpenRouter failovers answer a non-streaming request.
+    /// claim: CAT-1
+    /// defect: D147
+    #[test]
+    fn stream_only_candidates_are_together_qwen_on_chat() {
+        let mut seen = Vec::new();
+        for r in MODEL_ROUTES {
+            for c in r.candidates.iter().chain(r.responses) {
+                if stream_only(c) {
+                    assert_eq!(c.path, "/v1/chat/completions", "{}", r.model);
+                    assert_eq!(c.provider, ProviderId::Together, "{}", r.model);
+                    seen.push(r.model);
+                }
+            }
+        }
+        seen.sort_unstable();
+        assert_eq!(
+            seen,
+            [
+                "qwen/qwen3.6-plus",
+                "qwen/qwen3.7-max",
+                "qwen/qwen3.7-plus",
+                "qwen/qwen3.8-flash"
+            ]
+        );
+        let flash = for_model("qwen/qwen3.8-flash").map(|r| r.candidates);
+        assert_eq!(
+            flash.map(|c| c.iter().map(stream_only).collect::<Vec<_>>()),
+            Some(vec![true, false]),
+        );
+    }
+
+    /// OpenAI's Chat Completions refuses function tools with any reasoning effort on GPT-5.4 and
+    /// later ("use /v1/responses or set reasoning_effort to 'none'"), and GPT-5.6 and GPT-6 Astra
+    /// reason by default, so every tool call on their Chat primary failed. Those rows reach OpenAI
+    /// over Responses, which takes both; their Responses arm is unchanged.
+    /// claim: CAT-6
+    /// defect: D114
+    #[test]
+    fn gpt_5_4_and_later_reach_openai_over_responses() {
+        let mut checked = 0;
+        for r in MODEL_ROUTES {
+            let late = ["gpt-5.4", "gpt-5.5", "gpt-5.6", "gpt-6"]
+                .iter()
+                .any(|p| r.model.starts_with(p));
+            if !late {
+                continue;
+            }
+            for c in r
+                .candidates
+                .iter()
+                .filter(|c| c.provider == ProviderId::OpenAi)
+            {
+                checked += 1;
+                assert_eq!(c.path, "/v1/responses", "{}", r.model);
+            }
+        }
+        assert!(checked >= 8, "only {checked} GPT-5.4+ OpenAI candidates");
+    }
+
+    /// Amazon Bedrock's Messages surface refuses `output_config.format`, and the candidates
+    /// `verify/catalog_truth.toml` records under `[[schema_unenforced]]` accept a JSON schema and
+    /// answer outside it. Each such candidate either sits on a row whose card does not advertise
+    /// structured outputs, or `serves_structured_outputs` refuses it so a schema request skips it.
+    /// Every refused candidate other than Bedrock has a measurement there, and every card that
+    /// advertises structured outputs keeps a candidate that enforces them.
+    /// claim: CAT-6
+    /// defect: D107, D155
+    #[test]
+    fn schema_unenforced_candidates_match_truth() {
+        let t = truth();
+        let mut recorded = std::collections::HashSet::new();
+        for e in truth_array(&t, "schema_unenforced") {
+            let field = |k: &str| e.get(k).and_then(toml::Value::as_str).unwrap_or_default();
+            let (model, provider, id) = (field("model"), field("provider"), field("id"));
+            for k in ["model", "provider", "id", "source", "date", "evidence"] {
+                assert!(!field(k).is_empty(), "{model} {provider}/{id}: {k}");
+            }
+            let row = exact_row(model);
+            assert!(row.is_some(), "{model}: not a catalog row");
+            let Some(row) = row else { continue };
+            let c = row
+                .candidates
+                .iter()
+                .chain(row.responses)
+                .find(|c| by_id(c.provider).name == provider && c.upstream_model == id);
+            assert!(c.is_some(), "{model}: no candidate {provider}/{id}");
+            let Some(c) = c else { continue };
+            assert!(
+                row.card.features & STRUCTURED_OUTPUTS == 0 || !serves_structured_outputs(c),
+                "{model}: {provider}/{id} answers outside the schema, yet the card advertises \
+                 structured outputs and a schema request may be sent there"
+            );
+            recorded.insert((c.provider, c.upstream_model));
+        }
+        assert!(
+            !recorded.is_empty(),
+            "the truth file records no schema_unenforced"
+        );
+        for r in MODEL_ROUTES {
+            for c in r.candidates.iter().chain(r.responses) {
+                if c.provider != ProviderId::Bedrock && !serves_structured_outputs(c) {
+                    assert!(
+                        recorded.contains(&(c.provider, c.upstream_model)),
+                        "{}: {:?}/{} is refused without a [[schema_unenforced]] measurement",
+                        r.model,
+                        c.provider,
+                        c.upstream_model
+                    );
+                }
+                if c.provider == ProviderId::Bedrock {
+                    assert!(!serves_structured_outputs(c), "{}", r.model);
+                }
+            }
+            if r.card.features & STRUCTURED_OUTPUTS != 0 {
+                assert!(
+                    r.candidates.iter().any(serves_structured_outputs),
+                    "{}: advertises structured outputs, but no candidate enforces them",
+                    r.model
+                );
+            }
+        }
+    }
+
+    /// The D155 rows: OpenRouter's GLM 5.2 is skipped by a schema request (Together holds the
+    /// schema), and Kimi K2.6, Kimi K2.7 Code and Qwen3.6 Plus, whose every candidate answers
+    /// outside it, no longer advertise structured outputs (Qwen3.6 Plus is D170 too: Together, its
+    /// primary, answered `{"result": 391}` 3 of 8 streamed and 4 of 10 sweep runs, and OpenRouter's
+    /// Alibaba copy 2 of 24, so steering to OpenRouter would not enforce it). Qwen3.8 Flash keeps
+    /// them: both its candidates held the schema in 48 calls (its sweep failure was OpenRouter's
+    /// 429, D156).
+    /// claim: CAT-6
+    /// defect: D155, D170
+    #[test]
+    fn structured_outputs_are_advertised_only_where_enforced() {
+        let glm = for_model("z-ai/glm-5.2");
+        assert!(glm.is_some(), "z-ai/glm-5.2");
+        if let Some(r) = glm {
+            assert_ne!(r.card.features & STRUCTURED_OUTPUTS, 0);
+            let serves: Vec<_> = r
+                .candidates
+                .iter()
+                .map(|c| (c.provider, serves_structured_outputs(c)))
+                .collect();
+            assert_eq!(
+                serves,
+                [
+                    (ProviderId::Together, true),
+                    (ProviderId::OpenRouter, false)
+                ]
+            );
+        }
+        for m in [
+            "moonshotai/kimi-k2.6",
+            "moonshotai/kimi-k2.7-code",
+            "qwen/qwen3.6-plus",
+        ] {
+            let f = for_model(m).map(|r| r.card.features);
+            assert!(f.is_some_and(|f| f & STRUCTURED_OUTPUTS == 0), "{m}");
+            assert!(f.is_some_and(|f| f & TOOLS != 0), "{m} keeps tools");
+        }
+        let flash = for_model("qwen/qwen3.8-flash");
+        assert!(
+            flash.is_some_and(|r| r.card.features & STRUCTURED_OUTPUTS != 0
+                && r.candidates.iter().all(serves_structured_outputs))
+        );
+    }
+
+    /// Prices are the model maker's own published rate, never OpenRouter's listing (its cheapest
+    /// host), even on an OpenRouter-primary row whose maker sells an API. Qwen and Kimi rows served
+    /// by Together carry Alibaba's and Moonshot's own rates, whatever Together lists (D241).
+    /// claim: CAT-7
+    /// defect: D116, D241
+    #[test]
+    fn prices_follow_the_maker_not_openrouter() {
+        for (model, want) in [
+            ("z-ai/glm-5.1", ("1.4", "4.4", "0.26")),
+            ("moonshotai/kimi-k2.7-code", ("0.95", "4", "0.19")),
+            ("moonshotai/kimi-k2.6", ("0.95", "4", "0.16")),
+            ("qwen/qwen3.8-flash", ("0.15", "0.47", "0.15")),
+            ("qwen/qwen3.7-max", ("2.5", "7.5", "0.5")),
+            ("moonshotai/kimi-k3", ("3", "15", "0.3")),
+            // OpenAI's standard rate, which it bills the pool key; the promotion is recorded apart.
+            ("gpt-5.6-sol", ("4", "20", "0.4")),
+        ] {
+            let p = for_model(model).map(|r| r.price);
+            assert_eq!(
+                p.map(|p| (p.input, p.output, p.cache_read)),
+                Some(want),
+                "{model}"
+            );
+        }
+        let t = truth();
+        for promo in truth_array(&t, "promo") {
+            let model = promo["model"].as_str().expect("promo.model");
+            let row = exact_row(model);
+            assert!(
+                row.is_some(),
+                "{model}: promo for a row that is not in the catalog"
+            );
+            let Some(row) = row else { continue };
+            let until = promo["until"].as_str().expect("promo.until");
+            assert!(
+                until.len() == 10 && until.as_bytes()[4] == b'-',
+                "{model}: until {until:?}"
+            );
+            for (k, card) in [
+                ("input", row.price.input),
+                ("output", row.price.output),
+                ("cache_read", row.price.cache_read),
+            ] {
+                // A cached-input rate is optional: without one, cached input keeps the card's.
+                if k == "cache_read" && promo.get(k).is_none() {
+                    continue;
+                }
+                let rate = promo[k].as_str().map(usd_micros).expect("promo rate");
+                assert!(
+                    rate < usd_micros(card),
+                    "{model}: a promo {k} rate is a discount on the card"
+                );
+            }
+        }
+    }
+
+    /// `created` and `owned_by` are the vendor's own listing (OpenAI's and xAI's `/v1/models`), not
+    /// the day OpenRouter listed the model or OpenRouter's `x-ai` slug.
+    /// claim: CAT-8
+    /// defect: D117
+    #[test]
+    fn cards_carry_the_vendors_created_and_owner() {
+        let t = truth();
+        let recorded = |model: &str| {
+            truth_array(&t, "row")
+                .iter()
+                .find(|e| e["model"].as_str() == Some(model))
+                .and_then(|e| e.get("created"))
+                .and_then(toml::Value::as_integer)
+        };
+        for r in MODEL_ROUTES {
+            match r.candidates[0].provider {
+                ProviderId::OpenAi | ProviderId::XAi => {
+                    assert_eq!(
+                        recorded(r.model),
+                        i64::try_from(r.card.created).ok(),
+                        "{}: created must be the vendor listing's",
+                        r.model
+                    );
+                }
+                _ => {}
+            }
+            if r.candidates[0].provider == ProviderId::XAi {
+                assert_eq!(r.card.owned_by, "xai", "{}", r.model);
             }
         }
     }

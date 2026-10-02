@@ -136,7 +136,7 @@ fn openai_model_parses_families_and_hosts() {
         ),
         // Not OpenAI's own model, or not OpenAI at all: nothing is reshaped.
         ("grok-4.6", false, Unknown),
-        ("deepseek-chat", false, Unknown),
+        ("deepseek-flash", false, Unknown),
         ("x-ai/grok-4.6", false, Unknown),
         ("claude-opus-4-8", false, Unknown),
     ] {
@@ -170,6 +170,7 @@ fn anthropic_sdk_onto_gpt5_sends_max_completion_tokens_and_no_sampling() {
 
 /// `thinking: disabled` → `reasoning_effort: "none"` was "Unrecognized request argument" on
 /// gpt-4.1 and "does not support 'none'" on gpt-5.
+/// claim: T5
 #[test]
 fn thinking_disabled_fits_each_family() {
     let off = anth(json!({"thinking": {"type": "disabled"}}));
@@ -187,6 +188,7 @@ fn thinking_disabled_fits_each_family() {
 }
 
 /// `effort: max` → `xhigh` is outside gpt-5's and the o-series' accepted sets.
+/// claim: T5
 #[test]
 fn effort_is_clamped_to_what_each_family_accepts() {
     let max = anth(json!({"output_config": {"effort": "max"}}));
@@ -208,6 +210,7 @@ fn effort_is_clamped_to_what_each_family_accepts() {
 
 /// Sampling stays wherever the model accepts it: reasoning off, a non-reasoning model, or a host
 /// that normalizes it itself.
+/// claim: T5
 #[test]
 fn sampling_survives_where_the_upstream_accepts_it() {
     let body = anth(json!({"temperature": 0.2, "thinking": {"type": "disabled"}}));
@@ -321,23 +324,23 @@ fn responses_parallel_function_calls_become_one_assistant_message() {
 }
 
 /// Hosted and custom tools used to vanish: the model answered without a tool the client offered.
+/// The hosted search is the documented exception (D78, see
+/// `hosted_web_search_is_dropped_leaving_responses_unless_chosen`).
 #[test]
 fn responses_hosted_tools_are_forwarded_and_custom_tools_mapped() {
     let body = json!({"model": "m", "store": false, "input": "x", "tools": [
-        {"type": "web_search"},
         {"type": "file_search", "vector_store_ids": ["vs_1"]},
         {"type": "custom", "name": "apply_patch", "description": "patch", "format": {"type": "text"}},
         {"type": "function", "name": "f", "parameters": {"type": "object", "properties": {}}, "strict": true}
     ]});
     let v = r2c(&body, "gpt-5-nano");
     let tools = v["tools"].as_array().unwrap();
-    assert_eq!(tools[0], json!({"type": "web_search"}));
-    assert_eq!(tools[1]["type"], "file_search");
+    assert_eq!(tools[0]["type"], "file_search");
     assert_eq!(
-        tools[2],
+        tools[1],
         json!({"type": "custom", "custom": {"name": "apply_patch", "description": "patch", "format": {"type": "text"}}})
     );
-    assert_eq!(tools[3]["function"]["strict"], true);
+    assert_eq!(tools[2]["function"]["strict"], true);
 }
 
 #[test]
@@ -417,6 +420,7 @@ fn anthropic_server_tools_are_forwarded_not_emptied() {
 
 /// Images in a `tool_result` (a screenshot tool) were dropped: the model answered about output it
 /// never saw. A tool message holds text, so they follow as a user message.
+/// claim: T3
 #[test]
 fn tool_result_images_follow_the_tool_messages() {
     let img = json!({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="}});
@@ -463,6 +467,7 @@ fn tool_result_is_error_is_said_in_text() {
 }
 
 /// `strict: true` with an optional property is a 400 on OpenAI.
+/// claim: T4
 #[test]
 fn structured_output_is_strict_only_when_openai_can_be() {
     let optional = json!({"type": "object", "properties": {"a": {"type": "string"}, "b": {"type": "string"}}, "required": ["a"], "additionalProperties": false});
@@ -515,6 +520,7 @@ fn tool_strict_crosses_both_ways() {
 }
 
 /// A mid-conversation `role: "system"` became a user message: a user saying "answer in French".
+/// claim: TRN-2
 #[test]
 fn messages_mid_conversation_system_stays_a_system_message_on_chat() {
     let body = anth(json!({"system": "base", "messages": [
@@ -824,6 +830,7 @@ fn convo(tail: Value) -> Value {
 
 /// A mid-conversation system message was hoisted into top-level `system`, rewriting the prefix
 /// every earlier thinking block is bound to (and the prompt cache) each time one was appended.
+/// claim: TRN-2
 #[test]
 fn mid_conversation_system_stays_in_place_where_supported() {
     let body = convo(json!([
@@ -849,6 +856,7 @@ fn mid_conversation_system_stays_in_place_where_supported() {
 }
 
 /// Messages accepts a system message only after a user turn and before an assistant turn (or last).
+/// claim: TRN-2
 #[test]
 fn a_misplaced_system_message_moves_past_the_next_user_turn() {
     let v = c2m(
@@ -873,6 +881,7 @@ fn a_misplaced_system_message_moves_past_the_next_user_turn() {
     assert_eq!(v["system"][0]["text"], "Answer in French.");
 }
 
+/// claim: TRN-2
 #[test]
 fn mid_conversation_system_is_hoisted_where_unsupported() {
     let body = convo(
@@ -1066,7 +1075,7 @@ fn chat_onto_responses_maps_tools_choice_and_history_in_order() {
             "function_call:",
             "custom_tool_call:",
             "function_call_output:",
-            "function_call_output:",
+            "custom_tool_call_output:",
             "message:system",
             "message:user"
         ]
@@ -1094,6 +1103,7 @@ fn chat_onto_responses_does_not_store_by_default() {
 
 /// A Claude Code-shaped body (thinking in history, `cache_control` everywhere) onto a
 /// Responses-only GPT row: another vendor's thinking is not input, and markers are not fields.
+/// claim: TRN-21
 #[test]
 fn messages_onto_responses_drops_thinking_and_cache_control() {
     let body = anth(json!({
@@ -1117,6 +1127,45 @@ fn messages_onto_responses_drops_thinking_and_cache_control() {
         json!([{"type": "output_text", "text": "hello"}])
     );
     assert_eq!(v["max_output_tokens"], 300);
+}
+
+/// Claude Code's `metadata.user_id` is ~150 characters; OpenAI's Responses API answers a `user`
+/// over 64 with 400 "string too long" (its Chat Completions and xAI's Responses take it). Onto
+/// OpenAI's Responses it becomes a stable hash; xAI and a short id get the client's own.
+/// claim: TOOL-1, TRN-10
+/// defect: D146
+#[test]
+fn a_long_user_id_fits_openai_responses() {
+    let long = format!(
+        "user_{}_account__session_{}",
+        "a".repeat(64),
+        "b".repeat(70)
+    );
+    let body = anth(json!({"metadata": {"user_id": long},
+                           "messages": [{"role": "user", "content": "hi"}]}));
+    let v = req(
+        Endpoint::Messages,
+        Endpoint::Responses,
+        &body,
+        "gpt-5.4-mini",
+    );
+    let user = v["user"].as_str().unwrap();
+    assert!(user.len() <= 64, "{user}");
+    let again = req(Endpoint::Messages, Endpoint::Responses, &body, "gpt-5-mini");
+    assert_eq!(again["user"], user, "the same user maps to the same id");
+    let chat = chat(json!({"user": long}));
+    assert_eq!(c2r(&chat, "gpt-5.5")["user"], user);
+    // xAI's Responses takes it as sent; a short id is untouched.
+    assert_eq!(
+        req(Endpoint::Messages, Endpoint::Responses, &body, "grok-4.3")["user"],
+        long.as_str()
+    );
+    let short = anth(json!({"metadata": {"user_id": "u-123"},
+                            "messages": [{"role": "user", "content": "hi"}]}));
+    assert_eq!(
+        req(Endpoint::Messages, Endpoint::Responses, &short, "gpt-5.4")["user"],
+        "u-123"
+    );
 }
 
 #[test]
@@ -1160,6 +1209,7 @@ fn a_tiny_limit_is_raised_to_the_responses_floor() {
 /// `reasoning`: that text was never signed, and sent as a thinking block it is a 400 on every later
 /// turn ("messages.1.content.0.thinking.signature: Field required", measured). Anthropic takes the
 /// turn without its thinking, so the text goes; so does an unsigned thinking part.
+/// claim: TRN-21
 #[test]
 fn bare_reasoning_text_never_becomes_an_unsigned_thinking_block() {
     for assistant in [
@@ -1189,6 +1239,7 @@ fn bare_reasoning_text_never_becomes_an_unsigned_thinking_block() {
 /// Signed blocks cross whichever way the client carried them: our `thinking` array (what the
 /// gateway's Chat responses return), thinking parts, or OpenRouter's `reasoning_details` — a turn a
 /// Chat client got relayed from OpenRouter (failover) and echoes onto the Anthropic primary.
+/// claim: T2
 #[test]
 fn signed_thinking_crosses_from_every_chat_shape() {
     let want = json!([
@@ -1212,7 +1263,8 @@ fn signed_thinking_crosses_from_every_chat_shape() {
         ]}),
     ] {
         let v = c2m(
-            &chat(json!({"messages": [
+            // Thinking on: a request that does not think drops replayed thinking (D79).
+            &chat(json!({"reasoning_effort": "medium", "messages": [
                 {"role": "user", "content": "2+2?"}, assistant.clone(), {"role": "user", "content": "3+3?"},
             ]})),
             "claude-sonnet-4-5",
@@ -1302,6 +1354,35 @@ fn gateway_reasoning_items_come_back_as_signed_thinking() {
     // An OpenAI row gets none of it.
     let v = r2c(&body, "gpt-5-nano");
     assert!(!v.to_string().contains("SIG"), "{v}");
+}
+
+/// Codex and the Agents SDK replay a `reasoning` item without its `id`. The marker the gateway puts
+/// on `encrypted_content` still names it as ours, so a budget-thinking Claude turn keeps its signed
+/// thinking (and thinking stays on) instead of falling back to a request without thinking.
+#[test]
+fn an_id_less_gateway_reasoning_item_still_replays_its_signature() {
+    let body = json!({"model": "m", "store": false, "max_output_tokens": 4000,
+    "reasoning": {"effort": "high"},
+    "tools": [{"type": "function", "name": "get_weather", "parameters": weather_schema()}],
+    "input": [
+        {"role": "user", "content": "weather?"},
+        {"type": "reasoning", "summary": [{"type": "summary_text", "text": "t"}],
+         "encrypted_content": format!("{GATEWAY_SIGNATURE_PREFIX}SIG")},
+        {"type": "function_call", "call_id": "toolu_1", "name": "get_weather", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "toolu_1", "output": "sunny"},
+    ]});
+    let v = req(
+        Endpoint::Responses,
+        Endpoint::Messages,
+        &body,
+        "claude-sonnet-4-5",
+    );
+    assert_eq!(
+        v["messages"][1]["content"][0],
+        json!({"type": "thinking", "thinking": "t", "signature": "SIG"}),
+        "{v}"
+    );
+    assert_eq!(v["thinking"]["type"], "enabled", "{v}");
 }
 
 /// OpenAI's Chat Completions 400s `tool_choice` and `parallel_tool_calls` without `tools` ("only
@@ -1398,13 +1479,13 @@ fn unknown_hosts_get_the_classic_efforts() {
     for model in [
         "x-ai/grok-4.6",
         "grok-4.6",
-        "deepseek-chat",
+        "deepseek-flash",
         "moonshotai/kimi-k3",
     ] {
         assert_eq!(m2c(&big, model)["reasoning_effort"], "high", "{model}");
     }
     let max = anth(json!({"output_config": {"effort": "max"}}));
-    assert_eq!(m2c(&max, "deepseek-chat")["reasoning_effort"], "high");
+    assert_eq!(m2c(&max, "deepseek-flash")["reasoning_effort"], "high");
     let off = anth(json!({"thinking": {"type": "disabled"}}));
     for model in [
         "openai/gpt-oss-120b",
@@ -1419,4 +1500,865 @@ fn unknown_hosts_get_the_classic_efforts() {
     let r =
         json!({"model": "m", "store": false, "input": "hi", "reasoning": {"effort": "minimal"}});
     assert_eq!(r2c(&r, "x-ai/grok-4.6")["reasoning_effort"], "low");
+}
+
+// ---- verification phase 0: thinking + tools for clients that drop thinking ---------------------
+
+/// Anthropic's rule for a tool loop with thinking on: "a final `assistant` message must start with
+/// a thinking block (preceding the lastmost set of `tool_use` and `tool_result` blocks)". A body
+/// passes when thinking is off (absent or `disabled`) or the last assistant turn opens with a
+/// `thinking` / `redacted_thinking` block. `None` means Anthropic accepts it; `Some` says why not.
+fn tool_loop_thinking_violation(v: &Value) -> Option<String> {
+    let thinking_on = matches!(
+        v.pointer("/thinking/type").and_then(Value::as_str),
+        Some("enabled" | "adaptive")
+    );
+    if !thinking_on {
+        return None;
+    }
+    let last = v["messages"]
+        .as_array()?
+        .iter()
+        .rev()
+        .find(|m| m["role"] == "assistant")?;
+    let blocks = last["content"].as_array()?;
+    let has_tool_use = blocks.iter().any(|b| b["type"] == "tool_use");
+    let opens_with_thinking = matches!(
+        blocks.first().and_then(|b| b["type"].as_str()),
+        Some("thinking" | "redacted_thinking")
+    );
+    (has_tool_use && !opens_with_thinking).then(|| {
+        format!(
+            "thinking is {} but the final assistant turn starts with {}: {v}",
+            v["thinking"], blocks[0]["type"]
+        )
+    })
+}
+
+/// An Anthropic SDK turn 2 onto a Claude model OpenRouter serves: the client dropped turn 1's
+/// thinking, so OpenRouter has nothing to replay and Anthropic would 400 the enabled thinking. The
+/// request goes without reasoning; with the signed block echoed, it keeps it.
+/// claim: TRN-7
+/// defect: D77
+#[test]
+fn a_messages_tool_turn_without_thinking_goes_without_reasoning_onto_openrouter_claude() {
+    const MODEL: &str = "anthropic/claude-sonnet-4";
+    let turn2 = |assistant: Value| {
+        anth(json!({
+            "max_tokens": 2000,
+            "thinking": {"type": "enabled", "budget_tokens": 1024},
+            "tools": [{"name": "get_weather", "input_schema": weather_schema()}],
+            "messages": [
+                {"role": "user", "content": "weather?"},
+                {"role": "assistant", "content": assistant},
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "sunny"}]},
+            ],
+        }))
+    };
+    let call = json!({"type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": {"city": "Paris"}});
+    let has_reasoning = |v: &Value| CHAT_REASONING_KEYS.iter().any(|k| v.get(*k).is_some());
+
+    let signed = m2c(
+        &turn2(json!([{"type": "thinking", "thinking": "t", "signature": "SIG"}, call])),
+        MODEL,
+    );
+    assert!(has_reasoning(&signed), "control: {signed}");
+    let dropped = m2c(&turn2(json!([call])), MODEL);
+    assert!(!has_reasoning(&dropped), "{dropped}");
+    // Not a Claude model: nothing to replay, nothing dropped.
+    assert!(has_reasoning(&m2c(
+        &turn2(json!([call])),
+        "deepseek/deepseek-r1"
+    )));
+}
+
+/// Turn 2 of a thinking + tool loop on budget-thinking Claude, from clients that do not send our
+/// thinking back: Vercel / LangChain on Chat Completions (the assistant echo carries the tool call,
+/// maybe `reasoning_content`, never our `thinking` list), a Responses client that drops reasoning
+/// items, and Codex / the Agents SDK replaying the reasoning item without its `id` (the gateway
+/// only recognises its own `rs_gw…` ids). Each must become a body Anthropic accepts: replay a
+/// verifiable block, or turn thinking off for the request.
+/// claim: TRN-7, TRN-8
+/// defect: D14
+#[test]
+fn a_tool_turn_without_echoed_thinking_is_still_accepted_on_budget_claude() {
+    const MODEL: &str = "claude-sonnet-4-5";
+    assert_eq!(ClaudeModel::of(MODEL).reasoning, ClaudeGen::Budget);
+    let mut bad = Vec::new();
+    let turn2 = |assistant: Value| {
+        chat(json!({
+            "reasoning_effort": "high",
+            "tools": [{"type": "function", "function": {"name": "get_weather", "parameters": weather_schema()}}],
+            "messages": [
+                {"role": "user", "content": "weather in Paris?"},
+                assistant,
+                {"role": "tool", "tool_call_id": "toolu_01", "content": "sunny"},
+            ],
+        }))
+    };
+
+    // Control: a client that echoes our signed `thinking` list already produces a valid body, so
+    // the check below is not vacuous.
+    let echoed = c2m(
+        &turn2(json!({"role": "assistant", "content": null,
+            "thinking": [{"type": "thinking", "thinking": "Need weather.", "signature": "SIG"}],
+            "tool_calls": [{"id": "toolu_01", "type": "function",
+            "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"}}]})),
+        MODEL,
+    );
+    assert_eq!(echoed["thinking"]["type"], "enabled", "{echoed}");
+    assert_eq!(tool_loop_thinking_violation(&echoed), None);
+
+    // Chat Completions: the echo a stock SDK rebuilds (tool call, reasoning text, no `thinking`).
+    for assistant in [
+        json!({"role": "assistant", "content": null, "tool_calls": [{"id": "toolu_01", "type": "function",
+            "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"}}]}),
+        json!({"role": "assistant", "content": "", "reasoning_content": "Need weather.",
+            "tool_calls": [{"id": "toolu_01", "type": "function",
+            "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"}}]}),
+    ] {
+        if let Some(why) = tool_loop_thinking_violation(&c2m(&turn2(assistant), MODEL)) {
+            bad.push(format!("Chat→Messages: {why}"));
+        }
+    }
+
+    // Responses: reasoning dropped, and reasoning replayed without its id.
+    let call = json!({"type": "function_call", "call_id": "toolu_01", "name": "get_weather",
+        "arguments": "{\"city\":\"Paris\"}"});
+    let output = json!({"type": "function_call_output", "call_id": "toolu_01", "output": "sunny"});
+    let id_less = json!({"type": "reasoning", "encrypted_content": "EqQBsig==",
+        "summary": [{"type": "summary_text", "text": "Need weather."}]});
+    for (what, input) in [
+        (
+            "no reasoning item",
+            json!([{"role": "user", "content": "weather in Paris?"}, call, output]),
+        ),
+        (
+            "id-less reasoning item",
+            json!([{"role": "user", "content": "weather in Paris?"}, id_less, call, output]),
+        ),
+    ] {
+        let body = json!({
+            "model": "m", "store": false, "max_output_tokens": 4000, "reasoning": {"effort": "high"},
+            "tools": [{"type": "function", "name": "get_weather", "parameters": weather_schema()}],
+            "input": input,
+        });
+        let v = req(Endpoint::Responses, Endpoint::Messages, &body, MODEL);
+        if let Some(why) = tool_loop_thinking_violation(&v) {
+            bad.push(format!("Responses→Messages ({what}): {why}"));
+        }
+    }
+
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+// ---- verification phase 0: translation detail (D44-D50) ----------------------------------------
+
+/// Two consecutive user messages onto Messages, which wants one user turn: the turn may merge, but
+/// each message keeps its own text block (or a separator), never `"Hello" + "World"` fused into one
+/// word.
+/// claim: TRN-3
+/// defect: D44
+#[test]
+fn consecutive_user_messages_keep_their_text_apart() {
+    let v = c2m(
+        &chat(json!({"messages": [
+            {"role": "user", "content": "Hello"},
+            {"role": "user", "content": "World"},
+        ]})),
+        "claude-haiku-4-5",
+    );
+    let texts: Vec<String> = v["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["role"] == "user")
+        .flat_map(|m| match &m["content"] {
+            Value::String(s) => vec![s.clone()],
+            Value::Array(bs) => bs
+                .iter()
+                .filter_map(|b| b["text"].as_str().map(str::to_owned))
+                .collect(),
+            _ => Vec::new(),
+        })
+        .collect();
+    assert!(
+        !texts.iter().any(|t| t.contains("HelloWorld")),
+        "the two messages fused: {v}"
+    );
+    assert!(
+        texts.iter().any(|t| t.contains("Hello")) && texts.iter().any(|t| t.contains("World")),
+        "{v}"
+    );
+}
+
+/// A long run of same-role messages (queued user turns; an assistant turn whose parallel calls a
+/// client split across messages) merges in time linear in its length, and every message keeps its
+/// block. Each merge used to copy every block gathered so far: 256 KiB of user turns took 4.4 s of
+/// CPU in a release build, 1 MiB over a minute, all on one request.
+/// claim: TRN-3
+/// defect: D217
+#[test]
+fn a_long_run_of_same_role_messages_merges_in_linear_time() {
+    let users = vec![json!({"role": "user", "content": "hi"}); 6000];
+    let calls = vec![
+        json!({"role": "assistant", "content": null, "tool_calls": [
+            {"id": "c", "type": "function", "function": {"name": "f", "arguments": "{}"}}
+        ]});
+        3000
+    ];
+    let start = std::time::Instant::now();
+    let v = c2m(
+        &chat(json!({"messages": users.into_iter().chain(calls).collect::<Vec<_>>()})),
+        "claude-haiku-4-5",
+    );
+    let took = start.elapsed();
+    let blocks = |role: &str| -> usize {
+        v["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m["role"] == role)
+            .map(|m| m["content"].as_array().map_or(1, Vec::len))
+            .sum()
+    };
+    assert_eq!((blocks("user"), blocks("assistant")), (6000, 3000));
+    assert!(took < std::time::Duration::from_secs(2), "took {took:?}");
+}
+
+/// A Chat client's `cache_control` on a whole assistant or tool message (the same message-level
+/// marker the gateway honours on user and system messages) must reach the Messages block it
+/// becomes. Placed mid-history, so the automatic last-message breakpoint cannot stand in for it.
+/// claim: TRN-4
+/// defect: D47
+#[test]
+fn message_level_cache_control_survives_on_assistant_and_tool_messages() {
+    let cc = json!({"type": "ephemeral"});
+    let v = c2m(
+        &chat(json!({
+            "tools": [{"type": "function", "function": {"name": "get_weather", "parameters": weather_schema()}}],
+            "messages": [
+                {"role": "user", "content": "weather in Paris?"},
+                {"role": "assistant", "content": "Let me check.", "cache_control": cc,
+                 "tool_calls": [{"id": "toolu_01", "type": "function",
+                    "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"}}]},
+                {"role": "tool", "tool_call_id": "toolu_01", "content": "sunny", "cache_control": cc},
+                {"role": "assistant", "content": "It is sunny."},
+                {"role": "user", "content": "thanks"},
+            ],
+        })),
+        "claude-haiku-4-5",
+    );
+    let msgs = v["messages"].as_array().unwrap();
+    let marked = |m: &Value| {
+        m["content"].as_array().is_some_and(|bs| {
+            bs.iter().any(|b| {
+                b.get("cache_control") == Some(&cc)
+                    || b["content"].as_array().is_some_and(|inner| {
+                        inner.iter().any(|x| x.get("cache_control") == Some(&cc))
+                    })
+            })
+        })
+    };
+    assert!(
+        marked(&msgs[1]),
+        "assistant message lost its cache_control: {v}"
+    );
+    assert!(marked(&msgs[2]), "tool message lost its cache_control: {v}");
+}
+
+/// A custom (free-form) tool call in Chat or Responses history, onto Messages: the `tool_use`
+/// keeps the tool's name and its input. `name: ""` is a 400, and `input: {}` erases what the model
+/// wrote.
+/// claim: TRN-14
+/// defect: D48
+#[test]
+fn a_custom_tool_call_in_history_keeps_its_name_and_input_on_messages() {
+    let patch = "*** Begin Patch\n*** End Patch";
+    let chat_body = chat(json!({
+        "tools": [{"type": "custom", "custom": {"name": "apply_patch", "format": {"type": "text"}}}],
+        "messages": [
+            {"role": "user", "content": "fix it"},
+            {"role": "assistant", "content": null, "tool_calls": [
+                {"id": "call_1", "type": "custom", "custom": {"name": "apply_patch", "input": patch}}]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "applied"},
+        ],
+    }));
+    let resp_body = json!({
+        "model": "m", "store": false, "max_output_tokens": 4000,
+        "tools": [{"type": "custom", "name": "apply_patch", "format": {"type": "text"}}],
+        "input": [
+            {"role": "user", "content": "fix it"},
+            {"type": "custom_tool_call", "call_id": "call_1", "name": "apply_patch", "input": patch},
+            {"type": "custom_tool_call_output", "call_id": "call_1", "output": "applied"},
+        ],
+    });
+    let mut bad = Vec::new();
+    for (what, v) in [
+        ("Chat→Messages", c2m(&chat_body, "claude-haiku-4-5")),
+        (
+            "Responses→Messages",
+            req(
+                Endpoint::Responses,
+                Endpoint::Messages,
+                &resp_body,
+                "claude-haiku-4-5",
+            ),
+        ),
+    ] {
+        let tool_use = v["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|m| m["content"].as_array())
+            .flatten()
+            .find(|b| b["type"] == "tool_use")
+            .cloned()
+            .unwrap_or(Value::Null);
+        if tool_use["name"] != "apply_patch"
+            || !tool_use["input"].to_string().contains("Begin Patch")
+        {
+            bad.push(format!("{what}: {tool_use}"));
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+/// The tool message answering a custom call, onto a Responses row, is a
+/// `custom_tool_call_output`: OpenAI rejects a `function_call_output` whose call was a
+/// `custom_tool_call`.
+/// claim: TRN-14
+/// defect: D48
+#[test]
+fn a_custom_tool_result_reaches_responses_as_custom_tool_call_output() {
+    let v = c2r(
+        &chat(json!({"messages": [
+            {"role": "user", "content": "fix it"},
+            {"role": "assistant", "content": null, "tool_calls": [
+                {"id": "call_1", "type": "custom", "custom": {"name": "apply_patch", "input": "*** Begin Patch"}}]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "applied"},
+        ]})),
+        "gpt-5",
+    );
+    let types: Vec<&str> = v["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|i| i["type"].as_str())
+        .collect();
+    assert!(types.contains(&"custom_tool_call"), "{v}");
+    assert!(
+        types.contains(&"custom_tool_call_output") && !types.contains(&"function_call_output"),
+        "{types:?}: {v}"
+    );
+}
+
+/// OpenAI SDKs and frameworks send unset optional fields as explicit `null`. A null means "not
+/// set", so it must not reach an upstream that has no such field (Messages has no `audio`,
+/// Responses has no `stop`): forwarding it trades a working request for a 400 by name.
+/// claim: TRN-15
+/// defect: D49
+#[test]
+fn explicit_nulls_are_not_forwarded_upstream() {
+    let nulls = json!({"stop": null, "audio": null, "top_logprobs": null,
+        "web_search_options": null});
+    let mut bad = Vec::new();
+    for (what, v) in [
+        (
+            "Chat→Messages",
+            c2m(&chat(nulls.clone()), "claude-haiku-4-5"),
+        ),
+        ("Chat→Responses", c2r(&chat(nulls), "gpt-5")),
+    ] {
+        for key in ["stop", "audio", "top_logprobs", "web_search_options"] {
+            if v.get(key).is_some_and(Value::is_null) {
+                bad.push(format!("{what}: {key}: null forwarded"));
+            }
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+/// A Responses `developer` message onto a non-OpenAI Chat Completions host (DeepSeek, Mistral,
+/// most OpenAI-compatible servers) becomes `system`: those hosts only know system / user /
+/// assistant / tool.
+/// claim: TRN-16, TRN-2
+/// defect: D49
+#[test]
+fn a_responses_developer_message_is_system_on_a_non_openai_chat_host() {
+    let v = r2c(
+        &json!({"model": "m", "store": false, "input": [
+            {"role": "user", "content": "hi"},
+            {"role": "developer", "content": "Answer in French."},
+            {"role": "user", "content": "how are you?"},
+        ]}),
+        "deepseek-flash",
+    );
+    let r = roles(&v);
+    assert!(!r.contains(&"developer"), "{r:?}: {v}");
+}
+
+/// Responses input items the gateway has no mapping for must reach the upstream so it rejects
+/// them by name, never silently vanish: a dropped `computer_call_output` / `local_shell_call`
+/// leaves the model answering a different history. (`compaction` and `item_reference` are
+/// OpenAI-held state, dropped when translating: see D95.)
+/// claim: TRN-17
+/// defect: D49
+#[test]
+fn unknown_responses_input_items_are_forwarded_not_dropped() {
+    let mut dropped = Vec::new();
+    for item in [
+        json!({"type": "local_shell_call", "id": "lsh_1", "call_id": "call_1", "status": "completed",
+            "action": {"type": "exec", "command": ["ls"], "env": {}}}),
+        json!({"type": "computer_call_output", "call_id": "call_2",
+            "output": {"type": "computer_screenshot", "image_url": "data:image/png;base64,AAAA"}}),
+        json!({"type": "some_future_item", "id": "x_1"}),
+    ] {
+        let typ = item["type"].as_str().unwrap().to_owned();
+        let v = r2c(
+            &json!({"model": "m", "store": false, "input": [
+                {"role": "user", "content": "hi"}, item,
+            ]}),
+            "gpt-4o-mini",
+        );
+        if !v.to_string().contains(&typ) {
+            dropped.push(typ);
+        }
+    }
+    assert!(dropped.is_empty(), "silently dropped: {dropped:?}");
+}
+
+/// A same-wire Responses relay loses only the reasoning items the gateway minted (by id, or by the
+/// `encrypted_content` marker when the id is gone); OpenAI's own stay, and a body with none of ours
+/// is relayed byte for byte.
+#[test]
+fn only_gateway_reasoning_items_are_stripped_from_a_responses_relay() {
+    let plain = br#"{"model":"gpt-5", "input":[{"type":"reasoning","id":"rs_68ab","encrypted_content":"gAAAA"}]}"#;
+    assert_eq!(strip_gateway_reasoning(plain.to_vec()), plain);
+
+    let body = json!({"model": "gpt-5", "input": [
+        {"role": "user", "content": "hi"},
+        {"type": "reasoning", "id": "rs_gw18f2a0001", "encrypted_content": "SIG"},
+        {"type": "reasoning", "encrypted_content": format!("{GATEWAY_SIGNATURE_PREFIX}SIG")},
+        {"type": "reasoning", "id": "rs_68ab", "encrypted_content": "gAAAA"},
+    ]});
+    let out: Value =
+        serde_json::from_slice(&strip_gateway_reasoning(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+    assert_eq!(
+        out["input"],
+        json!([
+            {"role": "user", "content": "hi"},
+            {"type": "reasoning", "id": "rs_68ab", "encrypted_content": "gAAAA"},
+        ])
+    );
+}
+
+/// `request_with_tools` says whether the breakpoints are the gateway's: true only when it added one,
+/// false when the client marked anything (the writes are then the client's) or nothing was cacheable.
+#[test]
+fn request_reports_gateway_added_breakpoints() {
+    let caching = |body: Value| {
+        request_with_tools(
+            Endpoint::ChatCompletions,
+            Endpoint::Messages,
+            &serde_json::to_vec(&body).unwrap(),
+            "claude-opus-4-8",
+        )
+        .2
+    };
+    let sys = json!({"role": "system", "content": "be terse"});
+    let user = json!({"role": "user", "content": "hi"});
+    assert!(caching(json!({"model": "m", "messages": [sys, user]})));
+    assert!(!caching(json!({"model": "m", "messages": [user]})));
+    let marked = json!({"role": "system", "content": [
+        {"type": "text", "text": "be terse", "cache_control": {"type": "ephemeral"}}
+    ]});
+    assert!(!caching(json!({"model": "m", "messages": [marked, user]})));
+    // Same wire: a byte relay, never marked.
+    assert!(
+        !request_with_tools(
+            Endpoint::Messages,
+            Endpoint::Messages,
+            b"{}",
+            "claude-opus-4-8"
+        )
+        .2
+    );
+}
+
+/// openai-python sends `instructions: null` for `instructions=None`. Onto a Chat Completions row it
+/// is absent, not a system message whose content is null (xAI 422s, Together 400s it).
+/// claim: TRN-15
+/// defect: D102
+#[test]
+fn null_instructions_are_absent_on_chat() {
+    let body = json!({"model": "m", "store": false, "instructions": null, "input": "hi"});
+    for model in ["grok-4.3", "meta-llama/Llama-3.3-70B-Instruct-Turbo"] {
+        let out = r2c(&body, model);
+        assert_eq!(
+            out["messages"],
+            json!([{"role": "user", "content": "hi"}]),
+            "{out}"
+        );
+    }
+}
+
+/// Stripping the gateway's reasoning items from a same-wire Responses body removes those items and
+/// nothing else: schema property order (a strict structured output's field order), spacing and
+/// number spellings stay as the client sent them, so the relay is still a byte relay and a prompt
+/// cache prefix still matches. A body with nothing to strip is returned byte for byte.
+/// claim: TRN-20, TRN-4
+/// defect: D90
+#[test]
+fn stripping_gateway_reasoning_changes_only_the_stripped_items() {
+    let ours =
+        r#"{"type":"reasoning","id":"rs_gw_1","summary":[],"encrypted_content":"rs_gw:SIG"}"#;
+    let theirs = r#"{"type": "reasoning", "id": "rs_abc", "encrypted_content": "gAAA"}"#;
+    let user = r#"{ "role":"user", "content":"hi" }"#;
+    let body = |items: &[&str]| {
+        format!(
+            r#"{{"model":"gpt-5", "text":{{"format":{{"type":"json_schema","name":"o","strict":true,
+  "schema":{{"type":"object","properties":{{"zeta":{{"type":"number"}},"alpha":{{"type":"string"}}}},
+  "required":["zeta","alpha"]}}}}}}, "temperature":1.0,
+  "input":[{}], "store":false}}"#,
+            items.join(",\n    ")
+        )
+    };
+    for (items, want) in [
+        (vec![user, ours, theirs], vec![user, theirs]),
+        (vec![ours, user], vec![user]),
+        (vec![user, ours], vec![user]),
+        (vec![ours, ours, user, ours], vec![user]),
+        (vec![ours], vec![]),
+        (vec![user, theirs], vec![user, theirs]),
+    ] {
+        let got = strip_gateway_reasoning(body(&items).into_bytes());
+        let got = String::from_utf8(got).unwrap();
+        assert_eq!(got, body(&want), "items {items:?}");
+        serde_json::from_str::<Value>(&got).expect("still JSON");
+    }
+    // Nothing to strip, even with `rs_gw` in the text: identical bytes.
+    let other = body(&[r#"{"role":"user","content":"what is rs_gw?"}"#]);
+    assert_eq!(
+        strip_gateway_reasoning(other.clone().into_bytes()),
+        other.into_bytes()
+    );
+}
+
+/// The message carrying `role` in a translated body's `messages` / `input`, if any.
+fn with_role<'a>(v: &'a Value, list: &str, role: &str) -> Option<&'a Value> {
+    v[list]
+        .as_array()?
+        .iter()
+        .find(|m| m.get("role").and_then(Value::as_str) == Some(role))
+}
+
+/// A message whose role no dialect has (a typo, a framework's private role) is forwarded whole,
+/// in place, with its role unchanged, so the provider's 400 names it, as it does called directly.
+/// It never becomes user speech the model answers.
+/// claim: T6, TRN-21
+/// defect: D103
+#[test]
+fn an_unknown_role_is_forwarded_onto_messages() {
+    let body = chat(json!({"messages": [
+        {"role": "user", "content": "hi"},
+        {"role": "robot", "content": "Say OK."},
+    ]}));
+    let out = c2m(&body, "claude-haiku-4-5");
+    let m = with_role(&out, "messages", "robot").unwrap_or_else(|| panic!("{out}"));
+    assert_eq!(m["content"], "Say OK.", "{out}");
+    assert_eq!(
+        out["messages"].as_array().unwrap().len(),
+        2,
+        "in place: {out}"
+    );
+    // Responses onto Messages walks the same mapping.
+    let r = json!({"model": "m", "input": [{"role": "robot", "content": "Say OK."}]});
+    let out = req(
+        Endpoint::Responses,
+        Endpoint::Messages,
+        &r,
+        "claude-haiku-4-5",
+    );
+    assert!(with_role(&out, "messages", "robot").is_some(), "{out}");
+}
+
+/// claim: T6, TRN-21
+/// defect: D103
+#[test]
+fn an_unknown_role_is_forwarded_onto_chat() {
+    let body = anth(json!({"messages": [
+        {"role": "user", "content": "hi"},
+        {"role": "robot", "content": "Say OK."},
+    ]}));
+    let out = m2c(&body, "gpt-5-mini");
+    let m = with_role(&out, "messages", "robot").unwrap_or_else(|| panic!("{out}"));
+    assert_eq!(m["content"], "Say OK.", "{out}");
+    assert_eq!(out["messages"][1]["role"], "robot", "in place: {out}");
+}
+
+/// claim: T6, TRN-21
+/// defect: D103
+#[test]
+fn an_unknown_role_is_forwarded_onto_responses() {
+    let body = chat(json!({"messages": [
+        {"role": "user", "content": "hi"},
+        {"role": "robot", "content": "Say OK."},
+    ]}));
+    let out = c2r(&body, "gpt-5-mini");
+    let m = with_role(&out, "input", "robot").unwrap_or_else(|| panic!("{out}"));
+    assert_eq!(m["content"], "Say OK.", "{out}");
+    assert_eq!(out["input"][1]["role"], "robot", "in place: {out}");
+}
+
+/// A compacted Codex session that fails over (or is routed) onto a translated candidate degrades
+/// instead of failing: `compaction` (an encrypted summary only OpenAI can read) and
+/// `item_reference` (a pointer into OpenAI's store) are OpenAI-held state no translated upstream
+/// can resolve, so translation drops them and the request runs on the history the client holds.
+/// (A catalog walk refuses an `item_reference` that stands for an earlier turn before translation,
+/// D175; only a tool step's reaches it.) The same-wire Responses relay keeps them; D49's rule (forward anything the gateway has no
+/// mapping for) still holds for every other item.
+/// claim: TRN-17
+/// defect: D95
+#[test]
+fn openai_held_responses_items_are_dropped_only_when_translating() {
+    let body = json!({"model": "m", "store": false, "input": [
+        {"type": "compaction", "id": "cmp_1", "encrypted_content": "opaque"},
+        {"type": "item_reference", "id": "msg_abc123"},
+        {"role": "user", "content": "continue"},
+    ]});
+    for (what, v) in [
+        ("Responses→Chat", r2c(&body, "grok-4.3")),
+        (
+            "Responses→Messages",
+            req(
+                Endpoint::Responses,
+                Endpoint::Messages,
+                &body,
+                "claude-haiku-4-5",
+            ),
+        ),
+    ] {
+        let s = v.to_string();
+        assert!(
+            !s.contains("compaction") && !s.contains("item_reference"),
+            "{what}: {v}"
+        );
+        assert!(s.contains("continue"), "{what}: {v}");
+    }
+    // Same wire: relayed as sent.
+    let raw = serde_json::to_vec(&body).unwrap();
+    assert_eq!(strip_gateway_reasoning(raw.clone()), raw);
+}
+
+/// Responses client → a Messages row.
+fn r2m(body: &Value, model: &str) -> Value {
+    req(Endpoint::Responses, Endpoint::Messages, body, model)
+}
+
+/// `responses.create(instructions=None)` sends `instructions: null`: "not set", like every other
+/// null. Onto Chat Completions it became a system message with null content, which xAI (422) and
+/// Together (400) reject.
+/// claim: TRN-15
+/// defect: D102
+#[test]
+fn null_instructions_add_no_system_message() {
+    let body = json!({"model": "m", "store": false, "instructions": null, "input": "hi"});
+    for (what, v) in [
+        ("grok", r2c(&body, "grok-4.3")),
+        (
+            "together",
+            r2c(&body, "meta-llama/Llama-3.3-70B-Instruct-Turbo"),
+        ),
+        ("openai chat", r2c(&body, "gpt-4o-mini")),
+    ] {
+        assert_eq!(roles(&v), ["user"], "{what}: {v}");
+    }
+    let v = r2m(&body, "claude-haiku-4-5");
+    assert!(v.get("system").is_none(), "{v}");
+}
+
+/// A tool turn as a Responses client replays it: the reasoning item the gateway minted, the call it
+/// opened, then the result.
+fn replayed_tool_turn(reasoning: Option<Value>) -> Value {
+    let mut body = json!({"model": "m", "store": false, "input": [
+        {"role": "user", "content": "weather in Paris?"},
+        {"type": "reasoning", "id": "rs_gw18f2c3a4b5d60001", "encrypted_content": "rs_gw:EqQBsig==",
+         "summary": [{"type": "summary_text", "text": "Need weather."}]},
+        {"type": "function_call", "call_id": "toolu_01", "name": "get_weather", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "toolu_01", "output": "sunny"},
+    ], "tools": [{"type": "function", "name": "get_weather", "parameters": {"type": "object"}}]});
+    if let Some(r) = reasoning {
+        body["reasoning"] = r;
+    }
+    body
+}
+
+fn last_assistant(v: &Value) -> &Value {
+    v["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|m| m["role"] == "assistant")
+        .unwrap()
+}
+
+fn holds_thinking(m: &Value) -> bool {
+    m.get("reasoning_details").is_some()
+        || m.get("thinking").is_some()
+        || m["content"]
+            .as_array()
+            .is_some_and(|bs| bs.iter().any(is_thinking_block))
+}
+
+/// With thinking off, Anthropic on Bedrock (directly, and behind OpenRouter) rejects thinking in the
+/// final turn, every call of a tool loop included: "When thinking is disabled, an `assistant`
+/// message in the final position cannot contain `thinking`" (Anthropic's own API accepts it). A
+/// request that does not think has no use for any of it, so it leaves the assistant messages on
+/// every path to a Claude model. With thinking on it stays (a tool turn must open on it), and an
+/// adaptive-generation model with no reasoning asked still thinks adaptively, so it stays there too.
+/// claim: TRN-7, W4
+/// defect: D79
+#[test]
+fn replayed_thinking_is_dropped_when_thinking_is_off() {
+    let off = replayed_tool_turn(None);
+    let mut bad = Vec::new();
+    for (what, v) in [
+        (
+            "Responses → OpenRouter Chat",
+            r2c(&off, "anthropic/claude-sonnet-4"),
+        ),
+        (
+            "Responses → Messages (budget)",
+            r2m(&off, "claude-haiku-4-5"),
+        ),
+        (
+            "Responses → Bedrock Messages",
+            r2m(&off, "global.anthropic.claude-haiku-4-5-20251001-v1:0"),
+        ),
+        (
+            "Responses → Messages (effort none)",
+            r2m(
+                &replayed_tool_turn(Some(json!({"effort": "none"}))),
+                "claude-sonnet-4-5",
+            ),
+        ),
+    ] {
+        if holds_thinking(last_assistant(&v)) {
+            bad.push(format!("{what}: {v}"));
+        }
+    }
+    // A Chat client replaying OpenRouter's reasoning_details with reasoning off, same wire.
+    let chat = json!({"model": "anthropic/claude-sonnet-4", "messages": [
+        {"role": "user", "content": "weather in Paris?"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "toolu_01", "type": "function",
+            "function": {"name": "get_weather", "arguments": "{}"}}],
+         "reasoning_details": [{"type": "reasoning.text", "text": "Need weather.",
+            "signature": "EqQBsig==", "format": "anthropic-claude-v1", "index": 0}]},
+        {"role": "tool", "tool_call_id": "toolu_01", "content": "sunny"},
+    ]});
+    let relayed: Value = serde_json::from_slice(&claude_chat_relay_reasoning(
+        serde_json::to_vec(&chat).unwrap(),
+        "anthropic/claude-sonnet-4",
+    ))
+    .unwrap();
+    if holds_thinking(last_assistant(&relayed)) {
+        bad.push(format!("Chat → OpenRouter Chat, same wire: {relayed}"));
+    }
+    // A tool loop is one assistant turn: its first call 400s on Bedrock too (pi's live session
+    // failed on `messages.1` with a second round after it).
+    let mut two_rounds = off.clone();
+    let input = two_rounds["input"].as_array_mut().unwrap();
+    input.push(
+        json!({"type": "function_call", "call_id": "toolu_02", "name": "get_weather",
+        "arguments": "{}"}),
+    );
+    input.push(json!({"type": "function_call_output", "call_id": "toolu_02", "output": "rain"}));
+    for (what, v) in [
+        (
+            "two rounds → OpenRouter Chat",
+            r2c(&two_rounds, "anthropic/claude-sonnet-4"),
+        ),
+        (
+            "two rounds → Messages",
+            r2m(&two_rounds, "claude-haiku-4-5"),
+        ),
+    ] {
+        let assistants = v["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m["role"] == "assistant");
+        if assistants.clone().count() < 2 && what.contains("Chat") {
+            bad.push(format!("{what}: expected two assistant messages: {v}"));
+        }
+        if assistants.clone().any(holds_thinking) {
+            bad.push(format!("{what}: {v}"));
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+
+    // Thinking on: the tool turn keeps (and must open on) its thinking.
+    let on = replayed_tool_turn(Some(json!({"effort": "medium"})));
+    let v = r2c(&on, "anthropic/claude-sonnet-4");
+    assert!(last_assistant(&v).get("reasoning_details").is_some(), "{v}");
+    let v = r2m(&on, "claude-haiku-4-5");
+    assert!(holds_thinking(last_assistant(&v)), "{v}");
+    // Adaptive generation, no reasoning asked: still adaptive thinking, so the block stays.
+    let v = r2m(&off, "claude-opus-4-8");
+    assert!(holds_thinking(last_assistant(&v)), "{v}");
+}
+
+/// Codex offers its hosted `web_search` on every turn (`external_web_access: false`, its default
+/// cached mode). No Chat Completions or Messages upstream runs OpenAI's search, and Anthropic 400ed
+/// the forwarded tool, so Codex could not run on a Claude row at all. A model-discretion hosted
+/// search is dropped leaving Responses; a `tool_choice` that names it is forwarded with it, for the
+/// provider to reject.
+/// claim: W2, TRN-21
+/// defect: D78
+#[test]
+fn hosted_web_search_is_dropped_leaving_responses_unless_chosen() {
+    let body = |choice: Value| {
+        json!({"model": "m", "store": false, "input": "hi", "tool_choice": choice, "tools": [
+            {"type": "function", "name": "shell", "parameters": {"type": "object"}},
+            {"type": "web_search", "external_web_access": false},
+            {"type": "web_search_preview"},
+        ]})
+    };
+    let searches = |v: &Value| -> usize {
+        v["tools"].as_array().map_or(0, |ts| {
+            ts.iter()
+                .filter(|t| {
+                    t["type"]
+                        .as_str()
+                        .is_some_and(|ty| ty.starts_with("web_search"))
+                })
+                .count()
+        })
+    };
+    for (what, v) in [
+        ("Messages", r2m(&body(json!("auto")), "claude-opus-4-8")),
+        (
+            "Chat",
+            r2c(&body(json!("auto")), "anthropic/claude-sonnet-4"),
+        ),
+    ] {
+        assert_eq!(searches(&v), 0, "{what}: {v}");
+        assert_eq!(v["tools"].as_array().map(Vec::len), Some(1), "{what}: {v}");
+    }
+    // Chosen by name: forwarded, so the provider names it.
+    let v = r2m(&body(json!({"type": "web_search"})), "claude-opus-4-8");
+    assert!(searches(&v) > 0, "{v}");
+    // Only the search offered: no tools, so no tool_choice either.
+    let v = r2c(
+        &json!({"model": "m", "store": false, "input": "hi", "tool_choice": "auto",
+            "tools": [{"type": "web_search"}]}),
+        "grok-4.3",
+    );
+    assert!(
+        v.get("tools").is_none() && v.get("tool_choice").is_none(),
+        "{v}"
+    );
 }

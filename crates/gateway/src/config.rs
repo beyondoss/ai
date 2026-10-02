@@ -9,11 +9,13 @@ use crate::key::{Keyring, Kid};
 use crate::secret::Secret;
 use figment::Figment;
 use figment::providers::{Env, Format, Toml};
+use pingora_core::protocols::TcpKeepalive;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 use std::ops::Deref;
 use std::path::Path;
+use std::time::Duration;
 
 /// One provider's pool keys.
 ///
@@ -173,6 +175,18 @@ pub struct AiConfig {
     /// (which run keyless) working out of the box.
     pub require_signing_keys: bool,
 
+    /// Secrets that bind provider-held Responses ids to a tenant (`signed_id.rs`): kid (one
+    /// character, `[0-9A-Za-z]`) → base64 of at least 32 random bytes. From the
+    /// `[id_signing_keys]` table or `AI_ID_SIGNING_KEY_<KID>` env. Empty ⇒ a managed Responses
+    /// relay to a store (a GPT row's Responses arm, a managed `/{provider}/…/responses`) is a 503
+    /// (fail-closed); everything else is unaffected. More than one ⇒ rotation (see
+    /// `id_signing_kid`).
+    pub id_signing_keys: HashMap<String, Secret>,
+
+    /// The kid in `id_signing_keys` that signs new ids. Optional with exactly one key. Ids carry
+    /// the kid that signed them, so ids from a previous key verify while that key stays listed.
+    pub id_signing_kid: String,
+
     /// Managed Beyond pool keys, **by provider name** (`openai`, `anthropic`, `fireworks`, …).
     /// From the `[pool_keys]` TOML table (an array of keys, or a string = list of one) or
     /// SSM-injected `AI_POOL_KEY_<NAME>` env (the env form is the production path and stays one
@@ -208,9 +222,62 @@ pub struct AiConfig {
 
     /// Upstream timeouts (seconds). Streaming responses are long, so read/idle are generous.
     pub connect_timeout_secs: u64,
+    /// The longest the provider may stay silent: before its response head, or between body reads
+    /// (pingora has one per-read upstream timeout). 600 s, the OpenAI and Anthropic SDKs' default
+    /// request timeout, so the gateway never gives up on a slow-but-alive provider before the
+    /// client itself would. Silence is not a failure signal: a model thinking without emitting
+    /// looks exactly like a stuck provider. A *dead* provider connection is caught sooner, by
+    /// transport liveness (`h2_ping_interval_secs`, `tcp_keepalive_*`).
     pub read_timeout_secs: u64,
     pub write_timeout_secs: u64,
     pub idle_timeout_secs: u64,
+
+    /// Downstream write timeout (seconds): a write to the client that cannot make progress for this
+    /// long ends the request. A client that stops reading (a hung SDK, a paused process, a
+    /// half-dead connection) otherwise held its in-flight slot, its tenant slot, its upstream
+    /// connection and possibly a half-open probe permit forever, since nothing else times out a
+    /// blocked write. Per write: a slow but steady reader never trips it. `0` disables it.
+    ///
+    /// Not a guess at model behavior, and not replaceable by keepalive: it judges a client that
+    /// stopped consuming bytes the gateway already holds. A live process that stops reading still
+    /// ACKs at the kernel and advertises a zero window, so TCP keepalive (which probes only an idle
+    /// connection) reports it healthy forever, and its own timeout cannot fire because it is not
+    /// waiting on anything. A client that reads at all drains a full socket buffer within a few
+    /// round trips; 60 s of zero progress is hundreds of them.
+    pub client_write_timeout_secs: u64,
+
+    /// HTTP/2 PING interval on upstream connections (seconds); `0` disables. A provider that stops
+    /// acknowledging (a dead host, a partition, a wedged edge) fails the connection and every
+    /// stream on it within this interval plus pingora's fixed 5 s ACK deadline, however silent the
+    /// model is meant to be: a PING is answered by the peer's HTTP/2 stack, not by the model. 15 s:
+    /// the bound it buys (≤ 20 s) is far under any client's patience, and one 17-byte frame and its
+    /// ACK per connection per interval is negligible next to a token stream. The 5 s ACK deadline is
+    /// over ten worst-case intercontinental round trips (~300 ms) and fits several TCP
+    /// retransmissions, so a live but distant peer never misses it.
+    pub h2_ping_interval_secs: u64,
+    /// TCP keepalive on upstream and client connections: probe after this many idle seconds, every
+    /// `tcp_keepalive_interval_secs`, and drop the peer after `tcp_keepalive_count` unanswered
+    /// probes; `0` disables. Probes are answered by the peer's kernel, so a live process that is
+    /// merely quiet always passes, and a vanished host fails within idle + interval × count
+    /// (15 + 5 × 3 = 30 s). Upstream it covers HTTP/1.1 providers, which have no PING, and the
+    /// connection is also given `TCP_USER_TIMEOUT` of the same 30 s, so data the provider never
+    /// acknowledges (a partition mid-request, where keepalive does not probe) fails as fast.
+    /// Toward clients it frees a vanished client's slot during a silent model turn, when the
+    /// gateway has nothing to write. The interval is 15 × a 300 ms worst-case round trip and well
+    /// past Linux's 200 ms minimum retransmission timeout; three probes ride out two lost ones.
+    /// The kernel's own default (2 h idle, 9 × 75 s) is far too slow to matter.
+    pub tcp_keepalive_idle_secs: u64,
+    pub tcp_keepalive_interval_secs: u64,
+    pub tcp_keepalive_count: u32,
+
+    /// Most request-body bytes this process holds in memory at once, across every request. A body
+    /// past pingora's 64 KiB replay buffer is read in full for a catalog walk (twice over while its
+    /// `FullBody` re-run buffers its own copy), and a managed OpenAI chat body is buffered for the
+    /// usage splice; each is capped at 100 MiB but nothing bounded how many. A request that would
+    /// cross this gets a 503 with `Retry-After` (`ai_rejections_total{reason="body_memory"}`)
+    /// before its body is read, or as soon as a chunked one grows past it. Bodies within the replay
+    /// buffer are not counted. `0` disables.
+    pub max_buffered_body_bytes: usize,
 
     /// Graceful-shutdown drain window (seconds): after SIGTERM, how long Pingora lets **in-flight
     /// requests finish** before tearing the runtimes down. Maps to Pingora's `grace_period_seconds`
@@ -222,7 +289,8 @@ pub struct AiConfig {
     /// longest a request can live is `read_timeout_secs`, so a drain window of at least that
     /// guarantees every accepted request finishes — Pingora stops *accepting* new connections the
     /// instant SIGTERM lands, so this only ever waits out the existing longest stream, not new work.
-    /// Slower rollouts are the deliberate price of not mangling responses.
+    /// Slower rollouts are the deliberate price of not mangling responses. It is an upper bound,
+    /// not a wait: the process exits as soon as no request is left in flight (see `main`'s drain).
     ///
     /// **The orchestrator must grant the same window**, or it caps us: the platform SIGKILLs at its
     /// own stop timeout regardless of this value. Set k8s `terminationGracePeriodSeconds` (or the EC2
@@ -290,9 +358,10 @@ pub struct AiConfig {
     /// of whose key is used. `0` disables the breaker entirely. Default is generous so normal
     /// background 5xx noise never trips it.
     pub circuit_breaker_threshold: u32,
-    /// Rolling window (seconds) over which `circuit_breaker_threshold` failures are counted. Failures
-    /// older than the window are forgotten — so it trips on a *burst* of failures, not on a slow trickle
-    /// spread across a healthy day.
+    /// Fixed window (seconds) over which `circuit_breaker_threshold` failures are counted. A window
+    /// starts at its first failure; the first failure after it ends starts a new one with every count
+    /// back at zero — so it trips on a *burst* of failures, not on a slow trickle spread across a
+    /// healthy day.
     pub circuit_breaker_window_secs: u64,
     /// How long the breaker stays open before allowing a half-open probe request (seconds). Long enough
     /// to let a provider recover, short enough that recovery is detected promptly.
@@ -365,6 +434,8 @@ impl Default for AiConfig {
             snapshot_path: None,
             signing_keys: HashMap::new(),
             require_signing_keys: false,
+            id_signing_keys: HashMap::new(),
+            id_signing_kid: String::new(),
             pool_keys: HashMap::new(),
             provider_authorities: HashMap::new(),
             provider_dialects: HashMap::new(),
@@ -374,6 +445,12 @@ impl Default for AiConfig {
             read_timeout_secs: 600,
             write_timeout_secs: 60,
             idle_timeout_secs: 90,
+            client_write_timeout_secs: 60,
+            h2_ping_interval_secs: 15,
+            tcp_keepalive_idle_secs: 15,
+            tcp_keepalive_interval_secs: 5,
+            tcp_keepalive_count: 3,
+            max_buffered_body_bytes: 512 * 1024 * 1024,
             // Drain for the full request lifetime (= read_timeout_secs) so a deploy never truncates
             // an in-flight stream — we're a transparent proxy and must not mangle a paid-for
             // generation. Pingora stops accepting new connections at SIGTERM, so this only waits out
@@ -482,6 +559,33 @@ impl AiConfig {
                     .to_string(),
             ));
         }
+        // The kernel rejects a zero probe interval or count (EINVAL), which would fail every
+        // upstream connect and leave every accepted client socket without keepalive.
+        if self.tcp_keepalive_idle_secs > 0
+            && (self.tcp_keepalive_interval_secs == 0 || self.tcp_keepalive_count == 0)
+        {
+            return Err(GatewayError::Config(
+                "tcp_keepalive_interval_secs and tcp_keepalive_count must be > 0 when                  tcp_keepalive_idle_secs is set; set tcp_keepalive_idle_secs = 0 to disable keepalive"
+                    .to_string(),
+            ));
+        }
+        // A breaker with a zero window counts every failure into an already-expired window, so the
+        // count never passes 1 and the breaker never opens; a zero reset re-admits a probe at once,
+        // so an open breaker sheds nothing. Both read as "breaker on" while doing nothing.
+        if self.circuit_breaker_threshold > 0 && self.circuit_breaker_window_secs == 0 {
+            return Err(GatewayError::Config(
+                "circuit_breaker_window_secs must be > 0 (a 0 window never accrues a second \
+                 failure, so the breaker never opens); set circuit_breaker_threshold = 0 to disable it"
+                    .to_string(),
+            ));
+        }
+        if self.circuit_breaker_threshold > 0 && self.circuit_breaker_reset_secs == 0 {
+            return Err(GatewayError::Config(
+                "circuit_breaker_reset_secs must be > 0 (a 0 reset half-opens the breaker the \
+                 instant it opens); set circuit_breaker_threshold = 0 to disable it"
+                    .to_string(),
+            ));
+        }
         if self.circuit_breaker_threshold > crate::circuit_breaker::MAX_FAILURE_THRESHOLD {
             return Err(GatewayError::Config(format!(
                 "circuit_breaker_threshold = {} exceeds the maximum of {} (the breaker's packed \
@@ -490,7 +594,16 @@ impl AiConfig {
                 crate::circuit_breaker::MAX_FAILURE_THRESHOLD,
             )));
         }
+        // A malformed id signing key is a boot failure, not a 503 on every managed Responses turn.
+        self.build_id_signer()?;
         Ok(())
+    }
+
+    /// The signer for tenant-bound Responses ids (`signed_id.rs`), or `None` when no
+    /// `id_signing_keys` are set.
+    pub fn build_id_signer(&self) -> Result<Option<crate::signed_id::Signer>> {
+        crate::signed_id::Signer::from_config(&self.id_signing_keys, &self.id_signing_kid)
+            .map_err(GatewayError::Config)
     }
 
     /// The per-provider circuit-breaker config, or `None` when disabled (`circuit_breaker_threshold
@@ -518,11 +631,12 @@ impl AiConfig {
         )
     }
 
-    /// Fold the two secret-carrying env prefixes into the config, in a single pass.
+    /// Fold the secret-carrying env prefixes into the config, in a single pass.
     ///
-    /// `AI_POOL_KEY_<NAME>` → `pool_keys[name]` (provider name lowercased) and
-    /// `AI_SIGNING_KEY_<KID>` → `signing_keys[kid]` (key id verbatim). This is the production secret
-    /// path: both are map fields a flat figment env merge can't target, the ECS container has no
+    /// `AI_POOL_KEY_<NAME>` → `pool_keys[name]` (provider name lowercased),
+    /// `AI_SIGNING_KEY_<KID>` → `signing_keys[kid]` and `AI_ID_SIGNING_KEY_<KID>` →
+    /// `id_signing_keys[kid]` (key ids verbatim). This is the production secret path: all are map
+    /// fields a flat figment env merge can't target, the ECS container has no
     /// mounted config file, and env must win over anything baked into one.
     ///
     /// `std::env::vars()` allocates a `(String, String)` for *every* variable in the environment,
@@ -533,12 +647,35 @@ impl AiConfig {
     fn merge_secret_env(&mut self, vars: impl Iterator<Item = (String, String)>) {
         for (k, v) in vars {
             if let Some(name) = k.strip_prefix("AI_POOL_KEY_") {
-                self.pool_keys
-                    .insert(name.to_ascii_lowercase(), Secret::new(v).into());
+                let name = self.pool_key_env_provider(name);
+                self.pool_keys.insert(name, Secret::new(v).into());
             } else if let Some(kid) = k.strip_prefix("AI_SIGNING_KEY_") {
                 self.signing_keys.insert(kid.to_string(), v);
+            } else if let Some(kid) = k.strip_prefix("AI_ID_SIGNING_KEY_") {
+                self.id_signing_keys.insert(kid.to_string(), Secret::new(v));
             }
         }
+    }
+
+    /// The provider an `AI_POOL_KEY_<NAME>` variable is for.
+    ///
+    /// An environment variable name cannot hold `-`, so `<NAME>` is lowercased, and when that names
+    /// no provider but its `_` → `-` spelling does, the hyphenated provider wins:
+    /// `AI_POOL_KEY_FIREWORKS_ANTHROPIC` reaches a config-added `fireworks-anthropic`. A name that
+    /// matches exactly always wins, so a provider really called `my_vendor` keeps its key. (The
+    /// mapping is mechanical; it does not make a provider poolable. `openai-codex` is reached only
+    /// with a client's own ChatGPT bearer and has no pool key: see `providers::ProviderId`.)
+    fn pool_key_env_provider(&self, env_name: &str) -> String {
+        let name = env_name.to_ascii_lowercase();
+        let known = |n: &str| {
+            crate::route::known_providers().any(|p| p.name == n)
+                || self.provider_authorities.contains_key(n)
+        };
+        if known(&name) || !name.contains('_') {
+            return name;
+        }
+        let hyphenated = name.replace('_', "-");
+        if known(&hyphenated) { hyphenated } else { name }
     }
 
     /// Build the trusted keyring from the configured signing public keys.
@@ -634,6 +771,47 @@ fn read_toml(path: &Path) -> Result<PreRead> {
     }
 }
 
+impl AiConfig {
+    /// The upstream HTTP/2 PING interval (see `h2_ping_interval_secs`).
+    pub fn h2_ping_interval(&self) -> Option<Duration> {
+        (self.h2_ping_interval_secs > 0).then(|| Duration::from_secs(self.h2_ping_interval_secs))
+    }
+
+    /// TCP keepalive for an upstream connection: the probes, plus `TCP_USER_TIMEOUT` at the same
+    /// bound so unacknowledged request bytes (where keepalive does not probe) fail as fast.
+    pub fn upstream_tcp_keepalive(&self) -> Option<TcpKeepalive> {
+        self.tcp_keepalive(true)
+    }
+
+    /// TCP keepalive for an accepted client connection. No `TCP_USER_TIMEOUT`: a live client that
+    /// stops reading (zero window) is `client_write_timeout_secs`'s to judge, not the kernel's.
+    pub fn downstream_tcp_keepalive(&self) -> Option<TcpKeepalive> {
+        self.tcp_keepalive(false)
+    }
+
+    fn tcp_keepalive(&self, user_timeout: bool) -> Option<TcpKeepalive> {
+        if self.tcp_keepalive_idle_secs == 0 {
+            return None;
+        }
+        let idle = Duration::from_secs(self.tcp_keepalive_idle_secs);
+        let interval = Duration::from_secs(self.tcp_keepalive_interval_secs);
+        let count = self.tcp_keepalive_count as usize;
+        #[cfg(not(target_os = "linux"))]
+        let _ = user_timeout;
+        Some(TcpKeepalive {
+            idle,
+            interval,
+            count,
+            #[cfg(target_os = "linux")]
+            user_timeout: if user_timeout {
+                idle + interval * self.tcp_keepalive_count
+            } else {
+                Duration::ZERO
+            },
+        })
+    }
+}
+
 /// Fail the load if the config file carries any key that isn't an `AiConfig` field.
 ///
 /// `known` is derived from `AiConfig` itself by serializing its defaults, so it tracks the struct
@@ -708,6 +886,51 @@ mod tests {
         );
         // Defaults are valid.
         assert!(AiConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_a_zero_breaker_window_or_reset() {
+        let cfg = |window, reset, threshold| AiConfig {
+            circuit_breaker_window_secs: window,
+            circuit_breaker_reset_secs: reset,
+            circuit_breaker_threshold: threshold,
+            ..Default::default()
+        };
+        assert!(cfg(0, 30, 20).validate().is_err());
+        assert!(cfg(10, 0, 20).validate().is_err());
+        // A disabled breaker has no window to get wrong.
+        assert!(cfg(0, 0, 0).validate().is_ok());
+    }
+
+    #[test]
+    fn pool_key_env_reaches_a_hyphenated_provider() {
+        let mut c = AiConfig {
+            provider_authorities: HashMap::from([
+                ("fireworks-anthropic".to_string(), "h:443".to_string()),
+                ("my_vendor".to_string(), "h:443".to_string()),
+            ]),
+            ..Default::default()
+        };
+        c.merge_secret_env(
+            [
+                (
+                    "AI_POOL_KEY_FIREWORKS_ANTHROPIC".to_string(),
+                    "a".to_string(),
+                ),
+                ("AI_POOL_KEY_OPENAI_CODEX".to_string(), "b".to_string()),
+                ("AI_POOL_KEY_MY_VENDOR".to_string(), "c".to_string()),
+                ("AI_POOL_KEY_UNKNOWN_THING".to_string(), "d".to_string()),
+            ]
+            .into_iter(),
+        );
+        assert_eq!(c.pool_keys["fireworks-anthropic"][0].expose(), "a");
+        assert_eq!(c.pool_keys["openai-codex"][0].expose(), "b");
+        assert_eq!(
+            c.pool_keys["my_vendor"][0].expose(),
+            "c",
+            "an exact match wins"
+        );
+        assert_eq!(c.pool_keys["unknown_thing"][0].expose(), "d");
     }
 
     /// Write `body` to a uniquely-named temp TOML file (the literal `label` keeps parallel tests

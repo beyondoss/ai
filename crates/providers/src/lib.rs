@@ -708,7 +708,14 @@ pub fn for_host(host: &str, path: &str) -> Option<&'static ProviderSpec> {
 ///
 /// `None` means "no native provider recognizes this id" — the caller then wants a clear error naming
 /// what to set, not a guess.
+///
+/// A `vendor/model` slug is never native: no first-party API spells its ids with a `/`, and the
+/// slug's org can share a native prefix — Together's `deepseek-ai/DeepSeek-V4-Pro-0813` starts with
+/// DeepSeek's `deepseek-` but is not an id api.deepseek.com serves.
 pub fn for_model_id(model: &str) -> Option<&'static ProviderSpec> {
+    if model.contains('/') {
+        return None;
+    }
     let m = model.to_ascii_lowercase();
     PROVIDERS
         .iter()
@@ -926,6 +933,11 @@ mod tests {
         assert_eq!(
             for_model_id("deepseek-v3").map(|p| p.id),
             Some(ProviderId::DeepSeek)
+        );
+        assert_eq!(
+            for_model_id("deepseek-ai/DeepSeek-V4-Pro-0813").map(|p| p.id),
+            None,
+            "a vendor/model slug is never native, even when its org shares a native prefix"
         );
         assert_eq!(
             for_model_id("CLAUDE-OPUS-4-8").map(|p| p.id),

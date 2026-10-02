@@ -10,25 +10,31 @@
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use beyond_ai::admin::AdminApp;
-use beyond_ai::capture_sink::CaptureSink;
+use beyond_ai::capture_sink::{CaptureDrain, CaptureSink};
 use beyond_ai::config::AiConfig;
 use beyond_ai::doctor;
 use beyond_ai::metrics::Metrics;
-use beyond_ai::proxy::AiProxy;
+use beyond_ai::proxy::{AiProxy, LIVE_REQUESTS};
 use beyond_ai::state::GatewayState;
 use beyond_ai::store_watch::{Allowance, Capture, Deny, WatcherService};
+use beyond_ai::usage::{USAGE_TARGET, usage_log_filter};
 use clap::{Parser, Subcommand};
 use pingora_core::apps::HttpServerOptions;
 use pingora_core::apps::http_app::HttpServer;
-use pingora_core::server::Server;
+use pingora_core::listeners::TcpSocketOptions;
 use pingora_core::server::configuration::ServerConf;
+use pingora_core::server::{
+    RunArgs, Server, ShutdownSignal, ShutdownSignalWatch, UnixShutdownSignalWatch,
+};
 use pingora_core::services::background::background_service;
 use pingora_core::services::listening::Service as ListeningService;
 use pingora_proxy::ProxyServiceBuilder;
 use std::path::Path;
 use std::process::exit;
+use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
 use tracing_subscriber::EnvFilter;
-use tracing_subscriber::filter::filter_fn;
+use tracing_subscriber::filter::{FilterExt, filter_fn};
 use tracing_subscriber::layer::{Layer, SubscriberExt};
 use tracing_subscriber::util::SubscriberInitExt;
 
@@ -64,49 +70,167 @@ fn load_config(path: Option<&Path>) -> AiConfig {
     }
 }
 
+/// Pingora's own signal watch, plus a drain that ends the process as soon as nothing is in flight.
+///
+/// On SIGTERM pingora stops accepting and then sleeps the whole `grace_period_seconds` before it
+/// tears the runtimes down, whether or not anything is still running: an idle gateway took the full
+/// 600 s to stop, so every deploy on a platform with a shorter stop timeout (ECS Fargate: 120 s)
+/// ended in SIGKILL. The drain watches [`LIVE_REQUESTS`] (every request context, dropped only after
+/// its `logging`, billing row included) and exits the moment it reaches zero. Pingora's sleep stays
+/// the upper bound: a request still running when the grace ends is cut as before.
+///
+/// Before it exits, the drain writes out the `ai.payload` lines still queued (`capture`, D208):
+/// `exit` does not wait for the capture sink's thread, so a capture of the last requests was lost
+/// silently. `ai.usage` rows need no such step: they are written synchronously.
+struct DrainOnTerm {
+    grace: Duration,
+    capture: std::sync::Mutex<Option<CaptureDrain>>,
+}
+
+#[async_trait::async_trait]
+impl ShutdownSignalWatch for DrainOnTerm {
+    async fn recv(&self) -> ShutdownSignal {
+        let signal = UnixShutdownSignalWatch.recv().await;
+        if matches!(signal, ShutdownSignal::GracefulTerminate) {
+            let grace = self.grace;
+            let capture = self.capture.lock().ok().and_then(|mut c| c.take());
+            // A plain thread: pingora's main thread is about to block in its grace sleep, and the
+            // service runtimes are what is being drained.
+            let spawned = std::thread::Builder::new()
+                .name("ai-drain".into())
+                .spawn(move || drain_then_exit(grace, capture));
+            if let Err(e) = spawned {
+                tracing::warn!(error = %e, "could not start the shutdown drain; waiting out the grace period");
+            }
+        }
+        signal
+    }
+}
+
+/// How long the drain lets pingora's shutdown broadcast land (listeners stop accepting, idle
+/// keep-alive connections drop) before it trusts a zero [`LIVE_REQUESTS`].
+const DRAIN_SETTLE: Duration = Duration::from_millis(200);
+
+/// The longest the drain waits for queued `ai.payload` lines to be written before it exits. A
+/// wedged log pipeline must not hold the process past its stop timeout; what is still queued then
+/// is lost, and the warn line says so.
+const CAPTURE_FLUSH: Duration = Duration::from_secs(5);
+
+fn drain_then_exit(grace: Duration, capture: Option<CaptureDrain>) {
+    let start = Instant::now();
+    std::thread::sleep(DRAIN_SETTLE);
+    while start.elapsed() < grace {
+        let live = LIVE_REQUESTS.load(Ordering::Acquire);
+        if live == 0 {
+            tracing::info!(
+                after_ms = start.elapsed().as_millis() as u64,
+                "drained: no request in flight; exiting"
+            );
+            let budget = grace.saturating_sub(start.elapsed()).min(CAPTURE_FLUSH);
+            if let Some(c) = capture
+                && !c.finish(budget)
+            {
+                tracing::warn!(
+                    "capture sink did not drain before exit; queued ai.payload lines are lost"
+                );
+            }
+            exit(0);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// The target carrying captured request/response payloads. Split onto its own writer — see below.
 const PAYLOAD_TARGET: &str = "ai.payload";
 
-fn init_tracing(metrics: &Metrics, queue_depth: usize) {
-    // JSON to stdout; the `ai.usage` target carries billing facts that logfwd/OTLP ships to
-    // ClickHouse. `AI_LOG` overrides the level filter.
-    let filter = EnvFilter::try_from_env("AI_LOG").unwrap_or_else(|_| EnvFilter::new("info"));
+/// Stdout for `ai.usage` rows that notices when a row fails to land.
+///
+/// The fmt layer discards a writer's error, so a closed or broken stdout pipe silently lost every
+/// billing row. This counts each failed row on `ai_usage_write_errors_total` and says so on
+/// stderr — the only record left of it. One row is one `write_all`, which stops at the first error,
+/// so a failed row counts once.
+struct UsageStdout(prometheus::IntCounter);
 
-    // Two layers, split by target, because the two kinds of line want opposite guarantees.
+struct UsageLine<'a>(&'a prometheus::IntCounter, std::io::Stdout);
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for UsageStdout {
+    type Writer = UsageLine<'a>;
+    fn make_writer(&'a self) -> Self::Writer {
+        UsageLine(&self.0, std::io::stdout())
+    }
+}
+
+impl std::io::Write for UsageLine<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.1.write(buf).inspect_err(|e| {
+            // `write_all` retries an interrupted write itself; that is not a lost row.
+            if e.kind() != std::io::ErrorKind::Interrupted {
+                self.0.inc();
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "ai.usage billing row lost: stdout write failed: {e}"
+                );
+            }
+        })
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.1.flush()
+    }
+}
+
+fn init_tracing(metrics: &Metrics, queue_depth: usize) -> CaptureDrain {
+    // JSON to stdout; the `ai.usage` target carries billing facts that logfwd/OTLP ships to
+    // ClickHouse. `AI_LOG` sets the level filter for everything **except** those rows.
+    let env_filter =
+        || EnvFilter::try_from_env("AI_LOG").unwrap_or_else(|_| EnvFilter::new("info"));
+
+    // Three layers, split by target, because the three kinds of line want different guarantees.
     //
-    //  * Everything else — including `ai.usage` — keeps the **blocking** stdout writer. Billing rows
-    //    must never be dropped, and at a few hundred bytes each the synchronous write is free.
-    //  * `ai.payload` gets a **bounded, lossy** queue drained by its own thread. A captured payload
-    //    is orders of magnitude larger and exists only to explain incidents, so if the log pipeline
-    //    stalls we drop payloads (counted on `ai_capture_dropped_total`) rather than let a stalled
-    //    stdout pipe backpressure the proxy. See `capture_sink`.
+    //  * `ai.usage` — billing rows, not diagnostics. Its own layer with **no** `AI_LOG` filter (only a
+    //    max level hint of INFO, so pingora debug/trace records are never dispatched): an operator
+    //    turning `AI_LOG` down to `warn` must not silently stop billing, which is what one
+    //    global filter over every layer did. The **blocking** stdout writer: at a few hundred bytes
+    //    each the synchronous write is free, and a row must never be dropped — a failed write is
+    //    counted (`UsageStdout`).
+    //  * Everything else — diagnostics, filtered by `AI_LOG`, on the same blocking stdout.
+    //  * `ai.payload` gets a **bounded, lossy** queue drained by its own thread, under `AI_LOG` as
+    //    before. A captured payload is orders of magnitude larger and exists only to explain
+    //    incidents, so if the log pipeline stalls we drop payloads (counted on
+    //    `ai_capture_dropped_total`) rather than let a stalled stdout pipe backpressure the proxy.
+    //    See `capture_sink`.
     //
-    // The two filters are exact complements: every event lands in exactly one layer, so nothing is
-    // duplicated and nothing is silently swallowed.
+    // The target filters are exact complements: every event lands in at most one layer, so nothing
+    // is duplicated.
     // A gateway that can't spawn a thread at boot won't serve traffic either — fail visibly rather
     // than run with payload capture silently disabled. Same eprintln+exit shape as the config and
     // metrics failures above, which is why this isn't a `tracing` error: nothing is initialized yet.
-    let payload_sink = match CaptureSink::spawn(queue_depth, metrics.capture_dropped_total.clone())
-    {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("failed to start the capture-payload log sink: {e}");
-            exit(1);
-        }
-    };
+    let (payload_sink, payload_drain) =
+        match CaptureSink::spawn(queue_depth, metrics.capture_dropped_total.clone()) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("failed to start the capture-payload log sink: {e}");
+                exit(1);
+            }
+        };
+    let usage_layer = tracing_subscriber::fmt::layer()
+        .json()
+        .with_writer(UsageStdout(metrics.usage_write_errors_total.clone()))
+        .with_filter(usage_log_filter());
     let payload_layer = tracing_subscriber::fmt::layer()
         .json()
         .with_writer(payload_sink)
-        .with_filter(filter_fn(|meta| meta.target() == PAYLOAD_TARGET));
-    let main_layer = tracing_subscriber::fmt::layer()
-        .json()
-        .with_filter(filter_fn(|meta| meta.target() != PAYLOAD_TARGET));
+        .with_filter(filter_fn(|meta| meta.target() == PAYLOAD_TARGET).and(env_filter()));
+    let main_layer = tracing_subscriber::fmt::layer().json().with_filter(
+        filter_fn(|meta| meta.target() != PAYLOAD_TARGET && meta.target() != USAGE_TARGET)
+            .and(env_filter()),
+    );
 
     tracing_subscriber::registry()
+        .with(usage_layer)
         .with(main_layer)
         .with(payload_layer)
-        .with(filter)
         .init();
+    payload_drain
 }
 
 // Boot path: every `.expect()` here is a fatal start-up invariant (no runtime to build, no Pingora
@@ -161,7 +285,7 @@ fn main() {
     // the first thing on this path that logs through `tracing` rather than `eprintln!`. Everything
     // above reports its own failures directly to stderr and exits, so nothing is lost by initializing
     // here rather than at the top of `main`.
-    init_tracing(&metrics, capture_queue_depth);
+    let capture_drain = init_tracing(&metrics, capture_queue_depth);
     let state = match GatewayState::new(config, metrics) {
         Ok(s) => s,
         Err(e) => {
@@ -186,12 +310,8 @@ fn main() {
     // Client (app) traffic. Enable downstream HTTP/2 cleartext (h2c) when configured: Pingora peeks
     // the H2 connection preface and serves h2c, transparently falling back to HTTP/1.1 for h1
     // clients — so this is backward-compatible. Stays plaintext (no TLS); `add_tcp` is unchanged.
-    let mut proxy_builder = ProxyServiceBuilder::new(
-        &server.configuration,
-        AiProxy {
-            state: state.clone(),
-        },
-    );
+    let mut proxy_builder =
+        ProxyServiceBuilder::new(&server.configuration, AiProxy::new(state.clone()));
     if downstream_h2c {
         // `HttpServerOptions` is `#[non_exhaustive]`, so build via `Default` and set the field.
         let mut opts = HttpServerOptions::default();
@@ -199,7 +319,12 @@ fn main() {
         proxy_builder = proxy_builder.server_options(opts);
     }
     let mut proxy_svc = proxy_builder.build();
-    proxy_svc.add_tcp(&listen);
+    // TCP keepalive on accepted client sockets (see `tcp_keepalive_idle_secs`): a client that
+    // vanished during a silent model turn is dropped, and its slots freed, within the keepalive
+    // bound rather than when the model next speaks. `TcpSocketOptions` is `#[non_exhaustive]`.
+    let mut sock = TcpSocketOptions::default();
+    sock.tcp_keepalive = state.config.downstream_tcp_keepalive();
+    proxy_svc.add_tcp_with_settings(&listen, sock);
     // Size the proxy's worker pool. Pingora resolves a service's thread count as
     // `service.threads().unwrap_or(conf.threads)` (`server/mod.rs`), and `ServerConf::default()` is
     // `threads: 1` — so leaving this `None` runs every request filter, the Ed25519 verify, the body
@@ -231,6 +356,7 @@ fn main() {
         "ai-admin".to_string(),
         HttpServer::new_app(AdminApp {
             metrics: state.metrics.clone(),
+            managed: !state.config.signing_keys.is_empty(),
         }),
     );
     admin.add_tcp(&metrics_listen);
@@ -245,5 +371,11 @@ fn main() {
         downstream_h2c,
         "starting beyond-ai"
     );
-    server.run_forever();
+    server.run(RunArgs {
+        shutdown_signal: Box::new(DrainOnTerm {
+            grace: Duration::from_secs(grace_period_secs),
+            capture: std::sync::Mutex::new(Some(capture_drain)),
+        }),
+    });
+    exit(0);
 }

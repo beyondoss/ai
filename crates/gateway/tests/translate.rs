@@ -39,6 +39,7 @@ fn gpt_messages(stream: bool) -> String {
 
 /// Non-stream JSON is withheld until EOS and remapped. This is the path a stock SDK takes when
 /// `stream` is off — and the one Pingora empty-chunk withholding used to drop.
+/// claim: E1
 #[tokio::test]
 async fn openai_sdk_nonstream_claude_round_trips_json() {
     let nats_port = unused_nats_port();
@@ -98,6 +99,7 @@ async fn openai_sdk_nonstream_claude_round_trips_json() {
     );
 }
 
+/// claim: E2
 #[tokio::test]
 async fn anthropic_sdk_nonstream_gpt_round_trips_json() {
     let nats_port = unused_nats_port();
@@ -151,6 +153,7 @@ async fn anthropic_sdk_nonstream_gpt_round_trips_json() {
     );
 }
 
+/// claim: T1
 #[tokio::test]
 async fn openai_sdk_sees_claude_tool_calls_on_the_stream() {
     let nats_port = unused_nats_port();
@@ -188,6 +191,7 @@ async fn openai_sdk_sees_claude_tool_calls_on_the_stream() {
     );
 }
 
+/// claim: T1
 #[tokio::test]
 async fn anthropic_sdk_sees_gpt_tool_use_on_the_stream() {
     let nats_port = unused_nats_port();
@@ -219,6 +223,7 @@ async fn anthropic_sdk_sees_gpt_tool_use_on_the_stream() {
     assert!(!text.contains("chat.completion.chunk"), "{text}");
 }
 
+/// claim: T1
 #[tokio::test]
 async fn openai_sdk_nonstream_claude_tool_calls() {
     let nats_port = unused_nats_port();
@@ -251,6 +256,7 @@ async fn openai_sdk_nonstream_claude_tool_calls() {
     assert!(args.contains("SF"), "{args}");
 }
 
+/// claim: T1
 #[tokio::test]
 async fn anthropic_sdk_nonstream_gpt_tool_use() {
     let nats_port = unused_nats_port();
@@ -279,6 +285,7 @@ async fn anthropic_sdk_nonstream_gpt_tool_use() {
 
 /// The second turn of a stock OpenAI tool loop: assistant `tool_calls` + `role: tool` must become
 /// Anthropic `tool_use` + `tool_result` on the wire.
+/// claim: T1
 #[tokio::test]
 async fn openai_tool_loop_second_turn_reaches_anthropic() {
     let nats_port = unused_nats_port();
@@ -310,6 +317,7 @@ async fn openai_tool_loop_second_turn_reaches_anthropic() {
     assert_eq!(got["messages"][2]["content"][0]["content"], "64F");
 }
 
+/// claim: T6
 #[tokio::test]
 async fn openai_sdk_sees_mapped_anthropic_error() {
     let nats_port = unused_nats_port();
@@ -335,6 +343,7 @@ async fn openai_sdk_sees_mapped_anthropic_error() {
     assert!(v.get("type").is_none() || v["type"] != "error");
 }
 
+/// claim: T6
 #[tokio::test]
 async fn anthropic_sdk_sees_mapped_openai_error() {
     let nats_port = unused_nats_port();
@@ -359,6 +368,7 @@ async fn anthropic_sdk_sees_mapped_openai_error() {
     assert_eq!(v["error"]["message"], "mock");
 }
 
+/// claim: T6
 #[tokio::test]
 async fn openai_sdk_sees_mapped_anthropic_sse_error() {
     let nats_port = unused_nats_port();
@@ -384,6 +394,7 @@ async fn openai_sdk_sees_mapped_anthropic_sse_error() {
     assert!(!text.contains("event: error"), "{text}");
 }
 
+/// claim: T6
 #[tokio::test]
 async fn anthropic_sdk_sees_mapped_openai_sse_error() {
     let nats_port = unused_nats_port();
@@ -621,6 +632,7 @@ async fn failover_while_translating_still_returns_the_client_dialect() {
 
 /// A Chat Completions body with `cache_control` / `reasoning_effort` reaches Anthropic's fields;
 /// thinking blocks reappear on the client stream; `ai.usage` still meters the *upstream* parser.
+/// claim: T2
 #[tokio::test]
 async fn openai_sdk_passes_cache_control_and_sees_thinking_on_the_stream() {
     let nats_port = unused_nats_port();
@@ -683,10 +695,12 @@ fn stock_responses(model: &str, stream: bool) -> String {
     )
 }
 
-/// Stock Responses body + a GPT catalog id translates onto Chat Completions. Billing still
-/// reads the upstream Chat Completions usage, not the Responses JSON the client sees.
+/// Stock Responses body + a Chat Completions row with no Responses arm translates onto Chat
+/// Completions. Billing still reads the upstream Chat Completions usage, not the Responses JSON the
+/// client sees.
+/// claim: E3
 #[tokio::test]
-async fn stock_responses_gpt_translates_to_chat_completions() {
+async fn stock_responses_on_a_chat_row_translates_to_chat_completions() {
     let nats_port = unused_nats_port();
     let (pubkey, sk) = test_keypair(1);
     let mock = MockUpstream::start(Mode::Sse).await;
@@ -699,7 +713,7 @@ async fn stock_responses_gpt_translates_to_chat_completions() {
         .post(format!("{}/v1/responses", gw.url()))
         .header("authorization", format!("Bearer {}", vkey(&sk)))
         .header("content-type", "application/json")
-        .body(stock_responses("gpt-4o-mini", true))
+        .body(stock_responses("llama-3.1-8b-instant", true))
         .send()
         .await
         .unwrap();
@@ -716,8 +730,8 @@ async fn stock_responses_gpt_translates_to_chat_completions() {
 
     let cap = mock
         .captured()
-        .expect("translated request reaches OpenAI Chat Completions");
-    assert_eq!(cap.path, "/v1/chat/completions");
+        .expect("translated request reaches Chat Completions");
+    assert_eq!(cap.path, "/api/v1/chat/completions");
     let got = String::from_utf8(cap.body).unwrap();
     assert!(got.contains(r#""messages""#), "{got}");
     assert!(got.contains(r#""hi""#), "{got}");
@@ -731,7 +745,7 @@ async fn stock_responses_gpt_translates_to_chat_completions() {
     );
 
     let line = gw
-        .wait_for_log_line(&["ai.usage", r#""provider":"openai""#])
+        .wait_for_log_line(&["ai.usage", r#""provider":"openrouter""#])
         .await;
     assert!(
         line.contains(r#""input_tokens":5"#) && line.contains(r#""output_tokens":9"#),
@@ -741,6 +755,7 @@ async fn stock_responses_gpt_translates_to_chat_completions() {
 
 /// Stock Responses body + a Claude catalog id translates onto Messages. Billing still
 /// reads the upstream Anthropic usage.
+/// claim: E3
 #[tokio::test]
 async fn stock_responses_claude_translates_to_messages() {
     let nats_port = unused_nats_port();
@@ -796,8 +811,13 @@ async fn stock_responses_claude_translates_to_messages() {
     );
 }
 
-fn gpt_responses_session() -> &'static str {
-    r#"{"model":"gpt-4o","input":[{"role":"user","content":[{"type":"input_text","text":"hi"}]}],"previous_response_id":"resp_abc","include":["reasoning.encrypted_content"],"truncation":"auto"}"#
+/// A turn continuing tenant 42's `resp_abc`, the id as the gateway issued it to that tenant
+/// (`signed_id.rs`). The upstream gets `resp_abc` back.
+fn gpt_responses_session() -> String {
+    let prev = dev_id_signer().sign(42, "resp_abc");
+    format!(
+        r#"{{"model":"gpt-4o","input":[{{"role":"user","content":[{{"type":"input_text","text":"hi"}}]}}],"previous_response_id":"{prev}","include":["reasoning.encrypted_content"],"truncation":"auto"}}"#
+    )
 }
 
 fn gpt_responses_one_shot() -> &'static str {
@@ -806,6 +826,7 @@ fn gpt_responses_one_shot() -> &'static str {
 
 /// Managed `/v1/responses` + a GPT row + `previous_response_id` must hit OpenAI `/v1/responses`
 /// with the field intact — not Chat Completions with the id stripped.
+/// claim: E3
 #[tokio::test]
 async fn managed_responses_with_previous_response_id_relays_to_openai_responses() {
     let nats_port = unused_nats_port();
@@ -854,9 +875,11 @@ async fn managed_responses_with_previous_response_id_relays_to_openai_responses(
     );
 }
 
-/// `store: false` one-shot Responses may still translate onto Chat Completions.
+/// A `store: false` one-shot on a GPT row walks its Responses arm too: a byte relay, so what only
+/// Responses has (`include`, `truncation`, Codex's tools) is not lost to a translation.
+/// claim: E3
 #[tokio::test]
-async fn store_false_one_shot_responses_may_translate_onto_chat_completions() {
+async fn store_false_one_shot_responses_relay_to_the_responses_arm() {
     let nats_port = unused_nats_port();
     let (pubkey, sk) = test_keypair(1);
     let mock = MockUpstream::start(Mode::Json).await;
@@ -881,30 +904,19 @@ async fn store_false_one_shot_responses_may_translate_onto_chat_completions() {
     );
 
     let cap = mock.captured().expect("one-shot must reach OpenAI");
-    assert_eq!(
-        cap.path, "/v1/chat/completions",
-        "store:false may still land on Chat Completions"
-    );
+    assert_eq!(cap.path, "/v1/responses", "the row's Responses arm");
     let got = String::from_utf8(cap.body).unwrap();
+    assert!(got.contains(r#""store":false"#), "{got}");
     assert!(
-        !got.contains("previous_response_id"),
-        "session fields must not be required on a one-shot: {got}"
+        got.contains(r#""include":["file_search_call.results"]"#)
+            && got.contains(r#""truncation":"auto""#),
+        "include/truncation pass through on same-endpoint Responses: {got}"
     );
-    assert!(
-        !got.contains(r#""store""#),
-        "store is Responses-only and is dropped onto Chat Completions: {got}"
-    );
-    assert!(
-        !got.contains(r#""include""#) && !got.contains("truncation"),
-        "include/truncation are dropped when leaving Responses: {got}"
-    );
-    assert!(
-        got.contains(r#""messages""#),
-        "input must become messages on Chat Completions: {got}"
-    );
+    assert!(!got.contains(r#""messages""#), "not translated: {got}");
 }
 
 /// Claude rows have no OpenAI store. Responses + `previous_response_id` is 400, not Messages.
+/// claim: E3
 #[tokio::test]
 async fn claude_responses_with_previous_response_id_is_400() {
     let nats_port = unused_nats_port();
@@ -930,6 +942,19 @@ async fn claude_responses_with_previous_response_id_is_400() {
         "400 must name the field: {text}"
     );
     assert!(text.contains("claude-opus-4-8"), "{text}");
+
+    // An explicit `store: true` asks for the same state; only an omitted store is a one-shot.
+    let resp = test_client()
+        .post(format!("{}/v1/responses", gw.url()))
+        .header("authorization", format!("Bearer {}", vkey(&sk)))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"claude-opus-4-8","input":"hi","store":true}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 400);
+    let text = resp.text().await.unwrap();
+    assert!(text.contains("store cannot be honored"), "{text}");
     assert_eq!(mock.hits(), 0, "must not become a hollow Messages call");
 }
 
@@ -977,6 +1002,7 @@ async fn provider_prefixed_responses_is_still_a_relay() {
 /// A stock OpenAI SDK sends images as `http(s)` URLs. Translated onto Claude they must arrive as
 /// Anthropic `url` image sources — they used to be silently dropped, so the model answered about a
 /// picture it never saw.
+/// claim: T3
 #[tokio::test]
 async fn openai_sdk_image_url_reaches_claude_as_a_url_source() {
     let nats_port = unused_nats_port();

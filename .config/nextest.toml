@@ -27,3 +27,57 @@ fail-fast = false
 # `global-timeout` below ever gets to fire, and the job sits until GitHub cancels it at 30 minutes with
 # no log. Four keeps the shards well under a minute each while leaving headroom for the children.
 test-threads = 4
+
+[profile.deep]
+# The weekly property run (.github/workflows/deep.yml) at PROPTEST_CASES=100000 with PROPS_SECS=5400:
+# one property can take far longer than `ci`'s 180s kill. A test is terminated after 100 minutes
+# (past the 90-minute PROPS_SECS box, so the box ends a runaway property first, with its case count),
+# and the whole run after 5 hours, under the job's 330-minute timeout. No retries: a property
+# failure prints the PROPS_SEED that replays it, and a retry with a fresh seed would hide it.
+slow-timeout = { period = "60s", terminate-after = 100 }
+global-timeout = "300m"
+retries = 0
+fail-fast = false
+test-threads = 4
+
+[profile.verify]
+# `mise run verify:status`: runs every test tagged with a claim or defect, ignored reproductions
+# included, and writes the JUnit report the `verify` tool computes status from. Failures are
+# expected here (a reproduced defect's test fails until it's fixed), so nothing stops early.
+fail-fast = false
+retries = 0
+slow-timeout = { period = "60s", terminate-after = 3 }
+
+# Billing reconciliation waits up to 15 minutes for the providers' usage reports to catch up with
+# its batch (see verify/README.md), so it gets its own cap.
+[[profile.verify.overrides]]
+filter = "binary_id(beyond-ai-verify::reconcile_live)"
+slow-timeout = { period = "60s", terminate-after = 18 }
+
+# A long coding session runs 3-10 minutes, then (where reconciled) waits up to 15 more for the
+# provider's usage report (crates/verify/tests/long_live.rs).
+[[profile.verify.overrides]]
+filter = "binary_id(beyond-ai-verify::long_live)"
+slow-timeout = { period = "60s", terminate-after = 35 }
+
+[profile.verify.junit]
+path = "junit.xml"
+
+# `mise run verify:live`'s second phase: the reconciled live cells (those claiming BIL-5), after
+# every other cell has finished, so no other suite's traffic is in their providers' usage reports
+# (verify/README.md). Same settings as `verify`, its own report. `inherits` does not carry
+# `verify`'s overrides (measured: nextest 0.9.140 killed a long session at 180s), so they are
+# repeated here.
+[profile.verify-isolated]
+inherits = "verify"
+
+[[profile.verify-isolated.overrides]]
+filter = "binary_id(beyond-ai-verify::reconcile_live)"
+slow-timeout = { period = "60s", terminate-after = 18 }
+
+[[profile.verify-isolated.overrides]]
+filter = "binary_id(beyond-ai-verify::long_live)"
+slow-timeout = { period = "60s", terminate-after = 35 }
+
+[profile.verify-isolated.junit]
+path = "junit.xml"

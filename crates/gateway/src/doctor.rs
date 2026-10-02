@@ -56,6 +56,7 @@ pub async fn run_checks(config: &AiConfig) -> Vec<CheckResult> {
     }
 
     out.push(check_signing_keys(config));
+    out.push(check_id_signing_keys(config));
     out.push(check_pool_keys(config));
     out.push(check_catalog_coverage(config));
     out.extend(check_provider_dns(config).await);
@@ -176,6 +177,32 @@ fn check_signing_keys(config: &AiConfig) -> CheckResult {
             "signing_keys",
             e.to_string(),
             "every kid must be numeric and every value a base64 (or raw 32-byte) Ed25519 public key",
+        ),
+    }
+}
+
+/// The id signing keys bind the Responses ids OpenAI stores to a tenant (`signed_id.rs`). Without
+/// one, a deployment with `signing_keys` (managed traffic) refuses to boot; a BYO-only deployment
+/// needs none.
+fn check_id_signing_keys(config: &AiConfig) -> CheckResult {
+    match config.build_id_signer() {
+        Ok(Some(_)) => pass(
+            "id_signing_keys",
+            format!("{} id signing key(s) loaded", config.id_signing_keys.len()),
+        ),
+        Ok(None) if config.signing_keys.is_empty() => pass(
+            "id_signing_keys",
+            "none configured (BYO-only deployment: not needed)",
+        ),
+        Ok(None) => fail(
+            "id_signing_keys",
+            "no id signing keys configured — the gateway refuses to boot with signing_keys set",
+            "set AI_ID_SIGNING_KEY_<kid> to the base64 of 32 random bytes (openssl rand -base64 32)",
+        ),
+        Err(e) => fail(
+            "id_signing_keys",
+            e.to_string(),
+            "each kid is one character [0-9A-Za-z] and each value base64 of >= 32 bytes; set id_signing_kid with more than one",
         ),
     }
 }
@@ -318,6 +345,7 @@ mod tests {
     /// The catalog seed carries at least one Anthropic-only row, so a deployment with only an
     /// OpenAI pool key has a model it cannot serve. That must fail loudly at boot, naming the env
     /// var to set — the request-time symptom is a 503 indistinguishable from an unconfigured model.
+    /// claim: O3
     #[test]
     fn catalog_coverage_fails_when_a_model_has_no_reachable_provider() {
         let config = AiConfig {
@@ -404,6 +432,7 @@ mod tests {
         assert!(r.passed, "pure-BYO must not fail this check: {}", r.message);
     }
 
+    /// claim: O3
     #[test]
     fn signing_keys_empty_fails() {
         // No keys ⇒ every managed token 401s; doctor must flag it, not pass silently.

@@ -47,9 +47,12 @@ fn captured(mock: &MockUpstream) -> (Captured, Value) {
 }
 
 /// An Anthropic SDK (Claude Code's shape: `max_tokens`, `temperature`, thinking off, a screenshot
-/// in a tool result) on a GPT-5 row. OpenAI 400s `max_tokens` and non-default sampling on every
-/// reasoning model and `reasoning_effort: "none"` on GPT-5, and a tool message cannot hold the
-/// image, so each used to be a 400 or an answer about a picture the model never saw.
+/// in a tool result) on a GPT-5.1 row. OpenAI 400s `max_tokens` on every reasoning model, and
+/// non-default sampling unless the effort is `none` (GPT-5.1's lowest, which thinking off maps
+/// to; GPT-5's was `minimal`, where the temperature was dropped), and a tool message cannot hold
+/// the image, so each used to be a 400 or an answer about a picture the model never saw. The row
+/// was gpt-5-nano until it was scheduled to retire (2026-12-11).
+/// claim: T5, T3
 #[tokio::test]
 async fn anthropic_sdk_on_a_gpt5_row_sends_what_openai_accepts() {
     let nats_port = unused_nats_port();
@@ -61,7 +64,7 @@ async fn anthropic_sdk_on_a_gpt5_row_sends_what_openai_accepts() {
         .await;
 
     let body = json!({
-        "model": "gpt-5-nano",
+        "model": "gpt-5.1",
         "max_tokens": 512,
         "temperature": 0.2,
         "thinking": {"type": "disabled"},
@@ -81,11 +84,11 @@ async fn anthropic_sdk_on_a_gpt5_row_sends_what_openai_accepts() {
 
     let (cap, got) = captured(&mock);
     assert_eq!(cap.path, "/v1/chat/completions");
-    assert_eq!(got["model"], "gpt-5-nano");
+    assert_eq!(got["model"], "gpt-5.1");
     assert_eq!(got["max_completion_tokens"], 512, "{got}");
     assert!(got.get("max_tokens").is_none(), "{got}");
-    assert!(got.get("temperature").is_none(), "{got}");
-    assert_eq!(got["reasoning_effort"], "minimal", "GPT-5's lowest: {got}");
+    assert_eq!(got["reasoning_effort"], "none", "GPT-5.1's lowest: {got}");
+    assert_eq!(got["temperature"], 0.2, "kept with effort none: {got}");
     let roles: Vec<&str> = got["messages"]
         .as_array()
         .unwrap()
@@ -104,9 +107,10 @@ async fn anthropic_sdk_on_a_gpt5_row_sends_what_openai_accepts() {
     );
 }
 
-/// A Responses client (store: false) with parallel tool calls on a GPT row. Consecutive
+/// A Responses client (store: false) with parallel tool calls on a Chat Completions row. Consecutive
 /// `function_call` items became one assistant message each, which OpenAI rejects; a Responses
 /// named `tool_choice` went through flat, which Chat Completions rejects.
+/// claim: T1
 #[tokio::test]
 async fn responses_client_parallel_tool_calls_reach_chat_as_one_turn() {
     let nats_port = unused_nats_port();
@@ -118,12 +122,12 @@ async fn responses_client_parallel_tool_calls_reach_chat_as_one_turn() {
         .await;
 
     let body = json!({
-        "model": "gpt-4.1-nano",
+        "model": "llama-3.1-8b-instant",
         "store": false,
         "max_output_tokens": 64,
         "tools": [
             {"type": "function", "name": "get_weather", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}},
-            {"type": "web_search"}
+            {"type": "file_search", "vector_store_ids": ["vs_1"]}
         ],
         "tool_choice": {"type": "function", "name": "get_weather"},
         "input": [
@@ -137,7 +141,7 @@ async fn responses_client_parallel_tool_calls_reach_chat_as_one_turn() {
     post(&gw, &sk, "/v1/responses", &body).await;
 
     let (cap, got) = captured(&mock);
-    assert_eq!(cap.path, "/v1/chat/completions");
+    assert_eq!(cap.path, "/api/v1/chat/completions");
     let msgs = got["messages"].as_array().unwrap();
     assert_eq!(msgs.len(), 4, "{got}");
     assert_eq!(msgs[1]["tool_calls"].as_array().unwrap().len(), 2, "{got}");
@@ -149,10 +153,10 @@ async fn responses_client_parallel_tool_calls_reach_chat_as_one_turn() {
     );
     assert_eq!(
         got["tools"][1],
-        json!({"type": "web_search"}),
-        "a hosted tool is forwarded for OpenAI to reject by name, not dropped"
+        json!({"type": "file_search", "vector_store_ids": ["vs_1"]}),
+        "a hosted tool is forwarded for the provider to reject by name, not dropped (web_search aside: D78)"
     );
-    assert_eq!(got["max_completion_tokens"], 64);
+    assert_eq!(got["max_tokens"], 64);
 }
 
 fn weather_tool() -> Value {
@@ -165,6 +169,7 @@ fn weather_tool() -> Value {
 /// enforced account answers with 400 "bound to a different conversation" unless the request sets
 /// `thinking.block_binding.prefix_mismatch_behavior: drop_block`, and that field is itself a 400
 /// without the `thinking-binding-controls-2026-08-01` beta header, which only `proxy` can send.
+/// claim: T2
 #[tokio::test]
 async fn preserved_thinking_survives_a_forced_tool_turn() {
     let nats_port = unused_nats_port();
@@ -296,6 +301,7 @@ data: {"type":"message_stop"}
 /// ("thinking.signature: Field required"): the signature rode a string the request side never read
 /// back, and the echoed `reasoning_content` became an unsigned block. The stream now carries each
 /// finished block on the `thinking` list, and the echo reaches Anthropic signed.
+/// claim: T2
 #[tokio::test]
 async fn a_streamed_claude_turn_reaches_anthropic_signed_on_the_next_turn() {
     let nats_port = unused_nats_port();
@@ -362,9 +368,10 @@ async fn a_streamed_claude_turn_reaches_anthropic_signed_on_the_next_turn() {
     assert_eq!(turn[1]["input"], json!({"city": "Paris"}));
 }
 
-/// An Anthropic SDK thinking + tool loop on a Claude row only OpenRouter serves. OpenRouter replays
+/// An Anthropic SDK thinking + tool loop on a Claude row OpenRouter serves (Anthropic unreachable). OpenRouter replays
 /// Claude's thinking from `reasoning_details` alone; without it turn 2 was a 400 ("a final
 /// `assistant` message must start with a thinking block").
+/// claim: T2
 #[tokio::test]
 async fn anthropic_sdk_thinking_reaches_openrouter_as_reasoning_details() {
     let nats_port = unused_nats_port();
@@ -377,7 +384,7 @@ async fn anthropic_sdk_thinking_reaches_openrouter_as_reasoning_details() {
         .await;
 
     let body = json!({
-        "model": "claude-sonnet-4", "max_tokens": 2000,
+        "model": "claude-sonnet-4-6", "max_tokens": 2000,
         "thinking": {"type": "enabled", "budget_tokens": 1024},
         "tools": [{"name": "get_weather", "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}}}],
         "messages": [
@@ -441,4 +448,273 @@ async fn the_binding_beta_goes_only_with_the_field() {
     let (cap, got) = captured(&mock);
     assert_eq!(cap.anthropic_beta, None, "same-wire Messages is untouched");
     assert!(got.get("thinking").is_none(), "{got}");
+}
+
+/// A stock `client.responses.create(model=..., input=...)` sends no `store` (OpenAI defaults it to
+/// true). /v1/models lists `/v1/responses` for a Claude row, so that default call must succeed
+/// there, translated onto Messages. Today an omitted `store` counts as session state, and a row
+/// with no Responses arm answers 400 "store cannot be honored".
+/// claim: TRN-1, CAT-9
+/// defect: D12
+#[tokio::test]
+async fn stock_responses_create_without_store_works_on_a_claude_row() {
+    let nats_port = unused_nats_port();
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::AnthropicJson).await;
+    let gw = Gateway::builder(nats_port, &mock.authority(), &b64(&pubkey))
+        .providers(&["anthropic", "openai", "openrouter"])
+        .start()
+        .await;
+
+    // The catalog advertises the endpoint for this row.
+    let models: Value = test_client()
+        .get(format!("{}/v1/models", gw.url()))
+        .header("authorization", format!("Bearer {}", vkey(&sk)))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let row = models["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == "claude-opus-4-8")
+        .expect("claude-opus-4-8 is listed");
+    assert!(
+        row["endpoints"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("/v1/responses")),
+        "{row}"
+    );
+
+    let text = post(
+        &gw,
+        &sk,
+        "/v1/responses",
+        &json!({"model": "claude-opus-4-8", "input": "hi"}),
+    )
+    .await;
+    let resp: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(resp["object"], "response", "{resp}");
+
+    let (cap, got) = captured(&mock);
+    assert_eq!(cap.path, "/v1/messages");
+    assert_eq!(got["messages"][0]["content"], "hi", "{got}");
+    assert!(got.get("store").is_none(), "{got}");
+}
+
+/// The Vercel AI SDK's default OpenAI model (`openai(model)`, the Responses API) sends no `store`,
+/// so it takes OpenAI to be keeping every response: a conversation passed back as
+/// `response.messages` sends the assistant's earlier answer as an `item_reference` to the id it
+/// was given. On a row with no Responses arm nothing holds that item, and the gateway drops it
+/// while translating: the model answers turn 2 without its own turn 1 (live: Claude, Together,
+/// OpenRouter, Bedrock). The referenced answer must reach the upstream, or the client must be
+/// told (a 4xx naming `item_reference`), never a confident answer to a conversation the model
+/// never saw. The gateway stores no customer content, so it refuses: a 400 naming the item and
+/// how to send it in full (`store: false`). The translated response says `store: false` too.
+/// claim: E3
+/// defect: D175
+#[tokio::test]
+async fn an_item_reference_to_a_translated_answer_is_resolved_or_refused() {
+    let nats_port = unused_nats_port();
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::AnthropicJson).await;
+    let gw = Gateway::builder(nats_port, &mock.authority(), &b64(&pubkey))
+        .providers(&["anthropic", "openai", "openrouter"])
+        .start()
+        .await;
+
+    // Turn 1, as the AI SDK sends it: no store. The mock answers "hi".
+    let user1 = json!({"role": "user", "content": "Pick a number."});
+    let text = post(
+        &gw,
+        &sk,
+        "/v1/responses",
+        &json!({"model": "claude-opus-4-8", "input": [user1]}),
+    )
+    .await;
+    let turn1: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(
+        turn1["store"], false,
+        "nothing keeps a translated answer: {turn1}"
+    );
+    let message = turn1["output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["type"] == "message")
+        .unwrap_or_else(|| panic!("turn 1 has a message item: {turn1}"));
+    let id = message["id"].as_str().expect("the message item has an id");
+
+    // Turn 2: the AI SDK's `convertToOpenAIResponsesInput` with store unset (true) and the part's
+    // itemId set.
+    let body = json!({"model": "claude-opus-4-8", "input": [
+        user1,
+        {"type": "item_reference", "id": id},
+        {"role": "user", "content": "Which number did you pick?"},
+    ]});
+    let resp = test_client()
+        .post(format!("{}/v1/responses", gw.url()))
+        .header("authorization", format!("Bearer {}", vkey(&sk)))
+        .header("content-type", "application/json")
+        .body(serde_json::to_vec(&body).unwrap())
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    let text = resp.text().await.unwrap();
+    if (400..500).contains(&status) {
+        assert!(
+            text.contains("item_reference") && text.contains("store: false"),
+            "a refusal names the item and the remedy: {text}"
+        );
+        assert_eq!(mock.hits(), 1, "turn 2 never reached the upstream");
+        return;
+    }
+    assert_eq!(status, 200, "{text}");
+    let (_, got) = captured(&mock);
+    let assistant = got["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|m| m["role"] == "assistant" && m["content"].to_string().contains("hi"));
+    assert!(
+        assistant,
+        "turn 1's answer never reached the upstream, and the client was not told: {got}"
+    );
+}
+
+/// A Responses client's next turn after a Claude turn carries the `reasoning` item the gateway
+/// minted (`rs_gw…`, Claude's signature as `encrypted_content`). When that turn is served by a
+/// real OpenAI Responses upstream (a Responses-first row like Codex's, or a mixed-row failover), the item
+/// means nothing there and OpenAI rejects the foreign id / encrypted content: it must not be
+/// relayed.
+/// claim: TRN-20
+/// defect: D50
+#[tokio::test]
+async fn gateway_reasoning_items_never_reach_an_openai_responses_upstream() {
+    let nats_port = unused_nats_port();
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::builder(nats_port, &mock.authority(), &b64(&pubkey))
+        .providers(&["openai", "openrouter", "anthropic"])
+        .start()
+        .await;
+
+    let body = json!({
+        "model": "gpt-5.3-codex", "store": false,
+        "input": [
+            {"role": "user", "content": "weather in Paris?"},
+            {"type": "reasoning", "id": "rs_gw18f2c3a4b5d60001", "encrypted_content": "EqQBClaudeSig==",
+             "summary": [{"type": "summary_text", "text": "Need weather."}]},
+            {"type": "function_call", "call_id": "toolu_01", "name": "get_weather",
+             "arguments": "{\"city\":\"Paris\"}"},
+            {"type": "function_call_output", "call_id": "toolu_01", "output": "sunny"},
+        ],
+    });
+    post(&gw, &sk, "/v1/responses", &body).await;
+
+    let (cap, got) = captured(&mock);
+    assert_eq!(cap.path, "/v1/responses", "served by the Responses arm");
+    assert!(
+        !got.to_string().contains("rs_gw"),
+        "a gateway reasoning item reached OpenAI: {got}"
+    );
+}
+
+/// A client's output limit above what the serving model can produce is a 400 from the provider
+/// ("max_tokens is too large: 64000. This model supports at most 16384"): Claude Code sends 32000
+/// or 64000 on every request, so on a gpt-4o-class row every one failed. The walk caps the forwarded
+/// limit at the row's card `max_output_tokens`, translated or not, and never raises one.
+/// claim: TRN-5
+/// defect: D59
+#[tokio::test]
+async fn an_output_limit_above_the_model_maximum_is_clamped_to_it() {
+    const GPT_4O_MINI_MAX_OUTPUT: u64 = 16_384;
+    let nats_port = unused_nats_port();
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::builder(nats_port, &mock.authority(), &b64(&pubkey))
+        .providers(&["openai", "openrouter", "anthropic"])
+        .start()
+        .await;
+    let user = json!([{"role": "user", "content": "hi"}]);
+
+    // Claude Code's shape on a GPT row: translated onto Chat Completions.
+    let text = post(
+        &gw,
+        &sk,
+        "/v1/messages",
+        &json!({"model": "gpt-4o-mini", "max_tokens": 64000, "messages": user}),
+    )
+    .await;
+    assert!(text.contains(r#""type":"message""#), "{text}");
+    let (cap, got) = captured(&mock);
+    assert_eq!(cap.path, "/v1/chat/completions");
+    assert_eq!(
+        got["max_completion_tokens"], GPT_4O_MINI_MAX_OUTPUT,
+        "{got}"
+    );
+
+    // Same wire: the byte relay is capped too (and, on native OpenAI, respelled).
+    post(
+        &gw,
+        &sk,
+        "/v1/chat/completions",
+        &json!({"model": "gpt-4o-mini", "max_tokens": 64000, "messages": user}),
+    )
+    .await;
+    let (_, got) = captured(&mock);
+    assert_eq!(
+        got["max_completion_tokens"], GPT_4O_MINI_MAX_OUTPUT,
+        "{got}"
+    );
+    assert!(got.get("max_tokens").is_none(), "{got}");
+
+    // A limit within the model's reach is left alone.
+    post(
+        &gw,
+        &sk,
+        "/v1/chat/completions",
+        &json!({"model": "gpt-4o-mini", "max_completion_tokens": 1000, "messages": user}),
+    )
+    .await;
+    let (_, got) = captured(&mock);
+    assert_eq!(got["max_completion_tokens"], 1000, "{got}");
+}
+
+/// The clamp enforces only a limit the vendor publishes. Where it publishes none (Grok, Kimi,
+/// MiniMax, …) the card lists a conservative placeholder for `/v1/models`, which is not a cap: Claude
+/// Code's 64000 on a Grok row reaches xAI as sent, rather than being cut to the placeholder and
+/// ending with `finish_reason: length`.
+/// claim: TRN-5, CAT-4
+/// defect: D85
+#[tokio::test]
+async fn an_unpublished_max_output_is_not_a_cap() {
+    let nats_port = unused_nats_port();
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::builder(nats_port, &mock.authority(), &b64(&pubkey))
+        .providers(&["xai", "openrouter"])
+        .start()
+        .await;
+    let user = json!([{"role": "user", "content": "hi"}]);
+    for (path, body) in [
+        (
+            "/v1/messages",
+            json!({"model": "grok-4.20", "max_tokens": 64000, "messages": user}),
+        ),
+        (
+            "/v1/chat/completions",
+            json!({"model": "grok-4.20", "max_tokens": 64000, "messages": user}),
+        ),
+    ] {
+        post(&gw, &sk, path, &body).await;
+        let (_, got) = captured(&mock);
+        // Grok rows reach xAI over Responses (D106), so the limit arrives as its spelling there.
+        assert_eq!(got["max_output_tokens"], 64000, "{path}: {got}");
+    }
 }

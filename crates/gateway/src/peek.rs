@@ -8,6 +8,11 @@
 //! root-level *keys* and the `model` value are accumulated, each capped at [`MAX_CAPTURE`] bytes. Large uninteresting string content
 //! (system prompts, base64 images) is skipped with a SIMD-accelerated `memchr2` search to the next
 //! `"`/`\`, not inspected byte-by-byte — so even a multi-MB request is walked cheaply.
+//!
+//! Every function here indexes client bytes, so a slip is a panic on a hostile body: indexing and
+//! unchecked arithmetic are denied in this module, and each place that keeps one (a hot loop whose
+//! bound is its own condition) says why it cannot fail.
+#![deny(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 
 /// Most bytes of a root-level key or `model` value we will hold. Real model ids are well under
 /// 128 bytes (`proxy::sanitize_model` records anything longer as `unknown`), and the only keys we
@@ -80,6 +85,11 @@ impl ModelScanner {
     /// fell back to the requested alias in the billing log — the exact reconciliation gap
     /// `resp_model_scanner` exists to close, silently open for one of the two dialects.
     ///
+    /// A Responses stream has the same shape under a different key: `response.created` (and
+    /// `response.completed`) carry the pinned snapshot as `response.model`, and no event has a root
+    /// `model` at all. So a root `response` key opens the same one-level nested scan; without it a
+    /// Responses stream billed under the requested alias.
+    ///
     /// Kept opt-in rather than always-on so request-body scanning cannot start picking up a nested
     /// `model` that isn't the one the client asked for.
     pub fn for_response() -> Self {
@@ -116,7 +126,12 @@ impl ModelScanner {
         if self.in_message { 2 } else { 1 }
     }
 
+    #[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
     pub fn feed(&mut self, bytes: &[u8]) {
+        // Proof for the allow: every index is `i`/`j` with `i < n` (the loop condition, or a `memchr`
+        // offset inside `bytes[i..]`), or a key span bounded by the closing quote just found; counters
+        // (`i`, `j`, `depth`, `model_keys`) count bytes of a body that fits in memory, so they cannot
+        // overflow. This loop runs on every managed request body, so it keeps the unchecked forms.
         if self.done {
             return;
         }
@@ -150,7 +165,8 @@ impl ModelScanner {
                             // Only a *root* `message` opens the nested scan — a `message` key inside
                             // the message object itself must not re-arm it.
                             if self.accept_message_nesting && self.depth == 1 {
-                                self.last_key_is_message = self.cur == b"message";
+                                self.last_key_is_message =
+                                    self.cur == b"message" || self.cur == b"response";
                             }
                         }
                         Cap::ModelValue => {
@@ -249,7 +265,12 @@ impl ModelScanner {
 /// string value never triggers injection — only the genuine root-level field. The returned offset is
 /// always inside a non-empty object (a root `"stream"` is present), so the caller always follows the
 /// fragment with a comma.
+#[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 pub fn plan_stream_usage_injection(body: &[u8]) -> Option<usize> {
+    // Proof for the allow: every index is `i`/`j` with `i < n` (the loop condition, or a `memchr`
+    // offset inside `bytes[i..]`), or a key span bounded by the closing quote just found; counters
+    // (`i`, `j`, `depth`, `model_keys`) count bytes of a body that fits in memory, so they cannot
+    // overflow. This loop runs on every managed request body, so it keeps the unchecked forms.
     let n = body.len();
     // Cheap pre-filter: injection is only ever needed when a root-level `"stream"` key is present.
     // If the quoted token `"stream"` doesn't occur *anywhere*, the structural answer is
@@ -257,7 +278,14 @@ pub fn plan_stream_usage_injection(body: &[u8]) -> Option<usize> {
     // common case, since most requests aren't streaming. (Note `"stream_options"` does NOT contain
     // the needle: the byte after `stream` is `_`, not a closing quote — so a body carrying only
     // `stream_options` fails this pre-filter and returns `None` here, which is the correct answer.)
-    memchr::memmem::find(body, b"\"stream\"")?;
+    // An escaped key (`"str\u0065am"`) decodes to `stream` at the provider without spelling it,
+    // and such a key always carries `\u`; real clients never send one, so the second search runs
+    // only on a body with no `"stream"` at all.
+    if memchr::memmem::find(body, b"\"stream\"").is_none()
+        && memchr::memmem::find(body, b"\\u").is_none()
+    {
+        return None;
+    }
     let mut i = 0;
     while i < n && body[i].is_ascii_whitespace() {
         i += 1;
@@ -275,8 +303,7 @@ pub fn plan_stream_usage_injection(body: &[u8]) -> Option<usize> {
     let mut capturing_key = false;
     // Start index (just past the opening `"`) of the root-level key currently being scanned. The
     // body is fully in hand, so we slice the key out of it at the closing quote — no accumulation
-    // buffer, zero-copy. (Escaped keys are sliced raw; since neither `stream` nor `stream_options`
-    // contains an escape, an escaped key simply doesn't match either needle — the correct answer.)
+    // buffer, zero-copy. A key with an escape in it is decoded, as the provider's parser does.
     let mut key_start = 0usize;
     // The current root-level key is exactly `stream` (so the next literal is its value).
     let mut last_key_is_stream = false;
@@ -309,10 +336,20 @@ pub fn plan_stream_usage_injection(body: &[u8]) -> Option<usize> {
                         // A root `stream_options` means the client already controls usage — the
                         // answer is `None` regardless of anything else in the body, so stop now
                         // rather than walking the remainder for a result we already know.
-                        if key == b"stream_options" {
+                        let escaped_key = key.contains(&b'\\');
+                        if key == b"stream_options"
+                            || (escaped_key
+                                && escaped_key_is(&body[key_start - 1..=j], "stream_options"))
+                        {
                             return None;
                         }
-                        last_key_is_stream = key == b"stream";
+                        // The provider keeps the last of duplicate keys, so each `stream` key
+                        // decides afresh.
+                        last_key_is_stream = key == b"stream"
+                            || (escaped_key && escaped_key_is(&body[key_start - 1..=j], "stream"));
+                        if last_key_is_stream {
+                            stream_true = false;
+                        }
                     }
                 }
             }
@@ -367,6 +404,11 @@ pub struct BufferedScan {
     /// Where to splice the `stream_options` fragment, as [`plan_stream_usage_injection`] would have
     /// reported it.
     pub inject_at: Option<usize>,
+    /// Where the value of a root `stream_options` begins, when the body streams **and** already
+    /// carries one. The client may have turned usage off (`include_usage: false`) or left it out
+    /// (`{}`); either way OpenAI would send no usage chunk, so the caller rewrites that value (see
+    /// `proxy::force_include_usage`). `None` whenever `inject_at` is `Some`, and for a non-stream.
+    pub stream_options_at: Option<usize>,
     /// Byte range of the root-level `model` **value**, exclusive of its quotes — the span to
     /// overwrite when a model-routed request has to be re-spelled for the candidate serving it.
     ///
@@ -375,7 +417,32 @@ pub struct BufferedScan {
     /// value's length. `None` whenever [`Self::model`] is `None`, and the two always describe the
     /// same occurrence — the first root-level `model`.
     pub model_span: Option<(usize, usize)>,
+    /// The root object has more than one `model` key. JSON parsers disagree on which one wins
+    /// (most take the last), so a catalog walk that routed on one and rewrote one cannot know which
+    /// the provider would serve. A key spelled with escapes (`"mod\u0065l"`) counts: it decodes to
+    /// `model` at the provider.
+    pub duplicate_model: bool,
+    /// Byte range of each root-level output limit's digits, indexed like [`OUTPUT_LIMIT_KEYS`]
+    /// (first occurrence of each): the span a catalog walk caps at the serving model's maximum.
+    /// A value that is not a plain non-negative integer is not recorded.
+    pub limit_spans: [Option<(usize, usize)>; 3],
+    /// Offset of each root-level output limit key's opening quote, indexed like
+    /// [`OUTPUT_LIMIT_KEYS`] (first occurrence of each, whatever its value): where a walk onto
+    /// native OpenAI Chat Completions renames `max_tokens`.
+    pub limit_keys: [Option<usize>; 3],
+    /// The root carries more than one `stream_options`, or one spelled with escapes. OpenAI takes
+    /// the last and decodes escapes, so neither [`Self::stream_options_at`] (the first raw one) nor
+    /// [`Self::inject_at`] (which a later escaped key would override) can be trusted to decide
+    /// whether usage is on. The caller removes every such member and injects a fresh one.
+    pub stream_options_ambiguous: bool,
 }
+
+/// The fields that cap a response's length, whichever wire the body speaks.
+pub const OUTPUT_LIMIT_KEYS: [&[u8]; 3] = [
+    b"max_tokens",
+    b"max_completion_tokens",
+    b"max_output_tokens",
+];
 
 /// One structural walk producing both answers, for the path that already has the whole body.
 ///
@@ -390,10 +457,16 @@ pub struct BufferedScan {
 /// `ModelScanner`, which is incremental and cannot be replaced by this.
 ///
 /// Semantics are exactly the two functions it replaces, including the details that look incidental:
-/// `stream_options` anywhere at root wins regardless of `stream`, an escaped key matches neither
-/// needle (so it is sliced raw), and the model value *is* unescaped because `ModelScanner`
-/// unescapes it. `fused_scan_matches_the_two_walks_it_replaces` cross-checks a corpus against both.
+/// `stream_options` anywhere at root wins regardless of `stream`, a key spelled with escapes is
+/// decoded and the last `stream` decides (as the provider's parser does; a duplicate or escaped
+/// `stream_options` is flagged in `stream_options_ambiguous` instead, D88), and the model value
+/// *is* unescaped because `ModelScanner` unescapes it. `fused_scan_matches_the_two_walks_it_replaces` cross-checks a corpus against both.
+#[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 pub fn scan_buffered(body: &[u8]) -> BufferedScan {
+    // Proof for the allow: every index is `i`/`j` with `i < n` (the loop condition, or a `memchr`
+    // offset inside `bytes[i..]`), or a key span bounded by the closing quote just found; counters
+    // (`i`, `j`, `depth`, `model_keys`) count bytes of a body that fits in memory, so they cannot
+    // overflow. This loop runs on every managed request body, so it keeps the unchecked forms.
     let n = body.len();
     let mut i = 0;
     while i < n && body[i].is_ascii_whitespace() {
@@ -405,7 +478,12 @@ pub fn scan_buffered(body: &[u8]) -> BufferedScan {
         return BufferedScan {
             model: None,
             inject_at: None,
+            stream_options_at: None,
             model_span: None,
+            duplicate_model: false,
+            limit_spans: [None; 3],
+            limit_keys: [None; 3],
+            stream_options_ambiguous: false,
         };
     }
     let insert_at = i + 1;
@@ -420,6 +498,9 @@ pub fn scan_buffered(body: &[u8]) -> BufferedScan {
     let mut last_key_is_model = false;
     let mut stream_true = false;
     let mut saw_stream_options = false;
+    let mut stream_options_ambiguous = false;
+    // The closing quote of the root `stream_options` key; its value follows the next `:`.
+    let mut stream_options_key_end = 0usize;
     // Accumulated (unescaped) `model` value, and whether we're inside it. A `Vec` rather than a
     // slice because escapes must be resolved, exactly as `ModelScanner` does.
     let mut capturing_model = false;
@@ -428,6 +509,11 @@ pub fn scan_buffered(body: &[u8]) -> BufferedScan {
     // Where the value's raw bytes begin (just past the opening quote), and the finished span.
     let mut model_start = 0usize;
     let mut model_span: Option<(usize, usize)> = None;
+    let mut model_keys = 0u32;
+    // The output limit whose value comes next, as an index into `OUTPUT_LIMIT_KEYS`.
+    let mut limit_key: Option<usize> = None;
+    let mut limit_spans: [Option<(usize, usize)>; 3] = [None; 3];
+    let mut limit_keys: [Option<usize>; 3] = [None; 3];
 
     let mut j = i;
     while j < n {
@@ -457,10 +543,32 @@ pub fn scan_buffered(body: &[u8]) -> BufferedScan {
                         // Unlike the planner we cannot return early on `stream_options`: the model
                         // may still be ahead of us. Record it and keep walking.
                         if key == b"stream_options" {
-                            saw_stream_options = true;
+                            stream_options_ambiguous |= saw_stream_options;
+                            if !saw_stream_options {
+                                saw_stream_options = true;
+                                stream_options_key_end = j;
+                            }
+                        } else if key.contains(&b'\\')
+                            && escaped_key_is(&body[key_start - 1..=j], "stream_options")
+                        {
+                            stream_options_ambiguous = true;
                         }
-                        last_key_is_stream = key == b"stream";
-                        last_key_is_model = key == b"model";
+                        // The provider decodes an escaped key and keeps the last duplicate,
+                        // so each key that decodes to `stream` decides afresh (D88).
+                        last_key_is_stream = key == b"stream"
+                            || (key.contains(&b'\\')
+                                && escaped_key_is(&body[key_start - 1..=j], "stream"));
+                        if last_key_is_stream {
+                            stream_true = false;
+                        }
+                        last_key_is_model = key == b"model"
+                            || (key.contains(&b'\\')
+                                && escaped_key_is(&body[key_start - 1..=j], "model"));
+                        model_keys += u32::from(last_key_is_model);
+                        limit_key = OUTPUT_LIMIT_KEYS.iter().position(|k| *k == key);
+                        if let Some(k) = limit_key {
+                            limit_keys[k].get_or_insert(key_start - 1);
+                        }
                     }
                 } else if capturing_model {
                     capturing_model = false;
@@ -509,7 +617,24 @@ pub fn scan_buffered(body: &[u8]) -> BufferedScan {
                 expect_key = true;
                 last_key_is_stream = false;
                 last_key_is_model = false;
+                limit_key = None;
             }
+            b'0'..=b'9' if depth == 1 && !expect_key && limit_key.is_some() => {
+                let end = body[j..]
+                    .iter()
+                    .position(|c| !c.is_ascii_digit())
+                    .map_or(n, |rel| j + rel);
+                if let Some(k) = limit_key.take()
+                    && limit_spans[k].is_none()
+                {
+                    limit_spans[k] = Some((j, end));
+                }
+                j = end;
+                continue;
+            }
+            // A negative limit is no limit to cap. (A string or structured value never puts a digit
+            // at depth 1 before the `,` that ends it.)
+            b'-' if depth == 1 => limit_key = None,
             b't' if depth == 1 && last_key_is_stream => {
                 if body[j..].starts_with(b"true") {
                     stream_true = true;
@@ -521,16 +646,722 @@ pub fn scan_buffered(body: &[u8]) -> BufferedScan {
         j += 1;
     }
 
+    // The `stream_options` value: past the key's closing quote, whitespace, `:`, whitespace.
+    let stream_options_at = (stream_true && saw_stream_options)
+        .then(|| {
+            let rest = &body[stream_options_key_end + 1..];
+            let colon = rest.iter().position(|b| !b.is_ascii_whitespace())?;
+            (rest[colon] == b':').then_some(())?;
+            let value = rest[colon + 1..]
+                .iter()
+                .position(|b| !b.is_ascii_whitespace())?;
+            Some(stream_options_key_end + 1 + colon + 1 + value)
+        })
+        .flatten();
     BufferedScan {
         model,
         inject_at: (stream_true && !saw_stream_options).then_some(insert_at),
+        stream_options_at,
         model_span,
+        duplicate_model: model_keys > 1,
+        limit_spans,
+        limit_keys,
+        stream_options_ambiguous,
     }
 }
 
+/// Remove every root member whose value is `null`, by span: how OpenAI SDKs send an unset option,
+/// which OpenAI reads as "not set" and other Chat Completions hosts may reject (OpenRouter 400s
+/// `user: null`). One `memmem` keeps a body without `null` unwalked. `true` when the body changed.
+pub fn remove_root_nulls(body: &mut Vec<u8>) -> bool {
+    if memchr::memmem::find(body, b"null").is_none() {
+        return false;
+    }
+    let Some(members) = root_members(body) else {
+        return false;
+    };
+    let spans: Vec<(usize, usize)> = members.iter().map(Member::span).collect();
+    let null: Vec<bool> = members
+        .iter()
+        .map(|m| body.get(m.value.0..m.value.1) == Some(b"null"))
+        .collect();
+    remove_items(body, &spans, |k| null.get(k).copied().unwrap_or(false))
+}
+
+/// Remove every root member whose key decodes to `key` (escaped spellings included), by span. `true`
+/// when the body changed.
+pub fn remove_root_members(body: &mut Vec<u8>, key: &str) -> bool {
+    let Some(members) = root_members(body) else {
+        return false;
+    };
+    let spans: Vec<(usize, usize)> = members.iter().map(Member::span).collect();
+    let hit: Vec<bool> = members.iter().map(|m| m.key_is(body, key)).collect();
+    remove_items(body, &spans, |k| hit.get(k).copied().unwrap_or(false))
+}
+
+/// Whether a quoted JSON key containing escapes decodes to `want`. Only reached for a root key with a
+/// backslash in it, which real clients never send, so the allocation is off every ordinary path.
+fn escaped_key_is(quoted: &[u8], want: &str) -> bool {
+    // A decoded byte takes at most six raw ones (`\u00XX`), plus the two quotes: a longer string
+    // cannot decode to `want`, and is not decoded (it may be a whole prompt).
+    let most = want.len().saturating_mul(6).saturating_add(2);
+    quoted.len() <= most && serde_json::from_slice::<String>(quoted).is_ok_and(|k| k == want)
+}
+
+// ---- Span edits ------------------------------------------------------------------------------------
+//
+// A few rewrites (dropping a root member, dropping items from an array) must leave every other byte
+// of the body as the client sent it: member order (strict structured outputs, schema property
+// order), spacing, and number spellings are all part of what the provider sees and what a prompt
+// cache keys on. A `serde_json::Value` round-trip loses all three. These helpers find spans with the
+// same string/escape-aware walk as the scanners above and splice them out; nothing is re-encoded.
+
+/// One member of a JSON object: the key's raw bytes (inside its quotes, escapes as sent) and the
+/// value's extent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Member {
+    pub key: (usize, usize),
+    pub value: (usize, usize),
+}
+
+impl Member {
+    /// The member's extent: the key's opening quote through the value's last byte.
+    pub fn span(&self) -> (usize, usize) {
+        (self.key.0.saturating_sub(1), self.value.1)
+    }
+
+    /// Whether the key decodes to `want`. A raw compare, unless the key carries an escape
+    /// (`"stream_options"`), which a provider's parser decodes and so must we.
+    pub fn key_is(&self, body: &[u8], want: &str) -> bool {
+        let Some(raw) = body.get(self.key.0..self.key.1) else {
+            return false;
+        };
+        if raw.contains(&b'\\') {
+            let quoted = body.get(self.key.0.saturating_sub(1)..self.key.1.saturating_add(1));
+            quoted.is_some_and(|q| escaped_key_is(q, want))
+        } else {
+            raw == want.as_bytes()
+        }
+    }
+}
+
+fn skip_ws(b: &[u8], i: usize) -> usize {
+    let rest = b.get(i..).unwrap_or_default();
+    let n = rest.iter().take_while(|c| c.is_ascii_whitespace()).count();
+    i.saturating_add(n)
+}
+
+/// The end (exclusive) of the string whose opening quote is at `open`.
+fn string_end(b: &[u8], open: usize) -> Option<usize> {
+    let mut i = open.saturating_add(1);
+    loop {
+        let at = i.saturating_add(memchr::memchr2(b'"', b'\\', b.get(i..)?)?);
+        if b.get(at) == Some(&b'\\') {
+            i = at.saturating_add(2);
+        } else {
+            return Some(at.saturating_add(1));
+        }
+    }
+}
+
+/// The end (exclusive) of the JSON value starting at `i` (no leading whitespace).
+pub fn value_end(b: &[u8], i: usize) -> Option<usize> {
+    match *b.get(i)? {
+        b'"' => string_end(b, i),
+        b'{' | b'[' => {
+            let mut depth = 0u32;
+            let mut j = i;
+            while let Some(&c) = b.get(j) {
+                match c {
+                    b'"' => {
+                        j = string_end(b, j)?;
+                        continue;
+                    }
+                    b'{' | b'[' => depth = depth.saturating_add(1),
+                    b'}' | b']' => {
+                        // The first byte opened a container, so `depth` is at least 1 here.
+                        depth = depth.saturating_sub(1);
+                        if depth == 0 {
+                            return Some(j.saturating_add(1));
+                        }
+                    }
+                    _ => {}
+                }
+                j = j.saturating_add(1);
+            }
+            None
+        }
+        _ => {
+            let n = b
+                .get(i..)?
+                .iter()
+                .position(|c| matches!(c, b',' | b'}' | b']') || c.is_ascii_whitespace())
+                .map_or(b.len(), |k| i.saturating_add(k));
+            (n > i).then_some(n)
+        }
+    }
+}
+
+/// The members of the object whose `{` is at `open`, in order. `None` for malformed JSON.
+pub fn object_members(b: &[u8], open: usize) -> Option<Vec<Member>> {
+    members(b, open).collect()
+}
+
+/// The members of the body's root object. `None` when the root is not a well-formed object.
+pub fn root_members(b: &[u8]) -> Option<Vec<Member>> {
+    let open = skip_ws(b, 0);
+    (b.get(open) == Some(&b'{')).then_some(())?;
+    object_members(b, open)
+}
+
+/// The elements of the array whose `[` is at `open`, as spans, in order. `None` for malformed
+/// JSON.
+pub fn array_elements(b: &[u8], open: usize) -> Option<Vec<(usize, usize)>> {
+    elements(b, open).collect()
+}
+
+/// Remove the items `drop` selects from one container's item spans (members or elements, in
+/// order), with exactly the separators that keep it valid JSON. Every other byte is untouched.
+/// `true` when anything was removed.
+pub fn remove_items(
+    body: &mut Vec<u8>,
+    items: &[(usize, usize)],
+    drop: impl Fn(usize) -> bool,
+) -> bool {
+    let (Some(&(_, end)), Some(last)) = (items.last(), items.len().checked_sub(1)) else {
+        return false;
+    };
+    let last_kept = (0..=last).rev().find(|&k| !drop(k));
+    let mut cuts: Vec<(usize, usize)> = Vec::new();
+    for (k, &(start, _)) in items.iter().enumerate() {
+        if !drop(k) {
+            continue;
+        }
+        match last_kept.and_then(|l| Some((l, items.get(l)?))) {
+            // Ahead of a kept item: the item and the separator after it, up to the next item.
+            Some((l, _)) if k < l => {
+                let next = items.get(k.saturating_add(1)).map_or(end, |n| n.0);
+                cuts.push((start, next));
+            }
+            // The trailing run: from the last kept item's end, separators included.
+            Some((_, kept)) => {
+                cuts.push((kept.1, end));
+                break;
+            }
+            // Nothing kept: the whole run, leaving an empty container.
+            None => {
+                cuts.push((start, end));
+                break;
+            }
+        }
+    }
+    splice_out(body, &cuts);
+    !cuts.is_empty()
+}
+
+/// Cut every `(start, end)` span (ascending, disjoint, in bounds) out of `body` in one pass: each
+/// kept byte moves at most once, so a body with many cuts (a long history of references, every
+/// `null` option) costs O(len), not a tail move per cut.
+fn splice_out(body: &mut Vec<u8>, cuts: &[(usize, usize)]) {
+    let mut write = match cuts.first() {
+        Some(&(s, _)) => s,
+        None => return,
+    };
+    for (k, &(_, end)) in cuts.iter().enumerate() {
+        let next = cuts.get(k.saturating_add(1)).map_or(body.len(), |c| c.0);
+        // Spans are ascending and disjoint (`remove_items` builds them in order): `end <= next`.
+        if end < next {
+            body.copy_within(end..next, write);
+            write = write.saturating_add(next.saturating_sub(end));
+        }
+    }
+    body.truncate(write);
+}
+
+// ---- Span reads without a DOM ----------------------------------------------------------------------
+//
+// The admission checks (session state, image and file parts, item references) read a handful of
+// fields out of bodies up to `MAX_REQUEST_BODY`. A `serde_json::Value` of such a body costs 10-80
+// bytes of heap per byte of JSON (a `BTreeMap` node per object), so one 90 MiB request could take
+// gigabytes. These walk spans instead: no allocation beyond the caller's own, O(len) time.
+
+/// The members of the object whose `{` is at `open`, in order, one at a time: `Some(member)` per
+/// member, then `None` once if the object is malformed (after which the iterator ends). See
+/// [`members`].
+pub struct Members<'a> {
+    b: &'a [u8],
+    at: usize,
+    first: bool,
+    done: bool,
+    close: Option<usize>,
+}
+
+/// Iterate the members of the object whose `{` is at `open` without collecting them.
+pub fn members(b: &[u8], open: usize) -> Members<'_> {
+    Members {
+        b,
+        at: open.saturating_add(1),
+        first: true,
+        done: b.get(open) != Some(&b'{'),
+        close: None,
+    }
+}
+
+impl Members<'_> {
+    /// Offset just past the closing `}`, once the iterator has reached it.
+    pub fn end(&self) -> Option<usize> {
+        self.close
+    }
+
+    /// The next member; `Ok(None)` at the closing brace, `Err(())` on malformed JSON.
+    fn step(&mut self) -> Result<Option<Member>, ()> {
+        let b = self.b;
+        let mut i = skip_ws(b, self.at);
+        if std::mem::take(&mut self.first) {
+            if b.get(i) == Some(&b'}') {
+                self.close = Some(i.saturating_add(1));
+                return Ok(None);
+            }
+        } else {
+            match b.get(i) {
+                Some(b',') => i = skip_ws(b, i.saturating_add(1)),
+                Some(b'}') => {
+                    self.close = Some(i.saturating_add(1));
+                    return Ok(None);
+                }
+                _ => return Err(()),
+            }
+        }
+        if b.get(i) != Some(&b'"') {
+            return Err(());
+        }
+        let key_end = string_end(b, i).ok_or(())?;
+        let key = (i.saturating_add(1), key_end.saturating_sub(1));
+        i = skip_ws(b, key_end);
+        if b.get(i) != Some(&b':') {
+            return Err(());
+        }
+        let start = skip_ws(b, i.saturating_add(1));
+        let end = value_end(b, start).ok_or(())?;
+        self.at = end;
+        Ok(Some(Member {
+            key,
+            value: (start, end),
+        }))
+    }
+}
+
+impl Iterator for Members<'_> {
+    type Item = Option<Member>;
+
+    fn next(&mut self) -> Option<Option<Member>> {
+        if self.done {
+            return None;
+        }
+        match self.step() {
+            Ok(Some(m)) => Some(Some(m)),
+            Ok(None) => {
+                self.done = true;
+                None
+            }
+            Err(()) => {
+                self.done = true;
+                Some(None)
+            }
+        }
+    }
+}
+
+/// The elements of the array whose `[` is at `open`, one span at a time, as [`Members`] yields
+/// members: `Some(span)` per element, then `None` once if the array is malformed.
+pub struct Elements<'a> {
+    b: &'a [u8],
+    at: usize,
+    first: bool,
+    done: bool,
+}
+
+/// Iterate the elements of the array whose `[` is at `open` without collecting them.
+pub fn elements(b: &[u8], open: usize) -> Elements<'_> {
+    Elements {
+        b,
+        at: open.saturating_add(1),
+        first: true,
+        done: b.get(open) != Some(&b'['),
+    }
+}
+
+impl Elements<'_> {
+    fn step(&mut self) -> Result<Option<(usize, usize)>, ()> {
+        let b = self.b;
+        let mut i = skip_ws(b, self.at);
+        if std::mem::take(&mut self.first) {
+            if b.get(i) == Some(&b']') {
+                return Ok(None);
+            }
+        } else {
+            match b.get(i) {
+                Some(b',') => i = skip_ws(b, i.saturating_add(1)),
+                Some(b']') => return Ok(None),
+                _ => return Err(()),
+            }
+        }
+        let end = value_end(b, i).ok_or(())?;
+        self.at = end;
+        Ok(Some((i, end)))
+    }
+}
+
+impl Iterator for Elements<'_> {
+    type Item = Option<(usize, usize)>;
+
+    fn next(&mut self) -> Option<Option<(usize, usize)>> {
+        if self.done {
+            return None;
+        }
+        match self.step() {
+            Ok(Some(span)) => Some(Some(span)),
+            Ok(None) => {
+                self.done = true;
+                None
+            }
+            Err(()) => {
+                self.done = true;
+                Some(None)
+            }
+        }
+    }
+}
+
+/// Offset of the root object's `{`, when the body (past leading whitespace) is an object.
+pub fn root_open(b: &[u8]) -> Option<usize> {
+    let open = skip_ws(b, 0);
+    (b.get(open) == Some(&b'{')).then_some(open)
+}
+
+/// The last member keyed `key` (as a provider's parser keeps it) of the object whose `{` is at
+/// `open`: `Some(None)` when it has none, `None` when `open` is not a well-formed object.
+pub fn last_member(b: &[u8], open: usize, key: &str) -> Option<Option<Member>> {
+    if b.get(open) != Some(&b'{') {
+        return None;
+    }
+    let mut last = None;
+    for m in members(b, open) {
+        let m = m?;
+        if m.key_is(b, key) {
+            last = Some(m);
+        }
+    }
+    Some(last)
+}
+
+/// The JSON string at `span` (its quotes included), decoded: borrowed when it carries no escape,
+/// otherwise decoded once. `None` when `span` is not a string.
+pub fn str_value(b: &[u8], span: (usize, usize)) -> Option<std::borrow::Cow<'_, str>> {
+    match b.get(span.0..span.1)? {
+        [b'"', inner @ .., b'"'] if !inner.contains(&b'\\') => std::str::from_utf8(inner)
+            .ok()
+            .map(std::borrow::Cow::Borrowed),
+        quoted @ [b'"', .., b'"'] => serde_json::from_slice::<String>(quoted)
+            .ok()
+            .map(std::borrow::Cow::Owned),
+        _ => None,
+    }
+}
+
+/// Whether the JSON string at `span` (its quotes included) decodes to `want`. A raw compare, unless
+/// the string carries an escape, which a provider's parser decodes and so must we; only then is it
+/// decoded, and only when its length could still match.
+pub fn str_is(b: &[u8], span: (usize, usize), want: &str) -> bool {
+    let Some(quoted) = b.get(span.0..span.1) else {
+        return false;
+    };
+    match quoted {
+        [b'"', inner @ .., b'"'] if !inner.contains(&b'\\') => inner == want.as_bytes(),
+        [b'"', .., b'"'] => escaped_key_is(quoted, want),
+        _ => false,
+    }
+}
+
+/// Whether a `"type"` member anywhere inside `span` has a string value that is one of `types`: an
+/// image or file content part, at any depth (tool results included).
+///
+/// No walk of the structure: in valid JSON every `"` not escaped by an odd run of backslashes is a
+/// string delimiter, and string contents never hold one, so the bytes `"type"`, `:`, `"<value>"`
+/// with an unescaped opening quote are exactly a member `type: <value>`. The scan is one `memmem`
+/// pass plus O(1) per hit. A key or value spelled with escapes (`"type"`) is not read as one;
+/// no client sends them. A part that names its type twice counts if either is listed: refused, or
+/// steered, rather than guessed at.
+pub fn has_typed_member(b: &[u8], span: (usize, usize), types: &[&str]) -> bool {
+    const KEY: &[u8] = b"\"type\"";
+    let Some(region) = b.get(span.0..span.1) else {
+        return false;
+    };
+    memchr::memmem::find_iter(region, KEY).any(|at| {
+        let at = span.0.saturating_add(at);
+        if escaped_at(b, at) {
+            return false;
+        }
+        let colon = skip_ws(b, at.saturating_add(KEY.len()));
+        if b.get(colon) != Some(&b':') {
+            return false;
+        }
+        let open = skip_ws(b, colon.saturating_add(1));
+        if b.get(open) != Some(&b'"') || open >= span.1 {
+            return false;
+        }
+        string_end(b, open).is_some_and(|end| types.iter().any(|t| str_is(b, (open, end), t)))
+    })
+}
+
+/// Whether the byte at `at` is escaped: preceded by an odd run of backslashes.
+fn escaped_at(b: &[u8], at: usize) -> bool {
+    let before = b.get(..at).unwrap_or_default();
+    before.iter().rev().take_while(|&&c| c == b'\\').count() % 2 == 1
+}
+
+/// Replace every root member keyed `key` (escaped spellings included) with one `"key":value`, placed
+/// first; every other byte stays as sent. `key` must need no escaping, and `value` must be one JSON
+/// value. `false`, untouched, when the root is not a well-formed object.
+pub fn set_root_member(body: &mut Vec<u8>, key: &str, value: &[u8]) -> bool {
+    let Some(found) = root_members(body) else {
+        return false;
+    };
+    let spans: Vec<(usize, usize)> = found.iter().map(Member::span).collect();
+    let hit: Vec<bool> = found.iter().map(|m| m.key_is(body, key)).collect();
+    let had_others = hit.iter().any(|h| !h);
+    remove_items(body, &spans, |k| hit.get(k).copied().unwrap_or(false));
+    // Still an object: only whole members were cut, never its braces.
+    let Some(open) = root_open(body) else {
+        return false;
+    };
+    let mut member = Vec::with_capacity(key.len().saturating_add(value.len()).saturating_add(4));
+    member.push(b'"');
+    member.extend_from_slice(key.as_bytes());
+    member.extend_from_slice(b"\":");
+    member.extend_from_slice(value);
+    if had_others {
+        member.push(b',');
+    }
+    let at = open.saturating_add(1);
+    body.splice(at..at, member);
+    true
+}
+
+/// What a `serde_json::Value` of a body would hold, counted from its bytes without parsing it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Structure {
+    /// Objects with at least one member: each costs a `BTreeMap` node in a `Value`.
+    pub objects: usize,
+    /// Every `{`, `[`, `,` and `:` outside a string. Each value past the first is announced by one
+    /// (a member's key and value by the `,` or `{` before it and its `:`), so this bounds the
+    /// values, keys and strings the `Value` would hold.
+    pub tokens: usize,
+}
+
+/// [`Structure`] of `b`, in one pass: string contents are skipped with `memchr`.
+pub fn structure(b: &[u8]) -> Structure {
+    let mut s = Structure::default();
+    let mut i = 0usize;
+    while let Some(rest) = b.get(i..) {
+        let q = memchr::memchr(b'"', rest).map_or(b.len(), |q| i.saturating_add(q));
+        for (at, &c) in b.get(i..q).unwrap_or_default().iter().enumerate() {
+            if !matches!(c, b'{' | b'[' | b',' | b':') {
+                continue;
+            }
+            s.tokens = s.tokens.saturating_add(1);
+            // An object is empty when only whitespace stands between its braces.
+            let next = skip_ws(b, i.saturating_add(at).saturating_add(1));
+            if c == b'{' && b.get(next) != Some(&b'}') {
+                s.objects = s.objects.saturating_add(1);
+            }
+        }
+        match string_end(b, q) {
+            Some(end) => i = end,
+            None => break,
+        }
+    }
+    s
+}
+
 #[cfg(test)]
+#[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 mod tests {
     use super::*;
+
+    /// The iterators agree with the collecting walks, end at the closing bracket, and report a
+    /// malformed container once.
+    #[test]
+    fn members_and_elements_walk_without_collecting() {
+        let b = br#" { "a" : [1, {"b":2}, "x\"]"] , "c":{} } "#;
+        let open = root_open(b).unwrap();
+        let mut it = members(b, open);
+        let got: Vec<Member> = it.by_ref().map(Option::unwrap).collect();
+        assert_eq!(got, object_members(b, open).unwrap());
+        assert_eq!(it.end(), Some(b.len() - 1));
+        let arr = got[0].value.0;
+        let spans: Vec<(usize, usize)> = elements(b, arr).map(Option::unwrap).collect();
+        assert_eq!(spans, array_elements(b, arr).unwrap());
+        assert_eq!(members(b"{}", 0).count(), 0);
+        assert_eq!(elements(b"[ ]", 0).count(), 0);
+        for bad in [
+            &br#"{"a":1 "b":2}"#[..],
+            br#"{"a"}"#,
+            br#"{"a":1,"#,
+            b"{1:2}",
+        ] {
+            let items: Vec<Option<Member>> = members(bad, 0).collect();
+            assert_eq!(
+                items.last(),
+                Some(&None),
+                "{}",
+                String::from_utf8_lossy(bad)
+            );
+        }
+        assert_eq!(elements(b"[1 2]", 0).last(), Some(None));
+        assert_eq!(members(b"[1]", 0).count(), 0, "not an object");
+    }
+
+    #[test]
+    fn last_member_and_str_reads() {
+        let b = br#"{"type":"a","type":"image","n":null}"#;
+        let m = last_member(b, 0, "type").unwrap().unwrap();
+        assert!(str_is(b, m.value, "image"));
+        assert_eq!(str_value(b, m.value).as_deref(), Some("image"));
+        assert_eq!(last_member(b, 0, "none"), Some(None));
+        assert_eq!(last_member(b"[1]", 0, "type"), None);
+        let n = last_member(b, 0, "n").unwrap().unwrap();
+        assert!(!str_is(b, n.value, "null"));
+        assert_eq!(str_value(b, n.value), None);
+        // A string far longer than the name is not decoded to be compared.
+        let long = format!(r#"{{"k":"{}"}}"#, "\\u0041".repeat(10_000));
+        let m = last_member(long.as_bytes(), 0, "k").unwrap().unwrap();
+        assert!(!str_is(long.as_bytes(), m.value, "A"));
+    }
+
+    /// A `"type"` member is found at any depth inside the span, never inside a string, and only
+    /// with one of the listed values.
+    #[test]
+    fn has_typed_member_reads_only_real_type_members() {
+        let types = ["image_url", "image"];
+        let hit = |b: &[u8]| has_typed_member(b, (0, b.len()), &types);
+        assert!(hit(
+            br#"[{"type":"text"},{"content":[{"type" : "image", "x":1}]}]"#
+        ));
+        assert!(hit(br#"{"type":"image_url"}"#));
+        assert!(!hit(br#"[{"type":"text","text":"\"type\":\"image\""}]"#));
+        assert!(!hit(
+            br#"[{"type":"text","text":"say \\"},{"type":"input_image"}]"#
+        ));
+        assert!(!hit(br#"[{"name":"type","value":"image"}]"#));
+        assert!(!hit(br#"[{"type":"images"}]"#));
+        // A string ending in an escaped backslash leaves the next quote unescaped.
+        assert!(hit(br#"[{"text":"a\\","type":"image"}]"#));
+    }
+
+    /// The one root-member splice behind `store_false`, `force_stream` and
+    /// `thinking_off_for_tools`: every member under the key goes, one goes first, the rest of the
+    /// bytes stay as sent.
+    #[test]
+    fn set_root_member_replaces_every_spelling_and_keeps_the_rest() {
+        let set = |body: &str, key: &str, value: &str| {
+            let mut b = body.as_bytes().to_vec();
+            let changed = set_root_member(&mut b, key, value.as_bytes());
+            (changed, String::from_utf8(b).unwrap())
+        };
+        assert_eq!(
+            set(
+                r#" {"a":1, "store":true,"b" : [2],"store":null}"#,
+                "store",
+                "false"
+            ),
+            (true, r#" {"store":false,"a":1, "b" : [2]}"#.to_owned())
+        );
+        assert_eq!(
+            set(r#"{"store":true}"#, "store", "false"),
+            (true, r#"{"store":false}"#.to_owned())
+        );
+        assert_eq!(set("{}", "s", "true"), (true, r#"{"s":true}"#.to_owned()));
+        assert_eq!(set("[1]", "s", "true"), (false, "[1]".to_owned()));
+        assert_eq!(set(r#"{"a":"#, "s", "true"), (false, r#"{"a":"#.to_owned()));
+    }
+
+    /// Many cuts cost one pass, and land exactly where `remove_items` asked.
+    #[test]
+    fn remove_items_cuts_many_items_in_one_pass() {
+        let items: Vec<String> = (0..2000).map(|i| format!(r#"{{"k":{i}}}"#)).collect();
+        let mut body = format!("[{}]", items.join(",")).into_bytes();
+        let spans = array_elements(&body, 0).unwrap();
+        assert!(remove_items(&mut body, &spans, |k| k % 3 != 1));
+        let want: Vec<&String> = items.iter().skip(1).step_by(3).collect();
+        let want = format!(
+            "[{}]",
+            want.iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        assert_eq!(String::from_utf8(body).unwrap(), want);
+    }
+
+    #[test]
+    fn structure_counts_objects_and_tokens_outside_strings() {
+        assert_eq!(
+            structure(br#"{"a":[1,{"b":"{[,:]}"},{ },[]]}"#),
+            Structure {
+                objects: 2,
+                tokens: 10
+            }
+        );
+        assert_eq!(structure(b""), Structure::default());
+        assert_eq!(structure(br#""unterminated {"#), Structure::default());
+    }
+
+    /// Only a root member whose value is the literal `null` is removed (D101): not a string that
+    /// starts with `n`, not a nested `null`, not a role named user.
+    #[test]
+    fn remove_root_nulls_removes_only_root_nulls() {
+        fn strip(body: &[u8]) -> (bool, Vec<u8>) {
+            let mut b = body.to_vec();
+            let changed = remove_root_nulls(&mut b);
+            (changed, b)
+        }
+        let (changed, b) = strip(br#"{"model":"m","user" : null}"#);
+        assert!(changed);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&b).unwrap(),
+            serde_json::json!({"model": "m"})
+        );
+        assert!(!strip(br#"{"user":"nobody","model":"m"}"#).0);
+        let nested = br#"{"messages":[{"role":"user","user":null}],"metadata":{"user":null}}"#;
+        assert_eq!(strip(nested), (false, nested.to_vec()));
+        let (changed, b) = strip(br#"{"user":"u","x":null}"#);
+        assert!(changed);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&b).unwrap(),
+            serde_json::json!({"user": "u"})
+        );
+    }
+
+    /// Only root-level, non-negative integer output limits are spanned: the digits exactly, the
+    /// first of each key, never one nested in a message or tool schema.
+    #[test]
+    fn output_limit_spans_cover_root_integers_only() {
+        let body = br#"{"messages":[{"max_tokens":7}],"max_tokens" : 64000,"max_output_tokens":-1,"max_completion_tokens":"9","model":"m","max_tokens":5}"#;
+        let scan = scan_buffered(body);
+        let text = |s: Option<(usize, usize)>| s.map(|(a, b)| &body[a..b]);
+        assert_eq!(text(scan.limit_spans[0]), Some(&b"64000"[..]));
+        assert_eq!(scan.limit_spans[1], None, "a string is no limit");
+        assert_eq!(scan.limit_spans[2], None, "a negative is no limit");
+        let key = |at: Option<usize>| at.map(|a| &body[a..a + 12]);
+        assert_eq!(key(scan.limit_keys[0]), Some(&br#""max_tokens""#[..]));
+        assert_eq!(
+            scan.limit_keys[1].map(|a| &body[a..a + 23]),
+            Some(&br#""max_completion_tokens""#[..]),
+            "a key is recorded whatever its value"
+        );
+        assert_eq!(scan.model.as_deref(), Some("m"));
+    }
 
     /// A pathological `model` value is held to a bounded prefix, fed in small chunks the way a
     /// streamed body arrives, and the buffered scan agrees — while the span still covers the whole
@@ -650,6 +1481,36 @@ mod tests {
         }
     }
 
+    /// claim: SEC-21
+    /// defect: D34
+    #[test]
+    fn a_second_root_model_key_is_flagged_however_it_is_spelled() {
+        for body in [
+            br#"{"model":"cheap","messages":[],"model":"o1-pro"}"#.as_slice(),
+            br#"{"model":"cheap","mod\u0065l":"o1-pro"}"#,
+            br#"{"mod\u0065l":"o1-pro","model":"cheap"}"#,
+        ] {
+            let scan = scan_buffered(body);
+            assert!(scan.duplicate_model, "{}", String::from_utf8_lossy(body));
+        }
+        for body in [
+            br#"{"model":"cheap","messages":[{"model":"nested"}],"metadata":{"model":"x"}}"#
+                .as_slice(),
+            br#"{"model":"cheap","system":"\"model\":\"o1-pro\""}"#,
+            br#"{"models":["a"],"model":"cheap"}"#,
+        ] {
+            assert!(
+                !scan_buffered(body).duplicate_model,
+                "{}",
+                String::from_utf8_lossy(body)
+            );
+        }
+        // An escaped spelling alone is still the model: its value is what gets rewritten.
+        let scan = scan_buffered(br#"{"mod\u0065l":"o1-pro"}"#);
+        assert_eq!(scan.model.as_deref(), Some("o1-pro"));
+        assert!(scan.model_span.is_some());
+    }
+
     #[test]
     fn fused_scan_matches_the_two_walks_it_replaces() {
         // `scan_buffered` exists only to produce the same two answers in one pass. Anything it does
@@ -711,6 +1572,17 @@ mod tests {
         // The strict scanner used on request bodies must NOT pick it up — that is the whole reason
         // the nesting is opt-in.
         assert_eq!(scan(message_start), None);
+    }
+
+    #[test]
+    fn response_scanner_reads_a_responses_streams_nested_model() {
+        let created = b"event: response.created\ndata: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp_1\",\"status\":\"in_progress\",\"model\":\"gpt-5-2025-08-07\",\"output\":[]}}\n\n";
+        assert_eq!(scan_response(created).as_deref(), Some("gpt-5-2025-08-07"));
+        // Still exactly one level: a model inside the response's tools is not the response's.
+        assert_eq!(
+            scan_response(br#"{"response":{"tools":[{"model":"NESTED"}]}}"#),
+            None
+        );
     }
 
     #[test]
@@ -985,5 +1857,184 @@ mod tests {
             scan(br#"{"model":"gpt-4\"o"}"#).as_deref(),
             Some("gpt-4\"o")
         );
+    }
+
+    /// Every subset of root members removed by span leaves valid JSON equal to the object without
+    /// them, and an empty subset leaves the bytes identical. Same for array elements.
+    #[test]
+    fn span_removal_matches_value_removal_for_every_subset() {
+        use serde_json::Value;
+        let corpus = [
+            r#"{"a":1,"b" : "x\"}y" ,"c":[1,{"d":null}], "e":{"f":[]},"g":true}"#,
+            "{\n  \"only\": null\n}",
+            r#" { "k\u0065y":"v", "z": -1.5e3 } "#,
+        ];
+        for body in corpus {
+            let b = body.as_bytes();
+            let members = root_members(b).expect(body);
+            let spans: Vec<_> = members.iter().map(Member::span).collect();
+            let want: Value = serde_json::from_str(body).unwrap();
+            let keys: Vec<String> = want.as_object().unwrap().keys().cloned().collect();
+            assert_eq!(members.len(), keys.len(), "{body}");
+            for mask in 0u32..(1 << spans.len()) {
+                let mut out = b.to_vec();
+                let changed = remove_items(&mut out, &spans, |k| mask & (1 << k) != 0);
+                assert_eq!(changed, mask != 0);
+                if mask == 0 {
+                    assert_eq!(out, b);
+                }
+                let got: Value = serde_json::from_slice(&out)
+                    .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&out)));
+                let mut expect = want.clone();
+                for (k, m) in members.iter().enumerate() {
+                    if mask & (1 << k) != 0 {
+                        let key: String =
+                            serde_json::from_slice(&b[m.key.0 - 1..=m.key.1]).unwrap();
+                        expect.as_object_mut().unwrap().remove(&key);
+                    }
+                }
+                assert_eq!(got, expect, "{body} mask {mask:b}");
+            }
+        }
+        let arr = br#"[ 1, "two" ,{"x":[3]},[],null ]"#;
+        let elems = array_elements(arr, 0).unwrap();
+        let all: Vec<Value> = serde_json::from_slice::<Vec<Value>>(arr).unwrap();
+        for mask in 0u32..(1 << elems.len()) {
+            let mut out = arr.to_vec();
+            remove_items(&mut out, &elems, |k| mask & (1 << k) != 0);
+            let got: Vec<Value> = serde_json::from_slice(&out).unwrap();
+            let expect: Vec<Value> = all
+                .iter()
+                .enumerate()
+                .filter(|(k, _)| mask & (1 << k) == 0)
+                .map(|(_, v)| v.clone())
+                .collect();
+            assert_eq!(got, expect, "mask {mask:b}");
+        }
+        let esc = br#"{"k\u0065y":1}"#;
+        assert!(root_members(esc).unwrap()[0].key_is(esc, "key"));
+    }
+}
+
+/// Behaviors a mutation-testing pass found no test constraining.
+#[cfg(test)]
+#[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+mod mutation_gaps {
+    use super::*;
+
+    fn scan(body: &[u8]) -> Option<String> {
+        let mut s = ModelScanner::new();
+        s.feed(body);
+        s.take_model()
+    }
+
+    /// A root `model` whose value is not a string names no model: a string nested inside it is not
+    /// the value, so it can't pick a catalog row or a billing model.
+    /// claim: SEC-21
+    #[test]
+    fn a_non_string_root_model_names_no_model() {
+        assert_eq!(scan(br#"{"model":["gpt-4o"],"messages":[]}"#), None);
+        assert_eq!(scan(br#"{"model":{"id":"gpt-4o"},"messages":[]}"#), None);
+        let mut s = ModelScanner::for_response();
+        s.feed(br#"{"type":"message_start","message":{"model":["claude-x"],"id":"m"}}"#);
+        assert_eq!(s.take_model(), None);
+    }
+
+    /// Escapes inside a skipped string (a prompt) are stepped over one byte at a time, so an
+    /// escape other than `\"` never swallows the closing quote, and the root `model` after it is
+    /// still found.
+    /// claim: SEC-21
+    #[test]
+    fn escapes_in_skipped_strings_do_not_derail_the_scan() {
+        let body = br#"{"messages":[{"role":"user","content":"line\nnext \"model\":\"evil\" \\ end"}],"model":"gpt-4o"}"#;
+        assert_eq!(scan(body).as_deref(), Some("gpt-4o"));
+        // The same bytes split at every point agree.
+        for cut in 1..body.len() {
+            let mut s = ModelScanner::new();
+            s.feed(&body[..cut]);
+            s.feed(&body[cut..]);
+            assert_eq!(s.take_model().as_deref(), Some("gpt-4o"), "cut at {cut}");
+        }
+        // A root string whose escape is followed by its own closing quote: swallowing that quote
+        // would shift every quote after it.
+        assert_eq!(
+            scan(br#"{"system":"a\nb","model":"gpt-4o"}"#).as_deref(),
+            Some("gpt-4o")
+        );
+        // The buffered walks step over the same escapes.
+        for streamed in [
+            &br#"{"messages":[{"content":"line\nnext \"stream\":false"}],"model":"gpt-4o","stream":true}"#[..],
+            &br#"{"system":"a\nb","model":"gpt-4o","stream":true}"#[..],
+        ] {
+            let scan = scan_buffered(streamed);
+            assert_eq!(scan.model.as_deref(), Some("gpt-4o"));
+            assert_eq!(scan.inject_at, Some(1));
+            assert_eq!(plan_stream_usage_injection(streamed), Some(1));
+        }
+    }
+
+    /// A response's `model` after a nested object inside `message` is still the message's model:
+    /// leaving that nested object does not end the message.
+    /// claim: BIL-13
+    #[test]
+    fn a_response_model_after_a_nested_object_in_message_is_found() {
+        let mut s = ModelScanner::for_response();
+        s.feed(br#"{"type":"message_start","message":{"usage":{"input_tokens":1},"content":[],"model":"claude-x"}}"#);
+        assert_eq!(s.take_model().as_deref(), Some("claude-x"));
+    }
+
+    /// Only a root `"stream": true` streams, and a string *value* spelled like a key is not one:
+    /// another key's `true`, or a value reading `stream_options`, never changes the answer.
+    /// claim: BIL-2
+    #[test]
+    fn only_the_root_stream_literal_decides_streaming() {
+        let not_streaming = br#"{"stream":false,"store":true,"model":"m"}"#;
+        assert_eq!(plan_stream_usage_injection(not_streaming), None);
+        assert_eq!(scan_buffered(not_streaming).inject_at, None);
+
+        let value_spelled_like_a_key = br#"{"model":"stream_options","stream":true}"#;
+        assert_eq!(
+            plan_stream_usage_injection(value_spelled_like_a_key),
+            Some(1)
+        );
+        assert_eq!(scan_buffered(value_spelled_like_a_key).inject_at, Some(1));
+    }
+
+    /// Where a client's own `stream_options` value starts, with and without whitespace around the
+    /// colon — the span `force_include_usage` rewrites.
+    /// claim: BIL-2
+    #[test]
+    fn stream_options_value_offset_is_exact() {
+        for body in [
+            &br#"{"stream":true,"stream_options":{"include_usage":false}}"#[..],
+            &br#"{"stream":true,"stream_options" :  {"include_usage":false}}"#[..],
+        ] {
+            let at = scan_buffered(body)
+                .stream_options_at
+                .expect("streams with options");
+            assert!(
+                body[at..].starts_with(br#"{"include_usage":false}"#),
+                "{at}"
+            );
+        }
+    }
+
+    /// An output limit nested in an array is no limit to clamp.
+    /// claim: TRN-5
+    #[test]
+    fn a_nested_output_limit_is_not_spanned() {
+        let scan = scan_buffered(br#"{"max_tokens":[64000],"model":"m"}"#);
+        assert_eq!(scan.limit_spans[0], None);
+    }
+
+    /// A key with an escape counts as `model` only when it decodes to `model`.
+    /// claim: SEC-21
+    #[test]
+    fn an_escaped_key_is_model_only_when_it_decodes_to_model() {
+        let other = scan_buffered(br#"{"a\u0062":"x","model":"m"}"#);
+        assert_eq!(other.model.as_deref(), Some("m"));
+        assert!(!other.duplicate_model);
+        let model = scan_buffered(br#"{"mod\u0065l":"x","model":"m"}"#);
+        assert!(model.duplicate_model);
     }
 }

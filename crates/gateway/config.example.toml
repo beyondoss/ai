@@ -1,5 +1,8 @@
-# Beyond AI gateway — example config. Every key is overridable by an `AI_`-prefixed env var
-# (e.g. `AI_NATS_URL`, `AI_POOL_KEY_OPENAI`, `AI_READ_TIMEOUT_SECS`). Values below are defaults.
+# Beyond AI gateway — example config. Every scalar key is overridable by an `AI_`-prefixed env var
+# (e.g. `AI_NATS_URL`, `AI_READ_TIMEOUT_SECS`); pool and signing keys by `AI_POOL_KEY_<NAME>` /
+# `AI_SIGNING_KEY_<KID>`. The provider map tables (`provider_authorities`, `provider_dialects`,
+# `provider_auth_schemes`) are file-only. An unknown key in this file is a boot failure. Values below
+# are defaults.
 
 listen = "0.0.0.0:8080" # client (app) traffic; internal-only, fronted as ai.internal
 metrics_listen = "0.0.0.0:9090" # internal admin: /metrics (Prometheus), /livez, /readyz
@@ -27,9 +30,24 @@ config_bucket = "ai-gateway"
 
 # Upstream timeouts. read/idle are generous: LLM streams can run for minutes.
 connect_timeout_secs = 10
+# The longest the provider may stay silent (before its head, or between body reads): the OpenAI and
+# Anthropic SDKs' 600s default request timeout. Silence is not a failure; a dead peer is caught by
+# the liveness settings below.
 read_timeout_secs = 600
 write_timeout_secs = 60
 idle_timeout_secs = 90
+# A client that stops reading for this long is disconnected and its slots released (0 disables).
+client_write_timeout_secs = 60
+# Transport liveness. HTTP/2 PING to providers every 15s; an unanswered one (5s deadline) fails the
+# connection. TCP keepalive on provider and client sockets: probe after 15s idle, every 5s, drop the
+# peer after 3 misses (30s). 0 disables either.
+h2_ping_interval_secs = 15
+tcp_keepalive_idle_secs = 15
+tcp_keepalive_interval_secs = 5
+tcp_keepalive_count = 3
+# Most request-body bytes held in memory at once (large catalog bodies, usage-splice buffers).
+# Over it a request gets a 503 with Retry-After. 0 disables.
+max_buffered_body_bytes = 536870912
 
 # Graceful shutdown. On SIGTERM, in-flight requests drain for up to grace_period_secs before the
 # runtimes are torn down (then runtime_timeout_secs is the final teardown backstop).
@@ -139,11 +157,16 @@ capture_queue_depth = 1024
 # replicas do not share TTFT samples.
 # smart_router = true
 
+# The kid in [id_signing_keys] (below) that signs new tenant-bound Responses ids, e.g. "2". Empty
+# means the only key; required with more than one (rotation: add the new key everywhere, then
+# switch this).
+# id_signing_kid = ""
+
 # Optional per-provider upstream authority (host:port), BY PROVIDER NAME. For a known provider this
 # overrides its built-in default; for an unknown name it ADDS a new provider, then reachable at
 # `/{name}/…` (the provider is the first path segment of the request). Known providers (zero-config
-# defaults): openai, anthropic, openrouter, fireworks, groq, deepseek, together, cerebras, mistral,
-# xai, bedrock.
+# defaults): openai, openai-codex, anthropic, openrouter, fireworks, groq, deepseek, together,
+# cerebras, mistral, xai, bedrock.
 # [provider_authorities]
 # openai = "api.openai.com:443"
 # my-self-hosted = "llm.internal:8443"
@@ -184,7 +207,8 @@ capture_queue_depth = 1024
 # code and never overridable from config, so route Anthropic-wire Fireworks models through a second,
 # config-added provider alias instead — combine the three tables above (uncomment all three
 # `fireworks-anthropic` lines) and add a pool key under `[pool_keys] fireworks-anthropic = ["fw-..."]`.
-# The client then reaches those models at `/fireworks-anthropic/v1/messages`; Fireworks' own
+# The path after the provider segment is forwarded verbatim, so the client reaches those models at
+# `/fireworks-anthropic/inference/v1/messages` (Fireworks serves Messages under `/inference`); its own
 # `/inference/v1/chat/completions` OpenAI-wire models stay on the built-in `fireworks` provider. Zero
 # code change — this is purely config, and it's the officially recommended way to add an
 # Anthropic-wire vendor at a host the gateway already knows.
@@ -218,7 +242,7 @@ capture_queue_depth = 1024
 # [pool_keys]
 # openai = ["sk-..."]
 # anthropic = ["sk-ant-...", "sk-ant-other"]
-# bedrock = ["<amazon-bedrock-api-key>"]   # or AI_POOL_KEY_BEDROCK / AWS_BEARER_TOKEN_BEDROCK
+# bedrock = ["<amazon-bedrock-api-key>"]   # or AI_POOL_KEY_BEDROCK (the gateway does not read AWS_BEARER_TOKEN_BEDROCK)
 # fireworks = ["fw-..."]
 # fireworks-anthropic = ["fw-..."]   # same Fireworks account key, second alias — see provider_authorities above
 
@@ -227,3 +251,12 @@ capture_queue_depth = 1024
 # is 401 (fail-closed), never BYO. BYO raw tokens skip verification.
 [signing_keys]
 # 1 = "<base64-ed25519-public-key>"
+
+# Secrets that bind the ids OpenAI stores (response, conversation and item ids) to the tenant they
+# were issued to (kid -> base64 of >= 32 random bytes; `openssl rand -base64 32`). Inject via
+# AI_ID_SIGNING_KEY_<KID>. Every managed tenant shares Beyond's OpenAI organization, so REQUIRED
+# whenever [signing_keys] is set: the gateway refuses to boot without one. A BYO-only deployment
+# needs none. Keep a rotated-out key listed for 30 days so the ids it
+# signed still verify. See ARCHITECTURE.md "Tenant-bound Responses ids".
+[id_signing_keys]
+# 1 = "<base64-32-random-bytes>"

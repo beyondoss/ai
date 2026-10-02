@@ -1,0 +1,720 @@
+//! Reliability, verify phase 0: readiness, shutdown, stalls, slow readers, body memory and DNS.
+//!
+//! Run via `mise run test:integration:rs` (needs `nats-server` on PATH).
+
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+mod common;
+
+use std::time::{Duration, Instant};
+
+use beyond_ai::key::{VirtualKey, mint};
+use common::*;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+fn vkey(sk: &ed25519_dalek::SigningKey, tenant_id: u64) -> String {
+    mint(
+        &VirtualKey {
+            tenant_id,
+            vpc_id: 7,
+            key_id: None,
+        },
+        1,
+        sk,
+    )
+}
+
+const STREAM_BODY: &str =
+    r#"{"model":"gpt-4o","stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+
+/// NATS is down at boot, so the allowance set never seeds and every managed request is refused
+/// with "allowance unavailable". Readiness must say so, or the load balancer keeps sending traffic
+/// to a pod that refuses all of it.
+/// claim: REL-5
+/// defect: D11
+#[tokio::test]
+async fn readyz_is_not_ready_while_allowance_is_unseeded() {
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::builder(closed_port(), &mock.authority(), &b64(&pubkey))
+        .skip_allowance_ready()
+        .start()
+        .await;
+    let resp = test_client()
+        .post(format!("{}/openai/v1/chat/completions", gw.url()))
+        .header("authorization", format!("Bearer {}", vkey(&sk, 1)))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    let text = resp.text().await.unwrap();
+    assert!(
+        text.contains("allowance unavailable"),
+        "precondition: managed traffic is refused ({status} {text})"
+    );
+    let (ready, body) = gw.admin_get("/readyz").await;
+    assert_ne!(
+        ready, 200,
+        "readyz {ready} {body} while managed requests get {status} allowance unavailable"
+    );
+}
+
+/// An idle gateway exits promptly on SIGTERM: there is nothing to drain. Default config (600s
+/// grace).
+/// claim: REL-16, BIL-21
+/// defect: D38
+#[tokio::test]
+async fn an_idle_gateway_exits_promptly_on_sigterm() {
+    let (pubkey, _sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::Json).await;
+    let mut gw = Gateway::start(unused_nats_port(), &mock.authority(), &b64(&pubkey)).await;
+    gw.sigterm();
+    let exited = gw.wait_exit(Duration::from_secs(15)).await;
+    assert!(
+        exited.is_some_and(|t| t < Duration::from_secs(10)),
+        "idle gateway exit after SIGTERM: {exited:?} (None = still running at 15s)"
+    );
+}
+
+/// The same with a short configured grace: shutdown time tracks the grace, even when idle.
+/// claim: REL-16, BIL-21
+/// defect: D38
+#[tokio::test]
+async fn an_idle_gateway_with_a_short_grace_exits_before_the_grace() {
+    let (pubkey, _sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::Json).await;
+    let mut gw = Gateway::builder(unused_nats_port(), &mock.authority(), &b64(&pubkey))
+        .config_line("shutdown_grace_period_secs = 3")
+        .config_line("shutdown_runtime_timeout_secs = 1")
+        .start()
+        .await;
+    gw.sigterm();
+    let exited = gw.wait_exit(Duration::from_secs(15)).await;
+    assert!(
+        exited.is_some_and(|t| t < Duration::from_secs(2)),
+        "idle gateway (3s grace) exit after SIGTERM: {exited:?}"
+    );
+}
+
+/// `read_timeout_secs` is honored: a header stall ends at the configured bound.
+/// claim: REL-7
+/// defect: D36
+#[tokio::test]
+async fn a_header_stall_ends_at_the_configured_read_timeout() {
+    let (pubkey, _sk) = test_keypair(1);
+    let mock = ReplyUpstream::start(|_, _| Reply::HeaderStall).await;
+    let gw = Gateway::builder(unused_nats_port(), &mock.authority(), &b64(&pubkey))
+        .config_line("read_timeout_secs = 2")
+        .start()
+        .await;
+    let start = Instant::now();
+    let status = test_client()
+        .post(format!("{}/openai/v1/chat/completions", gw.url()))
+        .header("authorization", "Bearer sk-byo-test")
+        .header("content-type", "application/json")
+        .body(STREAM_BODY)
+        .send()
+        .await
+        .map(|r| r.status().as_u16())
+        .unwrap_or(0);
+    let took = start.elapsed();
+    assert!(
+        status >= 500 && took < Duration::from_secs(6),
+        "status {status} after {took:?}"
+    );
+}
+
+/// A TLS HTTP/2 upstream. Each request waits `head_delay`, then gets a 200 SSE head and one event
+/// and no more. With `freeze`, the connection stops being driven shortly after that event: the
+/// socket stays open and the kernel still ACKs TCP, but HTTP/2 PINGs go unanswered — a wedged
+/// peer, the case only H2 PING can see.
+async fn h2_upstream(head_delay: Duration, freeze: bool) -> (u16, tokio::task::JoinHandle<()>) {
+    use hyper::service::service_fn;
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use std::sync::Arc;
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let ck = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
+    let key = rustls::pki_types::PrivateKeyDer::Pkcs8(ck.key_pair.serialize_der().into());
+    let mut tls = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![ck.cert.der().clone()], key)
+        .unwrap();
+    tls.alpn_protocols = vec![b"h2".to_vec()];
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls));
+    let task = tokio::spawn(async move {
+        while let Ok((s, _)) = listener.accept().await {
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                let Ok(tls) = acceptor.accept(s).await else {
+                    return;
+                };
+                let answered = Arc::new(tokio::sync::Notify::new());
+                let notify = answered.clone();
+                let svc = service_fn(move |_req: hyper::Request<hyper::body::Incoming>| {
+                    let notify = notify.clone();
+                    async move {
+                        tokio::time::sleep(head_delay).await;
+                        notify.notify_one();
+                        Ok::<_, std::convert::Infallible>(
+                            hyper::Response::builder()
+                                .header("content-type", "text/event-stream")
+                                .body(StallingBody::new(bytes::Bytes::from_static(FIRST_EVENT)))
+                                .unwrap(),
+                        )
+                    }
+                });
+                let conn = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                    .serve_connection(TokioIo::new(tls), svc);
+                tokio::pin!(conn);
+                if !freeze {
+                    let _ = conn.await;
+                    return;
+                }
+                tokio::select! {
+                    _ = conn.as_mut() => return,
+                    _ = answered.notified() => {}
+                }
+                // Let the head and the event go out, then stop driving the connection while
+                // keeping it (and its socket) open.
+                let until = tokio::time::Instant::now() + Duration::from_millis(300);
+                tokio::select! {
+                    _ = conn.as_mut() => return,
+                    _ = tokio::time::sleep_until(until) => {}
+                }
+                std::future::pending::<()>().await;
+            });
+        }
+    });
+    (port, task)
+}
+
+const FIRST_EVENT: &[u8] = b"data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n";
+
+fn long_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(40))
+        .build()
+        .unwrap()
+}
+
+/// Post a stream request and read the response to its end: `(status, body or error, elapsed)`.
+async fn stream_to_end(gw: &Gateway) -> (u16, Result<String, String>, Duration) {
+    let start = Instant::now();
+    let resp = long_client()
+        .post(format!("{}/openai/v1/chat/completions", gw.url()))
+        .header("authorization", "Bearer sk-byo-test")
+        .header("content-type", "application/json")
+        .body(STREAM_BODY)
+        .send()
+        .await;
+    let resp = match resp {
+        Ok(r) => r,
+        Err(e) => return (0, Err(e.to_string()), start.elapsed()),
+    };
+    let status = resp.status().as_u16();
+    let body = resp.text().await.map_err(|e| e.to_string());
+    (status, body, start.elapsed())
+}
+
+/// A provider connection that goes dead mid-stream (the peer stops answering HTTP/2 PINGs while
+/// its socket stays open) is detected by transport liveness and failed promptly — not held until
+/// `read_timeout_secs` (600s). Measured with a 1s PING interval: detection within the interval plus
+/// pingora's 5s PING ACK deadline. Silence alone would never end it: the read timeout is the
+/// default 600s.
+/// claim: REL-7
+/// defect: D36
+#[tokio::test]
+async fn a_dead_h2_upstream_is_detected_by_ping() {
+    let defaults = beyond_ai::config::AiConfig::default();
+    assert!(
+        defaults.h2_ping_interval_secs > 0 && defaults.h2_ping_interval_secs + 5 < 60,
+        "upstream H2 PING is on by default, with a bound far under any client timeout: {}s",
+        defaults.h2_ping_interval_secs
+    );
+    let (port, _task) = h2_upstream(Duration::ZERO, true).await;
+    let (pubkey, _sk) = test_keypair(1);
+    let gw = Gateway::builder(
+        unused_nats_port(),
+        &format!("127.0.0.1:{port}"),
+        &b64(&pubkey),
+    )
+    .tls_upstream()
+    .upstream_http2(true)
+    .config_line("h2_ping_interval_secs = 1")
+    .start()
+    .await;
+    let (status, body, took) = stream_to_end(&gw).await;
+    assert_eq!(status, 200, "{body:?}");
+    assert!(
+        took < Duration::from_secs(12),
+        "a dead upstream was held for {took:?}: {body:?}"
+    );
+    assert!(
+        body.as_ref().is_err() || body.as_ref().is_ok_and(|b| !b.contains("[DONE]")),
+        "a dead upstream must end as an error, never a clean finish: {body:?}"
+    );
+}
+
+/// The other half of the contract: a provider that is alive but silent — a model thinking without
+/// emitting — is never cut by the gateway before `read_timeout_secs`, the clients' own 600s
+/// default. Silence is not a failure signal; only a dead transport is. Each upstream here holds
+/// its response head for 8s, several times the configured liveness bound (H2 PING every 1s with a
+/// 5s ACK deadline; TCP keepalive probing after 1s idle, every 1s, 2 probes), and the stream
+/// arrives: the PINGs and probes are answered by the peer's HTTP/2 stack and kernel, not the
+/// model. The old silence cut (`stream_idle_timeout_secs`, 120s by default) would have ended these
+/// at its bound, configured to 2s in the tests it replaced.
+/// claim: REL-7
+/// defect: D36
+#[tokio::test]
+async fn an_alive_but_silent_upstream_is_not_cut() {
+    let defaults = beyond_ai::config::AiConfig::default();
+    assert_eq!(
+        defaults.read_timeout_secs, 600,
+        "the silence bound is the OpenAI and Anthropic SDKs' 600s default request timeout"
+    );
+    let liveness = [
+        "h2_ping_interval_secs = 1",
+        "tcp_keepalive_idle_secs = 1",
+        "tcp_keepalive_interval_secs = 1",
+        "tcp_keepalive_count = 2",
+    ];
+    let (pubkey, _sk) = test_keypair(1);
+    let silence = Duration::from_secs(8);
+    // HTTP/2: the peer keeps answering PINGs while the model is silent.
+    let (port, _task) = h2_upstream(silence, false).await;
+    let mut h2 = Gateway::builder(
+        unused_nats_port(),
+        &format!("127.0.0.1:{port}"),
+        &b64(&pubkey),
+    )
+    .tls_upstream()
+    .upstream_http2(true);
+    // HTTP/1.1: only TCP keepalive watches the connection.
+    let h1_up =
+        ReplyUpstream::start(move |_, _| Reply::Delayed(silence, Box::new(Reply::sse()))).await;
+    let mut h1 = Gateway::builder(unused_nats_port(), &h1_up.authority(), &b64(&pubkey));
+    for line in liveness {
+        h2 = h2.config_line(line);
+        h1 = h1.config_line(line);
+    }
+    let (h2, h1) = (h2.start().await, h1.start().await);
+    let h2_run = async {
+        // This upstream stalls after its first event by design: the head and event arriving
+        // after the silence is what is asserted.
+        let start = Instant::now();
+        let mut resp = long_client()
+            .post(format!("{}/openai/v1/chat/completions", h2.url()))
+            .header("authorization", "Bearer sk-byo-test")
+            .header("content-type", "application/json")
+            .body(STREAM_BODY)
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status().as_u16();
+        let first = resp.chunk().await.ok().flatten().unwrap_or_default();
+        let took = start.elapsed();
+        (status, String::from_utf8_lossy(&first).into_owned(), took)
+    };
+    let ((status, first, took), (h1_status, body, h1_took)) =
+        tokio::join!(h2_run, stream_to_end(&h1));
+    assert!(
+        status == 200 && first.contains("\"hi\"") && took >= silence,
+        "h2: an alive, silent upstream was cut: {status} after {took:?}: {first}"
+    );
+    assert!(
+        h1_status == 200 && body.as_ref().is_ok_and(|b| b.contains("[DONE]")) && h1_took >= silence,
+        "h1: an alive, silent upstream was cut: {h1_status} after {h1_took:?}: {body:?}"
+    );
+}
+
+/// The kernel half of liveness is armed: the gateway's upstream socket and its accepted client
+/// socket both carry TCP keepalive, read back from `/proc/net/tcp` (timer 2 = keepalive). A
+/// vanished peer cannot be simulated without dropping packets, so this pins the configuration the
+/// kernel acts on; the probes themselves are the kernel's.
+/// claim: REL-7
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn upstream_and_client_sockets_arm_tcp_keepalive() {
+    let mock = ReplyUpstream::start(|_, _| Reply::HeaderStall).await;
+    let (pubkey, _sk) = test_keypair(1);
+    let gw = Gateway::builder(unused_nats_port(), &mock.authority(), &b64(&pubkey))
+        .config_line("tcp_keepalive_idle_secs = 7")
+        .start()
+        .await;
+    let mut s = tokio::net::TcpStream::connect(("127.0.0.1", gw.port))
+        .await
+        .unwrap();
+    let req = format!(
+        "POST /openai/v1/chat/completions HTTP/1.1\r\nhost: 127.0.0.1\r\n\
+         authorization: Bearer sk-byo-test\r\ncontent-type: application/json\r\n\
+         content-length: {}\r\n\r\n{STREAM_BODY}",
+        STREAM_BODY.len()
+    );
+    s.write_all(req.as_bytes()).await.unwrap();
+    // `(local port, remote port, timer)` of every established IPv4 socket.
+    let sockets = || -> Vec<(u16, u16, u8)> {
+        let table = std::fs::read_to_string("/proc/net/tcp").unwrap();
+        let port = |addr: &str| u16::from_str_radix(addr.rsplit(':').next().unwrap(), 16).unwrap();
+        table
+            .lines()
+            .skip(1)
+            .filter_map(|l| {
+                let f: Vec<&str> = l.split_whitespace().collect();
+                let timer = f.get(5)?.split(':').next()?.parse().ok()?;
+                (f.get(3) == Some(&"01")).then(|| (port(f[1]), port(f[2]), timer))
+            })
+            .collect()
+    };
+    let start = Instant::now();
+    let (mut upstream, mut client) = (None, None);
+    while start.elapsed() < Duration::from_secs(10) && (upstream != Some(2) || client != Some(2)) {
+        for (local, remote, timer) in sockets() {
+            if remote == mock.port {
+                upstream = Some(timer);
+            }
+            if local == gw.port {
+                client = Some(timer);
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    drop(s);
+    assert_eq!(upstream, Some(2), "upstream socket keepalive timer");
+    assert_eq!(client, Some(2), "client socket keepalive timer");
+}
+
+/// A client that sends a request for a large stream and then never reads must be released (its
+/// in-flight slot, upstream connection, gauge) within a bound. The bound is the downstream write
+/// timeout: 60s by default (asserted below), configured to 3s here so the release is observed
+/// inside the test's 20s window rather than after a minute.
+/// claim: REL-10
+/// defect: D42
+#[tokio::test]
+async fn a_client_that_stops_reading_is_released() {
+    assert_eq!(
+        beyond_ai::config::AiConfig::default().client_write_timeout_secs,
+        60,
+        "a default downstream write timeout exists"
+    );
+    let (pubkey, _sk) = test_keypair(1);
+    let big = {
+        let event = "data: {\"choices\":[{\"delta\":{\"content\":\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"}}]}\n\n";
+        bytes::Bytes::from(event.repeat((64 << 20) / event.len()))
+    };
+    let mock = ReplyUpstream::start(move |_, _| Reply::Full {
+        status: 200,
+        content_type: "text/event-stream",
+        body: big.clone(),
+    })
+    .await;
+    let gw = Gateway::builder(unused_nats_port(), &mock.authority(), &b64(&pubkey))
+        .config_line("client_write_timeout_secs = 3")
+        .start()
+        .await;
+    let mut s = tokio::net::TcpStream::connect(("127.0.0.1", gw.port))
+        .await
+        .unwrap();
+    let req = format!(
+        "POST /openai/v1/chat/completions HTTP/1.1\r\nhost: 127.0.0.1\r\n\
+         authorization: Bearer sk-byo-test\r\ncontent-type: application/json\r\n\
+         content-length: {}\r\n\r\n{STREAM_BODY}",
+        STREAM_BODY.len()
+    );
+    s.write_all(req.as_bytes()).await.unwrap();
+    // Read nothing, ever. Wait for the request to be in flight, then for it to be released.
+    wait_for_metric(&gw, "ai_requests_in_flight", "", 1.0).await;
+    let start = Instant::now();
+    let mut in_flight = 1.0;
+    while start.elapsed() < Duration::from_secs(20) {
+        in_flight = gw.metric("ai_requests_in_flight", "").await;
+        if in_flight == 0.0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    drop(s);
+    assert_eq!(
+        in_flight,
+        0.0,
+        "a non-reading client still holds its slot after {:?}",
+        start.elapsed()
+    );
+}
+
+/// Concurrent large uploads must not grow the gateway's memory without bound. Eight managed
+/// catalog requests with ~90 MiB bodies, held while the upstream stalls, may not cost more than
+/// 512 MiB of gateway RSS between them (the bodies alone are 720 MiB).
+/// claim: SEC-19
+/// defect: D35
+#[tokio::test]
+async fn concurrent_large_uploads_have_bounded_memory() {
+    const N: u64 = 8;
+    const BODY_MIB: usize = 90;
+    let (pubkey, sk) = test_keypair(1);
+    let mock = ReplyUpstream::start(|_, _| Reply::HeaderStall).await;
+    let gw = Gateway::builder(unused_nats_port(), &mock.authority(), &b64(&pubkey))
+        .providers(&["openai", "openrouter"])
+        .start()
+        .await;
+    let base = gw.rss_kib();
+    let body = std::sync::Arc::new({
+        let mut b = br#"{"model":"gpt-4o-mini","messages":[{"role":"user","content":""#.to_vec();
+        b.extend(std::iter::repeat_n(b'x', BODY_MIB << 20));
+        b.extend_from_slice(br#""}]}"#);
+        b
+    });
+    let mut conns = Vec::new();
+    for i in 0..N {
+        let (body, port, key) = (body.clone(), gw.port, vkey(&sk, 100 + i));
+        conns.push(tokio::spawn(async move {
+            let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .unwrap();
+            let head = format!(
+                "POST /v1/chat/completions HTTP/1.1\r\nhost: 127.0.0.1\r\n\
+                 authorization: Bearer {key}\r\ncontent-type: application/json\r\n\
+                 content-length: {}\r\n\r\n",
+                body.len()
+            );
+            let _ = s.write_all(head.as_bytes()).await;
+            let _ = s.write_all(&body).await;
+            // Keep the connection open while the test samples memory.
+            let mut buf = [0u8; 1024];
+            let _ = tokio::time::timeout(Duration::from_secs(20), s.read(&mut buf)).await;
+        }));
+    }
+    let start = Instant::now();
+    let mut peak = base;
+    while start.elapsed() < Duration::from_secs(12) {
+        peak = peak.max(gw.rss_kib());
+        if mock.hits() >= N as usize && start.elapsed() > Duration::from_secs(2) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    peak = peak.max(gw.rss_kib());
+    let grew_mib = (peak.saturating_sub(base)) / 1024;
+    for c in conns {
+        c.abort();
+    }
+    assert!(
+        grew_mib < 512,
+        "gateway RSS grew {grew_mib} MiB for {N} concurrent {BODY_MIB} MiB uploads (upstream saw {})",
+        mock.hits()
+    );
+}
+
+/// A provider authority whose name resolves to more than one address must be reachable when the
+/// first one is dead. `localhost` resolves to `::1` first here and the mock listens only on
+/// `127.0.0.1`.
+/// claim: REL-20
+/// defect: D40
+#[tokio::test]
+async fn dns_tries_the_next_address_when_the_first_is_dead() {
+    let addrs: Vec<_> = tokio::net::lookup_host("localhost:80")
+        .await
+        .map(|a| a.collect())
+        .unwrap_or_default();
+    let v6_first = addrs.first().is_some_and(|a| a.is_ipv6());
+    if !(v6_first && addrs.iter().any(|a| a.is_ipv4())) {
+        eprintln!("SKIP: localhost does not resolve ::1 before 127.0.0.1 here ({addrs:?})");
+        return;
+    }
+    let (pubkey, _sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::builder(unused_nats_port(), &mock.authority(), &b64(&pubkey))
+        .provider_authority("openai", &format!("localhost:{}", mock.port))
+        .start()
+        .await;
+    let status = test_client()
+        .post(format!("{}/openai/v1/chat/completions", gw.url()))
+        .header("authorization", "Bearer sk-byo-test")
+        .header("content-type", "application/json")
+        .body(r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .map(|r| r.status().as_u16())
+        .unwrap_or(0);
+    assert_eq!(
+        status,
+        200,
+        "localhost -> {addrs:?}; upstream hits {}",
+        mock.hits()
+    );
+}
+
+/// A panic inside a proxy phase skips `logging`, which is where a request gives back what it holds.
+/// The request context's drop must give it back instead: the in-flight and SSE gauges return to 0
+/// and the tenant's only concurrency slot is free for its next request. `AI_FAULT_PANIC` (debug
+/// builds only) panics the first request to reach `response_body_filter`, mid-stream.
+/// claim: REL-17
+/// defect: D39
+#[tokio::test]
+async fn a_panic_in_a_proxy_phase_releases_what_the_request_held() {
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::Sse).await;
+    let gw = Gateway::builder(unused_nats_port(), &mock.authority(), &b64(&pubkey))
+        .tenant_max_in_flight(1)
+        .env("AI_FAULT_PANIC", "response_body_filter")
+        .start()
+        .await;
+    let key = vkey(&sk, 39);
+    let send = || {
+        test_client()
+            .post(format!("{}/openai/v1/chat/completions", gw.url()))
+            .header("authorization", format!("Bearer {key}"))
+            .header("content-type", "application/json")
+            .body(STREAM_BODY)
+            .send()
+    };
+    // The panicking request: the connection dies mid-response, whatever the client makes of it.
+    let first = match send().await {
+        Ok(r) => r.text().await.map(|_| ()).map_err(|e| e.to_string()),
+        Err(e) => Err(e.to_string()),
+    };
+    // The panic message reaches the captured log through a reader thread, which can trail the
+    // dropped connection under load: wait for it rather than read the log once.
+    eprintln!("first request: {first:?}");
+    gw.wait_for_log_line(&["AI_FAULT_PANIC"]).await;
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(5)
+        && (gw.metric("ai_requests_in_flight", "").await != 0.0
+            || gw.metric("ai_active_streams", "").await != 0.0)
+    {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(gw.metric("ai_requests_in_flight", "").await, 0.0);
+    assert_eq!(gw.metric("ai_active_streams", "").await, 0.0);
+    // The tenant's single slot came back: its next request is served, not 429.
+    let second = send().await.unwrap();
+    assert_eq!(second.status().as_u16(), 200);
+}
+
+/// The drain waits for in-flight work: a request already running when SIGTERM lands finishes with
+/// its answer and its billing row, and the process exits right after it, not at the grace's end.
+/// claim: REL-16, BIL-21
+/// defect: D38
+#[tokio::test]
+async fn sigterm_drains_an_in_flight_request_then_exits() {
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::Slow(1500)).await;
+    let mut gw = Gateway::start(unused_nats_port(), &mock.authority(), &b64(&pubkey)).await;
+    let (url, key) = (gw.url(), vkey(&sk, 38));
+    let held = tokio::spawn(async move {
+        test_client()
+            .post(format!("{url}/openai/v1/chat/completions"))
+            .header("authorization", format!("Bearer {key}"))
+            .header("content-type", "application/json")
+            .body(r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}"#)
+            .send()
+            .await
+            .map(|r| r.status().as_u16())
+    });
+    wait_for_metric(&gw, "ai_requests_in_flight", "", 1.0).await;
+    gw.sigterm();
+    let exited = gw.wait_exit(Duration::from_secs(15)).await;
+    let status = held.await.unwrap();
+    assert_eq!(status.ok(), Some(200), "the in-flight request was cut");
+    assert!(
+        exited.is_some_and(|t| t < Duration::from_secs(5)),
+        "exit after the drain: {exited:?}"
+    );
+    assert!(
+        gw.log().contains("\"target\":\"ai.usage\""),
+        "the drained request's billing row was not written"
+    );
+}
+
+/// The catalog walk does the same: a candidate whose first address is dead is tried on its next
+/// address before the walk gives up on it.
+/// claim: REL-20
+/// defect: D40
+#[tokio::test]
+async fn a_catalog_candidate_is_tried_on_its_next_address() {
+    let addrs: Vec<_> = tokio::net::lookup_host("localhost:80")
+        .await
+        .map(|a| a.collect())
+        .unwrap_or_default();
+    let v6_first = addrs.first().is_some_and(|a| a.is_ipv6());
+    if !(v6_first && addrs.iter().any(|a| a.is_ipv4())) {
+        eprintln!("SKIP: localhost does not resolve ::1 before 127.0.0.1 here ({addrs:?})");
+        return;
+    }
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::builder(unused_nats_port(), &mock.authority(), &b64(&pubkey))
+        .providers(&["openai", "openrouter"])
+        .provider_authority("openai", &format!("localhost:{}", mock.port))
+        .provider_authority("openrouter", &GatewayBuilder::dead_authority())
+        .start()
+        .await;
+    let resp = test_client()
+        .post(format!("{}/auto/chat/completions", gw.url()))
+        .header("authorization", format!("Bearer {}", vkey(&sk, 40)))
+        .header("content-type", "application/json")
+        .header("x-beyond-model", "gpt-4o-mini")
+        .header("x-beyond-order", "openai,openrouter")
+        .body(r#"{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        (
+            resp.status().as_u16(),
+            resp.headers()
+                .get("x-beyond-provider")
+                .and_then(|v| v.to_str().ok())
+                .map(String::from)
+        ),
+        (200, Some("openai".to_string())),
+        "upstream hits {}",
+        mock.hits()
+    );
+}
+
+/// A body the process budget cannot hold is refused before it is read: a 503 with `Retry-After`
+/// and a JSON error, counted on `ai_rejections_total{reason="body_memory"}`. A body within the
+/// budget is still served.
+/// claim: SEC-19
+/// defect: D35
+#[tokio::test]
+async fn a_body_past_the_memory_budget_is_a_retryable_503() {
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::builder(unused_nats_port(), &mock.authority(), &b64(&pubkey))
+        .config_line("max_buffered_body_bytes = 1048576")
+        .start()
+        .await;
+    let chat = |pad: usize| {
+        format!(
+            r#"{{"model":"gpt-4o-mini","messages":[{{"role":"user","content":"{}"}}]}}"#,
+            "x".repeat(pad)
+        )
+    };
+    let send = |body: String| {
+        test_client()
+            .post(format!("{}/v1/chat/completions", gw.url()))
+            .header("authorization", format!("Bearer {}", vkey(&sk, 35)))
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+    };
+    // 1 MiB declared, held twice: past the 1 MiB budget.
+    let resp = send(chat(1 << 20)).await.unwrap();
+    let status = resp.status().as_u16();
+    let retry_after = resp.headers().get("retry-after").is_some();
+    let text = resp.text().await.unwrap_or_default();
+    assert!(
+        status == 503 && retry_after && text.contains("too many large request bodies"),
+        "status {status} retry-after {retry_after}: {text}"
+    );
+    assert_eq!(mock.hits(), 0, "refused before any upstream attempt");
+    wait_for_metric(&gw, "ai_rejections_total", "body_memory", 1.0).await;
+    // 200 KiB, held twice: within it.
+    let ok = send(chat(200 * 1024)).await.unwrap();
+    assert_eq!(ok.status().as_u16(), 200);
+}

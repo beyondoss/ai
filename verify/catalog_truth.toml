@@ -1,0 +1,1912 @@
+# Vendor-published facts behind `crates/providers/src/catalog.rs`, as data a test checks.
+#
+# One [[row]] per catalog row whose primary candidate is a direct vendor. Every field is the value
+# the PRIMARY vendor publishes, read from `source` on `date`. A field the vendor does not publish is
+# omitted, never guessed. Prices are USD per million tokens, as the vendor wrote them; the standard
+# tier only (not batch/flex; DeepSeek peak; xAI < 200k prompt; OpenAI <= 272K input).
+#
+# A row whose primary is OpenRouter may also have an entry when the model's maker sells it through
+# its own API and publishes the facts (Z.ai's GLM, Moonshot's Kimi, OpenAI's Codex ids): the card
+# then follows the maker, never OpenRouter's listing.
+#
+# `follows = "maker"` marks a Together-primary row whose recorded price is the maker's own (Alibaba's
+# Qwen, Moonshot's Kimi). CAT-7 then accepts Together listing less than the card (a note), and fails
+# Together listing more: that bills customers below our cost, which is an owner pricing decision.
+#
+# Two fields record a limit the row's candidates enforce below the vendor's published figure. The
+# card states the smaller one, so a request sized from it is accepted wherever the walk lands:
+# - `input_limit`: the most input tokens every candidate accepts, when lower than `context_window`
+#   (OpenAI's GPT-5 family counts output inside the window and caps input at the window less the
+#   max output; a failover host serving a smaller window).
+# - `output_limit`: the most output tokens one request can ask for, when lower than
+#   `max_output_tokens`.
+# Either needs `limit_evidence`: the measurement or document that sets it.
+#
+# `created` (Unix seconds) and `owned_by` are the vendor's own model listing (`GET /v1/models` at
+# api.openai.com / api.x.ai), not OpenRouter's listing date.
+#
+# `[[promo]]` records a vendor-announced promotional rate that some route charges while the card
+# keeps the standard rate (the catalog_live CAT-7 check accepts a charge at that rate until `until`).
+# `cache_read` is the promotional cached-input rate; without it cached input is held to the card's.
+#
+# `catalog_matches_vendor_truth` (crates/providers/src/catalog.rs) asserts:
+# - every recorded field equals the catalog row's value (`context_window` / `max_output_tokens`
+#   yield to `input_limit` / `output_limit` where recorded);
+# - a row that records `input` but omits `cache_read` / `cache_write` lists the input rate there
+#   (the ListPrice rule for an unpublished rate);
+# - every direct-vendor catalog row has a [[row]] here or an `unverified` entry with a reason.
+#
+# `[[not_serverless]]` entries are (provider, id) pairs the vendor no longer serves to a standard
+# key. No catalog candidate may name one (`no_candidate_is_retired_or_not_serverless`).
+#
+# `[[retired]]` records each vendor retirement, past or scheduled, with the vendor's deprecation
+# notice as `source`. An entry names a candidate (`provider` + `id`, the id as that provider spells
+# it, or a dated snapshot of it), a catalog row (`model`: the row and all its candidates), or both,
+# and carries exactly one date:
+# - `retired`: the vendor no longer serves it. No row may be named `model`, and no candidate may
+#   name the (provider, id). A client's request for it is a 404, never a remap to a successor.
+#   A row removed early by owner decision records the vendor's announced shutdown here too, so
+#   the date can still be ahead (the seven OpenAI rows due 2026-10-23, removed 2026-10-01: D243).
+# - `retires`: the vendor has announced the date. The row or candidate stays until then;
+#   `no_catalog_row_outlives_its_retirement` fails once that date is today or past, so the row is
+#   removed (and the entry turned into `retired`) before a customer's request reaches a vendor
+#   404. `/v1/models` has no deprecation field to carry it (the OpenAI list shape and Anthropic's
+#   `/v1/models` define none), so it is recorded here only.
+# The live cell `CAT-16::raw::{provider}::{row}` (crates/verify/tests/catalog_live.rs) holds each
+# candidate to the vendor's own listing and deprecation notices, so a retirement the vendor
+# announces shows up as a red cell, and a deprecation notice naming a candidate with no entry
+# here fails it.
+#
+# `[[not_carried]]` records a first-party model, in a family the catalog carries, that is
+# deliberately not a row, with the reason. `CAT-16::raw::{anthropic,openai,xai}::new-models`
+# fails on a vendor-listed model in a carried family that is not a row, a vendor-listed alias or
+# dated snapshot of one, nor recorded here or in `[[retired]]`, so a new release surfaces as a
+# visible gap. No model is skipped by name or modality: audio, realtime, image and video models
+# are recorded here one by one, with the endpoint they need that the gateway doesn't serve.
+#
+# `[[schema_unenforced]]` records a candidate that accepts a JSON-schema output request
+# (`response_format` `json_schema`, `strict: true`) and answers outside the schema, with the
+# OpenRouter endpoint listing that claimed otherwise and the measurement (D155). OpenRouter's
+# per-endpoint `supported_parameters` (`GET /api/v1/models/{id}/endpoints`) is not ground truth:
+# hosts that list `structured_outputs` answer fenced, renamed or broken JSON, and
+# `provider.require_parameters` does not avoid them. `schema_unenforced_candidates_match_truth`
+# asserts that each such candidate either sits on a row whose card does not advertise
+# `structured_outputs`, or is one `serves_structured_outputs` refuses (so a schema request skips
+# it), that every candidate it refuses (Bedrock aside) is recorded here, and that every
+# advertising card keeps a candidate that enforces the schema.
+#
+# Source audit: verify/catalog_truth_2026-10-01.md (raw pages fetched with curl and parsed locally).
+
+# Direct-vendor rows with no checked vendor facts, as { model = "...", reason = "..." }. Empty:
+# every direct-vendor row has a [[row]] below.
+unverified = []
+
+[[row]]
+model = "claude-fable-5"
+source = [
+  "https://platform.claude.com/docs/en/about-claude/pricing.md",
+  "https://platform.claude.com/docs/en/about-claude/models/overview.md",
+  "https://platform.claude.com/docs/en/about-claude/models/claude-fable-5/overview.md",
+]
+date = "2026-10-01"
+input = "10"
+output = "50"
+cache_read = "1"
+cache_write = "12.50"
+context_window = 1_000_000
+max_output_tokens = 128_000
+
+[[row]]
+model = "claude-fable-5-1"
+source = [
+  "https://platform.claude.com/docs/en/about-claude/pricing.md",
+  "https://platform.claude.com/docs/en/about-claude/models/overview.md",
+  "https://platform.claude.com/docs/en/about-claude/models/claude-fable-5-1/overview.md",
+]
+date = "2026-10-01"
+input = "10"
+output = "50"
+cache_read = "0.25"
+cache_write = "12.50"
+context_window = 1_000_000
+max_output_tokens = 128_000
+
+[[row]]
+model = "claude-haiku-4-5"
+source = [
+  "https://platform.claude.com/docs/en/about-claude/pricing.md",
+  "https://platform.claude.com/docs/en/about-claude/models/overview.md",
+  "https://platform.claude.com/docs/en/about-claude/models/claude-haiku-4-5/overview.md",
+]
+date = "2026-10-01"
+input = "1"
+output = "5"
+cache_read = "0.10"
+cache_write = "1.25"
+context_window = 200_000
+max_output_tokens = 64_000
+
+[[row]]
+model = "claude-opus-4-5"
+source = [
+  "https://platform.claude.com/docs/en/about-claude/pricing.md",
+  "https://platform.claude.com/docs/en/about-claude/models/overview.md",
+  "https://platform.claude.com/docs/en/about-claude/models/claude-opus-4-5/overview.md",
+]
+date = "2026-10-01"
+input = "5"
+output = "25"
+cache_read = "0.50"
+cache_write = "6.25"
+context_window = 200_000
+max_output_tokens = 64_000
+
+[[row]]
+model = "claude-opus-4-6"
+source = [
+  "https://platform.claude.com/docs/en/about-claude/pricing.md",
+  "https://platform.claude.com/docs/en/about-claude/models/overview.md",
+  "https://platform.claude.com/docs/en/about-claude/models/claude-opus-4-6/overview.md",
+]
+date = "2026-10-01"
+input = "5"
+output = "25"
+cache_read = "0.50"
+cache_write = "6.25"
+context_window = 1_000_000
+max_output_tokens = 128_000
+
+[[row]]
+model = "claude-opus-4-7"
+source = [
+  "https://platform.claude.com/docs/en/about-claude/pricing.md",
+  "https://platform.claude.com/docs/en/about-claude/models/overview.md",
+  "https://platform.claude.com/docs/en/about-claude/models/claude-opus-4-7/overview.md",
+]
+date = "2026-10-01"
+input = "5"
+output = "25"
+cache_read = "0.50"
+cache_write = "6.25"
+context_window = 1_000_000
+max_output_tokens = 128_000
+
+[[row]]
+model = "claude-opus-4-8"
+source = [
+  "https://platform.claude.com/docs/en/about-claude/pricing.md",
+  "https://platform.claude.com/docs/en/about-claude/models/overview.md",
+  "https://platform.claude.com/docs/en/about-claude/models/claude-opus-4-8/overview.md",
+]
+date = "2026-10-01"
+input = "5"
+output = "25"
+cache_read = "0.50"
+cache_write = "6.25"
+context_window = 1_000_000
+max_output_tokens = 128_000
+
+[[row]]
+model = "claude-opus-5"
+source = [
+  "https://platform.claude.com/docs/en/about-claude/pricing.md",
+  "https://platform.claude.com/docs/en/about-claude/models/overview.md",
+  "https://platform.claude.com/docs/en/about-claude/models/claude-opus-5/overview.md",
+]
+date = "2026-10-01"
+input = "5"
+output = "25"
+cache_read = "0.50"
+cache_write = "6.25"
+context_window = 1_000_000
+max_output_tokens = 128_000
+
+[[row]]
+model = "claude-opus-5-5"
+source = [
+  "https://platform.claude.com/docs/en/about-claude/pricing.md",
+  "https://platform.claude.com/docs/en/about-claude/models/overview.md",
+  "https://platform.claude.com/docs/en/about-claude/models/claude-opus-5-5/overview.md",
+]
+date = "2026-10-01"
+input = "4"
+output = "20"
+cache_read = "0.20"
+cache_write = "5"
+context_window = 1_000_000
+max_output_tokens = 128_000
+
+[[row]]
+model = "claude-sonnet-4-5"
+source = [
+  "https://platform.claude.com/docs/en/about-claude/pricing.md",
+  "https://platform.claude.com/docs/en/about-claude/models/overview.md",
+  "https://platform.claude.com/docs/en/about-claude/models/claude-sonnet-4-5/overview.md",
+]
+date = "2026-10-01"
+input = "3"
+output = "15"
+cache_read = "0.30"
+cache_write = "3.75"
+context_window = 200_000
+max_output_tokens = 64_000
+note = "Deprecated 2026-09-30, retires 2026-11-30. \"Context window: 200K tokens · Max output: 64K\"."
+
+[[row]]
+model = "claude-sonnet-4-6"
+source = [
+  "https://platform.claude.com/docs/en/about-claude/pricing.md",
+  "https://platform.claude.com/docs/en/about-claude/models/overview.md",
+  "https://platform.claude.com/docs/en/about-claude/models/claude-sonnet-4-6/overview.md",
+]
+date = "2026-10-01"
+input = "3"
+output = "15"
+cache_read = "0.30"
+cache_write = "3.75"
+context_window = 1_000_000
+max_output_tokens = 128_000
+
+[[row]]
+model = "claude-sonnet-5"
+source = [
+  "https://platform.claude.com/docs/en/about-claude/pricing.md",
+  "https://platform.claude.com/docs/en/about-claude/models/overview.md",
+  "https://platform.claude.com/docs/en/about-claude/models/claude-sonnet-5/overview.md",
+]
+date = "2026-10-01"
+input = "2"
+output = "10"
+cache_read = "0.20"
+cache_write = "2.50"
+context_window = 1_000_000
+max_output_tokens = 128_000
+
+[[row]]
+model = "claude-sonnet-5-5"
+source = [
+  "https://platform.claude.com/docs/en/about-claude/pricing.md",
+  "https://platform.claude.com/docs/en/about-claude/models/overview.md",
+  "https://platform.claude.com/docs/en/about-claude/models/claude-sonnet-5-5/overview.md",
+]
+date = "2026-10-01"
+input = "2"
+output = "10"
+cache_read = "0.20"
+cache_write = "2.50"
+context_window = 1_000_000
+max_output_tokens = 128_000
+
+[[row]]
+model = "deepseek-flash"
+source = [
+  "https://api-docs.deepseek.com/quick_start/pricing",
+  "https://docs.together.ai/docs/serverless/models",
+]
+date = "2026-10-01"
+input = "0.30"
+output = "1.20"
+cache_read = "0.006"
+context_window = 1_048_576
+max_output_tokens = 384_000
+input_present = ["image"]
+note = "DeepSeek-V4.1-Flash. Vision supported. Off-peak $0.15 / $0.003 / $0.60. Together serves the same model serverless as deepseek-ai/DeepSeek-V4.1-Flash (its serverless table; /v1/models type chat, 1,048,576 context, $0.30 / $1.20 / cached $0.006, DeepSeek's peak rate) and read an image (codeword.png, 2026-10-01). OpenRouter's listing (GET /api/v1/models/deepseek/deepseek-v4.1-flash/endpoints) names Hugging Face id deepseek-ai/DeepSeek-V4.1-Flash, input text and image."
+
+[[row]]
+model = "deepseek-v4-pro"
+source = [
+  "https://api-docs.deepseek.com/quick_start/pricing",
+  "https://docs.together.ai/docs/serverless/models",
+]
+date = "2026-10-01"
+input = "1.32"
+output = "3.96"
+cache_read = "0.044"
+context_window = 1_048_576
+max_output_tokens = 384_000
+input_absent = ["image"]
+note = "DeepSeek-V4-Pro-0813. \"Vision: Not supported\". Off-peak $0.66 / $0.022 / $1.98. Together serves the same snapshot as deepseek-ai/DeepSeek-V4-Pro-0813. So does OpenRouter's deepseek/deepseek-v4-pro-0813 (GET /api/v1/models/deepseek/deepseek-v4-pro-0813/endpoints: \"DeepSeek V4 Pro 0813 ... the GA release of DeepSeek V4 Pro\", Hugging Face id deepseek-ai/DeepSeek-V4-Pro-0813, input text only, 1,048,576 context, 21 endpoints, DeepSeek's own among them, 2026-10-01); its bare deepseek/deepseek-v4-pro is the 0423 snapshot."
+
+[[row]]
+model = "gpt-4.1"
+source = [
+  "https://api.openai.com/v1/models",
+  "https://developers.openai.com/api/docs/pricing.md",
+  "https://developers.openai.com/api/docs/models/gpt-4.1.md",
+]
+date = "2026-10-01"
+input = "2"
+output = "8"
+cache_read = "0.5"
+context_window = 1_047_576
+max_output_tokens = 32_768
+created = 1744316542
+
+[[row]]
+model = "gpt-4.1-mini"
+source = [
+  "https://api.openai.com/v1/models",
+  "https://developers.openai.com/api/docs/pricing.md",
+  "https://developers.openai.com/api/docs/models/gpt-4.1-mini.md",
+]
+date = "2026-10-01"
+input = "0.4"
+output = "1.6"
+cache_read = "0.1"
+context_window = 1_047_576
+max_output_tokens = 32_768
+created = 1744318173
+
+[[row]]
+model = "gpt-4o"
+source = [
+  "https://api.openai.com/v1/models",
+  "https://developers.openai.com/api/docs/pricing.md",
+  "https://developers.openai.com/api/docs/models/gpt-4o.md",
+]
+date = "2026-10-01"
+input = "2.5"
+output = "10"
+cache_read = "1.25"
+context_window = 128_000
+max_output_tokens = 16_384
+created = 1715367049
+
+[[row]]
+model = "gpt-4o-mini"
+source = [
+  "https://api.openai.com/v1/models",
+  "https://developers.openai.com/api/docs/pricing.md",
+  "https://developers.openai.com/api/docs/models/gpt-4o-mini.md",
+]
+date = "2026-10-01"
+input = "0.15"
+output = "0.6"
+cache_read = "0.075"
+context_window = 128_000
+max_output_tokens = 16_384
+created = 1721172741
+
+[[row]]
+model = "gpt-5"
+source = [
+  "https://api.openai.com/v1/models",
+  "https://developers.openai.com/api/docs/pricing.md",
+  "https://developers.openai.com/api/docs/models/gpt-5.md",
+]
+date = "2026-10-01"
+input = "1.25"
+output = "10"
+cache_read = "0.125"
+context_window = 400_000
+max_output_tokens = 128_000
+created = 1754425777
+input_limit = 272_000
+limit_evidence = "OpenAI API: 400 context_length_exceeded \"Input tokens exceed the configured limit of 272000 tokens\" (catalog sweep 2026-10-01, CAT-3::raw::openai); the window counts the 128K max output."
+note = "Default snapshot shuts down 2026-12-11."
+
+[[row]]
+model = "gpt-5-mini"
+source = [
+  "https://api.openai.com/v1/models",
+  "https://developers.openai.com/api/docs/pricing.md",
+  "https://developers.openai.com/api/docs/models/gpt-5-mini.md",
+]
+date = "2026-10-01"
+input = "0.25"
+output = "2"
+cache_read = "0.025"
+context_window = 400_000
+max_output_tokens = 128_000
+created = 1754425928
+input_limit = 272_000
+limit_evidence = "OpenAI API: 400 context_length_exceeded \"Input tokens exceed the configured limit of 272000 tokens\" (catalog sweep 2026-10-01, CAT-3::raw::openai); the window counts the 128K max output."
+note = "Default snapshot shuts down 2026-12-11."
+
+[[row]]
+model = "gpt-5-nano"
+source = [
+  "https://api.openai.com/v1/models",
+  "https://developers.openai.com/api/docs/pricing.md",
+  "https://developers.openai.com/api/docs/models/gpt-5-nano.md",
+]
+date = "2026-10-01"
+input = "0.05"
+output = "0.4"
+cache_read = "0.005"
+context_window = 400_000
+max_output_tokens = 128_000
+created = 1754426384
+input_limit = 272_000
+limit_evidence = "OpenAI API: 400 context_length_exceeded \"Input tokens exceed the configured limit of 272000 tokens\" (catalog sweep 2026-10-01, CAT-3::raw::openai); the window counts the 128K max output."
+note = "Default snapshot shuts down 2026-12-11."
+
+[[row]]
+model = "gpt-5-pro"
+source = [
+  "https://api.openai.com/v1/models",
+  "https://developers.openai.com/api/docs/pricing.md",
+  "https://developers.openai.com/api/docs/models/gpt-5-pro.md",
+]
+date = "2026-10-01"
+input = "15"
+output = "120"
+context_window = 400_000
+max_output_tokens = 272_000
+input_limit = 128_000
+limit_evidence = "The window less the 272K max output: the rule OpenAI's API enforces on every measured GPT-5-family row (input cap = window - max output). Not measurable on the pool key: its gpt-5-pro TPM is 200,000, and Responses' context error names no number."
+created = 1759469822
+note = "Responses only. Default snapshot shuts down 2026-12-11."
+
+[[row]]
+model = "gpt-5.1"
+source = [
+  "https://api.openai.com/v1/models",
+  "https://developers.openai.com/api/docs/pricing.md",
+  "https://developers.openai.com/api/docs/models/gpt-5.1.md",
+]
+date = "2026-10-01"
+input = "1.25"
+output = "10"
+cache_read = "0.125"
+context_window = 400_000
+max_output_tokens = 128_000
+created = 1762800673
+input_limit = 272_000
+limit_evidence = "OpenAI API: 400 context_length_exceeded \"Input tokens exceed the configured limit of 272000 tokens\" (catalog sweep 2026-10-01, CAT-3::raw::openai); the window counts the 128K max output."
+
+[[row]]
+model = "gpt-5.2"
+source = [
+  "https://api.openai.com/v1/models",
+  "https://developers.openai.com/api/docs/pricing.md",
+  "https://developers.openai.com/api/docs/models/gpt-5.2.md",
+]
+date = "2026-10-01"
+input = "1.75"
+output = "14"
+cache_read = "0.175"
+context_window = 400_000
+max_output_tokens = 128_000
+created = 1765313051
+input_limit = 272_000
+limit_evidence = "OpenAI API: 400 context_length_exceeded \"Input tokens exceed the configured limit of 272000 tokens\" (catalog sweep 2026-10-01, CAT-3::raw::openai); the window counts the 128K max output."
+
+[[row]]
+model = "gpt-5.2-pro"
+source = [
+  "https://api.openai.com/v1/models",
+  "https://developers.openai.com/api/docs/pricing.md",
+  "https://developers.openai.com/api/docs/models/gpt-5.2-pro.md",
+]
+date = "2026-10-01"
+input = "21"
+output = "168"
+features_absent = ["structured_outputs"]
+created = 1765343983
+note = "Responses only."
+
+[[row]]
+model = "gpt-5.3-codex"
+source = [
+  "https://api.openai.com/v1/models",
+  "https://developers.openai.com/api/docs/pricing.md",
+  "https://developers.openai.com/api/docs/models/gpt-5.3-codex.md",
+]
+date = "2026-10-01"
+input = "1.75"
+output = "14"
+cache_read = "0.175"
+context_window = 400_000
+max_output_tokens = 128_000
+created = 1770537915
+input_limit = 272_000
+limit_evidence = "The window less the 128K max output, as OpenAI enforces on every measured GPT-5-family row (Chat Completions names the cap; Responses, this model's only endpoint, answers \"Your input exceeds the context window of this model\" without a number)."
+
+[[row]]
+model = "gpt-5.4"
+source = [
+  "https://api.openai.com/v1/models",
+  "https://developers.openai.com/api/docs/pricing.md",
+  "https://developers.openai.com/api/docs/models/gpt-5.4.md",
+]
+date = "2026-10-01"
+input = "2.5"
+output = "15"
+cache_read = "0.25"
+context_window = 1_050_000
+max_output_tokens = 128_000
+created = 1772691852
+input_limit = 922_000
+limit_evidence = "OpenAI API: 400 context_length_exceeded \"Input tokens exceed the configured limit of 922000 tokens\" (catalog sweep 2026-10-01, CAT-3::raw::openai); the window counts the 128K max output."
+note = ">272K input: 2x input, 1.5x output (not listed)."
+
+[[row]]
+model = "gpt-5.4-mini"
+source = [
+  "https://api.openai.com/v1/models",
+  "https://developers.openai.com/api/docs/pricing.md",
+  "https://developers.openai.com/api/docs/models/gpt-5.4-mini.md",
+]
+date = "2026-10-01"
+input = "0.75"
+output = "4.5"
+cache_read = "0.075"
+context_window = 400_000
+max_output_tokens = 128_000
+created = 1773451123
+input_limit = 272_000
+limit_evidence = "OpenAI API: 400 context_length_exceeded \"Input tokens exceed the configured limit of 272000 tokens\" (catalog sweep 2026-10-01, CAT-3::raw::openai); the window counts the 128K max output."
+
+[[row]]
+model = "gpt-5.4-nano"
+source = [
+  "https://api.openai.com/v1/models",
+  "https://developers.openai.com/api/docs/pricing.md",
+  "https://developers.openai.com/api/docs/models/gpt-5.4-nano.md",
+]
+date = "2026-10-01"
+input = "0.2"
+output = "1.25"
+cache_read = "0.02"
+context_window = 400_000
+max_output_tokens = 128_000
+created = 1773450870
+input_limit = 272_000
+limit_evidence = "OpenAI API: 400 context_length_exceeded \"Input tokens exceed the configured limit of 272000 tokens\" (catalog sweep 2026-10-01, CAT-3::raw::openai); the window counts the 128K max output."
+
+[[row]]
+model = "gpt-5.4-pro"
+source = [
+  "https://api.openai.com/v1/models",
+  "https://developers.openai.com/api/docs/pricing.md",
+  "https://developers.openai.com/api/docs/models/gpt-5.4-pro.md",
+]
+date = "2026-10-01"
+input = "30"
+output = "180"
+features_absent = ["structured_outputs"]
+created = 1772659601
+note = ">272K input tier not listed."
+
+[[row]]
+model = "gpt-5.5"
+source = [
+  "https://api.openai.com/v1/models",
+  "https://developers.openai.com/api/docs/pricing.md",
+  "https://developers.openai.com/api/docs/models/gpt-5.5.md",
+]
+date = "2026-10-01"
+input = "5"
+output = "30"
+cache_read = "0.5"
+context_window = 1_050_000
+max_output_tokens = 128_000
+created = 1776824847
+input_limit = 922_000
+limit_evidence = "OpenAI API: 400 context_length_exceeded \"Input tokens exceed the configured limit of 922000 tokens\" (catalog sweep 2026-10-01, CAT-3::raw::openai); the window counts the 128K max output."
+note = ">272K input tier not listed."
+
+[[row]]
+model = "gpt-5.5-pro"
+source = [
+  "https://api.openai.com/v1/models",
+  "https://developers.openai.com/api/docs/pricing.md",
+  "https://developers.openai.com/api/docs/models/gpt-5.5-pro.md",
+]
+date = "2026-10-01"
+input = "30"
+output = "180"
+context_window = 1_050_000
+max_output_tokens = 128_000
+created = 1776894349
+input_limit = 922_000
+limit_evidence = "The window less the 128K max output, as OpenAI enforces on every measured GPT-5-family row; Responses-only, and its error names no number."
+note = ">272K input tier not listed."
+
+[[row]]
+model = "gpt-5.6-luna"
+source = [
+  "https://api.openai.com/v1/models",
+  "https://developers.openai.com/api/docs/pricing.md",
+  "https://developers.openai.com/api/docs/models/gpt-5.6-luna.md",
+]
+date = "2026-10-01"
+input = "0.2"
+output = "1.2"
+cache_read = "0.02"
+cache_write = "0.25"
+context_window = 1_050_000
+max_output_tokens = 128_000
+created = 1782228658
+input_limit = 922_000
+limit_evidence = "OpenAI API: 400 context_length_exceeded \"Input tokens exceed the configured limit of 922000 tokens\" (catalog sweep 2026-10-01, CAT-3::raw::openai); the window counts the 128K max output."
+
+[[row]]
+model = "gpt-5.6-sol"
+source = [
+  "https://api.openai.com/v1/models",
+  "https://developers.openai.com/api/docs/pricing.md",
+  "https://developers.openai.com/api/docs/models/gpt-5.6-sol.md",
+]
+date = "2026-10-01"
+input = "4.00"
+output = "20.00"
+cache_read = "0.40"
+cache_write = "5.00"
+context_window = 1_050_000
+max_output_tokens = 128_000
+created = 1782228018
+input_limit = 922_000
+limit_evidence = "OpenAI API: 400 context_length_exceeded \"Input tokens exceed the configured limit of 922000 tokens\" (catalog sweep 2026-10-01, CAT-3::raw::openai); the window counts the 128K max output."
+note = "Standard tier. The $2 / $10 row is Batch/Flex. \"Promotional pricing is available at least through November 21, 2026\" (not listed)."
+
+[[row]]
+model = "gpt-5.6-terra"
+source = [
+  "https://api.openai.com/v1/models",
+  "https://developers.openai.com/api/docs/pricing.md",
+  "https://developers.openai.com/api/docs/models/gpt-5.6-terra.md",
+]
+date = "2026-10-01"
+input = "2"
+output = "12"
+cache_read = "0.2"
+cache_write = "2.5"
+context_window = 1_050_000
+max_output_tokens = 128_000
+created = 1782228459
+input_limit = 922_000
+limit_evidence = "OpenAI API: 400 context_length_exceeded \"Input tokens exceed the configured limit of 922000 tokens\" (catalog sweep 2026-10-01, CAT-3::raw::openai); the window counts the 128K max output."
+
+[[row]]
+model = "gpt-6-astra"
+source = [
+  "https://api.openai.com/v1/models",
+  "https://developers.openai.com/api/docs/pricing.md",
+  "https://developers.openai.com/api/docs/models/gpt-6-astra.md",
+]
+date = "2026-10-01"
+input = "10"
+output = "50"
+cache_read = "1"
+cache_write = "12.5"
+context_window = 1_050_000
+max_output_tokens = 128_000
+created = 1787853604
+input_limit = 922_000
+limit_evidence = "OpenAI API: 400 context_length_exceeded \"Input tokens exceed the configured limit of 922000 tokens\" (catalog sweep 2026-10-01, CAT-3::raw::openai); the window counts the 128K max output."
+
+[[row]]
+model = "gpt-6-luna"
+source = [
+  "https://api.openai.com/v1/models",
+  "https://developers.openai.com/api/docs/pricing.md",
+  "https://developers.openai.com/api/docs/models/gpt-6-luna.md",
+]
+date = "2026-10-01"
+input = "0.1"
+output = "0.5"
+cache_read = "0.01"
+cache_write = "0.125"
+context_window = 1_050_000
+max_output_tokens = 128_000
+created = 1789406102
+input_limit = 922_000
+limit_evidence = "The model page: \"Maximum input tokens: 922,000\" of the 1,050,000 window (the window counts the 128K max output)."
+
+[[row]]
+model = "gpt-6-sol"
+source = [
+  "https://api.openai.com/v1/models",
+  "https://developers.openai.com/api/docs/pricing.md",
+  "https://developers.openai.com/api/docs/models/gpt-6-sol.md",
+]
+date = "2026-10-01"
+input = "2"
+output = "10"
+cache_read = "0.2"
+cache_write = "2.5"
+context_window = 1_050_000
+max_output_tokens = 128_000
+created = 1789405937
+input_limit = 922_000
+limit_evidence = "The model page: \"Maximum input tokens: 922,000\" of the 1,050,000 window (the window counts the 128K max output)."
+
+[[row]]
+model = "gpt-6.1-sol"
+source = [
+  "https://api.openai.com/v1/models",
+  "https://developers.openai.com/api/docs/pricing.md",
+  "https://developers.openai.com/api/docs/models/gpt-6.1-sol.md",
+]
+date = "2026-10-01"
+input = "2"
+output = "10"
+cache_read = "0.1"
+cache_write = "2.5"
+context_window = 1_050_000
+max_output_tokens = 128_000
+created = 1790552874
+input_limit = 922_000
+limit_evidence = "The model page: \"Maximum input tokens: 922,000\" of the 1,050,000 window (the window counts the 128K max output)."
+
+# xAI (every grok row reaches xAI over /v1/responses; checked 2026-10-01):
+# - File input: xAI reads inline PDFs (input_file with file_data) on Responses only. Chat
+#   Completions answers 400 "File content is not supported on /v1/chat/completions. Please use
+#   /v1/responses instead." Responses read the fixture PDF on every grok row.
+# - Storage: Responses stores every response for 30 days; `store` defaults to true
+#   (https://docs.x.ai/developers/model-capabilities/text/comparison.md "Control server-side storage
+#   (default: true)"; https://docs.x.ai/developers/model-capabilities/text/generate-text.md). The
+#   gateway sends store: false unless the client asked to store.
+# - Usage on Responses: input_tokens includes input_tokens_details.cached_tokens, and output_tokens
+#   includes output_tokens_details.reasoning_tokens (the OpenAI convention, unlike xAI's Chat
+#   Completions, which reports reasoning beside completion_tokens). Measured against xAI's own
+#   cost_in_usd_ticks: grok-4.3, 205 input (192 cached), 139 output (138 reasoning) = 4,021,500
+#   ticks = 13 x 1.25 + 192 x 0.20 + 139 x 2.50 per million. The reference example
+#   (https://docs.x.ai/developers/rest-api-reference/inference/responses.md) shows reasoning beside
+#   output_tokens (32 + 9 + 110 = 151 total); usage.rs bills either shape by its arithmetic.
+#   Cached tokens: https://docs.x.ai/developers/advanced-api-usage/prompt-caching/usage-and-pricing.md.
+# - Reasoning effort: reasoning.effort on grok-4.3, 4.5, 4.6; grok-4.20 and grok-build-0.1 answer
+#   400 "does not support parameter reasoningEffort" on Responses and Chat Completions alike
+#   (https://docs.x.ai/developers/model-capabilities/text/reasoning.md).
+# - Tools: function tools, tool_choice, parallel_tool_calls; at most 350 tools per request
+#   (https://docs.x.ai/developers/tools/function-calling.md). Streams use OpenAI's Responses event
+#   names (response.created ... response.completed, usage on response.completed).
+[[row]]
+model = "grok-4.20"
+source = [
+  "https://api.x.ai/v1/models",
+  "https://docs.x.ai/developers/pricing.md",
+  "https://docs.x.ai/developers/models/grok-4.20.md",
+]
+date = "2026-10-01"
+input = "1.25"
+output = "2.50"
+cache_read = "0.20"
+context_window = 1_000_000
+created = 1773014400
+owned_by = "xai"
+input_present = ["image", "file"]
+note = "File input is read on xAI /v1/responses, where every grok row reaches xAI (see the comment above grok-4.20)."
+
+[[row]]
+model = "grok-4.20-multi-agent"
+source = [
+  "https://api.x.ai/v1/models",
+  "https://docs.x.ai/developers/pricing.md",
+  "https://docs.x.ai/developers/models/grok-4.20-multi-agent.md",
+]
+date = "2026-10-01"
+input = "1.25"
+output = "2.50"
+cache_read = "0.20"
+context_window = 1_000_000
+features_absent = ["tools"]
+created = 1773014400
+owned_by = "xai"
+note = "xAI's page says \"Function calling: Yes\", but the API answers a function tool with 400 \"Client-side tools for multi-agent models require beta access\" (2026-10-01, /v1/responses, standard key), and Chat Completions refuses multi-agent outright. features_absent records what the pool key can use."
+
+[[row]]
+model = "grok-4.3"
+source = [
+  "https://api.x.ai/v1/models",
+  "https://docs.x.ai/developers/pricing.md",
+  "https://docs.x.ai/developers/models/grok-4.3.md",
+]
+date = "2026-10-01"
+input = "1.25"
+output = "2.50"
+cache_read = "0.20"
+context_window = 1_000_000
+created = 1776384000
+owned_by = "xai"
+input_present = ["image", "file"]
+note = "File input is read on xAI /v1/responses, where every grok row reaches xAI (see the comment above grok-4.20)."
+
+[[row]]
+model = "grok-4.5"
+source = [
+  "https://api.x.ai/v1/models",
+  "https://docs.x.ai/developers/pricing.md",
+  "https://docs.x.ai/developers/models/grok-4.5.md",
+]
+date = "2026-10-01"
+input = "2.00"
+output = "6.00"
+cache_read = "0.30"
+context_window = 500_000
+created = 1782691200
+owned_by = "xai"
+input_present = ["image", "file"]
+note = "File input is read on xAI /v1/responses, where every grok row reaches xAI (see the comment above grok-4.20)."
+
+[[row]]
+model = "grok-4.6"
+source = [
+  "https://api.x.ai/v1/models",
+  "https://docs.x.ai/developers/pricing.md",
+  "https://docs.x.ai/developers/models/grok-4.6.md",
+]
+date = "2026-10-01"
+input = "2.00"
+output = "6.00"
+cache_read = "0.50"
+context_window = 500_000
+created = 1785974400
+owned_by = "xai"
+input_present = ["image", "file"]
+note = "File input is read on xAI /v1/responses, where every grok row reaches xAI (see the comment above grok-4.20)."
+
+[[row]]
+model = "grok-4.7"
+source = [
+  "https://api.x.ai/v1/models",
+  "https://docs.x.ai/developers/pricing.md",
+  "https://docs.x.ai/developers/models/grok-4.7.md",
+]
+date = "2026-10-01"
+input = "2.00"
+output = "6.00"
+cache_read = "0.50"
+context_window = 500_000
+created = 1788307200
+owned_by = "xai"
+input_present = ["image", "file"]
+note = "File input is read on xAI /v1/responses, where every grok row reaches xAI (see the comment above grok-4.20)."
+
+[[row]]
+model = "grok-build-0.1"
+source = [
+  "https://api.x.ai/v1/models",
+  "https://docs.x.ai/developers/pricing.md",
+  "https://docs.x.ai/developers/models/grok-build-0.1.md",
+]
+date = "2026-10-01"
+input = "1.00"
+output = "2.00"
+cache_read = "0.20"
+context_window = 256_000
+created = 1776297600
+owned_by = "xai"
+input_present = ["image", "file"]
+note = "File input is read on xAI /v1/responses, where every grok row reaches xAI (see the comment above grok-4.20). OpenRouter x-ai/grok-build-0.1 answers a PDF with 404 \"No endpoints found that support file input\" (2026-10-01), so a file request skips it."
+
+[[row]]
+model = "llama-3.3-70b-versatile"
+source = [
+  "https://www.together.ai/pricing",
+  "https://docs.together.ai/docs/serverless/models",
+]
+date = "2026-10-01"
+input = "1.04"
+output = "1.04"
+context_window = 131_072
+note = "Primary is Together meta-llama/Llama-3.3-70B-Instruct-Turbo (serverless: Yes)."
+
+[[row]]
+model = "meta/muse-glimmer-30b"
+source = [
+  "https://www.together.ai/pricing",
+  "https://docs.together.ai/docs/serverless/models",
+]
+date = "2026-10-01"
+input = "0.35"
+output = "1.50"
+cache_read = "0.04"
+context_window = 131_072
+
+[[row]]
+model = "minimax/minimax-m3"
+source = [
+  "https://www.together.ai/pricing",
+  "https://docs.together.ai/docs/serverless/models",
+]
+date = "2026-10-01"
+input = "0.30"
+output = "1.20"
+cache_read = "0.06"
+context_window = 524_288
+
+[[row]]
+model = "moonshotai/kimi-k3"
+source = [
+  "https://platform.kimi.ai/docs/pricing/chat",
+  "https://api.together.xyz/v1/models",
+]
+date = "2026-10-01"
+follows = "maker"
+input = "3.00"
+output = "15.00"
+cache_read = "0.30"
+context_window = 1_048_576
+note = "Moonshot's own price (platform.moonshot.ai redirects to platform.kimi.ai). Together's /v1/models lists 2.7 / 13.5 (cached 0.27) on 2026-10-01, below the maker: the card follows the maker (D116, D241)."
+
+[[row]]
+model = "o3"
+source = [
+  "https://api.openai.com/v1/models",
+  "https://developers.openai.com/api/docs/pricing.md",
+  "https://developers.openai.com/api/docs/models/o3.md",
+]
+date = "2026-10-01"
+input = "2"
+output = "8"
+cache_read = "0.5"
+context_window = 200_000
+max_output_tokens = 100_000
+created = 1744225308
+
+[[row]]
+model = "openai/gpt-oss-120b"
+source = [
+  "https://console.groq.com/docs/models",
+  "https://console.groq.com/docs/prompt-caching",
+]
+date = "2026-10-01"
+input = "0.15"
+output = "0.60"
+cache_read = "0.075"
+context_window = 131_072
+max_output_tokens = 65_536
+
+[[row]]
+model = "openai/gpt-oss-20b"
+source = [
+  "https://console.groq.com/docs/models",
+  "https://console.groq.com/docs/prompt-caching",
+]
+date = "2026-10-01"
+input = "0.075"
+output = "0.30"
+cache_read = "0.0375"
+context_window = 131_072
+max_output_tokens = 65_536
+
+[[row]]
+model = "openai/gpt-oss-safeguard-20b"
+source = [
+  "https://console.groq.com/docs/models",
+  "https://console.groq.com/docs/prompt-caching",
+]
+date = "2026-10-01"
+input = "0.075"
+output = "0.30"
+cache_read = "0.0375"
+context_window = 131_072
+max_output_tokens = 65_536
+note = "Preview."
+
+[[row]]
+model = "qwen/qwen3.5-9b"
+source = [
+  "https://www.together.ai/pricing",
+  "https://docs.together.ai/docs/serverless/models",
+]
+date = "2026-10-01"
+input = "0.17"
+output = "0.25"
+context_window = 262_144
+
+[[row]]
+model = "qwen/qwen3.6-plus"
+source = [
+  "https://www.together.ai/pricing",
+  "https://docs.together.ai/docs/serverless/models",
+]
+date = "2026-10-01"
+input = "0.50"
+output = "3.00"
+context_window = 1_000_000
+features_absent = ["structured_outputs"]
+
+[[row]]
+model = "qwen/qwen3.7-max"
+source = [
+  "https://www.alibabacloud.com/help/en/model-studio/model-pricing",
+  "https://api.together.xyz/v1/models",
+]
+date = "2026-10-01"
+follows = "maker"
+input = "2.50"
+output = "7.50"
+cache_read = "0.50"
+note = "Alibaba Cloud Model Studio, International deployment (page updated Sep 28; the Global deployment is 1.65 / 4.951). Together's /v1/models matches: 2.5 / 7.5, cached 0.5 (its pricing page still shows the old 1.5 / 4.5). Cached: Together's listed rate, the maker's implicit-cache 20% of input. Context not published by the maker (D241)."
+
+[[row]]
+model = "qwen/qwen3.7-plus"
+source = [
+  "https://www.together.ai/pricing",
+  "https://docs.together.ai/docs/serverless/models",
+]
+date = "2026-10-01"
+input = "0.32"
+output = "1.28"
+context_window = 1_000_000
+
+[[row]]
+model = "qwen/qwen3.8-2.4t-a95b"
+source = [
+  "https://www.together.ai/pricing",
+  "https://docs.together.ai/docs/serverless/models",
+]
+date = "2026-10-01"
+input = "2.00"
+output = "6.00"
+cache_read = "0.25"
+input_limit = 1_010_000
+limit_evidence = "Together (the primary): 400 \"This model's maximum context length is 1010000 tokens\" (catalog sweep 2026-10-01, CAT-3::raw::together::qwen/qwen3.8-2.4t-a95b). Together publishes no window."
+note = "Cached: pricing page $0.25, docs table $0.50. Context not published."
+
+[[row]]
+model = "qwen/qwen3.8-27b"
+source = [
+  "https://console.groq.com/docs/models",
+  "https://console.groq.com/docs/prompt-caching",
+]
+date = "2026-10-01"
+input = "0.80"
+output = "4.00"
+context_window = 131_072
+max_output_tokens = 16_384
+note = "Preview. No prompt caching."
+
+[[row]]
+model = "qwen/qwen3.8-flash"
+source = [
+  "https://www.alibabacloud.com/help/en/model-studio/model-pricing",
+  "https://api.together.xyz/v1/models",
+]
+date = "2026-10-01"
+follows = "maker"
+input = "0.15"
+output = "0.47"
+context_window = 1_000_000
+note = "Alibaba Cloud Model Studio, International deployment, one tier to 1M (the Global deployment is 0.113 / 0.382). Together's /v1/models matches: 0.15 / 0.47 (its pricing page still shows the old 0.09 / 0.28) (D241)."
+
+[[row]]
+model = "text-embedding-3-large"
+source = ["https://developers.openai.com/api/docs/pricing.md"]
+date = "2026-10-01"
+input = "0.13"
+created = 1705953180
+
+[[row]]
+model = "text-embedding-3-small"
+source = ["https://developers.openai.com/api/docs/pricing.md"]
+date = "2026-10-01"
+input = "0.02"
+created = 1705948997
+
+[[row]]
+model = "thinkingmachines/inkling"
+source = [
+  "https://www.together.ai/pricing",
+  "https://docs.together.ai/docs/serverless/models",
+]
+date = "2026-10-01"
+input = "1.00"
+output = "4.05"
+cache_read = "0.17"
+context_window = 524_288
+
+[[row]]
+model = "z-ai/glm-5.2"
+source = [
+  "https://www.together.ai/pricing",
+  "https://docs.together.ai/docs/serverless/models",
+]
+date = "2026-10-01"
+input = "1.40"
+output = "4.40"
+cache_read = "0.26"
+context_window = 1_048_575
+
+[[row]]
+model = "z-ai/glm-5.3"
+source = [
+  "https://www.together.ai/pricing",
+  "https://docs.together.ai/docs/serverless/models",
+]
+date = "2026-10-01"
+input = "1.40"
+output = "4.40"
+cache_read = "0.26"
+context_window = 1_048_575
+
+[[row]]
+model = "z-ai/glm-5.3-flash"
+source = [
+  "https://www.together.ai/pricing",
+  "https://docs.together.ai/docs/serverless/models",
+]
+date = "2026-10-01"
+input = "0.15"
+output = "0.50"
+cache_read = "0.03"
+context_window = 1_048_575
+features_absent = ["tools"]
+note = "Together lists function calling, but neither candidate calls a tool reliably (D197). Forced get_weather (\"What is the weather in Paris right now? Use the tool.\", tool_choice named, max_tokens 4096), 2026-10-01: direct to Together zai-org/GLM-5.3-Flash, 9 of 100 calls put junk in city (\"Paris (FR, FR-75, 48.8566, 2.3522, 35m a.s.l., UTC+2 Europe/Paris)\", \"Paris temperature:18°C condition:Partly Cloudy ...\") or sent {} (1 of 20 with reasoning enabled, 1 of 20 disabled, 7 of 60 by default); through OpenRouter z-ai/glm-5.3-flash, 9 of 60 (56 served by its Together host, all 9 bad ones among them; 4 by InferenceNet and Wafer, clean). CAT-6::raw::openrouter::z-ai/glm-5.3-flash's own failure was a repetition loop (\"75001/75002/...\") cut off at the token cap, and D115 saw tool-call markup leak into the arguments. Control: Together zai-org/GLM-5.3, 20 of 20 clean. features_absent records what a client can rely on."
+
+[[row]]
+model = "moonshotai/kimi-k2.6"
+source = ["https://platform.moonshot.ai/docs/pricing/chat.md"]
+date = "2026-10-01"
+input = "0.95"
+output = "4.00"
+cache_read = "0.16"
+context_window = 262_144
+note = "OpenRouter-primary; Moonshot's own K2 table (cache hit $0.16, miss $0.95, output $4.00). No cache-write rate."
+features_absent = ["structured_outputs"]
+
+[[row]]
+model = "moonshotai/kimi-k2.7-code"
+source = ["https://platform.moonshot.ai/docs/pricing/chat.md"]
+date = "2026-10-01"
+input = "0.95"
+output = "4.00"
+cache_read = "0.19"
+context_window = 262_144
+note = "OpenRouter-primary; Moonshot's own K2 table (cache hit $0.19, miss $0.95, output $4.00). OpenRouter lists 0.6712 / 3.35, its cheapest host, not the maker's rate."
+features_absent = ["structured_outputs"]
+
+[[row]]
+model = "z-ai/glm-5.1"
+source = ["https://docs.z.ai/guides/overview/pricing.md"]
+date = "2026-10-01"
+input = "1.4"
+output = "4.4"
+cache_read = "0.26"
+note = "OpenRouter-primary; Z.ai's own text-model table. OpenRouter lists 0.9646 / 3.0316, its cheapest host, not the maker's rate."
+
+[[retired]]
+provider = "deepseek"
+id = "deepseek-chat"
+source = "https://api-docs.deepseek.com/updates"
+retired = "2026-07-24"
+note = "The two legacy API model names, deepseek-chat and deepseek-reasoner, will be discontinued in three months (2026-07-24)."
+
+[[retired]]
+provider = "deepseek"
+id = "deepseek-reasoner"
+source = "https://api-docs.deepseek.com/updates"
+retired = "2026-07-24"
+note = "Retired with deepseek-chat."
+
+[[retired]]
+provider = "mistral"
+id = "mistral-nemo"
+source = "https://docs.mistral.ai/models/mistral-nemo-12b-24-07"
+retired = "2026-07-31"
+note = "open-mistral-nemo-2407: deprecated 2026-05-22, retired 2026-07-31. \"Use Ministral 3 8B\"."
+
+[[retired]]
+provider = "mistral"
+id = "open-mistral-nemo-2407"
+source = "https://docs.mistral.ai/models/mistral-nemo-12b-24-07"
+retired = "2026-07-31"
+note = "Dated id of mistral-nemo."
+
+[[retired]]
+model = "claude-opus-4-1"
+provider = "anthropic"
+id = "claude-opus-4-1-20250805"
+source = "https://platform.claude.com/docs/en/about-claude/model-deprecations"
+retired = "2026-08-05"
+note = "Deprecated 2026-06-05, retired on the Claude API 2026-08-05 (replacement claude-opus-4-8). The row was OpenRouter-only (anthropic/claude-opus-4.1, whose one host was Amazon Bedrock, LEGACY there until 2027-01-08); removed by owner decision: a model its maker retired is not served under its name (D181)."
+
+[[retired]]
+provider = "openrouter"
+id = "anthropic/claude-opus-4.1"
+source = "https://platform.claude.com/docs/en/about-claude/model-deprecations"
+retired = "2026-08-05"
+note = "OpenRouter's slug for claude-opus-4-1-20250805 (D181)."
+
+[[retired]]
+model = "claude-sonnet-4"
+provider = "anthropic"
+id = "claude-sonnet-4-20250514"
+source = "https://platform.claude.com/docs/en/about-claude/model-deprecations"
+retired = "2026-06-15"
+note = "Deprecated 2026-04-14, retired on the Claude API 2026-06-15 (replacement claude-sonnet-4-6). The row was OpenRouter-only (anthropic/claude-sonnet-4, Bedrock-served; Bedrock lists it LEGACY, end of life 2026-10-14). Removed with claude-opus-4-1 (D181)."
+
+[[retired]]
+provider = "openrouter"
+id = "anthropic/claude-sonnet-4"
+source = "https://platform.claude.com/docs/en/about-claude/model-deprecations"
+retired = "2026-06-15"
+note = "OpenRouter's slug for claude-sonnet-4-20250514 (D181)."
+
+[[retired]]
+model = "gpt-5.1-codex"
+provider = "openrouter"
+id = "openai/gpt-5.1-codex"
+source = "https://developers.openai.com/api/docs/deprecations"
+retired = "2026-07-23"
+note = "\"Legacy GPT model snapshots (July 2026 shutdown)\": shut down 2026-07-23 (replacement gpt-5.6-sol). OpenAI's /v1/models still lists it on 2026-10-01; OpenRouter serves it from Azure only. The row was OpenRouter-only (D181)."
+
+[[retired]]
+model = "gpt-5.1-codex-max"
+provider = "openrouter"
+id = "openai/gpt-5.1-codex-max"
+source = "https://developers.openai.com/api/docs/deprecations"
+retired = "2026-07-23"
+note = "Shut down 2026-07-23 (replacement gpt-5.6-sol); still in OpenAI's /v1/models listing. OpenRouter-only row, Azure-served (D181)."
+
+[[retired]]
+model = "gpt-5.1-codex-mini"
+provider = "openrouter"
+id = "openai/gpt-5.1-codex-mini"
+source = "https://developers.openai.com/api/docs/deprecations"
+retired = "2026-07-23"
+note = "Shut down 2026-07-23 (replacement gpt-5.6-terra); still in OpenAI's /v1/models listing. OpenRouter-only row, Azure-served (D181)."
+
+[[retired]]
+model = "gpt-5.2-codex"
+provider = "openrouter"
+id = "openai/gpt-5.2-codex"
+source = "https://developers.openai.com/api/docs/deprecations"
+retired = "2026-07-23"
+note = "Shut down 2026-07-23 (replacement gpt-5.6-sol); still in OpenAI's /v1/models listing. OpenRouter-only row, Azure-served (D181)."
+
+[[retired]]
+provider = "openai"
+id = "gpt-5-codex"
+source = "https://developers.openai.com/api/docs/deprecations"
+retired = "2026-07-23"
+note = "Shut down 2026-07-23; still in OpenAI's /v1/models listing, so recorded to keep it out of the new-models gap list. Never a row."
+
+[[retired]]
+model = "claude-sonnet-4-5"
+provider = "anthropic"
+id = "claude-sonnet-4-5-20250929"
+source = "https://platform.claude.com/docs/en/about-claude/model-deprecations"
+retires = "2026-11-30"
+note = "Deprecated 2026-09-30, retires on the Claude API 2026-11-30 (replacement claude-sonnet-5-5). Still ACTIVE on Bedrock, which sets its own schedule; the row goes with its primary (D181)."
+
+[[retired]]
+model = "gpt-4"
+provider = "openai"
+id = "gpt-4-0613"
+source = "https://developers.openai.com/api/docs/deprecations"
+retired = "2026-10-23"
+note = "\"Legacy GPT model snapshots\" (announced 2026-04-22): gpt-4-0613 | gpt-4, shutdown 2026-10-23, replacement gpt-5.6-sol. Removed early by owner decision on 2026-10-01, before the shutdown (D181, D243)."
+
+[[retired]]
+model = "gpt-4-turbo"
+provider = "openai"
+id = "gpt-4-turbo-2024-04-09"
+source = "https://developers.openai.com/api/docs/deprecations"
+retired = "2026-10-23"
+note = "gpt-4-turbo | gpt-4-turbo-2024-04-09: shutdown 2026-10-23, replacement gpt-5.6-sol. Removed early by owner decision on 2026-10-01, before the shutdown (D181, D243)."
+
+[[retired]]
+model = "gpt-4.1-nano"
+provider = "openai"
+id = "gpt-4.1-nano-2025-04-14"
+source = "https://developers.openai.com/api/docs/deprecations"
+retired = "2026-10-23"
+note = "gpt-4.1-nano | gpt-4.1-nano-2025-04-14: shutdown 2026-10-23, replacement gpt-5.6-luna. The BIL-5 OpenAI reconciliation batch moved to gpt-4.1-mini first. Removed early by owner decision on 2026-10-01, before the shutdown (D181, D243)."
+
+[[retired]]
+provider = "openai"
+id = "gpt-4o-2024-05-13"
+source = "https://developers.openai.com/api/docs/deprecations"
+retires = "2026-10-23"
+note = "Only the 2024-05-13 snapshot shuts down 2026-10-23. Recorded because it is a dated snapshot of the gpt-4o id; the row is not affected only while OpenAI's gpt-4o alias points at a later snapshot (gpt-4o-2024-08-06 on 2026-10-01). It names no row, so the gpt-4o row is not held to that date (D181)."
+
+[[retired]]
+model = "o1"
+provider = "openai"
+id = "o1-2024-12-17"
+source = "https://developers.openai.com/api/docs/deprecations"
+retired = "2026-10-23"
+note = "o1-2024-12-17 | o1: shutdown 2026-10-23, replacement gpt-5.6-sol. Removed early by owner decision on 2026-10-01, before the shutdown (D181, D243)."
+
+[[retired]]
+model = "o1-pro"
+provider = "openai"
+id = "o1-pro-2025-03-19"
+source = "https://developers.openai.com/api/docs/deprecations"
+retired = "2026-10-23"
+note = "o1-pro-2025-03-19 | o1-pro: shutdown 2026-10-23, replacement gpt-5.6-sol with reasoning.mode pro. Removed early by owner decision on 2026-10-01, before the shutdown (D181, D243)."
+
+[[retired]]
+model = "o3-mini"
+provider = "openai"
+id = "o3-mini-2025-01-31"
+source = "https://developers.openai.com/api/docs/deprecations"
+retired = "2026-10-23"
+note = "o3-mini-2025-01-31 | o3-mini: shutdown 2026-10-23, replacement gpt-5.6-sol. Removed early by owner decision on 2026-10-01, before the shutdown (D181, D243)."
+
+[[retired]]
+model = "o4-mini"
+provider = "openai"
+id = "o4-mini-2025-04-16"
+source = "https://developers.openai.com/api/docs/deprecations"
+retired = "2026-10-23"
+note = "o4-mini-2025-04-16 | o4-mini: shutdown 2026-10-23, replacement gpt-5.6-terra. Removed early by owner decision on 2026-10-01, before the shutdown (D181, D243)."
+
+[[retired]]
+model = "gpt-5"
+provider = "openai"
+id = "gpt-5-2025-08-07"
+source = "https://developers.openai.com/api/docs/deprecations"
+retires = "2026-12-11"
+note = "\"GPT-5 and o3 model deprecations\" (2026-06-11): gpt-5-2025-08-07 shuts down 2026-12-11 (replacement gpt-5.6-sol). It is the only snapshot behind the gpt-5 alias (D181)."
+
+[[retired]]
+model = "gpt-5-mini"
+provider = "openai"
+id = "gpt-5-mini-2025-08-07"
+source = "https://developers.openai.com/api/docs/deprecations"
+retires = "2026-12-11"
+note = "gpt-5-mini-2025-08-07, the only snapshot behind gpt-5-mini: shutdown 2026-12-11, replacement gpt-5.6-terra (D181)."
+
+[[retired]]
+model = "gpt-5-nano"
+provider = "openai"
+id = "gpt-5-nano-2025-08-07"
+source = "https://developers.openai.com/api/docs/deprecations"
+retires = "2026-12-11"
+note = "gpt-5-nano-2025-08-07, the only snapshot behind gpt-5-nano: shutdown 2026-12-11, replacement gpt-5.6-luna (D181)."
+
+[[retired]]
+model = "gpt-5-pro"
+provider = "openai"
+id = "gpt-5-pro-2025-10-06"
+source = "https://developers.openai.com/api/docs/deprecations"
+retires = "2026-12-11"
+note = "gpt-5-pro-2025-10-06, the only snapshot behind gpt-5-pro: shutdown 2026-12-11, replacement gpt-5.6-sol with reasoning.mode pro (D181)."
+
+[[retired]]
+model = "o3"
+provider = "openai"
+id = "o3-2025-04-16"
+source = "https://developers.openai.com/api/docs/deprecations"
+retires = "2026-12-11"
+note = "o3-2025-04-16, the only snapshot behind o3: shutdown 2026-12-11, replacement gpt-5.6-sol (D181)."
+
+[[retired]]
+model = "o3-pro"
+provider = "openai"
+id = "o3-pro-2025-06-10"
+source = "https://developers.openai.com/api/docs/deprecations"
+retires = "2026-12-11"
+note = "o3-pro-2025-06-10: shutdown 2026-12-11, replacement gpt-5.6-sol with reasoning.mode pro. The row is OpenRouter-only (openai/o3-pro, OpenAI-hosted) (D181)."
+
+[[not_serverless]]
+provider = "fireworks"
+id = "accounts/fireworks/models/llama4-maverick-instruct-basic"
+source = "https://fireworks.ai/models/fireworks/llama4-maverick-instruct-basic"
+date = "2026-10-01"
+note = "Model page: \"serverless\":false."
+
+[[not_serverless]]
+provider = "fireworks"
+id = "accounts/fireworks/models/llama4-scout-instruct-basic"
+source = "https://fireworks.ai/models/fireworks/llama4-scout-instruct-basic"
+date = "2026-10-01"
+note = "Model page: \"serverless\":false."
+
+[[not_serverless]]
+provider = "fireworks"
+id = "accounts/fireworks/models/kimi-k2p6"
+source = "https://fireworks.ai/models/fireworks/kimi-k2p6"
+date = "2026-10-01"
+note = "Serverless deprecated 2026-09-25; on-demand deployment only."
+
+[[not_serverless]]
+provider = "fireworks"
+id = "accounts/fireworks/models/glm-5p1"
+source = "https://fireworks.ai/models/fireworks/glm-5p1"
+date = "2026-10-01"
+note = "Model page: \"serverless\":false."
+
+[[not_serverless]]
+provider = "fireworks"
+id = "accounts/fireworks/models/llama-v3p3-70b-instruct"
+source = "https://fireworks.ai/models/fireworks/llama-v3p3-70b-instruct"
+date = "2026-10-01"
+note = "Model page: \"serverless\":false."
+
+[[not_serverless]]
+provider = "together"
+id = "moonshotai/Kimi-K2.7-Code"
+source = "https://www.together.ai/pricing"
+date = "2026-10-01"
+note = "Only in the dedicated (PTU) table; absent from the serverless docs table."
+
+[[not_serverless]]
+provider = "together"
+id = "google/gemma-4-31B-it"
+source = "https://docs.together.ai/docs/serverless/models"
+date = "2026-10-01"
+note = "Absent from the serverless models table; a serverless key gets 400 model_not_available \"Unable to access non-serverless model google/gemma-4-31B-it\" (catalog sweep 2026-10-01)."
+
+[[not_serverless]]
+provider = "together"
+id = "Qwen/Qwen2.5-7B-Instruct-Turbo"
+source = "https://docs.together.ai/docs/serverless/models"
+date = "2026-10-01"
+note = "Absent from the serverless models table; a serverless key gets 400 model_not_available (catalog sweep 2026-10-01)."
+
+[[not_serverless]]
+provider = "together"
+id = "openai/gpt-oss-20b"
+source = "https://docs.together.ai/docs/serverless/models"
+date = "2026-10-01"
+note = "Absent from the serverless docs table; the pricing page lists gpt-oss-20B only outside the serverless table."
+
+[[not_serverless]]
+provider = "groq"
+id = "llama-3.1-8b-instant"
+source = "https://console.groq.com/docs/models"
+date = "2026-10-01"
+note = "Tagged \"Enterprise\", price \"ContactSales\"."
+
+[[not_serverless]]
+provider = "groq"
+id = "llama-3.3-70b-versatile"
+source = "https://console.groq.com/docs/models"
+date = "2026-10-01"
+note = "Tagged \"Enterprise\", price \"ContactSales\"."
+
+[[not_serverless]]
+provider = "groq"
+id = "minimaxai/minimax-m2.7"
+source = "https://console.groq.com/docs/models"
+date = "2026-10-01"
+note = "Tagged \"Enterprise\", price \"ContactSales\"."
+
+[[not_serverless]]
+provider = "fireworks"
+id = "accounts/fireworks/models/glm-5p2"
+source = "https://fireworks.ai/models/fireworks/glm-5p2"
+date = "2026-10-01"
+note = "Model page FAQ \"Is GLM 5.2 being deprecated on Fireworks?\": \"Only on serverless, starting on September 25, 2026. On-demand deployment will continue to be available.\" OpenRouter's Fireworks endpoint for z-ai/glm-5.2 is down (status -5, uptime 0). Removed from the z-ai/glm-5.2 row (D181)."
+
+[[not_serverless]]
+provider = "together"
+id = "MiniMaxAI/MiniMax-M2.7"
+source = "https://docs.together.ai/docs/serverless/models"
+date = "2026-10-01"
+note = "Listed with a price in Together's /v1/models but absent from the serverless table; a serverless key gets 400 model_not_available \"Unable to access non-serverless model\" (2026-10-01). So it cannot be a primary for minimaxai/minimax-m2.7."
+
+[[not_serverless]]
+provider = "together"
+id = "moonshotai/Kimi-K2.6"
+source = "https://docs.together.ai/docs/deprecations"
+date = "2026-10-01"
+note = "Serverless deprecated 2026-08-19; a serverless key gets 400 endpoint_not_ready \"all configured deployments are stopped\" (2026-10-01)."
+
+[[not_serverless]]
+provider = "together"
+id = "zai-org/GLM-5.1"
+source = "https://docs.together.ai/docs/deprecations"
+date = "2026-10-01"
+note = "Serverless deprecated 2026-07-10; a serverless key gets 400 model_not_available (2026-10-01)."
+
+[[not_carried]]
+provider = "openrouter"
+id = "minimax/minimax-m2.7"
+source = "https://openrouter.ai/api/v1/models/minimax/minimax-m2.7/endpoints"
+date = "2026-10-01"
+reason = "Removed (D182): OpenRouter sends every forced tool call and JSON-schema request for MiniMax M2.7 to Mara or SambaNova, at 0% uptime, which answer 410 Gone (6 of 6 forced calls, CAT-6 2026-10-01). Groq's copy is Enterprise-only, Together's is not serverless, and we hold no MiniMax key; MiniMax M3 is carried. Re-add with a MiniMax pool key (MiniMax's own rate: $0.30 / $1.20 / cache read $0.06 / write $0.375, https://platform.minimax.io/docs/guides/pricing-paygo.md)."
+
+[[not_carried]]
+provider = "xai"
+id = "grok-4.20-0309-non-reasoning"
+source = "https://api.x.ai/v1/models"
+date = "2026-10-01"
+reason = "Alias grok-4.20-non-reasoning. OpenRouter lists no x-ai/grok-4.20-non-reasoning, so the grok row shape (xAI Responses, then OpenRouter) has no failover; a client wanting no reasoning sends grok-4.20 with reasoning effort none."
+
+[[not_carried]]
+provider = "openai"
+id = "gpt-3.5-turbo"
+source = "https://developers.openai.com/api/docs/deprecations"
+date = "2026-10-01"
+reason = "Legacy family the catalog never carried; OpenAI shuts gpt-3.5-turbo-0125 | gpt-3.5-turbo down 2026-10-23."
+
+[[not_carried]]
+provider = "openai"
+id = "gpt-3.5-turbo-16k"
+source = "https://api.openai.com/v1/models"
+date = "2026-10-01"
+reason = "Legacy gpt-3.5 family the catalog never carried."
+
+[[not_carried]]
+provider = "openai"
+id = "gpt-3.5-turbo-0125"
+source = "https://developers.openai.com/api/docs/deprecations"
+date = "2026-10-01"
+reason = "Legacy gpt-3.5 snapshot; shutdown 2026-10-23."
+
+[[not_carried]]
+provider = "openai"
+id = "gpt-3.5-turbo-1106"
+source = "https://developers.openai.com/api/docs/deprecations"
+date = "2026-10-01"
+reason = "Legacy gpt-3.5 snapshot; OpenAI listed its shutdown for 2026-09-28 and still lists it."
+
+[[not_carried]]
+provider = "openrouter"
+id = "qwen/qwen3.8-max-0902"
+source = "https://openrouter.ai/api/v1/models/qwen/qwen3.8-max-0902/endpoints"
+date = "2026-10-01"
+reason = "Qwen3.8 Max: Alibaba sells it ($2 / $6, https://www.alibabacloud.com/help/en/model-studio/model-pricing), but OpenRouter's only host is Alibaba on OpenRouter's own key and Together does not list it: the single shared-pool host D156 removed the Mistral rows for. qwen/qwen3.8-max-prime is Alibaba's faster tier of the same model."
+
+[[not_carried]]
+provider = "openrouter"
+id = "z-ai/glm-5.3-prime"
+source = "https://docs.z.ai/guides/overview/pricing.md"
+date = "2026-10-01"
+reason = "Not on Z.ai's own price table; OpenRouter's only host is Alibaba (a speed tier, like Qwen's Prime). Single shared-pool host (D156)."
+
+[[not_carried]]
+provider = "openrouter"
+id = "z-ai/glm-5.3-flashx"
+source = "https://docs.z.ai/guides/overview/pricing.md"
+date = "2026-10-01"
+reason = "Z.ai prices it ($0.37 / $1.25), but OpenRouter's only host is Z.AI on OpenRouter's key and Together does not serve it (D156)."
+
+[[not_carried]]
+provider = "openrouter"
+id = "meta/muse-spark-1.3"
+source = "https://llama.developer.meta.com/docs/pricing-rate-limits"
+date = "2026-10-01"
+reason = "Meta's flagship ($1.25 / $4.25 on Meta's Model API), but we hold no Meta key and OpenRouter's only host is Meta on OpenRouter's key (D156). Add it with a Meta pool key."
+
+[[not_carried]]
+provider = "openrouter"
+id = "thinkingmachines/inkling-small"
+source = "https://docs.together.ai/docs/deprecations"
+date = "2026-10-01"
+reason = "Together, its serverless host, deprecated it 2026-09-15; OpenRouter's only host is DeepInfra, and the maker sells no API."
+
+[[retired]]
+provider = "openai"
+id = "gpt-5-chat-latest"
+source = "https://developers.openai.com/api/docs/deprecations"
+retired = "2026-07-23"
+note = "\"GPT-5 Chat points to the GPT-5 snapshot previously used in ChatGPT.\" Shut down 2026-07-23 (replacement gpt-5.6-sol); still in OpenAI's /v1/models listing. A text model (Chat Completions and Responses), never a row."
+
+[[retired]]
+provider = "openai"
+id = "gpt-5.1-chat-latest"
+source = "https://developers.openai.com/api/docs/deprecations"
+retired = "2026-07-23"
+note = "ChatGPT's GPT-5.1 Instant on the API. Shut down 2026-07-23 (replacement gpt-5.6-sol); still listed. Never a row."
+
+[[retired]]
+provider = "openai"
+id = "gpt-5.2-chat-latest"
+source = "https://developers.openai.com/api/docs/deprecations"
+retired = "2026-08-10"
+note = "\"2026-05-08: gpt-5.2-chat-latest and gpt-5.3-chat-latest model snapshots\": shut down 2026-08-10 (replacement gpt-5.6-sol); still listed. Never a row (the OpenRouter-only gpt-5.2-chat row went 2026-09-30)."
+
+[[retired]]
+provider = "openai"
+id = "gpt-5.3-chat-latest"
+source = "https://developers.openai.com/api/docs/deprecations"
+retired = "2026-08-10"
+note = "Shut down 2026-08-10 (replacement gpt-5.6-sol); its model page says \"This model has been deprecated\". Still listed. Never a row."
+
+[[retired]]
+provider = "openai"
+id = "gpt-3.5-turbo-instruct"
+source = "https://developers.openai.com/api/docs/deprecations"
+retired = "2026-09-28"
+note = "Legacy Completions model (gpt-3.5-turbo-instruct-0914 is its snapshot): shut down 2026-09-28 (replacement gpt-5.6-terra); still listed. Never a row: the gateway serves no /v1/completions."
+
+[[retired]]
+provider = "openai"
+id = "gpt-4o-search-preview"
+source = "https://developers.openai.com/api/docs/deprecations"
+retired = "2026-07-23"
+note = "Its default and only snapshot, gpt-4o-search-preview-2025-03-11, shut down 2026-07-23 (replacement gpt-5.6-terra); the alias is still listed. Never a row."
+
+[[retired]]
+provider = "openai"
+id = "gpt-4o-mini-search-preview"
+source = "https://developers.openai.com/api/docs/deprecations"
+retired = "2026-07-23"
+note = "Its only snapshot, gpt-4o-mini-search-preview-2025-03-11, shut down 2026-07-23 (replacement gpt-5.6-terra); the alias is still listed. Never a row."
+
+[[not_carried]]
+provider = "openai"
+id = "chat-latest"
+source = "https://developers.openai.com/api/docs/models/chat-latest"
+date = "2026-10-01"
+reason = "Moving alias: \"points to the latest Instant model currently used in ChatGPT ... The underlying model snapshot will be regularly updated\" ($5 / $30). A row's card and price would describe whatever ChatGPT runs that week, with no dated snapshot to pin; OpenAI recommends gpt-6-astra (carried) for API use."
+
+[[not_carried]]
+provider = "openai"
+id = "gpt-5-search-api"
+source = "https://developers.openai.com/api/docs/pricing"
+date = "2026-10-01"
+reason = "Search model ($1.25 / $10 tokens, \"Search\" in the pricing table): every web search it runs is billed per call on top of tokens ($10 / 1k calls), which a per-token card cannot list and the ledger does not meter on OpenAI. gpt-5-search-api-2025-10-14 is its snapshot."
+
+[[not_carried]]
+provider = "openai"
+id = "gpt-live-1"
+source = "https://developers.openai.com/api/docs/models/gpt-live-1"
+date = "2026-10-01"
+reason = "Full-duplex voice model, served only at v1/live/sessions (Chat Completions, Responses and Realtime: \"Not supported\"), billed $0.05 per session minute. The gateway serves Chat Completions, Responses, Messages and embeddings only."
+
+[[not_carried]]
+provider = "openai"
+id = "gpt-live-transcribe"
+source = "https://developers.openai.com/api/docs/models/gpt-live-transcribe"
+date = "2026-10-01"
+reason = "Speech-to-text, served only at v1/realtime/transcription_sessions. The gateway serves Chat Completions, Responses, Messages and embeddings only."
+
+[[not_carried]]
+provider = "openai"
+id = "gpt-transcribe"
+source = "https://developers.openai.com/api/docs/models/gpt-transcribe"
+date = "2026-10-01"
+reason = "Speech-to-text at v1/audio/transcriptions and v1/realtime/transcription_sessions. The gateway serves Chat Completions, Responses, Messages and embeddings only."
+
+[[not_carried]]
+provider = "openai"
+id = "gpt-4o-transcribe"
+source = "https://developers.openai.com/api/docs/deprecations"
+date = "2026-10-01"
+reason = "Speech-to-text at v1/audio/transcriptions; shuts down 2027-02-26 (replacement gpt-transcribe). The gateway serves Chat Completions, Responses, Messages and embeddings only."
+
+[[not_carried]]
+provider = "openai"
+id = "gpt-4o-mini-transcribe"
+source = "https://developers.openai.com/api/docs/deprecations"
+date = "2026-10-01"
+reason = "Speech-to-text at v1/audio/transcriptions (snapshots -2025-03-20, shutting down 2027-01-20, and -2025-12-15); shuts down 2027-02-26. The gateway serves Chat Completions, Responses, Messages and embeddings only."
+
+[[not_carried]]
+provider = "openai"
+id = "gpt-4o-transcribe-diarize"
+source = "https://developers.openai.com/api/docs/deprecations"
+date = "2026-10-01"
+reason = "Speech-to-text with diarization at v1/audio/transcriptions; shuts down 2027-02-26. The gateway serves Chat Completions, Responses, Messages and embeddings only."
+
+[[not_carried]]
+provider = "openai"
+id = "gpt-4o-mini-tts"
+source = "https://developers.openai.com/api/docs/models/gpt-4o-mini-tts"
+date = "2026-10-01"
+reason = "Text-to-speech at v1/audio/speech (snapshots -2025-03-20 and -2025-12-15). The gateway serves Chat Completions, Responses, Messages and embeddings only."
+
+[[not_carried]]
+provider = "openai"
+id = "gpt-audio"
+source = "https://developers.openai.com/api/docs/deprecations"
+date = "2026-10-01"
+reason = "Audio in and out on Chat Completions (\"For audio inputs and outputs with Chat Completions API\"); its audio tokens have their own rates, which a card and the ledger do not carry. Shuts down 2027-01-20 (replacement gpt-audio-1.5); gpt-audio-2025-08-28 is its snapshot."
+
+[[not_carried]]
+provider = "openai"
+id = "gpt-audio-1.5"
+source = "https://developers.openai.com/api/docs/models/gpt-audio-1.5"
+date = "2026-10-01"
+reason = "Audio in and out on Chat Completions; audio tokens have their own rates, which a card and the ledger do not carry."
+
+[[not_carried]]
+provider = "openai"
+id = "gpt-audio-mini"
+source = "https://developers.openai.com/api/docs/deprecations"
+date = "2026-10-01"
+reason = "Audio in and out on Chat Completions; audio tokens have their own rates, which a card and the ledger do not carry. Shuts down 2027-01-20 (replacement gpt-audio-1.5); -2025-10-06 shut down 2026-07-23, -2025-12-15 is listed."
+
+[[not_carried]]
+provider = "openai"
+id = "gpt-realtime"
+source = "https://developers.openai.com/api/docs/deprecations"
+date = "2026-10-01"
+reason = "Realtime API (v1/realtime, speech in and out); shuts down 2027-01-20 (replacement gpt-realtime-2.1); gpt-realtime-2025-08-28 is its snapshot. The gateway serves Chat Completions, Responses, Messages and embeddings only."
+
+[[not_carried]]
+provider = "openai"
+id = "gpt-realtime-1.5"
+source = "https://developers.openai.com/api/docs/models/gpt-realtime-2.1"
+date = "2026-10-01"
+reason = "Realtime API (v1/realtime) only. The gateway serves Chat Completions, Responses, Messages and embeddings only."
+
+[[not_carried]]
+provider = "openai"
+id = "gpt-realtime-2"
+source = "https://developers.openai.com/api/docs/models/gpt-realtime-2"
+date = "2026-10-01"
+reason = "Realtime API (v1/realtime) only. The gateway serves Chat Completions, Responses, Messages and embeddings only."
+
+[[not_carried]]
+provider = "openai"
+id = "gpt-realtime-2.1"
+source = "https://developers.openai.com/api/docs/models/gpt-realtime-2.1"
+date = "2026-10-01"
+reason = "Realtime API (v1/realtime) only: \"Realtime | v1/realtime | Supported\", every other endpoint not. The gateway serves Chat Completions, Responses, Messages and embeddings only."
+
+[[not_carried]]
+provider = "openai"
+id = "gpt-realtime-2.1-mini"
+source = "https://developers.openai.com/api/docs/models/gpt-realtime-2.1"
+date = "2026-10-01"
+reason = "Realtime API (v1/realtime) only. The gateway serves Chat Completions, Responses, Messages and embeddings only."
+
+[[not_carried]]
+provider = "openai"
+id = "gpt-realtime-mini"
+source = "https://developers.openai.com/api/docs/deprecations"
+date = "2026-10-01"
+reason = "Realtime API (v1/realtime); shuts down 2027-01-20 (replacement gpt-realtime-2.1-mini); -2025-12-15 is its listed snapshot. The gateway serves Chat Completions, Responses, Messages and embeddings only."
+
+[[not_carried]]
+provider = "openai"
+id = "gpt-realtime-translate"
+source = "https://developers.openai.com/api/docs/models/gpt-realtime-translate"
+date = "2026-10-01"
+reason = "Speech-to-speech translation at v1/realtime/translations only. The gateway serves Chat Completions, Responses, Messages and embeddings only."
+
+[[not_carried]]
+provider = "openai"
+id = "gpt-realtime-whisper"
+source = "https://developers.openai.com/api/docs/models/gpt-realtime-whisper"
+date = "2026-10-01"
+reason = "Speech-to-text at v1/realtime/transcription_sessions only. The gateway serves Chat Completions, Responses, Messages and embeddings only."
+
+[[not_carried]]
+provider = "openai"
+id = "gpt-image-1"
+source = "https://developers.openai.com/api/docs/deprecations"
+date = "2026-10-01"
+reason = "Image generation (v1/images/generations and edits); shuts down 2026-10-23. The gateway serves Chat Completions, Responses, Messages and embeddings only."
+
+[[not_carried]]
+provider = "openai"
+id = "gpt-image-1-mini"
+source = "https://developers.openai.com/api/docs/deprecations"
+date = "2026-10-01"
+reason = "Image generation; shuts down 2026-12-01 (replacement gpt-image-2.5-sunburst or -flare). The gateway serves Chat Completions, Responses, Messages and embeddings only."
+
+[[not_carried]]
+provider = "openai"
+id = "gpt-image-1.5"
+source = "https://developers.openai.com/api/docs/deprecations"
+date = "2026-10-01"
+reason = "Image generation; shuts down 2026-12-01. The gateway serves Chat Completions, Responses, Messages and embeddings only."
+
+[[not_carried]]
+provider = "openai"
+id = "gpt-image-2"
+source = "https://developers.openai.com/api/docs/models/gpt-image-2"
+date = "2026-10-01"
+reason = "Image generation (v1/images/generations and edits); gpt-image-2-2026-04-21 is its snapshot. The gateway serves Chat Completions, Responses, Messages and embeddings only."
+
+[[not_carried]]
+provider = "openai"
+id = "gpt-image-2.5-flare"
+source = "https://developers.openai.com/api/docs/models/gpt-image-2.5-flare"
+date = "2026-10-01"
+reason = "Image generation (\"Output modalities: image\"; v1/images/generations and edits); -2026-09-08 is its snapshot. The gateway serves Chat Completions, Responses, Messages and embeddings only."
+
+[[not_carried]]
+provider = "openai"
+id = "gpt-image-2.5-sunburst"
+source = "https://developers.openai.com/api/docs/models/gpt-image-2.5-flare"
+date = "2026-10-01"
+reason = "Image generation, gpt-image-2.5-flare's sibling; -2026-09-08 is its snapshot. The gateway serves Chat Completions, Responses, Messages and embeddings only."
+
+[[not_carried]]
+provider = "openai"
+id = "chatgpt-image-latest"
+source = "https://developers.openai.com/api/docs/models/chatgpt-image-latest"
+date = "2026-10-01"
+reason = "\"Previous image model used in ChatGPT\": image generation, a moving alias; shuts down 2026-12-01. The gateway serves Chat Completions, Responses, Messages and embeddings only."
+
+[[not_carried]]
+provider = "xai"
+id = "grok-imagine-image"
+source = "https://api.x.ai/v1/image-generation-models"
+date = "2026-10-01"
+reason = "Image generation (output modalities [\"image\"]; billed per image), listed by /v1/models beside the language models. The gateway serves Chat Completions, Responses, Messages and embeddings only."
+
+[[not_carried]]
+provider = "xai"
+id = "grok-imagine-image-2.0"
+source = "https://api.x.ai/v1/image-generation-models"
+date = "2026-10-01"
+reason = "Image generation (output [\"image\"], priced per image by quality and resolution). The gateway serves Chat Completions, Responses, Messages and embeddings only."
+
+[[not_carried]]
+provider = "xai"
+id = "grok-imagine-image-quality"
+source = "https://api.x.ai/v1/image-generation-models"
+date = "2026-10-01"
+reason = "Image generation (output [\"image\"]; alias grok-imagine-image-pro). The gateway serves Chat Completions, Responses, Messages and embeddings only."
+
+[[not_carried]]
+provider = "xai"
+id = "grok-imagine-video"
+source = "https://api.x.ai/v1/video-generation-models"
+date = "2026-10-01"
+reason = "Video generation (output modalities [\"video\"]). The gateway serves Chat Completions, Responses, Messages and embeddings only."
+
+[[not_carried]]
+provider = "xai"
+id = "grok-imagine-video-1.5"
+source = "https://api.x.ai/v1/video-generation-models"
+date = "2026-10-01"
+reason = "Video generation (output [\"video\"]; aliases grok-imagine-video-1.5-preview, -2026-05-30). The gateway serves Chat Completions, Responses, Messages and embeddings only."
+
+[[not_carried]]
+provider = "xai"
+id = "grok-imagine-video-1.5-lite"
+source = "https://api.x.ai/v1/video-generation-models"
+date = "2026-10-01"
+reason = "Video generation (output [\"video\"]). The gateway serves Chat Completions, Responses, Messages and embeddings only."
+
+[[promo]]
+model = "gpt-5.6-sol"
+input = "2.00"
+output = "10.00"
+cache_read = "0.20"
+until = "2026-11-21"
+source = "https://developers.openai.com/api/docs/pricing.md"
+note = "\"GPT-5.6 Sol's promotional pricing is available at least through November 21, 2026.\" OpenRouter, routed to OpenAI, charges it; OpenAI bills the pool key the standard $4 / $20 (organization costs report, 2026-10-01: 4,289 input tokens $0.017156, 1,394 output $0.02788). The card keeps the standard rate: it is what the primary charges, and one row has one list price."
+
+[[promo]]
+model = "gpt-5.6-sol-pro"
+input = "2.00"
+output = "10.00"
+cache_read = "0.20"
+until = "2026-11-21"
+source = "https://developers.openai.com/api/docs/pricing.md"
+note = "OpenRouter lists $4 / $20 / cached $0.40 and charges half (CAT-7::raw::openrouter::gpt-5.6-sol-pro, 2026-10-01, twice: 2,433 input of which 1,510 cached, 30 output -> $0.002448 against $0.004896 at the card): the gpt-5.6-sol promotion, since OpenRouter's listing calls -pro \"the same underlying model as GPT-5.6 Sol, served with reasoning.mode set to pro\". Its gpt-5.6-sol listing shows the promotional rates, cached input included: $2 / $10 / $0.20."
+
+[[schema_unenforced]]
+model = "z-ai/glm-5.2"
+provider = "openrouter"
+id = "z-ai/glm-5.2"
+source = "https://openrouter.ai/api/v1/models/z-ai/glm-5.2/endpoints"
+date = "2026-10-01"
+supported_parameters = "28 of 33 endpoints list structured_outputs, DigitalOcean among them"
+evidence = 'CAT-6::raw::openrouter::z-ai/glm-5.2 answered "{\n{\n  "answer": 391\n}", which is not JSON (live 2026-10-01). Direct to OpenRouter with provider.only DigitalOcean: 3 of 6 answers are not JSON ("{\n{\n...", "{"{"answer": 391}"). Together zai-org/GLM-5.2, the row primary, held the schema 6 of 6 (streamed) and in the sweep (non-streamed).'
+note = "Steered: the card keeps structured_outputs, and a schema request skips this candidate."
+
+[[schema_unenforced]]
+model = "moonshotai/kimi-k2.6"
+provider = "openrouter"
+id = "moonshotai/kimi-k2.6"
+source = "https://openrouter.ai/api/v1/models/moonshotai/kimi-k2.6/endpoints"
+date = "2026-10-01"
+supported_parameters = "18 of 18 endpoints list structured_outputs"
+evidence = 'CAT-6::raw::openrouter::moonshotai/kimi-k2.6 answered a ```json-fenced {"expression", "result"} (live 2026-10-01). Direct to OpenRouter, 28 json_schema calls: Decart, Phala, Chutes (empty content), StreamLake and Moonshot AI itself answered outside the schema; Baidu, CoreWeave, Inceptron, Cloudflare, Crusoe, SiliconFlow and Venice held it. provider.require_parameters still routed to Chutes.'
+note = "The row's only candidate: the card drops structured_outputs."
+
+[[schema_unenforced]]
+model = "moonshotai/kimi-k2.7-code"
+provider = "openrouter"
+id = "moonshotai/kimi-k2.7-code"
+source = "https://openrouter.ai/api/v1/models/moonshotai/kimi-k2.7-code/endpoints"
+date = "2026-10-01"
+supported_parameters = "11 of 12 endpoints list structured_outputs, CoreWeave among them"
+evidence = 'CAT-6::raw::openrouter::moonshotai/kimi-k2.7-code answered its reasoning as prose followed by {"answer": 391} (live 2026-10-01). Direct to OpenRouter with provider.only CoreWeave: 0 of 12 answers are schema JSON (prose reasoning; once {"question", "answer"}). Other hosts held it 46 of 46.'
+note = "The row's only candidate: the card drops structured_outputs."
+
+[[schema_unenforced]]
+model = "qwen/qwen3.6-plus"
+provider = "together"
+id = "Qwen/Qwen3.6-Plus"
+source = "https://docs.together.ai/docs/serverless/models"
+date = "2026-10-01"
+evidence = 'Together answers a non-streamed request 400 streaming_required (D147). Streamed json_schema calls: 3 of 8 answered {"result": 391}.'
+note = "Neither candidate enforces the schema: the card drops structured_outputs."
+
+[[schema_unenforced]]
+model = "qwen/qwen3.6-plus"
+provider = "openrouter"
+id = "qwen/qwen3.6-plus"
+source = "https://openrouter.ai/api/v1/models/qwen/qwen3.6-plus/endpoints"
+date = "2026-10-01"
+supported_parameters = "1 of 1 endpoint (Alibaba) lists structured_outputs"
+evidence = 'CAT-6::raw::openrouter::qwen/qwen3.6-plus answered {"result": 391} (live 2026-10-01). Direct to OpenRouter (Alibaba): 2 of 24 answered {"result": 391}.'
+note = "Neither candidate enforces the schema: the card drops structured_outputs."

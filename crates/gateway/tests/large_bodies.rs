@@ -53,6 +53,7 @@ async fn gateway(mode: Mode) -> (MockUpstream, Gateway, ed25519_dalek::SigningKe
     (mock, gw, sk)
 }
 
+/// claim: R5, REL-21
 #[tokio::test]
 async fn a_large_chat_body_with_model_last_is_served_and_billed() {
     let (mock, gw, sk) = gateway(Mode::Json).await;
@@ -125,6 +126,7 @@ async fn bodies_just_past_the_replay_buffer_do_not_hang() {
 }
 
 /// The dominant embeddings shape: a LangChain-style batch, `input` first, well past 64 KiB.
+/// claim: M1
 #[tokio::test]
 async fn a_large_embeddings_batch_with_input_first_is_served() {
     let (mock, gw, sk) = gateway(Mode::Embeddings).await;
@@ -161,8 +163,10 @@ async fn a_large_embeddings_batch_with_input_first_is_served() {
 async fn large_responses_session_state_after_input_walks_the_responses_arm() {
     let (mock, gw, sk) = gateway(Mode::Json).await;
     let filler = "y".repeat(150 * 1024);
+    // The id as the gateway issued it to tenant 42 (`signed_id.rs`); the upstream gets `resp_123`.
+    let prev = dev_id_signer().sign(42, "resp_123");
     let body = format!(
-        r#"{{"input":"{filler}","model":"gpt-4o-mini","previous_response_id":"resp_123","store":true}}"#
+        r#"{{"input":"{filler}","model":"gpt-4o-mini","previous_response_id":"{prev}","store":true}}"#
     );
     let resp = client()
         .post(format!("{}/v1/responses", gw.url()))
@@ -252,6 +256,7 @@ fn big_chat(model: &str) -> String {
 
 /// An HTTP/2 client (the default for the agent's `h2c` serve mode) used to get a bare 400: the
 /// subrequest was built by rendering the H2 request line as `HTTP/2`, which its parser rejects.
+/// claim: E6, REL-21, REL-11
 #[tokio::test]
 async fn an_h2c_client_can_send_a_large_body() {
     let (mock, gw, sk) = gateway(Mode::Json).await;
@@ -346,6 +351,7 @@ async fn the_tenant_cap_is_checked_before_a_large_body_is_read() {
 
 /// An abandoned attempt holds nothing the next one needs: with a cap of 1, a large-body failover
 /// completes even when the failed upstream never finishes its error body.
+/// claim: REL-21
 #[tokio::test]
 async fn a_large_body_failover_fits_a_tenant_cap_of_one() {
     let (pubkey, sk) = test_keypair(1);
@@ -380,6 +386,7 @@ async fn a_large_body_failover_fits_a_tenant_cap_of_one() {
 
 /// One request, one billing row: the abandoned attempt writes none, and every attempt shares the
 /// id the client was given.
+/// claim: R5, O1, B1, BIL-14, BIL-19, REL-21
 #[tokio::test]
 async fn a_relayed_failover_writes_one_usage_row_under_the_clients_id() {
     let (pubkey, sk) = test_keypair(1);
@@ -421,10 +428,16 @@ async fn a_relayed_failover_writes_one_usage_row_under_the_clients_id() {
     assert_eq!(rows, 1, "{}", gw.log());
 }
 
-/// A connection that fails before any response header (a reused connection closed under us) is
-/// retried from the held body, as the ordinary walk would for a small body.
+/// A connection that fails before any response header **after the upstream drained the whole
+/// body** (the mock reads it, then closes a reused connection) is not resent, to that candidate or
+/// the next: the provider may already be generating, and billing, the answer. The request ends
+/// with a JSON 502 and the fallback never sees the body.
+///
+/// This test used to expect the held body to be retried and every request to succeed — the
+/// unsafe behavior D09 removed. The mock's shape (drain, then close) is exactly the case the
+/// policy forbids resending, so the expectation changed with it.
 #[tokio::test]
-async fn a_reset_before_the_header_is_retried_from_the_held_body() {
+async fn a_reset_after_the_body_was_delivered_is_not_resent() {
     let (pubkey, sk) = test_keypair(1);
     let flaky = MockUpstream::start(Mode::CloseOnReusedConnection).await;
     let fallback = MockUpstream::start(Mode::Json).await;
@@ -433,7 +446,9 @@ async fn a_reset_before_the_header_is_retried_from_the_held_body() {
         .provider_authority("openrouter", &fallback.authority())
         .start()
         .await;
-    for _ in 0..4 {
+    const SENT: usize = 4;
+    let mut failed = 0;
+    for _ in 0..SENT {
         let resp = client()
             .post(format!("{}/v1/chat/completions", gw.url()))
             .header("authorization", format!("Bearer {}", vkey(&sk)))
@@ -443,6 +458,30 @@ async fn a_reset_before_the_header_is_retried_from_the_held_body() {
             .send()
             .await
             .unwrap();
-        assert_eq!(resp.status().as_u16(), 200);
+        match resp.status().as_u16() {
+            200 => {}
+            502 => {
+                failed += 1;
+                let text = resp.text().await.unwrap_or_default();
+                let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+                assert!(v["error"]["message"].is_string(), "a JSON error: {text}");
+            }
+            s => panic!("unexpected status {s}; log:\n{}", gw.log()),
+        }
     }
+    assert!(
+        failed > 0,
+        "no reused connection was closed, so the scenario did not fire"
+    );
+    assert_eq!(
+        flaky.hits(),
+        SENT,
+        "a body was sent twice; log:\n{}",
+        gw.log()
+    );
+    assert_eq!(
+        fallback.hits(),
+        0,
+        "the fallback was handed a delivered body"
+    );
 }

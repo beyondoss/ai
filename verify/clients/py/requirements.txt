@@ -1,0 +1,8 @@
+# Pinned real clients the verification suite drives through the gateway (see verify/README.md).
+anthropic==1.11.0
+aws-bedrock-token-generator==1.1.0
+langchain==1.4.3
+langchain-anthropic==1.7.5
+langchain-openai==1.6.7
+openai==3.22.1
+openai-agents==0.22.3

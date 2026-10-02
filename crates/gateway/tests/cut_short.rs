@@ -61,6 +61,7 @@ async fn usage_row(gw: &Gateway) -> serde_json::Value {
     v.get("fields").cloned().unwrap_or(v)
 }
 
+/// claim: B2, BIL-3, BIL-20
 #[tokio::test]
 async fn a_cancelled_openai_stream_is_billed_an_estimate() {
     let (pubkey, sk) = test_keypair(41);
@@ -74,7 +75,7 @@ async fn a_cancelled_openai_stream_is_billed_an_estimate() {
         format!("{}/openai/v1/chat/completions", gw.url()),
         &vkey(&sk, 41),
         "authorization",
-        body.clone(),
+        body,
     )
     .await;
 
@@ -87,14 +88,16 @@ async fn a_cancelled_openai_stream_is_billed_an_estimate() {
     );
     assert_eq!(
         row["input_tokens"].as_u64(),
-        Some(body.len() as u64 / 5),
-        "input is estimated from the request body at 5 bytes/token: {row}"
+        Some(15),
+        "input is the prompt's pre-tokens: system (1) You are terse. (4) user (1) Explain TCP \
+         congestion control in detail, please. (9): {row}"
     );
     wait_for_metric(&gw, "ai_usage_estimated_total", "", 1.0).await;
 }
 
 /// Anthropic reports input and cache tokens on `message_start`, the first event — so those stay
 /// exact, and only the output count (which rides the missing `message_delta`) is estimated.
+/// claim: B2, BIL-3, BIL-20
 #[tokio::test]
 async fn a_cancelled_anthropic_stream_keeps_exact_input_and_estimates_output() {
     let (pubkey, sk) = test_keypair(42);
@@ -141,7 +144,7 @@ async fn base64_images_do_not_inflate_the_input_estimate() {
         format!("{}/openai/v1/chat/completions", gw.url()),
         &vkey(&sk, 43),
         "authorization",
-        body.clone(),
+        body,
     )
     .await;
 
@@ -149,8 +152,8 @@ async fn base64_images_do_not_inflate_the_input_estimate() {
     assert_eq!(row["usage_estimated"], true, "{row}");
     assert_eq!(
         row["input_tokens"].as_u64(),
-        Some((body.len() - image.len()) as u64 / 5),
-        "the base64 payload is not text: {row}"
+        Some(5),
+        "user (1) what is this? (4); the base64 payload is not text: {row}"
     );
 }
 
@@ -181,6 +184,7 @@ async fn a_finished_stream_is_not_estimated() {
 
 /// A 200 stream that carries only an error event — Anthropic's `overloaded_error` before any output —
 /// is not work the provider billed for, so it is not estimated either.
+/// claim: BIL-12
 #[tokio::test]
 async fn an_error_only_stream_is_not_billed_an_estimate() {
     let (pubkey, sk) = test_keypair(45);
@@ -226,7 +230,7 @@ async fn anthropic_format_images_do_not_inflate_the_input_estimate() {
         format!("{}/v1/messages", gw.url()),
         &vkey(&sk, 46),
         "x-api-key",
-        body.clone(),
+        body,
     )
     .await;
 
@@ -234,7 +238,7 @@ async fn anthropic_format_images_do_not_inflate_the_input_estimate() {
     assert_eq!(row["usage_estimated"], true, "{row}");
     assert_eq!(
         row["input_tokens"].as_u64(),
-        Some((body.len() - image.len()) as u64 / 5),
-        "an Anthropic base64 source is not text: {row}"
+        Some(5),
+        "user (1) what is this? (4); an Anthropic base64 source is not text: {row}"
     );
 }

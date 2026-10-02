@@ -192,6 +192,7 @@ fn assert_lifecycle(evs: &[(String, Value)]) -> Value {
 /// A Responses client on a Claude row: thinking, text and both tool calls arrive as items, and
 /// `response.completed` carries them. Before this the stream had no items at all and the OpenAI
 /// SDK's `responses.stream()` raised on the first delta.
+/// claim: E3
 #[tokio::test]
 async fn responses_client_on_claude_gets_items_for_reasoning_text_and_calls() {
     let nats_port = unused_nats_port();
@@ -218,7 +219,7 @@ async fn responses_client_on_claude_gets_items_for_reasoning_text_and_calls() {
         types,
         ["reasoning", "message", "function_call", "function_call"]
     );
-    assert_eq!(out[0]["encrypted_content"], "EqQBsig==");
+    assert_eq!(out[0]["encrypted_content"], "rs_gw:EqQBsig==");
     assert_eq!(out[1]["content"][0]["text"], "Checking both.");
     assert_eq!(out[2]["call_id"], "toolu_a");
     assert_eq!(out[2]["arguments"], "{\"city\":\"Paris\"}");
@@ -240,8 +241,10 @@ async fn responses_client_on_claude_gets_items_for_reasoning_text_and_calls() {
     );
 }
 
+/// A Responses client on a Chat Completions row with no Responses arm (a GPT row's Responses
+/// request relays to its arm instead).
 #[tokio::test]
-async fn responses_client_on_gpt_gets_function_call_items() {
+async fn responses_client_on_a_chat_row_gets_function_call_items() {
     let nats_port = unused_nats_port();
     let (pubkey, sk) = test_keypair(1);
     let mock = MockUpstream::start(Mode::Raw(200, "text/event-stream", OPENAI_PARALLEL_SSE)).await;
@@ -254,7 +257,7 @@ async fn responses_client_on_gpt_gets_function_call_items() {
         &gw,
         "/v1/responses",
         &vkey(&sk),
-        responses_body("gpt-4o-mini", true),
+        responses_body("llama-3.1-8b-instant", true),
     )
     .await;
     assert_eq!(status, 200, "{text}\n{}", gw.log());
@@ -268,12 +271,13 @@ async fn responses_client_on_gpt_gets_function_call_items() {
         let args: Value = serde_json::from_str(item["arguments"].as_str().unwrap()).unwrap();
         assert_eq!(args["city"], city);
     }
-    assert_eq!(mock.captured().unwrap().path, "/v1/chat/completions");
+    assert_eq!(mock.captured().unwrap().path, "/api/v1/chat/completions");
 }
 
 /// Anthropic is down; OpenRouter serves the Claude row over Chat Completions. The signature it
 /// streams in `reasoning_details` must reach the Messages client, or the next turn on Anthropic
 /// 400s (`thinking.signature: Field required`) for the rest of the conversation.
+/// claim: E2, T2
 #[tokio::test]
 async fn messages_client_keeps_the_thinking_signature_across_openrouter_failover() {
     let nats_port = unused_nats_port();
@@ -315,6 +319,7 @@ async fn messages_client_keeps_the_thinking_signature_across_openrouter_failover
 /// A Chat client served by OpenRouter gets `role` and each reasoning entry's `format` once.
 /// OpenRouter repeats both on every chunk, and openai-python's `.stream()` concatenated them into a
 /// role of "assistantassistant…" for the next turn to send back.
+/// claim: S2
 #[tokio::test]
 async fn chat_client_on_openrouter_gets_each_identity_field_once() {
     let nats_port = unused_nats_port();
@@ -360,6 +365,7 @@ async fn chat_client_on_openrouter_gets_each_identity_field_once() {
 
 /// A Chat client on a Claude row: `prompt_tokens` is the whole prompt, cache included, and every
 /// chunk carries `created` (strictly typed clients reject a chunk without it).
+/// claim: S2
 #[tokio::test]
 async fn chat_client_on_claude_gets_whole_prompt_usage_and_created() {
     let nats_port = unused_nats_port();
@@ -522,7 +528,7 @@ async fn responses_client_gets_a_custom_tool_call_from_a_chat_row() {
         .start()
         .await;
 
-    let body = r#"{"model":"gpt-4o-mini","input":"patch it","stream":true,"store":false,"tools":[{"type":"custom","name":"apply_patch","description":"patch"}]}"#;
+    let body = r#"{"model":"llama-3.1-8b-instant","input":"patch it","stream":true,"store":false,"tools":[{"type":"custom","name":"apply_patch","description":"patch"}]}"#;
     let (status, text) = post(&gw, "/v1/responses", &vkey(&sk), body.to_owned()).await;
     assert_eq!(status, 200, "{text}\n{}", gw.log());
     let evs = events(&text);
@@ -536,8 +542,8 @@ async fn responses_client_gets_a_custom_tool_call_from_a_chat_row() {
     assert_eq!(resp["output"][0]["input"], "*** Begin Patch");
     assert_eq!(resp["output"][0]["call_id"], "call_c1");
     assert!(names(&evs).contains(&"response.custom_tool_call_input.delta"));
-    let cap = mock.captured().expect("reaches OpenAI");
-    assert_eq!(cap.path, "/v1/chat/completions");
+    let cap = mock.captured().expect("reaches the Chat Completions host");
+    assert_eq!(cap.path, "/api/v1/chat/completions");
     let sent: Value = serde_json::from_slice(&cap.body).unwrap();
     assert_eq!(sent["tools"][0]["custom"]["name"], "apply_patch");
 }
@@ -578,6 +584,7 @@ data: [DONE]
 /// An upstream stream that ends cleanly without its terminal event (no `message_delta`, no
 /// `message_stop`) was cut short. The Chat client used to get a bare `[DONE]`, and a Responses
 /// client `response.completed`, for a half-written answer.
+/// claim: T7
 #[tokio::test]
 async fn a_claude_stream_cut_before_its_end_is_an_error_for_the_client() {
     const CUT_SSE: &str = r#"event: message_start
@@ -625,6 +632,7 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
 }
 
 /// OpenRouter wraps the provider's error; the Messages client gets the provider's message too.
+/// claim: T6
 #[tokio::test]
 async fn openrouter_provider_errors_keep_the_provider_message() {
     let nats_port = unused_nats_port();
@@ -651,4 +659,60 @@ async fn openrouter_provider_errors_keep_the_provider_message() {
         v["error"]["message"],
         "Provider returned error (Anthropic): prompt is too long: 250000 tokens > 200000 maximum"
     );
+}
+
+/// xAI's error body is its own shape (`{"code": "invalid_image", "error": "<string>"}`, captured
+/// live from grok-4.3 on a corrupt PNG). It reaches each client in that client's envelope: an
+/// OpenAI SDK on a same-wire grok relay gets `{"error": {message, type, code, param}}`, and an
+/// Anthropic SDK gets the 400 typed `invalid_request_error`, not `api_error`.
+/// claim: T6
+/// defect: D100
+#[tokio::test]
+async fn xai_errors_arrive_in_the_clients_envelope() {
+    const XAI_400: &str = r#"{"code":"invalid_image","error":"code: 'Client specified an invalid argument', message: \"Invalid PNG image.\""}"#;
+    let (pubkey, sk) = test_keypair(1);
+    let mock = ScriptedUpstream::start(|_, _| {
+        vec![Step::Write(http_response(
+            400,
+            "application/json",
+            XAI_400.as_bytes(),
+        ))]
+    })
+    .await;
+    let gw = Gateway::builder(unused_nats_port(), &mock.authority(), &b64(&pubkey))
+        .providers(&["xai", "openrouter"])
+        .start()
+        .await;
+    let key = vkey(&sk);
+    let user = r#""messages":[{"role":"user","content":"hi"}]"#;
+
+    let (status, text) = post(
+        &gw,
+        "/v1/chat/completions",
+        &key,
+        format!(r#"{{"model":"grok-4.20",{user}}}"#),
+    )
+    .await;
+    assert_eq!(status, 400, "{text}");
+    let v: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(v["error"]["type"], "invalid_request_error", "{v}");
+    assert_eq!(v["error"]["code"], "invalid_image", "{v}");
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("Invalid PNG image")),
+        "{v}"
+    );
+
+    let (status, text) = post(
+        &gw,
+        "/v1/messages",
+        &key,
+        format!(r#"{{"model":"grok-4.20","max_tokens":16,{user}}}"#),
+    )
+    .await;
+    assert_eq!(status, 400, "{text}");
+    let v: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(v["type"], "error", "{v}");
+    assert_eq!(v["error"]["type"], "invalid_request_error", "{v}");
 }

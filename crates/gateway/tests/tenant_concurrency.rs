@@ -55,6 +55,7 @@ async fn wait_for_hits(mock: &MockUpstream, n: usize) {
     .expect("request reached the upstream");
 }
 
+/// claim: A3
 #[tokio::test]
 async fn a_tenant_at_its_ceiling_is_refused_and_recovers() {
     let (pubkey, sk) = test_keypair(51);
@@ -124,6 +125,7 @@ async fn a_tenant_at_its_ceiling_is_refused_and_recovers() {
 
 /// A client that hangs up mid-request must not strand its slot — otherwise a tenant whose users
 /// cancel often would ratchet down to zero capacity.
+/// claim: REL-9
 #[tokio::test]
 async fn a_cancelled_request_releases_its_slot() {
     let (pubkey, sk) = test_keypair(53);

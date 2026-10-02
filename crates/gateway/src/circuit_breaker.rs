@@ -31,8 +31,13 @@
 //! - **Consecutive**: Opens after N failures in a row. Any success resets the count.
 //!   Good for detecting complete backend failures.
 //!
-//! - **Windowed**: Opens after N failures within a time window. Failures outside
-//!   the window are forgotten. Good for detecting degraded backends with partial failures.
+//! - **Windowed**: Opens when, within a time window, at least N failures have been seen **and**
+//!   failures are at least half of the outcomes recorded since the window's first failure. A
+//!   success does not erase the count, so a backend failing every other request (a partial
+//!   brownout) opens it; a busy healthy backend with background errors does not, because its
+//!   successes outnumber them. The window is fixed, not rolling: it starts at its first failure,
+//!   and the first failure after it expires starts a new one with both counts reset. The two
+//!   counts saturate at the same value, so a failure majority can always trip it.
 //!
 //! # Example
 //!
@@ -79,8 +84,8 @@ pub enum FailurePolicy {
         /// Number of consecutive failures before opening.
         threshold: u32,
     },
-    /// N failures within the window opens the circuit.
-    /// Failures older than the window are forgotten.
+    /// N failures within the window, making up at least half of the window's outcomes, opens the
+    /// circuit. Outcomes older than the window are forgotten.
     Windowed {
         /// Number of failures within the window before opening.
         threshold: u32,
@@ -160,7 +165,10 @@ impl CircuitBreakerConfig {
 /// All state is packed into a single 64-bit atomic:
 /// - Bits 62-63: State (0=closed, 1=open, 2=half-open)
 /// - Bits 48-61: Failure count (14 bits, max 16383)
-/// - Bits 32-47: Half-open permits remaining (16 bits)
+/// - Bits 32-47: Half-open permits remaining (16 bits) in HALF_OPEN. In CLOSED windowed mode, the
+///   successes recorded since the current window's first failure (saturating at the failure count's
+///   14-bit cap, so failures can always catch up), which is what makes
+///   the trip decision a failure *rate*.
 /// - Bits 0-31: Timestamp (seconds since a process-wide **monotonic** base — see
 ///   `CircuitBreaker::system_clock` — so it would take 136 years of process uptime to wrap). In
 ///   OPEN it's when the circuit opened (drives the reset timeout); in CLOSED windowed mode it
@@ -325,11 +333,44 @@ impl CircuitBreaker {
 
                 STATE_HALF_OPEN => {
                     if permits == 0 {
+                        // Every probe permit is out. One that has gone unresolved for a whole
+                        // reset timeout belongs to an attempt that stalled (a header that never
+                        // came): reclaim it and admit a fresh probe, rather than shed this
+                        // provider's traffic for as long as that one attempt lives. A late outcome
+                        // from the stalled probe still lands normally.
+                        let now = self.now_secs();
+                        let reset = self.config.reset_timeout.as_secs();
+                        if reset > 0 && now.saturating_sub(timestamp) >= reset {
+                            let new_packed = Self::pack(
+                                STATE_HALF_OPEN,
+                                0,
+                                u64::from(self.config.half_open_permits.saturating_sub(1)),
+                                now,
+                            );
+                            if self
+                                .state
+                                .compare_exchange_weak(
+                                    packed,
+                                    new_packed,
+                                    Ordering::AcqRel,
+                                    Ordering::Acquire,
+                                )
+                                .is_ok()
+                            {
+                                return Ok(());
+                            }
+                            continue;
+                        }
                         return Err(CircuitOpen);
                     }
 
-                    // Try to claim a permit
-                    let new_packed = Self::pack(STATE_HALF_OPEN, failures, permits - 1, timestamp);
+                    // Try to claim a permit, stamping when it was handed out: the stalled-probe
+                    // reclaim above measures from the newest handout, not from when the breaker
+                    // half-opened. Otherwise a permit given back by `release` and claimed again
+                    // looks a whole reset timeout old at once, and a second probe is admitted
+                    // beside it.
+                    let new_packed =
+                        Self::pack(STATE_HALF_OPEN, failures, permits - 1, self.now_secs());
 
                     match self.state.compare_exchange_weak(
                         packed,
@@ -373,15 +414,29 @@ impl CircuitBreaker {
             return;
         }
 
+        let now = self.now_secs();
         loop {
             let packed = self.state.load(Ordering::Acquire);
-            let (state, _, _, _) = Self::unpack(packed);
+            let (state, failures, successes, ts) = Self::unpack(packed);
 
-            let new_packed = match state {
-                // Reset the failure count (and re-anchor the window via the timestamp). Covers both
-                // CLOSED-with-accrued-failures and HALF_OPEN (a probe succeeded → close the circuit).
-                STATE_CLOSED | STATE_HALF_OPEN => Self::pack(STATE_CLOSED, 0, 0, self.now_secs()),
-                STATE_OPEN => return, // Shouldn't record success while open
+            let new_packed = match (state, &self.config.failure_policy) {
+                // Windowed: a success inside a window that has seen failures is counted, not a
+                // reset — the trip decision is a failure rate (see `record_failure_windowed`).
+                // Once the window has expired the slate is wiped.
+                (STATE_CLOSED, FailurePolicy::Windowed { window, .. })
+                    if now.saturating_sub(ts) < window.as_secs() =>
+                {
+                    // Saturate at the failure count's own cap, not the field's: past it the
+                    // failures (14 bits) could never catch up, and the rate rule never trip.
+                    if successes >= FAILURE_MASK {
+                        return;
+                    }
+                    Self::pack(STATE_CLOSED, failures, successes + 1, ts)
+                }
+                // Consecutive, an expired window, or HALF_OPEN (a probe succeeded → close the
+                // circuit): reset the counts and re-anchor the window.
+                (STATE_CLOSED | STATE_HALF_OPEN, _) => Self::pack(STATE_CLOSED, 0, 0, now),
+                (STATE_OPEN, _) => return, // Shouldn't record success while open
                 _ => return,
             };
 
@@ -466,7 +521,7 @@ impl CircuitBreaker {
 
         loop {
             let packed = self.state.load(Ordering::Acquire);
-            let (state, failures, _, ts) = Self::unpack(packed);
+            let (state, failures, successes, ts) = Self::unpack(packed);
 
             let new_packed = match state {
                 STATE_CLOSED => {
@@ -482,15 +537,19 @@ impl CircuitBreaker {
                     // future until the clock catches up, which only ever counts more failures into
                     // one window (fail-closed).
                     let window_expired = failures == 0 || now.saturating_sub(ts) >= window_secs;
-                    let (new_failures, anchor) = if window_expired {
-                        (1, now)
+                    let (new_failures, successes, anchor) = if window_expired {
+                        (1, 0, now)
                     } else {
-                        (failures + 1, ts)
+                        ((failures + 1).min(FAILURE_MASK), successes, ts)
                     };
-                    if new_failures >= u64::from(threshold) {
+                    // A failure *rate*: enough failures to mean something, and at least as many
+                    // failures as successes since the window's first failure. Requiring both keeps
+                    // a busy healthy provider's background errors from tripping it, while a
+                    // provider failing every other request still opens.
+                    if new_failures >= u64::from(threshold) && new_failures >= successes {
                         Self::pack(STATE_OPEN, 0, 0, now)
                     } else {
-                        Self::pack(STATE_CLOSED, new_failures, 0, anchor)
+                        Self::pack(STATE_CLOSED, new_failures, successes, anchor)
                     }
                 }
                 STATE_HALF_OPEN => Self::pack(STATE_OPEN, 0, 0, now),
@@ -525,6 +584,43 @@ impl CircuitBreaker {
             },
             _ => CircuitState::Closed { failure_count: 0 },
         }
+    }
+
+    /// Give back a permit `allow()` handed out, without an outcome: the attempt never reached the
+    /// provider as far as its health is concerned (the gateway itself failed). In HALF_OPEN that
+    /// returns the probe permit so another request can probe; in any other state a permit costs
+    /// nothing, so this is a no-op.
+    pub fn release(&self) {
+        loop {
+            let packed = self.state.load(Ordering::Acquire);
+            let (state, failures, permits, ts) = Self::unpack(packed);
+            if state != STATE_HALF_OPEN || permits >= u64::from(self.config.half_open_permits) {
+                return;
+            }
+            let new_packed = Self::pack(STATE_HALF_OPEN, failures, permits + 1, ts);
+            if self
+                .state
+                .compare_exchange_weak(packed, new_packed, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return;
+            }
+        }
+    }
+
+    /// Whole seconds until this breaker would admit a request again, for the `Retry-After` on the
+    /// `503` it causes. At least 1.
+    pub fn retry_after_secs(&self) -> u64 {
+        let (state, _, permits, ts) = Self::unpack(self.state.load(Ordering::Acquire));
+        let reset = self.config.reset_timeout.as_secs();
+        let waiting = match state {
+            STATE_OPEN => reset.saturating_sub(self.now_secs().saturating_sub(ts)),
+            STATE_HALF_OPEN if permits == 0 => {
+                reset.saturating_sub(self.now_secs().saturating_sub(ts))
+            }
+            _ => 0,
+        };
+        waiting.max(1)
     }
 
     /// Reset the circuit breaker to closed state.
@@ -704,6 +800,7 @@ mod tests {
         assert!(cb.allow().is_err());
     }
 
+    /// claim: R6
     #[test]
     fn test_half_open_success_closes() {
         let cb = CircuitBreaker::new(
@@ -775,24 +872,145 @@ mod tests {
     }
 
     #[test]
-    fn test_windowed_success_resets_window() {
+    fn test_windowed_success_does_not_erase_failures() {
         let cb = CircuitBreaker::new(CircuitBreakerConfig::windowed(3, Duration::from_secs(10)));
 
         cb.record_failure();
         cb.record_failure();
         assert_eq!(cb.state(), CircuitState::Closed { failure_count: 2 });
 
-        // Success resets the failure count
+        // A success is counted against the rate, not a reset.
         cb.record_success();
-        assert_eq!(cb.state(), CircuitState::Closed { failure_count: 0 });
+        assert_eq!(cb.state(), CircuitState::Closed { failure_count: 2 });
 
-        // Need 3 fresh failures to open
-        cb.record_failure();
-        cb.record_failure();
-        assert!(matches!(cb.state(), CircuitState::Closed { .. }));
-
+        // 3 failures to 1 success: past the threshold and at least half the outcomes.
         cb.record_failure();
         assert_eq!(cb.state(), CircuitState::Open);
+    }
+
+    /// claim: R6
+    #[test]
+    fn test_windowed_half_failing_provider_opens() {
+        // The brownout a success-resets rule missed: every other request fails.
+        let cb = CircuitBreaker::new(CircuitBreakerConfig::windowed(4, Duration::from_secs(60)));
+        for _ in 0..4 {
+            cb.record_failure();
+            cb.record_success();
+        }
+        assert_eq!(cb.state(), CircuitState::Open);
+    }
+
+    #[test]
+    fn test_windowed_background_errors_on_a_busy_provider_stay_closed() {
+        // Far more failures than the threshold, but a tenth of the traffic.
+        let cb = CircuitBreaker::new(CircuitBreakerConfig::windowed(4, Duration::from_secs(60)));
+        for _ in 0..50 {
+            cb.record_failure();
+            for _ in 0..9 {
+                cb.record_success();
+            }
+        }
+        assert!(matches!(cb.state(), CircuitState::Closed { .. }));
+    }
+
+    #[test]
+    fn test_a_stalled_probe_permit_is_reclaimed_after_the_reset_timeout() {
+        static NOW: AtomicU64 = AtomicU64::new(100);
+        fn clock() -> u64 {
+            NOW.load(Ordering::Relaxed)
+        }
+        let cb = CircuitBreaker::with_clock(
+            CircuitBreakerConfig::windowed(1, Duration::from_secs(60))
+                .reset_timeout(Duration::from_secs(5))
+                .half_open_permits(1),
+            clock,
+        );
+        cb.record_failure();
+        NOW.store(105, Ordering::Relaxed);
+        assert!(cb.allow().is_ok(), "the probe");
+        assert!(cb.allow().is_err(), "the only permit is out");
+        NOW.store(109, Ordering::Relaxed);
+        assert!(cb.allow().is_err(), "not yet a whole reset timeout");
+        assert_eq!(cb.retry_after_secs(), 1);
+        NOW.store(110, Ordering::Relaxed);
+        assert!(
+            cb.allow().is_ok(),
+            "the stalled probe's permit is reclaimed"
+        );
+        assert!(cb.allow().is_err());
+        // A late success from either probe still closes it.
+        cb.record_success();
+        assert_eq!(cb.state(), CircuitState::Closed { failure_count: 0 });
+    }
+
+    /// A probe permit given back by `release` (an attempt with no provider outcome) and claimed
+    /// again is a fresh probe: the stalled-probe reclaim counts from that handout, so a second
+    /// probe is not admitted beside it.
+    #[test]
+    fn a_released_probe_permit_claimed_again_is_not_reclaimable_at_once() {
+        static NOW: AtomicU64 = AtomicU64::new(100);
+        fn clock() -> u64 {
+            NOW.load(Ordering::Relaxed)
+        }
+        let cb = CircuitBreaker::with_clock(
+            CircuitBreakerConfig::windowed(1, Duration::from_secs(60))
+                .reset_timeout(Duration::from_secs(5))
+                .half_open_permits(1),
+            clock,
+        );
+        cb.record_failure();
+        NOW.store(105, Ordering::Relaxed);
+        assert!(cb.allow().is_ok(), "the probe");
+        NOW.store(112, Ordering::Relaxed);
+        cb.release();
+        assert!(cb.allow().is_ok(), "the returned permit");
+        assert!(cb.allow().is_err(), "one probe at a time");
+        NOW.store(117, Ordering::Relaxed);
+        assert!(
+            cb.allow().is_ok(),
+            "reclaimed a reset timeout after its handout"
+        );
+    }
+
+    #[test]
+    fn test_retry_after_counts_down_the_reset_timeout() {
+        static NOW: AtomicU64 = AtomicU64::new(100);
+        fn clock() -> u64 {
+            NOW.load(Ordering::Relaxed)
+        }
+        let cb = CircuitBreaker::with_clock(
+            CircuitBreakerConfig::windowed(1, Duration::from_secs(60))
+                .reset_timeout(Duration::from_secs(30)),
+            clock,
+        );
+        assert_eq!(cb.retry_after_secs(), 1, "closed");
+        cb.record_failure();
+        assert_eq!(cb.retry_after_secs(), 30);
+        NOW.store(120, Ordering::Relaxed);
+        assert_eq!(cb.retry_after_secs(), 10);
+    }
+
+    #[test]
+    fn test_release_returns_a_probe_permit() {
+        let cb = CircuitBreaker::new(
+            CircuitBreakerConfig::windowed(1, Duration::from_secs(60))
+                .reset_timeout(Duration::from_millis(1))
+                .half_open_permits(1),
+        );
+        cb.record_failure();
+        thread::sleep(Duration::from_millis(10));
+        assert!(cb.allow().is_ok());
+        cb.release();
+        assert!(cb.allow().is_ok(), "the released permit probes again");
+        // Releasing more than was handed out cannot mint permits.
+        cb.release();
+        cb.release();
+        assert_eq!(
+            cb.state(),
+            CircuitState::HalfOpen {
+                permits_remaining: 1
+            }
+        );
     }
 
     #[test]
@@ -1072,6 +1290,34 @@ mod tests {
         }
     }
 
+    /// The windowed rate rule is "failures ≥ threshold and failures ≥ successes". A busy window can
+    /// record more successes than the failure count can hold; failures must still be able to catch
+    /// up, so the two counts saturate at the same value and a majority of failures always opens.
+    /// claim: REL-6
+    /// defect: D97
+    #[test]
+    fn a_failure_majority_opens_a_window_with_more_successes_than_the_failure_count_holds() {
+        let cb = CircuitBreaker::with_clock(
+            CircuitBreakerConfig::windowed(3, Duration::from_secs(60))
+                .reset_timeout(Duration::from_secs(3600)),
+            fixed_clock,
+        );
+        cb.record_failure();
+        for _ in 0..20_000 {
+            cb.record_success();
+        }
+        for _ in 0..20_001 {
+            cb.record_failure();
+            if cb.state() == CircuitState::Open {
+                return;
+            }
+        }
+        panic!(
+            "20001 failures against 20000 successes in one window never opened: {:?}",
+            cb.state()
+        );
+    }
+
     // =========================================================================
     // Pack/unpack tests
     // =========================================================================
@@ -1128,5 +1374,104 @@ mod tests {
         );
         assert_eq!(config.reset_timeout, Duration::from_secs(30));
         assert_eq!(config.half_open_permits, 5);
+    }
+}
+
+/// Behaviors a mutation-testing pass found no test constraining.
+#[cfg(test)]
+mod mutation_gaps {
+    use super::*;
+
+    /// `allow()` on a closed breaker is a read: it must not wipe the failures counted so far, or a
+    /// provider failing every request between admissions would never trip.
+    /// claim: R6
+    #[test]
+    fn allow_on_a_closed_breaker_keeps_its_failure_count() {
+        let cb = CircuitBreaker::new(CircuitBreakerConfig::consecutive(3));
+        cb.record_failure();
+        cb.record_failure();
+        assert!(cb.allow().is_ok());
+        assert_eq!(cb.state(), CircuitState::Closed { failure_count: 2 });
+        cb.record_failure();
+        assert_eq!(cb.state(), CircuitState::Open);
+    }
+
+    /// A windowed breaker's success after its window has expired wipes the slate, at the boundary
+    /// itself too; inside the window it only counts toward the rate.
+    /// claim: R6
+    #[test]
+    fn windowed_success_resets_once_the_window_has_expired() {
+        static NOW: AtomicU64 = AtomicU64::new(1_000);
+        fn clock() -> u64 {
+            NOW.load(Ordering::SeqCst)
+        }
+        let cb = CircuitBreaker::with_clock(
+            CircuitBreakerConfig::windowed(5, Duration::from_secs(10)),
+            clock,
+        );
+        cb.record_failure();
+        cb.record_failure();
+        NOW.store(1_009, Ordering::SeqCst);
+        cb.record_success();
+        assert_eq!(cb.state(), CircuitState::Closed { failure_count: 2 });
+        // Exactly one window after the first failure: expired.
+        NOW.store(1_010, Ordering::SeqCst);
+        cb.record_success();
+        assert_eq!(cb.state(), CircuitState::Closed { failure_count: 0 });
+    }
+
+    /// A failed probe reopens a windowed breaker, as it does a consecutive one.
+    /// claim: R6, REL-6
+    #[test]
+    fn windowed_half_open_failure_reopens() {
+        let cb = CircuitBreaker::new(CircuitBreakerConfig::windowed(3, Duration::from_secs(10)));
+        cb.force_state(CircuitState::HalfOpen {
+            permits_remaining: 1,
+        });
+        cb.record_failure();
+        assert_eq!(cb.state(), CircuitState::Open);
+    }
+
+    /// `Retry-After` while half-open: 1 when a probe permit is free (the next request is admitted),
+    /// and the rest of the reset timeout when every permit is out.
+    /// claim: R6, REL-19
+    #[test]
+    fn half_open_retry_after_depends_on_free_permits() {
+        static NOW: AtomicU64 = AtomicU64::new(500);
+        fn clock() -> u64 {
+            NOW.load(Ordering::SeqCst)
+        }
+        let cb = CircuitBreaker::with_clock(
+            CircuitBreakerConfig::consecutive(1)
+                .reset_timeout(Duration::from_secs(30))
+                .half_open_permits(1),
+            clock,
+        );
+        cb.force_state(CircuitState::HalfOpen {
+            permits_remaining: 1,
+        });
+        NOW.store(510, Ordering::SeqCst);
+        assert_eq!(cb.retry_after_secs(), 1, "a free permit admits now");
+        cb.force_state(CircuitState::HalfOpen {
+            permits_remaining: 0,
+        });
+        NOW.store(510, Ordering::SeqCst);
+        assert_eq!(
+            cb.retry_after_secs(),
+            30,
+            "no permit: wait out the reset timeout"
+        );
+    }
+
+    /// `reset()` closes an open breaker and clears its count.
+    /// claim: R6
+    #[test]
+    fn reset_closes_an_open_breaker() {
+        let cb = CircuitBreaker::new(CircuitBreakerConfig::consecutive(1));
+        cb.record_failure();
+        assert_eq!(cb.state(), CircuitState::Open);
+        cb.reset();
+        assert_eq!(cb.state(), CircuitState::Closed { failure_count: 0 });
+        assert!(cb.allow().is_ok());
     }
 }

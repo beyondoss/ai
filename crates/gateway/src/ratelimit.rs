@@ -501,6 +501,7 @@ mod tests {
     /// Window rotation, pinned to an explicit clock so it is deterministic and instant: exhaust the
     /// budget, step into the next window, get the whole budget back. The tail also covers the
     /// two-or-more-windows-elapsed path, where *both* slots are stale and have to be cleared.
+    /// claim: A3
     #[test]
     fn per_credential_budget_is_restored_by_the_next_window() {
         let rl = RateLimit::new(2, 0).unwrap();

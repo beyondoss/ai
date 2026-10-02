@@ -77,6 +77,7 @@ async fn enable_capture(gw: &Gateway, nats_port: u16, tenant: u64) {
     wait_for_metric(gw, "ai_capture_set_size", "", 1.0).await;
 }
 
+/// claim: O2
 #[tokio::test]
 async fn capture_does_not_alter_a_single_relayed_byte() {
     // THE invariant. Capture is a passive tap; if it perturbs the proxied bytes in either direction
@@ -134,6 +135,7 @@ async fn capture_does_not_alter_a_single_relayed_byte() {
     );
 }
 
+/// claim: O2
 #[tokio::test]
 async fn control_plane_capture_emits_both_bodies_and_correlates_by_request_id() {
     let nats = Nats::start().await;
@@ -320,6 +322,7 @@ async fn the_header_can_suppress_capture_for_an_enabled_tenant() {
     );
 }
 
+/// claim: O2
 #[tokio::test]
 async fn metadata_reaches_the_billing_row_but_never_the_provider() {
     // Tagging is useful with capture *off* — that's the point of shipping it alongside. It must

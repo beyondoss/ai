@@ -25,6 +25,9 @@
 use crate::circuit_breaker::CircuitBreaker;
 use crate::metrics::ProviderMetrics;
 use crate::secret::Secret;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 /// The shared provider table. `KNOWN_PROVIDERS` is the gateway-routable subset — the BYO-only rows
 /// (HuggingFace, NVIDIA, Kimi-Coding, OpenCode) have no `/{name}/…` mount and no pool key, so minting
@@ -49,7 +52,7 @@ pub enum Endpoint {
 
 impl Endpoint {
     /// The endpoint a catalog row's `wire` implies. GPT rows speak Chat Completions; Claude rows
-    /// speak Messages. GPT rows also list a parallel `/v1/responses` arm for session state.
+    /// speak Messages. GPT rows also list a parallel `/v1/responses` arm for Responses clients.
     pub fn of_wire(d: Dialect) -> Self {
         match d {
             Dialect::Anthropic => Endpoint::Messages,
@@ -160,14 +163,95 @@ pub fn dialect_default(d: Dialect) -> &'static str {
 /// generation path, where it ran (and billed) as a generation. Under `/auto` the `/v1` is optional
 /// (`/auto/chat/completions`), and a trailing slash is ignored everywhere.
 pub fn implied_endpoint(path: &str) -> Option<Endpoint> {
+    catalog_endpoint(path)
+        .filter(|e| e.sub.is_none())
+        .map(|e| e.endpoint)
+}
+
+/// One endpoint the gateway meters: the suffix its path ends with below any provider's mount
+/// prefix, the endpoint it is (a sub-resource is its parent's), and the sub-resource, if it is one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EndpointPath {
+    pub suffix: &'static str,
+    pub endpoint: Endpoint,
+    pub sub: Option<SubResource>,
+}
+
+/// Every endpoint a managed key may reach, and so every one the gateway meters: the one table the
+/// managed allowlist (`proxy::is_managed_provider_endpoint`, a security boundary), the forwarded
+/// wire, the sub-resources and the catalog's endpoint names all read (D209). Read with
+/// [`forward_endpoint`] (a `/{provider}/…` path, by suffix) or [`catalog_endpoint`] (a `/v1` or
+/// `/auto` path, exact), each with one normalisation for its kind of path ([`normalize_endpoint_path`]).
+pub const ENDPOINT_PATHS: [EndpointPath; 7] = [
+    EndpointPath {
+        suffix: "/chat/completions",
+        endpoint: Endpoint::ChatCompletions,
+        sub: None,
+    },
+    EndpointPath {
+        suffix: "/messages",
+        endpoint: Endpoint::Messages,
+        sub: None,
+    },
+    EndpointPath {
+        suffix: "/responses",
+        endpoint: Endpoint::Responses,
+        sub: None,
+    },
+    EndpointPath {
+        suffix: "/embeddings",
+        endpoint: Endpoint::Embeddings,
+        sub: None,
+    },
+    EndpointPath {
+        suffix: "/messages/count_tokens",
+        endpoint: Endpoint::Messages,
+        sub: Some(SubResource::CountTokens),
+    },
+    EndpointPath {
+        suffix: "/responses/input_tokens",
+        endpoint: Endpoint::Responses,
+        sub: Some(SubResource::InputTokens),
+    },
+    EndpointPath {
+        suffix: "/responses/compact",
+        endpoint: Endpoint::Responses,
+        sub: Some(SubResource::Compact),
+    },
+];
+
+/// The normalisation every forwarded-path lookup applies (no query string): one trailing slash
+/// dropped. [`catalog_endpoint`] drops every trailing slash instead.
+fn normalize_endpoint_path(path: &str) -> &str {
+    path.strip_suffix('/').unwrap_or(path)
+}
+
+/// The [`ENDPOINT_PATHS`] row a path (no query string) ends with, under any mount prefix (`/v1`,
+/// `/api/v1`, `/openai/v1`, `/inference/v1`, `/anthropic/v1`, `/backend-api/codex`). A path that
+/// carries a query does not match: split it off first ([`forward_endpoint`] does).
+pub fn endpoint_of_path(path: &str) -> Option<&'static EndpointPath> {
+    let path = normalize_endpoint_path(path);
+    ENDPOINT_PATHS.iter().find(|e| path.ends_with(e.suffix))
+}
+
+/// The [`ENDPOINT_PATHS`] row a forwarded `/{provider}/…` path names (query allowed and ignored).
+pub fn forward_endpoint(path_and_query: &str) -> Option<&'static EndpointPath> {
+    endpoint_of_path(
+        path_and_query
+            .split_once('?')
+            .map_or(path_and_query, |(p, _)| p),
+    )
+}
+
+/// The [`ENDPOINT_PATHS`] row a catalog-walk path names, exactly: under `/auto` the `/v1` is
+/// optional, and every trailing slash is ignored. Deliberately looser than a forwarded path, which
+/// keeps the provider's own spelling (one trailing slash is the same resource, `//` one the
+/// provider 404s): a catalog path is the gateway's own name, so `/v1/messages//` is Messages
+/// (pinned by `prop_documented_paths_classify_as_the_table_says`).
+fn catalog_endpoint(path: &str) -> Option<&'static EndpointPath> {
     let rest = catalog_path_rest(path)?.trim_end_matches('/');
-    match rest.strip_prefix("/v1").unwrap_or(rest) {
-        "/chat/completions" => Some(Endpoint::ChatCompletions),
-        "/messages" => Some(Endpoint::Messages),
-        "/responses" => Some(Endpoint::Responses),
-        "/embeddings" => Some(Endpoint::Embeddings),
-        _ => None,
-    }
+    let rest = rest.strip_prefix("/v1").unwrap_or(rest);
+    ENDPOINT_PATHS.iter().find(|e| rest == e.suffix)
 }
 
 /// A provider endpoint under one of the generation endpoints that a catalog walk can serve: the
@@ -189,13 +273,13 @@ impl SubResource {
     /// The sub-resource a catalog-walk path names, if any. Same rules as [`implied_endpoint`]:
     /// `/v1` optional under `/auto`, trailing slash ignored.
     pub fn of_path(path: &str) -> Option<Self> {
-        let rest = catalog_path_rest(path)?.trim_end_matches('/');
-        match rest.strip_prefix("/v1").unwrap_or(rest) {
-            "/messages/count_tokens" => Some(Self::CountTokens),
-            "/responses/input_tokens" => Some(Self::InputTokens),
-            "/responses/compact" => Some(Self::Compact),
-            _ => None,
-        }
+        catalog_endpoint(path).and_then(|e| e.sub)
+    }
+
+    /// The sub-resource a forwarded upstream path names (`/{provider}/…` with the provider segment
+    /// stripped, query allowed), so a provider-routed token count is as free as a catalog walk's.
+    pub fn of_forward_path(path_and_query: &str) -> Option<Self> {
+        forward_endpoint(path_and_query).and_then(|e| e.sub)
     }
 
     /// Appended to a serving candidate's own path (`/v1/messages` → `/v1/messages/count_tokens`).
@@ -256,6 +340,12 @@ pub fn is_responses_path(path: &str) -> bool {
     implied_endpoint(path) == Some(Endpoint::Responses)
 }
 
+/// Whether a forwarded (`/{provider}/…`, query stripped) path is the Responses generation
+/// endpoint itself, under any mount prefix: not a sub-resource or a stored response.
+pub fn forward_is_responses(path: &str) -> bool {
+    endpoint_of_path(path).is_some_and(|e| e.endpoint == Endpoint::Responses && e.sub.is_none())
+}
+
 /// Whether a catalog candidate path is the Responses endpoint.
 pub fn candidate_path_is_responses(path: &str) -> bool {
     path.ends_with("/responses")
@@ -280,7 +370,7 @@ pub enum WireAction {
 /// Catalog-walk decision for an inbound path vs the row's endpoint ([`Endpoint::of_row`]).
 ///
 /// Inbound `/v1/responses` is a third client dialect vs the row primary; per-candidate translate
-/// then uses the serving path, so a GPT session walk onto `/v1/responses` is a byte relay.
+/// then uses the serving path, so a GPT row's walk onto its `/v1/responses` arm is a byte relay.
 /// Same-wire Responses on `/{provider}` never reaches here.
 pub fn catalog_wire_action(path: &str, row: Endpoint) -> WireAction {
     match implied_endpoint(path) {
@@ -292,6 +382,180 @@ pub fn catalog_wire_action(path: &str, row: Endpoint) -> WireAction {
         None if names_no_endpoint(path) => WireAction::Relay,
         None => WireAction::Reject,
     }
+}
+
+/// Whether a managed catalog walk on `row` reads the whole body before it chooses candidates, even
+/// when a header named the row. A headerless walk reads it anyway (to find `model`); this makes a
+/// header-won one do the same where the body decides something: the row's card refuses image input
+/// or tools ([`refused_input`]), or a candidate cannot serve a capability the card advertises
+/// ([`unserved`]). Embeddings rows never: their bodies carry neither.
+pub fn walk_reads_body(row: &ModelRoute) -> bool {
+    Endpoint::of_row(row) != Endpoint::Embeddings
+        && (row.card.input & providers::catalog::IN_IMAGE == 0
+            || row.card.features & providers::catalog::TOOLS == 0
+            || row
+                .candidates
+                .iter()
+                .any(|c| !providers::catalog::serves_structured_outputs(c))
+            || (row.card.input & providers::catalog::IN_FILE != 0
+                && row
+                    .candidates
+                    .iter()
+                    .any(|c| !providers::catalog::serves_file_input(c))))
+}
+
+/// The most tools OpenAI Chat Completions accepts in one request: 400 `array_above_max_length`
+/// "Expected an array with maximum length 128" above it. OpenAI's Responses API took 600 (TOOL-1).
+pub const CHAT_TOOL_CAP: usize = 128;
+
+/// Whether a translated (Messages) request on `row` walks the row's Responses arm instead of its
+/// candidates: a row whose primary is Chat Completions and that has a Responses arm (the GPT rows
+/// before 5.4), and a body offering more than [`CHAT_TOOL_CAP`] tools. Chat Completions would refuse
+/// them; the arm is translated onto and takes them (D131). A Chat Completions client keeps its
+/// own endpoint (a byte relay, OpenAI's own limit and error), and a Responses client already walks
+/// the arm.
+pub fn tools_need_responses_arm(row: &ModelRoute, client: Option<Endpoint>, body: &[u8]) -> bool {
+    tool_count_decides_arm(row, client) && tool_count(body) > CHAT_TOOL_CAP
+}
+
+/// Whether a header-won walk on `row` from a client on `path` reads the body to count its tools
+/// ([`tools_need_responses_arm`]).
+pub fn walk_reads_tools(row: &ModelRoute, path: &str) -> bool {
+    tool_count_decides_arm(row, implied_endpoint(path))
+}
+
+/// A Messages client on a row whose primary is Chat Completions and that has a Responses arm.
+fn tool_count_decides_arm(row: &ModelRoute, client: Option<Endpoint>) -> bool {
+    client == Some(Endpoint::Messages)
+        && !row.responses.is_empty()
+        && row
+            .candidates
+            .first()
+            .is_some_and(|c| providers::catalog::endpoint_of_path(c.path) == "chat/completions")
+}
+
+/// Entries in the body's root `tools` array (the last `tools`, which a provider's parser keeps).
+/// Zero, with no structural scan, when the body never says `tools`.
+fn tool_count(body: &[u8]) -> usize {
+    if memchr::memmem::find(body, b"\"tools\"").is_none() {
+        return 0;
+    }
+    let Some(tools) = crate::peek::root_members(body)
+        .and_then(|m| m.into_iter().rev().find(|m| m.key_is(body, "tools")))
+    else {
+        return 0;
+    };
+    if body.get(tools.value.0) != Some(&b'[') {
+        return 0;
+    }
+    crate::peek::array_elements(body, tools.value.0).map_or(0, |items| items.len())
+}
+
+/// What `body` asks of `row` that its card says the row does not accept: `Some("image input")` for
+/// an image part on a row without image input, `Some("tools")` for a non-empty `tools` array on a
+/// row whose card lists no tools. The walk answers 400 before any upstream sees it. An image would
+/// otherwise be ignored and an answer about nothing billed (Together's gpt-oss-120b, and o3-mini
+/// before its row left), or fail with a 500 (gpt-4, likewise). Tools would be called with junk arguments by a model the card dropped
+/// them from for that (GLM 5.3 Flash, D197), or refused upstream in each provider's own words. A
+/// PDF on a row without file input is left to the candidate, because OpenRouter extracts a PDF's
+/// text for any model.
+pub fn refused_input(row: &ModelRoute, body: &[u8]) -> Option<&'static str> {
+    if Endpoint::of_row(row) == Endpoint::Embeddings {
+        return None;
+    }
+    if row.card.input & providers::catalog::IN_IMAGE == 0 && carries_image(body) {
+        return Some("image input");
+    }
+    if row.card.features & providers::catalog::TOOLS == 0 && tool_count(body) > 0 {
+        return Some("tools");
+    }
+    None
+}
+
+/// An image content part anywhere in the conversation: Chat Completions `image_url`, Messages
+/// `image` (tool results included), Responses `input_image`.
+fn carries_image(body: &[u8]) -> bool {
+    carries_part(
+        body,
+        &["image_url", "image", "input_image"],
+        &[b"\"image_url\"", b"\"image\"", b"\"input_image\""],
+        &["messages", "input", "system"],
+    )
+}
+
+/// Whether a content part whose `type` is one of `types` sits anywhere under one of the root
+/// `keys` (the last of each, as a provider's parser keeps it).
+///
+/// Read by span, never into a `Value` (D215): this runs on catalog-walk bodies up to
+/// `MAX_REQUEST_BODY` before any upstream, and a `Value` costs 10-250 bytes of heap per byte of
+/// JSON. The gate is each type name as a quoted string (`quoted`, the same names in quotes): prose
+/// that mentions an image or a file never spells one, since a quote inside a JSON string is
+/// escaped, so a body without one is answered by `memmem` alone. Past the gate, one walk of the
+/// root members and a `"type"` scan of the chosen values ([`crate::peek::has_typed_member`]). A
+/// body whose root is not one object carries nothing, as an unparseable one did.
+fn carries_part(body: &[u8], types: &[&str], quoted: &[&[u8]], keys: &[&str]) -> bool {
+    if !quoted
+        .iter()
+        .any(|q| memchr::memmem::find(body, q).is_some())
+    {
+        return false;
+    }
+    let Some(open) = crate::peek::root_open(body) else {
+        return false;
+    };
+    // At most three keys: the last span of each.
+    let mut spans = [None; 3];
+    for m in crate::peek::members(body, open) {
+        let Some(m) = m else {
+            return false;
+        };
+        for (span, key) in spans.iter_mut().zip(keys) {
+            if m.key_is(body, key) {
+                *span = Some(m.value);
+            }
+        }
+    }
+    spans
+        .iter()
+        .flatten()
+        .any(|&span| crate::peek::has_typed_member(body, span, types))
+}
+
+/// Catalog indices (bit per index) of `arms` that cannot serve `body`: Bedrock candidates when the
+/// body asks for a JSON-schema output (`response_format` / `output_config.format` / `text.format`
+/// all name `json_schema`), which Bedrock's Messages surface refuses; and a candidate that reads no
+/// PDF (`providers::catalog::serves_file_input`) when the body carries a file part. The walk leaves
+/// them out, unless that would leave nothing, in which case the provider's own error is the answer.
+/// Zero, with no scan, on a row whose candidates all serve both.
+pub fn unserved(arms: &[Candidate], body: &[u8]) -> u8 {
+    let mask = |serves: fn(&Candidate) -> bool| {
+        arms.iter()
+            .take(MAX_CANDIDATES)
+            .enumerate()
+            .filter(|(_, c)| !serves(c))
+            .fold(0u8, |m, (i, _)| m | (1 << i))
+    };
+    let mut out = 0;
+    let no_schema = mask(providers::catalog::serves_structured_outputs);
+    if no_schema != 0 && memchr::memmem::find(body, b"\"json_schema\"").is_some() {
+        out |= no_schema;
+    }
+    let no_file = mask(providers::catalog::serves_file_input);
+    if no_file != 0 && carries_file(body) {
+        out |= no_file;
+    }
+    out
+}
+
+/// A file content part anywhere in the conversation: Chat Completions `file`, Messages
+/// `document` (tool results included), Responses `input_file`. See [`carries_part`].
+fn carries_file(body: &[u8]) -> bool {
+    carries_part(
+        body,
+        &["file", "document", "input_file"],
+        &[b"\"file\"", b"\"document\"", b"\"input_file\""],
+        &["messages", "input"],
+    )
 }
 
 /// One precomputed managed auth value: the formatted secret plus, when the bytes are header-safe,
@@ -314,6 +578,86 @@ pub fn catalog_wire_action(path: &str, row: Endpoint) -> WireAction {
 pub struct PoolAuth {
     pub value: Secret,
     pub header: Option<http::HeaderValue>,
+    /// Where the bare key starts in `value` (after the scheme's `Bearer `), for [`Self::key`].
+    key_at: usize,
+    /// Searchers for [`Self::key`] ([`key_finders`]: the key itself first, then the spellings a JSON
+    /// encoder may give it), built once at boot: every managed error response is scanned for an
+    /// echo of the key (`proxy::Redact`), and building a searcher per response repeated the key's
+    /// preprocessing on each one (D92). Each holds a copy of the key, like `header`.
+    finders: Box<[memchr::memmem::Finder<'static>]>,
+    /// When this key's last refusal (a 401, a 403 naming the key, or an out-of-credit answer:
+    /// D180) cools off, in ms since [`clock_ms`]'s epoch; 0 when it has none. A cooling key is
+    /// skipped as a request's *first* key, and a provider whose keys all cool is skipped by a
+    /// catalog walk that has another candidate ([`Provider::cooling`]), so traffic stops paying a
+    /// round trip to a revoked or unfunded key on every request. Shared across requests; relaxed
+    /// ordering, since a stale read costs only one more walk.
+    bad_until_ms: AtomicU64,
+}
+
+impl PoolAuth {
+    /// The bare key, without its scheme: what a provider that echoes its credential would echo,
+    /// and so what the gateway scrubs from responses (`proxy::Redact`).
+    pub fn key(&self) -> &str {
+        self.value.expose().get(self.key_at..).unwrap_or("")
+    }
+
+    /// The boot-built searcher for [`Self::key`] as sent.
+    pub fn finder(&self) -> &memchr::memmem::Finder<'static> {
+        &self.finders[0]
+    }
+
+    /// Every boot-built searcher for [`Self::key`]: as sent, then each escaped spelling.
+    pub fn finders(&self) -> &[memchr::memmem::Finder<'static>] {
+        &self.finders
+    }
+
+    fn cooling(&self, now_ms: u64) -> bool {
+        self.bad_until_ms.load(Ordering::Relaxed) > now_ms
+    }
+}
+
+/// Searchers for every spelling of `key` an upstream echo may use: the key as sent first, then, for
+/// a key holding `/` or `+` (a Bedrock `ABSK…` key is base64), the spellings a JSON encoder writes
+/// them in: `\/` for `/`, and `+` or `+` for `+` (one encoder writes every occurrence
+/// the same way). A JSON client decodes each of those to the key, so each is scrubbed (D203). Never
+/// empty: an empty key yields one empty searcher, which the scrub skips.
+pub fn key_finders(key: &str) -> Box<[memchr::memmem::Finder<'static>]> {
+    let slashes: &[&str] = if key.contains('/') {
+        &["/", "\\/"]
+    } else {
+        &["/"]
+    };
+    let pluses: &[&str] = if key.contains('+') {
+        &["+", "\\u002b", "\\u002B"]
+    } else {
+        &["+"]
+    };
+    let mut spellings: Vec<String> = Vec::with_capacity(slashes.len() * pluses.len());
+    for slash in slashes {
+        for plus in pluses {
+            let s = key.replace('/', slash).replace('+', plus);
+            if !spellings.contains(&s) {
+                spellings.push(s);
+            }
+        }
+    }
+    spellings
+        .iter()
+        .map(|s| memchr::memmem::Finder::new(s.as_bytes()).into_owned())
+        .collect()
+}
+
+/// How long a pool key that drew a 401 (or a 403 naming the key, or an out-of-credit answer) is
+/// skipped as a request's first key.
+pub const KEY_COOLDOWN: Duration = Duration::from_secs(60);
+
+/// Monotonic milliseconds since the first call, plus one (so 0 stays "never failed"). Coarse
+/// enough for a cooldown, and an `AtomicU64` holds it where an `Instant` would need a lock.
+fn clock_ms() -> u64 {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    u64::try_from(EPOCH.get_or_init(Instant::now).elapsed().as_millis())
+        .unwrap_or(u64::MAX)
+        .saturating_add(1)
 }
 
 /// A *resolved* provider: static wire facts + the boot-resolved upstream authority/host + (for
@@ -331,7 +675,8 @@ pub struct Provider {
     pub auth: AuthScheme,
     /// Precomputed managed auth values, one per configured pool key, in config order. Empty ⇒ no
     /// pool key is configured for this provider ⇒ managed requests to it are rejected (503). A
-    /// managed 429 walks the next unused entry; the key is never sent to a different provider.
+    /// managed 429 or 401 walks the next unused entry; the key is never sent to a different
+    /// provider. A 401 (or a 403 whose body names the key) also cools the key off for later requests (see [`Self::first_key`]).
     pub pool_auth: Box<[PoolAuth]>,
     /// `host` as a ready-to-insert `HeaderValue` — see [`PoolAuth`].
     pub host_header: Option<http::HeaderValue>,
@@ -350,6 +695,37 @@ impl Provider {
     /// Whether at least one pool key is configured — the 503 gate for managed traffic.
     pub fn has_pool_key(&self) -> bool {
         !self.pool_auth.is_empty()
+    }
+
+    /// The pool key a new request on this provider starts on: the first one not cooling off from
+    /// an auth failure, or key 0 when every key is (a revoked set still has to answer something).
+    pub fn first_key(&self) -> u8 {
+        if self.pool_auth.len() < 2 {
+            return 0;
+        }
+        let now = clock_ms();
+        self.pool_auth
+            .iter()
+            .position(|k| !k.cooling(now))
+            .and_then(|i| u8::try_from(i).ok())
+            .unwrap_or(0)
+    }
+
+    /// Whether every pool key is cooling off from a refusal (see [`Self::mark_key_bad`]). A catalog
+    /// walk leaves such a provider out while another candidate can take the request (D180).
+    pub fn cooling(&self) -> bool {
+        let now = clock_ms();
+        !self.pool_auth.is_empty() && self.pool_auth.iter().all(|k| k.cooling(now))
+    }
+
+    /// Record that pool key `i` was refused (a 401, a 403 naming the key, or an out-of-credit
+    /// answer): later requests start past it for [`KEY_COOLDOWN`].
+    pub fn mark_key_bad(&self, i: u8) {
+        if let Some(k) = self.pool_auth.get(usize::from(i)) {
+            let cooldown = u64::try_from(KEY_COOLDOWN.as_millis()).unwrap_or(u64::MAX);
+            k.bad_until_ms
+                .store(clock_ms().saturating_add(cooldown), Ordering::Relaxed);
+        }
     }
 
     /// Resolve a provider from its name, upstream authority, dialect, auth scheme, pool keys, and
@@ -374,8 +750,23 @@ impl Provider {
             .iter()
             .map(|k| {
                 let value = Secret::new(auth.format(k));
-                let header = http::HeaderValue::from_str(value.expose()).ok();
-                PoolAuth { value, header }
+                // Sensitive: HPACK never indexes it (so it cannot be recovered from the
+                // compression table) and `Debug` prints `Sensitive`, not the key.
+                let header = http::HeaderValue::from_str(value.expose())
+                    .ok()
+                    .map(|mut h| {
+                        h.set_sensitive(true);
+                        h
+                    });
+                let key_at = auth.value_prefix().map_or(0, str::len);
+                let finders = key_finders(value.expose().get(key_at..).unwrap_or(""));
+                PoolAuth {
+                    value,
+                    header,
+                    key_at,
+                    finders,
+                    bad_until_ms: AtomicU64::new(0),
+                }
             })
             .collect();
         let host_header = http::HeaderValue::from_str(&host).ok();
@@ -635,6 +1026,19 @@ mod tests {
         ] {
             assert_eq!(SubResource::of_path(path), want, "{path}");
         }
+        for (path, want) in [
+            ("/v1/messages/count_tokens", Some(SubResource::CountTokens)),
+            (
+                "/v1/messages/count_tokens/?beta=true",
+                Some(SubResource::CountTokens),
+            ),
+            ("/v1/responses/input_tokens", Some(SubResource::InputTokens)),
+            ("/v1/responses/compact", Some(SubResource::Compact)),
+            ("/v1/messages", None),
+            ("/v1/responses", None),
+        ] {
+            assert_eq!(SubResource::of_forward_path(path), want, "{path}");
+        }
         let claude = providers::for_model("claude-opus-4-8").expect("row");
         let served: Vec<_> = claude
             .candidates
@@ -674,6 +1078,8 @@ mod tests {
         assert_eq!(dialect_default(Dialect::Anthropic), "anthropic");
     }
 
+    /// claim: SEC-4
+    /// defect: D53
     #[test]
     fn resolve_derives_host_and_pool_auth() {
         let p = Provider::resolve(
@@ -688,6 +1094,12 @@ mod tests {
         assert_eq!(p.host, "api.openai.com");
         assert_eq!(p.dialect, Dialect::OpenAi);
         assert_eq!(p.pool_auth[0].value.expose(), "Bearer sk-x");
+        let header = p.pool_auth[0].header.as_ref().unwrap();
+        assert!(
+            header.is_sensitive(),
+            "the pool key header is marked sensitive"
+        );
+        assert!(!format!("{header:?}").contains("sk-x"));
 
         // No pool key ⇒ no managed auth value (managed requests to it would 503).
         let a = Provider::resolve(

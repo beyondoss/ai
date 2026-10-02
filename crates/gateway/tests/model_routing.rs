@@ -116,6 +116,7 @@ async fn routes_by_model_header_to_the_primary_candidate() {
 
 /// The headline behaviour: primary refuses the connection, and the request still succeeds — served
 /// by the fallback, under the fallback's mount, key, and id.
+/// claim: R1, REL-1
 #[tokio::test]
 async fn fails_over_to_the_next_candidate_when_the_primary_wont_connect() {
     let nats_port = unused_nats_port();
@@ -175,6 +176,7 @@ async fn fails_over_to_the_next_candidate_when_the_primary_wont_connect() {
 /// The ledger test. If the abandoned candidate's failure were not recorded, its breaker would never
 /// open; if the serving candidate's success were recorded against it instead, likewise. One pair of
 /// assertions catches both.
+/// claim: REL-6
 #[tokio::test]
 async fn records_the_failed_candidates_breaker_not_the_serving_ones() {
     let nats_port = unused_nats_port();
@@ -343,6 +345,7 @@ async fn a_byo_key_is_refused_with_400() {
 }
 
 /// The billing row names the provider that actually served, and carries the catalog name routed on.
+/// claim: BIL-14
 #[tokio::test]
 async fn the_usage_row_names_the_candidate_that_served() {
     let nats_port = unused_nats_port();
@@ -434,12 +437,15 @@ async fn a_large_body_survives_a_failover_intact() {
 
     let cap = fallback.captured().expect("fallback served the request");
     let received = String::from_utf8(cap.body).unwrap();
-    // The rewrite lengthens the id by exactly the vendor prefix; nothing else may change.
+    // The rewrite lengthens the id by exactly the vendor prefix, and OpenRouter is asked not to
+    // compress the prompt (D109); nothing else may change.
+    const NO_COMPRESSION: &str = r#""plugins":[{"id":"context-compression","enabled":false}],"#;
     assert_eq!(
         received.len(),
-        sent + "openai/".len(),
+        sent + "openai/".len() + NO_COMPRESSION.len(),
         "the body must arrive whole, differing only by the rewritten model id",
     );
+    assert!(received.starts_with(&format!("{{{NO_COMPRESSION}")));
     assert!(received.contains(r#""model":"openai/gpt-4o-mini""#));
     assert!(
         received.contains(&filler),
@@ -482,6 +488,7 @@ async fn provider_routed_requests_are_unaffected() {
 
 /// Claude fails onto OpenRouter Chat Completions. Connect-fail the Anthropic primary; the
 /// fallback must receive a Chat Completions body and be billed with the OpenAI extractor.
+/// claim: BIL-1
 #[tokio::test]
 async fn claude_fails_over_to_openrouter_chat_and_is_still_metered() {
     let nats_port = unused_nats_port();
@@ -565,6 +572,7 @@ async fn claude_fails_over_to_openrouter_chat_and_is_still_metered() {
 /// The body here deliberately names a *different* model. It runs nothing (the row's primary serves,
 /// under the row's id), so reporting it as what the client "requested" would be reporting a
 /// discarded input. The disagreement is counted so a client bug is visible.
+/// claim: BIL-13
 #[tokio::test]
 async fn requested_model_is_the_routed_name_not_the_discarded_body_value() {
     let nats_port = unused_nats_port();
@@ -676,6 +684,7 @@ async fn provider_routed_requested_model_still_comes_from_the_body() {
 ///
 /// This is the outage that actually happens — a provider that is up and failing, not one that
 /// refuses connections — so it is the case the whole feature exists for.
+/// claim: R1, REL-1
 #[tokio::test]
 async fn fails_over_when_the_primary_answers_5xx() {
     let nats_port = unused_nats_port();
@@ -796,6 +805,7 @@ async fn a_429_walks_keys_not_vendors() {
 
 /// When every candidate 5xxes, the client gets the last provider's *actual* error rather than a
 /// synthetic one — better diagnostics than an exhausted retry loop produces.
+/// claim: REL-2
 #[tokio::test]
 async fn every_candidate_5xx_relays_the_last_error() {
     let nats_port = unused_nats_port();
@@ -821,6 +831,7 @@ async fn every_candidate_5xx_relays_the_last_error() {
 /// A body past pingora's 64 KiB replay buffer fails over like any other: the gateway holds the
 /// whole body and re-runs the request on the next candidate (see `FullBody`). Before, the 5xx was
 /// relayed and counted on `ai_failover_unreplayable_total`.
+/// claim: R5, REL-21
 #[tokio::test]
 async fn a_large_body_fails_over_on_a_5xx() {
     let nats_port = unused_nats_port();
@@ -878,6 +889,7 @@ async fn a_large_body_fails_over_on_a_5xx() {
 }
 
 /// When every candidate fails a large body, the client gets the last provider's own status.
+/// claim: REL-21
 #[tokio::test]
 async fn a_large_body_relays_the_last_error_when_every_candidate_fails() {
     let nats_port = unused_nats_port();
@@ -911,6 +923,7 @@ async fn a_large_body_relays_the_last_error_when_every_candidate_fails() {
 
 /// Anthropic's `529 overloaded` on an agent-sized body fails over in the gateway. Before, it was
 /// relayed and only the SDK's own retry reached the fallback.
+/// claim: REL-21
 #[tokio::test]
 async fn a_large_body_529_fails_over_in_the_gateway() {
     let nats_port = unused_nats_port();
@@ -1129,6 +1142,7 @@ async fn v1_messages_body_model_fails_over_to_openrouter_chat() {
 
 /// Anthropic 5xx → OpenRouter Chat Completions: the original Messages body is re-translated
 /// onto the serving candidate (not forwarded as Messages), and billing follows that candidate.
+/// claim: BIL-1
 #[tokio::test]
 async fn anthropic_5xx_fails_over_to_openrouter_chat_with_a_chat_body() {
     let nats_port = unused_nats_port();
@@ -1293,6 +1307,7 @@ async fn explicit_provider_path_ignores_the_catalog() {
 
 /// A Claude catalog id on Chat Completions is translated to Messages, not 400'd.
 /// The client (stock OpenAI SDK) sees `chat.completion.chunk`; billing parses the Anthropic stream.
+/// claim: E1, BIL-6
 #[tokio::test]
 async fn openai_sdk_can_call_claude_via_v1_chat_completions() {
     let nats_port = unused_nats_port();
@@ -1372,6 +1387,7 @@ async fn openai_sdk_can_call_claude_via_v1_chat_completions() {
 }
 
 /// Reverse: a GPT catalog id on Messages is translated to Chat Completions.
+/// claim: E2, BIL-6
 #[tokio::test]
 async fn anthropic_sdk_can_call_gpt_via_v1_messages() {
     let nats_port = unused_nats_port();
@@ -1531,6 +1547,7 @@ async fn embeddings_path_with_a_claude_row_is_still_a_wire_mismatch() {
 
 /// A stock OpenAI SDK's `client.embeddings.create` on the managed drop-in: the catalog row routes
 /// it to the embeddings path, and the input tokens are billed.
+/// claim: M1
 #[tokio::test]
 async fn v1_embeddings_route_through_the_catalog_and_bill_input() {
     let nats_port = unused_nats_port();
@@ -1567,6 +1584,7 @@ async fn v1_embeddings_route_through_the_catalog_and_bill_input() {
 
 /// Stock Python/Node SDKs send `Accept-Encoding: gzip` and providers honor it. The gateway must
 /// ask for `identity`, or the usage tail reads gzip and the request bills zero tokens.
+/// claim: BIL-16
 #[tokio::test]
 async fn managed_requests_ask_the_provider_for_an_uncompressed_body() {
     let nats_port = unused_nats_port();
@@ -1732,6 +1750,7 @@ async fn auto_short_paths_get_the_same_endpoint_check() {
 /// Claude Code's `count_tokens` reaches Anthropic's own endpoint, with the model re-spelled for the
 /// candidate. Free on the provider side, so no billing row. Before, it was forwarded to
 /// `/v1/messages` and ran as a billed generation.
+/// claim: E5, B4, BIL-18
 #[tokio::test]
 async fn count_tokens_reaches_anthropic_and_is_not_billed() {
     let nats_port = unused_nats_port();
@@ -1772,6 +1791,7 @@ async fn count_tokens_reaches_anthropic_and_is_not_billed() {
 
 /// Codex's remote compaction and OpenAI's input-token count reach `/v1/responses/*` on the GPT
 /// row's Responses arm. Compaction runs a model, so it bills from its usage block.
+/// claim: E5, B4, BIL-18
 #[tokio::test]
 async fn responses_compact_and_input_tokens_reach_openai() {
     let nats_port = unused_nats_port();
@@ -1910,6 +1930,7 @@ async fn v1_accepts_a_candidate_spelling_as_an_alias() {
 
 /// Stock OpenAI/Anthropic SDKs list models at GET /v1/models — the catalog, with each row's wire,
 /// card and price.
+/// claim: E4
 #[tokio::test]
 async fn v1_models_lists_the_catalog() {
     let nats_port = unused_nats_port();
@@ -1930,9 +1951,10 @@ async fn v1_models_lists_the_catalog() {
     let v: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(v["object"], "list");
     let data = v["data"].as_array().expect("data array");
-    assert!(
-        data.len() >= 2,
-        "catalog list must include more than a token model: {v}"
+    assert_eq!(
+        data.len(),
+        providers::catalog::MODEL_ROUTES.len(),
+        "every catalog row is listed: {v}"
     );
     let gpt = data
         .iter()
@@ -2023,6 +2045,7 @@ async fn post_claude(
 }
 
 /// Catalog is Anthropic-first; `x-beyond-order: bedrock` must hit Bedrock's mount, key, and id.
+/// claim: R3
 #[tokio::test]
 async fn order_header_front_loads_bedrock_on_an_anthropic_first_row() {
     let nats_port = unused_nats_port();
@@ -2123,6 +2146,7 @@ async fn junk_walk_header_keeps_catalog_order_and_is_counted() {
 
 /// Weighted split over many requests hits both named primaries. Leftover is failover, so a live
 /// primary is enough — we never need the leftover to fire.
+/// claim: R3
 #[tokio::test]
 async fn split_over_n_requests_hits_both_primaries() {
     let nats_port = unused_nats_port();
@@ -2159,6 +2183,7 @@ async fn split_over_n_requests_hits_both_primaries() {
 /// Cold start is catalog order. After a probe samples a faster fallback, **new** callers prefer
 /// it, while a caller already served stays on its provider (session pin, so its prompt cache is not
 /// thrown away). `x-beyond-order` still pins the slow primary.
+/// claim: R7, R4
 #[tokio::test]
 async fn ttft_ranker_prefers_the_faster_candidate_after_a_probe() {
     let nats_port = unused_nats_port();
@@ -2240,6 +2265,7 @@ async fn ttft_ranker_prefers_the_faster_candidate_after_a_probe() {
 
 /// A walk the caller shaped says nothing about where the key's other requests go: an
 /// `x-beyond-order` request must not re-pin the key to the (slower) provider it named.
+/// claim: R4
 #[tokio::test]
 async fn an_order_header_does_not_pin_the_key() {
     let nats_port = unused_nats_port();

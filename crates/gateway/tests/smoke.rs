@@ -253,7 +253,8 @@ async fn smoke_groq() {
     smoke_openai_wire(
         "groq",
         "GROQ_API_KEY",
-        "llama-3.1-8b-instant",
+        // `llama-3.1-8b-instant` is Enterprise-only on Groq now (verify/catalog_truth.toml).
+        "openai/gpt-oss-20b",
         "/groq/openai/v1/chat/completions",
     )
     .await;
@@ -291,7 +292,8 @@ async fn smoke_deepseek() {
     smoke_openai_wire(
         "deepseek",
         "DEEPSEEK_API_KEY",
-        "deepseek-chat",
+        // `deepseek-chat` was retired 2026-07-24.
+        "deepseek-flash",
         "/deepseek/v1/chat/completions",
     )
     .await;
@@ -364,7 +366,7 @@ fn provider_env_var(id: providers::ProviderId) -> Option<&'static str> {
 ///
 /// Skips any candidate whose key is absent, so a partial keyring smokes what it can.
 ///
-/// Every catalog pair is in this walk — Claude, GPT, Grok, DeepSeek, Mistral, and the
+/// Every catalog pair is in this walk — Claude, GPT, Grok, DeepSeek, and the
 /// Groq/Together/Fireworks llama / qwen / Kimi / GLM / MiniMax / gpt-oss rows. A new row is
 /// hit automatically when its provider key is in the environment; do not add a parallel
 /// allowlist here.

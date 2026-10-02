@@ -184,12 +184,18 @@ impl Router {
     /// Reorder `walk`: a live session pin first, else EWMA order, else probe an unmeasured arm.
     /// Identity when the row is unknown or `walk` is empty. The `bool` is whether a pin decided
     /// the primary. `affinity` is [`affinity`]'s hash of the caller, `None` for no pinning.
+    ///
+    /// `dispatchable` has bit `i` set when `route.candidates[i]` can be sent to (it has a pool key
+    /// here). Only those can be probed: an unkeyed candidate never gets a sample, so it would stay
+    /// unmeasured forever, win every probe, be skipped by `upstream_peer`, and starve a keyed
+    /// unmeasured arm behind it of its only chance to be measured.
     pub fn rank(
         &self,
         walk: Walk,
         route: &ModelRoute,
         seed: u64,
         affinity: Option<u64>,
+        dispatchable: u8,
     ) -> (Walk, bool) {
         if walk.len == 0 {
             return (walk, false);
@@ -210,7 +216,7 @@ impl Router {
             return (to_front(sort_measured(walk, score), pinned), true);
         }
         if seed != 0 && seed.is_multiple_of(PROBE_EVERY) {
-            return (probe(walk, score), false);
+            return (probe(walk, score, dispatchable), false);
         }
         (sort_measured(walk, score), false)
     }
@@ -368,13 +374,14 @@ fn sort_measured(walk: Walk, score: impl Fn(u8) -> Tier) -> Walk {
     out
 }
 
-/// Move the first unmeasured catalog index to slot 0; leave the rest in order. No-op when every
-/// slot is already measured (exploit-only) or the unmeasured one is already primary.
-fn probe(walk: Walk, score: impl Fn(u8) -> Tier) -> Walk {
+/// Move the first unmeasured, dispatchable catalog index to slot 0; leave the rest in order. No-op
+/// when every dispatchable slot is already measured (exploit-only) or the unmeasured one is
+/// already primary.
+fn probe(walk: Walk, score: impl Fn(u8) -> Tier, dispatchable: u8) -> Walk {
     let n = usize::from(walk.len);
     match walk.indices[..n]
         .iter()
-        .find(|&&orig| score(orig) == Tier::Unmeasured)
+        .find(|&&orig| dispatchable & (1 << orig) != 0 && score(orig) == Tier::Unmeasured)
     {
         Some(&orig) => to_front(walk, orig),
         None => walk,
@@ -399,6 +406,9 @@ mod tests {
     use crate::control::Walk;
     use providers::by_id;
 
+    /// Every candidate keyed.
+    const ALL: u8 = u8::MAX;
+
     fn opus() -> &'static ModelRoute {
         providers::for_model("claude-opus-4-8").expect("catalog row")
     }
@@ -416,17 +426,22 @@ mod tests {
     fn no_samples_keeps_catalog_order() {
         let r = Router::new();
         let row = opus();
-        let walk = r.rank(Walk::identity(row.candidates.len()), row, 1, None).0;
+        let walk = r
+            .rank(Walk::identity(row.candidates.len()), row, 1, None, ALL)
+            .0;
         assert_eq!(names(walk, row), ["anthropic", "bedrock", "openrouter"]);
     }
 
+    /// claim: R7
     #[test]
     fn faster_measured_candidate_is_tried_first() {
         let r = Router::new();
         let row = opus();
         r.observe(row, 0, 2_000_000, true);
         r.observe(row, 1, 100_000, true);
-        let walk = r.rank(Walk::identity(row.candidates.len()), row, 1, None).0;
+        let walk = r
+            .rank(Walk::identity(row.candidates.len()), row, 1, None, ALL)
+            .0;
         assert_eq!(names(walk, row), ["bedrock", "anthropic", "openrouter"]);
     }
 
@@ -435,7 +450,9 @@ mod tests {
         let r = Router::new();
         let row = opus();
         r.observe(row, 0, 200_000, true);
-        let walk = r.rank(Walk::identity(row.candidates.len()), row, 1, None).0;
+        let walk = r
+            .rank(Walk::identity(row.candidates.len()), row, 1, None, ALL)
+            .0;
         assert_eq!(names(walk, row), ["anthropic", "bedrock", "openrouter"]);
     }
 
@@ -445,7 +462,9 @@ mod tests {
         let row = opus();
         r.observe(row, 0, 1_000, false);
         r.observe(row, 1, 200_000, true);
-        let walk = r.rank(Walk::identity(row.candidates.len()), row, 1, None).0;
+        let walk = r
+            .rank(Walk::identity(row.candidates.len()), row, 1, None, ALL)
+            .0;
         assert_eq!(names(walk, row)[0], "bedrock");
     }
 
@@ -457,7 +476,9 @@ mod tests {
         let row = opus();
         r.observe(row, 0, 200_000, true);
         r.observe(row, 0, 50_000, false);
-        let walk = r.rank(Walk::identity(row.candidates.len()), row, 1, None).0;
+        let walk = r
+            .rank(Walk::identity(row.candidates.len()), row, 1, None, ALL)
+            .0;
         assert_eq!(names(walk, row), ["bedrock", "openrouter", "anthropic"]);
     }
 
@@ -467,7 +488,9 @@ mod tests {
         let row = opus();
         r.observe(row, 0, 50_000, false);
         r.observe(row, 0, 200_000, true);
-        let walk = r.rank(Walk::identity(row.candidates.len()), row, 1, None).0;
+        let walk = r
+            .rank(Walk::identity(row.candidates.len()), row, 1, None, ALL)
+            .0;
         assert_eq!(names(walk, row)[0], "anthropic");
     }
 
@@ -478,7 +501,9 @@ mod tests {
         r.observe(row, 0, 9_000_000, false);
         r.observe(row, 1, 6_000_000, false);
         r.observe(row, 2, 7_000_000, false);
-        let walk = r.rank(Walk::identity(row.candidates.len()), row, 1, None).0;
+        let walk = r
+            .rank(Walk::identity(row.candidates.len()), row, 1, None, ALL)
+            .0;
         assert_eq!(names(walk, row), ["bedrock", "openrouter", "anthropic"]);
     }
 
@@ -488,9 +513,35 @@ mod tests {
         let row = opus();
         r.observe(row, 0, 200_000, true);
         let walk = r
-            .rank(Walk::identity(row.candidates.len()), row, PROBE_EVERY, None)
+            .rank(
+                Walk::identity(row.candidates.len()),
+                row,
+                PROBE_EVERY,
+                None,
+                ALL,
+            )
             .0;
         assert_eq!(names(walk, row), ["bedrock", "anthropic", "openrouter"]);
+    }
+
+    /// claim: R7
+    /// defect: D119
+    #[test]
+    fn the_probe_skips_a_candidate_that_cannot_be_dispatched() {
+        let r = Router::new();
+        let row = opus();
+        r.observe(row, 0, 200_000, true);
+        // Bedrock (index 1) has no pool key: OpenRouter is the arm to measure.
+        let walk = r
+            .rank(
+                Walk::identity(row.candidates.len()),
+                row,
+                PROBE_EVERY,
+                None,
+                0b101,
+            )
+            .0;
+        assert_eq!(names(walk, row), ["openrouter", "anthropic", "bedrock"]);
     }
 
     #[test]
@@ -498,7 +549,9 @@ mod tests {
         let r = Router::new();
         let row = opus();
         r.observe(row, 0, 200_000, true);
-        let walk = r.rank(Walk::identity(row.candidates.len()), row, 0, None).0;
+        let walk = r
+            .rank(Walk::identity(row.candidates.len()), row, 0, None, ALL)
+            .0;
         assert_eq!(names(walk, row), ["anthropic", "bedrock", "openrouter"]);
     }
 
@@ -521,7 +574,7 @@ mod tests {
             card: providers::catalog::MODEL_ROUTES[0].card,
         };
         let walk = Walk::identity(3);
-        let ranked = r.rank(walk, &route, 1, None).0;
+        let ranked = r.rank(walk, &route, 1, None, ALL).0;
         assert_eq!(ranked.indices, walk.indices);
         assert_eq!(ranked.len, walk.len);
     }
@@ -534,6 +587,7 @@ mod tests {
         affinity(42, 7, Some(APP))
     }
 
+    /// claim: R4
     #[test]
     fn a_pin_keeps_the_caller_on_a_slower_candidate() {
         let r = Router::new();
@@ -541,12 +595,24 @@ mod tests {
         r.observe(row, 0, 2_000_000, true);
         r.observe(row, 1, 100_000, true);
         // Without a pin, Bedrock is faster and goes first.
-        let (walk, pinned) = r.rank(Walk::identity(row.candidates.len()), row, 1, Some(aff()));
+        let (walk, pinned) = r.rank(
+            Walk::identity(row.candidates.len()),
+            row,
+            1,
+            Some(aff()),
+            ALL,
+        );
         assert!(!pinned);
         assert_eq!(names(walk, row)[0], "bedrock");
         // This caller was last served by Anthropic: it stays there, Bedrock is its failover.
         r.pin(row, aff(), 0);
-        let (walk, pinned) = r.rank(Walk::identity(row.candidates.len()), row, 1, Some(aff()));
+        let (walk, pinned) = r.rank(
+            Walk::identity(row.candidates.len()),
+            row,
+            1,
+            Some(aff()),
+            ALL,
+        );
         assert!(pinned);
         assert_eq!(names(walk, row), ["anthropic", "bedrock", "openrouter"]);
     }
@@ -563,11 +629,18 @@ mod tests {
             row,
             PROBE_EVERY,
             Some(aff()),
+            ALL,
         );
         assert!(pinned);
         assert_eq!(names(walk, row)[0], "anthropic");
         // An unpinned caller on the same seed still probes.
-        let (walk, _) = r.rank(Walk::identity(row.candidates.len()), row, PROBE_EVERY, None);
+        let (walk, _) = r.rank(
+            Walk::identity(row.candidates.len()),
+            row,
+            PROBE_EVERY,
+            None,
+            ALL,
+        );
         assert_eq!(names(walk, row)[0], "bedrock");
     }
 
@@ -578,13 +651,25 @@ mod tests {
         r.observe(row, 0, 200_000, true);
         r.pin(row, aff(), 0);
         r.observe(row, 0, 50_000, false);
-        let (walk, pinned) = r.rank(Walk::identity(row.candidates.len()), row, 1, Some(aff()));
+        let (walk, pinned) = r.rank(
+            Walk::identity(row.candidates.len()),
+            row,
+            1,
+            Some(aff()),
+            ALL,
+        );
         assert!(!pinned);
         assert_eq!(names(walk, row), ["bedrock", "openrouter", "anthropic"]);
         // The failover's 2xx re-pins, and the caller stays there after Anthropic recovers.
         r.pin(row, aff(), 1);
         r.observe(row, 0, 200_000, true);
-        let (walk, pinned) = r.rank(Walk::identity(row.candidates.len()), row, 1, Some(aff()));
+        let (walk, pinned) = r.rank(
+            Walk::identity(row.candidates.len()),
+            row,
+            1,
+            Some(aff()),
+            ALL,
+        );
         assert!(pinned);
         assert_eq!(names(walk, row)[0], "bedrock");
     }
@@ -600,6 +685,7 @@ mod tests {
             row,
             1,
             Some(affinity(42, 7, Some(APP + 1))),
+            ALL,
         );
         assert!(!pinned, "another key must not inherit the pin");
         let (_, pinned) = r.rank(
@@ -607,6 +693,7 @@ mod tests {
             other_row,
             1,
             Some(aff()),
+            ALL,
         );
         assert!(!pinned, "another model must not inherit the pin");
     }
@@ -621,7 +708,7 @@ mod tests {
             indices: [0, 1, 0, 0, 0, 0, 0, 0],
             len: 2,
         };
-        let (out, pinned) = r.rank(walk, row, 1, Some(aff()));
+        let (out, pinned) = r.rank(walk, row, 1, Some(aff()), ALL);
         assert!(!pinned);
         assert_eq!(names(out, row), ["anthropic", "bedrock"]);
     }

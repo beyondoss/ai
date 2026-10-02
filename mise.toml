@@ -105,3 +105,47 @@ run = "cargo run -q -p beyond-ai-fleet-sim --bin fleet-sim -- matrix"
 [tasks."sim:list"]
 description = "List the fleet simulator's scenarios and which substrate each one needs."
 run = "cargo run -q -p beyond-ai-fleet-sim --bin fleet-sim -- list"
+
+[tasks."verify:status"]
+description = "Run every claim/defect-tagged test (ignored reproductions included) and print each claim's computed status. See verify/README.md."
+run = """
+set -e
+# Live cells (VERIFY_LIVE=1) drive the gateway binary from this tree; build it first.
+if [ "${VERIFY_LIVE:-}" = 1 ]; then cargo build -q -p beyond-ai; fi
+expr=$(cargo run -q -p beyond-ai-verify -- filter)
+cargo nextest run --workspace --profile verify --run-ignored all --no-tests=pass -E "$expr" || true
+# Reconciled live cells (BIL-5) run last, alone: a provider's usage report holds every request
+# on the key and model, so no other suite may be sending. See verify/README.md.
+rm -f target/nextest/verify-isolated/junit.xml
+reports="--junit target/nextest/verify/junit.xml"
+if [ "${VERIFY_LIVE:-}" = 1 ]; then
+  expr=$(cargo run -q -p beyond-ai-verify -- filter --isolated)
+  cargo nextest run --workspace --profile verify-isolated --no-tests=pass -E "$expr" || true
+  if [ -f target/nextest/verify-isolated/junit.xml ]; then reports="$reports --junit target/nextest/verify-isolated/junit.xml"; fi
+fi
+cargo run -q -p beyond-ai-verify -- status $reports "$@"
+"""
+
+[tasks."verify:live"]
+description = "verify:status including the live cells: real SDKs and agent harnesses, through this tree's gateway, to real providers. Spends real (small) money; reads keys from .env."
+env = { VERIFY_LIVE = "1" }
+run = "mise run verify:status"
+
+[tasks."verify:catalog"]
+description = "Live catalog sweep only (crates/verify/tests/catalog_live.rs): every in-scope candidate through this tree's gateway, then the cost summary and the Together/OpenRouter gap report. ~$2-3 per run; reads keys from .env. VERIFY_CATALOG_PLAN=1 prints the plan and estimate instead."
+env = { VERIFY_LIVE = "1" }
+run = """
+set -e
+cargo build -q -p beyond-ai
+cargo nextest run -p beyond-ai-verify --test catalog_live --profile verify --no-fail-fast "$@" || true
+VERIFY_CATALOG_SUMMARY=1 cargo test -q -p beyond-ai-verify --test catalog_live
+VERIFY_CATALOG_GAPS=1 cargo test -q -p beyond-ai-verify --test catalog_live
+"""
+
+[tasks."verify:gate"]
+description = "Fail on any inconsistency between verify/claims.toml, verify/defects.toml, test tags and the last verify:status run."
+run = """
+reports="--junit target/nextest/verify/junit.xml"
+if [ -f target/nextest/verify-isolated/junit.xml ]; then reports="$reports --junit target/nextest/verify-isolated/junit.xml"; fi
+cargo run -q -p beyond-ai-verify -- gate $reports
+"""

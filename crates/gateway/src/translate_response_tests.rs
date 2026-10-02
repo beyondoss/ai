@@ -425,6 +425,7 @@ data: {"type":"response.completed","sequence_number":20,"response":{"id":"resp_1
 
 // ---- 3. usage: cache tokens both ways ----------------------------------------------------------
 
+/// claim: TRN-23
 #[test]
 fn anthropic_cache_counts_join_prompt_tokens_for_an_openai_client() {
     let usage = json!({
@@ -452,6 +453,7 @@ fn anthropic_cache_counts_join_prompt_tokens_for_an_openai_client() {
     assert_eq!(u["prompt_tokens_details"]["cache_write_tokens"], 2000);
 }
 
+/// claim: TRN-23
 #[test]
 fn anthropic_message_delta_usage_is_cumulative() {
     let src = concat!(
@@ -474,6 +476,7 @@ fn anthropic_message_delta_usage_is_cumulative() {
     assert_eq!(u["completion_tokens"], 9);
 }
 
+/// claim: TRN-23
 #[test]
 fn openai_cached_tokens_are_not_anthropic_input_tokens() {
     let usage = json!({
@@ -500,6 +503,7 @@ fn openai_cached_tokens_are_not_anthropic_input_tokens() {
     assert_eq!(u["output_tokens"], 40);
 }
 
+/// claim: TRN-23
 #[test]
 fn responses_usage_carries_cache_and_reasoning_both_ways() {
     let usage = json!({
@@ -683,8 +687,8 @@ fn claude_stream_reaches_responses_with_reasoning_text_and_calls() {
         json!([{"type":"summary_text","text":"Two cities, two calls."}])
     );
     assert_eq!(
-        out[0]["encrypted_content"], "EqQBsig==",
-        "the signature rides encrypted_content"
+        out[0]["encrypted_content"], "rs_gw:EqQBsig==",
+        "the signature rides encrypted_content, behind the gateway marker"
     );
     assert_eq!(out[1]["content"][0]["text"], "Checking both.");
     assert_eq!(out[2]["call_id"], "toolu_a");
@@ -853,6 +857,7 @@ fn openrouter_nonstream_reasoning_details_become_signed_thinking() {
     );
 }
 
+/// claim: TRN-21
 #[test]
 fn unsigned_thinking_never_reaches_a_messages_client() {
     // DeepSeek / gpt-oss style: reasoning text, never a signature.
@@ -926,6 +931,7 @@ fn a_claude_signature_crosses_chat_into_anthropic_json_and_back() {
 
 // ---- 5. stop reasons ---------------------------------------------------------------------------
 
+/// claim: TRN-22
 #[test]
 fn every_anthropic_stop_reason_has_an_openai_finish_reason() {
     for (stop, finish) in [
@@ -956,6 +962,7 @@ fn every_anthropic_stop_reason_has_an_openai_finish_reason() {
     }
 }
 
+/// claim: TRN-22
 #[test]
 fn an_anthropic_refusal_explanation_reaches_openai_refusal() {
     let mut msg = anthropic_msg(json!([]), "refusal", json!({}));
@@ -968,6 +975,7 @@ fn an_anthropic_refusal_explanation_reaches_openai_refusal() {
     assert_eq!(oai["choices"][0]["finish_reason"], "content_filter");
 }
 
+/// claim: TRN-22
 #[test]
 fn an_openai_refusal_reaches_an_anthropic_client_as_a_refusal() {
     let oai = chat_completion(
@@ -1004,6 +1012,7 @@ fn an_openai_refusal_reaches_an_anthropic_client_as_a_refusal() {
     );
 }
 
+/// claim: TRN-22
 #[test]
 fn every_chat_finish_reason_has_an_anthropic_stop_reason() {
     for (finish, stop) in [
@@ -1036,6 +1045,7 @@ fn every_chat_finish_reason_has_an_anthropic_stop_reason() {
     assert_eq!(json_resp(Chat, Messages, &c)["stop_reason"], "tool_use");
 }
 
+/// claim: TRN-22
 #[test]
 fn an_openai_refusal_becomes_a_responses_refusal_part() {
     let r = json_resp(
@@ -1161,7 +1171,8 @@ fn a_non_2xx_body_is_an_error_whatever_its_shape() {
     let v = json_status(Chat, Messages, 404, &json!({"detail": "Not Found"}));
     assert_eq!(
         v,
-        json!({"type": "error", "error": {"type": "api_error", "message": "Not Found"}})
+        json!({"type": "error", "error": {"type": "not_found_error", "message": "Not Found"}}),
+        "a body naming no type is typed from its status"
     );
     // A 2xx with the same body is not second-guessed.
     let v = json_status(
@@ -1175,6 +1186,48 @@ fn a_non_2xx_body_is_an_error_whatever_its_shape() {
     assert_eq!(
         response_json_status(Messages, Chat, 502, b"<html>bad gateway</html>"),
         b"<html>bad gateway</html>"
+    );
+}
+
+/// D100: the same endpoint on another vendor still owes the client its API's envelope. xAI's flat
+/// `{"code", "error": "<string>"}` and Bedrock's `{"message"}` are re-encoded, typed from the
+/// status; a body already in the envelope is relayed byte for byte.
+#[test]
+fn a_same_endpoint_error_is_put_in_the_clients_envelope() {
+    let xai = json!({"code": "invalid_image", "error": "Invalid PNG image."});
+    let v = json_status(Chat, Chat, 400, &xai);
+    assert_eq!(v["error"]["message"], "Invalid PNG image.", "{v}");
+    assert_eq!(v["error"]["type"], "invalid_request_error", "{v}");
+    assert_eq!(v["error"]["code"], "invalid_image", "{v}");
+    let v = json_status(
+        Messages,
+        Messages,
+        429,
+        &json!({"message": "Too many requests"}),
+    );
+    assert_eq!(
+        v,
+        json!({"type": "error", "error": {"type": "rate_limit_error", "message": "Too many requests"}})
+    );
+    for (endpoint, body) in [
+        (
+            Chat,
+            r#"{"error":{"message":"bad","type":"invalid_request_error","param":null,"code":null}}"#,
+        ),
+        (
+            Messages,
+            r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#,
+        ),
+    ] {
+        assert_eq!(
+            response_json_status(endpoint, endpoint, 400, body.as_bytes()),
+            body.as_bytes()
+        );
+    }
+    // A 2xx on the same endpoint is never parsed.
+    assert_eq!(
+        response_json_status(Chat, Chat, 200, b"{\"error\":\"x\"}"),
+        b"{\"error\":\"x\"}"
     );
 }
 
@@ -1217,6 +1270,7 @@ fn stream_errors_keep_their_detail() {
 
 // ---- 19. required fields ---------------------------------------------------------------------
 
+/// claim: TRN-23
 #[test]
 fn chat_completions_and_every_chunk_carry_created_and_one_id() {
     let oai = json_resp(
@@ -1250,6 +1304,7 @@ fn chat_completions_and_every_chunk_carry_created_and_one_id() {
     );
 }
 
+/// claim: TRN-23
 #[test]
 fn responses_objects_carry_created_at_and_item_ids() {
     let r = json_resp(
@@ -1290,6 +1345,7 @@ fn responses_objects_carry_created_at_and_item_ids() {
 
 // ---- tool-call deltas keyed by index ----------------------------------------------------------
 
+/// claim: T1
 #[test]
 fn interleaved_parallel_tool_deltas_follow_their_index() {
     let src = concat!(
@@ -1461,6 +1517,7 @@ fn a_responses_stream_reaches_messages_with_tool_use() {
     assert_eq!(evs.last().unwrap().0, "message_stop");
 }
 
+/// claim: TRN-22
 #[test]
 fn a_responses_stream_ending_incomplete_or_failed_says_so() {
     let incomplete = RESPONSES_TOOLS_SSE
@@ -1685,6 +1742,7 @@ fn next_turn(assistant: Value) -> Value {
 /// and the echoed `reasoning_content` became an unsigned block. Now each finished block arrives
 /// whole on the `thinking` list — what the non-stream body returns — and `messages.append(final
 /// .choices[0].message)` sends back exactly the signed blocks.
+/// claim: T2
 #[test]
 fn a_streamed_claude_turn_goes_back_signed() {
     let blocks = [
@@ -1789,7 +1847,7 @@ fn every_thinking_block_streams_whole_under_its_own_index() {
         .filter(|i| i["type"] == "reasoning")
         .map(|i| &i["encrypted_content"])
         .collect();
-    assert_eq!(sigs, [&json!("S1"), &json!("S2")], "{resp:#}");
+    assert_eq!(sigs, [&json!("rs_gw:S1"), &json!("rs_gw:S2")], "{resp:#}");
 
     // A block that never got its signature is never offered for replay.
     let mut unsigned = blocks.to_vec();
@@ -1853,6 +1911,69 @@ fn a_chat_custom_tool_call_reaches_responses_as_a_custom_tool_call() {
         "print(1+1)"
     );
     assert!(named(&evs, "response.function_call_arguments.delta").is_empty());
+}
+
+/// Codex on a Claude row, streaming: Claude calls a namespace member under its flat name and the
+/// wrapped `apply_patch` with an `{"input": …}` object split across deltas. Codex sees
+/// `{name, namespace}` and a `custom_tool_call` whose input deltas are the raw patch, not JSON.
+/// claim: W2
+/// defect: D75
+#[test]
+fn codex_tool_calls_stream_back_under_the_names_codex_offered() {
+    const CLAUDE_SSE: &str = concat!(
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-opus-4-8\",\"content\":[],\"usage\":{\"input_tokens\":9,\"output_tokens\":1}}}\n\n",
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"multi_agent_v1__spawn_agent\",\"input\":{}}}\n\n",
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"task\\\":\\\"fix\\\"}\"}}\n\n",
+        "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_2\",\"name\":\"apply_patch\",\"input\":{}}}\n\n",
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"input\\\":\\\"*** Begin\"}}\n\n",
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\" Patch\\\\n\\\"}\"}}\n\n",
+        "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+        "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":20}}\n\n",
+        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+    );
+    let request = json!({"tools": [
+        {"type": "custom", "name": "apply_patch", "format": {"type": "grammar", "syntax": "lark", "definition": "start: x"}},
+        {"type": "namespace", "name": "multi_agent_v1", "description": "agents", "tools": [
+            {"type": "function", "name": "spawn_agent", "parameters": {"type": "object"}}]},
+    ]});
+    let tools = ToolNames::of_responses(&request, true);
+    let run = |chunks: &[&[u8]]| {
+        let mut b = SseBridge::new(Responses, Messages).with_tools(tools.clone());
+        let mut out = Vec::new();
+        for c in chunks {
+            out.extend(b.feed(c, false));
+        }
+        out.extend(b.feed(b"", true));
+        events(&String::from_utf8(out).unwrap())
+    };
+    let evs = run(&[CLAUDE_SSE.as_bytes()]);
+    let bytes: Vec<&[u8]> = CLAUDE_SSE.as_bytes().chunks(1).collect();
+    assert_eq!(normalize(&run(&bytes)), normalize(&evs));
+
+    let resp = assert_responses_lifecycle(&evs, "response.completed");
+    let out = resp["output"].as_array().unwrap();
+    assert_eq!(out[0]["type"], "function_call", "{resp:#}");
+    assert_eq!(out[0]["name"], "spawn_agent");
+    assert_eq!(out[0]["namespace"], "multi_agent_v1");
+    assert_eq!(out[0]["arguments"], "{\"task\":\"fix\"}");
+    assert_eq!(out[1]["type"], "custom_tool_call", "{resp:#}");
+    assert_eq!(out[1]["name"], "apply_patch");
+    assert_eq!(out[1]["input"], "*** Begin Patch\n");
+    assert_eq!(
+        named(&evs, "response.output_item.added")[0]["item"]["namespace"],
+        "multi_agent_v1"
+    );
+    let deltas: Vec<&str> = named(&evs, "response.custom_tool_call_input.delta")
+        .iter()
+        .map(|v| v["delta"].as_str().unwrap())
+        .collect();
+    assert_eq!(deltas, ["*** Begin Patch\n"]);
+    assert_eq!(
+        named(&evs, "response.function_call_arguments.delta").len(),
+        1,
+        "only the namespaced call streams arguments: {evs:#?}"
+    );
 }
 
 /// A Chat client on a Responses-only row (the `-codex` models) with a custom tool: the call was
@@ -1954,6 +2075,7 @@ fn an_openrouter_mid_stream_error_is_an_error() {
 /// An upstream stream that ends cleanly without saying how the response ended (no stop reason, no
 /// end marker) was cut short. The bridge used to close it as a success — `end_turn`,
 /// `response.completed`, a bare `[DONE]` — on a half-written answer.
+/// claim: T7
 #[test]
 fn a_stream_that_ends_without_saying_how_is_an_error_for_every_client() {
     let cut_claude = concat!(
@@ -2056,6 +2178,7 @@ fn sdk_message(evs: &[Event]) -> Value {
     Value::Object(msg)
 }
 
+/// claim: S2
 #[test]
 fn a_chat_relay_sends_each_identity_field_once() {
     // As OpenRouter sent it, the SDK's message is unusable on the next turn.
@@ -2118,4 +2241,426 @@ fn identity_fields_are_tracked_per_choice_and_entry() {
             {"index":1,"delta":{"content":"x"}},
             {"index":0,"delta":{"reasoning_details":[{"index":0},{"index":1,"format":"f"}]}}]})
     );
+}
+
+/// `ToolCalls::locate` answers from its maps exactly what a backward scan of every call answers,
+/// over deltas that mix indexes, reused indexes, ids, missing indexes and calls opened with a
+/// fresh id.
+#[test]
+fn locating_a_calls_delta_matches_a_backward_scan() {
+    fn scan(calls: &[ChatCall], index: Option<u64>, id: Option<&str>) -> Option<usize> {
+        match (index, id) {
+            (Some(i), _) => calls.iter().rposition(|c| {
+                c.index == Some(i) && (id.is_none() || c.id.is_empty() || Some(c.id.as_str()) == id)
+            }),
+            (None, Some(id)) => calls.iter().rposition(|c| c.id == id),
+            (None, None) => calls.len().checked_sub(1),
+        }
+    }
+    let mut seed = 0x9E37_79B9_7F4A_7C15_u64;
+    let mut next = |n: u64| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed % n
+    };
+    for _ in 0..50 {
+        let mut tc = ToolCalls::default();
+        let mut steps = Vec::new();
+        for _ in 0..200 {
+            let index = match next(5) {
+                0 => None,
+                i => Some(i - 1),
+            };
+            let id = ["", "a", "b", "c"][next(4) as usize];
+            let id = (!id.is_empty()).then_some(id);
+            let want = scan(&tc.calls, index, id).unwrap_or(tc.calls.len());
+            let at = tc.locate(index, id);
+            assert_eq!(at, want, "index {index:?} id {id:?}");
+            if let Some(id) = id
+                && tc.calls[at].id.is_empty()
+            {
+                tc.set_id(at, id.to_owned());
+            }
+            if next(6) == 0 {
+                tc.open(at, &mut steps);
+            }
+        }
+    }
+}
+
+/// The live call's end is judged incrementally, and a verdict that cannot change is not
+/// re-derived: an unchanged length keeps its failed parse, and arguments that closed without
+/// being JSON stay not whole whatever follows.
+#[test]
+fn a_live_calls_end_is_judged_once_per_change() {
+    let mut end = ArgsEnd::default();
+    assert!(!end.whole(r#"{"a":"}"#));
+    assert!(!end.whole(r#"{"a":"}""#));
+    assert!(end.whole(r#"{"a":"}"}"#));
+    let mut end = ArgsEnd::default();
+    assert!(!end.whole(r#""ab"#));
+    assert!(end.whole(r#""ab\"c""#));
+    let mut end = ArgsEnd::default();
+    assert!(!end.whole("tru"));
+    assert_eq!(end.failed_at, Some(3));
+    assert!(!end.whole("tru"));
+    assert!(end.whole("true"));
+    let mut end = ArgsEnd::default();
+    assert!(!end.whole(r#"{"a":1}}"#));
+    assert!(end.invalid, "closed, and not JSON");
+    assert!(!end.whole(r#"{"a":1}}  "#));
+}
+
+/// A repeated `role` is cut by span (the relay no longer parses and re-encodes every OpenRouter
+/// chunk), with exactly what the `Value` path keeps, and every other byte as sent.
+#[test]
+fn a_repeated_role_is_cut_by_span_as_the_value_path_would() {
+    let events = [
+        r#"{"choices":[{"index":0,"delta":{"role":"assistant","content":"a"}}]}"#,
+        r#"{"choices":[{"index":0,"delta":{"role":"assistant","content":"b"}}]}"#,
+        r#"{"choices":[{"index":0,"delta":{"content":"c","role":"assistant"}}]}"#,
+        r#"{"choices":[{"index":0,"delta":{"role":"assistant"}}]}"#,
+        r#"{"choices":[{"delta":{"role":"assistant"},"index":1},{"index":1,"delta":{"role":"assistant","content":"d"}}]}"#,
+        r#"{"choices":[{"index":2,"delta":{"role":null}}]}"#,
+        r#"{"choices":[{"delta":{"role":"assistant"}}, {"delta" : { "role" : "assistant" , "content" : "e" }}]}"#,
+        r#"{"id":"x","choices":[{"index":0,"delta":{"role":"assistant","content":"f"}}],"usage":null}"#,
+        r#"{"choices":[{"index":0,"delta":{"role":"assistant","role":"assistant"}}]}"#,
+        r#"{"choices":[{"index":3,"delta":{"content":"g"}}],"x":{"role":"user"}}"#,
+    ];
+    let mut bridge = SseBridge::new(Chat, Chat);
+    let mut reference = ChatIdentity::default();
+    for e in events {
+        let raw = format!("data: {e}\n\n");
+        let got = String::from_utf8(bridge.feed(raw.as_bytes(), false)).unwrap();
+        let mut want: Value = serde_json::from_str(e).unwrap();
+        let dropped = reference.strip(&mut want);
+        let data = got.strip_prefix("data: ").unwrap().trim_end();
+        assert_eq!(serde_json::from_str::<Value>(data).unwrap(), want, "{e}");
+        if !dropped {
+            assert_eq!(got, raw, "an event with nothing to drop is relayed as sent");
+        }
+    }
+}
+
+// ---- verification phase 0: zero-argument tool calls --------------------------------------------
+
+/// A Claude turn calling a tool that takes no arguments, as Anthropic streams it: the block opens
+/// with `input: {}` and its one `input_json_delta` carries an empty `partial_json`.
+fn claude_zero_arg_call_sse() -> String {
+    ant_sse(&[
+        json!({"type": "message_start", "message": {"id": "msg_1", "type": "message",
+        "role": "assistant", "model": "claude-haiku-4-5", "content": [],
+        "usage": {"input_tokens": 10, "output_tokens": 1}}}),
+        json!({"type": "content_block_start", "index": 0,
+        "content_block": {"type": "tool_use", "id": "toolu_01", "name": "get_time", "input": {}}}),
+        json!({"type": "content_block_delta", "index": 0,
+        "delta": {"type": "input_json_delta", "partial_json": ""}}),
+        json!({"type": "content_block_stop", "index": 0}),
+        json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 12}}),
+        json!({"type": "message_stop"}),
+    ])
+}
+
+/// A zero-argument tool call streamed from Claude must reach a Chat or Responses client as
+/// `arguments: "{}"`, the same string the non-stream body carries. `""` is not JSON: the Agents
+/// SDK `json.loads` it and Vercel's AI SDK rejects it as invalid tool input.
+/// claim: TRN-9
+/// defect: D13
+#[test]
+fn a_streamed_zero_argument_call_has_json_arguments() {
+    // The non-stream body is the baseline: it already says "{}".
+    let body = json_resp(
+        Messages,
+        Chat,
+        &anthropic_msg(
+            json!([{"type": "tool_use", "id": "toolu_01", "name": "get_time", "input": {}}]),
+            "tool_use",
+            json!({"input_tokens": 10, "output_tokens": 12}),
+        ),
+    );
+    assert_eq!(
+        body["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
+        "{}"
+    );
+
+    let src = claude_zero_arg_call_sse();
+
+    // Messages → Chat: the arguments an OpenAI SDK accumulates.
+    let chat = stream(Messages, Chat, &src);
+    let calls = chat_tool_calls(&chat);
+    assert_eq!(calls.len(), 1, "{chat:#?}");
+    assert_eq!(calls[0].1, "get_time");
+    assert_eq!(calls[0].2, "{}", "Messages→Chat stream: {chat:#?}");
+
+    // Messages → Responses: the deltas, the `.done` event and the completed item all agree.
+    let evs = stream(Messages, Responses, &src);
+    let resp = assert_responses_lifecycle(&evs, "response.completed");
+    let deltas: String = named(&evs, "response.function_call_arguments.delta")
+        .iter()
+        .map(|v| v["delta"].as_str().unwrap())
+        .collect();
+    let done = one(&evs, "response.function_call_arguments.done");
+    let item = &resp["output"][0];
+    assert_eq!(item["type"], "function_call", "{resp:#}");
+    assert_eq!(
+        (deltas.as_str(), &done["arguments"], &item["arguments"]),
+        ("{}", &json!("{}"), &json!("{}")),
+        "Messages→Responses stream (deltas, .done, completed item): {evs:#?}"
+    );
+}
+
+// ---- verification phase 0: translation detail (D44-D50) ----------------------------------------
+
+/// Anthropic streams one content block at a time: each `content_block_start` follows the previous
+/// block's `content_block_stop`, and deltas land only on the open block. Returns the first breach.
+fn messages_block_sequencing_violation(evs: &[Event]) -> Option<String> {
+    let mut open: Option<u64> = None;
+    for (name, v) in evs {
+        let idx = v["index"].as_u64();
+        match name.as_str() {
+            "content_block_start" => {
+                if let Some(o) = open {
+                    return Some(format!("block {idx:?} started while block {o} is open"));
+                }
+                open = idx;
+            }
+            "content_block_delta" if idx != open => {
+                return Some(format!("delta for block {idx:?} while {open:?} is open"));
+            }
+            "content_block_stop" => {
+                if idx != open {
+                    return Some(format!("stop for block {idx:?} while {open:?} is open"));
+                }
+                open = None;
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Parallel tool calls from a Chat upstream reach a Messages client as sequential blocks
+/// (start, deltas, stop, then the next start), whether the upstream sends the calls one after
+/// another or interleaves their argument deltas. The Anthropic SDK accumulates either way, but
+/// harnesses that act on `content_block_stop` (or assert one open block) see two open at once.
+/// claim: TRN-12
+/// defect: D45
+#[test]
+fn parallel_tool_use_blocks_are_sequential_on_a_messages_stream() {
+    let sequential = concat!(
+        "data: {\"id\":\"c\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"function\":{\"name\":\"f\",\"arguments\":\"{\\\"a\\\":1}\"}}]}}]}\n\n",
+        "data: {\"id\":\"c\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call_b\",\"function\":{\"name\":\"g\",\"arguments\":\"{\\\"b\\\":2}\"}}]}}]}\n\n",
+        "data: {\"id\":\"c\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2}}\n\n",
+    );
+    let interleaved = concat!(
+        "data: {\"id\":\"c\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"function\":{\"name\":\"f\",\"arguments\":\"\"}},{\"index\":1,\"id\":\"call_b\",\"function\":{\"name\":\"g\",\"arguments\":\"\"}}]}}]}\n\n",
+        "data: {\"id\":\"c\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"a\\\":\"}}]}}]}\n\n",
+        "data: {\"id\":\"c\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":1,\"function\":{\"arguments\":\"{\\\"b\\\":2}\"}}]}}]}\n\n",
+        "data: {\"id\":\"c\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"1}\"}}]}}]}\n\n",
+        "data: {\"id\":\"c\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2}}\n\n",
+    );
+    let mut bad = Vec::new();
+    for (what, src) in [("sequential", sequential), ("interleaved", interleaved)] {
+        let evs = stream(Chat, Messages, src);
+        // The calls themselves still arrive whole; only the sequencing is in question.
+        let content = anthropic_content(&evs);
+        assert_eq!(content.len(), 2, "{what}: {content:#?}");
+        assert_eq!(content[0]["input"], json!({"a": 1}), "{what}");
+        assert_eq!(content[1]["input"], json!({"b": 2}), "{what}");
+        if let Some(why) = messages_block_sequencing_violation(&evs) {
+            let order: Vec<String> = evs
+                .iter()
+                .filter(|(n, _)| n.starts_with("content_block_"))
+                .map(|(n, v)| format!("{}{}", &n["content_block_".len()..], v["index"]))
+                .collect();
+            bad.push(format!("{what}: {why} ({})", order.join(" ")));
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+/// An upstream context-overflow error, translated for each client, carries what that client's
+/// harness compacts on: Claude Code looks for "prompt is too long" in a Messages error, Codex and
+/// the Agents SDK for code `context_length_exceeded` in a Chat or Responses one.
+/// claim: TRN-18
+/// defect: D46
+#[test]
+fn a_context_overflow_error_carries_what_each_harness_compacts_on() {
+    let openai = json!({"error": {
+        "message": "This model's maximum context length is 128000 tokens. However, your messages resulted in 130512 tokens. Please reduce the length of the messages.",
+        "type": "invalid_request_error", "param": "messages", "code": "context_length_exceeded"}});
+    let anthropic = json!({"type": "error", "error": {"type": "invalid_request_error",
+        "message": "prompt is too long: 210345 tokens > 200000 maximum"}});
+    let mut bad = Vec::new();
+
+    let m = json_status(Chat, Messages, 400, &openai);
+    let msg = m["error"]["message"].as_str().unwrap_or("").to_lowercase();
+    if !msg.contains("prompt is too long") {
+        bad.push(format!("Chat upstream → Messages client: {m}"));
+    }
+    for client in [Chat, Responses] {
+        let c = json_status(Messages, client, 400, &anthropic);
+        if c["error"]["code"] != "context_length_exceeded" {
+            bad.push(format!("Messages upstream → {client:?} client: {c}"));
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+/// A mid-stream error reaches a Responses client's `response.failed` with its code intact when it
+/// is one a harness acts on: Codex compacts on `context_length_exceeded` and stops retrying on
+/// `insufficient_quota`, both read from `response.failed`'s `error.code`, which real OpenAI fills
+/// with those values though the published enum omits them.
+/// claim: TRN-19
+/// defect: D46
+#[test]
+fn a_mid_stream_overflow_or_quota_code_survives_response_failed() {
+    let mut bad = Vec::new();
+    for (code, typ) in [
+        ("context_length_exceeded", "invalid_request_error"),
+        ("insufficient_quota", "insufficient_quota"),
+    ] {
+        let src = format!(
+            concat!(
+                "data: {{\"id\":\"c\",\"model\":\"gpt-5\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"par\"}}}}]}}\n\n",
+                "data: {{\"error\":{{\"message\":\"boom\",\"type\":\"{typ}\",\"code\":\"{code}\"}}}}\n\n",
+                "data: [DONE]\n\n",
+            ),
+            typ = typ,
+            code = code,
+        );
+        let evs = stream(Chat, Responses, &src);
+        assert_eq!(one(&evs, "error")["code"], code, "the error event keeps it");
+        let failed = &one(&evs, "response.failed")["response"];
+        if failed["error"]["code"] != code {
+            bad.push(format!(
+                "{code}: response.failed carries {}",
+                failed["error"]
+            ));
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+/// A Messages-compatible host may send a tool call's whole input on `content_block_start` and no
+/// `input_json_delta` after it. The input is the call's arguments, so a Chat or Responses client
+/// must receive it rather than `""` / `{}`.
+/// claim: TRN-13
+/// defect: D50
+#[test]
+fn a_tool_input_sent_in_the_start_block_reaches_the_client() {
+    let src = ant_sse(&[
+        json!({"type": "message_start", "message": {"id": "msg_1", "type": "message",
+        "role": "assistant", "model": "claude-haiku-4-5", "content": [],
+        "usage": {"input_tokens": 10, "output_tokens": 1}}}),
+        json!({"type": "content_block_start", "index": 0, "content_block": {"type": "tool_use",
+        "id": "toolu_01", "name": "get_weather", "input": {"city": "Paris"}}}),
+        json!({"type": "content_block_stop", "index": 0}),
+        json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 12}}),
+        json!({"type": "message_stop"}),
+    ]);
+    let mut bad = Vec::new();
+
+    let chat = stream(Messages, Chat, &src);
+    let calls = chat_tool_calls(&chat);
+    let args = calls.first().map(|c| c.2.clone()).unwrap_or_default();
+    if serde_json::from_str::<Value>(&args).ok() != Some(json!({"city": "Paris"})) {
+        bad.push(format!("Messages→Chat arguments: {args:?}"));
+    }
+
+    let evs = stream(Messages, Responses, &src);
+    let resp = assert_responses_lifecycle(&evs, "response.completed");
+    let item_args = resp["output"][0]["arguments"].as_str().unwrap_or("");
+    if serde_json::from_str::<Value>(item_args).ok() != Some(json!({"city": "Paris"})) {
+        bad.push(format!("Messages→Responses item arguments: {item_args:?}"));
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+/// xAI puts reasoning beside `completion_tokens`; a Messages or Responses client is shown the output
+/// it is billed (visible + reasoning), the same count `usage::openai_body` bills.
+///
+/// claim: BIL-6, BIL-9
+/// defect: D64
+#[test]
+fn translated_usage_counts_reasoning_reported_beside_completion_tokens() {
+    let xai = json!({
+        "id": "x", "object": "chat.completion", "created": 1, "model": "grok-4.3",
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": "391"}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 202, "completion_tokens": 7, "total_tokens": 376,
+                  "completion_tokens_details": {"reasoning_tokens": 167}},
+    });
+    let ant = json_resp(Chat, Messages, &xai);
+    assert_eq!(ant["usage"]["output_tokens"], 174, "{ant}");
+    let resp = json_resp(Chat, Responses, &xai);
+    assert_eq!(resp["usage"]["output_tokens"], 174, "{resp}");
+    assert_eq!(
+        resp["usage"]["output_tokens_details"]["reasoning_tokens"], 167,
+        "{resp}"
+    );
+}
+
+/// A translated response carries the provider's usage onto the client's wire; a garbage count
+/// whose sum overflows a `u64` saturates rather than panicking mid-translation (release builds
+/// keep overflow-checks on).
+/// claim: BIL-4, REL-17
+/// defect: D87
+#[test]
+fn overflowing_chat_usage_saturates_when_translated() {
+    let max = u64::MAX;
+    let chat = json!({
+        "id": "x", "object": "chat.completion", "model": "grok-4",
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": max, "completion_tokens": max, "total_tokens": 1,
+                  "completion_tokens_details": {"reasoning_tokens": max}},
+    });
+    for client in [Messages, Responses] {
+        let resp =
+            std::panic::catch_unwind(|| json_resp(Chat, client, &chat)).expect("must not panic");
+        let out = resp["usage"]["output_tokens"].as_u64();
+        assert_eq!(out, Some(max), "{resp}");
+    }
+}
+
+/// Parallel calls onto Messages stream one `tool_use` block at a time. A call that takes no
+/// arguments sends none; once the upstream streams the next call's arguments, the empty call is
+/// done and the next block shows, rather than every later call waiting for the end of the stream.
+/// claim: TRN-12
+/// defect: D96
+#[test]
+fn an_empty_args_call_does_not_hold_parallel_calls_until_the_end() {
+    let chunk = |calls: Value| {
+        format!(
+            "data: {}\n\n",
+            json!({"id": "c", "model": "gpt-4o", "choices": [{"index": 0, "delta": {"tool_calls": calls}}]})
+        )
+    };
+    let chunks = [
+        chunk(
+            json!([{"index": 0, "id": "call_a", "type": "function", "function": {"name": "now", "arguments": ""}}]),
+        ),
+        chunk(
+            json!([{"index": 1, "id": "call_b", "type": "function", "function": {"name": "weather", "arguments": ""}}]),
+        ),
+        chunk(json!([{"index": 1, "function": {"arguments": "{\"city\":"}}])),
+        chunk(json!([{"index": 1, "function": {"arguments": "\"Paris\"}"}}])),
+    ];
+    let mut b = SseBridge::new(Messages, Chat);
+    let mut out = Vec::new();
+    for c in &chunks {
+        out.extend(b.feed(c.as_bytes(), false));
+    }
+    let evs = events(&String::from_utf8(out).unwrap());
+    let started: Vec<&str> = evs
+        .iter()
+        .filter(|(n, _)| n == "content_block_start")
+        .filter_map(|(_, v)| v.pointer("/content_block/name").and_then(Value::as_str))
+        .collect();
+    assert_eq!(started, ["now", "weather"], "{evs:?}");
+    let args: String = evs
+        .iter()
+        .filter_map(|(_, v)| v.pointer("/delta/partial_json").and_then(Value::as_str))
+        .collect();
+    assert_eq!(args, r#"{"city":"Paris"}"#);
 }

@@ -27,6 +27,7 @@ fn body() -> String {
 ///
 /// The threshold is 2 and the client abandons 5 requests, so a gateway that counted downstream
 /// aborts would have opened the breaker several times over and started rejecting.
+/// claim: REL-9, REL-6
 #[tokio::test]
 async fn client_cancellations_do_not_open_the_providers_breaker() {
     let nats_port = unused_nats_port();
@@ -104,6 +105,7 @@ async fn client_cancellations_do_not_open_the_providers_breaker() {
 
 /// The other half of the same rule: a genuinely broken provider must still trip the breaker. Without
 /// this, "stop blaming the provider for client aborts" could be satisfied by never blaming it at all.
+/// claim: REL-6
 #[tokio::test]
 async fn upstream_failures_still_open_the_breaker() {
     let nats_port = unused_nats_port();
@@ -141,20 +143,19 @@ async fn upstream_failures_still_open_the_breaker() {
     );
 }
 
-/// Pingora retries a **reused-connection** failure on its own, without ever calling
-/// `fail_to_connect` — and that is the load-bearing reason the breaker ledger lives in
-/// `upstream_peer` instead. A design that recorded outcomes in `fail_to_connect` would miss these
-/// attempts entirely: a permit claimed and never resolved.
-///
-/// It also exercises the replay path, since pingora re-feeds its buffered request body through
-/// `request_body_filter` on the retry — what `RequestCtx::reset_request_body_phase` exists to make
-/// idempotent.
+/// A reused connection that fails after the upstream drained the whole body (the mock reads the
+/// request, then closes) is **not** retried. Pingora would resend it on its own, without calling
+/// `fail_to_connect`, but the provider may already be generating and billing that request, so the
+/// gateway declines the reuse retry once the body was delivered (`error_while_proxy`) and the
+/// client gets a JSON 502. This test used to assert the retry; that resend is the duplicate spend
+/// D09 removed. The breaker still sees exactly one outcome per attempt.
 ///
 /// The mock kills any request that is not the first on its connection, so the scenario fires the
 /// moment pingora reuses a pooled connection — whenever that happens to be, rather than on a fixed
 /// request number that may well land on a fresh connection under load.
+/// claim: REL-1
 #[tokio::test]
-async fn a_reused_connection_failure_is_retried_and_the_body_survives() {
+async fn a_reused_connection_failure_after_the_body_is_not_resent() {
     let nats_port = unused_nats_port();
     let (pubkey, sk) = test_keypair(1);
     let mock = MockUpstream::start(Mode::CloseOnReusedConnection).await;
@@ -172,17 +173,9 @@ async fn a_reused_connection_failure_is_retried_and_the_body_survives() {
         &sk,
     );
     let client = reqwest::Client::new();
-    // Streaming + managed + OpenAI chat = the inject-eligible path, so the body is buffered and
-    // spliced, and pingora's replay re-feeds it through `request_body_filter`.
-    //
-    // 8 KiB: big enough that the replay is a real buffered body, and comfortably under pingora's
-    // 64 KiB retry-buffer cap, so the retry genuinely replays rather than declining to.
-    //
-    // Size is only safe to choose freely because the mock drains the request before killing the
-    // connection. Killing on the request *head* instead raced the gateway's body write and surfaced
-    // as `Upstream WriteError … Broken pipe`, which pingora does not retry — correctly, since it
-    // cannot know how much the upstream consumed. That race failed this test about half the time
-    // under a busy suite, for a reason unrelated to what it tests.
+    // Streaming + managed + OpenAI chat = the inject-eligible path, buffered and spliced. The mock
+    // drains the request before killing the connection, so the failure is on the response-header
+    // read, after the body was written.
     let filler = "y".repeat(8 * 1024);
     let body = format!(
         r#"{{"model":"gpt-4o-mini","stream":true,"messages":[{{"role":"user","content":"{filler}"}}]}}"#
@@ -190,6 +183,7 @@ async fn a_reused_connection_failure_is_retried_and_the_body_survives() {
 
     // Sequential, so each request has a pooled connection available to reuse.
     const SENT: usize = 6;
+    let mut failed = 0;
     for i in 0..SENT {
         let resp = client
             .post(format!("{}/v1/chat/completions", gw.url()))
@@ -198,27 +192,174 @@ async fn a_reused_connection_failure_is_retried_and_the_body_survives() {
             .body(body.clone())
             .send()
             .await
-            .unwrap();
-        assert_eq!(
-            resp.status().as_u16(),
-            200,
-            "request {i} must survive a reused-connection failure, not surface it to the client",
-        );
+            .unwrap_or_else(|e| panic!("request {i}: {e}; log:\n{}", gw.log()));
+        match resp.status().as_u16() {
+            200 => {}
+            502 => {
+                failed += 1;
+                assert!(
+                    resp.headers().contains_key("x-beyond-request-id"),
+                    "request {i}: the 502 carries the request id"
+                );
+                let text = resp.text().await.unwrap_or_default();
+                let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+                assert!(v["error"]["message"].is_string(), "request {i}: {text}");
+            }
+            s => panic!("request {i}: unexpected status {s}"),
+        }
     }
-
-    // More requests reached the upstream than the client sent ⇒ at least one was killed on a reused
-    // connection and retried. That is the whole scenario, asserted rather than assumed: if pingora
-    // had never reused a connection, this would be an equality and the test would say so.
     assert!(
-        mock.hits() > SENT,
-        "no reused-connection retry occurred ({} upstream requests for {SENT} client requests) — \
-         the scenario did not fire, so this test proved nothing",
+        failed > 0,
+        "no reused-connection failure occurred, so the scenario did not fire and this test proved \
+         nothing"
+    );
+    assert_eq!(
+        mock.hits(),
+        SENT,
+        "a delivered body was resent ({} upstream requests for {SENT} client requests)",
         mock.hits(),
     );
+}
 
-    // The retried attempt's body must be whole and well-formed — not the original with a replayed
-    // prefix concatenated onto it.
+/// An HTTP/1.1 upstream that closes a keep-alive connection with the next request unread in it, the
+/// idle-close race: it serves the first request on every connection, then waits for the whole of
+/// the second to arrive and closes without reading it, so its kernel answers with a reset. Returns
+/// the port and how many times that fired.
+async fn closes_reused_connections_unread() -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>)
+{
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    const OK: &str = r#"{"id":"c","object":"chat.completion","model":"gpt-4o-mini","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":11,"completion_tokens":7,"total_tokens":18}}"#;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let fired = std::sync::Arc::new(AtomicUsize::new(0));
+    let count = fired.clone();
+    // Bytes that make up one whole request at the front of `buf`, if they are all there.
+    fn whole(buf: &[u8]) -> Option<usize> {
+        let head = buf.windows(4).position(|w| w == b"\r\n\r\n")? + 4;
+        let text = String::from_utf8_lossy(&buf[..head]).to_ascii_lowercase();
+        let len = text
+            .lines()
+            .find_map(|l| l.strip_prefix("content-length:"))
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        (buf.len() >= head + len).then_some(head + len)
+    }
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = listener.accept().await {
+            let count = count.clone();
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 16 * 1024];
+                while whole(&buf).is_none() {
+                    match s.read(&mut chunk).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{OK}",
+                    OK.len()
+                );
+                if s.write_all(reply.as_bytes()).await.is_err() {
+                    return;
+                }
+                // The next request: wait until all of it sits in the socket, then close unread.
+                let mut peek = vec![0u8; 64 * 1024];
+                loop {
+                    match s.peek(&mut peek).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) if whole(&peek[..n]).is_some() => break,
+                        Ok(_) => tokio::time::sleep(Duration::from_millis(5)).await,
+                    }
+                }
+                count.fetch_add(1, Ordering::SeqCst);
+                drop(s);
+            });
+        }
+    });
+    (port, fired)
+}
+
+/// A pooled connection the provider closed with the request unread (it answers with a reset, before
+/// any response byte) never reached a server, so the gateway resends it on a fresh connection, as
+/// pingora does for a reused connection. A small body is read straight through to the upstream:
+/// nothing reads it ahead of connecting, so "the body was read" is not mistaken for "the provider
+/// took it" (D80). A clean end-of-file after the body stays unretried (see the test above, D09).
+/// claim: REL-1
+/// defect: D80
+#[tokio::test]
+async fn a_reused_connection_reset_before_reading_is_resent() {
+    let (port, fired) = closes_reused_connections_unread().await;
+    let (pubkey, _sk) = test_keypair(1);
+    let gw = Gateway::builder(
+        unused_nats_port(),
+        &format!("127.0.0.1:{port}"),
+        &b64(&pubkey),
+    )
+    .start()
+    .await;
+    let client = reqwest::Client::new();
+    for i in 0..6 {
+        let resp = client
+            .post(format!("{}/openai/v1/chat/completions", gw.url()))
+            .header("authorization", "Bearer sk-byo-test")
+            .header("content-type", "application/json")
+            .body(body())
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("request {i}: {e}; log:\n{}", gw.log()));
+        let status = resp.status().as_u16();
+        let text = resp.text().await.unwrap_or_default();
+        assert_eq!(status, 200, "request {i}: {text}\n{}", gw.log());
+    }
+    assert!(
+        fired.load(std::sync::atomic::Ordering::SeqCst) > 0,
+        "no pooled connection was reused, so the scenario did not fire"
+    );
+}
+
+/// A retry pingora *does* make — the managed 429 key walk — replays its buffered request body
+/// through `request_body_filter`, which is what `RequestCtx::reset_request_body_phase` exists to
+/// make idempotent. The retried body must be whole and well-formed, not the original with a
+/// replayed prefix concatenated onto it, and carry the usage splice exactly once.
+#[tokio::test]
+async fn a_key_walk_retry_replays_the_body_exactly_once() {
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::ThrottleKey("sk-replay-a")).await;
+    let gw = Gateway::builder(unused_nats_port(), &mock.authority(), &b64(&pubkey))
+        .providers(&["openai"])
+        .pool_keys("openai", &["sk-replay-a", "sk-replay-b"])
+        .start()
+        .await;
+    let vkey = mint(
+        &VirtualKey {
+            tenant_id: 42,
+            vpc_id: 7,
+            key_id: None,
+        },
+        1,
+        &sk,
+    );
+    // 8 KiB: a real buffered body, comfortably under pingora's 64 KiB retry buffer, so the retry
+    // genuinely replays rather than declining to.
+    let filler = "y".repeat(8 * 1024);
+    let body = format!(
+        r#"{{"model":"gpt-4o-mini","stream":true,"messages":[{{"role":"user","content":"{filler}"}}]}}"#
+    );
+    let resp = reqwest::Client::new()
+        .post(format!("{}/openai/v1/chat/completions", gw.url()))
+        .header("authorization", format!("Bearer {vkey}"))
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    assert_eq!(mock.hits(), 2, "the throttled key, then the walked one");
+
     let cap = mock.captured().expect("the retry reached the upstream");
+    assert_eq!(cap.authorization.as_deref(), Some("Bearer sk-replay-b"));
     let received: serde_json::Value = serde_json::from_slice(&cap.body).unwrap_or_else(|e| {
         panic!("retried body is not valid JSON ({e}) — the replay was appended, not reset")
     });

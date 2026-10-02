@@ -210,6 +210,16 @@ pub fn test_client() -> reqwest::Client {
         .expect("build test client")
 }
 
+/// The `[id_signing_keys]` table, when there is one.
+fn write_id_signing_toml(cfg: &mut String, keys: Option<&IdSigning>) {
+    if let Some((keys, _)) = keys {
+        cfg.push_str("\n[id_signing_keys]\n");
+        for (kid, secret) in keys {
+            cfg.push_str(&format!("{kid} = \"{}\"\n", b64(secret)));
+        }
+    }
+}
+
 /// Base64 (standard) — used to put an Ed25519 public key into the gateway's `signing_keys` config.
 pub fn b64(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(bytes)
@@ -478,6 +488,14 @@ fn stall_sse(anthropic: bool) -> String {
 /// the connection.
 pub struct StallingBody(Option<Bytes>);
 
+impl StallingBody {
+    /// `first`, then nothing ever again.
+    #[allow(dead_code)]
+    pub fn new(first: Bytes) -> Self {
+        StallingBody(Some(first))
+    }
+}
+
 impl hyper::body::Body for StallingBody {
     type Data = Bytes;
     type Error = std::io::Error;
@@ -523,6 +541,8 @@ pub struct Captured {
     /// Recorded so a translate walk onto a conversation-binding Claude model can prove the gateway
     /// sent the beta its `thinking.block_binding` needs (and that no other walk gets it).
     pub anthropic_beta: Option<String>,
+    /// Every header the upstream received, for assertions about what must *not* be forwarded.
+    pub headers: hyper::HeaderMap,
     pub body: Vec<u8>,
 }
 
@@ -784,6 +804,7 @@ async fn mock_handle(
             get("anthropic-beta"),
         )
     };
+    let headers = req.headers().clone();
     let body = req
         .into_body()
         .collect()
@@ -820,6 +841,7 @@ async fn mock_handle(
         anthropic_version,
         accept_encoding,
         anthropic_beta,
+        headers,
         body,
     });
     // A slow upstream is still a *working* upstream; the point is to be slower than the client's
@@ -835,7 +857,7 @@ async fn mock_handle(
         Mode::ThrottleKey(_) if throttled => 429,
         _ => 200,
     };
-    let (ct, payload) = if status == 429 {
+    let (ct, payload) = if status == 429 && !matches!(mode, Mode::Raw(..)) {
         (
             "application/json",
             Bytes::from_static(br#"{"error":{"message":"mock"}}"#),
@@ -1065,9 +1087,42 @@ pub struct GatewayBuilder {
     /// `Some(1)` reproduces Pingora's single-threaded default, which is what the scaling bench
     /// compares against.
     worker_threads: Option<usize>,
+    /// verify phase 0: billing — raw `key = value` scalars and child env (see the marked block).
+    extra_config: Vec<String>,
+    env_overrides: Vec<(String, String)>,
+    /// `[id_signing_keys]` (kid → raw secret) and `id_signing_kid`. Defaults to [`DEV_ID_SECRET`]
+    /// under kid `1`; `None` writes no table (managed Responses on a GPT row then 503s).
+    id_signing: Option<IdSigning>,
+}
+
+/// `[id_signing_keys]` (kid → raw secret) and the `id_signing_kid` that signs, if named.
+type IdSigning = (Vec<(char, Vec<u8>)>, Option<char>);
+
+/// The test gateway's default id signing secret (kid `1`): what [`dev_id_signer`] signs with.
+pub const DEV_ID_SECRET: [u8; 32] = [7; 32];
+
+/// A signer holding the test gateway's default id signing key, to mint and read the signed ids
+/// a test gateway issues (`signed_id.rs`).
+pub fn dev_id_signer() -> beyond_ai::signed_id::Signer {
+    beyond_ai::signed_id::Signer::new(&[(b'1', &DEV_ID_SECRET)], b'1').unwrap()
 }
 
 impl GatewayBuilder {
+    /// Replace the id signing keys (kid → raw secret) and name the one that signs new ids.
+    pub fn id_signing_keys(mut self, keys: &[(char, &[u8])], current: char) -> Self {
+        self.id_signing = Some((
+            keys.iter().map(|(k, s)| (*k, s.to_vec())).collect(),
+            Some(current),
+        ));
+        self
+    }
+
+    /// Configure no id signing key at all.
+    pub fn without_id_signing_keys(mut self) -> Self {
+        self.id_signing = None;
+        self
+    }
+
     /// Set which providers are configured. Defaults to `["openai", "fireworks"]`.
     pub fn providers(mut self, providers: &[&'static str]) -> Self {
         self.providers = providers.to_vec();
@@ -1253,6 +1308,13 @@ impl GatewayBuilder {
         if let Some(n) = self.tenant_max_in_flight {
             cfg.push_str(&format!("tenant_max_in_flight = {n}\n"));
         }
+        for line in &self.extra_config {
+            cfg.push_str(line);
+            cfg.push('\n');
+        }
+        if let Some((_, Some(kid))) = &self.id_signing {
+            cfg.push_str(&format!("id_signing_kid = \"{kid}\"\n"));
+        }
         if let Some(threshold) = self.circuit_breaker_threshold {
             // Tight window + reset so the test trips and recovers quickly.
             cfg.push_str(&format!(
@@ -1274,6 +1336,7 @@ impl GatewayBuilder {
             }
             if !self.signkey_b64.is_empty() {
                 cfg.push_str(&format!("\n[signing_keys]\n1 = \"{}\"\n", self.signkey_b64));
+                write_id_signing_toml(&mut cfg, self.id_signing.as_ref());
             }
             // Authority overrides still apply in real-upstream mode, so a smoke test can point one
             // provider at a dead port while the rest stay real — which is what proves a *live*
@@ -1308,6 +1371,7 @@ impl GatewayBuilder {
                 write_pool_keys_toml(&mut cfg, p, &keys);
             }
             cfg.push_str(&format!("\n[signing_keys]\n1 = \"{}\"\n", self.signkey_b64));
+            write_id_signing_toml(&mut cfg, self.id_signing.as_ref());
         }
         std::fs::File::create(&config_path)
             .unwrap()
@@ -1332,6 +1396,11 @@ impl GatewayBuilder {
                 // gates them all. Without this the payload layer is installed and silently starved.
                 std::env::var("AI_LOG")
                     .unwrap_or_else(|_| "warn,ai.usage=info,ai.payload=info".into()),
+            )
+            .envs(
+                self.env_overrides
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), v.as_str())),
             )
             // Capture the child's output instead of letting it inherit ours. Two reasons: the
             // `ai.usage` rows are only observable this way (they are a log target, not a metric),
@@ -1432,6 +1501,9 @@ impl Gateway {
             cache_ttl_secs: None,
             tenant_max_in_flight: None,
             wait_allowance_ready: true,
+            extra_config: Vec::new(),
+            env_overrides: Vec::new(),
+            id_signing: Some((vec![('1', DEV_ID_SECRET.to_vec())], None)),
         }
     }
 
@@ -1543,4 +1615,539 @@ where
     })
     .await;
     assert!(r.is_ok(), "status never became {want}");
+}
+
+// --- verify phase 0: billing ---
+//
+// What the billing reproductions need that `MockUpstream` cannot express: an upstream that sees the
+// request body before deciding what to send (a provider honoring `stream_options.include_usage`),
+// that stalls before the response head, that sends half a body and closes, or that drains the body
+// and never answers. `ScriptedUpstream` is a raw HTTP/1.1 server driven by a per-request script, so
+// every byte and every pause is the test's to choose. Plus two `GatewayBuilder` knobs: raw config
+// scalars and child env overrides (`AI_LOG`).
+
+impl GatewayBuilder {
+    /// Append a raw top-level `key = value` line to the gateway config (e.g. `read_timeout_secs = 2`).
+    pub fn config_line(mut self, line: &str) -> Self {
+        self.extra_config.push(line.to_string());
+        self
+    }
+
+    /// Set an env var on the gateway child, overriding the harness's own (including `AI_LOG`).
+    pub fn env(mut self, key: &str, value: &str) -> Self {
+        self.env_overrides
+            .push((key.to_string(), value.to_string()));
+        self
+    }
+}
+
+/// One step of a [`ScriptedUpstream`] reply. After the last step the connection is closed.
+pub enum Step {
+    Write(Vec<u8>),
+    Sleep(Duration),
+}
+
+/// A complete HTTP/1.1 response with `content-length` and `connection: close`.
+pub fn http_response(status: u16, content_type: &str, body: &[u8]) -> Vec<u8> {
+    let mut out = http_head(status, content_type, Some(body.len()));
+    out.extend_from_slice(body);
+    out
+}
+
+/// A response head. `content_length: None` ⇒ the body runs to connection close.
+pub fn http_head(status: u16, content_type: &str, content_length: Option<usize>) -> Vec<u8> {
+    let mut head =
+        format!("HTTP/1.1 {status} X\r\ncontent-type: {content_type}\r\nconnection: close\r\n");
+    if let Some(n) = content_length {
+        head.push_str(&format!("content-length: {n}\r\n"));
+    }
+    head.push_str("\r\n");
+    head.into_bytes()
+}
+
+type Script = Arc<dyn Fn(&[u8], usize) -> Vec<Step> + Send + Sync>;
+
+pub struct ScriptedUpstream {
+    pub port: u16,
+    /// Requests whose body arrived in full, in arrival order.
+    bodies: Arc<Mutex<Vec<Vec<u8>>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl ScriptedUpstream {
+    /// `script(body, n)` decides the reply to the `n`th (0-based) fully received request.
+    pub async fn start(script: impl Fn(&[u8], usize) -> Vec<Step> + Send + Sync + 'static) -> Self {
+        let script: Script = Arc::new(script);
+        let listener = bind_unreserved().await;
+        let port = listener.local_addr().unwrap().port();
+        let bodies: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&bodies);
+        let task = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let script = Arc::clone(&script);
+                let seen = Arc::clone(&seen);
+                tokio::spawn(scripted_conn(stream, script, seen));
+            }
+        });
+        ScriptedUpstream { port, bodies, task }
+    }
+
+    /// Always answer with this complete response.
+    pub async fn reply(status: u16, content_type: &'static str, body: String) -> Self {
+        let bytes = http_response(status, content_type, body.as_bytes());
+        Self::start(move |_, _| vec![Step::Write(bytes.clone())]).await
+    }
+
+    pub fn authority(&self) -> String {
+        format!("127.0.0.1:{}", self.port)
+    }
+
+    /// How many requests arrived with their whole body.
+    pub fn hits(&self) -> usize {
+        self.bodies.lock().unwrap().len()
+    }
+
+    pub fn bodies(&self) -> Vec<Vec<u8>> {
+        self.bodies.lock().unwrap().clone()
+    }
+}
+
+impl Drop for ScriptedUpstream {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// Read one request (head, then a `content-length` or chunked body), record it, run the script.
+async fn scripted_conn(
+    mut stream: tokio::net::TcpStream,
+    script: Script,
+    seen: Arc<Mutex<Vec<Vec<u8>>>>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 16 * 1024];
+    let head_end = loop {
+        if let Some(i) = find_bytes(&buf, b"\r\n\r\n") {
+            break i + 4;
+        }
+        match stream.read(&mut chunk).await {
+            Ok(0) | Err(_) => return,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+        }
+    };
+    let head = String::from_utf8_lossy(&buf[..head_end]).to_ascii_lowercase();
+    let header = |name: &str| {
+        head.lines()
+            .find_map(|l| l.strip_prefix(name).map(|v| v.trim().to_string()))
+    };
+    let mut rest = buf.split_off(head_end);
+    let body = if let Some(n) = header("content-length:").and_then(|v| v.parse::<usize>().ok()) {
+        while rest.len() < n {
+            match stream.read(&mut chunk).await {
+                Ok(0) | Err(_) => return,
+                Ok(k) => rest.extend_from_slice(&chunk[..k]),
+            }
+        }
+        rest.truncate(n);
+        rest
+    } else if header("transfer-encoding:").is_some_and(|v| v.contains("chunked")) {
+        while find_bytes(&rest, b"\r\n0\r\n\r\n").is_none() && !rest.starts_with(b"0\r\n\r\n") {
+            match stream.read(&mut chunk).await {
+                Ok(0) | Err(_) => return,
+                Ok(k) => rest.extend_from_slice(&chunk[..k]),
+            }
+        }
+        let mut out = Vec::new();
+        let mut at = 0;
+        while let Some(eol) = find_bytes(&rest[at..], b"\r\n") {
+            let size = std::str::from_utf8(&rest[at..at + eol])
+                .ok()
+                .and_then(|s| {
+                    usize::from_str_radix(s.split(';').next().unwrap_or("").trim(), 16).ok()
+                })
+                .unwrap_or(0);
+            at += eol + 2;
+            if size == 0 {
+                break;
+            }
+            out.extend_from_slice(&rest[at..at + size]);
+            at += size + 2;
+        }
+        out
+    } else {
+        Vec::new()
+    };
+    let n = {
+        let mut seen = seen.lock().unwrap();
+        seen.push(body.clone());
+        seen.len() - 1
+    };
+    for step in script(&body, n) {
+        match step {
+            Step::Write(bytes) => {
+                if stream.write_all(&bytes).await.is_err() {
+                    return;
+                }
+                let _ = stream.flush().await;
+            }
+            Step::Sleep(d) => sleep(d).await,
+        }
+    }
+    let _ = stream.shutdown().await;
+}
+
+fn find_bytes(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+/// The first `ai.usage` row's fields. `tracing`'s JSON layer nests event fields under `fields`.
+pub async fn usage_row_of(gw: &Gateway) -> serde_json::Value {
+    let line = gw.wait_for_log_line(&[r#""target":"ai.usage""#]).await;
+    let v: serde_json::Value = serde_json::from_str(&line).expect("usage line is JSON");
+    v.get("fields").cloned().unwrap_or(v)
+}
+
+/// Every `ai.usage` row logged so far, fields only.
+pub fn usage_rows_of(gw: &Gateway) -> Vec<serde_json::Value> {
+    gw.log()
+        .lines()
+        .filter(|l| l.contains(r#""target":"ai.usage""#))
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .map(|v| v.get("fields").cloned().unwrap_or(v))
+        .collect()
+}
+
+/// Wait up to `secs` for at least `n` usage rows; returns whatever exists at the deadline.
+pub async fn wait_usage_rows(gw: &Gateway, n: usize, secs: u64) -> Vec<serde_json::Value> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(secs);
+    loop {
+        let rows = usage_rows_of(gw);
+        if rows.len() >= n || std::time::Instant::now() >= deadline {
+            return rows;
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// A `bai_` virtual key for `tenant_id` signed with `sk`.
+pub fn billing_vkey(sk: &ed25519_dalek::SigningKey, tenant_id: u64) -> String {
+    beyond_ai::key::mint(
+        &beyond_ai::key::VirtualKey {
+            tenant_id,
+            vpc_id: 1,
+            key_id: None,
+        },
+        1,
+        sk,
+    )
+}
+
+// --- verify phase 0: reliability ---
+//
+// Additive helpers for the `reliability_*` test files: process lifecycle on a running gateway, an
+// upstream whose reply is chosen per request (`ReplyUpstream`), and raw HTTP/1.1 response parsing for the cases reqwest cannot express (chunked uploads, a reader that
+// stops reading).
+
+impl Gateway {
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// Send SIGTERM to the gateway process.
+    pub fn sigterm(&self) {
+        let _ = Command::new("kill")
+            .args(["-TERM", &self.child.id().to_string()])
+            .status();
+    }
+
+    /// Wait up to `limit` for the process to exit. `Some(elapsed)` when it did.
+    pub async fn wait_exit(&mut self, limit: Duration) -> Option<Duration> {
+        let start = std::time::Instant::now();
+        while start.elapsed() < limit {
+            if let Ok(Some(_)) = self.child.try_wait() {
+                return Some(start.elapsed());
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+        None
+    }
+
+    /// The current value of a metric (0 when absent).
+    pub async fn metric(&self, name: &str, label: &str) -> f64 {
+        parse_metric(&self.metrics().await, name, label)
+    }
+
+    /// Resident set size of the gateway process, in KiB, from `/proc/<pid>/status`.
+    pub fn rss_kib(&self) -> u64 {
+        self.proc_status_kib("VmRSS:")
+    }
+
+    /// The gateway process's peak resident set size so far (`VmHWM`), in KiB: a transient spike
+    /// that a later `rss_kib` sample would miss still shows here.
+    pub fn peak_rss_kib(&self) -> u64 {
+        self.proc_status_kib("VmHWM:")
+    }
+
+    fn proc_status_kib(&self, field: &str) -> u64 {
+        let status = std::fs::read_to_string(format!("/proc/{}/status", self.child.id()))
+            .unwrap_or_default();
+        status
+            .lines()
+            .find(|l| l.starts_with(field))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    }
+}
+
+/// Boot the gateway binary on a minimal config plus `extra` scalar lines and report whether it
+/// refuses to start: `Some(stderr)` if it exited within `limit`, `None` if it is still running.
+pub fn boot_refuses(extra: &str, limit: Duration) -> Option<String> {
+    let port = free_port();
+    let metrics_port = free_port();
+    let path = std::env::temp_dir().join(format!("beyond-ai-bootcheck-{port}.toml"));
+    let cfg = format!(
+        "listen = \"127.0.0.1:{port}\"\nmetrics_listen = \"127.0.0.1:{metrics_port}\"\n\
+         nats_url = \"nats://127.0.0.1:{}\"\nupstream_tls = false\n{extra}\n",
+        closed_port()
+    );
+    std::fs::write(&path, cfg).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_beyond-ai"))
+        .args(["run", "-c"])
+        .arg(&path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn beyond-ai");
+    let start = std::time::Instant::now();
+    let out = loop {
+        if let Ok(Some(_)) = child.try_wait() {
+            let mut err = String::new();
+            if let Some(mut s) = child.stderr.take() {
+                let _ = std::io::Read::read_to_string(&mut s, &mut err);
+            }
+            break Some(err);
+        }
+        if start.elapsed() > limit {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let _ = std::fs::remove_file(&path);
+    out
+}
+
+/// What a [`ReplyUpstream`] does with one request.
+#[derive(Clone)]
+pub enum Reply {
+    /// A complete response.
+    Full {
+        status: u16,
+        content_type: &'static str,
+        body: Bytes,
+    },
+    /// The response head and `first`, then nothing ever again.
+    Stall {
+        status: u16,
+        content_type: &'static str,
+        first: Bytes,
+    },
+    /// Never send a response head.
+    HeaderStall,
+    /// Wait this long, then send the inner reply.
+    Delayed(Duration, Box<Reply>),
+    /// Drop the connection without answering, after reading the body.
+    Reset,
+}
+
+impl Reply {
+    pub fn json(status: u16, body: &'static str) -> Self {
+        Reply::Full {
+            status,
+            content_type: "application/json",
+            body: Bytes::from_static(body.as_bytes()),
+        }
+    }
+
+    /// The stock OpenAI chat completion the plain mock serves.
+    pub fn ok() -> Self {
+        Reply::json(200, CANNED_JSON)
+    }
+
+    /// The stock OpenAI SSE stream the plain mock serves.
+    pub fn sse() -> Self {
+        Reply::Full {
+            status: 200,
+            content_type: "text/event-stream",
+            body: Bytes::from_static(CANNED_SSE.as_bytes()),
+        }
+    }
+}
+
+/// The request facts a script can branch on.
+pub struct ScriptReq {
+    pub authorization: Option<String>,
+    pub body_len: usize,
+    /// The forwarded path, query included.
+    pub path: String,
+    pub body: Bytes,
+}
+
+type ReplyScript = Arc<dyn Fn(usize, &ScriptReq) -> Reply + Send + Sync>;
+
+/// A plaintext HTTP/1.1 upstream whose reply to request `n` (0-based, global) is `script(n, req)`.
+pub struct ReplyUpstream {
+    pub port: u16,
+    hits: Arc<std::sync::atomic::AtomicUsize>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+async fn scripted_reply(mut reply: Reply) -> Result<Response<MockBody>, std::io::Error> {
+    loop {
+        match reply {
+            Reply::Delayed(d, inner) => {
+                sleep(d).await;
+                reply = *inner;
+            }
+            Reply::HeaderStall => std::future::pending::<()>().await,
+            Reply::Reset => return Err(std::io::Error::other("scripted reset")),
+            Reply::Full {
+                status,
+                content_type,
+                body,
+            } => {
+                return Ok(Response::builder()
+                    .status(status)
+                    .header("content-type", content_type)
+                    .body(Either::Left(Full::new(body)))
+                    .unwrap());
+            }
+            Reply::Stall {
+                status,
+                content_type,
+                first,
+            } => {
+                return Ok(Response::builder()
+                    .status(status)
+                    .header("content-type", content_type)
+                    .body(Either::Right(StallingBody(Some(first))))
+                    .unwrap());
+            }
+        }
+    }
+}
+
+impl ReplyUpstream {
+    pub async fn start(
+        script: impl Fn(usize, &ScriptReq) -> Reply + Send + Sync + 'static,
+    ) -> Self {
+        let script: ReplyScript = Arc::new(script);
+        let listener = bind_unreserved().await;
+        let port = listener.local_addr().unwrap().port();
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = hits.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let io = TokioIo::new(stream);
+                let (script, counter) = (script.clone(), counter.clone());
+                tokio::spawn(async move {
+                    let svc = service_fn(move |req: Request<hyper::body::Incoming>| {
+                        let (script, counter) = (script.clone(), counter.clone());
+                        async move {
+                            let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            let authorization = req
+                                .headers()
+                                .get("authorization")
+                                .and_then(|v| v.to_str().ok())
+                                .map(String::from);
+                            let path = req
+                                .uri()
+                                .path_and_query()
+                                .map_or_else(|| req.uri().path().to_owned(), |pq| pq.to_string());
+                            let body = req
+                                .into_body()
+                                .collect()
+                                .await
+                                .map(|b| b.to_bytes())
+                                .unwrap_or_default();
+                            let reply = script(
+                                n,
+                                &ScriptReq {
+                                    authorization,
+                                    body_len: body.len(),
+                                    path,
+                                    body,
+                                },
+                            );
+                            scripted_reply(reply).await
+                        }
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(io, svc)
+                        .await;
+                });
+            }
+        });
+        ReplyUpstream { port, hits, task }
+    }
+
+    pub fn authority(&self) -> String {
+        format!("127.0.0.1:{}", self.port)
+    }
+
+    pub fn hits(&self) -> usize {
+        self.hits.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Drop for ReplyUpstream {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// A raw HTTP/1.1 response: status, lower-cased headers, body (as far as it was read).
+#[derive(Debug, Default)]
+pub struct RawResponse {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+impl RawResponse {
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    }
+}
+
+/// Parse whatever HTTP/1.1 response bytes arrived. Status `0` when no status line came back.
+pub fn parse_raw_response(buf: &[u8]) -> RawResponse {
+    let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+        return RawResponse::default();
+    };
+    let head = String::from_utf8_lossy(&buf[..end]);
+    let mut lines = head.split("\r\n");
+    let status = lines
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let headers = lines
+        .filter_map(|l| l.split_once(':'))
+        .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
+        .collect();
+    RawResponse {
+        status,
+        headers,
+        body: buf[end + 4..].to_vec(),
+    }
 }

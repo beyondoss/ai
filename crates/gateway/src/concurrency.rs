@@ -16,7 +16,82 @@
 //! nothing in flight has no entry — and sharded so tenants on different shards never contend.
 
 use rustc_hash::FxHashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
+
+/// The process-wide budget for request bodies the gateway holds in memory (`max_buffered_body_bytes`).
+///
+/// A body past pingora's 64 KiB replay buffer is read in full before a catalog walk (and buffered
+/// again by the `FullBody` re-run that carries it), and a managed OpenAI chat body is buffered for
+/// the `stream_options` splice. Each is capped at 100 MiB, but nothing capped how many: eight
+/// concurrent 90 MiB uploads grew the process by ~1.4 GiB. Every such buffer reserves its bytes
+/// here first, and a request that would cross the budget is refused with a 503 + `Retry-After`
+/// before its body is read (or as soon as a chunked one grows past it) rather than letting the
+/// process grow until the kernel kills it. Small bodies (≤ the replay buffer) are not counted: they
+/// are bounded by concurrency and are the common case, which then pays no shared atomic.
+pub struct BodyBudget {
+    limit: usize,
+    used: AtomicUsize,
+}
+
+impl BodyBudget {
+    /// `None` when `limit == 0`: the budget is off.
+    pub fn new(limit: usize) -> Option<Self> {
+        (limit > 0).then(|| Self {
+            limit,
+            used: AtomicUsize::new(0),
+        })
+    }
+
+    /// Reserve `n` bytes. `false` (and nothing reserved) when that would cross the limit. Every
+    /// `true` must be paired with a [`Self::release`] of the same `n`.
+    pub fn try_reserve(&self, n: usize) -> bool {
+        self.used
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(n).filter(|total| *total <= self.limit)
+            })
+            .is_ok()
+    }
+
+    pub fn release(&self, n: usize) {
+        let _ = self
+            .used
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                Some(used.saturating_sub(n))
+            });
+    }
+
+    /// Bytes reserved right now. For tests and diagnostics.
+    pub fn used(&self) -> usize {
+        self.used.load(Ordering::Acquire)
+    }
+
+    /// The whole budget: a reservation larger than this can never be granted.
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+
+    /// Reserve `n` bytes for as long as the returned hold lives; `None` (nothing reserved) when that
+    /// would cross the limit. For memory held across one synchronous step, such as the `Value`s a
+    /// translation builds (`translate::translation_heap`, D216): the hold releases on drop, a panic
+    /// included.
+    pub fn hold(&self, n: usize) -> Option<BudgetHold<'_>> {
+        self.try_reserve(n)
+            .then_some(BudgetHold { budget: self, n })
+    }
+}
+
+/// Bytes reserved in a [`BodyBudget`] until dropped. See [`BodyBudget::hold`].
+pub struct BudgetHold<'a> {
+    budget: &'a BodyBudget,
+    n: usize,
+}
+
+impl Drop for BudgetHold<'_> {
+    fn drop(&mut self) {
+        self.budget.release(self.n);
+    }
+}
 
 /// Shard count. A power of two so the shard is a shift of a multiplicative hash. 64 shards keep
 /// contention negligible at any realistic core count; each is one small map.
@@ -85,8 +160,27 @@ mod tests {
     #[test]
     fn zero_is_off() {
         assert!(TenantSlots::new(0).is_none());
+        assert!(BodyBudget::new(0).is_none());
     }
 
+    #[test]
+    fn the_body_budget_refuses_past_its_limit_and_recovers() {
+        let budget = BodyBudget::new(100).expect("on");
+        assert!(budget.try_reserve(60));
+        assert!(!budget.try_reserve(41), "would cross the limit");
+        assert_eq!(budget.used(), 60, "a refused reserve claims nothing");
+        assert!(budget.try_reserve(40));
+        budget.release(60);
+        assert!(budget.try_reserve(60));
+        budget.release(1_000);
+        assert_eq!(
+            budget.used(),
+            0,
+            "an over-release saturates, never underflows"
+        );
+    }
+
+    /// claim: A3
     #[test]
     fn a_tenant_is_capped_and_recovers_on_release() {
         let slots = TenantSlots::new(2).expect("on");
