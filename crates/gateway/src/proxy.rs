@@ -4106,7 +4106,7 @@ impl ProxyHttp for AiProxy {
                 if dispatchable & walked & !cooling != 0 {
                     dispatchable &= !cooling;
                 }
-                if self.state.config.smart_router
+                if self.state.config.session_pins
                     && sub.is_none()
                     && std::ptr::eq(arms, row.candidates)
                     && !parsed_control

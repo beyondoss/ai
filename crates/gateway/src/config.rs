@@ -404,7 +404,7 @@ pub struct AiConfig {
     /// row's static order, still subject to `x-beyond-order` / `only` / `split`. A pure function of
     /// the caller and the row, so every replica agrees. The name is from when this also ranked by
     /// latency; it is kept so deployed configs (and `reject_unknown_toml_keys`) still load.
-    pub smart_router: bool,
+    pub session_pins: bool,
 
     /// Most requests one tenant may hold open on this process at once. `0` disables it (the
     /// default). Spend is enforced after the fact — the allowance-set's exhaust bit lands only once
@@ -495,7 +495,7 @@ impl Default for AiConfig {
             // 64 KiB: the same bound as the catalog-walk peek, so a cached response is no larger
             // than the request that produced it was allowed to be while still being "in hand".
             cache_max_bytes: 64 * 1024,
-            smart_router: true,
+            session_pins: true,
             // Off. The right ceiling depends on how many parallel agents a tenant legitimately runs
             // and how long the allowance pipeline lags; that is an operator's call.
             tenant_max_in_flight: 0,

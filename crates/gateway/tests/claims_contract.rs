@@ -412,7 +412,7 @@ async fn every_documented_header_behaves_and_malformed_values_are_dropped() {
         .providers(&["openai", "openrouter"])
         .provider_authority("openrouter", &openrouter.authority())
         .cache_ttl_secs(60)
-        .config_line("smart_router = false")
+        .config_line("session_pins = false")
         .start()
         .await;
     let key = vkey(&sk, 12);

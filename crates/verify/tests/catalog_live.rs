@@ -465,7 +465,7 @@ fn boot() -> Result<Gateway, String> {
     let mut cfg = format!(
         "listen = \"127.0.0.1:{port}\"\nmetrics_listen = \"127.0.0.1:{metrics_port}\"\n\
          nats_url = \"nats://127.0.0.1:{nats_port}\"\nconfig_bucket = \"ai-gateway\"\n\
-         upstream_tls = true\nsmart_router = false\n\n[pool_keys]\n"
+         upstream_tls = true\nsession_pins = false\n\n[pool_keys]\n"
     );
     for (provider, _) in SCOPE {
         if let Some(k) = key_of(provider) {
