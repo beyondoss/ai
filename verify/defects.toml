@@ -2259,7 +2259,7 @@ evidence = "Owner review 2026-10-01; proxy.rs relayed same-wire Responses bodies
 claims = ["SEC-25"]
 state = "fixed"
 test = "a_tenants_response_id_is_refused_for_another_tenant"
-fix = "9c3fb96"
+fix = "83e223e"
 note = "Fixed directly by tenant-bound ids (signed_id.rs): every provider id in a managed Responses relay's 2xx is rewritten to an HMAC-signed id bound to the tenant, and every id sent back must verify for the caller and is stripped to the provider id before forwarding; anything else is a 400 before any upstream. Stateless: no mapping is stored."
 
 [[defect]]
@@ -2273,5 +2273,5 @@ evidence = "Direct to OpenAI 2026-10-01 (gpt-4.1-nano): response R1 answered 'Th
 claims = ["SEC-25"]
 state = "fixed"
 test = "a_full_item_carrying_another_tenants_id_is_answered_from_its_own_content"
-fix = "756b104"
+fix = "5ac7902"
 note = "Fixed with D230: the id of every input item, not only item_reference, is checked (signed_id::Signer::unsign_item). One signed for the caller goes upstream as the provider id; on a full item, one that is not (another tenant's, a raw id, a client's own, such as the msg_<uuid> ids Codex mints for its messages) is cut, and the provider reads the item's own content, as it does an item with no id (live 2026-10-01: a message, and a reasoning item with encrypted_content, without ids, answered from their content). A reference has no content and is refused."
