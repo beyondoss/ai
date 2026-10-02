@@ -334,7 +334,8 @@ expired anyway), and after 1h so a pin taken during an outage drifts back to the
 An open breaker or an unkeyed candidate needs no check: `upstream_peer` skips it and the 2xx that
 follows re-pins. The table is 16384 packed `AtomicU64`s per pod, direct-mapped by hash: a collision
 overwrites and costs one re-rank. Per pod like the EWMA; with a healthy primary two pods rank a new
-caller the same way. `ai_session_pinned_total` counts walks a pin decided. `order` / `split` walks skip ranking and so
+caller the same way. Two pods that saw different outcomes hold different pins, and a conversation
+alternating between them hops providers (D253, [Running several replicas](#running-several-replicas)). `ai_session_pinned_total` counts walks a pin decided. `order` / `split` walks skip ranking and so
 skip the pin; an `only` walk may follow the key's pin. Neither writes one: a walk the caller shaped
 says nothing about where the key's other requests should go, and one debug header must not route
 them for an hour.
@@ -1454,7 +1455,8 @@ what is enforced is the binding.
 one key). Verification takes the key named by the id's own kid, so ids issued under a previous key
 keep verifying while it stays listed. Add the new key to every replica first, then switch
 `id_signing_kid`, and keep the old key at least as long as OpenAI keeps the responses (30 days by
-default). A malformed key or kid is a boot failure, and so is **no key on a deployment that has
+default). A replica without the new key refuses an id signed under it (see
+[Running several replicas](#running-several-replicas)). A malformed key or kid is a boot failure, and so is **no key on a deployment that has
 `signing_keys`** (one that serves managed traffic): it refuses to start, naming
 `AI_ID_SIGNING_KEY_1`. A BYO-only deployment stores nothing on Beyond's accounts and needs none.
 (The request path still fails closed with a 503, `reason="id_signing_unset"`, if it ever reaches a
@@ -2742,6 +2744,40 @@ timeout cannot fire because it is not waiting on anything. The bound is per writ
 resets it, and a client that is reading at all drains a full socket buffer within a few round trips,
 so 60s of zero progress is hundreds of them. Client sockets get no `TCP_USER_TIMEOUT`, so that
 judgement stays with this one setting.
+
+## Running several replicas
+
+Production runs several gateway processes behind one load balancer, sharing one NATS. A caller's
+requests land on any of them. `tests/replicas.rs` runs two processes against one `nats-server` and
+alternates a client between them; it backs every line below except the cache and the ranker,
+which `cache.rs` and `smart.rs` tests and the `ai_*_scope{kind="process"}` metrics cover.
+
+**Shared** (the same on every replica):
+
+- **Deny and allowance sets.** Every replica watches the same NATS KV bucket, so one write to
+  `blackhole.*` or `allowance.*` refuses the tenant on every replica within the 2s bound, and one
+  delete restores it everywhere ([Revocation](#revocation-how-fast-a-change-lands-and-streams-in-flight)).
+- **Id signing keys**, by configuration rather than through NATS: every replica must list the same
+  `id_signing_keys`. An id one replica signs verifies on any other that holds its kid. Rotate in
+  two phases: add the new key to every replica (still signing with the old kid), then switch
+  `id_signing_kid`. Switching first breaks conversations: a replica without the new key answers an
+  id signed under it with `400 previous_response_id does not belong to this tenant`
+  (`ai_rejections_total{reason="foreign_id"}`), before any upstream call.
+
+**Per pod** (each replica has its own, and nothing reconciles them):
+
+- **Response cache.** A hit happens only on the replica that filled the entry.
+- **TTFT ranker.** Each replica ranks from its own samples, so two replicas can order a row
+  differently.
+- **Session pins.** Each replica pins a key's conversation to the provider that served it there.
+  Two replicas that saw different outcomes hold different pins: one that saw the primary fail once
+  pins the fallback, one that did not pins the primary. A conversation the load balancer alternates
+  between them then changes provider on every turn, for up to the pin's 1h life, and pays a prompt
+  cache write on each move (D253). Pins agree only while every replica has seen the same outcomes.
+- **Limits.** `tenant_max_in_flight` and `rate_limit_rps` count on each replica. A tenant at its
+  in-flight cap on one replica is admitted on another, and a credential refused for rate on one is
+  admitted on another. N replicas admit N × each limit, so the overspend bound
+  (`lag × requests in flight × cost per request`) grows with the replica count.
 
 ## Failure Modes
 

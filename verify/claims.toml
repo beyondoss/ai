@@ -345,7 +345,7 @@ touches = [
   "crates/gateway/src/circuit_breaker.rs",
   "crates/gateway/src/control.rs",
 ]
-defects = []
+defects = ["D253"]
 
 [[claim]]
 id = "R5"

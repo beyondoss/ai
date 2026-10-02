@@ -2471,3 +2471,17 @@ state = "fixed"
 test = "v1_models_lists_only_rows_an_openai_pool_key_serves"
 fix = "85cea3f"
 note = "Fixed: GatewayState::new renders the list once at boot (state::models_list_body) from the rows with at least one candidate on a pool-keyed provider; a row whose primary is unkeyed but whose fallback is keyed stays listed. A BYO-only deployment (no pool keys) lists the whole catalog so callers with their own keys can discover names. Same shape; one body per deployment, independent of the caller's key type. Also tested: v1_models_lists_claude_but_not_together_only_rows_on_anthropic_and_openrouter (no catalog row is Together-only today; it checks the rows with no anthropic or openrouter candidate, e.g. openai/gpt-oss-120b), v1_models_on_a_byo_only_deployment_lists_the_whole_catalog, models_list_json_where_keeps_shape_and_order. The E4 live probes' VERIFY_CATALOG_ROWS is now the keyed row count for the cell's pools."
+
+[[defect]]
+id = "D253"
+severity = "med"
+area = "Routing"
+title = "Session pins are per pod, so a pooled row's conversation hops providers between replicas"
+impact = "A conversation a load balancer spreads over replicas can change provider on every turn while both providers are healthy, re-buying its prompt prefix at the cache-write rate (a Claude cache write is 1.25x input against 0.1x for a read) on each move, for up to the pin's 1h life. R4 promises one provider per conversation; with N replicas that holds only while every replica has seen the same outcomes for the row."
+confidence = "high"
+evidence = "Hermetic, tests/replicas.rs (two gateways, one nats-server, gpt-4o-mini row openai -> openrouter): the first request anywhere gets one 500 from the primary. Replica A fails over and pins openrouter; replica B, which never saw the failure, serves and pins openai. Alternating A, B for ten turns served [openrouter, openai, openrouter, openai, ...] every run; both pin tables decided every walk (ai_session_pinned_total >= 5 on each). The pin table (smart.rs, 16384 AtomicU64 per pod) is not shared, and nothing makes two pods agree once their outcomes differ. Other divergence routes: two pods' EWMAs ranking a new caller differently (different samples or probes), and a pod restart that empties its table."
+claims = ["R4"]
+state = "reproduced"
+test = "a_pinned_conversation_stays_on_one_provider_across_replicas"
+fix = ""
+note = "Proposed stateless fix: make the pin deterministic instead of remembered. Pick the pinned candidate by rendezvous hashing (tenant_id, vpc_id, key_id, row) over the row's dispatchable candidates (keyed, breaker not open, latest attempt not failed), so every replica computes the same provider with no shared state; a failed candidate drops out of the hash set and the conversation moves once, to the same fallback on every pod, and moves back once it recovers. Trade-off: a pinned caller's first provider is then chosen by hash rather than by TTFT rank (the ranker would still order failover and unpinned walks), so the hash could be restricted to candidates within a TTFT band of the best. Not fixed in this change; tests/replicas.rs pins_are_per_pod_so_an_alternating_conversation_hops_providers asserts today's behaviour."
