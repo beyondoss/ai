@@ -8,6 +8,11 @@
 //! root-level *keys* and the `model` value are accumulated, each capped at [`MAX_CAPTURE`] bytes. Large uninteresting string content
 //! (system prompts, base64 images) is skipped with a SIMD-accelerated `memchr2` search to the next
 //! `"`/`\`, not inspected byte-by-byte — so even a multi-MB request is walked cheaply.
+//!
+//! Every function here indexes client bytes, so a slip is a panic on a hostile body: indexing and
+//! unchecked arithmetic are denied in this module, and each place that keeps one (a hot loop whose
+//! bound is its own condition) says why it cannot fail.
+#![deny(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 
 /// Most bytes of a root-level key or `model` value we will hold. Real model ids are well under
 /// 128 bytes (`proxy::sanitize_model` records anything longer as `unknown`), and the only keys we
@@ -121,7 +126,12 @@ impl ModelScanner {
         if self.in_message { 2 } else { 1 }
     }
 
+    #[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
     pub fn feed(&mut self, bytes: &[u8]) {
+        // Proof for the allow: every index is `i`/`j` with `i < n` (the loop condition, or a `memchr`
+        // offset inside `bytes[i..]`), or a key span bounded by the closing quote just found; counters
+        // (`i`, `j`, `depth`, `model_keys`) count bytes of a body that fits in memory, so they cannot
+        // overflow. This loop runs on every managed request body, so it keeps the unchecked forms.
         if self.done {
             return;
         }
@@ -255,7 +265,12 @@ impl ModelScanner {
 /// string value never triggers injection — only the genuine root-level field. The returned offset is
 /// always inside a non-empty object (a root `"stream"` is present), so the caller always follows the
 /// fragment with a comma.
+#[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 pub fn plan_stream_usage_injection(body: &[u8]) -> Option<usize> {
+    // Proof for the allow: every index is `i`/`j` with `i < n` (the loop condition, or a `memchr`
+    // offset inside `bytes[i..]`), or a key span bounded by the closing quote just found; counters
+    // (`i`, `j`, `depth`, `model_keys`) count bytes of a body that fits in memory, so they cannot
+    // overflow. This loop runs on every managed request body, so it keeps the unchecked forms.
     let n = body.len();
     // Cheap pre-filter: injection is only ever needed when a root-level `"stream"` key is present.
     // If the quoted token `"stream"` doesn't occur *anywhere*, the structural answer is
@@ -446,7 +461,12 @@ pub const OUTPUT_LIMIT_KEYS: [&[u8]; 3] = [
 /// decoded and the last `stream` decides (as the provider's parser does; a duplicate or escaped
 /// `stream_options` is flagged in `stream_options_ambiguous` instead, D88), and the model value
 /// *is* unescaped because `ModelScanner` unescapes it. `fused_scan_matches_the_two_walks_it_replaces` cross-checks a corpus against both.
+#[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 pub fn scan_buffered(body: &[u8]) -> BufferedScan {
+    // Proof for the allow: every index is `i`/`j` with `i < n` (the loop condition, or a `memchr`
+    // offset inside `bytes[i..]`), or a key span bounded by the closing quote just found; counters
+    // (`i`, `j`, `depth`, `model_keys`) count bytes of a body that fits in memory, so they cannot
+    // overflow. This loop runs on every managed request body, so it keeps the unchecked forms.
     let n = body.len();
     let mut i = 0;
     while i < n && body[i].is_ascii_whitespace() {
@@ -663,9 +683,9 @@ pub fn remove_root_nulls(body: &mut Vec<u8>) -> bool {
     let spans: Vec<(usize, usize)> = members.iter().map(Member::span).collect();
     let null: Vec<bool> = members
         .iter()
-        .map(|m| &body[m.value.0..m.value.1] == b"null")
+        .map(|m| body.get(m.value.0..m.value.1) == Some(b"null"))
         .collect();
-    remove_items(body, &spans, |k| null[k])
+    remove_items(body, &spans, |k| null.get(k).copied().unwrap_or(false))
 }
 
 /// Remove every root member whose key decodes to `key` (escaped spellings included), by span. `true`
@@ -676,7 +696,7 @@ pub fn remove_root_members(body: &mut Vec<u8>, key: &str) -> bool {
     };
     let spans: Vec<(usize, usize)> = members.iter().map(Member::span).collect();
     let hit: Vec<bool> = members.iter().map(|m| m.key_is(body, key)).collect();
-    remove_items(body, &spans, |k| hit[k])
+    remove_items(body, &spans, |k| hit.get(k).copied().unwrap_or(false))
 }
 
 /// Whether a quoted JSON key containing escapes decodes to `want`. Only reached for a root key with a
@@ -707,37 +727,39 @@ pub struct Member {
 impl Member {
     /// The member's extent: the key's opening quote through the value's last byte.
     pub fn span(&self) -> (usize, usize) {
-        (self.key.0 - 1, self.value.1)
+        (self.key.0.saturating_sub(1), self.value.1)
     }
 
     /// Whether the key decodes to `want`. A raw compare, unless the key carries an escape
     /// (`"stream_options"`), which a provider's parser decodes and so must we.
     pub fn key_is(&self, body: &[u8], want: &str) -> bool {
-        let raw = &body[self.key.0..self.key.1];
+        let Some(raw) = body.get(self.key.0..self.key.1) else {
+            return false;
+        };
         if raw.contains(&b'\\') {
-            escaped_key_is(&body[self.key.0 - 1..=self.key.1], want)
+            let quoted = body.get(self.key.0.saturating_sub(1)..self.key.1.saturating_add(1));
+            quoted.is_some_and(|q| escaped_key_is(q, want))
         } else {
             raw == want.as_bytes()
         }
     }
 }
 
-fn skip_ws(b: &[u8], mut i: usize) -> usize {
-    while i < b.len() && b[i].is_ascii_whitespace() {
-        i += 1;
-    }
-    i
+fn skip_ws(b: &[u8], i: usize) -> usize {
+    let rest = b.get(i..).unwrap_or_default();
+    let n = rest.iter().take_while(|c| c.is_ascii_whitespace()).count();
+    i.saturating_add(n)
 }
 
 /// The end (exclusive) of the string whose opening quote is at `open`.
 fn string_end(b: &[u8], open: usize) -> Option<usize> {
-    let mut i = open + 1;
+    let mut i = open.saturating_add(1);
     loop {
-        let k = memchr::memchr2(b'"', b'\\', b.get(i..)?)?;
-        if b[i + k] == b'\\' {
-            i += k + 2;
+        let at = i.saturating_add(memchr::memchr2(b'"', b'\\', b.get(i..)?)?);
+        if b.get(at) == Some(&b'\\') {
+            i = at.saturating_add(2);
         } else {
-            return Some(i + k + 1);
+            return Some(at.saturating_add(1));
         }
     }
 }
@@ -749,30 +771,32 @@ pub fn value_end(b: &[u8], i: usize) -> Option<usize> {
         b'{' | b'[' => {
             let mut depth = 0u32;
             let mut j = i;
-            while j < b.len() {
-                match b[j] {
+            while let Some(&c) = b.get(j) {
+                match c {
                     b'"' => {
                         j = string_end(b, j)?;
                         continue;
                     }
-                    b'{' | b'[' => depth += 1,
+                    b'{' | b'[' => depth = depth.saturating_add(1),
                     b'}' | b']' => {
-                        depth -= 1;
+                        // The first byte opened a container, so `depth` is at least 1 here.
+                        depth = depth.saturating_sub(1);
                         if depth == 0 {
-                            return Some(j + 1);
+                            return Some(j.saturating_add(1));
                         }
                     }
                     _ => {}
                 }
-                j += 1;
+                j = j.saturating_add(1);
             }
             None
         }
         _ => {
-            let n = b[i..]
+            let n = b
+                .get(i..)?
                 .iter()
                 .position(|c| matches!(c, b',' | b'}' | b']') || c.is_ascii_whitespace())
-                .map_or(b.len(), |k| i + k);
+                .map_or(b.len(), |k| i.saturating_add(k));
             (n > i).then_some(n)
         }
     }
@@ -780,34 +804,7 @@ pub fn value_end(b: &[u8], i: usize) -> Option<usize> {
 
 /// The members of the object whose `{` is at `open`, in order. `None` for malformed JSON.
 pub fn object_members(b: &[u8], open: usize) -> Option<Vec<Member>> {
-    let mut out = Vec::new();
-    let mut i = skip_ws(b, open + 1);
-    if b.get(i) == Some(&b'}') {
-        return Some(out);
-    }
-    loop {
-        if b.get(i) != Some(&b'"') {
-            return None;
-        }
-        let key_end = string_end(b, i)?;
-        let key = (i + 1, key_end - 1);
-        i = skip_ws(b, key_end);
-        if b.get(i) != Some(&b':') {
-            return None;
-        }
-        let start = skip_ws(b, i + 1);
-        let end = value_end(b, start)?;
-        out.push(Member {
-            key,
-            value: (start, end),
-        });
-        i = skip_ws(b, end);
-        match b.get(i)? {
-            b',' => i = skip_ws(b, i + 1),
-            b'}' => return Some(out),
-            _ => return None,
-        }
-    }
+    members(b, open).collect()
 }
 
 /// The members of the body's root object. `None` when the root is not a well-formed object.
@@ -817,23 +814,10 @@ pub fn root_members(b: &[u8]) -> Option<Vec<Member>> {
     object_members(b, open)
 }
 
-/// The elements of the array whose `[` is at `open`, as spans, in order.
+/// The elements of the array whose `[` is at `open`, as spans, in order. `None` for malformed
+/// JSON.
 pub fn array_elements(b: &[u8], open: usize) -> Option<Vec<(usize, usize)>> {
-    let mut out = Vec::new();
-    let mut i = skip_ws(b, open + 1);
-    if b.get(i) == Some(&b']') {
-        return Some(out);
-    }
-    loop {
-        let end = value_end(b, i)?;
-        out.push((i, end));
-        i = skip_ws(b, end);
-        match b.get(i)? {
-            b',' => i = skip_ws(b, i + 1),
-            b']' => return Some(out),
-            _ => return None,
-        }
-    }
+    elements(b, open).collect()
 }
 
 /// Remove the items `drop` selects from one container's item spans (members or elements, in
@@ -844,23 +828,29 @@ pub fn remove_items(
     items: &[(usize, usize)],
     drop: impl Fn(usize) -> bool,
 ) -> bool {
-    let last_kept = (0..items.len()).rev().find(|&k| !drop(k));
+    let (Some(&(_, end)), Some(last)) = (items.last(), items.len().checked_sub(1)) else {
+        return false;
+    };
+    let last_kept = (0..=last).rev().find(|&k| !drop(k));
     let mut cuts: Vec<(usize, usize)> = Vec::new();
-    for k in 0..items.len() {
+    for (k, &(start, _)) in items.iter().enumerate() {
         if !drop(k) {
             continue;
         }
-        match last_kept {
+        match last_kept.and_then(|l| Some((l, items.get(l)?))) {
             // Ahead of a kept item: the item and the separator after it, up to the next item.
-            Some(l) if k < l => cuts.push((items[k].0, items[k + 1].0)),
+            Some((l, _)) if k < l => {
+                let next = items.get(k.saturating_add(1)).map_or(end, |n| n.0);
+                cuts.push((start, next));
+            }
             // The trailing run: from the last kept item's end, separators included.
-            Some(l) => {
-                cuts.push((items[l].1, items[items.len() - 1].1));
+            Some((_, kept)) => {
+                cuts.push((kept.1, end));
                 break;
             }
             // Nothing kept: the whole run, leaving an empty container.
             None => {
-                cuts.push((items[k].0, items[items.len() - 1].1));
+                cuts.push((start, end));
                 break;
             }
         }
@@ -1195,6 +1185,7 @@ pub fn structure(b: &[u8]) -> Structure {
 }
 
 #[cfg(test)]
+#[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 mod tests {
     use super::*;
 
@@ -1927,6 +1918,7 @@ mod tests {
 
 /// Behaviors a mutation-testing pass found no test constraining.
 #[cfg(test)]
+#[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 mod mutation_gaps {
     use super::*;
 
