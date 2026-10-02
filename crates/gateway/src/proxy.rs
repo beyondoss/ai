@@ -815,9 +815,6 @@ struct RequestControl {
 struct ModelRouting {
     /// The catalog row this request routes over. `&'static`, so it costs a pointer.
     route: &'static route::ModelRoute,
-    /// The ranker chose this walk with no `order` / `split` / `only` from the caller, so the
-    /// candidate that serves may be pinned for the caller's next requests (see `smart`).
-    pinnable: bool,
     /// A provider endpoint under the parent one (`count_tokens`, `compact`): its suffix is appended
     /// to the serving candidate's path. It never feeds the TTFT ranker (a token count answers in a
     /// fraction of a generation's time and would skew the walk), and a free one writes no billing
@@ -851,8 +848,8 @@ struct ModelRouting {
     /// Inbound endpoint. Always set on a catalog walk so a mixed-row failover can translate
     /// onto the next candidate's path. Same-endpoint attempts skip the mapper (`from == to`).
     translate: Option<translate::TranslateState>,
-    /// A 2xx whose TTFT sample and session pin wait on the body's first bytes (see
-    /// `settle_health`). `None` once settled, and for every non-2xx.
+    /// A 2xx whose TTFT sample waits on the body's first bytes (see `settle_health`). `None` once
+    /// settled, and for every non-2xx.
     health: Option<PendingHealth>,
     /// How many addresses the current candidate resolved to; `RequestCtx::attempt` indexes them.
     addrs: u8,
@@ -1720,7 +1717,8 @@ impl AiProxy {
     }
 
     /// Resolve a 2xx's pending health verdict from the first response bytes: feed the TTFT ranker
-    /// the sample it held back, and pin the caller only to an answer, never to an error-in-200.
+    /// the sample it held back (an error-in-200 is a failure, not a fast healthy sample), and
+    /// count an error-in-200 against the candidate's breaker.
     fn settle_health(&self, rc: &mut RequestCtx, chunk: &[u8], end_of_stream: bool) {
         let streaming = rc.streaming;
         let Some(a) = rc.auto.as_mut() else { return };
@@ -1738,8 +1736,13 @@ impl AiProxy {
         let us = pending.elapsed_us;
         a.health = None;
         record_walk_ttft_us(self.state, rc, us, !verdict);
-        if !verdict {
-            pin_walk(self.state, rc);
+        // The head resolved this attempt's breaker permit as a success (see `response_filter`):
+        // only the body shows the provider is broken. Count it as the failure it is, so a host that
+        // keeps answering errors in 200s opens its breaker and every walk, session pins included,
+        // skips it. The windowed rule trips once failures reach the threshold and match the
+        // successes, which one success plus one failure per such answer does.
+        if verdict && let Some(b) = rc.provider.breaker.as_ref() {
+            b.record_failure();
         }
     }
 
@@ -2242,32 +2245,6 @@ fn record_walk_ttft_us(state: &GatewayState, rc: &RequestCtx, us: u64, ok: bool)
         return;
     };
     state.smart.observe(auto.route, orig, us, ok);
-}
-
-/// Pin this caller to the candidate that just answered 2xx, so its next request goes back to the
-/// provider holding its prompt cache (see `smart`'s "Session pins"). Same scope as
-/// [`record_walk_ttft`]: managed catalog walks over `candidates`, smart router on.
-fn pin_walk(state: &GatewayState, rc: &RequestCtx) {
-    if !state.config.smart_router {
-        return;
-    }
-    let Some(auto) = rc.auto.as_ref() else {
-        return;
-    };
-    if !std::ptr::eq(auto.arms, auto.route.candidates) {
-        return;
-    }
-    // A walk the caller shaped (`order` / `split` pin it, `only` filters it) says nothing about
-    // where this key's other requests should go. Pinning it would route the whole app by one
-    // debug header for up to an hour.
-    if !auto.pinnable {
-        return;
-    }
-    let Some(orig) = auto.walk.catalog_index(auto.candidate) else {
-        return;
-    };
-    let affinity = smart::affinity(rc.tenant_id, rc.vpc_id, rc.key_id);
-    state.smart.pin(auto.route, affinity, orig);
 }
 
 /// Pingora will only replay a body that has fully arrived and fit in its private 64 KiB buffer.
@@ -3986,7 +3963,6 @@ impl ProxyHttp for AiProxy {
 
         // Model routing is **managed-only**, and the first candidate is chosen here.
         let mut walk = control::Walk::identity(0);
-        let mut pinnable = false;
         let mut walk_arms: &'static [route::Candidate] = &[];
         let inbound_responses =
             model_route.is_some() && route::is_responses_path(session.req_header().uri.path());
@@ -4175,7 +4151,6 @@ impl ProxyHttp for AiProxy {
                         .as_ref()
                         .is_some_and(control::Control::pins_walk)
                 {
-                    pinnable = parsed_control.as_ref().is_none_or(|c| c.only.is_none());
                     let affinity = smart::affinity(tenant_id, vpc_id, key_id);
                     let (ranked, pinned) =
                         self.state
@@ -4502,7 +4477,6 @@ impl ProxyHttp for AiProxy {
                     auto: model_route.map(|route| {
                         Box::new(ModelRouting {
                             route,
-                            pinnable,
                             sub,
                             candidate: first_usable(usable, 0).unwrap_or(0),
                             usable,
@@ -4675,7 +4649,6 @@ impl ProxyHttp for AiProxy {
             auto: model_route.map(|route| {
                 Box::new(ModelRouting {
                     route,
-                    pinnable,
                     sub,
                     // `first_usable` picked this candidate above; `upstream_peer` re-derives it from
                     // here on.

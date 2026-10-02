@@ -7,8 +7,11 @@
 //!
 //! - **Shared:** the NATS deny/allowance sets (a write lands on every replica within the bound) and
 //!   the id signing keys (an id one replica signs verifies on another; rotation is two-phase).
-//! - **Per pod:** session pins (a pooled row's conversation can hop providers between pods, D253),
-//!   `tenant_max_in_flight` and the per-credential rate limit (N replicas admit N × the limit).
+//! - **Computed, so the same everywhere:** session pins. No pod keeps any pin state; each computes
+//!   the same provider for a caller every turn from the caller and the row (D253, fixed). The one
+//!   residual divergence is an open breaker on one pod during a real outage.
+//! - **Per pod:** `tenant_max_in_flight` and the per-credential rate limit (N replicas admit N × the
+//!   limit).
 //!
 //! Run via `mise run test:integration:rs` (needs `nats-server` on PATH).
 
@@ -305,9 +308,10 @@ async fn post_auto(gw: &Gateway, key: &str) -> String {
     provider
 }
 
-/// Two replicas whose pin tables disagree for one key: replica A saw the primary fail once and
-/// pinned the key to the fallback; replica B never saw the failure and pinned the primary. Both
-/// providers are healthy from then on.
+/// Two replicas whose outcomes differ for one key: replica A saw the primary fail once and failed
+/// over to the fallback for that request; replica B never saw the failure and served the primary.
+/// Both providers are healthy from then on. Before D253's fix each pod remembered its own pin (A
+/// the fallback, B the primary) for up to an hour.
 async fn split_pins() -> (ReplyUpstream, MockUpstream, Gateway, Gateway, String) {
     let nats_port = unused_nats_port();
     let (pubkey, sk) = test_keypair(45);
@@ -334,35 +338,10 @@ async fn split_pins() -> (ReplyUpstream, MockUpstream, Gateway, Gateway, String)
     assert_eq!(
         post_auto(&a, &key).await,
         "openrouter",
-        "A fails over and pins the fallback"
+        "A fails over to the fallback for that request"
     );
-    assert_eq!(
-        post_auto(&b, &key).await,
-        "openai",
-        "B, cold, serves (and pins) the primary"
-    );
+    assert_eq!(post_auto(&b, &key).await, "openai", "B serves the primary");
     (primary, fallback, a, b, key)
-}
-
-/// Pins are per pod: after the split above, a conversation a load balancer alternates between the
-/// replicas lands on A's provider on A and B's on B, every turn, for the pin's life (up to 1h). Each
-/// hop re-buys the prompt prefix at the cache-write rate on a provider whose cache is cold. This is
-/// the behaviour as it stands (D253); the ignored test below asserts the fix. Untagged: it pins
-/// today's per-pod behaviour, and proves no claim.
-#[tokio::test]
-async fn pins_are_per_pod_so_an_alternating_conversation_hops_providers() {
-    let (_primary, _fallback, a, b, key) = split_pins().await;
-    let mut served = Vec::new();
-    for _ in 0..5 {
-        served.push((post_auto(&a, &key).await, post_auto(&b, &key).await));
-    }
-    assert!(
-        served
-            .iter()
-            .all(|(on_a, on_b)| on_a == "openrouter" && on_b == "openai"),
-        "each replica keeps its own pin, so the conversation hops every turn: {served:?}"
-    );
-    assert!(gw_pinned(&a).await >= 5.0 && gw_pinned(&b).await >= 5.0);
 }
 
 async fn gw_pinned(gw: &Gateway) -> f64 {
@@ -370,11 +349,11 @@ async fn gw_pinned(gw: &Gateway) -> f64 {
 }
 
 /// What R4 promises a conversation spread over replicas: one provider every turn, whichever pod
-/// takes it, while that provider is healthy.
+/// takes it, while that provider is usable. The pin is computed from the caller and the row every
+/// turn, and A's failure moved only the request that met it, so A is back on the primary at once.
 /// claim: R4
 /// defect: D253
 #[tokio::test]
-#[ignore = "D253 reproduced: pins are per pod, so a pooled row's conversation hops providers between replicas"]
 async fn a_pinned_conversation_stays_on_one_provider_across_replicas() {
     let (_primary, _fallback, a, b, key) = split_pins().await;
     let mut served = Vec::new();
@@ -386,6 +365,197 @@ async fn a_pinned_conversation_stays_on_one_provider_across_replicas() {
         served.windows(2).all(|w| w[0] == w[1]),
         "a healthy pinned conversation changed provider between replicas: {served:?}"
     );
+    assert_eq!(served[0], "openai", "the catalog primary, not the failover");
+    assert!(
+        gw_pinned(&a).await >= 5.0 && gw_pinned(&b).await >= 5.0,
+        "both pods routed the turns by the pin"
+    );
+}
+
+async fn post_claude(gw: &Gateway, key: &str) -> String {
+    let resp = test_client()
+        .post(format!("{}/auto/v1/messages", gw.url()))
+        .header("authorization", format!("Bearer {key}"))
+        .header("content-type", "application/json")
+        .header("x-beyond-model", "claude-opus-4-8")
+        .body(r#"{"model":"claude-opus-4-8","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let provider = resp
+        .headers()
+        .get("x-beyond-provider")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_owned();
+    let _ = resp.bytes().await;
+    provider
+}
+
+/// A pooled row (Anthropic + Bedrock, OpenRouter as failover) over two replicas: every session
+/// reaches one provider on both pods for 20 alternating turns, its very first included, although
+/// the pods' TTFT samples favour Bedrock (the Anthropic mock is slower). Sessions spread over both
+/// first-party hosts by hash, and none lands on the aggregator while they are usable.
+/// claim: R4
+/// defect: D253
+#[tokio::test]
+async fn a_pooled_session_reaches_one_provider_on_every_replica() {
+    let nats_port = unused_nats_port();
+    let (pubkey, sk) = test_keypair(48);
+    let anthropic = MockUpstream::start(Mode::Slow(20)).await;
+    let bedrock = MockUpstream::start(Mode::AnthropicJson).await;
+    let openrouter = MockUpstream::start(Mode::Json).await;
+    let replica = || {
+        Gateway::builder(nats_port, &anthropic.authority(), &b64(&pubkey))
+            .providers(&["anthropic", "bedrock", "openrouter"])
+            .provider_authority("bedrock", &bedrock.authority())
+            .provider_authority("openrouter", &openrouter.authority())
+            .start()
+    };
+    let a = replica().await;
+    let b = replica().await;
+    let mut by_provider = std::collections::BTreeMap::<String, usize>::new();
+    for tenant in 4800..4810 {
+        let key = billing_vkey(&sk, tenant);
+        let mut served = Vec::new();
+        for _ in 0..10 {
+            served.push(post_claude(&a, &key).await);
+            served.push(post_claude(&b, &key).await);
+        }
+        assert!(
+            served.windows(2).all(|w| w[0] == w[1]),
+            "session {tenant} changed provider between replicas: {served:?}"
+        );
+        *by_provider.entry(served[0].clone()).or_default() += 1;
+    }
+    assert!(
+        !by_provider.contains_key("openrouter"),
+        "a pin was hashed onto the aggregator: {by_provider:?}"
+    );
+    assert_eq!(
+        by_provider.len(),
+        2,
+        "sessions did not spread over both first-party hosts: {by_provider:?}"
+    );
+}
+
+/// A failure fails over for that request only: while the primary keeps failing each turn fails
+/// over in-gateway (the client never sees it), and the first turn after the primary answers again
+/// is back on it, on both replicas.
+/// claim: R4, R1
+/// defect: D253
+#[tokio::test]
+async fn a_failover_pin_returns_to_the_primary_once_it_is_healthy() {
+    let nats_port = unused_nats_port();
+    let (pubkey, sk) = test_keypair(49);
+    // The primary's first three attempts fail, then it is healthy.
+    let primary = ReplyUpstream::start(|n, _| {
+        if n < 3 {
+            Reply::json(500, r#"{"error":{"message":"outage"}}"#)
+        } else {
+            Reply::json(200, OK_JSON)
+        }
+    })
+    .await;
+    let fallback = MockUpstream::start(Mode::Json).await;
+    let replica = || {
+        Gateway::builder(nats_port, &primary.authority(), &b64(&pubkey))
+            .providers(&["openai", "openrouter"])
+            .provider_authority("openrouter", &fallback.authority())
+            .config_line("circuit_breaker_threshold = 100")
+            .start()
+    };
+    let a = replica().await;
+    let b = replica().await;
+    let key = billing_vkey(&sk, 4901);
+    let mut served = Vec::new();
+    for _ in 0..4 {
+        served.push(post_auto(&a, &key).await);
+        served.push(post_auto(&b, &key).await);
+    }
+    assert_eq!(
+        served[..3],
+        ["openrouter"; 3],
+        "the outage turns fail over: {served:?}"
+    );
+    assert!(
+        served[3..].iter().all(|p| p == "openai"),
+        "the conversation returns to the primary once it answers: {served:?}"
+    );
+}
+
+/// The residual divergence, stated: a replica whose breaker for the preferred host is open routes
+/// the session to the next candidate, and only while the breaker is open. The other replica, whose
+/// breaker never opened, keeps serving the preferred host; once the open breaker's probe succeeds,
+/// both are back on it.
+/// claim: R4, R6
+/// defect: D253
+#[tokio::test]
+async fn a_replica_with_an_open_breaker_routes_away_only_while_it_is_open() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let nats_port = unused_nats_port();
+    let (pubkey, sk) = test_keypair(50);
+    let failing = Arc::new(AtomicBool::new(true));
+    let primary = ReplyUpstream::start({
+        let failing = failing.clone();
+        move |_, _| {
+            if failing.load(Ordering::Relaxed) {
+                Reply::json(500, r#"{"error":{"message":"outage"}}"#)
+            } else {
+                Reply::json(200, OK_JSON)
+            }
+        }
+    })
+    .await;
+    let fallback = MockUpstream::start(Mode::Json).await;
+    let replica = || {
+        Gateway::builder(nats_port, &primary.authority(), &b64(&pubkey))
+            .providers(&["openai", "openrouter"])
+            .provider_authority("openrouter", &fallback.authority())
+            .config_line("circuit_breaker_threshold = 2")
+            .config_line("circuit_breaker_window_secs = 60")
+            .config_line("circuit_breaker_reset_secs = 2")
+            .start()
+    };
+    let a = replica().await;
+    let b = replica().await;
+    let key = billing_vkey(&sk, 5001);
+    // Only A meets the outage: two failed-over turns open its breaker for the primary.
+    for _ in 0..2 {
+        assert_eq!(post_auto(&a, &key).await, "openrouter");
+    }
+    failing.store(false, Ordering::Relaxed);
+    let hits = primary.hits();
+    for turn in 0..3 {
+        assert_eq!(
+            post_auto(&a, &key).await,
+            "openrouter",
+            "turn {turn}: A's breaker is open, so A skips the primary"
+        );
+        assert_eq!(
+            post_auto(&b, &key).await,
+            "openai",
+            "turn {turn}: B's breaker is closed, so B keeps the preferred host"
+        );
+    }
+    assert_eq!(primary.hits(), hits + 3, "only B reached the primary");
+    // Past the reset the half-open probe succeeds and A is back on the primary.
+    let start = Instant::now();
+    let mut on_a = String::new();
+    while start.elapsed() < Duration::from_secs(10) {
+        on_a = post_auto(&a, &key).await;
+        if on_a == "openai" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert_eq!(on_a, "openai", "A returns once its breaker closes");
+    for _ in 0..5 {
+        assert_eq!(post_auto(&a, &key).await, "openai");
+        assert_eq!(post_auto(&b, &key).await, "openai");
+    }
 }
 
 /// `tenant_max_in_flight` is per process: with a cap of 1 on each of two replicas, a tenant holding

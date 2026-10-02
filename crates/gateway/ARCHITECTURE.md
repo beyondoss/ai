@@ -34,7 +34,7 @@ published `beyond-slipstream` — clones, CI-builds, and publishes anywhere.
 | **Cut-short estimate**                     | A managed request the provider took but whose usage never arrived — a 2xx stream ended early, a non-stream body cut off or answered without usage (D195), a cancel before the response head — is billed an **estimate** flagged `usage_estimated`: input from the prompt text's pre-tokens, a lower bound (Anthropic keeps `message_start`'s exact count), output from the relayed delta events and text. Errs low.                                                                      | A reported count, or a way to see hidden reasoning — both estimates are blind to thinking the stream never shows                             |
 | **Tenant slot**                            | One of `tenant_max_in_flight` concurrent requests a tenant may hold **on this process**; over it → 429 before the breaker and upstream. The bound on overspend while the allowance-set lags. Off by default.                                                                                                                                                                                                                                                                             | A rate limit or a quota — short fast requests never hit it; N replicas admit N × the limit                                                   |
 | **Control header** (`x-beyond-*`)          | Per-request caller input: `metadata` tags, `capture` on/off, `cache` on/off, catalog `order` / `only` / `split`. Managed only; stripped before the upstream                                                                                                                                                                                                                                                                                                                              | A way to 4xx a request — unusable values are dropped and counted; an `only` that leaves no keyed candidate is the same 503 as an unkeyed row |
-| **Smart router**                           | **Per-pod** EWMA of TTFT per catalog candidate. Default walk for managed `/auto` and `/v1` when `order`/`split` are absent. Probe of unmeasured arms every 8th request. Ranks **new** callers only: a caller with a live session pin keeps its provider. `smart_router = false` restores static catalog order. Two replicas can rank the same row differently.                                                                                                                           | Live Redis, cost sort, or a fleet-wide shared ranking — none of those                                                                        |
+| **Smart router**                           | **Per-pod** EWMA of TTFT per catalog candidate. Default walk for managed `/auto` and `/v1` when `order`/`split` are absent. Probe of unmeasured arms every 8th request. Orders only walks with no caller identity: a managed default walk is a session pin, computed from the caller every turn (no TTFT). `smart_router = false` restores static catalog order. Two replicas can rank the same row differently.                                                                         | Live Redis, cost sort, or a fleet-wide shared ranking — none of those                                                                        |
 | **Snapshot**                               | On-disk deny-set cache (entries + NATS cursor) for edge/tunnel deployments. Allowance uses `{snapshot_path}.allowance`.                                                                                                                                                                                                                                                                                                                                                                  | Persistent store — a pure cache; delete it and the gateway re-scans NATS                                                                     |
 | **Virtual key** (`bai_v1` / `bai_v2`)      | Ed25519-signed token: v1 is `tenant_id`+`vpc_id` (16 B); v2 adds unique `key_id` (24 B). Same keyring.                                                                                                                                                                                                                                                                                                                                                                                   | A session or auth token — stateless, no server-side lookup                                                                                   |
 
@@ -316,30 +316,40 @@ pick it every time, `upstream_peer` would skip it, and a keyed arm behind it wou
 measured (D119). A sample older than 30s is treated as unmeasured so a
 recovered arm is retried. Ranking reads the monotonic clock once per request and reuses that
 instant for every candidate's staleness check. `smart_router = false`
-restores static catalog order. Samples never leave the pod —
+restores static catalog order (and with it no session-pin hashing). Samples never leave the pod —
 `ai_smart_rank_scope{kind="process"}=1` is the honesty metric; this is not fleet-wide smart
-routing. `x-beyond-split` is the only cross-replica pin (hash of the request counter).
+routing. What agrees across replicas is computed, never shared: session pins
+(below) and `x-beyond-split` (hash of the request counter).
 
-**Session pins.** Ranking decides where a _new_ caller goes; a pin keeps an existing one there.
-Provider prompt caches are per provider, so re-ranking every request moved agent loops between
-Anthropic and Bedrock and re-bought the whole prefix on each move (a Claude cache write is 1.25×
-input against 0.1× for a read), and the every-8th probe landed on whoever drew the seed, usually
-someone mid-session. After a 2xx that carried an answer (not an error-in-200, see above) on a
-candidate walk, `(tenant_id, vpc_id, key_id)` plus the catalog row is pinned to the candidate that
-served. While the pin is live the walk puts that
-candidate first, keeps the rest in EWMA order as failover, and never probes. One virtual key is one
-app, and an app's sessions share their system prompt and tools, so one pin per key per model is
-the grain the provider cache wants. A pin yields when its candidate's latest attempt failed (the
-walk fails over, and the next 2xx re-pins), after 300s without a 2xx (the provider cache has
-expired anyway), and after 1h so a pin taken during an outage drifts back to the ranked primary.
-An open breaker or an unkeyed candidate needs no check: `upstream_peer` skips it and the 2xx that
-follows re-pins. The table is 16384 packed `AtomicU64`s per pod, direct-mapped by hash: a collision
-overwrites and costs one re-rank. Per pod like the EWMA; with a healthy primary two pods rank a new
-caller the same way. Two pods that saw different outcomes hold different pins, and a conversation
-alternating between them hops providers (D253, [Running several replicas](#running-several-replicas)). `ai_session_pinned_total` counts walks a pin decided. `order` / `split` walks skip ranking and so
-skip the pin; an `only` walk may follow the key's pin. Neither writes one: a walk the caller shaped
-says nothing about where the key's other requests should go, and one debug header must not route
-them for an hour.
+**Session pins.** Ranking orders a walk for nobody in particular; a session pin keeps one caller on
+one provider. Provider prompt caches are per provider, so re-ranking every request moved agent
+loops between Anthropic and Bedrock and re-bought the whole prefix on each move (a Claude cache
+write is 1.25× input against 0.1× for a read), and the every-8th probe landed on whoever drew the
+seed, usually someone mid-session. The pin key is `(tenant_id, vpc_id, key_id)` plus the catalog
+row: one virtual key is one app, and an app's sessions share their system prompt and tools, so one
+pin per key per model is the grain the provider cache wants.
+
+The pin is **computed every turn and never remembered**: no pod keeps any pin state. A managed
+default walk (no `order` / `split`) with a verified caller, which is every one, is the row's leading
+run of equally-preferred first-party hosts (a provider with its own model-id prefix: the vendor, or
+a cloud reselling the model under its ids, so Anthropic + Bedrock, never OpenRouter or another
+aggregator) ordered by rendezvous hash of the pin key and the provider name, then the rest of the
+row in catalog order. A candidate that cannot be used on this pod (no pool key, every key cooling,
+cannot serve the body) moves to the back; an open breaker is skipped by `upstream_peer`. Nothing
+else moves the pin: no TTFT, no probe, no failure history. A failure fails over for that request
+only, and the next turn starts from the preferred host again. Catalog preference holds: the hash
+spreads apps over the pooled first-party hosts and never onto the costlier failover while one of
+them can serve, and a row whose primary is an aggregator keeps its catalog order. So the TTFT
+ranker and its probe above order only walks with no caller identity; a managed default walk is
+always pinned (`ai_session_pinned_total` counts them). Every replica computes the same walk from
+the same inputs; the residual divergence is an open breaker
+([Running several replicas](#running-several-replicas)). `order` / `split` walks skip ranking and
+so skip the pin; an `only` walk follows the pin computed over what it left.
+
+An error-in-200 (above) is counted against the serving candidate's breaker as well as the ranker:
+the head already resolved the permit as a success, so `settle_health` records the failure the body
+showed. Without that a host that keeps answering errors in 200s would never be routed around, since
+the pin no longer learns from failures.
 
 A managed request may also permute that list with headers, still on the same wire, without adding a
 provider the row does not already name (`ProviderSpec::name` on that row). Parsed in `control.rs`,
@@ -2788,17 +2798,31 @@ which `cache.rs` and `smart.rs` tests and the `ai_*_scope{kind="process"}` metri
   `id_signing_kid`. Switching first breaks conversations: a replica without the new key answers an
   id signed under it with `400 previous_response_id does not belong to this tenant`
   (`ai_rejections_total{reason="foreign_id"}`), before any upstream call.
+- **Session pins**, by computation rather than through NATS: no replica keeps pin state. Every
+  turn's provider is a function of the caller, the row and which candidates this pod can use
+  ("Session pins" under [Model routing](#model-routing-auto-managed-v1-providerscatalog)), and the
+  usable set is the same on every replica that shares the deployment's pool keys. A conversation
+  the load balancer alternates between replicas therefore reaches one provider on all of them, its
+  first turn included, and a failure one replica meets fails over for that request only (D253, where
+  each pod remembered its own pin for up to 1h and alternating turns hopped providers, is fixed
+  this way).
+
+  **Residual divergence, and the only one:** the circuit breaker is per pod. During a real outage
+  one replica's breaker for the preferred host can be open while another's is still closed (or
+  already half-open and recovered). While that lasts, a session alternating between them is served
+  by the next candidate on the open-breaker replica and by the preferred host on the other, paying a
+  cache write on each move. It ends when the breakers agree: the open one's half-open probe
+  succeeds after `circuit_breaker_reset_secs`, or the other trips too. Key cooling (every pool key
+  of a provider refused within `KEY_COOLDOWN`) is per pod as well and diverges the same way while
+  it lasts. Nothing else a pod observes moves a pin.
 
 **Per pod** (each replica has its own, and nothing reconciles them):
 
 - **Response cache.** A hit happens only on the replica that filled the entry.
 - **TTFT ranker.** Each replica ranks from its own samples, so two replicas can order a row
-  differently.
-- **Session pins.** Each replica pins a key's conversation to the provider that served it there.
-  Two replicas that saw different outcomes hold different pins: one that saw the primary fail once
-  pins the fallback, one that did not pins the primary. A conversation the load balancer alternates
-  between them then changes provider on every turn, for up to the pin's 1h life, and pays a prompt
-  cache write on each move (D253). Pins agree only while every replica has seen the same outcomes.
+  differently. It orders only walks with no caller identity; every managed default walk is a
+  session pin (see Shared above).
+- **Circuit breakers and key cooling**, the residual divergence above.
 - **Limits.** `tenant_max_in_flight` and `rate_limit_rps` count on each replica. A tenant at its
   in-flight cap on one replica is admitted on another, and a credential refused for rate on one is
   admitted on another. N replicas admit N × each limit, so the overspend bound

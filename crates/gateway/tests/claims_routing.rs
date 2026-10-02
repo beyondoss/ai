@@ -148,14 +148,13 @@ async fn the_breaker_opens_on_a_broken_provider_and_recovers() {
     }
 }
 
-/// The ranker's probe (every 8th request) measures a fallback the gateway can actually dispatch.
-/// A Claude row deployed without Bedrock is anthropic → bedrock (unkeyed) → openrouter: the probe
-/// must skip the unkeyed Bedrock arm and promote OpenRouter, or OpenRouter is never measured,
-/// ranked or pinned and only ever serves as failover.
-/// claim: R7
-/// defect: D119
+/// A session pin skips a candidate this gateway cannot dispatch to. A Claude row deployed without
+/// Bedrock is anthropic -> bedrock (unkeyed) -> openrouter: every caller, whatever its hash, lands
+/// on Anthropic, never on the unkeyed Bedrock (which `upstream_peer` would skip) and never on the
+/// costlier aggregator while Anthropic serves, the old probe slots (seq 8 and 16) included.
+/// claim: R4
 #[tokio::test]
-async fn the_probe_skips_an_unkeyed_candidate() {
+async fn a_session_pin_skips_an_unkeyed_candidate() {
     let (pubkey, sk) = test_keypair(61);
     let anthropic = MockUpstream::start(Mode::AnthropicJson).await;
     let openrouter = MockUpstream::start(Mode::Json).await;
@@ -165,8 +164,6 @@ async fn the_probe_skips_an_unkeyed_candidate() {
         .start()
         .await;
     let body = r#"{"model":"claude-haiku-4-5","messages":[{"role":"user","content":"hi"}]}"#;
-    // seq 0..=16, each from a fresh tenant so no session pin decides the primary. Seq 8 and 16
-    // are probe slots.
     let mut served = Vec::new();
     for t in 0..17 {
         let resp = test_client()
@@ -183,9 +180,9 @@ async fn the_probe_skips_an_unkeyed_candidate() {
         assert_eq!(resp.status().as_u16(), 200);
         served.push(provider_of(&resp).unwrap_or_default());
     }
-    assert_eq!(
-        served[8], "openrouter",
-        "the seq-8 probe lands on the keyed, unmeasured arm: {served:?}"
+    assert!(
+        served.iter().all(|p| p == "anthropic"),
+        "every pin lands on the keyed first-party host: {served:?}"
     );
-    assert_eq!(anthropic.hits() + openrouter.hits(), 17);
+    assert_eq!(openrouter.hits(), 0);
 }

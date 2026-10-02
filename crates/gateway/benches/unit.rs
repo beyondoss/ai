@@ -1103,7 +1103,8 @@ mod allowance {
     }
 }
 
-/// Catalog-walk ranker. Runs on every unpinned `/auto` or managed `/v1` request. The claim in
+/// Catalog-walk ranker: `rank_pinned` is every managed default walk; the EWMA benches order a walk
+/// with no caller identity. The claim in
 /// `smart` is atomics only: no allocation and no lock, on either the reorder or the sample.
 mod smart_rank {
     use super::*;
@@ -1122,13 +1123,12 @@ mod smart_rank {
         let router = Router::new();
         let row = opus();
         let walk = Walk::identity(row.candidates.len());
-        let aff = affinity(42, 7, None);
         bencher.bench(|| {
             router.rank(
                 black_box(walk),
                 black_box(row),
                 black_box(1),
-                black_box(Some(aff)),
+                black_box(None),
                 black_box(u8::MAX),
             )
         });
@@ -1144,19 +1144,19 @@ mod smart_rank {
             router.observe(row, i as u8, 100_000 * (i as u64 + 1), true);
         }
         let walk = Walk::identity(row.candidates.len());
-        let aff = affinity(42, 7, None);
         bencher.bench(|| {
             router.rank(
                 black_box(walk),
                 black_box(row),
                 black_box(1),
-                black_box(Some(aff)),
+                black_box(None),
                 black_box(u8::MAX),
             )
         });
     }
 
-    /// A caller with a live session pin: pin lookup, then the same sort plus a move-to-front.
+    /// A caller with an identity, which is every managed default walk: the computed session pin
+    /// (rendezvous hash of the first-party lead, usable first).
     #[divan::bench]
     fn rank_pinned(bencher: Bencher) {
         let router = Router::new();
@@ -1165,7 +1165,6 @@ mod smart_rank {
             router.observe(row, i as u8, 100_000 * (i as u64 + 1), true);
         }
         let aff = affinity(42, 7, None);
-        router.pin(row, aff, 1);
         let walk = Walk::identity(row.candidates.len());
         bencher.bench(|| {
             router.rank(
@@ -1176,16 +1175,6 @@ mod smart_rank {
                 black_box(u8::MAX),
             )
         });
-    }
-
-    /// Re-pinning after every 2xx. A live pin to the same candidate within the same second is a
-    /// load and no store.
-    #[divan::bench]
-    fn pin_refresh(bencher: Bencher) {
-        let router = Router::new();
-        let row = opus();
-        let aff = affinity(42, 7, None);
-        bencher.bench(|| router.pin(black_box(row), black_box(aff), black_box(0)));
     }
 
     /// One sample after a candidate answers. Once per attempt, not per chunk.

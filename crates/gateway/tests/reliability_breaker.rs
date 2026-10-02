@@ -212,8 +212,9 @@ async fn a_stalled_half_open_probe_does_not_wedge_the_provider() {
     );
 }
 
-/// A 200 whose body is an error (OpenRouter's error-in-200) is not a healthy answer: it must not
-/// pin the caller, and the caller's next requests should reach the working fallback.
+/// A 200 whose body is an error (OpenRouter's error-in-200) is not a healthy answer: it counts
+/// against the host's breaker like a 5xx, so a host that keeps answering that way is skipped and
+/// the caller's next requests reach the working fallback.
 /// claim: REL-8
 /// defect: D41
 #[tokio::test]
@@ -230,6 +231,9 @@ async fn a_200_with_an_error_body_is_not_pinned() {
     let gw = Gateway::builder(nats_port, &primary.authority(), &b64(&pubkey))
         .providers(&["openai", "openrouter"])
         .provider_authority("openrouter", &fallback.authority())
+        .config_line("circuit_breaker_threshold = 2")
+        .config_line("circuit_breaker_window_secs = 60")
+        .config_line("circuit_breaker_reset_secs = 60")
         .start()
         .await;
     let client = test_client();
@@ -258,6 +262,9 @@ async fn a_200_stream_with_an_error_first_event_is_not_pinned() {
     let gw = Gateway::builder(nats_port, &primary.authority(), &b64(&pubkey))
         .providers(&["openai", "openrouter"])
         .provider_authority("openrouter", &fallback.authority())
+        .config_line("circuit_breaker_threshold = 2")
+        .config_line("circuit_breaker_window_secs = 60")
+        .config_line("circuit_breaker_reset_secs = 60")
         .start()
         .await;
     let client = test_client();
@@ -443,9 +450,9 @@ async fn a_401_on_every_candidate_is_relayed_and_opens_no_breaker() {
 const OK_JSON: &str = r#"{"id":"chatcmpl-ok","object":"chat.completion","model":"gpt-4o-2024-08-06","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":11,"completion_tokens":7,"total_tokens":18}}"#;
 
 /// An error-in-200 whose first bytes cannot tell yet (`{"err`, then the rest a moment later) is
-/// still judged on the bytes that decide it: it must not pin the caller on the strength of a prefix
-/// that had not said anything.
-/// claim: REL-8, R4
+/// still judged on the bytes that decide it: it must count as the failure it is, not as an answer
+/// on the strength of a prefix that had not said anything.
+/// claim: REL-8
 #[tokio::test]
 async fn a_200_error_body_split_before_its_first_key_is_not_pinned() {
     let nats_port = unused_nats_port();
@@ -463,6 +470,9 @@ async fn a_200_error_body_split_before_its_first_key_is_not_pinned() {
     let gw = Gateway::builder(nats_port, &primary.authority(), &b64(&pubkey))
         .providers(&["openai", "openrouter"])
         .provider_authority("openrouter", &fallback.authority())
+        .config_line("circuit_breaker_threshold = 2")
+        .config_line("circuit_breaker_window_secs = 60")
+        .config_line("circuit_breaker_reset_secs = 60")
         .start()
         .await;
     let client = test_client();
@@ -519,11 +529,12 @@ async fn an_undecidable_first_kib_settles_as_an_answer_before_the_body_ends() {
     );
 }
 
-/// A candidate that was answering and then starts failing is demoted after its first failure:
-/// the next caller goes to the fallback first instead of paying for the failing attempt again.
-/// claim: R7, R1
+/// A primary that starts failing fails over in-gateway on every request (the client never sees
+/// it), and is tried again each turn until its breaker opens; then it is skipped. A failure moves
+/// only the request that met it, so the next turn of every session still starts at its pin.
+/// claim: R1, R6
 #[tokio::test]
-async fn a_candidate_that_starts_failing_is_demoted_after_one_failure() {
+async fn a_failing_primary_fails_over_each_request_until_its_breaker_opens() {
     let nats_port = unused_nats_port();
     let (pubkey, sk) = test_keypair(1);
     let primary = ReplyUpstream::start(|n, _| {
@@ -534,25 +545,25 @@ async fn a_candidate_that_starts_failing_is_demoted_after_one_failure() {
         }
     })
     .await;
-    // Slower than the primary's answers, so only the failure — not raw speed — can put it first.
-    let fallback = MockUpstream::start(Mode::Slow(150)).await;
+    let fallback = MockUpstream::start(Mode::Slow(30)).await;
     let gw = Gateway::builder(nats_port, &primary.authority(), &b64(&pubkey))
         .providers(&["openai", "openrouter"])
         .provider_authority("openrouter", &fallback.authority())
-        .config_line("circuit_breaker_threshold = 100")
+        .config_line("circuit_breaker_threshold = 3")
+        .config_line("circuit_breaker_window_secs = 60")
+        .config_line("circuit_breaker_reset_secs = 60")
         .start()
         .await;
     let client = test_client();
-    // Distinct tenants: no session pin, so only the ranker orders the walk.
-    for tenant in 100..105 {
+    for tenant in 100..108 {
         let resp = post_auto(&client, &gw.url(), &vkey(&sk, tenant)).await;
         assert_eq!(resp.status().as_u16(), 200, "tenant {tenant}");
         let _ = resp.bytes().await;
     }
     assert_eq!(
-        primary.hits(),
-        3,
-        "after its first 5xx the primary kept being tried first"
+        (primary.hits(), fallback.hits()),
+        (5, 6),
+        "two answers, three failed-over attempts, then the open breaker skips the primary"
     );
 }
 
