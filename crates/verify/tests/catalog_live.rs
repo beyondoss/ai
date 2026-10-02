@@ -2269,13 +2269,32 @@ fn cat7(trial: &str, arm: Arm) -> Result<(), Failed> {
         }
         "together" if primary == "together" => match listed("together", arm.cand.upstream_model) {
             Some(m) => {
+                // A row whose truth entry follows the model's maker (`follows = "maker"`, D116)
+                // keeps the maker's list price: Together charging less is a note. Together
+                // charging more is billing below cost, which the owner decides, so it fails.
+                let maker = truth(arm.row.model)
+                    .and_then(|t| t.get("follows"))
+                    .and_then(|v| v.as_str())
+                    == Some("maker");
                 for (field, card, k) in
                     [("input", p.input, "input"), ("output", p.output, "output")]
                 {
-                    if let Some(v) = m["pricing"][k].as_f64()
-                        && !price_eq(card, v)
-                    {
-                        problems.push(format!("{field}: card {card}, Together lists {v}"));
+                    match m["pricing"][k].as_f64() {
+                        Some(v) if price_eq(card, v) => {}
+                        Some(v) if maker && card.parse().is_ok_and(|c: f64| v < c) => note(
+                            trial,
+                            &format!(
+                                "{field}: Together lists {v}, below the maker's {card} on the card"
+                            ),
+                        ),
+                        Some(v) if maker => problems.push(format!(
+                            "{field}: Together lists {v}, above the maker's {card} on the card: \
+                             we bill below cost (owner pricing decision)"
+                        )),
+                        Some(v) => {
+                            problems.push(format!("{field}: card {card}, Together lists {v}"))
+                        }
+                        None => {}
                     }
                 }
                 note(trial, "price checked against Together's /v1/models listing");

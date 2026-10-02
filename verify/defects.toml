@@ -2331,3 +2331,43 @@ state = "fixed"
 test = "a_translated_stream_past_the_largest_answer_is_cut"
 fix = "b6f8d5b"
 note = "SseBridge counts what it gathers (accumulated(): text, reasoning, call ids, names and arguments, a fixed cost per call) and proxy aborts past translate::MAX_STREAM_OUTPUT, the largest catalog max_output_tokens (384,000, DeepSeek) x 128 bytes (the longest token in o200k_base and cl100k_base, measured from OpenAI's published vocab files), 46.9 MiB, as it aborts past MAX_TRANSLATE_BUFFER (reason=\"response_too_large\", buffer \"sse_output\"). ToolCalls finds a delta's call through per-index and per-id maps and RespToOai through per-output_index and per-item maps, O(1) instead of a scan (locating_a_calls_delta_matches_a_backward_scan checks the maps against the scan over random delta sequences)."
+
+[[defect]]
+id = "D240"
+severity = "high"
+area = "Billing"
+title = "Two completed Claude Code Messages streams were billed as estimates under full-suite load"
+impact = "A completed call billed usage_estimated bills the provider's exact input but an estimated output, which errs low: the tenant is under-billed and the row is not the provider's word."
+confidence = "low"
+evidence = "Final live run on 7eca5e5 (target/final-live6.log, concurrent phase, 3,137 cells): LNG-1+LNG-2::claude-code::claude::long_task flagged 534ea41d4f95638a-26 and -27 (POST /v1/messages -> 200) as estimates, 2 of 60 calls, every prompt size monotonic (no client retry). The cell's gateway log tail was empty: long_live read it after cleanup() had removed the directory, so no row or warn line survived. Re-run alone on 7eca5e5 with VERIFY_LONG_KEEP=1 (2026-10-01): PASS, 60 calls, 0 usage_estimated rows. git diff f97ccbf..7eca5e5 leaves the estimate decision (cut_short, body_cut, body_unmetered, no_head, anthropic_stream_finished, the usage tail and head) unchanged; the lazy InputTally (D215-D218) changes only the input count of a row already being estimated. So the range holds no commit that decides to estimate, and the bisect has nothing to bisect."
+claims = ["BIL-3", "LNG-1"]
+state = "suspected"
+note = "Not reproduced. Under the stream rules, an Anthropic 2xx stream is estimated only when message_delta is missing from the usage tail (the upstream or the client ended the stream before it), or the parent recorded no upstream head with a downstream error. long_live now keeps the log tail on failure and prints the row, client_gone, bytes, deltas and the usage the client saw beside the problem, so the next occurrence names which rule fired."
+
+[[defect]]
+id = "D241"
+severity = "med"
+area = "Billing"
+title = "Qwen3.7 Max and Qwen3.8 Flash cards lag Alibaba's raised prices; Kimi K3 held to Together's lower listing"
+impact = "qwen/qwen3.7-max billed 1.5 / 4.5 against Alibaba's and Together's 2.5 / 7.5, qwen/qwen3.8-flash 0.09 / 0.282 against 0.15 / 0.47: every call billed 40% below what Together charges us. moonshotai/kimi-k3's CAT-7 cell failed on Together listing 2.7 / 13.5 under Moonshot's own 3 / 15."
+confidence = "high"
+evidence = "Final live run on 7eca5e5: CAT-7::raw::together::{qwen/qwen3.7-max,qwen/qwen3.8-flash,moonshotai/kimi-k3}. 2026-10-01: Together GET /v1/models lists Qwen3.7-Max 2.5 / 7.5 (cached 0.5), Qwen3.8-Flash 0.15 / 0.47, Kimi-K3 2.7 / 13.5 (cached 0.27); together.ai/pricing still shows the old 1.5 / 4.5, 0.09 / 0.28, 3 / 15. Alibaba Cloud Model Studio pricing (International, updated Sep 28): qwen3.7-max 2.5 / 7.5, qwen3.8-flash 0.15 / 0.47. Moonshot (platform.kimi.ai/docs/pricing/chat): kimi-k3 3 / 15, cached 0.30."
+claims = ["CAT-7"]
+state = "fixed"
+test = "prices_follow_the_maker_not_openrouter"
+fix = "HEAD"
+note = "Fixed: the two Qwen cards take Alibaba's new International rates (2.5 / 7.5 / cached 0.5; 0.15 / 0.47), recorded in catalog_truth.toml with the maker as source. Kimi K3 keeps Moonshot's 3 / 15 (D116: a row's list price follows its maker). Rows marked follows = \"maker\" in catalog_truth.toml let CAT-7 note a Together price below the card and fail one above it, which would bill below cost and is an owner pricing decision. Alibaba's Global deployment is cheaper (1.65 / 4.951; 0.113 / 0.382); the card follows International because that is what Together, our only candidate, charges. Live: the three CAT-7 cells re-run 2026-10-01, PASS."
+
+[[defect]]
+id = "D242"
+severity = "low"
+area = "Verification"
+title = "BIL-5 OpenAI reconcile failed on OpenAI's admin listing answering an empty page"
+impact = "BIL-5::raw::openai::reconcile reported no key matching the pool key's hint, so the OpenAI ledger went unreconciled for the run."
+confidence = "high"
+evidence = "2026-10-01, the .env admin and pool keys: both are in organization user-bzhvsi1ix0dfb5bnbke94fmw, project proj_IbxtFg0KE7R8InuTCDqs0BQx (the openai-organization and openai-project response headers), and that project's api_keys listing holds one key whose redacted_value (sk-proj-…tuoA) matches the pool key's prefix and suffix. The same GET answered 200 with data [] on 1 of 12 reads 0.5 s apart, and once on the first read of the session; organization/users answered [] once too."
+claims = ["BIL-5"]
+state = "fixed"
+test = "live:BIL-5::raw::openai::reconcile"
+fix = "HEAD"
+note = "Not an account-setup problem and not a field or pagination change. Fixed in the harness: pool_key_id reads the listing again (up to 5 reads, backing off 0.5 s, 1 s, ...) when no key matches, since a key that can call is always in the org."

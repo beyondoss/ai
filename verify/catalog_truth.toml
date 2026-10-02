@@ -9,6 +9,10 @@
 # its own API and publishes the facts (Z.ai's GLM, Moonshot's Kimi, OpenAI's Codex ids): the card
 # then follows the maker, never OpenRouter's listing.
 #
+# `follows = "maker"` marks a Together-primary row whose recorded price is the maker's own (Alibaba's
+# Qwen, Moonshot's Kimi). CAT-7 then accepts Together listing less than the card (a note), and fails
+# Together listing more: that bills customers below our cost, which is an owner pricing decision.
+#
 # Two fields record a limit the row's candidates enforce below the vendor's published figure. The
 # card states the smaller one, so a request sized from it is accepted wherever the walk lands:
 # - `input_limit`: the most input tokens every candidate accepts, when lower than `context_window`
@@ -957,14 +961,16 @@ context_window = 524_288
 [[row]]
 model = "moonshotai/kimi-k3"
 source = [
-  "https://www.together.ai/pricing",
-  "https://docs.together.ai/docs/serverless/models",
+  "https://platform.kimi.ai/docs/pricing/chat",
+  "https://api.together.xyz/v1/models",
 ]
 date = "2026-10-01"
+follows = "maker"
 input = "3.00"
 output = "15.00"
 cache_read = "0.30"
 context_window = 1_048_576
+note = "Moonshot's own price (platform.moonshot.ai redirects to platform.kimi.ai). Together's /v1/models lists 2.7 / 13.5 (cached 0.27) on 2026-10-01, below the maker: the card follows the maker (D116, D241)."
 
 [[row]]
 model = "o1"
@@ -1110,14 +1116,15 @@ features_absent = ["structured_outputs"]
 [[row]]
 model = "qwen/qwen3.7-max"
 source = [
-  "https://www.together.ai/pricing",
-  "https://docs.together.ai/docs/serverless/models",
+  "https://www.alibabacloud.com/help/en/model-studio/model-pricing",
+  "https://api.together.xyz/v1/models",
 ]
 date = "2026-10-01"
-input = "1.50"
-output = "4.50"
-cache_read = "0.30"
-note = "Cached: pricing page $0.30, docs table $0.50. Context not published."
+follows = "maker"
+input = "2.50"
+output = "7.50"
+cache_read = "0.50"
+note = "Alibaba Cloud Model Studio, International deployment (page updated Sep 28; the Global deployment is 1.65 / 4.951). Together's /v1/models matches: 2.5 / 7.5, cached 0.5 (its pricing page still shows the old 1.5 / 4.5). Cached: Together's listed rate, the maker's implicit-cache 20% of input. Context not published by the maker (D241)."
 
 [[row]]
 model = "qwen/qwen3.7-plus"
@@ -1160,14 +1167,15 @@ note = "Preview. No prompt caching."
 [[row]]
 model = "qwen/qwen3.8-flash"
 source = [
-  "https://www.together.ai/pricing",
-  "https://docs.together.ai/docs/serverless/models",
+  "https://www.alibabacloud.com/help/en/model-studio/model-pricing",
+  "https://api.together.xyz/v1/models",
 ]
 date = "2026-10-01"
-input = "0.09"
-output = "0.282"
+follows = "maker"
+input = "0.15"
+output = "0.47"
 context_window = 1_000_000
-note = "Output: docs table and Together's /v1/models $0.282; the pricing page rounds to $0.28."
+note = "Alibaba Cloud Model Studio, International deployment, one tier to 1M (the Global deployment is 0.113 / 0.382). Together's /v1/models matches: 0.15 / 0.47 (its pricing page still shows the old 0.09 / 0.28) (D241)."
 
 [[row]]
 model = "text-embedding-3-large"

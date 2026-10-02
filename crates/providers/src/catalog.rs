@@ -2151,7 +2151,7 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         wire: WireFormat::OpenAi,
         candidates: &together("Qwen/Qwen3.7-Max", "qwen/qwen3.7-max"),
         responses: &[],
-        price: price("1.5", "4.5", "0.3", "1.5"), // cached: pricing page $0.30, docs table $0.50. cache_write unpublished; equals input
+        price: price("2.5", "7.5", "0.5", "2.5"), // Alibaba International = Together /v1/models (D241). cache_write unpublished; equals input
         card: card(
             "Qwen3.7 Max",
             "qwen",
@@ -2215,7 +2215,7 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         wire: WireFormat::OpenAi,
         candidates: &together("Qwen/Qwen3.8-Flash", "qwen/qwen3.8-flash"),
         responses: &[],
-        price: price("0.09", "0.282", "0.09", "0.09"), // docs table and /v1/models $0.282 out (pricing page rounds to $0.28); no cache rates, both equal input
+        price: price("0.15", "0.47", "0.15", "0.15"), // Alibaba International = Together /v1/models (D241); no cache rates, both equal input
         card: card(
             "Qwen3.8 Flash",
             "qwen",
@@ -4376,17 +4376,19 @@ mod tests {
     }
 
     /// Prices are the model maker's own published rate, never OpenRouter's listing (its cheapest
-    /// host), even on an OpenRouter-primary row whose maker sells an API. Together's Qwen3.8 Flash
-    /// output is $0.282 (docs table and `/v1/models`; the pricing page rounds).
+    /// host), even on an OpenRouter-primary row whose maker sells an API. Qwen and Kimi rows served
+    /// by Together carry Alibaba's and Moonshot's own rates, whatever Together lists (D241).
     /// claim: CAT-7
-    /// defect: D116
+    /// defect: D116, D241
     #[test]
     fn prices_follow_the_maker_not_openrouter() {
         for (model, want) in [
             ("z-ai/glm-5.1", ("1.4", "4.4", "0.26")),
             ("moonshotai/kimi-k2.7-code", ("0.95", "4", "0.19")),
             ("moonshotai/kimi-k2.6", ("0.95", "4", "0.16")),
-            ("qwen/qwen3.8-flash", ("0.09", "0.282", "0.09")),
+            ("qwen/qwen3.8-flash", ("0.15", "0.47", "0.15")),
+            ("qwen/qwen3.7-max", ("2.5", "7.5", "0.5")),
+            ("moonshotai/kimi-k3", ("3", "15", "0.3")),
             // OpenAI's standard rate, which it bills the pool key; the promotion is recorded apart.
             ("gpt-5.6-sol", ("4", "20", "0.4")),
         ] {

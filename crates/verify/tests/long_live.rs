@@ -653,7 +653,13 @@ fn ledger_problems<'a>(
                 ));
             }
             if row["usage_estimated"] == true {
-                problems.push(format!("{label}: a completed call billed as an estimate"));
+                // The row and what the client saw say which estimate fired (D240): a stream cut
+                // short (no message_delta), a body without usage, or a wait that lost its head.
+                problems.push(format!(
+                    "{label}: a completed call billed as an estimate (client_gone {}, \
+                     resp_bytes {}, deltas {}, client saw usage {}; row {row})",
+                    call["client_gone"], call["resp_bytes"], call["deltas"], call["seen_usage"]
+                ));
             }
             if call["client_gone"] != true && n(&row["output_tokens"]) == 0 {
                 problems.push(format!(
@@ -870,8 +876,8 @@ fn long_session(
             problems.push("not reconciled: the session already failed".to_owned());
         }
     }
-    gw.cleanup();
-    if problems.is_empty() {
+    // The log tail is read before `cleanup` removes the directory that holds it.
+    let result = if problems.is_empty() {
         Ok(())
     } else {
         Err(format!(
@@ -880,7 +886,9 @@ fn long_session(
             tail(&gw.log)
         )
         .into())
-    }
+    };
+    gw.cleanup();
+    result
 }
 
 /// LNG-2: each eligible main turn's `cache_read / input_total`, in call order.

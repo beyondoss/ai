@@ -681,7 +681,26 @@ fn hint_matches(hint: &str, key: &str) -> bool {
 
 /// The pool key's id in the provider's usage report, found by listing the org's keys (read-only)
 /// and matching the redacted hint.
+///
+/// OpenAI's admin listing intermittently answers a page with `"data": []` and a 200 (1 in 12 reads
+/// of a one-key project, 2026-10-01). The pool key is in the org whenever it can call, so an empty
+/// result is read again, a few times, before it is reported.
 pub(crate) fn pool_key_id(provider: Provider, pool: &str, admin: &str) -> Result<String, Failed> {
+    let mut attempt = 0;
+    loop {
+        match pool_key_id_once(provider, pool, admin) {
+            Err(e) if attempt < 4 && e.message() == Some(NO_MATCH) => {
+                attempt += 1;
+                std::thread::sleep(Duration::from_millis(500 * attempt));
+            }
+            other => return other,
+        }
+    }
+}
+
+const NO_MATCH: &str = "no API key in the organization matches the pool key's hint";
+
+fn pool_key_id_once(provider: Provider, pool: &str, admin: &str) -> Result<String, Failed> {
     let mut found = BTreeSet::new();
     match provider {
         Provider::Anthropic => {
@@ -742,7 +761,7 @@ pub(crate) fn pool_key_id(provider: Provider, pool: &str, admin: &str) -> Result
     }
     match found.len() {
         1 => Ok(found.pop_first().unwrap()),
-        0 => Err("no API key in the organization matches the pool key's hint".into()),
+        0 => Err(NO_MATCH.into()),
         _ => Err(format!("the pool key's hint matches several keys: {found:?}").into()),
     }
 }
