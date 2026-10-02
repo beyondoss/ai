@@ -2483,7 +2483,7 @@ evidence = "Hermetic, tests/replicas.rs (two gateways, one nats-server, gpt-4o-m
 claims = ["R4"]
 state = "fixed"
 test = "a_pinned_conversation_stays_on_one_provider_across_replicas"
-fix = "976173f"
+fix = "a0cc11f"
 note = "Fixed statelessly (no shared store, no NATS, no load-balancer affinity): session pins are computed every turn and never remembered; the per-pod pin table is gone. smart.rs preferred(): the row's leading run of equally-preferred first-party hosts (providers with their own model-id prefix: Anthropic + Bedrock, never an aggregator) ordered by rendezvous hash of the pin key (tenant, vpc, key_id, row) and provider name, then catalog order; only candidates unusable on the pod (unkeyed, every key cooling, body unserved) move back, and upstream_peer skips an open breaker. No TTFT, probe or failure history, so a failure fails over for that request only. The TTFT ranker now orders only walks with no caller identity. An error-in-200 now counts against the serving candidate's breaker (settle_health), since the pin no longer learns from failures. Residual divergence, documented in ARCHITECTURE.md Running several replicas: per-pod breakers (and key cooling) during a real outage. Also tested: a_pooled_session_reaches_one_provider_on_every_replica (20 alternating turns, 10 sessions), a_failover_pin_returns_to_the_primary_once_it_is_healthy, a_replica_with_an_open_breaker_routes_away_only_while_it_is_open, smart::tests::every_pod_computes_the_same_pin, a_failure_does_not_move_the_next_turn. Follow-up: the live TEN-2+SEC-15 pin_isolation cells look for keys pinned to two different providers on anthropic+openrouter; with computed pins every key lands on anthropic, so those cells need rework (not run here)."
 
 [[defect]]
