@@ -927,7 +927,8 @@ static KEY_TRIE: ([[u8; 26]; KEY_NODES], [bool; KEY_NODES]) = {
     (next, whole)
 };
 
-/// A lower bound on the input tokens of a request body, counted as the body streams past.
+/// A lower bound on the input tokens of a request body, fed the body in chunks (as it streams past,
+/// or from the copy `proxy::logging` holds when a row needs the estimate).
 ///
 /// It counts the **pre-tokens** of the prompt text, not bytes. A BPE tokenizer first splits text
 /// with a pre-tokenizer and never merges across those splits, so the pre-token count is at most the
@@ -1627,6 +1628,78 @@ mod tests {
             for cut in edges {
                 let (a, b) = body.as_bytes().split_at(cut);
                 assert_eq!(tally(&[a, b]).estimate_tokens(), whole, "split at {cut}");
+            }
+        }
+    }
+
+    /// Each escape counts as one table step of its class, and the two-chain walk counts what one
+    /// step per byte counts, on text dense with escapes and long enough to be split in two
+    /// chains, fed whole or cut anywhere.
+    #[test]
+    fn the_walk_counts_as_one_step_per_byte_and_escape() {
+        fn reference(inner: &[u8]) -> u64 {
+            let (mut state, mut units, mut i) = (NONE, 0u64, 0);
+            let mut step = |state: &mut u8, class: u8| {
+                let e = TALLY[usize::from((*state << 3) | class) & 127];
+                units += u64::from(e >> 4);
+                *state = e & 15;
+            };
+            while i < inner.len() {
+                if inner[i] == b'\\' {
+                    let c = inner[i + 1];
+                    let class = match c {
+                        b'u' => WIDE,
+                        b'"' | b'\\' | b'/' => PUNCT,
+                        _ => SPACE,
+                    };
+                    step(&mut state, class);
+                    i += if c == b'u' { 6 } else { 2 };
+                } else {
+                    step(&mut state, CLASS[usize::from(inner[i])]);
+                    i += 1;
+                }
+            }
+            step(&mut state, SPACE);
+            units
+        }
+        let pieces = [
+            "fn main() {\n",
+            "\tlet x = \"quoted\";\n",
+            "a\\b ",
+            "path/to ",
+            "it's ",
+            "café ",
+            "\u{1}",
+            "日本 ",
+            "    ",
+            "x2 ",
+            "(foo) ",
+            "123456 ",
+            "\r\n",
+            "\"",
+            "end",
+        ];
+        let mut seed = 0x2545_F491_4F6C_DD1D_u64;
+        for _ in 0..300 {
+            let mut text = String::new();
+            for _ in 0..(seed % 90) {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                text.push_str(pieces[(seed % pieces.len() as u64) as usize]);
+            }
+            let quoted = serde_json::to_string(&text).unwrap();
+            let inner = &quoted.as_bytes()[1..quoted.len() - 1];
+            let body = format!(r#"{{"model":"m","content":{quoted}}}"#);
+            let whole = tally(&[body.as_bytes()]).estimate_tokens();
+            assert_eq!(whole, reference(inner), "{quoted}");
+            for cut in (1..body.len()).step_by(7) {
+                let (a, b) = body.as_bytes().split_at(cut);
+                assert_eq!(
+                    tally(&[a, b]).estimate_tokens(),
+                    whole,
+                    "cut {cut} of {body}"
+                );
             }
         }
     }

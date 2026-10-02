@@ -87,6 +87,32 @@ const DEFAULT_MAX_TOKENS: u64 = 4096;
 /// let one upstream grow the gateway's memory without bound.
 pub const MAX_TRANSLATE_BUFFER: usize = 32 * 1024 * 1024;
 
+/// The largest answer any catalog row allows, in tokens (`max_output_tokens`, published or not).
+const MAX_CATALOG_OUTPUT_TOKENS: usize = {
+    let rows = providers::catalog::MODEL_ROUTES;
+    let (mut i, mut most) = (0, 0u32);
+    while i < rows.len() {
+        let m = rows[i].card.max_output_tokens;
+        if m > most {
+            most = m;
+        }
+        i += 1;
+    }
+    most as usize
+};
+
+/// Most bytes of text one token can carry: the longest entry in OpenAI's `o200k_base` and
+/// `cl100k_base` vocabularies is 128 bytes (measured 2026-10-01 from the published files).
+const MAX_TOKEN_BYTES: usize = 128;
+
+/// Most output a translated stream may gather (D218): every answer the catalog allows, at the most
+/// bytes a token can be (384,000 tokens x 128 bytes, 46.9 MiB). A bridge onto a Responses client
+/// keeps every text, reasoning and argument delta for the closing `response.completed`, and onto
+/// Messages a queued call's arguments wait whole; past this the upstream is sending more than any
+/// model can answer, and `proxy` aborts the response (`ai_rejections_total{reason=
+/// "response_too_large"}`), as it does past [`MAX_TRANSLATE_BUFFER`].
+pub const MAX_STREAM_OUTPUT: usize = MAX_CATALOG_OUTPUT_TOKENS * MAX_TOKEN_BYTES;
+
 /// The most heap translating `body` onto another wire takes at its peak (D216): the parsed `Value`,
 /// the translated `Value` and the encoded output, bounded from the body's length and structure
 /// ([`peek::structure`], one pass, no parse) as
@@ -522,33 +548,18 @@ impl serde::Serialize for Exact<'_> {
     }
 }
 
-/// A request or response body as a `Value`. A Messages body whose `tool_use` inputs hold a number
-/// a `Value` keeps as an `f64` is parsed a second time, keeping each `input`'s text (see
-/// [`KeepInputs`]); any other body is parsed once, as it always was.
+/// A request or response body as a `Value`. A Messages body is parsed once with [`KeepInputs`],
+/// which keeps each `input`'s text where a `Value` would not reproduce its numbers (D127); any
+/// other body is parsed once, plainly. (A Messages body with such a number used to be parsed
+/// twice: plainly, to find it, then again with `KeepInputs`.)
 fn parse_body(wire: Endpoint, body: &[u8]) -> Option<Value> {
-    let v = serde_json::from_slice::<Value>(body).ok()?;
-    if wire != Endpoint::Messages || !tool_inputs_have_float(&v) {
-        return Some(v);
+    if wire != Endpoint::Messages {
+        return serde_json::from_slice::<Value>(body).ok();
     }
     let mut de = serde_json::Deserializer::from_slice(body);
-    let kept = serde::de::DeserializeSeed::deserialize(KeepInputs, &mut de).ok();
-    match kept {
-        Some(kept) if de.end().is_ok() => Some(kept),
-        _ => Some(v),
-    }
-}
-
-/// Whether any content block's `input` (a response's, or a request message's) holds an `f64`.
-fn tool_inputs_have_float(v: &Value) -> bool {
-    let blocks_have = |content: Option<&Value>| {
-        content
-            .and_then(Value::as_array)
-            .is_some_and(|blocks| blocks.iter().any(|b| b.get("input").is_some_and(has_float)))
-    };
-    blocks_have(v.get("content"))
-        || v.get("messages")
-            .and_then(Value::as_array)
-            .is_some_and(|ms| ms.iter().any(|m| blocks_have(m.get("content"))))
+    let v = serde::de::DeserializeSeed::deserialize(KeepInputs, &mut de).ok()?;
+    de.end().ok()?;
+    Some(v)
 }
 
 /// Builds a `Value` as serde_json does, except that every `input` member keeps its text when it
@@ -5613,6 +5624,13 @@ impl ChatIdentity {
         dropped
     }
 
+    /// The packed key for (choice, entry, kind), when neither `sent` nor `pending` holds it yet:
+    /// the field is new and should be kept (and recorded). `None` for a repeat.
+    fn seen(sent: &[u64], pending: &[u64], choice: u64, entry: u64, kind: u64) -> Option<u64> {
+        let key = (choice & 0xff_ffff) << 40 | (entry & 0xffff_ffff) << 8 | kind;
+        (!sent.contains(&key) && !pending.contains(&key)).then_some(key)
+    }
+
     /// Keep `obj[field]` the first time this stream carries it for (choice, entry); drop it after.
     fn once(
         &mut self,
@@ -5726,31 +5744,66 @@ impl SseBridge {
         self.buf.len()
     }
 
-    /// Feed upstream SSE bytes. Returns client-dialect SSE bytes (possibly empty).
-    pub fn feed(&mut self, data: &[u8], end: bool) -> Vec<u8> {
-        self.buf.extend_from_slice(data);
-        let mut out = Vec::new();
-        while let Some(raw) = take_event(&mut self.buf, &mut self.scanned) {
-            out.extend(self.map_event(&raw));
+    /// Output this bridge has gathered so far and holds to the end of the stream: text, reasoning
+    /// and tool arguments for a Responses client's closing event, and tool calls waiting their
+    /// turn onto Messages. Counted as it is gathered; see [`MAX_STREAM_OUTPUT`].
+    pub fn accumulated(&self) -> usize {
+        self.oai_to_ant
+            .calls
+            .held
+            .saturating_add(self.oai_to_resp.held)
+            .saturating_add(self.oai_to_resp.calls.held)
+            .saturating_add(self.resp_to_oai.held)
+    }
+
+    /// Which of this bridge's bounds the stream has crossed, if any: an unterminated event past
+    /// [`MAX_TRANSLATE_BUFFER`] (`"sse_event"`), or gathered output past [`MAX_STREAM_OUTPUT`]
+    /// (`"sse_output"`).
+    pub fn overflow(&self) -> Option<&'static str> {
+        if self.pending_len() > MAX_TRANSLATE_BUFFER {
+            Some("sse_event")
+        } else if self.accumulated() > MAX_STREAM_OUTPUT {
+            Some("sse_output")
+        } else {
+            None
         }
+    }
+
+    /// Feed upstream SSE bytes. Returns client-dialect SSE bytes (possibly empty).
+    ///
+    /// Each complete event is mapped where it lies in the buffer, and the buffer is compacted once
+    /// per call: draining it per event moved the unread tail once per event, O(events x bytes)
+    /// for a chunk that carries many.
+    pub fn feed(&mut self, data: &[u8], end: bool) -> Vec<u8> {
+        let mut buf = std::mem::take(&mut self.buf);
+        buf.extend_from_slice(data);
+        let mut out = Vec::new();
+        let mut start = 0;
+        while let Some((from, to)) = next_event(&buf, &mut start, &mut self.scanned) {
+            self.map_event(buf.get(from..to).unwrap_or_default(), &mut out);
+        }
+        buf.drain(..start);
+        self.scanned = self.scanned.saturating_sub(start);
+        if end && !buf.is_empty() {
+            self.scanned = 0;
+            self.map_event(&buf, &mut out);
+            buf.clear();
+        }
+        self.buf = buf;
         if end {
-            if !self.buf.is_empty() {
-                self.scanned = 0;
-                let rest = std::mem::take(&mut self.buf);
-                out.extend(self.map_event(&rest));
-            }
             out.extend(self.flush());
         }
         out
     }
 
-    fn map_event(&mut self, raw: &[u8]) -> Vec<u8> {
+    fn map_event(&mut self, raw: &[u8], out: &mut Vec<u8>) {
         if self.upstream == self.client {
-            return self.relay(raw);
+            self.relay(raw, out);
+            return;
         }
         let (event, data) = parse_sse(raw);
         if data.is_empty() && event.is_empty() {
-            return Vec::new();
+            return;
         }
         let mut items = Vec::new();
         match self.upstream {
@@ -5759,24 +5812,148 @@ impl SseBridge {
             Endpoint::ChatCompletions => chat_items(&data, &mut items),
             Endpoint::Embeddings => {}
         }
-        let mut out = Vec::new();
         for item in items {
             self.ended |= item.ends();
-            self.deliver(item, &mut out);
+            self.deliver(item, out);
         }
-        out
     }
 
     /// A relayed event, as it came unless it is a chunk that repeats an identity field.
-    fn relay(&mut self, raw: &[u8]) -> Vec<u8> {
+    ///
+    /// Only the fields [`ChatIdentity`] edits can change an event, so one that names none of them
+    /// as a key (`"role"`, `"tool_calls"`, `"reasoning_details"`) is copied through unparsed, as
+    /// the relay was before it learned to drop repeats; one whose only such field is `role` (every
+    /// OpenRouter chunk) has a repeat cut by span ([`Self::relay_role`]); anything else goes
+    /// through a `Value`. A key spelled with escapes is not seen; no provider sends one.
+    fn relay(&mut self, raw: &[u8], out: &mut Vec<u8>) {
+        let has = |needle: &[u8]| memchr::memmem::find(raw, needle).is_some();
+        let lists = has(b"\"tool_calls\"") || has(b"\"reasoning_details\"");
+        if !lists && !has(b"\"role\"") {
+            out.extend_from_slice(raw);
+            return;
+        }
+        if !lists && self.relay_role(raw, out).is_some() {
+            return;
+        }
         let (event, data) = parse_sse(raw);
         if event.is_empty()
             && let Ok(mut v) = serde_json::from_str::<Value>(&data)
             && self.identity.strip(&mut v)
         {
-            return sse_data(&value_string(&v));
+            out.extend(sse_data(&value_string(&v)));
+            return;
         }
-        raw.to_vec()
+        out.extend_from_slice(raw);
+    }
+
+    /// [`ChatIdentity::strip`] for a chunk whose only identity field is `delta.role`, by span: the
+    /// first `role` per choice is recorded, a repeat is cut out of the event's own bytes, and
+    /// every other byte goes to `out` as sent. `None`, with nothing written or recorded, for any
+    /// shape this does not handle (more than one `data:` line, another field line, a duplicate
+    /// key, malformed JSON): the caller takes the `Value` path.
+    fn relay_role(&mut self, raw: &[u8], out: &mut Vec<u8>) -> Option<()> {
+        let rest = raw.strip_prefix(b"data:")?;
+        let line_end = memchr::memchr(b'\n', rest).unwrap_or(rest.len());
+        let (line, tail) = rest.split_at(line_end);
+        if !tail.iter().all(|&c| c == b'\n' || c == b'\r') {
+            return None;
+        }
+        let skip = line.iter().take_while(|c| c.is_ascii_whitespace()).count();
+        let base = raw.len() - rest.len() + skip;
+        let json = raw.get(base..base + line_end - skip)?;
+        let json = json.strip_suffix(b"\r").unwrap_or(json);
+        let open = peek::root_open(json)?;
+        let mut choices = None;
+        let mut root = peek::members(json, open);
+        for m in root.by_ref() {
+            let m = m?;
+            if m.key_is(json, "choices") {
+                choices.is_none().then_some(())?;
+                choices = Some(m.value);
+            }
+        }
+        if !json.get(root.end()?..)?.iter().all(u8::is_ascii_whitespace) {
+            return None;
+        }
+        let Some(choices) = choices.filter(|c| json.get(c.0) == Some(&b'[')) else {
+            out.extend_from_slice(raw);
+            return Some(());
+        };
+        // Each repeated `role` member's cut: the member and the separator that keeps the object
+        // valid (as `peek::remove_items` cuts one item).
+        let mut cuts: Vec<(usize, usize)> = Vec::new();
+        let mut record = Vec::new();
+        for (pos, choice) in peek::elements(json, choices.0).enumerate() {
+            let (start, _) = choice?;
+            if json.get(start) != Some(&b'{') {
+                continue;
+            }
+            let (mut index, mut delta) = (None, None);
+            for m in peek::members(json, start) {
+                let m = m?;
+                if m.key_is(json, "delta") {
+                    delta.is_none().then_some(())?;
+                    delta = Some(m.value);
+                } else if m.key_is(json, "index") {
+                    index = Some(m.value);
+                }
+            }
+            let Some(delta) = delta.filter(|d| json.get(d.0) == Some(&b'{')) else {
+                continue;
+            };
+            // `index_of`: a non-negative integer `index`, else the position.
+            let c = index
+                .and_then(|i| {
+                    std::str::from_utf8(json.get(i.0..i.1)?)
+                        .ok()?
+                        .parse::<u64>()
+                        .ok()
+                })
+                .unwrap_or(pos as u64);
+            let (mut prev_end, mut role, mut next_start) = (None, None, None);
+            for m in peek::members(json, delta.0) {
+                let m = m?;
+                let (from, to) = m.span();
+                if role.is_some() && next_start.is_none() {
+                    next_start = Some(from);
+                }
+                if m.key_is(json, "role") {
+                    role.is_none().then_some(())?;
+                    role = Some((m, prev_end));
+                }
+                if role.is_none() {
+                    prev_end = Some(to);
+                }
+            }
+            let Some((role, prev_end)) = role else {
+                continue;
+            };
+            if json.get(role.value.0) != Some(&b'"') {
+                continue;
+            }
+            let (from, to) = role.span();
+            match ChatIdentity::seen(&self.identity.sent, &record, c, 0, ChatIdentity::ROLE) {
+                Some(key) => record.push(key),
+                None => cuts.push(match (next_start, prev_end) {
+                    (Some(next), _) => (from, next),
+                    (None, Some(prev)) => (prev, to),
+                    (None, None) => (from, to),
+                }),
+            }
+        }
+        self.identity.sent.extend(record);
+        let Some(&(first, _)) = cuts.first() else {
+            out.extend_from_slice(raw);
+            return Some(());
+        };
+        out.reserve(raw.len());
+        out.extend_from_slice(raw.get(..base + first)?);
+        for (k, &(_, to)) in cuts.iter().enumerate() {
+            let next = cuts.get(k + 1).map_or(json.len(), |c| c.0);
+            out.extend_from_slice(json.get(to..next)?);
+        }
+        out.extend_from_slice(raw.get(base + json.len()..)?);
+        Some(())
     }
 
     fn deliver(&mut self, item: ChatItem, out: &mut Vec<u8>) {
@@ -6184,8 +6361,6 @@ impl AntToOai {
 
 /// A function (or custom tool) call a Responses upstream announced, and where its Chat deltas go.
 struct RespCall {
-    output_index: Option<u64>,
-    item_id: Option<String>,
     index: u32,
     /// Argument bytes already went out, so a closing event's full `arguments` must not repeat them.
     args_sent: bool,
@@ -6208,6 +6383,12 @@ struct RespToOai {
     meta: ChunkMeta,
     started: bool,
     calls: Vec<RespCall>,
+    /// The first call per `output_index` and per item id: a delta finds its call in O(1), not by
+    /// a scan of every call so far.
+    by_output: rustc_hash::FxHashMap<u64, usize>,
+    by_item: rustc_hash::FxHashMap<Box<str>, usize>,
+    /// Bytes of call bookkeeping held (see [`SseBridge::accumulated`]).
+    held: usize,
 }
 
 impl RespToOai {
@@ -6345,9 +6526,21 @@ impl RespToOai {
             .get(if custom { "input" } else { "arguments" })
             .and_then(Value::as_str)
             .unwrap_or("");
+        let output_index = v.get("output_index").and_then(Value::as_u64);
+        let item_id = non_empty_str(item, "id");
+        let at = self.calls.len();
+        if let Some(o) = output_index {
+            self.by_output.entry(o).or_insert(at);
+        }
+        if let Some(id) = item_id
+            && !self.by_item.contains_key(id)
+        {
+            self.by_item.insert(id.into(), at);
+        }
+        self.held = self.held.saturating_add(
+            std::mem::size_of::<RespCall>().saturating_add(item_id.map_or(0, str::len)),
+        );
         self.calls.push(RespCall {
-            output_index: v.get("output_index").and_then(Value::as_u64),
-            item_id: non_empty_str(item, "id").map(str::to_owned),
             index,
             args_sent: !args.is_empty(),
             custom,
@@ -6387,10 +6580,13 @@ impl RespToOai {
         let output_index = v.get("output_index").and_then(Value::as_u64);
         let item_id = non_empty_str(v, "item_id")
             .or_else(|| v.get("item").and_then(|i| non_empty_str(i, "id")));
-        self.calls.iter().position(|c| {
-            (output_index.is_some() && c.output_index == output_index)
-                || (item_id.is_some() && c.item_id.as_deref() == item_id)
-        })
+        // The first call matching either key.
+        let by_output = output_index.and_then(|o| self.by_output.get(&o).copied());
+        let by_item = item_id.and_then(|id| self.by_item.get(id).copied());
+        match (by_output, by_item) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
     }
 }
 
@@ -6439,9 +6635,39 @@ enum CallStep {
 /// `index`, and some reuse one `index` for parallel calls with different ids; all three used to
 /// open a new call per delta or pour one call's arguments into another's. A call opens once its
 /// name is known (or at the end), so a client never sees a nameless tool.
+///
+/// Each delta finds its call in O(1) (`slots`, `by_id`) rather than by a backward scan of every
+/// call so far, which made a response with many calls quadratic.
 #[derive(Default)]
 struct ToolCalls {
     calls: Vec<ChatCall>,
+    /// Per stream `index`: the calls that carry it.
+    slots: rustc_hash::FxHashMap<u64, Slot>,
+    /// The last call per id, for an upstream that names calls by id alone.
+    by_id: rustc_hash::FxHashMap<Box<str>, usize>,
+    /// Bytes of ids, names and arguments held (see [`SseBridge::accumulated`]).
+    held: usize,
+}
+
+/// The calls that carry one stream `index`, as [`ToolCalls::locate`] reads them.
+#[derive(Default)]
+struct Slot {
+    /// The last call with this index.
+    last: usize,
+    /// Calls with this index that have no id yet, in order.
+    unnamed: Vec<usize>,
+    /// The last call with this index per id.
+    by_id: rustc_hash::FxHashMap<Box<str>, usize>,
+}
+
+/// Record `at` as the newest call under `id` in `map`, unless a later call already holds it.
+fn note_id(map: &mut rustc_hash::FxHashMap<Box<str>, usize>, id: &str, at: usize) {
+    match map.get_mut(id) {
+        Some(p) => *p = (*p).max(at),
+        None => {
+            map.insert(id.into(), at);
+        }
+    }
 }
 
 impl ToolCalls {
@@ -6449,14 +6675,14 @@ impl ToolCalls {
         let index = c.get("index").and_then(Value::as_u64);
         let id = non_empty_str(c, "id");
         let at = self.locate(index, id);
+        if let Some(id) = id
+            && self.calls.get(at).is_some_and(|call| call.id.is_empty())
+        {
+            self.set_id(at, id.to_owned());
+        }
         let Some(call) = self.calls.get_mut(at) else {
             return;
         };
-        if call.id.is_empty()
-            && let Some(id) = id
-        {
-            id.clone_into(&mut call.id);
-        }
         // A custom tool's name and input ride `custom`, the way a function's ride `function`.
         let custom = c.get("custom");
         if custom.is_some() || c.get("type").and_then(Value::as_str) == Some("custom") {
@@ -6467,6 +6693,7 @@ impl ToolCalls {
             && let Some(name) = non_empty_str(func, "name")
         {
             name.clone_into(&mut call.name);
+            self.held = self.held.saturating_add(name.len());
         }
         let args = func
             .get("arguments")
@@ -6474,8 +6701,9 @@ impl ToolCalls {
             .and_then(Value::as_str)
             .unwrap_or("");
         call.args.push_str(args);
+        self.held = self.held.saturating_add(args.len());
         if !call.opened && !call.name.is_empty() {
-            Self::open(call, at, steps);
+            self.open(at, steps);
         } else if call.opened && !args.is_empty() {
             steps.push(CallStep::Args(at, args.to_owned()));
         }
@@ -6483,30 +6711,63 @@ impl ToolCalls {
 
     /// Open every call still waiting for its name.
     fn open_rest(&mut self, steps: &mut Vec<CallStep>) {
-        for (at, call) in self.calls.iter_mut().enumerate() {
-            if !call.opened {
-                Self::open(call, at, steps);
+        for at in 0..self.calls.len() {
+            if self.calls.get(at).is_some_and(|c| !c.opened) {
+                self.open(at, steps);
             }
         }
     }
 
-    fn open(call: &mut ChatCall, at: usize, steps: &mut Vec<CallStep>) {
+    fn open(&mut self, at: usize, steps: &mut Vec<CallStep>) {
+        let Some(call) = self.calls.get_mut(at) else {
+            return;
+        };
         call.opened = true;
         if call.id.is_empty() {
-            call.id = fresh_id("call");
+            self.set_id(at, fresh_id("call"));
         }
         steps.push(CallStep::Open(at));
     }
 
+    /// Give the call at `at`, which has none, its id, and file it under that id.
+    fn set_id(&mut self, at: usize, id: String) {
+        let Some(call) = self.calls.get_mut(at) else {
+            return;
+        };
+        self.held = self.held.saturating_add(id.len());
+        note_id(&mut self.by_id, &id, at);
+        if let Some(slot) = call.index.and_then(|i| self.slots.get_mut(&i)) {
+            if let Some(k) = slot.unnamed.iter().rposition(|&u| u == at) {
+                slot.unnamed.remove(k);
+            }
+            note_id(&mut slot.by_id, &id, at);
+        }
+        call.id = id;
+    }
+
+    /// The call a delta with `index` and `id` continues, else a new one: the last call with the
+    /// same `index` whose id is the delta's or not yet known (with no `index`, the last with the
+    /// same id; with neither, the last call).
     fn locate(&mut self, index: Option<u64>, id: Option<&str>) -> usize {
         let found = match (index, id) {
-            (Some(i), _) => self.calls.iter().rposition(|c| {
-                c.index == Some(i) && (id.is_none() || c.id.is_empty() || Some(c.id.as_str()) == id)
-            }),
-            (None, Some(id)) => self.calls.iter().rposition(|c| c.id == id),
+            (Some(i), None) => self.slots.get(&i).map(|s| s.last),
+            (Some(i), Some(id)) => self
+                .slots
+                .get(&i)
+                .and_then(|s| s.unnamed.last().copied().max(s.by_id.get(id).copied())),
+            (None, Some(id)) => self.by_id.get(id).copied(),
             (None, None) => self.calls.len().checked_sub(1),
         };
         found.unwrap_or_else(|| {
+            let at = self.calls.len();
+            if let Some(i) = index {
+                let slot = self.slots.entry(i).or_default();
+                slot.last = at;
+                slot.unnamed.push(at);
+            }
+            // A call's own bookkeeping, held whatever its strings (so an upstream cannot open
+            // calls for free).
+            self.held = self.held.saturating_add(std::mem::size_of::<ChatCall>());
             self.calls.push(ChatCall {
                 index,
                 id: String::new(),
@@ -6520,7 +6781,7 @@ impl ToolCalls {
                 slot: 0,
                 item: String::new(),
             });
-            self.calls.len().saturating_sub(1)
+            at
         })
     }
 
@@ -6568,31 +6829,42 @@ struct ArgsEnd {
     depth: u32,
     in_string: bool,
     escaped: bool,
-    /// The outer object or array has closed.
+    /// The outer object, array or string has closed.
     closed: bool,
+    /// It closed and the parse said it is not JSON: no byte after a closed value can fix that.
+    invalid: bool,
+    /// The argument length at which the last full parse failed. Asked again with nothing new (a
+    /// queued call's delta asks about the live call), the answer is the same, unparsed.
+    failed_at: Option<usize>,
 }
 
 impl ArgsEnd {
     /// Whether `args` (the live call's whole argument text so far) is complete JSON.
     fn whole(&mut self, args: &str) -> bool {
+        if self.invalid || self.failed_at == Some(args.len()) {
+            return false;
+        }
         let b = args.as_bytes();
         let first = b.iter().position(|c| !c.is_ascii_whitespace());
-        match first.map(|i| b[i]) {
+        match first.and_then(|i| b.get(i)) {
             None => return false,
-            // A scalar: short, so a parse each step is fine.
-            Some(c) if c != b'{' && c != b'[' => {
-                return serde_json::from_str::<serde::de::IgnoredAny>(args).is_ok();
-            }
+            // A number or literal: whole once it parses (`tru` is not yet, `true` is).
+            Some(&c) if !matches!(c, b'{' | b'[' | b'"') => return self.parses(args),
             Some(_) => {}
         }
-        while !self.closed && self.scanned < b.len() {
-            let c = b[self.scanned];
+        while !self.closed
+            && let Some(&c) = b.get(self.scanned)
+        {
             self.scanned += 1;
             if self.in_string {
                 match c {
                     _ if self.escaped => self.escaped = false,
                     b'\\' => self.escaped = true,
-                    b'"' => self.in_string = false,
+                    b'"' => {
+                        self.in_string = false;
+                        // A string argument closes with its quote.
+                        self.closed = self.depth == 0;
+                    }
                     _ => {}
                 }
                 continue;
@@ -6607,7 +6879,21 @@ impl ArgsEnd {
                 _ => {}
             }
         }
-        self.closed && serde_json::from_str::<serde::de::IgnoredAny>(args).is_ok()
+        if !self.closed {
+            return false;
+        }
+        let whole = self.parses(args);
+        self.invalid = !whole;
+        whole
+    }
+
+    /// One full parse of `args`, remembering a failure for its length.
+    fn parses(&mut self, args: &str) -> bool {
+        let ok = serde_json::from_str::<serde::de::IgnoredAny>(args).is_ok();
+        if !ok {
+            self.failed_at = Some(args.len());
+        }
+        ok
     }
 }
 
@@ -6995,6 +7281,8 @@ struct OaiToResp {
     /// `whole` instead.
     quiet: bool,
     whole: Option<Whole>,
+    /// Bytes of text and reasoning gathered (see [`SseBridge::accumulated`]).
+    held: usize,
 }
 
 /// How an assembled stream ended.
@@ -7230,6 +7518,7 @@ impl OaiToResp {
         );
         if let Some(r) = self.reasoning.as_mut() {
             r.text.push_str(text);
+            self.held = self.held.saturating_add(text.len());
         }
     }
 
@@ -7374,6 +7663,7 @@ impl OaiToResp {
         }
         if let Some((_, buf)) = self.message.as_mut().and_then(|m| m.part.as_mut()) {
             buf.push_str(text);
+            self.held = self.held.saturating_add(text.len());
         }
     }
 
@@ -7714,15 +8004,20 @@ fn responses_error_code(code: &str) -> &'static str {
     }
 }
 
-/// Remove and return the first complete event. `scanned` is how much of `buf` an earlier call
-/// already searched without finding an end; the search resumes there, not from byte 0.
-fn take_event(buf: &mut Vec<u8>, scanned: &mut usize) -> Option<Vec<u8>> {
+/// The next complete event in `buf` from `*start`: its span, with `*start` moved past it.
+/// `scanned` is how far into `buf` an earlier call already searched without finding an end; the
+/// search resumes there, not from the event's first byte. Nothing is copied or moved.
+fn next_event(buf: &[u8], start: &mut usize, scanned: &mut usize) -> Option<(usize, usize)> {
+    let rest = buf.get(*start..)?;
     // A terminator is judged at its first `\n`, which needs up to two bytes after it — so the last
     // two positions searched before may have been undecidable and are searched again.
-    match find_event_end(buf, scanned.saturating_sub(2)) {
-        Some(end) => {
-            *scanned = 0;
-            Some(buf.drain(..end).collect())
+    let from = scanned.saturating_sub(2).saturating_sub(*start);
+    match find_event_end(rest, from) {
+        Some(len) => {
+            let event = (*start, *start + len);
+            *start += len;
+            *scanned = *start;
+            Some(event)
         }
         None => {
             *scanned = buf.len();
@@ -7832,23 +8127,24 @@ mod tests {
             &b"data: a\r\n\r\ndata: bb\r\n\r\n"[..],
             &b"data: a\r\ndata: b\n\ndata: c\r\n\r\n"[..],
         ] {
-            let mut fresh = stream.to_vec();
-            let mut want = Vec::new();
-            let mut s = 0;
-            while let Some(e) = take_event(&mut fresh, &mut s) {
-                want.push(e);
-                s = 0;
-            }
-            for split in 0..=stream.len() {
-                let mut buf = Vec::new();
-                let mut scanned = 0;
-                let mut got = Vec::new();
-                for part in [&stream[..split], &stream[split..]] {
+            // As `SseBridge::feed` holds it: events taken by cursor, the buffer compacted per part.
+            let events = |parts: &[&[u8]]| {
+                let (mut buf, mut scanned, mut got) = (Vec::new(), 0, Vec::new());
+                for part in parts {
                     buf.extend_from_slice(part);
-                    while let Some(e) = take_event(&mut buf, &mut scanned) {
-                        got.push(e);
+                    let mut start = 0;
+                    while let Some((s, e)) = next_event(&buf, &mut start, &mut scanned) {
+                        got.push(buf[s..e].to_vec());
                     }
+                    buf.drain(..start);
+                    scanned -= start;
                 }
+                got
+            };
+            let want = events(&[stream]);
+            assert!(want.len() >= 2, "{want:?}");
+            for split in 0..=stream.len() {
+                let got = events(&[&stream[..split], &stream[split..]]);
                 assert_eq!(
                     got,
                     want,

@@ -480,10 +480,17 @@ pub struct RequestCtx {
     /// Process-unique id for this request (`{instance}-{seq}`), echoed in the `x-beyond-request-id`
     /// response header and the `ai.usage` event so a client report ties back to a log line.
     request_id: RequestId,
-    /// Text bytes of the request body (base64 payloads excluded), counted as it streams past —
-    /// managed only. The input-token estimate for a stream cut short before its usage block, on a
-    /// wire (OpenAI) that reports input only at the end. See `usage::InputTally`.
+    /// Text bytes of the request body (base64 payloads excluded): the input-token estimate for a
+    /// billing row the provider's usage did not fill (a stream cut short before its usage block, on
+    /// a wire that reports input only at the end). See `usage::InputTally`. Fed as the body streams
+    /// past only when `tally_eager`; otherwise `logging` reads the body itself, and only when it
+    /// needs an estimate ([`input_estimate`]).
     input_tally: usage::InputTally,
+    /// The body is fed to `input_tally` as it streams: a managed provider-routed body that may
+    /// outgrow pingora's 64 KiB retry buffer (a declared length past it, or none), the one case
+    /// where no copy of the body is left to read in `logging`. A catalog walk's body is in the
+    /// retry buffer or, past it, held by the `FullBody` parent.
+    tally_eager: bool,
     /// Response bytes relayed — managed only. Scales the retained tail up to the whole response in
     /// `usage::estimate_stream_output` / `estimate_body_output`. One add per chunk; nothing is
     /// scanned.
@@ -1577,6 +1584,7 @@ impl AiProxy {
                     request_id,
                     request_seq,
                     slot_held,
+                    body: body.clone(),
                 }))
                 .build();
             let Some((subrequest, handle)) = create_full_body_subrequest(session, ctx, body.len())
@@ -2399,6 +2407,9 @@ struct FullBody {
     /// The parent holds this tenant's concurrency slot for the whole request, taken before it read
     /// the body. Attempts neither take nor release one.
     slot_held: bool,
+    /// The parent's copy of the body (a refcount, not a copy): what `logging` tallies for an input
+    /// estimate ([`input_estimate`]).
+    body: Bytes,
 }
 
 /// [`FullBody::keys`] for a candidate no earlier attempt walked keys on.
@@ -2439,6 +2450,25 @@ impl FullBody {
         }
         false
     }
+}
+
+/// The input-token estimate for a billing row that needs one (`usage::InputTally`): the tally fed
+/// as the body streamed when it was ([`RequestCtx::tally_eager`]), else a tally of the body itself,
+/// made now: the `FullBody` parent's copy, or pingora's retry buffer (the whole body, within
+/// 64 KiB). Most rows carry the provider's own count and never get here, so the body is not walked
+/// for them at all.
+fn input_estimate(session: &Session, rc: &RequestCtx) -> u64 {
+    if rc.tally_eager {
+        return rc.input_tally.estimate_tokens();
+    }
+    let body = full_body_ctx(session)
+        .map(|fb| fb.body)
+        .or_else(|| session.as_ref().get_retry_buffer());
+    let mut tally = usage::InputTally::default();
+    if let Some(body) = body {
+        tally.feed(&body);
+    }
+    tally.estimate_tokens()
 }
 
 fn full_body_ctx(session: &Session) -> Option<FullBody> {
@@ -4425,6 +4455,7 @@ impl ProxyHttp for AiProxy {
                     }),
                     request_id,
                     input_tally: usage::InputTally::default(),
+                    tally_eager: false,
                     resp_bytes: 0,
                     upstream_phase: UpstreamPhase::None,
                     redact: None,
@@ -4601,6 +4632,9 @@ impl ProxyHttp for AiProxy {
             }),
             request_id,
             input_tally: usage::InputTally::default(),
+            tally_eager: managed
+                && model_route.is_none()
+                && declared_len.is_none_or(|n| n > BODY_PEEK_LIMIT),
             resp_bytes: 0,
             upstream_phase: UpstreamPhase::None,
             redact: None,
@@ -5273,9 +5307,9 @@ impl ProxyHttp for AiProxy {
             if let Some(c) = rc.control.as_mut().and_then(|c| c.capture.as_mut()) {
                 c.push_req(chunk);
             }
-            // Managed only: the estimate feeds a billing row, and BYO emits none. The bytes are
-            // already hot from the scanner or buffer above.
-            if rc.managed {
+            // Only where no copy of the body will be left for `logging` to read (`tally_eager`):
+            // everywhere else the estimate is made there, and only when a row needs one.
+            if rc.tally_eager {
                 rc.input_tally.feed(chunk);
             }
 
@@ -5850,8 +5884,8 @@ impl ProxyHttp for AiProxy {
                             .with_gateway_cache(gateway_cache)
                     });
                     let mut out = sse.feed(chunk, end_of_stream);
-                    if sse.pending_len() > translate::MAX_TRANSLATE_BUFFER {
-                        return Err(self.translate_overflow(&rc.request_id, "sse_event"));
+                    if let Some(buffer) = sse.overflow() {
+                        return Err(self.translate_overflow(&rc.request_id, buffer));
                     }
                     // An assembling bridge writes nothing until the upstream has ended.
                     if t.assemble && end_of_stream {
@@ -6464,7 +6498,7 @@ impl ProxyHttp for AiProxy {
                 usage_estimated = true;
                 let mut u = parsed.unwrap_or_default();
                 if u.input_tokens == 0 {
-                    u.input_tokens = rc.input_tally.estimate_tokens();
+                    u.input_tokens = input_estimate(session, rc);
                 }
                 u.output_tokens = u.output_tokens.max(output);
                 Some(u)
@@ -6860,6 +6894,7 @@ mod tests {
             control: None,
             request_id: RequestId::new(),
             input_tally: usage::InputTally::default(),
+            tally_eager: false,
             resp_bytes: 0,
             upstream_phase: UpstreamPhase::None,
             redact: None,

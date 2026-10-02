@@ -1443,7 +1443,9 @@ mod translate {
     }
 }
 
-/// `usage::InputTally`: every managed request body streams through it.
+/// `usage::InputTally`: the input estimate of a billing row the provider's usage left empty (a
+/// managed `/{provider}` body past the retry buffer is tallied as it streams; the rest only when a
+/// row needs it).
 mod input_tally {
     use super::*;
     use beyond_ai::usage::InputTally;

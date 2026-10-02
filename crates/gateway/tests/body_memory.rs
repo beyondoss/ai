@@ -155,6 +155,51 @@ async fn a_body_too_costly_to_translate_is_a_413_naming_translation() {
     );
 }
 
+/// A translated stream that outgrows every answer the catalog allows (the largest `max_output`,
+/// 384,000 tokens, at 128 bytes a token: `translate::MAX_STREAM_OUTPUT`, 46.9 MiB) is cut, rather
+/// than gathered whole: a Responses client's bridge keeps every text delta for the closing
+/// `response.completed`, so an upstream that never stops grew the gateway without bound. The
+/// client's stream ends without `response.completed`.
+/// claim: SEC-19
+/// defect: D218
+#[tokio::test]
+async fn a_translated_stream_past_the_largest_answer_is_cut() {
+    let delta = "x".repeat(64 * 1024);
+    let mut sse = String::new();
+    for _ in 0..(48 * MIB) / delta.len() {
+        sse.push_str(&format!(
+            "data: {{\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"model\":\"deepseek-v4-pro\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"{delta}\"}}}}]}}\n\n"
+        ));
+    }
+    sse.push_str("data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"model\":\"deepseek-v4-pro\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\ndata: [DONE]\n\n");
+    let sse: &'static str = Box::leak(sse.into_boxed_str());
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::Raw(200, "text/event-stream", sse)).await;
+    let gw = Gateway::builder(unused_nats_port(), &mock.authority(), &b64(&pubkey))
+        .providers(&["deepseek"])
+        .start()
+        .await;
+    let mut resp = test_client()
+        .post(format!("{}/v1/responses", gw.url()))
+        .header("authorization", format!("Bearer {}", vkey(&sk)))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"deepseek-v4-pro","store":false,"stream":true,"input":"go"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let mut got = Vec::new();
+    while let Ok(Some(chunk)) = resp.chunk().await {
+        got.extend_from_slice(&chunk);
+    }
+    assert!(!got.is_empty(), "the stream started");
+    assert!(
+        memchr::memmem::find(&got, b"response.completed").is_none(),
+        "a stream past the bound was gathered whole ({} bytes relayed)",
+        got.len()
+    );
+}
+
 /// What the translation bound must not refuse: a 16 MiB prompt (one long string, ~5 bytes of heap
 /// per byte to translate) and a 2 MiB agent history of 65,536 short messages (~45 bytes per byte),
 /// both onto a Claude row from a Chat client, both well inside the budget.

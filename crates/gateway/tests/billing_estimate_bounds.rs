@@ -100,6 +100,37 @@ async fn a_short_prompt_estimate_stays_under_the_provider_count() {
     }
 }
 
+/// The input estimate of a prompt past pingora's 64 KiB retry buffer, cut short: on a catalog walk
+/// (the `FullBody` re-run, whose parent holds the body) and on `/{provider}` (tallied as it
+/// streams, the one path with no copy left to read). 20,000 one-token words estimate 20,000 or a
+/// little more for the role; never zero, never the envelope.
+/// claim: BIL-20, B2
+#[tokio::test]
+async fn a_large_prompt_cut_short_is_billed_its_estimate() {
+    let (pubkey, sk) = test_keypair(133);
+    let mock = MockUpstream::start(Mode::StallSse).await;
+    let gw = Gateway::builder(unused_nats_port(), &mock.authority(), &b64(&pubkey))
+        .providers(&["openai"])
+        .start()
+        .await;
+    let key = billing_vkey(&sk, 133);
+    let body = format!(
+        r#"{{"model":"gpt-4o-mini","stream":true,"messages":[{{"role":"user","content":"{}"}}]}}"#,
+        "word ".repeat(20_000)
+    );
+    assert!(body.len() > 64 * 1024);
+    for path in ["/v1/chat/completions", "/openai/v1/chat/completions"] {
+        stream_then_cancel(format!("{}{path}", gw.url()), &bearer(&key), body.clone()).await;
+    }
+    let rows = wait_usage_rows(&gw, 2, 15).await;
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    for row in rows {
+        assert_eq!(row["usage_estimated"], true, "{row}");
+        let input = row["input_tokens"].as_u64().unwrap();
+        assert!((20_000..=20_002).contains(&input), "{row}");
+    }
+}
+
 /// A head with chunked framing and no chunk: the provider accepted the stream and then went
 /// silent before its first event.
 fn accepted_then_silent() -> Vec<Step> {

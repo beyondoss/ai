@@ -179,7 +179,12 @@ Client (stock OpenAI/Anthropic SDK)
   │    `SseBridge::assembling` and the client's JSON body is written once, at end of stream
   │    Both held buffers (the non-stream body; one not-yet-terminated SSE event) are capped at
   │    MAX_TRANSLATE_BUFFER (32 MiB) — past it the response is aborted
-  │    (ai_rejections_total{reason="response_too_large"}). A stream as a whole is never capped.
+  │    (ai_rejections_total{reason="response_too_large"}). A stream as a whole is never capped,
+  │    but what a bridge gathers to the end of it (a Responses client's text, reasoning and
+  │    arguments for `response.completed`; tool calls queued onto Messages) is: past
+  │    MAX_STREAM_OUTPUT, the largest catalog `max_output_tokens` × 128 bytes (the longest
+  │    o200k/cl100k token), 46.9 MiB, the response is aborted the same way (D218). Each event is
+  │    mapped in place and the buffer compacted once per chunk; a delta finds its tool call in O(1)
   │  Managed only: feed *upstream* chunks → ModelScanner::for_response → billed model
   │    (accepts Anthropic's nested message.model, so it stops in the first chunk for both dialects)
   │  Append *upstream* bytes to bounded 64KB tail (copy_within compaction once tail > 128KB)
@@ -552,7 +557,12 @@ entry, so openai-python's `.stream()` built a role of `"assistantassistant…"` 
 send back. These streams go through `SseBridge` in relay mode: an event is forwarded byte for byte
 unless it repeats an identity field, which `translate::ChatIdentity` drops. The identity fields are
 `role`, a reasoning entry's `id`/`format`, and a tool call's `id`/name, each tracked per choice and
-per entry. OpenAI's own streams stay a zero-copy relay.
+per entry. OpenAI's own streams stay a zero-copy relay. So do the others' events that name none
+of those keys (`memmem` for `"role"`, `"tool_calls"`, `"reasoning_details"`); an event whose only
+such key is `role` (every OpenRouter chunk) has a repeat cut by span (`SseBridge::relay_role`),
+keeping every other byte as sent; only a chunk carrying tool calls or reasoning details is parsed.
+Measured (`benches/unit.rs`, `chat_relay`): an OpenRouter chunk repeating `role` 1.27 µs and 28
+allocations → 0.69 µs and 2, a chunk naming no identity field 0.68 µs and 21 → 0.16 µs and 1.
 
 **Embeddings rows.** `text-embedding-3-small` and `-large` are catalog rows whose candidates are
 embeddings paths (OpenAI `/v1/embeddings`, then OpenRouter `/api/v1/embeddings`), so a stock
@@ -964,7 +974,8 @@ Responses-only models the catalog routes to `/v1/responses`, and is held to the 
   block is open waits, its arguments gathered, and opens once the open call's arguments are complete
   JSON (no valid byte can follow) or the stream ends. The end is found incrementally, scanning only
   the argument bytes new since the last step, with one parse to confirm it when the outer value
-  closes. An open call with no argument bytes is done once a waiting call's arguments start
+  (or a string argument) closes; a failed parse is not repeated until a byte arrives, and arguments
+  that closed without being JSON stay not whole. An open call with no argument bytes is done once a waiting call's arguments start
   arriving (a zero-argument call; the upstream has moved on). A sequential upstream streams each
   call as it comes; one that interleaves argument deltas has the later calls held back.
 - **Tool arguments keep their numbers as written.** Translation moves arguments between a JSON
@@ -974,9 +985,10 @@ Responses-only models the catalog routes to `/v1/responses`, and is held to the 
   arguments were altered before reaching the client's tool or its replayed history. Arguments
   holding a number a `Value` keeps as an `f64` (a decimal, an exponent, a huge integer) now keep
   their text: a Chat `arguments` string becomes a verbatim stand-in that `translate::Exact` writes
-  back as the original text, and a Messages body whose `tool_use` inputs hold one is parsed a
-  second time keeping each `input`'s text (`KeepInputs`). Integer-only arguments, the common case,
-  take the path they always did. serde_json's `arbitrary_precision` would have kept every number,
+  back as the original text, and every Messages body is parsed once with `KeepInputs`, which keeps
+  the text of each `input` holding one (a body with such a number used to be parsed twice: plainly
+  to find it, then with `KeepInputs`). Integer-only arguments come out as ordinary values, as they
+  always did. serde_json's `arbitrary_precision` would have kept every number,
   but it is crate-wide and breaks `untagged` enums holding numbers, which async-nats' JetStream
   responses are. Measured (`benches/unit.rs`, `translate`): a Messages tool call with a decimal
   onto a Chat client 4.0 → 5.4 µs, the same with integers and 20 replayed Chat calls onto Messages
@@ -1645,8 +1657,12 @@ recovery) is a billed turn too. Its row carries an estimate and `usage_estimated
 `ai_usage_estimated_total` counts them.
 
 - **Input:** Anthropic's `message_start` is the first event and carries exact input and cache
-  counts, so those are kept. Otherwise the prompt text's **pre-tokens**, counted as the body streams
-  past (`InputTally`, 12 bytes of state). A BPE tokenizer splits text with a pre-tokenizer before
+  counts, so those are kept. Otherwise the prompt text's **pre-tokens** (`InputTally`, 12 bytes of
+  state), counted only when a row needs the estimate, from the body `logging` still holds: pingora's
+  retry buffer (every body within 64 KiB) or the `FullBody` parent's copy (a catalog walk's larger
+  body). Only a managed `/{provider}` body that may outgrow the retry buffer (a declared length past
+  it, or none) is tallied as it streams, since no copy of it is left; before, every managed body was,
+  at the ~1.3 GB/s below, for an estimate almost no row uses. A BPE tokenizer splits text with a pre-tokenizer before
   merging and never merges across a split, so the split count is at most the token count whatever
   the vocabulary. The splits counted are the subset of the GPT tokenizers' stated regex
   (`cl100k_base`, `o200k_base`, Llama 3's) every measured tokenizer honors: words split at
@@ -1658,7 +1674,10 @@ recovery) is a billed turn too. Its row carries an estimate and `usage_estimated
   parameter do not: counted as bytes ÷ 5 they billed a 24-token prompt at 40 (D99). Binary payloads
   (a data URI under `url`, an Anthropic source's or `input_audio`'s `data`) are values of other
   keys, skipped with `memchr` at ~100 GB/s; text is classified four bytes per table lookup, ~1.3
-  GB/s on source code and ~3 GB/s on prose (`benches/unit.rs` `input_tally`). Measured 2026-10-01
+  GB/s on source code and ~3 GB/s on prose (`benches/unit.rs` `input_tally`). Walking escapes
+  inside the table loop instead of splitting the text at each one measured mixed (100 KiB of source
+  1.38x faster, prose 13% and escape-dense source 7% slower) and was not kept: the walk now runs
+  only for an estimate. Measured 2026-10-01
   on prose, code, Markdown, JSON, numbers, hex, base64-like text, French, Russian, CJK, emoji and
   punctuation runs: never above the count of `o200k_base`, `cl100k_base`, grok-4.3 (xAI's tokenize
   endpoint) or Claude Haiku 4.5 (`count_tokens`), about 0.8× of it on English and code for the GPT

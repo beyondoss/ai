@@ -2243,6 +2243,106 @@ fn identity_fields_are_tracked_per_choice_and_entry() {
     );
 }
 
+/// `ToolCalls::locate` answers from its maps exactly what a backward scan of every call answers,
+/// over deltas that mix indexes, reused indexes, ids, missing indexes and calls opened with a
+/// fresh id.
+#[test]
+fn locating_a_calls_delta_matches_a_backward_scan() {
+    fn scan(calls: &[ChatCall], index: Option<u64>, id: Option<&str>) -> Option<usize> {
+        match (index, id) {
+            (Some(i), _) => calls.iter().rposition(|c| {
+                c.index == Some(i) && (id.is_none() || c.id.is_empty() || Some(c.id.as_str()) == id)
+            }),
+            (None, Some(id)) => calls.iter().rposition(|c| c.id == id),
+            (None, None) => calls.len().checked_sub(1),
+        }
+    }
+    let mut seed = 0x9E37_79B9_7F4A_7C15_u64;
+    let mut next = |n: u64| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed % n
+    };
+    for _ in 0..50 {
+        let mut tc = ToolCalls::default();
+        let mut steps = Vec::new();
+        for _ in 0..200 {
+            let index = match next(5) {
+                0 => None,
+                i => Some(i - 1),
+            };
+            let id = ["", "a", "b", "c"][next(4) as usize];
+            let id = (!id.is_empty()).then_some(id);
+            let want = scan(&tc.calls, index, id).unwrap_or(tc.calls.len());
+            let at = tc.locate(index, id);
+            assert_eq!(at, want, "index {index:?} id {id:?}");
+            if let Some(id) = id
+                && tc.calls[at].id.is_empty()
+            {
+                tc.set_id(at, id.to_owned());
+            }
+            if next(6) == 0 {
+                tc.open(at, &mut steps);
+            }
+        }
+    }
+}
+
+/// The live call's end is judged incrementally, and a verdict that cannot change is not
+/// re-derived: an unchanged length keeps its failed parse, and arguments that closed without
+/// being JSON stay not whole whatever follows.
+#[test]
+fn a_live_calls_end_is_judged_once_per_change() {
+    let mut end = ArgsEnd::default();
+    assert!(!end.whole(r#"{"a":"}"#));
+    assert!(!end.whole(r#"{"a":"}""#));
+    assert!(end.whole(r#"{"a":"}"}"#));
+    let mut end = ArgsEnd::default();
+    assert!(!end.whole(r#""ab"#));
+    assert!(end.whole(r#""ab\"c""#));
+    let mut end = ArgsEnd::default();
+    assert!(!end.whole("tru"));
+    assert_eq!(end.failed_at, Some(3));
+    assert!(!end.whole("tru"));
+    assert!(end.whole("true"));
+    let mut end = ArgsEnd::default();
+    assert!(!end.whole(r#"{"a":1}}"#));
+    assert!(end.invalid, "closed, and not JSON");
+    assert!(!end.whole(r#"{"a":1}}  "#));
+}
+
+/// A repeated `role` is cut by span (the relay no longer parses and re-encodes every OpenRouter
+/// chunk), with exactly what the `Value` path keeps, and every other byte as sent.
+#[test]
+fn a_repeated_role_is_cut_by_span_as_the_value_path_would() {
+    let events = [
+        r#"{"choices":[{"index":0,"delta":{"role":"assistant","content":"a"}}]}"#,
+        r#"{"choices":[{"index":0,"delta":{"role":"assistant","content":"b"}}]}"#,
+        r#"{"choices":[{"index":0,"delta":{"content":"c","role":"assistant"}}]}"#,
+        r#"{"choices":[{"index":0,"delta":{"role":"assistant"}}]}"#,
+        r#"{"choices":[{"delta":{"role":"assistant"},"index":1},{"index":1,"delta":{"role":"assistant","content":"d"}}]}"#,
+        r#"{"choices":[{"index":2,"delta":{"role":null}}]}"#,
+        r#"{"choices":[{"delta":{"role":"assistant"}}, {"delta" : { "role" : "assistant" , "content" : "e" }}]}"#,
+        r#"{"id":"x","choices":[{"index":0,"delta":{"role":"assistant","content":"f"}}],"usage":null}"#,
+        r#"{"choices":[{"index":0,"delta":{"role":"assistant","role":"assistant"}}]}"#,
+        r#"{"choices":[{"index":3,"delta":{"content":"g"}}],"x":{"role":"user"}}"#,
+    ];
+    let mut bridge = SseBridge::new(Chat, Chat);
+    let mut reference = ChatIdentity::default();
+    for e in events {
+        let raw = format!("data: {e}\n\n");
+        let got = String::from_utf8(bridge.feed(raw.as_bytes(), false)).unwrap();
+        let mut want: Value = serde_json::from_str(e).unwrap();
+        let dropped = reference.strip(&mut want);
+        let data = got.strip_prefix("data: ").unwrap().trim_end();
+        assert_eq!(serde_json::from_str::<Value>(data).unwrap(), want, "{e}");
+        if !dropped {
+            assert_eq!(got, raw, "an event with nothing to drop is relayed as sent");
+        }
+    }
+}
+
 // ---- verification phase 0: zero-argument tool calls --------------------------------------------
 
 /// A Claude turn calling a tool that takes no arguments, as Anthropic streams it: the block opens
