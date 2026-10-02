@@ -1506,6 +1506,7 @@ async fn refusing_h2_upstream(
                 let mut head = vec![0x88, 0x0f, 0x10, 16];
                 head.extend_from_slice(b"application/json");
                 let (mut seen, mut last_served) = (0u32, 0u32);
+                let (mut goaway_last, mut drain) = (None::<u32>, None);
                 let refuse = |seen: u32| match mode {
                     Refuse::Always => true,
                     Refuse::FirstStream => conn == 0 && seen == 0,
@@ -1513,8 +1514,17 @@ async fn refusing_h2_upstream(
                 };
                 loop {
                     let mut h = [0u8; 9];
-                    if io.read_exact(&mut h).await.is_err() {
-                        return;
+                    let read = match drain {
+                        Some(at) => tokio::time::timeout_at(at, io.read_exact(&mut h)).await,
+                        None => Ok(io.read_exact(&mut h).await),
+                    };
+                    match read {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(_)) => return,
+                        Err(_) => {
+                            let _ = io.shutdown().await;
+                            return;
+                        }
                     }
                     let len = usize::from(h[0]) << 16 | usize::from(h[1]) << 8 | usize::from(h[2]);
                     let (kind, flags) = (h[3], h[4]);
@@ -1537,10 +1547,20 @@ async fn refusing_h2_upstream(
                         // SETTINGS → ACK; PING → PONG.
                         (0x4, 0) => h2_frame(&mut io, 0x4, 0x1, 0, &[]).await,
                         (0x6, 0) => h2_frame(&mut io, 0x6, 0x1, 0, &payload).await,
-                        // HEADERS or DATA ending the request body.
-                        (0x0 | 0x1, 0x1) if !refuse(seen) => {
+                        // After the GOAWAY, a stream above its last id is one the client already
+                        // gave up on: never processed.
+                        (0x0 | 0x1, 0x1) if goaway_last.is_some_and(|last| stream > last) => Ok(()),
+                        // HEADERS or DATA ending the request body. A GOAWAY's `last_stream_id`
+                        // promises every stream at or below it is processed, so a stream below
+                        // one already served (its body finished later) is served, never refused,
+                        // during the drain too.
+                        (0x0 | 0x1, 0x1)
+                            if goaway_last.is_some()
+                                || !refuse(seen)
+                                || (matches!(mode, Refuse::GoAway) && stream < last_served) =>
+                        {
                             seen += 1;
-                            last_served = stream;
+                            last_served = last_served.max(stream);
                             served.fetch_add(1, Ordering::SeqCst);
                             let r = h2_frame(&mut io, 0x1, 0x4, stream, &head).await;
                             match r {
@@ -1557,12 +1577,13 @@ async fn refusing_h2_upstream(
                                 Refuse::GoAway => {
                                     let mut p = last_served.to_be_bytes().to_vec();
                                     p.extend_from_slice(&0u32.to_be_bytes());
-                                    let _ = h2_frame(&mut io, 0x7, 0, 0, &p).await;
-                                    // Hold the connection open a moment, as a draining server
-                                    // does, then close it.
-                                    tokio::time::sleep(Duration::from_millis(200)).await;
-                                    let _ = io.shutdown().await;
-                                    return;
+                                    // Drain a moment, as a server does (finishing the streams at
+                                    // or below the last id), then close.
+                                    goaway_last = Some(last_served);
+                                    drain = Some(
+                                        tokio::time::Instant::now() + Duration::from_millis(200),
+                                    );
+                                    h2_frame(&mut io, 0x7, 0, 0, &p).await
                                 }
                                 Refuse::RefusedStream | Refuse::Always | Refuse::FirstStream => {
                                     h2_frame(&mut io, 0x3, 0, stream, &7u32.to_be_bytes()).await
@@ -1813,6 +1834,70 @@ async fn upstream_goaway_is_handled() {
         "concurrent requests across GOAWAYs: {statuses:?}"
     );
     assert!(served.load(Ordering::SeqCst) >= 26);
+}
+
+/// One GOAWAY refuses every multiplexed stream above its `last_stream_id` at once (D160 carries up
+/// to 100 streams per upstream connection), and the connection a resend lands on can be drained
+/// the same way before it gets to it. Sixteen concurrent requests against an upstream that serves
+/// one stream per connection and GOAWAYs the rest: every refused request is resent until a
+/// connection takes it, so all sixteen succeed and each reaches the upstream exactly once (a
+/// refusal is RFC 9113 §6.8's "not processed", so a resend cannot double-bill).
+/// claim: REL-22, REL-1
+/// defect: D248
+#[tokio::test]
+async fn concurrent_streams_refused_by_one_goaway_are_all_resent() {
+    let (pubkey, sk) = test_keypair(226);
+    let key = billing_vkey(&sk, 2206);
+    let path = "/openai/v1/chat/completions";
+    let (port, served, refused, task) = refusing_h2_upstream(Refuse::GoAway).await;
+    let gw = Gateway::builder(
+        unused_nats_port(),
+        &format!("127.0.0.1:{port}"),
+        &b64(&pubkey),
+    )
+    .providers(&["openai"])
+    .tls_upstream()
+    .upstream_http2(true)
+    .start()
+    .await;
+    let mut tasks = Vec::new();
+    for _ in 0..16 {
+        let (url, key) = (gw.url(), key.clone());
+        tasks.push(tokio::spawn(async move {
+            let r = test_client()
+                .post(format!("{url}{path}"))
+                .header("authorization", format!("Bearer {key}"))
+                .header("content-type", "application/json")
+                .body(CHAT)
+                .send()
+                .await;
+            match r {
+                Ok(r) => (r.status().as_u16(), r.text().await.unwrap_or_default()),
+                Err(e) => (0, e.to_string()),
+            }
+        }));
+    }
+    let sent = tasks.len();
+    let mut bad = Vec::new();
+    for t in tasks {
+        let (status, text) = t.await.unwrap();
+        if status != 200 {
+            bad.push((status, text));
+        }
+    }
+    task.abort();
+    assert!(bad.is_empty(), "refused streams not resent: {bad:?}");
+    // Under heavy CPU contention the burst can open one connection per request (none is back in
+    // the pool in time), so no stream shares a connection and nothing is refused: inconclusive,
+    // not a failure. Unloaded, nearly every run multiplexes (14 of 20 failed before the fix).
+    if refused.load(Ordering::SeqCst) == 0 {
+        eprintln!("inconclusive: no stream shared a connection, so none was refused");
+    }
+    assert_eq!(
+        served.load(Ordering::SeqCst),
+        sent,
+        "a request reached the upstream twice"
+    );
 }
 
 // --- memory under sustained load -----------------------------------------------------------------

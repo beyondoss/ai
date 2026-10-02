@@ -2443,3 +2443,16 @@ state = "fixed"
 test = "live:CAT-7::raw::openrouter::gpt-5.6-sol-pro"
 fix = "ff09001"
 note = "The card is right and keeps the standard rate. Fixed: a [[promo]] may name its cached-input rate (cache_read; both gpt-5.6-sol promotions now say 0.20, until 2026-11-21), and CAT-7 prices cached input at it (the card's cached rate when none is named). catalog_matches_vendor_truth holds a promo cache_read below the card's. Live: the cell re-run twice, PASS, once with 1510 cached input tokens at exactly the failing run's figures."
+
+[[defect]]
+id = "D248"
+severity = "med"
+area = "Reliability"
+title = "A request whose stream two draining connections refused in turn got a 502"
+impact = "With D160's multiplexing one GOAWAY refuses every stream above its last id at once; the resends race onto fresh connections, and one that a second drain refused again was a provider failure under D91's one-resend bound: a 502 'the provider refused the stream; it was not processed' for a request no connection had processed. CI: upstream_goaway_is_handled saw 3 of 16 concurrent requests 502."
+confidence = "high"
+evidence = "CI (PR #115): 'concurrent requests across GOAWAYs: [200,200,200,200,200,200,502,200,...,502,200,502]'. Hermetic: 16 concurrent requests against refusing_h2_upstream(GoAway) (one stream served per connection, the rest GOAWAYed) failed 14 of 20 runs before the fix, each failure that 502. The h2 client gives a stream above last_stream_id the remote go_away error (Streams::recv_go_away), already classified as refused (D72); the bound, not the classification, was wrong. Neither CI nor the hermetic test can tell which of the two shapes below CI hit; both were 502s for unprocessed requests."
+claims = ["REL-22", "REL-1"]
+state = "fixed"
+test = "concurrent_streams_refused_by_one_goaway_are_all_resent"
+note = "Fixed: a GOAWAY refusal on a connection the request found already open (client_reused) is a drain casualty: resent without spending the one refused resend, bounded by pingora's retry limit (each needs a live connection that served before). A GOAWAY on a connection the request opened, and every RST_STREAM(REFUSED_STREAM), keep D91's one resend. Streams at or below last_stream_id never get the go_away error, so they stay under D09. Second shape, found once the first was fixed (10 to 60% of hermetic runs under load): a resend whose body write met the GOAWAY failed as pingora H2Error 'cannot reserve capacity' (stream closed, bytes unsent, no h2 reason), which body_delivered counted as delivered: 502 'upstream failed after receiving the request'. Fixed: h2_body_unsent makes it a write failure (END_STREAM never went out), retried as an undelivered failure on a reused connection. The mock now drains like a real server (finishes streams at or below its last id for 200 ms, never refuses one below a stream it served); its old GOAWAY could break §6.8 and caused a broken-pipe flake. Open, unexplained: under single-CPU contention a second burst reusing the drained mock connections saw tries-1 broken pipes (no GOAWAY reached the h2 client before EOF); the test stays at one burst and reports a run with no refusal as inconclusive."

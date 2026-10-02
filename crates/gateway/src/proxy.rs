@@ -647,8 +647,36 @@ fn body_delivered(session: &mut Session, rc: &RequestCtx, e: Option<&pingora_cor
         && session.as_mut().is_body_done()
         && !e.is_some_and(|e| {
             e.esource() == &pingora_core::ErrorSource::Upstream
-                && matches!(e.etype(), WriteError | WriteTimedout)
+                && (matches!(e.etype(), WriteError | WriteTimedout) || h2_body_unsent(e))
         })
+}
+
+/// Whether writing the request body to an HTTP/2 stream failed because the stream had already
+/// closed with body bytes still unsent: pingora's `reserve_and_send` found no capacity to get
+/// (`cannot reserve capacity`, `while waiting for capacity`), a write failure it labels `H2Error`
+/// rather than `WriteError`. END_STREAM never went out, so the upstream cannot have the whole
+/// request. The usual cause is a GOAWAY that closed a stream mid-upload (D248); pingora gives no
+/// other handle on it than the context string.
+fn h2_body_unsent(e: &pingora_core::Error) -> bool {
+    let mut at = Some(e);
+    while let Some(x) = at {
+        if x.etype() == &pingora_core::ErrorType::H2Error
+            && x.context.as_ref().is_some_and(|c| {
+                matches!(
+                    c.as_str(),
+                    "cannot reserve capacity" | "while waiting for capacity"
+                )
+            })
+        {
+            return true;
+        }
+        at = x
+            .cause
+            .as_deref()
+            .and_then(|c| c.downcast_ref::<Box<pingora_core::Error>>())
+            .map(|b| &**b);
+    }
+    false
 }
 
 /// Whether `e` ended a request because someone stopped waiting for its response, rather than the
@@ -667,6 +695,14 @@ fn gave_up_waiting(e: &pingora_core::Error) -> bool {
         pingora_core::ErrorSource::Upstream => e.etype() == &pingora_core::ErrorType::ReadTimedout,
         _ => false,
     }
+}
+
+/// Whether the upstream refused this request's HTTP/2 stream with a GOAWAY, one shape of
+/// [`upstream_refused_stream`]: the connection is retired, so a resend takes another (D248).
+fn upstream_goaway(e: &pingora_core::Error) -> bool {
+    e.root_cause()
+        .downcast_ref::<h2::Error>()
+        .is_some_and(|h| h.is_remote() && h.is_go_away())
 }
 
 /// Whether the upstream refused this request's HTTP/2 stream before processing any of it, so it
@@ -6023,7 +6059,16 @@ impl ProxyHttp for AiProxy {
         // provider is failing to take work (its stream limit, a drain that never ends): a provider
         // failure like any other, so the walk fails over and the breaker hears of it (D91), rather
         // than a tight loop of resends up to pingora's retry limit.
-        let resend_refused = refused && !rc.refused_resent;
+        //
+        // Except a GOAWAY on a connection this request found already open (D248): that is the
+        // provider draining a connection that carried other streams, one GOAWAY refusing every
+        // multiplexed stream above its last id at once (D160), and it retires the connection, so
+        // the resend lands on another. Not the provider refusing work, so it does not spend the
+        // one resend. A GOAWAY on a connection the request opened itself refused its first stream:
+        // that one counts. Each drain resend needs a live connection that served before, and
+        // pingora's retry limit bounds them all.
+        let drained = refused && client_reused && upstream_goaway(&e);
+        let resend_refused = refused && (drained || !rc.refused_resent);
         if resend_refused {
             warn!(
                 request_id = %rc.request_id,
@@ -6082,7 +6127,7 @@ impl ProxyHttp for AiProxy {
             // candidate again on a fresh one, keeping its breaker permit (it was the connection,
             // not the provider).
             Some(_) if resend_refused || (client_reused && !refused) => {
-                rc.refused_resent |= refused;
+                rc.refused_resent |= refused && !drained;
                 rc.same_provider_retry = true;
                 e.set_retry(true);
             }
@@ -6097,10 +6142,16 @@ impl ProxyHttp for AiProxy {
             // again, the error stands (`logging` records it against the breaker). Otherwise
             // pingora's rule: a reused connection is retried once.
             None if resend_refused => {
-                rc.refused_resent = true;
+                rc.refused_resent |= !drained;
                 e.set_retry(true);
             }
             None if refused => e.set_retry(false),
+            // A body write that met a stream already closed (D248) is a reused connection's
+            // failure before delivery, like pingora's own `ReusedOnly` errors.
+            None if h2_body_unsent(&e) => {
+                e.retry = pingora_core::RetryType::ReusedOnly;
+                e.retry.decide_reuse(client_reused);
+            }
             None => e.retry.decide_reuse(client_reused),
         }
         e
