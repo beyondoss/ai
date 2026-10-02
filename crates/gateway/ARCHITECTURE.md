@@ -80,7 +80,8 @@ Client (stock OpenAI/Anthropic SDK)
   │  │    │           pool key required ───────────────────────── 503
   │  │    └─ BYO: pass through (no verify, no deny-set, no billing)
   │  ├─ BYO key on `/auto` (managed-only route) ──────────────────► 400
-  │  ├─ GET/HEAD /v1/models (after identity: a managed key must verify) ► keyed catalog list
+  │  ├─ GET/HEAD /v1/models, managed key (after verify) ► keyed catalog list
+  │  │    (a BYO key falls through: relayed to its provider like any BYO `/v1` request)
   │  ├─ Managed endpoint allowlist (method + path) ──────────────► 404 / 405
   │  ├─ Catalog walk: read the body to find `model` (≤ 64 KiB in hand, larger re-run
   │  │    as a `FullBody` subrequest); past 100 MiB ──────────────► 413, before any upstream
@@ -361,17 +362,22 @@ permuted sequence and otherwise behave as they do today.
 Not in this surface: cost sort, weighted load-balance across keys, `MODEL_ROUTES` edits, or parsing
 Vercel `providerOptions` from the body.
 
-`GET /v1/models` (and `HEAD`) lists the catalog in OpenAI list shape. The Anthropic SDK reads it
-too: each row has `display_name`, and the list has `has_more: false`.
+`GET /v1/models` (and `HEAD`) with a managed key lists the catalog in OpenAI list shape. The
+Anthropic SDK reads it too: each row has `display_name`, and the list has `has_more: false`.
 
 It lists only the rows this deployment can serve: a row is listed when at least one of its
 candidates has a pool key here (D250). A row whose primary is unkeyed but whose fallback is keyed
-stays listed, because the fallback serves it. A deployment with no pool keys at all is BYO-only. It
-lists the whole catalog, because its callers bring their own provider keys and listing is how they
-discover names. `GatewayState::new` renders the body once at boot (`state::models_list_body`), so a
-request clones `Bytes` and does no other work. The list is one body per deployment and does not
-depend on the caller's key type. There is no `/v1/models/{id}` retrieval: a managed key's `GET` on
-it is refused by the allowlist, and a BYO key's passes through to the provider.
+stays listed, because the fallback serves it. `GatewayState::new` renders the body once at boot
+(`state::models_list_body`), so a request clones `Bytes` and does no other work.
+
+A BYO caller never uses the catalog: on `/v1` its key goes straight to its own provider, so its
+listing is that provider's (D254). `GET`/`HEAD /v1/models` with a BYO key is not intercepted; it
+takes the same route as any BYO `/v1` request (the credential's shape, else the path's default
+dialect, which is OpenAI for `/v1/models`) and is a plain relay of the provider's own list with the
+caller's key, headers as sent (Anthropic's listing needs the `anthropic-version` its SDK sends),
+and no `ai.usage` row. Nothing serves the full, unfiltered catalog. There is no `/v1/models/{id}`
+retrieval: a managed key's `GET` on it is refused by the allowlist, and a BYO key's passes through
+to the provider.
 
 Each row adds:
 
@@ -585,7 +591,7 @@ The row's endpoint is `Endpoint::of_row`: `Embeddings` when its primary's
 path is, else what `wire` says.
 
 **Managed endpoint allowlist.** A managed key spends Beyond's shared pool key, so it reaches only
-metered generation calls. On `/v1` and `/auto` the method must be `POST` (`GET`/`HEAD /v1/models` is
+metered generation calls. On `/v1` and `/auto` the method must be `POST` (a managed `GET`/`HEAD /v1/models` is
 served before this check). On `/{provider}/…` the method must be `POST` and the forwarded path, query
 string excluded, must end in a generation endpoint: `/chat/completions`, `/messages`, `/responses`,
 `/embeddings`, `/messages/count_tokens`, `/responses/input_tokens` or `/responses/compact`. The
@@ -2535,7 +2541,8 @@ to serve.
 - Catalog model on managed `/v1` and `/auto` (unknown or missing → 404 naming the miss). Candidate
   spellings are aliases. Chat Completions ↔ Messages ↔ Responses is translated when the inbound
   path names a different one of those three; any other inbound-path vs row mismatch is a 400.
-  `/{provider}/…` is not allowlisted and never translates. `GET /v1/models` lists the catalog.
+  `/{provider}/…` is not allowlisted and never translates. A managed `GET /v1/models` lists the
+  keyed catalog; a BYO one relays to its provider.
 - Request body size ≤ `MAX_REQUEST_BODY` (declared `Content-Length` + streaming running total)
 - One root `model` key on a catalog walk. The walk routes on one and rewrites one, while most JSON
   parsers take the _last_, so `{"model":"cheap",…,"model":"gpt-5.5-pro"}` would route as the cheap
@@ -3000,7 +3007,7 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
   Messages. Managed `/v1/responses` + `gpt-4o` + `previous_response_id` hits OpenAI `/v1/responses`
   with the field intact; Claude + `previous_response_id` is 400 naming the field, no upstream
   (`responses_session_field` classes a `conversation` the same way);
-  `/{provider}/v1/responses` stays a relay. `ai.usage` still comes from the upstream parser. `GET /v1/models` lists the catalog, a candidate
+  `/{provider}/v1/responses` stays a relay. `ai.usage` still comes from the upstream parser. a managed `GET /v1/models` lists the keyed catalog (a BYO one relays to its provider), a candidate
   spelling is an alias, BYO on
   `/auto` → 400, BYO on `/v1` still forwarded, `/openai/…` ignoring the catalog, a stock SDK shape
   against `/v1` with only `model` in the body, the routing header never reaching an upstream,

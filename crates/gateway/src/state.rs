@@ -345,26 +345,19 @@ fn index_by_id(
     by_id
 }
 
-/// The `GET /v1/models` body for a deployment whose providers are `by_id`.
+/// The managed `GET /v1/models` body for a deployment whose providers are `by_id`.
 ///
 /// A row is listed when at least one of its candidates has a pool key here, so a row whose primary
 /// is unkeyed but whose fallback is keyed stays listed: a managed request for it is served by the
 /// fallback. A row none of whose candidates is keyed would only 503 a managed caller, so it is not
-/// advertised.
-///
-/// A deployment with no pool keys at all is BYO-only: every caller brings their own provider key,
-/// and the gateway serves every catalog name to them by passing through. It lists the whole catalog
-/// so those callers can discover names (the reason `/v1/models` answers BYO keys at all). The list
-/// does not depend on the caller's key type; it is one body per deployment.
+/// advertised (a deployment with no pool keys lists none). Only managed callers get this body: a BYO
+/// caller never uses the catalog, and its listing relays to its own provider (D254).
 pub(crate) fn models_list_body(
     by_id: &[Option<Arc<Provider>>; providers::ProviderId::COUNT],
 ) -> bytes::Bytes {
     let keyed =
         |id: providers::ProviderId| by_id[id.index()].as_ref().is_some_and(|p| p.has_pool_key());
-    if !by_id.iter().flatten().any(|p| p.has_pool_key()) {
-        return bytes::Bytes::from_static(providers::catalog::models_list_json().as_bytes());
-    }
-    bytes::Bytes::from(providers::catalog::models_list_json_where(|r| {
+    bytes::Bytes::from(providers::catalog::models_list_json(|r| {
         r.candidates.iter().any(|c| keyed(c.provider))
     }))
 }
@@ -389,8 +382,8 @@ pub struct GatewayState {
     /// config-added provider is absent: it has no `ProviderId`, and a catalog row can only name one.
     by_id: [Option<Arc<Provider>>; providers::ProviderId::COUNT],
 
-    /// The `GET /v1/models` body, rendered once at boot by [`models_list_body`]: the catalog rows
-    /// this deployment's pool keys can serve, or the whole catalog when it has no pool keys.
+    /// The managed `GET /v1/models` body, rendered once at boot by [`models_list_body`]: the
+    /// catalog rows this deployment's pool keys can serve.
     pub models_list: bytes::Bytes,
 
     /// Sparse deny-set — watched from NATS. Default-allow on miss; fail-open.

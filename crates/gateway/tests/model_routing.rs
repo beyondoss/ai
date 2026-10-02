@@ -2076,8 +2076,6 @@ async fn v1_models_lists_only_rows_an_openai_pool_key_serves() {
     assert_eq!(got, want);
     assert!(got.iter().any(|m| m == "gpt-4o-mini"), "{got:?}");
     assert!(!got.iter().any(|m| m == "claude-opus-4-8"), "{got:?}");
-    // The caller's key type does not change the list: a BYO caller sees the same body.
-    assert_eq!(listed_ids(&gw, "sk-byo-caller").await, want);
     assert_eq!(mock.hits(), 0, "listing must not contact an upstream");
 }
 
@@ -2137,27 +2135,6 @@ async fn v1_models_lists_claude_but_not_together_only_rows_on_anthropic_and_open
         "{} listed via its fallback: {got:?}",
         fallback_only.model
     );
-}
-
-/// A BYO-only deployment (no pool keys) lists the whole catalog: its callers bring their own
-/// provider keys, and listing is how they discover the names.
-/// claim: E4
-/// defect: D250
-#[tokio::test]
-async fn v1_models_on_a_byo_only_deployment_lists_the_whole_catalog() {
-    let nats_port = unused_nats_port();
-    let (pubkey, _sk) = test_keypair(1);
-    let mock = MockUpstream::start(Mode::Json).await;
-    let gw = Gateway::builder(nats_port, &mock.authority(), &b64(&pubkey))
-        .providers(&[])
-        .start()
-        .await;
-
-    let all: Vec<&str> = providers::catalog::MODEL_ROUTES
-        .iter()
-        .map(|r| r.model)
-        .collect();
-    assert_eq!(listed_ids(&gw, "sk-byo-caller").await, all);
 }
 
 const CLAUDE: &str = "claude-opus-4-8";

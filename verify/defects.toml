@@ -2470,7 +2470,7 @@ claims = ["E4", "CAT-9"]
 state = "fixed"
 test = "v1_models_lists_only_rows_an_openai_pool_key_serves"
 fix = "85cea3f"
-note = "Fixed: GatewayState::new renders the list once at boot (state::models_list_body) from the rows with at least one candidate on a pool-keyed provider; a row whose primary is unkeyed but whose fallback is keyed stays listed. A BYO-only deployment (no pool keys) lists the whole catalog so callers with their own keys can discover names. Same shape; one body per deployment, independent of the caller's key type. Also tested: v1_models_lists_claude_but_not_together_only_rows_on_anthropic_and_openrouter (no catalog row is Together-only today; it checks the rows with no anthropic or openrouter candidate, e.g. openai/gpt-oss-120b), v1_models_on_a_byo_only_deployment_lists_the_whole_catalog, models_list_json_where_keeps_shape_and_order. The E4 live probes' VERIFY_CATALOG_ROWS is now the keyed row count for the cell's pools."
+note = "Fixed: GatewayState::new renders the list once at boot (state::models_list_body) from the rows with at least one candidate on a pool-keyed provider; a row whose primary is unkeyed but whose fallback is keyed stays listed. Same shape; one body per deployment. (As first fixed, a BYO-only deployment listed the whole catalog and BYO callers got the same body; D254 replaced both: a BYO caller now gets its provider's own list.) Also tested: v1_models_lists_claude_but_not_together_only_rows_on_anthropic_and_openrouter (no catalog row is Together-only today; it checks the rows with no anthropic or openrouter candidate, e.g. openai/gpt-oss-120b), models_list_json_filter_keeps_shape_and_order. The E4 live probes' VERIFY_CATALOG_ROWS is now the keyed row count for the cell's pools."
 
 [[defect]]
 id = "D253"
@@ -2513,3 +2513,17 @@ state = "fixed"
 test = "a_pro_row_waits_past_read_timeout_for_its_head"
 fix = "1069390"
 note = "Fixed: no vendor documents a maximum request duration, so any number would be a guess. Rows catalog::long_running marks (owner openai, model ending -pro) get no gateway silence deadline; the request ends at the client's own timeout (a cancel the gateway sees and bills per D130) or a dead transport (h2 PING, TCP keepalive). Every other row keeps read_timeout_secs. Covers catalog walks (managed /v1, /auto); a provider-routed BYO path has no row and keeps the default. Unit test: long_running_is_exactly_openais_pro_rows."
+
+[[defect]]
+id = "D254"
+severity = "low"
+area = "Catalog"
+title = "BYO callers were listed Beyond's catalog instead of their provider's models"
+impact = "A BYO caller never uses the catalog: on /v1 its key goes straight to its own provider. GET /v1/models still answered it with Beyond's catalog (the keyed rows, or the whole catalog on a deployment with no pool keys), so a BYO client was shown names its provider may not serve (Claude rows to an OpenAI key) and missed models its provider does serve."
+confidence = "high"
+evidence = "proxy.rs answered every GET/HEAD /v1/models from GatewayState::models_list before the managed allowlist, whatever the key; v1_models_lists_only_rows_an_openai_pool_key_serves asserted a BYO caller got the same body as a managed one."
+claims = ["E4", "A1"]
+state = "fixed"
+test = "byo_openai_key_lists_openais_models"
+fix = "FIXME"
+note = "Fixed: only a managed key's GET/HEAD /v1/models is answered from the boot-built keyed catalog. A BYO one is not intercepted: it takes the BYO /v1 route (credential shape, else the path's default dialect, OpenAI for /v1/models) and is a plain relay of the provider's own list with the caller's key and headers, and no ai.usage row. The BYO-only whole-catalog listing and providers::catalog::models_list_json's unfiltered form are gone. Also tested: byo_anthropic_key_lists_anthropics_models, opaque_byo_key_lists_from_the_path_default, managed_key_still_lists_the_keyed_catalog; live, E4+A1::raw::{claude,gpt}::byo_models_raw holds each BYO list to the provider's own, fetched directly."

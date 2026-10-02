@@ -2280,26 +2280,19 @@ pub fn for_model(name: &str) -> Option<&'static ModelRoute> {
     }
 }
 
-/// OpenAI-shaped `GET /v1/models` body for the catalog, readable by the Anthropic SDK too
-/// (`display_name`, `has_more`). Beyond OpenAI's fields each model carries `wire` (`"openai"` /
-/// `"anthropic"`, so a caller can pick the matching SDK), its [`ModelCard`] (`context_window`,
-/// `max_output_tokens`, `input_modalities`, `output_modalities`, `capabilities`), the `endpoints` it
-/// answers on (any generation row serves all three through translation), and `pricing` (USD per
-/// million tokens — see [`ListPrice`]). Ids are log-safe (`[a-z0-9._/-]`), display names are
-/// tested free of quotes and backslashes, and prices are decimal strings, so this needs no JSON
-/// escaping.
+/// OpenAI-shaped `GET /v1/models` body over the catalog rows `keep` accepts, in catalog order,
+/// readable by the Anthropic SDK too (`display_name`, `has_more`). Beyond OpenAI's fields each model
+/// carries `wire` (`"openai"` / `"anthropic"`, so a caller can pick the matching SDK), its
+/// [`ModelCard`] (`context_window`, `max_output_tokens`, `input_modalities`, `output_modalities`,
+/// `capabilities`), the `endpoints` it answers on (any generation row serves all three through
+/// translation), and `pricing` (USD per million tokens — see [`ListPrice`]). Ids are log-safe
+/// (`[a-z0-9._/-]`), display names are tested free of quotes and backslashes, and prices are
+/// decimal strings, so this needs no JSON escaping.
 ///
-/// This is the whole compiled catalog. A gateway lists only the rows it can serve, and builds that
-/// body once at boot with [`models_list_json_where`].
-pub fn models_list_json() -> &'static str {
-    static JSON: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    JSON.get_or_init(|| models_list_json_where(|_| true))
-}
-
-/// [`models_list_json`] over only the rows `keep` accepts, in catalog order. Same shape and fields:
-/// a filtered list is a shorter `data` array and nothing else. It builds a fresh `String`, so a
-/// caller builds it once (the gateway does, at boot) rather than per request.
-pub fn models_list_json_where(keep: impl Fn(&ModelRoute) -> bool) -> String {
+/// A filtered list is a shorter `data` array and nothing else. It builds a fresh `String`, so a
+/// caller builds it once (the gateway does, at boot, over the rows its pool keys serve) rather than
+/// per request.
+pub fn models_list_json(keep: impl Fn(&ModelRoute) -> bool) -> String {
     {
         use std::fmt::Write as _;
         fn names(out: &mut String, bits: u8, table: &[(u8, &str)]) {
@@ -2746,22 +2739,20 @@ mod tests {
     /// claim: E4
     /// defect: D250
     #[test]
-    fn models_list_json_where_keeps_shape_and_order() {
-        assert_eq!(models_list_json_where(|_| true), models_list_json());
+    fn models_list_json_filter_keeps_shape_and_order() {
         let none: serde_json::Value =
-            serde_json::from_str(&models_list_json_where(|_| false)).expect("valid JSON");
+            serde_json::from_str(&models_list_json(|_| false)).expect("valid JSON");
         assert_eq!(none["object"], "list");
         assert_eq!(none["has_more"], false);
         assert_eq!(none["data"], serde_json::json!([]));
 
-        let full: serde_json::Value = serde_json::from_str(models_list_json()).unwrap();
+        let full: serde_json::Value = serde_json::from_str(&models_list_json(|_| true)).unwrap();
         let openai = |r: &ModelRoute| {
             r.candidates
                 .iter()
                 .any(|c| c.provider == ProviderId::OpenAi)
         };
-        let some: serde_json::Value =
-            serde_json::from_str(&models_list_json_where(openai)).unwrap();
+        let some: serde_json::Value = serde_json::from_str(&models_list_json(openai)).unwrap();
         let want: Vec<&serde_json::Value> = MODEL_ROUTES
             .iter()
             .zip(full["data"].as_array().unwrap())
@@ -2777,7 +2768,8 @@ mod tests {
     /// claim: E4
     #[test]
     fn models_list_json_describes_every_row() {
-        let v: serde_json::Value = serde_json::from_str(models_list_json()).expect("valid JSON");
+        let v: serde_json::Value =
+            serde_json::from_str(&models_list_json(|_| true)).expect("valid JSON");
         assert_eq!(v["object"], "list");
         assert_eq!(v["pricing_unit"], "usd_per_million_tokens");
         assert_eq!(v["has_more"], false);

@@ -1495,6 +1495,31 @@ def byo_raw():
     return ok, {"managed": s, "byo": b.status_code, "forged": f.status_code}
 
 
+def byo_models_raw():
+    """E4 + A1 on the wire (D254): a BYO key's GET /v1/models is its own provider's list, not the
+    catalog. Listed through the gateway and fetched directly from the provider with the same key,
+    the ids match; the listing writes no row."""
+    byo = os.environ["VERIFY_BYO_KEY"]
+    if PROVIDER == "anthropic":
+        headers, direct_url = {"x-api-key": byo, **ANTHROPIC_VERSION}, "https://api.anthropic.com/v1/models"
+    else:
+        headers, direct_url = bearer(byo), "https://api.openai.com/v1/models"
+    params = {"limit": 1000}
+    g = http().get(f"{BASE}/v1/models", params=params, headers=headers)
+    record("models", None, rows=0)
+    with httpx.Client(timeout=60) as c:
+        d = c.get(direct_url, params=params, headers=headers)
+    gj, dj = (g.json() if g.status_code == 200 else {}), (d.json() if d.status_code == 200 else {})
+    gids = sorted(m.get("id") for m in gj.get("data") or [])
+    dids = sorted(m.get("id") for m in dj.get("data") or [])
+    # The catalog's rows carry `pricing`; a provider's own list never does.
+    catalog_shaped = any("pricing" in m for m in gj.get("data") or [])
+    ok = g.status_code == 200 and d.status_code == 200 and bool(dids) and gids == dids and not catalog_shaped
+    return ok, {"gateway": g.status_code, "direct": d.status_code, "gateway_ids": len(gids), "direct_ids": len(dids),
+                "only_gateway": sorted(set(gids) - set(dids))[:5], "only_direct": sorted(set(dids) - set(gids))[:5],
+                "catalog_shaped": catalog_shaped}
+
+
 def raw_auto_cache():
     """K1 on the wire: a three-turn Chat conversation with a long system prompt and no
     cache_control reads the cache from turn 2 on; the row agrees."""
@@ -1773,7 +1798,7 @@ PROBES = {f.__name__: f for f in [
     reasoning_metered, web_search, mid_system, developer_role, cache_control_turns, cache_control_parts,
     max_tokens_clamp, strict_tools, explicit_nulls, context_overflow, agents_handoff, langchain_agent,
     langchain_embeddings, agents_structured, thinking_no_echo, raw_models, raw_count_compact, raw_failover, raw_steer,
-    raw_session_pin, raw_big_body, raw_stream_abort, byo_raw, raw_auto_cache, raw_embeddings, leak_scan, h2_burst,
+    raw_session_pin, raw_big_body, raw_stream_abort, byo_raw, byo_models_raw, raw_auto_cache, raw_embeddings, leak_scan, h2_burst,
     long_output, long_output_responses, long_output_nonstream]}
 
 if __name__ == "__main__":

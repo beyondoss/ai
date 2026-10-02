@@ -752,7 +752,7 @@ async fn the_path_and_method_table_is_pinned() {
             None,
         ),
         ("POST", "/", &managed, None, gpt.clone(), 404, None),
-        // Managed: POST only; GET/HEAD /v1/models answered from the catalog for anyone with a key.
+        // Managed: POST only; GET/HEAD /v1/models answered from the keyed catalog.
         (
             "PUT",
             "/v1/chat/completions",
@@ -789,7 +789,16 @@ async fn the_path_and_method_table_is_pinned() {
             200,
             None,
         ),
-        ("GET", "/v1/models/", &byo, None, String::new(), 200, None),
+        // BYO never uses the catalog: its listing relays to the provider its key belongs to.
+        (
+            "GET",
+            "/v1/models/",
+            &byo,
+            None,
+            String::new(),
+            200,
+            Some("/v1/models/"),
+        ),
         ("GET", "/v1/models", &none, None, String::new(), 401, None),
         // CORS is a non-goal: a preflight is just another request.
         (

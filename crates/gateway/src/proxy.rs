@@ -29,7 +29,7 @@
 //! large body fails over. Unknown or missing model → 404 naming the miss. Chat Completions ↔ Messages ↔ Responses on a managed catalog walk is
 //! translated; inbound Responses with session state walks a GPT row's `/v1/responses` arm (byte
 //! relay) or 400s if none remain, naming the field. Any other inbound path vs row endpoint mismatch
-//! → 400. `GET /v1/models` lists the catalog.
+//! → 400. A managed `GET /v1/models` lists the keyed catalog; a BYO one relays to its provider.
 //!
 //! One deliberate exception to the no-buffer rule: a **managed** OpenAI Chat Completions request is
 //! buffered and gets `stream_options.include_usage` injected when it streams without it (or forced
@@ -60,8 +60,9 @@
 //! dialect. Inbound `/v1/responses` with session state (`previous_response_id`, or `store` not
 //! explicitly false) walks the row's Responses arm or 400s; `store: false` one-shots may still
 //! translate onto Chat Completions. Other inbound-path mismatches are still a 400. `GET /v1/models`
-//! lists the catalog. `/{provider}/…` is the escape hatch, does not consult the catalog, and never
-//! translates. An unknown first segment is a 404.
+//! lists the keyed catalog to a managed key and relays a BYO key to its provider. `/{provider}/…`
+//! is the escape hatch, does not consult the catalog, and never translates. An unknown first
+//! segment is a 404.
 
 use crate::cache;
 use crate::capture::CaptureBufs;
@@ -2832,8 +2833,9 @@ fn dialect_for_path(path: &str) -> Dialect {
     }
 }
 
-/// Stock OpenAI/Anthropic SDKs list models at `GET /v1/models`. Intercepted before the catalog walk
-/// so an empty GET body is not a missing-model 404.
+/// Stock OpenAI/Anthropic SDKs list models at `GET /v1/models`. A managed request is answered from
+/// the keyed catalog before the catalog walk, so an empty GET body is not a missing-model 404. A BYO
+/// one relays to its provider like any BYO `/v1` request.
 fn is_v1_models_list(session: &Session) -> bool {
     let req = session.req_header();
     let path = req.uri.path();
@@ -3739,11 +3741,11 @@ impl ProxyHttp for AiProxy {
             .await;
         }
 
-        // Stock SDKs list models at GET /v1/models. Serve the catalog here so an empty GET is not
-        // a missing-model 404, and so BYO keys can discover names before they hold a managed one.
-        // The body is the rows this deployment's pool keys can serve (the whole catalog when it has
-        // none), built once at boot; it is the same for every caller whatever their key type.
-        if is_v1_models_list(session) {
+        // Stock SDKs list models at GET /v1/models. A managed caller is answered here, from the
+        // catalog rows this deployment's pool keys can serve (built once at boot), so an empty GET
+        // is not a missing-model 404. A BYO caller never uses the catalog: like any BYO `/v1`
+        // request it relays to the provider its key belongs to, which answers with its own list.
+        if managed && is_v1_models_list(session) {
             let body = self.state.models_list.clone();
             return Self::reply_models_list_boxed(session, &request_id, body).await;
         }

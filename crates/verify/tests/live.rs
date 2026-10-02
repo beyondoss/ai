@@ -333,6 +333,9 @@ const CELLS: &[Cell] = &[
     ("R5",                "raw",           Runtime::Python, "raw_big_body",     &[CLAUDE, FAILOVER], "R1"),
     ("B2+BIL-20",         "raw",           Runtime::Python, "raw_stream_abort", CLAUDE_GPT, ""),
     ("A1",                "raw",           Runtime::Python, "byo_raw",          CLAUDE_GPT, ""),
+    // A BYO key's /v1/models is its provider's own list (D254): Anthropic's key on the Claude
+    // route, OpenAI's on the GPT route, each held to the provider's list fetched directly.
+    ("E4+A1",             "raw",           Runtime::Python, "byo_models_raw",   CLAUDE_GPT, ""),
     ("K1+B3",             "raw",           Runtime::Python, "raw_auto_cache",   &[CLAUDE], ""),
     ("M1+B1",             "raw",           Runtime::Python, "raw_embeddings",   &[EMBED], ""),
     ("SEC-7",             "raw",           Runtime::Python, "leak_scan",        CLAUDE_GPT, ""),
