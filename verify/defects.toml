@@ -2457,3 +2457,17 @@ state = "fixed"
 test = "concurrent_streams_refused_by_one_goaway_are_all_resent"
 fix = "18068af"
 note = "Fixed: a GOAWAY refusal on a connection the request found already open (client_reused) is a drain casualty: resent without spending the one refused resend, bounded by pingora's retry limit (each needs a live connection that served before). A GOAWAY on a connection the request opened, and every RST_STREAM(REFUSED_STREAM), keep D91's one resend. Streams at or below last_stream_id never get the go_away error, so they stay under D09. Second shape, found once the first was fixed (10 to 60% of hermetic runs under load): a resend whose body write met the GOAWAY failed as pingora H2Error 'cannot reserve capacity' (stream closed, bytes unsent, no h2 reason), which body_delivered counted as delivered: 502 'upstream failed after receiving the request'. Fixed: h2_body_unsent makes it a write failure (END_STREAM never went out), retried as an undelivered failure on a reused connection. The mock now drains like a real server (finishes streams at or below its last id for 200 ms, never refuses one below a stream it served); its old GOAWAY could break §6.8 and caused a broken-pipe flake. Open, unexplained: under single-CPU contention a second burst reusing the drained mock connections saw tries-1 broken pipes (no GOAWAY reached the h2 client before EOF); the test stays at one burst and reports a run with no refusal as inconclusive."
+
+[[defect]]
+id = "D250"
+severity = "med"
+area = "Catalog"
+title = "GET /v1/models listed rows the deployment holds no pool key to serve"
+impact = "The listing was the whole compiled catalog whatever pool keys were configured, so a deployment without a provider's key advertised rows none of whose candidates it could reach; a managed client that picked one got a 503."
+confidence = "high"
+evidence = "proxy.rs served providers::catalog::models_list_json() for every GET /v1/models; the doctor's model_catalog check already computed the unreachable rows from the same pool keys but nothing used it for the listing. Hermetic: a gateway with only an openai pool key listed claude-opus-4-8."
+claims = ["E4", "CAT-9"]
+state = "fixed"
+test = "v1_models_lists_only_rows_an_openai_pool_key_serves"
+fix = "6a4e403"
+note = "Fixed: GatewayState::new renders the list once at boot (state::models_list_body) from the rows with at least one candidate on a pool-keyed provider; a row whose primary is unkeyed but whose fallback is keyed stays listed. A BYO-only deployment (no pool keys) lists the whole catalog so callers with their own keys can discover names. Same shape; one body per deployment, independent of the caller's key type. Also tested: v1_models_lists_claude_but_not_together_only_rows_on_anthropic_and_openrouter (no catalog row is Together-only today; it checks the rows with no anthropic or openrouter candidate, e.g. openai/gpt-oss-120b), v1_models_on_a_byo_only_deployment_lists_the_whole_catalog, models_list_json_where_keeps_shape_and_order. The E4 live probes' VERIFY_CATALOG_ROWS is now the keyed row count for the cell's pools."
