@@ -1064,6 +1064,50 @@ async fn a_slow_drip_stream_survives_a_short_read_timeout() {
     assert_eq!(row["usage_estimated"], false, "{row}");
 }
 
+/// A non-stream call to a pro row can stay silent before its head for longer than
+/// `read_timeout_secs`: OpenAI documents those models as taking "several minutes" and publishes no
+/// maximum. That row has no gateway silence deadline, so the answer arrives and is billed as
+/// answered; the same silence on any other row is still the gateway's 504 (D130).
+/// claim: REL-1
+/// claim: BIL-3
+/// defect: D252
+#[tokio::test]
+async fn a_pro_row_waits_past_read_timeout_for_its_head() {
+    const ANSWER: &str = r#"{"id":"resp_1","object":"response","created_at":1,"status":"completed","model":"gpt-5-pro","output":[{"type":"message","id":"msg_1","role":"assistant","status":"completed","content":[{"type":"output_text","text":"DONE","annotations":[]}]}],"usage":{"input_tokens":5,"input_tokens_details":{"cached_tokens":0},"output_tokens":2,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":7}}"#;
+    let up = ScriptedUpstream::start(|_, _| {
+        let mut out = http_head(200, "application/json", Some(ANSWER.len()));
+        out.extend_from_slice(ANSWER.as_bytes());
+        vec![Step::Sleep(Duration::from_millis(2500)), Step::Write(out)]
+    })
+    .await;
+    for (model, answered) in [("gpt-5-pro", true), ("gpt-5", false)] {
+        let (pubkey, sk) = test_keypair(172);
+        let gw = Gateway::builder(unused_nats_port(), &up.authority(), &b64(&pubkey))
+            .providers(&["openai", "openrouter"])
+            .config_line("read_timeout_secs = 1")
+            .start()
+            .await;
+        let resp = post(
+            &gw,
+            "/v1/responses",
+            &billing_vkey(&sk, 1702),
+            &format!(r#"{{"model":"{model}","input":"hi"}}"#),
+        )
+        .await;
+        let status = resp.status().as_u16();
+        let text = resp.text().await.unwrap_or_default();
+        if answered {
+            assert_eq!(status, 200, "{model}: {text}");
+            assert!(text.contains("DONE"), "{model}: {text}");
+            let row = usage_row_of(&gw).await;
+            assert_eq!(row["output_tokens"].as_u64(), Some(2), "{row}");
+            assert_eq!(row["usage_estimated"], false, "{row}");
+        } else {
+            assert_eq!(status, 504, "{model}: {text}");
+        }
+    }
+}
+
 /// A chunked SSE head and one event, then the connection closes without the terminating chunk.
 fn dies_mid_stream(_: &[u8], _: usize) -> Vec<Step> {
     let event = "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4o-mini\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n";

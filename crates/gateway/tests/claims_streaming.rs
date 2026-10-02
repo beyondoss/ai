@@ -206,6 +206,75 @@ async fn a_same_wire_openrouter_chat_relay_streams_each_event_as_it_arrives() {
     }
 }
 
+/// A translated stream whose provider sends only keep-alives while the model thinks (Anthropic's
+/// `event: ping`, here to a Chat Completions client) still hands its client a byte per ping: an
+/// SSE comment, which every SSE parser ignores, so a load balancer's idle timeout does not cut a
+/// stream that is alive. The answer that follows, and the row, are as without the pings.
+/// claim: S1
+/// claim: REL-1
+/// defect: D251
+#[tokio::test]
+async fn a_translated_stream_turns_provider_pings_into_keep_alive_comments() {
+    const GAP: Duration = Duration::from_millis(250);
+    const PINGS: usize = 4;
+    let provider = ScriptedUpstream::start(move |_, _| {
+        let mut head = http_head(200, "text/event-stream", None);
+        head.extend_from_slice(CLAUDE_FIRST.as_bytes());
+        let mut steps = vec![Step::Write(head)];
+        for _ in 0..PINGS {
+            steps.push(Step::Sleep(GAP));
+            steps.push(Step::Write(
+                b"event: ping\ndata: {\"type\": \"ping\"}\n\n".to_vec(),
+            ));
+        }
+        steps.push(Step::Sleep(GAP));
+        steps.push(Step::Write(CLAUDE_REST.as_bytes().to_vec()));
+        steps
+    })
+    .await;
+    let (pubkey, sk) = test_keypair(73);
+    let gw = Gateway::builder(unused_nats_port(), &provider.authority(), &b64(&pubkey))
+        .providers(&["anthropic"])
+        .start()
+        .await;
+    let body = r#"{"model":"claude-opus-4-8","stream":true,"stream_options":{"include_usage":true},"messages":[{"role":"user","content":"hi"}]}"#;
+    let mut resp = post_stream(&gw, &billing_vkey(&sk, 73), "/v1/chat/completions", body).await;
+    assert_eq!(resp.status().as_u16(), 200);
+    let mut text = String::new();
+    let mut alive_before_last = 0;
+    while let Some(c) = tokio::time::timeout(Duration::from_secs(10), resp.chunk())
+        .await
+        .expect("the stream must not hang")
+        .unwrap()
+    {
+        let c = String::from_utf8_lossy(&c);
+        if !text.contains("LAST") && !c.contains("LAST") {
+            alive_before_last += c.matches(": keep-alive\n\n").count();
+        }
+        text.push_str(&c);
+    }
+    assert_eq!(
+        alive_before_last, PINGS,
+        "one keep-alive comment per provider ping, before the answer: {text}"
+    );
+    assert!(
+        !text.contains("ping"),
+        "the ping itself is not relayed: {text}"
+    );
+    // The events, comments aside, are what a ping-free stream gives.
+    let events: Vec<&str> = text
+        .split("\n\n")
+        .filter(|e| !e.is_empty() && !e.starts_with(':'))
+        .collect();
+    assert!(events.iter().any(|e| e.contains("FIRST")), "{text}");
+    assert!(events.iter().any(|e| e.contains("LAST")), "{text}");
+    assert_eq!(events.last(), Some(&"data: [DONE]"), "{text}");
+    let row = usage_row_of(&gw).await;
+    assert_eq!(row["input_tokens"].as_u64(), Some(5), "{row}");
+    assert_eq!(row["output_tokens"].as_u64(), Some(2), "{row}");
+    assert_ne!(row["usage_estimated"], true, "{row}");
+}
+
 /// A deploy signal lands while a stream is open. The stream finishes, whole, and is billed.
 /// claim: S3
 #[tokio::test]

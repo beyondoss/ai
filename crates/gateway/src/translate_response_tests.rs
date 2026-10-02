@@ -22,9 +22,10 @@ fn json_status(up: Endpoint, client: Endpoint, status: u16, v: &Value) -> Value 
 /// One SSE event: its `event:` name (empty when unnamed) and its data (`"[DONE]"` as a string).
 type Event = (String, Value);
 
+/// Comment-only events (the bridge's keep-alives, D251) are skipped, as every SSE parser skips them.
 fn events(out: &str) -> Vec<Event> {
     out.split("\n\n")
-        .filter(|e| !e.trim().is_empty())
+        .filter(|e| !e.trim().is_empty() && !e.lines().all(|l| l.starts_with(':')))
         .map(|e| {
             let mut name = String::new();
             let mut data = String::new();
@@ -2222,6 +2223,97 @@ fn a_chat_relay_forwards_untouched_events_byte_for_byte() {
     // (OpenRouter's keep-alive) passes through too.
     let src = format!(": OPENROUTER PROCESSING\n\n{OPENAI_PARALLEL_SSE}");
     assert_eq!(run(Chat, Chat, &[src.as_bytes()]), src);
+}
+
+/// Feed `chunks` one call each; what each call returned.
+fn feeds(b: &mut SseBridge, chunks: &[&[u8]]) -> Vec<String> {
+    chunks
+        .iter()
+        .map(|c| String::from_utf8(b.feed(c, false)).unwrap())
+        .collect()
+}
+
+const ALIVE: &str = ": keep-alive\n\n";
+const ANT_START: &str = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n";
+const ANT_PING: &str = "event: ping\ndata: {\"type\": \"ping\"}\n\n";
+
+#[test]
+fn a_translated_stream_answers_a_ping_with_a_keep_alive_comment() {
+    // D251: a ping maps to no client event, so the client gets a comment in its place; one per
+    // feed that consumed an event and wrote nothing, never alongside real output.
+    for client in [Chat, Responses] {
+        let mut b = SseBridge::new(client, Messages);
+        let two = format!("{ANT_PING}{ANT_PING}");
+        let out = feeds(
+            &mut b,
+            &[
+                ANT_START.as_bytes(),
+                ANT_PING.as_bytes(),
+                two.as_bytes(),
+                &ANT_PING.as_bytes()[..5],
+                b"",
+            ],
+        );
+        assert!(
+            !out[0].is_empty() && !out[0].contains(ALIVE),
+            "{client:?}: {out:?}"
+        );
+        assert_eq!(out[1], ALIVE, "{client:?}");
+        assert_eq!(out[2], ALIVE, "at most one per feed: {client:?}");
+        assert_eq!(out[3], "", "half an event consumed nothing: {client:?}");
+        assert_eq!(out[4], "", "no event, no comment: {client:?}");
+        let rest = format!("{}{ANT_PING}", &ANT_PING[5..]);
+        assert_eq!(feeds(&mut b, &[rest.as_bytes()]), [ALIVE], "{client:?}");
+    }
+}
+
+#[test]
+fn hidden_thinking_is_answered_with_keep_alives() {
+    // OpenRouter streams Claude's thinking with its signature last; a Messages client gets the
+    // block whole once signed, so each held delta is a keep-alive meanwhile.
+    let delta = |d: &str| {
+        format!(
+            "data: {{\"id\":\"gen-1\",\"model\":\"anthropic/claude-opus-4.8\",\"choices\":[{{\"index\":0,\"delta\":{d}}}]}}\n\n"
+        )
+    };
+    let start = delta(r#"{"role":"assistant","content":"hi"}"#);
+    let thinking = delta(
+        r#"{"reasoning_details":[{"type":"reasoning.text","text":"hm","format":"anthropic-claude-v1","index":0}]}"#,
+    );
+    let mut b = SseBridge::new(Messages, Chat);
+    let out = feeds(
+        &mut b,
+        &[
+            start.as_bytes(),
+            thinking.as_bytes(),
+            b": OPENROUTER PROCESSING\n\n",
+        ],
+    );
+    assert!(out[0].contains("message_start"), "{out:?}");
+    assert_eq!(out[1], ALIVE, "{out:?}");
+    assert_eq!(out[2], ALIVE, "{out:?}");
+}
+
+#[test]
+fn no_keep_alive_where_the_bridge_owes_none() {
+    // A same-wire relay forwards the provider's own keep-alives as they came.
+    let mut relay = SseBridge::new(Messages, Messages);
+    assert_eq!(feeds(&mut relay, &[ANT_PING.as_bytes()]), [ANT_PING]);
+    let mut chat = SseBridge::new(Chat, Chat);
+    let or = ": OPENROUTER PROCESSING\n\n";
+    assert_eq!(feeds(&mut chat, &[or.as_bytes()]), [or]);
+    // An assembling bridge writes no event at all: its client is waiting for one JSON body.
+    let mut asm = SseBridge::assembling(Messages);
+    assert_eq!(
+        feeds(&mut asm, &[ANT_START.as_bytes(), ANT_PING.as_bytes()]),
+        ["", ""]
+    );
+    // Nothing follows an error.
+    let mut b = SseBridge::new(Chat, Messages);
+    let err = "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"x\"}}\n\n";
+    let out = feeds(&mut b, &[err.as_bytes(), ANT_PING.as_bytes()]);
+    assert!(out[0].contains("overloaded"), "{out:?}");
+    assert_eq!(out[1], "", "{out:?}");
 }
 
 #[test]

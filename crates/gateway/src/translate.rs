@@ -5660,6 +5660,16 @@ fn index_of(item: &Value, pos: usize) -> u64 {
         .unwrap_or(pos as u64)
 }
 
+/// An SSE comment line, sent to a translated stream's client in place of upstream events that
+/// map to nothing for it: Anthropic's `event: ping`, OpenRouter's `: OPENROUTER PROCESSING`, and
+/// thinking or a reasoning summary the client's dialect does not carry, or holds until its block
+/// is whole (D251). Dropping them left the client no byte for as long as the model thought, and a
+/// load balancer's or proxy's idle timeout (often 60–100 s) cut the stream. Every SSE parser
+/// ignores a line that starts with `:`, so the client's events are unchanged. At most one per
+/// [`SseBridge::feed`] call that consumed an event and wrote nothing, so the cadence is the
+/// provider's own (Anthropic pings every few seconds while it thinks) and needs no timer.
+pub const KEEP_ALIVE: &[u8] = b": keep-alive\n\n";
+
 /// What a client is told when the upstream stream ended without saying how.
 fn truncated_stream_error() -> Value {
     json!({ "error": {
@@ -5779,8 +5789,13 @@ impl SseBridge {
         buf.extend_from_slice(data);
         let mut out = Vec::new();
         let mut start = 0;
+        let mut consumed = false;
         while let Some((from, to)) = next_event(&buf, &mut start, &mut self.scanned) {
+            consumed = true;
             self.map_event(buf.get(from..to).unwrap_or_default(), &mut out);
+        }
+        if consumed && !end && out.is_empty() && self.keeps_alive() {
+            out.extend_from_slice(KEEP_ALIVE);
         }
         buf.drain(..start);
         self.scanned = self.scanned.saturating_sub(start);
@@ -5794,6 +5809,17 @@ impl SseBridge {
             out.extend(self.flush());
         }
         out
+    }
+
+    /// Whether a translated stream owes its client a [`KEEP_ALIVE`] for upstream events that
+    /// mapped to nothing (D251). A same-wire relay forwards the provider's own pings and comments
+    /// as they came; an assembling bridge writes no event; and nothing follows an error or the
+    /// client's terminal event.
+    fn keeps_alive(&self) -> bool {
+        self.upstream != self.client
+            && !self.oai_to_resp.quiet
+            && !self.errored
+            && !self.client_ended()
     }
 
     fn map_event(&mut self, raw: &[u8], out: &mut Vec<u8>) {

@@ -392,6 +392,20 @@ const STREAM_ONLY: &[(ProviderId, &str)] = &[
     (ProviderId::Together, "Qwen/Qwen3.8-Flash"),
 ];
 
+/// Whether a row's requests may stay silent for longer than any client's default timeout: OpenAI's
+/// `-pro` models (o3-pro, gpt-5-pro, gpt-5.x-pro and later), whose model pages each say "some
+/// requests may take several minutes to finish. To avoid timeouts, try using background mode"
+/// (developers.openai.com/api/docs/models/gpt-5-pro, and the gpt-5.4-pro and gpt-5.5-pro pages).
+/// OpenAI publishes no maximum request duration for them, and neither does Anthropic for any model
+/// (its "Long requests" note recommends streaming past 10 minutes, and its SDKs refuse a
+/// non-streaming call expected to run longer). So the gateway sets no silence deadline of its own
+/// on these rows (D252): any number would be a guess that 504s a call the provider still bills.
+/// Matched by owner and suffix, not a list, so a new `-pro` row is covered the day it lands; no
+/// other owner's `-pro` (DeepSeek's) carries the note.
+pub fn long_running(row: &ModelRoute) -> bool {
+    row.card.owned_by == "openai" && row.model.ends_with("-pro")
+}
+
 /// Whether a candidate answers only streams. See [`STREAM_ONLY`].
 pub fn stream_only(c: &Candidate) -> bool {
     STREAM_ONLY
@@ -2371,6 +2385,30 @@ mod tests {
     /// served on is not a row. It came down to 80 when the seven OpenAI rows due to shut down on
     /// 2026-10-23 left early by owner decision (D243): 91 rows became 84, and the floor follows the
     /// table rather than the table being padded to meet it.
+    /// D252: the rows OpenAI documents as taking "several minutes" get no gateway silence
+    /// deadline; every other row keeps `read_timeout_secs`.
+    #[test]
+    fn long_running_is_exactly_openais_pro_rows() {
+        let long: Vec<&str> = MODEL_ROUTES
+            .iter()
+            .filter(|r| long_running(r))
+            .map(|r| r.model)
+            .collect();
+        for m in [
+            "o3-pro",
+            "gpt-5-pro",
+            "gpt-5.2-pro",
+            "gpt-5.4-pro",
+            "gpt-5.5-pro",
+        ] {
+            assert!(long.contains(&m), "{m}: {long:?}");
+        }
+        for m in ["deepseek-v4-pro", "gpt-5", "claude-opus-4-8"] {
+            assert!(!long.contains(&m), "{m}: {long:?}");
+        }
+        assert!(long.iter().all(|m| m.ends_with("-pro")), "{long:?}");
+    }
+
     #[test]
     fn catalog_lists_at_least_80_models() {
         assert!(

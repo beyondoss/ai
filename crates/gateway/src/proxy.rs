@@ -1226,7 +1226,12 @@ impl AiProxy {
     /// Extracted so the provider-routed path and the model-routed candidate walk cannot drift apart
     /// on TLS, ALPN, or timeouts — a fallback candidate connected on different terms than the
     /// primary would be a genuinely nasty thing to debug.
-    fn build_peer(&self, addr: std::net::SocketAddr, provider: &Provider) -> HttpPeer {
+    fn build_peer(
+        &self,
+        addr: std::net::SocketAddr,
+        provider: &Provider,
+        row: Option<&route::ModelRoute>,
+    ) -> HttpPeer {
         let mut peer = HttpPeer::new(addr, self.state.config.upstream_tls, provider.host.clone());
         // Prefer HTTP/2 to the provider (config `upstream_http2`, default on), fall back to HTTP/1.1.
         // Every provider in `KNOWN_PROVIDERS` negotiates `h2` over TLS (verified by handshake), and H2
@@ -1259,7 +1264,14 @@ impl AiProxy {
         // from a stuck provider, so the per-read bound (the wait for the head, and each gap between
         // body reads) is the clients' own: `read_timeout_secs`, 600s, the OpenAI and Anthropic
         // SDKs' default request timeout. A *dead* peer is detected by transport liveness instead.
-        peer.options.read_timeout = Some(Duration::from_secs(self.state.config.read_timeout_secs));
+        // Pingora applies it to every read, so before the head it is the whole wait. A row whose
+        // vendor documents requests running "several minutes" and publishes no maximum
+        // (`long_running`: OpenAI's `-pro` models) gets no silence deadline at all (D252): a
+        // non-stream call there can outlast 600s, and a 504 is still billed by the provider. Its
+        // end is the client's own timeout (a cancel the gateway sees and bills, D130) or a dead
+        // transport.
+        peer.options.read_timeout = (!row.is_some_and(providers::catalog::long_running))
+            .then(|| Duration::from_secs(self.state.config.read_timeout_secs));
         peer.options.h2_ping_interval = self.state.config.h2_ping_interval();
         peer.options.tcp_keepalive = self.state.config.upstream_tcp_keepalive();
         peer.options.write_timeout =
@@ -4747,7 +4759,11 @@ impl ProxyHttp for AiProxy {
                 }
             };
             rc.upstream_phase = UpstreamPhase::Attempted;
-            return Ok(Box::new(self.build_peer(addr, &rc.provider)));
+            return Ok(Box::new(self.build_peer(
+                addr,
+                &rc.provider,
+                rc.auto.as_ref().map(|a| a.route),
+            )));
         }
 
         // Model-routed: this hook owns the candidate walk *and* the breaker ledger.
@@ -4864,7 +4880,11 @@ impl ProxyHttp for AiProxy {
                             path.push_str(sub.suffix());
                         }
                         rc.upstream_phase = UpstreamPhase::Attempted;
-                        return Ok(Box::new(self.build_peer(addr, &p)));
+                        return Ok(Box::new(self.build_peer(
+                            addr,
+                            &p,
+                            rc.auto.as_ref().map(|a| a.route),
+                        )));
                     }
                     Err(e) => {
                         // DNS failure is handled *here*, inside the walk, rather than by returning
@@ -4918,7 +4938,11 @@ impl ProxyHttp for AiProxy {
             }
         };
         rc.upstream_phase = UpstreamPhase::Attempted;
-        Ok(Box::new(self.build_peer(addr, &rc.provider)))
+        Ok(Box::new(self.build_peer(
+            addr,
+            &rc.provider,
+            rc.auto.as_ref().map(|a| a.route),
+        )))
     }
 
     /// Fail over — or walk a pool key — before a byte of the error reaches the client.
