@@ -39,6 +39,8 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use common::free_port;
 use ed25519_dalek::{Signer as _, SigningKey};
 use libtest_mimic::{Arguments, Failed, Trial};
+use providers::by_id;
+use providers::catalog::MODEL_ROUTES;
 use serde_json::{Value, json};
 
 /// The dev signing key's public half (seed `[7; 32]`, kid 1), as `mise run ai:mint-dev-key` prints.
@@ -63,10 +65,8 @@ const GPT4O_MINI: Route = Route {
     model: "gpt-4o-mini",
     pools: &[("openai", "OPENAI_API_KEY")],
 };
-/// The Claude row with every candidate keyed, so a session pin has a real choice to make. Bedrock
-/// is keyed too: the ranker's every-8th probe promotes the first *unmeasured* candidate, keyed or
-/// not, so with Bedrock unkeyed it probes Bedrock, skips it, and OpenRouter is never measured or
-/// pinned (D119).
+/// The Claude row with every candidate keyed, so the computed session pin hashes over both
+/// first-party hosts (Anthropic + Bedrock) and OpenRouter is the failover a header can reach.
 const POOLED: Route = Route {
     name: "pooled3",
     model: "claude-haiku-4-5",
@@ -252,15 +252,53 @@ fn mint_kid(kid: u8, seed: &[u8; 32], tenant: u64, vpc: u64, key_id: u64) -> Str
     format!("{signed}.{}", URL_SAFE_NO_PAD.encode(sig.to_bytes()))
 }
 
+// --- session pins --------------------------------------------------------------------------------
+
+/// The provider the gateway's computed session pin (D253) puts first for a caller on `model`, with
+/// every candidate of the row keyed and no breaker open: the row's leading run of first-party hosts
+/// (a provider with its own model-id prefix) ordered by rendezvous hash of the pin key and the
+/// provider name, highest first. A reimplementation of `affinity`, `pin_key`, `provider_hash` and
+/// `preferred` in `crates/gateway/src/smart.rs` over the published inputs only: the caller's
+/// `(tenant, vpc, key_id)` from its token, the row's index in the sorted `MODEL_ROUTES`, and the
+/// providers' names. If the two ever disagree, `pin_isolation` fails on the first key.
+fn pinned_provider(tenant: u64, vpc: u64, key_id: u64, model: &str) -> &'static str {
+    fn mix(mut z: u64) -> u64 {
+        z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+    fn fnv(name: &str) -> u64 {
+        name.bytes().fold(0xCBF2_9CE4_8422_2325, |h, b| {
+            (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01B3)
+        })
+    }
+    let affinity =
+        mix(mix(mix(tenant ^ 0x243F_6A88_85A3_08D3) ^ vpc) ^ (key_id ^ 0x1319_8A2E_0370_7344));
+    let row_i = MODEL_ROUTES
+        .binary_search_by(|r| r.model.cmp(model))
+        .expect("the cell's model is a catalog row");
+    let key = mix(affinity ^ (row_i as u64).wrapping_mul(0xA076_1D64_78BD_642F));
+    let row = &MODEL_ROUTES[row_i];
+    row.candidates
+        .iter()
+        .take_while(|c| !by_id(c.provider).model_id_match.is_empty())
+        .map(|c| by_id(c.provider).name)
+        .max_by_key(|name| mix(key ^ fnv(name)))
+        // No first-party lead: catalog order.
+        .unwrap_or_else(|| by_id(row.candidates[0].provider).name)
+}
+
 /// Tenant A's `a1`, `a2` and tenant B's `b1` (distinct key ids, since the deny-set's key grain is
-/// one global id space); and `paNN` / `pbNN`, the same vpc and key id under each tenant, so a pin
-/// that ignored the tenant would show.
-fn session_keys() -> Value {
+/// one global id space); and `paNN` / `pbNN`, the same vpc and key id under each tenant. Each key
+/// carries `pin`, the provider [`pinned_provider`] computes for it on `model`.
+fn session_keys(model: &str) -> Value {
     let mut m = serde_json::Map::new();
     let mut add = |name: String, tenant: u64, key_id: u64| {
         m.insert(
             name,
-            json!({"token": mint_v2(tenant, 1, key_id), "tenant": tenant, "key_id": key_id}),
+            json!({"token": mint_v2(tenant, 1, key_id), "tenant": tenant, "key_id": key_id,
+                   "pin": pinned_provider(tenant, 1, key_id, model)}),
         );
     };
     add("a1".into(), TENANT_A, 101);
@@ -496,7 +534,7 @@ fn run_cell(
     );
     wait_ready(metrics_port, &mut gw.0, &log_path)?;
 
-    let ids = session_keys();
+    let ids = session_keys(route.model);
     // The pool keys, for a scenario that looks for them in what the client was sent (SEC-7).
     let pool_keys: Vec<&str> = route.pools.iter().map(|(_, var)| &*keys[*var]).collect();
     let mut child = Guard(

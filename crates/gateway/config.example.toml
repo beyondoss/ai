@@ -151,10 +151,10 @@ capture_queue_depth = 1024
 # parallel, divided across replicas.
 # tenant_max_in_flight = 0
 
-# Rank managed catalog walks (`/auto`, managed `/v1`) by observed time-to-first-byte. This process's
-# EWMA per catalog candidate; cold start is the row's static order. `x-beyond-order` / `split` pin
-# a sequence; `only` filters then ranks. Set false to always use catalog order. Not fleet-wide:
-# replicas do not share TTFT samples.
+# Order managed default walks (`/auto`, managed `/v1`) by the caller's computed session pin: the
+# row's leading first-party hosts by rendezvous hash of the caller, then catalog order. Every
+# replica computes the same walk. `x-beyond-order` / `split` fix a sequence; `only` filters, then
+# the pin applies. Set false to always use catalog order.
 # smart_router = true
 
 # The kid in [id_signing_keys] (below) that signs new tenant-bound Responses ids, e.g. "2". Empty

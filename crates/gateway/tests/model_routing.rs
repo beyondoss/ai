@@ -15,8 +15,6 @@ mod common;
 
 use beyond_ai::key::{VirtualKey, mint};
 
-/// `smart::PROBE_EVERY` (crate-private).
-const PROBE_EVERY: u64 = 8;
 use common::*;
 
 const MODEL: &str = "gpt-4o-mini";
@@ -192,9 +190,8 @@ async fn records_the_failed_candidates_breaker_not_the_serving_ones() {
     let client = test_client();
     let key = vkey(&sk);
     // Enough attempts to trip the dead primary's breaker several times over.
-    // Pin openai-first: after the first failover the TTFT ranker would otherwise put the live
-    // fallback first and the dead primary would stop being attempted, so the breaker would never
-    // open. The ledger this test exists to prove is "we keep walking the pinned sequence".
+    // Pin openai-first, so the dead primary is attempted until its breaker opens. The ledger this
+    // test exists to prove is "we keep walking the pinned sequence".
     for _ in 0..6 {
         let resp = client
             .post(format!("{}/auto/chat/completions", gw.url()))
@@ -986,8 +983,7 @@ async fn a_5xx_candidates_breaker_opens_while_the_fallback_keeps_serving() {
 
     let client = test_client();
     let key = vkey(&sk);
-    // Pin openai-first: after the first 5xx the TTFT ranker would otherwise put the live fallback
-    // first and the 500 primary would stop being attempted, so the breaker would never open.
+    // Pin openai-first, so the 500 primary is attempted until its breaker opens.
     for i in 0..6 {
         let resp = client
             .post(format!("{}/auto/chat/completions", gw.url()))
@@ -2296,9 +2292,9 @@ async fn split_over_n_requests_hits_both_primaries() {
     );
 }
 
-/// A session pin is not ranked: callers stay on the catalog primary although the fallback is
-/// faster, no probe moves one of them onto it, and `x-beyond-order` still reaches the fallback.
-/// Unranked is the point: TTFT differs per pod, and a pin every replica agrees on cannot use it.
+/// A session pin is not ranked by latency: callers stay on the catalog primary although the
+/// fallback is faster, and `x-beyond-order` still reaches the fallback. Latency differs per pod,
+/// and a pin every replica agrees on cannot use it.
 /// claim: R4
 #[tokio::test]
 async fn a_session_pin_ignores_a_faster_fallback() {
@@ -2327,8 +2323,8 @@ async fn a_session_pin_ignores_a_faster_fallback() {
             &sk,
         )
     };
-    // Past two probe seeds, from the same caller and from new ones.
-    for n in 0..(2 * PROBE_EVERY + 1) {
+    // Many turns, from the same caller and from new ones.
+    for n in 0..17 {
         let resp = post_auto(&client, &gw.url(), &key, Some(MODEL)).await;
         assert_eq!(resp.status().as_u16(), 200);
         let resp = post_auto(&client, &gw.url(), &fresh(n), Some(MODEL)).await;

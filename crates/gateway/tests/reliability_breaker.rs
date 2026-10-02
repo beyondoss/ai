@@ -1,4 +1,4 @@
-//! Reliability, verify phase 0: the circuit breaker and the TTFT ranker — what counts as healthy,
+//! Reliability, verify phase 0: the circuit breaker and failover — what counts as healthy,
 //! whether a brownout opens the breaker, and whether a half-open probe can wedge a provider.
 //!
 //! Run via `mise run test:integration:rs` (needs `nats-server` on PATH).
@@ -65,8 +65,8 @@ fn provider_of(resp: &reqwest::Response) -> String {
 }
 
 /// A row whose primary's pool key is revoked (fast 401) and whose fallback works (a little slower)
-/// must keep serving. Thirty callers (distinct tenants, so no session pin hides the row's rank) should
-/// mostly succeed on the fallback.
+/// must keep serving. Thirty callers (distinct tenants, each its own computed pin) should mostly
+/// succeed on the fallback.
 /// claim: REL-4
 /// defect: D10
 #[tokio::test]

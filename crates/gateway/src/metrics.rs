@@ -268,9 +268,9 @@ pub struct Metrics {
     /// The `key_auth_failures_total` children, resolved once at boot, indexed as
     /// [`KeyCooled::ALL`]. Pre-resolved so every reason is exported at 0 from boot, too.
     key_cooled: [IntCounter; 3],
-    /// Catalog walks whose primary came from a live session pin rather than the TTFT rank (see
-    /// `smart`'s "Session pins"). Against `ai_requests_total` it is the share of traffic being kept
-    /// on its provider's prompt cache; a sudden drop means pins are yielding (failures) or evicting.
+    /// Managed default walks ordered by the caller's computed session pin (see `pin`). Against
+    /// `ai_requests_total` it is the share of traffic whose walk the pin decided; the rest fixed
+    /// their own walk with `x-beyond-order` / `split`, or are sub-resources or Responses walks.
     pub session_pinned_total: IntCounter,
     /// Managed requests re-run as a subrequest because finding `model` (or Responses session
     /// state) took the whole body past pingora's 64 KiB replay buffer. Typical for stock Python
@@ -360,9 +360,6 @@ pub struct Metrics {
     /// store. A miss here still goes upstream even if another replica would have hit. Do not read
     /// this as "shared cache is healthy" — there is no shared cache on the miss path.
     pub cache_scope: IntGauge,
-    /// Constant `1` with `kind="process"`: TTFT ranking is this pod's EWMA table. Replicas do not
-    /// share samples, so two pods can walk the same catalog row in different orders.
-    pub smart_rank_scope: IntGauge,
 }
 
 /// TTFT buckets (seconds). Tuned for LLM latency: sub-second prompts up through the multi-second
@@ -537,15 +534,6 @@ impl Metrics {
         )?;
         let cache_scope_process = cache_scope.with_label_values(&["process"]);
         cache_scope_process.set(1);
-        let smart_rank_scope = IntGaugeVec::new(
-            Opts::new(
-                "ai_smart_rank_scope",
-                "Catalog-walk TTFT ranker scope. kind=process means this pod's EWMA only; not a fleet-wide ranking",
-            ),
-            &["kind"],
-        )?;
-        let smart_rank_scope_process = smart_rank_scope.with_label_values(&["process"]);
-        smart_rank_scope_process.set(1);
 
         r.register(Box::new(requests_total.clone()))?;
         r.register(Box::new(candidate_failovers_total.clone()))?;
@@ -579,7 +567,6 @@ impl Metrics {
         r.register(Box::new(usage_write_errors_total.clone()))?;
         r.register(Box::new(cache_hits_total.clone()))?;
         r.register(Box::new(cache_scope.clone()))?;
-        r.register(Box::new(smart_rank_scope.clone()))?;
 
         Ok(Arc::new(Self {
             requests_total,
@@ -620,7 +607,6 @@ impl Metrics {
             usage_write_errors_total,
             cache_hits_total,
             cache_scope: cache_scope_process,
-            smart_rank_scope: smart_rank_scope_process,
         }))
     }
 

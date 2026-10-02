@@ -20,8 +20,8 @@
 //! leaves nothing usable is a 503 from routing (the same as no pool-keyed candidate) — not a 4xx
 //! from this module.
 //!
-//! `order` and `split` **pin** the walk: the TTFT ranker in [`crate::smart`] does not run. `only`
-//! is a filter, then the ranker still applies. No walk header at all is also ranked.
+//! `order` and `split` **fix** the walk: the computed session pin in [`crate::pin`] does not run.
+//! `only` is a filter, then the pin orders what is left. No walk header at all is also pinned.
 //!
 //! **Nothing here can fail a request.** Every malformed, oversize, or unrecognized value is dropped
 //! and counted, and the request proceeds exactly as if the header were absent. An observability
@@ -209,8 +209,8 @@ impl Control {
         out
     }
 
-    /// True when this request named an explicit walk (`order` or `split`). The TTFT ranker must
-    /// not override a caller who already picked. `only` is a filter, not a pin.
+    /// True when this request named an explicit walk (`order` or `split`). The computed session pin
+    /// must not override a caller who already picked. `only` is a filter, not a pin.
     pub fn pins_walk(&self) -> bool {
         self.order.is_some() || self.split.is_some()
     }

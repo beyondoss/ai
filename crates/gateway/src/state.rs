@@ -17,7 +17,6 @@ use crate::key::Keyring;
 use crate::metrics::{Metrics, ProviderMetrics};
 use crate::ratelimit::RateLimit;
 use crate::route::{self, AuthScheme, Dialect, Provider};
-use crate::smart;
 use arc_swap::ArcSwap;
 use arrayvec::ArrayString;
 use std::collections::HashMap;
@@ -405,11 +404,6 @@ pub struct GatewayState {
     /// does not share this table, and a miss does not consult a shared store.
     pub cache: Option<ResponseCache>,
 
-    /// Per-candidate TTFT EWMA used to rank catalog walks. Always allocated; [`AiConfig::smart_router`]
-    /// gates whether `rank` runs. Observing while the flag is off is wasted work, so the proxy
-    /// skips both. Process-local: replicas do not share samples.
-    pub smart: smart::Router,
-
     /// Per-tenant in-flight cap (see `concurrency`). `None` when `tenant_max_in_flight == 0`.
     pub tenant_slots: Option<TenantSlots>,
 
@@ -590,7 +584,6 @@ impl GatewayState {
             capture: ArcSwap::from_pointee(CaptureSet::new()),
             capture_defaults,
             cache,
-            smart: smart::Router::new(),
             tenant_slots: TenantSlots::new(config.tenant_max_in_flight),
             body_budget: BodyBudget::new(config.max_buffered_body_bytes),
             rate_limit,

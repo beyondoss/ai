@@ -24,7 +24,7 @@ published `beyond-slipstream` — clones, CI-builds, and publishes anywhere.
 | **Dialect**                                | The wire (OpenAI vs Anthropic) a request is answered on, driving usage parsing: the forwarded path's on `/{provider}/…`, the serving candidate's path's on a catalog walk; for a bare-path BYO request it's derived from the path to pick the default provider                                                                                                                                                                                                                           | The provider — one provider can serve both wires (OpenRouter `/api/v1/messages`)                                                             |
 | **Provider**                               | The request's **first path segment** (`/{provider}/…`); a named row in the routing table: authority, dialect, auth scheme                                                                                                                                                                                                                                                                                                                                                                | A vendor relationship — just connection facts and auth wiring                                                                                |
 | **Model route** (`/auto/…`, managed `/v1`) | Catalog row named by `x-beyond-model` if present, else the body's root `model`; provider, upstream path, and model id come from that row and the body's `model` is rewritten per attempt. Catalog miss → 404. Same-endpoint walks are a byte relay; Chat Completions ↔ Messages ↔ Responses is translated when the inbound path _or this candidate's path_ names a different one of those three. Inbound Responses with session state walks the GPT row's `/v1/responses` arm (or 400s). | Gemini. Not a per-key grant.                                                                                                                 |
-| **Candidate**                              | One `(provider, upstream model id, path)` a catalog row will accept. Default walk is TTFT-ranked (in-process EWMA); `x-beyond-order` / `split` pin, `only` filters. Cannot add a provider the row does not list.                                                                                                                                                                                                                                                                         | A parallel pool — still a sequence, entered on failure. Not a cost sort.                                                                     |
+| **Candidate**                              | One `(provider, upstream model id, path)` a catalog row will accept. Default walk is the caller's computed session pin; `x-beyond-order` / `split` fix it, `only` filters. Cannot add a provider the row does not list.                                                                                                                                                                                                                                                                  | A parallel pool — still a sequence, entered on failure. Not a cost sort.                                                                     |
 | **Deny-set**                               | Sparse maps of denied `tenant_id`s and `key_id`s → reason; gates managed traffic; default-allow; tenant deny kills every key                                                                                                                                                                                                                                                                                                                                                             | An allowlist or ACL — misses are allowed, not blocked                                                                                        |
 | **Allowance-set**                          | Sparse maps of exhausted `tenant_id`s and `key_id`s; remaining-ok vs exhausted; 402 **before** `upstream_peer`. Fail-closed (a retryable 503) until the watcher stores a scan/snapshot (empty = remaining-ok). v1 tokens: tenant grain only. Not a price table — the control plane writes the bit.                                                                                                                                                                                       | A price table, remaining-token counter the gateway decrements, or Redis on the miss path                                                     |
 | **Tail tap**                               | Bounded 64KB window kept from the end of the response for usage extraction                                                                                                                                                                                                                                                                                                                                                                                                               | A buffer or copy — the response is relayed unbuffered; only the tail is kept                                                                 |
@@ -34,7 +34,7 @@ published `beyond-slipstream` — clones, CI-builds, and publishes anywhere.
 | **Cut-short estimate**                     | A managed request the provider took but whose usage never arrived — a 2xx stream ended early, a non-stream body cut off or answered without usage (D195), a cancel before the response head — is billed an **estimate** flagged `usage_estimated`: input from the prompt text's pre-tokens, a lower bound (Anthropic keeps `message_start`'s exact count), output from the relayed delta events and text. Errs low.                                                                      | A reported count, or a way to see hidden reasoning — both estimates are blind to thinking the stream never shows                             |
 | **Tenant slot**                            | One of `tenant_max_in_flight` concurrent requests a tenant may hold **on this process**; over it → 429 before the breaker and upstream. The bound on overspend while the allowance-set lags. Off by default.                                                                                                                                                                                                                                                                             | A rate limit or a quota — short fast requests never hit it; N replicas admit N × the limit                                                   |
 | **Control header** (`x-beyond-*`)          | Per-request caller input: `metadata` tags, `capture` on/off, `cache` on/off, catalog `order` / `only` / `split`. Managed only; stripped before the upstream                                                                                                                                                                                                                                                                                                                              | A way to 4xx a request — unusable values are dropped and counted; an `only` that leaves no keyed candidate is the same 503 as an unkeyed row |
-| **Smart router**                           | **Per-pod** EWMA of TTFT per catalog candidate. Default walk for managed `/auto` and `/v1` when `order`/`split` are absent. Probe of unmeasured arms every 8th request. Orders only walks with no caller identity: a managed default walk is a session pin, computed from the caller every turn (no TTFT). `smart_router = false` restores static catalog order. Two replicas can rank the same row differently.                                                                         | Live Redis, cost sort, or a fleet-wide shared ranking — none of those                                                                        |
+| **Session pin**                            | The order of a managed default walk (`pin.rs`): the row's leading first-party hosts (Anthropic + Bedrock) by rendezvous hash of `(tenant_id, vpc_id, key_id)` and the row, then catalog order. Computed every turn from the caller alone, so every replica agrees. `smart_router = false` restores static catalog order.                                                                                                                                                                 | Latency ranking, a learned preference, or a cost sort — none of those; nothing a pod observes moves it                                       |
 | **Snapshot**                               | On-disk deny-set cache (entries + NATS cursor) for edge/tunnel deployments. Allowance uses `{snapshot_path}.allowance`.                                                                                                                                                                                                                                                                                                                                                                  | Persistent store — a pure cache; delete it and the gateway re-scans NATS                                                                     |
 | **Virtual key** (`bai_v1` / `bai_v2`)      | Ed25519-signed token: v1 is `tenant_id`+`vpc_id` (16 B); v2 adds unique `key_id` (24 B). Same keyring.                                                                                                                                                                                                                                                                                                                                                                                   | A session or auth token — stateless, no server-side lookup                                                                                   |
 
@@ -51,8 +51,8 @@ Client (stock OpenAI/Anthropic SDK)
   │  ├─ Route: first segment → provider row (authority, dialect, auth scheme)
   │  │    `/{provider}/…` is the escape hatch (no catalog)
   │  │    …or `/auto` / managed `/v1` → x-beyond-model if present, else body's root `model`
-  │  │      → catalog row → candidate list (default: TTFT rank; cold start = the row's static order)
-  │  │      x-beyond-order / split pin; only filters; then the ranker (same wire; no new providers)
+  │  │      → catalog row → candidate list (default: the caller's computed session pin)
+  │  │      x-beyond-order / split fix it; only filters; then the pin (same wire; no new providers)
   │  │      no/unknown model ──────────────────────────────────► 404 (names the miss)
   │  │      inbound path's endpoint ≠ row
   │  │        Chat Completions ↔ Messages ↔ Responses ─► translate
@@ -86,7 +86,7 @@ Client (stock OpenAI/Anthropic SDK)
   │  ├─ Catalog walk: read the body to find `model` (≤ 64 KiB in hand, larger re-run
   │  │    as a `FullBody` subrequest); past 100 MiB ──────────────► 413, before any upstream
   │  ├─ Managed only: parse x-beyond-* control headers (never 4xx; bad values counted)
-  │  │    order / only / split, then TTFT rank unless order/split pinned, *before* first_usable / breaker skip
+  │  │    order / only / split, then the session pin unless order/split fixed it, *before* first_usable / breaker skip
   │  │    capture decision = header (wins both ways) else capture-set rule ∧ 1-in-N sample
   │  ├─ Exact-match cache (managed catalog walk, body already in hand, cache_ttl_secs > 0):
   │  │    key = pre-rewrite body + method + inbound path + tenant_id + catalog row
@@ -301,60 +301,45 @@ in the catalog` vs `missing model: …`). There is no parallel grant set. A cand
 `upstream_model` spelling (OpenRouter's `anthropic/claude-opus-4.8`, Bedrock's inference-profile
 id) is an alias for the row — those are the ids we already rewrite _to_.
 
-The default walk is TTFT-ranked (`smart.rs`): **this process's** EWMA per catalog candidate, measured
-from `attempt_start` the same way `ai_ttft_seconds` is. Cold start (no samples) is the row's static
-order. A connect failure, a 5xx, or a managed walk's refusal (401/402/403) takes a penalty
-floor so a fast error does not outrank a slower 2xx; a 429 is a real answer. A 2xx's sample waits
-for the body's first bytes: a `200` whose body is an error object (OpenRouter's error-in-200: a root
-`error` key, or Anthropic's `"type":"error"`) or an SSE stream whose first event is an error counts
-as a failure, not a fast healthy sample (`settle_health`, at most 1 KiB read). A candidate whose **latest** attempt failed ranks behind every other
-candidate — unmeasured ones included — until it answers again or its sample goes stale (30s). That
-is what turns a client's own retry into a failover; see "Status-based failover, and where it stops". Unmeasured arms stay failover until a deterministic probe (every 8th
-request, skipping seq `0`) promotes the first one that can be dispatched: an arm with no pool key
-here (Bedrock on a deployment without it) never gets a sample, so a probe that could pick it would
-pick it every time, `upstream_peer` would skip it, and a keyed arm behind it would never be
-measured (D119). A sample older than 30s is treated as unmeasured so a
-recovered arm is retried. Ranking reads the monotonic clock once per request and reuses that
-instant for every candidate's staleness check. `smart_router = false`
-restores static catalog order (and with it no session-pin hashing). Samples never leave the pod —
-`ai_smart_rank_scope{kind="process"}=1` is the honesty metric; this is not fleet-wide smart
-routing. What agrees across replicas is computed, never shared: session pins
-(below) and `x-beyond-split` (hash of the request counter).
+The default walk is the caller's **session pin** (`pin.rs`). It keeps one caller on one provider:
+provider prompt caches are per provider, so a walk that moved an agent loop between Anthropic and
+Bedrock re-bought the whole prefix on each move (a Claude cache write is 1.25× input against 0.1×
+for a read). The pin key is `(tenant_id, vpc_id, key_id)` plus the catalog row: one virtual key is
+one app, and an app's sessions share their system prompt and tools, so one pin per key per model is
+the grain the provider cache wants.
 
-**Session pins.** Ranking orders a walk for nobody in particular; a session pin keeps one caller on
-one provider. Provider prompt caches are per provider, so re-ranking every request moved agent
-loops between Anthropic and Bedrock and re-bought the whole prefix on each move (a Claude cache
-write is 1.25× input against 0.1× for a read), and the every-8th probe landed on whoever drew the
-seed, usually someone mid-session. The pin key is `(tenant_id, vpc_id, key_id)` plus the catalog
-row: one virtual key is one app, and an app's sessions share their system prompt and tools, so one
-pin per key per model is the grain the provider cache wants.
+**Session pins.** The pin is **computed every turn and never remembered**: no pod keeps any pin
+state. A managed default walk (no `order` / `split`) with a verified caller, which is every one, is
+the row's leading run of equally-preferred first-party hosts (a provider with its own model-id
+prefix: the vendor, or a cloud reselling the model under its ids, so Anthropic + Bedrock, never
+OpenRouter or another aggregator) ordered by rendezvous hash of the pin key and the provider name,
+then the rest of the row in catalog order. A candidate that cannot be used on this pod (no pool
+key, every key cooling, cannot serve the body) moves to the back; an open breaker is skipped by
+`upstream_peer`. Nothing else moves the pin: no latency, no failure history. A failure fails over
+for that request only, and the next turn starts from the preferred host again. Catalog preference
+holds: the hash spreads apps over the pooled first-party hosts and never onto the costlier failover
+while one of them can serve, and a row whose primary is an aggregator keeps its catalog order.
+`ai_session_pinned_total` counts pinned walks. Every replica computes the same walk from the same
+inputs; the residual divergence is an open breaker
+([Running several replicas](#running-several-replicas)). `order` / `split` walks skip the pin; an
+`only` walk follows the pin computed over what it left. `smart_router = false` restores static
+catalog order. What agrees across replicas is computed, never shared: the pin and `x-beyond-split`
+(hash of the request counter).
 
-The pin is **computed every turn and never remembered**: no pod keeps any pin state. A managed
-default walk (no `order` / `split`) with a verified caller, which is every one, is the row's leading
-run of equally-preferred first-party hosts (a provider with its own model-id prefix: the vendor, or
-a cloud reselling the model under its ids, so Anthropic + Bedrock, never OpenRouter or another
-aggregator) ordered by rendezvous hash of the pin key and the provider name, then the rest of the
-row in catalog order. A candidate that cannot be used on this pod (no pool key, every key cooling,
-cannot serve the body) moves to the back; an open breaker is skipped by `upstream_peer`. Nothing
-else moves the pin: no TTFT, no probe, no failure history. A failure fails over for that request
-only, and the next turn starts from the preferred host again. Catalog preference holds: the hash
-spreads apps over the pooled first-party hosts and never onto the costlier failover while one of
-them can serve, and a row whose primary is an aggregator keeps its catalog order. So the TTFT
-ranker and its probe above order only walks with no caller identity; a managed default walk is
-always pinned (`ai_session_pinned_total` counts them). Every replica computes the same walk from
-the same inputs; the residual divergence is an open breaker
-([Running several replicas](#running-several-replicas)). `order` / `split` walks skip ranking and
-so skip the pin; an `only` walk follows the pin computed over what it left.
+There is no latency ranking. A per-pod TTFT ranker used to order the default walk; once every
+managed default walk was pinned (D253) it ordered only walks with no caller identity, which a
+managed request never is, and it was removed with its every-8th probe.
 
-An error-in-200 (above) is counted against the serving candidate's breaker as well as the ranker:
-the head already resolved the permit as a success, so `settle_health` records the failure the body
-showed. Without that a host that keeps answering errors in 200s would never be routed around, since
-the pin no longer learns from failures.
+A `200` whose body is an error object (OpenRouter's error-in-200: a root `error` key, or Anthropic's
+`"type":"error"`) or an SSE stream whose first event is an error is counted against the serving
+candidate's breaker (`settle_health`, at most 1 KiB read): the head already resolved the permit as a
+success, so `settle_health` records the failure the body showed. Without that a host that keeps
+answering errors in 200s would never be routed around, since the pin does not learn from failures.
 
 A managed request may also permute that list with headers, still on the same wire, without adding a
 provider the row does not already name (`ProviderSpec::name` on that row). Parsed in `control.rs`,
-stripped before the upstream, never a 4xx. `order` and `split` **pin** (the ranker does not run);
-`only` filters, then ranking still applies:
+stripped before the upstream, never a 4xx. `order` and `split` **fix** the walk (the session pin does
+not run); `only` filters, then the pin applies:
 
 | Header           | Value                     | Walk                                                                                                                                                                                                                                                                               |
 | ---------------- | ------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -363,8 +348,8 @@ stripped before the upstream, never a 4xx. `order` and `split` **pin** (the rank
 | `x-beyond-split` | `anthropic=70,bedrock=30` | pick the primary with those weights (hash of the request counter, not `rand` per replica); leftover stay failover in the current order. A weight above `control::MAX_SPLIT_WEIGHT` (`u32::MAX / MAX_CANDIDATES`, so the sum always fits a `u32`) makes the header malformed (D201) |
 
 Unknown names are dropped. Unparseable values are dropped, counted on
-`ai_control_header_errors_total`, and the request uses the unpinned walk (TTFT rank, or catalog
-order when the ranker is off). If nothing usable remains (an `only` of an unkeyed or off-row name,
+`ai_control_header_errors_total`, and the request uses the default walk (the session pin, or catalog
+order when `smart_router = false`). If nothing usable remains (an `only` of an unkeyed or off-row name,
 or every remaining candidate unkeyed) → 503, the same as no pool-keyed candidate. Applied
 **before** `first_usable` / breaker skip, so failover, breakers, and the 429 key-walk see the
 permuted sequence and otherwise behave as they do today.
@@ -454,7 +439,7 @@ the whole body before choosing, as a headerless walk always does. Then:
   Bedrock's Messages surface answers `output_config.format` with a 400 (Opus 4.8) or a 404 (Haiku
   4.5). So is a candidate that accepts the schema but does not hold its answer to it
   (`REFUSES_STRUCTURED_OUTPUTS`: OpenRouter's `z-ai/glm-5.2`, whose hosts include one that answers
-  `{\n{\n  "answer": 391\n}`). It is left out of the order, failover and TTFT ranking alike, unless
+  `{\n{\n  "answer": 391\n}`). It is left out of the order, failover and session pin alike, unless
   nothing else is usable (an `x-beyond-only: bedrock`), when that provider's own answer is the
   client's.
 - A body carrying a file part (Chat `file`, Messages `document`, Responses `input_file`) leaves a
@@ -653,8 +638,8 @@ generation endpoint, so they are forwarded, never translated:
 
 The walk keeps only the candidates that serve the path (OpenAI's `/v1/responses` is in a GPT row's
 Responses arm, or first in a Responses-first row's candidates), appends the suffix to the serving
-candidate's path, and keeps failover and key rotation. It skips the TTFT ranker and pins: a token
-count answers in a fraction of a generation's time and would skew both. A row with no serving
+candidate's path, and keeps failover and key rotation. It skips the session pin and walks the row in catalog
+order. A row with no serving
 candidate is a 400 naming the missing provider (`count_tokens` on a GPT row, `compact` on a Claude
 row). OpenRouter candidates are never used for them.
 
@@ -1153,9 +1138,9 @@ bills its estimate, instead of a hidden-reasoning model generating for minutes a
 What the parent does for every attempt, so a relayed request behaves like any other:
 
 - **One request.** Every attempt carries the parent's request id and sequence (`FullBody`), so the
-  client's `x-beyond-request-id` names the row that bills, and `x-beyond-split` or the probe seed
+  client's `x-beyond-request-id` names the row that bills, and `x-beyond-split`
   cannot pick a different primary per attempt (a 429 key walk stays on its vendor). An abandoned
-  attempt (one that recorded a `RelayRetry`) still feeds the breaker and the ranker but writes no
+  attempt (one that recorded a `RelayRetry`) still feeds the breaker but writes no
   `ai.usage` or `ai.payload` row.
 - **One tenant slot, taken before the read.** `tenant_max_in_flight` is checked before the body is
   read in full (`SlotGuard`), so it bounds the bodies held in memory, not only requests in flight: a
@@ -1226,7 +1211,7 @@ not the client. Billing dialect is the serving candidate's path, never the row o
 table. Sending the wrong wire would trip the dialect-mismatch guard and emit a zero-token billing
 row. `/{provider}/…` never translates. Do not invent mixed endpoint types inside one candidate
 path. GPT session-state Responses is a **parallel arm** (`ModelRoute::responses`), not mixed into
-`candidates`, so Chat Completions TTFT ranking and `stream_options` injection stay on that walk.
+`candidates`, so the session pin and `stream_options` injection stay on that walk.
 
 **Wire belongs to the serving candidate's path, not the provider and not only the row.**
 `ProviderSpec::wire` is one value per provider and that is an approximation: OpenRouter serves the
@@ -2330,8 +2315,8 @@ Two deliberate non-cases, plus one same-provider retry:
 - **A managed walk's `401` on its last key, `402` or `403` is a candidate failure.** It is that
   candidate refusing (a revoked or unfunded key, a 403 its vendor may not share), and the next
   candidate holds a different key at a different vendor, so the walk fails over exactly as on a `5xx` (replayable
-  body, or the `FullBody` re-run). The candidate takes the ranker's failure penalty and is never pinned, so one revoked key
-  cannot black-hole a row by answering fastest. It is **not** a breaker failure: the provider
+  body, or the `FullBody` re-run). The walk moves on in-gateway, so one revoked key cannot
+  black-hole a row. It is **not** a breaker failure: the provider
   answered, so its permit resolves as a success. When every candidate fails this way, the last
   candidate's own status is relayed.
 - **A key that is out of credit is cooled, and the walk leaves its provider out (D180).** A
@@ -2364,8 +2349,8 @@ left, a 429 with another pool key) the subrequest records the decision in its co
 and relays its response. The parent's pipe sees the decision before the response header reaches the
 client, abandons that attempt, and runs a new subrequest that skips the failed candidate or resumes
 the key walk. Same rules as above: one attempt per subrequest, the last candidate's own status when
-every one fails, `ai_candidate_failovers_total` / `ai_key_walks_total` as usual. The breaker and the
-TTFT ranker see each failed attempt, since each is a real request. The cost is holding the body in
+every one fails, `ai_candidate_failovers_total` / `ai_key_walks_total` as usual. The breaker sees
+each failed attempt, since each is a real request. The cost is holding the body in
 memory (the model splice already buffered it) and connecting only after it has fully arrived.
 
 **Where it still stops: `/{provider}/…` and BYO.** Those are not catalog walks, so a body past the
@@ -2376,10 +2361,10 @@ reports on what has been buffered so far, so retrying before the upload finished
 same request fail over or not depending on how fast the upstream rejected it. On a path that decides
 which vendor gets billed, a deterministic rule is worth more than the extra retries.
 
-**The client's own retry is still a second line.** The stock OpenAI and Anthropic SDKs retry 5xx and
-529, and a relayed 5xx marks the candidate failed in the TTFT ranker, which puts it behind every
-alternative, so that retry lands on a fallback. `smart_router = false` or a pinned walk
-(`x-beyond-order` / `split`) turns the demotion off.
+**The client's own retry is a second line only through the breaker.** The stock OpenAI and
+Anthropic SDKs retry 5xx and 529. A retry is a fresh request with the same computed walk, so it
+starts from the same preferred host; it lands on a fallback once that host's breaker is open (or the
+walk fails over in-gateway, as above). Nothing a relayed failure leaves behind demotes the host.
 
 **Pingora 0.9's default refuses to retry a non-idempotent method** — every LLM call is a `POST` —
 which silently disabled both walks above. `error_while_proxy` is overridden to keep 0.8's policy:
@@ -2734,7 +2719,7 @@ local plaintext mock.
 | `cache_ttl_secs`                | `0`                               | Per-pod exact-match response cache TTL. `0` disables. Only managed catalog walks whose body is already in hand before `upstream_peer`. A hit on **this process** replays the stored 2xx; a miss stays an unbuffered relay (no Redis).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | `cache_max_entries`             | `1024`                            | Cap on stored cache entries. Oldest insertion is dropped when a new one would exceed it.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | `cache_max_bytes`               | `65536`                           | Cap on a single stored response body. Oversize complete 2xxs are relayed but not stored.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| `smart_router`                  | `true`                            | Rank managed catalog walks by **this process's** TTFT EWMA. `false` restores static catalog order. `x-beyond-order` / `split` pin either way. Not a fleet-wide ranking.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `smart_router`                  | `true`                            | Order managed default walks by the caller's computed session pin. `false` restores static catalog order. `x-beyond-order` / `split` fix the walk either way. The name predates the removal of latency ranking.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 | `tenant_max_in_flight`          | `0`                               | Most requests one tenant may hold open **on this process**. `0` disables. Over it → 429 with `Retry-After: 1` (`ai_rejections_total{reason="tenant_concurrency"}`), before the breaker. Bounds overspend while the allowance-set lags. Managed only.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | `nats_url`                      | `nats://localhost:4222`           | NATS server for the control-plane watchers. Unreachable → deny-set stale (fail-open), capture off, allowance fail-closed until a scan or `{snapshot_path}.allowance` lands.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | `nats_creds`                    | _(unset)_                         | Base64 NATS `.creds` contents (ECS via SOPS). Held as `Secret`. Takes priority over `nats_creds_file`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
@@ -2784,8 +2769,8 @@ judgement stays with this one setting.
 
 Production runs several gateway processes behind one load balancer, sharing one NATS. A caller's
 requests land on any of them. `tests/replicas.rs` runs two processes against one `nats-server` and
-alternates a client between them; it backs every line below except the cache and the ranker,
-which `cache.rs` and `smart.rs` tests and the `ai_*_scope{kind="process"}` metrics cover.
+alternates a client between them; it backs every line below except the cache,
+which `cache.rs` tests and the `ai_cache_scope{kind="process"}` metric cover.
 
 **Shared** (the same on every replica):
 
@@ -2819,9 +2804,6 @@ which `cache.rs` and `smart.rs` tests and the `ai_*_scope{kind="process"}` metri
 **Per pod** (each replica has its own, and nothing reconciles them):
 
 - **Response cache.** A hit happens only on the replica that filled the entry.
-- **TTFT ranker.** Each replica ranks from its own samples, so two replicas can order a row
-  differently. It orders only walks with no caller identity; every managed default walk is a
-  session pin (see Shared above).
 - **Circuit breakers and key cooling**, the residual divergence above.
 - **Limits.** `tenant_max_in_flight` and `rate_limit_rps` count on each replica. A tenant at its
   in-flight cap on one replica is admitted on another, and a credential refused for rate on one is
@@ -2897,11 +2879,10 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
 | `ai_usage_parse_errors_total`         | Counter   | —                    | Managed 2xx responses that ended cleanly without parseable usage (billed an estimate or zero; free token counts excluded)                                                                                                  |
 | `ai_cache_hits_total`                 | Counter   | —                    | Exact-match cache hits that replayed a stored 2xx and skipped the provider                                                                                                                                                 |
 | `ai_cache_scope`                      | Gauge     | `kind`               | Constant `1` with `kind="process"`: this pod's cache table, not a fleet store                                                                                                                                              |
-| `ai_smart_rank_scope`                 | Gauge     | `kind`               | Constant `1` with `kind="process"`: this pod's TTFT EWMA, not a fleet-wide ranking                                                                                                                                         |
 | `ai_candidate_failovers_total`        | Counter   | —                    | Model-routed requests that abandoned a candidate for the next one                                                                                                                                                          |
 | `ai_key_walks_total`                  | Counter   | —                    | Managed 429s and 401s that retried the same provider with the next unused pool key                                                                                                                                         |
 | `ai_key_auth_failures_total`          | Counter   | `reason`             | A pool key was cooled off for 60s: `revoked` (a 401), `key_named_403` (a 403 whose body names the key) or `unfunded` (an out-of-credit answer, D180). The first two mean replace the key, the last fund its account (D204) |
-| `ai_session_pinned_total`             | Counter   | —                    | Catalog walks whose primary came from a session pin instead of the TTFT rank                                                                                                                                               |
+| `ai_session_pinned_total`             | Counter   | —                    | Managed default walks ordered by the caller's computed session pin                                                                                                                                                         |
 | `ai_full_body_relays_total`           | Counter   | —                    | Managed requests re-run as a subrequest because routing needed the whole body past 64 KiB                                                                                                                                  |
 | `ai_model_header_body_mismatch_total` | Counter   | —                    | Catalog-walk requests whose `x-beyond-model` and body `model` disagreed (header wins; client bug)                                                                                                                          |
 | `ai_failover_unreplayable_total`      | Counter   | —                    | 5xx/429 retries declined on `/{provider}` or a still-uploading body: not provably replayable (catalog walks re-run instead)                                                                                                |
@@ -2927,7 +2908,7 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
 | `capture_sink`    | Bounded, lossy `ai.payload` writer — drops on a full queue so a stalled log sink can't backpressure                                                   | unit ✓         |
 | `control`         | `x-beyond-*` header parse/validate; metadata canonicalized and re-serialized; catalog walk permute (`order` / `only` / `split`)                       | unit ✓ + e2e ✓ |
 | `translate`       | Chat Completions ↔ Messages ↔ Responses mapping for a catalog endpoint mismatch; SSE event-by-event                                                   | unit ✓ + e2e ✓ |
-| `smart`           | Per-pod TTFT EWMA table; ranks unpinned catalog walks; probe of unmeasured arms; not fleet-wide                                                       | unit ✓ + e2e ✓ |
+| `pin`             | Computed session pin: the order of a managed default walk; a pure function of the caller and the row                                                  | unit ✓ + e2e ✓ |
 | `cache`           | Per-pod exact-match response store (TTL + max entries + max bytes/entry); tap, never a buffer; miss does not consult Redis                            | unit ✓ + e2e ✓ |
 | `concurrency`     | Per-tenant in-flight cap (`tenant_max_in_flight`): sharded, sparse, exact counters; the overspend bound                                               | unit ✓ + e2e ✓ |
 | `ratelimit`       | Two-tier guardrail: per-credential (count-min sketch, fixed memory, no GC) + global BYO (one atomic)                                                  | unit ✓         |
@@ -2947,7 +2928,7 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
 ## Verification
 
 - **Unit (`cargo test --lib`):** key, route, peek, usage, deny, allowance, secret, config, cache, control,
-  smart, translate. `clippy --all-targets -D warnings` clean. The response side of translate
+  pin, translate. `clippy --all-targets -D warnings` clean. The response side of translate
   (`src/translate_response_tests.rs`) feeds every stream whole, byte by byte and in 7-byte chunks
   and requires the same events from each, and rebuilds client state the way the OpenAI and
   Anthropic SDKs accumulate it (tool calls by `index`, blocks by `content[index]`, the Responses
@@ -3040,13 +3021,12 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
   provider-routed traffic being unaffected, **`x-beyond-order` hitting Bedrock's mount/key/id on
   an Anthropic-first row**, **`only` of an unkeyed provider → 503**, a junk walk header keeping
   catalog order and incrementing `ai_control_header_errors_total`, a **split over N requests
-  hitting both primaries**, and a **TTFT ranker that, after a probe, prefers the faster of two
-  live candidates**.
+  hitting both primaries**.
 - **Response cache (`tests/cache.rs`):** two identical managed `/v1` requests hit once upstream,
   the replayed body and status are byte-identical, a different tenant misses, `x-beyond-cache: off`
   always goes upstream and never fills, a 429-then-200 is still one cacheable client-body hash, and
   two candidate orders (default vs `x-beyond-order`) do not cross-hit. `ai_cache_scope{kind="process"}`
-  and `ai_smart_rank_scope{kind="process"}` are `1` — rank and cache are per-pod, not fleet-wide.
+  is `1` — the cache is per-pod, not fleet-wide.
 - **Cut short (`tests/cut_short.rs`):** a real stream cancelled mid-flight through the binary —
   OpenAI bills estimated input (the prompt text's pre-tokens) and one token per relayed delta; Anthropic keeps
   `message_start`'s exact input and estimates output; a base64 image does not inflate the input
@@ -3083,7 +3063,7 @@ gateway's added cost is negligible and bounded** — i.e. it never becomes the c
   miss and hit, empty and 1M entries); `ratelimit::check` (managed tier only vs. BYO which runs
   both tiers) — single-threaded/hot-cache _and_ `check_flood_*`, which charges 65536 distinct
   credentials from 1 and 16 threads over ≥ 2 window rotations, plus `rotate_window`, which prices
-  the window rotation on its own; `smart::rank` / `observe` (unmeasured and fully measured);
+  the window rotation on its own; `pin::order` (a pinned default walk);
   `cache::key` over 0/4KB/64KB/256KB plus `ResponseCache::get` miss, hit, and a 16-thread shared
   hit; `translate` request and response (chat ↔ messages, including a 64KB body) and one SSE
   `text_delta`; `signed_id` sign / verify, one SSE event of each shape a Responses stream sends, and
@@ -3104,7 +3084,7 @@ gateway's added cost is negligible and bounded** — i.e. it never becomes the c
   | `route`                            | ~ns                                 | 0                             | —                                |
   | `deny::reason`                     | ~0.3–2ns                            | 0, flat 0→1M entries          | O(1) lookup, O(denied) memory    |
   | `allowance::reason_for`            | ~1.3–3.3ns                          | 0, flat 0→1M entries          | Same claim; v2 probes two maps   |
-  | `smart::rank` / `observe`          | ~110–150ns                          | 0                             | Atomics only, no lock            |
+  | `pin::order`                       | ~130–140ns                          | 0                             | No state, no lock                |
   | `ratelimit::check`                 | ~70ns; ~130–190ns at 16 threads     | 0                             | Fixed-memory, no per-key state   |
   | `ratelimit` rotation               | ~81µs                               | 0                             | Once per window, not per request |
   | `cache::key` (cache on)            | ~9µs at 64 KiB, ~35µs at 256 KiB    | 0                             | Two SipHash passes, ~7 GB/s      |
