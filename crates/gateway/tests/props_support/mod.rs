@@ -422,6 +422,10 @@ pub fn parse_events(bytes: &[u8]) -> Result<Vec<Event>, String> {
         .strip_suffix("\n\n")
         .ok_or_else(|| format!("client SSE does not end with a blank line: {text:?}"))?;
     for raw in body.split("\n\n") {
+        // A comment-only event (the bridge's keep-alive, D251) is no event to any SSE parser.
+        if raw.split('\n').all(|l| l.starts_with(':')) {
+            continue;
+        }
         let mut name = None;
         let mut data: Option<String> = None;
         for line in raw.split('\n') {
@@ -449,6 +453,15 @@ pub fn normalize_minted(bytes: &[u8]) -> String {
     let mut ids: Vec<String> = Vec::new();
     let mut out = String::new();
     for chunk in text.split_inclusive("\n\n") {
+        // Keep-alive comments (D251) follow the feed's chunking, not the stream: no parser sees
+        // them, so two feeds of one stream compare without them.
+        if chunk
+            .trim_end_matches('\n')
+            .split('\n')
+            .all(|l| l.starts_with(':'))
+        {
+            continue;
+        }
         let mut lines = String::new();
         for line in chunk.split_inclusive('\n') {
             if let Some(d) = line.strip_prefix("data: ") {

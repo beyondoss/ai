@@ -2485,3 +2485,31 @@ state = "reproduced"
 test = "a_pinned_conversation_stays_on_one_provider_across_replicas"
 fix = ""
 note = "Proposed stateless fix: make the pin deterministic instead of remembered. Pick the pinned candidate by rendezvous hashing (tenant_id, vpc_id, key_id, row) over the row's dispatchable candidates (keyed, breaker not open, latest attempt not failed), so every replica computes the same provider with no shared state; a failed candidate drops out of the hash set and the conversation moves once, to the same fallback on every pod, and moves back once it recovers. Trade-off: a pinned caller's first provider is then chosen by hash rather than by TTFT rank (the ranker would still order failover and unpinned walks), so the hash could be restricted to candidates within a TTFT band of the best. Not fixed in this change; tests/replicas.rs pins_are_per_pod_so_an_alternating_conversation_hops_providers asserts today's behaviour."
+
+[[defect]]
+id = "D251"
+severity = "med"
+area = "Translation"
+title = "A translated stream dropped the provider's keep-alives, so a thinking model's stream went silent for minutes"
+impact = "A Chat Completions client on a Claude row (or any translated pairing) received no byte while the model thought: SseBridge consumed Anthropic's event: ping, OpenRouter's : OPENROUTER PROCESSING comments and thinking deltas it holds or the client's dialect does not carry, and wrote nothing. A load balancer's or proxy's 60-100 s idle timeout then cut a stream that was alive."
+confidence = "high"
+evidence = "AntToOai::event returned early on event == \"ping\"; map_event returned on a comment-only event; a same-wire relay forwarded both byte for byte. So a Claude upstream that sends only pings between two text deltas left a Chat client nothing to read for the whole gap."
+claims = ["S1", "REL-1"]
+state = "fixed"
+test = "a_translated_stream_turns_provider_pings_into_keep_alive_comments"
+fix = "0daf317"
+note = "Fixed: a feed call that consumed at least one upstream event and produced no client output writes one SSE comment, ': keep-alive', so the cadence is the provider's own pings (no timer, no state). Not written by a same-wire relay (it already forwards the provider's pings), an assembling bridge, after an error or after the client's terminal event. The openai and anthropic SDK SSE decoders (Python and Node, verify/clients) drop lines starting with ':'; the bridge writes no id: line, so openai-python cannot dispatch a blank event. Unit tests: a_translated_stream_answers_a_ping_with_a_keep_alive_comment, hidden_thinking_is_answered_with_keep_alives, no_keep_alive_where_the_bridge_owes_none."
+
+[[defect]]
+id = "D252"
+severity = "med"
+area = "Reliability"
+title = "A non-stream call to a pro model was cut at read_timeout_secs before its head, a 504 the provider still billed"
+impact = "gpt-5-pro, o3-pro and gpt-5.x-pro can think longer than 600 s before sending a head on a non-stream request. The gateway's per-read timeout (pingora's read_timeout applies to every read, so before the head it is the whole wait) answered 504 and D130 billed an estimate, while the provider billed the full call and a client willing to wait longer got nothing."
+confidence = "high"
+evidence = "pingora-core 0.9 http/v1/client.rs and http/v2/client.rs wrap each header and body read in read_timeout; build_peer set it to read_timeout_secs (600) for every row. OpenAI's gpt-5-pro / gpt-5.4-pro / gpt-5.5-pro pages: 'some requests may take several minutes to finish. To avoid timeouts, try using background mode'; the background-mode guide publishes no maximum either. Anthropic's errors page ('Long requests') publishes no maximum and has its SDKs refuse non-streaming calls expected to exceed 10 minutes."
+claims = ["REL-1", "BIL-3"]
+state = "fixed"
+test = "a_pro_row_waits_past_read_timeout_for_its_head"
+fix = "0daf317"
+note = "Fixed: no vendor documents a maximum request duration, so any number would be a guess. Rows catalog::long_running marks (owner openai, model ending -pro) get no gateway silence deadline; the request ends at the client's own timeout (a cancel the gateway sees and bills per D130) or a dead transport (h2 PING, TCP keepalive). Every other row keeps read_timeout_secs. Covers catalog walks (managed /v1, /auto); a provider-routed BYO path has no row and keeps the default. Unit test: long_running_is_exactly_openais_pro_rows."
