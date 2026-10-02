@@ -2497,7 +2497,7 @@ evidence = "AntToOai::event returned early on event == \"ping\"; map_event retur
 claims = ["S1", "REL-1"]
 state = "fixed"
 test = "a_translated_stream_turns_provider_pings_into_keep_alive_comments"
-fix = "0daf317"
+fix = "1069390"
 note = "Fixed: a feed call that consumed at least one upstream event and produced no client output writes one SSE comment, ': keep-alive', so the cadence is the provider's own pings (no timer, no state). Not written by a same-wire relay (it already forwards the provider's pings), an assembling bridge, after an error or after the client's terminal event. The openai and anthropic SDK SSE decoders (Python and Node, verify/clients) drop lines starting with ':'; the bridge writes no id: line, so openai-python cannot dispatch a blank event. Unit tests: a_translated_stream_answers_a_ping_with_a_keep_alive_comment, hidden_thinking_is_answered_with_keep_alives, no_keep_alive_where_the_bridge_owes_none."
 
 [[defect]]
@@ -2511,5 +2511,5 @@ evidence = "pingora-core 0.9 http/v1/client.rs and http/v2/client.rs wrap each h
 claims = ["REL-1", "BIL-3"]
 state = "fixed"
 test = "a_pro_row_waits_past_read_timeout_for_its_head"
-fix = "0daf317"
+fix = "1069390"
 note = "Fixed: no vendor documents a maximum request duration, so any number would be a guess. Rows catalog::long_running marks (owner openai, model ending -pro) get no gateway silence deadline; the request ends at the client's own timeout (a cancel the gateway sees and bills per D130) or a dead transport (h2 PING, TCP keepalive). Every other row keeps read_timeout_secs. Covers catalog walks (managed /v1, /auto); a provider-routed BYO path has no row and keeps the default. Unit test: long_running_is_exactly_openais_pro_rows."
