@@ -802,7 +802,12 @@ fn attempt_cell(
         .env("VERIFY_PROVIDER", route.pools[0].0)
         .env("VERIFY_CLIENT", client)
         .env("VERIFY_CLAIMS", &checks.claims)
-        .env("VERIFY_GATEWAY_PID", gw.0.id().to_string());
+        .env("VERIFY_GATEWAY_PID", gw.0.id().to_string())
+        // E4: the listing must hold every catalog row, counted here so the floor can't go stale.
+        .env(
+            "VERIFY_CATALOG_ROWS",
+            providers::catalog::MODEL_ROUTES.len().to_string(),
+        );
     // A BYO probe sends the provider's own key through /{provider}/, the way a customer with
     // their own key would; a leak probe looks for the pool key in everything it was sent; an S1
     // stream cell calls the provider directly for its baseline. Only those probes see a real key.

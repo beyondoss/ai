@@ -128,6 +128,84 @@ async fn streams_reach_the_client_as_the_provider_sends_them() {
     }
 }
 
+/// A same-wire Chat Completions stream from a host other than OpenAI goes through `SseBridge`'s
+/// relay (it drops the `role` OpenRouter repeats on every chunk). Each event still leaves the
+/// gateway as it arrives: an OpenRouter stream of a Claude row, written one event at a time with
+/// gaps and OpenRouter's keep-alive comments between them, reaches the client spread the same way.
+/// claim: S1
+/// defect: D244
+#[tokio::test]
+async fn a_same_wire_openrouter_chat_relay_streams_each_event_as_it_arrives() {
+    const GAP: Duration = Duration::from_millis(300);
+    let chunk = |text: &str, finish: &str| {
+        format!(
+            "data: {{\"id\":\"gen-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\
+             \"model\":\"anthropic/claude-haiku-4.5\",\"provider\":\"Amazon Bedrock\",\"choices\":\
+             [{{\"index\":0,\"delta\":{{\"content\":\"{text}\",\"role\":\"assistant\"}},\
+             \"finish_reason\":{finish},\"native_finish_reason\":{finish}}}]}}\n\n"
+        )
+    };
+    let words = ["W0", "W1", "W2", "W3", "W4"];
+    let provider = ScriptedUpstream::start(move |_, _| {
+        let mut head = http_head(200, "text/event-stream", None);
+        head.extend_from_slice(chunk(words[0], "null").as_bytes());
+        let mut steps = vec![Step::Write(head)];
+        for w in &words[1..] {
+            steps.push(Step::Sleep(GAP / 2));
+            steps.push(Step::Write(b": OPENROUTER PROCESSING\n\n".to_vec()));
+            steps.push(Step::Sleep(GAP / 2));
+            steps.push(Step::Write(chunk(w, "null").into_bytes()));
+        }
+        steps.push(Step::Sleep(GAP));
+        let mut tail = chunk("", "\"stop\"");
+        tail.push_str(
+            "data: {\"id\":\"gen-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\
+             \"model\":\"anthropic/claude-haiku-4.5\",\"choices\":[],\"usage\":\
+             {\"prompt_tokens\":5,\"completion_tokens\":5,\"total_tokens\":10}}\n\ndata: [DONE]\n\n",
+        );
+        steps.push(Step::Write(tail.into_bytes()));
+        steps
+    })
+    .await;
+    let (pubkey, sk) = test_keypair(72);
+    let gw = Gateway::builder(unused_nats_port(), &provider.authority(), &b64(&pubkey))
+        .providers(&["openrouter"])
+        .start()
+        .await;
+    let body = r#"{"model":"claude-haiku-4-5","stream":true,"stream_options":{"include_usage":true},"messages":[{"role":"user","content":"hi"}]}"#;
+    let sent = Instant::now();
+    let mut resp = post_stream(&gw, &billing_vkey(&sk, 72), "/v1/chat/completions", body).await;
+    assert_eq!(resp.status().as_u16(), 200);
+    let mut text = String::new();
+    let mut seen_at = Vec::new();
+    while let Some(c) = tokio::time::timeout(Duration::from_secs(10), resp.chunk())
+        .await
+        .expect("the stream must not hang")
+        .unwrap()
+    {
+        text.push_str(&String::from_utf8_lossy(&c));
+        while seen_at.len() < words.len() && text.contains(words[seen_at.len()]) {
+            seen_at.push(sent.elapsed());
+        }
+    }
+    assert_eq!(seen_at.len(), words.len(), "every word arrived: {text}");
+    assert!(text.contains("[DONE]"), "{text}");
+    assert_eq!(
+        text.matches("\"role\"").count(),
+        1,
+        "the repeated role is dropped: {text}"
+    );
+    for (i, pair) in seen_at.windows(2).enumerate() {
+        assert!(
+            pair[1] - pair[0] >= GAP / 2,
+            "{} arrived {:?} after {}; the provider sent them {GAP:?} apart (all: {seen_at:?})",
+            words[i + 1],
+            pair[1] - pair[0],
+            words[i]
+        );
+    }
+}
+
 /// A deploy signal lands while a stream is open. The stream finishes, whole, and is billed.
 /// claim: S3
 #[tokio::test]

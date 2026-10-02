@@ -87,6 +87,11 @@ class Recorder:
         self.calls = []
         self.progress = {}
         self.lock = threading.Lock()
+        # Handlers still running. A client gets its last byte before its handler records the
+        # call, so `stop` waits for these: a call recorded after the list was taken left its
+        # billing row belonging to no call (TOOL-1 chat_128, D245).
+        self.inflight = 0
+        self.idle = threading.Condition(self.lock)
         rec = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -110,6 +115,16 @@ class Recorder:
                 return self.rfile.read(n) if n else b""
 
             def _proxy(self):
+                with rec.lock:
+                    rec.inflight += 1
+                try:
+                    self._relay()
+                finally:
+                    with rec.lock:
+                        rec.inflight -= 1
+                        rec.idle.notify_all()
+
+            def _relay(self):
                 body = self._body()
                 t0 = time.time()
                 call = {"method": self.command, "path": self.path.split("?")[0], "t0": t0,
@@ -200,9 +215,11 @@ class Recorder:
 
     def stop(self):
         """The calls in the order they were made. Each response's tail is kept only on the last
-        three (where a harness that died mid-stream shows why), or all with VERIFY_LONG_KEEP."""
+        three (where a harness that died mid-stream shows why), or all with VERIFY_LONG_KEEP.
+        Calls still being recorded are waited for (bounded)."""
         self.server.shutdown()
         with self.lock:
+            self.idle.wait_for(lambda: self.inflight == 0, timeout=10)
             calls = sorted(self.calls, key=lambda c: c["t0"])
         if not KEEP:
             for c in calls[:-3]:

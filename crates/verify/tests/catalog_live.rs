@@ -765,7 +765,24 @@ fn send(req: reqwest::blocking::RequestBuilder) -> Result<Reply, String> {
         h("x-beyond-request-id"),
     );
     let headers = r.headers().clone();
-    let raw = r.text().map_err(|e| format!("body: {e}"))?;
+    let raw = r.text().map_err(|e| {
+        // A provider that sent its head and then no whole body before the request's timeout: the
+        // gateway relays what came (its row says `client_cancelled`), so the stall is the
+        // provider's (qwen/qwen3.8-27b at its card's max_tokens on OpenRouter, D246).
+        if e.is_timeout()
+            && let Some(p) = &provider
+        {
+            common::provider_unavailable(format!(
+                "{p} sent HTTP {status} and then no complete body before the request timed out \
+                 ({})",
+                request_id.as_deref().unwrap_or("no request id")
+            ));
+        }
+        format!(
+            "body: {e}{}",
+            if e.is_timeout() { " (timed out)" } else { "" }
+        )
+    })?;
     Ok(Reply {
         status,
         provider,
@@ -2104,8 +2121,9 @@ fn truth(row: &str) -> Option<&'static toml::Value> {
         .find(|r| r.get("model").and_then(|m| m.as_str()) == Some(row))
 }
 
-/// A row's vendor-announced promotional (input, output) rate, USD per million, while it lasts.
-fn promo(row: &str) -> Option<(f64, f64)> {
+/// A row's vendor-announced promotional rate while it lasts: (input, output, cached input) USD per
+/// million, cached input at the card's rate when the promotion names none.
+fn promo(row: &str) -> Option<(f64, f64, Option<f64>)> {
     let p = truth_file()
         .get("promo")?
         .as_array()?
@@ -2120,7 +2138,7 @@ fn promo(row: &str) -> Option<(f64, f64)> {
         return None;
     }
     let rate = |k: &str| p.get(k)?.as_str()?.parse::<f64>().ok();
-    Some((rate("input")?, rate("output")?))
+    Some((rate("input")?, rate("output")?, rate("cache_read")))
 }
 
 fn price_eq(card: &str, listed: f64) -> bool {
@@ -2187,10 +2205,17 @@ fn cat7(trial: &str, arm: Arm) -> Result<(), Failed> {
                             );
                         // A vendor-announced promotion (`[[promo]]` in catalog_truth.toml) that this
                         // route charges while the card keeps the standard rate.
-                        let promo = promo(arm.row.model).filter(|(input, output)| {
+                        // Cached input at its own rate: a promotion that only halved input and
+                        // output read a cached prompt's charge as off the promotion (D247).
+                        let promo = promo(arm.row.model).filter(|(input, output, read_rate)| {
                             let p = |k: &str| row[k].as_u64().unwrap_or(0) as f64;
-                            let at =
-                                (p("input_tokens") * input + p("output_tokens") * output) / 1e6;
+                            let read = p("cache_read_tokens");
+                            let read_rate = read_rate
+                                .unwrap_or_else(|| arm.row.price.cache_read.parse().unwrap_or(0.0));
+                            let at = ((p("input_tokens") - read) * input
+                                + read * read_rate
+                                + p("output_tokens") * output)
+                                / 1e6;
                             ((at - theirs) / theirs).abs() <= COST_TOLERANCE
                         });
                         if off.abs() > COST_TOLERANCE && promo.is_some() {

@@ -4305,7 +4305,15 @@ mod tests {
                 until.len() == 10 && until.as_bytes()[4] == b'-',
                 "{model}: until {until:?}"
             );
-            for (k, card) in [("input", row.price.input), ("output", row.price.output)] {
+            for (k, card) in [
+                ("input", row.price.input),
+                ("output", row.price.output),
+                ("cache_read", row.price.cache_read),
+            ] {
+                // A cached-input rate is optional: without one, cached input keeps the card's.
+                if k == "cache_read" && promo.get(k).is_none() {
+                    continue;
+                }
                 let rate = promo[k].as_str().map(usd_micros).expect("promo rate");
                 assert!(
                     rate < usd_micros(card),

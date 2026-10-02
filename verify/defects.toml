@@ -2387,3 +2387,59 @@ state = "fixed"
 test = "no_catalog_row_outlives_its_retirement"
 fix = "19bb5bd"
 note = "Fixed in 75e43fc by removing the seven rows (and their [[row]] entries in verify/catalog_truth.toml); their [[retired]] entries now say retired = \"2026-10-23\" with OpenAI's deprecations page as source and the early, owner-decided removal in the note, so no row, candidate, Responses arm or openai/ OpenRouter slug can name them again. A request for one is a 404 like any unknown model; nothing remaps to a successor. no_catalog_row_outlives_its_retirement asserts all seven absent, recorded retired, and named by no candidate. The catalog floor came down from 90 to 80 (91 rows became 84). Live 2026-10-01 on 75e43fc: CAT-16::raw::{anthropic,openai,xai}::new-models PASS (OpenAI: 119 models in carried families, 0 gaps; the removed ids, still listed, are accounted for by [[retired]]); VERIFY_CATALOG_PLAN=1 names none of the seven. Re-pointed: body_memory's image-gate body moved from o3-mini to deepseek-v4-pro (also text-only); suspect_cards_are_corrected drops gpt-4 / gpt-4-turbo and keeps the two pro rows; the D111 and D113 gpt-4 card tests went with the row (both defects now name the absence test). String-only fixtures (translate::OpenAiModel parsing, peek's duplicate-model scans) keep the ids: they never reach the catalog."
+
+[[defect]]
+id = "D244"
+severity = "med"
+area = "Translation"
+title = "A same-wire OpenRouter Chat stream looked buffered through the gateway"
+impact = "If the relay that drops OpenRouter's repeated role held events, a streaming client would get its answer in one burst at the end instead of as it is written."
+confidence = "high"
+evidence = "Final live run on 101d023 (target/final-live8.log): E1+B1+T1+S1::raw::openrouter-chat::parity_tool_result_stream failed twice, \"direct spread 526 ms over 12 events, gateway 18 ms over 12\" and \"1641 ms ... 163 ms\". The direct answer carried three \": OPENROUTER PROCESSING\" keep-alives after its first chunk; the gateway's upstream answer, a separate call 3 s later, carried none."
+claims = ["S1"]
+state = "refuted"
+test = "a_same_wire_openrouter_chat_relay_streams_each_event_as_it_arrives"
+fix = ""
+note = "Refuted: the gateway relays each event as it arrives. The hermetic test streams an OpenRouter-shaped Claude answer (role on every chunk, keep-alive comments) one event at a time 300 ms apart through the same-wire Chat relay (SseBridge::relay / relay_role) and asserts every word reaches the client at least 150 ms after the one before, with the repeated role dropped: it passes on 101d023. OpenRouter's own pacing for this request varies call to call: 13 direct calls on 2026-10-01 (no gateway, the parity request, with and without the context-compression plugin the gateway adds) spread their 12 events over 177-294 ms, and one over 29 ms. The parity cell compares two different upstream calls, so a burst on the gateway's call against a stalled direct call reads as buffering. Live: the cell re-run twice on this branch, PASS."
+
+[[defect]]
+id = "D245"
+severity = "med"
+area = "Verification"
+title = "TOOL-1 counted a billed call's row as belonging to no call (recorder race)"
+impact = "TOOL-1::openai-py::gpt::chat_128 reported \"1 ai.usage rows belong to no call the client made\", which reads as double billing. It was the harness losing the call, not the gateway billing twice."
+confidence = "high"
+evidence = "Final live run on 101d023: the cell's SDK got 200 and the forced call to tool_127, and no other ledger problem was reported, so the recorder's call list was empty: a recorded call with a row would have matched it, and one without would have reported \"0 ai.usage rows, want 1\". harness_long.py's Recorder writes the response's last chunk to the client and only then records the call in its handler thread; tools_probe calls rec.stop() as soon as the SDK returns, and stop() took the list without waiting for running handlers."
+claims = ["TOOL-1"]
+state = "fixed"
+test = "live:TOOL-1::openai-py::gpt::chat_128"
+fix = "TBD"
+note = "Not a gateway defect: one client call, one row. Fixed in the harness: the Recorder counts running handlers, and stop() waits (up to 10 s) for them to finish recording before it takes the list. Every Recorder user (long sessions, MCP, TOOL-1) gets the fix. Live: the cell re-run twice, PASS."
+
+[[defect]]
+id = "D246"
+severity = "low"
+area = "Verification"
+title = "CAT-4 reported a provider's stalled body as \"error decoding response body\""
+impact = "CAT-4::raw::openrouter::qwen/qwen3.8-27b failed with a client-side decode error that read like a malformed body from the gateway."
+confidence = "high"
+evidence = "Final live run on 101d023, kept gateway log target/catalog-live/gw-3624224/gateway.log: OpenRouter answered 200 (upstream_status 200, non-stream) and its body was still incomplete when the client's 170 s request timeout closed the connection (pingora: \"Prematurely before response body is complete\"); the row is outcome client_cancelled, latency_ms 170001. reqwest names a timeout while reading a body \"error decoding response body\". Re-run twice on this branch: 200 in about 2 s."
+claims = ["CAT-4"]
+state = "fixed"
+test = "live:CAT-4::raw::openrouter::qwen/qwen3.8-27b"
+fix = "TBD"
+note = "The gateway relayed what came; the provider stalled. Fixed in catalog_live: a body that times out after the provider's head (x-beyond-provider) marks the cell provider-unavailable (INCONCLUSIVE) and the message says the read timed out."
+
+[[defect]]
+id = "D247"
+severity = "low"
+area = "Verification"
+title = "CAT-7's promotion check priced cached input at the full input rate"
+impact = "CAT-7::raw::openrouter::gpt-5.6-sol-pro failed on OpenRouter's documented half-price charge whenever the prompt hit OpenAI's cache."
+confidence = "high"
+evidence = "Final live run on 101d023: in 2433 (1510 cached) out 30, card 4 / 20 / cached 0.4 -> $0.004896; OpenRouter charged $0.002448, exactly half. The [[promo]] check priced all 2433 input tokens at the promotional $2 and ignored the cache, $0.005166, so it did not recognise the promotion. OpenRouter's listing calls gpt-5.6-sol-pro \"the same underlying model as GPT-5.6 Sol, served with reasoning.mode set to pro\", and its gpt-5.6-sol listing shows the promotional $2 / $10 / cached $0.20."
+claims = ["CAT-7"]
+state = "fixed"
+test = "live:CAT-7::raw::openrouter::gpt-5.6-sol-pro"
+fix = "TBD"
+note = "The card is right and keeps the standard rate. Fixed: a [[promo]] may name its cached-input rate (cache_read; both gpt-5.6-sol promotions now say 0.20, until 2026-11-21), and CAT-7 prices cached input at it (the card's cached rate when none is named). catalog_matches_vendor_truth holds a promo cache_read below the card's. Live: the cell re-run twice, PASS, once with 1510 cached input tokens at exactly the failing run's figures."

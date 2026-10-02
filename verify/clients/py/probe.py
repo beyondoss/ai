@@ -28,6 +28,9 @@ import httpx
 BASE = os.environ["VERIFY_BASE"]
 KEY = os.environ["VERIFY_KEY"]
 MODEL = os.environ["VERIFY_MODEL"]
+# E4: how many rows the catalog holds (the Rust side counts MODEL_ROUTES), so a listing is held
+# to exactly that, never to a floor that goes stale as rows come and go.
+CATALOG_ROWS = int(os.environ.get("VERIFY_CATALOG_ROWS", "-1"))
 
 calls = []
 _ids = []
@@ -192,7 +195,7 @@ def models_list():
     _ids.clear()
     m = next((x for x in o if x.id == MODEL), None)
     extra = (m.model_extra or {}) if m else {}
-    ok = (len(o) >= 90 and len(a) == len(o) and m is not None
+    ok = (len(o) == CATALOG_ROWS and len(a) == len(o) and m is not None
           and extra.get("context_window", 0) > 0 and "pricing" in extra and "capabilities" in extra)
     return ok, {"openai": len(o), "anthropic": len(a), "card": {k: extra.get(k) for k in ("context_window", "max_output_tokens", "pricing")}}
 
@@ -1331,7 +1334,7 @@ def raw_models():
                 and m.get("endpoints") and all(isinstance(p.get(k), (int, float, str)) for k in
                                                 ("input", "output", "cache_read", "cache_write"))):
             bad.append(m.get("id"))
-    ok = (o.status_code == 200 and body.get("object") == "list" and body.get("has_more") is False and len(rows) >= 90
+    ok = (o.status_code == 200 and body.get("object") == "list" and body.get("has_more") is False and len(rows) == CATALOG_ROWS
           and len(set(ids)) == len(ids) and MODEL in ids and not bad
           and a.status_code == 200 and [m["id"] for m in a.json()["data"]] == ids
           and h.status_code == 200 and not h.content and f.status_code == 401)

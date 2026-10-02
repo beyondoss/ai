@@ -27,6 +27,7 @@
 #
 # `[[promo]]` records a vendor-announced promotional rate that some route charges while the card
 # keeps the standard rate (the catalog_live CAT-7 check accepts a charge at that rate until `until`).
+# `cache_read` is the promotional cached-input rate; without it cached input is held to the card's.
 #
 # `catalog_matches_vendor_truth` (crates/providers/src/catalog.rs) asserts:
 # - every recorded field equals the catalog row's value (`context_window` / `max_output_tokens`
@@ -1847,6 +1848,7 @@ reason = "Video generation (output [\"video\"]). The gateway serves Chat Complet
 model = "gpt-5.6-sol"
 input = "2.00"
 output = "10.00"
+cache_read = "0.20"
 until = "2026-11-21"
 source = "https://developers.openai.com/api/docs/pricing.md"
 note = "\"GPT-5.6 Sol's promotional pricing is available at least through November 21, 2026.\" OpenRouter, routed to OpenAI, charges it; OpenAI bills the pool key the standard $4 / $20 (organization costs report, 2026-10-01: 4,289 input tokens $0.017156, 1,394 output $0.02788). The card keeps the standard rate: it is what the primary charges, and one row has one list price."
@@ -1855,9 +1857,10 @@ note = "\"GPT-5.6 Sol's promotional pricing is available at least through Novemb
 model = "gpt-5.6-sol-pro"
 input = "2.00"
 output = "10.00"
+cache_read = "0.20"
 until = "2026-11-21"
 source = "https://developers.openai.com/api/docs/pricing.md"
-note = "OpenRouter lists $4 / $20 and charges half (CAT-7::raw::openrouter::gpt-5.6-sol-pro, 2026-10-01): the gpt-5.6-sol promotion."
+note = "OpenRouter lists $4 / $20 / cached $0.40 and charges half (CAT-7::raw::openrouter::gpt-5.6-sol-pro, 2026-10-01, twice: 2,433 input of which 1,510 cached, 30 output -> $0.002448 against $0.004896 at the card): the gpt-5.6-sol promotion, since OpenRouter's listing calls -pro \"the same underlying model as GPT-5.6 Sol, served with reasoning.mode set to pro\". Its gpt-5.6-sol listing shows the promotional rates, cached input included: $2 / $10 / $0.20."
 
 [[schema_unenforced]]
 model = "z-ai/glm-5.2"

@@ -16,6 +16,8 @@ import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 const BASE = process.env.VERIFY_BASE;
 const KEY = process.env.VERIFY_KEY;
 const MODEL = process.env.VERIFY_MODEL;
+// E4: how many rows the catalog holds (the Rust side counts MODEL_ROUTES); a listing must hold exactly that.
+const CATALOG_ROWS = Number(process.env.VERIFY_CATALOG_ROWS ?? -1);
 const PROVIDER = process.env.VERIFY_PROVIDER ?? "";
 const CLIENT = process.env.VERIFY_CLIENT ?? "";
 const CLAIMS = (process.env.VERIFY_CLAIMS ?? "").split("+");
@@ -115,7 +117,7 @@ const probes = {
     for await (const m of anthropic().models.list({ limit: 1000 })) a.push(m);
     ids.length = 0;
     const m = o.find((x) => x.id === MODEL);
-    const ok = o.length >= 90 && a.length === o.length && m && m.context_window > 0 && m.pricing && m.capabilities;
+    const ok = o.length === CATALOG_ROWS && a.length === o.length && m && m.context_window > 0 && m.pricing && m.capabilities;
     return [Boolean(ok), { openai: o.length, anthropic: a.length }];
   },
 
