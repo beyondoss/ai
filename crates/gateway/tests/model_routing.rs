@@ -1953,8 +1953,8 @@ async fn v1_models_lists_the_catalog() {
     let data = v["data"].as_array().expect("data array");
     assert_eq!(
         data.len(),
-        providers::catalog::MODEL_ROUTES.len(),
-        "every catalog row is listed: {v}"
+        keyed_rows(&[ProviderId::OpenAi, ProviderId::OpenRouter]).len(),
+        "every row an openai or openrouter candidate serves is listed: {v}"
     );
     let gpt = data
         .iter()
@@ -2019,6 +2019,145 @@ async fn v1_models_lists_the_catalog() {
         "a catalog model without a list price bills as free: {v}"
     );
     assert_eq!(mock.hits(), 0, "listing must not contact an upstream");
+}
+
+use providers::ProviderId;
+
+/// The catalog ids, in order, of the rows with at least one candidate on a `keyed` provider: what a
+/// gateway holding pool keys for exactly those providers must list.
+fn keyed_rows(keyed: &[ProviderId]) -> Vec<&'static str> {
+    providers::catalog::MODEL_ROUTES
+        .iter()
+        .filter(|r| r.candidates.iter().any(|c| keyed.contains(&c.provider)))
+        .map(|r| r.model)
+        .collect()
+}
+
+/// The ids `GET /v1/models` lists, in order, for a caller holding `key`.
+async fn listed_ids(gw: &Gateway, key: &str) -> Vec<String> {
+    let resp = test_client()
+        .get(format!("{}/v1/models", gw.url()))
+        .header("authorization", format!("Bearer {key}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let v: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(v["object"], "list");
+    assert_eq!(v["has_more"], false);
+    v["data"]
+        .as_array()
+        .expect("data array")
+        .iter()
+        .map(|m| m["id"].as_str().expect("id").to_string())
+        .collect()
+}
+
+/// A deployment lists only the rows it can serve. With only an openai pool key, every listed row
+/// has an openai candidate, and a Claude row (no openai candidate) is absent.
+/// claim: E4, CAT-9
+/// defect: D250
+#[tokio::test]
+async fn v1_models_lists_only_rows_an_openai_pool_key_serves() {
+    let nats_port = unused_nats_port();
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::builder(nats_port, &mock.authority(), &b64(&pubkey))
+        .providers(&["openai"])
+        .start()
+        .await;
+
+    let want = keyed_rows(&[ProviderId::OpenAi]);
+    assert!(
+        !want.is_empty() && want.len() < providers::catalog::MODEL_ROUTES.len(),
+        "the test needs rows on both sides"
+    );
+    let got = listed_ids(&gw, &vkey(&sk)).await;
+    assert_eq!(got, want);
+    assert!(got.iter().any(|m| m == "gpt-4o-mini"), "{got:?}");
+    assert!(!got.iter().any(|m| m == "claude-opus-4-8"), "{got:?}");
+    // The caller's key type does not change the list: a BYO caller sees the same body.
+    assert_eq!(listed_ids(&gw, "sk-byo-caller").await, want);
+    assert_eq!(mock.hits(), 0, "listing must not contact an upstream");
+}
+
+/// With anthropic and openrouter pool keys, Claude rows are listed (Anthropic primary) and rows
+/// served only by Together-class hosts are not. A row whose primary is unkeyed but whose fallback is keyed
+/// (OpenRouter is the fallback on most open-weight rows) stays listed.
+/// claim: E4, CAT-9
+/// defect: D250
+#[tokio::test]
+async fn v1_models_lists_claude_but_not_together_only_rows_on_anthropic_and_openrouter() {
+    let nats_port = unused_nats_port();
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::builder(nats_port, &mock.authority(), &b64(&pubkey))
+        .providers(&["anthropic", "openrouter"])
+        .start()
+        .await;
+
+    let keyed = [ProviderId::Anthropic, ProviderId::OpenRouter];
+    let got = listed_ids(&gw, &vkey(&sk)).await;
+    assert_eq!(got, keyed_rows(&keyed));
+    assert!(got.iter().any(|m| m == "claude-opus-4-8"), "{got:?}");
+
+    // No catalog row is served by Together alone today; the rows this deployment cannot serve are
+    // the ones whose candidates are all Together-class hosts (`openai/gpt-oss-120b`: Groq,
+    // Together, Fireworks).
+    let unservable: Vec<&str> = providers::catalog::MODEL_ROUTES
+        .iter()
+        .filter(|r| !r.candidates.iter().any(|c| keyed.contains(&c.provider)))
+        .map(|r| r.model)
+        .collect();
+    assert!(
+        unservable.iter().any(|m| {
+            providers::for_model(m).is_some_and(|r| {
+                r.candidates
+                    .iter()
+                    .any(|c| c.provider == ProviderId::Together)
+            })
+        }),
+        "the catalog has a Together-served row with no anthropic or openrouter candidate"
+    );
+    for m in &unservable {
+        assert!(!got.iter().any(|g| g == m), "{m} listed: {got:?}");
+    }
+
+    let fallback_only = providers::catalog::MODEL_ROUTES
+        .iter()
+        .find(|r| {
+            !keyed.contains(&r.candidates[0].provider)
+                && r.candidates[1..]
+                    .iter()
+                    .any(|c| keyed.contains(&c.provider))
+        })
+        .expect("a row whose primary is unkeyed and whose fallback is keyed");
+    assert!(
+        got.iter().any(|g| g == fallback_only.model),
+        "{} listed via its fallback: {got:?}",
+        fallback_only.model
+    );
+}
+
+/// A BYO-only deployment (no pool keys) lists the whole catalog: its callers bring their own
+/// provider keys, and listing is how they discover the names.
+/// claim: E4
+/// defect: D250
+#[tokio::test]
+async fn v1_models_on_a_byo_only_deployment_lists_the_whole_catalog() {
+    let nats_port = unused_nats_port();
+    let (pubkey, _sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::builder(nats_port, &mock.authority(), &b64(&pubkey))
+        .providers(&[])
+        .start()
+        .await;
+
+    let all: Vec<&str> = providers::catalog::MODEL_ROUTES
+        .iter()
+        .map(|r| r.model)
+        .collect();
+    assert_eq!(listed_ids(&gw, "sk-byo-caller").await, all);
 }
 
 const CLAUDE: &str = "claude-opus-4-8";

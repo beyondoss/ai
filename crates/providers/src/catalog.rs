@@ -2274,9 +2274,19 @@ pub fn for_model(name: &str) -> Option<&'static ModelRoute> {
 /// million tokens — see [`ListPrice`]). Ids are log-safe (`[a-z0-9._/-]`), display names are
 /// tested free of quotes and backslashes, and prices are decimal strings, so this needs no JSON
 /// escaping.
+///
+/// This is the whole compiled catalog. A gateway lists only the rows it can serve, and builds that
+/// body once at boot with [`models_list_json_where`].
 pub fn models_list_json() -> &'static str {
     static JSON: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    JSON.get_or_init(|| {
+    JSON.get_or_init(|| models_list_json_where(|_| true))
+}
+
+/// [`models_list_json`] over only the rows `keep` accepts, in catalog order. Same shape and fields:
+/// a filtered list is a shorter `data` array and nothing else. It builds a fresh `String`, so a
+/// caller builds it once (the gateway does, at boot) rather than per request.
+pub fn models_list_json_where(keep: impl Fn(&ModelRoute) -> bool) -> String {
+    {
         use std::fmt::Write as _;
         fn names(out: &mut String, bits: u8, table: &[(u8, &str)]) {
             out.push('[');
@@ -2295,7 +2305,7 @@ pub fn models_list_json() -> &'static str {
         let mut out = String::from(
             "{\"object\":\"list\",\"pricing_unit\":\"usd_per_million_tokens\",\"has_more\":false,\"data\":[",
         );
-        for (i, r) in MODEL_ROUTES.iter().enumerate() {
+        for (i, r) in MODEL_ROUTES.iter().filter(|r| keep(r)).enumerate() {
             if i > 0 {
                 out.push(',');
             }
@@ -2342,7 +2352,7 @@ pub fn models_list_json() -> &'static str {
         }
         out.push_str("]}");
         out
-    })
+    }
 }
 
 #[cfg(test)]
@@ -2691,6 +2701,39 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A filtered list is the same body with a shorter `data` array: same envelope, same rows in
+    /// catalog order, each byte-identical to its entry in the full list.
+    /// claim: E4
+    /// defect: D250
+    #[test]
+    fn models_list_json_where_keeps_shape_and_order() {
+        assert_eq!(models_list_json_where(|_| true), models_list_json());
+        let none: serde_json::Value =
+            serde_json::from_str(&models_list_json_where(|_| false)).expect("valid JSON");
+        assert_eq!(none["object"], "list");
+        assert_eq!(none["has_more"], false);
+        assert_eq!(none["data"], serde_json::json!([]));
+
+        let full: serde_json::Value = serde_json::from_str(models_list_json()).unwrap();
+        let openai = |r: &ModelRoute| {
+            r.candidates
+                .iter()
+                .any(|c| c.provider == ProviderId::OpenAi)
+        };
+        let some: serde_json::Value =
+            serde_json::from_str(&models_list_json_where(openai)).unwrap();
+        let want: Vec<&serde_json::Value> = MODEL_ROUTES
+            .iter()
+            .zip(full["data"].as_array().unwrap())
+            .filter(|(r, _)| openai(r))
+            .map(|(_, row)| row)
+            .collect();
+        let got: Vec<&serde_json::Value> = some["data"].as_array().unwrap().iter().collect();
+        assert!(!got.is_empty() && got.len() < MODEL_ROUTES.len());
+        assert_eq!(got, want);
+        assert_eq!(some["pricing_unit"], full["pricing_unit"]);
     }
 
     /// claim: E4

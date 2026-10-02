@@ -1504,8 +1504,12 @@ impl AiProxy {
         Self::reject_message_boxed(session, request_id, 404, "invalid_request_error", msg).await
     }
 
-    async fn reply_models_list(session: &mut Session, request_id: &str) -> Result<bool> {
-        let body = Bytes::from(providers::catalog::models_list_json());
+    /// `body` is [`GatewayState::models_list`], rendered at boot; serving it is a refcount bump.
+    async fn reply_models_list(
+        session: &mut Session,
+        request_id: &str,
+        body: Bytes,
+    ) -> Result<bool> {
         let head_only = session.req_header().method == http::Method::HEAD;
         let mut len_buf = ArrayString::<20>::new();
         let _ = write!(len_buf, "{}", body.len());
@@ -1522,8 +1526,12 @@ impl AiProxy {
         Ok(true)
     }
 
-    async fn reply_models_list_boxed(session: &mut Session, request_id: &str) -> Result<bool> {
-        Box::pin(Self::reply_models_list(session, request_id)).await
+    async fn reply_models_list_boxed(
+        session: &mut Session,
+        request_id: &str,
+        body: Bytes,
+    ) -> Result<bool> {
+        Box::pin(Self::reply_models_list(session, request_id, body)).await
     }
 
     /// `signed_id`: a large catalog body's ids, checked before its first attempt connects (its
@@ -3721,8 +3729,11 @@ impl ProxyHttp for AiProxy {
 
         // Stock SDKs list models at GET /v1/models. Serve the catalog here so an empty GET is not
         // a missing-model 404, and so BYO keys can discover names before they hold a managed one.
+        // The body is the rows this deployment's pool keys can serve (the whole catalog when it has
+        // none), built once at boot; it is the same for every caller whatever their key type.
         if is_v1_models_list(session) {
-            return Self::reply_models_list_boxed(session, &request_id).await;
+            let body = self.state.models_list.clone();
+            return Self::reply_models_list_boxed(session, &request_id, body).await;
         }
 
         // A managed key spends Beyond's shared pool key, so it reaches only metered generation

@@ -722,6 +722,22 @@ fn retryable_failure(verdict: &Value, rows: &[Value], route: Route) -> Option<(V
     Some((e.clone(), providers))
 }
 
+/// How many rows `GET /v1/models` lists on a gateway holding pool keys for `pools`: those with at
+/// least one candidate on a pooled provider (a dead-authority provider still holds its key, so it
+/// still counts). Every cell configures at least one pool, so this is never the BYO-only case.
+fn keyed_row_count(pools: &[(&str, &str)]) -> usize {
+    providers::catalog::MODEL_ROUTES
+        .iter()
+        .filter(|r| {
+            r.candidates.iter().any(|c| {
+                pools
+                    .iter()
+                    .any(|(p, _)| *p == providers::by_id(c.provider).name)
+            })
+        })
+        .count()
+}
+
 fn attempt_cell(
     rt: Runtime,
     client: &str,
@@ -803,10 +819,11 @@ fn attempt_cell(
         .env("VERIFY_CLIENT", client)
         .env("VERIFY_CLAIMS", &checks.claims)
         .env("VERIFY_GATEWAY_PID", gw.0.id().to_string())
-        // E4: the listing must hold every catalog row, counted here so the floor can't go stale.
+        // E4: the listing must hold every row this gateway's pool keys serve (D250), counted here
+        // from the same catalog and the same pools so the number can't go stale.
         .env(
             "VERIFY_CATALOG_ROWS",
-            providers::catalog::MODEL_ROUTES.len().to_string(),
+            keyed_row_count(route.pools).to_string(),
         );
     // A BYO probe sends the provider's own key through /{provider}/, the way a customer with
     // their own key would; a leak probe looks for the pool key in everything it was sent; an S1

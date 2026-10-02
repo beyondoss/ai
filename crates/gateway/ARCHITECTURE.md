@@ -80,7 +80,7 @@ Client (stock OpenAI/Anthropic SDK)
   │  │    │           pool key required ───────────────────────── 503
   │  │    └─ BYO: pass through (no verify, no deny-set, no billing)
   │  ├─ BYO key on `/auto` (managed-only route) ──────────────────► 400
-  │  ├─ GET/HEAD /v1/models (after identity: a managed key must verify) ► catalog list
+  │  ├─ GET/HEAD /v1/models (after identity: a managed key must verify) ► keyed catalog list
   │  ├─ Managed endpoint allowlist (method + path) ──────────────► 404 / 405
   │  ├─ Catalog walk: read the body to find `model` (≤ 64 KiB in hand, larger re-run
   │  │    as a `FullBody` subrequest); past 100 MiB ──────────────► 413, before any upstream
@@ -361,7 +361,18 @@ Not in this surface: cost sort, weighted load-balance across keys, `MODEL_ROUTES
 Vercel `providerOptions` from the body.
 
 `GET /v1/models` (and `HEAD`) lists the catalog in OpenAI list shape. The Anthropic SDK reads it
-too: each row has `display_name`, and the list has `has_more: false`. Each row adds:
+too: each row has `display_name`, and the list has `has_more: false`.
+
+It lists only the rows this deployment can serve: a row is listed when at least one of its
+candidates has a pool key here (D250). A row whose primary is unkeyed but whose fallback is keyed
+stays listed, because the fallback serves it. A deployment with no pool keys at all is BYO-only. It
+lists the whole catalog, because its callers bring their own provider keys and listing is how they
+discover names. `GatewayState::new` renders the body once at boot (`state::models_list_body`), so a
+request clones `Bytes` and does no other work. The list is one body per deployment and does not
+depend on the caller's key type. There is no `/v1/models/{id}` retrieval: a managed key's `GET` on
+it is refused by the allowlist, and a BYO key's passes through to the provider.
+
+Each row adds:
 
 | Field                                                      | From                                                                      |
 | ---------------------------------------------------------- | ------------------------------------------------------------------------- |
