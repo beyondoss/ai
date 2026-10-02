@@ -2342,6 +2342,8 @@ confidence = "low"
 evidence = "Final live run on 7eca5e5 (target/final-live6.log, concurrent phase, 3,137 cells): LNG-1+LNG-2::claude-code::claude::long_task flagged 534ea41d4f95638a-26 and -27 (POST /v1/messages -> 200) as estimates, 2 of 60 calls, every prompt size monotonic (no client retry). The cell's gateway log tail was empty: long_live read it after cleanup() had removed the directory, so no row or warn line survived. Re-run alone on 7eca5e5 with VERIFY_LONG_KEEP=1 (2026-10-01): PASS, 60 calls, 0 usage_estimated rows. git diff f97ccbf..7eca5e5 leaves the estimate decision (cut_short, body_cut, body_unmetered, no_head, anthropic_stream_finished, the usage tail and head) unchanged; the lazy InputTally (D215-D218) changes only the input count of a row already being estimated. So the range holds no commit that decides to estimate, and the bisect has nothing to bisect."
 claims = ["BIL-3", "LNG-1"]
 state = "suspected"
+test = "live:LNG-1+LNG-2::claude-code::claude::long_task"
+fix = ""
 note = "Not reproduced. Under the stream rules, an Anthropic 2xx stream is estimated only when message_delta is missing from the usage tail (the upstream or the client ended the stream before it), or the parent recorded no upstream head with a downstream error. long_live now keeps the log tail on failure and prints the row, client_gone, bytes, deltas and the usage the client saw beside the problem, so the next occurrence names which rule fired."
 
 [[defect]]
@@ -2355,7 +2357,7 @@ evidence = "Final live run on 7eca5e5: CAT-7::raw::together::{qwen/qwen3.7-max,q
 claims = ["CAT-7"]
 state = "fixed"
 test = "prices_follow_the_maker_not_openrouter"
-fix = "HEAD"
+fix = "aa1caa2"
 note = "Fixed: the two Qwen cards take Alibaba's new International rates (2.5 / 7.5 / cached 0.5; 0.15 / 0.47), recorded in catalog_truth.toml with the maker as source. Kimi K3 keeps Moonshot's 3 / 15 (D116: a row's list price follows its maker). Rows marked follows = \"maker\" in catalog_truth.toml let CAT-7 note a Together price below the card and fail one above it, which would bill below cost and is an owner pricing decision. Alibaba's Global deployment is cheaper (1.65 / 4.951; 0.113 / 0.382); the card follows International because that is what Together, our only candidate, charges. Live: the three CAT-7 cells re-run 2026-10-01, PASS."
 
 [[defect]]
@@ -2369,5 +2371,5 @@ evidence = "2026-10-01, the .env admin and pool keys: both are in organization u
 claims = ["BIL-5"]
 state = "fixed"
 test = "live:BIL-5::raw::openai::reconcile"
-fix = "HEAD"
+fix = "aa1caa2"
 note = "Not an account-setup problem and not a field or pagination change. Fixed in the harness: pool_key_id reads the listing again (up to 5 reads, backing off 0.5 s, 1 s, ...) when no key matches, since a key that can call is always in the org."
