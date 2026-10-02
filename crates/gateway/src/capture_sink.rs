@@ -102,6 +102,9 @@ impl CaptureSink {
                         lost.inc();
                     }
                 }
+                // Close the queue before reporting done: a line sent after `finish` returns must
+                // find it disconnected and be counted, not sit in a buffer no one will drain.
+                drop(rx);
                 let _ = out.flush();
                 let _ = done_tx.send(());
             })?;
