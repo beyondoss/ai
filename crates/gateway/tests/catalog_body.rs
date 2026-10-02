@@ -2,8 +2,8 @@
 //!
 //! A catalog walk routes on one `model` and rewrites one `model` to the serving candidate's id. A
 //! body with a second root `model` key leaves the provider to pick between them, and most JSON
-//! parsers take the last: `{"model":"cheap",…,"model":"o1-pro"}` would route as the cheap row and
-//! be served as o1-pro. Asserted at the upstream.
+//! parsers take the last: `{"model":"cheap",…,"model":"gpt-5.5-pro"}` would route as the cheap row
+//! and be served as gpt-5.5-pro. Asserted at the upstream.
 //!
 //! Run via `mise run test:integration:rs` (needs `nats-server` on PATH).
 

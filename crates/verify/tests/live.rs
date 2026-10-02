@@ -162,7 +162,7 @@ const SONNET: Route = Route {
 };
 /// A 16k-output row, for max_tokens clamping, and the smallest window OpenAI serves on a row not
 /// scheduled to retire (128k), for a context overflow (TRN-18) that is rejected before billing.
-/// That cell was on gpt-4's 8k window until gpt-4 was scheduled to retire (2026-10-23).
+/// That cell was on gpt-4's 8k window until the gpt-4 row was removed (D243).
 const GPT4O_MINI: Route = Route {
     name: "gpt4o-mini",
     model: "gpt-4o-mini",

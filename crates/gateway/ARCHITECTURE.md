@@ -384,8 +384,8 @@ Qwen3.8 2.4T A95B, 1,010,000). One figure per row,
 not per candidate: the gateway counts no prompt tokens, so it could not choose a candidate by
 window anyway. The card lists the input kinds and capabilities the vendor lists **and every
 candidate serves on the endpoint it is reached on**: `grok-4.20-multi-agent` lists no tools (xAI
-gates its client-side tools behind beta access), `gpt-4` lists the tools every candidate calls
-though its model page omits them. A bit that one failover candidate refuses but the walk can steer
+gates its client-side tools behind beta access), and the former `gpt-4` row listed the tools
+every candidate called though its model page omitted them. A bit that one failover candidate refuses but the walk can steer
 around stays on the card, and a request using it skips that candidate (below): structured outputs
 on Bedrock and on OpenRouter's `z-ai/glm-5.2`, file input on OpenRouter's `x-ai/grok-build-0.1`. A
 bit no candidate honors is dropped: Kimi K2.6, Kimi K2.7 Code and Qwen3.6 Plus list no structured
@@ -412,8 +412,8 @@ the whole body before choosing, as a headerless walk always does. Then:
 
 - An image part (Chat `image_url`, Messages `image`, Responses `input_image`) on a row whose card
   lists no image input is a 400 naming the row (`ai_rejections_total{reason="modality"}`), before
-  any upstream: o3-mini would ignore the image and bill an answer about nothing, gpt-4 would
-  answer 500. PDFs on a row without file input are not refused: OpenRouter extracts a PDF's text
+  any upstream: o3-mini ignored the image and billed an answer about nothing, gpt-4 answered
+  500 (both rows since removed, D243). PDFs on a row without file input are not refused: OpenRouter extracts a PDF's text
   for most models.
 - A non-empty root `tools` array (any dialect) on a row whose card lists no tools is a 400 naming
   the row ("... does not accept tools", the same `modality` reason), before any upstream. A card
@@ -728,7 +728,7 @@ any host and in any spelling, gets the same clamp to `low`–`high` (reasoning i
 DeepSeek, Kimi, …) keep the body as sent, except that an effort only OpenAI's newer families define
 becomes the classic one: `xhigh` / `max` (what a large Anthropic `budget_tokens` or `effort: max`
 maps to) → `high`, `minimal` → `low`. `stop` on a
-model that rejects it (GPT-5+, o3, o4-mini) is still forwarded: dropping it would return text past
+model that rejects it (GPT-5+, o3) is still forwarded: dropping it would return text past
 the stop sequence the client asked for.
 
 **Forced tool use on models that reject it.** Claude Fable 5.1, Mythos 5.1, Opus 5.5 and Sonnet 5.5
@@ -1252,9 +1252,9 @@ Gemma 4 31B and Qwen2.5 7B Turbo).
 Rows left with only OpenRouter keep their names as OpenRouter-only rows. These ids are recorded in
 `verify/catalog_truth.toml`, and `no_candidate_is_retired_or_not_serverless` keeps them out. Those
 rows have no Responses arm — `previous_response_id` is OpenAI's store. OpenAI serves some GPT ids only
-on the Responses API (`gpt-5-pro`, `gpt-5.x-pro`, `gpt-5.3-codex`, `o1-pro`): their OpenAI candidate
+on the Responses API (`gpt-5-pro`, `gpt-5.x-pro`, `gpt-5.3-codex`): their OpenAI candidate
 is `/v1/responses` (a Chat Completions or Messages client is translated onto it), with OpenRouter
-Chat Completions as the failover (not on `o1-pro`: OpenRouter's one endpoint for it takes no tools).
+Chat Completions as the failover.
 Rows whose first-party API does not serve our keys (the `-pro` ids OpenAI does not serve this
 account; the Groq/Fireworks/Together ids above that a serverless key cannot reach) are
 OpenRouter-only. Every row and candidate is
@@ -1266,14 +1266,16 @@ Opus 4.1 and Sonnet 4 (retired at Anthropic 2026-08-05 and 2026-06-15) and GPT-5
 -Mini and GPT-5.2-Codex (shut down by OpenAI 2026-07-23, still in its `/v1/models` listing) were
 OpenRouter-only rows served from Bedrock or Azure; they were removed (D181), and a request for one
 is a catalog miss (404). The gateway never remaps a requested model to the vendor's successor.
-MiniMax M2.7 went too (D182): its one candidate, OpenRouter, sends every forced tool call and
+So did gpt-4, gpt-4-turbo, gpt-4.1-nano, o1, o1-pro, o3-mini and o4-mini, by owner decision
+ahead of OpenAI's 2026-10-23 shutdown (D243): recorded `retired` with that date, a request for one
+is a 404 like any unknown model. MiniMax M2.7 went too (D182): its one candidate, OpenRouter, sends every forced tool call and
 JSON-schema request for it to hosts that answer 410 Gone, so no candidate could serve its card.
 `verify/catalog_truth.toml` `[[retired]]` records each retirement with the vendor's notice: a
 `retired` date keeps the row and its candidates from coming back
 (`no_candidate_is_retired_or_not_serverless`, `no_catalog_row_outlives_its_retirement`), and a
 scheduled `retires` date keeps the row until that day, when the same test fails until it is
-removed (Claude Sonnet 4.5 on 2026-11-30; gpt-4, gpt-4-turbo, gpt-4.1-nano, o1, o1-pro, o3-mini and
-o4-mini on 2026-10-23; gpt-5, -mini, -nano, -pro, o3 and o3-pro on 2026-12-11). `GET /v1/models`
+removed (Claude Sonnet 4.5 on 2026-11-30; gpt-5, -mini, -nano, -pro, o3 and o3-pro on
+2026-12-11). `GET /v1/models`
 does not carry the date: neither the OpenAI list shape nor Anthropic's `/v1/models` has a
 deprecation field. The live cells `CAT-16::raw::{provider}::{row}` (`crates/verify/tests/catalog_live.rs`,
 listing calls only) hold every candidate to its vendor today: listed by the vendor's own models
@@ -2488,8 +2490,8 @@ to serve.
   `/{provider}/…` is not allowlisted and never translates. `GET /v1/models` lists the catalog.
 - Request body size ≤ `MAX_REQUEST_BODY` (declared `Content-Length` + streaming running total)
 - One root `model` key on a catalog walk. The walk routes on one and rewrites one, while most JSON
-  parsers take the _last_, so `{"model":"cheap",…,"model":"o1-pro"}` would route as the cheap row
-  and be served as o1-pro. `peek::scan_buffered` counts root `model` keys on the client body, before
+  parsers take the _last_, so `{"model":"cheap",…,"model":"gpt-5.5-pro"}` would route as the cheap
+  row and be served as gpt-5.5-pro. `peek::scan_buffered` counts root `model` keys on the client body, before
   any translation, and decodes a key spelled with escapes (`"mod\u0065l"`), since the provider
   would. A second one is refused (`ai_rejections_total{reason="duplicate_model"}`). Where the
   whole body is in hand before connecting (a headerless walk, which reads it to choose the row,

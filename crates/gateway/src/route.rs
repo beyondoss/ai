@@ -454,8 +454,8 @@ fn tool_count(body: &[u8]) -> usize {
 /// What `body` asks of `row` that its card says the row does not accept: `Some("image input")` for
 /// an image part on a row without image input, `Some("tools")` for a non-empty `tools` array on a
 /// row whose card lists no tools. The walk answers 400 before any upstream sees it. An image would
-/// otherwise be ignored and an answer about nothing billed (o3-mini, Together's gpt-oss-120b), or
-/// fail with a 500 (gpt-4). Tools would be called with junk arguments by a model the card dropped
+/// otherwise be ignored and an answer about nothing billed (Together's gpt-oss-120b, and o3-mini
+/// before its row left), or fail with a 500 (gpt-4, likewise). Tools would be called with junk arguments by a model the card dropped
 /// them from for that (GLM 5.3 Flash, D197), or refused upstream in each provider's own words. A
 /// PDF on a row without file input is left to the candidate, because OpenRouter extracts a PDF's
 /// text for any model.

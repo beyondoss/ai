@@ -219,7 +219,8 @@ async fn a_structured_output_request_skips_a_candidate_that_does_not_enforce_it(
 /// every client dialect and whether or not a header named the row, and no upstream is contacted
 /// (o3-mini answered "I can't view images" and billed it, gpt-4 answered 500). Text on the same
 /// row, and an image on a row that reads images, are served. The text-only row is
-/// deepseek-v4-pro (DeepSeek: "Vision: Not supported"); gpt-4 and o3-mini retire 2026-10-23.
+/// deepseek-v4-pro (DeepSeek: "Vision: Not supported"); the gpt-4 and o3-mini rows are gone
+/// (D243).
 /// claim: CAT-5
 /// defect: D112
 #[tokio::test]

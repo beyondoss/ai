@@ -76,7 +76,7 @@ const OPENAI: Recon = Recon {
     pool_var: "OPENAI_API_KEY",
     admin_var: "OPENAI_ADMIN_KEY",
     // Not a reasoning model, so the batch's tokens are the same on every run, and its Chat
-    // primary has a Responses arm. gpt-4.1-nano, the batch's row until then, retires 2026-10-23;
+    // primary has a Responses arm. gpt-4.1-nano, the batch's row until then, left the catalog;
     // gpt-4.1-mini is the same family (same caching), and no other live suite pins it.
     model: "gpt-4.1-mini",
     batch: &[

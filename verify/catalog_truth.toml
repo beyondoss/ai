@@ -44,6 +44,8 @@
 # and carries exactly one date:
 # - `retired`: the vendor no longer serves it. No row may be named `model`, and no candidate may
 #   name the (provider, id). A client's request for it is a 404, never a remap to a successor.
+#   A row removed early by owner decision records the vendor's announced shutdown here too, so
+#   the date can still be ahead (the seven OpenAI rows due 2026-10-23, removed 2026-10-01: D243).
 # - `retires`: the vendor has announced the date. The row or candidate stays until then;
 #   `no_catalog_row_outlives_its_retirement` fails once that date is today or past, so the row is
 #   removed (and the entry turned into `retired`) before a customer's request reaches a vendor
@@ -305,43 +307,6 @@ input_absent = ["image"]
 note = "DeepSeek-V4-Pro-0813. \"Vision: Not supported\". Off-peak $0.66 / $0.022 / $1.98. Together serves the same snapshot as deepseek-ai/DeepSeek-V4-Pro-0813. So does OpenRouter's deepseek/deepseek-v4-pro-0813 (GET /api/v1/models/deepseek/deepseek-v4-pro-0813/endpoints: \"DeepSeek V4 Pro 0813 ... the GA release of DeepSeek V4 Pro\", Hugging Face id deepseek-ai/DeepSeek-V4-Pro-0813, input text only, 1,048,576 context, 21 endpoints, DeepSeek's own among them, 2026-10-01); its bare deepseek/deepseek-v4-pro is the 0423 snapshot."
 
 [[row]]
-model = "gpt-4"
-source = [
-  "https://api.openai.com/v1/models",
-  "https://developers.openai.com/api/docs/pricing.md",
-  "https://developers.openai.com/api/docs/models/gpt-4.md",
-]
-date = "2026-10-01"
-input = "30"
-output = "60"
-context_window = 8192
-max_output_tokens = 8192
-features_absent = ["structured_outputs"]
-input_limit = 8191
-output_limit = 4096
-limit_evidence = "The 8,192 window holds prompt and output together, so the vendor's 8,192 max output is refused with any prompt (\"you requested 8206 tokens (14 in the messages, 8192 in the completion)\", CAT-4::raw::openai::gpt-4). The card takes OpenRouter's published figures for its candidate: context_length 8191 (\"This endpoint's maximum context length is 8191 tokens\") and max_completion_tokens 4096."
-created = 1687882411
-note = "Shutdown 2026-10-23. Feature list is \"fine_tuning, streaming\" only, yet every candidate (OpenAI Chat and Responses, OpenRouter) returns a forced function call (CAT-6::raw::openai::gpt-4): gpt-4-0613 is the snapshot that introduced function calling. The card lists tools; structured outputs stay off."
-
-[[row]]
-model = "gpt-4-turbo"
-source = [
-  "https://api.openai.com/v1/models",
-  "https://developers.openai.com/api/docs/pricing.md",
-  "https://developers.openai.com/api/docs/models/gpt-4-turbo.md",
-]
-date = "2026-10-01"
-input = "10"
-output = "30"
-context_window = 128_000
-max_output_tokens = 4096
-input_present = ["image"]
-features_present = ["tools"]
-features_absent = ["structured_outputs"]
-created = 1712361441
-note = "Shutdown 2026-10-23."
-
-[[row]]
 model = "gpt-4.1"
 source = [
   "https://api.openai.com/v1/models",
@@ -370,22 +335,6 @@ cache_read = "0.1"
 context_window = 1_047_576
 max_output_tokens = 32_768
 created = 1744318173
-
-[[row]]
-model = "gpt-4.1-nano"
-source = [
-  "https://api.openai.com/v1/models",
-  "https://developers.openai.com/api/docs/pricing.md",
-  "https://developers.openai.com/api/docs/models/gpt-4.1-nano.md",
-]
-date = "2026-10-01"
-input = "0.1"
-output = "0.4"
-cache_read = "0.025"
-context_window = 1_047_576
-max_output_tokens = 32_768
-created = 1744321707
-note = "Shutdown 2026-10-23."
 
 [[row]]
 model = "gpt-4o"
@@ -973,36 +922,6 @@ context_window = 1_048_576
 note = "Moonshot's own price (platform.moonshot.ai redirects to platform.kimi.ai). Together's /v1/models lists 2.7 / 13.5 (cached 0.27) on 2026-10-01, below the maker: the card follows the maker (D116, D241)."
 
 [[row]]
-model = "o1"
-source = [
-  "https://api.openai.com/v1/models",
-  "https://developers.openai.com/api/docs/pricing.md",
-  "https://developers.openai.com/api/docs/models/o1.md",
-]
-date = "2026-10-01"
-input = "15"
-output = "60"
-cache_read = "7.5"
-context_window = 200_000
-max_output_tokens = 100_000
-created = 1734375816
-note = "Shutdown 2026-10-23."
-
-[[row]]
-model = "o1-pro"
-source = [
-  "https://api.openai.com/v1/models",
-  "https://developers.openai.com/api/docs/pricing.md",
-  "https://developers.openai.com/api/docs/models/o1-pro.md",
-]
-date = "2026-10-01"
-input = "150"
-output = "600"
-features_present = ["tools"]
-created = 1742251791
-note = "Shutdown 2026-10-23."
-
-[[row]]
 model = "o3"
 source = [
   "https://api.openai.com/v1/models",
@@ -1016,39 +935,6 @@ cache_read = "0.5"
 context_window = 200_000
 max_output_tokens = 100_000
 created = 1744225308
-
-[[row]]
-model = "o3-mini"
-source = [
-  "https://api.openai.com/v1/models",
-  "https://developers.openai.com/api/docs/pricing.md",
-  "https://developers.openai.com/api/docs/models/o3-mini.md",
-]
-date = "2026-10-01"
-input = "1.1"
-output = "4.4"
-cache_read = "0.55"
-context_window = 200_000
-max_output_tokens = 100_000
-input_absent = ["image"]
-created = 1737146383
-note = "Shutdown 2026-10-23. Text only."
-
-[[row]]
-model = "o4-mini"
-source = [
-  "https://api.openai.com/v1/models",
-  "https://developers.openai.com/api/docs/pricing.md",
-  "https://developers.openai.com/api/docs/models/o4-mini.md",
-]
-date = "2026-10-01"
-input = "1.1"
-output = "4.4"
-cache_read = "0.275"
-context_window = 200_000
-max_output_tokens = 100_000
-created = 1744225351
-note = "Shutdown 2026-10-23."
 
 [[row]]
 model = "openai/gpt-oss-120b"
@@ -1382,24 +1268,24 @@ model = "gpt-4"
 provider = "openai"
 id = "gpt-4-0613"
 source = "https://developers.openai.com/api/docs/deprecations"
-retires = "2026-10-23"
-note = "\"Legacy GPT model snapshots\" (announced 2026-04-22): gpt-4-0613 | gpt-4, shutdown 2026-10-23, replacement gpt-5.6-sol (D181)."
+retired = "2026-10-23"
+note = "\"Legacy GPT model snapshots\" (announced 2026-04-22): gpt-4-0613 | gpt-4, shutdown 2026-10-23, replacement gpt-5.6-sol. Removed early by owner decision on 2026-10-01, before the shutdown (D181, D243)."
 
 [[retired]]
 model = "gpt-4-turbo"
 provider = "openai"
 id = "gpt-4-turbo-2024-04-09"
 source = "https://developers.openai.com/api/docs/deprecations"
-retires = "2026-10-23"
-note = "gpt-4-turbo | gpt-4-turbo-2024-04-09: shutdown 2026-10-23, replacement gpt-5.6-sol (D181)."
+retired = "2026-10-23"
+note = "gpt-4-turbo | gpt-4-turbo-2024-04-09: shutdown 2026-10-23, replacement gpt-5.6-sol. Removed early by owner decision on 2026-10-01, before the shutdown (D181, D243)."
 
 [[retired]]
 model = "gpt-4.1-nano"
 provider = "openai"
 id = "gpt-4.1-nano-2025-04-14"
 source = "https://developers.openai.com/api/docs/deprecations"
-retires = "2026-10-23"
-note = "gpt-4.1-nano | gpt-4.1-nano-2025-04-14: shutdown 2026-10-23, replacement gpt-5.6-luna. The BIL-5 OpenAI reconciliation batch runs on it (verify/README.md) and must move first (D181)."
+retired = "2026-10-23"
+note = "gpt-4.1-nano | gpt-4.1-nano-2025-04-14: shutdown 2026-10-23, replacement gpt-5.6-luna. The BIL-5 OpenAI reconciliation batch moved to gpt-4.1-mini first. Removed early by owner decision on 2026-10-01, before the shutdown (D181, D243)."
 
 [[retired]]
 provider = "openai"
@@ -1413,32 +1299,32 @@ model = "o1"
 provider = "openai"
 id = "o1-2024-12-17"
 source = "https://developers.openai.com/api/docs/deprecations"
-retires = "2026-10-23"
-note = "o1-2024-12-17 | o1: shutdown 2026-10-23, replacement gpt-5.6-sol (D181)."
+retired = "2026-10-23"
+note = "o1-2024-12-17 | o1: shutdown 2026-10-23, replacement gpt-5.6-sol. Removed early by owner decision on 2026-10-01, before the shutdown (D181, D243)."
 
 [[retired]]
 model = "o1-pro"
 provider = "openai"
 id = "o1-pro-2025-03-19"
 source = "https://developers.openai.com/api/docs/deprecations"
-retires = "2026-10-23"
-note = "o1-pro-2025-03-19 | o1-pro: shutdown 2026-10-23, replacement gpt-5.6-sol with reasoning.mode pro (D181)."
+retired = "2026-10-23"
+note = "o1-pro-2025-03-19 | o1-pro: shutdown 2026-10-23, replacement gpt-5.6-sol with reasoning.mode pro. Removed early by owner decision on 2026-10-01, before the shutdown (D181, D243)."
 
 [[retired]]
 model = "o3-mini"
 provider = "openai"
 id = "o3-mini-2025-01-31"
 source = "https://developers.openai.com/api/docs/deprecations"
-retires = "2026-10-23"
-note = "o3-mini-2025-01-31 | o3-mini: shutdown 2026-10-23, replacement gpt-5.6-sol (D181)."
+retired = "2026-10-23"
+note = "o3-mini-2025-01-31 | o3-mini: shutdown 2026-10-23, replacement gpt-5.6-sol. Removed early by owner decision on 2026-10-01, before the shutdown (D181, D243)."
 
 [[retired]]
 model = "o4-mini"
 provider = "openai"
 id = "o4-mini-2025-04-16"
 source = "https://developers.openai.com/api/docs/deprecations"
-retires = "2026-10-23"
-note = "o4-mini-2025-04-16 | o4-mini: shutdown 2026-10-23, replacement gpt-5.6-terra (D181)."
+retired = "2026-10-23"
+note = "o4-mini-2025-04-16 | o4-mini: shutdown 2026-10-23, replacement gpt-5.6-terra. Removed early by owner decision on 2026-10-01, before the shutdown (D181, D243)."
 
 [[retired]]
 model = "gpt-5"

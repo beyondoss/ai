@@ -134,7 +134,7 @@ pub struct ModelRoute {
 ///   instead. A max output that is not such a fraction is kept.
 /// - `input` and `features` list what the vendor lists **and every candidate serves on the
 ///   endpoint the catalog sends it to**. A bit the vendor's model page does not name (structured
-///   outputs on `gpt-4`) is removed; so is one a candidate's endpoint refuses (function calling on
+///   outputs on the former `gpt-4` row) is removed; so is one a candidate's endpoint refuses (function calling on
 ///   `grok-4.20-multi-agent`, which xAI gates behind beta access; tools on
 ///   `meta-llama/llama-4-scout`, which no OpenRouter host serves), and one no candidate enforces
 ///   (structured outputs on Kimi K2.6, Kimi K2.7 Code and Qwen3.6 Plus, whose hosts accept a JSON
@@ -143,9 +143,9 @@ pub struct ModelRoute {
 ///   candidate: structured outputs on Bedrock and OpenRouter's `z-ai/glm-5.2`
 ///   ([`serves_structured_outputs`]), file input on
 ///   OpenRouter's `x-ai/grok-build-0.1` ([`serves_file_input`]). One the page omits but every
-///   candidate serves is listed: function calling on `gpt-4`, the snapshot that introduced it.
-///   The gateway refuses image input on a row whose card omits it, rather than let a candidate
-///   ignore the image (o3-mini) or answer 500 (gpt-4).
+///   candidate serves is listed (function calling on the former `gpt-4` row, the snapshot that
+///   introduced it). The gateway refuses image input on a row whose card omits it, rather than let
+///   a candidate ignore the image (o3-mini did) or answer 500 (gpt-4 did).
 /// - `created` and `owned_by` are the vendor's own listing (OpenAI's and xAI's `/v1/models`),
 ///   never the day OpenRouter listed the model.
 /// - Anything the vendor does not publish still comes from OpenRouter's public card for the row's
@@ -298,7 +298,10 @@ const fn card_unpublished_output(
 /// whose sole host for each is Mistral on OpenRouter's shared upstream pool, which refused most
 /// requests with 429. They come back with `AI_POOL_KEY_MISTRAL`: `ProviderId::Mistral` and its
 /// spec are kept, so each row is again `compat_chat(ProviderId::Mistral, ..)` plus its
-/// `verify/catalog_truth.toml` entry (the 2026-10-01 audit has the vendor facts).
+/// `verify/catalog_truth.toml` entry (the 2026-10-01 audit has the vendor facts). `gpt-4`,
+/// `gpt-4-turbo`, `gpt-4.1-nano`, `o1`, `o1-pro`, `o3-mini` and `o4-mini` were removed the same day
+/// by owner decision (D243), ahead of OpenAI's 2026-10-23 shutdown; a request for one is a 404 like
+/// any unknown model.
 ///
 /// A card that omits `cache_read` or `cache_write` is filled with the **input** rate: no discount,
 /// no write premium. Omission is not $0. A consumer that subtracted cache tokens and then multiplied
@@ -1133,30 +1136,6 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
     // gpt-5.5, gpt-5.5-pro, gpt-5.6-* and gpt-6-astra. These rows list the base tier only; such a
     // request is under-listed. A cache-write rate is published only for gpt-6-astra and gpt-5.6-*.
     ModelRoute {
-        model: "gpt-4",
-        wire: WireFormat::OpenAi,
-        candidates: &openai_chat("gpt-4", "openai/gpt-4"),
-        responses: &openai_responses("gpt-4"),
-        price: price("30", "60", "30", "30"), // no separate cache card; both rates equal input
-        card: card("GPT-4", "openai", 1687882411, 8_191, 4_096, IN_TEXT, TOOLS),
-    },
-    ModelRoute {
-        model: "gpt-4-turbo",
-        wire: WireFormat::OpenAi,
-        candidates: &openai_chat("gpt-4-turbo", "openai/gpt-4-turbo"),
-        responses: &openai_responses("gpt-4-turbo"),
-        price: price("10", "30", "10", "10"), // no separate cache card; both rates equal input
-        card: card(
-            "GPT-4 Turbo",
-            "openai",
-            1712361441,
-            128_000,
-            4_096,
-            IN_TEXT | IN_IMAGE,
-            TOOLS,
-        ),
-    },
-    ModelRoute {
         model: "gpt-4.1",
         wire: WireFormat::OpenAi,
         candidates: &openai_chat("gpt-4.1", "openai/gpt-4.1"),
@@ -1182,22 +1161,6 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
             "GPT-4.1 Mini",
             "openai",
             1744318173,
-            1_047_576,
-            32_768,
-            IN_TEXT | IN_IMAGE | IN_FILE,
-            TOOLS | STRUCTURED_OUTPUTS,
-        ),
-    },
-    ModelRoute {
-        model: "gpt-4.1-nano",
-        wire: WireFormat::OpenAi,
-        candidates: &openai_chat("gpt-4.1-nano", "openai/gpt-4.1-nano"),
-        responses: &openai_responses("gpt-4.1-nano"),
-        price: price("0.1", "0.4", "0.025", "0.1"), // cache_write unpublished; equals input
-        card: card(
-            "GPT-4.1 Nano",
-            "openai",
-            1744321707,
             1_047_576,
             32_768,
             IN_TEXT | IN_IMAGE | IN_FILE,
@@ -1950,40 +1913,6 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         ),
     },
     ModelRoute {
-        model: "o1",
-        wire: WireFormat::OpenAi,
-        candidates: &openai_chat("o1", "openai/o1"),
-        responses: &openai_responses("o1"),
-        price: price("15", "60", "7.5", "15"), // cache_write unpublished; equals input
-        card: card(
-            "o1",
-            "openai",
-            1734375816,
-            200_000,
-            100_000,
-            IN_TEXT | IN_IMAGE | IN_FILE,
-            TOOLS | REASONING | STRUCTURED_OUTPUTS,
-        ),
-    },
-    ModelRoute {
-        model: "o1-pro",
-        wire: WireFormat::OpenAi,
-        // No OpenRouter failover: its one `openai/o1-pro` endpoint lists no `tools`, which the
-        // card (and OpenAI) offer, so a tool request that failed over would 404 there.
-        candidates: &openai_responses("o1-pro"),
-        responses: &openai_responses("o1-pro"),
-        price: price("150", "600", "150", "150"), // no separate cache card; both rates equal input
-        card: card(
-            "o1-pro",
-            "openai",
-            1742251791,
-            200_000,
-            100_000,
-            IN_TEXT | IN_IMAGE | IN_FILE,
-            TOOLS | REASONING | STRUCTURED_OUTPUTS,
-        ),
-    },
-    ModelRoute {
         model: "o3",
         wire: WireFormat::OpenAi,
         candidates: &openai_chat("o3", "openai/o3"),
@@ -2000,22 +1929,6 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         ),
     },
     ModelRoute {
-        model: "o3-mini",
-        wire: WireFormat::OpenAi,
-        candidates: &openai_chat("o3-mini", "openai/o3-mini"),
-        responses: &openai_responses("o3-mini"),
-        price: price("1.1", "4.4", "0.55", "1.1"), // cache_write unpublished; equals input
-        card: card(
-            "o3 Mini",
-            "openai",
-            1737146383,
-            200_000,
-            100_000,
-            IN_TEXT | IN_FILE,
-            TOOLS | REASONING | STRUCTURED_OUTPUTS,
-        ),
-    },
-    ModelRoute {
         model: "o3-pro",
         wire: WireFormat::OpenAi,
         candidates: &openrouter_only("openai/o3-pro"), // not served to our OpenAI key
@@ -2025,22 +1938,6 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
             "o3 Pro",
             "openai",
             1749598352,
-            200_000,
-            100_000,
-            IN_TEXT | IN_IMAGE | IN_FILE,
-            TOOLS | REASONING | STRUCTURED_OUTPUTS,
-        ),
-    },
-    ModelRoute {
-        model: "o4-mini",
-        wire: WireFormat::OpenAi,
-        candidates: &openai_chat("o4-mini", "openai/o4-mini"),
-        responses: &openai_responses("o4-mini"),
-        price: price("1.1", "4.4", "0.275", "1.1"), // cache_write unpublished; equals input
-        card: card(
-            "o4 Mini",
-            "openai",
-            1744225351,
             200_000,
             100_000,
             IN_TEXT | IN_IMAGE | IN_FILE,
@@ -2460,12 +2357,14 @@ mod tests {
     /// `deepseek-reasoner`, `mistral-nemo`) left the table. A row must never serve a different model
     /// under its name, so the floor came down rather than padding the table with rows to meet it.
     /// It came down again, to 90, when the seven Mistral rows left (D156): a row nobody can be
-    /// served on is not a row.
+    /// served on is not a row. It came down to 80 when the seven OpenAI rows due to shut down on
+    /// 2026-10-23 left early by owner decision (D243): 91 rows became 84, and the floor follows the
+    /// table rather than the table being padded to meet it.
     #[test]
-    fn catalog_lists_at_least_90_models() {
+    fn catalog_lists_at_least_80_models() {
         assert!(
-            MODEL_ROUTES.len() >= 90,
-            "MODEL_ROUTES has {} rows; keep the managed catalog at 90+",
+            MODEL_ROUTES.len() >= 80,
+            "MODEL_ROUTES has {} rows; keep the managed catalog at 80+",
             MODEL_ROUTES.len(),
         );
     }
@@ -3752,9 +3651,13 @@ mod tests {
     /// its vendor retired (`retired`) can't be re-added, as a row name or as a candidate, and a row
     /// whose retirement date has come fails here until it is removed, so the vendor's 404 never
     /// reaches a customer under our name. A client's request for a retired row is a 404, never a
-    /// remap to the vendor's successor.
+    /// remap to the vendor's successor. The seven OpenAI rows due 2026-10-23 left early by owner
+    /// decision (D243), recorded `retired` with that date: no row, candidate or Responses arm names
+    /// them, here or as OpenRouter's `openai/` slug. That took gpt-4's card with it, so the D111
+    /// (max output leaves room for a prompt in its 8,192 window) and D113 (the card lists the tools
+    /// every candidate serves) checks have no row left to hold.
     /// claim: CAT-1, CAT-2, CAT-16
-    /// defect: D181
+    /// defect: D111, D113, D181, D243
     #[test]
     fn no_catalog_row_outlives_its_retirement() {
         let t = truth();
@@ -3784,7 +3687,8 @@ mod tests {
                 );
             }
         }
-        // The rows retired on 2026-10-01 (D181) stay out under their names.
+        // The rows retired on 2026-10-01 (D181), and the seven OpenAI rows removed that day ahead
+        // of their 2026-10-23 shutdown (D243), stay out under their names.
         for gone in [
             "claude-opus-4-1",
             "claude-sonnet-4",
@@ -3792,6 +3696,13 @@ mod tests {
             "gpt-5.1-codex-max",
             "gpt-5.1-codex-mini",
             "gpt-5.2-codex",
+            "gpt-4",
+            "gpt-4-turbo",
+            "gpt-4.1-nano",
+            "o1",
+            "o1-pro",
+            "o3-mini",
+            "o4-mini",
         ] {
             assert!(
                 MODEL_ROUTES.iter().all(|r| r.model != gone),
@@ -3801,6 +3712,15 @@ mod tests {
                 all.iter()
                     .any(|e| e.model == Some(gone) && e.retired.is_some()),
                 "{gone}: no [[retired]] entry"
+            );
+            let slug = format!("openai/{gone}");
+            assert!(
+                MODEL_ROUTES.iter().all(|r| r
+                    .candidates
+                    .iter()
+                    .chain(r.responses)
+                    .all(|c| c.upstream_model != gone && c.upstream_model != slug)),
+                "{gone} is still a candidate"
             );
         }
     }
@@ -3992,19 +3912,15 @@ mod tests {
         assert!(checked > 0, "the truth file records no capability bits");
     }
 
-    /// The D54 cards: gpt-4 claims no structured outputs, deepseek-flash keeps image input (DeepSeek
-    /// lists vision; D54's suspicion was wrong), and no row advertises a max output that is
-    /// OpenRouter's 0.9x / 0.8x-of-window filler.
+    /// The D54 cards: the pro rows claim no structured outputs (gpt-4 and gpt-4-turbo did too, until
+    /// their rows left: D243), deepseek-flash keeps image input (DeepSeek lists vision; D54's
+    /// suspicion was wrong), and no row advertises a max output that is OpenRouter's
+    /// 0.9x / 0.8x-of-window filler.
     /// claim: CAT-6, CAT-4
     /// defect: D54
     #[test]
     fn suspect_cards_are_corrected() {
-        let gpt4 = for_model("gpt-4").map(|r| r.card);
-        assert!(gpt4.is_some(), "gpt-4");
-        if let Some(c) = gpt4 {
-            assert_eq!(c.features & STRUCTURED_OUTPUTS, 0);
-        }
-        for m in ["gpt-4-turbo", "gpt-5.2-pro", "gpt-5.4-pro"] {
+        for m in ["gpt-5.2-pro", "gpt-5.4-pro"] {
             let f = for_model(m).map(|r| r.card.features);
             assert!(f.is_some_and(|f| f & STRUCTURED_OUTPUTS == 0), "{m}");
         }
@@ -4078,30 +3994,6 @@ mod tests {
             for_model("qwen/qwen3.8-2.4t-a95b").map(|r| r.card.context_window),
             Some(1_010_000)
         );
-    }
-
-    /// gpt-4's 8,192-token window holds prompt and output together, so the vendor's 8,192 max
-    /// output was refused with any prompt at all. The card states a max output a prompt fits
-    /// beside, and the smaller window its OpenRouter candidate enforces.
-    /// claim: CAT-4, CAT-3
-    /// defect: D111
-    #[test]
-    fn gpt4_max_output_leaves_room_for_a_prompt() {
-        let c = for_model("gpt-4").map(|r| r.card);
-        assert_eq!(
-            c.map(|c| (c.context_window, c.max_output_tokens)),
-            Some((8_191, 4_096))
-        );
-    }
-
-    /// gpt-4 calls tools on every candidate (OpenAI Chat and Responses, OpenRouter), though its
-    /// model page lists none: the card lists what is served.
-    /// claim: CAT-6
-    /// defect: D113
-    #[test]
-    fn gpt4_card_lists_the_tools_it_serves() {
-        let f = for_model("gpt-4").map(|r| r.card.features);
-        assert_eq!(f, Some(TOOLS));
     }
 
     /// xAI serves multi-agent models on Responses only, and refuses their client-side tools

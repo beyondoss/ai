@@ -1558,9 +1558,9 @@ confidence = "high"
 evidence = "live 2026-10-01 catalog sweep: CAT-4::raw::openai::gpt-4 -> 400 \"This model's maximum context length is 8192 tokens. However, you requested 8206 tokens (14 in the messages, 8192 in the completion)\". Same in all three sweeps."
 claims = ["CAT-4"]
 state = "fixed"
-test = "gpt4_max_output_leaves_room_for_a_prompt"
+test = "no_catalog_row_outlives_its_retirement"
 fix = "f00e48a"
-note = "Fixed: gpt-4's 8,192 window holds prompt and output together, so no max output equal to it is usable. The card takes OpenRouter's published figures for its candidate: max_completion_tokens 4,096 and context_length 8,191 (the smaller window, D104's rule); catalog_truth.toml records output_limit / input_limit beside OpenAI's 8,192 / 8,192. The gateway also clamps a request's output limit to the card, so a larger ask fits. Live: CAT-4::raw::{openai,openai-responses,openrouter}::gpt-4 re-run 2026-10-01."
+note = "Fixed: gpt-4's 8,192 window holds prompt and output together, so no max output equal to it is usable. The card takes OpenRouter's published figures for its candidate: max_completion_tokens 4,096 and context_length 8,191 (the smaller window, D104's rule); catalog_truth.toml records output_limit / input_limit beside OpenAI's 8,192 / 8,192. The gateway also clamps a request's output limit to the card, so a larger ask fits. Live: CAT-4::raw::{openai,openai-responses,openrouter}::gpt-4 re-run 2026-10-01. The gpt-4 row was removed on 2026-10-01, ahead of OpenAI's 2026-10-23 shutdown (D243), so its card is gone and gpt4_max_output_leaves_room_for_a_prompt with it; no_catalog_row_outlives_its_retirement now holds the row out (a request for gpt-4 is a 404)."
 
 [[defect]]
 id = "D112"
@@ -1586,9 +1586,9 @@ confidence = "high"
 evidence = "live 2026-10-01 catalog sweep: CAT-6::raw::openai::gpt-4, CAT-6::raw::openai-responses::gpt-4, CAT-6::raw::openrouter::gpt-4 -> get_weather({\"city\":\"Paris\"})."
 claims = ["CAT-6"]
 state = "fixed"
-test = "gpt4_card_lists_the_tools_it_serves"
+test = "no_catalog_row_outlives_its_retirement"
 fix = "f00e48a"
-note = "The card follows the sourcing rule (list only what the vendor's model page names); the page omits function calling for gpt-4. Fixed: The card lists tools: every candidate returns the forced call, and gpt-4-0613 is the snapshot that introduced function calling; the model page's feature list omits it. catalog_truth.toml drops tools from features_absent with that note. Live: CAT-6::raw::{openai,openai-responses,openrouter}::gpt-4 re-run 2026-10-01."
+note = "The card follows the sourcing rule (list only what the vendor's model page names); the page omits function calling for gpt-4. Fixed: The card lists tools: every candidate returns the forced call, and gpt-4-0613 is the snapshot that introduced function calling; the model page's feature list omits it. catalog_truth.toml drops tools from features_absent with that note. Live: CAT-6::raw::{openai,openai-responses,openrouter}::gpt-4 re-run 2026-10-01. The gpt-4 row was removed on 2026-10-01, ahead of OpenAI's 2026-10-23 shutdown (D243), so its card is gone and gpt4_card_lists_the_tools_it_serves with it; no_catalog_row_outlives_its_retirement now holds the row out (a request for gpt-4 is a 404)."
 
 [[defect]]
 id = "D114"
@@ -2373,3 +2373,17 @@ state = "fixed"
 test = "live:BIL-5::raw::openai::reconcile"
 fix = "aa1caa2"
 note = "Not an account-setup problem and not a field or pagination change. Fixed in the harness: pool_key_id reads the listing again (up to 5 reads, backing off 0.5 s, 1 s, ...) when no key matches, since a key that can call is always in the org."
+
+[[defect]]
+id = "D243"
+severity = "low"
+area = "Catalog"
+title = "Seven models retiring 2026-10-23 removed before launch"
+impact = "gpt-4, gpt-4-turbo, gpt-4.1-nano, o1, o1-pro, o3-mini and o4-mini were rows until OpenAI's 2026-10-23 shutdown, so a client could build on a model with three weeks to live, and gpt-4 was already unreliable on tool calls."
+confidence = "high"
+evidence = "OpenAI deprecations (https://developers.openai.com/api/docs/deprecations), \"Legacy GPT model snapshots\": gpt-4-0613 | gpt-4, gpt-4-turbo-2024-04-09, gpt-4.1-nano-2025-04-14, o1-2024-12-17, o1-pro-2025-03-19, o3-mini-2025-01-31 and o4-mini-2025-04-16 shut down 2026-10-23 (recorded as retires in verify/catalog_truth.toml since D181). Owner decision 2026-10-01: not in production, nothing depends on them; remove them now."
+claims = ["CAT-1", "CAT-16"]
+state = "fixed"
+test = "no_catalog_row_outlives_its_retirement"
+fix = ""
+note = "Fixed by removing the seven rows (and their [[row]] entries in verify/catalog_truth.toml); their [[retired]] entries now say retired = \"2026-10-23\" with OpenAI's deprecations page as source and the early, owner-decided removal in the note, so no row, candidate, Responses arm or openai/ OpenRouter slug can name them again. A request for one is a 404 like any unknown model; nothing remaps to a successor. no_catalog_row_outlives_its_retirement asserts all seven absent, recorded retired, and named by no candidate. The catalog floor came down from 90 to 80 (91 rows became 84). Re-pointed: body_memory's image-gate body moved from o3-mini to deepseek-v4-pro (also text-only); suspect_cards_are_corrected drops gpt-4 / gpt-4-turbo and keeps the two pro rows; the D111 and D113 gpt-4 card tests went with the row (both defects now name the absence test). String-only fixtures (translate::OpenAiModel parsing, peek's duplicate-model scans) keep the ids: they never reach the catalog."

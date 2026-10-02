@@ -39,7 +39,7 @@ async fn gateway(mode: Mode) -> (MockUpstream, Gateway, ed25519_dalek::SigningKe
     let (pubkey, sk) = test_keypair(1);
     let mock = MockUpstream::start(mode).await;
     let gw = Gateway::builder(unused_nats_port(), &mock.authority(), &b64(&pubkey))
-        .providers(&["openai", "anthropic", "xai"])
+        .providers(&["openai", "anthropic", "xai", "deepseek"])
         .start()
         .await;
     (mock, gw, sk)
@@ -101,15 +101,16 @@ async fn a_huge_responses_history_is_admitted_without_a_dom() {
     );
 }
 
-/// The same for the image gate: an 8 MiB Chat body on a row without image input (o3-mini) whose
-/// text says `"image"`. It carries no image part, so it is relayed, and reading it took no `Value`.
+/// The same for the image gate: an 8 MiB Chat body on a row without image input (deepseek-v4-pro)
+/// whose text says `"image"`. It carries no image part, so it is relayed, and reading it took no
+/// `Value`. (It was o3-mini until that row left the catalog: D243.)
 /// claim: SEC-19
 /// defect: D215
 #[tokio::test]
 async fn a_huge_body_that_says_image_is_checked_without_a_dom() {
     let (mock, gw, sk) = gateway(Mode::Json).await;
     let body = format!(
-        r#"{{"model":"o3-mini","messages":[{{"role":"user","content":[{{"type":"text","text":"image"}},{}]}}]}}"#,
+        r#"{{"model":"deepseek-v4-pro","messages":[{{"role":"user","content":[{{"type":"text","text":"image"}},{}]}}]}}"#,
         tiny_objects(8 * MIB)
     );
     let len = body.len();

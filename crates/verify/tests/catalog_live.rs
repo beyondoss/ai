@@ -1409,7 +1409,7 @@ fn core_family(id: &str) -> Vec<String> {
 // ---------------------------------------------------------------------------------------------
 
 const OK_PROMPT: &str = "Reply with the single word OK.";
-/// Enough arithmetic that a reasoning model reasons at low effort, not so much that o1 spends 4k.
+/// Enough arithmetic that a reasoning model reasons at low effort, not so much that it spends 4k.
 const REASON_PROMPT: &str = "What is 1234 times 5678? Reply with only the number.";
 /// Claude's adaptive thinking skips arithmetic it can do in its head, even at medium effort.
 const CLAUDE_REASON_PROMPT: &str =
@@ -2503,7 +2503,7 @@ struct Mount {
 
 /// The OpenAI-model mounts use gpt-4o-mini: the cheapest OpenAI row not scheduled to retire, and
 /// not a reasoning model, so the body's `max_tokens` passes through as sent (gpt-4.1-nano, their
-/// model until then, retires 2026-10-23).
+/// model until then, left the catalog: D243).
 const MOUNTS: &[Mount] = &[
     Mount {
         name: "openai",
