@@ -66,6 +66,7 @@
 
 use crate::cache;
 use crate::capture::CaptureBufs;
+use crate::circuit_breaker::Permit;
 use crate::key;
 use crate::metrics::{KeyCooled, Rejection};
 use crate::route::{self, Dialect, Provider};
@@ -363,10 +364,10 @@ impl Drop for Ctx {
         self.held.release_tenant();
         self.held.release_body();
         if let Some(rc) = self.rc.as_mut()
-            && std::mem::take(&mut rc.breaker_pending)
+            && let Some(permit) = rc.breaker_pending.take()
             && let Some(b) = rc.provider.breaker.as_ref()
         {
-            b.release();
+            b.release(permit);
         }
         LIVE_REQUESTS.fetch_sub(1, Ordering::AcqRel);
     }
@@ -456,18 +457,20 @@ pub struct RequestCtx {
     /// second refusal there is a provider failure: fail over, or end the request. Cleared when the
     /// walk moves to a new candidate.
     refused_resent: bool,
-    /// Whether an `allow()` on `provider`'s breaker is outstanding and still owes exactly one
-    /// `record_*`.
+    /// The permit an `allow()` on `provider`'s breaker handed out, while it is outstanding and
+    /// still owes exactly one `record_*_for` or `release`. Resolving with the permit (not just
+    /// "the breaker") is what lets a half-open breaker ignore an attempt whose probe permit it has
+    /// since reclaimed (D256).
     ///
     /// The ledger that keeps breaker accounting honest once a request can attempt more than one
-    /// provider. Invariant: `breaker_pending` is true **iff** there is exactly one unresolved
+    /// provider. Invariant: `breaker_pending` is `Some` **iff** there is exactly one unresolved
     /// `allow()` against whatever `provider` currently points at. `logging` records only when it is
     /// set, so an attempt can never be recorded twice, and a candidate switch resolves the outgoing
     /// candidate before claiming the next one.
     ///
-    /// On the `/{provider}/…` path this is simply `breaker.is_some()`, set once in `request_filter`
-    /// — exactly the condition `logging` used to test inline — so that path's behaviour is unchanged.
-    breaker_pending: bool,
+    /// On the `/{provider}/…` path this is the permit `request_filter`'s one `allow()` returned
+    /// (`None` when the provider has no breaker).
+    breaker_pending: Option<Permit>,
     /// Model-routing state — `Some` for `/auto` and for a managed bare `/v1` catalog walk. `None`
     /// keeps every provider-routed request on exactly the code it ran before model routing existed.
     /// See [`ModelRouting`] for why it is boxed rather than inline.
@@ -4431,7 +4434,7 @@ impl ProxyHttp for AiProxy {
                     same_provider_retry: false,
                     relay_abandoned: false,
                     refused_resent: false,
-                    breaker_pending: false,
+                    breaker_pending: None,
                     auto: model_route.map(|route| {
                         Box::new(ModelRouting {
                             route,
@@ -4518,10 +4521,11 @@ impl ProxyHttp for AiProxy {
         // `upstream_peer` picks a candidate, and gating here would claim a permit against candidate
         // 0 and then claim a second one against whichever candidate is actually tried. That path
         // gates per candidate instead, at the same "last thing before the connection" position.
-        if model_route.is_none()
-            && let Some(breaker) = &provider.breaker
-            && breaker.allow().is_err()
-        {
+        let breaker_permit = match (&model_route, &provider.breaker) {
+            (None, Some(breaker)) => breaker.allow().map(Some).map_err(|_| breaker),
+            _ => Ok(None),
+        };
+        if let Err(breaker) = breaker_permit {
             if tenant_slot && let Some(slots) = self.state.tenant_slots.as_ref() {
                 slots.release(tenant_id);
             }
@@ -4538,10 +4542,9 @@ impl ProxyHttp for AiProxy {
             .await;
         }
         // A permit is now outstanding against this provider (see `RequestCtx::breaker_pending`).
-        // `breaker.is_some()` is exactly the condition `logging` used to test inline before the
-        // ledger existed, so recording is unchanged for the provider-routed path. The model-routed
-        // path starts owing nothing and takes on its first permit in `upstream_peer`.
-        let breaker_pending = model_route.is_none() && provider.breaker.is_some();
+        // The model-routed path starts owing nothing and takes on its first permit in
+        // `upstream_peer`.
+        let breaker_pending = breaker_permit.ok().flatten();
         // Past any key cooling off from a 401 (D71); a catalog walk picks per candidate.
         let pool_key = provider.first_key();
         if tenant_slot {
@@ -4710,11 +4713,10 @@ impl ProxyHttp for AiProxy {
             // Reaching here with a permit outstanding means the previous attempt failed before any
             // response arrived, so the candidate we were on earned the failure. Resolve it before
             // touching anything else; `logging` then only ever sees the final candidate's permit.
-            if rc.breaker_pending {
-                if let Some(b) = &rc.provider.breaker {
-                    b.record_failure();
-                }
-                rc.breaker_pending = false;
+            if let Some(permit) = rc.breaker_pending.take()
+                && let Some(b) = &rc.provider.breaker
+            {
+                b.record_failure_for(permit);
             }
 
             loop {
@@ -4767,9 +4769,8 @@ impl ProxyHttp for AiProxy {
                 // transition happens *inside* `allow()`, so a `state()`-based pre-check would report
                 // `Open` past the reset timeout, skip a candidate that `allow()` would have admitted
                 // as a probe, and leave the breaker with no way to ever close.
-                if let Some(b) = &p.breaker
-                    && b.allow().is_err()
-                {
+                let permit = p.breaker.as_ref().map(|b| (b, b.allow()));
+                if let Some((b, Err(_))) = permit {
                     self.state.metrics.rejection(Rejection::CircuitOpen).inc();
                     if let Some(a) = rc.auto.as_mut() {
                         let secs = u16::try_from(b.retry_after_secs()).unwrap_or(u16::MAX);
@@ -4779,7 +4780,7 @@ impl ProxyHttp for AiProxy {
                     continue;
                 }
                 // A permit (if this breaker has one to give) is now outstanding against `p`.
-                rc.breaker_pending = p.breaker.is_some();
+                rc.breaker_pending = permit.and_then(|(_, r)| r.ok());
                 // New vendor ⇒ that vendor's first key not cooling off (D71). Never carry provider
                 // A's index (or secret) onto provider B. A re-run of a large body resumes the key
                 // walk an earlier attempt started on this candidate (see `FullBody`); one with no
@@ -4833,10 +4834,11 @@ impl ProxyHttp for AiProxy {
                             error = %e,
                             "upstream dns resolution failed; trying the next candidate",
                         );
-                        if let Some(b) = &p.breaker {
-                            b.record_failure();
+                        if let Some(b) = &p.breaker
+                            && let Some(permit) = rc.breaker_pending.take()
+                        {
+                            b.record_failure_for(permit);
                         }
-                        rc.breaker_pending = false;
                         rc.advance_candidate(i);
                         continue;
                     }
@@ -5066,10 +5068,10 @@ impl ProxyHttp for AiProxy {
         // that is the right outcome — and recording it here as well would double-count. A key
         // failure is not one: resolve its permit as the success it is (the provider answered).
         if key_failure
-            && std::mem::take(&mut rc.breaker_pending)
+            && let Some(permit) = rc.breaker_pending.take()
             && let Some(b) = rc.provider.breaker.as_ref()
         {
-            b.record_success();
+            b.record_success_for(permit);
         }
         rc.advance_candidate(at);
         let mut e = pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(status));
@@ -5604,13 +5606,13 @@ impl ProxyHttp for AiProxy {
             // half-open probe resolved only at end of stream let one long or stalled stream 503
             // the provider for everyone until it ended. `logging` resolves only the attempts that
             // never got a head.
-            if std::mem::take(&mut rc.breaker_pending)
+            if let Some(permit) = rc.breaker_pending.take()
                 && let Some(b) = rc.provider.breaker.as_ref()
             {
                 if status >= 500 {
-                    b.record_failure();
+                    b.record_failure_for(permit);
                 } else {
-                    b.record_success();
+                    b.record_success_for(permit);
                 }
             }
 
@@ -6063,10 +6065,10 @@ impl ProxyHttp for AiProxy {
                 // any processing), not the provider's: give the permit back without an outcome,
                 // as a small body keeps it for its own same-candidate retry.
                 if retry == Some(RelayRetry::Reset(orig))
-                    && std::mem::take(&mut rc.breaker_pending)
+                    && let Some(permit) = rc.breaker_pending.take()
                     && let Some(b) = rc.provider.breaker.as_ref()
                 {
-                    b.release();
+                    b.release(permit);
                 }
                 if let Some(retry) = retry {
                     rc.relay_abandoned = fb.record(retry);
@@ -6331,20 +6333,22 @@ impl ProxyHttp for AiProxy {
 
         // Resolve the outstanding circuit-breaker permit, if this request still owes one.
         //
-        // `breaker_pending` is the ledger (see `RequestCtx::breaker_pending`): it is set when a
-        // permit is claimed and cleared when it is recorded, so exactly one `record_*` lands per
-        // `allow()`. On the model-routed path a candidate switch resolves the outgoing candidate in
-        // `upstream_peer` and clears the flag there, which is what stops this from double-recording
+        // `breaker_pending` is the ledger (see `RequestCtx::breaker_pending`): it holds the permit
+        // from when it is claimed until it is taken to resolve it, so exactly one `record_*_for`
+        // lands per `allow()`. On the model-routed path a candidate switch resolves the outgoing
+        // candidate in `upstream_peer` and takes the permit there, which is what stops this from double-recording
         // against whichever candidate happened to be current at the end.
         //
         // Failure = the provider is *broken*: a 5xx response, or no response at all paired with an
         // upstream error (connect/read failure). Success = the provider *answered* — 2xx/3xx, and
         // deliberately **4xx/429 too**: a 429 is a healthy provider throttling our pool key, which the
         // rate limiter and the client's `Retry-After` own, NOT a reason to cut all traffic to it.
-        if let Some(breaker) = rc.provider.breaker.as_ref().filter(|_| rc.breaker_pending) {
+        if let Some(breaker) = rc.provider.breaker.as_ref()
+            && let Some(permit) = rc.breaker_pending.take()
+        {
             match rc.upstream_status {
-                Some(s) if s >= 500 => breaker.record_failure(),
-                Some(_) => breaker.record_success(),
+                Some(s) if s >= 500 => breaker.record_failure_for(permit),
+                Some(_) => breaker.record_success_for(permit),
                 // No response head arrived. Blame the provider only when the failure actually came
                 // *from* upstream. Pingora tags a client-side abort `ErrorSource::Downstream` (the
                 // `into_down()` at proxy_h1.rs's downstream read/write sites), and a user hitting
@@ -6359,16 +6363,15 @@ impl ProxyHttp for AiProxy {
                 // on *our* bytes, so its read timeout or reset says the client stalled, not that
                 // the provider is sick. A connect failure moved no body byte, so it still counts.
                 None if is_upstream_failure(e) && !client_still_uploading(session, rc) => {
-                    breaker.record_failure();
+                    breaker.record_failure_for(permit);
                 }
                 // Client went away, its upload stalled, or the request ended with no error at all:
                 // no provider outcome. Give the permit back without one (D86). A success here closed
                 // a half-open breaker on a probe that never heard from the provider, letting every
                 // caller flood one that may still be broken; `release` returns the probe permit so
                 // the next request probes instead.
-                None => breaker.release(),
+                None => breaker.release(permit),
             }
-            rc.breaker_pending = false;
         }
 
         let cache_hit = if matches!(
@@ -6899,7 +6902,7 @@ mod tests {
             same_provider_retry: false,
             relay_abandoned: false,
             refused_resent: false,
-            breaker_pending: false,
+            breaker_pending: None,
             auto: None,
             control: None,
             request_id: RequestId::new(),

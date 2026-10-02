@@ -645,7 +645,8 @@ mod circuit_breaker {
     #[divan::bench]
     fn record_success_healthy(bencher: Bencher) {
         let cb = breaker();
-        bencher.bench(|| black_box(&cb).record_success());
+        let permit = cb.allow().expect("closed");
+        bencher.bench(|| black_box(&cb).record_success_for(permit));
     }
 }
 

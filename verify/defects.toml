@@ -2527,3 +2527,17 @@ state = "fixed"
 test = "byo_openai_key_lists_openais_models"
 fix = "df266f1"
 note = "Fixed: only a managed key's GET/HEAD /v1/models is answered from the boot-built keyed catalog. A BYO one is not intercepted: it takes the BYO /v1 route (credential shape, else the path's default dialect, OpenAI for /v1/models) and is a plain relay of the provider's own list with the caller's key and headers, and no ai.usage row. The BYO-only whole-catalog listing and providers::catalog::models_list_json's unfiltered form are gone. Also tested: byo_anthropic_key_lists_anthropics_models, opaque_byo_key_lists_from_the_path_default, managed_key_still_lists_the_keyed_catalog; live, E4+A1::raw::{claude,gpt}::byo_models_raw holds each BYO list to the provider's own, fetched directly."
+
+[[defect]]
+id = "D256"
+severity = "med"
+area = "Reliability"
+title = "A reclaimed half-open probe's late release minted a second probe permit"
+impact = "With half_open_permits = 1, a probe that stalled past circuit_breaker_reset_secs had its permit reclaimed for a new probe (D86). When the stalled attempt later ended with no provider outcome (client abort, stalled upload), release() returned a permit it no longer held, so two probes ran against a provider that may still be broken, and each such release could push the count upward. The stalled probe's late answer also closed or reopened the breaker under the live probe."
+confidence = "high"
+evidence = "circuit_breaker.rs: the reclaim reset permits to half_open_permits - 1 and stamped now; release() only checked state == HALF_OPEN and permits < half_open_permits, so allow() at t0, reclaim at t0 + reset, release() of the first permit, allow() again admitted a second concurrent probe. The same held for a permit claimed while CLOSED and released after the breaker tripped and half-opened."
+claims = ["REL-6"]
+state = "fixed"
+test = "a_reclaimed_probe_releasing_late_does_not_mint_a_second_probe"
+fix = "this commit"
+note = "Fixed lock-free in the same packed AtomicU64: while OPEN or HALF_OPEN the 14-bit failure field holds a probe generation, bumped on OPEN -> HALF_OPEN and on every reclaim (an opening breaker seeds it from the clock). allow() returns a Permit carrying it (a CLOSED permit carries none); release(permit), record_success_for and record_failure_for are no-ops in HALF_OPEN for any other generation, and release still saturates at half_open_permits. proxy.rs's ledger RequestCtx::breaker_pending is now Option<Permit>. Unpermitted record_success/record_failure (the error-in-200 settle) are unchanged. Also tested: a_permit_from_another_generation_neither_releases_nor_decides, concurrent_stale_releases_never_mint_permits, test_a_stalled_probe_permit_is_reclaimed_after_the_reset_timeout (stale outcomes no longer decide)."

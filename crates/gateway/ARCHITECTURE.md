@@ -209,7 +209,7 @@ Client (stock OpenAI/Anthropic SDK)
      Cache hit: same row with `cache_hit` and the stored tokens; no parse, no upstream latency
      Capturing: emit ai.payload (both bodies, truncation + completeness flags), correlated by
        request_id → bounded queue, DROPPED on overflow so a stalled sink can't backpressure
-     Record circuit-breaker outcome, only if one is still owed (breaker_pending): 5xx / upstream
+     Resolve the circuit-breaker permit, only if one is still owed (breaker_pending): 5xx / upstream
        failure → failure; no head and no provider outcome (client abort, stalled upload)
        → permit released (`CircuitBreaker::release`), never a success
      Decrement requests_in_flight gauge; release the tenant slot
@@ -2076,7 +2076,19 @@ the rate guardrails (which protect against abusive _inbound_ load):
   closes the breaker, a `5xx` reopens it. A probe resolved only at end of stream let one long or
   stalled stream (up to the read timeout) 503 that provider for everyone. A probe permit that is
   still unresolved a whole `circuit_breaker_reset_secs` after it was handed out (a header that
-  never came) is reclaimed and a fresh probe admitted; the stalled one's late outcome still lands.
+  never came) is reclaimed and a fresh probe admitted.
+- **A permit belongs to a probe generation.** `allow()` returns a `Permit` carrying the half-open
+  _generation_, held in the packed word's 14-bit failure field while OPEN or HALF_OPEN. Each OPEN →
+  HALF_OPEN and each stalled-probe reclaim bumps it (an opening breaker seeds it from the clock), so
+  the same single CAS that reclaims also disowns every permit out. A permit from another generation
+  (reclaimed, from an earlier half-open, or claimed while CLOSED) is then a no-op in HALF_OPEN:
+  `release` returns nothing and `record_success_for` / `record_failure_for` decide nothing. Before
+  (D256), a reclaimed probe that later ended with no outcome released a permit it no longer held,
+  so `half_open_permits = 1` ran two probes and the count could drift upward; its late answer also
+  closed or reopened the breaker under the live probe. `release` still saturates at
+  `half_open_permits`. Outside HALF_OPEN a permit's outcome counts as any other. An outcome with no
+  permit (`record_success` / `record_failure`, the error found in a 200 body after its head resolved
+  the permit) is never stale.
 - **A `429` is NOT a failure.** It means the provider is healthy and throttling _that credential_ — a
   velocity/spend signal the rate limiter, the same-provider key walk, and the client's `Retry-After`
   backoff own. Tripping on it would convert a self-healing throttle into a self-inflicted outage. The
@@ -2105,15 +2117,15 @@ the rate guardrails (which protect against abusive _inbound_ load):
   used. One breaker per provider, built at boot, shared lock-free across callers.
 - `circuit_breaker_threshold = 0` disables it.
 
-**The permit ledger.** `RequestCtx::breaker_pending` is true **iff** exactly one `allow()` is
-outstanding against whatever `provider` currently points at. `response_filter` (a response head
-arrived) and `logging` (no head ever did) record only when it is set, and clear it — so one
-`allow()` yields exactly one `record_*`, and a scarce half-open probe permit can neither leak nor be
-resolved twice.
+**The permit ledger.** `RequestCtx::breaker_pending` holds the `Permit` **iff** exactly one
+`allow()` is outstanding against whatever `provider` currently points at. `response_filter` (a
+response head arrived) and `logging` (no head ever did) resolve only when it is set, and `take()` it
+— so one `allow()` yields exactly one `record_*_for` or `release`, and a scarce half-open probe
+permit can neither leak nor be resolved twice.
 
 For a provider-routed request that is the old behaviour restated: `allow()` is the last thing in
 `request_filter` (after every other rejection, so a permit corresponds to a real upstream attempt),
-and `breaker_pending` is simply `breaker.is_some()`.
+and `breaker_pending` is the permit it returned (`None` when the provider has no breaker).
 
 For a **model-routed** request the ledger is owned by `upstream_peer`, which gates each candidate as
 it is chosen and records the outgoing candidate's failure when it moves on. Three reasons it lives

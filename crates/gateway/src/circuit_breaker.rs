@@ -164,7 +164,10 @@ impl CircuitBreakerConfig {
 ///
 /// All state is packed into a single 64-bit atomic:
 /// - Bits 62-63: State (0=closed, 1=open, 2=half-open)
-/// - Bits 48-61: Failure count (14 bits, max 16383)
+/// - Bits 48-61: Failure count (14 bits, max 16383) in CLOSED. In OPEN and HALF_OPEN, the probe
+///   **generation**: bumped on every OPEN → HALF_OPEN and every stalled-probe reclaim, and carried
+///   in each [`Permit`] `allow()` hands out, so a permit that was reclaimed (or issued before the
+///   breaker half-opened) can no longer release a probe permit or decide the probe (D256).
 /// - Bits 32-47: Half-open permits remaining (16 bits) in HALF_OPEN. In CLOSED windowed mode, the
 ///   successes recorded since the current window's first failure (saturating at the failure count's
 ///   14-bit cap, so failures can always catch up), which is what makes
@@ -289,14 +292,16 @@ impl CircuitBreaker {
     /// Returns `Ok(())` if the request is allowed, `Err(CircuitOpen)` if the
     /// circuit is open and the request should be rejected.
     ///
-    /// In half-open state, this atomically decrements the permit count.
-    pub fn allow(&self) -> Result<(), CircuitOpen> {
+    /// In half-open state, this atomically decrements the permit count. The returned [`Permit`]
+    /// is what the attempt later resolves with [`record_success_for`](Self::record_success_for),
+    /// [`record_failure_for`](Self::record_failure_for) or [`release`](Self::release).
+    pub fn allow(&self) -> Result<Permit, CircuitOpen> {
         loop {
             let packed = self.state.load(Ordering::Acquire);
             let (state, failures, permits, timestamp) = Self::unpack(packed);
 
             match state {
-                STATE_CLOSED => return Ok(()),
+                STATE_CLOSED => return Ok(Permit(NOT_A_PROBE)),
 
                 STATE_OPEN => {
                     let now = self.now_secs();
@@ -310,10 +315,11 @@ impl CircuitBreaker {
                     let elapsed = now.saturating_sub(timestamp);
 
                     if elapsed >= self.config.reset_timeout.as_secs() {
-                        // Timeout elapsed, try to transition to half-open
+                        // Timeout elapsed, try to transition to half-open, in a new generation:
+                        // a permit from an earlier half-open (or from CLOSED) is not this probe.
                         let new_packed = Self::pack(
                             STATE_HALF_OPEN,
-                            0,
+                            failures + 1,
                             u64::from(self.config.half_open_permits),
                             now,
                         );
@@ -336,14 +342,17 @@ impl CircuitBreaker {
                         // Every probe permit is out. One that has gone unresolved for a whole
                         // reset timeout belongs to an attempt that stalled (a header that never
                         // came): reclaim it and admit a fresh probe, rather than shed this
-                        // provider's traffic for as long as that one attempt lives. A late outcome
-                        // from the stalled probe still lands normally.
+                        // provider's traffic for as long as that one attempt lives. Every permit
+                        // out is that old (the timestamp is the newest handout), so all of them
+                        // are reclaimed at once by bumping the generation: the stalled attempts'
+                        // later `release` or outcome is then a no-op, never a second probe (D256).
                         let now = self.now_secs();
                         let reset = self.config.reset_timeout.as_secs();
                         if reset > 0 && now.saturating_sub(timestamp) >= reset {
+                            let generation = (failures + 1) & FAILURE_MASK;
                             let new_packed = Self::pack(
                                 STATE_HALF_OPEN,
-                                0,
+                                generation,
                                 u64::from(self.config.half_open_permits.saturating_sub(1)),
                                 now,
                             );
@@ -357,7 +366,7 @@ impl CircuitBreaker {
                                 )
                                 .is_ok()
                             {
-                                return Ok(());
+                                return Ok(Permit::probe(generation));
                             }
                             continue;
                         }
@@ -378,7 +387,7 @@ impl CircuitBreaker {
                         Ordering::AcqRel,
                         Ordering::Acquire,
                     ) {
-                        Ok(_) => return Ok(()),
+                        Ok(_) => return Ok(Permit::probe(failures)),
                         Err(_) => continue, // CAS failed, retry
                     }
                 }
@@ -392,7 +401,7 @@ impl CircuitBreaker {
                         Ordering::AcqRel,
                         Ordering::Acquire,
                     );
-                    return Ok(());
+                    return Ok(Permit(NOT_A_PROBE));
                 }
             }
         }
@@ -402,7 +411,21 @@ impl CircuitBreaker {
     ///
     /// In closed state, resets the failure counter (and window for windowed mode).
     /// In half-open state, closes the circuit (service is healthy again).
+    ///
+    /// An outcome not tied to a permit (an error found in a 200 body after its head resolved the
+    /// permit). An attempt resolving the permit `allow()` gave it uses
+    /// [`record_success_for`](Self::record_success_for).
     pub fn record_success(&self) {
+        self.success(None);
+    }
+
+    /// Resolve `permit` as a success. In HALF_OPEN only the current generation's probe decides:
+    /// a reclaimed probe's late answer, or one admitted before the breaker half-opened, is a no-op.
+    pub fn record_success_for(&self, permit: Permit) {
+        self.success(Some(permit));
+    }
+
+    fn success(&self, scope: Option<Permit>) {
         // Fast path: a healthy CLOSED breaker with no accrued failures is the overwhelmingly common
         // case — every successful response calls this. Bail before any write so high-throughput
         // success traffic to one provider doesn't bounce its breaker cache line across every worker
@@ -433,6 +456,7 @@ impl CircuitBreaker {
                     }
                     Self::pack(STATE_CLOSED, failures, successes + 1, ts)
                 }
+                (STATE_HALF_OPEN, _) if Self::stale(scope, failures) => return,
                 // Consecutive, an expired window, or HALF_OPEN (a probe succeeded → close the
                 // circuit): reset the counts and re-anchor the window.
                 (STATE_CLOSED | STATE_HALF_OPEN, _) => Self::pack(STATE_CLOSED, 0, 0, now),
@@ -457,19 +481,45 @@ impl CircuitBreaker {
     /// In closed state, increments the failure counter and opens the circuit
     /// if the threshold is reached.
     /// In half-open state, reopens the circuit immediately.
+    ///
+    /// An outcome not tied to a permit; see [`record_success`](Self::record_success).
     pub fn record_failure(&self) {
+        self.failure(None);
+    }
+
+    /// Resolve `permit` as a failure. In HALF_OPEN only the current generation's probe decides,
+    /// as for [`record_success_for`](Self::record_success_for).
+    pub fn record_failure_for(&self, permit: Permit) {
+        self.failure(Some(permit));
+    }
+
+    fn failure(&self, scope: Option<Permit>) {
         match &self.config.failure_policy {
             FailurePolicy::Consecutive { threshold } => {
-                self.record_failure_consecutive(*threshold);
+                self.record_failure_consecutive(*threshold, scope);
             }
             FailurePolicy::Windowed { threshold, window } => {
-                self.record_failure_windowed(*threshold, window.as_secs());
+                self.record_failure_windowed(*threshold, window.as_secs(), scope);
             }
         }
     }
 
+    /// Whether `scope` is a permit from another generation than the HALF_OPEN word's `generation`.
+    /// An unscoped outcome (`None`) is never stale.
+    #[inline]
+    fn stale(scope: Option<Permit>, generation: u64) -> bool {
+        scope.is_some_and(|p| u64::from(p.0) != generation)
+    }
+
+    /// The OPEN word for a breaker opening at `now`. Its generation is seeded from the clock, not
+    /// 0, so a permit that outlives a close and a later re-open is unlikely to match the new one.
+    #[inline]
+    fn open_word(now: u64) -> u64 {
+        Self::pack(STATE_OPEN, now, 0, now)
+    }
+
     /// Record failure with consecutive failure tracking.
-    fn record_failure_consecutive(&self, threshold: u32) {
+    fn record_failure_consecutive(&self, threshold: u32, scope: Option<Permit>) {
         let threshold = threshold.min(MAX_FAILURE_THRESHOLD);
         // Read the clock once, above the retry loop — the timestamp this failure stamps is the time
         // the failure happened, not the time its CAS finally landed, and re-reading a vDSO clock on
@@ -484,12 +534,14 @@ impl CircuitBreaker {
                 STATE_CLOSED => {
                     let new_failures = failures + 1;
                     if new_failures >= u64::from(threshold) {
-                        Self::pack(STATE_OPEN, 0, 0, now)
+                        Self::open_word(now)
                     } else {
                         Self::pack(STATE_CLOSED, new_failures, 0, now)
                     }
                 }
-                STATE_HALF_OPEN => Self::pack(STATE_OPEN, 0, 0, now),
+                STATE_HALF_OPEN if Self::stale(scope, failures) => return,
+                // Keep the generation; the next half-open bumps it.
+                STATE_HALF_OPEN => Self::pack(STATE_OPEN, failures, 0, now),
                 STATE_OPEN => return,
                 _ => return,
             };
@@ -515,7 +567,7 @@ impl CircuitBreaker {
     /// CAS and each sees the latest count, so they linearize into a correct running total instead of
     /// each independently resetting to 1 and dropping the others (which could pin the count at 1 and
     /// keep a genuinely-broken provider's breaker stuck closed).
-    fn record_failure_windowed(&self, threshold: u32, window_secs: u64) {
+    fn record_failure_windowed(&self, threshold: u32, window_secs: u64, scope: Option<Permit>) {
         let threshold = threshold.min(MAX_FAILURE_THRESHOLD);
         let now = self.now_secs();
 
@@ -547,12 +599,13 @@ impl CircuitBreaker {
                     // a busy healthy provider's background errors from tripping it, while a
                     // provider failing every other request still opens.
                     if new_failures >= u64::from(threshold) && new_failures >= successes {
-                        Self::pack(STATE_OPEN, 0, 0, now)
+                        Self::open_word(now)
                     } else {
                         Self::pack(STATE_CLOSED, new_failures, successes, anchor)
                     }
                 }
-                STATE_HALF_OPEN => Self::pack(STATE_OPEN, 0, 0, now),
+                STATE_HALF_OPEN if Self::stale(scope, failures) => return,
+                STATE_HALF_OPEN => Self::pack(STATE_OPEN, failures, 0, now),
                 STATE_OPEN => return,
                 _ => return,
             };
@@ -589,12 +642,17 @@ impl CircuitBreaker {
     /// Give back a permit `allow()` handed out, without an outcome: the attempt never reached the
     /// provider as far as its health is concerned (the gateway itself failed). In HALF_OPEN that
     /// returns the probe permit so another request can probe; in any other state a permit costs
-    /// nothing, so this is a no-op.
-    pub fn release(&self) {
+    /// nothing, so this is a no-op. So is a permit from another generation (reclaimed from a
+    /// stalled probe, or handed out before the breaker half-opened): it no longer holds a probe
+    /// permit, and returning one would admit a probe beside the live one (D256).
+    pub fn release(&self, permit: Permit) {
         loop {
             let packed = self.state.load(Ordering::Acquire);
             let (state, failures, permits, ts) = Self::unpack(packed);
-            if state != STATE_HALF_OPEN || permits >= u64::from(self.config.half_open_permits) {
+            if state != STATE_HALF_OPEN
+                || u64::from(permit.0) != failures
+                || permits >= u64::from(self.config.half_open_permits)
+            {
                 return;
             }
             let new_packed = Self::pack(STATE_HALF_OPEN, failures, permits + 1, ts);
@@ -637,12 +695,29 @@ impl CircuitBreaker {
             CircuitState::Closed { failure_count } => {
                 Self::pack(STATE_CLOSED, u64::from(failure_count), 0, now)
             }
-            CircuitState::Open => Self::pack(STATE_OPEN, 0, 0, now),
+            CircuitState::Open => Self::open_word(now),
             CircuitState::HalfOpen { permits_remaining } => {
                 Self::pack(STATE_HALF_OPEN, 0, u64::from(permits_remaining), now)
             }
         };
         self.state.store(packed, Ordering::Release);
+    }
+}
+
+/// What `allow()` hands out: the right to resolve one attempt. In HALF_OPEN it carries the probe
+/// generation it was claimed in; from CLOSED it is no probe at all, so it can never resolve or
+/// release one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Permit(u16);
+
+/// A permit claimed while CLOSED. Outside the 14-bit generation range, so it matches none.
+const NOT_A_PROBE: u16 = u16::MAX;
+
+impl Permit {
+    /// A probe permit of `generation` (a 14-bit field value, so it always fits).
+    #[inline]
+    fn probe(generation: u64) -> Self {
+        Self((generation & FAILURE_MASK) as u16)
     }
 }
 
@@ -927,20 +1002,114 @@ mod tests {
         );
         cb.record_failure();
         NOW.store(105, Ordering::Relaxed);
-        assert!(cb.allow().is_ok(), "the probe");
+        let stalled = cb.allow().expect("the probe");
         assert!(cb.allow().is_err(), "the only permit is out");
         NOW.store(109, Ordering::Relaxed);
         assert!(cb.allow().is_err(), "not yet a whole reset timeout");
         assert_eq!(cb.retry_after_secs(), 1);
         NOW.store(110, Ordering::Relaxed);
-        assert!(
-            cb.allow().is_ok(),
-            "the stalled probe's permit is reclaimed"
-        );
+        let live = cb.allow().expect("the stalled probe's permit is reclaimed");
         assert!(cb.allow().is_err());
-        // A late success from either probe still closes it.
-        cb.record_success();
+        // The stalled probe no longer decides: its late answer, either way, is a no-op.
+        cb.record_success_for(stalled);
+        cb.record_failure_for(stalled);
+        assert_eq!(
+            cb.state(),
+            CircuitState::HalfOpen {
+                permits_remaining: 0
+            }
+        );
+        // The live probe does.
+        cb.record_success_for(live);
         assert_eq!(cb.state(), CircuitState::Closed { failure_count: 0 });
+    }
+
+    /// D256: a permit claimed in an earlier half-open, or while CLOSED, is not this half-open's
+    /// probe: it can neither release a probe permit nor decide the probe.
+    /// claim: REL-6
+    /// defect: D256
+    #[test]
+    fn a_permit_from_another_generation_neither_releases_nor_decides() {
+        static NOW: AtomicU64 = AtomicU64::new(100);
+        fn clock() -> u64 {
+            NOW.load(Ordering::Relaxed)
+        }
+        let cb = CircuitBreaker::with_clock(
+            CircuitBreakerConfig::consecutive(1)
+                .reset_timeout(Duration::from_secs(5))
+                .half_open_permits(1),
+            clock,
+        );
+        let before_trip = cb.allow().expect("closed");
+        cb.record_failure();
+        NOW.store(105, Ordering::Relaxed);
+        let first = cb.allow().expect("first half-open's probe");
+        cb.record_failure_for(first);
+        assert_eq!(cb.state(), CircuitState::Open);
+        NOW.store(110, Ordering::Relaxed);
+        let probe = cb.allow().expect("second half-open's probe");
+        for stale in [before_trip, first] {
+            cb.release(stale);
+            cb.record_success_for(stale);
+            cb.record_failure_for(stale);
+        }
+        assert_eq!(
+            cb.state(),
+            CircuitState::HalfOpen {
+                permits_remaining: 0
+            }
+        );
+        cb.release(probe);
+        assert_eq!(
+            cb.state(),
+            CircuitState::HalfOpen {
+                permits_remaining: 1
+            }
+        );
+    }
+
+    /// Concurrent stale releases racing a reclaim never leave more permits than configured, and
+    /// never more than one probe out with `half_open_permits = 1`.
+    /// claim: REL-6
+    /// defect: D256
+    #[test]
+    fn concurrent_stale_releases_never_mint_permits() {
+        static NOW: AtomicU64 = AtomicU64::new(100);
+        fn clock() -> u64 {
+            NOW.load(Ordering::Relaxed)
+        }
+        let cb = Arc::new(CircuitBreaker::with_clock(
+            CircuitBreakerConfig::consecutive(1)
+                .reset_timeout(Duration::from_secs(5))
+                .half_open_permits(1),
+            clock,
+        ));
+        cb.record_failure();
+        let mut stale = Vec::new();
+        for t in 1..=32 {
+            NOW.store(100 + 5 * t, Ordering::Relaxed);
+            stale.push(cb.allow().expect("reclaimed every reset timeout"));
+        }
+        let live = stale.pop().unwrap();
+        let handles: Vec<_> = stale
+            .into_iter()
+            .map(|p| {
+                let cb = Arc::clone(&cb);
+                thread::spawn(move || cb.release(p))
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert!(cb.allow().is_err(), "the live probe is the only one");
+        cb.release(live);
+        cb.release(live);
+        assert_eq!(
+            cb.state(),
+            CircuitState::HalfOpen {
+                permits_remaining: 1
+            }
+        );
     }
 
     /// A probe permit given back by `release` (an attempt with no provider outcome) and claimed
@@ -960,15 +1129,47 @@ mod tests {
         );
         cb.record_failure();
         NOW.store(105, Ordering::Relaxed);
-        assert!(cb.allow().is_ok(), "the probe");
+        let probe = cb.allow().expect("the probe");
         NOW.store(112, Ordering::Relaxed);
-        cb.release();
+        cb.release(probe);
         assert!(cb.allow().is_ok(), "the returned permit");
         assert!(cb.allow().is_err(), "one probe at a time");
         NOW.store(117, Ordering::Relaxed);
         assert!(
             cb.allow().is_ok(),
             "reclaimed a reset timeout after its handout"
+        );
+    }
+
+    /// D256: a stalled probe's permit is reclaimed for a new probe. When the stalled attempt later
+    /// ends with no provider outcome, its `release` must not hand back a permit it no longer holds:
+    /// with `half_open_permits = 1` that would admit a second probe beside the live one.
+    /// claim: REL-6
+    /// defect: D256
+    #[test]
+    fn a_reclaimed_probe_releasing_late_does_not_mint_a_second_probe() {
+        static NOW: AtomicU64 = AtomicU64::new(100);
+        fn clock() -> u64 {
+            NOW.load(Ordering::Relaxed)
+        }
+        let cb = CircuitBreaker::with_clock(
+            CircuitBreakerConfig::windowed(1, Duration::from_secs(60))
+                .reset_timeout(Duration::from_secs(5))
+                .half_open_permits(1),
+            clock,
+        );
+        cb.record_failure();
+        NOW.store(105, Ordering::Relaxed);
+        let stalled = cb.allow().expect("the probe");
+        NOW.store(110, Ordering::Relaxed);
+        let _live = cb.allow().expect("the stalled probe's permit is reclaimed");
+        cb.release(stalled);
+        assert!(cb.allow().is_err(), "one probe at a time");
+        assert_eq!(
+            cb.state(),
+            CircuitState::HalfOpen {
+                permits_remaining: 0
+            }
         );
     }
 
@@ -999,12 +1200,12 @@ mod tests {
         );
         cb.record_failure();
         thread::sleep(Duration::from_millis(10));
-        assert!(cb.allow().is_ok());
-        cb.release();
-        assert!(cb.allow().is_ok(), "the released permit probes again");
+        let probe = cb.allow().expect("the probe");
+        cb.release(probe);
+        let again = cb.allow().expect("the released permit probes again");
         // Releasing more than was handed out cannot mint permits.
-        cb.release();
-        cb.release();
+        cb.release(again);
+        cb.release(again);
         assert_eq!(
             cb.state(),
             CircuitState::HalfOpen {
