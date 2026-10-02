@@ -1259,56 +1259,61 @@ async fn every_candidate_5xx_ends_in_a_json_error_with_a_request_id() {
 
 /// Many concurrent requests over the gateway's H2 upstream connection all succeed, negotiated as
 /// h2, and run concurrently rather than queueing behind one another.
+///
+/// Concurrency is proved by ordering, not by wall clock: the provider answers none of the 32 until
+/// all 32 are in flight at it at once, which a gateway that queued them could never reach. (This used
+/// to time 32 × 400 ms requests against a 5 s limit, which a starved CI runner overran on its own.)
+/// The provider is H2-only — ALPN `h2` and an HTTP/2-only server — so every 200 was served over h2.
 /// claim: REL-22
 #[tokio::test]
 async fn upstream_h2_multiplexes_concurrent_requests() {
-    let mock = MockUpstream::start_tls(Mode::Slow(400)).await;
+    const N: usize = 32;
+    let all_in_flight = Arc::new(tokio::sync::Barrier::new(N));
+    let (port, _conns, upstream) = counting_h2_upstream(Duration::ZERO, Some(all_in_flight)).await;
     let (pubkey, sk) = test_keypair(221);
-    let gw = Gateway::builder(unused_nats_port(), &mock.authority(), &b64(&pubkey))
-        .providers(&["openai"])
-        .tls_upstream()
-        .upstream_http2(true)
-        .start()
-        .await;
+    let gw = Gateway::builder(
+        unused_nats_port(),
+        &format!("127.0.0.1:{port}"),
+        &b64(&pubkey),
+    )
+    .providers(&["openai"])
+    .tls_upstream()
+    .upstream_http2(true)
+    .start()
+    .await;
     let key = billing_vkey(&sk, 2201);
-    let start = Instant::now();
     let mut tasks = Vec::new();
-    for _ in 0..32 {
+    for _ in 0..N {
         let (url, key) = (gw.url(), key.clone());
         tasks.push(tokio::spawn(async move {
-            let resp = test_client()
+            test_client()
                 .post(format!("{url}/openai/v1/chat/completions"))
                 .header("authorization", format!("Bearer {key}"))
                 .header("content-type", "application/json")
                 .body(CHAT)
                 .send()
                 .await
-                .unwrap();
-            let proto = resp
-                .headers()
-                .get("x-mock-proto")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("")
-                .to_owned();
-            (resp.status().as_u16(), proto)
+                .map(|r| r.status().as_u16())
+                .map_err(|e| e.to_string())
         }));
     }
+    let mut results = Vec::new();
     for t in tasks {
-        let (status, proto) = t.await.unwrap();
-        assert_eq!(status, 200);
-        assert_eq!(proto, "h2");
+        results.push(t.await.unwrap());
     }
+    upstream.abort();
     assert!(
-        start.elapsed() < Duration::from_secs(5),
-        "32 × 400ms requests took {:?}: serialized",
-        start.elapsed()
+        results.iter().all(|r| *r == Ok(200)),
+        "the {N} requests were never all in flight at the provider at once (serialized?): \
+         {results:?}"
     );
 }
 
-/// A TLS H2-only upstream that answers every request after `delay`, and counts the connections it
-/// accepted.
+/// A TLS H2-only upstream that answers every request after `delay` — and, given a barrier, only
+/// once that many requests are waiting at it together — and counts the connections it accepted.
 async fn counting_h2_upstream(
     delay: Duration,
+    barrier: Option<Arc<tokio::sync::Barrier>>,
 ) -> (u16, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
     use http_body_util::{BodyExt, Full};
     use hyper::service::service_fn;
@@ -1329,23 +1334,27 @@ async fn counting_h2_upstream(
     let task = tokio::spawn(async move {
         while let Ok((s, _)) = listener.accept().await {
             counter.fetch_add(1, Ordering::SeqCst);
-            let acceptor = acceptor.clone();
+            let (acceptor, barrier) = (acceptor.clone(), barrier.clone());
             tokio::spawn(async move {
                 let Ok(tls) = acceptor.accept(s).await else {
                     return;
                 };
-                let svc = service_fn(
-                    move |req: hyper::Request<hyper::body::Incoming>| async move {
+                let svc = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+                    let barrier = barrier.clone();
+                    async move {
                         let _ = req.into_body().collect().await;
                         tokio::time::sleep(delay).await;
+                        if let Some(b) = barrier {
+                            b.wait().await;
+                        }
                         Ok::<_, std::convert::Infallible>(
                             hyper::Response::builder()
                                 .header("content-type", "application/json")
                                 .body(Full::new(Bytes::from_static(OK_JSON.as_bytes())))
                                 .unwrap(),
                         )
-                    },
-                );
+                    }
+                });
                 let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
                     .serve_connection(TokioIo::new(tls), svc)
                     .await;
@@ -1363,7 +1372,7 @@ async fn counting_h2_upstream(
 /// defect: D160
 #[tokio::test]
 async fn concurrent_requests_share_an_upstream_h2_connection() {
-    let (port, conns, task) = counting_h2_upstream(Duration::from_millis(400)).await;
+    let (port, conns, task) = counting_h2_upstream(Duration::from_millis(400), None).await;
     let (pubkey, sk) = test_keypair(224);
     let gw = Gateway::builder(
         unused_nats_port(),

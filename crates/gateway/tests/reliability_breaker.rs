@@ -7,6 +7,7 @@
 
 mod common;
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use beyond_ai::key::{VirtualKey, mint};
@@ -360,44 +361,91 @@ async fn a_probe_with_no_provider_outcome_leaves_the_breaker_half_open() {
     let nats_port = unused_nats_port();
     let (pubkey, _sk) = test_keypair(1);
     // 0: a 500 opens the breaker. 1: the stalled probe (never answered: its body never ends).
-    // Everything after: still broken, and slow enough that concurrent callers overlap.
-    let mock = ReplyUpstream::start(|n, _| match n {
-        0 => Reply::json(500, r#"{"error":{"message":"mock"}}"#),
-        _ => Reply::Delayed(
-            Duration::from_millis(800),
+    // 2: the next probe, held in flight until the test has seen the other callers answered, then
+    // still broken. Anything after it is a caller a closed breaker let through: answered at once,
+    // so the flood shows up as extra 500s and hits rather than as a hang.
+    let release = Arc::new(tokio::sync::Notify::new());
+    let held = release.clone();
+    let mock = ReplyUpstream::start(move |n, _| match n {
+        2 => Reply::Held(
+            held.clone(),
             Box::new(Reply::json(500, r#"{"error":{"message":"mock"}}"#)),
         ),
+        _ => Reply::json(500, r#"{"error":{"message":"mock"}}"#),
     })
     .await;
     let gw = Gateway::builder(nats_port, &mock.authority(), &b64(&pubkey))
         .config_line("circuit_breaker_threshold = 1")
         .config_line("circuit_breaker_window_secs = 60")
-        .config_line("circuit_breaker_reset_secs = 1")
-        .config_line("read_timeout_secs = 1")
+        // A probe permit out for `reset` is reclaimed for a fresh probe (the stalled-probe rule), on
+        // a whole-second clock, so after as little as `reset - 1` s. Neither probe here may get
+        // there: the stalled one lives `read_timeout`, and if the next caller reclaimed its permit
+        // just before the stalled attempt gave it back, the late give-back minted a second permit
+        // and two probes reached the provider (the 1 s reset and 1 s read timeout this used to
+        // have hit that on a starved runner). So `read_timeout` (4 s) < `reset - 1` (7 s).
+        .config_line("circuit_breaker_reset_secs = 8")
+        // Ends the stalled probe (the provider's silence while the client's body never ends), and
+        // bounds how long the next probe may be held at the provider. The hold spans the gateway
+        // refusing two callers from its in-memory breaker state: milliseconds, so 4 s is orders of
+        // magnitude of headroom for a starved runner. The stall costs this once per run.
+        .config_line("read_timeout_secs = 4")
         .start()
         .await;
     let client = test_client();
     assert_eq!(post_byo(&client, &gw.url()).await, 500);
-    tokio::time::sleep(Duration::from_millis(2100)).await;
+    // The breaker half-opens once `reset` whole seconds have elapsed since it opened, and stays
+    // half-open until a probe has an outcome, so any wait of at least `reset + 1` s (one tick for the
+    // whole-second clock) works, and a starved runner overshooting it changes nothing. The probe
+    // below is what proves it half-opened (`hits == 2`).
+    tokio::time::sleep(Duration::from_secs(9)).await;
     let head = "POST /v1/chat/completions HTTP/1.1\r\nhost: 127.0.0.1\r\n\
                 authorization: Bearer sk-byo-test\r\ncontent-type: application/json\r\n\
                 transfer-encoding: chunked\r\n\r\n";
     chunked_upload(gw.port, head, 1, false).await;
     assert_eq!(mock.hits(), 2, "the stalled upload was the probe");
-    let callers: Vec<_> = (0..3)
-        .map(|_| {
-            let (client, url) = (client.clone(), gw.url());
-            tokio::spawn(async move { post_byo(&client, &url).await })
-        })
-        .collect();
-    let mut statuses = Vec::new();
-    for c in callers {
-        statuses.push(c.await.unwrap());
+    // The stalled attempt gives its permit back as it ends, which is not before its client has the
+    // answer: a caller sent the instant `chunked_upload` returns can still find the permit out and
+    // get a (correct) 503. So send one caller at a time until one is admitted as the next probe,
+    // which the provider then holds; a 503 before that is the breaker honestly still waiting.
+    let mut probe = None;
+    let deadline = Instant::now() + CONDITION_BUDGET;
+    while probe.is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "no caller was ever admitted as the next probe"
+        );
+        let (client, url) = (client.clone(), gw.url());
+        let caller = tokio::spawn(async move { post_byo(&client, &url).await });
+        loop {
+            if mock.hits() == 3 {
+                probe = Some(caller);
+                break;
+            }
+            if caller.is_finished() {
+                let status = caller.await.unwrap();
+                assert_eq!(
+                    status, 503,
+                    "a caller got past the breaker without reaching the provider"
+                );
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
-    statuses.sort_unstable();
+    // With that probe held in flight, the breaker must still be half-open with its one permit out:
+    // the next callers are refused, rather than let through to a provider that is still broken.
+    // The ordering is enforced, not made likely by a delay as it was before (800 ms), which a
+    // starved runner could outlast.
+    let others = [
+        post_byo(&client, &gw.url()).await,
+        post_byo(&client, &gw.url()).await,
+    ];
+    let hits_while_held = mock.hits();
+    release.notify_one();
+    let probe = probe.unwrap().await.unwrap();
     assert_eq!(
-        (statuses.as_slice(), mock.hits()),
-        (&[500, 503, 503][..], 3),
+        (others, hits_while_held, probe, mock.hits()),
+        ([503, 503], 3, 500, 3),
         "a closed breaker let every caller through to the broken provider"
     );
 }
