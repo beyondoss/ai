@@ -47,10 +47,13 @@ fn prop_ids_round_trip_for_their_tenant_and_never_verify_for_another() {
             }
             // A provider id is never mistaken for a signed one.
             prop_assert_eq!(s.verify(a, &raw), None);
-            // Packed ids stay within OpenAI's 64-character cap for its own id shape.
+            // Packed ids stay within OpenAI's 64-character cap for its own id shape: a prefix and
+            // a non-empty lowercase-hex body (an empty body, e.g. `resp_`, is no OpenAI id and is
+            // signed verbatim, like any other non-packable id).
             if raw.len() <= 55
                 && raw.split_once('_').is_some_and(|(_, h)| {
-                    h.len() % 2 == 0
+                    !h.is_empty()
+                        && h.len() % 2 == 0
                         && h.bytes()
                             .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
                 })
