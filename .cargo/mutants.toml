@@ -18,4 +18,7 @@ exclude_re = [
   # `logging`'s breaker ledger never sees a pending permit with a status: `response_filter` takes
   # the permit when it sets `upstream_status`, so the `Some(s)` arms are defensive only.
   'replace match guard s >= 500 with (true|false) in <impl ProxyHttp for AiProxy>::logging',
+  # The same guard's operator mutation (it is the only `>=` in `logging` today; re-check this
+  # exclusion if another one is added there).
+  'replace >= with < in <impl ProxyHttp for AiProxy>::logging',
 ]
