@@ -2287,7 +2287,7 @@ evidence = "tests/body_memory.rs on f97ccbf: an 8 MiB Responses history of {\"a\
 claims = ["SEC-19"]
 state = "fixed"
 test = "a_huge_responses_history_is_admitted_without_a_dom"
-fix = "1c22745"
+fix = "f40dd52"
 note = "Every admission check reads spans (peek::members, elements, last_member iterate without collecting; peek::has_typed_member finds a `\"type\": <value>` member by memmem, since in valid JSON an unescaped quote is always a delimiter). The image and file gates are the type names as quoted strings, which prose never spells. Fail-closed is kept: a body that is not one well-formed object is session state (\"store\"). After: +17,428 KiB and +16,868 KiB peak RSS for the same 8 MiB bodies (about two copies of the body); responses_session_field_items 100,000: 3.87 ms, no allocation; refused_input on 500 KB of prose 62.4 -> 26.0 us. Also a_huge_body_that_says_image_is_checked_without_a_dom. Not changed: a key or type value spelled with escapes is not seen by the gates (no client sends one), and a part naming its type twice counts if either spelling is listed (refused or steered rather than guessed)."
 
 [[defect]]
@@ -2301,7 +2301,7 @@ evidence = "benches/unit.rs translate_heap (divan peak live bytes of translate::
 claims = ["SEC-19"]
 state = "fixed"
 test = "a_body_too_costly_to_translate_is_a_413_naming_translation"
-fix = "1c22745"
+fix = "f40dd52"
 note = "translate::translation_heap bounds a translation's peak heap from one structural pass (peek::structure: non-empty objects and structural tokens), 5 x len + 2048 x objects + 128 x tokens, which covers every measured shape (worst 249 B/B estimated 309). A body past the replay buffer holds that in max_buffered_body_bytes for the translation step (concurrency::BudgetHold, released on drop): more than the whole budget is a 413 naming translation (ai_rejections_total{reason=\"translate_too_large\"}), more than is free is the budget's retryable 503. The candidate's request head may have gone out; no body byte does. With the default 512 MiB budget a 16 MiB prompt and a 2 MiB history of 65,536 messages translate (large_bodies_that_fit_the_budget_still_translate); the 4 MiB tiny-item body is refused with peak RSS +9.5 MiB. Not changed: the budget off (0) holds and refuses nothing; non-stream response bodies (<= MAX_TRANSLATE_BUFFER, from the provider) are still parsed whole."
 
 [[defect]]
@@ -2315,7 +2315,7 @@ evidence = "Release timing of translate::request, Chat -> Messages, {\"role\":\"
 claims = ["TRN-3"]
 state = "fixed"
 test = "a_long_run_of_same_role_messages_merges_in_linear_time"
-fix = "1c22745"
+fix = "f40dd52"
 note = "merge_content moves each block into the turn once (Vec::extend in place). 256 KiB of user turns 4.37 s -> 7.55 ms, assistant calls 718 ms -> 3.6 ms; every message still keeps its own block (D44's test unchanged)."
 
 [[defect]]
@@ -2325,9 +2325,9 @@ area = "Reliability"
 title = "A translated stream gathered its whole output with no bound"
 impact = "A stream translated onto a Responses client keeps every text, reasoning and tool-argument delta for the closing response.completed (and the assembling bridge, D147, the whole answer); onto Messages, queued parallel calls gather their arguments. Only the not-yet-terminated SSE event was capped (MAX_TRANSLATE_BUFFER), so an upstream that kept streaming grew the gateway without bound. Separately, each tool-call delta found its call by scanning every call so far (ToolCalls::locate's rposition, RespToOai's position), quadratic in the number of calls."
 confidence = "high"
-evidence = "tests/body_memory.rs a_translated_stream_past_the_largest_answer_is_cut on 1c22745: 48 MiB of Chat content deltas from deepseek-v4-pro onto a Responses client were gathered and relayed whole, 251,811,907 bytes ending in a response.completed that repeated the full output."
+evidence = "tests/body_memory.rs a_translated_stream_past_the_largest_answer_is_cut on f40dd52: 48 MiB of Chat content deltas from deepseek-v4-pro onto a Responses client were gathered and relayed whole, 251,811,907 bytes ending in a response.completed that repeated the full output."
 claims = ["SEC-19"]
 state = "fixed"
 test = "a_translated_stream_past_the_largest_answer_is_cut"
-fix = "1194550"
+fix = "6d3c6cb"
 note = "SseBridge counts what it gathers (accumulated(): text, reasoning, call ids, names and arguments, a fixed cost per call) and proxy aborts past translate::MAX_STREAM_OUTPUT, the largest catalog max_output_tokens (384,000, DeepSeek) x 128 bytes (the longest token in o200k_base and cl100k_base, measured from OpenAI's published vocab files), 46.9 MiB, as it aborts past MAX_TRANSLATE_BUFFER (reason=\"response_too_large\", buffer \"sse_output\"). ToolCalls finds a delta's call through per-index and per-id maps and RespToOai through per-output_index and per-item maps, O(1) instead of a scan (locating_a_calls_delta_matches_a_backward_scan checks the maps against the scan over random delta sequences)."

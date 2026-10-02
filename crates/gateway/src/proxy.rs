@@ -1004,8 +1004,12 @@ impl RequestCtx {
     ///   translating between Chat Completions, Messages and Responses when the wires differ, and
     ///   the same-wire edits a walk makes (the output-limit cap, `max_tokens` respelled for native
     ///   OpenAI, dropped nulls and unreplayable reasoning).
+    /// - `background_check`: a managed `/{provider}/…/responses` body is held whole so a
+    ///   `background: true` is refused before any byte goes upstream (D202).
+    /// - `signed`: a managed Responses relay to a provider's store swaps each tenant-signed id for
+    ///   the provider's (`signed_id`, D230).
     ///
-    /// Both can apply to the same request, in which case every edit is made to the one buffer.
+    /// Several can apply to the same request, in which case every edit is made to the one buffer.
     fn rewrites_body(&self) -> bool {
         self.inject_eligible
             || self.background_check
