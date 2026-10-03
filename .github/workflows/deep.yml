@@ -6,6 +6,15 @@ on:
   schedule:
     - cron: "0 7 * * 0"
   workflow_dispatch:
+    inputs:
+      shards:
+        description: "JSON list of mutants shards to run (default: all 32)"
+        required: false
+        default: ""
+      only_mutants:
+        description: "Skip the property and catalog jobs"
+        type: boolean
+        default: false
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
@@ -20,7 +29,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31]
+        shard: ${{ fromJSON(inputs.shards || '[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31]') }}
     steps:
       - uses: actions/checkout@v7
       - uses: jdx/mise-action@v4
@@ -71,6 +80,7 @@ jobs:
   # kill, so a property that somehow runs away still reports how many cases it ran.
   properties:
     name: property tests (deep)
+    if: ${{ !inputs.only_mutants }}
     runs-on: ubuntu-latest
     timeout-minutes: 330
     steps:
@@ -90,6 +100,7 @@ jobs:
   # ahead, so the row is removed before the vendor's shutdown.
   catalog-retirements:
     name: catalog retirements (strict)
+    if: ${{ !inputs.only_mutants }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
