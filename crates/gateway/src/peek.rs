@@ -2037,4 +2037,41 @@ mod mutation_gaps {
         let model = scan_buffered(br#"{"mod\u0065l":"x","model":"m"}"#);
         assert!(model.duplicate_model);
     }
+
+    /// Only a body whose root is an object is ever rewritten: one that merely contains an object
+    /// after a leading value (trailing garbage a provider rejects) gets no splice, which would
+    /// otherwise land inside the leading value.
+    /// claim: BIL-2
+    #[test]
+    fn a_body_that_does_not_open_with_an_object_is_never_planned() {
+        assert_eq!(plan_stream_usage_injection(br#"{"stream":true}"#), Some(1));
+        assert_eq!(plan_stream_usage_injection(br#"[]{"stream":true}"#), None);
+        assert_eq!(plan_stream_usage_injection(br#" 0{"stream":true}"#), None);
+    }
+
+    /// The response scanner reads raw provider bytes: a root `message` whose value was not an
+    /// object arms no nesting once a `,` ends it, so a malformed body's bare object at the root is
+    /// not read as the `message` object and cannot supply the billed model.
+    /// claim: BIL-13
+    #[test]
+    fn a_comma_disarms_a_root_message_that_was_not_an_object() {
+        let mut s = ModelScanner::for_response();
+        s.feed(br#"{"message":"x",{"model":"not-billed"}}"#);
+        assert_eq!(s.take_model(), None);
+        // The armed path, for contrast.
+        let mut s = ModelScanner::for_response();
+        s.feed(br#"{"message":{"model":"billed"}}"#);
+        assert_eq!(s.take_model().as_deref(), Some("billed"));
+    }
+
+    /// A `"type"` whose opening quote is escaped (one backslash) sits inside a string, here a key
+    /// spelled `\"type`, so it is no member; three backslashes are still an odd run.
+    /// claim: T3
+    #[test]
+    fn an_escaped_type_quote_is_not_a_type_member() {
+        let hit = |b: &[u8]| has_typed_member(b, (0, b.len()), &["image"]);
+        assert!(hit(br#"{"type":"image"}"#));
+        assert!(!hit(br#"{"\"type":"image"}"#));
+        assert!(!hit(br#"{"\\\"type":"image"}"#));
+    }
 }
