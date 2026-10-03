@@ -173,10 +173,10 @@ impl UsageTail {
         }
         let first = (USAGE_TAIL_CAP - self.head).min(data.len());
         self.buf[self.head..self.head + first].copy_from_slice(&data[..first]);
+        // The wrapped remainder; empty (a no-op copy) when the chunk fit before the end. No `if`:
+        // a guard here could only skip an empty copy, so it had no behaviour to test.
         let rest = data.len() - first;
-        if rest > 0 {
-            self.buf[..rest].copy_from_slice(&data[first..]);
-        }
+        self.buf[..rest].copy_from_slice(&data[first..]);
         self.head = (self.head + data.len()) % USAGE_TAIL_CAP;
     }
 
@@ -8774,5 +8774,73 @@ mod mutation_gaps {
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["stream_options"]["include_usage"], true);
         assert_eq!(v["stream_options"]["include_obfuscation"], false);
+    }
+
+    /// D80 resends only when **every** condition holds: a reused connection, pingora's
+    /// `ReusedOnly` verdict, a read error, and a reset or abort at the root. With any one false the
+    /// request may have reached a server, so it is never sent twice.
+    /// claim: REL-1, REL-11
+    #[test]
+    fn a_reset_before_reading_needs_every_condition() {
+        use std::io::{Error as Io, ErrorKind as K};
+        let err = |etype: T, kind: K, reused_only: bool| {
+            let mut e = Error::because(etype, "upstream", Io::from(kind));
+            if reused_only {
+                e.retry = pingora_core::RetryType::ReusedOnly;
+            }
+            e
+        };
+        let reset = err(T::ReadError, K::ConnectionReset, true);
+        assert!(reset_before_reading(&reset, true));
+        let aborted = err(T::ReadError, K::ConnectionAborted, true);
+        assert!(reset_before_reading(&aborted, true));
+        // A fresh connection: the reset says nothing about an idle-close race.
+        assert!(!reset_before_reading(&reset, false));
+        // Pingora did not judge it retryable on reuse.
+        let decided = err(T::ReadError, K::ConnectionReset, false);
+        assert!(!reset_before_reading(&decided, true));
+        // Not a read: a write that met the reset may have delivered part of the request.
+        let write = err(T::WriteError, K::ConnectionReset, true);
+        assert!(!reset_before_reading(&write, true));
+        // A timeout is a liveness verdict on a peer that may have taken the request.
+        let timed_out = err(T::ReadError, K::TimedOut, true);
+        assert!(!reset_before_reading(&timed_out, true));
+    }
+
+    /// The usage tail at the exact moment it becomes a ring and across its wrap: a chunk that
+    /// lands flush on the end (no remainder, `head` back to 0), then a final usage event that
+    /// straddles the end. Any slip here truncates or misorders the event billing reads.
+    /// claim: BIL-15
+    #[test]
+    fn the_usage_tail_wraps_at_exactly_its_capacity() {
+        let stream: Vec<u8> = (0..2 * USAGE_TAIL_CAP).map(|i| (i % 253) as u8).collect();
+        let mut tail = UsageTail::default();
+        tail.push(&stream[..USAGE_TAIL_CAP]);
+        assert!(
+            tail.ring(),
+            "exactly the cap is a ring with nothing dropped"
+        );
+        assert_eq!(tail.head, 0);
+        tail.push(&stream[USAGE_TAIL_CAP..USAGE_TAIL_CAP + 10]);
+        tail.push(&stream[USAGE_TAIL_CAP + 10..2 * USAGE_TAIL_CAP - 3]);
+        assert_eq!(tail.head, USAGE_TAIL_CAP - 3);
+        tail.push(&stream[2 * USAGE_TAIL_CAP - 3..]);
+        assert_eq!(tail.head, 0, "flush on the end wraps head to the front");
+        assert_eq!(tail.contiguous(), &stream[USAGE_TAIL_CAP..]);
+
+        // Outgrown (compacted to head 0), then filled to 5 bytes short of the end, so the usage
+        // event's first 5 bytes land at the end and the rest wrap to the front.
+        let mut tail = UsageTail::default();
+        tail.push(&stream[..USAGE_TAIL_CAP + 5]);
+        tail.push(&stream[USAGE_TAIL_CAP + 5..2 * USAGE_TAIL_CAP - 5]);
+        assert_eq!(tail.head, USAGE_TAIL_CAP - 10);
+        tail.push(&stream[2 * USAGE_TAIL_CAP - 5..]);
+        assert_eq!(tail.head, USAGE_TAIL_CAP - 5);
+        let event = br#"data: {"usage":{"total_tokens":7}}"#;
+        tail.push(event);
+        assert_eq!(tail.head, event.len() - 5);
+        let mut whole = stream.clone();
+        whole.extend_from_slice(event);
+        assert_eq!(tail.contiguous(), &whole[whole.len() - USAGE_TAIL_CAP..]);
     }
 }

@@ -149,15 +149,6 @@ impl CircuitBreakerConfig {
         self.half_open_permits = permits;
         self
     }
-
-    /// Get the failure threshold from the policy.
-    #[allow(dead_code)]
-    fn threshold(&self) -> u32 {
-        match &self.failure_policy {
-            FailurePolicy::Consecutive { threshold } => *threshold,
-            FailurePolicy::Windowed { threshold, .. } => *threshold,
-        }
-    }
 }
 
 /// Lock-free circuit breaker.
