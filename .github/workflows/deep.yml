@@ -54,8 +54,10 @@ jobs:
           cat s1/mutants.out/missed.txt s1/mutants.out/timeout.txt 2>/dev/null | sort -u > survivors.txt || true
           echo "stage 1 survivors: $(wc -l < survivors.txt)"
           if [ -s survivors.txt ]; then
-            RE=$(sed -E 's/^[^:]+:[0-9]+:[0-9]+: //' survivors.txt | sed -E 's/[][(){}.*+?^$|\\]/\\&/g' | paste -sd'|')
-            cargo mutants -p beyond-ai --test-tool nextest $FILES --re "$RE" \
+            # Select exactly the survivors' lines with a synthetic diff: `--re` matches names
+            # unreliably and skipped most stage-1 survivors.
+            python3 .github/scripts/survivor-diff.py . survivors.txt > survivors.diff
+            cargo mutants -p beyond-ai --test-tool nextest --in-diff survivors.diff \
               --jobs 2 --timeout-multiplier 3 --minimum-test-timeout 600 --output s2 </dev/null || rc=$?
             mkdir -p mutants.out && cp s2/mutants.out/*.txt mutants.out/ 2>/dev/null || true
             [ "${rc:-0}" = 3 ] && exit 0
