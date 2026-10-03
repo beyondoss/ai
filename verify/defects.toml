@@ -2541,3 +2541,17 @@ state = "fixed"
 test = "a_reclaimed_probe_releasing_late_does_not_mint_a_second_probe"
 fix = "4c9fa18"
 note = "Fixed lock-free in the same packed AtomicU64: while OPEN or HALF_OPEN the 14-bit failure field holds a probe generation, bumped on OPEN -> HALF_OPEN and on every reclaim (an opening breaker seeds it from the clock). allow() returns a Permit carrying it (a CLOSED permit carries none); release(permit), record_success_for and record_failure_for are no-ops in HALF_OPEN for any other generation, and release still saturates at half_open_permits. proxy.rs's ledger RequestCtx::breaker_pending is now Option<Permit>. Unpermitted record_success/record_failure (the error-in-200 settle) are unchanged. Also tested: a_permit_from_another_generation_neither_releases_nor_decides, concurrent_stale_releases_never_mint_permits, test_a_stalled_probe_permit_is_reclaimed_after_the_reset_timeout (stale outcomes no longer decide)."
+
+[[defect]]
+id = "D257"
+severity = "med"
+area = "Reliability"
+title = "A snapshot rebuild that crashed midway booted the allowance-set READY with only some exhausted tenants"
+impact = "Reliability and security: rebuild_snapshot removed the file, appended one Put per scanned entry and wrote the cursor last, in place. A crash midway left some Puts and no cursor. The next boot with NATS unreachable installed that partial file as a ready allowance-set: the exhausted tenants it was missing were served, and /readyz returned 200, breaking allowance's fail-closed guarantee."
+confidence = "high"
+evidence = "store_watch.rs: the boot path stored W::from_entries(snapshot) in the live slot and called record_size (the allowance ready flip) before checking is_resumable(&snap.cursor); allowanceset_from_entries starts from AllowanceSet::from_ready(); rebuild_snapshot did remove_file, SnapshotWriter::open, write_update per entry, checkpoint, with no temp file or rename."
+claims = ["REL-5", "REL-13"]
+state = "fixed"
+test = "an_allowance_snapshot_without_a_cursor_stays_fail_closed"
+fix = "320db0e"
+note = "Two fixes. (1) WatchedSet::SEED_FROM_CURSORLESS_SNAPSHOT: deny (fail-open) still seeds from any snapshot; allowance (fail-closed) seeds only from a snapshot with a cursor record, decided before anything is installed. Every writer puts the cursor after the data it covers, so a cursor (even an empty scan's revision 0) means a complete read; only a revision > 0 cursor skips the scan, unchanged. (2) rebuild_snapshot now writes {path}.tmp, fsyncs it, renames over path, fsyncs the directory and reopens path, so a crash leaves the old or the new complete file. Gating on is_resumable instead (as first proposed) would leave an edge gateway with an empty allowance bucket unready with NATS down; e2e on_disk_snapshot_enforces_across_restart_without_nats caught that. Also tested: an_allowance_snapshot_with_a_cursor_seeds_ready, a_deny_snapshot_without_a_cursor_still_blocks_with_nats_down, a_crash_before_the_rename_leaves_the_previous_complete_snapshot, a_rebuild_discards_a_stale_staged_file_and_reopens_the_new_one, only_allowance_refuses_a_cursorless_snapshot."

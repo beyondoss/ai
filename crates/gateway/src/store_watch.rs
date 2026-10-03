@@ -1292,7 +1292,7 @@ mod tests {
     /// The trait's policy, pinned: only the fail-closed set refuses a cursorless snapshot.
     /// defect: D257
     #[test]
-    fn only_allowance_refuses_an_unresumable_snapshot() {
+    fn only_allowance_refuses_a_cursorless_snapshot() {
         const {
             assert!(Deny::SEED_FROM_CURSORLESS_SNAPSHOT);
             assert!(!Allowance::SEED_FROM_CURSORLESS_SNAPSHOT);
