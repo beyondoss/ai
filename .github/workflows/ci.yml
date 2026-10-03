@@ -274,9 +274,14 @@ jobs:
         run: |
           git diff "origin/${{ github.base_ref }}...HEAD" -- crates/gateway/src crates/providers/src > "$RUNNER_TEMP/pr.diff"
           if [ ! -s "$RUNNER_TEMP/pr.diff" ]; then echo "no gateway or catalog source changes"; exit 0; fi
+          # Exit 3 means only timeouts: the mutant made the suite hang or overrun, i.e. the tests did
+          # not pass with it, so it is caught. Missed mutants (2) and a failed baseline (4) still fail.
+          rc=0
           cargo mutants --in-diff "$RUNNER_TEMP/pr.diff" -p beyond-ai -p beyond-ai-providers \
             --shard ${{ matrix.shard }}/8 --test-tool nextest --jobs 2 --timeout-multiplier 2 \
-            --no-shuffle </dev/null
+            --no-shuffle </dev/null || rc=$?
+          if [ "$rc" = 3 ]; then echo "timeouts only (counted as caught):"; cat mutants.out/timeout.txt; exit 0; fi
+          exit "$rc"
       - name: missed mutants
         if: failure()
         run: cat mutants.out/missed.txt 2>/dev/null || true
