@@ -21,4 +21,22 @@ exclude_re = [
   # The same guard's operator mutation (it is the only `>=` in `logging` today; re-check this
   # exclusion if another one is added there).
   'replace >= with < in <impl ProxyHttp for AiProxy>::logging',
+  # `pack` ORs fields masked into disjoint bit ranges, where `|` and `^` are the same operation.
+  'replace \| with \^ in CircuitBreaker::pack',
+  # `k < l`: `k` is a dropped item and `l` a kept one, so `k == l` never happens.
+  'replace < with <= in remove_items',
+  # `state << 3 | class`: the shifted state's low three bits are zero and a class is below 8, so
+  # `|` and `^` agree (the TALLY index in `run` and `step`).
+  'replace \| with \^ in InputTally::(run|step)',
+  # `close` clears COLON and ESCAPE (distinct bits, so `^` is `|`). ESCAPE is never set when it
+  # runs, and in valid JSON a `,` `:` `]` or `}` follows every closing quote, so `Structure`
+  # re-sets COLON before reading it: clearing neither (`&`) changes no count on a valid body.
+  'replace \| with (&|\^) in InputTally::close',
+  # The drained `max_tokens` is the last member only when `max_completion_tokens` precedes it
+  # (both are present on this path), so the byte before it is always the separating comma.
+  '''replace match guard body\[comma\] == b',' with true in rename_max_tokens''',
+  # `model_span` and the `stream_options` value are distinct root values: `s == at` never holds.
+  'replace > with >= in force_include_usage',
+  # A one-line delegation to `summary_line` (tested); pingora calls it only on its own error lines.
+  'replace <impl ProxyHttp for AiProxy>::request_summary -> String',
 ]

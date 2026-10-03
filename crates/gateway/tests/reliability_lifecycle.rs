@@ -718,3 +718,76 @@ async fn a_body_past_the_memory_budget_is_a_retryable_503() {
     let ok = send(chat(200 * 1024)).await.unwrap();
     assert_eq!(ok.status().as_u16(), 200);
 }
+
+/// The up-front reservation refuses, before reading a byte of it, a body the budget can hold once
+/// but not twice: a catalog walk holds a large body twice (the peek and its full-body re-run),
+/// whether the body or the `x-beyond-model` header names the row. A buffered `/{provider}` body
+/// is held once, and is refused before the upstream sees the request.
+/// claim: SEC-19
+/// defect: D35
+#[tokio::test]
+async fn a_large_body_reserves_every_copy_it_will_hold_before_it_is_read() {
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::builder(unused_nats_port(), &mock.authority(), &b64(&pubkey))
+        .config_line("max_buffered_body_bytes = 1048576")
+        .start()
+        .await;
+    let chat = |pad: usize| {
+        format!(
+            r#"{{"model":"gpt-4o-mini","messages":[{{"role":"user","content":"{}"}}]}}"#,
+            "x".repeat(pad)
+        )
+    };
+    let send = |path: &'static str, header: Option<&'static str>, body: String| {
+        let mut req = test_client()
+            .post(format!("{}{path}", gw.url()))
+            .header("authorization", format!("Bearer {}", vkey(&sk, 35)))
+            .header("content-type", "application/json");
+        if let Some(model) = header {
+            req = req.header("x-beyond-model", model);
+        }
+        req.body(body).send()
+    };
+    // 600 KiB fits the 1 MiB budget once, not twice. Declared and never sent: the refusal comes
+    // from the declared length, before a byte of the body is read.
+    for (what, header) in [
+        ("body-named", ""),
+        ("header-named", "x-beyond-model: gpt-4o-mini\r\n"),
+    ] {
+        let addr = gw.url().trim_start_matches("http://").to_owned();
+        let mut s = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        let head = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nhost: gw\r\nauthorization: Bearer {}\r\n\
+             content-type: application/json\r\n{header}content-length: {}\r\n\r\n",
+            vkey(&sk, 35),
+            600 * 1024
+        );
+        s.write_all(head.as_bytes()).await.unwrap();
+        let mut buf = vec![0u8; 4096];
+        let n = tokio::time::timeout(Duration::from_secs(5), s.read(&mut buf))
+            .await
+            .unwrap_or_else(|_| panic!("{what}: no answer until the body arrives"))
+            .unwrap();
+        let text = String::from_utf8_lossy(&buf[..n]);
+        assert!(
+            text.starts_with("HTTP/1.1 503") && text.contains("too many large request bodies"),
+            "{what}: {text}"
+        );
+    }
+    // 1.5 MiB on `/openai/…`, buffered for `stream_options`: past the budget even once.
+    let resp = send("/openai/v1/chat/completions", None, chat(1536 * 1024))
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    let text = resp.text().await.unwrap_or_default();
+    assert!(
+        status == 503 && text.contains("too many large request bodies"),
+        "provider route: status {status}: {text}"
+    );
+    assert_eq!(
+        mock.hits(),
+        0,
+        "every refusal came before an upstream attempt"
+    );
+}

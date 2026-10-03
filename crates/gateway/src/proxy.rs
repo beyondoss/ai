@@ -2785,18 +2785,21 @@ fn is_v1_models_list(session: &Session) -> bool {
         && (path == "/v1/models" || path == "/v1/models/")
 }
 
+/// [`ProxyHttp::request_summary`]'s line: method, path without the query, and host.
+fn summary_line(req: &pingora::http::RequestHeader) -> String {
+    let host = req
+        .headers
+        .get(http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .or_else(|| req.uri.host())
+        .unwrap_or("");
+    format!("{} {}, Host: {host}", req.method, req.uri.path())
+}
+
 /// Cap a caller-supplied model name before echoing it in an error. The peek is 64 KiB; we do not
 /// want that in a JSON error body.
 fn clip_catalog_name(name: &str) -> &str {
-    const MAX: usize = 128;
-    if name.len() <= MAX {
-        return name;
-    }
-    let mut end = MAX;
-    while end > 0 && !name.is_char_boundary(end) {
-        end -= 1;
-    }
-    &name[..end]
+    &name[..name.floor_char_boundary(128)]
 }
 
 /// Resolve the provider name for a request whose first path segment matched no known/config
@@ -2965,12 +2968,12 @@ fn catalog_error_relay(auto: &ModelRouting, status: Option<u16>, streaming: bool
         && !catalog_translating(auto)
 }
 
-/// A Chat Completions client served by a Chat Completions candidate of a vendor other than OpenAI,
-/// whose stream may repeat what OpenAI's sends once (see `translate::ChatIdentity`).
+/// A catalog walk (not a sub-resource) served by a Chat Completions candidate of a vendor other
+/// than OpenAI, whose stream may repeat what OpenAI's sends once (see `translate::ChatIdentity`).
+/// It decides only for a Chat Completions client: any other is translated off that candidate
+/// anyway (`catalog_translating`), which builds the same bridge.
 fn catalog_chat_relay(auto: &ModelRouting) -> bool {
-    auto.translate
-        .as_ref()
-        .is_some_and(|t| t.client == route::Endpoint::ChatCompletions)
+    auto.translate.is_some()
         && auto.candidate_at(auto.candidate).is_some_and(|c| {
             c.provider != providers::ProviderId::OpenAi
                 && route::Endpoint::of_upstream_path(c.path) == route::Endpoint::ChatCompletions
@@ -3256,14 +3259,7 @@ impl ProxyHttp for AiProxy {
     /// **with** the query, which is where a Gemini-style `?key=` credential (a virtual key or a
     /// BYO Google key) lives. Logged without the query.
     fn request_summary(&self, session: &Session, _ctx: &Self::CTX) -> String {
-        let req = session.req_header();
-        let host = req
-            .headers
-            .get(http::header::HOST)
-            .and_then(|v| v.to_str().ok())
-            .or_else(|| req.uri.host())
-            .unwrap_or("");
-        format!("{} {}, Host: {host}", req.method, req.uri.path())
+        summary_line(session.req_header())
     }
 
     fn allow_spawning_subrequest(&self, _session: &Session, _ctx: &Self::CTX) -> bool {
@@ -8311,6 +8307,76 @@ mod tests {
         assert_eq!(clip_catalog_name("gpt-4o-mini"), "gpt-4o-mini");
         let long = "x".repeat(200);
         assert_eq!(clip_catalog_name(&long).len(), 128);
+        // Byte 128 falls inside a two-byte character: the cut backs off to its start.
+        let wide = format!("{}{}", "x".repeat(127), "é".repeat(10));
+        assert_eq!(clip_catalog_name(&wide), "x".repeat(127));
+    }
+
+    /// Pingora's own error lines print the request without its query, where a `?key=` credential
+    /// rides.
+    /// claim: SEC-4
+    #[test]
+    fn the_summary_line_leaves_out_the_query() {
+        let mut req = pingora::http::RequestHeader::build(
+            http::Method::POST,
+            b"/v1beta/models/g:generateContent?key=secret",
+            None,
+        )
+        .unwrap();
+        req.insert_header("host", "gw.example").unwrap();
+        assert_eq!(
+            summary_line(&req),
+            "POST /v1beta/models/g:generateContent, Host: gw.example"
+        );
+    }
+
+    /// The compression opt-out is spliced only just inside a non-empty root object; an empty
+    /// object, an array, or a body that already names `plugins` goes as sent.
+    /// claim: CAT-3
+    /// defect: D109
+    #[test]
+    fn compression_is_disabled_only_inside_a_non_empty_object() {
+        let off = |b: &[u8]| disable_openrouter_compression(b.to_vec());
+        for same in [
+            &b"{}"[..],
+            b" { } ",
+            b"[1]",
+            br#"[{"a":1}]"#,
+            b"",
+            b"  ",
+            br#"{"plugins":[],"a":1}"#,
+        ] {
+            assert_eq!(off(same), same, "{}", String::from_utf8_lossy(same));
+        }
+        let spliced = |pre: &str, rest: &str| {
+            let mut v = pre.as_bytes().to_vec();
+            v.extend_from_slice(OPENROUTER_NO_COMPRESSION);
+            v.extend_from_slice(rest.as_bytes());
+            v
+        };
+        assert_eq!(off(br#"{"a":1}"#), spliced("{", r#""a":1}"#));
+        assert_eq!(off(br#" {"a":1}"#), spliced(" {", r#""a":1}"#));
+    }
+
+    /// An empty `model` value (a zero-width span) is still rewritten.
+    /// claim: R1
+    #[test]
+    fn an_empty_model_span_is_rewritten() {
+        let body = br#"{"model":""}"#.to_vec();
+        assert_eq!(
+            apply_model_rewrite(body, (10, 10), b"gpt-4o"),
+            br#"{"model":"gpt-4o"}"#
+        );
+    }
+
+    /// A full-body attempt that was cancelled rather than panicked is just finished: only a
+    /// panic has a payload to log.
+    /// claim: REL-17
+    #[tokio::test]
+    async fn a_cancelled_full_body_attempt_is_finished_not_a_panic() {
+        let cancelled = tokio::spawn(std::future::pending::<()>());
+        cancelled.abort();
+        assert_eq!(reap_attempt(cancelled, "rid").await, Reaped::Finished);
     }
 
     #[test]

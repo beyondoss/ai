@@ -1266,12 +1266,8 @@ impl InputTally {
                     units += u32::from(e >> 4);
                     sa = e & 15;
                 }
-                (None, Some(y)) => {
-                    let e = quad(sb, y);
-                    units += u32::from(e >> 4);
-                    sb = e & 15;
-                }
-                (None, None) => break,
+                // The cut is past the middle, so `a` is the longer half: `qb` never outlasts `qa`.
+                (None, _) => break,
             }
         }
         for (state, rest) in [(&mut sa, qa.remainder()), (&mut sb, qb.remainder())] {
@@ -1348,7 +1344,7 @@ pub fn stream_carried_error(tail: &[u8]) -> bool {
 /// Runs once, on the cut-short path only, so it parses each line into a `Value` rather than
 /// maintaining a typed view per wire.
 pub fn estimate_stream_output(tail: &[u8], total_bytes: u64) -> u64 {
-    let (mut events, mut deltas, mut text) = (0u64, 0u64, 0u64);
+    let (mut deltas, mut text) = (0u64, 0u64);
     for line in sse_lines(tail) {
         let Some(payload) = strip_sse_data(line) else {
             continue;
@@ -1356,14 +1352,14 @@ pub fn estimate_stream_output(tail: &[u8], total_bytes: u64) -> u64 {
         let Ok(v) = serde_json::from_slice::<serde_json::Value>(payload) else {
             continue;
         };
-        events += 1;
         let n = delta_text_len(&v);
         if n > 0 {
             deltas += 1;
             text += n;
         }
     }
-    if events == 0 || tail.is_empty() {
+    // No delta, no text (an empty tail has neither, which keeps `sampled` nonzero below).
+    if deltas == 0 {
         return 0;
     }
     // The bytes before the tail are extrapolated at 90%: a stream opens with heavier preamble

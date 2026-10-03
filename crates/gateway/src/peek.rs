@@ -869,11 +869,10 @@ fn splice_out(body: &mut Vec<u8>, cuts: &[(usize, usize)]) {
     };
     for (k, &(_, end)) in cuts.iter().enumerate() {
         let next = cuts.get(k.saturating_add(1)).map_or(body.len(), |c| c.0);
-        // Spans are ascending and disjoint (`remove_items` builds them in order): `end <= next`.
-        if end < next {
-            body.copy_within(end..next, write);
-            write = write.saturating_add(next.saturating_sub(end));
-        }
+        // Spans are ascending and disjoint (`remove_items` builds them in order): `end <= next`,
+        // and two touching spans copy nothing.
+        body.copy_within(end..next, write);
+        write = write.saturating_add(next.saturating_sub(end));
     }
     body.truncate(write);
 }
@@ -2073,5 +2072,18 @@ mod mutation_gaps {
         assert!(hit(br#"{"type":"image"}"#));
         assert!(!hit(br#"{"\"type":"image"}"#));
         assert!(!hit(br#"{"\\\"type":"image"}"#));
+    }
+
+    /// A value cannot be empty: a separator where a value should start ends none, so `{"a":}` and
+    /// `{"a":,"b":1}` are malformed rather than members with an empty value.
+    /// claim: SEC-21
+    #[test]
+    fn a_separator_where_a_value_starts_is_no_value() {
+        for b in [&b","[..], b"}", b"]", b" "] {
+            assert_eq!(value_end(b, 0), None, "{:?}", b);
+        }
+        assert_eq!(value_end(b"12,", 0), Some(2));
+        assert_eq!(root_members(br#"{"a":}"#), None);
+        assert_eq!(root_members(br#"{"a":,"b":1}"#), None);
     }
 }
