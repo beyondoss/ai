@@ -146,20 +146,56 @@ jobs:
           test ! -e /work
           echo "AGENT_LIVE_EXEC_CMD=docker exec agent-exec-target {}" >> "$GITHUB_ENV"
           echo "AGENT_LIVE_WORKDIR=/work" >> "$GITHUB_ENV"
+      # A resource trend that outlives a wedge: memory, swap, PSI, load, pid count, disk and the
+      # biggest processes every 5s, appended to a file by a transient *system* unit. It is outside the
+      # step's process tree, so it can never hold the step's stdout pipe, and it stops itself.
+      - name: start resource sampler
+        run: |
+          : > "$RUNNER_TEMP/resources.log"
+          sudo systemd-run --unit=ci-resources --collect --quiet -p RuntimeMaxSec=40min \
+            -p StandardOutput=append:"$RUNNER_TEMP/resources.log" -p StandardError=append:"$RUNNER_TEMP/resources.log" \
+            sh -c 'while :; do
+              echo "=== $(date -u +%T) load $(cut -d" " -f1-4 /proc/loadavg) pids $(ls -d /proc/[0-9]* | wc -l)"
+              free -m | tail -2
+              for r in memory cpu io; do echo "psi $r $(head -1 /proc/pressure/$r)"; done
+              df -h / | tail -1
+              ps -eo pid,rss,nlwp,stat,etime,comm --sort=-rss | head -6
+              ps -eo pid,stat,wchan:24,comm | awk "\$2 ~ /^D/ {print \"D-state:\", \$0}"
+              sleep 5
+            done'
       - name: compile tests
         run: cargo nextest run --workspace --profile ci ${{ matrix.extra }} -E '${{ matrix.filter }}' --no-run
         timeout-minutes: 20
+      # The run is a transient system unit (`systemd-run --wait`), not a child of the step. The
+      # wedge leaves the test step `in_progress` past the nextest global-timeout, the step timeout and
+      # the job timeout, so every one of those limits needs the runner itself to act, and it doesn't.
+      # These limits are enforced by systemd instead:
+      #   RuntimeMaxSec  ends the run at 11m (nextest's own global-timeout is 10m) and fails the unit
+      #                  with result `timeout`. systemd-run returns then even if a process survives
+      #                  its SIGKILL, so the step finishes and the steps after it run.
+      #   MemoryMax      measured peak of the agent-rest and agent-code-mode runs is ~0.3 GB (cgroup,
+      #                  4 CPUs, 16 GB). 8 GB is ~25x that and half the runner, so a runaway is
+      #                  OOM-killed with result `oom-kill` in the log instead of swapping the VM.
+      #   TasksMax       peak is ~80 pids/threads. 4096 stops a fork loop long before the pid table.
+      # When the unit stops, systemd kills everything left in its cgroup, so a leaked `serve` daemon or
+      # nats-server cannot outlive the step (nextest still prints `LEAK` naming the test). The unit's
+      # output is a file, never the step's pipe. The environment is passed explicitly because sudo
+      # resets it, and cargo is passed by absolute path because systemd-run resolves the binary with
+      # sudo's PATH, not ours. No GNU `timeout` (see above).
       - name: test
         run: |
           set +e
           LOG="$RUNNER_TEMP/nextest.log"
           : > "$LOG"
           echo "nextest output -> $LOG"
-          cargo nextest run --workspace --profile ci ${{ matrix.extra }} -E '${{ matrix.filter }}' \
-            > "$LOG" 2>&1 </dev/null
+          env_args=()
+          while IFS= read -r name; do env_args+=("--setenv=$name=${!name}"); done < <(compgen -e)
+          sudo systemd-run --wait --collect --same-dir --uid="$(id -un)" --gid="$(id -gn)" \
+            -p MemoryMax=8G -p MemorySwapMax=0 -p TasksMax=4096 -p RuntimeMaxSec=11min \
+            -p StandardInput=null -p StandardOutput=append:"$LOG" -p StandardError=append:"$LOG" \
+            "${env_args[@]}" \
+            "$(command -v cargo)" nextest run --workspace --profile ci ${{ matrix.extra }} -E '${{ matrix.filter }}'
           status=$?
-          pkill -9 -f 'beyond-ai-agent' 2>/dev/null
-          pkill -9 -f 'nats-server' 2>/dev/null
           echo "--- last 200 lines of the log file ---"
           tail -200 "$LOG"
           exit $status
@@ -169,9 +205,20 @@ jobs:
         if: always()
         run: |
           echo "--- disk ---"; df -h / | tail -1
-          echo "--- memory ---"; free -m | head -2
+          echo "--- memory ---"; free -m | head -3
           echo "--- surviving beyond-ai processes (leaked daemons) ---"
           ps -eo pid,etime,rss,args | grep -E "beyond-ai|nats-server" | grep -v grep || echo "  none"
+          sudo systemctl stop ci-resources 2>/dev/null
+          echo "--- last resource samples ---"; tail -60 "$RUNNER_TEMP/resources.log"
+      - name: upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-${{ matrix.name }}-logs
+          path: |
+            ${{ runner.temp }}/nextest.log
+            ${{ runner.temp }}/resources.log
+          if-no-files-found: ignore
   # The gateway's concurrency-sensitive hermetic tests (reliability, billing, streaming,
   # cancellation, capture), run repeatedly with every core saturated by a CPU hog. Two real races
   # (D248's GOAWAY resend, D208's capture drain) passed on a fast dev box and failed only on CI's
