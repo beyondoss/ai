@@ -1668,11 +1668,11 @@ title = "The ranker's probe promotes an unkeyed candidate, so a keyed arm behind
 impact = "Every 8th request is meant to promote the first unmeasured candidate so a fallback gets measured and can be ranked. The probe looks at the whole catalog row, keyed or not, and an unkeyed candidate never gets a sample, so it stays 'unmeasured' forever and wins every probe. upstream_peer then skips it and the request goes to the usual primary. On a Claude row deployed without Bedrock (anthropic, bedrock, openrouter), OpenRouter is never probed, measured, ranked or pinned: it is only ever used as failover, whatever its latency."
 confidence = "high"
 evidence = "live 2026-10-01, TEN-2 pin cells on claude-haiku-4-5 with Anthropic and OpenRouter keyed and Bedrock unkeyed: 20 sequential calls from 20 fresh bai_v2 keys (each its own pin) were all served by anthropic, including seq 8 and 16, the probe slots (TEN-2+SEC-15::{anthropic-py,openai-py}::pooled::pin_isolation, first run). With Bedrock keyed too (route pooled3), seq 8 lands on bedrock (key pa09) in every run. Code: smart.rs probe() picks the first walk index whose effective() is Tier::Unmeasured; the walk passed to rank() is the row's identity walk, ranked before the usable (keyed) mask is computed in proxy.rs (~3432-3470)."
-claims = ["R7"]
+claims = ["R4"]
 state = "fixed"
-test = "the_probe_skips_an_unkeyed_candidate"
+test = "a_pin_skips_a_candidate_that_cannot_be_used_here"
 fix = "c2e954f"
-note = "Found by crates/verify/tests/tenancy_live.rs, whose pin cells now key Bedrock so the probe can reach a second provider. Proposed: skip unkeyed (and breaker-open) candidates when choosing the probe target. Fixed in c2e954f: proxy.rs computes a dispatchable mask per catalog index (pool key here, not skipped by a large-body re-run or a key walk, serves the sub-resource) before ranking and passes it to Router::rank, whose probe promotes only the first unmeasured dispatchable candidate; the usable walk-slot mask is now derived from the same mask. Tests: the_probe_skips_an_unkeyed_candidate (claude-haiku-4-5 with anthropic and openrouter keyed, bedrock not: the seq-8 probe lands on openrouter) and smart::tests::the_probe_skips_a_candidate_that_cannot_be_dispatched. Breaker-open candidates are not excluded: a breaker opens on failures, which rank Failed, not Unmeasured, and allow() mutates breaker state, so it is not consulted while ranking."
+note = "Found by crates/verify/tests/tenancy_live.rs, whose pin cells now key Bedrock so the probe can reach a second provider. Proposed: skip unkeyed (and breaker-open) candidates when choosing the probe target. Fixed in c2e954f: proxy.rs computes a dispatchable mask per catalog index (pool key here, not skipped by a large-body re-run or a key walk, serves the sub-resource) before ranking and passes it to Router::rank, whose probe promotes only the first unmeasured dispatchable candidate; the usable walk-slot mask is now derived from the same mask. Tests: the_probe_skips_an_unkeyed_candidate (claude-haiku-4-5 with anthropic and openrouter keyed, bedrock not: the seq-8 probe lands on openrouter) and smart::tests::the_probe_skips_a_candidate_that_cannot_be_dispatched. Breaker-open candidates are not excluded: a breaker opens on failures, which rank Failed, not Unmeasured, and allow() mutates breaker state, so it is not consulted while ranking. Repointed 2026-10-02: the TTFT ranker and its probe were removed (R7 retired), so the probe test is gone. The mask c2e954f introduced survives as the computed pin's usable set: a candidate that cannot be dispatched here moves behind every one that can (pin::tests::a_pin_skips_a_candidate_that_cannot_be_used_here, claim R4)."
 
 [[defect]]
 id = "D120"
@@ -2457,3 +2457,87 @@ state = "fixed"
 test = "concurrent_streams_refused_by_one_goaway_are_all_resent"
 fix = "18068af"
 note = "Fixed: a GOAWAY refusal on a connection the request found already open (client_reused) is a drain casualty: resent without spending the one refused resend, bounded by pingora's retry limit (each needs a live connection that served before). A GOAWAY on a connection the request opened, and every RST_STREAM(REFUSED_STREAM), keep D91's one resend. Streams at or below last_stream_id never get the go_away error, so they stay under D09. Second shape, found once the first was fixed (10 to 60% of hermetic runs under load): a resend whose body write met the GOAWAY failed as pingora H2Error 'cannot reserve capacity' (stream closed, bytes unsent, no h2 reason), which body_delivered counted as delivered: 502 'upstream failed after receiving the request'. Fixed: h2_body_unsent makes it a write failure (END_STREAM never went out), retried as an undelivered failure on a reused connection. The mock now drains like a real server (finishes streams at or below its last id for 200 ms, never refuses one below a stream it served); its old GOAWAY could break §6.8 and caused a broken-pipe flake. Open, unexplained: under single-CPU contention a second burst reusing the drained mock connections saw tries-1 broken pipes (no GOAWAY reached the h2 client before EOF); the test stays at one burst and reports a run with no refusal as inconclusive."
+
+[[defect]]
+id = "D250"
+severity = "med"
+area = "Catalog"
+title = "GET /v1/models listed rows the deployment holds no pool key to serve"
+impact = "The listing was the whole compiled catalog whatever pool keys were configured, so a deployment without a provider's key advertised rows none of whose candidates it could reach; a managed client that picked one got a 503."
+confidence = "high"
+evidence = "proxy.rs served providers::catalog::models_list_json() for every GET /v1/models; the doctor's model_catalog check already computed the unreachable rows from the same pool keys but nothing used it for the listing. Hermetic: a gateway with only an openai pool key listed claude-opus-4-8."
+claims = ["E4", "CAT-9"]
+state = "fixed"
+test = "v1_models_lists_only_rows_an_openai_pool_key_serves"
+fix = "85cea3f"
+note = "Fixed: GatewayState::new renders the list once at boot (state::models_list_body) from the rows with at least one candidate on a pool-keyed provider; a row whose primary is unkeyed but whose fallback is keyed stays listed. Same shape; one body per deployment. (As first fixed, a BYO-only deployment listed the whole catalog and BYO callers got the same body; D254 replaced both: a BYO caller now gets its provider's own list.) Also tested: v1_models_lists_claude_but_not_together_only_rows_on_anthropic_and_openrouter (no catalog row is Together-only today; it checks the rows with no anthropic or openrouter candidate, e.g. openai/gpt-oss-120b), models_list_json_filter_keeps_shape_and_order. The E4 live probes' VERIFY_CATALOG_ROWS is now the keyed row count for the cell's pools."
+
+[[defect]]
+id = "D253"
+severity = "med"
+area = "Routing"
+title = "Session pins are per pod, so a pooled row's conversation hops providers between replicas"
+impact = "A conversation a load balancer spreads over replicas can change provider on every turn while both providers are healthy, re-buying its prompt prefix at the cache-write rate (a Claude cache write is 1.25x input against 0.1x for a read) on each move, for up to the pin's 1h life. R4 promises one provider per conversation; with N replicas that holds only while every replica has seen the same outcomes for the row."
+confidence = "high"
+evidence = "Hermetic, tests/replicas.rs (two gateways, one nats-server, gpt-4o-mini row openai -> openrouter): the first request anywhere gets one 500 from the primary. Replica A fails over and pins openrouter; replica B, which never saw the failure, serves and pins openai. Alternating A, B for ten turns served [openrouter, openai, openrouter, openai, ...] every run; both pin tables decided every walk (ai_session_pinned_total >= 5 on each). The pin table (smart.rs, 16384 AtomicU64 per pod) is not shared, and nothing makes two pods agree once their outcomes differ. Other divergence routes: two pods' EWMAs ranking a new caller differently (different samples or probes), and a pod restart that empties its table."
+claims = ["R4"]
+state = "fixed"
+test = "a_pinned_conversation_stays_on_one_provider_across_replicas"
+fix = "a0cc11f"
+note = "Fixed statelessly (no shared store, no NATS, no load-balancer affinity): session pins are computed every turn and never remembered; the per-pod pin table is gone. smart.rs preferred(): the row's leading run of equally-preferred first-party hosts (providers with their own model-id prefix: Anthropic + Bedrock, never an aggregator) ordered by rendezvous hash of the pin key (tenant, vpc, key_id, row) and provider name, then catalog order; only candidates unusable on the pod (unkeyed, every key cooling, body unserved) move back, and upstream_peer skips an open breaker. No TTFT, probe or failure history, so a failure fails over for that request only. The TTFT ranker now orders only walks with no caller identity. An error-in-200 now counts against the serving candidate's breaker (settle_health), since the pin no longer learns from failures. Residual divergence, documented in ARCHITECTURE.md Running several replicas: per-pod breakers (and key cooling) during a real outage. Also tested: a_pooled_session_reaches_one_provider_on_every_replica (20 alternating turns, 10 sessions), a_failover_pin_returns_to_the_primary_once_it_is_healthy, a_replica_with_an_open_breaker_routes_away_only_while_it_is_open, smart::tests::every_pod_computes_the_same_pin, a_failure_does_not_move_the_next_turn. Follow-up: the live TEN-2+SEC-15 pin_isolation cells look for keys pinned to two different providers on anthropic+openrouter; with computed pins every key lands on anthropic, so those cells need rework (not run here)."
+
+[[defect]]
+id = "D251"
+severity = "med"
+area = "Translation"
+title = "A translated stream dropped the provider's keep-alives, so a thinking model's stream went silent for minutes"
+impact = "A Chat Completions client on a Claude row (or any translated pairing) received no byte while the model thought: SseBridge consumed Anthropic's event: ping, OpenRouter's : OPENROUTER PROCESSING comments and thinking deltas it holds or the client's dialect does not carry, and wrote nothing. A load balancer's or proxy's 60-100 s idle timeout then cut a stream that was alive."
+confidence = "high"
+evidence = "AntToOai::event returned early on event == \"ping\"; map_event returned on a comment-only event; a same-wire relay forwarded both byte for byte. So a Claude upstream that sends only pings between two text deltas left a Chat client nothing to read for the whole gap."
+claims = ["S1", "REL-1"]
+state = "fixed"
+test = "a_translated_stream_turns_provider_pings_into_keep_alive_comments"
+fix = "1069390"
+note = "Fixed: a feed call that consumed at least one upstream event and produced no client output writes one SSE comment, ': keep-alive', so the cadence is the provider's own pings (no timer, no state). Not written by a same-wire relay (it already forwards the provider's pings), an assembling bridge, after an error or after the client's terminal event. The openai and anthropic SDK SSE decoders (Python and Node, verify/clients) drop lines starting with ':'; the bridge writes no id: line, so openai-python cannot dispatch a blank event. Unit tests: a_translated_stream_answers_a_ping_with_a_keep_alive_comment, hidden_thinking_is_answered_with_keep_alives, no_keep_alive_where_the_bridge_owes_none."
+
+[[defect]]
+id = "D252"
+severity = "med"
+area = "Reliability"
+title = "A non-stream call to a pro model was cut at read_timeout_secs before its head, a 504 the provider still billed"
+impact = "gpt-5-pro, o3-pro and gpt-5.x-pro can think longer than 600 s before sending a head on a non-stream request. The gateway's per-read timeout (pingora's read_timeout applies to every read, so before the head it is the whole wait) answered 504 and D130 billed an estimate, while the provider billed the full call and a client willing to wait longer got nothing."
+confidence = "high"
+evidence = "pingora-core 0.9 http/v1/client.rs and http/v2/client.rs wrap each header and body read in read_timeout; build_peer set it to read_timeout_secs (600) for every row. OpenAI's gpt-5-pro / gpt-5.4-pro / gpt-5.5-pro pages: 'some requests may take several minutes to finish. To avoid timeouts, try using background mode'; the background-mode guide publishes no maximum either. Anthropic's errors page ('Long requests') publishes no maximum and has its SDKs refuse non-streaming calls expected to exceed 10 minutes."
+claims = ["REL-1", "BIL-3"]
+state = "fixed"
+test = "a_pro_row_waits_past_read_timeout_for_its_head"
+fix = "1069390"
+note = "Fixed: no vendor documents a maximum request duration, so any number would be a guess. Rows catalog::long_running marks (owner openai, model ending -pro) get no gateway silence deadline; the request ends at the client's own timeout (a cancel the gateway sees and bills per D130) or a dead transport (h2 PING, TCP keepalive). Every other row keeps read_timeout_secs. Covers catalog walks (managed /v1, /auto); a provider-routed BYO path has no row and keeps the default. Unit test: long_running_is_exactly_openais_pro_rows."
+
+[[defect]]
+id = "D254"
+severity = "low"
+area = "Catalog"
+title = "BYO callers were listed Beyond's catalog instead of their provider's models"
+impact = "A BYO caller never uses the catalog: on /v1 its key goes straight to its own provider. GET /v1/models still answered it with Beyond's catalog (the keyed rows, or the whole catalog on a deployment with no pool keys), so a BYO client was shown names its provider may not serve (Claude rows to an OpenAI key) and missed models its provider does serve."
+confidence = "high"
+evidence = "proxy.rs answered every GET/HEAD /v1/models from GatewayState::models_list before the managed allowlist, whatever the key; v1_models_lists_only_rows_an_openai_pool_key_serves asserted a BYO caller got the same body as a managed one."
+claims = ["E4", "A1"]
+state = "fixed"
+test = "byo_openai_key_lists_openais_models"
+fix = "df266f1"
+note = "Fixed: only a managed key's GET/HEAD /v1/models is answered from the boot-built keyed catalog. A BYO one is not intercepted: it takes the BYO /v1 route (credential shape, else the path's default dialect, OpenAI for /v1/models) and is a plain relay of the provider's own list with the caller's key and headers, and no ai.usage row. The BYO-only whole-catalog listing and providers::catalog::models_list_json's unfiltered form are gone. Also tested: byo_anthropic_key_lists_anthropics_models, opaque_byo_key_lists_from_the_path_default, managed_key_still_lists_the_keyed_catalog; live, E4+A1::raw::{claude,gpt}::byo_models_raw holds each BYO list to the provider's own, fetched directly."
+
+[[defect]]
+id = "D256"
+severity = "med"
+area = "Reliability"
+title = "A reclaimed half-open probe's late release minted a second probe permit"
+impact = "With half_open_permits = 1, a probe that stalled past circuit_breaker_reset_secs had its permit reclaimed for a new probe (D86). When the stalled attempt later ended with no provider outcome (client abort, stalled upload), release() returned a permit it no longer held, so two probes ran against a provider that may still be broken, and each such release could push the count upward. The stalled probe's late answer also closed or reopened the breaker under the live probe."
+confidence = "high"
+evidence = "circuit_breaker.rs: the reclaim reset permits to half_open_permits - 1 and stamped now; release() only checked state == HALF_OPEN and permits < half_open_permits, so allow() at t0, reclaim at t0 + reset, release() of the first permit, allow() again admitted a second concurrent probe. The same held for a permit claimed while CLOSED and released after the breaker tripped and half-opened."
+claims = ["REL-6"]
+state = "fixed"
+test = "a_reclaimed_probe_releasing_late_does_not_mint_a_second_probe"
+fix = "4c9fa18"
+note = "Fixed lock-free in the same packed AtomicU64: while OPEN or HALF_OPEN the 14-bit failure field holds a probe generation, bumped on OPEN -> HALF_OPEN and on every reclaim (an opening breaker seeds it from the clock). allow() returns a Permit carrying it (a CLOSED permit carries none); release(permit), record_success_for and record_failure_for are no-ops in HALF_OPEN for any other generation, and release still saturates at half_open_permits. proxy.rs's ledger RequestCtx::breaker_pending is now Option<Permit>. Unpermitted record_success/record_failure (the error-in-200 settle) are unchanged. Also tested: a_permit_from_another_generation_neither_releases_nor_decides, concurrent_stale_releases_never_mint_permits, test_a_stalled_probe_permit_is_reclaimed_after_the_reset_timeout (stale outcomes no longer decide)."

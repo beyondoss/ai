@@ -444,51 +444,55 @@ def cache_isolation():
     return ok, detail
 
 
-def provider_of(key):
-    status, rid, usage, err, headers = once(key, max_tokens=8)
+def provider_of(key, headers=None):
+    status, rid, usage, err, h = once(key, max_tokens=8, headers=headers)
     if status != 200:
         raise RuntimeError(f"{key}: {status} {err}")
-    p = headers.get("x-beyond-provider")
+    p = h.get("x-beyond-provider")
     record(key, rid, usage, provider=p)
     return p
 
 
 def pin_isolation():
-    """Pooled row (anthropic + openrouter). Each bai_v2 key is its own pin. Find a tenant-A key
-    pinned to the provider a new caller is NOT ranked to; tenant B's key with the same vpc_id and
-    key_id must still be ranked like a new caller, not steered by A's pin."""
-    pinned = {}  # A key name -> provider it was pinned to
-    names = sorted(k for k in KEYS if k.startswith("pa"))
-    fresh = iter(names)
-    tries = []
-    for name in fresh:
-        pinned[name] = provider_of(name)
-        if len(set(pinned.values())) > 1:
-            break
-    if len(set(pinned.values())) < 2:
-        return False, {"why": "every call landed on one provider; the ranker never probed the other", "pinned": pinned}
+    """Pooled row (Anthropic + Bedrock + OpenRouter). Session pins are computed every turn (D253):
+    a key's provider is the rendezvous-hash choice among the row's first-party hosts, which the cell
+    computes from the published inputs and hands over as each key's `pin`. Every call of a key lands
+    on its pin. Tenant A steering its own walk with headers, and A's failed calls, move neither
+    tenant B's twin key (same vpc and key_id) nor A's own next call: nothing one caller does is
+    remembered, so there is nothing to steer."""
+    names = sorted(k[2:] for k in KEYS if k.startswith("pa"))
+    # A twin pair whose pins differ: the tenant is part of the pin key, and the sample covers both
+    # first-party hosts.
+    split = next((n for n in names if KEYS["pa" + n]["pin"] != KEYS["pb" + n]["pin"]), None)
+    if split is None:
+        return False, {"why": "no twin pair hashes apart; the pin key would ignore the tenant",
+                       "pins": {k: v["pin"] for k, v in KEYS.items() if "pin" in v}}
+    a, b = "pa" + split, "pb" + split
+    pin_a, pin_b = KEYS[a]["pin"], KEYS[b]["pin"]
+    sample = [a, b] + [k for k in ("pa01", "pb01", "pa02", "pb02") if k not in (a, b)]
+    # Determinism: the same key reaches the same provider on every call, and it is the computed one.
+    got = {k: [provider_of(k) for _ in range(2)] for k in sample}
+    stable = all(ps == [KEYS[k]["pin"]] * 2 for k, ps in got.items())
+    # A steers its own walk where B is not pinned (OpenRouter, the failover no pin hashes onto).
+    steered = [provider_of(a, {"x-beyond-only": "openrouter"}),
+               provider_of(a, {"x-beyond-order": "openrouter"})]
+    b_after_headers = provider_of(b)
+    # A's calls fail at its pinned provider: an empty user message, a 4xx that no breaker counts.
+    # (An oversized max_tokens is not one: the gateway clamps it to the row's limit.)
+    failures = []
     for _ in range(3):
-        try:
-            f1 = next(fresh)
-            f2 = next(fresh)
-        except StopIteration:
-            break
-        ranked = provider_of(f1)
-        pinned[f1] = ranked
-        other = next((k for k, p in pinned.items() if p != ranked and k not in (f1,)), None)
-        if other is None:
-            continue
-        a_follow = provider_of(other)
-        twin = "pb" + other[2:]
-        b_got = provider_of(twin)
-        ranked2 = provider_of(f2)
-        pinned[f2] = ranked2
-        tries.append({"ranked": ranked, "a_key": other, "a_pinned": pinned[other], "a_followed": a_follow,
-                      "b_twin": twin, "b_got": b_got, "ranked_after": ranked2})
-        if ranked == ranked2:
-            ok = a_follow == pinned[other] and b_got == ranked and b_got != pinned[other]
-            return ok, {"pinned": pinned, "tries": tries}
-    return False, {"why": "the ranked primary kept flipping; inconclusive", "pinned": pinned, "tries": tries}
+        status, rid, usage, err, _ = once(a, ask=[{"role": "user", "content": ""}])
+        record(a, rid, usage, **({"refused": True} if status != 200 else {}))
+        failures.append(status)
+    b_after_failures = provider_of(b)
+    a_after = provider_of(a)
+    detail = {"pins": {k: KEYS[k]["pin"] for k in sample}, "got": got, "a": a, "b": b,
+              "a_steered": steered, "b_after_a_headers": b_after_headers,
+              "a_failures": failures, "b_after_a_failures": b_after_failures, "a_after": a_after}
+    ok = (stable and steered == ["openrouter", "openrouter"]
+          and all(400 <= s < 500 for s in failures)
+          and b_after_headers == pin_b and b_after_failures == pin_b and a_after == pin_a)
+    return ok, detail
 
 
 def tenant_limit():

@@ -29,7 +29,7 @@
 //! large body fails over. Unknown or missing model → 404 naming the miss. Chat Completions ↔ Messages ↔ Responses on a managed catalog walk is
 //! translated; inbound Responses with session state walks a GPT row's `/v1/responses` arm (byte
 //! relay) or 400s if none remain, naming the field. Any other inbound path vs row endpoint mismatch
-//! → 400. `GET /v1/models` lists the catalog.
+//! → 400. A managed `GET /v1/models` lists the keyed catalog; a BYO one relays to its provider.
 //!
 //! One deliberate exception to the no-buffer rule: a **managed** OpenAI Chat Completions request is
 //! buffered and gets `stream_options.include_usage` injected when it streams without it (or forced
@@ -60,18 +60,20 @@
 //! dialect. Inbound `/v1/responses` with session state (`previous_response_id`, or `store` not
 //! explicitly false) walks the row's Responses arm or 400s; `store: false` one-shots may still
 //! translate onto Chat Completions. Other inbound-path mismatches are still a 400. `GET /v1/models`
-//! lists the catalog. `/{provider}/…` is the escape hatch, does not consult the catalog, and never
-//! translates. An unknown first segment is a 404.
+//! lists the keyed catalog to a managed key and relays a BYO key to its provider. `/{provider}/…`
+//! is the escape hatch, does not consult the catalog, and never translates. An unknown first
+//! segment is a 404.
 
 use crate::cache;
 use crate::capture::CaptureBufs;
+use crate::circuit_breaker::Permit;
 use crate::key;
 use crate::metrics::{KeyCooled, Rejection};
 use crate::route::{self, Dialect, Provider};
 use crate::signed_id;
 use crate::state::{GatewayState, RequestId};
 use crate::terminal::TerminalTracker;
-use crate::{control, peek, remedy, smart, translate, usage};
+use crate::{control, peek, pin, remedy, translate, usage};
 use arrayvec::{ArrayString, ArrayVec};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -362,10 +364,10 @@ impl Drop for Ctx {
         self.held.release_tenant();
         self.held.release_body();
         if let Some(rc) = self.rc.as_mut()
-            && std::mem::take(&mut rc.breaker_pending)
+            && let Some(permit) = rc.breaker_pending.take()
             && let Some(b) = rc.provider.breaker.as_ref()
         {
-            b.release();
+            b.release(permit);
         }
         LIVE_REQUESTS.fetch_sub(1, Ordering::AcqRel);
     }
@@ -448,25 +450,27 @@ pub struct RequestCtx {
     /// candidate/breaker failure (a 429 is a healthy throttle) and must not pick a new vendor.
     same_provider_retry: bool,
     /// This is a [`FullBody`] attempt that recorded a [`RelayRetry`]: the parent is discarding its
-    /// response and re-running. It still feeds the breaker and the ranker; it writes no `ai.usage`
+    /// response and re-running. It still feeds the breaker; it writes no `ai.usage`
     /// or `ai.payload` row (the attempt that serves does).
     relay_abandoned: bool,
     /// This attempt is the one resend a refused H2 stream gets on its candidate (D72, D91). A
     /// second refusal there is a provider failure: fail over, or end the request. Cleared when the
     /// walk moves to a new candidate.
     refused_resent: bool,
-    /// Whether an `allow()` on `provider`'s breaker is outstanding and still owes exactly one
-    /// `record_*`.
+    /// The permit an `allow()` on `provider`'s breaker handed out, while it is outstanding and
+    /// still owes exactly one `record_*_for` or `release`. Resolving with the permit (not just
+    /// "the breaker") is what lets a half-open breaker ignore an attempt whose probe permit it has
+    /// since reclaimed (D256).
     ///
     /// The ledger that keeps breaker accounting honest once a request can attempt more than one
-    /// provider. Invariant: `breaker_pending` is true **iff** there is exactly one unresolved
+    /// provider. Invariant: `breaker_pending` is `Some` **iff** there is exactly one unresolved
     /// `allow()` against whatever `provider` currently points at. `logging` records only when it is
     /// set, so an attempt can never be recorded twice, and a candidate switch resolves the outgoing
     /// candidate before claiming the next one.
     ///
-    /// On the `/{provider}/…` path this is simply `breaker.is_some()`, set once in `request_filter`
-    /// — exactly the condition `logging` used to test inline — so that path's behaviour is unchanged.
-    breaker_pending: bool,
+    /// On the `/{provider}/…` path this is the permit `request_filter`'s one `allow()` returned
+    /// (`None` when the provider has no breaker).
+    breaker_pending: Option<Permit>,
     /// Model-routing state — `Some` for `/auto` and for a managed bare `/v1` catalog walk. `None`
     /// keeps every provider-routed request on exactly the code it ran before model routing existed.
     /// See [`ModelRouting`] for why it is boxed rather than inline.
@@ -814,13 +818,9 @@ struct RequestControl {
 struct ModelRouting {
     /// The catalog row this request routes over. `&'static`, so it costs a pointer.
     route: &'static route::ModelRoute,
-    /// The ranker chose this walk with no `order` / `split` / `only` from the caller, so the
-    /// candidate that serves may be pinned for the caller's next requests (see `smart`).
-    pinnable: bool,
     /// A provider endpoint under the parent one (`count_tokens`, `compact`): its suffix is appended
-    /// to the serving candidate's path. It never feeds the TTFT ranker (a token count answers in a
-    /// fraction of a generation's time and would skew the walk), and a free one writes no billing
-    /// row.
+    /// to the serving candidate's path. It walks the row in catalog order (no session pin), and a
+    /// free one writes no billing row.
     sub: Option<route::SubResource>,
     /// Walk slot of the candidate currently being attempted. Maps through [`Self::walk`] onto
     /// [`Self::arms`].
@@ -829,8 +829,8 @@ struct ModelRouting {
     /// pool key for it. Computed once in `request_filter` so `upstream_peer` never re-derives it.
     /// Bounded by [`route::MAX_CANDIDATES`], which is why a `u8` suffices.
     usable: u8,
-    /// Catalog indices in walk order. Identity when no header and no TTFT samples; permuted by
-    /// `x-beyond-order` / `only` / `split` and, when those do not pin, by [`crate::smart`].
+    /// Catalog indices in walk order. Permuted by `x-beyond-order` / `only` / `split` and, when
+    /// those do not fix it, by the caller's computed session pin ([`crate::pin`]).
     /// `first_usable` walks this sequence; failover, breakers, and the 429 key-walk see the same.
     walk: control::Walk,
     /// The candidate slice this walk indexes — [`ModelRoute::candidates`] or
@@ -850,8 +850,8 @@ struct ModelRouting {
     /// Inbound endpoint. Always set on a catalog walk so a mixed-row failover can translate
     /// onto the next candidate's path. Same-endpoint attempts skip the mapper (`from == to`).
     translate: Option<translate::TranslateState>,
-    /// A 2xx whose TTFT sample and session pin wait on the body's first bytes (see
-    /// `settle_health`). `None` once settled, and for every non-2xx.
+    /// A 2xx whose health verdict waits on the body's first bytes (see `settle_health`). `None`
+    /// once settled, and for every non-2xx.
     health: Option<PendingHealth>,
     /// How many addresses the current candidate resolved to; `RequestCtx::attempt` indexes them.
     addrs: u8,
@@ -864,10 +864,8 @@ struct ModelRouting {
     open_retry_after: Option<u16>,
 }
 
-/// A 2xx's held-back ranker sample, waiting on the body to say whether it is an answer.
+/// A 2xx's held-back health verdict, waiting on the body to say whether it is an answer.
 struct PendingHealth {
-    /// Time to the response head, the sample the ranker gets.
-    elapsed_us: u64,
     /// The body's first bytes, up to [`HEALTH_PREFIX_CAP`].
     prefix: Vec<u8>,
 }
@@ -997,11 +995,6 @@ fn json_leading_string(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
     let body = bytes.strip_prefix(b"\"")?;
     let end = memchr::memchr(b'"', body)?;
     Some((&body[..end], &body[end + 1..]))
-}
-
-/// Microseconds since `start`, saturating.
-fn elapsed_us(start: Instant) -> u64 {
-    start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
 }
 
 impl ModelRouting {
@@ -1226,7 +1219,12 @@ impl AiProxy {
     /// Extracted so the provider-routed path and the model-routed candidate walk cannot drift apart
     /// on TLS, ALPN, or timeouts — a fallback candidate connected on different terms than the
     /// primary would be a genuinely nasty thing to debug.
-    fn build_peer(&self, addr: std::net::SocketAddr, provider: &Provider) -> HttpPeer {
+    fn build_peer(
+        &self,
+        addr: std::net::SocketAddr,
+        provider: &Provider,
+        row: Option<&route::ModelRoute>,
+    ) -> HttpPeer {
         let mut peer = HttpPeer::new(addr, self.state.config.upstream_tls, provider.host.clone());
         // Prefer HTTP/2 to the provider (config `upstream_http2`, default on), fall back to HTTP/1.1.
         // Every provider in `KNOWN_PROVIDERS` negotiates `h2` over TLS (verified by handshake), and H2
@@ -1259,7 +1257,14 @@ impl AiProxy {
         // from a stuck provider, so the per-read bound (the wait for the head, and each gap between
         // body reads) is the clients' own: `read_timeout_secs`, 600s, the OpenAI and Anthropic
         // SDKs' default request timeout. A *dead* peer is detected by transport liveness instead.
-        peer.options.read_timeout = Some(Duration::from_secs(self.state.config.read_timeout_secs));
+        // Pingora applies it to every read, so before the head it is the whole wait. A row whose
+        // vendor documents requests running "several minutes" and publishes no maximum
+        // (`long_running`: OpenAI's `-pro` models) gets no silence deadline at all (D252): a
+        // non-stream call there can outlast 600s, and a 504 is still billed by the provider. Its
+        // end is the client's own timeout (a cancel the gateway sees and bills, D130) or a dead
+        // transport.
+        peer.options.read_timeout = (!row.is_some_and(providers::catalog::long_running))
+            .then(|| Duration::from_secs(self.state.config.read_timeout_secs));
         peer.options.h2_ping_interval = self.state.config.h2_ping_interval();
         peer.options.tcp_keepalive = self.state.config.upstream_tcp_keepalive();
         peer.options.write_timeout =
@@ -1504,8 +1509,12 @@ impl AiProxy {
         Self::reject_message_boxed(session, request_id, 404, "invalid_request_error", msg).await
     }
 
-    async fn reply_models_list(session: &mut Session, request_id: &str) -> Result<bool> {
-        let body = Bytes::from(providers::catalog::models_list_json());
+    /// `body` is [`GatewayState::models_list`], rendered at boot; serving it is a refcount bump.
+    async fn reply_models_list(
+        session: &mut Session,
+        request_id: &str,
+        body: Bytes,
+    ) -> Result<bool> {
         let head_only = session.req_header().method == http::Method::HEAD;
         let mut len_buf = ArrayString::<20>::new();
         let _ = write!(len_buf, "{}", body.len());
@@ -1522,8 +1531,12 @@ impl AiProxy {
         Ok(true)
     }
 
-    async fn reply_models_list_boxed(session: &mut Session, request_id: &str) -> Result<bool> {
-        Box::pin(Self::reply_models_list(session, request_id)).await
+    async fn reply_models_list_boxed(
+        session: &mut Session,
+        request_id: &str,
+        body: Bytes,
+    ) -> Result<bool> {
+        Box::pin(Self::reply_models_list(session, request_id, body)).await
     }
 
     /// `signed_id`: a large catalog body's ids, checked before its first attempt connects (its
@@ -1657,7 +1670,7 @@ impl AiProxy {
                             skip |= 1 << i;
                             resume = None;
                         }
-                        // A key walk resumes on this candidate first: the re-run may re-rank the
+                        // A key walk resumes on this candidate first: the re-run may re-order the
                         // row, and a 429 must never become a vendor switch. The other candidates
                         // stay in the walk, so the next key's 5xx still fails over.
                         RelayRetry::Key { candidate, key } => {
@@ -1698,8 +1711,8 @@ impl AiProxy {
         .await
     }
 
-    /// Resolve a 2xx's pending health verdict from the first response bytes: feed the TTFT ranker
-    /// the sample it held back, and pin the caller only to an answer, never to an error-in-200.
+    /// Resolve a 2xx's pending health verdict from the first response bytes: count an
+    /// error-in-200 against the candidate's breaker.
     fn settle_health(&self, rc: &mut RequestCtx, chunk: &[u8], end_of_stream: bool) {
         let streaming = rc.streaming;
         let Some(a) = rc.auto.as_mut() else { return };
@@ -1714,11 +1727,14 @@ impl AiProxy {
             None if end_of_stream || pending.prefix.len() >= HEALTH_PREFIX_CAP => false,
             None => return,
         };
-        let us = pending.elapsed_us;
         a.health = None;
-        record_walk_ttft_us(self.state, rc, us, !verdict);
-        if !verdict {
-            pin_walk(self.state, rc);
+        // The head resolved this attempt's breaker permit as a success (see `response_filter`):
+        // only the body shows the provider is broken. Count it as the failure it is, so a host that
+        // keeps answering errors in 200s opens its breaker and every walk, session pins included,
+        // skips it. The windowed rule trips once failures reach the threshold and match the
+        // successes, which one success plus one failure per such answer does.
+        if verdict && let Some(b) = rc.provider.breaker.as_ref() {
+            b.record_failure();
         }
     }
 
@@ -2196,59 +2212,6 @@ fn first_usable(usable: u8, from: u8) -> Option<u8> {
     (remaining != 0).then(|| remaining.trailing_zeros() as u8)
 }
 
-/// Feed one attempt into the TTFT ranker. No-op when the flag is off, the request is not a catalog
-/// walk, or the current walk slot is gone. `ok` is "the provider answered" (including 429); connect
-/// failure and 5xx pass `false`.
-fn record_walk_ttft(state: &GatewayState, rc: &RequestCtx, ok: bool) {
-    record_walk_ttft_us(state, rc, elapsed_us(rc.attempt_start()), ok);
-}
-
-/// [`record_walk_ttft`] with the sample measured earlier (a 2xx's head, settled on its body).
-fn record_walk_ttft_us(state: &GatewayState, rc: &RequestCtx, us: u64, ok: bool) {
-    if !state.config.smart_router {
-        return;
-    }
-    let Some(auto) = rc.auto.as_ref() else {
-        return;
-    };
-    // Responses arms share a ModelRoute with Chat Completions candidates; writing TTFT into
-    // overlapping catalog indices would rerank the Chat Completions walk. Skip. A sub-resource
-    // (a token count) answers far faster than a generation and would skew it too.
-    if !std::ptr::eq(auto.arms, auto.route.candidates) || auto.sub.is_some() {
-        return;
-    }
-    let Some(orig) = auto.walk.catalog_index(auto.candidate) else {
-        return;
-    };
-    state.smart.observe(auto.route, orig, us, ok);
-}
-
-/// Pin this caller to the candidate that just answered 2xx, so its next request goes back to the
-/// provider holding its prompt cache (see `smart`'s "Session pins"). Same scope as
-/// [`record_walk_ttft`]: managed catalog walks over `candidates`, smart router on.
-fn pin_walk(state: &GatewayState, rc: &RequestCtx) {
-    if !state.config.smart_router {
-        return;
-    }
-    let Some(auto) = rc.auto.as_ref() else {
-        return;
-    };
-    if !std::ptr::eq(auto.arms, auto.route.candidates) {
-        return;
-    }
-    // A walk the caller shaped (`order` / `split` pin it, `only` filters it) says nothing about
-    // where this key's other requests should go. Pinning it would route the whole app by one
-    // debug header for up to an hour.
-    if !auto.pinnable {
-        return;
-    }
-    let Some(orig) = auto.walk.catalog_index(auto.candidate) else {
-        return;
-    };
-    let affinity = smart::affinity(rc.tenant_id, rc.vpc_id, rc.key_id);
-    state.smart.pin(auto.route, affinity, orig);
-}
-
 /// Pingora will only replay a body that has fully arrived and fit in its private 64 KiB buffer.
 /// See `upstream_response_filter` — the same gate for a 429 key-walk and a 5xx vendor walk.
 fn body_replayable(session: &mut Session) -> bool {
@@ -2431,7 +2394,7 @@ struct FullBody {
     /// Catalog indices (bit per index) that already had their one same-candidate retry after a
     /// stale reused connection failed before the upstream had the body.
     reset: u8,
-    /// A key walk in progress on this catalog index: it goes first in the walk, so a re-ranked row
+    /// A key walk in progress on this catalog index: it goes first in the walk, so a re-ordered row
     /// cannot move a 429's key walk onto another vendor. The other candidates stay usable, so a
     /// 5xx (or a last key's auth failure) that ends the key walk still fails over (D81).
     resume: Option<u8>,
@@ -2812,8 +2775,9 @@ fn dialect_for_path(path: &str) -> Dialect {
     }
 }
 
-/// Stock OpenAI/Anthropic SDKs list models at `GET /v1/models`. Intercepted before the catalog walk
-/// so an empty GET body is not a missing-model 404.
+/// Stock OpenAI/Anthropic SDKs list models at `GET /v1/models`. A managed request is answered from
+/// the keyed catalog before the catalog walk, so an empty GET body is not a missing-model 404. A BYO
+/// one relays to its provider like any BYO `/v1` request.
 fn is_v1_models_list(session: &Session) -> bool {
     let req = session.req_header();
     let path = req.uri.path();
@@ -3719,10 +3683,13 @@ impl ProxyHttp for AiProxy {
             .await;
         }
 
-        // Stock SDKs list models at GET /v1/models. Serve the catalog here so an empty GET is not
-        // a missing-model 404, and so BYO keys can discover names before they hold a managed one.
-        if is_v1_models_list(session) {
-            return Self::reply_models_list_boxed(session, &request_id).await;
+        // Stock SDKs list models at GET /v1/models. A managed caller is answered here, from the
+        // catalog rows this deployment's pool keys can serve (built once at boot), so an empty GET
+        // is not a missing-model 404. A BYO caller never uses the catalog: like any BYO `/v1`
+        // request it relays to the provider its key belongs to, which answers with its own list.
+        if managed && is_v1_models_list(session) {
+            let body = self.state.models_list.clone();
+            return Self::reply_models_list_boxed(session, &request_id, body).await;
         }
 
         // A managed key spends Beyond's shared pool key, so it reaches only metered generation
@@ -3961,7 +3928,6 @@ impl ProxyHttp for AiProxy {
 
         // Model routing is **managed-only**, and the first candidate is chosen here.
         let mut walk = control::Walk::identity(0);
-        let mut pinnable = false;
         let mut walk_arms: &'static [route::Candidate] = &[];
         let inbound_responses =
             model_route.is_some() && route::is_responses_path(session.req_header().uri.path());
@@ -4030,8 +3996,8 @@ impl ProxyHttp for AiProxy {
                 // Chat Completions would lose what only Responses has (Codex's `namespace` tools,
                 // `custom` grammars, encrypted reasoning). Only a row without an arm translates,
                 // and only a one-shot may (session state there is the 400 below). A failover stays
-                // inside the arm it walks. TTFT ranking is only for `candidates` — do not observe
-                // Responses attempts into that table.
+                // inside the arm it walks, in catalog order: the session pin orders `candidates`
+                // only.
                 // An embeddings row has no Responses arm either, but "store cannot be honored"
                 // would name a field the caller may never have set: it walks its candidates and the
                 // wire check below rejects the endpoint, which is what is actually wrong.
@@ -4088,17 +4054,17 @@ impl ProxyHttp for AiProxy {
                 // the 429 key-walk then see this sequence. Unknown names were already dropped;
                 // an `only` filter that left nobody is the same 503 as an unkeyed row.
                 //
-                // `order` / `split` pin; otherwise the in-process TTFT ranker may reorder. `only`
-                // filters, then ranking still applies. See `smart`. Responses walks skip the
-                // ranker so Chat Completions TTFT cells stay untouched.
+                // `order` / `split` fix the walk; otherwise the caller's computed session pin orders
+                // it (`pin`). `only` filters, then the pin applies to what is left. Responses walks
+                // and sub-resources keep catalog order.
                 walk = parsed_control.as_ref().map_or_else(
                     || control::Walk::identity(arms.len()),
                     |c| c.catalog_walk(arms, request_seq),
                 );
                 // Bit `orig` ⇒ `arms[orig]` can be sent to: registered here with a pool key, not
                 // skipped by a large-body re-run or held off by a key walk, and serving this
-                // sub-resource. Computed before ranking so the probe only promotes an arm that can
-                // actually take the request (D119); the usable mask below is this, by walk slot.
+                // sub-resource. Computed before the session pin, which moves what cannot take the
+                // request behind what can; the usable mask below is this, by walk slot.
                 let mut dispatchable = 0u8;
                 // Bit `orig` ⇒ every pool key of that arm's provider is cooling off from a refusal
                 // (a 401, an out-of-credit answer): left out below while another arm can serve.
@@ -4122,7 +4088,7 @@ impl ProxyHttp for AiProxy {
                     }
                 }
                 // A candidate that cannot serve this body (`route::unserved`: Bedrock and a
-                // JSON-schema output) is not dispatched to, ranked or probed, unless nothing else
+                // JSON-schema output) is not dispatched to or pinned onto, unless nothing else
                 // can take the request, when the provider's own error is the answer.
                 let unserved = match (&full_body, body_complete.as_deref()) {
                     // The parent computed it against the row's candidates.
@@ -4143,21 +4109,16 @@ impl ProxyHttp for AiProxy {
                 if dispatchable & walked & !cooling != 0 {
                     dispatchable &= !cooling;
                 }
-                if self.state.config.smart_router
+                if self.state.config.session_pins
                     && sub.is_none()
                     && std::ptr::eq(arms, row.candidates)
                     && !parsed_control
                         .as_ref()
                         .is_some_and(control::Control::pins_walk)
                 {
-                    pinnable = parsed_control.as_ref().is_none_or(|c| c.only.is_none());
-                    let affinity = smart::affinity(tenant_id, vpc_id, key_id);
-                    let (ranked, pinned) =
-                        self.state
-                            .smart
-                            .rank(walk, row, request_seq, Some(affinity), dispatchable);
-                    walk = ranked;
-                    if pinned {
+                    let affinity = pin::affinity(tenant_id, vpc_id, key_id);
+                    if let Some(pinned) = pin::order(walk, row, affinity, dispatchable) {
+                        walk = pinned;
                         self.state.metrics.session_pinned_total.inc();
                     }
                 }
@@ -4473,11 +4434,10 @@ impl ProxyHttp for AiProxy {
                     same_provider_retry: false,
                     relay_abandoned: false,
                     refused_resent: false,
-                    breaker_pending: false,
+                    breaker_pending: None,
                     auto: model_route.map(|route| {
                         Box::new(ModelRouting {
                             route,
-                            pinnable,
                             sub,
                             candidate: first_usable(usable, 0).unwrap_or(0),
                             usable,
@@ -4561,10 +4521,11 @@ impl ProxyHttp for AiProxy {
         // `upstream_peer` picks a candidate, and gating here would claim a permit against candidate
         // 0 and then claim a second one against whichever candidate is actually tried. That path
         // gates per candidate instead, at the same "last thing before the connection" position.
-        if model_route.is_none()
-            && let Some(breaker) = &provider.breaker
-            && breaker.allow().is_err()
-        {
+        let breaker_permit = match (&model_route, &provider.breaker) {
+            (None, Some(breaker)) => breaker.allow().map(Some).map_err(|_| breaker),
+            _ => Ok(None),
+        };
+        if let Err(breaker) = breaker_permit {
             if tenant_slot && let Some(slots) = self.state.tenant_slots.as_ref() {
                 slots.release(tenant_id);
             }
@@ -4581,10 +4542,9 @@ impl ProxyHttp for AiProxy {
             .await;
         }
         // A permit is now outstanding against this provider (see `RequestCtx::breaker_pending`).
-        // `breaker.is_some()` is exactly the condition `logging` used to test inline before the
-        // ledger existed, so recording is unchanged for the provider-routed path. The model-routed
-        // path starts owing nothing and takes on its first permit in `upstream_peer`.
-        let breaker_pending = model_route.is_none() && provider.breaker.is_some();
+        // The model-routed path starts owing nothing and takes on its first permit in
+        // `upstream_peer`.
+        let breaker_pending = breaker_permit.ok().flatten();
         // Past any key cooling off from a 401 (D71); a catalog walk picks per candidate.
         let pool_key = provider.first_key();
         if tenant_slot {
@@ -4650,7 +4610,6 @@ impl ProxyHttp for AiProxy {
             auto: model_route.map(|route| {
                 Box::new(ModelRouting {
                     route,
-                    pinnable,
                     sub,
                     // `first_usable` picked this candidate above; `upstream_peer` re-derives it from
                     // here on.
@@ -4736,7 +4695,11 @@ impl ProxyHttp for AiProxy {
                 }
             };
             rc.upstream_phase = UpstreamPhase::Attempted;
-            return Ok(Box::new(self.build_peer(addr, &rc.provider)));
+            return Ok(Box::new(self.build_peer(
+                addr,
+                &rc.provider,
+                rc.auto.as_ref().map(|a| a.route),
+            )));
         }
 
         // Model-routed: this hook owns the candidate walk *and* the breaker ledger.
@@ -4750,11 +4713,10 @@ impl ProxyHttp for AiProxy {
             // Reaching here with a permit outstanding means the previous attempt failed before any
             // response arrived, so the candidate we were on earned the failure. Resolve it before
             // touching anything else; `logging` then only ever sees the final candidate's permit.
-            if rc.breaker_pending {
-                if let Some(b) = &rc.provider.breaker {
-                    b.record_failure();
-                }
-                rc.breaker_pending = false;
+            if let Some(permit) = rc.breaker_pending.take()
+                && let Some(b) = &rc.provider.breaker
+            {
+                b.record_failure_for(permit);
             }
 
             loop {
@@ -4807,9 +4769,8 @@ impl ProxyHttp for AiProxy {
                 // transition happens *inside* `allow()`, so a `state()`-based pre-check would report
                 // `Open` past the reset timeout, skip a candidate that `allow()` would have admitted
                 // as a probe, and leave the breaker with no way to ever close.
-                if let Some(b) = &p.breaker
-                    && b.allow().is_err()
-                {
+                let permit = p.breaker.as_ref().map(|b| (b, b.allow()));
+                if let Some((b, Err(_))) = permit {
                     self.state.metrics.rejection(Rejection::CircuitOpen).inc();
                     if let Some(a) = rc.auto.as_mut() {
                         let secs = u16::try_from(b.retry_after_secs()).unwrap_or(u16::MAX);
@@ -4819,7 +4780,7 @@ impl ProxyHttp for AiProxy {
                     continue;
                 }
                 // A permit (if this breaker has one to give) is now outstanding against `p`.
-                rc.breaker_pending = p.breaker.is_some();
+                rc.breaker_pending = permit.and_then(|(_, r)| r.ok());
                 // New vendor ⇒ that vendor's first key not cooling off (D71). Never carry provider
                 // A's index (or secret) onto provider B. A re-run of a large body resumes the key
                 // walk an earlier attempt started on this candidate (see `FullBody`); one with no
@@ -4853,7 +4814,11 @@ impl ProxyHttp for AiProxy {
                             path.push_str(sub.suffix());
                         }
                         rc.upstream_phase = UpstreamPhase::Attempted;
-                        return Ok(Box::new(self.build_peer(addr, &p)));
+                        return Ok(Box::new(self.build_peer(
+                            addr,
+                            &p,
+                            rc.auto.as_ref().map(|a| a.route),
+                        )));
                     }
                     Err(e) => {
                         // DNS failure is handled *here*, inside the walk, rather than by returning
@@ -4869,10 +4834,11 @@ impl ProxyHttp for AiProxy {
                             error = %e,
                             "upstream dns resolution failed; trying the next candidate",
                         );
-                        if let Some(b) = &p.breaker {
-                            b.record_failure();
+                        if let Some(b) = &p.breaker
+                            && let Some(permit) = rc.breaker_pending.take()
+                        {
+                            b.record_failure_for(permit);
                         }
-                        rc.breaker_pending = false;
                         rc.advance_candidate(i);
                         continue;
                     }
@@ -4907,7 +4873,11 @@ impl ProxyHttp for AiProxy {
             }
         };
         rc.upstream_phase = UpstreamPhase::Attempted;
-        Ok(Box::new(self.build_peer(addr, &rc.provider)))
+        Ok(Box::new(self.build_peer(
+            addr,
+            &rc.provider,
+            rc.auto.as_ref().map(|a| a.route),
+        )))
     }
 
     /// Fail over — or walk a pool key — before a byte of the error reaches the client.
@@ -5061,7 +5031,7 @@ impl ProxyHttp for AiProxy {
             && let Some(orig) = rc.auto.as_ref().and_then(|a| a.walk.catalog_index(at))
         {
             // The parent holds the body: it drops this response and re-runs on the next candidate.
-            // `response_filter` still runs for it, so the ranker and breaker see the failure.
+            // `response_filter` still runs for it, so the breaker sees the failure.
             self.state.metrics.candidate_failovers_total.inc();
             warn!(
                 request_id = %rc.request_id,
@@ -5093,19 +5063,15 @@ impl ProxyHttp for AiProxy {
             status,
             "upstream returned {status}; trying the next candidate",
         );
-        // `response_filter` does not run for an abandoned attempt, so the ranker would never see
-        // this failure unless we record it here. Penalty, not the raw elapsed — a 3ms 500 (or a
-        // 1ms 401) must not beat a slower 2xx.
-        record_walk_ttft(self.state, rc, false);
         // The outgoing candidate's breaker failure is recorded by `upstream_peer`'s prologue, which
         // still sees `breaker_pending` set. A 5xx is a failure by the breaker's own definition, so
         // that is the right outcome — and recording it here as well would double-count. A key
         // failure is not one: resolve its permit as the success it is (the provider answered).
         if key_failure
-            && std::mem::take(&mut rc.breaker_pending)
+            && let Some(permit) = rc.breaker_pending.take()
             && let Some(b) = rc.provider.breaker.as_ref()
         {
-            b.record_success();
+            b.record_success_for(permit);
         }
         rc.advance_candidate(at);
         let mut e = pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(status));
@@ -5625,20 +5591,13 @@ impl ProxyHttp for AiProxy {
                 .metrics
                 .ttft_seconds
                 .observe(rc.attempt_start().elapsed().as_secs_f64());
-            // An abandoned 429 is a key walk: the ordinary path records no sample for it either.
             // A 2xx is not yet known to be healthy: a provider can answer 200 with an error body
             // (OpenRouter's error-in-200, an SSE stream whose first event is an error), so its
-            // sample and its pin wait for the body's first bytes (`response_body_filter`).
-            if (200..300).contains(&status) {
-                if let Some(a) = rc.auto.as_mut() {
-                    a.health = Some(PendingHealth {
-                        elapsed_us: elapsed_us(a.attempt_start),
-                        prefix: Vec::new(),
-                    });
-                }
-            } else if !(rc.relay_abandoned && status == 429) {
-                let healthy = status < 500 && !(rc.managed && is_candidate_refusal(status));
-                record_walk_ttft(self.state, rc, healthy);
+            // breaker verdict waits for the body's first bytes (`response_body_filter`).
+            if (200..300).contains(&status)
+                && let Some(a) = rc.auto.as_mut()
+            {
+                a.health = Some(PendingHealth { prefix: Vec::new() });
             }
             rc.provider.metrics.record_response(status);
             rc.upstream_status = Some(status);
@@ -5647,13 +5606,13 @@ impl ProxyHttp for AiProxy {
             // half-open probe resolved only at end of stream let one long or stalled stream 503
             // the provider for everyone until it ended. `logging` resolves only the attempts that
             // never got a head.
-            if std::mem::take(&mut rc.breaker_pending)
+            if let Some(permit) = rc.breaker_pending.take()
                 && let Some(b) = rc.provider.breaker.as_ref()
             {
                 if status >= 500 {
-                    b.record_failure();
+                    b.record_failure_for(permit);
                 } else {
-                    b.record_success();
+                    b.record_success_for(permit);
                 }
             }
 
@@ -6106,10 +6065,10 @@ impl ProxyHttp for AiProxy {
                 // any processing), not the provider's: give the permit back without an outcome,
                 // as a small body keeps it for its own same-candidate retry.
                 if retry == Some(RelayRetry::Reset(orig))
-                    && std::mem::take(&mut rc.breaker_pending)
+                    && let Some(permit) = rc.breaker_pending.take()
                     && let Some(b) = rc.provider.breaker.as_ref()
                 {
-                    b.release();
+                    b.release(permit);
                 }
                 if let Some(retry) = retry {
                     rc.relay_abandoned = fb.record(retry);
@@ -6133,7 +6092,6 @@ impl ProxyHttp for AiProxy {
             }
             Some((_, at, usable)) if first_usable(usable, at.saturating_add(1)).is_some() => {
                 self.state.metrics.candidate_failovers_total.inc();
-                record_walk_ttft(self.state, rc, false);
                 rc.advance_candidate(at);
                 e.set_retry(true);
             }
@@ -6303,7 +6261,6 @@ impl ProxyHttp for AiProxy {
                 // next candidate, since `logging` would then also resolve the still-pending permit —
                 // which would trip the breaker at half its configured threshold on the last
                 // candidate, exactly where everything lands once the primaries are sick.
-                record_walk_ttft(self.state, rc, false);
                 rc.provider.metrics.connect_retries_total.inc();
                 warn!(
                     request_id = %rc.request_id,
@@ -6376,20 +6333,26 @@ impl ProxyHttp for AiProxy {
 
         // Resolve the outstanding circuit-breaker permit, if this request still owes one.
         //
-        // `breaker_pending` is the ledger (see `RequestCtx::breaker_pending`): it is set when a
-        // permit is claimed and cleared when it is recorded, so exactly one `record_*` lands per
-        // `allow()`. On the model-routed path a candidate switch resolves the outgoing candidate in
-        // `upstream_peer` and clears the flag there, which is what stops this from double-recording
+        // `breaker_pending` is the ledger (see `RequestCtx::breaker_pending`): it holds the permit
+        // from when it is claimed until it is taken to resolve it, so exactly one `record_*_for`
+        // lands per `allow()`. On the model-routed path a candidate switch resolves the outgoing
+        // candidate in `upstream_peer` and takes the permit there, which is what stops this from double-recording
         // against whichever candidate happened to be current at the end.
         //
         // Failure = the provider is *broken*: a 5xx response, or no response at all paired with an
         // upstream error (connect/read failure). Success = the provider *answered* — 2xx/3xx, and
         // deliberately **4xx/429 too**: a 429 is a healthy provider throttling our pool key, which the
         // rate limiter and the client's `Retry-After` own, NOT a reason to cut all traffic to it.
-        if let Some(breaker) = rc.provider.breaker.as_ref().filter(|_| rc.breaker_pending) {
+        if let Some(breaker) = rc.provider.breaker.as_ref()
+            && let Some(permit) = rc.breaker_pending.take()
+        {
             match rc.upstream_status {
-                Some(s) if s >= 500 => breaker.record_failure(),
-                Some(_) => breaker.record_success(),
+                // Defensive only, so its mutants are equivalent (excluded in .cargo/mutants.toml):
+                // `response_filter` sets `upstream_status` and takes the permit in the same step,
+                // and nothing else sets it on a request that holds a permit (a cache hit never
+                // claims one), so a pending permit here always comes with `None`.
+                Some(s) if s >= 500 => breaker.record_failure_for(permit),
+                Some(_) => breaker.record_success_for(permit),
                 // No response head arrived. Blame the provider only when the failure actually came
                 // *from* upstream. Pingora tags a client-side abort `ErrorSource::Downstream` (the
                 // `into_down()` at proxy_h1.rs's downstream read/write sites), and a user hitting
@@ -6404,16 +6367,15 @@ impl ProxyHttp for AiProxy {
                 // on *our* bytes, so its read timeout or reset says the client stalled, not that
                 // the provider is sick. A connect failure moved no body byte, so it still counts.
                 None if is_upstream_failure(e) && !client_still_uploading(session, rc) => {
-                    breaker.record_failure();
+                    breaker.record_failure_for(permit);
                 }
                 // Client went away, its upload stalled, or the request ended with no error at all:
                 // no provider outcome. Give the permit back without one (D86). A success here closed
                 // a half-open breaker on a probe that never heard from the provider, letting every
                 // caller flood one that may still be broken; `release` returns the probe permit so
                 // the next request probes instead.
-                None => breaker.release(),
+                None => breaker.release(permit),
             }
-            rc.breaker_pending = false;
         }
 
         let cache_hit = if matches!(
@@ -6944,7 +6906,7 @@ mod tests {
             same_provider_retry: false,
             relay_abandoned: false,
             refused_resent: false,
-            breaker_pending: false,
+            breaker_pending: None,
             auto: None,
             control: None,
             request_id: RequestId::new(),

@@ -465,7 +465,7 @@ fn boot() -> Result<Gateway, String> {
     let mut cfg = format!(
         "listen = \"127.0.0.1:{port}\"\nmetrics_listen = \"127.0.0.1:{metrics_port}\"\n\
          nats_url = \"nats://127.0.0.1:{nats_port}\"\nconfig_bucket = \"ai-gateway\"\n\
-         upstream_tls = true\nsmart_router = false\n\n[pool_keys]\n"
+         upstream_tls = true\nsession_pins = false\n\n[pool_keys]\n"
     );
     for (provider, _) in SCOPE {
         if let Some(k) = key_of(provider) {
@@ -3519,7 +3519,8 @@ fn plan() -> (Vec<Planned>, Vec<String>) {
 
 /// The time budget a live cell's retries must finish inside is the one nextest enforces, read
 /// from this workspace's `.config/nextest.toml`: 60s × 3 under `verify` and `verify-isolated`,
-/// the reconciliation and long-session overrides by binary, `ci`'s own, and none under `default`
+/// the reconciliation and long-session overrides by binary, live.rs's long-output cells by
+/// test name, `ci`'s own, and none under `default`
 /// (which never terminates a test). A cell then reports INCONCLUSIVE instead of a nextest
 /// TIMEOUT (CAT-3 on gpt-5-pro, 2026-10-01: two 55s rate-limited attempts and 22s waits).
 /// claim: CAT-3
@@ -3528,25 +3529,58 @@ fn retries_end_inside_the_nextest_budget() -> Result<(), Failed> {
         .map_err(|e| e.to_string())?;
     let config: toml::Value = toml::from_str(&text).map_err(|e| e.to_string())?;
     let min = |m: u64| Some(Duration::from_secs(m * 60));
-    let cases: &[(&str, Option<&str>, Option<Duration>)] = &[
-        ("verify", Some("beyond-ai-verify::catalog_live"), min(3)),
-        ("verify", Some("beyond-ai-verify::reconcile_live"), min(18)),
-        ("verify", Some("beyond-ai-verify::long_live"), min(35)),
-        ("verify-isolated", Some("beyond-ai-verify::live"), min(3)),
+    let long = Some("S1+B1+BIL-6::openai-py::claude::long_output");
+    let short = Some("E1::openai-py::claude::chat_basic");
+    // (profile, binary, test name, budget)
+    type Case<'a> = (&'a str, Option<&'a str>, Option<&'a str>, Option<Duration>);
+    let cases: &[Case] = &[
+        (
+            "verify",
+            Some("beyond-ai-verify::catalog_live"),
+            None,
+            min(3),
+        ),
+        (
+            "verify",
+            Some("beyond-ai-verify::reconcile_live"),
+            None,
+            min(18),
+        ),
+        ("verify", Some("beyond-ai-verify::long_live"), None, min(35)),
+        ("verify", Some("beyond-ai-verify::live"), long, min(6)),
+        ("verify", Some("beyond-ai-verify::live"), short, min(3)),
+        (
+            "verify",
+            Some("beyond-ai-verify::catalog_live"),
+            long,
+            min(3),
+        ),
+        (
+            "verify-isolated",
+            Some("beyond-ai-verify::live"),
+            None,
+            min(3),
+        ),
         (
             "verify-isolated",
             Some("beyond-ai-verify::long_live"),
+            None,
             min(35),
         ),
-        ("ci", Some("beyond-ai-verify::catalog_live"), min(3)),
-        ("default", Some("beyond-ai-verify::catalog_live"), None),
-        ("verify", None, min(3)),
+        ("ci", Some("beyond-ai-verify::catalog_live"), None, min(3)),
+        (
+            "default",
+            Some("beyond-ai-verify::catalog_live"),
+            None,
+            None,
+        ),
+        ("verify", None, None, min(3)),
     ];
     let wrong: Vec<String> = cases
         .iter()
-        .filter_map(|&(profile, binary, want)| {
-            let got = common::budget_in(&config, profile, binary);
-            (got != want).then(|| format!("{profile} {binary:?}: {got:?}, want {want:?}"))
+        .filter_map(|&(profile, binary, test, want)| {
+            let got = common::budget_in(&config, profile, binary, test);
+            (got != want).then(|| format!("{profile} {binary:?} {test:?}: {got:?}, want {want:?}"))
         })
         .collect();
     if wrong.is_empty() {

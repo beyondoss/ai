@@ -163,6 +163,19 @@ pub fn free_port() -> u16 {
 /// this bound while always holding the most recent lines — which is what every assertion reads.
 const LOG_CAPTURE_CAP: usize = 512 * 1024;
 
+/// How long a wait on a *condition* (a metric reaching a value, a log line appearing) may take
+/// before it fails the test.
+///
+/// This is a failure detector, not a pass condition: a wait returns the moment its condition holds,
+/// so on a passing run the bound costs nothing, and a short bound buys nothing but flakes. Under the
+/// `gateway-stress` CI job every core runs a `yes` hog, and a gateway subprocess that must be
+/// scheduled several times (a NATS round-trip, a watcher apply, a scrape) can take seconds to get
+/// there — a 5 s bound failed there on unchanged code. The ceiling is the harness: nextest's `ci`
+/// profile terminates a test after 180 s, and a test makes a few such waits, so 30 s each still
+/// fails a genuinely stuck wait *by name* well before nextest kills it anonymously. It matches
+/// [`test_client`]'s request timeout, for the same reason.
+pub const CONDITION_BUDGET: Duration = Duration::from_secs(30);
+
 /// A NATS port for a gateway that does not write deny/allowance keys of its own.
 ///
 /// Allowance is fail-closed until the watcher stores a scan (empty = remaining-ok), so a closed
@@ -245,6 +258,57 @@ async fn wait_for_port(port: u16, what: &str) {
     })
     .await
     .unwrap_or_else(|_| panic!("{what} did not come up on port {port}"));
+}
+
+/// Wait until process `pid` itself holds a listening socket on `127.0.0.1:port`.
+///
+/// "Something accepts on the port" is not enough for a gateway subprocess. [`free_port`] reserves
+/// ports only within one nextest run, and Pingora does not fail a bind that finds the address in
+/// use: it retries for up to 30 s (`TCP_LISTENER_MAX_TRY`) while its other listeners serve. So when
+/// a listener from outside the run still holds the port (a shared `nats-server` from the previous
+/// run of the stress loop, which its watchdog stops only within a second or so, later under CPU
+/// starvation), a bare TCP connect succeeds against *that* process, and requests go to it. NATS
+/// greets every connection with `INFO` before the client says anything, which hyper reports as
+/// `UnexpectedMessage`: the `/metrics` fetch in
+/// `a_provider_route_connect_failure_is_retried_twice_then_named` under the stress job. Matching
+/// the listening socket's inode against the child's own descriptors waits for the right process.
+async fn wait_for_own_listener(pid: u32, port: u16, what: &str) {
+    timeout(Duration::from_secs(20), async {
+        while !listens_on(pid, port) {
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{what} (pid {pid}) did not come up on port {port}"));
+}
+
+/// Whether `pid` owns a socket in `LISTEN` on IPv4 `port` (from `/proc/<pid>/net/tcp` and the
+/// process's descriptor table).
+fn listens_on(pid: u32, port: u16) -> bool {
+    let Ok(table) = std::fs::read_to_string(format!("/proc/{pid}/net/tcp")) else {
+        return false;
+    };
+    let want = format!(":{port:04X}");
+    // Columns: sl, local_address, rem_address, st, ..., inode (10th). `0A` is TCP_LISTEN.
+    let inodes: Vec<String> = table
+        .lines()
+        .skip(1)
+        .filter_map(|l| {
+            let cols: Vec<&str> = l.split_whitespace().collect();
+            (cols.len() > 9 && cols[1].ends_with(&want) && cols[3] == "0A")
+                .then(|| format!("socket:[{}]", cols[9]))
+        })
+        .collect();
+    if inodes.is_empty() {
+        return false;
+    }
+    let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+        return false;
+    };
+    fds.flatten().any(|fd| {
+        std::fs::read_link(fd.path())
+            .is_ok_and(|target| inodes.iter().any(|i| target.as_os_str() == i.as_str()))
+    })
 }
 
 // --- nats-server (JetStream) ------------------------------------------------
@@ -1457,11 +1521,12 @@ impl GatewayBuilder {
             config_path,
             log,
         };
-        wait_for_port(port, "beyond-ai").await;
+        let pid = gw.child.id();
+        wait_for_own_listener(pid, port, "beyond-ai").await;
         // The metrics/admin listener (`/livez`, `/readyz`, `/metrics`) binds on a *separate* port from
         // the proxy; wait for it too, or a test that probes it right after `start()` races the bind
         // (pre-existing flake in `health_endpoints_report_ready_on_the_metrics_listener`).
-        wait_for_port(metrics_port, "beyond-ai-metrics").await;
+        wait_for_own_listener(pid, metrics_port, "beyond-ai-metrics").await;
         if wait_allowance_ready {
             wait_for_metric(&gw, "ai_allowance_ready", "", 1.0).await;
         }
@@ -1522,7 +1587,8 @@ impl Gateway {
     /// "an `ai.usage` row that names *this* provider" — and a single substring cannot express that
     /// without depending on field order.
     pub async fn wait_for_log_line(&self, needles: &[&str]) -> String {
-        for _ in 0..200 {
+        let deadline = std::time::Instant::now() + CONDITION_BUDGET;
+        while std::time::Instant::now() < deadline {
             let log = self.log();
             if let Some(line) = log.lines().find(|l| needles.iter().all(|n| l.contains(n))) {
                 return line.to_string();
@@ -1530,7 +1596,7 @@ impl Gateway {
             sleep(Duration::from_millis(25)).await;
         }
         panic!(
-            "no log line matched {needles:?} within 5s; captured log was:\n{}",
+            "no log line matched {needles:?} within {CONDITION_BUDGET:?}; captured log was:\n{}",
             self.log(),
         );
     }
@@ -1588,7 +1654,7 @@ pub fn parse_metric(metrics: &str, name: &str, label_value: &str) -> f64 {
 }
 
 pub async fn wait_for_metric(gw: &Gateway, name: &str, label: &str, min: f64) {
-    let r = timeout(Duration::from_secs(5), async {
+    let r = timeout(CONDITION_BUDGET, async {
         loop {
             if parse_metric(&gw.metrics().await, name, label) >= min {
                 return;
@@ -1959,6 +2025,10 @@ pub enum Reply {
     HeaderStall,
     /// Wait this long, then send the inner reply.
     Delayed(Duration, Box<Reply>),
+    /// Wait until the test releases it (`notify_one`), then send the inner reply. For an ordering
+    /// a test must observe — "the others were answered while this one was still in flight" — that a
+    /// delay only makes likely, and a starved runner breaks.
+    Held(Arc<tokio::sync::Notify>, Box<Reply>),
     /// Drop the connection without answering, after reading the body.
     Reset,
 }
@@ -2010,6 +2080,10 @@ async fn scripted_reply(mut reply: Reply) -> Result<Response<MockBody>, std::io:
         match reply {
             Reply::Delayed(d, inner) => {
                 sleep(d).await;
+                reply = *inner;
+            }
+            Reply::Held(release, inner) => {
+                release.notified().await;
                 reply = *inner;
             }
             Reply::HeaderStall => std::future::pending::<()>().await,

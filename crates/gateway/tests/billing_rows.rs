@@ -126,7 +126,13 @@ async fn zero_cost_endings_carry_their_outcome() {
     let gw = Gateway::builder(unused_nats_port(), &primary.authority(), &b64(&pubkey))
         .providers(&["openai", "openrouter"])
         .provider_authority("openrouter", &fallback.authority())
-        .circuit_breaker_threshold(1)
+        // Threshold 1, and a reset far longer than anything this test does: request 2 must find
+        // both breakers still *open*. The builder's 1 s reset let a starved CI runner take longer
+        // than that between the two requests, so request 2 became a half-open probe that reached a
+        // provider. Nothing here waits for the reset, so its length costs no time.
+        .config_line("circuit_breaker_threshold = 1")
+        .config_line("circuit_breaker_window_secs = 60")
+        .config_line("circuit_breaker_reset_secs = 600")
         .start()
         .await;
     let key = billing_vkey(&sk, 83);
@@ -140,11 +146,11 @@ async fn zero_cost_endings_carry_their_outcome() {
         &[],
     )
     .await;
-    let rows = wait_usage_rows(&gw, 1, 5).await;
+    let rows = wait_usage_rows(&gw, 1, CONDITION_BUDGET.as_secs()).await;
     let hits_after_first = (primary.hits(), fallback.hits());
     // 2: every breaker open → no provider is called at all.
     let second = post(url, ("authorization", format!("Bearer {key}")), body, &[]).await;
-    let rows2 = wait_usage_rows(&gw, rows.len() + 1, 3).await;
+    let rows2 = wait_usage_rows(&gw, rows.len() + 1, CONDITION_BUDGET.as_secs()).await;
     let hits_after_second = (primary.hits(), fallback.hits());
 
     let evidence = format!(

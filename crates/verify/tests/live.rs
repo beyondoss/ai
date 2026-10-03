@@ -271,6 +271,13 @@ const CELLS: &[Cell] = &[
     ("TRN-18",            "anthropic-py",  Runtime::Python, "context_overflow", &[GPT4O_MINI], ""),
     ("W5+TRN-24",         "openai-agents", Runtime::Python, "agents_handoff",   CLAUDE_GPT, ""),
     ("W6",                "langchain",     Runtime::Python, "langchain_agent",  CLAUDE_GPT, ""),
+    // Long outputs (~32k tokens, the integers 1..11000) on translated paths, where only short
+    // generations ran before: every line arrives, the stream ends on its terminal event, the stop
+    // reason maps, and the row bills exactly the usage shown. Haiku-class, ~$0.16 a cell. Their
+    // nextest budget is raised in .config/nextest.toml (a ~135s generation plus the gateway boot).
+    ("S1+B1+BIL-6",       "openai-py",     Runtime::Python, "long_output",      &[CLAUDE], ""),
+    ("TRN-1+S1+B1+BIL-6", "openai-py",     Runtime::Python, "long_output_responses", &[CLAUDE], ""),
+    ("B1+BIL-6",          "openai-py",     Runtime::Python, "long_output_nonstream", &[CLAUDE], ""),
     // Node SDKs.
     ("E1+B1+S1+S2",       "openai-node",   Runtime::Node,   "chat_basic",       GEN,      "R1"),
     ("E2+B1+S1",          "anthropic-ts",  Runtime::Node,   "messages_basic",   GEN,      "R1"),
@@ -326,6 +333,9 @@ const CELLS: &[Cell] = &[
     ("R5",                "raw",           Runtime::Python, "raw_big_body",     &[CLAUDE, FAILOVER], "R1"),
     ("B2+BIL-20",         "raw",           Runtime::Python, "raw_stream_abort", CLAUDE_GPT, ""),
     ("A1",                "raw",           Runtime::Python, "byo_raw",          CLAUDE_GPT, ""),
+    // A BYO key's /v1/models is its provider's own list (D254): Anthropic's key on the Claude
+    // route, OpenAI's on the GPT route, each held to the provider's list fetched directly.
+    ("E4+A1",             "raw",           Runtime::Python, "byo_models_raw",   CLAUDE_GPT, ""),
     ("K1+B3",             "raw",           Runtime::Python, "raw_auto_cache",   &[CLAUDE], ""),
     ("M1+B1",             "raw",           Runtime::Python, "raw_embeddings",   &[EMBED], ""),
     ("SEC-7",             "raw",           Runtime::Python, "leak_scan",        CLAUDE_GPT, ""),
@@ -722,6 +732,22 @@ fn retryable_failure(verdict: &Value, rows: &[Value], route: Route) -> Option<(V
     Some((e.clone(), providers))
 }
 
+/// How many rows `GET /v1/models` lists on a gateway holding pool keys for `pools`: those with at
+/// least one candidate on a pooled provider (a dead-authority provider still holds its key, so it
+/// still counts). Every cell configures at least one pool, so this is never the BYO-only case.
+fn keyed_row_count(pools: &[(&str, &str)]) -> usize {
+    providers::catalog::MODEL_ROUTES
+        .iter()
+        .filter(|r| {
+            r.candidates.iter().any(|c| {
+                pools
+                    .iter()
+                    .any(|(p, _)| *p == providers::by_id(c.provider).name)
+            })
+        })
+        .count()
+}
+
 fn attempt_cell(
     rt: Runtime,
     client: &str,
@@ -803,10 +829,11 @@ fn attempt_cell(
         .env("VERIFY_CLIENT", client)
         .env("VERIFY_CLAIMS", &checks.claims)
         .env("VERIFY_GATEWAY_PID", gw.0.id().to_string())
-        // E4: the listing must hold every catalog row, counted here so the floor can't go stale.
+        // E4: the listing must hold every row this gateway's pool keys serve (D250), counted here
+        // from the same catalog and the same pools so the number can't go stale.
         .env(
             "VERIFY_CATALOG_ROWS",
-            providers::catalog::MODEL_ROUTES.len().to_string(),
+            keyed_row_count(route.pools).to_string(),
         );
     // A BYO probe sends the provider's own key through /{provider}/, the way a customer with
     // their own key would; a leak probe looks for the pool key in everything it was sent; an S1

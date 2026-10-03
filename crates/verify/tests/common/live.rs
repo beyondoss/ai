@@ -206,7 +206,8 @@ pub const REPORT_RESERVE: Duration = Duration::from_secs(5);
 /// How long nextest lets this test run before it terminates it: the running profile's
 /// `slow-timeout` period × `terminate-after`. Read from the workspace's `.config/nextest.toml`
 /// for `NEXTEST_PROFILE`: the first of that profile's `[[profile.<name>.overrides]]` whose filter
-/// is `binary_id(<this binary>)` (`NEXTEST_BINARY_ID`), else the profile's own `slow-timeout`,
+/// is `binary_id(<this binary>)` (`NEXTEST_BINARY_ID`), or `binary_id(<this binary>) & test(/P/)`
+/// with the literal `P` in this test's name (`NEXTEST_TEST_NAME`), else the profile's own `slow-timeout`,
 /// following `inherits` and then `default` (overrides are not inherited, as in nextest). `None`
 /// outside nextest, or under a profile that never terminates a test.
 pub fn test_budget() -> Option<Duration> {
@@ -222,21 +223,39 @@ pub fn test_budget() -> Option<Duration> {
             &config,
             &profile,
             std::env::var("NEXTEST_BINARY_ID").ok().as_deref(),
+            std::env::var("NEXTEST_TEST_NAME").ok().as_deref(),
         )
     })
 }
 
-/// [`test_budget`] for `profile` and `binary` in a parsed nextest config.
-pub fn budget_in(config: &toml::Value, profile: &str, binary: Option<&str>) -> Option<Duration> {
+/// [`test_budget`] for `profile`, `binary` and `test` in a parsed nextest config.
+pub fn budget_in(
+    config: &toml::Value,
+    profile: &str,
+    binary: Option<&str>,
+    test: Option<&str>,
+) -> Option<Duration> {
     let profiles = config.get("profile")?;
     let overridden = binary.and_then(|b| {
-        let filter = format!("binary_id({b})");
+        let whole = format!("binary_id({b})");
+        let matches = |filter: &str| {
+            filter == whole
+                || filter
+                    .strip_prefix(whole.as_str())
+                    .and_then(|f| f.strip_prefix(" & test(/"))
+                    .and_then(|f| f.strip_suffix("/)"))
+                    .is_some_and(|p| test.is_some_and(|t| t.contains(p)))
+        };
         profiles
             .get(profile)?
             .get("overrides")?
             .as_array()?
             .iter()
-            .find(|o| o.get("filter").and_then(toml::Value::as_str) == Some(filter.as_str()))?
+            .find(|o| {
+                o.get("filter")
+                    .and_then(toml::Value::as_str)
+                    .is_some_and(matches)
+            })?
             .get("slow-timeout")
             .cloned()
     });

@@ -39,7 +39,8 @@ fn body() -> &'static str {
 /// unlike `ai.usage` they are not guaranteed to have landed by the time the HTTP response does.
 /// Polling here is not flake-papering — it is the asynchrony the design deliberately introduced.
 async fn wait_for_log(gw: &Gateway, what: &str, pred: impl Fn(&str) -> bool) -> String {
-    for _ in 0..200 {
+    let deadline = std::time::Instant::now() + CONDITION_BUDGET;
+    while std::time::Instant::now() < deadline {
         let log = gw.log();
         if pred(&log) {
             return log;

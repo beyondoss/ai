@@ -54,7 +54,8 @@
 //! vendor's published price and card values with the URL they came from (or a reasoned entry in
 //! its `unverified` list). `catalog_matches_vendor_truth` holds the table to that file, and a
 //! retired or non-serverless id recorded there can never come back as a candidate. A scheduled
-//! retirement (`retires`) fails `no_catalog_row_outlives_its_retirement` on its date, and the live
+//! retirement (`retires`) warns in `no_catalog_row_outlives_its_retirement` from 14 days before
+//! its date and fails it only under `CATALOG_RETIREMENT_STRICT=1` (the weekly deep job), and the live
 //! cells `CAT-16::raw::*` (`crates/verify/tests/catalog_live.rs`) check every candidate against its
 //! vendor's own listing and deprecation notices, and every first-party release in a carried family
 //! against the table, so neither a retirement nor a new model goes unnoticed.
@@ -390,6 +391,20 @@ const STREAM_ONLY: &[(ProviderId, &str)] = &[
     (ProviderId::Together, "Qwen/Qwen3.7-Max"),
     (ProviderId::Together, "Qwen/Qwen3.8-Flash"),
 ];
+
+/// Whether a row's requests may stay silent for longer than any client's default timeout: OpenAI's
+/// `-pro` models (o3-pro, gpt-5-pro, gpt-5.x-pro and later), whose model pages each say "some
+/// requests may take several minutes to finish. To avoid timeouts, try using background mode"
+/// (developers.openai.com/api/docs/models/gpt-5-pro, and the gpt-5.4-pro and gpt-5.5-pro pages).
+/// OpenAI publishes no maximum request duration for them, and neither does Anthropic for any model
+/// (its "Long requests" note recommends streaming past 10 minutes, and its SDKs refuse a
+/// non-streaming call expected to run longer). So the gateway sets no silence deadline of its own
+/// on these rows (D252): any number would be a guess that 504s a call the provider still bills.
+/// Matched by owner and suffix, not a list, so a new `-pro` row is covered the day it lands; no
+/// other owner's `-pro` (DeepSeek's) carries the note.
+pub fn long_running(row: &ModelRoute) -> bool {
+    row.card.owned_by == "openai" && row.model.ends_with("-pro")
+}
 
 /// Whether a candidate answers only streams. See [`STREAM_ONLY`].
 pub fn stream_only(c: &Candidate) -> bool {
@@ -2265,17 +2280,20 @@ pub fn for_model(name: &str) -> Option<&'static ModelRoute> {
     }
 }
 
-/// OpenAI-shaped `GET /v1/models` body for the catalog, readable by the Anthropic SDK too
-/// (`display_name`, `has_more`). Beyond OpenAI's fields each model carries `wire` (`"openai"` /
-/// `"anthropic"`, so a caller can pick the matching SDK), its [`ModelCard`] (`context_window`,
-/// `max_output_tokens`, `input_modalities`, `output_modalities`, `capabilities`), the `endpoints` it
-/// answers on (any generation row serves all three through translation), and `pricing` (USD per
-/// million tokens — see [`ListPrice`]). Ids are log-safe (`[a-z0-9._/-]`), display names are
-/// tested free of quotes and backslashes, and prices are decimal strings, so this needs no JSON
-/// escaping.
-pub fn models_list_json() -> &'static str {
-    static JSON: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    JSON.get_or_init(|| {
+/// OpenAI-shaped `GET /v1/models` body over the catalog rows `keep` accepts, in catalog order,
+/// readable by the Anthropic SDK too (`display_name`, `has_more`). Beyond OpenAI's fields each model
+/// carries `wire` (`"openai"` / `"anthropic"`, so a caller can pick the matching SDK), its
+/// [`ModelCard`] (`context_window`, `max_output_tokens`, `input_modalities`, `output_modalities`,
+/// `capabilities`), the `endpoints` it answers on (any generation row serves all three through
+/// translation), and `pricing` (USD per million tokens — see [`ListPrice`]). Ids are log-safe
+/// (`[a-z0-9._/-]`), display names are tested free of quotes and backslashes, and prices are
+/// decimal strings, so this needs no JSON escaping.
+///
+/// A filtered list is a shorter `data` array and nothing else. It builds a fresh `String`, so a
+/// caller builds it once (the gateway does, at boot, over the rows its pool keys serve) rather than
+/// per request.
+pub fn models_list_json(keep: impl Fn(&ModelRoute) -> bool) -> String {
+    {
         use std::fmt::Write as _;
         fn names(out: &mut String, bits: u8, table: &[(u8, &str)]) {
             out.push('[');
@@ -2294,7 +2312,7 @@ pub fn models_list_json() -> &'static str {
         let mut out = String::from(
             "{\"object\":\"list\",\"pricing_unit\":\"usd_per_million_tokens\",\"has_more\":false,\"data\":[",
         );
-        for (i, r) in MODEL_ROUTES.iter().enumerate() {
+        for (i, r) in MODEL_ROUTES.iter().filter(|r| keep(r)).enumerate() {
             if i > 0 {
                 out.push(',');
             }
@@ -2341,7 +2359,7 @@ pub fn models_list_json() -> &'static str {
         }
         out.push_str("]}");
         out
-    })
+    }
 }
 
 #[cfg(test)]
@@ -2360,6 +2378,30 @@ mod tests {
     /// served on is not a row. It came down to 80 when the seven OpenAI rows due to shut down on
     /// 2026-10-23 left early by owner decision (D243): 91 rows became 84, and the floor follows the
     /// table rather than the table being padded to meet it.
+    /// D252: the rows OpenAI documents as taking "several minutes" get no gateway silence
+    /// deadline; every other row keeps `read_timeout_secs`.
+    #[test]
+    fn long_running_is_exactly_openais_pro_rows() {
+        let long: Vec<&str> = MODEL_ROUTES
+            .iter()
+            .filter(|r| long_running(r))
+            .map(|r| r.model)
+            .collect();
+        for m in [
+            "o3-pro",
+            "gpt-5-pro",
+            "gpt-5.2-pro",
+            "gpt-5.4-pro",
+            "gpt-5.5-pro",
+        ] {
+            assert!(long.contains(&m), "{m}: {long:?}");
+        }
+        for m in ["deepseek-v4-pro", "gpt-5", "claude-opus-4-8"] {
+            assert!(!long.contains(&m), "{m}: {long:?}");
+        }
+        assert!(long.iter().all(|m| m.ends_with("-pro")), "{long:?}");
+    }
+
     #[test]
     fn catalog_lists_at_least_80_models() {
         assert!(
@@ -2692,10 +2734,42 @@ mod tests {
         }
     }
 
+    /// A filtered list is the same body with a shorter `data` array: same envelope, same rows in
+    /// catalog order, each byte-identical to its entry in the full list.
+    /// claim: E4
+    /// defect: D250
+    #[test]
+    fn models_list_json_filter_keeps_shape_and_order() {
+        let none: serde_json::Value =
+            serde_json::from_str(&models_list_json(|_| false)).expect("valid JSON");
+        assert_eq!(none["object"], "list");
+        assert_eq!(none["has_more"], false);
+        assert_eq!(none["data"], serde_json::json!([]));
+
+        let full: serde_json::Value = serde_json::from_str(&models_list_json(|_| true)).unwrap();
+        let openai = |r: &ModelRoute| {
+            r.candidates
+                .iter()
+                .any(|c| c.provider == ProviderId::OpenAi)
+        };
+        let some: serde_json::Value = serde_json::from_str(&models_list_json(openai)).unwrap();
+        let want: Vec<&serde_json::Value> = MODEL_ROUTES
+            .iter()
+            .zip(full["data"].as_array().unwrap())
+            .filter(|(r, _)| openai(r))
+            .map(|(_, row)| row)
+            .collect();
+        let got: Vec<&serde_json::Value> = some["data"].as_array().unwrap().iter().collect();
+        assert!(!got.is_empty() && got.len() < MODEL_ROUTES.len());
+        assert_eq!(got, want);
+        assert_eq!(some["pricing_unit"], full["pricing_unit"]);
+    }
+
     /// claim: E4
     #[test]
     fn models_list_json_describes_every_row() {
-        let v: serde_json::Value = serde_json::from_str(models_list_json()).expect("valid JSON");
+        let v: serde_json::Value =
+            serde_json::from_str(&models_list_json(|_| true)).expect("valid JSON");
         assert_eq!(v["object"], "list");
         assert_eq!(v["pricing_unit"], "usd_per_million_tokens");
         assert_eq!(v["has_more"], false);
@@ -3485,12 +3559,52 @@ mod tests {
         }
     }
 
-    /// Today's date as `YYYY-MM-DD` (UTC), for the `retires` dates in `verify/catalog_truth.toml`.
-    fn today() -> String {
+    /// Today as days since 1970-01-01 (UTC), for the `retires` dates in
+    /// `verify/catalog_truth.toml`. Only the test entry point reads the clock; the logic it feeds
+    /// (`retirement_warnings`) takes the day as an argument.
+    fn today() -> i64 {
         let secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
-        civil(i64::try_from(secs / 86_400).unwrap_or(0))
+        i64::try_from(secs / 86_400).unwrap_or(0)
+    }
+
+    /// How many days before a `retires` date the warning starts.
+    const RETIREMENT_WARN_DAYS: i64 = 14;
+
+    /// The `retires` dates that touch a catalog row and fall within `RETIREMENT_WARN_DAYS` of
+    /// `today` (days since the epoch), or are already past: one message per (row, entry). Pure, so
+    /// the window is testable with any day.
+    fn retirement_warnings(all: &[Retirement<'_>], today: i64) -> Vec<String> {
+        let (now, horizon) = (civil(today), civil(today + RETIREMENT_WARN_DAYS));
+        let mut out = Vec::new();
+        for r in MODEL_ROUTES {
+            for e in all.iter().filter(|e| e.touches(r)) {
+                let Some(day) = e.retires.filter(|d| *d <= horizon.as_str()) else {
+                    continue;
+                };
+                let what = e
+                    .candidate
+                    .map_or_else(|| r.model.to_owned(), |(p, id)| format!("{p}/{id}"));
+                let when = if day <= now.as_str() {
+                    "is past its retirement"
+                } else {
+                    "retires soon"
+                };
+                out.push(format!(
+                    "{}: {what} {when} ({day}; today is {now}): remove it from the catalog and \
+                     record the entry as retired",
+                    r.model
+                ));
+            }
+        }
+        out
+    }
+
+    /// Whether `CATALOG_RETIREMENT_STRICT=1` turns retirement warnings into a failure (the weekly
+    /// `deep.yml` job sets it; PR runs don't, so the calendar never fails an unrelated change).
+    fn retirement_strict() -> bool {
+        std::env::var("CATALOG_RETIREMENT_STRICT").is_ok_and(|v| v == "1")
     }
 
     /// Days since 1970-01-01 → `YYYY-MM-DD` (Howard Hinnant's `civil_from_days`).
@@ -3512,6 +3626,46 @@ mod tests {
         assert_eq!(civil(0), "1970-01-01");
         assert_eq!(civil(20_727), "2026-10-01");
         assert_eq!(civil(11_016), "2000-02-29");
+    }
+
+    /// The retirement window, on an injected day: nothing before 14 days out, a warning naming the
+    /// row and date from 14 days before through the eve, and a "past" warning from the day on.
+    #[test]
+    fn retirement_warnings_start_fourteen_days_out() {
+        let row = MODEL_ROUTES[0].model;
+        let all = [Retirement {
+            model: Some(row),
+            candidate: None,
+            retired: None,
+            retires: Some("2026-11-30"),
+        }];
+        let day = 20_787;
+        assert_eq!(civil(day), "2026-11-30");
+        assert!(retirement_warnings(&all, day - 15).is_empty());
+        for d in [day - 14, day - 1] {
+            let w = retirement_warnings(&all, d);
+            assert_eq!(w.len(), 1, "{w:?}");
+            assert!(
+                w[0].starts_with(&format!("{row}: {row} retires soon (2026-11-30;")),
+                "{w:?}"
+            );
+        }
+        for d in [day, day + 30] {
+            let w = retirement_warnings(&all, d);
+            assert_eq!(w.len(), 1, "{w:?}");
+            assert!(
+                w[0].contains("is past its retirement (2026-11-30;"),
+                "{w:?}"
+            );
+        }
+        // An entry that touches no row never warns.
+        let other = [Retirement {
+            model: Some("no-such-row"),
+            candidate: None,
+            retired: None,
+            retires: Some("2026-11-30"),
+        }];
+        assert!(retirement_warnings(&other, day).is_empty());
     }
 
     fn is_iso_date(s: &str) -> bool {
@@ -3647,10 +3801,12 @@ mod tests {
         }
     }
 
-    /// Every catalog row is absent from `[[retired]]` or carries a future `retires` date: a model
-    /// its vendor retired (`retired`) can't be re-added, as a row name or as a candidate, and a row
-    /// whose retirement date has come fails here until it is removed, so the vendor's 404 never
-    /// reaches a customer under our name. A client's request for a retired row is a 404, never a
+    /// No catalog row or candidate is named by a `retired` entry: a model its vendor retired can't
+    /// be re-added, as a row name or as a candidate (a hard failure everywhere). A row with a
+    /// `retires` date prints a warning from 14 days before it (and after it); with
+    /// `CATALOG_RETIREMENT_STRICT=1`, set by the weekly `deep.yml` job, the warning is a failure,
+    /// so the row is removed before the vendor's 404 reaches a customer under our name, while the
+    /// calendar never fails an unrelated PR. A client's request for a retired row is a 404, never a
     /// remap to the vendor's successor. The seven OpenAI rows due 2026-10-23 left early by owner
     /// decision (D243), recorded `retired` with that date: no row, candidate or Responses arm names
     /// them, here or as OpenRouter's `openai/` slug. That took gpt-4's card with it, so the D111
@@ -3661,7 +3817,6 @@ mod tests {
     #[test]
     fn no_catalog_row_outlives_its_retirement() {
         let t = truth();
-        let today = today();
         let all = retirements(&t);
         assert!(
             all.iter().any(|e| e.retired.is_some()) && all.iter().any(|e| e.retires.is_some()),
@@ -3678,15 +3833,21 @@ mod tests {
                     r.model,
                     e.retired.unwrap_or_default()
                 );
-                let day = e.retires.unwrap_or_default();
-                assert!(
-                    day > today.as_str(),
-                    "{}: {what} retires {day} (today is {today}): remove it from the catalog and \
-                     record the entry as retired",
-                    r.model
-                );
             }
         }
+        // A scheduled `retires` date warns from 14 days out; only the weekly strict run fails.
+        let warnings = retirement_warnings(&all, today());
+        for w in &warnings {
+            eprintln!("warning: {w}");
+            if std::env::var_os("GITHUB_ACTIONS").is_some() {
+                eprintln!("::warning title=catalog retirement::{w}");
+            }
+        }
+        assert!(
+            !retirement_strict() || warnings.is_empty(),
+            "CATALOG_RETIREMENT_STRICT=1 and a scheduled retirement is due:\n{}",
+            warnings.join("\n")
+        );
         // The rows retired on 2026-10-01 (D181), and the seven OpenAI rows removed that day ahead
         // of their 2026-10-23 shutdown (D243), stay out under their names.
         for gone in [

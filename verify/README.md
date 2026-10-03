@@ -127,8 +127,10 @@ Three more answers count as the provider's:
 
 **Retries fit the test's time budget.** nextest terminates a test at its profile's `slow-timeout`
 period × `terminate-after` (180s under `verify`; the reconciliation and long-session binaries have
-their own). The retry loop (`common::sdk_retry`, `sdk_backoff`) reads that budget from
-`.config/nextest.toml` for `NEXTEST_PROFILE` and `NEXTEST_BINARY_ID`, and gives up a retry whose
+their own, as do live.rs's `long_output*` cells, matched by test name: 6 minutes for a ~32k-token
+generation measured at 135-177s). The retry loop (`common::sdk_retry`, `sdk_backoff`) reads that
+budget from `.config/nextest.toml` for `NEXTEST_PROFILE`, `NEXTEST_BINARY_ID` and
+`NEXTEST_TEST_NAME`, and gives up a retry whose
 wait plus one more attempt as long as the last would not finish inside it, keeping five seconds to
 read the billing row and report. The catalog sweep also caps each request's timeout at the time
 left. So a cell reports its last answer (INCONCLUSIVE, where it is the provider's) instead of being
@@ -297,8 +299,12 @@ family is skipped by name or modality: an audio, realtime, image or video model 
 `[[not_carried]]` one by one, saying which endpoint it needs that the gateway doesn't serve. Together and OpenRouter list
 hundreds of models, so their gaps are a report, not a failure: `VERIFY_CATALOG_GAPS=1` prints recent
 models in the namespaces the catalog carries that are not in it (`mise run verify:catalog` prints
-it last). The hermetic `no_catalog_row_outlives_its_retirement` fails on the day a recorded
-`retires` date comes, so a scheduled retirement is acted on before the vendor's 404.
+it last). The hermetic `no_catalog_row_outlives_its_retirement` always fails on a row or candidate
+named by a `retired` entry. For a recorded `retires` date it prints a warning naming the row and
+date from 14 days before that date, and fails only under `CATALOG_RETIREMENT_STRICT=1`: the weekly
+`deep.yml` job sets it, so a scheduled retirement is acted on before the vendor's 404 while the
+calendar never fails an unrelated PR. Run it strict locally with
+`CATALOG_RETIREMENT_STRICT=1 cargo test -p beyond-ai-providers --lib no_catalog_row_outlives_its_retirement -- --nocapture`.
 
 ```sh
 VERIFY_LIVE=1 cargo nextest run -p beyond-ai-verify --test catalog_live --profile verify -E 'test(/^CAT-16::/)'

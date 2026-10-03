@@ -77,8 +77,8 @@ defects = ["D74", "D128", "D145", "D147", "D175"]
 id = "E4"
 priority = "P0"
 group = "Endpoints and SDK compatibility"
-text = "/v1/models lists every row and stock SDKs read it"
-oracle = "models.list() returns 101 with card fields"
+text = "/v1/models lists every row a managed key can use, a BYO key gets its own provider's list, and stock SDKs read both"
+oracle = "managed: models.list() returns every keyed row with card fields; BYO: the list equals the provider's own, fetched directly with the same key"
 layer = "both"
 clients = ["openai-py", "openai-node", "anthropic-py", "anthropic-ts", "raw"]
 client_note = "Not ai-sdk: the pinned AI SDK (ai 7.0.126, @ai-sdk/openai 4.0.83, @ai-sdk/anthropic 4.0.71, @ai-sdk/openai-compatible 3.0.62) has no model-listing call for an OpenAI, Anthropic or OpenAI-compatible provider; its only listing, getAvailableModels(), belongs to Vercel's own gateway provider and reads GET {baseURL}/config, not /v1/models. Not opencode: opencode 1.18.34 never reads a custom provider's /v1/models. It takes models from models.dev and the provider's config; with a provider configured and no models, `opencode models beyond` says \"Provider not found\" and `opencode run` fails, and the recording proxy saw no request at all (2026-10-01). Its listing of a config generated from /v1/models is claim E7."
@@ -289,7 +289,7 @@ failover_clients = [
 ]
 touches = [
   "crates/gateway/src/proxy.rs",
-  "crates/gateway/src/smart.rs",
+  "crates/gateway/src/pin.rs",
   "crates/gateway/src/circuit_breaker.rs",
   "crates/gateway/src/control.rs",
 ]
@@ -307,7 +307,7 @@ clients = ["openai-py", "anthropic-py", "raw"]
 failover_clients = []
 touches = [
   "crates/gateway/src/proxy.rs",
-  "crates/gateway/src/smart.rs",
+  "crates/gateway/src/pin.rs",
   "crates/gateway/src/circuit_breaker.rs",
   "crates/gateway/src/control.rs",
 ]
@@ -324,7 +324,7 @@ clients = ["raw", "openai-py"]
 failover_clients = []
 touches = [
   "crates/gateway/src/proxy.rs",
-  "crates/gateway/src/smart.rs",
+  "crates/gateway/src/pin.rs",
   "crates/gateway/src/circuit_breaker.rs",
   "crates/gateway/src/control.rs",
 ]
@@ -341,11 +341,11 @@ clients = ["anthropic-py", "claude-code", "pi", "raw"]
 failover_clients = []
 touches = [
   "crates/gateway/src/proxy.rs",
-  "crates/gateway/src/smart.rs",
+  "crates/gateway/src/pin.rs",
   "crates/gateway/src/circuit_breaker.rs",
   "crates/gateway/src/control.rs",
 ]
-defects = []
+defects = ["D253"]
 
 [[claim]]
 id = "R5"
@@ -358,7 +358,7 @@ clients = ["openai-py", "anthropic-py", "claude-code", "raw"]
 failover_clients = ["openai-py", "anthropic-py"]
 touches = [
   "crates/gateway/src/proxy.rs",
-  "crates/gateway/src/smart.rs",
+  "crates/gateway/src/pin.rs",
   "crates/gateway/src/circuit_breaker.rs",
   "crates/gateway/src/control.rs",
 ]
@@ -376,29 +376,15 @@ clients = ["raw"]
 failover_clients = []
 touches = [
   "crates/gateway/src/proxy.rs",
-  "crates/gateway/src/smart.rs",
+  "crates/gateway/src/pin.rs",
   "crates/gateway/src/circuit_breaker.rs",
   "crates/gateway/src/control.rs",
 ]
 defects = []
 
-[[claim]]
-id = "R7"
-priority = "P2"
-group = "Routing and failover"
-text = "TTFT ranker prefers the faster candidate"
-oracle = "slowed candidate drops in order"
-layer = "hermetic"
-layer_note = "Reclassified from live/both on 2026-10-01: The ranker reacts to measured latency, which a live provider can't make deterministic; proven with controlled mock delays."
-clients = ["raw"]
-failover_clients = []
-touches = [
-  "crates/gateway/src/proxy.rs",
-  "crates/gateway/src/smart.rs",
-  "crates/gateway/src/circuit_breaker.rs",
-  "crates/gateway/src/control.rs",
-]
-defects = ["D119"]
+# R7 ("TTFT ranker prefers the faster candidate") is retired: latency ranking was removed after D253
+# left it ordering only walks with no caller identity, which a managed request never is. The
+# default walk is the computed session pin (R4).
 
 # --- Billing -----------------------------------------------------------------------------------
 [[claim]]
@@ -1006,10 +992,11 @@ defects = ["D31"]
 id = "SEC-15"
 priority = "P1"
 group = "Security and isolation"
-text = "Pins, ranker and limiter state can't be steered across tenants"
+text = "Pins and limiter state can't be steered across tenants"
 layer = "hermetic"
 touches = [
   "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/pin.rs",
   "crates/gateway/src/key.rs",
   "crates/gateway/src/route.rs",
   "crates/gateway/src/cache.rs",
@@ -1498,7 +1485,7 @@ layer = "both"
 touches = [
   "crates/gateway/src/proxy.rs",
   "crates/gateway/src/circuit_breaker.rs",
-  "crates/gateway/src/smart.rs",
+  "crates/gateway/src/pin.rs",
   "crates/gateway/src/state.rs",
   "crates/gateway/src/admin.rs",
   "crates/gateway/src/store_watch.rs",
@@ -1516,7 +1503,7 @@ layer = "hermetic"
 touches = [
   "crates/gateway/src/proxy.rs",
   "crates/gateway/src/circuit_breaker.rs",
-  "crates/gateway/src/smart.rs",
+  "crates/gateway/src/pin.rs",
   "crates/gateway/src/state.rs",
   "crates/gateway/src/admin.rs",
   "crates/gateway/src/store_watch.rs",
@@ -1535,7 +1522,7 @@ layer_note = "Reclassified from live/both on 2026-10-01: A response dying mid-wa
 touches = [
   "crates/gateway/src/proxy.rs",
   "crates/gateway/src/circuit_breaker.rs",
-  "crates/gateway/src/smart.rs",
+  "crates/gateway/src/pin.rs",
   "crates/gateway/src/state.rs",
   "crates/gateway/src/admin.rs",
   "crates/gateway/src/store_watch.rs",
@@ -1553,7 +1540,7 @@ layer = "hermetic"
 touches = [
   "crates/gateway/src/proxy.rs",
   "crates/gateway/src/circuit_breaker.rs",
-  "crates/gateway/src/smart.rs",
+  "crates/gateway/src/pin.rs",
   "crates/gateway/src/state.rs",
   "crates/gateway/src/admin.rs",
   "crates/gateway/src/store_watch.rs",
@@ -1573,7 +1560,7 @@ layer = "hermetic"
 touches = [
   "crates/gateway/src/proxy.rs",
   "crates/gateway/src/circuit_breaker.rs",
-  "crates/gateway/src/smart.rs",
+  "crates/gateway/src/pin.rs",
   "crates/gateway/src/state.rs",
   "crates/gateway/src/admin.rs",
   "crates/gateway/src/store_watch.rs",
@@ -1591,14 +1578,14 @@ layer = "hermetic"
 touches = [
   "crates/gateway/src/proxy.rs",
   "crates/gateway/src/circuit_breaker.rs",
-  "crates/gateway/src/smart.rs",
+  "crates/gateway/src/pin.rs",
   "crates/gateway/src/state.rs",
   "crates/gateway/src/admin.rs",
   "crates/gateway/src/store_watch.rs",
   "crates/gateway/src/main.rs",
   "crates/gateway/src/config.rs",
 ]
-defects = ["D17", "D37", "D86", "D91", "D97"]
+defects = ["D17", "D37", "D86", "D91", "D97", "D256"]
 
 [[claim]]
 id = "REL-7"
@@ -1610,7 +1597,7 @@ layer = "hermetic"
 touches = [
   "crates/gateway/src/proxy.rs",
   "crates/gateway/src/circuit_breaker.rs",
-  "crates/gateway/src/smart.rs",
+  "crates/gateway/src/pin.rs",
   "crates/gateway/src/state.rs",
   "crates/gateway/src/admin.rs",
   "crates/gateway/src/store_watch.rs",
@@ -1628,7 +1615,7 @@ layer = "hermetic"
 touches = [
   "crates/gateway/src/proxy.rs",
   "crates/gateway/src/circuit_breaker.rs",
-  "crates/gateway/src/smart.rs",
+  "crates/gateway/src/pin.rs",
   "crates/gateway/src/state.rs",
   "crates/gateway/src/admin.rs",
   "crates/gateway/src/store_watch.rs",
@@ -1646,7 +1633,7 @@ layer = "hermetic"
 touches = [
   "crates/gateway/src/proxy.rs",
   "crates/gateway/src/circuit_breaker.rs",
-  "crates/gateway/src/smart.rs",
+  "crates/gateway/src/pin.rs",
   "crates/gateway/src/state.rs",
   "crates/gateway/src/admin.rs",
   "crates/gateway/src/store_watch.rs",
@@ -1664,7 +1651,7 @@ layer = "hermetic"
 touches = [
   "crates/gateway/src/proxy.rs",
   "crates/gateway/src/circuit_breaker.rs",
-  "crates/gateway/src/smart.rs",
+  "crates/gateway/src/pin.rs",
   "crates/gateway/src/state.rs",
   "crates/gateway/src/admin.rs",
   "crates/gateway/src/store_watch.rs",
@@ -1682,7 +1669,7 @@ layer = "hermetic"
 touches = [
   "crates/gateway/src/proxy.rs",
   "crates/gateway/src/circuit_breaker.rs",
-  "crates/gateway/src/smart.rs",
+  "crates/gateway/src/pin.rs",
   "crates/gateway/src/state.rs",
   "crates/gateway/src/admin.rs",
   "crates/gateway/src/store_watch.rs",
@@ -1700,7 +1687,7 @@ layer = "hermetic"
 touches = [
   "crates/gateway/src/proxy.rs",
   "crates/gateway/src/circuit_breaker.rs",
-  "crates/gateway/src/smart.rs",
+  "crates/gateway/src/pin.rs",
   "crates/gateway/src/state.rs",
   "crates/gateway/src/admin.rs",
   "crates/gateway/src/store_watch.rs",
@@ -1718,7 +1705,7 @@ layer = "hermetic"
 touches = [
   "crates/gateway/src/proxy.rs",
   "crates/gateway/src/circuit_breaker.rs",
-  "crates/gateway/src/smart.rs",
+  "crates/gateway/src/pin.rs",
   "crates/gateway/src/state.rs",
   "crates/gateway/src/admin.rs",
   "crates/gateway/src/store_watch.rs",
@@ -1736,7 +1723,7 @@ layer = "both"
 touches = [
   "crates/gateway/src/proxy.rs",
   "crates/gateway/src/circuit_breaker.rs",
-  "crates/gateway/src/smart.rs",
+  "crates/gateway/src/pin.rs",
   "crates/gateway/src/state.rs",
   "crates/gateway/src/admin.rs",
   "crates/gateway/src/store_watch.rs",
@@ -1754,7 +1741,7 @@ layer = "hermetic"
 touches = [
   "crates/gateway/src/proxy.rs",
   "crates/gateway/src/circuit_breaker.rs",
-  "crates/gateway/src/smart.rs",
+  "crates/gateway/src/pin.rs",
   "crates/gateway/src/state.rs",
   "crates/gateway/src/admin.rs",
   "crates/gateway/src/store_watch.rs",
@@ -1772,7 +1759,7 @@ layer = "hermetic"
 touches = [
   "crates/gateway/src/proxy.rs",
   "crates/gateway/src/circuit_breaker.rs",
-  "crates/gateway/src/smart.rs",
+  "crates/gateway/src/pin.rs",
   "crates/gateway/src/state.rs",
   "crates/gateway/src/admin.rs",
   "crates/gateway/src/store_watch.rs",
@@ -1790,7 +1777,7 @@ layer = "hermetic"
 touches = [
   "crates/gateway/src/proxy.rs",
   "crates/gateway/src/circuit_breaker.rs",
-  "crates/gateway/src/smart.rs",
+  "crates/gateway/src/pin.rs",
   "crates/gateway/src/state.rs",
   "crates/gateway/src/admin.rs",
   "crates/gateway/src/store_watch.rs",
@@ -1809,7 +1796,7 @@ layer_note = "Reclassified from live/both on 2026-10-01: Memory under load is a 
 touches = [
   "crates/gateway/src/proxy.rs",
   "crates/gateway/src/circuit_breaker.rs",
-  "crates/gateway/src/smart.rs",
+  "crates/gateway/src/pin.rs",
   "crates/gateway/src/state.rs",
   "crates/gateway/src/admin.rs",
   "crates/gateway/src/store_watch.rs",
@@ -1827,7 +1814,7 @@ layer = "hermetic"
 touches = [
   "crates/gateway/src/proxy.rs",
   "crates/gateway/src/circuit_breaker.rs",
-  "crates/gateway/src/smart.rs",
+  "crates/gateway/src/pin.rs",
   "crates/gateway/src/state.rs",
   "crates/gateway/src/admin.rs",
   "crates/gateway/src/store_watch.rs",
@@ -1845,7 +1832,7 @@ layer = "hermetic"
 touches = [
   "crates/gateway/src/proxy.rs",
   "crates/gateway/src/circuit_breaker.rs",
-  "crates/gateway/src/smart.rs",
+  "crates/gateway/src/pin.rs",
   "crates/gateway/src/state.rs",
   "crates/gateway/src/admin.rs",
   "crates/gateway/src/store_watch.rs",
@@ -1863,7 +1850,7 @@ layer = "hermetic"
 touches = [
   "crates/gateway/src/proxy.rs",
   "crates/gateway/src/circuit_breaker.rs",
-  "crates/gateway/src/smart.rs",
+  "crates/gateway/src/pin.rs",
   "crates/gateway/src/state.rs",
   "crates/gateway/src/admin.rs",
   "crates/gateway/src/store_watch.rs",
@@ -1881,7 +1868,7 @@ layer = "both"
 touches = [
   "crates/gateway/src/proxy.rs",
   "crates/gateway/src/circuit_breaker.rs",
-  "crates/gateway/src/smart.rs",
+  "crates/gateway/src/pin.rs",
   "crates/gateway/src/state.rs",
   "crates/gateway/src/admin.rs",
   "crates/gateway/src/store_watch.rs",
@@ -2402,7 +2389,7 @@ text = "Prompt caching holds across long sessions: cache read share rises after 
 oracle = "per-turn ledger cache_read / input ratio over a long harness session exceeds a stated floor after warm-up, per route"
 layer = "live"
 clients = ["claude-code", "pi", "opencode"]
-touches = ["crates/gateway/src/translate.rs", "crates/gateway/src/smart.rs"]
+touches = ["crates/gateway/src/translate.rs", "crates/gateway/src/pin.rs"]
 defects = []
 
 [[claim]]
@@ -2442,7 +2429,7 @@ layer = "live"
 clients = ["openai-py", "anthropic-py"]
 touches = [
   "crates/gateway/src/cache.rs",
-  "crates/gateway/src/smart.rs",
+  "crates/gateway/src/pin.rs",
   "crates/gateway/src/concurrency.rs",
 ]
 defects = []

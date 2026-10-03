@@ -12,7 +12,7 @@
 //! columns the moment this runs.
 //!
 //! Also on a request we actually serve, and measured here for that reason: `allowance::reason_for`
-//! (every managed request, same shape as deny), `smart::rank` / `observe` (every unpinned catalog
+//! (every managed request, same shape as deny), `pin::order` (every managed default
 //! walk), `cache::key` + `ResponseCache::get` (every catalog walk **when the cache is enabled** —
 //! it is off by default), and `translate` (only when the client wire and the candidate wire
 //! differ). Circuit-open and a hung failover are not here: neither is steady-state gateway CPU.
@@ -645,7 +645,8 @@ mod circuit_breaker {
     #[divan::bench]
     fn record_success_healthy(bencher: Bencher) {
         let cb = breaker();
-        bencher.bench(|| black_box(&cb).record_success());
+        let permit = cb.allow().expect("closed");
+        bencher.bench(|| black_box(&cb).record_success_for(permit));
     }
 }
 
@@ -1103,103 +1104,25 @@ mod allowance {
     }
 }
 
-/// Catalog-walk ranker. Runs on every unpinned `/auto` or managed `/v1` request. The claim in
-/// `smart` is atomics only: no allocation and no lock, on either the reorder or the sample.
-mod smart_rank {
+/// Catalog-walk order: `order` is every managed default walk, the computed session pin
+/// (rendezvous hash of the first-party lead, usable first). No allocation, no lock, no state.
+mod pin_order {
     use super::*;
     use beyond_ai::control::Walk;
-    use beyond_ai::smart::{Router, affinity};
-    use providers::ModelRoute;
+    use beyond_ai::pin::{affinity, order};
 
-    fn opus() -> &'static ModelRoute {
-        providers::for_model("claude-opus-4-8").expect("catalog row")
-    }
-
-    /// No samples yet: rank keeps catalog order. This is the first request of a process, and every
-    /// request until something has been observed.
     #[divan::bench]
-    fn rank_unmeasured(bencher: Bencher) {
-        let router = Router::new();
-        let row = opus();
-        let walk = Walk::identity(row.candidates.len());
+    fn order_pinned(bencher: Bencher) {
+        let row = providers::for_model("claude-opus-4-8").expect("catalog row");
         let aff = affinity(42, 7, None);
-        bencher.bench(|| {
-            router.rank(
-                black_box(walk),
-                black_box(row),
-                black_box(1),
-                black_box(Some(aff)),
-                black_box(u8::MAX),
-            )
-        });
-    }
-
-    /// Every candidate has an EWMA, so rank sorts. Still a handful of slots (`MAX_CANDIDATES`),
-    /// still no heap.
-    #[divan::bench]
-    fn rank_measured(bencher: Bencher) {
-        let router = Router::new();
-        let row = opus();
-        for (i, _) in row.candidates.iter().enumerate() {
-            router.observe(row, i as u8, 100_000 * (i as u64 + 1), true);
-        }
-        let walk = Walk::identity(row.candidates.len());
-        let aff = affinity(42, 7, None);
-        bencher.bench(|| {
-            router.rank(
-                black_box(walk),
-                black_box(row),
-                black_box(1),
-                black_box(Some(aff)),
-                black_box(u8::MAX),
-            )
-        });
-    }
-
-    /// A caller with a live session pin: pin lookup, then the same sort plus a move-to-front.
-    #[divan::bench]
-    fn rank_pinned(bencher: Bencher) {
-        let router = Router::new();
-        let row = opus();
-        for (i, _) in row.candidates.iter().enumerate() {
-            router.observe(row, i as u8, 100_000 * (i as u64 + 1), true);
-        }
-        let aff = affinity(42, 7, None);
-        router.pin(row, aff, 1);
         let walk = Walk::identity(row.candidates.len());
         bencher.bench(|| {
-            router.rank(
+            order(
                 black_box(walk),
                 black_box(row),
-                black_box(1),
-                black_box(Some(aff)),
+                black_box(aff),
                 black_box(u8::MAX),
             )
-        });
-    }
-
-    /// Re-pinning after every 2xx. A live pin to the same candidate within the same second is a
-    /// load and no store.
-    #[divan::bench]
-    fn pin_refresh(bencher: Bencher) {
-        let router = Router::new();
-        let row = opus();
-        let aff = affinity(42, 7, None);
-        bencher.bench(|| router.pin(black_box(row), black_box(aff), black_box(0)));
-    }
-
-    /// One sample after a candidate answers. Once per attempt, not per chunk.
-    #[divan::bench]
-    fn observe(bencher: Bencher) {
-        let router = Router::new();
-        let row = opus();
-        bencher.bench(|| {
-            router.observe(
-                black_box(row),
-                black_box(0),
-                black_box(200_000),
-                black_box(true),
-            );
         });
     }
 }

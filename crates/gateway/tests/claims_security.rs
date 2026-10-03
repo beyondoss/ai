@@ -960,33 +960,36 @@ async fn pins_limits_and_slots_do_not_cross_tenants() {
         }
     };
 
-    // seq 0: tenant A is served by the (slow) catalog primary and pinned to it.
-    assert_eq!(post(tenant(100, None)).await, 200);
-    assert_eq!(slow.hits(), 1);
-    // seq 1..=15: distinct new callers. The seq-8 probe measures the fast arm and new callers move.
-    for t in 0..15 {
-        assert_eq!(post(tenant(2000 + t, None)).await, 200);
-    }
-    assert!(fast.hits() >= 3, "new callers prefer the fast arm");
-
-    // Tenant A stays where its prompt cache is; a sibling credential of A (v2, its own key_id) and
-    // tenant B are new callers and go to the fast arm. Neither is steered by A's pin, and A is not
-    // steered by them.
-    let (slow0, fast0) = (slow.hits(), fast.hits());
+    // A session pin is computed from the caller's own verified identity every turn and keeps no
+    // state, so nothing another caller does can move it. Tenant B steering its own requests at the
+    // fast arm (an order header), and a sibling credential of A doing the same, leave tenant A on
+    // the catalog primary, turn after turn.
+    let ordered = |key: String| {
+        let (c, url) = (client.clone(), gw.url());
+        async move {
+            c.post(format!("{url}/auto/chat/completions"))
+                .header("authorization", format!("Bearer {key}"))
+                .header("content-type", "application/json")
+                .header("x-beyond-model", "gpt-4o-mini")
+                .header("x-beyond-order", "openrouter")
+                .body(CHAT)
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16()
+        }
+    };
     for _ in 0..4 {
+        assert_eq!(ordered(tenant(300, None)).await, 200);
+        assert_eq!(ordered(tenant(100, Some(5))).await, 200);
         assert_eq!(post(tenant(100, None)).await, 200);
-        assert_eq!(post(tenant(100, Some(5))).await, 200);
-        assert_eq!(post(tenant(300, None)).await, 200);
     }
+    assert_eq!(slow.hits(), 4, "tenant A stayed on its pin, the primary");
     assert_eq!(
-        slow.hits() - slow0,
-        4,
-        "only tenant A's v1 key stays pinned to the slow arm"
-    );
-    assert_eq!(
-        fast.hits() - fast0,
+        fast.hits(),
         8,
-        "A's sibling key and tenant B rank on their own"
+        "the other callers' steering moved only them"
     );
 
     // Rate limit: tenant C flooding its own bucket leaves tenant D untouched.

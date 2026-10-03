@@ -399,13 +399,12 @@ pub struct AiConfig {
     /// Cap on a single stored response body (bytes). Oversize 2xxs are relayed but not stored.
     pub cache_max_bytes: usize,
 
-    /// Rank managed catalog walks by observed time-to-first-byte (in-process EWMA per catalog
-    /// candidate). Off falls back to the row's static order, still subject to `x-beyond-order` /
-    /// `only` / `split`. Default on: the headers pin when a caller wants a fixed sequence.
-    ///
-    /// Ranking is **this process**. Replicas do not share TTFT samples, so the default walk is not
-    /// a fleet-wide smart router.
-    pub smart_router: bool,
+    /// Order a managed default walk by the caller's computed session pin (`crate::pin`): the row's
+    /// leading first-party hosts by rendezvous hash of the caller, then catalog order. Off is the
+    /// row's static order, still subject to `x-beyond-order` / `only` / `split`. A pure function of
+    /// the caller and the row, so every replica agrees. The name is from when this also ranked by
+    /// latency; it is kept so deployed configs (and `reject_unknown_toml_keys`) still load.
+    pub session_pins: bool,
 
     /// Most requests one tenant may hold open on this process at once. `0` disables it (the
     /// default). Spend is enforced after the fact — the allowance-set's exhaust bit lands only once
@@ -496,7 +495,7 @@ impl Default for AiConfig {
             // 64 KiB: the same bound as the catalog-walk peek, so a cached response is no larger
             // than the request that produced it was allowed to be while still being "in hand".
             cache_max_bytes: 64 * 1024,
-            smart_router: true,
+            session_pins: true,
             // Off. The right ceiling depends on how many parallel agents a tenant legitimately runs
             // and how long the allowance pipeline lags; that is an operator's call.
             tenant_max_in_flight: 0,

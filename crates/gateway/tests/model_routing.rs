@@ -15,8 +15,6 @@ mod common;
 
 use beyond_ai::key::{VirtualKey, mint};
 
-/// `smart::PROBE_EVERY` (crate-private).
-const PROBE_EVERY: u64 = 8;
 use common::*;
 
 const MODEL: &str = "gpt-4o-mini";
@@ -192,9 +190,8 @@ async fn records_the_failed_candidates_breaker_not_the_serving_ones() {
     let client = test_client();
     let key = vkey(&sk);
     // Enough attempts to trip the dead primary's breaker several times over.
-    // Pin openai-first: after the first failover the TTFT ranker would otherwise put the live
-    // fallback first and the dead primary would stop being attempted, so the breaker would never
-    // open. The ledger this test exists to prove is "we keep walking the pinned sequence".
+    // Pin openai-first, so the dead primary is attempted until its breaker opens. The ledger this
+    // test exists to prove is "we keep walking the pinned sequence".
     for _ in 0..6 {
         let resp = client
             .post(format!("{}/auto/chat/completions", gw.url()))
@@ -986,8 +983,7 @@ async fn a_5xx_candidates_breaker_opens_while_the_fallback_keeps_serving() {
 
     let client = test_client();
     let key = vkey(&sk);
-    // Pin openai-first: after the first 5xx the TTFT ranker would otherwise put the live fallback
-    // first and the 500 primary would stop being attempted, so the breaker would never open.
+    // Pin openai-first, so the 500 primary is attempted until its breaker opens.
     for i in 0..6 {
         let resp = client
             .post(format!("{}/auto/chat/completions", gw.url()))
@@ -1953,8 +1949,8 @@ async fn v1_models_lists_the_catalog() {
     let data = v["data"].as_array().expect("data array");
     assert_eq!(
         data.len(),
-        providers::catalog::MODEL_ROUTES.len(),
-        "every catalog row is listed: {v}"
+        keyed_rows(&[ProviderId::OpenAi, ProviderId::OpenRouter]).len(),
+        "every row an openai or openrouter candidate serves is listed: {v}"
     );
     let gpt = data
         .iter()
@@ -2019,6 +2015,122 @@ async fn v1_models_lists_the_catalog() {
         "a catalog model without a list price bills as free: {v}"
     );
     assert_eq!(mock.hits(), 0, "listing must not contact an upstream");
+}
+
+use providers::ProviderId;
+
+/// The catalog ids, in order, of the rows with at least one candidate on a `keyed` provider: what a
+/// gateway holding pool keys for exactly those providers must list.
+fn keyed_rows(keyed: &[ProviderId]) -> Vec<&'static str> {
+    providers::catalog::MODEL_ROUTES
+        .iter()
+        .filter(|r| r.candidates.iter().any(|c| keyed.contains(&c.provider)))
+        .map(|r| r.model)
+        .collect()
+}
+
+/// The ids `GET /v1/models` lists, in order, for a caller holding `key`.
+async fn listed_ids(gw: &Gateway, key: &str) -> Vec<String> {
+    let resp = test_client()
+        .get(format!("{}/v1/models", gw.url()))
+        .header("authorization", format!("Bearer {key}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let v: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(v["object"], "list");
+    assert_eq!(v["has_more"], false);
+    v["data"]
+        .as_array()
+        .expect("data array")
+        .iter()
+        .map(|m| m["id"].as_str().expect("id").to_string())
+        .collect()
+}
+
+/// A deployment lists only the rows it can serve. With only an openai pool key, every listed row
+/// has an openai candidate, and a Claude row (no openai candidate) is absent.
+/// claim: E4, CAT-9
+/// defect: D250
+#[tokio::test]
+async fn v1_models_lists_only_rows_an_openai_pool_key_serves() {
+    let nats_port = unused_nats_port();
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::builder(nats_port, &mock.authority(), &b64(&pubkey))
+        .providers(&["openai"])
+        .start()
+        .await;
+
+    let want = keyed_rows(&[ProviderId::OpenAi]);
+    assert!(
+        !want.is_empty() && want.len() < providers::catalog::MODEL_ROUTES.len(),
+        "the test needs rows on both sides"
+    );
+    let got = listed_ids(&gw, &vkey(&sk)).await;
+    assert_eq!(got, want);
+    assert!(got.iter().any(|m| m == "gpt-4o-mini"), "{got:?}");
+    assert!(!got.iter().any(|m| m == "claude-opus-4-8"), "{got:?}");
+    assert_eq!(mock.hits(), 0, "listing must not contact an upstream");
+}
+
+/// With anthropic and openrouter pool keys, Claude rows are listed (Anthropic primary) and rows
+/// served only by Together-class hosts are not. A row whose primary is unkeyed but whose fallback is keyed
+/// (OpenRouter is the fallback on most open-weight rows) stays listed.
+/// claim: E4, CAT-9
+/// defect: D250
+#[tokio::test]
+async fn v1_models_lists_claude_but_not_together_only_rows_on_anthropic_and_openrouter() {
+    let nats_port = unused_nats_port();
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::builder(nats_port, &mock.authority(), &b64(&pubkey))
+        .providers(&["anthropic", "openrouter"])
+        .start()
+        .await;
+
+    let keyed = [ProviderId::Anthropic, ProviderId::OpenRouter];
+    let got = listed_ids(&gw, &vkey(&sk)).await;
+    assert_eq!(got, keyed_rows(&keyed));
+    assert!(got.iter().any(|m| m == "claude-opus-4-8"), "{got:?}");
+
+    // No catalog row is served by Together alone today; the rows this deployment cannot serve are
+    // the ones whose candidates are all Together-class hosts (`openai/gpt-oss-120b`: Groq,
+    // Together, Fireworks).
+    let unservable: Vec<&str> = providers::catalog::MODEL_ROUTES
+        .iter()
+        .filter(|r| !r.candidates.iter().any(|c| keyed.contains(&c.provider)))
+        .map(|r| r.model)
+        .collect();
+    assert!(
+        unservable.iter().any(|m| {
+            providers::for_model(m).is_some_and(|r| {
+                r.candidates
+                    .iter()
+                    .any(|c| c.provider == ProviderId::Together)
+            })
+        }),
+        "the catalog has a Together-served row with no anthropic or openrouter candidate"
+    );
+    for m in &unservable {
+        assert!(!got.iter().any(|g| g == m), "{m} listed: {got:?}");
+    }
+
+    let fallback_only = providers::catalog::MODEL_ROUTES
+        .iter()
+        .find(|r| {
+            !keyed.contains(&r.candidates[0].provider)
+                && r.candidates[1..]
+                    .iter()
+                    .any(|c| keyed.contains(&c.provider))
+        })
+        .expect("a row whose primary is unkeyed and whose fallback is keyed");
+    assert!(
+        got.iter().any(|g| g == fallback_only.model),
+        "{} listed via its fallback: {got:?}",
+        fallback_only.model
+    );
 }
 
 const CLAUDE: &str = "claude-opus-4-8";
@@ -2180,12 +2292,12 @@ async fn split_over_n_requests_hits_both_primaries() {
     );
 }
 
-/// Cold start is catalog order. After a probe samples a faster fallback, **new** callers prefer
-/// it, while a caller already served stays on its provider (session pin, so its prompt cache is not
-/// thrown away). `x-beyond-order` still pins the slow primary.
-/// claim: R7, R4
+/// A session pin is not ranked by latency: callers stay on the catalog primary although the
+/// fallback is faster, and `x-beyond-order` still reaches the fallback. Latency differs per pod,
+/// and a pin every replica agrees on cannot use it.
+/// claim: R4
 #[tokio::test]
-async fn ttft_ranker_prefers_the_faster_candidate_after_a_probe() {
+async fn a_session_pin_ignores_a_faster_fallback() {
     let nats_port = unused_nats_port();
     let (pubkey, sk) = test_keypair(1);
     let slow = MockUpstream::start(Mode::Slow(80)).await;
@@ -2200,7 +2312,6 @@ async fn ttft_ranker_prefers_the_faster_candidate_after_a_probe() {
 
     let client = test_client();
     let key = vkey(&sk);
-    // A distinct app per request: each one is a new caller with no pin.
     let fresh = |n: u64| {
         mint(
             &VirtualKey {
@@ -2212,55 +2323,33 @@ async fn ttft_ranker_prefers_the_faster_candidate_after_a_probe() {
             &sk,
         )
     };
-
-    let first = post_auto(&client, &gw.url(), &key, Some(MODEL)).await;
-    assert_eq!(first.status().as_u16(), 200);
-    assert_eq!(slow.hits(), 1, "cold start is catalog (openai) first");
-    assert_eq!(fast.hits(), 0, "the fallback is not probed on seq 0");
-
-    // seq 1..=7 still exploit the only sampled arm; seq 8 probes openrouter; seq 9+ rank by EWMA.
-    for n in 0..15 {
-        let resp = post_auto(&client, &gw.url(), &fresh(n), Some(MODEL)).await;
-        assert_eq!(resp.status().as_u16(), 200);
-    }
-    assert!(
-        fast.hits() >= 3,
-        "after the probe the faster arm must serve new callers (slow={}, fast={})",
-        slow.hits(),
-        fast.hits()
-    );
-    let cap = fast.captured().expect("fast arm served at least once");
-    assert_eq!(cap.path, "/api/v1/chat/completions");
-
-    // The first caller was served by openai; it stays there even though openrouter now ranks first.
-    let fast_before = fast.hits();
-    for _ in 0..(PROBE_EVERY + 1) {
+    // Many turns, from the same caller and from new ones.
+    for n in 0..17 {
         let resp = post_auto(&client, &gw.url(), &key, Some(MODEL)).await;
+        assert_eq!(resp.status().as_u16(), 200);
+        let resp = post_auto(&client, &gw.url(), &fresh(n), Some(MODEL)).await;
         assert_eq!(resp.status().as_u16(), 200);
     }
     assert_eq!(
         fast.hits(),
-        fast_before,
-        "a pinned caller must stay on the provider holding its prompt cache, probe seed included"
+        0,
+        "a pinned caller left the catalog primary for the faster fallback"
     );
 
-    let slow_before_pin = slow.hits();
-    let pinned = client
+    let ordered = client
         .post(format!("{}/auto/chat/completions", gw.url()))
         .header("authorization", format!("Bearer {key}"))
         .header("content-type", "application/json")
         .header("x-beyond-model", MODEL)
-        .header("x-beyond-order", "openai")
+        .header("x-beyond-order", "openrouter")
         .body(body())
         .send()
         .await
         .unwrap();
-    assert_eq!(pinned.status().as_u16(), 200);
-    assert_eq!(
-        slow.hits(),
-        slow_before_pin + 1,
-        "x-beyond-order must pin the slow primary even after the ranker learned the fast arm"
-    );
+    assert_eq!(ordered.status().as_u16(), 200);
+    assert_eq!(fast.hits(), 1, "x-beyond-order still steers the walk");
+    let cap = fast.captured().expect("fast arm served");
+    assert_eq!(cap.path, "/api/v1/chat/completions");
 }
 
 /// A walk the caller shaped says nothing about where the key's other requests go: an

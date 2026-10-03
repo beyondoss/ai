@@ -17,7 +17,6 @@ use crate::key::Keyring;
 use crate::metrics::{Metrics, ProviderMetrics};
 use crate::ratelimit::RateLimit;
 use crate::route::{self, AuthScheme, Dialect, Provider};
-use crate::smart;
 use arc_swap::ArcSwap;
 use arrayvec::ArrayString;
 use std::collections::HashMap;
@@ -345,6 +344,23 @@ fn index_by_id(
     by_id
 }
 
+/// The managed `GET /v1/models` body for a deployment whose providers are `by_id`.
+///
+/// A row is listed when at least one of its candidates has a pool key here, so a row whose primary
+/// is unkeyed but whose fallback is keyed stays listed: a managed request for it is served by the
+/// fallback. A row none of whose candidates is keyed would only 503 a managed caller, so it is not
+/// advertised (a deployment with no pool keys lists none). Only managed callers get this body: a BYO
+/// caller never uses the catalog, and its listing relays to its own provider (D254).
+pub(crate) fn models_list_body(
+    by_id: &[Option<Arc<Provider>>; providers::ProviderId::COUNT],
+) -> bytes::Bytes {
+    let keyed =
+        |id: providers::ProviderId| by_id[id.index()].as_ref().is_some_and(|p| p.has_pool_key());
+    bytes::Bytes::from(providers::catalog::models_list_json(|r| {
+        r.candidates.iter().any(|c| keyed(c.provider))
+    }))
+}
+
 pub struct GatewayState {
     pub config: AiConfig,
     pub metrics: Arc<Metrics>,
@@ -365,6 +381,10 @@ pub struct GatewayState {
     /// config-added provider is absent: it has no `ProviderId`, and a catalog row can only name one.
     by_id: [Option<Arc<Provider>>; providers::ProviderId::COUNT],
 
+    /// The managed `GET /v1/models` body, rendered once at boot by [`models_list_body`]: the
+    /// catalog rows this deployment's pool keys can serve.
+    pub models_list: bytes::Bytes,
+
     /// Sparse deny-set — watched from NATS. Default-allow on miss; fail-open.
     pub deny: ArcSwap<DenySet>,
 
@@ -383,11 +403,6 @@ pub struct GatewayState {
     /// Exact-match response cache. `None` when `cache_ttl_secs == 0`. Process-local: another replica
     /// does not share this table, and a miss does not consult a shared store.
     pub cache: Option<ResponseCache>,
-
-    /// Per-candidate TTFT EWMA used to rank catalog walks. Always allocated; [`AiConfig::smart_router`]
-    /// gates whether `rank` runs. Observing while the flag is off is wasted work, so the proxy
-    /// skips both. Process-local: replicas do not share samples.
-    pub smart: smart::Router,
 
     /// Per-tenant in-flight cap (see `concurrency`). `None` when `tenant_max_in_flight == 0`.
     pub tenant_slots: Option<TenantSlots>,
@@ -514,6 +529,7 @@ impl GatewayState {
             );
         }
         let by_id = index_by_id(&providers);
+        let models_list = models_list_body(&by_id);
         let rate_limit = RateLimit::new(config.rate_limit_rps, config.byo_rate_limit_rps);
 
         // 8 OS-random bytes as the instance token, so two gateways' request_ids never collide when
@@ -562,12 +578,12 @@ impl GatewayState {
             id_signer,
             providers,
             by_id,
+            models_list,
             deny: ArcSwap::from_pointee(DenySet::new()),
             allowance: ArcSwap::from_pointee(AllowanceSet::new()),
             capture: ArcSwap::from_pointee(CaptureSet::new()),
             capture_defaults,
             cache,
-            smart: smart::Router::new(),
             tenant_slots: TenantSlots::new(config.tenant_max_in_flight),
             body_budget: BodyBudget::new(config.max_buffered_body_bytes),
             rate_limit,

@@ -1,7 +1,7 @@
 name: Deep checks
 # The slow hermetic hunts that don't fit a PR: the full mutation run over the money and correctness
-# paths, and the property tests at a case count high enough to find rare shapes. Neither needs
-# provider keys. Weekly, or on demand from the Actions tab.
+# paths, the property tests at a case count high enough to find rare shapes, and the strict catalog
+# retirement-date check. None needs provider keys. Weekly, or on demand from the Actions tab.
 on:
   schedule:
     - cron: "0 7 * * 0"
@@ -57,3 +57,18 @@ jobs:
         env:
           PROPTEST_CASES: "100000"
           PROPS_SECS: "5400"
+  # The calendar check PRs skip: a catalog row with a `retires` date in verify/catalog_truth.toml
+  # only warns in a PR run (from 14 days before the date), so a date never fails an unrelated
+  # change. CATALOG_RETIREMENT_STRICT=1 turns that warning into a failure here, up to two weeks
+  # ahead, so the row is removed before the vendor's shutdown.
+  catalog-retirements:
+    name: catalog retirements (strict)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p beyond-ai-providers --lib no_catalog_row_outlives_its_retirement </dev/null
+        env:
+          CATALOG_RETIREMENT_STRICT: "1"

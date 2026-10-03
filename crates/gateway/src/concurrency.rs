@@ -8,7 +8,7 @@
 //! the overshoot is a number an operator can price rather than whatever a runaway agent fleet
 //! happens to reach.
 //!
-//! It is **per process**, like the cache and the TTFT ranker: N replicas admit up to N × the limit.
+//! It is **per process**, like the cache and the circuit breaker: N replicas admit up to N × the limit.
 //! It is not a rate limit either — a tenant making short requests at a high rate never hits it,
 //! and should not, because short requests are not where overspend comes from.
 //!

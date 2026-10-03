@@ -3,8 +3,7 @@
 //! Off by default (`cache_ttl_secs = 0`). These tests turn it on. Lookup only happens where the
 //! client body is already in hand before `upstream_peer` (headerless managed catalog walk). A hit
 //! must be byte-identical to the stored 2xx and must not touch the upstream, the breaker, or the
-//! key-walk. The cache (and TTFT ranker) are per-pod — `ai_cache_scope` / `ai_smart_rank_scope`
-//! export `kind="process"`.
+//! key-walk. The cache is per-pod — `ai_cache_scope` exports `kind="process"`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -335,9 +334,9 @@ async fn two_candidate_orders_do_not_cross_hit() {
 }
 
 #[tokio::test]
-async fn cache_and_rank_export_process_scope() {
-    // Honesty gauges: rank and cache are this pod's tables. A dashboard that assumed fleet-wide
-    // smart routing or a shared cache would be wrong; these series exist so that claim cannot rot.
+async fn cache_exports_process_scope() {
+    // Honesty gauge: the cache is this pod's table. A dashboard that assumed a shared cache would
+    // be wrong; this series exists so that claim cannot rot.
     let nats = unused_nats_port();
     let (pubkey, _sk) = test_keypair(19);
     let mock = MockUpstream::start(Mode::Json).await;
@@ -346,7 +345,6 @@ async fn cache_and_rank_export_process_scope() {
         .start()
         .await;
     wait_for_metric(&gw, "ai_cache_scope", "process", 1.0).await;
-    wait_for_metric(&gw, "ai_smart_rank_scope", "process", 1.0).await;
 }
 
 /// With `x-beyond-model` the header names the row, not the body, and the body's `model` is

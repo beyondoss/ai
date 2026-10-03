@@ -48,7 +48,8 @@
 #   A row removed early by owner decision records the vendor's announced shutdown here too, so
 #   the date can still be ahead (the seven OpenAI rows due 2026-10-23, removed 2026-10-01: D243).
 # - `retires`: the vendor has announced the date. The row or candidate stays until then;
-#   `no_catalog_row_outlives_its_retirement` fails once that date is today or past, so the row is
+#   `no_catalog_row_outlives_its_retirement` warns from 14 days before that date, and fails then
+#   under `CATALOG_RETIREMENT_STRICT=1` (the weekly deep.yml job; PR runs only warn), so the row is
 #   removed (and the entry turned into `retired`) before a customer's request reaches a vendor
 #   404. `/v1/models` has no deprecation field to carry it (the OpenAI list shape and Anthropic's
 #   `/v1/models` define none), so it is recorded here only.

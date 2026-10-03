@@ -251,6 +251,21 @@ const DNS_TIMEOUT: Duration = Duration::from_secs(3);
 /// sorted back into provider order on the way out: the output is read by a human (and asserted in
 /// tests), so it must not depend on which lookup happened to finish first.
 async fn check_provider_dns(config: &AiConfig) -> Vec<CheckResult> {
+    check_provider_dns_with(config, |authority| async move {
+        tokio::net::lookup_host(authority.as_str())
+            .await
+            .map(|addrs| addrs.collect::<Vec<_>>())
+    })
+    .await
+}
+
+/// [`check_provider_dns`] over an injected resolver, so a test can prove the lookups overlap
+/// without timing them.
+async fn check_provider_dns_with<R, F>(config: &AiConfig, resolve: R) -> Vec<CheckResult>
+where
+    R: Fn(String) -> F,
+    F: std::future::Future<Output = std::io::Result<Vec<std::net::SocketAddr>>> + Send + 'static,
+{
     // Effective authority per provider name: the known default unless config overrides it, plus any
     // config-only provider. A BTreeMap dedups and keeps the output stable/ordered.
     //
@@ -273,12 +288,11 @@ async fn check_provider_dns(config: &AiConfig) -> Vec<CheckResult> {
         // A spawned task is `'static`, so it owns its strings: one allocation per provider, which is
         // what buys the overlap. Everything above this point stays borrowed.
         let (name, authority) = (name.to_string(), authority.to_string());
+        let lookup = resolve(authority.clone());
         lookups.spawn(async move {
-            let lookup =
-                tokio::time::timeout(DNS_TIMEOUT, tokio::net::lookup_host(authority.as_str()))
-                    .await;
+            let lookup = tokio::time::timeout(DNS_TIMEOUT, lookup).await;
             let res = match lookup {
-                Ok(Ok(mut addrs)) => match addrs.next() {
+                Ok(Ok(addrs)) => match addrs.first() {
                     Some(addr) => pass(check_name, format!("{name} → {authority} ({addr})")),
                     None => fail(
                         check_name,
@@ -485,41 +499,39 @@ mod tests {
     ///
     /// 1. **Order is deterministic** — the report follows provider-name order no matter which lookup
     ///    finished first. That's the part the concurrency rewrite could break silently.
-    /// 2. **The lookups overlap** — N of them cost about one lookup, not N.
-    ///
-    /// Every authority is overridden to a `.invalid` name (RFC 2606: reserved, never resolves), so the
-    /// run is all negative lookups: no live provider DNS in a unit test, and no chance of a name whose
-    /// success path (RFC 3484 address sorting) serializes inside glibc and muddies the timing.
-    ///
-    /// (2) is measured against a baseline taken in the same test, because a negative lookup costs
-    /// anywhere from ~20ms (real resolver round trip) to microseconds (no resolver reachable — the
-    /// offline-sandbox case). Below `MIN_BASELINE` the sequential and concurrent regimes are
-    /// indistinguishable from scheduling noise, so we skip the timing claim rather than ship a flaky
-    /// assertion; (1) still runs.
+    /// 2. **The lookups overlap** — all N are in flight at once. A test resolver holds every lookup
+    ///    at a barrier until all N have started, so a sequential check deadlocks and the outer
+    ///    timeout fails it by name. No wall-clock comparison: that flaked on contended CI runners.
     #[tokio::test]
     async fn provider_dns_lookups_overlap_and_report_in_order() {
-        use std::time::Instant;
-        const MIN_BASELINE: Duration = Duration::from_millis(2);
-
         let mut authorities: HashMap<String, String> = route::known_providers()
             .map(|s| (s.name.to_string(), format!("zz-{}.invalid:443", s.name)))
             .collect();
         // Plus a few config-only providers, so the run covers both `CheckResult.name` branches.
         authorities
             .extend((0..4).map(|i| (format!("zz-extra-{i}"), format!("zz-{i}.invalid:443"))));
-        let expected = authorities.len();
         let c = AiConfig {
             provider_authorities: authorities,
             ..Default::default()
         };
+        let expected = route::known_providers().count() + 4;
 
-        let t = Instant::now();
-        let _ = tokio::net::lookup_host("zz-baseline.invalid:443").await;
-        let baseline = t.elapsed();
-
-        let t = Instant::now();
-        let results = check_provider_dns(&c).await;
-        let elapsed = t.elapsed();
+        // Each lookup waits until every lookup is in flight: the check finishes only if they all run
+        // at once, which proves the overlap without timing anything (a sequential check deadlocks
+        // and the outer timeout fails it by name).
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(expected));
+        let results = tokio::time::timeout(
+            Duration::from_secs(10),
+            check_provider_dns_with(&c, |_authority| {
+                let barrier = barrier.clone();
+                async move {
+                    barrier.wait().await;
+                    Err(std::io::Error::other("test resolver"))
+                }
+            }),
+        )
+        .await
+        .expect("the provider DNS lookups do not overlap: not all were in flight at once");
 
         // Every provider reported exactly once, in name order. The name leads each message, ahead of
         // either ` →` (pass) or `:` (fail).
@@ -531,14 +543,5 @@ mod tests {
         let mut sorted = names.clone();
         sorted.sort_unstable();
         assert_eq!(names, sorted, "doctor output must be in provider order");
-
-        if baseline >= MIN_BASELINE {
-            let sequential = baseline * expected as u32;
-            assert!(
-                elapsed < sequential / 2,
-                "{expected} lookups took {elapsed:?}; sequential would be ≈{sequential:?} \
-                 (one lookup = {baseline:?}) — they are not overlapping",
-            );
-        }
     }
 }
