@@ -22,7 +22,7 @@ workspace = true
 [dependencies]
 # slipstream is published — consume it from crates.io, aliased to `store` so the code's
 # `use store::...` is unchanged. No path deps into the `beyond` repo: this crate builds standalone.
-store = { package = "beyond-slipstream", version = "0.1.0" }
+store = { package = "beyond-slipstream", version = "0.8.0" }
 
 # The provider table (`route`'s `KNOWN_PROVIDERS`/`AuthScheme`/`Dialect`), shared with `crates/agent`
 # so the gateway's proxy routing and the agent's direct routing can never disagree about a provider's

@@ -54,10 +54,10 @@ use async_trait::async_trait;
 use pingora_core::server::ShutdownWatch;
 use pingora_core::services::background::BackgroundService;
 use std::marker::PhantomData;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use store::snapshot::SnapshotWriter;
+use store::snapshot::{SnapshotError, SnapshotWriter};
 use store::{
     Connection, KvEntry, KvError, KvStore, KvUpdate, NatsConnection, NatsConnectionConfig,
     StoreConfig, WatchCursor,
@@ -137,6 +137,24 @@ pub trait WatchedSet: Send + Sync + 'static {
     /// scan lands — so it has nothing to gain from durable seeding and returns `None`, which makes
     /// every snapshot path below inert without needing to special-case it.
     fn snapshot_path(state: &GatewayState) -> Option<String>;
+
+    /// May a snapshot with **no cursor record** still seed this set at boot?
+    ///
+    /// Every writer puts the cursor *after* the data it covers (a rebuild after it has written every
+    /// entry, a batch after its deltas), so a snapshot that carries a cursor — even the revision 0
+    /// of an empty scan — reflects a complete read. One without a cursor does not: the old in-place
+    /// rebuild crashed midway left some `Put`s and no cursor. Which way that cuts depends on the
+    /// set's fail direction:
+    ///
+    /// - **Fail-open** (deny): any surviving entry is strictly better than the empty set it would
+    ///   otherwise boot with, so `true`.
+    /// - **Fail-closed** (allowance): installing it would flip the set *ready* holding only part of
+    ///   the exhausted tenants, serving the rest and turning `/readyz` 200 (D257). So `false`: the
+    ///   set stays unseeded (503) until a snapshot with a cursor or a NATS scan.
+    ///
+    /// This is about *seeding*, not resuming: only an [`is_resumable`] cursor (revision > 0) skips
+    /// the scan on connect, for every set.
+    const SEED_FROM_CURSORLESS_SNAPSHOT: bool;
 }
 
 /// The deny-set: spend/fraud holds under `blackhole.{tenant}` and `blackhole.key.{id}`.
@@ -147,6 +165,7 @@ impl WatchedSet for Deny {
 
     const PREFIX: &'static str = "blackhole.";
     const NOUN: &'static str = "deny-set";
+    const SEED_FROM_CURSORLESS_SNAPSHOT: bool = true;
 
     fn from_entries<'a>(
         _state: &GatewayState,
@@ -188,6 +207,8 @@ impl WatchedSet for Capture {
 
     const PREFIX: &'static str = "aicapture.";
     const NOUN: &'static str = "capture-set";
+    // Inert (no snapshot), and fail-open like deny if it ever gets one.
+    const SEED_FROM_CURSORLESS_SNAPSHOT: bool = true;
 
     fn from_entries<'a>(
         state: &GatewayState,
@@ -265,6 +286,7 @@ impl WatchedSet for Allowance {
 
     const PREFIX: &'static str = "allowance.";
     const NOUN: &'static str = "allowance-set";
+    const SEED_FROM_CURSORLESS_SNAPSHOT: bool = false;
 
     fn from_entries<'a>(
         _state: &GatewayState,
@@ -389,18 +411,37 @@ impl<W: WatchedSet> BackgroundService for WatcherService<W> {
             let load_path = path.clone();
             match tokio::task::spawn_blocking(move || store::snapshot::load(&load_path)).await {
                 Ok(Ok(Some(snap))) => {
-                    let set = W::from_entries(&self.state, snap.entries.values());
-                    let count = W::len(&set);
-                    info!(set = W::NOUN, count, "seeded from on-disk snapshot");
-                    W::record_size(&self.state, count);
-                    W::slot(&self.state).store(Arc::new(set));
                     // A snapshot without a *resumable* cursor can't safely resume (a bare watch
                     // would race), so only treat it as seeded when it carries a real resume point;
                     // otherwise fall through to a NATS scan on connect. Note this must test
                     // `is_resumable`, not `!is_none()`: a snapshot checkpointed after an empty scan
                     // carries revision 0, which is a *present* cursor that slipstream still can't
                     // resume from.
-                    if is_resumable(&snap.cursor) {
+                    //
+                    // Separately, a fail-closed set must not go live from a snapshot that isn't
+                    // proof of a complete read, i.e. one with no cursor record at all (D257, see
+                    // `SEED_FROM_CURSORLESS_SNAPSHOT`). Decide before installing anything:
+                    // `record_size` is the allowance ready flip, so it is skipped too.
+                    let resumable = is_resumable(&snap.cursor);
+                    let complete = !snap.cursor.is_none();
+                    if complete || W::SEED_FROM_CURSORLESS_SNAPSHOT {
+                        let set = W::from_entries(&self.state, snap.entries.values());
+                        let count = W::len(&set);
+                        info!(
+                            set = W::NOUN,
+                            count, complete, resumable, "seeded from on-disk snapshot"
+                        );
+                        W::record_size(&self.state, count);
+                        W::slot(&self.state).store(Arc::new(set));
+                    } else {
+                        warn!(
+                            set = W::NOUN,
+                            entries = snap.entries.len(),
+                            "on-disk snapshot has no cursor (not a complete read); a \
+                             fail-closed set stays unseeded until a NATS scan"
+                        );
+                    }
+                    if resumable {
                         cursor = snap.cursor;
                         seeded = true;
                     }
@@ -584,40 +625,21 @@ fn allowanceset_from_entries<'a>(entries: impl Iterator<Item = &'a KvEntry>) -> 
     set
 }
 
-/// Rewrite the on-disk snapshot from a fresh scan: truncate, write one `Put` per live entry, and
-/// checkpoint the cursor. Returns the reopened writer, or `None` if the rewrite failed (the gateway
-/// then runs snapshot-less — the in-memory deny-set is unaffected). Synchronous file I/O, so it runs
-/// on a blocking thread off the serving runtime.
+/// Rewrite the on-disk snapshot from a fresh scan, atomically: write every live entry plus the
+/// cursor to `{path}.tmp`, fsync it, rename it over `path`, fsync the directory, and reopen `path`
+/// for appends. A crash at any point leaves either the old complete file or the new complete one.
+/// Returns the reopened writer, or `None` if the rewrite failed (the gateway then runs
+/// snapshot-less — the in-memory set is unaffected). Synchronous file I/O, so it runs on a blocking
+/// thread off the serving runtime.
 async fn rebuild_snapshot(
     path: PathBuf,
     entries: Vec<KvEntry>,
     cursor: WatchCursor,
 ) -> Option<SnapshotWriter> {
-    let res = tokio::task::spawn_blocking(
-        move || -> Result<SnapshotWriter, store::snapshot::SnapshotError> {
-            // Remove the old log so we don't replay a deleted-but-uncompacted key on a later load.
-            // A failed removal is *not* ignorable: if `SnapshotWriter::open` then appends to the
-            // surviving file, a compacted-away `Delete` can't undo its stale `Put`, and a later
-            // `load()` resurrects a tenant we no longer deny — the exact corruption this rebuild
-            // exists to prevent. `NotFound` is the expected, benign case (first boot, or scratch
-            // storage); any other error aborts the rebuild so we run snapshot-less rather than on
-            // poisoned state.
-            match std::fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e.into()),
-            }
-            let mut w = SnapshotWriter::open(&path, SNAPSHOT_COMPACT_THRESHOLD)?;
-            // Consume `entries` — it was moved into this closure and `write_update` only borrows,
-            // so wrapping each entry in a `Put` by value costs nothing, where cloning it copied a
-            // `String` key and a `Vec<u8>` value (2 heap allocations) per scanned entry.
-            for e in entries {
-                w.write_update(&KvUpdate::Put(e))?;
-            }
-            w.checkpoint(&cursor)?;
-            Ok(w)
-        },
-    )
+    let res = tokio::task::spawn_blocking(move || {
+        let tmp = write_snapshot_tmp(&path, entries, &cursor)?;
+        commit_snapshot(&tmp, &path)
+    })
     .await;
     match res {
         Ok(Ok(w)) => Some(w),
@@ -630,6 +652,63 @@ async fn rebuild_snapshot(
             None
         }
     }
+}
+
+/// `{path}.tmp`: where a rebuild is staged before it replaces `path`.
+fn snapshot_tmp_path(path: &Path) -> PathBuf {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    PathBuf::from(tmp)
+}
+
+/// First half of a rebuild: write the complete new snapshot (every entry, then the cursor) to
+/// `{path}.tmp` and fsync it. `path` itself is untouched, so a crash anywhere in here leaves the
+/// previous complete snapshot in place. (D257: the old in-place rebuild removed `path` first, so a
+/// crash left some `Put`s and no cursor.)
+fn write_snapshot_tmp(
+    path: &Path,
+    entries: Vec<KvEntry>,
+    cursor: &WatchCursor,
+) -> Result<PathBuf, SnapshotError> {
+    let tmp = snapshot_tmp_path(path);
+    // `SnapshotWriter::open` appends, so a temp file left by an earlier crash must go first, or its
+    // records would be replayed under ours. `NotFound` is the normal case; any other failure aborts.
+    match std::fs::remove_file(&tmp) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    let mut w = SnapshotWriter::open(&tmp, SNAPSHOT_COMPACT_THRESHOLD)?;
+    // Consume `entries` — it was moved in and `write_update` only borrows, so wrapping each entry
+    // in a `Put` by value costs nothing, where cloning it copied a key and a value per entry.
+    for e in entries {
+        w.write_update(&KvUpdate::Put(e))?;
+    }
+    // `checkpoint` flushes to the OS (its compaction hint is moot for a fresh file); the fsync
+    // below makes the file durable before the rename can expose it.
+    let _needs_compact = w.checkpoint(cursor)?;
+    drop(w);
+    std::fs::File::open(&tmp)?.sync_all()?;
+    Ok(tmp)
+}
+
+/// Second half of a rebuild: rename the staged `tmp` over `path`, fsync the directory so the rename
+/// itself is durable, and reopen `path` for appends.
+///
+/// A failed rename is *not* ignorable: carrying on would append to the surviving old file, where a
+/// `Put` whose `Delete` was compacted away can no longer be undone, and a later `load()` would
+/// resurrect a tenant we no longer deny — the exact corruption the rebuild exists to prevent. So
+/// any error here aborts and the gateway runs snapshot-less rather than on poisoned state. The
+/// writer is opened on `path` *after* the rename, so it appends to the new inode, never to the one
+/// renamed away.
+fn commit_snapshot(tmp: &Path, path: &Path) -> Result<SnapshotWriter, SnapshotError> {
+    std::fs::rename(tmp, path)?;
+    let dir = match path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => Path::new("."),
+    };
+    std::fs::File::open(dir)?.sync_all()?;
+    SnapshotWriter::open(path, SNAPSHOT_COMPACT_THRESHOLD)
 }
 
 async fn connect(state: &GatewayState) -> crate::error::Result<Arc<dyn KvStore>> {
@@ -1110,5 +1189,113 @@ mod tests {
         // A watch that outlived the cap was doing real work: recovery is immediate again.
         b.credit(RECONNECT_BACKOFF_MAX);
         assert_eq!(b.delay(), RECONNECT_BACKOFF_BASE);
+    }
+
+    /// A scratch directory for one snapshot test, removed on drop.
+    struct ScratchDir(PathBuf);
+
+    impl ScratchDir {
+        fn new(tag: &str) -> Self {
+            let d = std::env::temp_dir().join(format!(
+                "beyond-ai-snapunit-{tag}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&d);
+            std::fs::create_dir_all(&d).unwrap();
+            Self(d)
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn put(key: &str, rev: u64) -> KvEntry {
+        KvEntry {
+            key: key.to_string(),
+            value: b"1".to_vec(),
+            version: VersionToken::from_u64(rev),
+        }
+    }
+
+    fn keys(snap: &store::snapshot::Snapshot) -> Vec<&str> {
+        let mut k: Vec<&str> = snap.entries.keys().map(String::as_str).collect();
+        k.sort_unstable();
+        k
+    }
+
+    fn full_rebuild(path: &Path, entries: Vec<KvEntry>, rev: u64) -> SnapshotWriter {
+        let tmp = write_snapshot_tmp(path, entries, &WatchCursor::from_u64(rev)).unwrap();
+        commit_snapshot(&tmp, path).unwrap()
+    }
+
+    /// A crash after the new snapshot is staged but before the rename must leave the previous
+    /// complete snapshot, cursor included, not a partial one (the old in-place rebuild removed the
+    /// file first, so a crash left some `Put`s and no cursor).
+    /// claim: REL-13
+    /// defect: D257
+    #[test]
+    fn a_crash_before_the_rename_leaves_the_previous_complete_snapshot() {
+        let dir = ScratchDir::new("crash");
+        let path = dir.0.join("snap.log");
+        drop(full_rebuild(
+            &path,
+            vec![put("allowance.1", 1), put("allowance.2", 2)],
+            2,
+        ));
+
+        // "Crash" between the steps: stage the next rebuild and never commit it.
+        let tmp = write_snapshot_tmp(
+            &path,
+            vec![put("allowance.3", 9)],
+            &WatchCursor::from_u64(9),
+        )
+        .unwrap();
+        assert!(tmp.exists());
+
+        let snap = store::snapshot::load(&path).unwrap().unwrap();
+        assert_eq!(keys(&snap), ["allowance.1", "allowance.2"]);
+        assert_eq!(snap.cursor.as_u64(), Some(2));
+        assert!(is_resumable(&snap.cursor));
+    }
+
+    /// A staged file left by a crash is discarded, not appended to, by the next rebuild; and the
+    /// writer the rebuild returns appends to the renamed file, so later deltas survive a reload.
+    /// claim: REL-13
+    /// defect: D257
+    #[test]
+    fn a_rebuild_discards_a_stale_staged_file_and_reopens_the_new_one() {
+        let dir = ScratchDir::new("reopen");
+        let path = dir.0.join("snap.log");
+        // A crashed earlier rebuild left a staged file holding a key the next scan no longer has.
+        drop(write_snapshot_tmp(
+            &path,
+            vec![put("allowance.9", 1)],
+            &WatchCursor::from_u64(1),
+        ));
+
+        let mut w = full_rebuild(&path, vec![put("allowance.1", 3)], 3);
+        assert!(!snapshot_tmp_path(&path).exists());
+        w.write_update(&KvUpdate::Put(put("allowance.2", 4)))
+            .unwrap();
+        let _ = w.checkpoint(&WatchCursor::from_u64(4)).unwrap();
+        drop(w);
+
+        let snap = store::snapshot::load(&path).unwrap().unwrap();
+        assert_eq!(keys(&snap), ["allowance.1", "allowance.2"]);
+        assert_eq!(snap.cursor.as_u64(), Some(4));
+    }
+
+    /// The trait's policy, pinned: only the fail-closed set refuses a cursorless snapshot.
+    /// defect: D257
+    #[test]
+    fn only_allowance_refuses_a_cursorless_snapshot() {
+        const {
+            assert!(Deny::SEED_FROM_CURSORLESS_SNAPSHOT);
+            assert!(!Allowance::SEED_FROM_CURSORLESS_SNAPSHOT);
+        }
     }
 }
