@@ -26,6 +26,9 @@ fail-fast = false
 # not a test failure — the runner itself dies, so neither the per-test terminate-after nor the
 # `global-timeout` below ever gets to fire, and the job sits until GitHub cancels it at 30 minutes with
 # no log. Four keeps the shards well under a minute each while leaving headroom for the children.
+# Measured 2026-10-02 at four threads, 4 CPUs, cgroup-wide: agent-rest and agent-code-mode peak at
+# ~0.3 GB and ~80 tasks on a 16 GB runner, so memory does not explain the wedge; CI's `test` step now
+# runs nextest in a systemd unit with MemoryMax/TasksMax/RuntimeMaxSec (see ci.yml).
 test-threads = 4
 
 [profile.deep]
