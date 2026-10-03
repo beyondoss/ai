@@ -2670,7 +2670,6 @@ fn message_text(m: &Value) -> Option<String> {
                 .collect();
             Some(t)
         }
-        Some(Value::Null) | None => None,
         _ => None,
     }
 }
@@ -2946,7 +2945,7 @@ fn anthropic_system_to_openai(sys: &Value) -> Option<Value> {
                 }
                 Some(json!({ "role": "system", "content": parts }))
             } else {
-                let t = anthropic_system_text(sys)?;
+                let t = anthropic_system_text(blocks);
                 (!t.is_empty()).then(|| json!({ "role": "system", "content": t }))
             }
         }
@@ -2954,18 +2953,13 @@ fn anthropic_system_to_openai(sys: &Value) -> Option<Value> {
     }
 }
 
-fn anthropic_system_text(sys: &Value) -> Option<String> {
-    match sys {
-        Value::String(s) => Some(s.clone()),
-        Value::Array(blocks) => Some(
-            blocks
-                .iter()
-                .filter_map(|b| b.get("text").and_then(Value::as_str).or_else(|| b.as_str()))
-                .collect::<Vec<_>>()
-                .join("\n"),
-        ),
-        _ => None,
-    }
+/// A system prompt's text blocks, one per line.
+fn anthropic_system_text(blocks: &[Value]) -> String {
+    blocks
+        .iter()
+        .filter_map(|b| b.get("text").and_then(Value::as_str).or_else(|| b.as_str()))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn anthropic_tool_to_openai(t: &Value) -> Option<Value> {
@@ -4212,12 +4206,7 @@ fn openai_req_to_responses(v: &Value, openai: OpenAiModel) -> Value {
             let role = m.get("role").and_then(Value::as_str).unwrap_or("");
             match role {
                 "system" | "developer" if !in_conversation => {
-                    instructions.extend(
-                        openai_system_to_responses_blocks(m)
-                            .iter()
-                            .filter_map(|b| b.get("text").and_then(Value::as_str))
-                            .map(str::to_owned),
-                    );
+                    instructions.extend(openai_system_texts(m).map(str::to_owned));
                 }
                 // Responses takes system and developer messages in `input`; a mid-conversation one
                 // stays where the client put it.
@@ -5147,34 +5136,19 @@ fn responses_part_to_openai(part: &Value) -> Option<Value> {
     }
 }
 
-fn openai_system_to_responses_blocks(m: &Value) -> Vec<Value> {
-    match m.get("content") {
-        Some(Value::String(s)) => {
-            let mut b = json!({ "type": "text", "text": s });
-            if let Some(obj) = b.as_object_mut() {
-                copy_cache_control(obj, m);
-            }
-            vec![b]
-        }
-        Some(Value::Array(parts)) => parts
+/// A Chat Completions system or developer message's text parts (Responses `instructions` is one
+/// string: Anthropic's `cache_control` has nowhere to go).
+fn openai_system_texts(m: &Value) -> impl Iterator<Item = &str> {
+    let (one, parts) = match m.get("content") {
+        Some(Value::String(s)) => (Some(s.as_str()), &[][..]),
+        Some(Value::Array(parts)) => (None, parts.as_slice()),
+        _ => (None, &[][..]),
+    };
+    one.into_iter().chain(
+        parts
             .iter()
-            .filter_map(|p| {
-                let text = p
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .or_else(|| p.as_str())?;
-                let mut b = json!({ "type": "text", "text": text });
-                if let Some(obj) = b.as_object_mut() {
-                    copy_cache_control(obj, p);
-                    if !obj.contains_key("cache_control") {
-                        copy_cache_control(obj, m);
-                    }
-                }
-                Some(b)
-            })
-            .collect(),
-        _ => Vec::new(),
-    }
+            .filter_map(|p| p.get("text").and_then(Value::as_str).or_else(|| p.as_str())),
+    )
 }
 
 /// A Chat Completions response for a Responses client. Items come in the order OpenAI emits
@@ -10043,6 +10017,149 @@ mod mutation_gaps {
             );
             let out: Value = serde_json::from_slice(&out).unwrap();
             assert_eq!(out["stop_reason"], native, "{finish}");
+        }
+    }
+
+    /// Which reasoning-control values ask for reasoning, each documented "off" spelling included,
+    /// and an object that says off in any one of its keys.
+    /// claim: TRN-7
+    #[test]
+    fn reasoning_value_on_reads_every_off_spelling() {
+        for (v, on) in [
+            (Value::Null, false),
+            (json!(false), false),
+            (json!(true), true),
+            (json!("none"), false),
+            (json!("high"), true),
+            (json!({}), true),
+            (json!({"effort": "none"}), false),
+            (json!({"effort": "high"}), true),
+            (json!({"enabled": false}), false),
+            (json!({"enabled": true}), true),
+            (json!({"type": "disabled"}), false),
+            (json!({"type": "enabled"}), true),
+            (json!({"effort": "high", "enabled": false}), false),
+            (json!({"effort": "high", "type": "disabled"}), false),
+            (json!({"enabled": true, "type": "disabled"}), false),
+            (json!(7), true),
+        ] {
+            assert_eq!(reasoning_value_on(&v), on, "{v}");
+        }
+    }
+
+    /// The hashed ids (tool ids, email `user_id`s) repeat across builds and processes only if the
+    /// hash is the published FNV-1a, not merely deterministic.
+    /// claim: TRN-23
+    #[test]
+    fn fnv1a64_matches_the_published_vectors() {
+        assert_eq!(fnv1a64(b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(fnv1a64(b"a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(fnv1a64(b"foobar"), 0x8594_4171_f739_67e8);
+    }
+
+    /// The effort ↔ budget tables, every row and boundary, and the effort a native `thinking`
+    /// object stands for.
+    /// claim: T5
+    #[test]
+    fn effort_and_budget_tables_hold_row_by_row() {
+        for (effort, budget) in [
+            ("minimal", 1024),
+            ("low", 1024),
+            ("medium", 4096),
+            ("high", 8192),
+            ("xhigh", 16384),
+            ("max", 16384),
+            ("other", 4096),
+        ] {
+            assert_eq!(budget_for_effort(effort), budget, "{effort}");
+        }
+        for (budget, effort) in [
+            (0, "low"),
+            (1024, "low"),
+            (1025, "medium"),
+            (4096, "medium"),
+            (4097, "high"),
+            (8192, "high"),
+            (8193, "xhigh"),
+        ] {
+            assert_eq!(effort_from_budget(budget), effort, "{budget}");
+        }
+        for (thinking, effort) in [
+            (json!({"type": "disabled"}), Some("none")),
+            (json!({"type": "adaptive"}), Some("high")),
+            (json!({"type": "adaptive", "effort": "max"}), Some("xhigh")),
+            (
+                json!({"type": "enabled", "budget_tokens": 2000}),
+                Some("medium"),
+            ),
+            (json!({"type": "enabled"}), Some("medium")),
+            (json!({"type": "between_tools"}), None),
+        ] {
+            assert_eq!(effort_from_thinking(&thinking), effort, "{thinking}");
+        }
+    }
+
+    /// A data URI is base64 inline data only with a media type and a payload.
+    /// claim: T3
+    #[test]
+    fn a_data_uri_needs_both_a_media_type_and_data() {
+        assert_eq!(
+            parse_data_uri("data:image/png;base64,AAAA"),
+            Some(("image/png", "AAAA"))
+        );
+        assert_eq!(parse_data_uri("data:;base64,AAAA"), None);
+        assert_eq!(parse_data_uri("data:image/png;base64,"), None);
+        assert_eq!(parse_data_uri("data:image/svg+xml;utf8,<svg/>"), None);
+    }
+
+    /// Tool-call arguments as a JSON string or an object become the input object; anything else
+    /// is `{}` (Messages' `input` must be an object).
+    /// claim: T1
+    #[test]
+    fn tool_arguments_become_an_input_object() {
+        assert_eq!(parse_arguments(Some(&json!(r#"{"a":1}"#))), json!({"a": 1}));
+        assert_eq!(parse_arguments(Some(&json!({"a": 1}))), json!({"a": 1}));
+        assert_eq!(parse_arguments(Some(&json!([1]))), json!({}));
+        assert_eq!(parse_arguments(Some(&json!(3))), json!({}));
+        assert_eq!(parse_arguments(None), json!({}));
+    }
+
+    /// OpenAI strict mode: every object, at any depth (properties, items, combinators), closes
+    /// `additionalProperties` and requires every property; `type: object` alone or `properties`
+    /// alone makes a schema an object.
+    /// claim: TRN-11, T4
+    #[test]
+    fn openai_strict_schema_checks_every_nested_object() {
+        let strict = json!({"type": "object", "properties": {"a": {"type": "string"}},
+            "required": ["a"], "additionalProperties": false});
+        let open = json!({"type": "object", "properties": {"a": {"type": "string"}}});
+        assert!(openai_strict_schema(&strict));
+        assert!(!openai_strict_schema(&open));
+        assert!(!openai_strict_schema(&json!({"type": "object"})));
+        assert!(!openai_strict_schema(&json!({"properties": {}})));
+        assert!(openai_strict_schema(&json!({"type": "string"})));
+        for key in ["items", "anyOf", "oneOf", "allOf", "prefixItems"] {
+            let one = if key == "items" {
+                open.clone()
+            } else {
+                json!([open])
+            };
+            assert!(
+                !openai_strict_schema(&json!({"type": "array", key: one})),
+                "{key}"
+            );
+            let ok = if key == "items" {
+                strict.clone()
+            } else {
+                json!([strict])
+            };
+            assert!(
+                openai_strict_schema(&json!({"type": "array", key: ok})),
+                "{key}"
+            );
+        }
+        for key in ["$defs", "definitions"] {
+            assert!(!openai_strict_schema(&json!({key: {"x": open}})), "{key}");
         }
     }
 }

@@ -2362,3 +2362,518 @@ fn hosted_web_search_is_dropped_leaving_responses_unless_chosen() {
         "{v}"
     );
 }
+
+// ---- gaps a cargo-mutants run found no test constraining ----------------------------------------
+
+/// `stop` as one string is a one-element `stop_sequences`; `modalities: ["text"]` is the default
+/// and is not forwarded (only a non-text modality is, for the provider to reject by name).
+/// claim: E2
+#[test]
+fn a_string_stop_and_text_only_modalities_onto_messages() {
+    let v = c2m(
+        &chat(json!({"stop": "END", "modalities": ["text"]})),
+        "claude-haiku-4-5",
+    );
+    assert_eq!(v["stop_sequences"], json!(["END"]), "{v}");
+    assert!(v.get("modalities").is_none(), "{v}");
+}
+
+/// With thinking off, an assistant message that holds nothing but its thinking keeps it: emptied,
+/// it would be a 400 of its own.
+/// claim: TRN-7
+/// defect: D79
+#[test]
+fn an_all_thinking_assistant_message_keeps_its_thinking_when_thinking_is_off() {
+    let body = chat(json!({"reasoning_effort": "none", "messages": [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "",
+         "thinking": [{"type": "thinking", "thinking": "x", "signature": "SIG"}]},
+        {"role": "user", "content": "again"},
+    ]}));
+    let v = c2m(&body, "claude-haiku-4-5");
+    assert_eq!(v["thinking"], json!({"type": "disabled"}), "{v}");
+    assert_eq!(
+        v["messages"][1]["content"],
+        json!([{"type": "thinking", "thinking": "x", "signature": "SIG"}]),
+        "{v}"
+    );
+}
+
+/// The same-wire Claude relay applies both of its rules to one body: the reasoning control goes
+/// (the tool turn has nothing signed to replay), and then, the request no longer thinking, so does
+/// the unreplayable thinking the assistant message carried.
+/// claim: TRN-7
+/// defect: D14, D79
+#[test]
+fn the_claude_chat_relay_applies_both_reasoning_rules_to_one_body() {
+    let chat = json!({"model": "anthropic/claude-sonnet-4", "reasoning_effort": "high", "messages": [
+        {"role": "user", "content": "weather in Paris?"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "toolu_01", "type": "function",
+            "function": {"name": "get_weather", "arguments": "{}"}}],
+         "reasoning_details": [{"type": "reasoning.text", "text": "unsigned",
+            "format": "anthropic-claude-v1", "index": 0}]},
+        {"role": "tool", "tool_call_id": "toolu_01", "content": "sunny"},
+    ]});
+    let relayed: Value = serde_json::from_slice(&claude_chat_relay_reasoning(
+        serde_json::to_vec(&chat).unwrap(),
+        "anthropic/claude-sonnet-4",
+    ))
+    .unwrap();
+    assert!(relayed.get("reasoning_effort").is_none(), "{relayed}");
+    assert!(
+        relayed["messages"][1].get("reasoning_details").is_none(),
+        "{relayed}"
+    );
+}
+
+/// The `refusal` field stands in for an assistant turn's content only when the content is empty
+/// (`""`, `[]` or null); beside real content it adds nothing.
+/// claim: TRN-22
+#[test]
+fn an_assistant_refusal_fills_only_empty_content() {
+    let turn = |content: Value| {
+        let body = chat(json!({"messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": content, "refusal": "I can't help with that."},
+            {"role": "user", "content": "ok"},
+        ]}));
+        c2m(&body, "claude-haiku-4-5")["messages"][1]["content"].clone()
+    };
+    for empty in [json!(""), json!([]), Value::Null] {
+        assert_eq!(turn(empty.clone()), "I can't help with that.", "{empty}");
+    }
+    assert_eq!(turn(json!("Sure.")), "Sure.");
+}
+
+/// Each legacy form alone (`functions`, a `function_call` choice, a `function` result in history)
+/// is rewritten; a body that also sends the modern field keeps the modern one.
+/// claim: T1
+#[test]
+fn each_legacy_function_form_alone_is_rewritten_and_the_modern_field_wins() {
+    let schema = weather_schema();
+    let tool =
+        json!({"type": "function", "function": {"name": "get_weather", "parameters": schema}});
+
+    let only_functions =
+        chat(json!({"functions": [{"name": "get_weather", "parameters": schema}]}));
+    assert_eq!(
+        c2m(&only_functions, "claude-haiku-4-5")["tools"][0]["name"],
+        "get_weather"
+    );
+
+    let only_choice = chat(json!({"tools": [tool], "function_call": {"name": "get_weather"}}));
+    assert_eq!(
+        c2m(&only_choice, "claude-haiku-4-5")["tool_choice"],
+        json!({"type": "tool", "name": "get_weather"})
+    );
+
+    // A history that opens on a function result (a truncated transcript): still a tool result.
+    let only_history = chat(json!({"messages": [
+        {"role": "function", "name": "get_weather", "content": "sunny"},
+    ]}));
+    let v = c2m(&only_history, "claude-haiku-4-5");
+    assert_eq!(v["messages"][0]["content"][0]["type"], "tool_result", "{v}");
+    assert_eq!(
+        v["messages"][0]["content"][0]["tool_use_id"], "call_legacy_0",
+        "{v}"
+    );
+
+    let both = chat(json!({
+        "tools": [tool],
+        "functions": [{"name": "legacy_fn", "parameters": schema}],
+        "tool_choice": "required",
+        "function_call": {"name": "legacy_fn"},
+    }));
+    let v = c2m(&both, "claude-haiku-4-5");
+    assert_eq!(v["tools"].as_array().map(Vec::len), Some(1), "{v}");
+    assert_eq!(v["tools"][0]["name"], "get_weather", "{v}");
+    assert_eq!(v["tool_choice"], json!({"type": "any"}), "{v}");
+}
+
+/// A same-role message with empty content merges as nothing: an empty text block is a 400.
+/// claim: TRN-3
+#[test]
+fn an_empty_same_role_message_adds_no_block() {
+    let body = chat(json!({"messages": [
+        {"role": "user", "content": "Hello"},
+        {"role": "user", "content": ""},
+    ]}));
+    let v = c2m(&body, "claude-haiku-4-5");
+    assert_eq!(v["messages"][0]["content"], "Hello", "{v}");
+}
+
+/// `cache_control` set inside a tool's `function` object (where some clients put it) reaches the
+/// Messages tool. (Its `ttl` tells it from the marker the gateway would add on its own.)
+/// claim: TRN-4
+#[test]
+fn a_function_level_cache_control_reaches_the_messages_tool() {
+    let body = chat(json!({"tools": [{"type": "function", "function": {
+        "name": "get_weather", "parameters": weather_schema(),
+        "cache_control": {"type": "ephemeral", "ttl": "1h"},
+    }}]}));
+    let v = c2m(&body, "claude-haiku-4-5");
+    assert_eq!(
+        v["tools"][0]["cache_control"],
+        json!({"type": "ephemeral", "ttl": "1h"}),
+        "{v}"
+    );
+}
+
+/// Effort onto budget thinking, row by row of its table, and an explicit `reasoning_effort` wins
+/// over a native `thinking.budget_tokens`. On a 4.7+ model `max` stays `max` (it aliases `xhigh`
+/// for the table, but those models take both).
+/// claim: T5
+#[test]
+fn effort_maps_to_its_budget_and_wins_over_a_native_budget() {
+    let budget = |extra: Value| {
+        let v = c2m(
+            &chat(with(json!({"max_tokens": 64000}), extra)),
+            "claude-haiku-4-5",
+        );
+        v["thinking"]["budget_tokens"].clone()
+    };
+    assert_eq!(budget(json!({"reasoning_effort": "low"})), 1024);
+    assert_eq!(budget(json!({"reasoning_effort": "minimal"})), 1024);
+    assert_eq!(budget(json!({"reasoning_effort": "medium"})), 4096);
+    assert_eq!(budget(json!({"reasoning_effort": "high"})), 8192);
+    assert_eq!(budget(json!({"reasoning_effort": "xhigh"})), 16384);
+    assert_eq!(budget(json!({"reasoning_effort": "max"})), 16384);
+    assert_eq!(
+        budget(json!({"thinking": {"type": "enabled", "budget_tokens": 2000}})),
+        2000
+    );
+    assert_eq!(
+        budget(json!({"reasoning_effort": "high",
+            "thinking": {"type": "enabled", "budget_tokens": 2000}})),
+        8192
+    );
+    let v = c2m(&chat(json!({"reasoning_effort": "max"})), "claude-opus-4-8");
+    assert_eq!(v["output_config"]["effort"], "max", "{v}");
+}
+
+/// A tool message's parts onto a `tool_result`: all text flattens to one string; any non-text part
+/// keeps them as blocks, each mapped (a `file` becomes a `document`, a text part loses fields
+/// Messages would reject), an image alone included.
+/// claim: T3
+#[test]
+fn tool_message_parts_map_onto_the_tool_result() {
+    let result = |content: Value| {
+        let body = chat(json!({"messages": [
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": null, "tool_calls": [{"id": "call_1",
+                "type": "function", "function": {"name": "f", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "call_1", "content": content},
+        ]}));
+        c2m(&body, "claude-haiku-4-5")["messages"][2]["content"][0]["content"].clone()
+    };
+    assert_eq!(
+        result(json!([{"type": "text", "text": "a"}, {"type": "text", "text": "b"}])),
+        "ab"
+    );
+    let png = "data:image/png;base64,iVBORw0KGgo=";
+    assert_eq!(
+        result(json!([{"type": "image_url", "image_url": {"url": png}}])),
+        json!([{"type": "image", "source": {"type": "base64", "media_type": "image/png",
+            "data": "iVBORw0KGgo="}}])
+    );
+    assert_eq!(
+        result(json!([
+            {"type": "text", "text": "report", "annotations": []},
+            {"type": "file", "file": {"file_data": "data:application/pdf;base64,JVBERi0=",
+                "filename": "r.pdf"}},
+        ])),
+        json!([
+            {"type": "text", "text": "report"},
+            {"type": "document", "title": "r.pdf", "source": {"type": "base64",
+                "media_type": "application/pdf", "data": "JVBERi0="}},
+        ])
+    );
+}
+
+/// A user text part with no text is dropped, not forwarded half-formed.
+/// claim: T3
+#[test]
+fn a_user_text_part_without_text_is_dropped() {
+    let body = chat(json!({"messages": [{"role": "user", "content": [
+        {"type": "text", "text": null},
+        {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}},
+    ]}]}));
+    let v = c2m(&body, "claude-haiku-4-5");
+    assert_eq!(
+        v["messages"][0]["content"],
+        json!([{"type": "image", "source": {"type": "url", "url": "https://example.com/a.png"}}]),
+        "{v}"
+    );
+}
+
+/// `input` that is a string saying "item_reference" is a one-shot prompt, not session state; an
+/// `input` array that cannot be read fails closed.
+/// claim: E3
+#[test]
+fn session_field_reads_item_references_only_from_a_well_formed_input_array() {
+    let said = br#"{"store": false, "input": "what is an item_reference?"}"#;
+    assert_eq!(responses_session_field(said, false), None);
+    let malformed = br#"{"store": false, "input": [{"type": "item_reference" "id": "msg_1"}]}"#;
+    assert_eq!(responses_session_field(malformed, false), Some("store"));
+    // An `input` that never says `item_reference` is never walked (D215), so its malformed items
+    // are the provider's to reject.
+    let unwalked = br#"{"store": false, "input": [{"type": "message" "role": "user"}]}"#;
+    assert_eq!(responses_session_field(unwalked, false), None);
+}
+
+/// A body whose only reasoning-shaped key is an assistant `thinking` array is still read: with no
+/// reasoning asked, a budget Claude model gets it without that thinking.
+/// claim: TRN-7
+/// defect: D79
+#[test]
+fn the_claude_chat_relay_reads_a_body_that_says_only_thinking() {
+    let chat = json!({"model": "anthropic/claude-sonnet-4", "messages": [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "hello",
+         "thinking": [{"type": "thinking", "thinking": "x", "signature": "SIG"}]},
+        {"role": "user", "content": "again"},
+    ]});
+    let relayed: Value = serde_json::from_slice(&claude_chat_relay_reasoning(
+        serde_json::to_vec(&chat).unwrap(),
+        "anthropic/claude-sonnet-4",
+    ))
+    .unwrap();
+    assert!(
+        relayed["messages"][1].get("thinking").is_none(),
+        "{relayed}"
+    );
+}
+
+/// Onto Chat: an empty system string is no system message, and `tool_choice: none` stays `none`.
+/// claim: E1
+#[test]
+fn an_empty_system_and_tool_choice_none_onto_chat() {
+    let v = m2c(
+        &anth(json!({"system": "",
+            "tools": [{"name": "get_weather", "input_schema": weather_schema()}],
+            "tool_choice": {"type": "none"}})),
+        "gpt-4o",
+    );
+    assert_eq!(roles(&v), ["user"], "{v}");
+    assert_eq!(v["tool_choice"], "none", "{v}");
+}
+
+/// JSON mode (`json_object`) crosses between Chat's `response_format` and Responses'
+/// `text.format`, both ways.
+/// claim: T4
+#[test]
+fn json_mode_crosses_between_chat_and_responses() {
+    let v = r2c(
+        &json!({"model": "m", "input": "hi", "text": {"format": {"type": "json_object"}}}),
+        "gpt-4o",
+    );
+    assert_eq!(v["response_format"], json!({"type": "json_object"}), "{v}");
+    let v = c2r(
+        &chat(json!({"response_format": {"type": "json_object"}})),
+        "gpt-5-pro",
+    );
+    assert_eq!(v["text"]["format"], json!({"type": "json_object"}), "{v}");
+}
+
+/// Onto Responses, the defaults are not forwarded (`n: 1`, `modalities: ["text"]`), and `user` is
+/// hashed only past OpenAI's 64-character cap.
+/// claim: E3
+#[test]
+fn chat_defaults_and_a_64_character_user_onto_responses() {
+    let user = "u".repeat(64);
+    let v = c2r(
+        &chat(json!({"n": 1, "modalities": ["text"], "user": user})),
+        "gpt-5-pro",
+    );
+    assert!(v.get("n").is_none(), "{v}");
+    assert!(v.get("modalities").is_none(), "{v}");
+    assert_eq!(v["user"], user.as_str(), "{v}");
+}
+
+/// An assistant refusal onto Responses: the `refusal` field of an empty turn, and a refusal part,
+/// are `refusal` content; a refusal part in a user message is just text there.
+/// claim: TRN-22
+#[test]
+fn refusals_onto_responses_stay_refusals_only_from_the_assistant() {
+    let v = c2r(
+        &chat(json!({"messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": null, "refusal": "No."},
+            {"role": "assistant", "content": [{"type": "refusal", "refusal": "Still no."}]},
+            {"role": "user", "content": [{"type": "refusal", "refusal": "quoted"}]},
+        ]})),
+        "gpt-5-pro",
+    );
+    let input = &v["input"];
+    assert_eq!(
+        input[1]["content"],
+        json!([{"type": "refusal", "refusal": "No."}]),
+        "{v}"
+    );
+    assert_eq!(
+        input[2]["content"],
+        json!([{"type": "refusal", "refusal": "Still no."}]),
+        "{v}"
+    );
+    assert_eq!(
+        input[3]["content"],
+        json!([{"type": "input_text", "text": "quoted"}]),
+        "{v}"
+    );
+}
+
+/// A Chat `custom` tool's nested grammar format becomes Responses' flat one; a function tool never
+/// takes a format.
+/// claim: TRN-14
+#[test]
+fn a_custom_tool_grammar_flattens_onto_responses() {
+    let v = c2r(
+        &chat(json!({"tools": [
+            {"type": "custom", "custom": {"name": "patch", "format": {"type": "grammar",
+                "grammar": {"syntax": "lark", "definition": "start: \"x\""}}}},
+            {"type": "custom", "custom": {"name": "free", "format": null}},
+            {"type": "function", "function": {"name": "f", "parameters": weather_schema(),
+                "format": {"type": "text"}}},
+        ]})),
+        "gpt-5-pro",
+    );
+    assert_eq!(
+        v["tools"][0],
+        json!({"type": "custom", "name": "patch", "format": {"type": "grammar",
+            "syntax": "lark", "definition": "start: \"x\""}}),
+        "{v}"
+    );
+    assert_eq!(
+        v["tools"][1],
+        json!({"type": "custom", "name": "free"}),
+        "{v}"
+    );
+    assert!(v["tools"][2].get("format").is_none(), "{v}");
+}
+
+/// A Responses `custom` tool wrapped for Messages: its description, if any, then a blank line, then
+/// what `input` is; with none, the explanation alone.
+/// claim: TRN-14
+#[test]
+fn a_wrapped_custom_tool_description_has_no_leading_blank_line() {
+    let desc = |tool: Value| {
+        let body = json!({"model": "m", "input": "hi", "tools": [tool]});
+        let v = req(
+            Endpoint::Responses,
+            Endpoint::Messages,
+            &body,
+            "claude-haiku-4-5",
+        );
+        v["tools"][0]["description"].as_str().unwrap().to_owned()
+    };
+    let bare = desc(json!({"type": "custom", "name": "apply_patch"}));
+    assert!(bare.starts_with("`input` is"), "{bare:?}");
+    let described = desc(json!({"type": "custom", "name": "apply_patch", "description": "Edit."}));
+    assert!(
+        described.starts_with("Edit.\n\n`input` is"),
+        "{described:?}"
+    );
+}
+
+/// `allowed_tools` crosses both ways: Chat nests mode and list, Responses flattens them, and a
+/// choice already in the other's shape is mapped or kept, never emptied.
+/// claim: T1
+#[test]
+fn allowed_tools_cross_in_both_directions() {
+    let tools = json!([{"type": "function", "function": {"name": "get_weather",
+        "parameters": weather_schema()}}]);
+    let nested = json!({"type": "allowed_tools", "allowed_tools": {"mode": "required",
+        "tools": [{"type": "function", "function": {"name": "get_weather"}}]}});
+    let v = c2r(
+        &chat(json!({"tools": tools, "tool_choice": nested})),
+        "gpt-5-pro",
+    );
+    assert_eq!(
+        v["tool_choice"],
+        json!({"type": "allowed_tools", "mode": "required",
+            "tools": [{"type": "function", "name": "get_weather"}]}),
+        "{v}"
+    );
+    // A Responses client that sent Chat's nested shape: passed as sent.
+    let body = json!({"model": "m", "input": "hi", "tool_choice": nested,
+        "tools": [{"type": "function", "name": "get_weather", "parameters": weather_schema()}]});
+    assert_eq!(r2c(&body, "gpt-4o")["tool_choice"], nested);
+}
+
+/// A Responses tool already in Chat's nested shape passes whole, even beside a top-level `name`.
+/// claim: T1
+#[test]
+fn a_nested_responses_tool_passes_whole() {
+    let tool = json!({"type": "function", "name": "get_weather",
+        "function": {"name": "get_weather", "parameters": weather_schema()}});
+    let v = r2c(
+        &json!({"model": "m", "input": "hi", "tools": [tool]}),
+        "gpt-4o",
+    );
+    assert_eq!(v["tools"][0], tool, "{v}");
+}
+
+/// A developer message stays `developer` on a native OpenAI Chat row (only other hosts get
+/// `system`).
+/// claim: TRN-16
+#[test]
+fn a_responses_developer_message_stays_developer_on_native_openai_chat() {
+    let body = json!({"model": "m", "input": [
+        {"role": "developer", "content": "be terse"},
+        {"role": "user", "content": "hi"},
+    ]});
+    assert_eq!(roles(&r2c(&body, "gpt-4o")), ["developer", "user"]);
+}
+
+/// A gateway reasoning item opens the assistant message after it, not only a tool call.
+/// claim: T2, TRN-8
+#[test]
+fn gateway_reasoning_before_an_assistant_message_rides_that_message() {
+    let body = json!({"model": "m", "store": false, "reasoning": {"effort": "high"}, "input": [
+        {"role": "user", "content": "hi"},
+        {"type": "reasoning", "id": "rs_gw18f2a0001",
+         "summary": [{"type": "summary_text", "text": "t"}], "encrypted_content": "SIG"},
+        {"type": "message", "role": "assistant",
+         "content": [{"type": "output_text", "text": "hello"}]},
+        {"role": "user", "content": "again"},
+    ]});
+    let v = req(
+        Endpoint::Responses,
+        Endpoint::Messages,
+        &body,
+        "claude-sonnet-4-5",
+    );
+    assert_eq!(
+        v["messages"][1]["content"][0],
+        json!({"type": "thinking", "thinking": "t", "signature": "SIG"}),
+        "{v}"
+    );
+}
+
+/// OpenAI's own reasoning item is kept on a relay even when its text happens to say `rs_gw`.
+/// claim: TRN-20
+#[test]
+fn an_openai_reasoning_item_that_mentions_rs_gw_is_not_stripped() {
+    let body = br#"{"model":"gpt-5","input":[{"type":"reasoning","id":"rs_68ab","summary":[{"type":"summary_text","text":"ids like rs_gw1"}],"encrypted_content":"gAAAA"}]}"#;
+    assert_eq!(strip_gateway_reasoning(body.to_vec()), body);
+}
+
+/// A signed thinking part in a Responses assistant message reaches Messages as that block.
+/// claim: T2
+#[test]
+fn a_thinking_part_in_a_responses_message_reaches_messages() {
+    let block = json!({"type": "thinking", "thinking": "t", "signature": "SIG"});
+    let body = json!({"model": "m", "store": false, "reasoning": {"effort": "high"}, "input": [
+        {"role": "user", "content": "hi"},
+        {"type": "message", "role": "assistant",
+         "content": [block, {"type": "output_text", "text": "hello"}]},
+        {"role": "user", "content": "again"},
+    ]});
+    let v = req(
+        Endpoint::Responses,
+        Endpoint::Messages,
+        &body,
+        "claude-sonnet-4-5",
+    );
+    assert_eq!(v["messages"][1]["content"][0], block, "{v}");
+}

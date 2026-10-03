@@ -2756,3 +2756,305 @@ fn an_empty_args_call_does_not_hold_parallel_calls_until_the_end() {
         .collect();
     assert_eq!(args, r#"{"city":"Paris"}"#);
 }
+
+// ---- gaps a cargo-mutants run found no test constraining ----------------------------------------
+
+/// One Chat Completions chunk as an SSE event.
+fn chat_chunk(delta: Value, finish: Option<&str>) -> String {
+    let v = json!({"id": "chatcmpl-1", "model": "gpt-5",
+        "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]});
+    format!("data: {v}\n\n")
+}
+
+/// One Responses event, named by its `type`.
+fn resp_event(v: Value) -> String {
+    format!("event: {}\ndata: {v}\n\n", v["type"].as_str().unwrap())
+}
+
+/// A Messages response onto Chat: no text is `""`, unless the turn called a tool (then `null`).
+/// claim: TRN-22
+#[test]
+fn an_empty_messages_turn_is_empty_content_unless_it_called_a_tool() {
+    let usage = json!({"input_tokens": 1, "output_tokens": 1});
+    let chat = json_resp(
+        Messages,
+        Chat,
+        &anthropic_msg(json!([]), "end_turn", usage.clone()),
+    );
+    assert_eq!(chat["choices"][0]["message"]["content"], "", "{chat}");
+    let call = json!([{"type": "tool_use", "id": "toolu_1", "name": "f", "input": {}}]);
+    let chat = json_resp(Messages, Chat, &anthropic_msg(call, "tool_use", usage));
+    assert!(chat["choices"][0]["message"]["content"].is_null(), "{chat}");
+}
+
+/// A Chat message whose content is a list of parts, a refusal part among them: text blocks on
+/// Messages with a `refusal` stop, and `output_text` and `refusal` parts on Responses.
+/// claim: TRN-22
+#[test]
+fn chat_content_parts_and_a_refusal_part_reach_messages_and_responses() {
+    let message = json!({"role": "assistant", "content": [
+        {"type": "text", "text": "Partly."},
+        {"type": "refusal", "refusal": "Not that part."},
+    ]});
+    let body = chat_completion(message, "stop", json!({}));
+    let anth = json_resp(Chat, Messages, &body);
+    assert_eq!(
+        anth["content"],
+        json!([{"type": "text", "text": "Partly."}, {"type": "text", "text": "Not that part."}])
+    );
+    assert_eq!(anth["stop_reason"], "refusal");
+    let resp = json_resp(Chat, Responses, &body);
+    assert_eq!(
+        resp["output"][0]["content"],
+        json!([
+            {"type": "output_text", "text": "Partly.", "annotations": []},
+            {"type": "refusal", "refusal": "Not that part."},
+        ]),
+        "{resp}"
+    );
+}
+
+/// A Chat tool turn with `content: ""` has no message item on Responses, only its call.
+/// claim: TRN-22
+#[test]
+fn an_empty_chat_content_is_no_responses_message_item() {
+    let message = json!({"role": "assistant", "content": "", "tool_calls": [{"id": "call_1",
+        "type": "function", "function": {"name": "f", "arguments": "{}"}}]});
+    let resp = json_resp(
+        Chat,
+        Responses,
+        &chat_completion(message, "tool_calls", json!({})),
+    );
+    let types: Vec<&str> = resp["output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["type"].as_str().unwrap())
+        .collect();
+    assert_eq!(types, ["function_call"], "{resp}");
+}
+
+/// A Responses stream onto Chat: one role chunk first, summary parts joined by a blank line, and
+/// argument deltas that name their call by `item_id` alone still land on it.
+/// claim: E1
+#[test]
+fn a_responses_stream_onto_chat_opens_once_and_finds_calls_by_item_id() {
+    let src = [
+        resp_event(
+            json!({"type": "response.created", "response": {"id": "resp_1",
+            "created_at": 1_790_000_000, "model": "gpt-5", "output": []}}),
+        ),
+        resp_event(
+            json!({"type": "response.output_item.added", "output_index": 0,
+            "item": {"id": "rs_1", "type": "reasoning", "summary": []}}),
+        ),
+        resp_event(
+            json!({"type": "response.reasoning_summary_part.added", "item_id": "rs_1",
+            "output_index": 0, "summary_index": 0}),
+        ),
+        resp_event(
+            json!({"type": "response.reasoning_summary_text.delta", "item_id": "rs_1",
+            "output_index": 0, "summary_index": 0, "delta": "a"}),
+        ),
+        resp_event(
+            json!({"type": "response.reasoning_summary_part.added", "item_id": "rs_1",
+            "output_index": 0, "summary_index": 1}),
+        ),
+        resp_event(
+            json!({"type": "response.reasoning_summary_text.delta", "item_id": "rs_1",
+            "output_index": 0, "summary_index": 1, "delta": "b"}),
+        ),
+        resp_event(
+            json!({"type": "response.output_item.added", "output_index": 1,
+            "item": {"id": "fc_1", "type": "function_call", "call_id": "call_1",
+                "name": "get_weather", "arguments": ""}}),
+        ),
+        resp_event(
+            json!({"type": "response.function_call_arguments.delta", "item_id": "fc_1",
+            "delta": "{\"city\":"}),
+        ),
+        resp_event(
+            json!({"type": "response.function_call_arguments.delta", "item_id": "fc_1",
+            "delta": "\"Paris\"}"}),
+        ),
+        resp_event(
+            json!({"type": "response.completed", "response": {"id": "resp_1",
+            "status": "completed", "output": [], "usage": {"input_tokens": 1,
+                "output_tokens": 1}}}),
+        ),
+    ]
+    .concat();
+    let evs = stream(Responses, Chat, &src);
+    let chunks = chunks(&evs);
+    let roles: Vec<usize> = chunks
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.pointer("/choices/0/delta/role").is_some())
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(roles, [0], "{evs:#?}");
+    let reasoning: String = chunks
+        .iter()
+        .filter_map(|c| c.pointer("/choices/0/delta/reasoning_content")?.as_str())
+        .collect();
+    assert_eq!(reasoning, "a\n\nb");
+    assert_eq!(
+        chat_tool_calls(&evs),
+        [(
+            "call_1".to_owned(),
+            "get_weather".to_owned(),
+            r#"{"city":"Paris"}"#.to_owned()
+        )]
+    );
+}
+
+/// A streamed call opens once its name is known, never nameless; one that never names itself
+/// still shows at the end; and `finish_reason: "stop"` beside a call is a `tool_use` stop.
+/// claim: T1, TRN-12
+#[test]
+fn a_chat_stream_call_opens_named_and_stops_as_tool_use() {
+    let src = [
+        chat_chunk(
+            json!({"tool_calls": [{"index": 0, "id": "call_1", "type": "function",
+            "function": {"arguments": ""}}]}),
+            None,
+        ),
+        chat_chunk(
+            json!({"tool_calls": [{"index": 0, "function": {"name": "get_weather"}}]}),
+            None,
+        ),
+        chat_chunk(
+            json!({"tool_calls": [{"index": 0,
+            "function": {"arguments": "{\"city\":\"Paris\"}"}}]}),
+            None,
+        ),
+        // A delta with nothing new is no event.
+        chat_chunk(
+            json!({"tool_calls": [{"index": 0, "function": {"arguments": ""}}]}),
+            Some("stop"),
+        ),
+        "data: [DONE]\n\n".to_owned(),
+    ]
+    .concat();
+    let evs = stream(Chat, Messages, &src);
+    assert_eq!(
+        anthropic_content(&evs),
+        [
+            json!({"type": "tool_use", "id": "call_1", "name": "get_weather",
+            "input": {"city": "Paris"}})
+        ]
+    );
+    assert_eq!(named(&evs, "content_block_delta").len(), 1, "{evs:#?}");
+    assert_eq!(stop_reason(&evs), "tool_use");
+
+    // A call that never names itself, then text: the text block closes before the call opens at
+    // the end (Messages blocks are sequential).
+    let src = [
+        chat_chunk(
+            json!({"tool_calls": [{"index": 0, "id": "call_1",
+            "function": {"arguments": "{}"}}]}),
+            None,
+        ),
+        chat_chunk(json!({"content": "hi"}), Some("tool_calls")),
+        "data: [DONE]\n\n".to_owned(),
+    ]
+    .concat();
+    let evs = stream(Chat, Messages, &src);
+    assert_eq!(
+        anthropic_content(&evs),
+        [
+            json!({"type": "text", "text": "hi"}),
+            json!({"type": "tool_use", "id": "call_1", "name": "", "input": {}}),
+        ]
+    );
+    let blocks: Vec<(&str, u64)> = evs
+        .iter()
+        .filter(|(n, _)| n == "content_block_start" || n == "content_block_stop")
+        .map(|(n, v)| (n.as_str(), v["index"].as_u64().unwrap()))
+        .collect();
+    assert_eq!(
+        blocks,
+        [
+            ("content_block_start", 0),
+            ("content_block_stop", 0),
+            ("content_block_start", 1),
+            ("content_block_stop", 1),
+        ]
+    );
+}
+
+/// An upstream stream that is only `[DONE]` still opens with `message_start` on Messages.
+/// claim: E2
+#[test]
+fn a_done_only_chat_stream_still_starts_the_message() {
+    let evs = stream(Chat, Messages, "data: [DONE]\n\n");
+    let names: Vec<&str> = evs.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(names, ["message_start", "message_delta", "message_stop"]);
+}
+
+/// A live call whose arguments hold an escaped quote is seen to end where its JSON does, so the
+/// next parallel call streams live rather than waiting, whole, for the end of the stream.
+/// claim: TRN-12
+#[test]
+fn an_escaped_quote_does_not_hide_where_a_call_ends() {
+    let src = [
+        chat_chunk(
+            json!({"tool_calls": [{"index": 0, "id": "call_1", "type": "function",
+            "function": {"name": "say", "arguments": r#"{"q":"a\"b"}"#}}]}),
+            None,
+        ),
+        chat_chunk(
+            json!({"tool_calls": [{"index": 1, "id": "call_2", "type": "function",
+            "function": {"name": "get_weather", "arguments": "{\"city\":"}}]}),
+            None,
+        ),
+        chat_chunk(
+            json!({"tool_calls": [{"index": 1, "function": {"arguments": "\"Paris\"}"}}]}),
+            Some("tool_calls"),
+        ),
+        "data: [DONE]\n\n".to_owned(),
+    ]
+    .concat();
+    let evs = stream(Chat, Messages, &src);
+    let second: Vec<&Value> = named(&evs, "content_block_delta")
+        .into_iter()
+        .filter(|v| v["index"] == 1)
+        .collect();
+    assert_eq!(second.len(), 2, "{evs:#?}");
+    assert_eq!(anthropic_content(&evs)[0]["input"]["q"], r#"a"b"#);
+}
+
+/// Onto Responses: a custom call whose deltas carry `custom` but no `type` is still a
+/// `custom_tool_call`, and an OpenRouter `reasoning.summary` detail streams as summary text.
+/// claim: TRN-14, T2
+#[test]
+fn a_typeless_custom_call_and_a_reasoning_summary_reach_responses() {
+    let src = [
+        chat_chunk(
+            json!({"reasoning_details": [{"type": "reasoning.summary", "summary": "plan",
+            "index": 0}]}),
+            None,
+        ),
+        chat_chunk(
+            json!({"tool_calls": [{"index": 0, "id": "call_1",
+            "custom": {"name": "apply_patch", "input": "*** Begin"}}]}),
+            Some("tool_calls"),
+        ),
+        "data: [DONE]\n\n".to_owned(),
+    ]
+    .concat();
+    let evs = stream(Chat, Responses, &src);
+    let summary: String = named(&evs, "response.reasoning_summary_text.delta")
+        .iter()
+        .filter_map(|v| v["delta"].as_str())
+        .collect();
+    assert_eq!(summary, "plan", "{evs:#?}");
+    let done = one(&evs, "response.completed");
+    let types: Vec<&str> = done["response"]["output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["type"].as_str().unwrap())
+        .collect();
+    assert_eq!(types, ["reasoning", "custom_tool_call"], "{done}");
+}

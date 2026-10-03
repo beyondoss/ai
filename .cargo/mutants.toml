@@ -39,4 +39,9 @@ exclude_re = [
   'replace > with >= in force_include_usage',
   # A one-line delegation to `summary_line` (tested); pingora calls it only on its own error lines.
   'replace <impl ProxyHttp for AiProxy>::request_summary -> String',
+  # `ArgsEnd::whole`'s first line is a memo: `invalid` (a closed value that failed to parse, which
+  # no later byte can fix) and `failed_at` (this exact length already failed) each skip a re-parse
+  # whose answer is the same `false`. Either operator gives the same result, only slower. (It is
+  # the only `||` in `whole`; re-check this exclusion if another one is added there.)
+  'replace \|\| with && in ArgsEnd::whole',
 ]
