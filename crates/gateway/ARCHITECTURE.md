@@ -525,9 +525,10 @@ stays a byte relay. `/{provider}/…` never translates.
 **Stream-only candidates.** Together serves Qwen3.6 Plus, Qwen3.7 Plus, Qwen3.7 Max and Qwen3.8
 Flash only as streams: a request without `"stream": true` is a 400 `streaming_required` (D147).
 `providers::catalog::stream_only` names those candidates. When one serves an attempt whose client
-did not ask for a stream, the body goes out with `"stream":true,"stream_options":{"include_usage":true}`
-spliced first and any `stream` / `stream_options` the client sent cut out by span
-(`translate::force_stream`; onto a Messages path only `stream`). Every other byte is unchanged.
+did not ask for a stream, the body goes out with `"stream":true` spliced first and any `stream` the
+client sent cut out by span (`translate::force_stream`). Its usage is asked for by the splice every
+Chat Completions stream gets (an injected `stream_options`, or the client's own made to include
+usage). Every other byte is unchanged.
 The streamed answer is
 assembled into the client's ordinary JSON body: `TranslateState::assemble` gives the attempt a
 `SseBridge::assembling` bridge. That is the bridge a Responses client's stream already uses, which

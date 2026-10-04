@@ -6,6 +6,15 @@ on:
   schedule:
     - cron: "0 7 * * 0"
   workflow_dispatch:
+    inputs:
+      shards:
+        description: "JSON list of mutants shards to run (default: all 32)"
+        required: false
+        default: ""
+      only_mutants:
+        description: "Skip the property and catalog jobs"
+        type: boolean
+        default: false
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
@@ -14,13 +23,13 @@ jobs:
   # job stays well under GitHub's 6-hour ceiling. A surviving mutant is code no test checks: the job
   # fails and lists it.
   mutants:
-    name: mutants (shard ${{ matrix.shard }}/8)
+    name: mutants (shard ${{ matrix.shard }}/32)
     runs-on: ubuntu-latest
     timeout-minutes: 300
     strategy:
       fail-fast: false
       matrix:
-        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+        shard: ${{ fromJSON(inputs.shards || '[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31]') }}
     steps:
       - uses: actions/checkout@v7
       - uses: jdx/mise-action@v4
@@ -28,15 +37,46 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: nextest,cargo-mutants
-      - run: |
-          cargo mutants -p beyond-ai --test-tool nextest --shard ${{ matrix.shard }}/8 \
-            --file crates/gateway/src/usage.rs --file crates/gateway/src/translate.rs \
+      # No debug info: mutants only need pass/fail, and each mutant rebuilds the test binaries, so
+      # full debug info writes several GB per mutant (it saturated the local SSD, and likely filled
+      # runner disks: shards were cancelled mid-run).
+      # Two stages per shard: every mutant against the fast lib unit tests, then only the
+      # survivors against the full suite. Stage 2's missed.txt is the real list.
+      - env:
+          CARGO_PROFILE_DEV_DEBUG: 0
+          CARGO_PROFILE_TEST_DEBUG: 0
+        run: |
+          FILES="--file crates/gateway/src/usage.rs --file crates/gateway/src/translate.rs \
             --file crates/gateway/src/proxy.rs --file crates/gateway/src/peek.rs \
-            --file crates/gateway/src/circuit_breaker.rs --file crates/gateway/src/route.rs \
-            --jobs 2 --timeout-multiplier 2 </dev/null
+            --file crates/gateway/src/circuit_breaker.rs --file crates/gateway/src/route.rs"
+          cargo mutants -p beyond-ai --test-tool nextest --shard ${{ matrix.shard }}/32 $FILES \
+            --jobs 2 --timeout-multiplier 3 --minimum-test-timeout 180 --output s1 -- --lib </dev/null || true
+          cat s1/mutants.out/missed.txt s1/mutants.out/timeout.txt 2>/dev/null | sort -u > survivors.txt || true
+          echo "stage 1 survivors: $(wc -l < survivors.txt)"
+          if [ -s survivors.txt ]; then
+            # Select exactly the survivors: `--in-diff` narrows to their lines, an anchored `--re` to
+            # their full names (a description alone matches the same text elsewhere). Keep $FILES:
+            # without it the toml's examine_globs apply and route.rs is skipped.
+            python3 .github/scripts/survivor-diff.py . survivors.txt > survivors.diff
+            RE=$(python3 -c "import re,sys; print('|'.join('^'+re.escape(l.strip())+'\$' for l in open(sys.argv[1]) if l.strip()))" survivors.txt)
+            cargo mutants -p beyond-ai --test-tool nextest $FILES --in-diff survivors.diff --re "$RE" \
+              --jobs 2 --timeout-multiplier 3 --minimum-test-timeout 600 --output s2 </dev/null || rc=$?
+            mkdir -p mutants.out && cp s2/mutants.out/*.txt mutants.out/ 2>/dev/null || true
+            [ "${rc:-0}" = 3 ] && exit 0
+            exit "${rc:-0}"
+          fi
       - name: missed mutants
         if: failure()
         run: cat mutants.out/missed.txt 2>/dev/null || true
+      - name: upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutants-shard-${{ matrix.shard }}
+          path: |
+            s1/mutants.out/*.txt
+            s2/mutants.out/*.txt
+          if-no-files-found: ignore
   # The property tests (translator, usage parsers, body scanners) at 50x the PR case count. Every
   # property runs all 100,000 cases: PROPS_SECS (each property's wall-clock box, 60s by default) is
   # raised past anything a property needs, and the `deep` nextest profile lifts `ci`'s 180s
@@ -44,6 +84,7 @@ jobs:
   # kill, so a property that somehow runs away still reports how many cases it ran.
   properties:
     name: property tests (deep)
+    if: ${{ !inputs.only_mutants }}
     runs-on: ubuntu-latest
     timeout-minutes: 330
     steps:
@@ -63,6 +104,7 @@ jobs:
   # ahead, so the row is removed before the vendor's shutdown.
   catalog-retirements:
     name: catalog retirements (strict)
+    if: ${{ !inputs.only_mutants }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:

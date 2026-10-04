@@ -149,15 +149,6 @@ impl CircuitBreakerConfig {
         self.half_open_permits = permits;
         self
     }
-
-    /// Get the failure threshold from the policy.
-    #[allow(dead_code)]
-    fn threshold(&self) -> u32 {
-        match &self.failure_policy {
-            FailurePolicy::Consecutive { threshold } => *threshold,
-            FailurePolicy::Windowed { threshold, .. } => *threshold,
-        }
-    }
 }
 
 /// Lock-free circuit breaker.
@@ -460,7 +451,7 @@ impl CircuitBreaker {
                 // Consecutive, an expired window, or HALF_OPEN (a probe succeeded → close the
                 // circuit): reset the counts and re-anchor the window.
                 (STATE_CLOSED | STATE_HALF_OPEN, _) => Self::pack(STATE_CLOSED, 0, 0, now),
-                (STATE_OPEN, _) => return, // Shouldn't record success while open
+                // OPEN records no success; any other word is invalid.
                 _ => return,
             };
 
@@ -542,7 +533,7 @@ impl CircuitBreaker {
                 STATE_HALF_OPEN if Self::stale(scope, failures) => return,
                 // Keep the generation; the next half-open bumps it.
                 STATE_HALF_OPEN => Self::pack(STATE_OPEN, failures, 0, now),
-                STATE_OPEN => return,
+                // OPEN is already open; any other word is invalid.
                 _ => return,
             };
 
@@ -606,7 +597,7 @@ impl CircuitBreaker {
                 }
                 STATE_HALF_OPEN if Self::stale(scope, failures) => return,
                 STATE_HALF_OPEN => Self::pack(STATE_OPEN, failures, 0, now),
-                STATE_OPEN => return,
+                // OPEN is already open; any other word is invalid.
                 _ => return,
             };
 
@@ -1712,5 +1703,47 @@ mod mutation_gaps {
         cb.reset();
         assert_eq!(cb.state(), CircuitState::Closed { failure_count: 0 });
         assert!(cb.allow().is_ok());
+    }
+
+    /// A probe generation wraps through 0 (the 14-bit field), and a probe of generation 0 still
+    /// closes the breaker on success: the no-op fast path is for a clean CLOSED word only.
+    /// claim: R6, REL-6
+    #[test]
+    fn a_generation_zero_probe_success_closes_the_breaker() {
+        // Opening at t = 16383 seeds the generation at the field's max, so half-opening wraps it
+        // to 0.
+        fn clock() -> u64 {
+            FAILURE_MASK
+        }
+        let cb = CircuitBreaker::with_clock(
+            CircuitBreakerConfig::consecutive(1)
+                .reset_timeout(Duration::ZERO)
+                .half_open_permits(1),
+            clock,
+        );
+        cb.record_failure();
+        let probe = cb.allow().expect("half-open probe");
+        assert_eq!(probe, Permit::probe(0), "the generation wrapped to 0");
+        cb.record_success_for(probe);
+        assert_eq!(cb.state(), CircuitState::Closed { failure_count: 0 });
+    }
+
+    /// The breaker's `Debug` prints its config, not an empty struct.
+    /// claim: R6
+    #[test]
+    fn debug_names_the_breaker_and_its_config() {
+        let cb = CircuitBreaker::new(CircuitBreakerConfig::consecutive(7));
+        let s = format!("{cb:?}");
+        assert!(
+            s.starts_with("CircuitBreaker {") && s.contains("threshold: 7"),
+            "{s}"
+        );
+    }
+
+    /// A refusal reads as what it is when it reaches a log line or an error chain.
+    /// claim: R6
+    #[test]
+    fn an_open_circuit_says_so() {
+        assert_eq!(CircuitOpen.to_string(), "circuit breaker is open");
     }
 }

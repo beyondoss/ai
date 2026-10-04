@@ -98,3 +98,62 @@ async fn an_error_already_in_the_clients_envelope_is_relayed_untouched() {
     assert_eq!(resp.status().as_u16(), 400);
     assert_eq!(resp.text().await.unwrap(), OPENAI_SHAPED);
 }
+
+/// The same-endpoint half of D100: a Chat client on a row whose candidate is a non-OpenAI Chat
+/// Completions vendor (DeepSeek) gets that vendor's foreign error shape re-encoded in OpenAI's
+/// envelope, with no translation in play.
+/// claim: T6
+/// defect: D100
+#[tokio::test]
+async fn a_same_endpoint_vendors_foreign_error_arrives_in_the_clients_envelope() {
+    let (pubkey, sk) = test_keypair(137);
+    let mock = MockUpstream::start(Mode::Raw(400, "application/json", XAI_400)).await;
+    let gw = Gateway::builder(unused_nats_port(), &mock.authority(), &b64(&pubkey))
+        .providers(&["deepseek"])
+        .start()
+        .await;
+    let resp = test_client()
+        .post(format!("{}/v1/chat/completions", gw.url()))
+        .header(
+            "authorization",
+            format!("Bearer {}", billing_vkey(&sk, 137)),
+        )
+        .header("content-type", "application/json")
+        .body(r#"{"model":"deepseek-v4-pro","messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 400);
+    let v: Value = resp.json().await.unwrap();
+    assert_eq!(v["error"]["type"], "invalid_request_error", "{v}");
+    assert_eq!(v["error"]["code"], "invalid_image", "{v}");
+}
+
+/// A sub-resource is its provider's own API and is never re-encoded: Anthropic's error on
+/// `/v1/messages/count_tokens` reaches the client byte for byte.
+/// claim: T6
+#[tokio::test]
+async fn a_sub_resource_error_is_relayed_untouched() {
+    const ANTHROPIC_400: &str = r#"{"type":"error","error":{"type":"invalid_request_error","message":"messages: field required"}}"#;
+    let (pubkey, sk) = test_keypair(138);
+    let mock = MockUpstream::start(Mode::Raw(400, "application/json", ANTHROPIC_400)).await;
+    let gw = Gateway::builder(unused_nats_port(), &mock.authority(), &b64(&pubkey))
+        .providers(&["anthropic"])
+        .start()
+        .await;
+    let resp = test_client()
+        .post(format!("{}/v1/messages/count_tokens", gw.url()))
+        .header("x-api-key", billing_vkey(&sk, 138))
+        .header("anthropic-version", "2023-06-01")
+        .header("content-type", "application/json")
+        .body(r#"{"model":"claude-opus-4-8","messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 400);
+    assert_eq!(resp.text().await.unwrap(), ANTHROPIC_400);
+    assert_eq!(
+        mock.captured().expect("forwarded").path,
+        "/v1/messages/count_tokens"
+    );
+}

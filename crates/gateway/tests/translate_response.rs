@@ -363,6 +363,37 @@ async fn chat_client_on_openrouter_gets_each_identity_field_once() {
     );
 }
 
+/// A Chat client served by OpenAI itself is a byte relay: OpenAI's stream is the reference the
+/// identity bridge repairs others toward, so nothing in it is dropped, even a field on every chunk.
+/// claim: S2
+#[tokio::test]
+async fn chat_client_on_openai_gets_its_stream_byte_for_byte() {
+    const OPENAI_SSE: &str = concat!(
+        r#"data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"gpt-4o-mini","choices":[{"index":0,"delta":{"role":"assistant","content":"Hi"},"finish_reason":null}]}"#,
+        "\n\n",
+        r#"data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"gpt-4o-mini","choices":[{"index":0,"delta":{"role":"assistant","content":"!"},"finish_reason":"stop"}]}"#,
+        "\n\n",
+        r#"data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"gpt-4o-mini","choices":[],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}"#,
+        "\n\ndata: [DONE]\n\n",
+    );
+    let nats_port = unused_nats_port();
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::Raw(200, "text/event-stream", OPENAI_SSE)).await;
+    let gw = Gateway::builder(nats_port, &mock.authority(), &b64(&pubkey))
+        .providers(&["openai", "openrouter"])
+        .start()
+        .await;
+    let body =
+        r#"{"model":"gpt-4o-mini","stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+    let (status, text) = post(&gw, "/v1/chat/completions", &vkey(&sk), body.to_owned()).await;
+    assert_eq!(status, 200, "{text}\n{}", gw.log());
+    assert_eq!(text, OPENAI_SSE);
+    assert_eq!(
+        mock.captured().expect("OpenAI served").path,
+        "/v1/chat/completions"
+    );
+}
+
 /// A Chat client on a Claude row: `prompt_tokens` is the whole prompt, cache included, and every
 /// chunk carries `created` (strictly typed clients reject a chunk without it).
 /// claim: S2

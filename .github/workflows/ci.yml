@@ -318,6 +318,10 @@ jobs:
         with:
           tool: nextest,cargo-mutants
       - name: mutate the lines this PR changed
+        # No debug info: mutants only need pass/fail, and each mutant rebuilds the test binaries.
+        env:
+          CARGO_PROFILE_DEV_DEBUG: 0
+          CARGO_PROFILE_TEST_DEBUG: 0
         run: |
           git diff "origin/${{ github.base_ref }}...HEAD" -- crates/gateway/src crates/providers/src > "$RUNNER_TEMP/pr.diff"
           if [ ! -s "$RUNNER_TEMP/pr.diff" ]; then echo "no gateway or catalog source changes"; exit 0; fi

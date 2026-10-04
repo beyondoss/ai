@@ -1266,12 +1266,8 @@ impl InputTally {
                     units += u32::from(e >> 4);
                     sa = e & 15;
                 }
-                (None, Some(y)) => {
-                    let e = quad(sb, y);
-                    units += u32::from(e >> 4);
-                    sb = e & 15;
-                }
-                (None, None) => break,
+                // The cut is past the middle, so `a` is the longer half: `qb` never outlasts `qa`.
+                (None, _) => break,
             }
         }
         for (state, rest) in [(&mut sa, qa.remainder()), (&mut sb, qb.remainder())] {
@@ -1348,7 +1344,7 @@ pub fn stream_carried_error(tail: &[u8]) -> bool {
 /// Runs once, on the cut-short path only, so it parses each line into a `Value` rather than
 /// maintaining a typed view per wire.
 pub fn estimate_stream_output(tail: &[u8], total_bytes: u64) -> u64 {
-    let (mut events, mut deltas, mut text) = (0u64, 0u64, 0u64);
+    let (mut deltas, mut text) = (0u64, 0u64);
     for line in sse_lines(tail) {
         let Some(payload) = strip_sse_data(line) else {
             continue;
@@ -1356,14 +1352,14 @@ pub fn estimate_stream_output(tail: &[u8], total_bytes: u64) -> u64 {
         let Ok(v) = serde_json::from_slice::<serde_json::Value>(payload) else {
             continue;
         };
-        events += 1;
         let n = delta_text_len(&v);
         if n > 0 {
             deltas += 1;
             text += n;
         }
     }
-    if events == 0 || tail.is_empty() {
+    // No delta, no text (an empty tail has neither, which keeps `sampled` nonzero below).
+    if deltas == 0 {
         return 0;
     }
     // The bytes before the tail are extrapolated at 90%: a stream opens with heavier preamble
@@ -2821,5 +2817,37 @@ data: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":40}}\n\n";
         // 91 + (1 + 2 + 40) value bytes = 134, at 4.5 bytes a token: 29.8, one byte short of 30.
         assert_eq!(estimate_body_output(tail.as_bytes(), n), 29);
         assert_eq!(estimate_body_output(tail.as_bytes(), 2 * n), 59);
+    }
+
+    /// A string that is not text is skipped whole whatever it holds: an escaped quote inside a
+    /// skipped value or key, and a key that leaves the trie on a non-letter, end where their
+    /// closing quote does, so the text after them still counts.
+    /// claim: BIL-20
+    #[test]
+    fn skipped_strings_end_at_their_own_closing_quote() {
+        let text = r#""content":"hello world""#;
+        for envelope in [
+            r#""model":"a\"b""#,
+            r#""\"":1"#,
+            r#""X":"y""#,
+            r#""tX":"y""#,
+        ] {
+            let body = format!(r#"{{{envelope},"messages":[{{{text}}}]}}"#);
+            let mut t = InputTally::default();
+            t.feed(body.as_bytes());
+            assert_eq!(t.estimate_tokens(), 2, "{body}");
+        }
+    }
+
+    /// A stream's last event is read even when no blank line ends it, on the slow path that reads
+    /// an event's `data:` lines joined (D126).
+    /// claim: BIL-1
+    #[test]
+    fn a_final_multi_line_event_without_a_blank_line_still_bills() {
+        let sse = b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n\
+data: {\"choices\":[],\"usage\":\n\
+data: {\"prompt_tokens\":7,\"completion_tokens\":2,\"total_tokens\":9}}\n";
+        let u = openai_stream(sse).expect("usage");
+        assert_eq!((u.input_tokens, u.output_tokens), (7, 2));
     }
 }

@@ -1209,4 +1209,104 @@ mod tests {
         assert_eq!(azure.auth.header(), "api-key");
         assert_eq!(azure.pool_auth[0].value.expose(), "azure-secret");
     }
+
+    fn catalog_row(model: &str) -> ModelRoute {
+        *providers::catalog::MODEL_ROUTES
+            .iter()
+            .find(|r| r.model == model)
+            .expect("catalog row")
+    }
+
+    /// A header-won walk reads the body only where the body decides something. On gpt-4o-mini
+    /// (images, files, tools, every candidate serving structured outputs and files) it decides
+    /// nothing; each refusal or unserved capability alone makes it read; an embeddings row never.
+    /// claim: CAT-6
+    #[test]
+    fn walk_reads_body_only_when_the_body_decides_something() {
+        use providers::catalog::{IN_FILE, IN_IMAGE, IN_TEXT, ModelCard, TOOLS};
+        use providers::{Candidate, ProviderId};
+        let base = catalog_row("gpt-4o-mini");
+        assert!(!walk_reads_body(&base));
+        assert!(!walk_reads_body(&catalog_row("text-embedding-3-small")));
+
+        const BEDROCK: &[Candidate] = &[Candidate {
+            provider: ProviderId::Bedrock,
+            upstream_model: "m",
+            path: "/v1/chat/completions",
+        }];
+        const NO_FILES: &[Candidate] = &[Candidate {
+            provider: ProviderId::OpenRouter,
+            upstream_model: "x-ai/grok-build-0.1",
+            path: "/api/v1/chat/completions",
+        }];
+        let card = |input, features| ModelCard {
+            input,
+            features,
+            ..base.card
+        };
+        for (what, row, want) in [
+            (
+                "no image input",
+                ModelRoute {
+                    card: card(IN_TEXT | IN_FILE, TOOLS),
+                    ..base
+                },
+                true,
+            ),
+            (
+                "no tools",
+                ModelRoute {
+                    card: card(IN_TEXT | IN_IMAGE | IN_FILE, 0),
+                    ..base
+                },
+                true,
+            ),
+            (
+                "a candidate refusing structured outputs",
+                ModelRoute {
+                    candidates: BEDROCK,
+                    ..base
+                },
+                true,
+            ),
+            (
+                "a candidate refusing the card's file input",
+                ModelRoute {
+                    candidates: NO_FILES,
+                    ..base
+                },
+                true,
+            ),
+            (
+                "a candidate refusing files on a card without them",
+                ModelRoute {
+                    card: card(IN_TEXT | IN_IMAGE, TOOLS),
+                    candidates: NO_FILES,
+                    ..base
+                },
+                false,
+            ),
+        ] {
+            assert_eq!(walk_reads_body(&row), want, "{what}");
+        }
+    }
+
+    /// Only a Messages client on a Chat Completions row with a Responses arm counts tools.
+    /// claim: TOOL-1
+    #[test]
+    fn walk_reads_tools_only_for_a_messages_client() {
+        let row = catalog_row("gpt-4o-mini");
+        assert!(walk_reads_tools(&row, "/v1/messages"));
+        assert!(!walk_reads_tools(&row, "/v1/chat/completions"));
+        assert!(!walk_reads_tools(&row, "/v1/responses"));
+    }
+
+    /// Session-state Responses never walks onto a candidate that is not a Responses path.
+    /// claim: SES-3, E3
+    #[test]
+    fn candidate_path_is_responses_reads_the_path() {
+        assert!(candidate_path_is_responses("/v1/responses"));
+        assert!(!candidate_path_is_responses("/v1/chat/completions"));
+        assert!(!candidate_path_is_responses("/v1/messages"));
+    }
 }

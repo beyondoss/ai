@@ -142,6 +142,13 @@ impl Walk {
         (i < self.len).then_some(self.indices[i as usize])
     }
 
+    /// The walked catalog indices as a bitmask (bit `orig` set for `arms[orig]`).
+    pub fn mask(self) -> u8 {
+        (0..self.len)
+            .filter_map(|i| self.catalog_index(i))
+            .fold(0u8, |m, orig| m | (1 << orig))
+    }
+
     /// `ProviderId::index` bytes in walk order — the exact-match cache's per-arm discriminator.
     pub fn provider_ids(self, candidates: &[Candidate]) -> ([u8; MAX_CANDIDATES], u8) {
         let mut ids = [0u8; MAX_CANDIDATES];

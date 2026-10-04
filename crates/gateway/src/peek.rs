@@ -120,12 +120,6 @@ impl ModelScanner {
         (self.depth == 1 && self.root_is_object) || (self.depth == 2 && self.in_message)
     }
 
-    /// The depth whose `:` / `,` punctuation drives `expect_key`. Mirrors [`Self::at_key_level`].
-    #[inline]
-    fn key_depth(&self) -> u32 {
-        if self.in_message { 2 } else { 1 }
-    }
-
     #[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
     pub fn feed(&mut self, bytes: &[u8]) {
         // Proof for the allow: every index is `i`/`j` with `i < n` (the loop condition, or a `memchr`
@@ -235,8 +229,11 @@ impl ModelScanner {
                     }
                     self.depth = self.depth.saturating_sub(1);
                 }
-                b':' if self.depth == self.key_depth() => self.expect_key = false,
-                b',' if self.depth == self.key_depth() => {
+                // Unguarded by depth: a `:` or `,` inside a nested value is always followed by
+                // the key-level `,` or `}` that closes it before the next key-level string, and
+                // that one sets `expect_key` again.
+                b':' => self.expect_key = false,
+                b',' => {
                     self.expect_key = true;
                     self.last_key_is_model = false;
                     if self.depth == 1 {
@@ -286,12 +283,9 @@ pub fn plan_stream_usage_injection(body: &[u8]) -> Option<usize> {
     {
         return None;
     }
-    let mut i = 0;
-    while i < n && body[i].is_ascii_whitespace() {
-        i += 1;
-    }
     // Must be a JSON object; anything else (array, scalar, garbage) we never rewrite.
-    if i >= n || body[i] != b'{' {
+    let i = body.iter().position(|b| !b.is_ascii_whitespace())?;
+    if body[i] != b'{' {
         return None;
     }
     let insert_at = i + 1;
@@ -312,10 +306,10 @@ pub fn plan_stream_usage_injection(body: &[u8]) -> Option<usize> {
     let mut j = i;
     while j < n {
         if in_string {
-            // Fast path: inside a string we're not capturing (any non-root-key string — message
-            // content, system prompts, base64 images), jump straight to the next `"`/`\` with a
-            // SIMD search instead of inspecting every byte. Mirrors the skip in `ModelScanner::feed`.
-            if !capturing_key && !escaped {
+            // Fast path: jump straight to the next `"`/`\` with a SIMD search instead of
+            // inspecting every byte, a root key included (it is sliced out of the body at its
+            // closing quote). Mirrors the skip in `ModelScanner::feed`.
+            if !escaped {
                 match memchr::memchr2(b'"', b'\\', &body[j..]) {
                     Some(rel) => j += rel,
                     None => break, // rest of the body is skippable string content
@@ -376,8 +370,10 @@ pub fn plan_stream_usage_injection(body: &[u8]) -> Option<usize> {
             }
             b'[' => depth += 1,
             b'}' | b']' => depth = depth.saturating_sub(1),
-            b':' if depth == 1 => expect_key = false,
-            b',' if depth == 1 => {
+            // Unguarded by depth, as in `ModelScanner::feed`: a nested `:` or `,` is always
+            // followed by the root `,` or `}` that closes its value before the next root key.
+            b':' => expect_key = false,
+            b',' => {
                 expect_key = true;
                 last_key_is_stream = false;
             }
@@ -518,9 +514,10 @@ pub fn scan_buffered(body: &[u8]) -> BufferedScan {
     let mut j = i;
     while j < n {
         if in_string {
-            // SIMD skip over any string we aren't capturing — message content, system prompts,
-            // base64 images. Mirrors both functions this replaces.
-            if !capturing_key && !capturing_model && !escaped {
+            // SIMD skip over any string whose bytes we don't accumulate — message content, system
+            // prompts, base64 images, and keys too, which are sliced out of the body at their
+            // closing quote.
+            if !capturing_model && !escaped {
                 match memchr::memchr2(b'"', b'\\', &body[j..]) {
                     Some(rel) => j += rel,
                     None => break, // rest of the body is skippable string content
@@ -869,11 +866,10 @@ fn splice_out(body: &mut Vec<u8>, cuts: &[(usize, usize)]) {
     };
     for (k, &(_, end)) in cuts.iter().enumerate() {
         let next = cuts.get(k.saturating_add(1)).map_or(body.len(), |c| c.0);
-        // Spans are ascending and disjoint (`remove_items` builds them in order): `end <= next`.
-        if end < next {
-            body.copy_within(end..next, write);
-            write = write.saturating_add(next.saturating_sub(end));
-        }
+        // Spans are ascending and disjoint (`remove_items` builds them in order): `end <= next`,
+        // and two touching spans copy nothing.
+        body.copy_within(end..next, write);
+        write = write.saturating_add(next.saturating_sub(end));
     }
     body.truncate(write);
 }
@@ -2036,5 +2032,87 @@ mod mutation_gaps {
         assert!(!other.duplicate_model);
         let model = scan_buffered(br#"{"mod\u0065l":"x","model":"m"}"#);
         assert!(model.duplicate_model);
+    }
+
+    /// Only a body whose root is an object is ever rewritten: one that merely contains an object
+    /// after a leading value (trailing garbage a provider rejects) gets no splice, which would
+    /// otherwise land inside the leading value.
+    /// claim: BIL-2
+    #[test]
+    fn a_body_that_does_not_open_with_an_object_is_never_planned() {
+        assert_eq!(plan_stream_usage_injection(br#"{"stream":true}"#), Some(1));
+        assert_eq!(plan_stream_usage_injection(br#"[]{"stream":true}"#), None);
+        assert_eq!(plan_stream_usage_injection(br#" 0{"stream":true}"#), None);
+    }
+
+    /// The response scanner reads raw provider bytes: a root `message` whose value was not an
+    /// object arms no nesting once a `,` ends it, so a malformed body's bare object at the root is
+    /// not read as the `message` object and cannot supply the billed model.
+    /// claim: BIL-13
+    #[test]
+    fn a_comma_disarms_a_root_message_that_was_not_an_object() {
+        let mut s = ModelScanner::for_response();
+        s.feed(br#"{"message":"x",{"model":"not-billed"}}"#);
+        assert_eq!(s.take_model(), None);
+        // The armed path, for contrast.
+        let mut s = ModelScanner::for_response();
+        s.feed(br#"{"message":{"model":"billed"}}"#);
+        assert_eq!(s.take_model().as_deref(), Some("billed"));
+    }
+
+    /// A `"type"` whose opening quote is escaped (one backslash) sits inside a string, here a key
+    /// spelled `\"type`, so it is no member; three backslashes are still an odd run.
+    /// claim: T3
+    #[test]
+    fn an_escaped_type_quote_is_not_a_type_member() {
+        let hit = |b: &[u8]| has_typed_member(b, (0, b.len()), &["image"]);
+        assert!(hit(br#"{"type":"image"}"#));
+        assert!(!hit(br#"{"\"type":"image"}"#));
+        assert!(!hit(br#"{"\\\"type":"image"}"#));
+    }
+
+    /// A value cannot be empty: a separator where a value should start ends none, so `{"a":}` and
+    /// `{"a":,"b":1}` are malformed rather than members with an empty value.
+    /// claim: SEC-21
+    #[test]
+    fn a_separator_where_a_value_starts_is_no_value() {
+        for b in [&b","[..], b"}", b"]", b" "] {
+            assert_eq!(value_end(b, 0), None, "{:?}", b);
+        }
+        assert_eq!(value_end(b"12,", 0), Some(2));
+        assert_eq!(root_members(br#"{"a":}"#), None);
+        assert_eq!(root_members(br#"{"a":,"b":1}"#), None);
+    }
+
+    /// A string value spelled with an escape is decoded before it is compared, as the provider's
+    /// parser decodes it.
+    /// claim: T3
+    #[test]
+    fn an_escaped_string_value_is_compared_decoded() {
+        // `"image"`, spelled out so the escape survives as written.
+        let quoted = format!(r#""ima{}u0067e""#, '\\');
+        let b = quoted.as_bytes();
+        assert!(str_is(b, (0, b.len()), "image"));
+        assert!(!str_is(b, (0, b.len()), "imag"));
+    }
+
+    /// A `"type"` member counts only when its value starts inside the span: a span that ends at
+    /// the key reads no value past it.
+    /// claim: T3
+    #[test]
+    fn a_type_value_past_the_span_is_not_read() {
+        let b = br#"{"type":"image"}"#;
+        assert!(has_typed_member(b, (0, b.len()), &["image"]));
+        assert!(!has_typed_member(b, (1, 7), &["image"]));
+    }
+
+    /// A root `stream_options` spelled with an escape decodes to `stream_options` at the provider,
+    /// so the client already controls usage there too: nothing to inject.
+    /// claim: BIL-2
+    #[test]
+    fn an_escaped_stream_options_key_means_no_injection() {
+        let body = format!(r#"{{"stream":true,"stream{}u005foptions":{{}}}}"#, '\\');
+        assert_eq!(plan_stream_usage_injection(body.as_bytes()), None);
+        assert_eq!(plan_stream_usage_injection(br#"{"stream":true}"#), Some(1));
     }
 }

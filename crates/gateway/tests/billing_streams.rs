@@ -343,3 +343,52 @@ async fn duplicate_or_escaped_stream_options_cannot_turn_off_exact_metering() {
         );
     }
 }
+
+/// `message_start` (input and cache counts) need not be the first bytes of an Anthropic stream: a
+/// few KiB of `ping`s ahead of it still leave it inside the head the gateway keeps, so a stream far
+/// longer than the tail bills its exact input.
+/// claim: BIL-8
+#[tokio::test]
+async fn a_message_start_behind_pings_is_still_read_from_the_head() {
+    let mut sse = String::new();
+    while sse.len() < 4 * 1024 {
+        sse.push_str("event: ping\ndata: {\"type\":\"ping\"}\n\n");
+    }
+    sse.push_str("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-opus-4-8\",\"content\":[],\"usage\":{\"input_tokens\":1234,\"cache_read_input_tokens\":56,\"cache_creation_input_tokens\":0,\"output_tokens\":1}}}\n\n");
+    while sse.len() < 160 * 1024 {
+        sse.push_str("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello hello hello\"}}\n\n");
+    }
+    sse.push_str("event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":300}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
+    let (pubkey, sk) = test_keypair(63);
+    let mock = MockUpstream::start(Mode::Raw(
+        200,
+        "text/event-stream",
+        Box::leak(sse.into_boxed_str()),
+    ))
+    .await;
+    let gw = Gateway::builder(unused_nats_port(), &mock.authority(), &b64(&pubkey))
+        .providers(&["anthropic"])
+        .start()
+        .await;
+    let resp = test_client()
+        .post(format!("{}/anthropic/v1/messages", gw.url()))
+        .header("x-api-key", billing_vkey(&sk, 64))
+        .header("anthropic-version", "2023-06-01")
+        .header("content-type", "application/json")
+        .body(r#"{"model":"claude-opus-4-8","max_tokens":512,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let _ = resp.text().await;
+    let row = usage_row_of(&gw).await;
+    assert_eq!(
+        (
+            row["input_tokens"].as_u64(),
+            row["cache_read_tokens"].as_u64(),
+            row["output_tokens"].as_u64()
+        ),
+        (Some(1234), Some(56), Some(300)),
+        "{row}"
+    );
+}

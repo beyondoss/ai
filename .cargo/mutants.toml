@@ -21,4 +21,75 @@ exclude_re = [
   # The same guard's operator mutation (it is the only `>=` in `logging` today; re-check this
   # exclusion if another one is added there).
   'replace >= with < in <impl ProxyHttp for AiProxy>::logging',
+  # `pack` ORs fields masked into disjoint bit ranges, where `|` and `^` are the same operation.
+  'replace \| with \^ in CircuitBreaker::pack',
+  # `k < l`: `k` is a dropped item and `l` a kept one, so `k == l` never happens.
+  'replace < with <= in remove_items',
+  # `state << 3 | class`: the shifted state's low three bits are zero and a class is below 8, so
+  # `|` and `^` agree (the TALLY index in `run` and `step`).
+  'replace \| with \^ in InputTally::(run|step)',
+  # `close` clears COLON and ESCAPE (distinct bits, so `^` is `|`). ESCAPE is never set when it
+  # runs, and in valid JSON a `,` `:` `]` or `}` follows every closing quote, so `Structure`
+  # re-sets COLON before reading it: clearing neither (`&`) changes no count on a valid body.
+  'replace \| with (&|\^) in InputTally::close',
+  # The drained `max_tokens` is the last member only when `max_completion_tokens` precedes it
+  # (both are present on this path), so the byte before it is always the separating comma.
+  '''replace match guard body\[comma\] == b',' with true in rename_max_tokens''',
+  # `model_span` and the `stream_options` value are distinct root values: `s == at` never holds.
+  'replace > with >= in force_include_usage',
+  # A one-line delegation to `summary_line` (tested); pingora calls it only on its own error lines.
+  'replace <impl ProxyHttp for AiProxy>::request_summary -> String',
+  # `ArgsEnd::whole`'s first line is a memo: `invalid` (a closed value that failed to parse, which
+  # no later byte can fix) and `failed_at` (this exact length already failed) each skip a re-parse
+  # whose answer is the same `false`. Either operator gives the same result, only slower. (It is
+  # the only `||` in `whole`; re-check this exclusion if another one is added there.)
+  'replace \|\| with && in ArgsEnd::whole',
+  # `KeepInputs::expecting` only words a parse error's message, which `parse_body` discards (it
+  # keeps `None`); `visit_unit`'s `Value::Null` is `Value::default()`.
+  "replace <impl serde::de::Visitor<'de> for KeepInputs>::(expecting|visit_unit)",
+  # `ChatIdentity::key` packs three masked fields into disjoint bit ranges: `|` and `^` agree. The
+  # key is only compared for equality, and XOR with a field's mask is a bijection on the values in
+  # range, so `&` -> `^` keeps every key distinct too.
+  'replace (\||&) with \^ in ChatIdentity::key',
+  # `tally_eager` only picks where the input estimate is made: as the body streams, or in `logging`
+  # from the copy that is still held (pingora's retry buffer or the `FullBody` parent). Both tally
+  # the same request text; widening it (`||`, or `true`) only tallies eagerly where the held copy
+  # would have done.
+  'replace (&& with \|\| in tally_eager|tally_eager -> bool with true)',
+  # `map_response` clones a same-wire body as is: the guard only skips that clone.
+  'replace match guard client == Endpoint::Responses with false in SseBridge::assembled',
+  # `str_is`'s raw compare is a fast path: `escaped_key_is` decodes a string with no escape to
+  # itself, so skipping the raw compare (`false`) gives the same answer, only slower.
+  '''replace match guard !inner\.contains\(&b'\\\\'\) with false in str_is''',
+  # `unserved` ORs `1 << i` for distinct indices `i`, where `|` and `^` are the same operation.
+  'replace \| with \^ in unserved',
+  # The const `TALLY` / `TALLY4` tables pack `state << 3 | class` and `next | add << 4` from
+  # disjoint bit ranges, where `|` and `^` agree. A const initializer's mutant names no function,
+  # only the file and position.
+  'usage\.rs:\d+:\d+: replace \| with \^$',
+  # `de_service_tier`'s visitors for a non-string tier answer `Ok(None)`, which is `Option`'s
+  # default.
+  'replace de_service_tier::<impl serde::de::Visitor<.de> for V>::visit_(bool|i64|u64|f64|none|unit) -> Result<Self::Value, E> with Ok\(Default::default\(\)\)',
+  # A push that leaves the buffer at exactly the cap: `>=` "compacts" it with a self-copy and a
+  # no-op truncate, and `ring()` reads it as a ring either way.
+  'replace > with >= in UsageTail::push',
+  # `release_body` with nothing held: `BodyBudget::release(0)` changes nothing; the guard only skips
+  # an atomic.
+  'replace > with >= in Held::release_body',
+  # `settle_health`'s undecided arm stops the work at the cap or the body's end. Without it the
+  # verdict stays pending, and a pending verdict only re-reads the same capped prefix (it never
+  # counts a failure from it), so nothing observable changes. (The guard's `||` is the only one in
+  # `settle_health`; re-check this exclusion if another one is added there.)
+  'replace match guard end_of_stream \|\| pending\.prefix\.len\(\) >= HEALTH_PREFIX_CAP with false in AiProxy::settle_health',
+  'replace \|\| with && in AiProxy::settle_health',
+  # No `anthropic-beta` header: the rebuild finds no token to keep and removes a header that is not
+  # there. The same headers, one lookup more.
+  'delete match arm \(None, _\) in retain_managed_client_headers',
+  # `mask_all` with `at *= …`: `at` stays 0, so each search restarts at the front, where every hit
+  # so far now reads `[redacted]` (or its `*` padding) and no longer matches: the same hits, found
+  # in quadratic time. Only a pool key spelled like the marker itself could tell them apart.
+  'replace \+= with \*= in mask_all',
+  # `Ctx` implements `Deref` as `DerefMut`'s supertrait: every hook holds the context mutably, so
+  # nothing calls `deref` itself (a panicking body passes the integration suites).
+  'replace <impl std::ops::Deref for Ctx>::deref -> &Self::Target',
 ]

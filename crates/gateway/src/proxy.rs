@@ -173,10 +173,10 @@ impl UsageTail {
         }
         let first = (USAGE_TAIL_CAP - self.head).min(data.len());
         self.buf[self.head..self.head + first].copy_from_slice(&data[..first]);
+        // The wrapped remainder; empty (a no-op copy) when the chunk fit before the end. No `if`:
+        // a guard here could only skip an empty copy, so it had no behaviour to test.
         let rest = data.len() - first;
-        if rest > 0 {
-            self.buf[..rest].copy_from_slice(&data[first..]);
-        }
+        self.buf[..rest].copy_from_slice(&data[first..]);
         self.head = (self.head + data.len()) % USAGE_TAIL_CAP;
     }
 
@@ -1113,7 +1113,7 @@ impl RequestCtx {
 /// Kept as a table so `reject_bodies_are_valid_json` can walk it and assert each entry parses,
 /// carries the `type` and `message` it claims, and is reachable — a hand-written JSON literal is
 /// exactly the thing that rots silently otherwise.
-pub const REJECT_BODIES: [(&str, &str, &str); 16] = [
+pub static REJECT_BODIES: [(&str, &str, &str); 16] = [
     (
         "invalid_request_error",
         "unknown provider",
@@ -1205,7 +1205,7 @@ pub const REJECT_BODIES: [(&str, &str, &str); 16] = [
 /// `pub` for the bench target (`benches/unit.rs`), which measures it against the `serde_json`
 /// construction it replaced. Not part of the crate's intended surface.
 pub fn error_body(typ: &str, msg: &str) -> Bytes {
-    for (t, m, body) in REJECT_BODIES {
+    for &(t, m, body) in &REJECT_BODIES {
         if t == typ && m == msg {
             return Bytes::from_static(body.as_bytes());
         }
@@ -1689,14 +1689,7 @@ impl AiProxy {
                         Err(e) => e,
                         // The attempt ended without a response or an error (it panicked, say).
                         // Never leave the client waiting on a connection pingora would keep alive.
-                        Ok(_) => pingora_core::Error::explain(
-                            pingora_core::ErrorType::HTTPStatus(502),
-                            if reaped == Reaped::Panicked {
-                                "full-body attempt panicked"
-                            } else {
-                                "full-body attempt ended without a response"
-                            },
-                        ),
+                        Ok(_) => reaped.unanswered(),
                     });
                 }
             }
@@ -1802,7 +1795,7 @@ impl AiProxy {
         let Some(budget) = self.state.body_budget.as_ref() else {
             return Ok(None);
         };
-        if body.len() <= BODY_PEEK_LIMIT {
+        if !past_replay_buffer(body.len()) {
             return Ok(None);
         }
         let heap = translate::translation_heap(body);
@@ -2224,6 +2217,19 @@ fn body_replayable(session: &mut Session) -> bool {
 /// truncates), so [`ModelRouting::replay`] carries our copy for `request_body_filter` to prepend.
 const BODY_PEEK_LIMIT: usize = 64 * 1024;
 
+/// Whether a body of `n` bytes is past [`BODY_PEEK_LIMIT`]: pingora cannot replay it from its own
+/// buffer, so every copy the gateway holds of it is charged to the process body budget. Below it,
+/// concurrency bounds the bodies in memory.
+fn past_replay_buffer(n: usize) -> bool {
+    n > BODY_PEEK_LIMIT
+}
+
+/// [`RequestCtx::tally_eager`]: a managed provider-routed body that may outgrow the retry buffer
+/// is the one case where no copy is left for `logging` to tally.
+fn tally_eager(managed: bool, catalog: bool, declared_len: Option<usize>) -> bool {
+    managed && !catalog && declared_len.is_none_or(past_replay_buffer)
+}
+
 /// The `x-beyond-model` header, viewed as a catalog lookup. Present-but-unknown is distinct from
 /// absent: the header wins, so an unknown header is a 404 rather than a fall-through to the body.
 #[derive(Clone, Copy)]
@@ -2251,7 +2257,8 @@ fn catalog_from_header(session: &Session) -> CatalogHeader {
 /// What `peek_body_model` read before a catalog row could be chosen.
 struct BodyPeek {
     model: Option<String>,
-    /// The full pre-rewrite body, when the peek read it to the end.
+    /// The full pre-rewrite body, when the peek read it to the end. Read only once `over_cap` and
+    /// `over_budget` are known to be false.
     complete: Option<Vec<u8>>,
     /// The whole body was read and it outgrew pingora's 64 KiB retry buffer: pingora has nothing
     /// to send and nothing left to read. The caller re-runs the request with `complete` as its body
@@ -2303,15 +2310,16 @@ async fn peek_body_model(
             break;
         }
         match session.read_request_body().await? {
-            Some(chunk) if !chunk.is_empty() => {
+            // An empty chunk feeds nothing, adds nothing, and re-reserves the same total (a no-op).
+            Some(chunk) => {
                 scanner.feed(&chunk);
                 buf.extend_from_slice(&chunk);
-                if buf.len() > BODY_PEEK_LIMIT && !held.reserve_body(buf.len().saturating_mul(2)) {
+                if past_replay_buffer(buf.len()) && !held.reserve_body(buf.len().saturating_mul(2))
+                {
                     over_budget = true;
                     break;
                 }
             }
-            Some(_) => {}
             None => break,
         }
     }
@@ -2319,7 +2327,7 @@ async fn peek_body_model(
     let done = session.as_mut().is_body_done();
     Ok(BodyPeek {
         model: scanner.take_model(),
-        complete: (done && !over_budget).then_some(buf),
+        complete: done.then_some(buf),
         relay: truncated && done,
         over_cap: over_cap && !done,
         over_budget,
@@ -2517,6 +2525,21 @@ enum Reaped {
     Finished,
     Panicked,
     StillRunning,
+}
+
+impl Reaped {
+    /// The 502 for an attempt that ended with neither a response nor an error, saying whether it
+    /// panicked.
+    fn unanswered(self) -> Box<pingora_core::Error> {
+        pingora_core::Error::explain(
+            pingora_core::ErrorType::HTTPStatus(502),
+            if self == Reaped::Panicked {
+                "full-body attempt panicked"
+            } else {
+                "full-body attempt ended without a response"
+            },
+        )
+    }
 }
 
 /// Wait, at most [`ABANDONED_ATTEMPT_GRACE`], for an attempt's task to end, and say how it did. A
@@ -2785,18 +2808,21 @@ fn is_v1_models_list(session: &Session) -> bool {
         && (path == "/v1/models" || path == "/v1/models/")
 }
 
+/// [`ProxyHttp::request_summary`]'s line: method, path without the query, and host.
+fn summary_line(req: &pingora::http::RequestHeader) -> String {
+    let host = req
+        .headers
+        .get(http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .or_else(|| req.uri.host())
+        .unwrap_or("");
+    format!("{} {}, Host: {host}", req.method, req.uri.path())
+}
+
 /// Cap a caller-supplied model name before echoing it in an error. The peek is 64 KiB; we do not
 /// want that in a JSON error body.
 fn clip_catalog_name(name: &str) -> &str {
-    const MAX: usize = 128;
-    if name.len() <= MAX {
-        return name;
-    }
-    let mut end = MAX;
-    while end > 0 && !name.is_char_boundary(end) {
-        end -= 1;
-    }
-    &name[..end]
+    &name[..name.floor_char_boundary(128)]
 }
 
 /// Resolve the provider name for a request whose first path segment matched no known/config
@@ -2965,12 +2991,12 @@ fn catalog_error_relay(auto: &ModelRouting, status: Option<u16>, streaming: bool
         && !catalog_translating(auto)
 }
 
-/// A Chat Completions client served by a Chat Completions candidate of a vendor other than OpenAI,
-/// whose stream may repeat what OpenAI's sends once (see `translate::ChatIdentity`).
+/// A catalog walk (not a sub-resource) served by a Chat Completions candidate of a vendor other
+/// than OpenAI, whose stream may repeat what OpenAI's sends once (see `translate::ChatIdentity`).
+/// It decides only for a Chat Completions client: any other is translated off that candidate
+/// anyway (`catalog_translating`), which builds the same bridge.
 fn catalog_chat_relay(auto: &ModelRouting) -> bool {
-    auto.translate
-        .as_ref()
-        .is_some_and(|t| t.client == route::Endpoint::ChatCompletions)
+    auto.translate.is_some()
         && auto.candidate_at(auto.candidate).is_some_and(|c| {
             c.provider != providers::ProviderId::OpenAi
                 && route::Endpoint::of_upstream_path(c.path) == route::Endpoint::ChatCompletions
@@ -3256,14 +3282,7 @@ impl ProxyHttp for AiProxy {
     /// **with** the query, which is where a Gemini-style `?key=` credential (a virtual key or a
     /// BYO Google key) lives. Logged without the query.
     fn request_summary(&self, session: &Session, _ctx: &Self::CTX) -> String {
-        let req = session.req_header();
-        let host = req
-            .headers
-            .get(http::header::HOST)
-            .and_then(|v| v.to_str().ok())
-            .or_else(|| req.uri.host())
-            .unwrap_or("");
-        format!("{} {}, Host: {host}", req.method, req.uri.path())
+        summary_line(session.req_header())
     }
 
     fn allow_spawning_subrequest(&self, _session: &Session, _ctx: &Self::CTX) -> bool {
@@ -3757,7 +3776,7 @@ impl ProxyHttp for AiProxy {
         // whole body in hand the gateway can hash it for the cache and read Responses session
         // fields.
         let responses = route::is_responses_path(session.req_header().uri.path());
-        let large = declared_len.is_none_or(|n| n > BODY_PEEK_LIMIT);
+        let large = declared_len.is_none_or(past_replay_buffer);
         let mut peeked = false;
         // Taken before any full read (see `SlotGuard`), handed to the request context below.
         let mut early_slot: Option<SlotGuard<'_>> = None;
@@ -3784,7 +3803,7 @@ impl ProxyHttp for AiProxy {
                     }
                     // A large body is held twice (here and in its `FullBody` re-run): reserve
                     // both before reading a byte of it.
-                    if let Some(n) = declared_len.filter(|n| *n > BODY_PEEK_LIMIT)
+                    if let Some(n) = declared_len.filter(|&n| past_replay_buffer(n))
                         && !ctx.held.reserve_body(n.saturating_mul(2))
                     {
                         return self.reject_body_memory(session, &request_id).await;
@@ -3850,7 +3869,7 @@ impl ProxyHttp for AiProxy {
                 Ok(guard) => early_slot = guard,
                 Err(()) => return self.reject_tenant_busy(session, &request_id).await,
             }
-            if let Some(n) = declared_len.filter(|n| *n > BODY_PEEK_LIMIT)
+            if let Some(n) = declared_len.filter(|&n| past_replay_buffer(n))
                 && !ctx.held.reserve_body(n.saturating_mul(2))
             {
                 return self.reject_body_memory(session, &request_id).await;
@@ -4097,9 +4116,7 @@ impl ProxyHttp for AiProxy {
                     (None, Some(b)) => route::unserved(arms, b),
                     (None, None) => 0,
                 };
-                let walked = (0..walk.len)
-                    .filter_map(|i| walk.catalog_index(i))
-                    .fold(0u8, |m, orig| m | (1 << orig));
+                let walked = walk.mask();
                 if dispatchable & walked & !unserved != 0 {
                     dispatchable &= !unserved;
                 }
@@ -4335,7 +4352,7 @@ impl ProxyHttp for AiProxy {
         // reserves as it grows (`request_body_filter`).
         if (inject_eligible || background_check)
             && model_route.is_none()
-            && let Some(n) = declared_len.filter(|n| *n > BODY_PEEK_LIMIT)
+            && let Some(n) = declared_len.filter(|&n| past_replay_buffer(n))
             && !ctx.held.reserve_body(n)
         {
             return self.reject_body_memory(session, &request_id).await;
@@ -4631,9 +4648,7 @@ impl ProxyHttp for AiProxy {
             }),
             request_id,
             input_tally: usage::InputTally::default(),
-            tally_eager: managed
-                && model_route.is_none()
-                && declared_len.is_none_or(|n| n > BODY_PEEK_LIMIT),
+            tally_eager: tally_eager(managed, model_route.is_some(), declared_len),
             resp_bytes: 0,
             upstream_phase: UpstreamPhase::None,
             redact: None,
@@ -5324,7 +5339,7 @@ impl ProxyHttp for AiProxy {
                 // A large body buffered for a rewrite (the `/{provider}` usage splice; a catalog
                 // walk's large body is a `FullBody` re-run, already reserved) holds budget as it
                 // grows. Tagged downstream: the client's size, not the provider's health.
-                if rc.req_buf.len() > BODY_PEEK_LIMIT && !held.reserve_body(rc.req_buf.len()) {
+                if past_replay_buffer(rc.req_buf.len()) && !held.reserve_body(rc.req_buf.len()) {
                     self.state.metrics.rejection(Rejection::BodyMemory).inc();
                     return Err(
                         gateway_error(503, "too many large request bodies in flight").into_down(),
@@ -5468,15 +5483,15 @@ impl ProxyHttp for AiProxy {
                             changed |= translate::thinking_off_for_tools(&mut buf, tool_thinking);
                         }
                         // A candidate that answers only streams, for a client that did not ask
-                        // for one: ask it for the stream (with its usage) and assemble the answer
-                        // into the client's own body (D147). Per attempt, like the tools: a
-                        // failover candidate gets the client's body as it came.
+                        // for one: ask it for the stream and assemble the answer into the
+                        // client's own body (D147). Per attempt, like the tools: a failover
+                        // candidate gets the client's body as it came. Its usage is asked for by
+                        // the splice below, as on every Chat Completions stream (`inject_at`, or
+                        // `force_include_usage` on the client's own `stream_options`); a Messages
+                        // body takes no `stream_options`.
                         t.assemble = stream_only
                             && to != route::Endpoint::Responses
-                            && translate::force_stream(
-                                &mut buf,
-                                to == route::Endpoint::ChatCompletions,
-                            );
+                            && translate::force_stream(&mut buf, false);
                         changed |= t.assemble;
                     }
                     if changed {
@@ -8311,6 +8326,76 @@ mod tests {
         assert_eq!(clip_catalog_name("gpt-4o-mini"), "gpt-4o-mini");
         let long = "x".repeat(200);
         assert_eq!(clip_catalog_name(&long).len(), 128);
+        // Byte 128 falls inside a two-byte character: the cut backs off to its start.
+        let wide = format!("{}{}", "x".repeat(127), "é".repeat(10));
+        assert_eq!(clip_catalog_name(&wide), "x".repeat(127));
+    }
+
+    /// Pingora's own error lines print the request without its query, where a `?key=` credential
+    /// rides.
+    /// claim: SEC-4
+    #[test]
+    fn the_summary_line_leaves_out_the_query() {
+        let mut req = pingora::http::RequestHeader::build(
+            http::Method::POST,
+            b"/v1beta/models/g:generateContent?key=secret",
+            None,
+        )
+        .unwrap();
+        req.insert_header("host", "gw.example").unwrap();
+        assert_eq!(
+            summary_line(&req),
+            "POST /v1beta/models/g:generateContent, Host: gw.example"
+        );
+    }
+
+    /// The compression opt-out is spliced only just inside a non-empty root object; an empty
+    /// object, an array, or a body that already names `plugins` goes as sent.
+    /// claim: CAT-3
+    /// defect: D109
+    #[test]
+    fn compression_is_disabled_only_inside_a_non_empty_object() {
+        let off = |b: &[u8]| disable_openrouter_compression(b.to_vec());
+        for same in [
+            &b"{}"[..],
+            b" { } ",
+            b"[1]",
+            br#"[{"a":1}]"#,
+            b"",
+            b"  ",
+            br#"{"plugins":[],"a":1}"#,
+        ] {
+            assert_eq!(off(same), same, "{}", String::from_utf8_lossy(same));
+        }
+        let spliced = |pre: &str, rest: &str| {
+            let mut v = pre.as_bytes().to_vec();
+            v.extend_from_slice(OPENROUTER_NO_COMPRESSION);
+            v.extend_from_slice(rest.as_bytes());
+            v
+        };
+        assert_eq!(off(br#"{"a":1}"#), spliced("{", r#""a":1}"#));
+        assert_eq!(off(br#" {"a":1}"#), spliced(" {", r#""a":1}"#));
+    }
+
+    /// An empty `model` value (a zero-width span) is still rewritten.
+    /// claim: R1
+    #[test]
+    fn an_empty_model_span_is_rewritten() {
+        let body = br#"{"model":""}"#.to_vec();
+        assert_eq!(
+            apply_model_rewrite(body, (10, 10), b"gpt-4o"),
+            br#"{"model":"gpt-4o"}"#
+        );
+    }
+
+    /// A full-body attempt that was cancelled rather than panicked is just finished: only a
+    /// panic has a payload to log.
+    /// claim: REL-17
+    #[tokio::test]
+    async fn a_cancelled_full_body_attempt_is_finished_not_a_panic() {
+        let cancelled = tokio::spawn(std::future::pending::<()>());
+        cancelled.abort();
+        assert_eq!(reap_attempt(cancelled, "rid").await, Reaped::Finished);
     }
 
     #[test]
@@ -8319,7 +8404,7 @@ mod tests {
         // build, so the thing to guard is that they still *say* what the `error_type` in the log
         // line and the metric label claim. A drifting literal would ship a response whose `type`
         // contradicts the reason we rejected for.
-        for (typ, msg, body) in REJECT_BODIES {
+        for &(typ, msg, body) in &REJECT_BODIES {
             let v: serde_json::Value =
                 serde_json::from_str(body).unwrap_or_else(|e| panic!("{body} is not JSON: {e}"));
             assert_eq!(v["error"]["type"], typ, "type mismatch in {body}");
@@ -8330,6 +8415,7 @@ mod tests {
             assert_eq!(body, built, "constant diverges from the built body");
             // The lookup must find it rather than falling through to the allocating branch.
             assert_eq!(error_body(typ, msg), Bytes::from_static(body.as_bytes()));
+            assert_eq!(error_body(typ, msg).as_ptr(), body.as_ptr(), "{typ}: {msg}");
         }
     }
 
@@ -8383,7 +8469,7 @@ mod tests {
         );
         // Every tabulated message must also appear at a call site, catching the reverse drift (a
         // table entry left behind after its rejection was removed). Twice: the table and the caller.
-        for (_, msg, _) in REJECT_BODIES {
+        for &(_, msg, _) in &REJECT_BODIES {
             assert!(
                 src.matches(&format!("\"{msg}\"")).count() >= 2,
                 "REJECT_BODIES entry {msg:?} has no reject_boxed call site"
@@ -8774,5 +8860,146 @@ mod mutation_gaps {
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["stream_options"]["include_usage"], true);
         assert_eq!(v["stream_options"]["include_obfuscation"], false);
+    }
+
+    /// D80 resends only when **every** condition holds: a reused connection, pingora's
+    /// `ReusedOnly` verdict, a read error, and a reset or abort at the root. With any one false the
+    /// request may have reached a server, so it is never sent twice.
+    /// claim: REL-1, REL-11
+    #[test]
+    fn a_reset_before_reading_needs_every_condition() {
+        use std::io::{Error as Io, ErrorKind as K};
+        let err = |etype: T, kind: K, reused_only: bool| {
+            let mut e = Error::because(etype, "upstream", Io::from(kind));
+            if reused_only {
+                e.retry = pingora_core::RetryType::ReusedOnly;
+            }
+            e
+        };
+        let reset = err(T::ReadError, K::ConnectionReset, true);
+        assert!(reset_before_reading(&reset, true));
+        let aborted = err(T::ReadError, K::ConnectionAborted, true);
+        assert!(reset_before_reading(&aborted, true));
+        // A fresh connection: the reset says nothing about an idle-close race.
+        assert!(!reset_before_reading(&reset, false));
+        // Pingora did not judge it retryable on reuse.
+        let decided = err(T::ReadError, K::ConnectionReset, false);
+        assert!(!reset_before_reading(&decided, true));
+        // Not a read: a write that met the reset may have delivered part of the request.
+        let write = err(T::WriteError, K::ConnectionReset, true);
+        assert!(!reset_before_reading(&write, true));
+        // A timeout is a liveness verdict on a peer that may have taken the request.
+        let timed_out = err(T::ReadError, K::TimedOut, true);
+        assert!(!reset_before_reading(&timed_out, true));
+    }
+
+    /// The usage tail at the exact moment it becomes a ring and across its wrap: a chunk that
+    /// lands flush on the end (no remainder, `head` back to 0), then a final usage event that
+    /// straddles the end. Any slip here truncates or misorders the event billing reads.
+    /// claim: BIL-15
+    #[test]
+    fn the_usage_tail_wraps_at_exactly_its_capacity() {
+        let stream: Vec<u8> = (0..2 * USAGE_TAIL_CAP).map(|i| (i % 253) as u8).collect();
+        let mut tail = UsageTail::default();
+        tail.push(&stream[..USAGE_TAIL_CAP]);
+        assert!(
+            tail.ring(),
+            "exactly the cap is a ring with nothing dropped"
+        );
+        assert_eq!(tail.head, 0);
+        tail.push(&stream[USAGE_TAIL_CAP..USAGE_TAIL_CAP + 10]);
+        tail.push(&stream[USAGE_TAIL_CAP + 10..2 * USAGE_TAIL_CAP - 3]);
+        assert_eq!(tail.head, USAGE_TAIL_CAP - 3);
+        tail.push(&stream[2 * USAGE_TAIL_CAP - 3..]);
+        assert_eq!(tail.head, 0, "flush on the end wraps head to the front");
+        assert_eq!(tail.contiguous(), &stream[USAGE_TAIL_CAP..]);
+
+        // Outgrown (compacted to head 0), then filled to 5 bytes short of the end, so the usage
+        // event's first 5 bytes land at the end and the rest wrap to the front.
+        let mut tail = UsageTail::default();
+        tail.push(&stream[..USAGE_TAIL_CAP + 5]);
+        tail.push(&stream[USAGE_TAIL_CAP + 5..2 * USAGE_TAIL_CAP - 5]);
+        assert_eq!(tail.head, USAGE_TAIL_CAP - 10);
+        tail.push(&stream[2 * USAGE_TAIL_CAP - 5..]);
+        assert_eq!(tail.head, USAGE_TAIL_CAP - 5);
+        let event = br#"data: {"usage":{"total_tokens":7}}"#;
+        tail.push(event);
+        assert_eq!(tail.head, event.len() - 5);
+        let mut whole = stream.clone();
+        whole.extend_from_slice(event);
+        assert_eq!(tail.contiguous(), &whole[whole.len() - USAGE_TAIL_CAP..]);
+    }
+
+    /// A body write that met an HTTP/2 stream already closed (D248) is pingora's `H2Error` with a
+    /// capacity context, found anywhere down the cause chain; another type or context is not it.
+    /// claim: REL-22
+    #[test]
+    fn only_an_h2_capacity_failure_is_an_unsent_body() {
+        for ctx in ["cannot reserve capacity", "while waiting for capacity"] {
+            assert!(h2_body_unsent(&Error::explain(T::H2Error, ctx)), "{ctx}");
+            let wrapped = Error::because(
+                T::WriteError,
+                "writing the body",
+                Error::explain(T::H2Error, ctx),
+            );
+            assert!(h2_body_unsent(&wrapped), "caused by {ctx}");
+            assert!(
+                !h2_body_unsent(&Error::explain(T::WriteError, ctx)),
+                "not H2: {ctx}"
+            );
+        }
+        assert!(!h2_body_unsent(&Error::explain(T::H2Error, "stream reset")));
+        assert!(!h2_body_unsent(&Error::new(T::H2Error)));
+    }
+
+    /// With no key to scrub (none sent, or an empty one) and no body to hold, a chunk is relayed as
+    /// it came, never searched; a body held whole is held whether or not there is a key.
+    /// claim: SEC-7
+    #[test]
+    fn redact_holds_a_whole_body_even_with_no_key() {
+        let chunk = Bytes::from_static(br#"{"error":{"message":"x"}}"#);
+        let empty = memchr::memmem::Finder::new(b"");
+        let mut r = Redact::default();
+        let got = r.feed(std::slice::from_ref(&empty), Some(chunk.clone()), false);
+        assert_eq!(got.map(|b| b.as_ptr()), Some(chunk.as_ptr()));
+        let mut r = Redact {
+            whole: true,
+            status: 400,
+            ..Redact::default()
+        };
+        assert_eq!(r.feed(&[], Some(chunk.clone()), false), Some(Bytes::new()));
+        assert_eq!(r.feed(&[], None, true), Some(chunk));
+    }
+
+    /// An attempt that ended unanswered is a 502 that says whether it panicked.
+    /// claim: REL-1
+    /// defect: D207
+    #[test]
+    fn an_unanswered_attempt_says_whether_it_panicked() {
+        let context = |e: Box<Error>| e.context.as_ref().map(|c| c.as_str().to_owned());
+        let panicked = Reaped::Panicked.unanswered();
+        assert_eq!(panicked.etype(), &T::HTTPStatus(502));
+        assert_eq!(
+            context(panicked).as_deref(),
+            Some("full-body attempt panicked")
+        );
+        for quiet in [Reaped::Finished, Reaped::StillRunning] {
+            assert_eq!(
+                context(quiet.unanswered()).as_deref(),
+                Some("full-body attempt ended without a response")
+            );
+        }
+    }
+
+    /// An `anthropic-beta` line whose every token is allowed goes out exactly as the client wrote
+    /// it, spacing included: only a value with a token to drop is rebuilt.
+    /// claim: SEC-6
+    #[test]
+    fn an_allowed_beta_line_is_forwarded_untouched() {
+        let value = "prompt-caching-2024-07-31,  interleaved-thinking-2025-05-14";
+        let mut req = pingora::http::RequestHeader::build("POST", b"/v1/messages", None).unwrap();
+        req.insert_header("anthropic-beta", value).unwrap();
+        retain_managed_client_headers(&mut req).unwrap();
+        assert_eq!(req.headers.get("anthropic-beta").unwrap(), value);
     }
 }

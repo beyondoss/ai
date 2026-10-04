@@ -340,3 +340,44 @@ async fn a_large_body_failover_charges_the_breaker_it_left() {
         gw.log()
     );
 }
+
+/// A large body's 429 key walk reaches every pool key, however many: thirty keys, the last one
+/// served, thirty uploads. The bound on a full-body walk's attempts guards a looping bug, not a
+/// long legitimate walk; and when a walk does reach it (one hundred and fifty keys, all
+/// throttled), the last attempt it allows is the client's answer, the provider's own 429, not a
+/// synthetic 502.
+/// claim: REL-21, R5
+/// defect: D81
+#[tokio::test]
+async fn a_large_body_walks_every_pool_key_up_to_the_attempt_bound() {
+    let (pubkey, sk) = test_keypair(1);
+    for (n, served_by) in [(30usize, Some("Bearer sk-k029")), (150, None)] {
+        let keys: Vec<String> = (0..n).map(|i| format!("sk-k{i:03}")).collect();
+        let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
+        let primary = ReplyUpstream::start(move |_, req| {
+            if served_by.is_some() && req.authorization.as_deref() == served_by {
+                Reply::ok()
+            } else {
+                Reply::json(429, r#"{"error":{"message":"slow down"}}"#)
+            }
+        })
+        .await;
+        let gw = Gateway::builder(unused_nats_port(), &primary.authority(), &b64(&pubkey))
+            .providers(&["openai"])
+            .pool_keys("openai", &keys)
+            .start()
+            .await;
+        let out = send(&gw, &vkey(&sk), LARGE).await;
+        let want = if served_by.is_some() {
+            (200, n)
+        } else {
+            (429, 144)
+        };
+        assert_eq!(
+            (out.status, primary.hits()),
+            want,
+            "{n} keys: {out:?}\n{}",
+            gw.log()
+        );
+    }
+}

@@ -210,3 +210,54 @@ async fn each_cooled_key_is_counted_with_its_reason() {
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
+
+/// The cooldown is per candidate wherever it sits in the row: an unfunded provider at the row's
+/// second catalog slot, walked first by `x-beyond-order`, is passed over for the next requests
+/// just as one in the first slot is. (Its out-of-quota 429 is relayed, and cools its key.)
+/// claim: REL-4
+/// defect: D180
+#[tokio::test]
+async fn an_unfunded_candidate_cools_off_from_any_catalog_slot() {
+    let (pubkey, sk) = test_keypair(180);
+    let key = billing_vkey(&sk, 181);
+    let unfunded = MockUpstream::start(Mode::Raw(429, "application/json", OPENAI_NO_QUOTA)).await;
+    let openai = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::builder(unused_nats_port(), &openai.authority(), &b64(&pubkey))
+        .providers(&["openai", "openrouter"])
+        .provider_authority("openrouter", &unfunded.authority())
+        .start()
+        .await;
+    let mut served = Vec::new();
+    for _ in 0..3 {
+        let resp = test_client()
+            .post(format!("{}/v1/chat/completions", gw.url()))
+            .header("authorization", format!("Bearer {key}"))
+            .header("content-type", "application/json")
+            .header("x-beyond-order", "openrouter,openai")
+            .body(r#"{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}"#)
+            .send()
+            .await
+            .unwrap();
+        let by = resp
+            .headers()
+            .get("x-beyond-provider")
+            .map(|v| v.to_str().unwrap().to_owned());
+        served.push((resp.status().as_u16(), by));
+    }
+    let by = |p: &str| Some(p.to_owned());
+    assert_eq!(
+        served,
+        [
+            (429, by("openrouter")),
+            (200, by("openai")),
+            (200, by("openai"))
+        ],
+        "{}",
+        gw.log()
+    );
+    assert_eq!(
+        unfunded.hits(),
+        1,
+        "OpenRouter was tried after it said it had no quota"
+    );
+}
