@@ -518,6 +518,10 @@ pub enum Mode {
     /// Reply with exactly this status, content type, and body — for fixtures that belong to one
     /// test file (a provider's real stream shape, an error body with no `error` key).
     Raw(u16, &'static str, &'static str),
+    /// [`Raw`](Mode::Raw) for a request whose body contains the marker (the first field), the
+    /// [`Json`](Mode::Json) 200 otherwise: one upstream that refuses some requests and serves the
+    /// rest, as OpenRouter does a request too costly for the balance left.
+    RawWhenBody(&'static str, u16, &'static str, &'static str),
     /// Answer with this status, then never send the body: an upstream that fails and hangs. The
     /// gateway must not wait on an attempt it abandoned.
     StatusThenStall(u16),
@@ -739,7 +743,11 @@ fn canned_body(mode: Mode) -> (&'static str, Bytes) {
         // A slow reply, and the surviving requests of a close-on-Nth mock, are ordinary successes.
         Mode::StallSse => ("text/event-stream", Bytes::from(stall_sse(false))),
         Mode::AnthropicStallSse => ("text/event-stream", Bytes::from(stall_sse(true))),
-        Mode::Json | Mode::Slow(_) | Mode::CloseOnReusedConnection | Mode::ThrottleKey(_) => (
+        Mode::Json
+        | Mode::Slow(_)
+        | Mode::CloseOnReusedConnection
+        | Mode::ThrottleKey(_)
+        | Mode::RawWhenBody(..) => (
             "application/json",
             Bytes::from_static(CANNED_JSON.as_bytes()),
         ),
@@ -880,6 +888,16 @@ async fn mock_handle(
     // not retry — correctly, since it cannot know how much the upstream consumed. Draining first
     // puts the failure squarely on the response-header read, which is the `ReusedOnly` shape this
     // mode exists to produce.
+    let mode = match mode {
+        Mode::RawWhenBody(marker, status, ct, raw) => {
+            if memchr::memmem::find(&body, marker.as_bytes()).is_some() {
+                Mode::Raw(status, ct, raw)
+            } else {
+                Mode::Json
+            }
+        }
+        m => m,
+    };
     if matches!(mode, Mode::CloseOnReusedConnection) && on_conn > 0 {
         return Err(std::io::Error::other("mock closing a reused connection"));
     }
