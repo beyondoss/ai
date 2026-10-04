@@ -895,8 +895,10 @@ fn is_pool_key_failure(status: u16) -> bool {
 /// failure. Only a 401 ([`is_pool_key_failure`]) walks keys, and cools its key at the head. A
 /// relayed answer can cool its key from `logging` too, read from the body: a 403 that names the
 /// key ([`body_names_the_key`]), and an out-of-credit answer under any status (a 402, Anthropic's
-/// credit-balance 400, OpenAI's `insufficient_quota` 429: `remedy::Neutralized::unfunded`). Each
-/// is counted on `ai_key_auth_failures_total` by reason (`metrics::KeyCooled`).
+/// credit-balance 400, OpenAI's `insufficient_quota` 429: `remedy::Neutralized::unfunded`). A 402
+/// the walk fails over on is abandoned at its head, body unread, so its key is cooled there when
+/// the status alone says out of credit (`remedy::unfunded_402`, D258). Each is counted on
+/// `ai_key_auth_failures_total` by reason (`metrics::KeyCooled`).
 fn is_candidate_refusal(status: u16) -> bool {
     (401..=403).contains(&status)
 }
@@ -1702,6 +1704,21 @@ impl AiProxy {
             "no candidate provider available".to_owned(),
         )
         .await
+    }
+
+    /// Cool this attempt's pool key because its account is out of credit (D180): later requests
+    /// start past it, and a catalog walk leaves the provider out once all its keys cool. Waiting
+    /// does not fix it, so it is cooled as a 401 is.
+    fn cool_unfunded_key(&self, request_id: &RequestId, provider: &Provider, key: u8, status: u16) {
+        self.state.metrics.key_cooled(KeyCooled::Unfunded);
+        warn!(
+            %request_id,
+            provider = provider.name.as_str(),
+            key,
+            status,
+            "pool key is out of credit; cooling it",
+        );
+        provider.mark_key_bad(key);
     }
 
     /// Resolve a 2xx's pending health verdict from the first response bytes: count an
@@ -5023,6 +5040,18 @@ impl ProxyHttp for AiProxy {
         if first_usable(usable, at.saturating_add(1)).is_none() {
             return Ok(());
         }
+        // Failing over abandons this response at its head, so `Redact` never reads the body that
+        // tells `logging` an account is out of credit (D180), and every later request would pay a
+        // round trip to it first. A 402 says so by its status alone except on OpenRouter, whose
+        // 402 may be one request too large for the balance (`remedy::unfunded_402`): cool that key
+        // here, as `logging` would have, on either abandoning path below (D258).
+        let unfunded = key_failure
+            && status == 402
+            && rc
+                .auto
+                .as_ref()
+                .and_then(|a| a.candidate_at(at))
+                .is_some_and(|c| remedy::unfunded_402(c.provider));
         // Fail over only when the body is **provably** replayable: fully read, and small enough
         // that pingora buffered all of it.
         //
@@ -5056,6 +5085,10 @@ impl ProxyHttp for AiProxy {
                 "upstream returned {status}; re-running the full body on the next candidate",
             );
             rc.relay_abandoned = fb.record(RelayRetry::Candidate(orig));
+            // Not recorded (the final attempt): this answer is relayed and `logging` reads it.
+            if unfunded && rc.relay_abandoned {
+                self.cool_unfunded_key(&rc.request_id, &rc.provider, rc.pool_key, status);
+            }
             return Ok(());
         }
         if !body_replayable(session) {
@@ -5087,6 +5120,9 @@ impl ProxyHttp for AiProxy {
             && let Some(b) = rc.provider.breaker.as_ref()
         {
             b.record_success_for(permit);
+        }
+        if unfunded {
+            self.cool_unfunded_key(&rc.request_id, &rc.provider, rc.pool_key, status);
         }
         rc.advance_candidate(at);
         let mut e = pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(status));
@@ -6448,17 +6484,12 @@ impl ProxyHttp for AiProxy {
             // credit-balance 400, OpenAI's insufficient_quota 429: read from the body by `Redact`)
             // is that key refused until someone pays, which waiting does not fix. Cool it as a 401
             // is cooled: later requests start past it, and a catalog walk leaves the provider out
-            // once all its keys cool (D180). This request already answered.
-            if rc.managed && rc.redact.as_ref().is_some_and(|r| r.unfunded) {
-                self.state.metrics.key_cooled(KeyCooled::Unfunded);
-                warn!(
-                    request_id = %rc.request_id,
-                    provider = rc.provider.name.as_str(),
-                    key = rc.pool_key,
-                    status = rc.upstream_status.unwrap_or(0),
-                    "pool key is out of credit; cooling it",
-                );
-                rc.provider.mark_key_bad(rc.pool_key);
+            // once all its keys cool (D180). This request already answered. Not an abandoned
+            // `FullBody` attempt: its body never reaches the client and is read only if it raced
+            // the parent's drop, and a walk's 402 was already judged at the head (D258).
+            if rc.managed && !rc.relay_abandoned && rc.redact.as_ref().is_some_and(|r| r.unfunded) {
+                let status = rc.upstream_status.unwrap_or(0);
+                self.cool_unfunded_key(&rc.request_id, &rc.provider, rc.pool_key, status);
             }
             // Extract usage facts (shape depends on dialect + streaming). Every case reads the tail;
             // Anthropic streaming *additionally* reads the head, because that's where `message_start`

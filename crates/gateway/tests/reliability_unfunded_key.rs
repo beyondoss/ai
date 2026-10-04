@@ -261,3 +261,95 @@ async fn an_unfunded_candidate_cools_off_from_any_catalog_slot() {
         "OpenRouter was tried after it said it had no quota"
     );
 }
+
+/// A catalog walk fails over on a 402 at the response head (D84), so the body `logging` reads to
+/// cool an out-of-credit key (D180) is never read. Anthropic's `billing_error` 402 says out of
+/// credit by its status alone, so the walk cools the key there: the first request is served by the
+/// next candidate, and every request after it, for the cooldown, goes straight to it. OpenRouter's
+/// 402 can instead be one request larger than the balance ("This request requires more credits"),
+/// which a smaller request is not: that one fails over too, and cools nothing, so OpenRouter keeps
+/// getting the row's requests. Both hold for a body pingora replays and for one past its 64 KiB
+/// retry buffer, which fails over by a `FullBody` re-run.
+/// claim: REL-4
+/// defect: D258
+#[tokio::test]
+async fn a_402_the_walk_fails_over_on_cools_an_unfunded_key() {
+    const ANTHROPIC_BILLING: &str = r#"{"type":"error","error":{"type":"billing_error","message":"Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits."}}"#;
+    const OPENROUTER_TOO_COSTLY: &str = r#"{"error":{"message":"This request requires more credits, or fewer max_tokens. You requested up to 64000 tokens, but can only afford 1234. To increase, visit https://openrouter.ai/settings/credits and add more credits","code":402}}"#;
+    let (pubkey, sk) = test_keypair(158);
+    let key = billing_vkey(&sk, 158);
+    let mut failures = Vec::new();
+    let cases = [
+        // (refusing provider, its 402, the next candidate, its mock, whether the 402 cools)
+        (
+            "anthropic",
+            ANTHROPIC_BILLING,
+            "openrouter",
+            Mode::Json,
+            true,
+        ),
+        (
+            "openrouter",
+            OPENROUTER_TOO_COSTLY,
+            "anthropic",
+            Mode::AnthropicJson,
+            false,
+        ),
+    ];
+    // Replayed by pingora, and past its 64 KiB retry buffer (a `FullBody` re-run).
+    let large = "x".repeat(100 * 1024);
+    for ((first, body, next, mode, cools), prompt) in cases
+        .into_iter()
+        .flat_map(|c| [(c, "hi"), (c, large.as_str())])
+    {
+        let size = prompt.len();
+        let refusing = MockUpstream::start(Mode::Raw(402, "application/json", body)).await;
+        let serving = MockUpstream::start(mode).await;
+        let gw = Gateway::builder(unused_nats_port(), &serving.authority(), &b64(&pubkey))
+            .providers(&["anthropic", "openrouter"])
+            .provider_authority(first, &refusing.authority())
+            .provider_authority(next, &serving.authority())
+            .start()
+            .await;
+        for n in 1..=3 {
+            let resp = test_client()
+                .post(format!("{}/v1/chat/completions", gw.url()))
+                .header("authorization", format!("Bearer {key}"))
+                .header("content-type", "application/json")
+                .header("x-beyond-order", format!("{first},{next}"))
+                .body(format!(
+                    r#"{{"model":"claude-opus-4-8","messages":[{{"role":"user","content":"{prompt}"}}]}}"#
+                ))
+                .send()
+                .await
+                .unwrap();
+            let got = resp.status().as_u16();
+            let by = resp
+                .headers()
+                .get("x-beyond-provider")
+                .map(|v| v.to_str().unwrap().to_owned());
+            let text = resp.text().await.unwrap();
+            if got != 200 || by.as_deref() != Some(next) {
+                failures.push(format!(
+                    "{first} ({size} B) request {n}: {got} by {by:?}: {text}"
+                ));
+            }
+        }
+        let cooled = gw
+            .metric("ai_key_auth_failures_total", r#"reason="unfunded""#)
+            .await;
+        let (want_hits, want_cooled) = if cools { (1, 1.0) } else { (3, 0.0) };
+        if refusing.hits() != want_hits || serving.hits() != 3 || cooled != want_cooled {
+            failures.push(format!(
+                "{first} ({size} B): {} hits on its 402 (want {want_hits}), {} on {next}, {cooled} keys cooled (want {want_cooled})",
+                refusing.hits(),
+                serving.hits(),
+            ));
+        }
+        if !failures.is_empty() {
+            failures.push(gw.log());
+            break;
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+}
