@@ -131,6 +131,11 @@ capture_default_sample_n = 1
 # lossless writer. Deeper absorbs a longer sink stall at the cost of holding more bytes in memory.
 capture_queue_depth = 1024
 
+# Bound on the bytes those queued lines hold (`0`: none). One line carries up to two
+# `capture_max_bytes` bodies (more after JSON escaping), so the line count alone is not a memory
+# bound. A line that would cross it is DROPPED and counted on `ai_capture_dropped_total`.
+capture_queue_bytes = 67108864
+
 # Exact-match response cache. Off by default (`0`). When set, a managed catalog walk (`/auto`,
 # managed `/v1`) whose client body is already in hand before upstream_peer hashes that pre-rewrite
 # body + inbound path + tenant_id + effective candidate order and, on a hit, replays the stored 2xx

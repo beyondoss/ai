@@ -1231,6 +1231,9 @@ pub struct Gateway {
     pub port: u16,
     pub metrics_port: u16,
     config_path: std::path::PathBuf,
+    /// The read end of a stdout pipe nobody drains ([`GatewayBuilder::stall_stdout`]): held, so the
+    /// pipe stays open and full rather than broken.
+    _stalled_stdout: Option<std::process::ChildStdout>,
 }
 
 /// The managed pool key configured for a provider. Each provider gets a distinct value so a test
@@ -1303,6 +1306,8 @@ pub struct GatewayBuilder {
     /// verify phase 0: billing — raw `key = value` scalars and child env (see the marked block).
     extra_config: Vec<String>,
     env_overrides: Vec<(String, String)>,
+    /// Leave stdout undrained (see [`GatewayBuilder::stall_stdout`]).
+    stall_stdout: bool,
     /// `[id_signing_keys]` (kid → raw secret) and `id_signing_kid`. Defaults to [`DEV_ID_SECRET`]
     /// under kid `1`; `None` writes no table (managed Responses on a GPT row then 503s).
     id_signing: Option<IdSigning>,
@@ -1480,6 +1485,7 @@ impl GatewayBuilder {
         let port = free_port();
         let metrics_port = free_port();
         let wait_allowance_ready = self.wait_allowance_ready;
+        let stall_stdout = self.stall_stdout;
         let config_path = std::env::temp_dir().join(format!("beyond-ai-config-{port}.toml"));
         let nats_port = self.nats_port;
         // Scalars first, `[…]` tables last (TOML ordering).
@@ -1652,12 +1658,17 @@ impl GatewayBuilder {
                 }
             });
         };
-        drain(
-            child
-                .stdout
-                .take()
-                .map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
-        );
+        let stalled_stdout = if stall_stdout {
+            child.stdout.take()
+        } else {
+            drain(
+                child
+                    .stdout
+                    .take()
+                    .map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
+            );
+            None
+        };
         drain(
             child
                 .stderr
@@ -1670,6 +1681,7 @@ impl GatewayBuilder {
             metrics_port,
             config_path,
             log,
+            _stalled_stdout: stalled_stdout,
         };
         // The metrics/admin listener (`/livez`, `/readyz`, `/metrics`) binds on a *separate* port from
         // the proxy; wait for it too, or a test that probes it right after `start()` races the bind
@@ -1733,6 +1745,7 @@ impl Gateway {
             wait_allowance_ready: true,
             extra_config: Vec::new(),
             env_overrides: Vec::new(),
+            stall_stdout: false,
             id_signing: Some((vec![('1', DEV_ID_SECRET.to_vec())], None)),
         }
     }
@@ -1880,6 +1893,13 @@ impl GatewayBuilder {
     /// Append a raw top-level `key = value` line to the gateway config (e.g. `read_timeout_secs = 2`).
     pub fn config_line(mut self, line: &str) -> Self {
         self.extra_config.push(line.to_string());
+        self
+    }
+
+    /// Never read the gateway's stdout: a log pipeline that stopped draining. The pipe fills and
+    /// every later `write(2)` to it blocks. Only stderr reaches [`Gateway::log`].
+    pub fn stall_stdout(mut self) -> Self {
+        self.stall_stdout = true;
         self
     }
 
