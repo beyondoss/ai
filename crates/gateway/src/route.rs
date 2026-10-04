@@ -1237,11 +1237,16 @@ mod tests {
             ProviderMetrics::disconnected(),
             None,
         );
-        // A cooldown that ends 200 ms from now, rather than `KEY_COOLDOWN`'s minute.
-        p.pool_auth[0]
-            .bad_until_ms
-            .store(clock_ms().saturating_add(200), Ordering::Relaxed);
-        assert_eq!(p.first_key(), 1);
+        // A cooldown that ends 200 ms from now, rather than `KEY_COOLDOWN`'s minute. It only shows
+        // the key cooling if it is read before those 200 ms are up; a run a loaded host stalled
+        // past them proves nothing, so it is re-run.
+        let cooling_read = (0..50).find_map(|_| {
+            let until = clock_ms().saturating_add(200);
+            p.pool_auth[0].bad_until_ms.store(until, Ordering::Relaxed);
+            let first = p.first_key();
+            (clock_ms() < until).then_some(first)
+        });
+        assert_eq!(cooling_read, Some(1), "the cooling key is skipped");
         std::thread::sleep(Duration::from_millis(250));
         assert_eq!(p.first_key(), 0, "the cooldown has passed");
     }

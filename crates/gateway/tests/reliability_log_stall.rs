@@ -102,11 +102,42 @@ async fn a_rejection_flood_logs_a_capped_number_of_lines() {
         let resp = client.post(&url).body("{}").send().await.unwrap();
         assert_eq!(resp.status(), 404);
     };
-    let flood: u64 = 600;
+    // Nothing is suppressed unless more than the cap lands in one of the gateway's whole seconds,
+    // and a loaded host slows the client: flood in rounds until one provably did. `n` rejections
+    // inside `d` seconds touch at most ceil(d) + 1 of those seconds, so n > 100 * (ceil(d) + 1)
+    // puts more than 100 into at least one. Eight clients at once, so a round is short.
+    const ROUND: u64 = 600;
+    const CLIENTS: u64 = 8;
+    let mut flood: u64 = 0;
     let started = std::time::Instant::now();
-    for _ in 0..flood {
-        reject().await;
-    }
+    let dense = loop {
+        let round = std::time::Instant::now();
+        let mut set = tokio::task::JoinSet::new();
+        for _ in 0..CLIENTS {
+            let (client, url) = (client.clone(), url.clone());
+            set.spawn(async move {
+                for _ in 0..ROUND / CLIENTS {
+                    let resp = client.post(&url).body("{}").send().await.unwrap();
+                    assert_eq!(resp.status(), 404);
+                }
+            });
+        }
+        while let Some(done) = set.join_next().await {
+            done.unwrap();
+        }
+        flood += ROUND;
+        let spread = round.elapsed().as_secs_f64().ceil() as u64;
+        if ROUND > 100 * (spread + 1) {
+            break true;
+        }
+        if flood >= 20 * ROUND {
+            break false;
+        }
+    };
+    assert!(
+        dense,
+        "no round of {ROUND} rejections fit in 4s: this host is too loaded to flood the cap"
+    );
     let seconds = started.elapsed().as_secs() + 1;
     // A fresh second, so this line is admitted and reports what the flood left out.
     tokio::time::sleep(Duration::from_millis(1100)).await;

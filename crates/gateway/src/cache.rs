@@ -484,17 +484,29 @@ mod tests {
 
     #[test]
     fn insert_drops_an_expired_prefix_without_evicting_a_newer_live_entry() {
-        let c = ResponseCache::new(Duration::from_millis(40), 2, 1024);
+        const TTL: Duration = Duration::from_millis(40);
         let k1 = key_of(1, "/v1", b"a", &[]);
         let k2 = key_of(1, "/v1", b"b", &[]);
-        c.insert(k1, entry(b"old"));
-        std::thread::sleep(Duration::from_millis(50));
-        c.insert(k2, entry(b"new"));
         let k3 = key_of(1, "/v1", b"c", &[]);
-        c.insert(k3, entry(b"newer"));
-        assert!(c.get(&k1).is_none());
-        assert_eq!(c.get(&k2).unwrap().body.as_ref(), b"new");
-        assert_eq!(c.get(&k3).unwrap().body.as_ref(), b"newer");
+        // k2 and k3 must still be live when read back. A loaded host can stall this thread past
+        // the TTL between the inserts and the reads; such a run proves nothing, so it is re-run.
+        for _ in 0..50 {
+            let c = ResponseCache::new(TTL, 2, 1024);
+            c.insert(k1, entry(b"old"));
+            std::thread::sleep(TTL + Duration::from_millis(10));
+            let live_from = Instant::now();
+            c.insert(k2, entry(b"new"));
+            c.insert(k3, entry(b"newer"));
+            let (got1, got2, got3) = (c.get(&k1), c.get(&k2), c.get(&k3));
+            if live_from.elapsed() >= TTL {
+                continue;
+            }
+            assert!(got1.is_none());
+            assert_eq!(got2.unwrap().body.as_ref(), b"new");
+            assert_eq!(got3.unwrap().body.as_ref(), b"newer");
+            return;
+        }
+        panic!("every run stalled past the {TTL:?} TTL");
     }
 
     #[test]

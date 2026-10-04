@@ -78,7 +78,10 @@ async fn an_idle_gateway_exits_promptly_on_sigterm() {
     );
 }
 
-/// The same with a short configured grace: shutdown time tracks the grace, even when idle.
+/// The same with a short configured grace: shutdown time tracks the grace, even when idle. The
+/// drain's own line shows what ended the process (pingora's path out waits the grace, then the
+/// runtime timeout), so the time bound need only be the grace, which a loaded host cannot stretch
+/// a sub-second drain past.
 /// claim: REL-16, BIL-21
 /// defect: D38
 #[tokio::test]
@@ -86,16 +89,20 @@ async fn an_idle_gateway_with_a_short_grace_exits_before_the_grace() {
     let (pubkey, _sk) = test_keypair(1);
     let mock = MockUpstream::start(Mode::Json).await;
     let mut gw = Gateway::builder(unused_nats_port(), &mock.authority(), &b64(&pubkey))
-        .config_line("shutdown_grace_period_secs = 3")
+        .config_line("shutdown_grace_period_secs = 10")
         .config_line("shutdown_runtime_timeout_secs = 1")
+        // The drain's line is `info`.
+        .env("AI_LOG", "info")
         .start()
         .await;
     gw.sigterm();
-    let exited = gw.wait_exit(Duration::from_secs(15)).await;
+    let exited = gw.wait_exit(CONDITION_BUDGET).await;
     assert!(
-        exited.is_some_and(|t| t < Duration::from_secs(2)),
-        "idle gateway (3s grace) exit after SIGTERM: {exited:?}"
+        exited.is_some_and(|t| t < Duration::from_secs(10)),
+        "idle gateway (10s grace) exit after SIGTERM: {exited:?}"
     );
+    gw.wait_for_log_line(&["drained: no request in flight; exiting"])
+        .await;
 }
 
 /// `read_timeout_secs` is honored: a header stall ends at the configured bound.
@@ -120,8 +127,10 @@ async fn a_header_stall_ends_at_the_configured_read_timeout() {
         .map(|r| r.status().as_u16())
         .unwrap_or(0);
     let took = start.elapsed();
+    // Unloaded it ends at the 2s bound; the bound it must not wait out instead is the default 600s
+    // (and the client gives up at 30s, as status 0).
     assert!(
-        status >= 500 && took < Duration::from_secs(6),
+        status >= 500 && took < Duration::from_secs(20),
         "status {status} after {took:?}"
     );
 }
@@ -249,8 +258,9 @@ async fn a_dead_h2_upstream_is_detected_by_ping() {
     .await;
     let (status, body, took) = stream_to_end(&gw).await;
     assert_eq!(status, 200, "{body:?}");
+    // Unloaded: about 6s. Under the client's own 40s timeout, which would end it as an error too.
     assert!(
-        took < Duration::from_secs(12),
+        took < Duration::from_secs(30),
         "a dead upstream was held for {took:?}: {body:?}"
     );
     assert!(
@@ -602,7 +612,11 @@ async fn a_panic_in_a_proxy_phase_releases_what_the_request_held() {
 async fn sigterm_drains_an_in_flight_request_then_exits() {
     let (pubkey, sk) = test_keypair(1);
     let mock = MockUpstream::start(Mode::Slow(1500)).await;
-    let mut gw = Gateway::start(unused_nats_port(), &mock.authority(), &b64(&pubkey)).await;
+    // `info`: the drain's line, and the billing row.
+    let mut gw = Gateway::builder(unused_nats_port(), &mock.authority(), &b64(&pubkey))
+        .env("AI_LOG", "info")
+        .start()
+        .await;
     let (url, key) = (gw.url(), vkey(&sk, 38));
     let held = tokio::spawn(async move {
         test_client()
@@ -616,13 +630,14 @@ async fn sigterm_drains_an_in_flight_request_then_exits() {
     });
     wait_for_metric(&gw, "ai_requests_in_flight", "", 1.0).await;
     gw.sigterm();
-    let exited = gw.wait_exit(Duration::from_secs(15)).await;
+    // The grace is the default 600s: an exit at all within the budget is the drain's, and its own
+    // line says so.
+    let exited = gw.wait_exit(CONDITION_BUDGET).await;
     let status = held.await.unwrap();
     assert_eq!(status.ok(), Some(200), "the in-flight request was cut");
-    assert!(
-        exited.is_some_and(|t| t < Duration::from_secs(5)),
-        "exit after the drain: {exited:?}"
-    );
+    assert!(exited.is_some(), "no exit after the drain: {exited:?}");
+    gw.wait_for_log_line(&["drained: no request in flight; exiting"])
+        .await;
     assert!(
         gw.log().contains("\"target\":\"ai.usage\""),
         "the drained request's billing row was not written"

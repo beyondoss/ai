@@ -388,6 +388,7 @@ dependencies = [
  "reqwest",
  "ring",
  "rustc-hash",
+ "rustix",
  "rustls",
  "serde",
  "serde_json",
