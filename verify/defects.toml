@@ -2623,7 +2623,7 @@ evidence = "Code: capture_sink.rs spawn_to (sync_channel(depth)), QueueWriter::d
 claims = ["REL-18", "O2"]
 state = "fixed"
 test = "a_line_over_the_byte_budget_is_dropped_and_counted"
-fix = "f04358c"
+fix = "7eb16d1"
 note = "Fixed: the queue is also bounded in bytes, capture_queue_bytes (default 64 MiB, 0 disables). QueueWriter::drop charges the line's length to an AtomicUsize before try_send (undone if it would cross the bound, or if the queue is full or closed); the drain thread releases it after the write, so a line in its hands while the destination is wedged still counts. A line over the bound is dropped and counted on ai_capture_dropped_total, like a full-queue drop: no new label, the counter already means every lost line (D208). Two relaxed atomics per enqueued line, nothing on a request that captures nothing. Also tested: a_written_line_releases_its_bytes, a_full_queue_drop_releases_its_bytes."
 
 [[defect]]
@@ -2637,7 +2637,7 @@ evidence = "Code: main.rs init_tracing, main_layer = fmt::layer().json() with no
 claims = ["REL-10", "BIL-4"]
 state = "fixed"
 test = "a_stalled_stdout_does_not_stall_requests"
-fix = "f04358c"
+fix = "7eb16d1"
 note = "Fixed: diagnostics go through a second capture_sink instance (bounded at 8 192 lines and 16 MiB, its own ai-log-sink thread); a full queue drops the line and counts it on the new ai_log_dropped_total. The drain on SIGTERM, and pingora's own exit path, flush it after the payload sink within the same 5 s bound. request rejected lines are capped at 100 a second process-wide (proxy::LogRate: three relaxed atomics, on the rejection path only); the rest are counted and the next line logged carries suppressed = how many were left out, while ai_rejections_total counts every rejection. ai.usage rows stay on the blocking writer on the worker (BIL-4): a dedicated billing thread fed by a blocking queue was considered and rejected, since once its queue fills the worker blocks exactly as on the pipe (it only delays the stall), and rows sitting in a queue would be lost to a crash, a panic abort or the end of the grace period, where today they are in the pipe when logging returns. So a stalled pipe still stalls billing traffic, by design; diagnostics and payloads no longer add to it. Also tested: a_rejection_flood_logs_a_capped_number_of_lines, shutdown_flushes_the_diagnostic_sink, proxy rejection_lines_are_capped_per_second_and_the_rest_counted."
 
 [[defect]]
@@ -2651,7 +2651,7 @@ evidence = "proxy.rs build_peer: read_timeout = (!long_running).then(read_timeou
 claims = ["REL-1", "BIL-3", "A3"]
 state = "fixed"
 test = "a_stream_that_never_ends_is_cut_at_request_max_secs"
-fix = "57b59d6"
+fix = "c0905f9"
 note = "Fixed: request_max_secs (default 4h: the catalog's largest max_output_tokens, 384,000, at ~27 tokens/s; 0 disables) fixes a deadline in request_filter (RequestCtx::deadline, carried into FullBody re-runs). upstream_peer caps each attempt's read timeout at the time left when that is shorter (read_capped); pingora re-arms it per read and every read starts after the attempt, so a capped timeout fires only at or past the deadline, and error_while_proxy turns it into the deadline's CustomCode 504 ('request exceeded the gateway's maximum duration'). A moving stream, either direction, is cut per chunk against a coarse clock (deadline.rs: one relaxed atomic load, advanced by one ticker thread per process each second), and peek_body_model checks it per chunk (a 408). An attempt with no time left ends before connecting. A policy limit: is_upstream_failure is false for it (no breaker failure), no resend or failover, no key cooled; billing follows the existing rules (a cut 2xx is cut_short with an estimate, a pre-head wait after delivery bills the prompt via gave_up_waiting, D130). ai_rejections_total{reason=\"request_deadline\"}. Also tested: a_silent_provider_is_a_504_at_request_max_secs (ordinary and -pro rows; breaker threshold 1, no failover, no key cooled, slot back), request_max_secs_zero_disables_the_ceiling, an_up_front_body_still_trickling_at_request_max_secs_gets_a_408, a_streamed_upload_still_trickling_at_request_max_secs_ends, a_large_body_re_run_keeps_the_requests_deadline, a_candidate_reached_after_the_deadline_is_not_contacted. Not changed: a per-chunk cut lands up to one tick (1s) late; RequestCtx grew 8 bytes (432 -> 440)."
 
 [[defect]]
@@ -2665,5 +2665,5 @@ evidence = "pingora-core 0.9 protocols/http/v2/server.rs read_body_bytes (no tim
 claims = ["REL-1", "SEC-16", "A3"]
 state = "fixed"
 test = "a_client_stalled_in_an_up_front_body_read_gets_a_408"
-fix = "57b59d6"
+fix = "c0905f9"
 note = "Fixed: client_read_timeout_secs (default 60, pingora's own HTTP/1.1 value; 0 disables) bounds each up-front read. request_filter sets it as the downstream session's read timeout, which pingora enforces on HTTP/1.1 (body reads it streams included, unchanged at the default), and peek_body_model wraps each read in a timer only where the session has none (HTTP/2). Every error of the peek's I/O (the read and the 100 Continue write) is tagged downstream, so a timeout is fail_to_proxy's 408 'request body timed out' (D260's answer) and a client that went away gets nothing written. No provider contacted, no breaker, no billing row (no request context yet), and the SlotGuard gives the slot back as request_filter returns. Not changed: an h2c body streamed through to a provider (a small header-won body) is still bounded by the upstream read timeout (D260) and by request_max_secs (D264)."
