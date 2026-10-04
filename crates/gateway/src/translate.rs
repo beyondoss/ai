@@ -376,7 +376,6 @@ fn map_request(from: Endpoint, to: Endpoint, v: &Value, up: Upstream) -> (Value,
         (Endpoint::Messages, Endpoint::Responses) => {
             openai_req_to_responses(&anthropic_req_to_openai(v, up), up.openai)
         }
-        (a, b) if a == b => v.clone(),
         _ => v.clone(),
     };
     (out, false)
@@ -454,7 +453,6 @@ fn map_response(
         (Endpoint::Responses, Endpoint::Messages) => {
             openai_resp_to_anthropic(&responses_resp_to_openai(v))
         }
-        (a, b) if a == b => v.clone(),
         _ => v.clone(),
     }
 }
@@ -574,6 +572,8 @@ impl<'de> serde::de::DeserializeSeed<'de> for KeepInputs {
     }
 }
 
+/// Only the methods serde_json's `deserialize_any` calls: a string comes through `visit_str`
+/// (borrowed or copied, never `visit_string`'s owned form), and JSON has no `Option` to visit.
 impl<'de> serde::de::Visitor<'de> for KeepInputs {
     type Value = Value;
 
@@ -601,20 +601,8 @@ impl<'de> serde::de::Visitor<'de> for KeepInputs {
         Ok(Value::String(s.to_owned()))
     }
 
-    fn visit_string<E>(self, s: String) -> Result<Value, E> {
-        Ok(Value::String(s))
-    }
-
     fn visit_unit<E>(self) -> Result<Value, E> {
         Ok(Value::Null)
-    }
-
-    fn visit_none<E>(self) -> Result<Value, E> {
-        Ok(Value::Null)
-    }
-
-    fn visit_some<D: serde::Deserializer<'de>>(self, d: D) -> Result<Value, D::Error> {
-        d.deserialize_any(self)
     }
 
     fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Value, A::Error> {
@@ -753,8 +741,10 @@ fn error_info(v: &Value) -> ErrorInfo {
     if let Some(meta) = metadata.as_ref() {
         let provider = meta.get("provider_name").and_then(Value::as_str);
         let inner = match meta.get("raw") {
+            // JSON that is not an object names no type or message, so it is quoted whole, as text
+            // that is not JSON is.
             Some(Value::String(raw)) => match serde_json::from_str::<Value>(raw) {
-                Ok(parsed) if parsed.is_object() => {
+                Ok(parsed) => {
                     if typ.is_none() {
                         typ = parsed
                             .get("error")
@@ -765,7 +755,7 @@ fn error_info(v: &Value) -> ErrorInfo {
                     }
                     plain_error_message(&parsed).or_else(|| Some(clip(raw)))
                 }
-                _ => Some(clip(raw)),
+                Err(_) => Some(clip(raw)),
             },
             Some(raw @ Value::Object(_)) => plain_error_message(raw),
             _ => None,
@@ -3384,11 +3374,11 @@ fn finish_anthropic_stop(stop: &'static str, refused: bool, called: bool) -> &'s
     }
 }
 
-/// A Chat `finish_reason` kept past its chunk.
+/// A Chat `finish_reason` kept past its chunk, as far as [`responses_status`] tells reasons apart
+/// (a tool call's `tool_calls` is a completed response, like `stop`).
 fn chat_finish(reason: &str) -> &'static str {
     match reason {
         "length" => "length",
-        "tool_calls" | "function_call" => "tool_calls",
         "content_filter" => "content_filter",
         _ => "stop",
     }
@@ -3478,9 +3468,8 @@ impl Usage {
         // must be shown the output it is billed.
         let r = reasoning.unwrap_or(0);
         // Saturating: provider numbers are untrusted and overflow-checks are on (D87).
-        let outside = r > 0
-            && u64_at(u, "/total_tokens")
-                == Some(prompt.saturating_add(completion).saturating_add(r));
+        let outside =
+            u64_at(u, "/total_tokens") == Some(prompt.saturating_add(completion).saturating_add(r));
         Self {
             uncached: prompt
                 .saturating_sub(cache_read)
@@ -5598,10 +5587,15 @@ impl ChatIdentity {
         dropped
     }
 
+    /// (choice, entry, kind) packed into disjoint bit ranges: 24 bits, 32 bits, 8 bits.
+    fn key(choice: u64, entry: u64, kind: u64) -> u64 {
+        (choice & 0xff_ffff) << 40 | (entry & 0xffff_ffff) << 8 | kind
+    }
+
     /// The packed key for (choice, entry, kind), when neither `sent` nor `pending` holds it yet:
     /// the field is new and should be kept (and recorded). `None` for a repeat.
     fn seen(sent: &[u64], pending: &[u64], choice: u64, entry: u64, kind: u64) -> Option<u64> {
-        let key = (choice & 0xff_ffff) << 40 | (entry & 0xffff_ffff) << 8 | kind;
+        let key = Self::key(choice, entry, kind);
         (!sent.contains(&key) && !pending.contains(&key)).then_some(key)
     }
 
@@ -5617,7 +5611,7 @@ impl ChatIdentity {
         if !obj.get(field).is_some_and(Value::is_string) {
             return false;
         }
-        let key = (choice & 0xff_ffff) << 40 | (entry & 0xffff_ffff) << 8 | kind;
+        let key = Self::key(choice, entry, kind);
         if self.sent.contains(&key) {
             obj.remove(field);
             return true;
@@ -6030,9 +6024,10 @@ impl SseBridge {
                 }
             }
             Endpoint::Messages if !self.errored => self.oai_to_ant.finish(&mut out),
-            Endpoint::Responses if !self.errored => self.oai_to_resp.finish(&mut out),
+            // After an error this is a no-op: `OaiToResp::error` marked the response completed.
+            Endpoint::Responses => self.oai_to_resp.finish(&mut out),
             // Embeddings never stream and never translate.
-            Endpoint::Messages | Endpoint::Responses | Endpoint::Embeddings => {}
+            Endpoint::Messages | Endpoint::Embeddings => {}
         }
         out
     }
@@ -10161,5 +10156,251 @@ mod mutation_gaps {
         for key in ["$defs", "definitions"] {
             assert!(!openai_strict_schema(&json!({key: {"x": open}})), "{key}");
         }
+    }
+
+    /// Each bound is crossed one byte past its documented size, not at it: an unterminated event
+    /// at 32 MiB, and gathered output at the catalog's largest answer times the widest token.
+    /// claim: SEC-19
+    #[test]
+    fn a_bridge_overflows_one_byte_past_each_bound() {
+        let largest = providers::catalog::MODEL_ROUTES
+            .iter()
+            .map(|r| r.card.max_output_tokens as usize)
+            .max()
+            .unwrap();
+        assert_eq!(MAX_STREAM_OUTPUT, largest * 128);
+        let mut b = SseBridge::new(Endpoint::Messages, Endpoint::ChatCompletions);
+        b.buf = vec![b' '; 32 << 20];
+        assert_eq!(b.overflow(), None);
+        b.buf.push(b' ');
+        assert_eq!(b.overflow(), Some("sse_event"));
+        b.buf = Vec::new();
+        b.oai_to_resp.held = MAX_STREAM_OUTPUT;
+        assert_eq!(b.overflow(), None);
+        b.oai_to_resp.held += 1;
+        assert_eq!(b.overflow(), Some("sse_output"));
+    }
+
+    /// A thinking block is held whole up to 8 MiB and dropped one byte past it, in both the
+    /// Messages-stream holder and the OpenRouter gatherer.
+    /// claim: T2
+    #[test]
+    fn thinking_is_held_up_to_8_mib_and_dropped_past_it() {
+        let cap = 8 << 20;
+        let at_cap = "a".repeat(cap);
+        let mut held = HeldThinking::default();
+        held.push(&at_cap[..cap - 1]);
+        held.push("a");
+        assert!(!held.overflow);
+        assert_eq!(held.text.len(), cap);
+        held.push("a");
+        assert!(held.overflow && held.text.is_empty());
+        let mut held = HeldThinking::default();
+        held.push(&at_cap);
+        held.push("a");
+        assert!(held.overflow, "one push past the cap");
+
+        let mut done = Vec::new();
+        let mut g = Gather::default();
+        g.text(None, &at_cap, &mut done);
+        g.sign("S", &mut done);
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0]["thinking"].as_str().map(str::len), Some(cap));
+        let mut done = Vec::new();
+        let mut g = Gather::default();
+        g.text(None, &at_cap, &mut done);
+        g.text(None, "a", &mut done);
+        g.sign("S", &mut done);
+        g.text(None, &at_cap, &mut done);
+        g.text(None, "a", &mut done);
+        g.close(&mut done);
+        assert!(done.is_empty(), "{done:?}");
+    }
+
+    /// An unsigned gathered block closes as a `thinking` block; with nothing gathered, closing
+    /// adds nothing.
+    /// claim: T2
+    #[test]
+    fn closing_a_gather_emits_only_a_block_it_holds() {
+        let mut done = Vec::new();
+        Gather::default().close(&mut done);
+        assert!(done.is_empty());
+        let mut g = Gather::default();
+        g.text(Some(0), "hm", &mut done);
+        g.close(&mut done);
+        assert_eq!(done, [json!({"type": "thinking", "thinking": "hm"})]);
+    }
+
+    /// Only a number a `Value` keeps as an `f64`, at any depth, makes tool input keep its text; an
+    /// object stands for kept text only when that is its one member.
+    /// claim: T1
+    #[test]
+    fn only_a_float_keeps_tool_input_text() {
+        assert!(has_float(&json!([1.5])));
+        assert!(has_float(&json!({"a": [1, {"b": [2.5]}]})));
+        assert!(!has_float(&json!({"a": [1, -2, "1.5"]})));
+        assert_eq!(exact_value(r#"{"a": 1}"#, json!({"a": 1})), json!({"a": 1}));
+        let kept = exact_value(r#"{"a": [1.10]}"#, json!({"a": [1.1]}));
+        assert_eq!(raw_json(&kept), Some(r#"{"a": [1.10]}"#));
+        let mut two = kept.as_object().unwrap().clone();
+        two.insert("b".into(), json!(2));
+        assert_eq!(raw_json(&Value::Object(two)), None);
+        // Negative integers survive the input-keeping parse as integers.
+        let v = parse_body(
+            Endpoint::Messages,
+            br#"{"temperature": -1, "input": {"n": -5}}"#,
+        )
+        .unwrap();
+        assert_eq!(v, json!({"temperature": -1, "input": {"n": -5}}));
+    }
+
+    /// What is and is not an upstream error body.
+    /// claim: T6
+    #[test]
+    fn looks_like_error_needs_the_whole_signal() {
+        for (v, err) in [
+            // A Responses object is an error only when it failed *and* carries the error.
+            (
+                json!({"object": "response", "status": "failed", "error": {"code": "x"}}),
+                true,
+            ),
+            (
+                json!({"object": "response", "status": "failed", "error": null}),
+                false,
+            ),
+            (
+                json!({"object": "response", "status": "completed", "error": {"code": "x"}}),
+                false,
+            ),
+            // A string `error` beside a success field is not an error.
+            (json!({"error": "warn", "choices": []}), false),
+            (json!({"error": "warn", "content": []}), false),
+            (json!({"error": "warn", "output": []}), false),
+            (json!({"error": "warn", "type": "message"}), false),
+            (json!({"error": "boom"}), true),
+            (json!({"error": {"message": "boom"}, "choices": []}), true),
+        ] {
+            assert_eq!(looks_like_error(&v), err, "{v}");
+        }
+    }
+
+    /// Anthropic's error envelope needs `type: "error"` and both an error `type` and `message`.
+    /// claim: T6
+    #[test]
+    fn the_messages_envelope_needs_every_field() {
+        let full = json!({"type": "error", "error": {"type": "x", "message": "m"}});
+        assert!(in_client_envelope(&full, Endpoint::Messages));
+        for v in [
+            json!({"error": {"type": "x", "message": "m"}}),
+            json!({"type": "error", "error": {"message": "m"}}),
+            json!({"type": "error", "error": {"type": "x"}}),
+        ] {
+            assert!(!in_client_envelope(&v, Endpoint::Messages), "{v}");
+        }
+        assert!(in_client_envelope(
+            &json!({"error": {"message": "m"}}),
+            Endpoint::ChatCompletions
+        ));
+    }
+
+    /// The error type a status means when the body names none, row by row.
+    /// claim: T6
+    #[test]
+    fn status_error_types_hold_row_by_row() {
+        use Endpoint::{ChatCompletions as Chat, Messages};
+        for (client, status, typ) in [
+            (Messages, 400, "invalid_request_error"),
+            (Messages, 401, "authentication_error"),
+            (Messages, 402, "billing_error"),
+            (Messages, 403, "permission_error"),
+            (Messages, 404, "not_found_error"),
+            (Messages, 413, "request_too_large"),
+            (Messages, 429, "rate_limit_error"),
+            (Messages, 500, "api_error"),
+            (Messages, 504, "timeout_error"),
+            (Messages, 529, "overloaded_error"),
+            (Chat, 401, "invalid_request_error"),
+            (Chat, 429, "rate_limit_error"),
+            (Chat, 504, "api_error"),
+        ] {
+            assert_eq!(
+                status_error_type(status, client),
+                typ,
+                "{client:?} {status}"
+            );
+        }
+    }
+
+    /// OpenAI error types and codes onto Anthropic's closed set, row by row.
+    /// claim: T6
+    #[test]
+    fn anthropic_error_types_hold_row_by_row() {
+        for (typ, code, want) in [
+            ("server_error", None, "api_error"),
+            ("insufficient_quota", None, "billing_error"),
+            (
+                "invalid_request_error",
+                Some("insufficient_quota"),
+                "billing_error",
+            ),
+            ("requests", None, "rate_limit_error"),
+            ("x", Some("rate_limit_exceeded"), "rate_limit_error"),
+            (
+                "invalid_request_error",
+                Some("invalid_api_key"),
+                "authentication_error",
+            ),
+            (
+                "invalid_request_error",
+                Some("model_not_found"),
+                "not_found_error",
+            ),
+            (
+                "invalid_request_error",
+                Some("other"),
+                "invalid_request_error",
+            ),
+        ] {
+            let code = code.map(|c| json!(c));
+            assert_eq!(
+                anthropic_error_type(typ, code.as_ref()),
+                want,
+                "{typ} {code:?}"
+            );
+        }
+    }
+
+    /// An error message past 4096 bytes is cut at the last character boundary at or before it.
+    /// claim: T6
+    #[test]
+    fn clip_cuts_at_a_character_boundary() {
+        assert_eq!(clip(&"a".repeat(4096)), "a".repeat(4096));
+        assert_eq!(clip(&"a".repeat(5000)), format!("{}…", "a".repeat(4096)));
+        let wide = format!("{}é{}", "a".repeat(4095), "b".repeat(10));
+        assert_eq!(clip(&wide), format!("{}…", "a".repeat(4095)));
+    }
+
+    /// An error body with no message anywhere is quoted whole (a choice that finished with an
+    /// error says so instead); OpenRouter's provider error as an object is quoted after its
+    /// wrapper's message; and a message that does not say overflow gets no overflow code.
+    /// claim: T6, TRN-18
+    #[test]
+    fn error_messages_come_from_wherever_the_body_keeps_them() {
+        let chat = Endpoint::ChatCompletions;
+        let out = map_error(&json!({"foo": "bar"}), chat, 500);
+        assert_eq!(out["error"]["message"], r#"{"foo":"bar"}"#, "{out}");
+        let ended = json!({"choices": [{"finish_reason": "error"}]});
+        assert_eq!(
+            map_error(&ended, chat, 200)["error"]["message"],
+            "The upstream ended the response with an error."
+        );
+        let wrapped = json!({"error": {"message": "Provider returned error", "code": 400,
+            "metadata": {"provider_name": "Acme", "raw": {"error": {"message": "inner"}}}}});
+        assert_eq!(
+            map_error(&wrapped, chat, 400)["error"]["message"],
+            "Provider returned error (Acme): inner"
+        );
+        let plain = map_error(&json!({"error": {"message": "bad"}}), chat, 400);
+        assert_eq!(plain["error"]["code"], Value::Null, "{plain}");
     }
 }

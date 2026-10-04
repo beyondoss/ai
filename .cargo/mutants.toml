@@ -44,4 +44,11 @@ exclude_re = [
   # whose answer is the same `false`. Either operator gives the same result, only slower. (It is
   # the only `||` in `whole`; re-check this exclusion if another one is added there.)
   'replace \|\| with && in ArgsEnd::whole',
+  # `KeepInputs::expecting` only words a parse error's message, which `parse_body` discards (it
+  # keeps `None`); `visit_unit`'s `Value::Null` is `Value::default()`.
+  "replace <impl serde::de::Visitor<'de> for KeepInputs>::(expecting|visit_unit)",
+  # `ChatIdentity::key` packs three masked fields into disjoint bit ranges: `|` and `^` agree.
+  'replace \| with \^ in ChatIdentity::key',
+  # `map_response` clones a same-wire body as is: the guard only skips that clone.
+  'replace match guard client == Endpoint::Responses with false in SseBridge::assembled',
 ]

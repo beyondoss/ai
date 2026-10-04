@@ -2877,3 +2877,16 @@ fn a_thinking_part_in_a_responses_message_reaches_messages() {
     );
     assert_eq!(v["messages"][1]["content"][0], block, "{v}");
 }
+
+/// A plain-text document onto Chat Completions is its text (alone, the content string).
+/// claim: T3
+#[test]
+fn a_plain_text_document_becomes_a_text_part() {
+    let doc = json!({"type": "document",
+        "source": {"type": "text", "media_type": "text/plain", "data": "the notes"}});
+    let v = m2c(
+        &anth(json!({"messages": [{"role": "user", "content": [doc]}]})),
+        "gpt-5",
+    );
+    assert_eq!(v["messages"][0]["content"], "the notes", "{v}");
+}
