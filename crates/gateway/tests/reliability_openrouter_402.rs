@@ -209,3 +209,41 @@ async fn a_burst_of_openrouter_402s_cools_its_key_once() {
         gw.log(),
     );
 }
+
+/// Only a 402 is a strike. A 403 the walk fails over on is a refusal of this request or account,
+/// never a sign the key is out of credit (D84): however many come in a row, OpenRouter's key is not
+/// cooled and every request still tries it first.
+/// claim: REL-4
+/// defect: D261
+#[tokio::test]
+async fn openrouter_403s_in_a_row_never_cool_its_key() {
+    let (pubkey, sk) = test_keypair(164);
+    let key = billing_vkey(&sk, 164);
+    let openrouter = MockUpstream::start(Mode::Raw(
+        403,
+        "application/json",
+        r#"{"error":{"message":"forbidden","code":403}}"#,
+    ))
+    .await;
+    let anthropic = MockUpstream::start(Mode::AnthropicJson).await;
+    let gw = gateway(&openrouter, &anthropic, &pubkey).await;
+    let requests = strikes() + 2;
+    for n in 1..=requests {
+        let (status, by, text) = send(&gw, &key, "hi").await;
+        assert_eq!(
+            (status, by.as_deref()),
+            (200, Some("anthropic")),
+            "request {n}: {text}\n{}",
+            gw.log()
+        );
+    }
+    let cooled = gw
+        .metric("ai_key_auth_failures_total", r#"reason="unfunded""#)
+        .await;
+    assert_eq!(
+        (openrouter.hits(), cooled),
+        (requests, 0.0),
+        "every request tries OpenRouter and no key cools\n{}",
+        gw.log()
+    );
+}
