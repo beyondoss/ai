@@ -2818,4 +2818,36 @@ data: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":40}}\n\n";
         assert_eq!(estimate_body_output(tail.as_bytes(), n), 29);
         assert_eq!(estimate_body_output(tail.as_bytes(), 2 * n), 59);
     }
+
+    /// A string that is not text is skipped whole whatever it holds: an escaped quote inside a
+    /// skipped value or key, and a key that leaves the trie on a non-letter, end where their
+    /// closing quote does, so the text after them still counts.
+    /// claim: BIL-20
+    #[test]
+    fn skipped_strings_end_at_their_own_closing_quote() {
+        let text = r#""content":"hello world""#;
+        for envelope in [
+            r#""model":"a\"b""#,
+            r#""\"":1"#,
+            r#""X":"y""#,
+            r#""tX":"y""#,
+        ] {
+            let body = format!(r#"{{{envelope},"messages":[{{{text}}}]}}"#);
+            let mut t = InputTally::default();
+            t.feed(body.as_bytes());
+            assert_eq!(t.estimate_tokens(), 2, "{body}");
+        }
+    }
+
+    /// A stream's last event is read even when no blank line ends it, on the slow path that reads
+    /// an event's `data:` lines joined (D126).
+    /// claim: BIL-1
+    #[test]
+    fn a_final_multi_line_event_without_a_blank_line_still_bills() {
+        let sse = b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n\
+data: {\"choices\":[],\"usage\":\n\
+data: {\"prompt_tokens\":7,\"completion_tokens\":2,\"total_tokens\":9}}\n";
+        let u = openai_stream(sse).expect("usage");
+        assert_eq!((u.input_tokens, u.output_tokens), (7, 2));
+    }
 }

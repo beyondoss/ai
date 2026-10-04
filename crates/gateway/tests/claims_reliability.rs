@@ -2031,3 +2031,92 @@ async fn rss_plateaus_under_sustained_load_and_large_bodies() {
          round {WARM} (limit {limit}); per round: {rss:?}"
     );
 }
+
+/// On a catalog walk, a provider that keeps refusing streams gets the same one resend as on its
+/// provider route, then the walk moves on (here, with no other candidate, the error stands): two
+/// refusals, never a loop of them.
+/// claim: REL-22
+/// defect: D91
+#[tokio::test]
+async fn a_catalog_walk_resends_a_refused_stream_once() {
+    let (pubkey, sk) = test_keypair(224);
+    let key = billing_vkey(&sk, 2207);
+    let (port, served, refused, task) = refusing_h2_upstream(Refuse::Always).await;
+    let gw = Gateway::builder(
+        unused_nats_port(),
+        &format!("127.0.0.1:{port}"),
+        &b64(&pubkey),
+    )
+    .providers(&["openai"])
+    .tls_upstream()
+    .upstream_http2(true)
+    .start()
+    .await;
+    let resp = post(&gw, "/v1/chat/completions", &key, CHAT).await;
+    let status = resp.status().as_u16();
+    let text = resp.text().await.unwrap_or_default();
+    task.abort();
+    assert_eq!(
+        (
+            status,
+            refused.load(Ordering::SeqCst),
+            served.load(Ordering::SeqCst)
+        ),
+        (502, 2, 0),
+        "one send and one resend: {text}"
+    );
+}
+
+/// A large body's walk gives every candidate its own one resend of a refused stream, then fails
+/// over: the first two candidates refuse every stream, the third refuses only its first, and the
+/// client gets the third's answer. Each refusal is counted against its own candidate, never
+/// another's.
+/// claim: REL-22, REL-21
+/// defect: D72
+#[tokio::test]
+async fn each_candidate_of_a_large_body_walk_gets_one_refused_stream_resend() {
+    let (pubkey, sk) = test_keypair(225);
+    let key = billing_vkey(&sk, 2208);
+    let large = format!(
+        r#"{{"model":"deepseek-flash","messages":[{{"role":"user","content":"{}"}}]}}"#,
+        "x".repeat(200 * 1024)
+    );
+    let (p0, served0, refused0, t0) = refusing_h2_upstream(Refuse::Always).await;
+    let (p1, served1, refused1, t1) = refusing_h2_upstream(Refuse::Always).await;
+    let (p2, served2, refused2, t2) = refusing_h2_upstream(Refuse::FirstStream).await;
+    let gw = Gateway::builder(
+        unused_nats_port(),
+        &format!("127.0.0.1:{p0}"),
+        &b64(&pubkey),
+    )
+    .providers(&["deepseek", "together", "openrouter"])
+    .provider_authority("deepseek", &format!("127.0.0.1:{p0}"))
+    .provider_authority("together", &format!("127.0.0.1:{p1}"))
+    .provider_authority("openrouter", &format!("127.0.0.1:{p2}"))
+    .tls_upstream()
+    .upstream_http2(true)
+    .start()
+    .await;
+    let resp = post(&gw, "/v1/chat/completions", &key, &large).await;
+    let status = resp.status().as_u16();
+    let text = resp.text().await.unwrap_or_default();
+    for t in [t0, t1, t2] {
+        t.abort();
+    }
+    let counts = |served: &AtomicUsize, refused: &AtomicUsize| {
+        (
+            refused.load(Ordering::SeqCst),
+            served.load(Ordering::SeqCst),
+        )
+    };
+    assert_eq!(status, 200, "{text}\n{}", gw.log());
+    assert_eq!(
+        [
+            counts(&served0, &refused0),
+            counts(&served1, &refused1),
+            counts(&served2, &refused2)
+        ],
+        [(2, 0), (2, 0), (1, 1)],
+        "(refused, served) per candidate"
+    );
+}

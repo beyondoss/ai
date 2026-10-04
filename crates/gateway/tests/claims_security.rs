@@ -1667,3 +1667,62 @@ async fn bare_v1_byo_routes_by_the_forwarded_credential() {
         "an Anthropic key reached OpenAI"
     );
 }
+
+/// A managed key anywhere makes a bare `/v1` request managed: BYO credentials for two providers
+/// beside it are not ambiguous, because every credential location is stripped and the pool key
+/// goes instead. The request is served, and no client credential reaches the provider.
+/// claim: SEC-11
+/// defect: D82
+#[tokio::test]
+async fn a_managed_key_beside_mixed_byo_credentials_is_not_ambiguous() {
+    let openai = MockUpstream::start(Mode::Json).await;
+    let (pubkey, sk) = test_keypair(82);
+    let gw = Gateway::builder(unused_nats_port(), &openai.authority(), &b64(&pubkey))
+        .providers(&["openai"])
+        .start()
+        .await;
+    let managed = format!("Bearer {}", billing_vkey(&sk, 821));
+    let status = bare_byo(
+        &gw,
+        "/v1/chat/completions",
+        &[
+            ("authorization", &managed),
+            ("x-api-key", "stray"),
+            ("x-api-key", "sk-proj-openai-byo"),
+        ],
+    )
+    .await;
+    assert_eq!((status, openai.hits()), (200, 1), "{}", gw.log());
+    let cap = openai.captured().unwrap();
+    assert!(cap.x_api_key.is_none(), "{:?}", cap.x_api_key);
+    assert_ne!(cap.authorization.as_deref(), Some(managed.as_str()));
+}
+
+/// A BYO `?key=` query parameter is the caller's own credential on its own account: forwarded with
+/// the rest of the path, untouched. Only a managed (virtual) key is stripped from the query.
+/// claim: SEC-11
+#[tokio::test]
+async fn a_byo_key_query_parameter_is_forwarded() {
+    let mock = MockUpstream::start(Mode::Json).await;
+    let (pubkey, _sk) = test_keypair(82);
+    let gw = Gateway::builder(unused_nats_port(), &mock.authority(), &b64(&pubkey))
+        .providers(&["openai"])
+        .start()
+        .await;
+    let resp = test_client()
+        .post(format!(
+            "{}/openai/v1/chat/completions?key=byo-secret&x=1",
+            gw.url()
+        ))
+        .header("authorization", "Bearer sk-proj-openai-byo")
+        .header("content-type", "application/json")
+        .body(CHAT)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    assert_eq!(
+        mock.captured().unwrap().path,
+        "/v1/chat/completions?key=byo-secret&x=1"
+    );
+}

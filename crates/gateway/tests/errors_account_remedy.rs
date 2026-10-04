@@ -179,3 +179,134 @@ async fn a_request_over_the_tpm_limit_is_told_to_shrink_not_to_retry() {
         "the account behind the gateway stays out: {text}"
     );
 }
+
+/// A streaming request's provider error is a JSON body like any other: the account remedy in it is
+/// neutralized the same way, rather than relayed because the client asked for a stream.
+/// claim: T6
+/// defect: D174
+#[tokio::test]
+async fn a_streaming_requests_account_remedy_is_neutralized_too() {
+    let (pubkey, sk) = test_keypair(174);
+    let mock = MockUpstream::start(Mode::Raw(
+        429,
+        "application/json",
+        OPENROUTER_SHARED_POOL_429,
+    ))
+    .await;
+    let gw = Gateway::builder(
+        unused_nats_port(),
+        &GatewayBuilder::dead_authority(),
+        &b64(&pubkey),
+    )
+    .providers(&["openrouter"])
+    .provider_authority("openrouter", &mock.authority())
+    .start()
+    .await;
+    let key = billing_vkey(&sk, 174);
+    let resp = test_client()
+        .post(format!("{}/openrouter/v1/chat/completions", gw.url()))
+        .header("authorization", format!("Bearer {key}"))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"anthropic/claude-opus-4.8","stream":true,"messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    let text = resp.text().await.unwrap();
+    let leaks = remedy_leaks(&text);
+    assert!(
+        status == 429 && leaks.is_empty(),
+        "{status}, leaks {leaks:?}: {text}\n{}",
+        gw.log()
+    );
+}
+
+/// The neutralized error is held whole and loses its `Content-Length`; on an HTTP/1.1 upstream it
+/// goes to the client chunked, so the connection stays open for the client's next request.
+/// claim: T6
+/// defect: D174
+#[tokio::test]
+async fn a_rewritten_error_is_chunked_to_an_http1_client() {
+    let (pubkey, sk) = test_keypair(174);
+    let mock = MockUpstream::start(Mode::Raw(
+        429,
+        "application/json",
+        OPENROUTER_SHARED_POOL_429,
+    ))
+    .await;
+    let gw = Gateway::builder(
+        unused_nats_port(),
+        &GatewayBuilder::dead_authority(),
+        &b64(&pubkey),
+    )
+    .providers(&["openrouter"])
+    .provider_authority("openrouter", &mock.authority())
+    .start()
+    .await;
+    let key = billing_vkey(&sk, 174);
+    let body =
+        r#"{"model":"anthropic/claude-opus-4.8","messages":[{"role":"user","content":"hi"}]}"#;
+    let resp = test_client()
+        .post(format!("{}/openrouter/v1/chat/completions", gw.url()))
+        .header("authorization", format!("Bearer {key}"))
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 429);
+    assert_eq!(resp.version(), reqwest::Version::HTTP_11);
+    let te = resp
+        .headers()
+        .get("transfer-encoding")
+        .map(|v| v.to_str().unwrap().to_owned());
+    let length = resp.headers().get("content-length").cloned();
+    let text = resp.text().await.unwrap();
+    assert_eq!((te.as_deref(), length), (Some("chunked"), None), "{text}");
+    assert!(remedy_leaks(&text).is_empty(), "{text}");
+}
+
+/// Only a JSON error is held whole for the rewrite: a plain-text one (an edge's HTML or text
+/// page) has no remedy to find and is relayed as sent, its `Content-Length` kept.
+/// claim: T6
+/// defect: D174
+#[tokio::test]
+async fn a_non_json_error_is_relayed_with_its_length() {
+    const PLAIN: &str = "upstream connect error or disconnect/reset before headers";
+    let (pubkey, sk) = test_keypair(174);
+    let mock = MockUpstream::start(Mode::Raw(400, "text/plain", PLAIN)).await;
+    let gw = Gateway::builder(
+        unused_nats_port(),
+        &GatewayBuilder::dead_authority(),
+        &b64(&pubkey),
+    )
+    .providers(&["openrouter"])
+    .provider_authority("openrouter", &mock.authority())
+    .start()
+    .await;
+    let key = billing_vkey(&sk, 174);
+    let resp = test_client()
+        .post(format!("{}/openrouter/v1/chat/completions", gw.url()))
+        .header("authorization", format!("Bearer {key}"))
+        .header("content-type", "application/json")
+        .body(
+            r#"{"model":"anthropic/claude-opus-4.8","messages":[{"role":"user","content":"hi"}]}"#,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 400);
+    let length = resp
+        .headers()
+        .get("content-length")
+        .map(|v| v.to_str().unwrap().to_owned());
+    let te = resp.headers().get("transfer-encoding").cloned();
+    let text = resp.text().await.unwrap();
+    assert_eq!(text, PLAIN);
+    assert_eq!(
+        (length, te),
+        (Some(PLAIN.len().to_string()), None),
+        "{}",
+        gw.log()
+    );
+}

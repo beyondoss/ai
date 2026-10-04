@@ -223,3 +223,29 @@ async fn large_bodies_that_fit_the_budget_still_translate() {
     assert_eq!(status, 200, "{text}");
     assert_eq!(mock.hits(), 2);
 }
+
+/// The 413 is for a translation that needs more than the whole budget. One that needs exactly the
+/// budget fits it, so it is not a 413; it cannot be held while the walk holds the body's own two
+/// copies, which is the budget's retryable 503.
+/// claim: SEC-19
+/// defect: D216
+#[tokio::test]
+async fn a_translation_needing_exactly_the_budget_is_not_a_413() {
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::AnthropicJson).await;
+    let body = format!(
+        r#"{{"model":"claude-opus-4-8","store":false,"input":[{}]}}"#,
+        tiny_objects(100 * 1024)
+    );
+    let heap = beyond_ai::translate::translation_heap(body.as_bytes());
+    let gw = Gateway::builder(unused_nats_port(), &mock.authority(), &b64(&pubkey))
+        .providers(&["anthropic"])
+        .config_line(&format!("max_buffered_body_bytes = {heap}"))
+        .start()
+        .await;
+    let (status, text, _) = send(&gw, &sk, "/v1/responses", body).await;
+    assert!(
+        status == 503 && text.contains("too many large request bodies"),
+        "{status}: {text}"
+    );
+}

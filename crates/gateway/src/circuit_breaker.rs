@@ -1739,4 +1739,11 @@ mod mutation_gaps {
             "{s}"
         );
     }
+
+    /// A refusal reads as what it is when it reaches a log line or an error chain.
+    /// claim: R6
+    #[test]
+    fn an_open_circuit_says_so() {
+        assert_eq!(CircuitOpen.to_string(), "circuit breaker is open");
+    }
 }

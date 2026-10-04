@@ -370,3 +370,41 @@ async fn a_key_walk_retry_replays_the_body_exactly_once() {
         "the usage injection must still be spliced exactly once on the retried attempt",
     );
 }
+
+/// The same on a catalog walk: a pooled connection the provider closed with the request unread is
+/// the connection's failure, not the candidate's, so the walk retries the same candidate on a fresh
+/// connection, even with no other candidate to walk to.
+/// claim: REL-1
+/// defect: D80
+#[tokio::test]
+async fn a_catalog_walk_resends_a_reused_connection_reset_before_reading() {
+    let (port, fired) = closes_reused_connections_unread().await;
+    let (pubkey, sk) = test_keypair(1);
+    let gw = Gateway::builder(
+        unused_nats_port(),
+        &format!("127.0.0.1:{port}"),
+        &b64(&pubkey),
+    )
+    .providers(&["openai"])
+    .start()
+    .await;
+    let vkey = billing_vkey(&sk, 80);
+    let client = reqwest::Client::new();
+    for i in 0..6 {
+        let resp = client
+            .post(format!("{}/v1/chat/completions", gw.url()))
+            .header("authorization", format!("Bearer {vkey}"))
+            .header("content-type", "application/json")
+            .body(body())
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("request {i}: {e}; log:\n{}", gw.log()));
+        let status = resp.status().as_u16();
+        let text = resp.text().await.unwrap_or_default();
+        assert_eq!(status, 200, "request {i}: {text}\n{}", gw.log());
+    }
+    assert!(
+        fired.load(std::sync::atomic::Ordering::SeqCst) > 0,
+        "no pooled connection was reused, so the scenario did not fire"
+    );
+}

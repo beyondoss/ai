@@ -791,3 +791,162 @@ async fn a_large_body_reserves_every_copy_it_will_hold_before_it_is_read() {
         "every refusal came before an upstream attempt"
     );
 }
+
+/// A body pingora can replay from its own 64 KiB buffer is bounded by concurrency, not charged to
+/// the body budget: 60 KiB and exactly 64 KiB are served under a budget smaller than two copies of
+/// either. Only a body past the buffer reserves (the test above).
+/// claim: SEC-19
+/// defect: D35
+#[tokio::test]
+async fn a_body_within_the_replay_buffer_is_not_charged_to_the_budget() {
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::builder(unused_nats_port(), &mock.authority(), &b64(&pubkey))
+        .config_line("max_buffered_body_bytes = 100000")
+        .start()
+        .await;
+    let chat = |len: usize| {
+        let empty = r#"{"model":"gpt-4o-mini","messages":[{"role":"user","content":""}]}"#;
+        let body = format!(
+            r#"{{"model":"gpt-4o-mini","messages":[{{"role":"user","content":"{}"}}]}}"#,
+            "x".repeat(len - empty.len())
+        );
+        assert_eq!(body.len(), len);
+        body
+    };
+    for len in [60 * 1024, 64 * 1024] {
+        let resp = test_client()
+            .post(format!("{}/v1/chat/completions", gw.url()))
+            .header("authorization", format!("Bearer {}", vkey(&sk, 35)))
+            .header("content-type", "application/json")
+            .body(chat(len))
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status().as_u16();
+        let text = resp.text().await.unwrap_or_default();
+        assert_eq!(status, 200, "{len} B: {text}");
+    }
+    assert_eq!(mock.hits(), 2);
+}
+
+/// A chunked body (no `Content-Length`, so nothing to reserve up front) that outgrows the budget
+/// while the walk reads it is the budget's retryable 503, not "request body too large": it is far
+/// below the size cap.
+/// claim: SEC-19
+/// defect: D35
+#[tokio::test]
+async fn a_chunked_body_that_outgrows_the_budget_is_a_503_not_a_413() {
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::builder(unused_nats_port(), &mock.authority(), &b64(&pubkey))
+        .config_line("max_buffered_body_bytes = 1048576")
+        .start()
+        .await;
+    let mut s = tokio::net::TcpStream::connect(("127.0.0.1", gw.port))
+        .await
+        .unwrap();
+    let head = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nhost: gw\r\nauthorization: Bearer {}\r\n\
+         content-type: application/json\r\ntransfer-encoding: chunked\r\n\r\n",
+        vkey(&sk, 35)
+    );
+    s.write_all(head.as_bytes()).await.unwrap();
+    // 700 KiB in 64 KiB chunks: held twice, past the 1 MiB budget half way through.
+    let open = br#"{"model":"gpt-4o-mini","messages":[{"role":"user","content":""#;
+    let mut body = open.to_vec();
+    body.resize(700 * 1024, b'x');
+    body.extend_from_slice(br#""}]}"#);
+    for chunk in body.chunks(64 * 1024) {
+        let frame = [format!("{:x}\r\n", chunk.len()).as_bytes(), chunk, b"\r\n"].concat();
+        // The gateway may answer, and stop reading, before the last chunk.
+        if s.write_all(&frame).await.is_err() {
+            break;
+        }
+    }
+    let _ = s.write_all(b"0\r\n\r\n").await;
+    let mut buf = vec![0u8; 4096];
+    let n = tokio::time::timeout(Duration::from_secs(10), s.read(&mut buf))
+        .await
+        .expect("an answer")
+        .unwrap();
+    let text = String::from_utf8_lossy(&buf[..n]);
+    assert!(
+        text.starts_with("HTTP/1.1 503") && text.contains("too many large request bodies"),
+        "{text}"
+    );
+    assert_eq!(mock.hits(), 0);
+}
+
+/// The size cap is inclusive: a body declared at exactly `MAX_REQUEST_BODY` (100 MiB) is read, not
+/// refused up front the way one byte more is.
+/// claim: SEC-19
+#[tokio::test]
+async fn a_body_declared_at_the_size_cap_is_not_refused_up_front() {
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::builder(unused_nats_port(), &mock.authority(), &b64(&pubkey))
+        .start()
+        .await;
+    const CAP: usize = 100 * 1024 * 1024;
+    for (len, refused) in [(CAP + 1, true), (CAP, false)] {
+        let mut s = tokio::net::TcpStream::connect(("127.0.0.1", gw.port))
+            .await
+            .unwrap();
+        let head = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nhost: gw\r\nauthorization: Bearer {}\r\n\
+             content-type: application/json\r\ncontent-length: {len}\r\n\r\n{{\"model\":\"gpt-4o-mini\"",
+            vkey(&sk, 35)
+        );
+        s.write_all(head.as_bytes()).await.unwrap();
+        // Refused up front, the answer comes at once; read, the walk waits for the rest of it.
+        let mut buf = vec![0u8; 4096];
+        let answer = tokio::time::timeout(Duration::from_secs(2), s.read(&mut buf)).await;
+        let text = match answer {
+            Ok(Ok(n)) => String::from_utf8_lossy(&buf[..n]).into_owned(),
+            _ => String::new(),
+        };
+        assert_eq!(
+            text.starts_with("HTTP/1.1 413"),
+            refused,
+            "{len} B declared: {text:?}"
+        );
+    }
+}
+
+/// `client_write_timeout_secs = 0` disables the downstream write timeout rather than making it
+/// zero: a client that is slow to start reading a large stream still gets every byte of it.
+/// claim: REL-10
+/// defect: D42
+#[tokio::test]
+async fn a_zero_client_write_timeout_disables_it() {
+    let (pubkey, _sk) = test_keypair(1);
+    let big = {
+        let event = "data: {\"choices\":[{\"delta\":{\"content\":\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"}}]}\n\n";
+        bytes::Bytes::from(event.repeat((32 << 20) / event.len()))
+    };
+    let want = big.len();
+    let mock = ReplyUpstream::start(move |_, _| Reply::Full {
+        status: 200,
+        content_type: "text/event-stream",
+        body: big.clone(),
+    })
+    .await;
+    let gw = Gateway::builder(unused_nats_port(), &mock.authority(), &b64(&pubkey))
+        .config_line("client_write_timeout_secs = 0")
+        .start()
+        .await;
+    let resp = test_client()
+        .post(format!("{}/openai/v1/chat/completions", gw.url()))
+        .header("authorization", "Bearer sk-byo-test")
+        .header("content-type", "application/json")
+        .body(STREAM_BODY)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    // Let the socket buffers fill before reading: every write after that has to wait.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let got = resp.bytes().await.map(|b| b.len());
+    assert_eq!(got.ok(), Some(want), "{}", gw.log());
+}
