@@ -19,6 +19,8 @@
 
 mod common;
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use common::*;
@@ -486,41 +488,19 @@ async fn a_failover_pin_returns_to_the_primary_once_it_is_healthy() {
 }
 
 /// The residual divergence, stated: a replica whose breaker for the preferred host is open routes
-/// the session to the next candidate, and only while the breaker is open. The other replica, whose
-/// breaker never opened, keeps serving the preferred host; once the open breaker's probe succeeds,
-/// both are back on it.
+/// the session to the next candidate, while the other replica, whose breaker never opened, keeps
+/// serving the preferred host. The reset is far past the test's length so the breaker stays open
+/// however slowly a loaded host runs the turns (a short reset let it half-open mid-loop).
 /// claim: R4, R6
 /// defect: D253
 #[tokio::test]
-async fn a_replica_with_an_open_breaker_routes_away_only_while_it_is_open() {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+async fn a_replica_with_an_open_breaker_routes_away_while_the_other_keeps_the_host() {
     let nats_port = unused_nats_port();
     let (pubkey, sk) = test_keypair(50);
-    let failing = Arc::new(AtomicBool::new(true));
-    let primary = ReplyUpstream::start({
-        let failing = failing.clone();
-        move |_, _| {
-            if failing.load(Ordering::Relaxed) {
-                Reply::json(500, r#"{"error":{"message":"outage"}}"#)
-            } else {
-                Reply::json(200, OK_JSON)
-            }
-        }
-    })
-    .await;
+    let (primary, failing) = flaky_primary().await;
     let fallback = MockUpstream::start(Mode::Json).await;
-    let replica = || {
-        Gateway::builder(nats_port, &primary.authority(), &b64(&pubkey))
-            .providers(&["openai", "openrouter"])
-            .provider_authority("openrouter", &fallback.authority())
-            .config_line("circuit_breaker_threshold = 2")
-            .config_line("circuit_breaker_window_secs = 60")
-            .config_line("circuit_breaker_reset_secs = 2")
-            .start()
-    };
-    let a = replica().await;
-    let b = replica().await;
+    let a = breaker_replica(nats_port, &primary, &fallback, &pubkey, 600).await;
+    let b = breaker_replica(nats_port, &primary, &fallback, &pubkey, 600).await;
     let key = billing_vkey(&sk, 5001);
     // Only A meets the outage: two failed-over turns open its breaker for the primary.
     for _ in 0..2 {
@@ -541,10 +521,29 @@ async fn a_replica_with_an_open_breaker_routes_away_only_while_it_is_open() {
         );
     }
     assert_eq!(primary.hits(), hits + 3, "only B reached the primary");
-    // Past the reset the half-open probe succeeds and A is back on the primary.
+}
+
+/// The other half: once the open breaker's half-open probe succeeds, the replica that routed away
+/// is back on the preferred host, and both replicas agree again. Polled, so a loaded host only
+/// makes it slower.
+/// claim: R4, R6
+/// defect: D253
+#[tokio::test]
+async fn a_replica_returns_to_the_host_once_its_breaker_probe_succeeds() {
+    let nats_port = unused_nats_port();
+    let (pubkey, sk) = test_keypair(51);
+    let (primary, failing) = flaky_primary().await;
+    let fallback = MockUpstream::start(Mode::Json).await;
+    let a = breaker_replica(nats_port, &primary, &fallback, &pubkey, 1).await;
+    let b = breaker_replica(nats_port, &primary, &fallback, &pubkey, 1).await;
+    let key = billing_vkey(&sk, 5002);
+    for _ in 0..2 {
+        assert_eq!(post_auto(&a, &key).await, "openrouter");
+    }
+    failing.store(false, Ordering::Relaxed);
     let start = Instant::now();
     let mut on_a = String::new();
-    while start.elapsed() < Duration::from_secs(10) {
+    while start.elapsed() < Duration::from_secs(20) {
         on_a = post_auto(&a, &key).await;
         if on_a == "openai" {
             break;
@@ -556,6 +555,42 @@ async fn a_replica_with_an_open_breaker_routes_away_only_while_it_is_open() {
         assert_eq!(post_auto(&a, &key).await, "openai");
         assert_eq!(post_auto(&b, &key).await, "openai");
     }
+}
+
+/// A primary that answers 500 while the flag is set, then 200.
+async fn flaky_primary() -> (ReplyUpstream, Arc<AtomicBool>) {
+    let failing = Arc::new(AtomicBool::new(true));
+    let primary = ReplyUpstream::start({
+        let failing = failing.clone();
+        move |_, _| {
+            if failing.load(Ordering::Relaxed) {
+                Reply::json(500, r#"{"error":{"message":"outage"}}"#)
+            } else {
+                Reply::json(200, OK_JSON)
+            }
+        }
+    })
+    .await;
+    (primary, failing)
+}
+
+/// A replica preferring `primary` (openai) with `fallback` as openrouter, whose breaker opens after
+/// two failures and half-opens after `reset_secs`.
+async fn breaker_replica(
+    nats_port: u16,
+    primary: &ReplyUpstream,
+    fallback: &MockUpstream,
+    pubkey: &[u8],
+    reset_secs: u64,
+) -> Gateway {
+    Gateway::builder(nats_port, &primary.authority(), &b64(pubkey))
+        .providers(&["openai", "openrouter"])
+        .provider_authority("openrouter", &fallback.authority())
+        .config_line("circuit_breaker_threshold = 2")
+        .config_line("circuit_breaker_window_secs = 60")
+        .config_line(&format!("circuit_breaker_reset_secs = {reset_secs}"))
+        .start()
+        .await
 }
 
 /// `tenant_max_in_flight` is per process: with a cap of 1 on each of two replicas, a tenant holding

@@ -47,8 +47,15 @@ exclude_re = [
   # `KeepInputs::expecting` only words a parse error's message, which `parse_body` discards (it
   # keeps `None`); `visit_unit`'s `Value::Null` is `Value::default()`.
   "replace <impl serde::de::Visitor<'de> for KeepInputs>::(expecting|visit_unit)",
-  # `ChatIdentity::key` packs three masked fields into disjoint bit ranges: `|` and `^` agree.
-  'replace \| with \^ in ChatIdentity::key',
+  # `ChatIdentity::key` packs three masked fields into disjoint bit ranges: `|` and `^` agree. The
+  # key is only compared for equality, and XOR with a field's mask is a bijection on the values in
+  # range, so `&` -> `^` keeps every key distinct too.
+  'replace (\||&) with \^ in ChatIdentity::key',
+  # `tally_eager` only picks where the input estimate is made: as the body streams, or in `logging`
+  # from the copy that is still held (pingora's retry buffer or the `FullBody` parent). Both tally
+  # the same request text; widening it (`||`, or `true`) only tallies eagerly where the held copy
+  # would have done.
+  'replace (&& with \|\| in tally_eager|tally_eager -> bool with true)',
   # `map_response` clones a same-wire body as is: the guard only skips that clone.
   'replace match guard client == Endpoint::Responses with false in SseBridge::assembled',
   # `str_is`'s raw compare is a fast path: `escaped_key_is` decodes a string with no escape to

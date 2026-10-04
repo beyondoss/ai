@@ -2224,6 +2224,12 @@ fn past_replay_buffer(n: usize) -> bool {
     n > BODY_PEEK_LIMIT
 }
 
+/// [`RequestCtx::tally_eager`]: a managed provider-routed body that may outgrow the retry buffer
+/// is the one case where no copy is left for `logging` to tally.
+fn tally_eager(managed: bool, catalog: bool, declared_len: Option<usize>) -> bool {
+    managed && !catalog && declared_len.is_none_or(past_replay_buffer)
+}
+
 /// The `x-beyond-model` header, viewed as a catalog lookup. Present-but-unknown is distinct from
 /// absent: the header wins, so an unknown header is a 404 rather than a fall-through to the body.
 #[derive(Clone, Copy)]
@@ -4642,9 +4648,7 @@ impl ProxyHttp for AiProxy {
             }),
             request_id,
             input_tally: usage::InputTally::default(),
-            tally_eager: managed
-                && model_route.is_none()
-                && declared_len.is_none_or(past_replay_buffer),
+            tally_eager: tally_eager(managed, model_route.is_some(), declared_len),
             resp_bytes: 0,
             upstream_phase: UpstreamPhase::None,
             redact: None,
