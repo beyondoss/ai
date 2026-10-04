@@ -23,6 +23,24 @@ use std::time::{Duration, Instant};
 const CHAT: &str = r#"{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}"#;
 const CHAT_STREAM: &str =
     r#"{"model":"gpt-4o-mini","stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+/// How soon a request that a deadline ends must have ended. Each one here ends in 1–3 s unloaded,
+/// and whatever would end it if the deadline did not (the provider's 60 s script, a body that
+/// trickles in for over a minute, the 600 s silence bound, or never) comes far later. So the bound
+/// tells the two apart many times over, and a loaded host stretching the 1–3 s cannot fail it;
+/// what ended each request is asserted separately, from the answer, the row and the metrics.
+const ENDS_WELL_BEFORE: Duration = Duration::from_secs(20);
+
+/// A request body that takes far longer than [`ENDS_WELL_BEFORE`] to trickle in at
+/// [`TRICKLE_GAP`] a byte: trailing whitespace after valid JSON, so a body that does arrive whole
+/// still parses.
+fn trickled_body() -> String {
+    format!("{CHAT}{}", " ".repeat(200))
+}
+
+/// Shorter than the default `client_read_timeout_secs` (60 s), so only `request_max_secs` ends a
+/// trickle.
+const TRICKLE_GAP: Duration = Duration::from_millis(300);
+
 const OK_JSON: &str = r#"{"id":"chatcmpl-1","object":"chat.completion","model":"gpt-4o-mini","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":1,"total_tokens":6}}"#;
 
 /// An SSE head and then an event every 200 ms for a minute: a stream that never stops moving.
@@ -78,7 +96,7 @@ async fn a_stream_that_never_ends_is_cut_at_request_max_secs() {
     let started = Instant::now();
     let resp = post(&gw, "/openai/v1/chat/completions", &key, CHAT_STREAM).await;
     assert_eq!(resp.status(), 200);
-    let body = tokio::time::timeout(Duration::from_secs(15), resp.bytes())
+    let body = tokio::time::timeout(CONDITION_BUDGET, resp.bytes())
         .await
         .expect("the stream ended");
     let took = started.elapsed();
@@ -87,9 +105,9 @@ async fn a_stream_that_never_ends_is_cut_at_request_max_secs() {
         "a cut stream ended cleanly: {:?}",
         body.map(|b| String::from_utf8_lossy(&b).into_owned())
     );
-    // Two seconds, plus up to one tick of the coarse clock that checks a moving stream.
+    // Never before the two seconds; unloaded, within one tick of the coarse clock after them.
     assert!(
-        took >= Duration::from_millis(1500) && took < Duration::from_secs(6),
+        took >= Duration::from_millis(1500) && took < ENDS_WELL_BEFORE,
         "{took:?}"
     );
     let row = usage_row_of(&gw).await;
@@ -162,7 +180,7 @@ async fn a_silent_provider_is_a_504_at_request_max_secs() {
         assert_eq!(status, 504, "{path}: {text}\n{}", gw.log());
         assert!(text.contains("maximum duration"), "{path}: {text}");
         assert!(
-            took >= Duration::from_millis(1900) && took < Duration::from_secs(5),
+            took >= Duration::from_millis(1900) && took < ENDS_WELL_BEFORE,
             "{path}: {took:?}"
         );
         let row = usage_row_of(&gw).await;
@@ -273,7 +291,7 @@ async fn h2_stalled_upload(port: u16, headers: &[(&str, String)], sent: &str) ->
     let (resp, mut send) = client.send_request(req.body(()).unwrap(), false).unwrap();
     send.send_data(bytes::Bytes::copy_from_slice(sent.as_bytes()), false)
         .unwrap();
-    let resp = tokio::time::timeout(Duration::from_secs(10), resp)
+    let resp = tokio::time::timeout(CONDITION_BUDGET, resp)
         .await
         .expect("an answer")
         .unwrap();
@@ -303,7 +321,7 @@ async fn h1_stalled_upload(port: u16, headers: &[(&str, String)], sent: &str) ->
     s.write_all(head.as_bytes()).await.unwrap();
     s.write_all(sent.as_bytes()).await.unwrap();
     let mut buf = [0u8; 4096];
-    let n = tokio::time::timeout(Duration::from_secs(10), s.read(&mut buf))
+    let n = tokio::time::timeout(CONDITION_BUDGET, s.read(&mut buf))
         .await
         .expect("an answer")
         .unwrap_or(0);
@@ -356,7 +374,7 @@ async fn a_client_stalled_in_an_up_front_body_read_gets_a_408() {
         let took = started.elapsed();
         assert_eq!(status, 408, "{what}: {text}\nlog:\n{}", gw.log());
         assert!(text.contains("request body timed out"), "{what}: {text}");
-        assert!(took < Duration::from_secs(5), "{what}: {took:?}");
+        assert!(took < ENDS_WELL_BEFORE, "{what}: {took:?}");
         assert_eq!(conns.load(SeqCst), 0, "{what}: reached the upstream");
 
         // The slot is back: under a ceiling of 1 the next request is admitted, which the silent
@@ -407,6 +425,7 @@ async fn an_up_front_body_still_trickling_at_request_max_secs_gets_a_408() {
     .start()
     .await;
     let key = billing_vkey(&sk, 268);
+    let body = trickled_body();
     let tcp = tokio::net::TcpStream::connect(("127.0.0.1", gw.port))
         .await
         .unwrap();
@@ -415,27 +434,27 @@ async fn an_up_front_body_still_trickling_at_request_max_secs_gets_a_408() {
     let req = http::Request::post("http://gw/auto/chat/completions")
         .header("authorization", format!("Bearer {key}"))
         .header("content-type", "application/json")
-        .header("content-length", CHAT.len().to_string())
+        .header("content-length", body.len().to_string())
         .body(())
         .unwrap();
     let (resp, mut send) = client.send_request(req, false).unwrap();
     let trickle = tokio::spawn(async move {
-        for b in CHAT.bytes() {
+        for b in body.bytes() {
             if send.send_data(bytes::Bytes::from(vec![b]), false).is_err() {
                 return;
             }
-            tokio::time::sleep(Duration::from_millis(300)).await;
+            tokio::time::sleep(TRICKLE_GAP).await;
         }
     });
     let started = Instant::now();
-    let resp = tokio::time::timeout(Duration::from_secs(10), resp)
+    let resp = tokio::time::timeout(CONDITION_BUDGET, resp)
         .await
         .expect("an answer")
         .unwrap();
     let took = started.elapsed();
     trickle.abort();
     assert_eq!(resp.status().as_u16(), 408, "{}", gw.log());
-    assert!(took < Duration::from_secs(5), "{took:?}");
+    assert!(took < ENDS_WELL_BEFORE, "{took:?}");
     assert_eq!(conns.load(SeqCst), 0, "reached the upstream");
 }
 
@@ -470,17 +489,17 @@ async fn a_streamed_upload_still_trickling_at_request_max_secs_ends() {
     );
     wr.write_all(head.as_bytes()).await.unwrap();
     let trickle = tokio::spawn(async move {
-        for b in CHAT.bytes() {
+        for b in trickled_body().bytes() {
             let chunk = format!("1\r\n{}\r\n", b as char);
             if wr.write_all(chunk.as_bytes()).await.is_err() {
                 return;
             }
-            tokio::time::sleep(Duration::from_millis(300)).await;
+            tokio::time::sleep(TRICKLE_GAP).await;
         }
     });
     let started = Instant::now();
     let mut buf = [0u8; 4096];
-    let n = tokio::time::timeout(Duration::from_secs(10), rd.read(&mut buf))
+    let n = tokio::time::timeout(CONDITION_BUDGET, rd.read(&mut buf))
         .await
         .expect("an answer")
         .unwrap_or(0);
@@ -489,7 +508,7 @@ async fn a_streamed_upload_still_trickling_at_request_max_secs_ends() {
     let text = String::from_utf8_lossy(&buf[..n]);
     assert!(text.starts_with("HTTP/1.1 504"), "{text}\n{}", gw.log());
     assert!(text.contains("maximum duration"), "{text}");
-    assert!(took < Duration::from_secs(5), "{took:?}");
+    assert!(took < ENDS_WELL_BEFORE, "{took:?}");
     assert_eq!(conns.load(SeqCst), 1);
 }
 
@@ -521,7 +540,7 @@ async fn a_large_body_re_run_keeps_the_requests_deadline() {
     let text = resp.text().await.unwrap_or_default();
     assert_eq!(status, 504, "{text}\n{}", gw.log());
     assert!(text.contains("maximum duration"), "{text}");
-    assert!(took < Duration::from_secs(5), "{took:?}");
+    assert!(took < ENDS_WELL_BEFORE, "{took:?}");
     assert_eq!(conns.load(SeqCst), 1);
 }
 

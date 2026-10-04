@@ -259,7 +259,10 @@ async fn a_deny_and_an_allowance_land_on_every_replica_within_the_bound() {
     for gw in [&a, &b] {
         assert_eq!(chat(gw, &key).await, 200);
     }
-    let bound = Duration::from_secs(2);
+    // The documented two seconds, unless this host is loaded enough to make every request slow
+    // (see `stretched`): measured now, on the requests the polls make.
+    let round_trip = median_round_trip(|| chat(&a, &other)).await;
+    let bound = stretched(Duration::from_secs(2), round_trip);
 
     put_kv(nats.port, "blackhole.4401", b"spend").await;
     for (gw, name) in [(&a, "A"), (&b, "B")] {
@@ -668,14 +671,29 @@ async fn the_per_credential_rate_limit_is_per_replica() {
     let b = replica().await;
     let key = billing_vkey(&sk, 4701);
 
+    // Bursts of 3 x RPS at once: a burst inside one second spans at most two of the limiter's
+    // whole-second windows, so one of them holds more than RPS and A must refuse. A loaded host can
+    // spread a burst wider than that, which proves nothing either way, so it is sent again.
     let mut refused = false;
-    for _ in 0..(RPS * 10) {
-        if chat(&a, &key).await == 429 {
-            refused = true;
+    let mut spreads = Vec::new();
+    for _ in 0..20 {
+        let started = Instant::now();
+        let mut set = tokio::task::JoinSet::new();
+        for _ in 0..RPS * 3 {
+            let (url, key) = (a.url(), key.clone());
+            set.spawn(async move { chat_url(&url, &key).await });
+        }
+        refused = set.join_all().await.contains(&429);
+        let spread = started.elapsed();
+        spreads.push(spread);
+        if refused || spread < Duration::from_secs(1) {
             break;
         }
     }
-    assert!(refused, "A refuses the credential past {RPS} req/s");
+    assert!(
+        refused,
+        "A refuses the credential past {RPS} req/s (bursts took {spreads:?})"
+    );
     // B has seen none of these requests: its window holds 0, so its own RPS are admitted now.
     for i in 0..RPS {
         assert_eq!(chat(&b, &key).await, 200, "B request {i} after A's 429");

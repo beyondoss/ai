@@ -775,30 +775,60 @@ async fn the_rate_limit_counts_one_identity_across_credential_locations() {
         .await;
     let vk = vkey(&sk, 12);
     let url = format!("{}/openai/v1/chat/completions", gw.url());
-    // Two requests per location, six in all. Separate buckets would see two each and never trip a
-    // limit of two; one bucket sees six inside at most two windows, so at least one window has 3.
-    let mut statuses = Vec::new();
-    for round in 0..2 {
-        for loc in 0..3 {
-            let mut req = test_client()
-                .post(if loc == 2 {
-                    format!("{url}?key={vk}")
-                } else {
-                    url.clone()
-                })
-                .header("content-type", "application/json")
-                .body(CHAT);
-            req = match loc {
-                0 => req.header("authorization", format!("Bearer {vk}")),
-                1 => req.header("x-api-key", vk.clone()),
-                _ => req,
-            };
-            statuses.push((round, loc, req.send().await.unwrap().status().as_u16()));
+    // Two requests per location, six in all, sent at once. Separate buckets would see two each and
+    // never trip a limit of two; one bucket that sees six inside a second (at most two of the
+    // limiter's whole-second windows) has 3 in at least one. A loaded host can spread the six
+    // over more windows than that, which proves nothing either way: such a burst is re-sent, as a
+    // fresh identity so no earlier burst's count carries into it.
+    let send_six = |vk: String| {
+        let url = url.clone();
+        async move {
+            let started = Instant::now();
+            let mut set = tokio::task::JoinSet::new();
+            for round in 0..2 {
+                for loc in 0..3 {
+                    let mut req = test_client()
+                        .post(if loc == 2 {
+                            format!("{url}?key={vk}")
+                        } else {
+                            url.clone()
+                        })
+                        .header("content-type", "application/json")
+                        .body(CHAT);
+                    req = match loc {
+                        0 => req.header("authorization", format!("Bearer {vk}")),
+                        1 => req.header("x-api-key", vk.clone()),
+                        _ => req,
+                    };
+                    set.spawn(
+                        async move { (round, loc, req.send().await.unwrap().status().as_u16()) },
+                    );
+                }
+            }
+            let mut statuses = set.join_all().await;
+            statuses.sort();
+            (statuses, started.elapsed())
+        }
+    };
+    let mut bursts = Vec::new();
+    for tenant in 0..20 {
+        let (statuses, spread) = send_six(if tenant == 0 {
+            vk.clone()
+        } else {
+            vkey(&sk, 1200 + tenant)
+        })
+        .await;
+        let tripped = statuses.iter().any(|(_, _, s)| *s == 429);
+        bursts.push((statuses, spread));
+        if tripped || spread < Duration::from_secs(1) {
+            break;
         }
     }
     assert!(
-        statuses.iter().any(|(_, _, s)| *s == 429),
-        "one identity in three locations must share one bucket: {statuses:?}"
+        bursts
+            .last()
+            .is_some_and(|(statuses, _)| statuses.iter().any(|(_, _, s)| *s == 429)),
+        "one identity in three locations must share one bucket: {bursts:?}"
     );
 
     let respelled = vk.replacen("bai_v1.1.", "bai_v1.01.", 1);
@@ -1134,17 +1164,24 @@ async fn a_deny_lands_within_the_bound_and_in_flight_streams_finish() {
     }
     assert_eq!(up.hits(), 1, "the stream is in flight before the deny");
 
+    // The two seconds, unless this host is loaded enough to make every request slow (see
+    // `stretched`): measured now, on the same requests the poll below makes.
+    let round_trip = median_round_trip(|| async { post().await.status() }).await;
+    let bound = stretched(Duration::from_secs(2), round_trip);
     put_kv(nats.port, "blackhole.1717", b"spend").await;
     let written = Instant::now();
     let mut status = 0;
-    while written.elapsed() < Duration::from_secs(2) {
+    while written.elapsed() < bound {
         status = post().await.status().as_u16();
         if status == 402 {
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    assert_eq!(status, 402, "the deny did not land within 2s");
+    assert_eq!(
+        status, 402,
+        "the deny did not land within {bound:?} (requests take {round_trip:?})"
+    );
 
     let (status, body) = in_flight.await.unwrap();
     assert_eq!(

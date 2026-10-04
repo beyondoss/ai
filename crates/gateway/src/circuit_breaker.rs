@@ -917,15 +917,23 @@ mod tests {
 
     #[test]
     fn test_windowed_resets_after_window() {
-        // Note: window uses second-level precision, so use 1 second window
-        let cb = CircuitBreaker::new(CircuitBreakerConfig::windowed(3, Duration::from_secs(1)));
+        // A hand-stepped clock: on the real one, a second boundary falling between two of these
+        // calls (a preempted thread, a loaded host) would split one window into two.
+        static NOW: AtomicU64 = AtomicU64::new(100);
+        fn clock() -> u64 {
+            NOW.load(Ordering::Relaxed)
+        }
+        let cb = CircuitBreaker::with_clock(
+            CircuitBreakerConfig::windowed(3, Duration::from_secs(1)),
+            clock,
+        );
 
         cb.record_failure();
         cb.record_failure();
         assert_eq!(cb.state(), CircuitState::Closed { failure_count: 2 });
 
-        // Wait for window to expire (1 second + buffer)
-        thread::sleep(Duration::from_millis(1100));
+        // The window (second-level precision) expires.
+        NOW.store(101, Ordering::Relaxed);
 
         // This failure starts a new window
         cb.record_failure();

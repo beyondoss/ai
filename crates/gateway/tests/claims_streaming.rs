@@ -10,7 +10,9 @@ mod common;
 
 use common::*;
 use serde_json::Value;
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+use std::time::Duration;
 
 /// How long the scripted provider pauses between its first event and the rest of the stream.
 const PAUSE: Duration = Duration::from_millis(1500);
@@ -49,32 +51,43 @@ async fn pausing_provider(first: &'static str, rest: &'static str) -> ScriptedUp
     .await
 }
 
-/// Read a streamed response, noting when `FIRST` arrived and when the stream ended. Runs `on_first`
-/// the moment the first event is in hand.
-async fn read_stream(
-    resp: reqwest::Response,
-    sent: Instant,
-    mut on_first: impl FnMut(),
-) -> (Duration, Duration, String) {
+/// A provider that sends `first`, then waits for `gate` before it sends `rest` and closes.
+async fn gated_provider(
+    first: &'static str,
+    rest: &'static str,
+    gate: Arc<AtomicBool>,
+) -> ScriptedUpstream {
+    ScriptedUpstream::start(move |_, _| {
+        let mut head = http_head(200, "text/event-stream", None);
+        head.extend_from_slice(first.as_bytes());
+        let gate = gate.clone();
+        vec![
+            Step::Write(head),
+            Step::Until(Arc::new(move || gate.load(SeqCst))),
+            Step::Write(rest.as_bytes().to_vec()),
+        ]
+    })
+    .await
+}
+
+/// Read a streamed response to its end. Runs `on_first` the moment the first event is in hand.
+async fn read_stream(resp: reqwest::Response, mut on_first: impl FnMut()) -> String {
     let mut resp = resp;
     let mut text = String::new();
-    let mut first_at = None;
-    while let Some(chunk) = tokio::time::timeout(Duration::from_secs(10), resp.chunk())
+    let mut seen_first = false;
+    while let Some(chunk) = tokio::time::timeout(CONDITION_BUDGET, resp.chunk())
         .await
         .expect("the stream must not hang")
         .unwrap()
     {
         text.push_str(&String::from_utf8_lossy(&chunk));
-        if first_at.is_none() && text.contains("FIRST") {
-            first_at = Some(sent.elapsed());
+        if !seen_first && text.contains("FIRST") {
+            seen_first = true;
             on_first();
         }
     }
-    (
-        first_at.expect("the first event arrived"),
-        sent.elapsed(),
-        text,
-    )
+    assert!(seen_first, "the first event arrived: {text}");
+    text
 }
 
 async fn post_stream(gw: &Gateway, key: &str, path: &str, body: &str) -> reqwest::Response {
@@ -89,7 +102,9 @@ async fn post_stream(gw: &Gateway, key: &str, path: &str, body: &str) -> reqwest
 }
 
 /// The first event reaches the client while the provider is still mid-stream, on a byte relay and
-/// on a translated walk alike — the gateway never holds a stream back to the end.
+/// on a translated walk alike — the gateway never holds a stream back to the end. The provider
+/// sends the rest only once the client has the first event, so the stream completing at all is
+/// the proof: an ordering, which no host load can reorder, where a timing would be.
 /// claim: S1
 #[tokio::test]
 async fn streams_reach_the_client_as_the_provider_sends_them() {
@@ -103,7 +118,8 @@ async fn streams_reach_the_client_as_the_provider_sends_them() {
         ),
     ] {
         let (pubkey, sk) = test_keypair(70);
-        let provider = pausing_provider(first, rest).await;
+        let gate = Arc::new(AtomicBool::new(false));
+        let provider = gated_provider(first, rest, gate.clone()).await;
         let gw = Gateway::builder(unused_nats_port(), &provider.authority(), &b64(&pubkey))
             .providers(providers)
             .start()
@@ -111,19 +127,13 @@ async fn streams_reach_the_client_as_the_provider_sends_them() {
         let body = format!(
             r#"{{"model":"{model}","stream":true,"messages":[{{"role":"user","content":"hi"}}]}}"#
         );
-        let sent = Instant::now();
         let resp = post_stream(&gw, &billing_vkey(&sk, 70), "/v1/chat/completions", &body).await;
         assert_eq!(resp.status().as_u16(), 200, "{model}");
-        let (first_at, done_at, text) = read_stream(resp, sent, || {}).await;
-        assert!(text.contains("LAST"), "{model}: {text}");
+        let text = read_stream(resp, || gate.store(true, SeqCst)).await;
+        let (first, last) = (text.find("FIRST"), text.find("LAST"));
         assert!(
-            first_at < PAUSE * 2 / 3,
-            "{model}: the first event took {first_at:?}; the provider sent it at once"
-        );
-        assert!(
-            done_at - first_at >= PAUSE / 2,
-            "{model}: the first event must arrive before the provider's pause ends \
-             (first {first_at:?}, done {done_at:?})"
+            first.is_some() && last.is_some() && first < last,
+            "{model}: {text}"
         );
     }
 }
@@ -131,12 +141,12 @@ async fn streams_reach_the_client_as_the_provider_sends_them() {
 /// A same-wire Chat Completions stream from a host other than OpenAI goes through `SseBridge`'s
 /// relay (it drops the `role` OpenRouter repeats on every chunk). Each event still leaves the
 /// gateway as it arrives: an OpenRouter stream of a Claude row, written one event at a time with
-/// gaps and OpenRouter's keep-alive comments between them, reaches the client spread the same way.
+/// OpenRouter's keep-alive comments between them, reaches the client one event at a time: the
+/// provider writes each event only once the client holds the one before it.
 /// claim: S1
 /// defect: D244
 #[tokio::test]
 async fn a_same_wire_openrouter_chat_relay_streams_each_event_as_it_arrives() {
-    const GAP: Duration = Duration::from_millis(300);
     let chunk = |text: &str, finish: &str| {
         format!(
             "data: {{\"id\":\"gen-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\
@@ -146,17 +156,25 @@ async fn a_same_wire_openrouter_chat_relay_streams_each_event_as_it_arrives() {
         )
     };
     let words = ["W0", "W1", "W2", "W3", "W4"];
+    // How many of `words` the client holds.
+    let seen = Arc::new(AtomicUsize::new(0));
+    let client_has = {
+        let seen = seen.clone();
+        move |n: usize| {
+            let seen = seen.clone();
+            Step::Until(Arc::new(move || seen.load(SeqCst) >= n))
+        }
+    };
     let provider = ScriptedUpstream::start(move |_, _| {
         let mut head = http_head(200, "text/event-stream", None);
         head.extend_from_slice(chunk(words[0], "null").as_bytes());
         let mut steps = vec![Step::Write(head)];
-        for w in &words[1..] {
-            steps.push(Step::Sleep(GAP / 2));
+        for (i, w) in words.iter().enumerate().skip(1) {
+            steps.push(client_has(i));
             steps.push(Step::Write(b": OPENROUTER PROCESSING\n\n".to_vec()));
-            steps.push(Step::Sleep(GAP / 2));
             steps.push(Step::Write(chunk(w, "null").into_bytes()));
         }
-        steps.push(Step::Sleep(GAP));
+        steps.push(client_has(words.len()));
         let mut tail = chunk("", "\"stop\"");
         tail.push_str(
             "data: {\"id\":\"gen-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\
@@ -173,61 +191,64 @@ async fn a_same_wire_openrouter_chat_relay_streams_each_event_as_it_arrives() {
         .start()
         .await;
     let body = r#"{"model":"claude-haiku-4-5","stream":true,"stream_options":{"include_usage":true},"messages":[{"role":"user","content":"hi"}]}"#;
-    let sent = Instant::now();
     let mut resp = post_stream(&gw, &billing_vkey(&sk, 72), "/v1/chat/completions", body).await;
     assert_eq!(resp.status().as_u16(), 200);
     let mut text = String::new();
-    let mut seen_at = Vec::new();
-    while let Some(c) = tokio::time::timeout(Duration::from_secs(10), resp.chunk())
+    // A word the provider has not written yet cannot be in hand: each one arriving is the gateway
+    // having relayed the one before it on its own, not held it for the next.
+    while let Some(c) = tokio::time::timeout(CONDITION_BUDGET, resp.chunk())
         .await
-        .expect("the stream must not hang")
+        .expect("the stream must not hang: an event was held back for the next")
         .unwrap()
     {
         text.push_str(&String::from_utf8_lossy(&c));
-        while seen_at.len() < words.len() && text.contains(words[seen_at.len()]) {
-            seen_at.push(sent.elapsed());
+        let mut n = seen.load(SeqCst);
+        while n < words.len() && text.contains(words[n]) {
+            n += 1;
         }
+        seen.store(n, SeqCst);
     }
-    assert_eq!(seen_at.len(), words.len(), "every word arrived: {text}");
+    assert_eq!(seen.load(SeqCst), words.len(), "every word arrived: {text}");
     assert!(text.contains("[DONE]"), "{text}");
     assert_eq!(
         text.matches("\"role\"").count(),
         1,
         "the repeated role is dropped: {text}"
     );
-    for (i, pair) in seen_at.windows(2).enumerate() {
-        assert!(
-            pair[1] - pair[0] >= GAP / 2,
-            "{} arrived {:?} after {}; the provider sent them {GAP:?} apart (all: {seen_at:?})",
-            words[i + 1],
-            pair[1] - pair[0],
-            words[i]
-        );
-    }
 }
 
 /// A translated stream whose provider sends only keep-alives while the model thinks (Anthropic's
 /// `event: ping`, here to a Chat Completions client) still hands its client a byte per ping: an
 /// SSE comment, which every SSE parser ignores, so a load balancer's idle timeout does not cut a
-/// stream that is alive. The answer that follows, and the row, are as without the pings.
+/// stream that is alive. The answer that follows, and the row, are as without the pings. Each ping
+/// is sent only once the client holds the comment for the one before, so each comment is shown to
+/// leave as its ping arrives, whatever the host's load.
 /// claim: S1
 /// claim: REL-1
 /// defect: D251
 #[tokio::test]
 async fn a_translated_stream_turns_provider_pings_into_keep_alive_comments() {
-    const GAP: Duration = Duration::from_millis(250);
     const PINGS: usize = 4;
+    // Keep-alive comments the client holds; `usize::MAX` until it holds the first event.
+    let alive = Arc::new(AtomicUsize::new(usize::MAX));
+    let client_has = {
+        let alive = alive.clone();
+        move |n: usize| {
+            let alive = alive.clone();
+            Step::Until(Arc::new(move || alive.load(SeqCst).wrapping_add(1) > n))
+        }
+    };
     let provider = ScriptedUpstream::start(move |_, _| {
         let mut head = http_head(200, "text/event-stream", None);
         head.extend_from_slice(CLAUDE_FIRST.as_bytes());
         let mut steps = vec![Step::Write(head)];
-        for _ in 0..PINGS {
-            steps.push(Step::Sleep(GAP));
+        for i in 0..PINGS {
+            steps.push(client_has(i));
             steps.push(Step::Write(
                 b"event: ping\ndata: {\"type\": \"ping\"}\n\n".to_vec(),
             ));
         }
-        steps.push(Step::Sleep(GAP));
+        steps.push(client_has(PINGS));
         steps.push(Step::Write(CLAUDE_REST.as_bytes().to_vec()));
         steps
     })
@@ -241,18 +262,18 @@ async fn a_translated_stream_turns_provider_pings_into_keep_alive_comments() {
     let mut resp = post_stream(&gw, &billing_vkey(&sk, 73), "/v1/chat/completions", body).await;
     assert_eq!(resp.status().as_u16(), 200);
     let mut text = String::new();
-    let mut alive_before_last = 0;
-    while let Some(c) = tokio::time::timeout(Duration::from_secs(10), resp.chunk())
+    while let Some(c) = tokio::time::timeout(CONDITION_BUDGET, resp.chunk())
         .await
-        .expect("the stream must not hang")
+        .expect("the stream must not hang: a ping did not reach the client as a comment")
         .unwrap()
     {
-        let c = String::from_utf8_lossy(&c);
-        if !text.contains("LAST") && !c.contains("LAST") {
-            alive_before_last += c.matches(": keep-alive\n\n").count();
+        text.push_str(&String::from_utf8_lossy(&c));
+        if text.contains("FIRST") {
+            alive.store(text.matches(": keep-alive\n\n").count(), SeqCst);
         }
-        text.push_str(&c);
     }
+    let before_last = &text[..text.find("LAST").unwrap_or(text.len())];
+    let alive_before_last = before_last.matches(": keep-alive\n\n").count();
     assert_eq!(
         alive_before_last, PINGS,
         "one keep-alive comment per provider ping, before the answer: {text}"
@@ -293,7 +314,7 @@ async fn sigterm_drains_an_open_stream() {
     )
     .await;
     assert_eq!(resp.status().as_u16(), 200);
-    let (_, _, text) = read_stream(resp, Instant::now(), || gw.sigterm()).await;
+    let text = read_stream(resp, || gw.sigterm()).await;
     assert!(
         text.contains("LAST") && text.contains("[DONE]"),
         "the open stream must complete across SIGTERM: {text}"

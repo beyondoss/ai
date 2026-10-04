@@ -89,6 +89,10 @@ hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }
 # fork/timeout runner, so no rusty-fork or tempfile in the build graph.
 proptest = { version = "1.10", default-features = false, features = ["std"] }
 rcgen = "0.13"
+# Thread CPU time (`clock_gettime(CLOCK_THREAD_CPUTIME_ID)`) behind a safe API, for perf assertions
+# that must hold on a loaded host (`unsafe_code` is forbidden, so not raw `libc`). Already in the
+# build graph via `tempfile` and `clap`: this only adds its `time` feature.
+rustix = { version = "1", default-features = false, features = ["std", "time"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "http2"] }
 tokio-rustls = "0.26"
 

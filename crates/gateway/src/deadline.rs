@@ -99,8 +99,14 @@ mod tests {
         let start = Instant::now();
         let d = at(start, 2);
         let left = remaining(d).unwrap();
+        // Measured after the read, so it covers however long this thread was descheduled: what is
+        // left plus what has passed is the whole two seconds, less the millisecond truncation.
+        let passed = start.elapsed();
         assert!(left <= Duration::from_secs(2), "{left:?}");
-        assert!(left > Duration::from_millis(1500), "{left:?}");
+        assert!(
+            left + passed + Duration::from_millis(1) >= Duration::from_secs(2),
+            "{left:?} left after {passed:?}"
+        );
         assert_eq!(
             remaining(0),
             Some(Duration::ZERO),
@@ -108,12 +114,39 @@ mod tests {
         );
     }
 
+    /// The coarse clock advances on its own and expires a deadline, never early: it lags real time
+    /// (by up to a tick, more on a loaded host), so a deadline it calls expired has truly passed.
+    /// Polled rather than slept on, so a ticker thread a loaded host runs late cannot fail it.
     #[test]
     fn the_coarse_clock_ticks_and_expires_deadlines() {
         start();
-        let d = at(Instant::now(), 1);
-        assert!(!expired(d));
-        std::thread::sleep(Duration::from_millis(2300));
-        assert!(expired(d), "now {} deadline {d}", now_ms());
+        let begun = Instant::now();
+        let d = at(begun, 1);
+        let mut seen = now_ms();
+        loop {
+            let now = now_ms();
+            if now != seen {
+                // A tick. The ticker sleeps a whole TICK between stores, and load only adds to it.
+                assert!(
+                    now + 1 >= seen + TICK.as_millis() as u64,
+                    "ticked {seen} -> {now}"
+                );
+                seen = now;
+            }
+            if now >= d {
+                break;
+            }
+            assert!(
+                begun.elapsed() < Duration::from_secs(30),
+                "the coarse clock never reached the deadline: now {now} deadline {d}"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let passed = begun.elapsed();
+        assert!(expired(d));
+        assert!(
+            passed + Duration::from_millis(1) >= Duration::from_secs(1),
+            "expired after only {passed:?}"
+        );
     }
 }

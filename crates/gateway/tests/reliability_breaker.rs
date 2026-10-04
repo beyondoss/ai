@@ -195,7 +195,7 @@ async fn a_stalled_half_open_probe_does_not_wedge_the_provider() {
     // Hold the probe open (unread) while other callers try.
     let start = Instant::now();
     let mut seen = Vec::new();
-    while start.elapsed() < Duration::from_secs(8) {
+    while start.elapsed() < CONDITION_BUDGET {
         let s = post_byo(&client, &gw.url()).await;
         seen.push(s);
         if s == 200 {
@@ -207,7 +207,8 @@ async fn a_stalled_half_open_probe_does_not_wedge_the_provider() {
     assert_eq!(
         seen.last(),
         Some(&200),
-        "with the probe stalled, no request succeeded in 8s ({} tries, upstream hits {}): {seen:?}",
+        "with the probe stalled, no request succeeded in {CONDITION_BUDGET:?} ({} tries, upstream \
+         hits {}): {seen:?}",
         seen.len(),
         mock.hits()
     );
