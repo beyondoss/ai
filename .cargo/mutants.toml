@@ -123,4 +123,8 @@ exclude_re = [
   # `keep_usage_head` keeps a head only where it is read (an Anthropic stream); widening the gate
   # (`||`) keeps a bounded head nothing reads.
   'replace && with \|\| in RequestCtx::keep_usage_head',
+  # `cap_read_at_deadline` caps the read timeout at the time left when that is shorter. `<=` also
+  # caps when the two are equal to the nanosecond, where the timer fires at the same instant either
+  # way and only the label differs (the deadline vs. a read timeout, both at the deadline).
+  'replace < with <= in AiProxy::cap_read_at_deadline',
 ]

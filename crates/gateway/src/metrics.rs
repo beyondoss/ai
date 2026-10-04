@@ -90,12 +90,15 @@ pub enum Rejection {
     /// `max_buffered_body_bytes` budget (`translate::translation_heap`, D216). 413 before any
     /// upstream.
     TranslateTooLarge,
+    /// A request outlived `request_max_secs` and was ended: a 504 before its response head, a cut
+    /// stream after.
+    RequestDeadline,
 }
 
 impl Rejection {
     /// Every variant, in `as_index` order. The array in `Metrics` is built from this, so adding a
     /// variant without adding it here fails the exhaustive `match` in `as_index`.
-    pub(crate) const ALL: [Rejection; 23] = [
+    pub(crate) const ALL: [Rejection; 24] = [
         Rejection::Auth,
         Rejection::DenySpend,
         Rejection::DenyFraud,
@@ -119,6 +122,7 @@ impl Rejection {
         Rejection::ForeignId,
         Rejection::IdSigningUnset,
         Rejection::TranslateTooLarge,
+        Rejection::RequestDeadline,
     ];
 
     /// The `reason=` label value. `RateLimit` keeps the original `"rate_limit"` string so existing
@@ -148,6 +152,7 @@ impl Rejection {
             Rejection::ForeignId => "foreign_id",
             Rejection::IdSigningUnset => "id_signing_unset",
             Rejection::TranslateTooLarge => "translate_too_large",
+            Rejection::RequestDeadline => "request_deadline",
         }
     }
 
@@ -176,6 +181,7 @@ impl Rejection {
             Rejection::ForeignId => 20,
             Rejection::IdSigningUnset => 21,
             Rejection::TranslateTooLarge => 22,
+            Rejection::RequestDeadline => 23,
         }
     }
 }

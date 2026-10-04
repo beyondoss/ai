@@ -38,6 +38,12 @@ write_timeout_secs = 60
 idle_timeout_secs = 90
 # A client that stops reading for this long is disconnected and its slots released (0 disables).
 client_write_timeout_secs = 60
+# A client that sends no body byte for this long while its body is read gets a 408 (0 disables).
+# Pingora's own HTTP/1.1 default, applied to HTTP/2 too.
+client_read_timeout_secs = 60
+# The longest one request may live, start to end: a 504 before the response head, a cut stream
+# after. 4h is the catalog's largest max output (384k tokens) at a slow decode (0 disables).
+request_max_secs = 14400
 # Transport liveness. HTTP/2 PING to providers every 15s; an unanswered one (5s deadline) fails the
 # connection. TCP keepalive on provider and client sockets: probe after 15s idle, every 5s, drop the
 # peer after 3 misses (30s). 0 disables either.

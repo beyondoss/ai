@@ -233,6 +233,9 @@ impl AiProxy {
     /// A proxy over `state` for the rest of the process. Keeps one reference to it forever (the
     /// gateway builds one proxy at boot, and its state is never torn down before exit).
     pub fn new(state: Arc<GatewayState>) -> Self {
+        if state.config.request_max_secs > 0 {
+            crate::deadline::start();
+        }
         let state: &'static Arc<GatewayState> = Box::leak(Box::new(state));
         Self { state }
     }
@@ -440,6 +443,10 @@ pub struct RequestCtx {
     /// the body is never buffered.
     req_buf: Vec<u8>,
     start: Instant,
+    /// When this request must end (`request_max_secs`), in [`crate::deadline`]'s units;
+    /// [`crate::deadline::NONE`] when the ceiling is off. A `FullBody` attempt carries its
+    /// parent's, so a re-run does not restart the clock.
+    deadline: u64,
     /// Connect-retry counter (see `fail_to_connect`).
     attempt: u8,
     /// Index into `provider.pool_auth` of the key used on this attempt. Starts on
@@ -458,6 +465,10 @@ pub struct RequestCtx {
     /// second refusal there is a provider failure: fail over, or end the request. Cleared when the
     /// walk moves to a new candidate.
     refused_resent: bool,
+    /// This attempt's upstream read timeout is the time left before `deadline` (shorter than the
+    /// silence bound, see `cap_read_at_deadline`), so a read timeout on it is the deadline passing,
+    /// not the provider going quiet.
+    read_capped: bool,
     /// The permit an `allow()` on `provider`'s breaker handed out, while it is outstanding and
     /// still owes exactly one `record_*_for` or `release`. Resolving with the permit (not just
     /// "the breaker") is what lets a half-open breaker ignore an attempt whose probe permit it has
@@ -722,11 +733,14 @@ fn h2_body_unsent(e: &pingora_core::Error) -> bool {
 /// 52x, Envoy's 503 local reply), so a bare close is billed nothing; an estimate errs low. Not a
 /// dead peer either (`ETIMEDOUT` from TCP keepalive or `TCP_USER_TIMEOUT`, a `ReadError`): nobody
 /// can say it ever read the request.
+///
+/// The request deadline passing ([`is_deadline`]) is the gateway giving up too, as a read timeout
+/// is: a provider still working on a delivered request bills its prompt.
 fn gave_up_waiting(e: &pingora_core::Error) -> bool {
     match e.esource() {
         pingora_core::ErrorSource::Downstream => true,
         pingora_core::ErrorSource::Upstream => e.etype() == &pingora_core::ErrorType::ReadTimedout,
-        _ => false,
+        _ => is_deadline(e),
     }
 }
 
@@ -1266,6 +1280,55 @@ pub fn error_body(typ: &str, msg: &str) -> Bytes {
 }
 
 impl AiProxy {
+    /// The bound [`peek_body_model`] puts on each body read itself: `client_read_timeout_secs`,
+    /// where the session has no read timeout of its own (HTTP/2; HTTP/1.1 enforces it inside
+    /// pingora, so a second timer would be waste).
+    fn up_front_read_timeout(&self, session: &Session) -> Option<Duration> {
+        let secs = self.state.config.client_read_timeout_secs;
+        (secs > 0 && session.as_ref().get_read_timeout().is_none())
+            .then(|| Duration::from_secs(secs))
+    }
+
+    /// End a request at its deadline (`request_max_secs`): counted, logged, and answered 504 if no
+    /// response has started (after one has, pingora cuts the stream as any mid-stream error does).
+    fn deadline_cut(&self, request_id: &str) -> Box<pingora_core::Error> {
+        self.state
+            .metrics
+            .rejection(Rejection::RequestDeadline)
+            .inc();
+        warn!(
+            request_id,
+            limit_secs = self.state.config.request_max_secs,
+            "request reached request_max_secs; ending it",
+        );
+        gateway_error(504, REQUEST_DEADLINE)
+    }
+
+    /// Cap this attempt's upstream read timeout at the time left before the request's deadline,
+    /// when that is the shorter bound, and say so in `read_capped`: pingora re-arms the timeout on
+    /// every read and every read starts after this attempt did, so a capped timeout can only fire
+    /// at or past the deadline, and `error_while_proxy` turns it into [`Self::deadline_cut`]. This
+    /// is what ends a silent stream (an HTTP/2 PING keeps the connection alive, and a `-pro` row
+    /// has no silence bound at all); a moving one is cut per chunk. No time left: the request ends
+    /// here, before a connection is made that the provider would bill.
+    fn cap_read_at_deadline(
+        &self,
+        rc: &mut RequestCtx,
+        mut peer: HttpPeer,
+    ) -> Result<Box<HttpPeer>> {
+        rc.read_capped = false;
+        if let Some(left) = crate::deadline::remaining(rc.deadline) {
+            if left.is_zero() {
+                return Err(self.deadline_cut(&rc.request_id));
+            }
+            if peer.options.read_timeout.is_none_or(|t| left < t) {
+                peer.options.read_timeout = Some(left);
+                rc.read_capped = true;
+            }
+        }
+        Ok(Box::new(peer))
+    }
+
     /// Build the upstream peer for a resolved address + provider.
     ///
     /// Extracted so the provider-routed path and the model-routed candidate walk cannot drift apart
@@ -1635,12 +1698,16 @@ impl AiProxy {
     async fn relay_full_body(
         &self,
         session: &mut Session,
-        request_id: RequestId,
-        request_seq: u64,
+        parent: Parent,
         route: &'static route::ModelRoute,
         body: Vec<u8>,
         slot_held: bool,
     ) -> Result<bool> {
+        let Parent {
+            request_id,
+            request_seq,
+            deadline,
+        } = parent;
         let session_field = if route::is_responses_path(session.req_header().uri.path()) {
             translate::responses_session_field(&body, !route.responses.is_empty())
         } else {
@@ -1689,6 +1756,7 @@ impl AiProxy {
                     request_id,
                     request_seq,
                     slot_held,
+                    deadline,
                     body: body.clone(),
                 }))
                 .build();
@@ -2265,7 +2333,9 @@ fn apply_provider_attribution(
 /// own DNS failure returned from `upstream_peer` (which leaves the source `Unset`), or an internal
 /// fault. Each is a real failure to complete this request against this provider.
 fn is_upstream_failure(e: Option<&pingora_core::Error>) -> bool {
-    e.is_some_and(|e| !matches!(e.esource(), pingora_core::ErrorSource::Downstream))
+    e.is_some_and(|e| {
+        !matches!(e.esource(), pingora_core::ErrorSource::Downstream) && !is_deadline(e)
+    })
 }
 
 /// Whether this attempt had started sending the client's body upstream and the client had not
@@ -2382,13 +2452,26 @@ struct BodyPeek {
 /// A body growing past the replay buffer reserves twice its size in the body budget as it grows
 /// (this buffer, and the `FullBody` re-run's own copy): a chunked upload has no length to reserve
 /// up front.
+///
+/// A client that stalls here holds its tenant slot while nothing upstream is open, so each read is
+/// bounded: by pingora's own downstream read timeout on HTTP/1.1 (`client_read_timeout_secs`, set
+/// in `request_filter`), by `read_timeout` here on HTTP/2, whose pingora server has none. A body
+/// still arriving at the request's `deadline` ends too. Either is the client's: every error here
+/// is tagged downstream, so `fail_to_proxy` answers a timeout 408 and writes nothing to a client
+/// that went away.
 async fn peek_body_model(
     session: &mut Session,
     reserve: usize,
     held: &mut Held,
+    read_timeout: Option<Duration>,
+    deadline: u64,
 ) -> pingora_core::Result<BodyPeek> {
+    let down = |mut e: Box<pingora_core::Error>| {
+        e.as_down();
+        e
+    };
     if expects_continue(session) {
-        session.write_continue_response().await?;
+        session.write_continue_response().await.map_err(down)?;
         // The client has its `100 Continue`, from us. Forwarding `Expect` would make the provider
         // send a second one, which the gateway relays: two interim responses for one request.
         session
@@ -2405,7 +2488,23 @@ async fn peek_body_model(
             over_cap = true;
             break;
         }
-        match session.read_request_body().await? {
+        if crate::deadline::expired(deadline) {
+            return Err(down(pingora_core::Error::explain(
+                pingora_core::ErrorType::ReadTimedout,
+                "request body still arriving at request_max_secs",
+            )));
+        }
+        let read = session.read_request_body();
+        let read = match read_timeout {
+            Some(t) => tokio::time::timeout(t, read).await.unwrap_or_else(|_| {
+                pingora_core::Error::e_explain(
+                    pingora_core::ErrorType::ReadTimedout,
+                    "reading body, client_read_timeout_secs",
+                )
+            }),
+            None => read.await,
+        };
+        match read.map_err(down)? {
             // An empty chunk feeds nothing, adds nothing, and re-reserves the same total (a no-op).
             Some(chunk) => {
                 scanner.feed(&chunk);
@@ -2514,9 +2613,19 @@ struct FullBody {
     /// The parent holds this tenant's concurrency slot for the whole request, taken before it read
     /// the body. Attempts neither take nor release one.
     slot_held: bool,
+    /// The parent's deadline (`RequestCtx::deadline`): every attempt ends by it.
+    deadline: u64,
     /// The parent's copy of the body (a refcount, not a copy): what `logging` tallies for an input
     /// estimate ([`input_estimate`]).
     body: Bytes,
+}
+
+/// What every [`FullBody`] attempt inherits from the request that re-runs it.
+#[derive(Clone, Copy)]
+struct Parent {
+    request_id: RequestId,
+    request_seq: u64,
+    deadline: u64,
 }
 
 /// [`FullBody::keys`] for a candidate no earlier attempt walked keys on.
@@ -2877,6 +2986,16 @@ const TRANSLATE_TOO_LARGE: &str = "request body is too large to translate onto t
 
 fn gateway_error(status: u16, msg: &'static str) -> Box<pingora_core::Error> {
     pingora_core::Error::new(pingora_core::ErrorType::CustomCode(msg, status))
+}
+
+/// The 504 for a request that outlived `request_max_secs` before its response head.
+const REQUEST_DEADLINE: &str = "request exceeded the gateway's maximum duration";
+
+/// Whether `e` is the request deadline passing ([`AiProxy::deadline_cut`]). A policy limit, never a
+/// provider outcome: [`is_upstream_failure`] is false for it, so no breaker hears of it, and
+/// `error_while_proxy` passes it through as the gateway's own decision (no resend, no failover).
+fn is_deadline(e: &pingora_core::Error) -> bool {
+    matches!(e.etype(), pingora_core::ErrorType::CustomCode(m, 504) if *m == REQUEST_DEADLINE)
 }
 
 /// The client-facing `(status, error type, message)` for an error that ended a request, or `None`
@@ -3468,8 +3587,18 @@ impl ProxyHttp for AiProxy {
                     .downstream_session
                     .set_write_timeout(Some(Duration::from_secs(secs)));
             }
+            // A client that stops sending its body is bounded the same way: per read, pingora's
+            // own timeout on HTTP/1.1 (a no-op on HTTP/2, which `peek_body_model` bounds itself).
+            let secs = self.state.config.client_read_timeout_secs;
+            session
+                .downstream_session
+                .set_read_timeout((secs > 0).then(|| Duration::from_secs(secs)));
         }
         let start = Instant::now();
+        let deadline = match &full_body {
+            Some(fb) => fb.deadline,
+            None => crate::deadline::at(start, self.state.config.request_max_secs),
+        };
         // One id per request, generated before any reject path so even a 400/401 carries it (in the
         // log line and the `x-beyond-request-id` header). Moved into `ctx` at the end for the
         // admitted path. Cheap: a counter bump + a short `format!` (see `next_request_id`). A
@@ -3974,7 +4103,14 @@ impl ProxyHttp for AiProxy {
                         return self.reject_body_memory(session, &request_id).await;
                     }
                     let reserve = declared_len.unwrap_or(0).min(MAX_REQUEST_BODY);
-                    let peek = Box::pin(peek_body_model(session, reserve, &mut ctx.held)).await?;
+                    let peek = Box::pin(peek_body_model(
+                        session,
+                        reserve,
+                        &mut ctx.held,
+                        self.up_front_read_timeout(session),
+                        deadline,
+                    ))
+                    .await?;
                     peeked = true;
                     if peek.over_cap {
                         return self.reject_too_large(session, &request_id).await;
@@ -4003,8 +4139,11 @@ impl ProxyHttp for AiProxy {
                         let relayed = self
                             .relay_full_body(
                                 session,
-                                request_id,
-                                request_seq,
+                                Parent {
+                                    request_id,
+                                    request_seq,
+                                    deadline,
+                                },
                                 route,
                                 body,
                                 slot_held,
@@ -4040,7 +4179,14 @@ impl ProxyHttp for AiProxy {
                 return self.reject_body_memory(session, &request_id).await;
             }
             let reserve = declared_len.unwrap_or(0).min(MAX_REQUEST_BODY);
-            let peek = Box::pin(peek_body_model(session, reserve, &mut ctx.held)).await?;
+            let peek = Box::pin(peek_body_model(
+                session,
+                reserve,
+                &mut ctx.held,
+                self.up_front_read_timeout(session),
+                deadline,
+            ))
+            .await?;
             if peek.over_cap {
                 return self.reject_too_large(session, &request_id).await;
             }
@@ -4058,7 +4204,17 @@ impl ProxyHttp for AiProxy {
                 }
                 let slot_held = early_slot.is_some();
                 let relayed = self
-                    .relay_full_body(session, request_id, request_seq, route, body, slot_held)
+                    .relay_full_body(
+                        session,
+                        Parent {
+                            request_id,
+                            request_seq,
+                            deadline,
+                        },
+                        route,
+                        body,
+                        slot_held,
+                    )
                     .await;
                 drop(early_slot);
                 return relayed;
@@ -4611,11 +4767,13 @@ impl ProxyHttp for AiProxy {
                     body_bytes_fed: 0,
                     upstream_status: Some(hit.status),
                     start,
+                    deadline,
                     attempt: 0,
                     pool_key: 0,
                     same_provider_retry: false,
                     relay_abandoned: false,
                     refused_resent: false,
+                    read_capped: false,
                     breaker_pending: None,
                     auto: model_route.map(|route| {
                         Box::new(ModelRouting {
@@ -4765,11 +4923,13 @@ impl ProxyHttp for AiProxy {
             body_bytes_fed: 0,
             upstream_status: None,
             start,
+            deadline,
             attempt: 0,
             pool_key,
             same_provider_retry: false,
             relay_abandoned: false,
             refused_resent: false,
+            read_capped: false,
             breaker_pending,
             auto: model_route.map(|route| {
                 Box::new(ModelRouting {
@@ -4871,11 +5031,8 @@ impl ProxyHttp for AiProxy {
                 }
             };
             rc.upstream_phase = UpstreamPhase::Attempted;
-            return Ok(Box::new(self.build_peer(
-                addr,
-                &rc.provider,
-                rc.auto.as_ref().map(|a| a.route),
-            )));
+            let peer = self.build_peer(addr, &rc.provider, rc.auto.as_ref().map(|a| a.route));
+            return self.cap_read_at_deadline(rc, peer);
         }
 
         // Model-routed: this hook owns the candidate walk *and* the breaker ledger.
@@ -4990,11 +5147,8 @@ impl ProxyHttp for AiProxy {
                             path.push_str(sub.suffix());
                         }
                         rc.upstream_phase = UpstreamPhase::Attempted;
-                        return Ok(Box::new(self.build_peer(
-                            addr,
-                            &p,
-                            rc.auto.as_ref().map(|a| a.route),
-                        )));
+                        let peer = self.build_peer(addr, &p, rc.auto.as_ref().map(|a| a.route));
+                        return self.cap_read_at_deadline(rc, peer);
                     }
                     Err(e) => {
                         // DNS failure is handled *here*, inside the walk, rather than by returning
@@ -5049,11 +5203,8 @@ impl ProxyHttp for AiProxy {
             }
         };
         rc.upstream_phase = UpstreamPhase::Attempted;
-        Ok(Box::new(self.build_peer(
-            addr,
-            &rc.provider,
-            rc.auto.as_ref().map(|a| a.route),
-        )))
+        let peer = self.build_peer(addr, &rc.provider, rc.auto.as_ref().map(|a| a.route));
+        self.cap_read_at_deadline(rc, peer)
     }
 
     /// Fail over — or walk a pool key — before a byte of the error reaches the client.
@@ -5465,6 +5616,11 @@ impl ProxyHttp for AiProxy {
         let Some(rc) = rc.as_mut() else {
             return Ok(());
         };
+        // An upload still trickling in at the request's deadline ends there (see
+        // `response_body_filter`).
+        if crate::deadline::expired(rc.deadline) {
+            return Err(self.deadline_cut(&rc.request_id));
+        }
         // Feed the body through the structural scanner as it passes (never withheld, never
         // buffered) to extract the exact root-level `model` — but only for **managed** traffic,
         // which is the only path that reads it. `rc.model` is used at exactly two places, both
@@ -5985,6 +6141,11 @@ impl ProxyHttp for AiProxy {
             return Ok(None);
         };
         self.state.fault_point("response_body_filter");
+        // A response still moving at the request's deadline is cut (a silent one is ended by the
+        // capped read timeout instead). One atomic load: see `crate::deadline`.
+        if crate::deadline::expired(rc.deadline) {
+            return Err(self.deadline_cut(&rc.request_id));
+        }
         // First, so nothing downstream — translation, capture, the cache, the usage tail — ever
         // holds the pool key (D66).
         if let Some(r) = rc.redact.as_mut() {
@@ -6163,6 +6324,14 @@ impl ProxyHttp for AiProxy {
     ) -> Box<pingora_core::Error> {
         use pingora_core::ErrorType as T;
         let mut e = e.more_context(format!("Peer: {peer}"));
+        // A read timeout capped at the request's deadline is the deadline passing, not the
+        // provider going quiet: the gateway's own decision, like those below.
+        if e.etype() == &T::ReadTimedout
+            && let Some(rc) = ctx.rc.as_ref()
+            && rc.read_capped
+        {
+            return self.deadline_cut(&rc.request_id);
+        }
         // Our own decisions (a 5xx / 401 vendor walk, a 429 key walk, a body cap) are made.
         if matches!(e.etype(), T::HTTPStatus(_) | T::CustomCode(..)) {
             return e;
@@ -7088,11 +7257,13 @@ mod tests {
             background_check: false,
             req_buf: Vec::new(),
             start: Instant::now(),
+            deadline: crate::deadline::NONE,
             attempt: 0,
             pool_key: 0,
             same_provider_retry: false,
             relay_abandoned: false,
             refused_resent: false,
+            read_capped: false,
             breaker_pending: None,
             auto: None,
             control: None,
@@ -7324,8 +7495,9 @@ mod tests {
         let size = std::mem::size_of::<RequestCtx>();
         assert!(
             // 432: + the boxed `signed` (8 bytes, `None` off the managed Responses relay).
-            size <= 432,
-            "RequestCtx grew to {size} bytes (ceiling 432). It is touched once per response chunk \
+            // 440: + `deadline` (8 bytes; every request has one, and the per-chunk check reads it).
+            size <= 440,
+            "RequestCtx grew to {size} bytes (ceiling 440). It is touched once per response chunk \
              on a stream — if the new state is only needed on one route, box it the way \
              `ModelRouting` is rather than paying for it on every request.",
         );
