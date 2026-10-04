@@ -385,6 +385,12 @@ pub struct AiConfig {
     /// be able to backpressure the data plane. Deeper absorbs longer sink stalls at the cost of
     /// holding more payload bytes in memory.
     pub capture_queue_depth: usize,
+    /// Bound on the bytes held by queued capture lines (`0`: none). A line count alone is not a
+    /// memory bound: one line carries up to two `capture_max_bytes` bodies, more after JSON
+    /// escaping, so a full queue of 1 024 could hold gigabytes while the log pipeline stalls. A
+    /// line that would cross this bound is **dropped** (counted on `ai_capture_dropped_total`),
+    /// never waited for (D262).
+    pub capture_queue_bytes: usize,
 
     /// Exact-match response cache TTL (seconds). `0` disables it (the default). Only managed
     /// catalog walks whose client body is already in hand before `upstream_peer` (`/auto`, managed
@@ -488,6 +494,8 @@ impl Default for AiConfig {
             // Absorbs a multi-second sink stall at a healthy capture rate. Past that we drop rather
             // than block — see the field docs and `ai_capture_dropped_total`.
             capture_queue_depth: 1024,
+            // 64 MiB: dozens of full-size payloads, a small fraction of `max_buffered_body_bytes`.
+            capture_queue_bytes: 64 * 1024 * 1024,
             // Off. A TTL of 0 is the disable knob; turning it on is an operator choice, not a
             // surprise change in what the gateway talks to.
             cache_ttl_secs: 0,

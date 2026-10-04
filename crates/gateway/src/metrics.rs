@@ -325,7 +325,8 @@ pub struct Metrics {
     /// Payload bytes handed to the capture sink (request + response). This is the cost signal — it
     /// predicts the log-pipeline and storage bill before the invoice does.
     pub capture_bytes_total: IntCounter,
-    /// Captures dropped because the sink queue was full. **The important one.** Capture is
+    /// Captures dropped because the sink queue was full (in lines or in bytes, D262), the
+    /// destination refused the write, or shutdown had begun. **The important one.** Capture is
     /// deliberately lossy so a stalled log sink can never backpressure the proxy, which means a
     /// missing payload is ambiguous — was capture off for that request, or did we lose it? Without
     /// this counter that question is unanswerable during the incident capture exists to serve.
@@ -346,6 +347,11 @@ pub struct Metrics {
     /// `ai.usage` billing rows whose stdout write failed (a closed or broken pipe). The row is lost
     /// to the log pipeline, so this counter, and the line on stderr, are the only record of it.
     pub usage_write_errors_total: IntCounter,
+    /// Diagnostic log lines (every target but `ai.usage` and `ai.payload`) dropped because the log
+    /// sink's queue was full or the destination refused the write (D263). Diagnostics are written
+    /// off the worker threads, lossy, so a stalled stdout costs log lines rather than parking the
+    /// workers that serve traffic; a non-zero rate means the log pipeline is not keeping up.
+    pub log_dropped_total: IntCounter,
     /// Current allowance-set cardinality (exhausted tenants + keys). Sparse; a climb that never
     /// falls means the control plane is writing exhaust bits without deleting them on restore.
     pub allowance_set_size: IntGauge,
@@ -503,7 +509,7 @@ impl Metrics {
         ))?;
         let capture_dropped_total = IntCounter::with_opts(Opts::new(
             "ai_capture_dropped_total",
-            "Captures dropped because the sink queue was full",
+            "Captures dropped: the sink queue was full (lines or bytes), or the write failed",
         ))?;
         let control_header_errors_total = IntCounter::with_opts(Opts::new(
             "ai_control_header_errors_total",
@@ -520,6 +526,10 @@ impl Metrics {
         let usage_write_errors_total = IntCounter::with_opts(Opts::new(
             "ai_usage_write_errors_total",
             "ai.usage billing rows whose stdout write failed (the row is lost)",
+        ))?;
+        let log_dropped_total = IntCounter::with_opts(Opts::new(
+            "ai_log_dropped_total",
+            "Diagnostic log lines dropped: the log sink queue was full, or the write failed",
         ))?;
         let cache_hits_total = IntCounter::with_opts(Opts::new(
             "ai_cache_hits_total",
@@ -565,6 +575,7 @@ impl Metrics {
         r.register(Box::new(usage_parse_errors_total.clone()))?;
         r.register(Box::new(usage_estimated_total.clone()))?;
         r.register(Box::new(usage_write_errors_total.clone()))?;
+        r.register(Box::new(log_dropped_total.clone()))?;
         r.register(Box::new(cache_hits_total.clone()))?;
         r.register(Box::new(cache_scope.clone()))?;
 
@@ -605,6 +616,7 @@ impl Metrics {
             usage_parse_errors_total,
             usage_estimated_total,
             usage_write_errors_total,
+            log_dropped_total,
             cache_hits_total,
             cache_scope: cache_scope_process,
         }))

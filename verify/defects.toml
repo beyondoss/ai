@@ -2611,3 +2611,31 @@ state = "fixed"
 test = "openrouter_402s_in_a_row_cool_its_key"
 fix = "0357214"
 note = "Checking the balance out of band was rejected: OpenRouter's GET /api/v1/key answers an inference key with its own spending limit only (limit_remaining is null for a key that draws on account credit, the common case), and GET /api/v1/credits, the account balance, needs a management key, which cannot make completions and the gateway does not hold. Fixed by a heuristic instead: each OpenRouter 402 the walk fails over on (either abandoning path: in-place retry, recorded FullBody retry) is a strike against that pool key (Provider::strike_unread_402: a relaxed AtomicU32 beside the key's cooldown, per replica, nothing stored), and route::OPENROUTER_402_STRIKES (3) in a row cool it through AiProxy::cool_unfunded_key (same metric reason, same warn line as D180/D258). Any 2xx from the key resets the count (Provider::key_served in upstream_response_filter: one relaxed load, a store only when non-zero) and any cooling spends it; a key already cooling does not count the 402s of requests sent before it cooled, so a burst cools it once. A relayed OpenRouter 402 is read as before: out of credit cools, too costly neither counts nor resets. Cost: a near-empty account sent only requests too costly for it may cool for KEY_COOLDOWN although a smaller request would be served. Also tested: too_costly_openrouter_402s_between_successes_never_cool_its_key, a_burst_of_openrouter_402s_cools_its_key_once, route::tests::{unread_402s_in_a_row_cool_only_their_own_key, a_cooled_key_counts_afresh_once_its_cooldown_has_passed, cooling_a_key_spends_its_strikes}; D258's test now sends one fewer than the strike count for its OpenRouter case."
+
+[[defect]]
+id = "D262"
+severity = "med"
+area = "Reliability"
+title = "The payload-capture queue was bounded in lines, not bytes: a stalled log pipeline could pin gigabytes"
+impact = "capture_sink queued ai.payload lines in a sync_channel(capture_queue_depth), 1 024 lines by default, and one line holds up to two capture_max_bytes (256 KiB) bodies, more after JSON escaping (up to 6x for control bytes). When the log forwarder stopped draining stdout, the queue filled and held about 0.5 to 3 GiB of captured payloads, counted by no budget (max_buffered_body_bytes included), on a process sized around that budget."
+confidence = "high"
+evidence = "Code: capture_sink.rs spawn_to (sync_channel(depth)), QueueWriter::drop (try_send of the whole line, no size check); config.rs capture_queue_depth = 1024, capture_max_bytes = 256 KiB; capture.rs emits both directions on one line. Found by a read-only audit of long-run memory bounds."
+claims = ["REL-18", "O2"]
+state = "fixed"
+test = "a_line_over_the_byte_budget_is_dropped_and_counted"
+fix = "f04358c"
+note = "Fixed: the queue is also bounded in bytes, capture_queue_bytes (default 64 MiB, 0 disables). QueueWriter::drop charges the line's length to an AtomicUsize before try_send (undone if it would cross the bound, or if the queue is full or closed); the drain thread releases it after the write, so a line in its hands while the destination is wedged still counts. A line over the bound is dropped and counted on ai_capture_dropped_total, like a full-queue drop: no new label, the counter already means every lost line (D208). Two relaxed atomics per enqueued line, nothing on a request that captures nothing. Also tested: a_written_line_releases_its_bytes, a_full_queue_drop_releases_its_bytes."
+
+[[defect]]
+id = "D263"
+severity = "high"
+area = "Reliability"
+title = "A stalled stdout parked every Tokio worker: diagnostics were written with a blocking write on the worker that logged them"
+impact = "Every target but ai.payload (ai.usage aside) went through the default fmt writer, a blocking write(2) to stdout on the worker thread that emitted the event. When the log forwarder stopped draining the pipe, the first warn! parked its worker, then the next, until every worker was parked and every in-flight request kept its tenant slot and body budget: the gateway stopped serving because its log sink stopped reading. A warn! per rejected request (\"request rejected\") let a flood of bad keys or rate-limited requests make stdout the bottleneck."
+confidence = "high"
+evidence = "Code: main.rs init_tracing, main_layer = fmt::layer().json() with no writer (stdout); proxy.rs reject_retry_after and reject_message, one warn! per rejection. Hermetic: a_stalled_stdout_does_not_stall_requests with the old writer fails in its first round (a request times out behind the undrained pipe: pingora's debug lines at AI_LOG=debug fill it before the first request)."
+claims = ["REL-10", "BIL-4"]
+state = "fixed"
+test = "a_stalled_stdout_does_not_stall_requests"
+fix = "f04358c"
+note = "Fixed: diagnostics go through a second capture_sink instance (bounded at 8 192 lines and 16 MiB, its own ai-log-sink thread); a full queue drops the line and counts it on the new ai_log_dropped_total. The drain on SIGTERM, and pingora's own exit path, flush it after the payload sink within the same 5 s bound. request rejected lines are capped at 100 a second process-wide (proxy::LogRate: three relaxed atomics, on the rejection path only); the rest are counted and the next line logged carries suppressed = how many were left out, while ai_rejections_total counts every rejection. ai.usage rows stay on the blocking writer on the worker (BIL-4): a dedicated billing thread fed by a blocking queue was considered and rejected, since once its queue fills the worker blocks exactly as on the pipe (it only delays the stall), and rows sitting in a queue would be lost to a crash, a panic abort or the end of the grace period, where today they are in the pipe when logging returns. So a stalled pipe still stalls billing traffic, by design; diagnostics and payloads no longer add to it. Also tested: a_rejection_flood_logs_a_capped_number_of_lines, shutdown_flushes_the_diagnostic_sink, proxy rejection_lines_are_capped_per_second_and_the_rest_counted."

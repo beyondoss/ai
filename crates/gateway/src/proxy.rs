@@ -88,7 +88,8 @@ use pingora_proxy::{FailToProxy, ProxyHttp, Session};
 use std::borrow::Cow;
 use std::fmt::Write as _;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
@@ -1367,7 +1368,7 @@ impl AiProxy {
         msg: &str,
         retry_after: Option<u64>,
     ) -> Result<bool> {
-        warn!(request_id, status, error_type = typ, "request rejected");
+        log_rejection(request_id, status, typ);
         // `typ` and `msg` are always a pair of literals from `RejectBody`, so the body is one of a
         // handful of compile-time constants and `error_body` hands back a `Bytes::from_static` —
         // no JSON DOM, no `String`, no copy. Building it with `serde_json::json!` cost 13
@@ -1502,7 +1503,7 @@ impl AiProxy {
         typ: &'static str,
         msg: String,
     ) -> Result<bool> {
-        warn!(request_id, status, error_type = typ, "request rejected");
+        log_rejection(request_id, status, typ);
         let body = Bytes::from(
             serde_json::json!({ "error": { "type": typ, "message": msg } }).to_string(),
         );
@@ -2785,6 +2786,75 @@ async fn pipe_full_body(
             }
         }
     }
+}
+
+/// Most `request rejected` lines logged per second, process-wide (D263). A rejection is the one
+/// line a client can make the gateway write at will — bad keys, a rate-limited flood — and one line
+/// per rejected request made the log the bottleneck of a flood the rejection was meant to shed. A
+/// second's first lines still carry their `request_id` for the oncall's grep; past the allowance
+/// they are counted, and the next line logged says how many were not (`suppressed`).
+/// `ai_rejections_total` still counts every one.
+const REJECT_LOG_PER_SEC: u64 = 100;
+
+static REJECT_LOG: LogRate = LogRate::new(REJECT_LOG_PER_SEC);
+
+/// A per-second allowance of log lines shared by every worker: relaxed atomics, no lock. Approximate
+/// at a second's boundary (a racing line may land in either second), which a log rate can afford.
+pub(crate) struct LogRate {
+    second: AtomicU64,
+    used: AtomicU64,
+    suppressed: AtomicU64,
+    per_sec: u64,
+}
+
+impl LogRate {
+    pub(crate) const fn new(per_sec: u64) -> Self {
+        Self {
+            second: AtomicU64::new(0),
+            used: AtomicU64::new(0),
+            suppressed: AtomicU64::new(0),
+            per_sec,
+        }
+    }
+
+    /// Whether to log a line at `now` (whole seconds on a monotonic clock). `Some(n)`: log it, and
+    /// say `n` lines were suppressed since the last one logged. `None`: suppressed, and counted.
+    pub(crate) fn admit(&self, now: u64) -> Option<u64> {
+        let seen = self.second.load(Ordering::Relaxed);
+        if now > seen
+            && self
+                .second
+                .compare_exchange(seen, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            self.used.store(0, Ordering::Relaxed);
+        }
+        if self.used.fetch_add(1, Ordering::Relaxed) < self.per_sec {
+            Some(self.suppressed.swap(0, Ordering::Relaxed))
+        } else {
+            self.suppressed.fetch_add(1, Ordering::Relaxed);
+            None
+        }
+    }
+}
+
+/// The `request rejected` line every gateway-made rejection writes, under [`REJECT_LOG`]'s cap.
+fn log_rejection(request_id: &str, status: u16, typ: &str) {
+    if let Some(suppressed) = REJECT_LOG.admit(log_second()) {
+        warn!(
+            request_id,
+            status,
+            error_type = typ,
+            suppressed,
+            "request rejected"
+        );
+    }
+}
+
+/// Whole seconds since the first call: [`LogRate`]'s clock.
+fn log_second() -> u64 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_secs()
 }
 
 /// The `Retry-After` (seconds) on a gateway-made rejection: every 429 and 503 carries one, so a
@@ -8832,6 +8902,26 @@ mod mutation_gaps {
 
     /// `Retry-After` defaults: 5s for an unavailable allowance, 1s for any other 429/503, none
     /// otherwise.
+    /// Rejection lines are capped per second: the second's first `per_sec` lines are logged, the
+    /// rest suppressed and counted, and the next logged line (in a later second) reports how many.
+    /// defect: D263
+    #[test]
+    fn rejection_lines_are_capped_per_second_and_the_rest_counted() {
+        let rate = LogRate::new(3);
+        assert_eq!(rate.admit(1), Some(0));
+        assert_eq!(rate.admit(1), Some(0));
+        assert_eq!(rate.admit(1), Some(0));
+        assert_eq!(rate.admit(1), None);
+        assert_eq!(rate.admit(1), None);
+        // A new second refills the allowance; its first line reports the two suppressed.
+        assert_eq!(rate.admit(2), Some(2));
+        assert_eq!(rate.admit(2), Some(0));
+        // A racing caller with an older second neither rewinds the window nor refills it.
+        assert_eq!(rate.admit(1), Some(0));
+        assert_eq!(rate.admit(2), None);
+        assert_eq!(rate.admit(5), Some(1));
+    }
+
     /// claim: REL-19
     #[test]
     fn default_retry_after_by_status_and_message() {
