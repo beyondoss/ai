@@ -156,6 +156,48 @@ async fn a_body_too_costly_to_translate_is_a_413_naming_translation() {
     );
 }
 
+/// The response half of D216: a non-streaming Claude answer whose tool input is 4 MiB of tiny
+/// objects, translated for a Chat client, takes the same ~1 GiB of `Value`s. Its heap is held in the
+/// budget like a request's, and it does not fit: the status line is already downstream, so the
+/// response is aborted rather than translated, and the gateway's memory stays where it was.
+/// claim: SEC-19
+/// defect: D216
+#[tokio::test]
+async fn a_response_too_costly_to_translate_is_aborted() {
+    let answer = format!(
+        r#"{{"id":"msg_1","type":"message","role":"assistant","model":"claude-opus-4-8","content":[{{"type":"tool_use","id":"toolu_1","name":"f","input":{{"x":[{}]}}}}],"stop_reason":"tool_use","usage":{{"input_tokens":1,"output_tokens":1}}}}"#,
+        tiny_objects(4 * MIB)
+    );
+    let len = answer.len();
+    let answer: &'static str = Box::leak(answer.into_boxed_str());
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::Raw(200, "application/json", answer)).await;
+    let gw = Gateway::builder(unused_nats_port(), &mock.authority(), &b64(&pubkey))
+        .providers(&["anthropic"])
+        .start()
+        .await;
+    let (_, text, rise) = send(
+        &gw,
+        &sk,
+        "/v1/chat/completions",
+        r#"{"model":"claude-opus-4-8","max_tokens":16,"messages":[{"role":"user","content":"go"}]}"#
+            .to_owned(),
+    )
+    .await;
+    assert_eq!(mock.hits(), 1);
+    assert!(
+        !text.contains("tool_calls"),
+        "the response was translated ({} bytes)",
+        text.len()
+    );
+    assert!(
+        rise <= copies_budget(len),
+        "peak RSS rose {rise} KiB for a {} KiB response (budget {} KiB)",
+        len / 1024,
+        copies_budget(len)
+    );
+}
+
 /// A translated stream that outgrows every answer the catalog allows (the largest `max_output`,
 /// 384,000 tokens, at 128 bytes a token: `translate::MAX_STREAM_OUTPUT`, 46.9 MiB) is cut, rather
 /// than gathered whole: a Responses client's bridge keeps every text delta for the closing

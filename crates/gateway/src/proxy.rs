@@ -1939,7 +1939,8 @@ impl AiProxy {
     /// Never exempt on a `FullBody` re-run, whose parent reserved two copies of the body, not the
     /// `Value`s built from it. A translation that needs more than the whole budget is a 413 naming
     /// translation; one that does not fit now is the budget's retryable 503. With the budget off
-    /// there is nothing to hold, and nothing is refused.
+    /// there is nothing to hold, and nothing is refused. On a response the status line is already
+    /// downstream, so either refusal aborts it.
     fn hold_translation_heap(
         &self,
         body: &[u8],
@@ -5748,19 +5749,14 @@ impl ProxyHttp for AiProxy {
                         a.route.card.output_cap().unwrap_or(0),
                     );
                     let serving = catalog_serving_endpoint(a.as_ref());
-                    let upstream_model =
-                        a.candidate_at(a.candidate).map_or("", |c| c.upstream_model);
-                    let openai_host = a
-                        .candidate_at(a.candidate)
-                        .is_some_and(|c| c.provider == providers::ProviderId::OpenAi);
-                    let stream_only = a
-                        .candidate_at(a.candidate)
-                        .is_some_and(providers::catalog::stream_only);
-                    let reads_developer = a
-                        .candidate_at(a.candidate)
-                        .is_none_or(providers::catalog::reads_developer_role);
-                    let tool_thinking = a
-                        .candidate_at(a.candidate)
+                    let candidate = a.candidate_at(a.candidate);
+                    let upstream_model = candidate.map_or("", |c| c.upstream_model);
+                    let openai_host =
+                        candidate.is_some_and(|c| c.provider == providers::ProviderId::OpenAi);
+                    let stream_only = candidate.is_some_and(providers::catalog::stream_only);
+                    let reads_developer =
+                        candidate.is_none_or(providers::catalog::reads_developer_role);
+                    let tool_thinking = candidate
                         .map_or(providers::catalog::ToolThinking::Free, |c| {
                             providers::catalog::tool_thinking(c)
                         });
@@ -5835,7 +5831,7 @@ impl ProxyHttp for AiProxy {
                     }
                     // Native OpenAI Chat takes `max_completion_tokens` on every model and 400s
                     // `max_tokens` on its reasoning ones; a translated body already says the former.
-                    if a.candidate_at(a.candidate).is_some_and(native_openai_chat)
+                    if candidate.is_some_and(native_openai_chat)
                         && rename_max_tokens(&mut buf, &scan.limit_keys)
                     {
                         scan = peek::scan_buffered(&buf);
@@ -6241,6 +6237,20 @@ impl ProxyHttp for AiProxy {
                         return Err(self.translate_overflow(&rc.request_id, "json_body"));
                     }
                     if end_of_stream {
+                        // The response's `Value`s are held in the body budget like a request's
+                        // (D216). Headers are already downstream, so a refusal aborts the response,
+                        // as `translate_overflow` does. A same-wire 2xx is relayed as bytes.
+                        let _heap = if upstream == t.client && (200..300).contains(&status) {
+                            None
+                        } else {
+                            self.hold_translation_heap(&t.json_buf).inspect_err(|_| {
+                                warn!(
+                                    request_id = %rc.request_id,
+                                    bytes = t.json_buf.len(),
+                                    "translated response exceeds the body budget; aborting",
+                                );
+                            })?
+                        };
                         translate::response_json_tools(
                             upstream,
                             t.client,
