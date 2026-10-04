@@ -5748,19 +5748,14 @@ impl ProxyHttp for AiProxy {
                         a.route.card.output_cap().unwrap_or(0),
                     );
                     let serving = catalog_serving_endpoint(a.as_ref());
-                    let upstream_model =
-                        a.candidate_at(a.candidate).map_or("", |c| c.upstream_model);
-                    let openai_host = a
-                        .candidate_at(a.candidate)
-                        .is_some_and(|c| c.provider == providers::ProviderId::OpenAi);
-                    let stream_only = a
-                        .candidate_at(a.candidate)
-                        .is_some_and(providers::catalog::stream_only);
-                    let reads_developer = a
-                        .candidate_at(a.candidate)
-                        .is_none_or(providers::catalog::reads_developer_role);
-                    let tool_thinking = a
-                        .candidate_at(a.candidate)
+                    let candidate = a.candidate_at(a.candidate);
+                    let upstream_model = candidate.map_or("", |c| c.upstream_model);
+                    let openai_host =
+                        candidate.is_some_and(|c| c.provider == providers::ProviderId::OpenAi);
+                    let stream_only = candidate.is_some_and(providers::catalog::stream_only);
+                    let reads_developer =
+                        candidate.is_none_or(providers::catalog::reads_developer_role);
+                    let tool_thinking = candidate
                         .map_or(providers::catalog::ToolThinking::Free, |c| {
                             providers::catalog::tool_thinking(c)
                         });
@@ -5835,7 +5830,7 @@ impl ProxyHttp for AiProxy {
                     }
                     // Native OpenAI Chat takes `max_completion_tokens` on every model and 400s
                     // `max_tokens` on its reasoning ones; a translated body already says the former.
-                    if a.candidate_at(a.candidate).is_some_and(native_openai_chat)
+                    if candidate.is_some_and(native_openai_chat)
                         && rename_max_tokens(&mut buf, &scan.limit_keys)
                     {
                         scan = peek::scan_buffered(&buf);
