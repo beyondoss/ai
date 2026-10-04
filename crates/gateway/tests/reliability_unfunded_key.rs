@@ -7,6 +7,7 @@
 
 mod common;
 
+use beyond_ai::route::OPENROUTER_402_STRIKES;
 use common::*;
 use serde_json::Value;
 
@@ -268,7 +269,8 @@ async fn an_unfunded_candidate_cools_off_from_any_catalog_slot() {
 /// next candidate, and every request after it, for the cooldown, goes straight to it. OpenRouter's
 /// 402 can instead be one request larger than the balance ("This request requires more credits"),
 /// which a smaller request is not: that one fails over too, and cools nothing, so OpenRouter keeps
-/// getting the row's requests. Both hold for a body pingora replays and for one past its 64 KiB
+/// getting the row's requests (until enough arrive in a row with no success between them: D261,
+/// `reliability_openrouter_402.rs`, so this sends one fewer). Both hold for a body pingora replays and for one past its 64 KiB
 /// retry buffer, which fails over by a `FullBody` re-run.
 /// claim: REL-4
 /// defect: D258
@@ -311,7 +313,9 @@ async fn a_402_the_walk_fails_over_on_cools_an_unfunded_key() {
             .provider_authority(next, &serving.authority())
             .start()
             .await;
-        for n in 1..=3 {
+        // Below OpenRouter's strike count (D261), which would cool its key.
+        let requests = if cools { 3 } else { strikes() - 1 };
+        for n in 1..=requests {
             let resp = test_client()
                 .post(format!("{}/v1/chat/completions", gw.url()))
                 .header("authorization", format!("Bearer {key}"))
@@ -338,8 +342,8 @@ async fn a_402_the_walk_fails_over_on_cools_an_unfunded_key() {
         let cooled = gw
             .metric("ai_key_auth_failures_total", r#"reason="unfunded""#)
             .await;
-        let (want_hits, want_cooled) = if cools { (1, 1.0) } else { (3, 0.0) };
-        if refusing.hits() != want_hits || serving.hits() != 3 || cooled != want_cooled {
+        let (want_hits, want_cooled) = if cools { (1, 1.0) } else { (requests, 0.0) };
+        if refusing.hits() != want_hits || serving.hits() != requests || cooled != want_cooled {
             failures.push(format!(
                 "{first} ({size} B): {} hits on its 402 (want {want_hits}), {} on {next}, {cooled} keys cooled (want {want_cooled})",
                 refusing.hits(),
@@ -352,4 +356,9 @@ async fn a_402_the_walk_fails_over_on_cools_an_unfunded_key() {
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+}
+
+/// [`OPENROUTER_402_STRIKES`] as a request count.
+fn strikes() -> usize {
+    usize::try_from(OPENROUTER_402_STRIKES).unwrap()
 }
