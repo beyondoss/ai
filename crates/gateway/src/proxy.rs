@@ -1770,6 +1770,23 @@ impl AiProxy {
         provider.mark_key_bad(key);
     }
 
+    /// Judge a `402` a catalog walk abandons at its head, unread (`by_status`: `None` for any other
+    /// answer, else [`remedy::unfunded_402`]'s verdict). Out of credit by its status alone: cool
+    /// the key (D258). OpenRouter's, which may be one request too costly instead: a strike against
+    /// the key, and the [`route::OPENROUTER_402_STRIKES`]th in a row with no 2xx between cools it
+    /// (D261). A relayed 402 is read by `logging` instead: out of credit cools the key (which spends
+    /// its strikes), too costly neither counts nor resets one.
+    fn abandon_402(&self, rc: &RequestCtx, by_status: Option<bool>, status: u16) {
+        let cool = match by_status {
+            Some(true) => true,
+            Some(false) => rc.provider.strike_unread_402(rc.pool_key),
+            None => false,
+        };
+        if cool {
+            self.cool_unfunded_key(&rc.request_id, &rc.provider, rc.pool_key, status);
+        }
+    }
+
     /// Resolve a 2xx's pending health verdict from the first response bytes: count an
     /// error-in-200 against the candidate's breaker.
     fn settle_health(&self, rc: &mut RequestCtx, chunk: &[u8], end_of_stream: bool) {
@@ -5010,6 +5027,10 @@ impl ProxyHttp for AiProxy {
             return Ok(());
         };
         let status = upstream_response.status.as_u16();
+        // A 2xx says this key's account pays: forget its unread OpenRouter 402s (D261).
+        if rc.managed && (200..300).contains(&status) {
+            rc.provider.key_served(rc.pool_key);
+        }
 
         // Managed 401: this pool key is revoked (D71). Never the caller's fault. Cool it off so
         // later requests start on a good key, then walk like a 429. Not a 403 (D84, see
@@ -5101,14 +5122,12 @@ impl ProxyHttp for AiProxy {
         // tells `logging` an account is out of credit (D180), and every later request would pay a
         // round trip to it first. A 402 says so by its status alone except on OpenRouter, whose
         // 402 may be one request too large for the balance (`remedy::unfunded_402`): cool that key
-        // here, as `logging` would have, on either abandoning path below (D258).
-        let unfunded = key_failure
-            && status == 402
-            && rc
-                .auto
-                .as_ref()
-                .and_then(|a| a.candidate_at(at))
-                .is_some_and(|c| remedy::unfunded_402(c.provider));
+        // here, as `logging` would have, on either abandoning path below (D258). OpenRouter's
+        // unread 402 is a strike against its key instead, and enough in a row cool it (D261).
+        let unfunded_402 = (key_failure && status == 402)
+            .then(|| rc.auto.as_ref().and_then(|a| a.candidate_at(at)))
+            .flatten()
+            .map(|c| remedy::unfunded_402(c.provider));
         // Fail over only when the body is **provably** replayable: fully read, and small enough
         // that pingora buffered all of it.
         //
@@ -5143,8 +5162,8 @@ impl ProxyHttp for AiProxy {
             );
             rc.relay_abandoned = fb.record(RelayRetry::Candidate(orig));
             // Not recorded (the final attempt): this answer is relayed and `logging` reads it.
-            if unfunded && rc.relay_abandoned {
-                self.cool_unfunded_key(&rc.request_id, &rc.provider, rc.pool_key, status);
+            if rc.relay_abandoned {
+                self.abandon_402(rc, unfunded_402, status);
             }
             return Ok(());
         }
@@ -5178,9 +5197,7 @@ impl ProxyHttp for AiProxy {
         {
             b.record_success_for(permit);
         }
-        if unfunded {
-            self.cool_unfunded_key(&rc.request_id, &rc.provider, rc.pool_key, status);
-        }
+        self.abandon_402(rc, unfunded_402, status);
         rc.advance_candidate(at);
         let mut e = pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(status));
         e.set_retry(true);

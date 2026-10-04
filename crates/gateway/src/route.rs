@@ -26,7 +26,7 @@ use crate::circuit_breaker::CircuitBreaker;
 use crate::metrics::ProviderMetrics;
 use crate::secret::Secret;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// The shared provider table. `KNOWN_PROVIDERS` is the gateway-routable subset — the BYO-only rows
@@ -592,6 +592,11 @@ pub struct PoolAuth {
     /// round trip to a revoked or unfunded key on every request. Shared across requests; relaxed
     /// ordering, since a stale read costs only one more walk.
     bad_until_ms: AtomicU64,
+    /// OpenRouter `402`s on this key whose cause went unread (a catalog walk failed over on the
+    /// head, so the body never said whether the account is empty or one request was too costly)
+    /// since its last 2xx or cooldown: [`OPENROUTER_402_STRIKES`] in a row cool it (D261). Zero
+    /// on every other provider's keys. Relaxed, like `bad_until_ms`.
+    unread_402s: AtomicU32,
 }
 
 impl PoolAuth {
@@ -650,6 +655,11 @@ pub fn key_finders(key: &str) -> Box<[memchr::memmem::Finder<'static>]> {
 /// How long a pool key that drew a 401 (or a 403 naming the key, or an out-of-credit answer) is
 /// skipped as a request's first key.
 pub const KEY_COOLDOWN: Duration = Duration::from_secs(60);
+
+/// How many OpenRouter `402`s in a row, unread and with no 2xx from the key between them, cool the
+/// key as out of credit (D261). A `402` that is one request too costly for a funded account is
+/// that request's, so a success soon resets the count; an empty account answers every request so.
+pub const OPENROUTER_402_STRIKES: u32 = 3;
 
 /// Monotonic milliseconds since the first call, plus one (so 0 stays "never failed"). Coarse
 /// enough for a cooldown, and an `AtomicU64` holds it where an `Instant` would need a lock.
@@ -725,6 +735,33 @@ impl Provider {
             let cooldown = u64::try_from(KEY_COOLDOWN.as_millis()).unwrap_or(u64::MAX);
             k.bad_until_ms
                 .store(clock_ms().saturating_add(cooldown), Ordering::Relaxed);
+            // Cooled: the strikes are spent. Once the cooldown passes the key starts afresh.
+            k.unread_402s.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// Count an OpenRouter `402` on pool key `i` whose body went unread (D261): whether it is the
+    /// [`OPENROUTER_402_STRIKES`]th in a row, which cools the key (the caller does, through the
+    /// usual out-of-credit path). Exactly one of any concurrent strikes past the threshold
+    /// answers `true`, and a key already cooling does not count the `402`s of requests sent
+    /// before it cooled, so a burst cools it once.
+    pub fn strike_unread_402(&self, i: u8) -> bool {
+        self.pool_auth.get(usize::from(i)).is_some_and(|k| {
+            !k.cooling(clock_ms())
+                && k.unread_402s
+                    .fetch_add(1, Ordering::Relaxed)
+                    .saturating_add(1)
+                    == OPENROUTER_402_STRIKES
+        })
+    }
+
+    /// Pool key `i` answered a 2xx: its account pays, so forget its unread `402`s (D261). A load
+    /// and nothing else on the common path, where the count is already zero.
+    pub fn key_served(&self, i: u8) {
+        if let Some(k) = self.pool_auth.get(usize::from(i))
+            && k.unread_402s.load(Ordering::Relaxed) != 0
+        {
+            k.unread_402s.store(0, Ordering::Relaxed);
         }
     }
 
@@ -766,6 +803,7 @@ impl Provider {
                     key_at,
                     finders,
                     bad_until_ms: AtomicU64::new(0),
+                    unread_402s: AtomicU32::new(0),
                 }
             })
             .collect();
@@ -1206,6 +1244,84 @@ mod tests {
         assert_eq!(p.first_key(), 1);
         std::thread::sleep(Duration::from_millis(250));
         assert_eq!(p.first_key(), 0, "the cooldown has passed");
+    }
+
+    fn openrouter(keys: &[&str]) -> Provider {
+        Provider::resolve(
+            "openrouter",
+            "openrouter.ai:443".to_string(),
+            Dialect::OpenAi,
+            AuthScheme::Bearer,
+            keys,
+            ProviderMetrics::disconnected(),
+            None,
+        )
+    }
+
+    /// Strike `p`'s key `i` until a strike says to cool it, then cool it as the proxy does: how
+    /// many strikes that took, or `None` past twice the threshold.
+    fn strike_until_cooled(p: &Provider, i: u8) -> Option<u32> {
+        (1..=OPENROUTER_402_STRIKES * 2).find(|_| {
+            let cool = p.strike_unread_402(i);
+            if cool {
+                p.mark_key_bad(i);
+            }
+            cool
+        })
+    }
+
+    /// The [`OPENROUTER_402_STRIKES`]th unread 402 in a row cools the key, a 2xx between them
+    /// starts the count over, and the count is per key (D261).
+    #[test]
+    fn unread_402s_in_a_row_cool_only_their_own_key() {
+        let p = openrouter(&["sk-a", "sk-b"]);
+        for _ in 1..OPENROUTER_402_STRIKES {
+            assert!(!p.strike_unread_402(0));
+        }
+        p.key_served(0);
+        p.key_served(1);
+        for _ in 1..OPENROUTER_402_STRIKES {
+            assert!(!p.strike_unread_402(0), "a 2xx started the count over");
+            assert!(!p.strike_unread_402(1), "key 1's count is its own");
+        }
+        assert!(p.strike_unread_402(0));
+        assert!(
+            !p.strike_unread_402(0),
+            "a strike racing the cooling one past the threshold does not cool it again"
+        );
+        p.mark_key_bad(0);
+        assert_eq!(p.first_key(), 1);
+        assert!(p.strike_unread_402(1), "key 1 had its own run");
+        assert!(!p.strike_unread_402(9), "no such key");
+    }
+
+    /// A cooling key does not count the 402s of requests sent before it cooled; once its cooldown
+    /// passes it needs a full run again (D261).
+    #[test]
+    fn a_cooled_key_counts_afresh_once_its_cooldown_has_passed() {
+        let p = openrouter(&["sk-a", "sk-b"]);
+        assert_eq!(strike_until_cooled(&p, 0), Some(OPENROUTER_402_STRIKES));
+        for _ in 0..OPENROUTER_402_STRIKES * 2 {
+            assert!(!p.strike_unread_402(0), "cooling: not counted");
+        }
+        assert_eq!(p.pool_auth[0].unread_402s.load(Ordering::Relaxed), 0);
+        p.pool_auth[0]
+            .bad_until_ms
+            .store(clock_ms().saturating_add(50), Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(80));
+        assert_eq!(p.first_key(), 0, "the cooldown has passed");
+        assert_eq!(strike_until_cooled(&p, 0), Some(OPENROUTER_402_STRIKES));
+    }
+
+    /// Any cooling (a 401's too) spends the strikes, so a key back from it needs a full run.
+    #[test]
+    fn cooling_a_key_spends_its_strikes() {
+        let p = openrouter(&["sk-a"]);
+        for _ in 1..OPENROUTER_402_STRIKES {
+            assert!(!p.strike_unread_402(0));
+        }
+        p.mark_key_bad(0);
+        assert_eq!(p.pool_auth[0].unread_402s.load(Ordering::Relaxed), 0);
     }
 
     #[test]
