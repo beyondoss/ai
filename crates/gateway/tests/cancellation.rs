@@ -533,3 +533,208 @@ async fn a_read_timeout_on_a_reused_connection_is_not_resent() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(mock.hits(), 2, "{text}\nlog:\n{}", gw.log());
 }
+
+/// Send `head` and then `sent` (the start of a body whose rest never comes) on a raw HTTP/1.1
+/// connection that stays open, and return the gateway's answer (status line and all).
+async fn h1_stalled_upload(port: u16, head: &str, sent: &str) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    s.write_all(head.as_bytes()).await.unwrap();
+    s.write_all(sent.as_bytes()).await.unwrap();
+    let mut buf = [0u8; 4096];
+    let n = tokio::time::timeout(Duration::from_secs(10), s.read(&mut buf))
+        .await
+        .expect("an answer")
+        .unwrap_or(0);
+    String::from_utf8_lossy(&buf[..n]).into_owned()
+}
+
+/// The same over h2c: one stream whose headers declare `content-length` and whose single DATA
+/// frame carries only `sent`, the stream left open. Returns the status and the response body.
+async fn h2_stalled_upload(port: u16, headers: &[(&str, String)], sent: &str) -> (u16, String) {
+    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    let (mut client, conn) = h2::client::handshake(tcp).await.unwrap();
+    tokio::spawn(conn);
+    let mut req = http::Request::post("http://gw/auto/chat/completions");
+    for (k, v) in headers {
+        req = req.header(*k, v.as_str());
+    }
+    let (resp, mut send) = client.send_request(req.body(()).unwrap(), false).unwrap();
+    send.send_data(bytes::Bytes::copy_from_slice(sent.as_bytes()), false)
+        .unwrap();
+    let resp = tokio::time::timeout(Duration::from_secs(10), resp)
+        .await
+        .expect("an answer")
+        .unwrap();
+    let status = resp.status().as_u16();
+    let mut body = resp.into_body();
+    let mut text = Vec::new();
+    while let Some(chunk) = body.data().await {
+        let Ok(chunk) = chunk else { break };
+        let _ = body.flow_control().release_capacity(chunk.len());
+        text.extend_from_slice(&chunk);
+    }
+    drop(send);
+    (status, String::from_utf8_lossy(&text).into_owned())
+}
+
+/// A managed client that stalls mid-upload, connection open, ends its own request: the upstream's
+/// read timeout fires on a provider still waiting for the client's bytes, which is the client's
+/// stall, not the provider failing (D260). So the walk does not fail over to the next candidate,
+/// the candidate's breaker hears nothing (the next request still reaches it, with a threshold of
+/// 1), no pool key is cooled, the client gets a 408, and the half a provider was sent is not
+/// billed.
+///
+/// Over HTTP/1.1 and h2c, each a `Content-Length` body with bytes still to come. h2c is the shape
+/// that reaches this in production: pingora's HTTP/2 server has no body read timeout, so the
+/// upstream's `read_timeout_secs` is the only clock on a stalled stream. Over HTTP/1.1 pingora's
+/// own 60 s body read timeout (a 408) wins against the default 600 s; this one runs at 1 s. A
+/// chunked body cannot stall here: with no declared length a catalog walk reads the whole body
+/// before it connects (see the chunked test below for one that streams).
+/// claim: REL-1, SEC-16, BIL-3
+/// defect: D260
+#[tokio::test]
+async fn a_client_stalled_mid_upload_is_not_failed_over() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let payload = body();
+    let half = &payload[..payload.len() / 2];
+    for h2 in [false, true] {
+        let what = if h2 { "h2c" } else { "http/1.1" };
+        let (primary, primary_conns) = silent_upstream().await;
+        let (fallback, fallback_conns) = silent_upstream().await;
+        let (pubkey, sk) = test_keypair(1);
+        let gw = Gateway::builder(
+            unused_nats_port(),
+            &format!("127.0.0.1:{primary}"),
+            &b64(&pubkey),
+        )
+        .providers(&["openai", "openrouter"])
+        .provider_authority("openrouter", &format!("127.0.0.1:{fallback}"))
+        .config_line("read_timeout_secs = 1")
+        .config_line("circuit_breaker_threshold = 1")
+        .config_line("circuit_breaker_window_secs = 60")
+        .config_line("circuit_breaker_reset_secs = 60")
+        .start()
+        .await;
+        let vkey = billing_vkey(&sk, 260);
+        let headers = [
+            ("authorization", format!("Bearer {vkey}")),
+            ("content-type", "application/json".to_owned()),
+            ("x-beyond-model", "gpt-4o-mini".to_owned()),
+            ("x-beyond-order", "openai,openrouter".to_owned()),
+            ("content-length", payload.len().to_string()),
+        ];
+        let (status, text) = if h2 {
+            h2_stalled_upload(gw.port, &headers, half).await
+        } else {
+            let mut head = "POST /auto/chat/completions HTTP/1.1\r\nhost: gw\r\n".to_owned();
+            for (k, v) in &headers {
+                head.push_str(&format!("{k}: {v}\r\n"));
+            }
+            head.push_str("\r\n");
+            let text = h1_stalled_upload(gw.port, &head, half).await;
+            let status = text
+                .strip_prefix("HTTP/1.1 ")
+                .and_then(|t| t.get(..3))
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            (status, text)
+        };
+        assert_eq!(status, 408, "{what}: {text}\nlog:\n{}", gw.log());
+        assert!(text.contains("request body timed out"), "{what}: {text}");
+        let row = usage_row_of(&gw).await;
+        assert_eq!(row["usage_estimated"], false, "{what}: {row}");
+        assert_eq!(row["input_tokens"].as_u64(), Some(0), "{what}: {row}");
+        assert_eq!(row["outcome"], "client_cancelled", "{what}: {row}");
+        // With a threshold of 1, a failure charged to the primary would have opened its breaker
+        // and sent this request to the fallback.
+        let resp = reqwest::Client::new()
+            .post(format!("{}/auto/chat/completions", gw.url()))
+            .header("authorization", format!("Bearer {vkey}"))
+            .header("content-type", "application/json")
+            .header("x-beyond-model", "gpt-4o-mini")
+            .header("x-beyond-order", "openai,openrouter")
+            .body(payload.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 504, "{what}");
+        assert_eq!(
+            (primary_conns.load(SeqCst), fallback_conns.load(SeqCst)),
+            (2, 0),
+            "{what}: log:\n{}",
+            gw.log()
+        );
+        let metrics = gw.metrics().await;
+        assert_eq!(
+            parse_metric(&metrics, "ai_candidate_failovers_total", ""),
+            0.0,
+            "{what}"
+        );
+        for reason in ["revoked", "unfunded", "key_named_403"] {
+            assert_eq!(
+                parse_metric(&metrics, "ai_key_auth_failures_total", reason),
+                0.0,
+                "{what}: {reason}"
+            );
+        }
+    }
+}
+
+/// A managed chunked upload that stalls mid-stream on a provider route (which streams the body:
+/// no catalog walk reads it first) times out as the client's own: a 408, its breaker charged
+/// nothing (the next request still reaches the provider, with a threshold of 1), and not billed.
+/// claim: REL-1, SEC-16, BIL-3
+/// defect: D260
+#[tokio::test]
+async fn a_client_stalled_mid_chunked_upload_times_out_as_its_own() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (upstream, conns) = silent_upstream().await;
+    let (pubkey, sk) = test_keypair(1);
+    let gw = Gateway::builder(
+        unused_nats_port(),
+        &format!("127.0.0.1:{upstream}"),
+        &b64(&pubkey),
+    )
+    .config_line("read_timeout_secs = 1")
+    .config_line("circuit_breaker_threshold = 1")
+    .config_line("circuit_breaker_window_secs = 60")
+    .config_line("circuit_breaker_reset_secs = 60")
+    .start()
+    .await;
+    let vkey = billing_vkey(&sk, 261);
+    let payload = body();
+    let half = &payload[..payload.len() / 2];
+    let head = format!(
+        "POST /openai/v1/chat/completions HTTP/1.1\r\nhost: gw\r\nauthorization: Bearer {vkey}\r\n\
+         content-type: application/json\r\ntransfer-encoding: chunked\r\n\r\n",
+    );
+    let text = h1_stalled_upload(gw.port, &head, &format!("{:x}\r\n{half}\r\n", half.len())).await;
+    assert!(
+        text.starts_with("HTTP/1.1 408"),
+        "{text}\nlog:\n{}",
+        gw.log()
+    );
+    let row = usage_row_of(&gw).await;
+    assert_eq!(row["usage_estimated"], false, "{row}");
+    assert_eq!(row["input_tokens"].as_u64(), Some(0), "{row}");
+    assert_eq!(row["outcome"], "client_cancelled", "{row}");
+    let resp = reqwest::Client::new()
+        .post(format!("{}/openai/v1/chat/completions", gw.url()))
+        .header("authorization", format!("Bearer {vkey}"))
+        .header("content-type", "application/json")
+        .body(payload.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        504,
+        "the breaker opened on a client's stall"
+    );
+    assert_eq!(conns.load(SeqCst), 2, "log:\n{}", gw.log());
+}
