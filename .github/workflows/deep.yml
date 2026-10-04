@@ -54,10 +54,12 @@ jobs:
           cat s1/mutants.out/missed.txt s1/mutants.out/timeout.txt 2>/dev/null | sort -u > survivors.txt || true
           echo "stage 1 survivors: $(wc -l < survivors.txt)"
           if [ -s survivors.txt ]; then
-            # Select exactly the survivors' lines with a synthetic diff: `--re` matches names
-            # unreliably and skipped most stage-1 survivors.
+            # Select exactly the survivors: `--in-diff` narrows to their lines, an anchored `--re` to
+            # their full names (a description alone matches the same text elsewhere). Keep $FILES:
+            # without it the toml's examine_globs apply and route.rs is skipped.
             python3 .github/scripts/survivor-diff.py . survivors.txt > survivors.diff
-            cargo mutants -p beyond-ai --test-tool nextest --in-diff survivors.diff \
+            RE=$(python3 -c "import re,sys; print('|'.join('^'+re.escape(l.strip())+'\$' for l in open(sys.argv[1]) if l.strip()))" survivors.txt)
+            cargo mutants -p beyond-ai --test-tool nextest $FILES --in-diff survivors.diff --re "$RE" \
               --jobs 2 --timeout-multiplier 3 --minimum-test-timeout 600 --output s2 </dev/null || rc=$?
             mkdir -p mutants.out && cp s2/mutants.out/*.txt mutants.out/ 2>/dev/null || true
             [ "${rc:-0}" = 3 ] && exit 0
