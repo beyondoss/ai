@@ -1939,7 +1939,8 @@ impl AiProxy {
     /// Never exempt on a `FullBody` re-run, whose parent reserved two copies of the body, not the
     /// `Value`s built from it. A translation that needs more than the whole budget is a 413 naming
     /// translation; one that does not fit now is the budget's retryable 503. With the budget off
-    /// there is nothing to hold, and nothing is refused.
+    /// there is nothing to hold, and nothing is refused. On a response the status line is already
+    /// downstream, so either refusal aborts it.
     fn hold_translation_heap(
         &self,
         body: &[u8],
@@ -6236,6 +6237,20 @@ impl ProxyHttp for AiProxy {
                         return Err(self.translate_overflow(&rc.request_id, "json_body"));
                     }
                     if end_of_stream {
+                        // The response's `Value`s are held in the body budget like a request's
+                        // (D216). Headers are already downstream, so a refusal aborts the response,
+                        // as `translate_overflow` does. A same-wire 2xx is relayed as bytes.
+                        let _heap = if upstream == t.client && (200..300).contains(&status) {
+                            None
+                        } else {
+                            self.hold_translation_heap(&t.json_buf).inspect_err(|_| {
+                                warn!(
+                                    request_id = %rc.request_id,
+                                    bytes = t.json_buf.len(),
+                                    "translated response exceeds the body budget; aborting",
+                                );
+                            })?
+                        };
                         translate::response_json_tools(
                             upstream,
                             t.client,
