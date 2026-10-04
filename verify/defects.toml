@@ -2595,5 +2595,5 @@ evidence = "Hermetic (cancellation.rs, read_timeout_secs = 1, primary and fallba
 claims = ["REL-1", "SEC-16", "BIL-3"]
 state = "fixed"
 test = "a_client_stalled_mid_upload_is_not_failed_over"
-fix = "bb5a748"
+fix = "3e5c0d3"
 note = "Fixed: error_while_proxy retags a ReadTimedout while the client still owes body bytes (client_stalled_upload: body_bytes_fed > 0 and !is_body_done, any source) as a downstream error before the delivered/failover decision. The walk ends with no failover, logging releases the breaker permit, body_delivered stays false (no estimate, outcome client_cancelled), and fail_to_proxy answers 408 'request body timed out', the same answer as pingora's HTTP/1.1 body read timeout. Zero bytes fed is excluded (an Expect: 100-continue client waits on the provider). Error path only. Not changed: pingora marks an HTTP/2 upstream connection for shutdown on any upstream read timeout before the hook runs. A chunked body on a catalog walk is read whole before connecting, so its stall is pingora's downstream 408; a_client_stalled_mid_chunked_upload_times_out_as_its_own pins a streamed chunked stall on a provider route."
