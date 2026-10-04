@@ -105,6 +105,14 @@ const XAI_NO_CREDIT: (&str, &str) = (
 /// the key. Anchored at the start, which is OpenRouter's own text.
 const OPENROUTER_TOO_COSTLY: &str = "This request requires more credits";
 
+/// Whether a `402` from `provider` says the account is out of credit by its status alone, as
+/// [`unfunded`] decides from the body: every provider's but OpenRouter's, whose `402` may instead
+/// be one request too large for the balance ([`OPENROUTER_TOO_COSTLY`]). For a catalog walk that
+/// fails over on the response head and so never reads the body (D258).
+pub fn unfunded_402(provider: providers::ProviderId) -> bool {
+    provider != providers::ProviderId::OpenRouter
+}
+
 /// OpenRouter error metadata that describes Beyond's account with it, not the error.
 const ACCOUNT_METADATA: &[&str] = &["is_byok", "limit_source", "remedy_hint"];
 
@@ -455,6 +463,16 @@ mod tests {
             let (v, got) = rewritten(body, status).unwrap_or_else(|| panic!("kept: {body}"));
             assert_eq!(got, want, "{body}");
             assert_eq!(v["error"]["message"], UNAVAILABLE, "{body}");
+        }
+    }
+
+    /// A walk that fails over on a 402 judges it by status and provider (D258): out of credit
+    /// everywhere except OpenRouter, the one provider whose 402 can be one request too costly.
+    #[test]
+    fn only_openrouter_needs_the_body_of_a_402() {
+        use providers::ProviderId;
+        for id in ProviderId::ALL {
+            assert_eq!(unfunded_402(id), id != ProviderId::OpenRouter, "{id:?}");
         }
     }
 }
