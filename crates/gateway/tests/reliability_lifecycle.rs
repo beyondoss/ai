@@ -775,7 +775,29 @@ async fn a_large_body_reserves_every_copy_it_will_hold_before_it_is_read() {
             "{what}: {text}"
         );
     }
-    // 1.5 MiB on `/openai/…`, buffered for `stream_options`: past the budget even once.
+    // 1.5 MiB declared on `/openai/…`, buffered for `stream_options`: past the budget even once,
+    // and refused from the declared length too, before a byte of it is read.
+    {
+        let addr = gw.url().trim_start_matches("http://").to_owned();
+        let mut s = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        let head = format!(
+            "POST /openai/v1/chat/completions HTTP/1.1\r\nhost: gw\r\nauthorization: Bearer {}\r\n\
+             content-type: application/json\r\ncontent-length: {}\r\n\r\n",
+            vkey(&sk, 35),
+            1536 * 1024
+        );
+        s.write_all(head.as_bytes()).await.unwrap();
+        let mut buf = vec![0u8; 4096];
+        let n = tokio::time::timeout(Duration::from_secs(5), s.read(&mut buf))
+            .await
+            .expect("provider route: no answer until the body arrives")
+            .unwrap();
+        let text = String::from_utf8_lossy(&buf[..n]);
+        assert!(
+            text.starts_with("HTTP/1.1 503") && text.contains("too many large request bodies"),
+            "provider route, declared: {text}"
+        );
+    }
     let resp = send("/openai/v1/chat/completions", None, chat(1536 * 1024))
         .await
         .unwrap();
@@ -912,6 +934,33 @@ async fn a_body_declared_at_the_size_cap_is_not_refused_up_front() {
             "{len} B declared: {text:?}"
         );
     }
+}
+
+/// The size cap is inclusive on the bytes that stream through too: a body of exactly
+/// `MAX_REQUEST_BODY` (100 MiB) relayed to a `/{provider}` route is answered, not aborted at its
+/// last byte.
+/// claim: SEC-19
+#[tokio::test]
+async fn a_body_of_exactly_the_size_cap_streams_through() {
+    let (pubkey, _sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::builder(unused_nats_port(), &mock.authority(), &b64(&pubkey))
+        .start()
+        .await;
+    const CAP: usize = 100 * 1024 * 1024;
+    let close = br#""}]}"#;
+    let mut body = br#"{"model":"gpt-4o-mini","messages":[{"role":"user","content":""#.to_vec();
+    body.resize(CAP - close.len(), b'x');
+    body.extend_from_slice(close);
+    let resp = test_client()
+        .post(format!("{}/openai/v1/chat/completions", gw.url()))
+        .header("authorization", "Bearer sk-byo-test")
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "{}", gw.log());
 }
 
 /// `client_write_timeout_secs = 0` disables the downstream write timeout rather than making it

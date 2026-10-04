@@ -650,9 +650,37 @@ fn body_delivered(session: &mut Session, rc: &RequestCtx, e: Option<&pingora_cor
     rc.upstream_phase == UpstreamPhase::Connected
         && session.as_mut().is_body_done()
         && !e.is_some_and(|e| {
-            e.esource() == &pingora_core::ErrorSource::Upstream
-                && (matches!(e.etype(), WriteError | WriteTimedout) || h2_body_unsent(e))
+            (e.esource() == &pingora_core::ErrorSource::Upstream
+                && (matches!(e.etype(), WriteError | WriteTimedout) || h2_body_unsent(e)))
+                || client_body_cut_short(e)
         })
+}
+
+/// Whether the client closed its HTTP/1.1 connection before its body's framing-defined end
+/// (D259): a `Content-Length` body with bytes still to come, or a chunked one without its
+/// terminating chunk. Pingora then marks the body *done* (`is_body_done`), though never complete,
+/// so without this the half a provider was sent read as the whole request, and `logging` billed
+/// it an estimate. Like [`h2_body_unsent`], the context string is pingora's only handle on it.
+fn client_body_cut_short(e: &pingora_core::Error) -> bool {
+    if e.esource() != &pingora_core::ErrorSource::Downstream {
+        return false;
+    }
+    let mut at = Some(e);
+    while let Some(x) = at {
+        if x.context.as_ref().is_some_and(|c| {
+            let c = c.as_str();
+            c.starts_with("Peer prematurely closed connection with")
+                || c.starts_with("Connection prematurely closed without the termination chunk")
+        }) {
+            return true;
+        }
+        at = x
+            .cause
+            .as_deref()
+            .and_then(|c| c.downcast_ref::<Box<pingora_core::Error>>())
+            .map(|b| &**b);
+    }
+    false
 }
 
 /// Whether writing the request body to an HTTP/2 stream failed because the stream had already
@@ -1046,6 +1074,27 @@ impl RequestCtx {
             || self.background_check
             || self.auto.is_some()
             || self.signed.is_some()
+    }
+
+    /// Whether the bytes sent to the client are watched for the stream's terminal event
+    /// (`closed_after_terminal`): a managed stream's, unless it is assembled into one JSON body.
+    /// The verdict is read only on a managed request's billing row, and a JSON body has no
+    /// terminal event, so watching anything else would scan every chunk for nothing.
+    fn tracks_terminal(&self) -> bool {
+        self.managed && self.streaming && !self.auto.as_ref().is_some_and(|a| catalog_assembling(a))
+    }
+
+    /// Anthropic SSE only: keep a bounded head of the upstream response so `message_start`'s input
+    /// and cache token counts survive the tail's compaction. At most `USAGE_HEAD_CAP` bytes in all,
+    /// satisfied within the first chunk or two, after which this copies nothing: one small
+    /// allocation on the one path that needs it, and nothing anywhere else. See `USAGE_HEAD_CAP`
+    /// for why only this dialect needs it.
+    fn keep_usage_head(&mut self, chunk: &[u8]) {
+        if self.streaming && self.dialect == Dialect::Anthropic {
+            let want = USAGE_HEAD_CAP.saturating_sub(self.resp_head.len());
+            self.resp_head
+                .extend_from_slice(&chunk[..want.min(chunk.len())]);
+        }
     }
 
     /// Point the forwarded path at the candidate about to be attempted.
@@ -4603,26 +4652,8 @@ impl ProxyHttp for AiProxy {
             streaming: false,
             inject_eligible,
             background_check,
-            // Only the inject-eligible path ever buffers the request body (to splice
-            // `stream_options` after the root `{`; the `stream` key can appear anywhere in the root
-            // object, so the decision needs the whole body — buffering is inherent here, not
-            // incidental). When it does, pre-size from the declared Content-Length so accumulation is
-            // a single allocation instead of a geometric realloc chain; capped at `MAX_REQUEST_BODY`
-            // so a lying header can't pre-allocate unbounded memory. Every other request leaves this
-            // empty and never buffers.
-            //
-            // The `+ STREAM_OPTIONS_FRAG.len()` is headroom for the splice, which
-            // `apply_stream_usage_injection` performs *in place*: with it the injection never
-            // reallocates, so a body arrives, is spliced, and goes upstream on one allocation.
-            req_buf: match (
-                inject_eligible || background_check || model_route.is_some() || signed.is_some(),
-                declared_len,
-            ) {
-                (true, Some(len)) => {
-                    Vec::with_capacity(len.min(MAX_REQUEST_BODY) + STREAM_OPTIONS_FRAG.len())
-                }
-                _ => Vec::new(),
-            },
+            // Pre-sized below, once the context says whether this request rewrites its body.
+            req_buf: Vec::new(),
             // Grown lazily by the response tap (`response_body_filter`), not pre-reserved: a
             // non-streaming response — the common case — is a few hundred bytes, so reserving the
             // full 64KB cap up front would waste an allocation on every request to hold ~200B. A
@@ -4672,6 +4703,20 @@ impl ProxyHttp for AiProxy {
             terminal: TerminalTracker::default(),
             signed,
         });
+        // A body buffered for a rewrite (`RequestCtx::rewrites_body`) is pre-sized from the
+        // declared Content-Length, so accumulation is a single allocation instead of a geometric
+        // realloc chain; capped at `MAX_REQUEST_BODY` so a lying header can't pre-allocate
+        // unbounded memory. Every other request leaves it empty and never buffers.
+        //
+        // The `+ STREAM_OPTIONS_FRAG.len()` is headroom for the splice, which
+        // `apply_stream_usage_injection` performs *in place*: with it the injection never
+        // reallocates, so a body arrives, is spliced, and goes upstream on one allocation.
+        if let Some(rc) = ctx.rc.as_mut()
+            && rc.rewrites_body()
+            && let Some(len) = declared_len
+        {
+            rc.req_buf = Vec::with_capacity(len.min(MAX_REQUEST_BODY) + STREAM_OPTIONS_FRAG.len());
+        }
         // Admitted: count it in-flight. Released in `logging`, or by `Ctx`'s drop if a panic
         // skipped `logging`, so the gauge cannot leak. `active_streams` only covers SSE; this
         // covers every request.
@@ -5873,19 +5918,8 @@ impl ProxyHttp for AiProxy {
                 rc.resp_model_scanner.feed(chunk);
             }
 
-            // Anthropic SSE only: keep a bounded head so `message_start`'s input + cache token
-            // counts survive the tail's compaction. Bounded by `USAGE_HEAD_CAP` and satisfied
-            // within the first chunk or two, after which the length check makes this a no-op — so
-            // it costs one small allocation on the one path that needs it, and nothing anywhere
-            // else. See `USAGE_HEAD_CAP` for why only this dialect needs it.
-            if rc.streaming
-                && rc.dialect == Dialect::Anthropic
-                && rc.resp_head.len() < USAGE_HEAD_CAP
-            {
-                let want = USAGE_HEAD_CAP - rc.resp_head.len();
-                rc.resp_head
-                    .extend_from_slice(&chunk[..want.min(chunk.len())]);
-            }
+            // Anthropic SSE only: the head that keeps `message_start` (see `keep_usage_head`).
+            rc.keep_usage_head(chunk);
 
             rc.resp_tail.push(chunk);
             // Managed only. Counts *upstream* bytes (pre-translate), like the tail.
@@ -5972,15 +6006,12 @@ impl ProxyHttp for AiProxy {
                     tap.push(&out);
                 }
             }
-            if rc.managed
-                && rc.streaming
-                && !rc.auto.as_ref().is_some_and(|a| catalog_assembling(a))
-            {
+            if rc.tracks_terminal() {
                 rc.terminal.feed(&out);
             }
             *body = Some(Bytes::from(out));
         } else if !chunk.is_empty() {
-            if rc.managed && rc.streaming {
+            if rc.tracks_terminal() {
                 rc.terminal.feed(chunk);
             }
             // Capture tap — same passive-tap contract as the usage tail above (copy, never withhold),
@@ -6964,6 +6995,25 @@ mod tests {
             terminal: TerminalTracker::default(),
             signed: None,
         }
+    }
+
+    /// The Anthropic stream head is bounded at `USAGE_HEAD_CAP` however the stream is chunked: the
+    /// chunk that crosses the cap is cut there, and later chunks add nothing. Other responses keep
+    /// no head.
+    #[test]
+    fn the_usage_head_holds_at_most_its_cap() {
+        let mut rc = test_ctx(false);
+        rc.streaming = true;
+        rc.keep_usage_head(&[b'a'; 1000]);
+        assert!(rc.resp_head.is_empty(), "an OpenAI stream keeps no head");
+        rc.dialect = Dialect::Anthropic;
+        rc.keep_usage_head(&[b'a'; 5 * 1024]);
+        assert_eq!(rc.resp_head.len(), 5 * 1024);
+        rc.keep_usage_head(&[b'b'; 10 * 1024]);
+        assert_eq!(rc.resp_head.len(), USAGE_HEAD_CAP);
+        assert_eq!(rc.resp_head.last(), Some(&b'b'));
+        rc.keep_usage_head(b"more");
+        assert_eq!(rc.resp_head.len(), USAGE_HEAD_CAP);
     }
 
     /// The replay contract, exercised directly: `upstream_peer` resets the body phase before pingora

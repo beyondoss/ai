@@ -191,6 +191,38 @@ async fn a_translated_walk_merges_its_own_beta_with_the_allowed_client_tokens() 
     );
 }
 
+/// The gateway supplies `anthropic-version` only where it wrote the Messages body itself: a Chat
+/// Completions client translated onto Claude gets `2023-06-01`; a Messages client relayed to
+/// Anthropic sends its own version or none, and the provider answers what it sent.
+/// claim: SEC-6
+#[tokio::test]
+async fn anthropic_version_is_added_only_to_a_translated_walk() {
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::AnthropicJson).await;
+    let gw = Gateway::builder(unused_nats_port(), &mock.authority(), &b64(&pubkey))
+        .providers(&["anthropic"])
+        .start()
+        .await;
+    let auth = || ("authorization", format!("Bearer {}", managed_key(&sk)));
+    const CLAUDE_CHAT: &str =
+        r#"{"model":"claude-opus-4-8","messages":[{"role":"user","content":"hi"}]}"#;
+    assert_eq!(
+        post(&gw, "/v1/chat/completions", auth(), CLAUDE_CHAT, &[]).await,
+        200
+    );
+    let cap = mock.captured().unwrap();
+    assert_eq!(cap.path, "/v1/messages");
+    assert_eq!(cap.anthropic_version.as_deref(), Some("2023-06-01"));
+
+    assert_eq!(post(&gw, "/v1/messages", auth(), MESSAGES, &[]).await, 200);
+    let cap = mock.captured().unwrap();
+    assert_eq!(cap.path, "/v1/messages");
+    assert_eq!(
+        cap.anthropic_version, None,
+        "a relayed Messages request is sent as the client wrote it"
+    );
+}
+
 /// Send one raw HTTP/1.1 request (so `Connection: Upgrade` goes out exactly as written) and read
 /// the response.
 async fn raw_request(port: u16, request: String) -> RawResponse {

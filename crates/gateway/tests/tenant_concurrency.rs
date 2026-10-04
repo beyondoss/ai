@@ -157,3 +157,39 @@ async fn a_cancelled_request_releases_its_slot() {
         "three cancellations left the tenant with a slot"
     );
 }
+
+/// The cap bounds managed spend only: a BYO request is the caller's own key and holds no slot, so
+/// BYO requests in flight together are each served, however low the cap.
+/// claim: A3
+#[tokio::test]
+async fn byo_requests_take_no_tenant_slot() {
+    let (pubkey, _sk) = test_keypair(54);
+    let mock = MockUpstream::start(Mode::Slow(1_000)).await;
+    let gw = Gateway::builder(unused_nats_port(), &mock.authority(), &b64(&pubkey))
+        .tenant_max_in_flight(1)
+        .start()
+        .await;
+    let client = test_client();
+    let held = {
+        let (client, url) = (client.clone(), gw.url());
+        tokio::spawn(async move {
+            client
+                .post(format!("{url}/openai/v1/chat/completions"))
+                .header("authorization", "Bearer sk-byo-test")
+                .header("content-type", "application/json")
+                .body(body())
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16()
+        })
+    };
+    wait_for_hits(&mock, 1).await;
+    assert_eq!(
+        post(&client, &gw, "sk-byo-test").await.status().as_u16(),
+        200,
+        "a second BYO request in flight is served"
+    );
+    assert_eq!(held.await.unwrap(), 200);
+}

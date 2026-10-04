@@ -408,3 +408,128 @@ async fn a_catalog_walk_resends_a_reused_connection_reset_before_reading() {
         "no pooled connection was reused, so the scenario did not fire"
     );
 }
+
+/// A listener that accepts connections, reads whatever arrives and never answers; returns its port
+/// and how many connections it has accepted.
+async fn silent_upstream() -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use tokio::io::AsyncReadExt;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = accepted.clone();
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = listener.accept().await {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                while matches!(s.read(&mut buf).await, Ok(n) if n > 0) {}
+            });
+        }
+    });
+    (port, accepted)
+}
+
+/// A client that resets its connection mid-upload ends its request: the walk does not fail over to
+/// the next candidate (or resend to the same one) with a body nobody will finish sending. (A clean
+/// close reads as the body's end, so the request counts as delivered and is not resent either.)
+/// claim: REL-9
+#[tokio::test]
+async fn a_client_gone_mid_upload_is_not_failed_over() {
+    use std::sync::atomic::Ordering::SeqCst;
+    use tokio::io::AsyncWriteExt;
+    let (primary, primary_conns) = silent_upstream().await;
+    let (fallback, fallback_conns) = silent_upstream().await;
+    let (pubkey, sk) = test_keypair(1);
+    let gw = Gateway::builder(
+        unused_nats_port(),
+        &format!("127.0.0.1:{primary}"),
+        &b64(&pubkey),
+    )
+    .providers(&["openai", "openrouter"])
+    .provider_authority("openrouter", &format!("127.0.0.1:{fallback}"))
+    .start()
+    .await;
+    let payload = body();
+    let mut s = tokio::net::TcpStream::connect(("127.0.0.1", gw.port))
+        .await
+        .unwrap();
+    let head = format!(
+        "POST /auto/chat/completions HTTP/1.1\r\nhost: gw\r\nauthorization: Bearer {}\r\n\
+         content-type: application/json\r\nx-beyond-model: gpt-4o-mini\r\n\
+         x-beyond-order: openai,openrouter\r\ncontent-length: {}\r\n\r\n",
+        billing_vkey(&sk, 81),
+        payload.len()
+    );
+    s.write_all(head.as_bytes()).await.unwrap();
+    s.write_all(&payload.as_bytes()[..payload.len() / 2])
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while primary_conns.load(SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the request reached the primary");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    s.set_zero_linger().unwrap();
+    drop(s);
+    // The abort ends the request in `logging`; nothing is sent anywhere after it.
+    gw.wait_for_log_line(&["upstream request errored"]).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        (primary_conns.load(SeqCst), fallback_conns.load(SeqCst)),
+        (1, 0),
+        "log:\n{}",
+        gw.log()
+    );
+}
+
+/// A provider-routed request whose client stalls mid-upload on a pooled connection ends at the read
+/// timeout, and is not resent: the timeout is a liveness verdict on an attempt that may still be
+/// running, not a reused connection's failure before delivery (D248's `ReusedOnly` rule is for a
+/// body write that met a closed stream only).
+/// claim: REL-1
+#[tokio::test]
+async fn a_read_timeout_on_a_reused_connection_is_not_resent() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mock = ReplyUpstream::start(|_, _| Reply::ok()).await;
+    let (pubkey, _sk) = test_keypair(1);
+    let gw = Gateway::builder(unused_nats_port(), &mock.authority(), &b64(&pubkey))
+        .config_line("read_timeout_secs = 1")
+        .start()
+        .await;
+    // Pools a connection to the upstream.
+    let first = test_client()
+        .post(format!("{}/openai/v1/chat/completions", gw.url()))
+        .header("authorization", "Bearer sk-byo-test")
+        .header("content-type", "application/json")
+        .body(body())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status().as_u16(), 200);
+    let payload = body();
+    let mut s = tokio::net::TcpStream::connect(("127.0.0.1", gw.port))
+        .await
+        .unwrap();
+    let head = format!(
+        "POST /openai/v1/chat/completions HTTP/1.1\r\nhost: gw\r\n\
+         authorization: Bearer sk-byo-test\r\ncontent-type: application/json\r\n\
+         content-length: {}\r\n\r\n",
+        payload.len()
+    );
+    s.write_all(head.as_bytes()).await.unwrap();
+    s.write_all(&payload.as_bytes()[..payload.len() / 2])
+        .await
+        .unwrap();
+    // The rest never comes: the gateway answers once the upstream read times out.
+    let mut buf = [0u8; 4096];
+    let n = tokio::time::timeout(Duration::from_secs(10), s.read(&mut buf))
+        .await
+        .expect("an answer")
+        .unwrap_or(0);
+    let text = String::from_utf8_lossy(&buf[..n]);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(mock.hits(), 2, "{text}\nlog:\n{}", gw.log());
+}

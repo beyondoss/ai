@@ -103,9 +103,6 @@ fn de_service_tier<'de, D: serde::Deserializer<'de>>(
         fn visit_unit<E>(self) -> Result<Self::Value, E> {
             Ok(None)
         }
-        fn visit_some<D: serde::Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
-            d.deserialize_any(V)
-        }
         fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
             Ok(None)
         }
@@ -1056,16 +1053,15 @@ static TALLY: [u8; 128] = {
                 WIDE => (s, 0),
                 LETTER => match from {
                     LETTERS | LETTERS_APOSTROPHE => (LETTERS, 0),
-                    // One punctuation byte joins the letters after it.
-                    PUNCT1 => (LETTERS, 1),
                     PUNCT2 => (LETTERS, 2),
+                    // A new word, which one punctuation byte before it joins (`PUNCT1`).
                     _ => (LETTERS, 1),
                 },
                 DIGIT => match from {
                     DIGITS1 => (DIGITS2, 0),
                     DIGITS2 => (DIGITS3, 0),
-                    DIGITS3 => (DIGITS1, 1),
                     LETTERS_APOSTROPHE | PUNCT1 | PUNCT2 => (DIGITS1, 2),
+                    // A new group: a fourth digit (`DIGITS3`) starts one too.
                     _ => (DIGITS1, 1),
                 },
                 _ => match from {
@@ -1201,15 +1197,11 @@ impl InputTally {
     fn text(&mut self, rest: &[u8]) -> usize {
         let mut i = 0;
         loop {
-            if self.aux > 0 {
-                // The hex digits of a `\u` escape, already classed as one wide byte.
-                let n = usize::from(self.aux).min(rest.len() - i);
-                i += n;
-                self.aux -= n as u8;
-                if self.aux > 0 {
-                    return i;
-                }
-            }
+            // The hex digits of a `\u` escape, already classed as one wide byte (none outside
+            // one). Digits still pending leave nothing of `rest`, which the next line returns on.
+            let n = usize::from(self.aux).min(rest.len() - i);
+            i += n;
+            self.aux -= n as u8;
             let Some(&b) = rest.get(i) else { return i };
             if self.flags & ESCAPE != 0 {
                 self.flags &= !ESCAPE;
@@ -1697,6 +1689,33 @@ mod tests {
                     "cut {cut} of {body}"
                 );
             }
+        }
+    }
+
+    /// A long run of plain text (no escape to split it first) is walked as two chains cut at a
+    /// space past its middle: the count is the one a walk of short pieces, never cut, gives.
+    #[test]
+    fn a_long_plain_run_counts_as_its_short_pieces_do() {
+        let words = [
+            "alpha", "it's", "x2", "(foo)", "1234567", "café", "a-b", "Mr.", "日本", "zz",
+        ];
+        let mut seed = 0x9E37_79B9_7F4A_7C15_u64;
+        for len in [256, 257, 300, 511, 1024, 4096] {
+            let mut text = String::new();
+            while text.len() < len {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                text.push_str(words[(seed % words.len() as u64) as usize]);
+                // Mostly no space between words, so the cut's space is rarely next to the middle.
+                if seed.is_multiple_of(5) {
+                    text.push(' ');
+                }
+            }
+            let body = format!(r#"{{"content":"{text}"}}"#);
+            let whole = tally(&[body.as_bytes()]).estimate_tokens();
+            let pieces: Vec<&[u8]> = body.as_bytes().chunks(64).collect();
+            assert_eq!(tally(&pieces).estimate_tokens(), whole, "{text}");
         }
     }
 

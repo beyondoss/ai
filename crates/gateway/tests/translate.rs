@@ -59,6 +59,16 @@ async fn openai_sdk_nonstream_claude_round_trips_json() {
         .await
         .unwrap();
     assert_eq!(resp.status().as_u16(), 200);
+    // Translation changes the length: the provider's `Content-Length` is dropped and an HTTP/1.1
+    // client gets the body chunked.
+    assert_eq!(resp.version(), reqwest::Version::HTTP_11);
+    assert!(resp.headers().get("content-length").is_none());
+    assert_eq!(
+        resp.headers()
+            .get("transfer-encoding")
+            .and_then(|v| v.to_str().ok()),
+        Some("chunked")
+    );
     let text = resp.text().await.unwrap();
     let v: Value = serde_json::from_str(&text).expect(&text);
     assert_eq!(v["object"], "chat.completion");

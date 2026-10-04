@@ -3303,3 +3303,75 @@ fn a_responses_refusal_streams_onto_chat() {
         .collect();
     assert_eq!(refusal, "Nope.", "{evs:#?}");
 }
+
+/// A Chat stream's reasoning reaches a Responses client as one reasoning item per block: a new
+/// OpenRouter block index opens one (the same index continues it), so does text after a signature
+/// (even text with no index), and a whole signed `thinking` block opens its own, its text intact.
+/// Each item announces its summary part once, before its first delta.
+#[test]
+fn chat_reasoning_blocks_become_one_responses_item_each() {
+    let src = concat!(
+        "data: {\"id\":\"g\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\"a1 \",\"format\":\"anthropic-claude-v1\",\"index\":0}]}}]}\n\n",
+        "data: {\"id\":\"g\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\"a2\",\"format\":\"anthropic-claude-v1\",\"index\":0}]}}]}\n\n",
+        "data: {\"id\":\"g\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\"b\",\"format\":\"anthropic-claude-v1\",\"index\":1}]}}]}\n\n",
+        "data: {\"id\":\"g\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_details\":[{\"type\":\"reasoning.text\",\"signature\":\"s1\",\"format\":\"anthropic-claude-v1\",\"index\":1}]}}]}\n\n",
+        "data: {\"id\":\"g\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"thinking\":[{\"type\":\"thinking\",\"thinking\":\"c\",\"signature\":\"s2\"}]}}]}\n\n",
+        "data: {\"id\":\"g\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"d\"}}]}\n\n",
+        "data: {\"id\":\"g\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: {\"id\":\"g\",\"model\":\"m\",\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n",
+        "data: [DONE]\n\n",
+    );
+    let evs = stream(Chat, Responses, src);
+    let resp = assert_responses_lifecycle(&evs, "response.completed");
+    let out = resp["output"].as_array().unwrap();
+    let summaries: Vec<(&str, &Value)> = out
+        .iter()
+        .map(|i| (i["type"].as_str().unwrap(), &i["summary"]))
+        .collect();
+    let s = |t: &str| json!([{"type": "summary_text", "text": t}]);
+    assert_eq!(
+        summaries,
+        [
+            ("reasoning", &s("a1 a2")),
+            ("reasoning", &s("b")),
+            ("reasoning", &s("c")),
+            ("reasoning", &s("d")),
+            ("message", &Value::Null),
+        ],
+        "{resp:#}"
+    );
+    // One `summary_part.added` per item, each before that item's first delta.
+    let mut announced = Vec::new();
+    for (name, v) in &evs {
+        let item = v["item_id"].as_str().unwrap_or_default().to_owned();
+        match name.as_str() {
+            "response.reasoning_summary_part.added" => {
+                assert!(!announced.contains(&item), "{item} announced twice");
+                announced.push(item);
+            }
+            "response.reasoning_summary_text.delta" => {
+                assert!(announced.contains(&item), "{item}: a delta before its part");
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(announced.len(), 4);
+}
+
+/// A Chat tool call whose first chunk already carries its arguments reaches a Responses client
+/// with them as an arguments delta, not only on the finished item.
+#[test]
+fn a_chat_tool_call_opened_with_its_arguments_streams_them_to_responses() {
+    let src = concat!(
+        "data: {\"id\":\"c\",\"model\":\"gpt\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\":\\\"Paris\\\"}\"}}]}}]}\n\n",
+        "data: {\"id\":\"c\",\"model\":\"gpt\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: {\"id\":\"c\",\"model\":\"gpt\",\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n",
+        "data: [DONE]\n\n",
+    );
+    let evs = stream(Chat, Responses, src);
+    let deltas: String = named(&evs, "response.function_call_arguments.delta")
+        .iter()
+        .map(|v| v["delta"].as_str().unwrap())
+        .collect();
+    assert_eq!(deltas, "{\"city\":\"Paris\"}", "{evs:#?}");
+}
