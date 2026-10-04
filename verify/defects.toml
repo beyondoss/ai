@@ -2623,7 +2623,7 @@ evidence = "Code: capture_sink.rs spawn_to (sync_channel(depth)), QueueWriter::d
 claims = ["REL-18", "O2"]
 state = "fixed"
 test = "a_line_over_the_byte_budget_is_dropped_and_counted"
-fix = "bac5107"
+fix = "b5442bf"
 note = "Fixed: the queue is also bounded in bytes, capture_queue_bytes (default 64 MiB, 0 disables). QueueWriter::drop charges the line's length to an AtomicUsize before try_send (undone if it would cross the bound, or if the queue is full or closed); the drain thread releases it after the write, so a line in its hands while the destination is wedged still counts. A line over the bound is dropped and counted on ai_capture_dropped_total, like a full-queue drop: no new label, the counter already means every lost line (D208). Two relaxed atomics per enqueued line, nothing on a request that captures nothing. Also tested: a_written_line_releases_its_bytes, a_full_queue_drop_releases_its_bytes."
 
 [[defect]]
@@ -2637,5 +2637,5 @@ evidence = "Code: main.rs init_tracing, main_layer = fmt::layer().json() with no
 claims = ["REL-10", "BIL-4"]
 state = "fixed"
 test = "a_stalled_stdout_does_not_stall_requests"
-fix = "bac5107"
+fix = "b5442bf"
 note = "Fixed: diagnostics go through a second capture_sink instance (bounded at 8 192 lines and 16 MiB, its own ai-log-sink thread); a full queue drops the line and counts it on the new ai_log_dropped_total. The drain on SIGTERM, and pingora's own exit path, flush it after the payload sink within the same 5 s bound. request rejected lines are capped at 100 a second process-wide (proxy::LogRate: three relaxed atomics, on the rejection path only); the rest are counted and the next line logged carries suppressed = how many were left out, while ai_rejections_total counts every rejection. ai.usage rows stay on the blocking writer on the worker (BIL-4): a dedicated billing thread fed by a blocking queue was considered and rejected, since once its queue fills the worker blocks exactly as on the pipe (it only delays the stall), and rows sitting in a queue would be lost to a crash, a panic abort or the end of the grace period, where today they are in the pipe when logging returns. So a stalled pipe still stalls billing traffic, by design; diagnostics and payloads no longer add to it. Also tested: a_rejection_flood_logs_a_capped_number_of_lines, shutdown_flushes_the_diagnostic_sink, proxy rejection_lines_are_capped_per_second_and_the_rest_counted."
