@@ -300,7 +300,15 @@ async fn an_h2c_client_can_send_a_large_body() {
 async fn the_tenant_cap_is_checked_before_a_large_body_is_read() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let (pubkey, sk) = test_keypair(1);
-    let slow = MockUpstream::start(Mode::Slow(3000)).await;
+    // The holder's answer is held until the probe has its 429, so the tenant is at its cap for as
+    // long as the probe needs on any runner: a 3 s slow reply and a 300 ms head start lost that
+    // race on a starved host.
+    let release = std::sync::Arc::new(tokio::sync::Notify::new());
+    let held = std::sync::Arc::clone(&release);
+    let slow = ReplyUpstream::start(move |_, _| {
+        Reply::Held(std::sync::Arc::clone(&held), Box::new(Reply::ok()))
+    })
+    .await;
     let gw = Gateway::builder(unused_nats_port(), &slow.authority(), &b64(&pubkey))
         .providers(&["openai", "openrouter"])
         .tenant_max_in_flight(1)
@@ -320,7 +328,12 @@ async fn the_tenant_cap_is_checked_before_a_large_body_is_read() {
                 .await
         })
     };
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // The holder has the tenant's one slot once its request reaches the upstream.
+    let deadline = std::time::Instant::now() + CONDITION_BUDGET;
+    while slow.hits() == 0 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(slow.hits(), 1, "the holder reached the upstream");
 
     // A slow upload: declares 300 KB, sends 2 KB, then waits.
     let addr = gw.url().trim_start_matches("http://").to_owned();
@@ -340,12 +353,16 @@ async fn the_tenant_cap_is_checked_before_a_large_body_is_read() {
     .await
     .unwrap();
     let mut buf = vec![0u8; 512];
-    let n = tokio::time::timeout(Duration::from_millis(1000), sock.read(&mut buf))
+    // The upload never finishes, so any answer at all came before the body was read; a gateway
+    // that buffered first could only ever answer with a body-read failure, never this 429. The
+    // bound is a stall guard, not the claim, so it is the generous one.
+    let n = tokio::time::timeout(CONDITION_BUDGET, sock.read(&mut buf))
         .await
         .expect("answered before the upload finished, not after buffering it")
         .unwrap();
     let text = String::from_utf8_lossy(&buf[..n]);
     assert!(text.starts_with("HTTP/1.1 429"), "{text}");
+    release.notify_one();
     let _ = holder.await;
 }
 

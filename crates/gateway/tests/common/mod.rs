@@ -122,16 +122,45 @@ async fn bind_unreserved() -> TcpListener {
 ///   directory closes that: the create is atomic, so exactly one process wins a given port.
 ///
 /// The residual window — between returning a port and the *subprocess* binding it — is unavoidable
-/// when the bind happens elsewhere, but it is now only racing processes outside this test run.
+/// when the bind happens elsewhere, and it races every process on the host, not just this run. So
+/// the port is drawn at random from **below** the kernel's ephemeral range
+/// (`ip_local_port_range`), where the kernel never puts a `bind(:0)` or an outgoing connection.
+/// Drawn from inside it (the old `bind(:0)`), the port was the kernel's favourite next pick: Linux
+/// readily re-hands a just-released ephemeral port to the next `bind(:0)` on the host, and under a
+/// concurrent cargo-mutants run (other runs' mocks, gateways and `nats-server`s binding `:0` all the
+/// time) that stole gateway and NATS ports inside the window. Measured with a neighbour process
+/// churning 6,000 `bind(:0)` listeners: 16 of 81 tests failed on unchanged code ("did not come up",
+/// `ai_allowance_ready` never 1, a "dead" upstream that answered). Below the range only another
+/// explicit chooser can collide — another run's `free_port`, at random over ~16k ports — and a
+/// gateway start that loses that race is retried on fresh ports ([`wait_for_own_listener`]).
 /// In-process servers should still bind `:0` and read the port back (see `MockUpstream`), which has
 /// no window at all.
 pub fn free_port() -> u16 {
     let used = used_ports();
     let dir = PORT_DIR.get_or_init(port_reservation_dir);
+    let (lo, hi) = *SUBPROCESS_PORTS.get_or_init(subprocess_port_range);
+    let mut rng = {
+        use std::hash::{BuildHasher, Hasher};
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u32(std::process::id());
+        h.finish() | 1
+    };
 
     let mut held = Vec::new();
     for _ in 0..1000 {
-        let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = if lo < hi {
+            // xorshift64: a random walk over [lo, hi) that needs no RNG crate.
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            let port = lo + (rng % u64::from(hi - lo)) as u16;
+            match StdTcpListener::bind(("127.0.0.1", port)) {
+                Ok(l) => l,
+                Err(_) => continue, // something on the host listens there
+            }
+        } else {
+            StdTcpListener::bind("127.0.0.1:0").unwrap()
+        };
         let port = listener.local_addr().unwrap().port();
         if !used.lock().unwrap_or_else(|p| p.into_inner()).insert(port) {
             // Already handed out in this process: keep this listener open so the next bind gets a
@@ -159,6 +188,21 @@ pub fn free_port() -> u16 {
     panic!("could not find an unused free port after 1000 attempts");
 }
 
+/// The `[lo, hi)` range [`free_port`] draws from: the 16k ports just below the kernel's ephemeral
+/// range, or an empty range (fall back to `bind(:0)`) when that range starts too low to leave room.
+static SUBPROCESS_PORTS: OnceLock<(u16, u16)> = OnceLock::new();
+
+fn subprocess_port_range() -> (u16, u16) {
+    let low = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range")
+        .ok()
+        .and_then(|s| s.split_whitespace().next()?.parse::<u16>().ok())
+        .unwrap_or(32768);
+    if low < 4096 {
+        return (0, 0);
+    }
+    (low.saturating_sub(16384).max(2048), low)
+}
+
 /// How much of a gateway's log to retain. Half is dropped when it fills, so the buffer stays within
 /// this bound while always holding the most recent lines — which is what every assertion reads.
 const LOG_CAPTURE_CAP: usize = 512 * 1024;
@@ -176,6 +220,17 @@ const LOG_CAPTURE_CAP: usize = 512 * 1024;
 /// [`test_client`]'s request timeout, for the same reason.
 pub const CONDITION_BUDGET: Duration = Duration::from_secs(30);
 
+/// How long a spawned server (`beyond-ai`, `nats-server`) may take to listen on its port.
+///
+/// A stall guard, not a performance bound: an idle host boots the gateway in ~0.1 s and 200 busy
+/// loops on 16 cores slow that to ~1.3 s, but a mutation run on the same box (load 60-230, disk
+/// writeback pinned at ~99% IO pressure while freshly linked 120 MB test binaries are exec'd)
+/// stalled whole batches of starts past the old 20 s — every test starting a gateway in that
+/// window failed at once. The gateway does no network or disk work before it binds (config read,
+/// state build, `add_tcp`), so a start this slow is the host, not the code. A port another process
+/// took is not waited out against this budget: it is detected and retried on fresh ports.
+pub const STARTUP_BUDGET: Duration = Duration::from_secs(60);
+
 /// A NATS port for a gateway that does not write deny/allowance keys of its own.
 ///
 /// Allowance is fail-closed until the watcher stores a scan (empty = remaining-ok), so a closed
@@ -185,26 +240,32 @@ pub const CONDITION_BUDGET: Duration = Duration::from_secs(30);
 pub fn unused_nats_port() -> u16 {
     static SERVER: OnceLock<Nats> = OnceLock::new();
     SERVER
-        .get_or_init(|| {
-            let mut nats = Nats::spawn_reaped("beyond-ai-nats-shared");
-            let deadline = std::time::Instant::now() + Duration::from_secs(20);
-            while std::time::Instant::now() < deadline {
-                if std::net::TcpStream::connect(("127.0.0.1", nats.port)).is_ok() {
-                    return nats;
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            let port = nats.port;
-            nats.stop();
-            panic!("shared nats-server did not come up on port {port}");
-        })
+        .get_or_init(|| Nats::spawn_ready(Nats::spawn_reaped, "beyond-ai-nats-shared"))
         .port
 }
 
 /// A TCP port nothing is listening on. The fail-closed allowance test uses this so the watcher
 /// never seeds.
+///
+/// Held, not merely unbound: the port is bound by a socket that never listens, kept for the life
+/// of this test process. A connect to it is refused at once (no listener), and no other process can
+/// bind it meanwhile (the holder sets neither `SO_REUSEADDR` nor `SO_REUSEPORT`). An unbound port
+/// from [`free_port`] was only dead until something else on the host took it — under a concurrent
+/// cargo-mutants run, another run's mock or gateway — and then the "dead" candidate answered: the
+/// failover tests' "a dead primary must be invisible" and "tried once" assertions failed.
 pub fn closed_port() -> u16 {
-    free_port()
+    static HELD: Mutex<Vec<tokio::net::TcpSocket>> = Mutex::new(Vec::new());
+    for _ in 0..100 {
+        let port = free_port();
+        let Ok(sock) = tokio::net::TcpSocket::new_v4() else {
+            continue;
+        };
+        if sock.bind(([127, 0, 0, 1], port).into()).is_ok() {
+            HELD.lock().unwrap_or_else(|p| p.into_inner()).push(sock);
+            return port;
+        }
+    }
+    panic!("could not hold a closed port after 100 attempts");
 }
 
 /// An HTTP client that cannot hang.
@@ -244,22 +305,6 @@ pub fn test_keypair(seed: u8) -> (Vec<u8>, ed25519_dalek::SigningKey) {
     (sk.verifying_key().to_bytes().to_vec(), sk)
 }
 
-async fn wait_for_port(port: u16, what: &str) {
-    timeout(Duration::from_secs(20), async {
-        loop {
-            if tokio::net::TcpStream::connect(("127.0.0.1", port))
-                .await
-                .is_ok()
-            {
-                return;
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .unwrap_or_else(|_| panic!("{what} did not come up on port {port}"));
-}
-
 /// Wait until process `pid` itself holds a listening socket on `127.0.0.1:port`.
 ///
 /// "Something accepts on the port" is not enough for a gateway subprocess. [`free_port`] reserves
@@ -272,14 +317,36 @@ async fn wait_for_port(port: u16, what: &str) {
 /// `UnexpectedMessage`: the `/metrics` fetch in
 /// `a_provider_route_connect_failure_is_retried_twice_then_named` under the stress job. Matching
 /// the listening socket's inode against the child's own descriptors waits for the right process.
-async fn wait_for_own_listener(pid: u32, port: u16, what: &str) {
-    timeout(Duration::from_secs(20), async {
-        while !listens_on(pid, port) {
-            sleep(Duration::from_millis(50)).await;
+///
+/// `false` when the port is held by someone else: Pingora logs `<addr> is in use, will try again`
+/// on its first failed bind, and the caller respawns on fresh ports rather than wait out Pingora's
+/// 30 s of retries against a 20 s bound — which is how a lone test in a concurrent cargo-mutants
+/// run failed with "did not come up" while every test around it passed. A child that exits, or a
+/// start that outlasts [`STARTUP_BUDGET`], fails the test with the child's own log.
+async fn wait_for_own_listener(gw: &mut Gateway, port: u16) -> bool {
+    let pid = gw.child.id();
+    let in_use = format!("127.0.0.1:{port} is in use");
+    let deadline = std::time::Instant::now() + STARTUP_BUDGET;
+    while !listens_on(pid, port) {
+        if gw.log().contains(&in_use) {
+            return false;
         }
-    })
-    .await
-    .unwrap_or_else(|_| panic!("{what} (pid {pid}) did not come up on port {port}"));
+        if let Ok(Some(status)) = gw.child.try_wait() {
+            panic!(
+                "beyond-ai (pid {pid}) exited ({status}) before listening on {port}; log:\n{}",
+                log_tail(&gw.log())
+            );
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "beyond-ai (pid {pid}) did not come up on port {port} within {STARTUP_BUDGET:?}; \
+                 log:\n{}",
+                log_tail(&gw.log())
+            );
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    true
 }
 
 /// Whether `pid` owns a socket in `LISTEN` on IPv4 `port` (from `/proc/<pid>/net/tcp` and the
@@ -317,13 +384,23 @@ pub struct Nats {
     child: Child,
     pub port: u16,
     store_dir: std::path::PathBuf,
+    /// The `server_name` it was started with, unique to this test process and port. Its `INFO`
+    /// greeting carries it, which is how [`Nats::spawn_ready`] knows the listener is this server.
+    name: String,
 }
 
 impl Nats {
-    fn spawn(store_prefix: &str) -> Self {
+    /// A port, a store directory, and a server name for one `nats-server`.
+    fn layout(store_prefix: &str) -> (u16, std::path::PathBuf, String) {
         let port = free_port();
-        let store_dir = std::env::temp_dir().join(format!("{store_prefix}-{port}"));
+        let name = format!("{store_prefix}-{}-{port}", std::process::id());
+        let store_dir = std::env::temp_dir().join(&name);
         let _ = std::fs::create_dir_all(&store_dir);
+        (port, store_dir, name)
+    }
+
+    fn spawn(store_prefix: &str) -> Self {
+        let (port, store_dir, name) = Self::layout(store_prefix);
         let child = Command::new("nats-server")
             .args([
                 "-js",
@@ -333,6 +410,8 @@ impl Nats {
                 &port.to_string(),
                 "-sd",
                 store_dir.to_str().unwrap(),
+                "-n",
+                &name,
             ])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -342,6 +421,7 @@ impl Nats {
             child,
             port,
             store_dir,
+            name,
         }
     }
 
@@ -349,17 +429,16 @@ impl Nats {
     /// in [`unused_nats_port`], held in a `static`, whose destructor never runs. Under nextest every
     /// test is its own process, so each run leaked one `nats-server` per test (thousands a day on a
     /// busy machine). A shell watchdog polls this test process and stops the server, and removes its
-    /// store, within a second of the process exiting, however it exits.
+    /// store, within a second of the process exiting, however it exits. The shell exits as soon as
+    /// the server does, so a server that failed to start shows as an exited `child` here too.
     fn spawn_reaped(store_prefix: &str) -> Self {
-        const WATCHDOG: &str = r#"nats-server -js -a 127.0.0.1 -p "$2" -sd "$3" >/dev/null 2>&1 &
+        const WATCHDOG: &str = r#"nats-server -js -a 127.0.0.1 -p "$2" -sd "$3" -n "$4" >/dev/null 2>&1 &
 server=$!
 while kill -0 "$1" 2>/dev/null && kill -0 "$server" 2>/dev/null; do sleep 1; done
 kill "$server" 2>/dev/null
 wait "$server" 2>/dev/null
 rm -rf "$3""#;
-        let port = free_port();
-        let store_dir = std::env::temp_dir().join(format!("{store_prefix}-{port}"));
-        let _ = std::fs::create_dir_all(&store_dir);
+        let (port, store_dir, name) = Self::layout(store_prefix);
         let child = Command::new("sh")
             .args([
                 "-c",
@@ -368,6 +447,7 @@ rm -rf "$3""#;
                 &std::process::id().to_string(),
                 &port.to_string(),
                 store_dir.to_str().unwrap(),
+                &name,
             ])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -377,14 +457,65 @@ rm -rf "$3""#;
             child,
             port,
             store_dir,
+            name,
         }
     }
 
-    pub async fn start() -> Self {
-        let nats = Self::spawn("beyond-ai-nats");
-        wait_for_port(nats.port, "nats-server").await;
-        nats
+    /// Spawn with `spawn` until a server is up on its own port, and return it.
+    ///
+    /// "Something accepts on the port" is not "our server is up". [`free_port`] reserves a port only
+    /// within one nextest run, so another process on the host (a concurrent run: cargo-mutants runs
+    /// several) can bind it before `nats-server` does. That server then exits on `EADDRINUSE`, yet a
+    /// bare TCP connect succeeds against the other process, and the gateway under test retries its
+    /// NATS connect against a listener that is not this server for the rest of the test: an
+    /// `ai_allowance_ready` that never reaches 1, ~30 s after a start that looked fine. Matching the
+    /// `server_name` in the `INFO` greeting proves the listener is this server, and a server that
+    /// exited is respawned on a fresh port instead of waited on.
+    fn spawn_ready(spawn: fn(&str) -> Self, store_prefix: &str) -> Self {
+        for _ in 0..5 {
+            let mut nats = spawn(store_prefix);
+            let deadline = std::time::Instant::now() + STARTUP_BUDGET;
+            while std::time::Instant::now() < deadline {
+                if nats_greets_as(nats.port, &nats.name) {
+                    return nats;
+                }
+                if matches!(nats.child.try_wait(), Ok(Some(_))) {
+                    break; // lost its port: respawn on another
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            let exited = matches!(nats.child.try_wait(), Ok(Some(_)));
+            let port = nats.port;
+            nats.stop();
+            assert!(
+                exited,
+                "nats-server did not come up on port {port} within {STARTUP_BUDGET:?}"
+            );
+        }
+        panic!("nats-server lost its port to another process five times running");
     }
+
+    pub async fn start() -> Self {
+        tokio::task::spawn_blocking(|| Self::spawn_ready(Self::spawn, "beyond-ai-nats"))
+            .await
+            .expect("nats-server start task")
+    }
+}
+
+/// Whether the listener on `port` greets like the `nats-server` named `name`: NATS sends
+/// `INFO {json}` on every new connection, before the client says anything.
+fn nats_greets_as(port: u16, name: &str) -> bool {
+    use std::io::{BufRead, BufReader};
+    let Ok(sock) = std::net::TcpStream::connect(("127.0.0.1", port)) else {
+        return false;
+    };
+    if sock.set_read_timeout(Some(Duration::from_secs(2))).is_err() {
+        return false;
+    }
+    let mut line = String::new();
+    BufReader::new(sock).read_line(&mut line).is_ok()
+        && line.starts_with("INFO ")
+        && line.contains(&format!("\"server_name\":\"{name}\""))
 }
 
 impl Nats {
@@ -1203,9 +1334,9 @@ impl GatewayBuilder {
     }
 
     /// An authority nothing is listening on: connecting gets ECONNREFUSED immediately, with no
-    /// timeout to wait out. The port is leased and dropped by `free_port`, so it is unbound.
+    /// timeout to wait out. The port is held bound, unlistened, for the test's life ([`closed_port`]).
     pub fn dead_authority() -> String {
-        format!("127.0.0.1:{}", free_port())
+        format!("127.0.0.1:{}", closed_port())
     }
 
     /// Pin the proxy's worker-thread count. Used by the scaling bench to stand a single-threaded
@@ -1326,7 +1457,8 @@ impl GatewayBuilder {
         self
     }
 
-    pub async fn start(self) -> Gateway {
+    /// One spawn on fresh ports. `None` when another process holds one of them.
+    async fn spawn_once(&self) -> Option<Gateway> {
         let port = free_port();
         let metrics_port = free_port();
         let wait_allowance_ready = self.wait_allowance_ready;
@@ -1514,23 +1646,38 @@ impl GatewayBuilder {
                 .take()
                 .map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
         );
-        let gw = Gateway {
+        let mut gw = Gateway {
             child,
             port,
             metrics_port,
             config_path,
             log,
         };
-        let pid = gw.child.id();
-        wait_for_own_listener(pid, port, "beyond-ai").await;
         // The metrics/admin listener (`/livez`, `/readyz`, `/metrics`) binds on a *separate* port from
         // the proxy; wait for it too, or a test that probes it right after `start()` races the bind
         // (pre-existing flake in `health_endpoints_report_ready_on_the_metrics_listener`).
-        wait_for_own_listener(pid, metrics_port, "beyond-ai-metrics").await;
+        if !wait_for_own_listener(&mut gw, port).await
+            || !wait_for_own_listener(&mut gw, metrics_port).await
+        {
+            return None;
+        }
         if wait_allowance_ready {
             wait_for_metric(&gw, "ai_allowance_ready", "", 1.0).await;
         }
-        gw
+        Some(gw)
+    }
+
+    /// Start the gateway and wait until it serves (and, by default, until allowance is ready).
+    ///
+    /// A start whose port another process took first is retried on fresh ports; see
+    /// [`wait_for_own_listener`].
+    pub async fn start(self) -> Gateway {
+        for _ in 0..5 {
+            if let Some(gw) = self.spawn_once().await {
+                return gw;
+            }
+        }
+        panic!("beyond-ai lost its ports to another process five times running");
     }
 }
 
@@ -1644,6 +1791,21 @@ impl Drop for Gateway {
 
 // --- assertions -------------------------------------------------------------
 
+/// The last ~16 KiB of a captured gateway log, cut on a line boundary: enough to name why a wait
+/// failed (a watcher's retry errors, a bind that keeps finding its port in use) without flooding
+/// the failure output.
+pub fn log_tail(log: &str) -> &str {
+    let mut start = log.len().saturating_sub(16 * 1024);
+    while !log.is_char_boundary(start) {
+        start += 1;
+    }
+    let tail = &log[start..];
+    match tail.find('\n') {
+        Some(nl) if start > 0 => &tail[nl + 1..],
+        _ => tail,
+    }
+}
+
 pub fn parse_metric(metrics: &str, name: &str, label_value: &str) -> f64 {
     metrics
         .lines()
@@ -1663,7 +1825,11 @@ pub async fn wait_for_metric(gw: &Gateway, name: &str, label: &str, min: f64) {
         }
     })
     .await;
-    assert!(r.is_ok(), "metric {name}{{{label}}} never reached {min}");
+    if r.is_err() {
+        let log = gw.log();
+        let tail = log_tail(&log);
+        panic!("metric {name}{{{label}}} never reached {min}; gateway log tail:\n{tail}");
+    }
 }
 
 pub async fn wait_for_status<F, Fut>(want: u16, mut f: F)
