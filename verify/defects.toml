@@ -2595,7 +2595,7 @@ evidence = "Hermetic (cancellation.rs, read_timeout_secs = 1, primary and fallba
 claims = ["REL-1", "SEC-16", "BIL-3"]
 state = "fixed"
 test = "a_client_stalled_mid_upload_is_not_failed_over"
-fix = "3e5c0d3"
+fix = "f470b2b"
 note = "Fixed: error_while_proxy retags a ReadTimedout while the client still owes body bytes (client_stalled_upload: body_bytes_fed > 0 and !is_body_done, any source) as a downstream error before the delivered/failover decision. The walk ends with no failover, logging releases the breaker permit, body_delivered stays false (no estimate, outcome client_cancelled), and fail_to_proxy answers 408 'request body timed out', the same answer as pingora's HTTP/1.1 body read timeout. Zero bytes fed is excluded (an Expect: 100-continue client waits on the provider). Error path only. Not changed: pingora marks an HTTP/2 upstream connection for shutdown on any upstream read timeout before the hook runs. A chunked body on a catalog walk is read whole before connecting, so its stall is pingora's downstream 408; a_client_stalled_mid_chunked_upload_times_out_as_its_own pins a streamed chunked stall on a provider route."
 
 [[defect]]
@@ -2609,5 +2609,5 @@ evidence = "Hermetic: openrouter_402s_in_a_row_cool_its_key. With x-beyond-order
 claims = ["REL-4"]
 state = "fixed"
 test = "openrouter_402s_in_a_row_cool_its_key"
-fix = "bf9fae6"
+fix = "0357214"
 note = "Checking the balance out of band was rejected: OpenRouter's GET /api/v1/key answers an inference key with its own spending limit only (limit_remaining is null for a key that draws on account credit, the common case), and GET /api/v1/credits, the account balance, needs a management key, which cannot make completions and the gateway does not hold. Fixed by a heuristic instead: each OpenRouter 402 the walk fails over on (either abandoning path: in-place retry, recorded FullBody retry) is a strike against that pool key (Provider::strike_unread_402: a relaxed AtomicU32 beside the key's cooldown, per replica, nothing stored), and route::OPENROUTER_402_STRIKES (3) in a row cool it through AiProxy::cool_unfunded_key (same metric reason, same warn line as D180/D258). Any 2xx from the key resets the count (Provider::key_served in upstream_response_filter: one relaxed load, a store only when non-zero) and any cooling spends it; a key already cooling does not count the 402s of requests sent before it cooled, so a burst cools it once. A relayed OpenRouter 402 is read as before: out of credit cools, too costly neither counts nor resets. Cost: a near-empty account sent only requests too costly for it may cool for KEY_COOLDOWN although a smaller request would be served. Also tested: too_costly_openrouter_402s_between_successes_never_cool_its_key, a_burst_of_openrouter_402s_cools_its_key_once, route::tests::{unread_402s_in_a_row_cool_only_their_own_key, a_cooled_key_counts_afresh_once_its_cooldown_has_passed, cooling_a_key_spends_its_strikes}; D258's test now sends one fewer than the strike count for its OpenRouter case."
