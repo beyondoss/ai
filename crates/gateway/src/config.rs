@@ -246,6 +246,24 @@ pub struct AiConfig {
     /// round trips; 60 s of zero progress is hundreds of them.
     pub client_write_timeout_secs: u64,
 
+    /// Downstream body read timeout (seconds): a client that sends no request-body byte for this
+    /// long while the gateway reads its body ends its own request with a 408 (no upstream contact,
+    /// no breaker, nothing billed). Per read, so a slow steady upload never trips it. HTTP/1.1
+    /// sessions get it as pingora's own downstream read timeout (whose default is the same 60 s);
+    /// HTTP/2 has none in pingora, so the gateway bounds each read of a body it reads up front
+    /// itself. `0` disables it on both.
+    pub client_read_timeout_secs: u64,
+
+    /// The longest one request may live, start to end (seconds); `0` disables. Every other bound
+    /// is per read or per write, so a stream that keeps moving, or a silent one kept alive by
+    /// HTTP/2 PINGs (OpenAI's `-pro` rows have no silence deadline), would otherwise hold its
+    /// tenant slot, the in-flight gauge and its body budget for as long as nobody hangs up. A
+    /// policy ceiling, not a failure: no breaker outcome, no key cooled. Before the response head
+    /// it is a 504; after it, the stream is cut as any mid-stream failure is (billed as cut short).
+    /// 4 h: the largest `max_output_tokens` in the catalog (384,000) at ~27 tokens/s, slower than
+    /// any production decode, so no legitimate generation reaches it.
+    pub request_max_secs: u64,
+
     /// HTTP/2 PING interval on upstream connections (seconds); `0` disables. A provider that stops
     /// acknowledging (a dead host, a partition, a wedged edge) fails the connection and every
     /// stream on it within this interval plus pingora's fixed 5 s ACK deadline, however silent the
@@ -451,6 +469,10 @@ impl Default for AiConfig {
             write_timeout_secs: 60,
             idle_timeout_secs: 90,
             client_write_timeout_secs: 60,
+            // pingora's own HTTP/1.1 body read timeout, now applied to HTTP/2 too.
+            client_read_timeout_secs: 60,
+            // The longest catalog generation at a slow decode (see the field).
+            request_max_secs: 4 * 60 * 60,
             h2_ping_interval_secs: 15,
             tcp_keepalive_idle_secs: 15,
             tcp_keepalive_interval_secs: 5,

@@ -23,6 +23,7 @@ pub mod circuit_breaker;
 pub mod concurrency;
 pub mod config;
 pub mod control;
+pub mod deadline;
 pub mod deny;
 pub mod doctor;
 pub mod error;
