@@ -489,6 +489,18 @@ async fn a_pdf_request_skips_a_candidate_that_reads_none() {
             "{path}: the PDF reached xAI as input_file: {sent}"
         );
     }
+    // A body past pingora's 64 KiB replay buffer is walked by a `FullBody` re-run, which takes the
+    // mask its parent computed: the same skip.
+    let big_pdf = format!(
+        "data:application/pdf;base64,JVBERi0xLjQK{}",
+        "A".repeat(96 * 1024)
+    );
+    let large = json!({"model": "grok-build-0.1", "messages": [{"role": "user", "content": [
+        {"type": "file", "file": {"filename": "a.pdf", "file_data": big_pdf}},
+        {"type": "text", "text": "What is the code word?"}]}]});
+    let resp = post(&gw, &key, "/v1/chat/completions", &order, &large).await;
+    assert_eq!(resp.status().as_u16(), 200, "large body");
+    assert_eq!(provider_of(&resp).as_deref(), Some("xai"), "large body");
     assert_eq!(
         openrouter.hits(),
         0,

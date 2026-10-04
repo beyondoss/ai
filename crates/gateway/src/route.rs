@@ -818,6 +818,31 @@ mod tests {
         }
     }
 
+    /// A large body's re-run reads [`unserved`] from its parent, which computed it against the
+    /// row's `candidates`; a re-run that walks the Responses arm instead takes 0 (`proxy`'s
+    /// `std::ptr::eq(arms, row.candidates)` guard). That is exact only while no row with a Responses
+    /// arm has a candidate `unserved` can flag. A row that breaks this needs the parent to compute
+    /// the mask for the arm the re-run walks (and the guard's exclusion in `.cargo/mutants.toml`
+    /// dropped).
+    #[test]
+    fn no_row_with_a_responses_arm_has_an_unserved_candidate() {
+        for route in providers::catalog::MODEL_ROUTES {
+            if route.responses.is_empty() {
+                continue;
+            }
+            for c in route.candidates.iter().chain(route.responses) {
+                assert!(
+                    providers::catalog::serves_structured_outputs(c)
+                        && providers::catalog::serves_file_input(c),
+                    "{}: {} {}",
+                    route.model,
+                    providers::by_id(c.provider).name,
+                    c.upstream_model,
+                );
+            }
+        }
+    }
+
     #[test]
     fn is_default_prefix_boundary_checks() {
         // The real default-prefix shape: exactly "/v1" or "/v1/…".
@@ -1128,6 +1153,59 @@ mod tests {
         assert_eq!(p.pool_auth.len(), 2);
         assert_eq!(p.pool_auth[0].value.expose(), "Bearer sk-a");
         assert_eq!(p.pool_auth[1].value.expose(), "Bearer sk-b");
+    }
+
+    /// A refused key 0 starts the next request on key 1, in a pool of two (the smallest with a
+    /// key to skip to) or more, and the provider is not cooling while a key is fresh.
+    #[test]
+    fn a_refused_first_key_starts_requests_on_the_next() {
+        for keys in [&["sk-a", "sk-b"][..], &["sk-a", "sk-b", "sk-c"]] {
+            let p = Provider::resolve(
+                "openai",
+                "api.openai.com:443".to_string(),
+                Dialect::OpenAi,
+                AuthScheme::Bearer,
+                keys,
+                ProviderMetrics::disconnected(),
+                None,
+            );
+            assert_eq!(p.first_key(), 0);
+            p.mark_key_bad(0);
+            assert_eq!(
+                p.first_key(),
+                1,
+                "{} keys: key 0 is cooling off",
+                keys.len()
+            );
+            assert!(!p.cooling(), "a fresh key can still take the request");
+            for i in 1..keys.len() {
+                p.mark_key_bad(i as u8);
+            }
+            assert!(p.cooling());
+            assert_eq!(p.first_key(), 0, "every key cooling: key 0 still answers");
+        }
+    }
+
+    /// The cooldown is measured on a running clock: a refusal whose cooldown has passed no longer
+    /// skips the key.
+    #[test]
+    fn a_key_stops_cooling_once_its_cooldown_has_passed() {
+        let p = Provider::resolve(
+            "openai",
+            "api.openai.com:443".to_string(),
+            Dialect::OpenAi,
+            AuthScheme::Bearer,
+            &["sk-a", "sk-b"],
+            ProviderMetrics::disconnected(),
+            None,
+        );
+        // A cooldown that ends 200 ms from now, rather than `KEY_COOLDOWN`'s minute.
+        p.pool_auth[0]
+            .bad_until_ms
+            .store(clock_ms().saturating_add(200), Ordering::Relaxed);
+        assert_eq!(p.first_key(), 1);
+        std::thread::sleep(Duration::from_millis(250));
+        assert_eq!(p.first_key(), 0, "the cooldown has passed");
     }
 
     #[test]

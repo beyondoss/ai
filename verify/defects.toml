@@ -2567,5 +2567,19 @@ evidence = "Hermetic: a_402_the_walk_fails_over_on_cools_an_unfunded_key. With x
 claims = ["REL-4"]
 state = "fixed"
 test = "a_402_the_walk_fails_over_on_cools_an_unfunded_key"
-fix = "3bd64c4"
+fix = "a7c753a"
 note = "Reading the refused 402's body before abandoning it, as first proposed, is not possible: pingora 0.9's upstream_response_filter gets the head only, the upstream session is not reachable from any hook, and an Err there drops the connection with the body unread (the same reason D180 could not fail over the request that saw the answer). So the status decides, where it can: remedy::unfunded_402 says a 402 is out of credit by its status alone on every provider but OpenRouter, whose 402 may be one request larger than the balance (\"This request requires more credits\", which must not cool the shared key: D180, D200). upstream_response_filter cools the key (AiProxy::cool_unfunded_key: same metric reason, same warn line as logging's D180 path) on both abandoning paths, the in-place retry and a recorded FullBody retry; a FullBody final attempt is relayed and cooled from its body as before. No new state (Provider::mark_key_bad, the existing key cooldown) and no work on any other status, the 2xx path included. logging no longer cools from the body of an abandoned FullBody attempt (relay_abandoned), which raced the parent's drop and would count a head-cooled 402 twice; this also makes a FullBody key walk's abandoned bodies deterministically unread, as ARCHITECTURE.md already said. Limit: an OpenRouter 402 the walk fails over on still cools nothing, so a row that leads with OpenRouter (or an x-beyond-order that puts it first) keeps a round trip to an unfunded OpenRouter account; by default the aggregator is last in the walk (D253), where its 402 is relayed and cooled from the body. Also tested: remedy::tests::only_openrouter_needs_the_body_of_a_402; the same test asserts the OpenRouter too-costly 402 fails over and cools nothing (OpenRouter is sent all three requests) for both body sizes."
+
+[[defect]]
+id = "D259"
+severity = "low"
+area = "Billing"
+title = "A client that closed mid-upload was billed an input estimate for a request the provider never had whole"
+impact = "BIL-3 bills a wait given up on only once the provider has the whole request (D130). A client that closed its connection before the end of its own body (a Content-Length body with bytes still to come, a chunked body without its terminating chunk) left the provider half a request, which it never processes or bills, yet the ai.usage row was usage_estimated: true with the half body's input estimate (outcome client_cancelled)."
+confidence = "high"
+evidence = "pingora-core 0.9 http/v1/body.rs: on EOF mid-body the reader sets body_state to Done and returns ConnectionClosed ('Peer prematurely closed connection with N bytes of body remaining to read', or 'Connection prematurely closed without the termination chunk'); body_done() is true for Done as well as Complete. proxy.rs body_delivered read session.is_body_done(), so logging's no_head (managed, no head, gave_up_waiting: any Downstream error) estimated the prompt. Hermetic: half a body then FIN against a silent upstream -> row {usage_estimated: true, input_tokens: 1, outcome: client_cancelled}. Found triaging the error_while_proxy Downstream mutant (cargo-mutants full run)."
+claims = ["BIL-3", "BIL-20"]
+state = "fixed"
+test = "a_client_that_closes_mid_upload_is_not_billed_an_estimate"
+fix = "28bc659"
+note = "Fixed: body_delivered also requires that the error is not a downstream premature close (client_body_cut_short, matched on pingora's context strings through the cause chain, as h2_body_unsent matches its own; pingora's session API exposes no body_complete). Covers both framings; error_while_proxy's Downstream early return already kept such a request from being resent. A client that sends its whole body and then gives up is still billed (D130). HTTP/2 downstream resets are a different error and were not affected."

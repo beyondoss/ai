@@ -9,6 +9,7 @@ mod common;
 
 use beyond_ai::key::{VirtualKey, mint};
 use common::*;
+use std::time::Duration;
 
 const MODEL: &str = "gpt-4o-mini";
 
@@ -300,6 +301,90 @@ async fn a_reset_during_the_upload_fails_over() {
         ),
         (200, 1, 1),
         "log:\n{}",
+        gw.log()
+    );
+}
+
+/// The small-body form of the test above: a header-won walk streams a small body through, so a
+/// provider that resets after reading only the request head, while the client is still sending
+/// the body, cannot have the request. The walk fails over to the next candidate (pingora replays
+/// what it buffered and reads the rest), rather than resending to the provider that reset it.
+/// claim: REL-1, REL-21
+/// defect: D51
+#[tokio::test]
+async fn a_reset_before_a_small_body_is_sent_fails_over() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (pubkey, sk) = test_keypair(1);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let primary = listener.local_addr().unwrap();
+    let resets = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = resets.clone();
+    let task = tokio::spawn(async move {
+        while let Ok((mut s, _)) = listener.accept().await {
+            let mut seen = Vec::new();
+            let mut buf = [0u8; 4096];
+            while !seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                match s.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => seen.extend_from_slice(&buf[..n]),
+                }
+            }
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _ = s.set_zero_linger();
+            drop(s);
+        }
+    });
+    let fallback = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::builder(unused_nats_port(), &primary.to_string(), &b64(&pubkey))
+        .providers(&["openai", "openrouter"])
+        .provider_authority("openrouter", &fallback.authority())
+        .start()
+        .await;
+    let payload = body(SMALL);
+    let (first, rest) = payload.as_bytes().split_at(payload.len() / 2);
+    let mut s = tokio::net::TcpStream::connect(("127.0.0.1", gw.port))
+        .await
+        .unwrap();
+    let head = format!(
+        "POST /auto/chat/completions HTTP/1.1\r\nhost: gw\r\nauthorization: Bearer {}\r\n\
+         content-type: application/json\r\nx-beyond-model: {MODEL}\r\n\
+         x-beyond-order: openai,openrouter\r\ncontent-length: {}\r\n\r\n",
+        vkey(&sk),
+        payload.len()
+    );
+    s.write_all(head.as_bytes()).await.unwrap();
+    s.write_all(first).await.unwrap();
+    // The primary resets while the rest of the body is still with the client.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while resets.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the request reached the primary");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    s.write_all(rest).await.unwrap();
+    let mut answer = Vec::new();
+    let mut buf = [0u8; 4096];
+    let _ = tokio::time::timeout(Duration::from_secs(10), async {
+        while !answer.windows(4).any(|w| w == b"\r\n\r\n") {
+            match s.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => answer.extend_from_slice(&buf[..n]),
+            }
+        }
+    })
+    .await;
+    task.abort();
+    let text = String::from_utf8_lossy(&answer);
+    assert_eq!(
+        (
+            text.starts_with("HTTP/1.1 200"),
+            resets.load(std::sync::atomic::Ordering::SeqCst),
+            fallback.hits()
+        ),
+        (true, 1, 1),
+        "{text}\nlog:\n{}",
         gw.log()
     );
 }

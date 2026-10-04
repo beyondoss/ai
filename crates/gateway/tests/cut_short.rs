@@ -211,6 +211,49 @@ async fn an_error_only_stream_is_not_billed_an_estimate() {
     assert_eq!(row["output_tokens"].as_u64(), Some(0), "{row}");
 }
 
+/// A stream whose error event comes *after* output (OpenRouter's mid-stream `"error":{…}`, the
+/// provider failing part way through an answer) is work the provider did and bills: estimated from
+/// what was relayed, unlike an error-only stream.
+/// claim: BIL-3, BIL-12
+#[tokio::test]
+async fn an_error_after_output_is_billed_an_estimate() {
+    let (pubkey, sk) = test_keypair(47);
+    let delta = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"word \"}}]}\n\n";
+    let sse = format!(
+        "{}data: {{\"error\":{{\"message\":\"upstream failed\",\"code\":502}}}}\n\n",
+        delta.repeat(3)
+    );
+    let mock = ReplyUpstream::start(move |_, _| Reply::Full {
+        status: 200,
+        content_type: "text/event-stream",
+        body: bytes::Bytes::from(sse.clone()),
+    })
+    .await;
+    let gw = Gateway::builder(unused_nats_port(), &mock.authority(), &b64(&pubkey))
+        .start()
+        .await;
+    let resp = test_client()
+        .post(format!("{}/openai/v1/chat/completions", gw.url()))
+        .header("authorization", format!("Bearer {}", vkey(&sk, 47)))
+        .header("content-type", "application/json")
+        .body(
+            r#"{"model":"gpt-4o-mini","stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let _ = resp.text().await.unwrap();
+
+    let row = usage_row(&gw).await;
+    assert_eq!(row["usage_estimated"], true, "{row}");
+    assert_eq!(
+        row["output_tokens"].as_u64(),
+        Some(3),
+        "one token per delta relayed: {row}"
+    );
+}
+
 /// The over-count this guards: a Messages client's image is `{"type":"base64","data":"…"}` — not a
 /// data URI — and when an OpenAI-wire candidate serves it, input is estimated from the body. That
 /// payload must not be counted as text either.
@@ -241,4 +284,57 @@ async fn anthropic_format_images_do_not_inflate_the_input_estimate() {
         Some(5),
         "user (1) what is this? (4); an Anthropic base64 source is not text: {row}"
     );
+}
+
+/// A client that closes before the end of its own body (a `Content-Length` body with bytes still
+/// to come, a chunked one without its last chunk) never gave the provider the request: the half
+/// it was sent is no prompt it bills. Not estimated (D259), unlike a client that sent the whole
+/// body and then gave up waiting (D130).
+/// claim: BIL-3
+/// defect: D259
+#[tokio::test]
+async fn a_client_that_closes_mid_upload_is_not_billed_an_estimate() {
+    use tokio::io::AsyncWriteExt;
+    let payload = r#"{"model":"gpt-4o-mini","messages":[{"role":"user","content":"Explain TCP congestion control in detail, please."}]}"#;
+    let half = &payload[..payload.len() / 2];
+    for (what, framing, sent) in [
+        (
+            "content-length",
+            format!("content-length: {}", payload.len()),
+            half.to_owned(),
+        ),
+        (
+            "chunked",
+            "transfer-encoding: chunked".to_owned(),
+            format!("{:x}\r\n{half}\r\n", half.len()),
+        ),
+    ] {
+        let (pubkey, sk) = test_keypair(48);
+        let mock = ReplyUpstream::start(|_, _| Reply::HeaderStall).await;
+        let gw = Gateway::builder(unused_nats_port(), &mock.authority(), &b64(&pubkey))
+            .start()
+            .await;
+        let mut s = tokio::net::TcpStream::connect(("127.0.0.1", gw.port))
+            .await
+            .unwrap();
+        let head = format!(
+            "POST /openai/v1/chat/completions HTTP/1.1\r\nhost: gw\r\nauthorization: Bearer {}\r\n\
+             content-type: application/json\r\n{framing}\r\n\r\n",
+            vkey(&sk, 48),
+        );
+        s.write_all(head.as_bytes()).await.unwrap();
+        s.write_all(sent.as_bytes()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while mock.hits() == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the request reached the upstream");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        drop(s);
+        let row = usage_row(&gw).await;
+        assert_eq!(row["usage_estimated"], false, "{what}: {row}");
+        assert_eq!(row["input_tokens"].as_u64(), Some(0), "{what}: {row}");
+    }
 }

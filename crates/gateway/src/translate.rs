@@ -8021,7 +8021,9 @@ fn next_event(buf: &[u8], start: &mut usize, scanned: &mut usize) -> Option<(usi
     }
 }
 
-/// End (exclusive) of the first `\n\n` or `\r\n\r\n`, judging only `\n`s at or after `from`.
+/// End (exclusive) of the first blank line: a line ending (`\n`, or the `\n` of `\r\n`) followed by
+/// an empty line ended by `\n` or `\r\n`, judging only `\n`s at or after `from`. That covers
+/// `\n\n` and `\r\n\r\n`, and the mixed endings SSE allows too.
 ///
 /// One forward pass over newlines. The earlier two-`windows` form ran both searches to completion,
 /// so a stream using only one line ending walked the whole buffer for the other on every call.
@@ -8031,11 +8033,7 @@ fn find_event_end(buf: &[u8], from: usize) -> Option<usize> {
         let nl = at + off;
         match buf.get(nl + 1) {
             Some(b'\n') => return Some(nl + 2),
-            Some(b'\r')
-                if nl > 0 && buf.get(nl - 1) == Some(&b'\r') && buf.get(nl + 2) == Some(&b'\n') =>
-            {
-                return Some(nl + 3);
-            }
+            Some(b'\r') if buf.get(nl + 2) == Some(&b'\n') => return Some(nl + 3),
             _ => {}
         }
         at = nl + 1;
@@ -8113,6 +8111,19 @@ mod tests {
         assert_eq!(b.pending_len(), big.len());
     }
 
+    /// A blank line ends an event whatever line endings frame it; a lone `\r\n` (one line ending)
+    /// does not.
+    #[test]
+    fn an_event_ends_at_a_blank_line_of_either_ending() {
+        assert_eq!(find_event_end(b"data: a\n\nb", 0), Some(9));
+        assert_eq!(find_event_end(b"data: a\r\n\r\nb", 0), Some(11));
+        assert_eq!(find_event_end(b"data: a\n\r\nb", 0), Some(10));
+        assert_eq!(find_event_end(b"data: a\r\n\nb", 0), Some(10));
+        assert_eq!(find_event_end(b"\n\r\nb", 0), Some(3));
+        assert_eq!(find_event_end(b"data: a\r\ndata: b\r\n", 0), None);
+        assert_eq!(find_event_end(b"data: a\n\r", 0), None, "undecided");
+    }
+
     /// The resumable search must find exactly what a from-scratch search finds, including a
     /// terminator split across chunks at every possible point, for both line endings.
     #[test]
@@ -8121,6 +8132,8 @@ mod tests {
             &b"data: a\n\ndata: bb\n\n: c\n\n"[..],
             &b"data: a\r\n\r\ndata: bb\r\n\r\n"[..],
             &b"data: a\r\ndata: b\n\ndata: c\r\n\r\n"[..],
+            // A `\n` line ending then a `\r\n` blank line, and the reverse: SSE allows both.
+            &b"data: a\n\r\ndata: b\r\n\ndata: c\n\n"[..],
         ] {
             // As `SseBridge::feed` holds it: events taken by cursor, the buffer compacted per part.
             let events = |parts: &[&[u8]]| {

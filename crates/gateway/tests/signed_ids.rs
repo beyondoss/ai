@@ -357,6 +357,33 @@ async fn a_json_response_has_every_id_signed() {
     );
 }
 
+/// Signing changes the answer's length, so the provider's `Content-Length` is dropped and an
+/// HTTP/1.1 client gets the body chunked.
+/// claim: SEC-25
+#[tokio::test]
+async fn a_signed_json_response_is_chunked_to_an_http1_client() {
+    let (_mock, gw, sk) = gpt_gateway(Mode::Raw(200, "application/json", RESPONSE)).await;
+    let resp = test_client()
+        .post(format!("{}/v1/responses", gw.url()))
+        .header("authorization", format!("Bearer {}", billing_vkey(&sk, A)))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"gpt-4o","input":"hi"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    assert_eq!(resp.version(), reqwest::Version::HTTP_11);
+    assert!(resp.headers().get("content-length").is_none());
+    assert_eq!(
+        resp.headers()
+            .get("transfer-encoding")
+            .and_then(|v| v.to_str().ok()),
+        Some("chunked")
+    );
+    let text = resp.text().await.unwrap();
+    assert!(!text.contains(RESP), "{text}");
+}
+
 /// A streamed answer signs every id on every event that carries one, and the same item is the same
 /// signed id on all of them (`item.id` on `output_item.*`, `item_id` on each content event, the
 /// output on `completed`), so a client that keys items by id still joins them.

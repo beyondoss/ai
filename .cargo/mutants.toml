@@ -59,8 +59,10 @@ exclude_re = [
   # `map_response` clones a same-wire body as is: the guard only skips that clone.
   'replace match guard client == Endpoint::Responses with false in SseBridge::assembled',
   # `str_is`'s raw compare is a fast path: `escaped_key_is` decodes a string with no escape to
-  # itself, so skipping the raw compare (`false`) gives the same answer, only slower.
-  '''replace match guard !inner\.contains\(&b'\\\\'\) with false in str_is''',
+  # itself, so skipping the raw compare (`false`) gives the same answer, only slower. `str_value`'s
+  # raw borrow is the same fast path: serde decodes a valid string with no escape to its own bytes.
+  # (A raw control byte, which serde refuses, is not valid JSON.)
+  '''replace match guard !inner\.contains\(&b'\\\\'\) with false in (str_is|str_value)''',
   # `unserved` ORs `1 << i` for distinct indices `i`, where `|` and `^` are the same operation.
   'replace \| with \^ in unserved',
   # The const `TALLY` / `TALLY4` tables pack `state << 3 | class` and `next | add << 4` from
@@ -70,6 +72,9 @@ exclude_re = [
   # `de_service_tier`'s visitors for a non-string tier answer `Ok(None)`, which is `Option`'s
   # default.
   'replace de_service_tier::<impl serde::de::Visitor<.de> for V>::visit_(bool|i64|u64|f64|none|unit) -> Result<Self::Value, E> with Ok\(Default::default\(\)\)',
+  # Its `expecting` only words an "invalid type" error, and the visitor accepts every JSON type, so
+  # serde never builds one.
+  'replace de_service_tier::<impl serde::de::Visitor<.de> for V>::expecting -> std::fmt::Result with Ok\(Default::default\(\)\)',
   # A push that leaves the buffer at exactly the cap: `>=` "compacts" it with a self-copy and a
   # no-op truncate, and `ring()` reads it as a ring either way.
   'replace > with >= in UsageTail::push',
@@ -92,4 +97,30 @@ exclude_re = [
   # `Ctx` implements `Deref` as `DerefMut`'s supertrait: every hook holds the context mutably, so
   # nothing calls `deref` itself (a panicking body passes the integration suites).
   'replace <impl std::ops::Deref for Ctx>::deref -> &Self::Target',
+  # `MAX_CATALOG_OUTPUT_TOKENS` folds the catalog's largest `max_output_tokens`: replacing the
+  # running maximum with an equal value (`>=`) changes nothing. A const initializer's mutant names
+  # no function, only the file and position.
+  'translate\.rs:\d+:\d+: replace > with >=$',
+  # `KEY_NODES` sizes the key trie as the root plus one node per key byte. The keys share prefixes
+  # (`in`put / `in`structions), so the trie uses fewer: one node less (`1 * n`) still
+  # holds it, and every index stays below the bound `feed` takes it modulo.
+  'usage\.rs:\d+:\d+: replace \+ with \*$',
+  # `run` cuts a run at a space so the halves walk as two chains; a space resets the state, so where
+  # (or whether) it cuts changes no count, only the speed. The cut's arithmetic is tested; its
+  # length gate (the only `>=` in `run`) is that choice.
+  'replace >= with < in InputTally::run',
+  # `tracks_terminal` only skips work: the terminal verdict is read on a managed request's billing
+  # row alone, and a non-stream or assembled body never ends in a terminal SSE event, so watching
+  # more of them (`||`, `true`) reaches the same verdicts. Watching none (`false`) is tested.
+  'replace && with \|\| in RequestCtx::tracks_terminal',
+  'replace RequestCtx::tracks_terminal -> bool with true',
+  # A large body's re-run takes its parent's `unserved` mask only when it walks the row's
+  # `candidates`, which the mask was computed against; walking the Responses arm it takes 0. No row
+  # with a Responses arm has a candidate the mask can flag (pinned by
+  # `route::tests::no_row_with_a_responses_arm_has_an_unserved_candidate`), so the parent's mask
+  # is 0 there too and the guard (`true`) changes nothing today.
+  'replace match guard std::ptr::eq\(arms, row\.candidates\) with true in <impl ProxyHttp for AiProxy>::request_filter',
+  # `keep_usage_head` keeps a head only where it is read (an Anthropic stream); widening the gate
+  # (`||`) keeps a bounded head nothing reads.
+  'replace && with \|\| in RequestCtx::keep_usage_head',
 ]

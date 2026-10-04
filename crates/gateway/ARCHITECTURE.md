@@ -1757,8 +1757,11 @@ Two more endings the provider bills and we used to write as zero get the same tr
   (D252), so a non-stream pro call is answered and billed in full rather than cut at 600s and billed
   an estimate for nothing delivered.
   "Had the whole request" is `body_delivered`: the connection was up (`upstream_request_filter`
-  ran), the client's body was read to its end, and nothing failed writing it upstream. A request
-  that never reached a provider (every breaker open, a connect failure, a reset mid-upload) stays
+  ran), the client's body was read to its end, and nothing failed writing it upstream. A client that
+  closes before its body's framing-defined end (bytes of a `Content-Length` still to come, a chunked
+  body's last chunk missing) did not get it there, though pingora marks such a body done
+  (`client_body_cut_short`, D259). A request that never reached a provider (every breaker open, a
+  connect failure, a reset mid-upload, the client closing mid-upload) stays
   unbilled, and so does one the upstream **closed or reset** before any head (the gateway's 502): the
   peer declined to answer, and nothing says it processed the request. The real edges in front of
   Anthropic, OpenAI and OpenRouter answer a request they forwarded and then lost with an HTTP error

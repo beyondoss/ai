@@ -609,7 +609,9 @@ pub fn scan_buffered(body: &[u8]) -> BufferedScan {
             }
             b'[' => depth += 1,
             b'}' | b']' => depth = depth.saturating_sub(1),
-            b':' if depth == 1 => expect_key = false,
+            // Unguarded by depth, as in both walks this one replaces: a nested `:` is always
+            // followed by the root `,` or `}` that closes its value before the next root key.
+            b':' => expect_key = false,
             b',' if depth == 1 => {
                 expect_key = true;
                 last_key_is_stream = false;
@@ -630,8 +632,8 @@ pub fn scan_buffered(body: &[u8]) -> BufferedScan {
                 continue;
             }
             // A negative limit is no limit to cap. (A string or structured value never puts a digit
-            // at depth 1 before the `,` that ends it.)
-            b'-' if depth == 1 => limit_key = None,
+            // at depth 1 before the `,` that ends it, so a nested `-` may clear it too.)
+            b'-' => limit_key = None,
             b't' if depth == 1 && last_key_is_stream => {
                 if body[j..].starts_with(b"true") {
                     stream_true = true;
@@ -1229,6 +1231,10 @@ mod tests {
         let n = last_member(b, 0, "n").unwrap().unwrap();
         assert!(!str_is(b, n.value, "null"));
         assert_eq!(str_value(b, n.value), None);
+        // An escaped value is decoded, as the provider's parser decodes it.
+        let e = br#"{"type":"im\u0061ge"}"#;
+        let m = last_member(e, 0, "type").unwrap().unwrap();
+        assert_eq!(str_value(e, m.value).as_deref(), Some("image"));
         // A string far longer than the name is not decoded to be compared.
         let long = format!(r#"{{"k":"{}"}}"#, "\\u0041".repeat(10_000));
         let m = last_member(long.as_bytes(), 0, "k").unwrap().unwrap();
@@ -1533,6 +1539,10 @@ mod tests {
             b"not json".to_vec(),
             b"".to_vec(),
             b"{}".to_vec(),
+            // Not JSON: a key with no `:` before its nested value. Both walks read the nested `:`
+            // as the root's, so neither takes the next root string for a key.
+            br#"{"a" {"b":1} "model":"x"}"#.to_vec(),
+            br#"{"a" {"b":1} "stream":true}"#.to_vec(),
             format!(r#"{{"messages":[{{"content":"{big}"}}],"stream":true,"model":"gpt-4o"}}"#)
                 .into_bytes(),
             format!(r#"{{"system":"{big} \"stream\":true","model":"x"}}"#).into_bytes(),
