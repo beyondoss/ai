@@ -148,7 +148,9 @@ async fn send_big(gw: &Gateway) -> (u16, String, Duration) {
 #[tokio::test]
 async fn an_h2_answer_then_reset_no_error_is_relayed() {
     let (port, hits) = early_answer_upstream(AfterAnswer::ResetNoError).await;
-    let gw = gateway(port, 20).await;
+    // Held behind the body write, the answer would wait out this write timeout: far past the
+    // bound below, which is in turn many times what relaying it takes unloaded.
+    let gw = gateway(port, 60).await;
     let (status, body, took) = send_big(&gw).await;
     assert_eq!(
         status,
@@ -157,7 +159,7 @@ async fn an_h2_answer_then_reset_no_error_is_relayed() {
         gw.log()
     );
     assert!(body.contains("maximum context length"), "{body}");
-    assert!(took < Duration::from_secs(5), "held for {took:?}");
+    assert!(took < Duration::from_secs(30), "held for {took:?}");
     assert_eq!(
         hits.load(Ordering::SeqCst),
         1,

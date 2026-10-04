@@ -207,6 +207,39 @@ fn subprocess_port_range() -> (u16, u16) {
 /// this bound while always holding the most recent lines — which is what every assertion reads.
 const LOG_CAPTURE_CAP: usize = 512 * 1024;
 
+/// A stated latency bound (a deny lands within 2 s), held exactly on an idle host and stretched on
+/// a loaded one, where nothing local can meet a wall-clock promise. `round_trip` is
+/// [`median_round_trip`] of an ordinary request through the same gateway, measured in the same run:
+/// the bound is the larger of the stated one and [`LOAD_STRETCH`] such round trips. On an idle host
+/// a round trip is ~35 ms (debug gateway, fresh client connection), so the stated bound is what
+/// binds; under a load that makes every hop slow (600 ms round trips at a load average of 160), the
+/// bound grows with it. A regression that ignores the event altogether (a deny that never
+/// lands) still fails, at whichever bound is in force.
+pub fn stretched(stated: Duration, round_trip: Duration) -> Duration {
+    stated.max(round_trip * LOAD_STRETCH)
+}
+
+/// Round trips a stretched bound may take. A deny lands within one to three round trips at every
+/// load measured; 40 leaves an idle host's bound at the stated one (40 x 35 ms is under 2 s), so a
+/// deny that lands a second late there still fails.
+pub const LOAD_STRETCH: u32 = 40;
+
+/// The median of five timed runs of `op` (an ordinary request, for [`stretched`]).
+pub async fn median_round_trip<F, Fut, T>(mut op: F) -> Duration
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    let mut took = Vec::with_capacity(5);
+    for _ in 0..5 {
+        let start = std::time::Instant::now();
+        let _ = op().await;
+        took.push(start.elapsed());
+    }
+    took.sort();
+    took[2]
+}
+
 /// How long a wait on a *condition* (a metric reaching a value, a log line appearing) may take
 /// before it fails the test.
 ///
@@ -1915,6 +1948,10 @@ impl GatewayBuilder {
 pub enum Step {
     Write(Vec<u8>),
     Sleep(Duration),
+    /// Wait, however long it takes, until the test says so: a reply whose next bytes must follow
+    /// something the client saw, as an ordering rather than a delay a loaded host could outrun.
+    /// A gateway that never lets the client see it hangs the test at its own read bound.
+    Until(Arc<dyn Fn() -> bool + Send + Sync>),
 }
 
 /// A complete HTTP/1.1 response with `content-length` and `connection: close`.
@@ -2062,6 +2099,11 @@ async fn scripted_conn(
                 let _ = stream.flush().await;
             }
             Step::Sleep(d) => sleep(d).await,
+            Step::Until(ready) => {
+                while !ready() {
+                    sleep(Duration::from_millis(5)).await;
+                }
+            }
         }
     }
     let _ = stream.shutdown().await;

@@ -382,9 +382,16 @@ async fn a_large_body_failover_fits_a_tenant_cap_of_one() {
         .worker_threads(1)
         .start()
         .await;
+    // A held slot shows as a 429; an attempt waiting on the stalled error body, as no answer
+    // until that upstream's 600s read timeout. Unloaded each takes well under a second, so the
+    // bound below is a stall guard many times over, not a speed claim a loaded host could fail.
+    let patient = reqwest::Client::builder()
+        .timeout(CONDITION_BUDGET * 2)
+        .build()
+        .unwrap();
     for _ in 0..3 {
         let started = std::time::Instant::now();
-        let resp = client()
+        let resp = patient
             .post(format!("{}/v1/chat/completions", gw.url()))
             .header("authorization", format!("Bearer {}", vkey(&sk)))
             .header("content-type", "application/json")
@@ -394,7 +401,7 @@ async fn a_large_body_failover_fits_a_tenant_cap_of_one() {
             .unwrap();
         assert_eq!(resp.status().as_u16(), 200);
         assert!(
-            started.elapsed() < Duration::from_secs(4),
+            started.elapsed() < CONDITION_BUDGET,
             "{:?}",
             started.elapsed()
         );
