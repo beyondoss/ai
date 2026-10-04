@@ -2583,3 +2583,17 @@ state = "fixed"
 test = "a_client_that_closes_mid_upload_is_not_billed_an_estimate"
 fix = "28bc659"
 note = "Fixed: body_delivered also requires that the error is not a downstream premature close (client_body_cut_short, matched on pingora's context strings through the cause chain, as h2_body_unsent matches its own; pingora's session API exposes no body_complete). Covers both framings; error_while_proxy's Downstream early return already kept such a request from being resent. A client that sends its whole body and then gives up is still billed (D130). HTTP/2 downstream resets are a different error and were not affected."
+
+[[defect]]
+id = "D260"
+severity = "low"
+area = "Reliability"
+title = "A client that stalled mid-upload was failed over to the next candidate, charging the one it left"
+impact = "A managed client that stopped sending its body with the connection still open (an agent process paused, a stuck pipe) ended at the upstream read timeout as a provider failure: a catalog walk failed over to the next candidate with a body nobody would finish (which then waited out its own timeout), upstream_peer charged the candidate it left a breaker failure (one stall per window opens it at threshold 1, and enough of them at any threshold open it for every tenant), and the client got a 504 blaming the provider. h2c clients reach this at the default 600s, since pingora's HTTP/2 server has no body read timeout; HTTP/1.1 ones when read_timeout_secs is below pingora's own 60s body read timeout (a downstream 408 that already behaved). No pool key was cooled and nothing was billed (body_delivered needs is_body_done), and a provider route already kept its breaker clean (logging's client_still_uploading)."
+confidence = "high"
+evidence = "Hermetic (cancellation.rs, read_timeout_secs = 1, primary and fallback both silent listeners): half a Content-Length body to /auto with x-beyond-order openai,openrouter, connection held open -> after ~2s a 504 'upstream timed out', primary and fallback each accepted one connection; the same over h2c. error_while_proxy saw Upstream ReadTimedout with body_delivered false (is_body_done false), so a small replayable body took the walk's failover arm. pingora-proxy 0.9 proxy_h1.rs proxy_handle_upstream: read_response_task and rx.recv() share one select loop, so the read timeout re-arms on every body chunk, and send_body_to1 blocking on an upstream that stopped reading runs under write_timeout (WriteTimedout). Recorded as unfixed by the PR #121 triage agent."
+claims = ["REL-1", "SEC-16", "BIL-3"]
+state = "fixed"
+test = "a_client_stalled_mid_upload_is_not_failed_over"
+fix = "3e5c0d3"
+note = "Fixed: error_while_proxy retags a ReadTimedout while the client still owes body bytes (client_stalled_upload: body_bytes_fed > 0 and !is_body_done, any source) as a downstream error before the delivered/failover decision. The walk ends with no failover, logging releases the breaker permit, body_delivered stays false (no estimate, outcome client_cancelled), and fail_to_proxy answers 408 'request body timed out', the same answer as pingora's HTTP/1.1 body read timeout. Zero bytes fed is excluded (an Expect: 100-continue client waits on the provider). Error path only. Not changed: pingora marks an HTTP/2 upstream connection for shutdown on any upstream read timeout before the hook runs. A chunked body on a catalog walk is read whole before connecting, so its stall is pingora's downstream 408; a_client_stalled_mid_chunked_upload_times_out_as_its_own pins a streamed chunked stall on a provider route."

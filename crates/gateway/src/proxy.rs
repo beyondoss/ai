@@ -2257,6 +2257,18 @@ fn client_still_uploading(session: &mut Session, rc: &RequestCtx) -> bool {
     rc.body_bytes_fed > 0 && !session.as_mut().is_body_done()
 }
 
+/// Whether the upstream's read timeout fired while the client still owed body bytes (D260): the
+/// client stalled mid-upload with its connection open. Pingora's upstream half waits on the
+/// response and on the next body chunk at once, re-arming the read timeout on each chunk, and a
+/// body write blocked on an upstream that stopped reading is a `WriteTimedout` instead; so this
+/// timeout means neither side moved a byte for `read_timeout_secs`, with the provider waiting on
+/// the client. Zero bytes fed is excluded as [`client_still_uploading`] excludes it: a client
+/// that sent `Expect: 100-continue` waits on the provider's answer before its first byte. Any
+/// source: pingora's own downstream body read timeout (HTTP/1.1, 60 s) is already the client's.
+fn client_stalled_upload(session: &mut Session, rc: &RequestCtx, e: &pingora_core::Error) -> bool {
+    e.etype() == &pingora_core::ErrorType::ReadTimedout && client_still_uploading(session, rc)
+}
+
 /// The lowest set bit in `usable` at or after index `from`, or `None` if there is none.
 ///
 /// The candidate walk's only cursor primitive. `from` strictly increases across a request, so the
@@ -6067,6 +6079,17 @@ impl ProxyHttp for AiProxy {
         // Our own decisions (a 5xx / 401 vendor walk, a 429 key walk, a body cap) are made.
         if matches!(e.etype(), T::HTTPStatus(_) | T::CustomCode(..)) {
             return e;
+        }
+        // A client that stalled mid-upload timed its own request out (D260): retag the timeout as
+        // the client's, so the walk below ends here rather than failing over with a body nobody
+        // will finish, `logging` charges no breaker and bills no estimate, and `fail_to_proxy`
+        // answers 408 rather than blaming the provider with a 504.
+        if ctx
+            .rc
+            .as_ref()
+            .is_some_and(|rc| client_stalled_upload(session, rc, &e))
+        {
+            e.as_down();
         }
         // One rule for every body size (D09, D51): a connection failure is retried only when the
         // upstream cannot have the whole request (`body_delivered` is false: the connection never
