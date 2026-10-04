@@ -584,3 +584,78 @@ async fn a_candidate_reached_after_the_deadline_is_not_contacted() {
     assert!(text.contains("maximum duration"), "{text}");
     assert_eq!(fallback_conns.load(SeqCst), 0, "{}", gw.log());
 }
+
+/// `client_read_timeout_secs = 0` turns the up-front read bound off, on both transports: a client
+/// that pauses mid-body longer than any small bound still has its request read and sent on (the
+/// silent upstream accepts its connection) rather than answered 408.
+/// claim: REL-1
+/// defect: D265
+#[tokio::test]
+async fn client_read_timeout_secs_zero_disables_the_up_front_bound() {
+    use tokio::io::AsyncWriteExt;
+    let payload = CHAT;
+    let (first, rest) = payload.split_at(payload.len() / 2);
+    for h2 in [true, false] {
+        let what = if h2 { "h2c" } else { "http/1.1" };
+        let (upstream, conns) = silent_upstream().await;
+        let (pubkey, sk) = test_keypair(68);
+        let gw = Gateway::builder(
+            unused_nats_port(),
+            &format!("127.0.0.1:{upstream}"),
+            &b64(&pubkey),
+        )
+        .config_line("client_read_timeout_secs = 0")
+        .start()
+        .await;
+        let key = billing_vkey(&sk, 268);
+        let headers = [
+            ("authorization", format!("Bearer {key}")),
+            ("content-type", "application/json".to_owned()),
+            ("content-length", payload.len().to_string()),
+        ];
+        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", gw.port))
+            .await
+            .unwrap();
+        // Held so the connection stays open while the upstream is waited on.
+        let mut _keep: Vec<Box<dyn std::any::Any + Send>> = Vec::new();
+        if h2 {
+            let (mut client, conn) = h2::client::handshake(tcp).await.unwrap();
+            tokio::spawn(conn);
+            let mut req = http::Request::post("http://gw/auto/chat/completions");
+            for (k, v) in &headers {
+                req = req.header(*k, v.as_str());
+            }
+            let (resp, mut send) = client.send_request(req.body(()).unwrap(), false).unwrap();
+            send.send_data(bytes::Bytes::copy_from_slice(first.as_bytes()), false)
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            send.send_data(bytes::Bytes::copy_from_slice(rest.as_bytes()), true)
+                .unwrap();
+            _keep.push(Box::new((client, resp, send)));
+        } else {
+            let mut s = tcp;
+            let mut head = "POST /auto/chat/completions HTTP/1.1\r\nhost: gw\r\n".to_owned();
+            for (k, v) in &headers {
+                head.push_str(&format!("{k}: {v}\r\n"));
+            }
+            head.push_str("\r\n");
+            s.write_all(head.as_bytes()).await.unwrap();
+            s.write_all(first.as_bytes()).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            s.write_all(rest.as_bytes()).await.unwrap();
+            _keep.push(Box::new(s));
+        }
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while conns.load(SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "{what}: the paused upload never reached the upstream\n{}",
+                gw.log()
+            )
+        });
+    }
+}
