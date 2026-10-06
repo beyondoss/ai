@@ -1648,24 +1648,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // can run first, before any worker exists. The flavour depends on whether this process is a
     // fleet replica — see [`build_runtime`] — which has to be decided from the raw arguments,
     // because the runtime must exist before anything can parse them properly.
-    let result = build_runtime(is_service_mode())?.block_on(run());
-    // The ordinary way out (`run` finishing, every subcommand that returns): the same cleanup as
-    // `exit_process`, before the process goes.
-    finish_process_cleanup();
-    result
+    // The ordinary way out (`run` finishing, every subcommand that returns) and a panic unwinding
+    // out of `run` both pass through this guard's `Drop`: the same cleanup as `exit_process`.
+    let _sweep = tools::mcp_stdio::ExitSweep;
+    build_runtime(is_service_mode())?.block_on(run())
 }
 
 /// What every way out of the process does first: retire every stdio MCP server still running
-/// (close its stdin, give it its grace, sweep its process group — `mcp_stdio::retire_all`), and
-/// wait for those sweeps and for any `bash` group kill still in flight. `process::exit` — and a
-/// return from `main` — would otherwise end those threads mid-kill, orphaning exactly the
-/// grandchildren they exist to reap. Bounded: a server's grace plus a margin for the sweep.
+/// (close its stdin, give it its grace, sweep its process group) and wait for those sweeps and for
+/// any `bash` group kill still in flight — see `mcp_stdio::sweep_before_exit`.
 fn finish_process_cleanup() {
-    tools::mcp_stdio::retire_all();
-    #[cfg(unix)]
-    tools::exec::wait_for_pending_group_kills(
-        tools::mcp_stdio::SHUTDOWN_GRACE + std::time::Duration::from_secs(2),
-    );
+    tools::mcp_stdio::sweep_before_exit();
 }
 
 /// `std::process::exit` after [`finish_process_cleanup`]. Every exit of `run` and `serve` that
@@ -2515,7 +2508,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .unwrap_or_else(|e| {
                     eprintln!("{e}");
-                    std::process::exit(2);
+                    exit_process(2);
                 }),
                 lifecycle_heartbeat: std::time::Duration::from_secs(lifecycle_heartbeat_secs),
                 tools,
@@ -2536,7 +2529,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 // `ToolPolicy::validate_deny_path_patterns` uses for a malformed `--deny-path` glob.
                 approve: beyond_ai_agent::approval::GatedSet::parse(&approve).unwrap_or_else(|e| {
                     eprintln!("{e}");
-                    std::process::exit(2);
+                    exit_process(2);
                 }),
                 approval_timeout: (approval_timeout > 0)
                     .then(|| std::time::Duration::from_secs(approval_timeout)),
@@ -4460,7 +4453,7 @@ async fn run_task(
             Some(
                 beyond_ai_agent::memory::open(dsn.as_deref(), &cwd).unwrap_or_else(|e| {
                     eprintln!("{e}");
-                    std::process::exit(2);
+                    exit_process(2);
                 }),
             )
         };
@@ -4522,7 +4515,7 @@ async fn run_task(
     if let Some(arg) = &output_schema {
         let schema = tools::structured_output::load_schema(arg).unwrap_or_else(|e| {
             eprintln!("{e}");
-            std::process::exit(2);
+            exit_process(2);
         });
         let tool = tools::structured_output::StructuredOutput::new(
             schema,
@@ -4531,7 +4524,7 @@ async fn run_task(
         )
         .unwrap_or_else(|e| {
             eprintln!("{e}");
-            std::process::exit(2);
+            exit_process(2);
         });
         registry.register(Arc::new(tool));
     }

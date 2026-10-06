@@ -104,9 +104,33 @@ pub(crate) fn retire(server: &std::sync::Arc<ServerProcess>) {
     }
 }
 
+/// The way out of the process: [`retire_all`], then wait for those sweeps (and any `bash` group
+/// kill still in flight). `process::exit`, a return from `main` and a panic unwinding out of it
+/// would otherwise end the sweep threads mid-kill, orphaning exactly the grandchildren they exist
+/// to reap. Bounded by a server's grace plus a margin for the sweep — so exiting takes a little
+/// longer whenever a stdio server ran (it is given the chance to exit cleanly), and up to that
+/// bound when one ignores its stdin closing.
+pub fn sweep_before_exit() {
+    retire_all();
+    #[cfg(unix)]
+    crate::tools::exec::wait_for_pending_group_kills(
+        SHUTDOWN_GRACE + std::time::Duration::from_secs(2),
+    );
+}
+
+/// Runs [`sweep_before_exit`] when dropped — at the end of `main`, and while a panic unwinds out of
+/// it, where a `Drop` that only *started* a sweep thread would have it killed by the exit.
+pub struct ExitSweep;
+
+impl Drop for ExitSweep {
+    fn drop(&mut self) {
+        sweep_before_exit();
+    }
+}
+
 /// Retire every stdio server still running — for the way out of the process, where a connection
 /// some owner still holds would otherwise never be dropped. Follow it with
-/// [`crate::tools::exec::wait_for_pending_group_kills`].
+/// [`crate::tools::exec::wait_for_pending_group_kills`] ([`sweep_before_exit`] does both).
 pub fn retire_all() {
     let live: Vec<_> = lock(&LIVE)
         .iter()
@@ -357,6 +381,9 @@ mod tests {
         assert!(needs_check(events.as_bytes()));
     }
 
+    /// `retire_all` and the pending-kill registry are process-wide: tests that use them take turns.
+    static PROCESS_WIDE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     /// The sweep after a server's leader is reaped signals its group only. A process that is not
     /// a group leader stands in for an unrelated one handed the reaped server's pid: the sweep must
     /// leave it alone (no kill-by-pid fallback).
@@ -400,6 +427,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn retire_gives_the_grace_then_kills_a_server_that_ignores_stdin() {
+        let _serial = PROCESS_WIDE.lock().await;
         let mut cmd = tokio::process::Command::new("sh");
         cmd.args(["-c", "trap '' TERM; exec sleep 60"])
             .process_group(0);
@@ -410,8 +438,66 @@ mod tests {
         // Still running well inside the grace.
         tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
         assert!(!server.exited(), "killed before its grace was up");
-        crate::tools::exec::wait_for_pending_group_kills(SHUTDOWN_GRACE * 2);
+        let deadline = std::time::Instant::now() + SHUTDOWN_GRACE * 2;
+        while !server.exited() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
         assert!(server.exited(), "killed once the grace was up");
         assert!(started.elapsed() >= SHUTDOWN_GRACE);
+    }
+
+    /// A panic unwinding out of `main` still sweeps: [`ExitSweep`]'s `Drop` retires every server
+    /// and waits for the sweeps before the unwind goes on — a server's double-forked grandchild is
+    /// gone by the time the panic surfaces, not left to a thread the exit would kill.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_panic_unwinding_past_the_exit_guard_still_sweeps() {
+        let _serial = PROCESS_WIDE.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("orphan.pid");
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.args([
+            "-c",
+            // The grandchild's stdio is detached, so a regression leaks it without also holding
+            // the test harness's output pipe open.
+            &format!(
+                "sleep 600 </dev/null >/dev/null 2>&1 & echo $! > {}; exec sleep 600",
+                pidfile.display()
+            ),
+        ])
+        .process_group(0);
+        let (server, transport) = stdio_transport(cmd).unwrap();
+        let orphan: u32 = loop {
+            if let Some(pid) = std::fs::read_to_string(&pidfile)
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+            {
+                break pid;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+        let alive = |pid: u32| {
+            std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|s| {
+                s.rsplit_once(") ")
+                    .is_some_and(|(_, rest)| !rest.starts_with('Z'))
+            })
+        };
+        assert!(alive(orphan));
+        let held = (server, transport);
+        let unwound = tokio::task::spawn_blocking(move || {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                let _sweep = ExitSweep;
+                let _held = held;
+                std::panic::panic_any("boom after MCP connect");
+            }))
+            .is_err()
+        })
+        .await
+        .unwrap();
+        assert!(unwound);
+        assert!(
+            !alive(orphan),
+            "the panic surfaced with the server's grandchild {orphan} still running"
+        );
     }
 }

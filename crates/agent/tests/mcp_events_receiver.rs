@@ -305,3 +305,80 @@ async fn a_retry_that_beats_the_resubscribe_after_a_restart_is_told_to_retry_not
         (runs_for_event(&bodies, "retried early") >= 1).then_some(())
     });
 }
+
+/// Only callbacks that will come back are held after a restart: a configured subscription is
+/// subscribed again, a runtime one is not — so a retried delivery to the runtime one's old callback
+/// gets `410` (stop) at once, rather than `503` (retry) for minutes on end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn after_a_restart_a_runtime_subscriptions_old_callback_is_gone_not_held() {
+    let (_fx, mcp_url, fixture) = spawn_http_fixture(&[("MCP_FIXTURE_ALLOW_HTTP_CALLBACK", "1")]);
+    let home = tempfile::tempdir().unwrap();
+    write_settings(home.path(), hooks(&mcp_url, "notify"));
+    let (base, _bodies) = spawn_model_server_routed(vec![], turn_text("noted"));
+    let port = free_port();
+    let mut first = daemon(home.path(), &base, port, &[]);
+    let mut ws = ws_connect(port, Some(EVENTS_SESSION)).await;
+    ws_wait_active(&mut ws).await;
+    ws_send(
+        &mut ws,
+        json!({ "type": "mcp_events_subscribe", "id": "s", "server": "hooks", "name": "ticket.updated",
+                "arguments": { "project": "alpha" }, "delivery": "webhook", "action": "notify" }),
+    )
+    .await;
+    let r = ws_next(&mut ws, Duration::from_secs(20), "the subscribe", |f| {
+        f["type"] == "response" && f["id"] == "s"
+    })
+    .await;
+    assert_eq!(r["success"], true, "{r:#}");
+    let runtime_url = eventually(Duration::from_secs(10), "the runtime hook", || {
+        state(&fixture)["hooks"]
+            .as_array()?
+            .iter()
+            .find(|h| h["project"] == "alpha")
+            .and_then(|h| h["url"].as_str().map(str::to_owned))
+    });
+    eventually(Duration::from_secs(10), "both callbacks persisted", || {
+        let saved: Value =
+            serde_json::from_slice(&std::fs::read(state_file(home.path())).ok()?).ok()?;
+        (saved["subscriptions"]
+            .as_object()?
+            .values()
+            .filter(|s| s["webhook"]["token"].is_string())
+            .count()
+            == 2)
+            .then_some(())
+    });
+    drop(ws);
+    first.kill().unwrap();
+    let _ = first.wait();
+    let _second = daemon(home.path(), &base, port, &[]);
+    // The configured one comes back on its old callback.
+    eventually(
+        Duration::from_secs(20),
+        "the configured resubscribe",
+        || {
+            let n = state(&fixture)["methods"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|m| *m == "events/subscribe")
+                .count();
+            (n >= 3).then_some(())
+        },
+    );
+    let path = runtime_url
+        .split_once(&format!("127.0.0.1:{port}"))
+        .unwrap()
+        .1
+        .to_owned();
+    let status = raw_request(
+        port,
+        &format!("POST {path} HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\n"),
+        b"{}",
+        Duration::from_secs(5),
+    );
+    assert_eq!(
+        status, 410,
+        "nothing will resubscribe a runtime subscription: its callback is gone"
+    );
+}

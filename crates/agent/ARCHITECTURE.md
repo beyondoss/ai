@@ -3951,9 +3951,10 @@ mcp_events_subscribe (any session) ──► owned by that session
   their route. The token and the last confirmed secret persist in the state file, so after a restart
   the same callback URL is registered again before anything is sent — a delivery the server retries
   while the daemon was down (a crash leaves its subscription in place) still lands and verifies.
-  Persisted tokens are held from the moment the state is read (up to 10 min): a retry that arrives
-  before its subscription has re-registered gets `503` (retry), never `410` (which the draft treats
-  as "stop").
+  Persisted tokens of _configured_ subscriptions are held from the moment the state is read (up to
+  10 min): a retry that arrives before its subscription has re-registered gets `503` (retry), never
+  `410` (which the draft treats as "stop"). A runtime subscription is not resubscribed after a
+  restart, so its token is not held and its old callback answers `410`.
   After a _graceful_ shutdown the subscription was unsubscribed, so an event type the server cannot
   replay from a cursor loses what it emitted while the daemon was down; one with replay resumes from
   the persisted cursor. Refresh runs at ¾ of the way to `refreshBefore` (an unparseable one refreshes after
@@ -3975,18 +3976,20 @@ mcp_events_subscribe (any session) ──► owned by that session
   The coalescer commits before it injects. A batch leaves the pending queue only when the **model has
   received it** and the transcript holding it has been persisted (`McpEventsHub::finish_run`, from the
   `prompt` arm): the run's own prompt counts once the run did not fail (an abort still leaves the
-  prompt in the transcript the next run reads); a batch steered in mid-run counts only if its text is
-  in the transcript — an abort clears the steer lane (`Steering::clear_run_scoped`) before the model
-  sees what is queued there. A batch whose run failed, whose transcript did not persist, or whose
+  prompt in the transcript the next run reads); a batch steered in mid-run counts only if it is in the
+  transcript, found by the batch id its text starts with (`[MCP events · batch N]`), so two batches
+  with the same content are told apart — an abort clears the steer lane
+  (`Steering::clear_run_scoped`) before the model sees what is queued there. A batch whose run failed, whose transcript did not persist, or whose
   steer was dropped goes back to pending and is injected again; after 3 such attempts an event is
   dropped and reported (`mcp_event_status` `kind: "dropped"`), so a poison event cannot re-run the
   model forever. A restart re-injects whatever is still pending. **Guarantee:** every acknowledged
   event reaches the model at least once (or is reported dropped after 3 attempts that never reached
-  it). It reaches it exactly once unless a run fails or is aborted before the model saw a steered
-  batch (then it is re-injected, by design), or the process dies — or the `done` record fails to be
-  written — between a run's transcript persist and that record (then that batch is re-injected once
-  more). A graceful exit writes the record first, so SIGTERM, stdin EOF and the reaper never
-  duplicate (`tests/mcp_events_durability.rs`).
+  it). It reaches it exactly once except in four cases, each of which re-injects the batch: a run
+  fails or is aborted before the model saw a steered batch (by design); a compaction during the run
+  summarizes a steered batch's turn away, so it is no longer found in the transcript (the model did
+  see it — this one is a duplicate); the process dies, or the `done` record fails to be written,
+  between a run's transcript persist and that record. A graceful exit writes the record first, so
+  SIGTERM, stdin EOF and the reaper never duplicate (`tests/mcp_events_durability.rs`).
 - **Into the session.** Each subscription dedups by `eventId` (newest 1024, persisted), then every
   accepted occurrence is broadcast as `mcp_event`. Unless `action: "notify"`, it is queued for the
   model; one coalescer per session injects at most one synthetic `prompt` per
@@ -4097,12 +4100,19 @@ mcp_events_subscribe (any session) ──► owned by that session
   a recycled pid), kills it if it has not exited, then kills whatever is left of its process group
   by group only (no kill-by-pid fallback: once the leader is reaped its pid may be reused), so a
   grandchild it double-forked (a browser) goes too. The waiting and killing run on a tracked OS
-  thread (`exec::spawn_tracked_cleanup`). Every exit of `run` and `serve` after their tools exist —
-  `main` returning, and each `process::exit` (stdin EOF, SIGTERM, a cancelled or refused `run`) —
-  goes through `exit_process`/`finish_process_cleanup` in `main.rs`: `retire_all`, then
-  `exec::wait_for_pending_group_kills`, bounded by the grace plus 2 s (`tests/mcp_stdio_transport.rs`:
-  `serve` on EOF and SIGTERM, `run` finishing and `run` cancelled mid-turn). A hard-killed agent
-  still sweeps nothing — fixing that needs a supervisor. (The group kill now passes `--` before the
+  thread (`exec::spawn_tracked_cleanup`). Every exit of `run` and `serve` after their tools exist
+  runs `mcp_stdio::sweep_before_exit` — `retire_all`, then `exec::wait_for_pending_group_kills`,
+  bounded by the grace plus 2 s: each `process::exit` goes through `exit_process` (stdin EOF,
+  SIGTERM, a cancelled `run`, a refused one, and every configuration error found after the servers
+  are up), and `main` returning — or a panic unwinding out of it — passes the `mcp_stdio::ExitSweep`
+  guard's `Drop` (`tests/mcp_stdio_transport.rs`: `serve` on EOF and SIGTERM, `run` finishing,
+  cancelled mid-turn and refused for bad configuration; the panic path by
+  `mcp_stdio::tests::a_panic_unwinding_past_the_exit_guard_still_sweeps`). The only exits that skip it
+  are argument-parsing failures, before anything is spawned. **The cost, by design:** a process that
+  ran a stdio server exits a little later — measured at about 166 ms instead of 44 ms for a server
+  that exits on EOF — because each server is given the chance to exit cleanly and is then swept,
+  and up to about 3.15 s when a server ignores its stdin closing and has to wait out its grace. A
+  hard-killed agent still sweeps nothing — fixing that needs a supervisor. (The group kill now passes `--` before the
   group id. Without it procps-ng `kill` still killed a live group but exited 1 doing so — and 0 for
   a group already gone — so `kill_process_group`'s by-pid fallback ran after every successful group
   kill, which is the pid-reuse hazard.) Its stdout

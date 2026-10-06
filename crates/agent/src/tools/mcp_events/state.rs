@@ -268,12 +268,12 @@ impl StateStore {
         self.dirty();
     }
 
-    /// Every persisted webhook callback token.
-    pub(super) fn webhook_tokens(&self) -> Vec<String> {
+    /// Every persisted webhook callback, as `(subscription key, token)`.
+    pub(super) fn webhook_tokens(&self) -> Vec<(String, String)> {
         lock(&self.inner.data)
             .subs
-            .values()
-            .filter_map(|s| s.webhook.as_ref().map(|w| w.token.clone()))
+            .iter()
+            .filter_map(|(k, s)| s.webhook.as_ref().map(|w| (k.clone(), w.token.clone())))
             .collect()
     }
 

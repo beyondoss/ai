@@ -269,3 +269,60 @@ fn a_run_stopped_mid_turn_still_sweeps_its_stdio_servers() {
         "the server was not given its grace window to exit on its own"
     );
 }
+
+/// A configuration error `run` only finds after its MCP servers are up (here an unreadable
+/// `--output-schema`) exits through the same cleanup: no grandchild is left behind.
+#[test]
+fn a_run_refused_for_bad_configuration_after_connecting_still_sweeps() {
+    let home = tempfile::tempdir().unwrap();
+    let pidfile = home.path().join("orphan.pid");
+    write_settings(
+        home.path(),
+        json!([stdio_server(
+            "tools",
+            &home.path().join("control"),
+            json!({ "MCP_FIXTURE_ORPHAN_PIDFILE": pidfile.to_string_lossy() }),
+            json!([])
+        )]),
+    );
+    let (base, _bodies) = spawn_model_server_routed(vec![], turn_text("all done"));
+    let mut child = common::run_cmd(BIN)
+        .args([
+            "run",
+            "say hi",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--no-session-persistence",
+            "--output-schema",
+            "{ this is not json",
+        ])
+        .env("HOME", home.path())
+        .env("BEYOND_AI_AGENT_MCP_IDLE_SECS", "0")
+        .current_dir(home.path())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::fs::File::create(home.path().join("run.stdout")).unwrap())
+        .stderr(std::fs::File::create(home.path().join("run.stderr")).unwrap())
+        .spawn_guarded();
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(std::time::Instant::now() < deadline, "`run` did not exit");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(status.code(), Some(2), "refused as a usage error");
+    let orphan: u32 = std::fs::read_to_string(&pidfile)
+        .expect("the server was up before the refusal")
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(
+        !alive(orphan),
+        "`run` refused its configuration and left its stdio server's grandchild {orphan} running"
+    );
+}

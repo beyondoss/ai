@@ -143,7 +143,7 @@ fn an_event_during_a_manual_compact_is_queued_and_reaches_the_model_after_it() {
     assert!(!reqs.is_empty(), "the model saw the event");
     for r in &reqs {
         assert_eq!(
-            r.matches("[MCP events]").count(),
+            r.matches("[MCP events · batch ").count(),
             1,
             "injected exactly once"
         );
