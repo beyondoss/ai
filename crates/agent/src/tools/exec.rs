@@ -617,9 +617,9 @@ pub(crate) fn kill_group_members(pgid: u32) {
 fn kill_group(pgid: u32, pid_fallback: bool) {
     let group_result = std::process::Command::new("kill")
         .arg("-KILL")
-        // `--` first: procps-ng `kill` reads a bare `-<number>` after the signal as another option,
-        // not a process group, and exits 0 having signalled nothing — so without it this group kill
-        // was a silent no-op (the `ps` sweep below did all the work) and its status meaningless.
+        // `--` first, so the exit status means what the code below assumes. Without it procps-ng
+        // `kill` still signals a live group, but exits 1 doing so (and 0 for a group that is already
+        // gone) — inverted, so the kill-by-pid fallback below ran after every successful group kill.
         .arg("--")
         .arg(format!("-{pgid}"))
         // `kill` prints "No such process" on a group that already exited, which is the *expected*

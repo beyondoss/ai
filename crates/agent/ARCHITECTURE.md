@@ -4103,8 +4103,9 @@ mcp_events_subscribe (any session) ──► owned by that session
   `exec::wait_for_pending_group_kills`, bounded by the grace plus 2 s (`tests/mcp_stdio_transport.rs`:
   `serve` on EOF and SIGTERM, `run` finishing and `run` cancelled mid-turn). A hard-killed agent
   still sweeps nothing — fixing that needs a supervisor. (The group kill now passes `--` before the
-  group id: procps-ng `kill` read a bare `-<pgid>` as an option and signalled nothing, so the `ps`
-  sweep had been doing all the work.) Its stdout
+  group id. Without it procps-ng `kill` still killed a live group but exited 1 doing so — and 0 for
+  a group already gone — so `kill_process_group`'s by-pid fallback ran after every successful group
+  kill, which is the pid-reuse hazard.) Its stdout
   pump rewrites exactly the lossy responses (`mcp_stdio::rescue`); a cheap byte test means an
   ordinary tool result is never even parsed. `rescue`/`unwrap_rescued` are the whole workaround, one
   boundary to swap when PR #131's `tools/mcp_wire.rs` workaround is unified with it. Stateless
