@@ -602,8 +602,25 @@ impl Capture {
 /// needs it: the process that was killed is not necessarily the process holding the memory.
 #[cfg(unix)]
 pub(crate) fn kill_process_group(pgid: u32) {
+    kill_group(pgid, true);
+}
+
+/// [`kill_process_group`] without its kill-by-pid fallback: only processes that are *in* group
+/// `pgid` are signalled. For a caller whose group leader has already been reaped — its pid is free
+/// to be reused by an unrelated process, which a fallback `kill -KILL <pid>` would then hit.
+#[cfg(unix)]
+pub(crate) fn kill_group_members(pgid: u32) {
+    kill_group(pgid, false);
+}
+
+#[cfg(unix)]
+fn kill_group(pgid: u32, pid_fallback: bool) {
     let group_result = std::process::Command::new("kill")
         .arg("-KILL")
+        // `--` first: procps-ng `kill` reads a bare `-<number>` after the signal as another option,
+        // not a process group, and exits 0 having signalled nothing — so without it this group kill
+        // was a silent no-op (the `ps` sweep below did all the work) and its status meaningless.
+        .arg("--")
         .arg(format!("-{pgid}"))
         // `kill` prints "No such process" on a group that already exited, which is the *expected*
         // case here — and since an MCP connection sweeps its group on every drop, inheriting that
@@ -615,7 +632,7 @@ pub(crate) fn kill_process_group(pgid: u32) {
     // exited on its own between the timeout firing and this running) isn't worth logging on its own —
     // the group kill covers the overwhelmingly common case, so try the direct fallback next regardless
     // of *why* it didn't succeed; a no-op fallback against an already-gone process is harmless.
-    if !matches!(&group_result, Ok(status) if status.success()) {
+    if pid_fallback && !matches!(&group_result, Ok(status) if status.success()) {
         match std::process::Command::new("kill")
             .arg("-KILL")
             .arg(pgid.to_string())

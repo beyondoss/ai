@@ -90,9 +90,50 @@ fn routes() -> std::sync::MutexGuard<'static, HashMap<String, Arc<Route>>> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Whether `token` names a live subscription — the listener's cheap check before it reads a body.
+/// Callback tokens persisted by an earlier run of this process whose subscription has not
+/// re-registered its route yet, each until when it is held. A delivery the server retried across
+/// the restart then gets `503` (retry) rather than `410` (which the draft treats as "stop").
+static RESERVED: LazyLock<Mutex<HashMap<String, std::time::Instant>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// How long a persisted token is held for its subscription to come back.
+const RESERVE_FOR: Duration = Duration::from_secs(600);
+
+fn reserved() -> std::sync::MutexGuard<'static, HashMap<String, std::time::Instant>> {
+    RESERVED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Hold a persisted callback token until its subscription re-registers (see [`RESERVED`]).
+pub(super) fn reserve(token: &str) {
+    if routes().contains_key(token) {
+        return;
+    }
+    reserved().insert(token.to_owned(), std::time::Instant::now() + RESERVE_FOR);
+}
+
+/// Stop holding a token: its route is live, or its subscription was explicitly removed.
+pub(super) fn unreserve(token: &str) {
+    reserved().remove(token);
+}
+
+fn is_reserved(token: &str) -> bool {
+    let mut r = reserved();
+    match r.get(token) {
+        Some(until) if *until > std::time::Instant::now() => true,
+        Some(_) => {
+            r.remove(token);
+            false
+        }
+        None => false,
+    }
+}
+
+/// Whether `token` names a live subscription, or one expected back after a restart — the
+/// listener's cheap check before it reads a body.
 pub fn route_exists(token: &str) -> bool {
-    routes().contains_key(token)
+    routes().contains_key(token) || is_reserved(token)
 }
 
 /// CSPRNG bytes. A failure is an error, never a fallback to something predictable.
@@ -255,6 +296,13 @@ pub async fn receive_webhook(
     body: &[u8],
 ) -> WebhookReply {
     let Some(route) = routes().get(token).cloned() else {
+        if is_reserved(token) {
+            return WebhookReply::error(
+                503,
+                "Service Unavailable",
+                "subscription resuming after a restart; retry",
+            );
+        }
         return WebhookReply::error(410, "Gone", "no such subscription");
     };
     let header = |name: &str| {
@@ -456,7 +504,7 @@ pub(super) async fn run_webhook(
         .store
         .sub(&key)
         .and_then(|s| s.webhook)
-        .filter(|w| !route_exists(&w.token))
+        .filter(|w| !routes().contains_key(&w.token))
         .and_then(|w| {
             Some((
                 w.token.clone(),
@@ -488,6 +536,7 @@ pub(super) async fn run_webhook(
         tx,
     });
     routes().insert(token.clone(), route.clone());
+    unreserve(&token);
     let _guard = RouteGuard(token.clone(), route.clone());
 
     let ttl_ms = webhook_ttl().as_millis() as u64;

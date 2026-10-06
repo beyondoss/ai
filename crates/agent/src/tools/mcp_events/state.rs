@@ -268,6 +268,15 @@ impl StateStore {
         self.dirty();
     }
 
+    /// Every persisted webhook callback token.
+    pub(super) fn webhook_tokens(&self) -> Vec<String> {
+        lock(&self.inner.data)
+            .subs
+            .values()
+            .filter_map(|s| s.webhook.as_ref().map(|w| w.token.clone()))
+            .collect()
+    }
+
     /// An explicit unsubscribe forgets the position; a session ending keeps it, to resume from.
     pub(super) fn forget_sub(&self, key: &str) {
         {
@@ -499,7 +508,17 @@ fn load(path: &Path) -> Loaded {
         .ok()
         .and_then(|b| serde_json::from_slice::<Snapshot>(&b).ok())
         .unwrap_or_default();
-    let log = std::fs::read(log_path(path)).unwrap_or_default();
+    let mut log = std::fs::read(log_path(path)).unwrap_or_default();
+    // A torn tail — a crash mid-append — is cut off on disk before anything is appended again:
+    // left in place, the next record would be written onto the end of the fragment, and the two
+    // would be one unparseable line, losing an event that was acknowledged.
+    let complete = log.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+    if complete < log.len() {
+        match truncate_durably(&log_path(path), complete as u64) {
+            Ok(()) => log.truncate(complete),
+            Err(e) => tracing::warn!(error = %e, "could not cut a torn MCP Events log tail"),
+        }
+    }
     let mut live: BTreeMap<u64, PendingEvent> = BTreeMap::new();
     for line in log.split(|&b| b == b'\n') {
         if line.is_empty() {
@@ -617,7 +636,9 @@ async fn flush(data: &Arc<Mutex<Data>>) -> Result<(), String> {
     enum LogWrite {
         None,
         Append(Vec<u8>),
-        Rewrite(Vec<u8>),
+        /// The whole live log, and the unwritten records it makes redundant — kept to be put back
+        /// if the rewrite fails, so they still reach the disk by the next write, compacted or not.
+        Rewrite(Vec<u8>, Vec<u8>),
     }
     let (path, log_write, snapshot) = {
         let mut d = lock(data);
@@ -629,12 +650,12 @@ async fn flush(data: &Arc<Mutex<Data>>) -> Result<(), String> {
         let compact = d.log_len + d.unwritten.len() as u64 > COMPACT_MIN_BYTES
             && d.log_len + d.unwritten.len() as u64 > 2 * d.pending_bytes;
         let log_write = if compact {
-            d.unwritten.clear();
+            let displaced = std::mem::take(&mut d.unwritten);
             let mut all = Vec::with_capacity(d.pending_bytes as usize);
             for e in &d.pending {
                 all.extend_from_slice(&log_line(&LogOp::Add(e.clone())));
             }
-            LogWrite::Rewrite(all)
+            LogWrite::Rewrite(all, displaced)
         } else if d.unwritten.is_empty() {
             LogWrite::None
         } else {
@@ -661,7 +682,7 @@ async fn flush(data: &Arc<Mutex<Data>>) -> Result<(), String> {
             LogWrite::Append(bytes) => {
                 append_durably(&log, bytes).map(|()| Some((false, bytes.len() as u64)))
             }
-            LogWrite::Rewrite(bytes) => {
+            LogWrite::Rewrite(bytes, _) => {
                 write_atomic(&log, bytes).map(|()| Some((true, bytes.len() as u64)))
             }
         };
@@ -687,9 +708,9 @@ async fn flush(data: &Arc<Mutex<Data>>) -> Result<(), String> {
     if d.path.as_deref() != Some(path.as_path()) {
         return result;
     }
-    // A failed append goes back in front of whatever was added meanwhile. A failed compaction loses
-    // nothing: the live events are still in memory, and the next flush compacts again.
-    if let Some(LogWrite::Append(mut bytes)) = put_back {
+    // A failed append, or a failed compaction's displaced records, go back in front of whatever was
+    // added meanwhile: the next write retries them, whether it compacts or appends.
+    if let Some(LogWrite::Append(mut bytes) | LogWrite::Rewrite(_, mut bytes)) = put_back {
         bytes.extend_from_slice(&d.unwritten);
         d.unwritten = bytes;
     }
@@ -802,6 +823,13 @@ fn sync_dir(path: &Path) -> std::io::Result<()> {
         std::fs::File::open(dir)?.sync_all()?;
     }
     Ok(())
+}
+
+/// Cut a file back to `len` bytes, durably.
+fn truncate_durably(path: &Path, len: u64) -> std::io::Result<()> {
+    let f = std::fs::OpenOptions::new().write(true).open(path)?;
+    f.set_len(len)?;
+    f.sync_all()
 }
 
 /// Append `bytes` and `fdatasync` them (and the directory, the first time the file appears).
@@ -1112,6 +1140,112 @@ mod tests {
             ids,
             ["e1", "e100"],
             "neither side's undelivered events lost"
+        );
+    }
+
+    /// A crash mid-append leaves half a record at the end of the log. The next acknowledged event
+    /// must not be glued onto it (and lost on every later replay): the torn tail is cut off first.
+    #[tokio::test]
+    async fn a_torn_log_tail_does_not_swallow_the_next_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.mcp-events.json");
+        {
+            let s = store(&path, 10);
+            s.loaded().await;
+            assert!(s.push_pending(event(1)));
+            s.commit().await.unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // The crash: half of a second record.
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(log_path(&path))
+                .unwrap();
+            f.write_all(br#"{"add":{"seq":2,"action":"follow_up","ser"#)
+                .unwrap();
+        }
+        {
+            let s = store(&path, 10);
+            s.loaded().await;
+            assert_eq!(s.pending_len(), 1, "the torn record is not an event");
+            let mut after = event(0);
+            after.event = serde_json::json!({ "eventId": "after-crash" });
+            assert!(s.push_pending(after));
+            s.commit().await.unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let again = store(&path, 10);
+        again.loaded().await;
+        let ids: Vec<String> = again
+            .ready_pending()
+            .iter()
+            .map(|e| e.event["eventId"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            ids,
+            ["e1", "after-crash"],
+            "the event after the crash survives"
+        );
+    }
+
+    /// A compaction that fails puts back the records it would have made redundant: if the next
+    /// write appends instead of compacting, they still reach the disk.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_compaction_loses_no_records() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir(&sessions).unwrap();
+        let path = sessions.join("s.mcp-events.json");
+        let s = store(&path, 10_000);
+        s.loaded().await;
+        // ~2 MB of log, all but one event delivered: the next write wants to compact.
+        for i in 0..30 {
+            assert!(s.push_pending(event_sized(i, 64 * 1024)));
+        }
+        s.commit().await.unwrap();
+        let seqs: Vec<u64> = s.ready_pending().iter().map(|e| e.seq).collect();
+        s.assign_batch(&seqs[..29], 1);
+        assert!(s.delivered(1));
+        let mut x = event(0);
+        x.event = serde_json::json!({ "eventId": "x" });
+        assert!(s.push_pending(x));
+        // The compaction's temp file cannot be created; appends to the existing log still work.
+        std::fs::set_permissions(&sessions, std::fs::Permissions::from_mode(0o500)).unwrap();
+        if std::fs::write(sessions.join("probe"), b"").is_ok() {
+            // Running as root: permissions do not bind, the failure cannot be staged.
+            std::fs::set_permissions(&sessions, std::fs::Permissions::from_mode(0o700)).unwrap();
+            return;
+        }
+        let failed = s.commit().await;
+        std::fs::set_permissions(&sessions, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(failed.is_err(), "the compaction failed");
+        // Now enough live data that the next write appends rather than compacts.
+        for i in 100..140 {
+            assert!(s.push_pending(event_sized(i, 64 * 1024)));
+        }
+        s.commit().await.unwrap();
+        drop(s);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let again = store(&path, 10_000);
+        again.loaded().await;
+        let ids: Vec<String> = again
+            .ready_pending()
+            .iter()
+            .map(|e| e.event["eventId"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            ids.len(),
+            42,
+            "1 + x + 40, and the 29 delivered stay delivered: {}",
+            ids.len()
+        );
+        assert!(
+            ids.contains(&"x".to_owned()),
+            "the event pushed before the failure is on disk"
         );
     }
 }

@@ -10,93 +10,111 @@
 //! - the child is spawned by the caller's `Command` (its process group, env, args) with piped
 //!   stdin/stdout and inherited stderr;
 //! - a line that is not UTF-8 is skipped, not fatal (rmcp's codec skipped it too);
-//! - when rmcp drops the transport, the server's stdin closes (the MCP shutdown signal) and it gets
-//!   [`SHUTDOWN_GRACE`] to exit on its own before it is killed; [`retire`] then sweeps its process
-//!   group, so anything it double-forked goes with it — on a reap, a registry rebuild, and process
-//!   exit alike (`serve` calls [`settle`] and waits for the sweeps before it exits).
+//! - when the transport or the connection goes away, the server's stdin closes (the MCP shutdown
+//!   signal) and it gets [`SHUTDOWN_GRACE`] to exit on its own; then whatever is left of its process
+//!   group is killed, so anything it double-forked goes with it ([`retire`]) — on a reap, a registry
+//!   rebuild, and process exit alike (every exit path of `run` and `serve` calls [`retire_all`] and
+//!   waits for the sweeps).
 //!
 //! **One boundary.** [`rescue`] / [`unwrap_rescued`] are the whole workaround. PR #131 (Skills) carries
 //! its own rmcp `_meta` workaround in `tools/mcp_wire.rs`; unifying the two is meant to be a swap of
 //! these two functions, nothing else.
 
 use serde_json::{Value, json};
-use tokio::sync::oneshot;
 
 /// How long a stdio server gets to exit after its stdin closes before it is killed.
 pub const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
 
-/// Stdout pumps still running — servers whose shutdown has not finished. [`settle`] waits on it.
-static LIVE_PUMPS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-static PUMPS_CHANGED: tokio::sync::Notify = tokio::sync::Notify::const_new();
+/// A spawned stdio server. The child and its stdin are shared — not owned by a task — so that a
+/// synchronous caller (a `Drop`, a thread on the way out of the process) can close stdin and poll
+/// for the exit itself, with no runtime needing to run anything.
+pub struct ServerProcess {
+    pgid: Option<u32>,
+    child: std::sync::Mutex<tokio::process::Child>,
+    stdin: std::sync::Mutex<Option<tokio::process::ChildStdin>>,
+    retired: std::sync::atomic::AtomicBool,
+}
 
-/// One running pump, counted in [`LIVE_PUMPS`] for exactly as long as it lives.
-struct LivePump;
+/// Every stdio server spawned and not yet dropped, for [`retire_all`].
+static LIVE: std::sync::Mutex<Vec<std::sync::Weak<ServerProcess>>> =
+    std::sync::Mutex::new(Vec::new());
 
-impl LivePump {
-    fn new() -> Self {
-        LIVE_PUMPS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        LivePump
+fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+impl ServerProcess {
+    /// Its process-group id (its pid: it leads its group).
+    pub(crate) fn pgid(&self) -> Option<u32> {
+        self.pgid
+    }
+
+    /// Whether the server has exited — a non-blocking wait on the child this process owns, so it
+    /// is portable and can never be answered by a recycled pid. Reaps it when it has.
+    fn exited(&self) -> bool {
+        !matches!(lock(&self.child).try_wait(), Ok(None))
     }
 }
 
-impl Drop for LivePump {
-    fn drop(&mut self) {
-        LIVE_PUMPS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-        PUMPS_CHANGED.notify_waiters();
-    }
-}
-
-/// Wait (up to `timeout`) for every stdio server whose connection was dropped to finish shutting
-/// down: stdin closed, its [`SHUTDOWN_GRACE`] given, exited or killed. Called on the way out of the
-/// process, before `std::process::exit`, so the grace is real: on a current-thread runtime nothing
-/// else would poll rmcp's tasks (which close stdin) or the pumps once the caller blocks.
-pub async fn settle(timeout: std::time::Duration) {
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        let changed = PUMPS_CHANGED.notified();
-        if LIVE_PUMPS.load(std::sync::atomic::Ordering::Acquire) == 0 {
-            return;
-        }
-        if tokio::time::timeout_at(deadline, changed).await.is_err() {
-            return;
-        }
-    }
-}
-
-/// Sweep a dropped stdio server's process group — anything it double-forked away (a browser, say)
-/// went to init and survives a kill aimed at the server alone.
+/// End a stdio server: close its stdin now (its cue to exit), give it [`SHUTDOWN_GRACE`] to do so,
+/// kill it if it has not, and kill whatever else is left in its process group — a grandchild it
+/// double-forked away (a browser, say) went to init and survives a kill aimed at the server alone.
+/// Idempotent.
 ///
-/// The sweep waits first, up to [`SHUTDOWN_GRACE`] (plus a beat), for the server itself to exit:
-/// dropping its connection closed its stdin, which is its cue, and a well-behaved server closes its
-/// browser on the way out. Whatever is left is then killed, leader included — so this is complete
-/// even when the pump that would have killed the leader never runs again (process exit).
-///
-/// On a tracked OS thread ([`crate::tools::exec::spawn_tracked_cleanup`]), never a task: it is
-/// called from `Drop`, and `std::process::exit` waits for it via
-/// [`crate::tools::exec::wait_for_pending_group_kills`].
-pub(crate) fn retire(pgid: Option<u32>) {
+/// The waiting and killing run on a tracked OS thread
+/// ([`crate::tools::exec::spawn_tracked_cleanup`]), never a task: this is called from `Drop`, and
+/// on the way out of the process, where no task may run again;
+/// [`crate::tools::exec::wait_for_pending_group_kills`] waits for it.
+pub(crate) fn retire(server: &std::sync::Arc<ServerProcess>) {
+    if server
+        .retired
+        .swap(true, std::sync::atomic::Ordering::AcqRel)
+    {
+        return;
+    }
+    drop(lock(&server.stdin).take());
     #[cfg(unix)]
-    if let Some(pgid) = pgid {
+    {
+        let server = server.clone();
         crate::tools::exec::spawn_tracked_cleanup(move || {
-            let deadline =
-                std::time::Instant::now() + SHUTDOWN_GRACE + std::time::Duration::from_millis(500);
-            while leader_running(pgid) && std::time::Instant::now() < deadline {
+            let deadline = std::time::Instant::now() + SHUTDOWN_GRACE;
+            let mut reaped = server.exited();
+            while !reaped && std::time::Instant::now() < deadline {
                 std::thread::sleep(std::time::Duration::from_millis(25));
+                reaped = server.exited();
             }
-            crate::tools::exec::kill_process_group(pgid);
+            if !reaped {
+                // Not reaped, so the pid is still this server's: killing it by pid is safe.
+                let _ = lock(&server.child).start_kill();
+            }
+            if let Some(pgid) = server.pgid {
+                // The rest of the group — by group only: once the leader is reaped its pid may be
+                // reused, so there is no kill-by-pid fallback here.
+                crate::tools::exec::kill_group_members(pgid);
+            }
+            if !reaped {
+                for _ in 0..40 {
+                    if server.exited() {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+            }
         });
     }
 }
 
-/// Whether the group's leader (the server; its pid is the group id) is still running. A zombie —
-/// exited, not yet reaped — is not.
-fn leader_running(pid: u32) -> bool {
-    std::fs::read(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
-        stat.iter()
-            .rposition(|&b| b == b')')
-            .and_then(|i| stat.get(i + 2))
-            .is_some_and(|&state| state != b'Z' && state != b'X')
-    })
+/// Retire every stdio server still running — for the way out of the process, where a connection
+/// some owner still holds would otherwise never be dropped. Follow it with
+/// [`crate::tools::exec::wait_for_pending_group_kills`].
+pub fn retire_all() {
+    let live: Vec<_> = lock(&LIVE)
+        .iter()
+        .filter_map(std::sync::Weak::upgrade)
+        .collect();
+    for server in &live {
+        retire(server);
+    }
 }
 
 /// The key a rescued result is wrapped under on its way through rmcp; see [`rescue`].
@@ -164,48 +182,68 @@ pub(crate) fn rescue(line: &[u8]) -> Option<Vec<u8>> {
     Some(msg.to_string().into_bytes())
 }
 
-/// Closes over the server's stdin. When rmcp drops its transport, dropping this closes stdin (the
-/// server's cue to exit) and tells the pump to start the grace window.
+/// The transport's write half: writes go to the server's stdin while it is open. Dropping it (rmcp
+/// dropped the transport) retires the server.
 struct StdinGuard {
-    stdin: tokio::process::ChildStdin,
-    _closed: oneshot::Sender<()>,
+    server: std::sync::Arc<ServerProcess>,
+}
+
+impl Drop for StdinGuard {
+    fn drop(&mut self) {
+        retire(&self.server);
+    }
+}
+
+fn closed() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::BrokenPipe,
+        "the server's stdin is closed",
+    )
 }
 
 impl tokio::io::AsyncWrite for StdinGuard {
     fn poll_write(
-        mut self: std::pin::Pin<&mut Self>,
+        self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
-        std::pin::Pin::new(&mut self.stdin).poll_write(cx, buf)
+        match lock(&self.server.stdin).as_mut() {
+            Some(stdin) => std::pin::Pin::new(stdin).poll_write(cx, buf),
+            None => std::task::Poll::Ready(Err(closed())),
+        }
     }
 
     fn poll_flush(
-        mut self: std::pin::Pin<&mut Self>,
+        self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.stdin).poll_flush(cx)
+        match lock(&self.server.stdin).as_mut() {
+            Some(stdin) => std::pin::Pin::new(stdin).poll_flush(cx),
+            None => std::task::Poll::Ready(Ok(())),
+        }
     }
 
     fn poll_shutdown(
-        mut self: std::pin::Pin<&mut Self>,
+        self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.stdin).poll_shutdown(cx)
+        match lock(&self.server.stdin).as_mut() {
+            Some(stdin) => std::pin::Pin::new(stdin).poll_shutdown(cx),
+            None => std::task::Poll::Ready(Ok(())),
+        }
     }
 }
 
-/// Spawn a stdio MCP server; return its pid (its process-group id, since it leads one) and an rmcp
-/// transport whose inbound lines pass through [`rescue`].
+/// Spawn a stdio MCP server; return it and an rmcp transport whose inbound lines pass through
+/// [`rescue`].
 ///
-/// One small task per server pumps its stdout into an in-memory pipe rmcp reads. It owns the child:
-/// when rmcp drops the transport (stdin closes) or the server closes stdout, it waits up to
-/// [`SHUTDOWN_GRACE`] for a clean exit and kills the server if it is still there. The process-group
-/// sweep is [`retire`]'s, called by whoever drops the connection.
+/// One small task per server pumps its stdout into an in-memory pipe rmcp reads; it ends when the
+/// server closes stdout or rmcp stops reading. Ending the server is [`retire`]'s, called when the
+/// transport is dropped and when the connection is.
 pub(crate) fn stdio_transport(
     mut cmd: tokio::process::Command,
 ) -> std::io::Result<(
-    Option<u32>,
+    std::sync::Arc<ServerProcess>,
     (tokio::io::DuplexStream, impl tokio::io::AsyncWrite),
 )> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
@@ -214,7 +252,7 @@ pub(crate) fn stdio_transport(
         .stderr(std::process::Stdio::inherit())
         .kill_on_drop(true);
     let mut child = cmd.spawn()?;
-    let pid = child.id();
+    let pgid = child.id();
     let stdout = child
         .stdout
         .take()
@@ -223,70 +261,44 @@ pub(crate) fn stdio_transport(
         .stdin
         .take()
         .ok_or_else(|| std::io::Error::other("no stdin"))?;
-    let (closed_tx, mut closed_rx) = oneshot::channel::<()>();
+    let server = std::sync::Arc::new(ServerProcess {
+        pgid,
+        child: std::sync::Mutex::new(child),
+        stdin: std::sync::Mutex::new(Some(stdin)),
+        retired: std::sync::atomic::AtomicBool::new(false),
+    });
+    {
+        let mut live = lock(&LIVE);
+        live.retain(|w| w.strong_count() > 0);
+        live.push(std::sync::Arc::downgrade(&server));
+    }
     let (rmcp_side, mut pump_side) = tokio::io::duplex(64 * 1024);
-    let live = LivePump::new();
     tokio::spawn(async move {
-        let mut child = child;
         let mut reader = tokio::io::BufReader::new(stdout);
         let mut line = Vec::new();
         loop {
             line.clear();
-            tokio::select! {
-                _ = &mut closed_rx => break,
-                n = reader.read_until(b'\n', &mut line) => match n {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => {
-                        if std::str::from_utf8(&line).is_err() {
-                            tracing::debug!("skipping a non-UTF-8 line from an MCP server's stdout");
-                            continue;
-                        }
-                        let body = line.strip_suffix(b"\n").unwrap_or(&line);
-                        let body = body.strip_suffix(b"\r").unwrap_or(body);
-                        let written = match rescue(body) {
-                            Some(rewritten) => {
-                                let mut out = rewritten;
-                                out.push(b'\n');
-                                pump_side.write_all(&out).await
-                            }
-                            None => {
-                                let mut out = body.to_vec();
-                                out.push(b'\n');
-                                pump_side.write_all(&out).await
-                            }
-                        };
-                        if written.is_err() {
-                            break;
-                        }
-                    }
-                },
+            match reader.read_until(b'\n', &mut line).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            if std::str::from_utf8(&line).is_err() {
+                tracing::debug!("skipping a non-UTF-8 line from an MCP server's stdout");
+                continue;
+            }
+            let body = line.strip_suffix(b"\n").unwrap_or(&line);
+            let body = body.strip_suffix(b"\r").unwrap_or(body);
+            let mut out = rescue(body).unwrap_or_else(|| body.to_vec());
+            out.push(b'\n');
+            if pump_side.write_all(&out).await.is_err() {
+                break;
             }
         }
-        // The grace window: stdin is closed (rmcp dropped the transport) or the server closed its
-        // own stdout. Either way, give it the time a well-behaved server needs to clean up.
-        drop(pump_side);
-        if tokio::time::timeout(SHUTDOWN_GRACE, child.wait())
-            .await
-            .is_err()
-        {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
-        }
-        // The group sweep is not done here: it belongs to whoever dropped the connection
-        // ([`retire`]), which runs on a tracked OS thread and so also happens on process exit,
-        // when this task may never be polled again.
-        drop(live);
     });
-    Ok((
-        pid,
-        (
-            rmcp_side,
-            StdinGuard {
-                stdin,
-                _closed: closed_tx,
-            },
-        ),
-    ))
+    let guard = StdinGuard {
+        server: server.clone(),
+    };
+    Ok((server, (rmcp_side, guard)))
 }
 
 #[cfg(test)]
@@ -343,5 +355,63 @@ mod tests {
         }})
         .to_string();
         assert!(needs_check(events.as_bytes()));
+    }
+
+    /// The sweep after a server's leader is reaped signals its group only. A process that is not
+    /// a group leader stands in for an unrelated one handed the reaped server's pid: the sweep must
+    /// leave it alone (no kill-by-pid fallback).
+    #[cfg(unix)]
+    #[test]
+    fn the_sweep_after_a_reap_never_kills_by_pid() {
+        let mut bystander = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = bystander.id();
+        crate::tools::exec::kill_group_members(pid);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let survived = bystander.try_wait().unwrap().is_none();
+        // The hazard is real: with the fallback, the same call kills it.
+        crate::tools::exec::kill_process_group(pid);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut killed = false;
+        while std::time::Instant::now() < deadline {
+            if bystander.try_wait().unwrap().is_some() {
+                killed = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let _ = bystander.kill();
+        let _ = bystander.wait();
+        assert!(
+            survived,
+            "a process merely holding the pid survives the group sweep"
+        );
+        assert!(
+            killed,
+            "the kill-by-pid fallback this sweep avoids would have killed it"
+        );
+    }
+
+    /// A server that ignores stdin closing is killed once its grace is up — and only then: the
+    /// grace is measured on the child itself (a non-blocking wait), not by reading `/proc`, so it
+    /// holds on every unix.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retire_gives_the_grace_then_kills_a_server_that_ignores_stdin() {
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.args(["-c", "trap '' TERM; exec sleep 60"])
+            .process_group(0);
+        let (server, transport) = stdio_transport(cmd).unwrap();
+        let started = std::time::Instant::now();
+        retire(&server);
+        drop(transport);
+        // Still running well inside the grace.
+        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+        assert!(!server.exited(), "killed before its grace was up");
+        crate::tools::exec::wait_for_pending_group_kills(SHUTDOWN_GRACE * 2);
+        assert!(server.exited(), "killed once the grace was up");
+        assert!(started.elapsed() >= SHUTDOWN_GRACE);
     }
 }

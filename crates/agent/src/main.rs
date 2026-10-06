@@ -1648,7 +1648,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // can run first, before any worker exists. The flavour depends on whether this process is a
     // fleet replica — see [`build_runtime`] — which has to be decided from the raw arguments,
     // because the runtime must exist before anything can parse them properly.
-    build_runtime(is_service_mode())?.block_on(run())
+    let result = build_runtime(is_service_mode())?.block_on(run());
+    // The ordinary way out (`run` finishing, every subcommand that returns): the same cleanup as
+    // `exit_process`, before the process goes.
+    finish_process_cleanup();
+    result
+}
+
+/// What every way out of the process does first: retire every stdio MCP server still running
+/// (close its stdin, give it its grace, sweep its process group — `mcp_stdio::retire_all`), and
+/// wait for those sweeps and for any `bash` group kill still in flight. `process::exit` — and a
+/// return from `main` — would otherwise end those threads mid-kill, orphaning exactly the
+/// grandchildren they exist to reap. Bounded: a server's grace plus a margin for the sweep.
+fn finish_process_cleanup() {
+    tools::mcp_stdio::retire_all();
+    #[cfg(unix)]
+    tools::exec::wait_for_pending_group_kills(
+        tools::mcp_stdio::SHUTDOWN_GRACE + std::time::Duration::from_secs(2),
+    );
+}
+
+/// `std::process::exit` after [`finish_process_cleanup`]. Every exit of `run` and `serve` that
+/// happens after their tools exist goes through here.
+fn exit_process(code: i32) -> ! {
+    finish_process_cleanup();
+    std::process::exit(code)
 }
 
 /// Is this process a `serve --service` replica?
@@ -2588,19 +2612,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             // the backgrounded grandchildren the guard exists to reap. Bounded, so a wedged `kill`/`ps`
             // shell-out can't hold the daemon's own shutdown open.
             //
-            // Stdio MCP servers are in the same position: their connections were dropped with the
-            // sessions, which closed their stdin. `settle` lets their shutdown actually run (their
-            // grace window, then a kill) — nothing polls those tasks once this thread blocks below
-            // — and the group sweeps (`mcp_stdio::retire`) are among the pending kills waited on.
-            tools::mcp_stdio::settle(
-                tools::mcp_stdio::SHUTDOWN_GRACE + std::time::Duration::from_secs(1),
-            )
-            .await;
-            #[cfg(unix)]
-            tools::exec::wait_for_pending_group_kills(
-                tools::mcp_stdio::SHUTDOWN_GRACE + std::time::Duration::from_secs(2),
-            );
-            std::process::exit(shutdown_cause.map(serve::Signal::exit_code).unwrap_or(0));
+            // Stdio MCP servers are in the same position — see `exit_process`.
+            exit_process(shutdown_cause.map(serve::Signal::exit_code).unwrap_or(0));
         }
         Command::Tools => {
             let mut reg = tools::default_registry();
@@ -3472,9 +3485,7 @@ fn unwrap_turn_result(
             // won't wait for on its own, so an in-flight timed-out/backgrounded grandchild would be
             // silently orphaned without this. Bounded, not indefinite: a hung `kill`/`ps` shell-out
             // must not hang the whole process's own shutdown.
-            #[cfg(unix)]
-            tools::exec::wait_for_pending_group_kills(std::time::Duration::from_secs(2));
-            std::process::exit(code);
+            exit_process(code);
         }
         Err(e) => Err(e.into()),
     }
@@ -4937,9 +4948,7 @@ async fn run_task(
     persist_run_tail(&store, &session)?;
     if broken_pipe.load(Ordering::Relaxed) {
         emit_cli_lifecycle(life.as_ref(), &session, CliTerminal::Aborted, None).await;
-        #[cfg(unix)]
-        tools::exec::wait_for_pending_group_kills(std::time::Duration::from_secs(2));
-        std::process::exit(0);
+        exit_process(0);
     }
     if let Err(e) = &turn_result {
         emit_cli_lifecycle(
@@ -4976,9 +4985,7 @@ async fn run_task(
         persist_run_tail(&store, &session)?;
         if broken_pipe.load(Ordering::Relaxed) {
             emit_cli_lifecycle(life.as_ref(), &session, CliTerminal::Aborted, None).await;
-            #[cfg(unix)]
-            tools::exec::wait_for_pending_group_kills(std::time::Duration::from_secs(2));
-            std::process::exit(0);
+            exit_process(0);
         }
         if let Err(e) = &turn_result {
             emit_cli_lifecycle(
@@ -5092,7 +5099,7 @@ async fn run_task(
                     "[no structured output: the model ended the run without calling `{}`]",
                     tools::structured_output::NAME
                 );
-                std::process::exit(1);
+                exit_process(1);
             }
         }
     } else {
@@ -5126,7 +5133,7 @@ async fn run_task(
     // checked too, defensively, even though it's currently unreachable here).
     if let Some(message) = text_mode_failure_message(json, stop_reason) {
         eprintln!("{message}");
-        std::process::exit(1);
+        exit_process(1);
     }
     Ok(())
 }

@@ -466,8 +466,8 @@ struct McpTool {
 /// dead weight until someone actually calls it. So the process is reaped after
 /// [`IDLE_REAP_AFTER`] without a call, and re-spawned on the next one.
 ///
-/// Dropping the client is what kills the child: rmcp drops the stdio transport, and the stdout pump in
-/// `mcp_events::stdio_transport` kills and reaps the process. No separate shutdown, no zombie.
+/// Dropping the client is what ends the child: rmcp drops the stdio transport, and
+/// `mcp_stdio::retire` closes its stdin, gives it its grace, then kills and reaps what is left.
 /// A connected server: the client, and the process group to sweep when it goes away.
 ///
 /// The group is kept beside the client rather than on the connection because it belongs to *this*
@@ -476,8 +476,11 @@ struct McpTool {
 struct Live {
     client: Arc<McpClient>,
     /// `None` for HTTP transports: there is no process of ours to reap.
-    pgid: Option<u32>,
+    proc: ServerProc,
 }
+
+/// A stdio server's process, to retire when its connection goes away; `None` for HTTP.
+type ServerProc = Option<Arc<crate::tools::mcp_stdio::ServerProcess>>;
 
 struct McpConnection {
     config: McpServerConfig,
@@ -643,7 +646,7 @@ impl McpConnection {
         config: McpServerConfig,
         dial: Dial,
         client: McpClient,
-        pgid: Option<u32>,
+        proc: ServerProc,
         idle_after: Duration,
     ) -> Self {
         Self {
@@ -651,7 +654,7 @@ impl McpConnection {
             dial,
             client: tokio::sync::Mutex::new(Some(Live {
                 client: Arc::new(client),
-                pgid,
+                proc,
             })),
             last_used: std::sync::atomic::AtomicU64::new(now_secs()),
             idle_after,
@@ -678,11 +681,11 @@ impl McpConnection {
         if let Some(live) = guard.as_ref() {
             return Ok(live.client.clone());
         }
-        let (client, pgid) = connect_one_client(&self.config, &self.dial).await?;
+        let (client, proc) = connect_one_client(&self.config, &self.dial).await?;
         let client = Arc::new(client);
         *guard = Some(Live {
             client: client.clone(),
-            pgid,
+            proc,
         });
         Ok(client)
     }
@@ -705,13 +708,15 @@ impl McpConnection {
         let mut guard = self.client.lock().await;
         match guard.as_ref() {
             Some(live) if Arc::strong_count(&live.client) == 1 => {
-                let pgid = live.pgid;
-                // Drops the client, which closes the server's stdin; the stdio transport gives it
-                // `mcp_stdio::SHUTDOWN_GRACE` to exit and kills it if it hasn't...
+                let proc = live.proc.clone();
+                let pgid = proc.as_ref().and_then(|p| p.pgid());
+                // Drops the client; then the server's stdin closes, it gets
+                // `mcp_stdio::SHUTDOWN_GRACE` to exit, and its group is swept — taking anything it
+                // forked away from itself, which a kill aimed at the server alone leaves running.
                 *guard = None;
-                // ...and this takes anything it forked away from itself, which a kill aimed at the
-                // server alone leaves running.
-                crate::tools::mcp_stdio::retire(pgid);
+                if let Some(proc) = &proc {
+                    crate::tools::mcp_stdio::retire(proc);
+                }
                 tracing::debug!(
                     server = %self.config.name,
                     pgid,
@@ -1215,7 +1220,7 @@ async fn connect_many(
 async fn connect_one_client(
     config: &McpServerConfig,
     dial: &Dial,
-) -> Result<(McpClient, Option<u32>), String> {
+) -> Result<(McpClient, ServerProc), String> {
     match &config.transport {
         McpTransport::Stdio { command, args, .. } => {
             connect_stdio(config, dial, command, args).await
@@ -1341,8 +1346,8 @@ async fn connect_one(
         );
         return Ok(tools_from_manifest(config, dial, manifest, idle_reap_after));
     }
-    let (client, pgid) = connect_one_client(config, dial).await?;
-    tools_from_client(config, dial, client, pgid, idle_reap_after, manifest_dir).await
+    let (client, proc) = connect_one_client(config, dial).await?;
+    tools_from_client(config, dial, client, proc, idle_reap_after, manifest_dir).await
 }
 
 /// Spawns `command` as its own process-group leader (`process_group(0)`), the same way
@@ -1376,7 +1381,7 @@ async fn connect_stdio(
     dial: &Dial,
     command: &str,
     args: &[String],
-) -> Result<(McpClient, Option<u32>), String> {
+) -> Result<(McpClient, ServerProc), String> {
     let env = config.resolved_env();
     let cmd = tokio::process::Command::new(command).configure(|cmd| {
         cmd.args(args);
@@ -1396,22 +1401,25 @@ async fn connect_stdio(
     });
     // Spawned here rather than by rmcp's `TokioChildProcess` — for every stdio server — so its
     // stdout passes through `mcp_stdio::stdio_transport`, which keeps rmcp 3.x from silently dropping
-    // custom results (see `mcp_stdio::rescue`). When rmcp drops the transport the server's stdin
-    // closes, it gets `mcp_stdio::SHUTDOWN_GRACE` to exit, and then it and its group are killed.
-    let (pgid, transport) = crate::tools::mcp_stdio::stdio_transport(cmd)
+    // custom results (see `mcp_stdio::rescue`). When the transport or the connection goes away,
+    // `mcp_stdio::retire` closes the server's stdin, gives it `mcp_stdio::SHUTDOWN_GRACE` to exit,
+    // and then kills what is left of its group.
+    let (proc, transport) = crate::tools::mcp_stdio::stdio_transport(cmd)
         .map_err(|e| format!("failed to spawn `{command}`: {e}"))?;
 
     let client = McpHandler::new(&config.name, dial.host.clone())
         .serve_with_lifecycle(transport, client_lifecycle())
         .await
         .map_err(|e| format!("MCP handshake over stdio failed: {e}"))?;
-    Ok((client, pgid))
+    Ok((client, Some(proc)))
 }
 
 /// The other way a server goes away: the last tool holding the connection is dropped (a `serve`
-/// registry rebuild, a finished `run`, process exit). Dropping the client closes the server's stdin;
-/// [`mcp_stdio::retire`](crate::tools::mcp_stdio::retire) then gives it its grace and sweeps its
-/// group — on a tracked OS thread, so it completes even on process exit, when no task runs again.
+/// registry rebuild, a finished `run`). [`mcp_stdio::retire`](crate::tools::mcp_stdio::retire)
+/// closes the server's stdin at once, gives it its grace and sweeps its group, on a tracked OS
+/// thread. A connection never dropped before the process exits is retired by
+/// `mcp_stdio::retire_all`, which every exit path of `run` and `serve` calls before waiting for the
+/// sweeps.
 ///
 /// What this does *not* cover is the agent being hard-killed: a server in its own group no longer
 /// receives the terminal's signals, and nothing then sweeps it. No worse than before — an orphaned
@@ -1420,9 +1428,11 @@ impl Drop for McpConnection {
     fn drop(&mut self) {
         // `get_mut` rather than a lock: we hold `&mut self`, so no one else can be holding it.
         if let Some(live) = self.client.get_mut().take() {
-            let pgid = live.pgid;
+            let proc = live.proc.clone();
             drop(live);
-            crate::tools::mcp_stdio::retire(pgid);
+            if let Some(proc) = &proc {
+                crate::tools::mcp_stdio::retire(proc);
+            }
         }
     }
 }
@@ -1987,8 +1997,8 @@ async fn tools_from_client(
     config: &McpServerConfig,
     dial: &Dial,
     client: McpClient,
-    // The server's process group, so a reap can take its children too; `None` for HTTP.
-    pgid: Option<u32>,
+    // The server's process, so a reap can take its group too; `None` for HTTP.
+    proc: ServerProc,
     idle_reap_after: Duration,
     manifest_dir: Option<&crate::tools::mcp_manifest::ManifestDir>,
 ) -> Result<(Vec<Arc<dyn Tool>>, McpServerCatalog), String> {
@@ -2019,7 +2029,7 @@ async fn tools_from_client(
         config.clone(),
         dial.clone(),
         client,
-        pgid,
+        proc,
         idle_reap_after,
     ));
     register_for_reaping(&conn, idle_reap_after);

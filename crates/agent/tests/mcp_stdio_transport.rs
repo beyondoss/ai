@@ -142,3 +142,130 @@ fn serve_exiting_on_eof_sweeps_its_stdio_servers_groups_after_their_grace() {
 fn serve_exiting_on_sigterm_sweeps_its_stdio_servers_groups_after_their_grace() {
     exit_sweeps_the_servers_group(true);
 }
+
+/// `agent run` ends the same way: when it exits, each stdio server has had its grace and its
+/// process group is swept — a grandchild it double-forked does not outlive the run.
+#[test]
+fn run_exiting_sweeps_its_stdio_servers_groups_after_their_grace() {
+    let home = tempfile::tempdir().unwrap();
+    let marker = home.path().join("exited-cleanly");
+    let pidfile = home.path().join("orphan.pid");
+    write_settings(
+        home.path(),
+        json!([stdio_server(
+            "tools",
+            &home.path().join("control"),
+            json!({
+                "MCP_FIXTURE_EXIT_MARKER": marker.to_string_lossy(),
+                "MCP_FIXTURE_ORPHAN_PIDFILE": pidfile.to_string_lossy(),
+            }),
+            json!([])
+        )]),
+    );
+    let (base, _bodies) = spawn_model_server_routed(vec![], turn_text("all done"));
+    let mut output = common::run_cmd(BIN)
+        .args([
+            "run",
+            "say hi",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--no-session-persistence",
+        ])
+        .env("HOME", home.path())
+        .env("BEYOND_AI_AGENT_MCP_IDLE_SECS", "0")
+        .current_dir(home.path())
+        // Files, not pipes: a leaked grandchild inherits them, and waiting on a pipe it holds open
+        // would turn the regression this catches into a hang.
+        .stdin(std::process::Stdio::null())
+        .stdout(std::fs::File::create(home.path().join("run.stdout")).unwrap())
+        .stderr(std::fs::File::create(home.path().join("run.stderr")).unwrap())
+        .spawn_guarded();
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = output.try_wait().unwrap() {
+            break status;
+        }
+        assert!(std::time::Instant::now() < deadline, "`run` did not exit");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        status.success(),
+        "{}",
+        std::fs::read_to_string(home.path().join("run.stderr")).unwrap_or_default()
+    );
+    let orphan: u32 = std::fs::read_to_string(&pidfile)
+        .expect("the server started and recorded its grandchild")
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(
+        !alive(orphan),
+        "`run` exited and left its stdio server's grandchild {orphan} running"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&marker).ok().as_deref(),
+        Some("clean exit"),
+        "the server was not given its grace window to exit on its own"
+    );
+}
+
+/// A `run` stopped by SIGTERM mid-turn exits from deep inside the turn, with its tools — and so its
+/// MCP connections — still held: nothing is dropped. Its stdio servers are still retired
+/// (`mcp_stdio::retire_all`) and swept before the process goes.
+#[test]
+fn a_run_stopped_mid_turn_still_sweeps_its_stdio_servers() {
+    let home = tempfile::tempdir().unwrap();
+    let marker = home.path().join("exited-cleanly");
+    let pidfile = home.path().join("orphan.pid");
+    write_settings(
+        home.path(),
+        json!([stdio_server(
+            "tools",
+            &home.path().join("control"),
+            json!({
+                "MCP_FIXTURE_EXIT_MARKER": marker.to_string_lossy(),
+                "MCP_FIXTURE_ORPHAN_PIDFILE": pidfile.to_string_lossy(),
+            }),
+            json!([])
+        )]),
+    );
+    let (base, _bodies) = spawn_model_server_routed(vec![], turn_text("all done"));
+    let mut child = common::run_cmd(BIN)
+        .args([
+            "run",
+            &beyond_ai_test_support::stall_prompt(60_000),
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--no-session-persistence",
+        ])
+        .env("HOME", home.path())
+        .env("BEYOND_AI_AGENT_MCP_IDLE_SECS", "0")
+        .current_dir(home.path())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn_guarded();
+    let orphan: u32 = eventually(Duration::from_secs(20), "the orphan's pid", || {
+        std::fs::read_to_string(&pidfile).ok()?.trim().parse().ok()
+    });
+    // Mid-turn: the model is stalling.
+    std::thread::sleep(Duration::from_millis(1000));
+    common::mcp_events_fixture::sigterm_and_wait(&mut child);
+    assert!(
+        !alive(orphan),
+        "a cancelled `run` left its stdio server's grandchild {orphan} running"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&marker).ok().as_deref(),
+        Some("clean exit"),
+        "the server was not given its grace window to exit on its own"
+    );
+}

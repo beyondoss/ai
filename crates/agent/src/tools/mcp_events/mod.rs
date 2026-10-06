@@ -529,6 +529,18 @@ impl McpEventsHub {
                 hub.refresh_keep_alive();
             }
         });
+        // Persisted webhook callbacks are held from the moment the state is read, so a delivery the
+        // server retried across a restart gets `503` (retry), not `410` (stop), until its
+        // subscription has re-registered.
+        if hub.callback_url.is_some() {
+            let store = hub.store.clone();
+            tokio::spawn(async move {
+                store.loaded().await;
+                for token in store.webhook_tokens() {
+                    webhook::reserve(&token);
+                }
+            });
+        }
         let coalescer = tokio::spawn(coalesce(
             hub.store.clone(),
             weak,
@@ -1053,6 +1065,9 @@ impl Hub {
         let lock = self.key_lock(key);
         let _held = lock.lock().await;
         if forget {
+            if let Some(w) = self.store.sub(key).and_then(|s| s.webhook) {
+                webhook::unreserve(&w.token);
+            }
             self.store.forget_sub(key);
             self.configured
                 .lock()
@@ -1194,6 +1209,16 @@ impl Hub {
                     () = shutdown.cancelled() => break,
                 }
                 let Some(hub) = weak.upgrade() else { return };
+                // An explicit unsubscribe while this was waiting ends the effort: it is no longer
+                // configured to be kept up.
+                if !hub
+                    .configured
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .contains(&spec.key())
+                {
+                    break;
+                }
                 if resumed {
                     // The server ended it: its event types may have changed, so look again.
                     if let Ok(mut d) = hub.discovery.lock() {

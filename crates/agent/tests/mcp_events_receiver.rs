@@ -243,3 +243,65 @@ async fn the_callback_survives_a_crash_so_retried_deliveries_still_land() {
         (runs_for_event(&bodies, "retried after the crash") >= 1).then_some(())
     });
 }
+
+/// After a restart, a delivery the server retries can arrive before the subscription has
+/// re-registered its route (here discovery is slow). It must get `503` — retry — not `410`, which
+/// tells the server to give up; once the route is back, the retry lands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_retry_that_beats_the_resubscribe_after_a_restart_is_told_to_retry_not_to_stop() {
+    let (_fx, mcp_url, fixture) = spawn_http_fixture(&[
+        ("MCP_FIXTURE_ALLOW_HTTP_CALLBACK", "1"),
+        ("MCP_FIXTURE_LIST_DELAY_MS", "3000"),
+    ]);
+    let home = tempfile::tempdir().unwrap();
+    write_settings(home.path(), hooks(&mcp_url, "follow_up"));
+    let (base, bodies) = spawn_model_server_routed(vec![], turn_text("noted"));
+    let port = free_port();
+    let mut first = daemon(home.path(), &base, port, &[]);
+    eventually(Duration::from_secs(30), "the subscription", || {
+        (state(&fixture)["hooks"].as_array().unwrap().len() == 1).then_some(())
+    });
+    eventually(Duration::from_secs(10), "the persisted callback", || {
+        let saved: Value =
+            serde_json::from_slice(&std::fs::read(state_file(home.path())).ok()?).ok()?;
+        saved["subscriptions"]
+            .as_object()?
+            .values()
+            .any(|s| s["webhook"]["token"].is_string())
+            .then_some(())
+    });
+    first.kill().unwrap();
+    let _ = first.wait();
+    let r = emit(
+        &fixture,
+        json!({ "event_id": "early-1", "data": { "summary": "retried early" } }),
+    );
+    assert_ne!(r["deliveries"][0]["status"], 200, "{r:#}");
+
+    let _second = daemon(home.path(), &base, port, &[]);
+    // The state is read at once; discovery takes 3 s, so the route is not back yet.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let r = control(
+        &fixture,
+        "POST",
+        "/control/redeliver",
+        Some(&json!({ "event_id": "early-1" })),
+    );
+    assert_eq!(
+        r["deliveries"][0]["status"], 503,
+        "resuming: retry, not stop: {r:#}"
+    );
+    let landed = eventually(Duration::from_secs(30), "the retry to land", || {
+        let r = control(
+            &fixture,
+            "POST",
+            "/control/redeliver",
+            Some(&json!({ "event_id": "early-1" })),
+        );
+        (r["deliveries"][0]["status"] == 200).then_some(r)
+    });
+    assert_eq!(landed["deliveries"][0]["status"], 200);
+    eventually(Duration::from_secs(20), "the model run", || {
+        (runs_for_event(&bodies, "retried early") >= 1).then_some(())
+    });
+}

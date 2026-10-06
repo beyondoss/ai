@@ -242,3 +242,44 @@ async fn configured_subscriptions_that_fail_at_boot_are_retried_and_kept_alive()
         || (state(&fixture)["hooks"].as_array().unwrap().len() == 1).then_some(()),
     );
 }
+
+/// An explicit unsubscribe of a configured subscription that is down — being retried — ends the
+/// retrying: when the server comes back, nothing subscribes behind the operator's back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unsubscribing_a_configured_subscription_while_its_server_is_down_stops_the_retries() {
+    let (_fx, mcp_url, fixture) = spawn_http_fixture(&[
+        ("MCP_FIXTURE_ALLOW_HTTP_CALLBACK", "1"),
+        ("MCP_FIXTURE_EVENTS_DOWN", "1"),
+    ]);
+    let home = tempfile::tempdir().unwrap();
+    write_settings(home.path(), hooks(&mcp_url));
+    let (base, _bodies) = spawn_model_server_routed(vec![], turn_text("noted"));
+    let port = free_port();
+    let _d = spawn_daemon(home.path(), &base, port, &[]);
+    let mut ws = ws_connect(port, Some(EVENTS_SESSION)).await;
+    // Let the first attempt fail.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    ws_send(
+        &mut ws,
+        json!({ "type": "mcp_events_unsubscribe", "id": "u", "server": "hooks", "name": "ticket.updated" }),
+    )
+    .await;
+    let r = ws_next(&mut ws, Duration::from_secs(20), "the unsubscribe", |f| {
+        f["type"] == "response" && f["id"] == "u"
+    })
+    .await;
+    assert_eq!(r["success"], true, "{r:#}");
+    control(
+        &fixture,
+        "POST",
+        "/control/events_down",
+        Some(&json!({ "down": false })),
+    );
+    // Longer than the retry backoff at this point (2–4 s).
+    tokio::time::sleep(Duration::from_millis(7000)).await;
+    assert!(
+        state(&fixture)["hooks"].as_array().unwrap().is_empty(),
+        "unsubscribed, so not resubscribed: {:#}",
+        state(&fixture)
+    );
+}
