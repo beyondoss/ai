@@ -9,8 +9,8 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use common::mcp_events_fixture::{
-    Frames, emit, fast_knobs, model_requests_with, send, state, stdio_server, wait_active,
-    wait_control_file, write_settings,
+    Frames, emit, eventually, fast_knobs, model_requests_with, send, state, stdio_server,
+    wait_active, wait_control_file, write_settings,
 };
 use common::{BIN, ChildGuard, SpawnGuarded, serve_cmd, spawn_model_server_routed, turn_text};
 use serde_json::{Value, json};
@@ -343,4 +343,104 @@ fn a_session_bound_legacy_http_server_is_reached_through_its_own_session_and_get
         .cloned()
         .unwrap();
     assert_eq!(poll["params"]["maxAgeMs"], 60000, "{poll:#}");
+}
+
+/// `hasMore: true` with no events, forever: a broken server. The client must back off to its
+/// poll floor instead of spinning.
+#[test]
+fn has_more_with_no_events_does_not_spin() {
+    let home = tempfile::tempdir().unwrap();
+    let control_file = home.path().join("control");
+    let server = stdio_server(
+        "spin",
+        &control_file,
+        json!({ "MCP_FIXTURE_HASMORE_EMPTY": "1" }),
+        json!([{ "name": "ticket.updated", "delivery": "poll", "action": "notify" }]),
+    );
+    let mut s = start(json!([server]), home);
+    let control = wait_control_file(&control_file);
+    wait_active(&mut s.stdin, &mut s.frames, 1);
+    let polls = |st: &Value| {
+        st["methods"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| *m == "events/poll")
+            .count()
+    };
+    let before = polls(&state(&control));
+    std::thread::sleep(Duration::from_millis(1500));
+    let during = polls(&state(&control)) - before;
+    // The floor is 100 ms here: about 15 polls in 1.5 s. A spinning client makes thousands.
+    assert!(during <= 25, "{during} polls in 1.5 s");
+}
+
+/// A `truncated` page means events may have been skipped: the model is told, not just the frame.
+#[test]
+fn a_gap_is_explained_to_the_model() {
+    let home = tempfile::tempdir().unwrap();
+    let control_file = home.path().join("control");
+    let server = stdio_server(
+        "tickets",
+        &control_file,
+        json!({}),
+        json!([{ "name": "ticket.updated", "delivery": "poll" }]),
+    );
+    let mut s = start(json!([server]), home);
+    let control = wait_control_file(&control_file);
+    wait_active(&mut s.stdin, &mut s.frames, 1);
+    common::mcp_events_fixture::control(
+        &control,
+        "POST",
+        "/control/truncate_next",
+        Some(&json!({})),
+    );
+    s.frames
+        .wait(Duration::from_secs(20), "the gap status", |f| {
+            f["type"] == "mcp_event_status" && f["kind"] == "gap"
+        });
+    eventually(
+        Duration::from_secs(20),
+        "the model being told about the gap",
+        || (!model_requests_with(&s.bodies, "may have been missed").is_empty()).then_some(()),
+    );
+}
+
+/// Subscribing to a slow server does not hold up subscribing to a fast one: the per-key lock is
+/// not a global one, and discovery happens outside it.
+#[test]
+fn a_slow_server_does_not_serialize_subscriptions_to_others() {
+    let home = tempfile::tempdir().unwrap();
+    let slow = stdio_server(
+        "slow",
+        &home.path().join("control-slow"),
+        json!({ "MCP_FIXTURE_LIST_DELAY_MS": "3000" }),
+        json!([]),
+    );
+    let fast = stdio_server(
+        "fast",
+        &home.path().join("control-fast"),
+        json!({}),
+        json!([]),
+    );
+    let mut s = start(json!([slow, fast]), home);
+    send(
+        &mut s.stdin,
+        json!({ "type": "mcp_events_subscribe", "id": "slow", "server": "slow", "name": "build.finished", "action": "notify" }),
+    );
+    send(
+        &mut s.stdin,
+        json!({ "type": "mcp_events_subscribe", "id": "fast", "server": "fast", "name": "build.finished", "action": "notify" }),
+    );
+    let first = s.frames.wait(
+        Duration::from_secs(30),
+        "the first subscribe response",
+        |f| f["type"] == "response" && (f["id"] == "slow" || f["id"] == "fast"),
+    );
+    assert_eq!(
+        first["id"], "fast",
+        "the fast server answered first: {first:#}"
+    );
+    assert_eq!(first["success"], true);
+    assert_eq!(s.frames.response("slow")["success"], true);
 }

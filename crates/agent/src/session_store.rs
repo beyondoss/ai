@@ -2671,7 +2671,17 @@ fn move_sibling_memory(session_jsonl: &Path, dst_dir: &Path) {
     {
         let _ = fs::rename(&src_mem, dst_dir.join(name));
     }
+    // The MCP Events state (cursors, undelivered events) travels with its session too.
+    let events = session_jsonl.with_extension(MCP_EVENTS_SIDECAR);
+    if let Some(name) = events.file_name()
+        && events.is_file()
+    {
+        let _ = fs::rename(&events, dst_dir.join(name));
+    }
 }
+
+/// The extension of a session's MCP Events state file (`tools::mcp_events::state_path_for`).
+const MCP_EVENTS_SIDECAR: &str = "mcp-events.json";
 
 /// Best-effort removal of a session's sibling working-memory dir, for the hard-delete fallback path where
 /// there is no `.trash/` to move it into. Same no-error contract as [`move_sibling_memory`].
@@ -2680,6 +2690,7 @@ fn remove_sibling_memory(session_jsonl: &Path) {
     if src_mem.is_dir() {
         let _ = fs::remove_dir_all(&src_mem);
     }
+    let _ = fs::remove_file(session_jsonl.with_extension(MCP_EVENTS_SIDECAR));
 }
 
 /// A directory of session files. `Clone` is just a `PathBuf` copy — cheap, and lets a caller move an
@@ -2996,6 +3007,13 @@ impl SessionRepo {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
+        let events = path.with_extension(MCP_EVENTS_SIDECAR);
+        if events.is_file() {
+            let _ = fs::rename(
+                &events,
+                trash_dir.join(format!("{id}.{stamp}.{MCP_EVENTS_SIDECAR}")),
+            );
+        }
         match fs::rename(path, trash_dir.join(format!("{id}.{stamp}"))) {
             Ok(()) => Ok(()),
             // Raced with another deleter: it is already gone, which is the post-condition.
@@ -8583,6 +8601,28 @@ mod tests {
             "the prod DB port is 5433\n",
             "the restored working memory must have its contents intact"
         );
+    }
+
+    #[test]
+    fn delete_and_restore_move_the_mcp_events_state_file_too() {
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let store = repo.create(SessionMeta::new("/w", "m")).unwrap();
+        let id = store.meta().id.clone();
+        let sidecar = store.path().with_extension("mcp-events.json");
+        fs::write(&sidecar, "{\"pending\":[]}").unwrap();
+
+        repo.delete(&id).unwrap();
+        assert!(
+            !sidecar.exists(),
+            "the events state leaves with its session"
+        );
+        let trashed = dir.path().join(".trash").join(sidecar.file_name().unwrap());
+        assert!(trashed.exists(), "and lands in .trash/ beside it");
+
+        assert!(repo.restore_session(&id).unwrap());
+        assert!(sidecar.exists(), "a restore brings it back");
+        assert!(!trashed.exists());
     }
 
     #[test]

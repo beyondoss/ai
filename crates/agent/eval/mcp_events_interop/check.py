@@ -104,7 +104,9 @@ async def main():
         agent = subprocess.Popen([AGENT, "serve", "--listen", f"127.0.0.1:{agent_port}",
                                   "--mcp-events-callback-url", f"http://127.0.0.1:{agent_port}",
                                   "--gateway-url", "http://127.0.0.1:9", "--key", "bai_v1.test",
-                                  "--model", "claude-test", "--session-dir", os.path.join(tmp, "sessions")],
+                                  "--model", "claude-test", "--session-dir", os.path.join(tmp, "sessions"),
+                                  # The configured subscription is owned by this daemon session.
+                                  "--mcp-events-session", "indep"],
                                  env=env, stdout=subprocess.DEVNULL, stderr=open(os.path.join(tmp, "agent.err"), "w"))
         wait_port(agent_port)
         if stdio:

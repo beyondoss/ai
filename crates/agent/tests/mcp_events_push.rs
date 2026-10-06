@@ -271,3 +271,106 @@ fn events_arriving_during_a_busy_run_coalesce_into_one_follow_up_after_it() {
         .collect(Duration::from_millis(1000), |f| f["id"] == "mcp_events:2");
     assert!(more.is_empty());
 }
+
+/// A burst far larger than the stream's notification buffer: the router overflows, the stream
+/// reconnects from the last cursor it actually delivered, and the server replays the rest — every
+/// event arrives, exactly once.
+#[test]
+fn a_burst_that_overflows_the_stream_buffer_loses_nothing() {
+    let control_path = "$HOME_DIR/control";
+    let server = stdio_server(
+        "tickets",
+        std::path::Path::new(control_path),
+        json!({ "MCP_FIXTURE_HEARTBEAT_MS": "200" }),
+        json!([{ "name": "ticket.updated", "delivery": "push", "action": "notify" }]),
+    );
+    let mut s = start(
+        json!([server]),
+        &[("BEYOND_AI_AGENT_MCP_EVENTS_STREAM_BUFFER", "4")],
+    );
+    let fixture = wait_control_file(&s.home.path().join("control"));
+    wait_active(&mut s.stdin, &mut s.frames, 1);
+    let r = control(
+        &fixture,
+        "POST",
+        "/control/emit_burst",
+        Some(&json!({ "count": 60 })),
+    );
+    let want: Vec<String> = r["event_ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(want.len(), 60);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let mut got: Vec<String> = Vec::new();
+    while got.len() < want.len() && std::time::Instant::now() < deadline {
+        for f in s.frames.collect(Duration::from_millis(500), event_frame) {
+            got.push(f["event"]["eventId"].as_str().unwrap().to_owned());
+        }
+    }
+    let mut sorted = got.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(sorted.len(), got.len(), "no event surfaced twice");
+    let mut want_sorted = want.clone();
+    want_sorted.sort();
+    assert_eq!(sorted, want_sorted, "every event in the burst arrived");
+    assert!(
+        s.frames.seen.iter().any(|f| f["type"] == "mcp_event_status"
+            && f["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("overflowed"))),
+        "the buffer really overflowed (the path under test ran)"
+    );
+}
+
+/// The server changes the event type's schema in place and ends the stream with the draft's
+/// `-32014 {reason: schema_changed}`: the client re-fetches `events/list`, resubscribes, and
+/// delivery continues.
+#[test]
+fn a_schema_change_termination_rediscovers_and_resubscribes() {
+    let control_path = "$HOME_DIR/control";
+    let server = stdio_server(
+        "tickets",
+        std::path::Path::new(control_path),
+        json!({ "MCP_FIXTURE_HEARTBEAT_MS": "200" }),
+        json!([{ "name": "ticket.updated", "delivery": "push", "action": "notify" }]),
+    );
+    let mut s = start(json!([server]), &[]);
+    let fixture = wait_control_file(&s.home.path().join("control"));
+    wait_active(&mut s.stdin, &mut s.frames, 1);
+    let lists_before = count(&state(&fixture)["methods"], "events/list");
+    let r = control(&fixture, "POST", "/control/schema_change", Some(&json!({})));
+    assert_eq!(r["streams"], 1, "{r:#}");
+    s.frames
+        .wait(Duration::from_secs(20), "the resubscription", |f| {
+            f["type"] == "mcp_event_status" && f["kind"] == "resubscribed"
+        });
+    let st = state(&fixture);
+    assert!(
+        count(&st["methods"], "events/list") > lists_before,
+        "re-discovered: {st:#}"
+    );
+    assert!(
+        count(&st["methods"], "events/stream") >= 2,
+        "a new stream: {st:#}"
+    );
+    emit(&fixture, json!({ "event_id": "after-change", "data": {} }));
+    let f = s.frames.wait(
+        Duration::from_secs(20),
+        "an event after the change",
+        event_frame,
+    );
+    assert_eq!(f["event"]["eventId"], "after-change");
+}
+
+fn count(methods: &Value, name: &str) -> usize {
+    methods
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| *m == name)
+        .count()
+}

@@ -93,6 +93,11 @@ struct State {
     requests: Vec<Value>,
     /// Legacy mode: requests refused for lacking the session id.
     sessionless_rejections: u64,
+    /// `/control/truncate_next`: the next poll answers `truncated: true`.
+    truncate_next: bool,
+    /// `/control/jwks {status}` (initially `MCP_FIXTURE_JWKS_STATUS`, else 200 when a key is
+    /// configured and 404 when not): what the JWKS endpoint answers.
+    jwks_status: Option<u16>,
 }
 
 fn env_flag(name: &str) -> bool {
@@ -368,7 +373,12 @@ async fn post_signed(
     tamper: Option<&str>,
 ) -> (u16, Vec<u8>) {
     let body = serde_json::to_vec(body).unwrap();
-    let ts_secs = now_ms() / 1000 - if tamper == Some("stale") { 600 } else { 0 };
+    let ts_secs = now_ms() / 1000
+        + match tamper {
+            Some("stale") => -600,
+            Some("future") => 600,
+            _ => 0,
+        };
     let ts = ts_secs.to_string();
     let sigs: Vec<String> = secrets
         .iter()
@@ -460,7 +470,14 @@ async fn rpc(
         m if m.starts_with("events/") && no_events => {
             Err(err(-32601, &format!("Method not found: {m}")))
         }
-        "events/list" => Ok(json!({ "events": event_types() })),
+        "events/list" => {
+            // `MCP_FIXTURE_LIST_DELAY_MS`: a slow server, for concurrency tests.
+            let delay = env_u64("MCP_FIXTURE_LIST_DELAY_MS", 0);
+            if delay > 0 {
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+            }
+            Ok(json!({ "events": event_types() }))
+        }
         "events/poll" => {
             let name = params["name"].as_str().unwrap_or("").to_owned();
             if !known_event(&name) {
@@ -475,9 +492,20 @@ async fn rpc(
             }
             let project = project_of(&params);
             let max = params["maxEvents"].as_u64().unwrap_or(100) as usize;
-            let st = state.lock().unwrap();
+            let mut st = state.lock().unwrap();
             let head = st.log.last().map(|o| o.seq).unwrap_or(0);
             let next_poll = env_u64("MCP_FIXTURE_NEXT_POLL_MS", 100);
+            // `MCP_FIXTURE_HASMORE_EMPTY=1`: a broken server that always claims more and sends none.
+            if env_flag("MCP_FIXTURE_HASMORE_EMPTY") {
+                return Ok(
+                    json!({ "events": [], "cursor": head.to_string(), "truncated": false, "hasMore": true, "nextPollMs": next_poll }),
+                );
+            }
+            if std::mem::take(&mut st.truncate_next) {
+                return Ok(
+                    json!({ "events": [], "cursor": head.to_string(), "truncated": true, "hasMore": false, "nextPollMs": next_poll }),
+                );
+            }
             let Some(cursor) = params["cursor"]
                 .as_str()
                 .and_then(|c| c.parse::<u64>().ok())
@@ -919,6 +947,61 @@ async fn control(state: &Shared, method: &str, path: &str, body: &[u8]) -> (u16,
                 None => (404, json!({"error": "no such event"})),
             }
         }
+        ("POST", "/control/jwks") => {
+            state.lock().unwrap().jwks_status = req["status"].as_u64().map(|s| s as u16);
+            (200, json!({}))
+        }
+        ("POST", "/control/truncate_next") => {
+            state.lock().unwrap().truncate_next = true;
+            (200, json!({}))
+        }
+        ("POST", "/control/emit_burst") => {
+            // Append `count` events and push them to every stream in one go — faster than any
+            // client can consume them.
+            let count = req["count"].as_u64().unwrap_or(10);
+            let st = &mut *state.lock().unwrap();
+            let mut ids = Vec::new();
+            for _ in 0..count {
+                let seq = st.log.len() as u64 + 1;
+                let occ = Occ {
+                    seq,
+                    event_id: format!("burst_{seq}"),
+                    name: req["name"].as_str().unwrap_or("ticket.updated").to_owned(),
+                    timestamp: iso(now_ms()),
+                    data: json!({ "n": seq }),
+                    project: req["project"].as_str().map(str::to_owned),
+                };
+                for s in st
+                    .streams
+                    .values()
+                    .filter(|s| matches(&occ, &s.name, &s.project))
+                {
+                    let mut p = occ_json(&occ, true);
+                    p["_meta"] = json!({ "io.modelcontextprotocol/subscriptionId": s.request_id });
+                    let _ = s.tx.send(json!({"jsonrpc": "2.0", "method": "notifications/events/event", "params": p}));
+                }
+                ids.push(occ.event_id.clone());
+                st.log.push(occ);
+            }
+            (200, json!({ "event_ids": ids }))
+        }
+        ("POST", "/control/schema_change") => {
+            // The event type changed in place: end every push stream with the draft's
+            // `-32014 Unsupported {reason: schema_changed}`.
+            let streams: Vec<StreamSub> = state
+                .lock()
+                .unwrap()
+                .streams
+                .drain()
+                .map(|(_, s)| s)
+                .collect();
+            let error = json!({"code": -32014, "message": "Unsupported", "data": {"feature": "payloadSchema", "reason": "schema_changed"}});
+            let n = streams.len();
+            for s in streams {
+                let _ = s.tx.send(json!({"jsonrpc": "2.0", "method": "notifications/events/terminated", "params": {"error": error, "_meta": {"io.modelcontextprotocol/subscriptionId": s.request_id}}}));
+            }
+            (200, json!({ "streams": n }))
+        }
         ("POST", "/control/terminate") => {
             let (streams, hooks) = {
                 let mut st = state.lock().unwrap();
@@ -1090,8 +1173,14 @@ async fn handle_http(state: Shared, mut stream: TcpStream) {
     }
     if req.path == "/.well-known/mcp-webhook-jwks.json" {
         let doc = jwks();
-        if doc.is_null() {
-            return respond(&mut stream, 404, "text/plain", b"no keys").await;
+        let forced = state.lock().unwrap().jwks_status.or_else(|| {
+            std::env::var("MCP_FIXTURE_JWKS_STATUS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+        });
+        let status = forced.unwrap_or(if doc.is_null() { 404 } else { 200 });
+        if status != 200 || doc.is_null() {
+            return respond(&mut stream, status, "text/plain", b"no keys").await;
         }
         return respond(
             &mut stream,
@@ -1256,6 +1345,13 @@ async fn write_line(out: &Stdout, v: &Value) -> bool {
 
 async fn run_stdio(state: Shared) {
     let out: Stdout = Arc::new(tokio::sync::Mutex::new(tokio::io::stdout()));
+    // `MCP_FIXTURE_GARBAGE_STDOUT=1`: a server that prints a line that is not UTF-8 before it
+    // speaks MCP (a stray banner from a native library, say). A client must skip it, not die.
+    if env_flag("MCP_FIXTURE_GARBAGE_STDOUT") {
+        let mut o = out.lock().await;
+        let _ = o.write_all(b"\xff\xfe\xfd not utf-8 \xc3\x28\n").await;
+        let _ = o.flush().await;
+    }
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     while let Ok(Some(line)) = lines.next_line().await {
         let Ok(msg) = serde_json::from_str::<Value>(&line) else {
@@ -1334,6 +1430,12 @@ async fn main() {
     });
     if stdio {
         run_stdio(state).await;
+        // `MCP_FIXTURE_EXIT_MARKER=<path>`: stdin closed — the MCP shutdown signal. Take a moment
+        // to "clean up" (as a server closing a browser would), then record that we got to.
+        if let Ok(path) = std::env::var("MCP_FIXTURE_EXIT_MARKER") {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let _ = std::fs::write(path, "clean exit");
+        }
     } else {
         println!(
             "{}",

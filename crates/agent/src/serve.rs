@@ -335,10 +335,13 @@
 //! another owner has taken over (service mode's shared mounts): reconnect to the same id, which lands
 //! on whoever owns it now. — or `{type:"mcp_event", server, name, arguments, delivery, action,
 //! event}`, one per MCP Events occurrence a subscription of this session received (after `eventId`
-//! dedup), and `{type:"mcp_event_status", kind, …}` for its lifecycle (`subscribed`, `error`, `gap`,
-//! `terminated`, `delivery_status`). An event whose action is not `notify` is also injected as a
-//! `prompt` command with `id: "mcp_events:<n>"` and `streaming_behavior` `follow_up`/`steer`, so its
-//! `ack`/`response` frames carry that id.
+//! dedup), and `{type:"mcp_event_status", kind, …}` for its lifecycle (`subscribed`, `resubscribed`,
+//! `error`, `gap`, `terminated`, `delivery_status`). Subscriptions configured in settings belong to
+//! one session only — this stdio session, or the daemon's `--mcp-events-session` — so only it sees
+//! their events. An event whose action is not `notify` is also injected (durably — it is re-injected
+//! after a restart until its run completes) as a `prompt` command with `id: "mcp_events:<n>"`,
+//! `mcp_events: <n>` and `streaming_behavior` `follow_up`/`steer`, so its `ack`/`response` frames
+//! carry that id.
 //!
 //! `{type:"catchup", data:{messages, leaf_id}, turn_in_flight, turn_truncated}` is pushed **once,
 //! unsolicited, on attach** over the WebSocket/UDS transports (nothing is sent to a fresh session with
@@ -704,6 +707,12 @@ pub struct ServeConfig {
     /// holds live MCP Events subscriptions. Off by default — a subscription is a background trigger,
     /// and reaping its session would silently end it.
     pub mcp_events_reapable: bool,
+    /// `--mcp-events-session`: the daemon session that owns the configured
+    /// (`mcp_servers[].events`) subscriptions — one per process, so one event is one model run.
+    pub mcp_events_session: String,
+    /// Whether *this* session owns the configured subscriptions: `true` for the stdio `serve`
+    /// (its only session); set per session by `serve_ws::session_cfg` in the daemon.
+    pub mcp_events_owner: bool,
     /// Agent definitions discovered at startup (see [`crate::agents`]) — the delegable personas the
     /// `subagent` tool accepts, advertised in `<available_agents>`. Discovered once, like `mcp_tools`,
     /// rather than re-walked on every registry rebuild. Empty when subagents aren't configured.
@@ -2775,11 +2784,12 @@ pub(crate) async fn serve_session(
                 emit,
                 running: running.clone(),
                 keep_alive: (!cfg.mcp_events_reapable).then(|| keep_alive.clone()),
-                // Beside the transcript, so the position persists with the session: a restart
-                // resumes from the cursor instead of from "now".
+                owns_configured: cfg.mcp_events_owner,
+                // Beside the transcript, so cursors and undelivered events persist with the
+                // session: a restart resumes from the cursor and delivers what was pending.
                 state_path: persistence
                     .session_file()
-                    .map(|p| p.with_extension("mcp-events.json")),
+                    .map(crate::tools::mcp_events::state_path_for),
                 session_id: persistence.session_id().to_string(),
             },
         );
@@ -3935,6 +3945,7 @@ pub(crate) async fn serve_session(
     // prompt (a host `bash`, a branch summary, a retry backoff): replayed, in order, the moment it is
     // idle again — never refused as busy. See `mcp_events::is_injection`.
     let mut deferred_events: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    let mut events_state_file = persistence.session_file().map(std::path::Path::to_path_buf);
     // `mcp_events_*` commands run as spawned tasks, accepted from every loop, idle or busy; their
     // responses go out through a *weak* handle on the writer so a straggler cannot hold teardown.
     let events_cmds = mcp_events.as_ref().map(|hub| {
@@ -3990,6 +4001,14 @@ pub(crate) async fn serve_session(
                 "tenant": service.as_ref().map(|svc| svc.tenant()),
             })));
             break;
+        }
+        // The events state follows the active transcript (`new_session`, `switch_session`, …).
+        if let Some(hub) = &mcp_events {
+            let file = persistence.session_file().map(std::path::Path::to_path_buf);
+            if file != events_state_file {
+                hub.relocate(file.as_deref());
+                events_state_file = file;
+            }
         }
         let line = if let Some(deferred) = deferred_events.pop_front() {
             deferred
@@ -4269,6 +4288,12 @@ pub(crate) async fn serve_session(
                 // returns, once `session`/`persistence` are no longer borrowed by `run` — a variable
                 // declared inside the loop body would be dropped at `break` and unreachable there.
                 let mut pending_deferred: Vec<(Option<String>, Value)> = Vec::new();
+                // MCP Events injection batches this run carries (its own prompt, and any steered
+                // in while it runs): delivered once the run is over and its transcript persisted.
+                let mut accepted_injections: Vec<u64> =
+                    crate::tools::mcp_events::injection_batch(&cmd)
+                        .into_iter()
+                        .collect();
                 let result = 'retry: loop {
                     tokens_before.store(0, Ordering::Relaxed);
                     refused.store(false, Ordering::Relaxed);
@@ -4599,9 +4624,12 @@ pub(crate) async fn serve_session(
                                                             parse_images(c.get("images")),
                                                         );
                                                         let queued = steering.push_steer(m);
-                                                        if !queued && crate::tools::mcp_events::is_injection(&c) {
-                                                            deferred_events.push_back(l.to_string());
-                                                            continue;
+                                                        if let Some(batch) = crate::tools::mcp_events::injection_batch(&c) {
+                                                            if !queued {
+                                                                deferred_events.push_back(l.to_string());
+                                                                continue;
+                                                            }
+                                                            accepted_injections.push(batch);
                                                         }
                                                         // Fix 5 (pi-parity gap): same queue-content
                                                         // visibility the dedicated `steer`/`follow_up`
@@ -5200,6 +5228,11 @@ pub(crate) async fn serve_session(
                     }
                 }
 
+                if let Some(hub) = &mcp_events
+                    && !accepted_injections.is_empty()
+                {
+                    hub.delivered(&accepted_injections).await;
+                }
                 if running.swap(false, Ordering::Relaxed)
                     && let Some(m) = &cfg.metrics
                 {

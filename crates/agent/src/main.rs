@@ -803,6 +803,12 @@ enum Command {
         /// subscriptions are background triggers, and reaping it would silently end them.
         #[usage(long, env = "AI_AGENT_MCP_EVENTS_REAPABLE")]
         mcp_events_reapable: bool,
+        /// MCP Events: the daemon session that owns the subscriptions configured in
+        /// `mcp_servers[].events`. It is started at boot, every configured event is delivered to
+        /// it (and only it), and a client attaches to it by this id. Other sessions subscribe only
+        /// at runtime (`mcp_events_subscribe`). Over stdio the one session owns them.
+        #[usage(long, env = "AI_AGENT_MCP_EVENTS_SESSION")]
+        mcp_events_session: Option<String>,
         /// Address this exact session: reattach to it if it already exists, or create it under exactly
         /// this id if it doesn't. Gives a caller a known, predictable name to route on rather than
         /// parsing an id back out of `get_state`/the startup `{"kind":"session", id, …}` banner.
@@ -1954,6 +1960,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             mcp_allow_private,
             mcp_events_callback_url,
             mcp_events_reapable,
+            mcp_events_session,
             session_id,
             r#continue: continue_session,
             no_session_persistence,
@@ -2434,6 +2441,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 mcp_http,
                 mcp_events_callback_url,
                 mcp_events_reapable,
+                mcp_events_session: mcp_events_session
+                    .clone()
+                    .unwrap_or_else(|| tools::mcp_events::DEFAULT_EVENTS_SESSION.to_owned()),
+                // Over stdio the one session owns the configured subscriptions; the daemon picks
+                // its events session per session (`serve_ws::session_cfg`).
+                mcp_events_owner: true,
                 metrics: metrics.clone(),
                 // The process `main` built: it owns the signal handler. `serve_ws::session_cfg`
                 // flips this for each session it spawns.

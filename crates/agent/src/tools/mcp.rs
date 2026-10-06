@@ -706,13 +706,13 @@ impl McpConnection {
         match guard.as_ref() {
             Some(live) if Arc::strong_count(&live.client) == 1 => {
                 let pgid = live.pgid;
-                // Drops the client, which closes the server's stdin and kills it...
+                // Drops the client, which closes the server's stdin. The stdio transport then gives
+                // it `mcp_stdio::SHUTDOWN_GRACE` to exit, kills it if it hasn't, and sweeps its
+                // process group — taking anything it forked away from itself too.
                 *guard = None;
-                // ...and this takes anything it forked away from itself, which a kill aimed at the
-                // server alone leaves running.
-                sweep_process_group(pgid);
                 tracing::debug!(
                     server = %self.config.name,
+                    pgid,
                     idle_secs = idle,
                     "reaped an idle MCP server process"
                 );
@@ -1355,7 +1355,7 @@ async fn connect_one(
 /// second browser beside the first. (`@playwright/mcp` happens not to do this; "happens not to" is not
 /// a property to build a memory budget on.)
 ///
-/// The group is what makes [`sweep_process_group`] able to catch them, and it is why the pid is read
+/// The group is what makes the transport's final sweep (`mcp_stdio::stdio_transport`) able to catch them, and it is why the pid is read
 /// here and carried on the connection.
 ///
 /// Dropping the client is still the primary shutdown, not the kill: the MCP stdio contract is that a
@@ -1392,10 +1392,11 @@ async fn connect_stdio(
         // [`kill_process_group`] able to catch them.
         cmd.process_group(0);
     });
-    // Spawned here rather than by rmcp's `TokioChildProcess` so the server's stdout passes through
-    // `mcp_events::stdio_transport`, which keeps rmcp 3.x from silently dropping custom results
-    // (see `mcp_events::rescue_line`). Killed when rmcp drops the transport, as before.
-    let (pgid, transport) = crate::tools::mcp_events::stdio_transport(cmd)
+    // Spawned here rather than by rmcp's `TokioChildProcess` — for every stdio server — so its
+    // stdout passes through `mcp_stdio::stdio_transport`, which keeps rmcp 3.x from silently dropping
+    // custom results (see `mcp_stdio::rescue`). When rmcp drops the transport the server's stdin
+    // closes, it gets `mcp_stdio::SHUTDOWN_GRACE` to exit, and then it and its group are killed.
+    let (pgid, transport) = crate::tools::mcp_stdio::stdio_transport(cmd)
         .map_err(|e| format!("failed to spawn `{command}`: {e}"))?;
 
     let client = McpHandler::new(&config.name, dial.host.clone())
@@ -1405,38 +1406,12 @@ async fn connect_stdio(
     Ok((client, pgid))
 }
 
-/// The other way a server goes away: the last tool holding the connection is dropped (a `serve`
-/// registry rebuild, a finished `run`, process exit). The stdio transport kills the server on drop; this adds
-/// the sweep, so that path reclaims as much as a reap does.
-impl Drop for McpConnection {
-    fn drop(&mut self) {
-        // `get_mut` rather than a lock: we hold `&mut self`, so no one else can be holding it.
-        if let Some(live) = self.client.get_mut().take() {
-            let pgid = live.pgid;
-            drop(live);
-            sweep_process_group(pgid);
-        }
-    }
-}
-
-/// Sweep a reaped server's process group, in the background.
-///
-/// Deliberately *after* the client is dropped rather than instead of it: dropping closes the server's
-/// stdin, which is the MCP shutdown signal, and a well-behaved server closes its browser on seeing it.
-/// This is the backstop for the rest — and it reuses `exec`'s implementation rather than adding a
-/// second one, including its `ps`-enumeration pass, because group-signal delivery alone turned out not
-/// to be reliable there either.
-///
-/// What this does *not* cover is the agent being hard-killed: a server in its own group no longer
-/// receives the terminal's signals, and nothing then sweeps it. That is no worse than before — an
-/// orphaned browser already outlived a killed agent — and fixing it properly needs a supervisor rather
-/// than a signal.
-fn sweep_process_group(pgid: Option<u32>) {
-    let Some(pgid) = pgid else { return };
-    // On its own thread: `kill_process_group` blocks (it shells out and sleeps between passes), and
-    // this is called from both an async reap and a `Drop`, neither of which may block.
-    std::thread::spawn(move || crate::tools::exec::kill_process_group(pgid));
-}
+// The other way a server goes away — the last tool holding the connection is dropped (a `serve`
+// registry rebuild, a finished `run`) — needs nothing here: dropping the client drops the stdio
+// transport, whose pump runs the same grace-then-kill-then-sweep a reap does
+// (`mcp_stdio::stdio_transport`). What that does *not* cover is the agent being hard-killed: a
+// server in its own group no longer receives the terminal's signals, and nothing then sweeps it —
+// no worse than before, and fixing it properly needs a supervisor rather than a signal.
 
 /// Dial an HTTP server. Two shapes, decided by `dial.http`:
 ///

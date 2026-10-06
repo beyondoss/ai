@@ -20,6 +20,7 @@ pub mod mcp;
 pub mod mcp_events;
 pub mod mcp_host;
 pub mod mcp_manifest;
+pub mod mcp_stdio;
 pub mod memory;
 pub mod output;
 pub mod read;

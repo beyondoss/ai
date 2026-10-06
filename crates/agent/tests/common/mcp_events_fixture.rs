@@ -250,3 +250,189 @@ pub fn model_requests_with(bodies: &std::sync::Mutex<Vec<String>>, needle: &str)
         .cloned()
         .collect()
 }
+
+// ---------------------------------------------------------------------------------------------
+// Daemon (`serve --listen`) helpers
+// ---------------------------------------------------------------------------------------------
+
+/// The daemon session that owns configured subscriptions by default.
+pub const EVENTS_SESSION: &str = "mcp-events";
+
+/// A `serve --listen` daemon on `port` with `--mcp-events-callback-url` pointing back at it.
+pub fn spawn_daemon(home: &Path, base: &str, port: u16, extra: &[&str]) -> ChildGuard {
+    let mut cmd = super::serve_dir_cmd(super::BIN, base, &home.join("sessions").to_string_lossy());
+    cmd.args([
+        "--listen",
+        &format!("127.0.0.1:{port}"),
+        "--mcp-events-callback-url",
+        &format!("http://127.0.0.1:{port}"),
+    ])
+    .args(extra)
+    .env("HOME", home)
+    .env("BEYOND_AI_AGENT_MCP_EVENTS_COALESCE_MS", "300")
+    .env("BEYOND_AI_AGENT_MCP_IDLE_SECS", "0")
+    .stdin(Stdio::null())
+    .stdout(Stdio::null())
+    .stderr(Stdio::from(
+        std::fs::File::create(home.join(format!("serve-{port}.stderr"))).unwrap(),
+    ));
+    let child = cmd.spawn_guarded();
+    super::wait_for_port(port);
+    child
+}
+
+/// The next WebSocket frame matching `pred`, or a panic naming `what` after `timeout`.
+pub async fn ws_next(
+    ws: &mut super::TestWs,
+    timeout: Duration,
+    what: &str,
+    pred: impl Fn(&Value) -> bool,
+) -> Value {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match tokio::time::timeout(left, super::ws_next_frame(ws)).await {
+            Ok(Some(f)) if pred(&f) => return f,
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("socket closed waiting for {what}"),
+            Err(_) => panic!("timed out waiting for {what}"),
+        }
+    }
+}
+
+/// Every WebSocket frame matching `pred` within `window`.
+pub async fn ws_collect(
+    ws: &mut super::TestWs,
+    window: Duration,
+    pred: impl Fn(&Value) -> bool,
+) -> Vec<Value> {
+    let deadline = Instant::now() + window;
+    let mut out = Vec::new();
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return out;
+        }
+        if let Ok(Some(f)) = tokio::time::timeout(left, super::ws_next_frame(ws)).await
+            && pred(&f)
+        {
+            out.push(f);
+        }
+    }
+}
+
+/// `mcp_events_list` over a WebSocket.
+pub async fn ws_list(ws: &mut super::TestWs, id: &str) -> Value {
+    super::ws_send(ws, json!({ "type": "mcp_events_list", "id": id })).await;
+    ws_next(ws, Duration::from_secs(20), id, |f| {
+        f["type"] == "response" && f["id"] == id
+    })
+    .await
+}
+
+/// Wait until the session's subscriptions are all `active`.
+pub async fn ws_wait_active(ws: &mut super::TestWs) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut n = 0;
+    loop {
+        n += 1;
+        let l = ws_list(ws, &format!("wa{n}")).await;
+        let subs = l["data"]["subscriptions"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        if !subs.is_empty() && subs.iter().all(|s| s["state"] == "active") {
+            return subs[0].clone();
+        }
+        assert!(Instant::now() < deadline, "never active: {l:#}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// `list_daemon_sessions`, on a fresh connection: `id → live`.
+pub async fn daemon_sessions(port: u16) -> std::collections::HashMap<String, bool> {
+    let mut ws = super::ws_connect(port, None).await;
+    super::ws_send(
+        &mut ws,
+        json!({ "type": "list_daemon_sessions", "id": "lds" }),
+    )
+    .await;
+    let r = ws_next(
+        &mut ws,
+        Duration::from_secs(20),
+        "list_daemon_sessions",
+        |f| f["type"] == "response" && f["command"] == "list_daemon_sessions",
+    )
+    .await;
+    r["data"]["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| (s["id"].as_str().unwrap_or("").to_owned(), s["live"] == true))
+        .collect()
+}
+
+/// SIGTERM a child and wait (bounded) for it to exit.
+pub fn sigterm_and_wait(child: &mut ChildGuard) {
+    Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while child.try_wait().unwrap().is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "serve did not exit after SIGTERM"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// One raw HTTP request to the daemon's listener; returns the status code (0 if no answer came
+/// within `timeout`).
+pub fn raw_request(port: u16, head: &str, body: &[u8], timeout: Duration) -> u16 {
+    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.set_read_timeout(Some(timeout)).unwrap();
+    s.write_all(head.as_bytes()).unwrap();
+    let _ = s.write_all(body);
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 4096];
+    loop {
+        match s.read(&mut tmp) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                buf.extend_from_slice(&tmp[..n]);
+                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+        }
+    }
+    String::from_utf8_lossy(&buf)
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(0)
+}
+
+/// How many agent runs `needle` *triggered*: model requests (that advertise tools — not the title
+/// call) whose **last** user turn mentions it. Later runs carry it in their history; they don't
+/// count.
+pub fn runs_for_event(bodies: &std::sync::Mutex<Vec<String>>, needle: &str) -> usize {
+    bodies
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|b| b.contains("\"tools\":["))
+        .filter(|b| {
+            let body = b.split_once("\r\n\r\n").map(|(_, body)| body).unwrap_or(b);
+            let Ok(v) = serde_json::from_str::<Value>(body) else {
+                return false;
+            };
+            v["messages"]
+                .as_array()
+                .and_then(|m| m.iter().rev().find(|m| m["role"] == "user"))
+                .is_some_and(|m| m.to_string().contains(needle))
+        })
+        .count()
+}

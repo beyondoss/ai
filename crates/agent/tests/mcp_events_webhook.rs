@@ -164,7 +164,7 @@ async fn webhook_end_to_end_verify_deliver_dedup_reject_refresh_rotate_unsubscri
             "instructions": "Reply with the ticket id."
         }])
     )]));
-    let mut ws = ws_connect(d.port, Some("evt-session")).await;
+    let mut ws = ws_connect(d.port, Some("mcp-events")).await;
     let sub = wait_active(&mut ws).await;
     assert_eq!(sub["delivery"], "webhook");
     assert!(sub["subscription_id"].as_str().unwrap().starts_with("sub_"));
@@ -262,34 +262,7 @@ async fn webhook_end_to_end_verify_deliver_dedup_reject_refresh_rotate_unsubscri
     )
     .await;
 
-    // Rotation grace: a delivery signed only with the *previous* secret verifies; one signed with
-    // a secret two rotations old does not. Read the generation count right before, since the loop
-    // keeps rotating.
-    let gens = hook(&fixture)["secrets"].as_array().unwrap().len();
-    let r = emit(
-        &fixture,
-        json!({ "project": "alpha", "event_id": "prev-secret", "sign_with_generation": gens - 2, "data": {} }),
-    );
-    let prev_status = r["deliveries"][0]["status"].as_u64().unwrap();
-    let r = emit(
-        &fixture,
-        json!({ "project": "alpha", "event_id": "old-secret", "sign_with_generation": 0, "data": {} }),
-    );
-    assert_eq!(
-        r["deliveries"][0]["status"], 401,
-        "a secret two rotations old is refused: {r:#}"
-    );
-    // `prev_status` can race one more rotation (then that secret is two back); never anything else.
-    assert!(prev_status == 200 || prev_status == 401, "{prev_status}");
-    if prev_status == 200 {
-        next(
-            &mut ws,
-            Duration::from_secs(20),
-            "the previous-secret event",
-            |f| f["event"]["eventId"] == "prev-secret",
-        )
-        .await;
-    }
+    // (Rotation grace is proven exactly in its own test below.)
 
     // Shutdown unsubscribes, and the callback answers 410 Gone afterwards.
     drop(ws);
@@ -310,7 +283,7 @@ async fn a_terminated_envelope_ends_the_subscription_and_later_deliveries_get_41
         &mcp_url,
         json!([{ "name": "ticket.updated", "delivery": "webhook", "action": "notify" }])
     )]));
-    let mut ws = ws_connect(d.port, Some("term-session")).await;
+    let mut ws = ws_connect(d.port, Some("mcp-events")).await;
     wait_active(&mut ws).await;
     let callback = hook(&fixture)["url"].as_str().unwrap().to_owned();
 
@@ -435,7 +408,7 @@ async fn a_server_can_verify_the_callback_through_the_receiver_document_instead_
         serde_json::from_str::<Value>(&body).unwrap(),
         json!({ "receivers": ["/_beyond/mcp-events/"] })
     );
-    let mut ws = ws_connect(d.port, Some("wellknown1")).await;
+    let mut ws = ws_connect(d.port, Some("mcp-events")).await;
     wait_active(&mut ws).await;
     let v = &state(&fixture)["verifications"][0];
     assert_eq!(v["via"], "well-known", "{v:#}");
@@ -466,4 +439,158 @@ fn raw_get(port: u16, path: &str) -> (u16, String) {
             .map(|(_, b)| b.to_owned())
             .unwrap_or_default(),
     )
+}
+
+/// Exact, with no race against the refresh loop: grants of 3 s mean a refresh lands every ~2.25 s,
+/// and right after one has been observed there are ~2 s in which the receiver's secrets are known:
+/// the current one, the previous one (accepted — rotation grace), and anything older (refused).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rotation_grace_accepts_exactly_the_previous_secret_and_refuses_older_ones() {
+    let (_fx, mcp_url, fixture) = spawn_http_fixture(&[
+        ("MCP_FIXTURE_ALLOW_HTTP_CALLBACK", "1"),
+        ("MCP_FIXTURE_MAX_TTL_MS", "3000"),
+    ]);
+    let d = start_daemon(json!([webhook_server(
+        &mcp_url,
+        json!([{ "name": "ticket.updated", "delivery": "webhook", "action": "notify" }])
+    )]));
+    let mut ws = ws_connect(d.port, Some(common::mcp_events_fixture::EVENTS_SESSION)).await;
+    wait_active(&mut ws).await;
+    // Catch the moment the second refresh lands (three secrets seen: original + two rotations).
+    let gens = eventually(Duration::from_secs(20), "the second refresh", || {
+        let n = hook(&fixture)["secrets"].as_array().unwrap().len();
+        (n >= 3).then_some(n)
+    });
+    let current = gens - 1;
+    let r = emit(
+        &fixture,
+        json!({ "event_id": "cur-secret", "sign_with_generation": current, "data": {} }),
+    );
+    assert_eq!(
+        r["deliveries"][0]["status"], 200,
+        "the current secret: {r:#}"
+    );
+    let r = emit(
+        &fixture,
+        json!({ "event_id": "prev-secret", "sign_with_generation": current - 1, "data": {} }),
+    );
+    assert_eq!(
+        r["deliveries"][0]["status"], 200,
+        "the previous secret is still accepted: {r:#}"
+    );
+    let r = emit(
+        &fixture,
+        json!({ "event_id": "old-secret", "sign_with_generation": current - 2, "data": {} }),
+    );
+    assert_eq!(
+        r["deliveries"][0]["status"], 401,
+        "two rotations old is refused: {r:#}"
+    );
+    assert_eq!(
+        hook(&fixture)["secrets"].as_array().unwrap().len(),
+        gens,
+        "no refresh landed during the checks, so they were exact"
+    );
+    for id in ["cur-secret", "prev-secret"] {
+        next(&mut ws, Duration::from_secs(10), id, |f| {
+            f["event"]["eventId"] == id
+        })
+        .await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_future_dated_or_absurd_timestamp_is_refused_without_harm() {
+    let (_fx, mcp_url, fixture) = spawn_http_fixture(&[("MCP_FIXTURE_ALLOW_HTTP_CALLBACK", "1")]);
+    let d = start_daemon(json!([webhook_server(
+        &mcp_url,
+        json!([{ "name": "ticket.updated", "delivery": "webhook", "action": "notify" }])
+    )]));
+    let mut ws = ws_connect(d.port, Some(common::mcp_events_fixture::EVENTS_SESSION)).await;
+    wait_active(&mut ws).await;
+    // Ten minutes in the future, correctly signed: outside the window either way.
+    let r = emit(
+        &fixture,
+        json!({ "event_id": "future", "tamper": "future", "data": {} }),
+    );
+    assert_eq!(r["deliveries"][0]["status"], 400, "{r:#}");
+    // i64::MIN would overflow `now - ts`; the answer must still be a plain 400 (no panic, no reset).
+    let path = callback_path(&fixture, d.port);
+    let body = b"{}";
+    let head = format!(
+        "POST {path} HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+         webhook-id: x\r\nwebhook-timestamp: -9223372036854775808\r\nwebhook-signature: v1,AAAA\r\n\r\n",
+        body.len()
+    );
+    let status =
+        common::mcp_events_fixture::raw_request(d.port, &head, body, Duration::from_secs(5));
+    assert_eq!(status, 400);
+    // The daemon is fine afterwards.
+    let r = emit(&fixture, json!({ "event_id": "after", "data": {} }));
+    assert_eq!(r["deliveries"][0]["status"], 200, "{r:#}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_route_answers_unknown_and_oversized_deliveries_before_reading_the_body() {
+    let (_fx, mcp_url, fixture) = spawn_http_fixture(&[("MCP_FIXTURE_ALLOW_HTTP_CALLBACK", "1")]);
+    let d = start_daemon(json!([webhook_server(
+        &mcp_url,
+        json!([{ "name": "ticket.updated", "delivery": "webhook", "action": "notify" }])
+    )]));
+    let mut ws = ws_connect(d.port, Some(common::mcp_events_fixture::EVENTS_SESSION)).await;
+    wait_active(&mut ws).await;
+    // A 4 MB body is announced and never sent: the answer must come anyway, at once.
+    let head = |path: &str, len: usize| {
+        format!(
+            "POST {path} HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: {len}\r\n\r\n"
+        )
+    };
+    let started = Instant::now();
+    let unknown = common::mcp_events_fixture::raw_request(
+        d.port,
+        &head("/_beyond/mcp-events/not-a-token", 4_000_000),
+        b"",
+        Duration::from_secs(3),
+    );
+    assert_eq!(
+        unknown, 410,
+        "unknown token: Gone, without reading the body"
+    );
+    let live = callback_path(&fixture, d.port);
+    let oversized = common::mcp_events_fixture::raw_request(
+        d.port,
+        &head(&live, 2_000_000),
+        b"",
+        Duration::from_secs(3),
+    );
+    assert_eq!(
+        oversized, 413,
+        "over the 1 MiB cap: Payload Too Large, without reading the body"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "both answered without waiting for a body"
+    );
+}
+
+fn callback_path(fixture: &str, port: u16) -> String {
+    let url = hook(fixture)["url"].as_str().unwrap().to_owned();
+    url.split_once(&format!("127.0.0.1:{port}"))
+        .unwrap()
+        .1
+        .to_owned()
+}
+
+/// Service mode has no MCP Events, so it has no webhook route either — not even a `410`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_webhook_route_does_not_exist_in_service_mode() {
+    let (base, _bodies) = spawn_model_server_routed(vec![], turn_text("noted"));
+    let svc = common::service::Service::start(&base, &["s1"]).await;
+    let status = common::mcp_events_fixture::raw_request(
+        svc.port,
+        "POST /_beyond/mcp-events/anything HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\n",
+        b"{}",
+        Duration::from_secs(5),
+    );
+    assert_eq!(status, 404);
 }

@@ -145,7 +145,7 @@ async fn an_event_arriving_while_detached_is_delivered_and_seen_on_reattach() {
     // long before the event below arrives.
     let _d = daemon(home.path(), &base, port, &["--session-idle-timeout", "1"]);
 
-    let mut ws = ws_connect(port, Some("bgsession1")).await;
+    let mut ws = ws_connect(port, Some("mcp-events")).await;
     ws_wait_active(&mut ws).await;
     drop(ws);
     tokio::time::sleep(Duration::from_millis(2500)).await;
@@ -171,7 +171,7 @@ async fn an_event_arriving_while_detached_is_delivered_and_seen_on_reattach() {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Re-attach: the catch-up carries the event and the model's answer to it.
-    let mut ws = ws_connect(port, Some("bgsession1")).await;
+    let mut ws = ws_connect(port, Some("mcp-events")).await;
     let catchup = next(&mut ws, Duration::from_secs(20), "the catchup frame", |f| {
         f["type"] == "catchup"
     })
@@ -196,7 +196,7 @@ async fn mcp_events_reapable_lets_the_reaper_end_a_detached_sessions_subscriptio
         port,
         &["--session-idle-timeout", "1", "--mcp-events-reapable"],
     );
-    let mut ws = ws_connect(port, Some("reapme1")).await;
+    let mut ws = ws_connect(port, Some("mcp-events")).await;
     ws_wait_active(&mut ws).await;
     drop(ws);
     // Reaped → the session's teardown unsubscribes.
@@ -224,7 +224,7 @@ async fn a_restarted_daemon_resumes_webhook_delivery_from_its_persisted_cursor_w
 
     let port = free_port();
     let mut first = daemon(home.path(), &base, port, &[]);
-    let mut ws = ws_connect(port, Some("resumer1")).await;
+    let mut ws = ws_connect(port, Some("mcp-events")).await;
     ws_wait_active(&mut ws).await;
     emit(&fixture, json!({ "event_id": "r-1", "data": { "n": 1 } }));
     next(&mut ws, Duration::from_secs(20), "r-1", |f| {
@@ -238,8 +238,8 @@ async fn a_restarted_daemon_resumes_webhook_delivery_from_its_persisted_cursor_w
     let state_file = std::fs::read_dir(home.path().join("sessions"))
         .unwrap()
         .map(|e| e.unwrap().path())
-        .find(|p| p.to_string_lossy().ends_with("resumer1.mcp-events.json"))
-        .expect("a resumer1.mcp-events.json beside resumer1's transcript");
+        .find(|p| p.to_string_lossy().ends_with("mcp-events.mcp-events.json"))
+        .expect("the events session state file beside its's transcript");
     let saved: Value = serde_json::from_slice(&std::fs::read(state_file).unwrap()).unwrap();
     let entry = saved["subscriptions"]
         .as_object()
@@ -257,7 +257,7 @@ async fn a_restarted_daemon_resumes_webhook_delivery_from_its_persisted_cursor_w
 
     let port = free_port();
     let _second = daemon(home.path(), &base, port, &[]);
-    let mut ws = ws_connect(port, Some("resumer1")).await;
+    let mut ws = ws_connect(port, Some("mcp-events")).await;
     let got = collect(&mut ws, Duration::from_secs(6), |f| {
         f["type"] == "mcp_event"
     })

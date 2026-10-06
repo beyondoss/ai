@@ -10,7 +10,10 @@ mod common;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
-use common::mcp_events_fixture::{emit, spawn_http_fixture, state, write_settings};
+use common::mcp_events_fixture::{
+    EVENTS_SESSION, control, emit, eventually, spawn_daemon, spawn_http_fixture, state,
+    write_settings, ws_next, ws_wait_active,
+};
 use common::{
     BIN, SpawnGuarded, TestWs, free_port, serve_dir_cmd, spawn_model_server_routed, turn_text,
     wait_for_port, ws_connect, ws_next_frame, ws_send,
@@ -59,7 +62,7 @@ async fn deliveries_must_carry_a_valid_v1a_signature_when_the_server_publishes_a
         .stderr(Stdio::null())
         .spawn_guarded();
     wait_for_port(port);
-    let mut ws = ws_connect(port, Some("identity1")).await;
+    let mut ws = ws_connect(port, Some("mcp-events")).await;
     // The verification challenge itself was v1a-signed and checked: the subscribe succeeds.
     let mut active = false;
     for n in 0..100 {
@@ -105,4 +108,116 @@ async fn deliveries_must_carry_a_valid_v1a_signature_when_the_server_publishes_a
         .is_none(),
         "neither refused delivery surfaced"
     );
+}
+
+/// Fail closed, part one: once a key has been seen for an origin, a later `404` (or a failing
+/// fetch) on refresh does not switch enforcement off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn once_keys_are_seen_a_server_that_stops_publishing_is_still_held_to_them() {
+    let (_fx, mcp_url, fixture) = spawn_http_fixture(&[
+        ("MCP_FIXTURE_ALLOW_HTTP_CALLBACK", "1"),
+        ("MCP_FIXTURE_ED25519_SEED", &"07".repeat(32)),
+        ("MCP_FIXTURE_MAX_TTL_MS", "1500"),
+    ]);
+    let home = tempfile::tempdir().unwrap();
+    write_settings(home.path(), hooks(&mcp_url));
+    let (base, _bodies) = spawn_model_server_routed(vec![], turn_text("noted"));
+    let port = free_port();
+    let _d = spawn_daemon(home.path(), &base, port, &[]);
+    let mut ws = ws_connect(port, Some(EVENTS_SESSION)).await;
+    ws_wait_active(&mut ws).await;
+
+    // The server stops publishing its JWKS; let several refreshes go by.
+    control(
+        &fixture,
+        "POST",
+        "/control/jwks",
+        Some(&json!({ "status": 404 })),
+    );
+    let refreshes_now = state(&fixture)["hooks"][0]["refreshes"].as_u64().unwrap();
+    eventually(Duration::from_secs(20), "two more refreshes", || {
+        (state(&fixture)["hooks"][0]["refreshes"].as_u64().unwrap() >= refreshes_now + 2)
+            .then_some(())
+    });
+    let r = emit(
+        &fixture,
+        json!({ "event_id": "no-v1a-after-404", "tamper": "no_v1a", "data": {} }),
+    );
+    assert_eq!(r["deliveries"][0]["status"], 401, "still enforced: {r:#}");
+    control(
+        &fixture,
+        "POST",
+        "/control/jwks",
+        Some(&json!({ "status": 503 })),
+    );
+    let refreshes_now = state(&fixture)["hooks"][0]["refreshes"].as_u64().unwrap();
+    eventually(
+        Duration::from_secs(20),
+        "a refresh with a failing fetch",
+        || {
+            (state(&fixture)["hooks"][0]["refreshes"].as_u64().unwrap() > refreshes_now)
+                .then_some(())
+        },
+    );
+    let r = emit(
+        &fixture,
+        json!({ "event_id": "no-v1a-after-503", "tamper": "no_v1a", "data": {} }),
+    );
+    assert_eq!(r["deliveries"][0]["status"], 401, "still enforced: {r:#}");
+    let r = emit(
+        &fixture,
+        json!({ "event_id": "signed-still-fine", "data": {} }),
+    );
+    assert_eq!(r["deliveries"][0]["status"], 200, "{r:#}");
+}
+
+/// Fail closed, part two: with no key known for the origin, a first subscribe whose JWKS fetch
+/// fails (not a clear `404`) is refused rather than started without identity checks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failing_jwks_fetch_refuses_the_first_subscribe_instead_of_enforcing_nothing() {
+    let (_fx, mcp_url, _fixture) = spawn_http_fixture(&[
+        ("MCP_FIXTURE_ALLOW_HTTP_CALLBACK", "1"),
+        ("MCP_FIXTURE_ED25519_SEED", &"07".repeat(32)),
+        ("MCP_FIXTURE_JWKS_STATUS", "500"),
+    ]);
+    let home = tempfile::tempdir().unwrap();
+    write_settings(
+        home.path(),
+        json!([{
+            "name": "hooks", "transport": "http", "url": mcp_url,
+            "headers": { "Authorization": "Bearer principal-1" },
+        }]),
+    );
+    let (base, _bodies) = spawn_model_server_routed(vec![], turn_text("noted"));
+    let port = free_port();
+    let _d = spawn_daemon(home.path(), &base, port, &[]);
+    let mut ws = ws_connect(port, Some("identity-refused")).await;
+    ws_send(
+        &mut ws,
+        json!({ "type": "mcp_events_subscribe", "id": "s", "server": "hooks", "name": "ticket.updated", "delivery": "webhook" }),
+    )
+    .await;
+    let r = ws_next(
+        &mut ws,
+        Duration::from_secs(30),
+        "the subscribe response",
+        |f| f["id"] == "s",
+    )
+    .await;
+    assert_eq!(r["success"], false, "{r:#}");
+    assert!(
+        r["error"]
+            .as_str()
+            .unwrap()
+            .contains("webhook-signing keys"),
+        "{r:#}"
+    );
+}
+
+fn hooks(mcp_url: &str) -> Value {
+    json!([{
+        "name": "hooks", "transport": "http", "url": mcp_url,
+        "headers": { "Authorization": "Bearer principal-1" },
+        "events": [{ "name": "ticket.updated", "delivery": "webhook", "action": "notify" }],
+    }])
 }

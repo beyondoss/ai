@@ -461,6 +461,9 @@ fn session_cfg(base: &ServeConfig, id: &str, service: Option<Arc<ServiceSession>
     c.listen_uds = None;
     c.listen_uds_mode = None;
     c.session_id = Some(id.to_string());
+    // Configured MCP Events subscriptions belong to exactly one daemon session, so one event is
+    // one model run — not one per connected session.
+    c.mcp_events_owner = id == base.mcp_events_session;
     // An addressed session selects itself; `--continue`'s "most recent for this cwd" would only be
     // able to disagree with the id the client actually routed on.
     c.continue_session = false;
@@ -1717,6 +1720,11 @@ pub async fn serve_ws(
     };
     // Read before `cfg` is moved into the session body factory inside this initializer.
     let cfg_drain_grace = cfg.drain_grace;
+    // The daemon session that owns configured MCP Events subscriptions, started below so its
+    // triggers run with no client attached. Only when something is configured, never in service
+    // mode.
+    let events_session = (!cfg.service_mode && !cfg.mcp_catalog.event_subscriptions().is_empty())
+        .then(|| cfg.mcp_events_session.clone());
     let supervisor = Arc::new(Supervisor {
         table: Arc::default(),
         // Service mode lists per tenant, from the shards, never from one process-wide directory.
@@ -1728,6 +1736,21 @@ pub async fn serve_ws(
         body: serve_session_body(cfg),
     });
     let mut shutdown = crate::serve::ShutdownSignal::new()?;
+
+    if let Some(id) = events_session {
+        // Pinned and at once unpinned: the session starts exactly as if a client had connected and
+        // left. It stays because its subscriptions keep it alive, not because anything holds it.
+        match supervisor.pin(Some(id.clone()), None).await {
+            Ok(p) => {
+                supervisor.unpin(&p.id, p.incarnation);
+                eprintln!("serve: MCP Events session `{id}` owns the configured subscriptions");
+            }
+            Err(e) => eprintln!(
+                "serve: could not start the MCP Events session `{id}`: {}",
+                HttpError::from(e)
+            ),
+        }
+    }
 
     // The idle reaper (on unless `--session-idle-timeout 0` turned it off). A background ticker that
     // stops dead and detached-idle-not-mid-run sessions — the same `Stopping` transition (drop the
@@ -1882,7 +1905,8 @@ where
 
     // MCP Events receiver document (draft endpoint-verification path (d)): a public, static
     // statement of which paths accept deliveries, so a server can verify without a challenge.
-    if head.path == crate::tools::mcp_events::RECEIVER_DOCUMENT_PATH
+    if supervisor.service.is_none()
+        && head.path == crate::tools::mcp_events::RECEIVER_DOCUMENT_PATH
         && let Some(doc) = crate::tools::mcp_events::receiver_document()
     {
         drain_http_body(&mut stream, &head, &leftover).await;
@@ -1892,10 +1916,12 @@ where
 
     // MCP Events webhook deliveries (draft extension). Ahead of the grant check: the caller is an
     // MCP server, not a tenant, and it authenticates with the subscription's HMAC signature, which
-    // `mcp_events::receive_webhook` verifies over the raw body.
-    if let Some(token) = head
-        .path
-        .strip_prefix(crate::tools::mcp_events::WEBHOOK_PATH_PREFIX)
+    // `mcp_events::receive_webhook` verifies over the raw body. Not routed at all in service mode,
+    // which has no MCP Events (and so no subscription a delivery could belong to).
+    if supervisor.service.is_none()
+        && let Some(token) = head
+            .path
+            .strip_prefix(crate::tools::mcp_events::WEBHOOK_PATH_PREFIX)
     {
         let token = token.to_owned();
         handle_mcp_event_webhook(&mut stream, &head, leftover, &token).await;
@@ -2219,22 +2245,52 @@ async fn handle_mcp_event_webhook<S>(
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    if head.method != "POST" {
-        refuse(stream, head, &leftover, HttpError::MethodNotAllowed).await;
-        return;
-    }
-    let Some(len) = head.content_length else {
-        let _ = write_http_err(stream, &HttpError::LengthRequired, None).await;
-        return;
-    };
-    let body = match read_http_body(stream, &leftover, len).await {
-        Ok(body) => body,
-        Err(e) => {
-            let _ = write_http_err(stream, &e, None).await;
-            return;
+    use crate::tools::mcp_events::{MAX_WEBHOOK_BODY, WebhookReply};
+    let reply_now = |reply: WebhookReply| reply;
+    // Cheap answers first, before a byte of the body is read: an unknown token is `410` (the
+    // draft's "do not retry"), a non-POST `405`, a body past the cap `413` (the draft lets a
+    // receiver refuse oversized deliveries, and the server must not retry them).
+    let early = if head.method != "POST" {
+        Some(WebhookReply::error(405, "Method Not Allowed", "POST only"))
+    } else if !crate::tools::mcp_events::route_exists(token) {
+        Some(WebhookReply::error(410, "Gone", "no such subscription"))
+    } else {
+        match head.content_length {
+            None => Some(WebhookReply::error(
+                411,
+                "Length Required",
+                "Content-Length required",
+            )),
+            Some(len) if len > MAX_WEBHOOK_BODY => Some(WebhookReply::error(
+                413,
+                "Payload Too Large",
+                "delivery body too large",
+            )),
+            Some(_) => None,
         }
     };
-    let reply = crate::tools::mcp_events::receive_webhook(token, &head.headers, &body);
+    if let Some(reply) = early {
+        // Drain a body small enough to be worth it (closing on unread bytes can turn the answer
+        // into a reset); a large or absent-length one is not read at all.
+        if head.content_length.is_some_and(|l| l <= MAX_WEBHOOK_BODY) {
+            drain_http_body(stream, head, &leftover).await;
+        }
+        let reply = reply_now(reply);
+        let _ = write_http_ok(stream, reply.status, reply.reason, None, &reply.body).await;
+        return;
+    }
+    let len = head.content_length.unwrap_or(0);
+    // Grown as bytes arrive — never sized from the untrusted `Content-Length`.
+    let mut body = leftover[..leftover.len().min(len)].to_vec();
+    let mut tmp = [0u8; 8192];
+    while body.len() < len {
+        let want = (len - body.len()).min(tmp.len());
+        match stream.read(&mut tmp[..want]).await {
+            Ok(0) | Err(_) => return,
+            Ok(n) => body.extend_from_slice(&tmp[..n]),
+        }
+    }
+    let reply = crate::tools::mcp_events::receive_webhook(token, &head.headers, &body).await;
     let _ = write_http_ok(stream, reply.status, reply.reason, None, &reply.body).await;
 }
 
