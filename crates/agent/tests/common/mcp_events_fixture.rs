@@ -260,7 +260,19 @@ pub const EVENTS_SESSION: &str = "mcp-events";
 
 /// A `serve --listen` daemon on `port` with `--mcp-events-callback-url` pointing back at it.
 pub fn spawn_daemon(home: &Path, base: &str, port: u16, extra: &[&str]) -> ChildGuard {
+    spawn_daemon_env(home, base, port, extra, &[])
+}
+
+/// [`spawn_daemon`] with extra environment.
+pub fn spawn_daemon_env(
+    home: &Path,
+    base: &str,
+    port: u16,
+    extra: &[&str],
+    env: &[(&str, &str)],
+) -> ChildGuard {
     let mut cmd = super::serve_dir_cmd(super::BIN, base, &home.join("sessions").to_string_lossy());
+    cmd.envs(env.iter().copied());
     cmd.args([
         "--listen",
         &format!("127.0.0.1:{port}"),
@@ -435,4 +447,25 @@ pub fn runs_for_event(bodies: &std::sync::Mutex<Vec<String>>, needle: &str) -> u
                 .is_some_and(|m| m.to_string().contains(needle))
         })
         .count()
+}
+
+/// The undelivered events a session's events state holds on disk: its pending log
+/// (`<session>.mcp-events.log`, beside the snapshot at `state_json`) replayed — `add` records
+/// minus `done` ones, oldest first. A torn line is skipped, as the agent itself does.
+pub fn pending_on_disk(state_json: &Path) -> Vec<Value> {
+    let log = std::fs::read(state_json.with_extension("log")).unwrap_or_default();
+    let mut live: std::collections::BTreeMap<u64, Value> = std::collections::BTreeMap::new();
+    for line in log.split(|&b| b == b'\n').filter(|l| !l.is_empty()) {
+        let Ok(op) = serde_json::from_slice::<Value>(line) else {
+            continue;
+        };
+        if let Some(add) = op.get("add") {
+            live.insert(add["seq"].as_u64().unwrap_or(0), add.clone());
+        } else if let Some(done) = op.get("done").and_then(Value::as_array) {
+            for s in done {
+                live.remove(&s.as_u64().unwrap_or(0));
+            }
+        }
+    }
+    live.into_values().collect()
 }

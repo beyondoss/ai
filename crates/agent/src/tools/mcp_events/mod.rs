@@ -21,18 +21,21 @@
 //!
 //! **Into the session, durably.** Every occurrence is deduplicated by `eventId`, broadcast as an
 //! `mcp_event` frame, and — unless the subscription's action is `notify` — queued as a *pending*
-//! event in the session's state file before the server is told it was received (cursor advanced,
-//! webhook acked). One coalescer injects at most one synthetic `prompt` per [`coalesce_window`] into
-//! the session's own command channel, after committing the state that holds it; a pending event
-//! leaves the file only once the prompt that carried it has run and its transcript is persisted.
-//! A restart re-injects whatever is still pending. Follow-ups are held while a run is in flight.
+//! event, durably (see [`state`]), before the server is told it was received (cursor advanced,
+//! webhook acked); a write that fails is not acknowledged. One coalescer injects at most one
+//! synthetic `prompt` per [`coalesce_window`] into the session's own command channel. A pending
+//! event leaves the queue once the model has received it in a transcript that persisted
+//! ([`McpEventsHub::finish_run`]); one whose run failed, or whose steer an abort dropped, is
+//! injected again (at most [`MAX_INJECT_ATTEMPTS`] times). A restart re-injects whatever is still
+//! pending. Follow-ups are held while a run is in flight.
 //!
 //! **Lifetime.** Subscriptions belong to the `serve_session` task — the slot, not the transcript —
-//! and end with it. While a session holds a live subscription or undelivered events it is exempt
-//! from the daemon's idle reaper (unless `--mcp-events-reapable`); a session with none is reaped as
-//! usual. An injection that lands while the session is busy with a non-prompt command is deferred,
-//! never refused ([`is_injection`]); `mcp_events_*` commands run as spawned tasks
-//! ([`McpEventsCommands`]).
+//! and end with it. Configured ones are kept up: retried with capped backoff after a failure or a
+//! termination, for as long as the session runs. While a session holds a live subscription, one
+//! being (re)established, or undelivered events it is exempt from the daemon's idle reaper (unless
+//! `--mcp-events-reapable`); a session with none is reaped as usual. An injection that lands while
+//! the session is busy with a non-prompt command is deferred, never refused ([`is_injection`]);
+//! `mcp_events_*` commands run as spawned tasks ([`McpEventsCommands`]).
 
 mod state;
 pub mod webhook;
@@ -94,6 +97,10 @@ pub const RECEIVER_DOCUMENT_PATH: &str = "/.well-known/mcp-webhook-receiver.json
 const DEDUP_WINDOW: usize = 1024;
 /// Most events one injection carries; the rest wait for the next one (never dropped).
 const MAX_INJECT_BATCH: usize = 50;
+/// How many times an event is injected without reaching the model (its runs failed, or an abort
+/// dropped it from the steer lane) before it is dropped and reported — at least once, but a
+/// poison event must not re-run the model forever.
+const MAX_INJECT_ATTEMPTS: u32 = 3;
 /// Timeout on every unary `events/*` request.
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long session teardown waits for unsubscribes before giving up on them.
@@ -142,6 +149,22 @@ fn webhook_ttl() -> Duration {
 fn max_pending() -> usize {
     env_u64("BEYOND_AI_AGENT_MCP_EVENTS_MAX_PENDING", 1_000).max(1) as usize
 }
+
+/// Most bytes of undelivered events one session holds (as stored), beside the count bound.
+fn max_pending_bytes() -> u64 {
+    env_u64(
+        "BEYOND_AI_AGENT_MCP_EVENTS_MAX_PENDING_BYTES",
+        16 * 1024 * 1024,
+    )
+    .max(1)
+}
+
+/// A subscription that has stayed up this long has its re-discovery budget restored.
+fn healthy_for() -> Duration {
+    env_ms("BEYOND_AI_AGENT_MCP_EVENTS_HEALTHY_MS", 600_000)
+}
+/// Longest wait between attempts to (re)establish a configured subscription.
+const CONFIGURED_RETRY_CAP: Duration = Duration::from_secs(60);
 
 fn now_unix() -> i64 {
     SystemTime::now()
@@ -338,6 +361,7 @@ impl SubState {
             PersistedSub {
                 cursor: self.cursor(),
                 recent,
+                webhook: None,
             },
         );
     }
@@ -429,12 +453,19 @@ struct Hub {
     /// while different keys (and slow servers) never wait on each other.
     key_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     discovery: Mutex<HashMap<String, Discovered>>,
-    rediscoveries: Mutex<HashMap<String, u32>>,
+    /// Per key: re-discoveries used, and when the last one happened (the budget resets after
+    /// [`healthy_for`]).
+    rediscoveries: Mutex<HashMap<String, (u32, Instant)>>,
+    /// Keys of the configured (`mcp_servers[].events`) subscriptions this session owns: kept up —
+    /// retried with capped backoff, forever — for as long as they are configured.
+    configured: Mutex<HashSet<String>>,
     shutdown: CancellationToken,
     /// For direct HTTP events requests; built on first use, never for a stdio-only session.
     http: std::sync::OnceLock<reqwest::Client>,
     keep_alive: Option<Arc<AtomicBool>>,
-    /// Configured subscriptions still being started (they count as live for the keep-alive).
+    /// Configured subscriptions not currently up — starting, or retrying after a failure or a
+    /// termination. They count as live for the keep-alive: a daemon whose servers are all briefly
+    /// down must not have its events session reaped.
     starting: AtomicUsize,
     store: StateStore,
     /// `mcp_events_*` commands in flight — spawned so none ever blocks the session's command loop.
@@ -483,11 +514,12 @@ impl McpEventsHub {
             key_locks: Mutex::new(HashMap::new()),
             discovery: Mutex::new(HashMap::new()),
             rediscoveries: Mutex::new(HashMap::new()),
+            configured: Mutex::new(HashSet::new()),
             shutdown: CancellationToken::new(),
             http: std::sync::OnceLock::new(),
             keep_alive: cfg.keep_alive,
             starting: AtomicUsize::new(0),
-            store: StateStore::open(cfg.state_path, max_pending()),
+            store: StateStore::open(cfg.state_path, max_pending(), max_pending_bytes()),
             command_tasks: Mutex::new(tokio::task::JoinSet::new()),
             owns_configured: cfg.owns_configured,
         });
@@ -514,66 +546,75 @@ impl McpEventsHub {
     }
 
     /// Subscribe to every `mcp_servers[].events` entry — only in the session that owns them — in
-    /// the background: a slow or broken server must not hold the session's start. Failures surface
-    /// as `mcp_event_status` frames and on stderr, and stay visible in `mcp_events_list`.
+    /// the background: a slow or broken server must not hold the session's start. Each is kept up:
+    /// a failed subscribe is retried with capped backoff for as long as the session runs, and so is
+    /// a subscription the server later ends. Failures surface as `mcp_event_status` frames and on
+    /// stderr, and stay visible in `mcp_events_list`.
     pub fn start_configured(&self) {
         if !self.hub.owns_configured {
             return;
         }
-        let configured = self.hub.catalog.event_subscriptions();
-        let count: usize = configured.iter().map(|(_, s)| s.len()).sum();
-        if count == 0 {
-            return;
-        }
-        self.hub.starting.store(count, Ordering::Release);
-        self.hub.refresh_keep_alive();
-        let hub = self.hub.clone();
-        tokio::spawn(async move {
-            for (server, subs) in configured {
-                for sub in subs {
-                    let spec = SubSpec {
-                        server: server.clone(),
-                        sub,
-                    };
-                    let result = Hub::subscribe(&hub, spec.clone()).await;
-                    hub.starting.fetch_sub(1, Ordering::AcqRel);
-                    hub.refresh_keep_alive();
-                    if let Err(e) = result {
-                        eprintln!(
-                            "warning: session {}: mcp events: `{}` on `{}`: {e}",
-                            hub.session_id, spec.sub.name, spec.server
-                        );
-                        (hub.emit)(json!({
-                            "type": "mcp_event_status",
-                            "kind": "error",
-                            "server": spec.server,
-                            "name": spec.sub.name,
-                            "arguments": spec.arguments(),
-                            "error": e,
-                        }));
-                    }
-                }
+        for (server, subs) in self.hub.catalog.event_subscriptions() {
+            for sub in subs {
+                let spec = SubSpec {
+                    server: server.clone(),
+                    sub,
+                };
+                self.hub
+                    .configured
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(spec.key());
+                Hub::keep_subscribed(&self.hub, spec, Duration::ZERO);
             }
-        });
+        }
     }
 
-    /// The prompts that carried these injection batches have run and their transcript is
-    /// persisted: the events in them are delivered. Durable before it returns.
-    pub async fn delivered(&self, batches: &[u64]) {
+    /// A run that carried injection batches is over. `delivered`: the batches the model received,
+    /// in a transcript that is now persisted — their events leave the pending queue (durably, before
+    /// this returns). `returned`: batches that did not reach the model (a steer dropped by an
+    /// abort, a run that failed, a transcript that did not persist) — their events are pending
+    /// again and will be injected again.
+    pub async fn finish_run(&self, delivered: &[u64], returned: &[u64]) {
         let mut any = false;
-        for b in batches {
+        for b in returned {
+            for e in self.hub.store.return_batch(*b, MAX_INJECT_ATTEMPTS) {
+                any = true;
+                eprintln!(
+                    "warning: session {}: mcp events: dropping an event from `{}` on `{}` after                      {MAX_INJECT_ATTEMPTS} injections that never reached the model",
+                    self.hub.session_id, e.name, e.server
+                );
+                (self.hub.emit)(json!({
+                    "type": "mcp_event_status",
+                    "kind": "dropped",
+                    "server": e.server,
+                    "name": e.name,
+                    "arguments": e.arguments,
+                    "event": e.event,
+                    "error": format!("{MAX_INJECT_ATTEMPTS} injections never reached the model"),
+                }));
+            }
+        }
+        for b in delivered {
             any |= self.hub.store.delivered(*b);
         }
         if any {
-            self.hub.store.commit().await;
+            if let Err(e) = self.hub.store.commit().await {
+                // Still delivered in memory; the record of it is retried with the next write. A
+                // crash before then re-injects these events (at least once, never lost).
+                tracing::warn!(error = %e, "could not record delivered MCP events yet");
+            }
             self.hub.refresh_keep_alive();
         }
     }
 
     /// The session moved to another transcript file (`new_session`, `switch_session`, …): the
-    /// events state follows it.
-    pub fn relocate(&self, session_file: Option<&std::path::Path>) {
-        self.hub.store.relocate(session_file.map(state_path_for));
+    /// events state moves with it now, merged with whatever that transcript already had.
+    pub async fn relocate(&self, session_file: Option<&std::path::Path>) {
+        self.hub
+            .store
+            .relocate(session_file.map(state_path_for))
+            .await;
     }
 
     /// Unsubscribe everything (best effort, bounded), stop the coalescer, and write the final
@@ -583,15 +624,26 @@ impl McpEventsHub {
         for a in &actives {
             a.cancel.cancel();
         }
+        let aborts: Vec<_> = actives.iter().map(|a| a.task.abort_handle()).collect();
         let _ = tokio::time::timeout(SHUTDOWN_GRACE, async {
             for a in actives {
                 let _ = a.task.await;
             }
         })
         .await;
+        // Anything still running past the grace is aborted, not left behind (its webhook route
+        // goes with it).
+        for a in aborts {
+            a.abort();
+        }
         self.hub.shutdown.cancel();
         if let Some(c) = self.coalescer.take() {
-            let _ = c.await;
+            // The coalescer watches `shutdown` everywhere it can wait, its send included; bounded
+            // all the same, and aborted if it overstays.
+            let abort = c.abort_handle();
+            if tokio::time::timeout(SHUTDOWN_GRACE, c).await.is_err() {
+                abort.abort();
+            }
         }
         let mut tasks = std::mem::take(
             &mut *self
@@ -605,7 +657,7 @@ impl McpEventsHub {
         if let Some(k) = &self.hub.keep_alive {
             k.store(false, Ordering::Release);
         }
-        self.hub.store.commit().await;
+        let _ = self.hub.store.commit().await;
     }
 
     /// The handle `serve` dispatches `mcp_events_*` commands through, from any loop, idle or busy.
@@ -955,7 +1007,7 @@ impl Hub {
         };
         if let Err(e) = outcome {
             cancel.cancel();
-            let _ = tokio::time::timeout(SHUTDOWN_GRACE, task).await;
+            stop_task(task).await;
             if reuse.is_some() {
                 state.with(|s| s.state = prior_state);
             }
@@ -969,7 +1021,7 @@ impl Hub {
         let replaced = hub.lock_subs().remove(&key);
         if let Some(old) = replaced {
             old.cancel.cancel();
-            let _ = tokio::time::timeout(SHUTDOWN_GRACE, old.task).await;
+            stop_task(old.task).await;
         }
         state.with(|s| {
             if s.state == "starting" {
@@ -1002,13 +1054,17 @@ impl Hub {
         let _held = lock.lock().await;
         if forget {
             self.store.forget_sub(key);
+            self.configured
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(key);
         }
         let Some(active) = self.lock_subs().remove(key) else {
             return false;
         };
         self.refresh_keep_alive();
         active.cancel.cancel();
-        let _ = tokio::time::timeout(SHUTDOWN_GRACE, active.task).await;
+        stop_task(active.task).await;
         true
     }
 
@@ -1043,16 +1099,14 @@ impl Hub {
             return Delivery::Duplicate;
         }
         if spec.sub.action != McpEventAction::Notify
-            && !self.store.push_pending(PendingEvent {
-                seq: 0,
-                action: spec.sub.action,
-                server: spec.server.clone(),
-                name: spec.sub.name.clone(),
-                arguments: spec.arguments(),
-                instructions: spec.sub.instructions.clone(),
-                event: event.clone(),
-                batch: None,
-            })
+            && !self.store.push_pending(PendingEvent::new(
+                spec.sub.action,
+                spec.server.clone(),
+                spec.sub.name.clone(),
+                spec.arguments(),
+                spec.sub.instructions.clone(),
+                event.clone(),
+            ))
         {
             return Delivery::Full;
         }
@@ -1094,16 +1148,14 @@ impl Hub {
         }
         self.status_event(spec, "gap", json!({ "cursor": state.cursor() }));
         if spec.sub.action != McpEventAction::Notify {
-            let queued = self.store.push_pending(PendingEvent {
-                seq: 0,
-                action: spec.sub.action,
-                server: spec.server.clone(),
-                name: spec.sub.name.clone(),
-                arguments: spec.arguments(),
-                instructions: spec.sub.instructions.clone(),
-                event: json!({ "gap": true, "cursor": state.cursor() }),
-                batch: None,
-            });
+            let queued = self.store.push_pending(PendingEvent::new(
+                spec.sub.action,
+                spec.server.clone(),
+                spec.sub.name.clone(),
+                spec.arguments(),
+                spec.sub.instructions.clone(),
+                json!({ "gap": true, "cursor": state.cursor() }),
+            ));
             if !queued {
                 tracing::warn!("pending queue full; a gap notice was not queued for the model");
             }
@@ -1124,15 +1176,96 @@ impl Hub {
         (self.emit)(frame);
     }
 
-    /// The server ended a subscription. If it says the event type was removed or changed in place,
-    /// re-discover and resubscribe (bounded) — the draft's SHOULD — rather than treat it as final.
+    /// Keep a configured subscription up: subscribe after `delay`, and on failure retry with
+    /// capped backoff — forever, until the session ends. It counts as live (for the keep-alive)
+    /// the whole time it is not up.
+    fn keep_subscribed(hub: &Arc<Hub>, spec: SubSpec, delay: Duration) {
+        hub.starting.fetch_add(1, Ordering::AcqRel);
+        hub.refresh_keep_alive();
+        let weak = Arc::downgrade(hub);
+        let shutdown = hub.shutdown.clone();
+        let resumed = !delay.is_zero();
+        tokio::spawn(async move {
+            let mut delay = delay;
+            let mut failures = 0u32;
+            loop {
+                tokio::select! {
+                    () = tokio::time::sleep(delay) => {}
+                    () = shutdown.cancelled() => break,
+                }
+                let Some(hub) = weak.upgrade() else { return };
+                if resumed {
+                    // The server ended it: its event types may have changed, so look again.
+                    if let Ok(mut d) = hub.discovery.lock() {
+                        d.remove(&spec.server);
+                    }
+                }
+                match Hub::subscribe(&hub, spec.clone()).await {
+                    Ok(_) => {
+                        if resumed {
+                            hub.resubscribed(&spec);
+                        }
+                        break;
+                    }
+                    Err(e) => {
+                        failures += 1;
+                        delay = backoff(failures, CONFIGURED_RETRY_CAP);
+                        eprintln!(
+                            "warning: session {}: mcp events: `{}` on `{}`: {e} (retrying in {}s)",
+                            hub.session_id,
+                            spec.sub.name,
+                            spec.server,
+                            delay.as_secs()
+                        );
+                        hub.status_event(
+                            &spec,
+                            "error",
+                            json!({ "error": e, "retry_in_ms": delay.as_millis() as u64 }),
+                        );
+                    }
+                }
+            }
+            if let Some(hub) = weak.upgrade() {
+                hub.starting.fetch_sub(1, Ordering::AcqRel);
+                hub.refresh_keep_alive();
+            }
+        });
+    }
+
+    /// A subscription came back after the server ended it: whatever happened in between may not
+    /// have been delivered, so tell the model (and attached clients) there may be a gap.
+    fn resubscribed(&self, spec: &SubSpec) {
+        self.status_event(spec, "resubscribed", json!({}));
+        let state = self.lock_subs().get(&spec.key()).map(|a| a.state.clone());
+        if let Some(state) = state {
+            self.gap(spec, &state, &Value::Null);
+        }
+    }
+
+    /// The server ended a subscription. A configured one is kept up ([`Self::keep_subscribed`]).
+    /// Otherwise, if the server says the event type was removed or changed in place, re-discover
+    /// and resubscribe — the draft's SHOULD — up to [`MAX_REDISCOVERIES`] times per
+    /// [`healthy_for`]; the model is told about the possible gap once it is back.
     fn ended(self: &Arc<Self>, spec: &SubSpec, state: &SubState, error: RpcError) {
         state.with(|s| {
             s.state = "terminated";
             s.last_error = Some(error.to_string());
         });
-        self.refresh_keep_alive();
         self.status_event(spec, "terminated", json!({ "error": error.to_json() }));
+        if self.shutdown.is_cancelled() {
+            self.refresh_keep_alive();
+            return;
+        }
+        let configured = self
+            .configured
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&spec.key());
+        if configured {
+            Hub::keep_subscribed(self, spec.clone(), Duration::from_secs(1));
+            return;
+        }
+        self.refresh_keep_alive();
         if !error.wants_rediscovery() {
             return;
         }
@@ -1141,9 +1274,13 @@ impl Hub {
                 .rediscoveries
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let n = r.entry(spec.key()).or_insert(0);
-            *n += 1;
-            *n
+            let entry = r.entry(spec.key()).or_insert((0, Instant::now()));
+            if entry.1.elapsed() >= healthy_for() {
+                entry.0 = 0;
+            }
+            entry.0 += 1;
+            entry.1 = Instant::now();
+            entry.0
         };
         if attempt > MAX_REDISCOVERIES {
             return;
@@ -1160,7 +1297,7 @@ impl Hub {
                 d.remove(&spec.server);
             }
             match Hub::subscribe(&hub, spec.clone()).await {
-                Ok(_) => hub.status_event(&spec, "resubscribed", json!({})),
+                Ok(_) => hub.resubscribed(&spec),
                 Err(e) => hub.status_event(&spec, "error", json!({ "error": e })),
             }
         });
@@ -1204,6 +1341,16 @@ fn choose_mode(
                 offered_str()
             )
         }),
+    }
+}
+
+/// Wait (bounded) for a cancelled subscription task to finish — it unsubscribes on its way out —
+/// and abort it if it overstays, so a task stuck in a request it does not watch cancellation in
+/// is never left running (or holding its webhook route).
+async fn stop_task(task: tokio::task::JoinHandle<()>) {
+    let abort = task.abort_handle();
+    if tokio::time::timeout(SHUTDOWN_GRACE, task).await.is_err() {
+        abort.abort();
     }
 }
 
@@ -1268,34 +1415,47 @@ async fn run_poll(
                     .and_then(Value::as_array)
                     .cloned()
                     .unwrap_or_default();
-                let had_events = !events.is_empty();
-                // Events first, cursor after — and only if every one of them was accepted. A page
-                // the pending queue cannot take is polled again from the same cursor later (the
-                // ones already taken are then duplicates), so the cursor never passes an event the
-                // model will not see.
+                // Events first, cursor after — and only if every one of them was accepted *and*
+                // durably stored. A page the pending queue cannot take, or a store that cannot be
+                // written, is polled again from the same cursor later (the ones already taken are
+                // then duplicates), so the cursor never passes an event the model will not see.
                 let mut full = false;
+                // Counted after dedup: a page of nothing but duplicates is no backlog.
+                let mut new_events = false;
                 for event in events {
-                    if hub.deliver(&spec, McpEventDelivery::Poll, &state, event) == Delivery::Full {
-                        full = true;
-                        break;
+                    match hub.deliver(&spec, McpEventDelivery::Poll, &state, event) {
+                        Delivery::Full => {
+                            full = true;
+                            break;
+                        }
+                        Delivery::Accepted => new_events = true,
+                        Delivery::Duplicate => {}
                     }
                 }
-                if full {
-                    hub.status_event(
-                        &spec,
-                        "error",
-                        json!({ "error": "pending queue full; holding the cursor until the model catches up" }),
-                    );
+                let stored = if full {
+                    Ok(())
+                } else {
+                    hub.store.commit().await
+                };
+                if full || stored.is_err() {
+                    let why = match &stored {
+                        Err(e) => format!("could not store events ({e}); holding the cursor"),
+                        Ok(()) => {
+                            "pending queue full; holding the cursor until the model catches up"
+                                .to_owned()
+                        }
+                    };
+                    hub.status_event(&spec, "error", json!({ "error": why }));
                     poll_floor().max(Duration::from_secs(1))
                 } else {
                     state.set_cursor_from(&page);
                     if page.get("truncated").and_then(Value::as_bool) == Some(true) {
                         hub.gap(&spec, &state, &page);
                     }
-                    if page.get("hasMore").and_then(Value::as_bool) == Some(true) && had_events {
+                    if page.get("hasMore").and_then(Value::as_bool) == Some(true) && new_events {
                         Duration::ZERO
                     } else if page.get("hasMore").and_then(Value::as_bool) == Some(true) {
-                        // `hasMore` with nothing in the page: a broken server, not a backlog.
+                        // `hasMore` with nothing new in the page: a broken server, not a backlog.
                         poll_floor()
                     } else {
                         page.get("nextPollMs")
@@ -1604,11 +1764,11 @@ async fn coalesce(
                     .partition(|p| p.action == McpEventAction::Steer);
                 let mut sent = false;
                 if !steer.is_empty() {
-                    sent |= inject_batch(&store, &inject, "steer", &steer).await;
+                    sent |= inject_batch(&store, &inject, "steer", &steer, &shutdown).await;
                 }
                 let held = !follow.is_empty() && busy;
                 if !follow.is_empty() && !busy {
-                    sent |= inject_batch(&store, &inject, "follow_up", &follow).await;
+                    sent |= inject_batch(&store, &inject, "follow_up", &follow, &shutdown).await;
                 }
                 if sent {
                     last_inject = Some(Instant::now());
@@ -1629,12 +1789,18 @@ async fn inject_batch(
     inject: &mpsc::WeakSender<String>,
     behavior: &str,
     events: &[PendingEvent],
+    shutdown: &CancellationToken,
 ) -> bool {
     let events = &events[..events.len().min(MAX_INJECT_BATCH)];
     let batch = NEXT_BATCH.fetch_add(1, Ordering::Relaxed);
     let seqs: Vec<u64> = events.iter().map(|e| e.seq).collect();
     store.assign_batch(&seqs, batch);
-    store.commit().await;
+    // The model may see these events only once they are durable: a crash afterwards must find them.
+    if let Err(e) = store.commit().await {
+        tracing::warn!(error = %e, "MCP events not injected yet: their state could not be stored");
+        store.unassign(batch);
+        return false;
+    }
     let Some(tx) = inject.upgrade() else {
         store.unassign(batch);
         return false;
@@ -1647,7 +1813,12 @@ async fn inject_batch(
         "mcp_events": batch,
     })
     .to_string();
-    if tx.send(line).await.is_err() {
+    // A full command channel can hold this for a while; the session ending must not wait on it.
+    let sent = tokio::select! {
+        r = tx.send(line) => r.is_ok(),
+        () = shutdown.cancelled() => false,
+    };
+    if !sent {
         store.unassign(batch);
         return false;
     }
@@ -1749,16 +1920,14 @@ mod tests {
     }
 
     fn pending(action: McpEventAction, event: Value) -> PendingEvent {
-        PendingEvent {
-            seq: 0,
+        PendingEvent::new(
             action,
-            server: "s".into(),
-            name: "n".into(),
-            arguments: json!({}),
-            instructions: Some("triage it".into()),
+            "s".into(),
+            "n".into(),
+            json!({}),
+            Some("triage it".into()),
             event,
-            batch: None,
-        }
+        )
     }
 
     #[test]
@@ -1780,11 +1949,43 @@ mod tests {
         assert!(text.contains("may have been missed"), "{text}");
     }
 
+    /// The session's command channel is full and never drained: the coalescer blocked sending an
+    /// injection still ends promptly on shutdown, and the batch goes back to pending.
+    #[tokio::test]
+    async fn the_coalescer_ends_on_shutdown_even_while_its_send_is_blocked() {
+        let store = StateStore::open(None, 10, u64::MAX);
+        let (tx, _rx) = mpsc::channel::<String>(1);
+        tx.send("occupied".into()).await.unwrap();
+        let running = Arc::new(AtomicBool::new(false));
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn(coalesce(
+            store.clone(),
+            tx.downgrade(),
+            running,
+            shutdown.clone(),
+            Arc::new(|| {}),
+        ));
+        assert!(store.push_pending(pending(McpEventAction::FollowUp, json!({"eventId": "f1"}))));
+        // Long enough for the coalescer to be parked in its send.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(
+            store.ready_pending().is_empty(),
+            "in flight, blocked on the full channel"
+        );
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("the coalescer ends on shutdown")
+            .unwrap();
+        assert_eq!(store.ready_pending().len(), 1, "the batch is pending again");
+        drop(tx);
+    }
+
     /// The coalescer in isolation: a follow-up is held while a run is in flight and injected once
     /// it stops; a steer goes in at once.
     #[tokio::test]
     async fn the_coalescer_holds_follow_ups_while_busy_and_releases_them_after() {
-        let store = StateStore::open(None, 10);
+        let store = StateStore::open(None, 10, u64::MAX);
         let (tx, mut rx) = mpsc::channel::<String>(8);
         let running = Arc::new(AtomicBool::new(true));
         let shutdown = CancellationToken::new();

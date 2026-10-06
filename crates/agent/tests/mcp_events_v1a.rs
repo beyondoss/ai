@@ -214,6 +214,72 @@ async fn a_failing_jwks_fetch_refuses_the_first_subscribe_instead_of_enforcing_n
     );
 }
 
+/// A JWKS endpoint that sends its headers and then stalls must not hold the subscribe (or leak the
+/// task doing it): the whole fetch is under one deadline, the first subscribe is refused once its
+/// retries are spent, and nothing is left waiting on the server afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_jwks_body_that_stalls_is_timed_out_and_leaves_nothing_behind() {
+    let (_fx, mcp_url, fixture) = spawn_http_fixture(&[
+        ("MCP_FIXTURE_ALLOW_HTTP_CALLBACK", "1"),
+        ("MCP_FIXTURE_ED25519_SEED", &"07".repeat(32)),
+    ]);
+    control(
+        &fixture,
+        "POST",
+        "/control/jwks",
+        Some(&json!({ "stall": true })),
+    );
+    let home = tempfile::tempdir().unwrap();
+    write_settings(
+        home.path(),
+        json!([{
+            "name": "hooks", "transport": "http", "url": mcp_url,
+            "headers": { "Authorization": "Bearer principal-1" },
+        }]),
+    );
+    let (base, _bodies) = spawn_model_server_routed(vec![], turn_text("noted"));
+    let port = free_port();
+    let _d = common::mcp_events_fixture::spawn_daemon_env(
+        home.path(),
+        &base,
+        port,
+        &[],
+        &[("BEYOND_AI_AGENT_MCP_EVENTS_JWKS_TIMEOUT_MS", "300")],
+    );
+    let mut ws = ws_connect(port, Some("stalled-jwks")).await;
+    let started = Instant::now();
+    ws_send(
+        &mut ws,
+        json!({ "type": "mcp_events_subscribe", "id": "s", "server": "hooks", "name": "ticket.updated", "delivery": "webhook" }),
+    )
+    .await;
+    let r = ws_next(
+        &mut ws,
+        Duration::from_secs(30),
+        "the subscribe response",
+        |f| f["id"] == "s",
+    )
+    .await;
+    assert_eq!(r["success"], false, "{r:#}");
+    assert!(
+        r["error"]
+            .as_str()
+            .unwrap()
+            .contains("webhook-signing keys"),
+        "refused for want of keys, not by the 20 s ready timeout: {r:#}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        started.elapsed()
+    );
+    eventually(
+        Duration::from_secs(5),
+        "every stalled JWKS fetch to have been dropped",
+        || (state(&fixture)["jwks_stalled"] == 0).then_some(()),
+    );
+}
+
 fn hooks(mcp_url: &str) -> Value {
     json!([{
         "name": "hooks", "transport": "http", "url": mcp_url,

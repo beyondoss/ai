@@ -2587,8 +2587,19 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             // way out, and that `process::exit` would otherwise terminate mid-`kill`, orphaning exactly
             // the backgrounded grandchildren the guard exists to reap. Bounded, so a wedged `kill`/`ps`
             // shell-out can't hold the daemon's own shutdown open.
+            //
+            // Stdio MCP servers are in the same position: their connections were dropped with the
+            // sessions, which closed their stdin. `settle` lets their shutdown actually run (their
+            // grace window, then a kill) — nothing polls those tasks once this thread blocks below
+            // — and the group sweeps (`mcp_stdio::retire`) are among the pending kills waited on.
+            tools::mcp_stdio::settle(
+                tools::mcp_stdio::SHUTDOWN_GRACE + std::time::Duration::from_secs(1),
+            )
+            .await;
             #[cfg(unix)]
-            tools::exec::wait_for_pending_group_kills(std::time::Duration::from_secs(2));
+            tools::exec::wait_for_pending_group_kills(
+                tools::mcp_stdio::SHUTDOWN_GRACE + std::time::Duration::from_secs(2),
+            );
             std::process::exit(shutdown_cause.map(serve::Signal::exit_code).unwrap_or(0));
         }
         Command::Tools => {

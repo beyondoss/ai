@@ -1,8 +1,9 @@
 //! MCP Events (draft) in a multi-session daemon: subscriptions configured in
 //! `mcp_servers[].events` are owned by **one** session — the events session, started at boot — so
 //! one event is one subscription and one model run however many clients are connected, and
-//! ordinary sessions stay reapable. A session whose only subscription has terminated becomes
-//! reapable too. Real `serve --listen`, a real streamable-HTTP fixture, a mock model.
+//! ordinary sessions stay reapable. Configured subscriptions are kept up — retried after a failure
+//! or a termination, the events session kept alive meanwhile — while a session whose only
+//! (runtime) subscription has terminated becomes reapable. Real `serve --listen`, a real streamable-HTTP fixture, a mock model.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod common;
@@ -11,9 +12,9 @@ use std::time::Duration;
 
 use common::mcp_events_fixture::{
     EVENTS_SESSION, control, daemon_sessions, emit, eventually, runs_for_event, spawn_daemon,
-    spawn_http_fixture, state, write_settings, ws_list,
+    spawn_http_fixture, state, write_settings, ws_list, ws_next,
 };
-use common::{free_port, spawn_model_server_routed, turn_text, ws_connect};
+use common::{free_port, spawn_model_server_routed, turn_text, ws_connect, ws_send};
 use serde_json::json;
 
 fn hooks(mcp_url: &str) -> serde_json::Value {
@@ -128,32 +129,116 @@ async fn plain_sessions_stay_reapable_while_the_events_session_is_kept_alive() {
     );
 }
 
+/// A runtime subscription is the session's own: once the server ends it there is nothing left to
+/// keep the session alive, and the reaper takes it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_session_whose_only_subscription_terminated_becomes_reapable() {
     let (_fx, mcp_url, fixture) = spawn_http_fixture(&[("MCP_FIXTURE_ALLOW_HTTP_CALLBACK", "1")]);
     let home = tempfile::tempdir().unwrap();
-    write_settings(home.path(), hooks(&mcp_url));
+    // The server is configured, its events are not: nothing is owned by the events session.
+    let mut servers = hooks(&mcp_url);
+    servers[0]["events"] = json!([]);
+    write_settings(home.path(), servers);
     let (base, _bodies) = spawn_model_server_routed(vec![], turn_text("noted"));
     let port = free_port();
     let _d = spawn_daemon(home.path(), &base, port, &["--session-idle-timeout", "1"]);
-    eventually(
-        Duration::from_secs(20),
-        "the events session's subscription",
-        || (state(&fixture)["hooks"].as_array().unwrap().len() == 1).then_some(()),
-    );
-    // Alive while the subscription is.
+    let mut ws = ws_connect(port, Some("runtime")).await;
+    ws_send(
+        &mut ws,
+        json!({ "type": "mcp_events_subscribe", "id": "s", "server": "hooks",
+                "name": "ticket.updated", "delivery": "webhook", "action": "notify" }),
+    )
+    .await;
+    let r = ws_next(&mut ws, Duration::from_secs(20), "the subscribe", |f| {
+        f["type"] == "response" && f["id"] == "s"
+    })
+    .await;
+    assert_eq!(r["success"], true, "{r:#}");
+    drop(ws);
+    // Alive while the subscription is, detached or not.
     tokio::time::sleep(Duration::from_millis(2500)).await;
-    assert_eq!(daemon_sessions(port).await.get(EVENTS_SESSION), Some(&true));
+    assert_eq!(daemon_sessions(port).await.get("runtime"), Some(&true));
 
     let r = control(&fixture, "POST", "/control/terminate", Some(&json!({})));
     assert_eq!(r["webhook_statuses"][0], 200, "{r:#}");
     let mut reaped = false;
     for _ in 0..100 {
-        if daemon_sessions(port).await.get(EVENTS_SESSION) == Some(&false) {
+        if daemon_sessions(port).await.get("runtime") == Some(&false) {
             reaped = true;
             break;
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
     assert!(reaped, "nothing left to keep it alive: the reaper takes it");
+}
+
+/// A configured subscription the server ends is not given up on: the events session subscribes
+/// again (with backoff) and stays alive meanwhile.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_configured_subscription_the_server_ends_is_resubscribed() {
+    let (_fx, mcp_url, fixture) = spawn_http_fixture(&[("MCP_FIXTURE_ALLOW_HTTP_CALLBACK", "1")]);
+    let home = tempfile::tempdir().unwrap();
+    write_settings(home.path(), hooks(&mcp_url));
+    let (base, _bodies) = spawn_model_server_routed(vec![], turn_text("noted"));
+    let port = free_port();
+    let _d = spawn_daemon(home.path(), &base, port, &["--session-idle-timeout", "1"]);
+    let subscribes = || {
+        state(&fixture)["methods"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| *m == "events/subscribe")
+            .count()
+    };
+    eventually(
+        Duration::from_secs(20),
+        "the events session's subscription",
+        || (state(&fixture)["hooks"].as_array().unwrap().len() == 1).then_some(()),
+    );
+    let before = subscribes();
+    let r = control(&fixture, "POST", "/control/terminate", Some(&json!({})));
+    assert_eq!(r["webhook_statuses"][0], 200, "{r:#}");
+    assert!(state(&fixture)["hooks"].as_array().unwrap().is_empty());
+    eventually(Duration::from_secs(20), "a fresh subscription", || {
+        (subscribes() > before && state(&fixture)["hooks"].as_array().unwrap().len() == 1)
+            .then_some(())
+    });
+    assert_eq!(
+        daemon_sessions(port).await.get(EVENTS_SESSION),
+        Some(&true),
+        "kept alive throughout"
+    );
+}
+
+/// Every configured server briefly broken at boot: the subscriptions are retried until they come
+/// up — not tried once and forgotten — and the events session is not reaped meanwhile.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn configured_subscriptions_that_fail_at_boot_are_retried_and_kept_alive() {
+    let (_fx, mcp_url, fixture) = spawn_http_fixture(&[
+        ("MCP_FIXTURE_ALLOW_HTTP_CALLBACK", "1"),
+        ("MCP_FIXTURE_EVENTS_DOWN", "1"),
+    ]);
+    let home = tempfile::tempdir().unwrap();
+    write_settings(home.path(), hooks(&mcp_url));
+    let (base, _bodies) = spawn_model_server_routed(vec![], turn_text("noted"));
+    let port = free_port();
+    let _d = spawn_daemon(home.path(), &base, port, &["--session-idle-timeout", "1"]);
+    tokio::time::sleep(Duration::from_millis(4000)).await;
+    assert!(state(&fixture)["hooks"].as_array().unwrap().is_empty());
+    assert_eq!(
+        daemon_sessions(port).await.get(EVENTS_SESSION),
+        Some(&true),
+        "a session whose subscriptions are all down for now is not reaped"
+    );
+    control(
+        &fixture,
+        "POST",
+        "/control/events_down",
+        Some(&json!({ "down": false })),
+    );
+    eventually(
+        Duration::from_secs(30),
+        "the subscription, once the server is back",
+        || (state(&fixture)["hooks"].as_array().unwrap().len() == 1).then_some(()),
+    );
 }

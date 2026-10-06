@@ -4002,11 +4002,13 @@ pub(crate) async fn serve_session(
             })));
             break;
         }
-        // The events state follows the active transcript (`new_session`, `switch_session`, …).
+        // The events state follows the active transcript (`new_session`, `switch_session`, …) —
+        // moved and merged before the next command is read, so nothing that command (or an
+        // injection behind it) does can land in the old one.
         if let Some(hub) = &mcp_events {
             let file = persistence.session_file().map(std::path::Path::to_path_buf);
             if file != events_state_file {
-                hub.relocate(file.as_deref());
+                hub.relocate(file.as_deref()).await;
                 events_state_file = file;
             }
         }
@@ -4288,12 +4290,12 @@ pub(crate) async fn serve_session(
                 // returns, once `session`/`persistence` are no longer borrowed by `run` — a variable
                 // declared inside the loop body would be dropped at `break` and unreachable there.
                 let mut pending_deferred: Vec<(Option<String>, Value)> = Vec::new();
-                // MCP Events injection batches this run carries (its own prompt, and any steered
-                // in while it runs): delivered once the run is over and its transcript persisted.
-                let mut accepted_injections: Vec<u64> =
-                    crate::tools::mcp_events::injection_batch(&cmd)
-                        .into_iter()
-                        .collect();
+                // MCP Events injection batches this run carries: its own prompt's, and each one
+                // steered in while it runs (with the text the model would receive). Settled once
+                // the run is over — see `mcp_events_finish` below.
+                let own_injection = crate::tools::mcp_events::injection_batch(&cmd);
+                let mut steered_injections: Vec<(u64, String)> = Vec::new();
+                let messages_before_run = session.messages.len();
                 let result = 'retry: loop {
                     tokens_before.store(0, Ordering::Relaxed);
                     refused.store(false, Ordering::Relaxed);
@@ -4623,13 +4625,14 @@ pub(crate) async fn serve_session(
                                                             m,
                                                             parse_images(c.get("images")),
                                                         );
+                                                        let steer_text = m.text.clone();
                                                         let queued = steering.push_steer(m);
                                                         if let Some(batch) = crate::tools::mcp_events::injection_batch(&c) {
                                                             if !queued {
                                                                 deferred_events.push_back(l.to_string());
                                                                 continue;
                                                             }
-                                                            accepted_injections.push(batch);
+                                                            steered_injections.push((batch, steer_text.to_string()));
                                                         }
                                                         // Fix 5 (pi-parity gap): same queue-content
                                                         // visibility the dedicated `steer`/`follow_up`
@@ -5228,10 +5231,39 @@ pub(crate) async fn serve_session(
                     }
                 }
 
+                // A batch is delivered only once the model has it in a transcript that persisted:
+                // the run's own prompt when the run did not fail (an abort still leaves the prompt
+                // in the transcript the next run reads); a steered one only if it actually made it
+                // into the transcript — an abort clears the steer lane (`clear_run_scoped`) before
+                // the model sees what is queued there. Everything else goes back to pending, to be
+                // injected again.
                 if let Some(hub) = &mcp_events
-                    && !accepted_injections.is_empty()
+                    && (own_injection.is_some() || !steered_injections.is_empty())
                 {
-                    hub.delivered(&accepted_injections).await;
+                    let run_ok = persist_error.is_none()
+                        && matches!(result, Ok(()) | Err(agent_core::Error::Cancelled));
+                    let (mut delivered, mut returned) = (Vec::new(), Vec::new());
+                    if let Some(b) = own_injection {
+                        if run_ok {
+                            delivered.push(b)
+                        } else {
+                            returned.push(b)
+                        }
+                    }
+                    // Compaction can shrink the transcript mid-run; then look at all of it.
+                    let since = if session.messages.len() >= messages_before_run {
+                        messages_before_run
+                    } else {
+                        0
+                    };
+                    for (b, text) in steered_injections.drain(..) {
+                        if run_ok && transcript_has_user_text(&session.messages[since..], &text) {
+                            delivered.push(b);
+                        } else {
+                            returned.push(b);
+                        }
+                    }
+                    hub.finish_run(&delivered, &returned).await;
                 }
                 if running.swap(false, Ordering::Relaxed)
                     && let Some(m) = &cfg.metrics
@@ -9211,6 +9243,17 @@ type PendingCodeSlot = Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<
 /// panic-free-production-code convention (no bare `.unwrap()` on a lock), and there's no invariant
 /// here a partial write could actually violate (the guarded value is always a plain, independently
 /// valid `Option`/replace-whole-value).
+/// Whether a user message whose text is exactly `text` is among `messages` — how a steered MCP
+/// Events injection is known to have reached the model.
+fn transcript_has_user_text(messages: &[agent_core::Message], text: &str) -> bool {
+    messages.iter().rev().any(|m| {
+        m.role == agent_core::Role::User
+            && m.content.iter().any(
+                |b| matches!(b, agent_core::ContentBlock::Text { text: t, .. } if t.as_ref() == text),
+            )
+    })
+}
+
 pub(crate) fn lock_ignoring_poison<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }

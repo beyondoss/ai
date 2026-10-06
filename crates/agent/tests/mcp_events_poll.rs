@@ -375,6 +375,80 @@ fn has_more_with_no_events_does_not_spin() {
     assert!(during <= 25, "{during} polls in 1.5 s");
 }
 
+/// `hasMore: true` on a page whose events are all duplicates is no backlog either: the poll floor
+/// applies, so a server repeating itself cannot spin the client.
+#[test]
+fn has_more_with_only_duplicates_does_not_spin() {
+    let home = tempfile::tempdir().unwrap();
+    let control_file = home.path().join("control");
+    let server = stdio_server(
+        "spin",
+        &control_file,
+        json!({ "MCP_FIXTURE_HASMORE_DUPS": "1" }),
+        json!([{ "name": "ticket.updated", "delivery": "poll", "action": "notify" }]),
+    );
+    let mut s = start(json!([server]), home);
+    let control = wait_control_file(&control_file);
+    wait_active(&mut s.stdin, &mut s.frames, 1);
+    let polls = |st: &Value| {
+        st["methods"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| *m == "events/poll")
+            .count()
+    };
+    let before = polls(&state(&control));
+    std::thread::sleep(Duration::from_millis(1500));
+    let during = polls(&state(&control)) - before;
+    assert!(during <= 25, "{during} polls in 1.5 s");
+}
+
+/// No events configured, nothing subscribed: the session leaves no MCP Events files behind.
+#[test]
+fn a_session_without_events_writes_no_events_state() {
+    let home = tempfile::tempdir().unwrap();
+    let control_file = home.path().join("control");
+    let server = stdio_server("tools", &control_file, json!({}), json!([]));
+    let mut s = start(json!([server]), home);
+    send(
+        &mut s.stdin,
+        json!({ "type": "prompt", "id": "p", "message": "hi" }),
+    );
+    s.frames.response("p");
+    send(
+        &mut s.stdin,
+        json!({ "type": "mcp_events_list", "id": "l" }),
+    );
+    s.frames.response("l");
+    let dir = s._home.path().to_path_buf();
+    drop(s.stdin);
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while s._child.try_wait().unwrap().is_none() {
+        assert!(std::time::Instant::now() < deadline, "serve did not exit");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let leftovers: Vec<String> = walk(&dir)
+        .into_iter()
+        .filter(|n| n.contains(".mcp-events."))
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+}
+
+/// Every file name under `dir`, recursively.
+fn walk(dir: &std::path::Path) -> Vec<String> {
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(dir).unwrap().flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            out.extend(walk(&p));
+        } else {
+            out.push(p.to_string_lossy().into_owned());
+        }
+    }
+    out
+}
+
 /// A `truncated` page means events may have been skipped: the model is told, not just the frame.
 #[test]
 fn a_gap_is_explained_to_the_model() {

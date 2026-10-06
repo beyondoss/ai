@@ -74,3 +74,71 @@ fn a_reaped_server_gets_its_grace_window_after_stdin_closes() {
     });
     assert_eq!(std::fs::read_to_string(&marker).unwrap(), "clean exit");
 }
+
+/// Whether `pid` is still a live process (a zombie counts as gone).
+fn alive(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .map(|s| {
+            s.rsplit_once(") ")
+                .is_some_and(|(_, rest)| !rest.starts_with('Z'))
+        })
+        .unwrap_or(false)
+}
+
+/// `serve` exiting — stdin EOF or SIGTERM — gives each stdio server its grace window (it sees stdin
+/// close and exits cleanly) and then sweeps its process group, so a grandchild it double-forked
+/// away does not outlive the agent.
+fn exit_sweeps_the_servers_group(sigterm: bool) {
+    let home = tempfile::tempdir().unwrap();
+    let marker = home.path().join("exited-cleanly");
+    let pidfile = home.path().join("orphan.pid");
+    let (mut child, mut stdin, mut frames) = start(
+        home.path(),
+        json!({
+            "MCP_FIXTURE_EXIT_MARKER": marker.to_string_lossy(),
+            "MCP_FIXTURE_ORPHAN_PIDFILE": pidfile.to_string_lossy(),
+        }),
+        "0",
+    );
+    send(&mut stdin, json!({ "type": "get_mcp", "id": "m" }));
+    frames.response("m");
+    let orphan: u32 = eventually(Duration::from_secs(10), "the orphan's pid", || {
+        std::fs::read_to_string(&pidfile).ok()?.trim().parse().ok()
+    });
+    assert!(alive(orphan), "the grandchild runs before serve exits");
+
+    if sigterm {
+        common::mcp_events_fixture::sigterm_and_wait(&mut child);
+        drop(stdin);
+    } else {
+        drop(stdin);
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while child.try_wait().unwrap().is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "serve did not exit on EOF"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    // Both are done by the time serve has exited: nothing is left to finish them afterwards.
+    assert!(
+        !alive(orphan),
+        "serve exited and left its stdio server's grandchild {orphan} running"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&marker).ok().as_deref(),
+        Some("clean exit"),
+        "the server was not given its grace window to exit on its own"
+    );
+}
+
+#[test]
+fn serve_exiting_on_eof_sweeps_its_stdio_servers_groups_after_their_grace() {
+    exit_sweeps_the_servers_group(false);
+}
+
+#[test]
+fn serve_exiting_on_sigterm_sweeps_its_stdio_servers_groups_after_their_grace() {
+    exit_sweeps_the_servers_group(true);
+}

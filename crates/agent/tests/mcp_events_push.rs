@@ -374,3 +374,47 @@ fn count(methods: &Value, name: &str) -> usize {
         .filter(|m| *m == name)
         .count()
 }
+
+/// A runtime subscription the server keeps ending with `schema_changed`: each time it comes back
+/// the model is told events may have been missed in between, and the re-discovery budget is
+/// restored once the subscription has stayed up for a while — so a long-lived subscription that
+/// sees a schema change now and then is not given up on after the fifth.
+#[test]
+fn rediscovery_tells_the_model_about_the_gap_and_its_budget_recovers() {
+    let control_path = "$HOME_DIR/control";
+    let server = stdio_server(
+        "tickets",
+        std::path::Path::new(control_path),
+        json!({ "MCP_FIXTURE_HEARTBEAT_MS": "200" }),
+        json!([]),
+    );
+    let mut s = start(
+        json!([server]),
+        &[("BEYOND_AI_AGENT_MCP_EVENTS_HEALTHY_MS", "300")],
+    );
+    let fixture = wait_control_file(&s.home.path().join("control"));
+    send(
+        &mut s.stdin,
+        json!({ "type": "mcp_events_subscribe", "id": "s", "server": "tickets",
+                "name": "ticket.updated", "arguments": { "project": "alpha" },
+                "delivery": "push", "action": "follow_up" }),
+    );
+    let r = s.frames.response("s");
+    assert_eq!(r["success"], true, "{r:#}");
+    for round in 1..=6 {
+        // Up for longer than the healthy period before each change.
+        std::thread::sleep(Duration::from_millis(500));
+        let r = control(&fixture, "POST", "/control/schema_change", Some(&json!({})));
+        assert_eq!(r["streams"], 1, "round {round}: {r:#}");
+        s.frames.wait(
+            Duration::from_secs(20),
+            &format!("resubscription {round}"),
+            |f| f["type"] == "mcp_event_status" && f["kind"] == "resubscribed",
+        );
+    }
+    eventually(
+        Duration::from_secs(20),
+        "the gap notice to reach the model",
+        || (!model_requests_with(&s.bodies, "may have been missed").is_empty()).then_some(()),
+    );
+}

@@ -98,6 +98,13 @@ struct State {
     /// `/control/jwks {status}` (initially `MCP_FIXTURE_JWKS_STATUS`, else 200 when a key is
     /// configured and 404 when not): what the JWKS endpoint answers.
     jwks_status: Option<u16>,
+    /// `/control/events_down {down}` (initially `MCP_FIXTURE_EVENTS_DOWN=1`): every `events/*`
+    /// request fails with an internal error — a server that is briefly broken.
+    events_down: bool,
+    /// `/control/jwks {stall: true}`: the JWKS endpoint sends its headers and then stalls.
+    jwks_stall: bool,
+    /// How many JWKS requests are stalled right now (they hold their connection open).
+    jwks_stalled: u64,
 }
 
 fn env_flag(name: &str) -> bool {
@@ -434,7 +441,11 @@ async fn rpc(
     params: Value,
     principal: Option<String>,
 ) -> Result<Value, RpcErr> {
-    state.lock().unwrap().methods.push(method.to_owned());
+    let events_down = {
+        let mut st = state.lock().unwrap();
+        st.methods.push(method.to_owned());
+        st.events_down
+    };
     let no_events = env_flag("MCP_FIXTURE_NO_EVENTS");
     let capabilities = if no_events {
         json!({ "tools": {} })
@@ -470,6 +481,9 @@ async fn rpc(
         m if m.starts_with("events/") && no_events => {
             Err(err(-32601, &format!("Method not found: {m}")))
         }
+        m if m.starts_with("events/") && events_down => {
+            Err(err(-32603, &format!("temporarily unavailable: {m}")))
+        }
         "events/list" => {
             // `MCP_FIXTURE_LIST_DELAY_MS`: a slow server, for concurrency tests.
             let delay = env_u64("MCP_FIXTURE_LIST_DELAY_MS", 0);
@@ -500,6 +514,14 @@ async fn rpc(
                 return Ok(
                     json!({ "events": [], "cursor": head.to_string(), "truncated": false, "hasMore": true, "nextPollMs": next_poll }),
                 );
+            }
+            // `MCP_FIXTURE_HASMORE_DUPS=1`: a broken server that always claims more and sends the
+            // same (already delivered) event again — a page of nothing but duplicates.
+            if env_flag("MCP_FIXTURE_HASMORE_DUPS") {
+                return Ok(json!({
+                    "events": [{ "eventId": "dup-forever", "name": "ticket.updated", "timestamp": "2026-01-01T00:00:00Z", "data": {}, "cursor": "1" }],
+                    "cursor": head.to_string(), "truncated": false, "hasMore": true, "nextPollMs": next_poll,
+                }));
             }
             if std::mem::take(&mut st.truncate_next) {
                 return Ok(
@@ -897,6 +919,7 @@ async fn control(state: &Shared, method: &str, path: &str, body: &[u8]) -> (u16,
                     "cancelled": st.cancelled, "verifications": st.verifications,
                     "deliveries": st.deliveries, "streams": st.streams.len(), "log": st.log.len(),
                 "requests": st.requests, "sessionless_rejections": st.sessionless_rejections,
+                "jwks_stalled": st.jwks_stalled,
                 }),
             )
         }
@@ -948,7 +971,13 @@ async fn control(state: &Shared, method: &str, path: &str, body: &[u8]) -> (u16,
             }
         }
         ("POST", "/control/jwks") => {
-            state.lock().unwrap().jwks_status = req["status"].as_u64().map(|s| s as u16);
+            let mut st = state.lock().unwrap();
+            st.jwks_status = req["status"].as_u64().map(|s| s as u16);
+            st.jwks_stall = req["stall"].as_bool().unwrap_or(false);
+            (200, json!({}))
+        }
+        ("POST", "/control/events_down") => {
+            state.lock().unwrap().events_down = req["down"].as_bool().unwrap_or(true);
             (200, json!({}))
         }
         ("POST", "/control/truncate_next") => {
@@ -1172,6 +1201,24 @@ async fn handle_http(state: Shared, mut stream: TcpStream) {
         return;
     }
     if req.path == "/.well-known/mcp-webhook-jwks.json" {
+        if state.lock().unwrap().jwks_stall {
+            state.lock().unwrap().jwks_stalled += 1;
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 4096\r\n\r\n{\"keys\": [")
+                .await;
+            let _ = stream.flush().await;
+            // Never finishes the body; the client must give up on its own. Ends when the client
+            // closes (a read sees EOF), so an aborted fetch is observable.
+            let mut buf = [0u8; 64];
+            loop {
+                match tokio::time::timeout(Duration::from_secs(600), stream.read(&mut buf)).await {
+                    Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+                    Ok(Ok(_)) => {}
+                }
+            }
+            state.lock().unwrap().jwks_stalled -= 1;
+            return;
+        }
         let doc = jwks();
         let forced = state.lock().unwrap().jwks_status.or_else(|| {
             std::env::var("MCP_FIXTURE_JWKS_STATUS")
@@ -1410,7 +1457,10 @@ async fn run_stdio(state: Shared) {
 #[tokio::main]
 async fn main() {
     let stdio = std::env::args().any(|a| a == "--stdio");
-    let state: Shared = Arc::new(Mutex::new(State::default()));
+    let state: Shared = Arc::new(Mutex::new(State {
+        events_down: env_flag("MCP_FIXTURE_EVENTS_DOWN"),
+        ..State::default()
+    }));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let control = format!("http://{addr}");
@@ -1429,6 +1479,15 @@ async fn main() {
         }
     });
     if stdio {
+        // `MCP_FIXTURE_ORPHAN_PIDFILE=<path>`: double-fork a grandchild away from ourselves (as a
+        // browser-driving server does) and record its pid; only a process-group sweep reaches it.
+        if let Ok(pidfile) = std::env::var("MCP_FIXTURE_ORPHAN_PIDFILE") {
+            let _ = tokio::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!("sleep 600 & echo $! > {pidfile}"))
+                .status()
+                .await;
+        }
         run_stdio(state).await;
         // `MCP_FIXTURE_EXIT_MARKER=<path>`: stdin closed — the MCP shutdown signal. Take a moment
         // to "clean up" (as a server closing a browser would), then record that we got to.

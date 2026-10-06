@@ -706,10 +706,12 @@ impl McpConnection {
         match guard.as_ref() {
             Some(live) if Arc::strong_count(&live.client) == 1 => {
                 let pgid = live.pgid;
-                // Drops the client, which closes the server's stdin. The stdio transport then gives
-                // it `mcp_stdio::SHUTDOWN_GRACE` to exit, kills it if it hasn't, and sweeps its
-                // process group — taking anything it forked away from itself too.
+                // Drops the client, which closes the server's stdin; the stdio transport gives it
+                // `mcp_stdio::SHUTDOWN_GRACE` to exit and kills it if it hasn't...
                 *guard = None;
+                // ...and this takes anything it forked away from itself, which a kill aimed at the
+                // server alone leaves running.
+                crate::tools::mcp_stdio::retire(pgid);
                 tracing::debug!(
                     server = %self.config.name,
                     pgid,
@@ -1406,12 +1408,24 @@ async fn connect_stdio(
     Ok((client, pgid))
 }
 
-// The other way a server goes away — the last tool holding the connection is dropped (a `serve`
-// registry rebuild, a finished `run`) — needs nothing here: dropping the client drops the stdio
-// transport, whose pump runs the same grace-then-kill-then-sweep a reap does
-// (`mcp_stdio::stdio_transport`). What that does *not* cover is the agent being hard-killed: a
-// server in its own group no longer receives the terminal's signals, and nothing then sweeps it —
-// no worse than before, and fixing it properly needs a supervisor rather than a signal.
+/// The other way a server goes away: the last tool holding the connection is dropped (a `serve`
+/// registry rebuild, a finished `run`, process exit). Dropping the client closes the server's stdin;
+/// [`mcp_stdio::retire`](crate::tools::mcp_stdio::retire) then gives it its grace and sweeps its
+/// group — on a tracked OS thread, so it completes even on process exit, when no task runs again.
+///
+/// What this does *not* cover is the agent being hard-killed: a server in its own group no longer
+/// receives the terminal's signals, and nothing then sweeps it. No worse than before — an orphaned
+/// browser already outlived a killed agent — and fixing it properly needs a supervisor.
+impl Drop for McpConnection {
+    fn drop(&mut self) {
+        // `get_mut` rather than a lock: we hold `&mut self`, so no one else can be holding it.
+        if let Some(live) = self.client.get_mut().take() {
+            let pgid = live.pgid;
+            drop(live);
+            crate::tools::mcp_stdio::retire(pgid);
+        }
+    }
+}
 
 /// Dial an HTTP server. Two shapes, decided by `dial.http`:
 ///

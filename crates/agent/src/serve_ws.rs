@@ -2237,6 +2237,16 @@ where
 
 /// POST `/_beyond/mcp-events/<token>`: one MCP Events webhook delivery. Everything past reading the
 /// body is `mcp_events::receive_webhook`'s.
+/// How long a webhook delivery's body may take to arrive, all of it.
+fn webhook_body_timeout() -> std::time::Duration {
+    std::time::Duration::from_millis(
+        std::env::var("BEYOND_AI_AGENT_MCP_EVENTS_BODY_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10_000),
+    )
+}
+
 async fn handle_mcp_event_webhook<S>(
     stream: &mut S,
     head: &HttpHead,
@@ -2280,16 +2290,29 @@ async fn handle_mcp_event_webhook<S>(
         return;
     }
     let len = head.content_length.unwrap_or(0);
-    // Grown as bytes arrive — never sized from the untrusted `Content-Length`.
-    let mut body = leftover[..leftover.len().min(len)].to_vec();
-    let mut tmp = [0u8; 8192];
-    while body.len() < len {
-        let want = (len - body.len()).min(tmp.len());
-        match stream.read(&mut tmp[..want]).await {
-            Ok(0) | Err(_) => return,
-            Ok(n) => body.extend_from_slice(&tmp[..n]),
+    // Grown as bytes arrive — never sized from the untrusted `Content-Length` — and under one
+    // deadline for the whole body, so a sender that trickles (or stops) cannot hold the connection.
+    let read = async {
+        let mut body = leftover[..leftover.len().min(len)].to_vec();
+        let mut tmp = [0u8; 8192];
+        while body.len() < len {
+            let want = (len - body.len()).min(tmp.len());
+            match stream.read(&mut tmp[..want]).await {
+                Ok(0) | Err(_) => return None,
+                Ok(n) => body.extend_from_slice(&tmp[..n]),
+            }
         }
-    }
+        Some(body)
+    };
+    let body = match tokio::time::timeout(webhook_body_timeout(), read).await {
+        Ok(Some(body)) => body,
+        Ok(None) => return,
+        Err(_) => {
+            let reply = WebhookReply::error(408, "Request Timeout", "body not received in time");
+            let _ = write_http_ok(stream, reply.status, reply.reason, None, &reply.body).await;
+            return;
+        }
+    };
     let reply = crate::tools::mcp_events::receive_webhook(token, &head.headers, &body).await;
     let _ = write_http_ok(stream, reply.status, reply.reason, None, &reply.body).await;
 }

@@ -233,6 +233,16 @@ pub(super) struct Conn {
 
 static NEXT_HTTP_ID: AtomicU64 = AtomicU64::new(1);
 
+/// The deadline on one JWKS fetch, headers and body together.
+fn jwks_timeout() -> Duration {
+    Duration::from_millis(
+        std::env::var("BEYOND_AI_AGENT_MCP_EVENTS_JWKS_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5_000),
+    )
+}
+
 /// Read a response body, refusing one past `cap` bytes (never trusting `Content-Length` to size a
 /// buffer).
 async fn read_capped(mut resp: reqwest::Response, cap: usize) -> Result<Vec<u8>, String> {
@@ -320,21 +330,27 @@ impl Conn {
         else {
             return KeyFetch::Failed("unparseable server URL".into());
         };
-        let resp = match tokio::time::timeout(Duration::from_secs(5), http.get(jwks).send()).await {
-            Ok(Ok(r)) => r,
-            Ok(Err(e)) => return KeyFetch::Failed(e.to_string()),
-            Err(_) => return KeyFetch::Failed("timed out".into()),
+        // One deadline over the whole exchange — headers *and* body: a server that sends headers
+        // and then stalls must not hold a subscribe (or a refresh) open.
+        let fetch = async {
+            let resp = http.get(jwks).send().await.map_err(|e| e.to_string())?;
+            let status = resp.status().as_u16();
+            if status != 200 {
+                return Ok((status, Vec::new()));
+            }
+            read_capped(resp, MAX_JWKS_BYTES)
+                .await
+                .map(|body| (status, body))
         };
-        match resp.status().as_u16() {
-            200 => match read_capped(resp, MAX_JWKS_BYTES).await {
-                Ok(body) => match serde_json::from_slice::<Value>(&body) {
-                    Ok(doc) => KeyFetch::Keys(super::webhook::ed25519_keys_from_jwks(&doc)),
-                    Err(e) => KeyFetch::Failed(format!("unparseable JWKS: {e}")),
-                },
-                Err(e) => KeyFetch::Failed(e),
+        match tokio::time::timeout(jwks_timeout(), fetch).await {
+            Err(_) => KeyFetch::Failed("timed out".into()),
+            Ok(Err(e)) => KeyFetch::Failed(e),
+            Ok(Ok((200, body))) => match serde_json::from_slice::<Value>(&body) {
+                Ok(doc) => KeyFetch::Keys(super::webhook::ed25519_keys_from_jwks(&doc)),
+                Err(e) => KeyFetch::Failed(format!("unparseable JWKS: {e}")),
             },
-            404 | 410 => KeyFetch::NotPublished,
-            other => KeyFetch::Failed(format!("HTTP {other}")),
+            Ok(Ok((404 | 410, _))) => KeyFetch::NotPublished,
+            Ok(Ok((other, _))) => KeyFetch::Failed(format!("HTTP {other}")),
         }
     }
 
@@ -563,6 +579,10 @@ fn rpc_outcome(msg: Value) -> Result<Value, RpcError> {
 pub(super) struct SseReader {
     resp: reqwest::Response,
     buf: Vec<u8>,
+    /// Where the next unread event starts in `buf`. Events are parsed in place and the consumed
+    /// prefix is dropped only when more bytes are needed — once per chunk, never once per event —
+    /// so a chunk holding many events costs time linear in its size.
+    start: usize,
     /// How far into `buf` no separator can start — the next scan begins here.
     scanned: usize,
     pub(super) error: Option<String>,
@@ -573,6 +593,7 @@ impl SseReader {
         Self {
             resp,
             buf: Vec::new(),
+            start: 0,
             scanned: 0,
             error: None,
         }
@@ -580,25 +601,23 @@ impl SseReader {
 
     pub(super) async fn next(&mut self) -> Option<Value> {
         loop {
-            if let Some((end, sep_end)) = find_event_end(&self.buf, self.scanned) {
-                let event: Vec<u8> = self.buf.drain(..sep_end).take(end).collect();
-                self.scanned = 0;
-                let text = String::from_utf8_lossy(&event);
-                let data: Vec<&str> = text
-                    .lines()
-                    .filter_map(|l| l.strip_prefix("data:"))
-                    .map(|d| d.strip_prefix(' ').unwrap_or(d))
-                    .collect();
-                if data.is_empty() {
-                    continue;
+            if let Some((end, sep_end)) = find_event_end(&self.buf, self.scanned.max(self.start)) {
+                let parsed = parse_sse_event(&self.buf[self.start..end]);
+                self.start = sep_end;
+                self.scanned = sep_end;
+                match parsed {
+                    Some(v) => return Some(v),
+                    None => continue,
                 }
-                if let Ok(v) = serde_json::from_str::<Value>(&data.join("\n")) {
-                    return Some(v);
-                }
-                continue;
+            }
+            // Need more bytes: drop what has been consumed (at most a partial event remains).
+            if self.start > 0 {
+                self.buf.drain(..self.start);
+                self.scanned = self.scanned.saturating_sub(self.start);
+                self.start = 0;
             }
             // A separator is at most four bytes, so one could still start in the last three.
-            self.scanned = self.buf.len().saturating_sub(3);
+            self.scanned = self.scanned.max(self.buf.len().saturating_sub(3));
             if self.buf.len() > MAX_SSE_EVENT_BYTES {
                 self.error = Some(format!("an SSE event exceeded {MAX_SSE_EVENT_BYTES} bytes"));
                 return None;
@@ -609,6 +628,21 @@ impl SseReader {
             }
         }
     }
+}
+
+/// One SSE event's `data:` lines, joined and parsed as JSON. `None` for an event with no data or
+/// data that is not JSON.
+fn parse_sse_event(event: &[u8]) -> Option<Value> {
+    let text = String::from_utf8_lossy(event);
+    let data: Vec<&str> = text
+        .lines()
+        .filter_map(|l| l.strip_prefix("data:"))
+        .map(|d| d.strip_prefix(' ').unwrap_or(d))
+        .collect();
+    if data.is_empty() {
+        return None;
+    }
+    serde_json::from_str::<Value>(&data.join("\n")).ok()
 }
 
 /// Where the first blank line (`\n\n` or `\r\n\r\n`) at or after `from` ends:
@@ -882,6 +916,33 @@ mod tests {
         // A normal event still parses.
         let resp = reqwest::Response::from(http::Response::new("data: {\"a\":1}\n\n".to_owned()));
         assert_eq!(SseReader::new(resp).next().await, Some(json!({"a": 1})));
+    }
+
+    /// Many events in one chunk are drained in time linear in the chunk, not quadratic: consuming
+    /// each event by shifting the rest of the buffer down moves ~700 GB here (seconds), the linear drain a fraction of one.
+    #[tokio::test]
+    async fn many_events_in_one_chunk_drain_in_linear_time() {
+        let n = 300_000;
+        let mut body = String::with_capacity(n * 20);
+        for i in 0..n {
+            body.push_str(&format!("data: {{\"i\":{i}}}\n\n"));
+        }
+        // All of it already buffered — one large read, as a fast server on a fast link delivers.
+        let resp = reqwest::Response::from(http::Response::new(String::new()));
+        let mut reader = SseReader::new(resp);
+        reader.buf = body.into_bytes();
+        let started = std::time::Instant::now();
+        let mut seen = 0;
+        while let Some(v) = reader.next().await {
+            assert_eq!(v["i"], seen);
+            seen += 1;
+        }
+        assert_eq!(seen, n);
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "draining {n} events took {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

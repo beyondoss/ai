@@ -363,24 +363,29 @@ impl Drop for GroupKillGuard {
             // (SIGTERM/SIGINT/SIGHUP) can reach `std::process::exit` moments after this guard drops,
             // and `process::exit` tears down every thread immediately with no chance for this one to
             // finish — see `wait_for_pending_group_kills`, which such a caller must call first.
-            let (tx, rx) = std::sync::mpsc::channel();
-            std::thread::spawn(move || {
-                kill_process_group(pid);
-                let _ = tx.send(());
-            });
-            if let Ok(mut pending) = PENDING_GROUP_KILLS.lock() {
-                // Opportunistically reclaim entries whose kill thread has already finished (`Ok`) or
-                // whose sender was dropped (`Disconnected`), so this registry — otherwise drained in
-                // full only just before `process::exit` — can't grow for the whole lifetime of a
-                // long-lived `serve` daemon that cancels one bash after another. A still-running kill
-                // thread's receiver (`Err(Empty)`) is kept, so `wait_for_pending_group_kills` can still
-                // block on it.
-                pending.retain(|rx| {
-                    matches!(rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty))
-                });
-                pending.push(rx);
-            }
+            spawn_tracked_cleanup(move || kill_process_group(pid));
         }
+    }
+}
+
+/// Run `cleanup` on its own OS thread, registered so [`wait_for_pending_group_kills`] waits for it
+/// before `std::process::exit` tears it down. The one way a `Drop` here hands off process cleanup.
+#[cfg(unix)]
+pub(crate) fn spawn_tracked_cleanup(cleanup: impl FnOnce() + Send + 'static) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        cleanup();
+        let _ = tx.send(());
+    });
+    if let Ok(mut pending) = PENDING_GROUP_KILLS.lock() {
+        // Opportunistically reclaim entries whose kill thread has already finished (`Ok`) or
+        // whose sender was dropped (`Disconnected`), so this registry — otherwise drained in
+        // full only just before `process::exit` — can't grow for the whole lifetime of a
+        // long-lived `serve` daemon that cancels one bash after another. A still-running kill
+        // thread's receiver (`Err(Empty)`) is kept, so `wait_for_pending_group_kills` can still
+        // block on it.
+        pending.retain(|rx| matches!(rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)));
+        pending.push(rx);
     }
 }
 

@@ -43,6 +43,10 @@ const TIMESTAMP_TOLERANCE_SECS: u64 = 300;
 pub const MAX_WEBHOOK_BODY: usize = 1024 * 1024;
 /// How long a delivery waits for its event to be made durable before answering `503`.
 const ACK_TIMEOUT: Duration = Duration::from_secs(10);
+/// Most space-separated entries of a `webhook-signature` header that are looked at. A sender has
+/// no reason for more than a few (one per secret in a rotation, plus `v1a,`); the rest are ignored,
+/// so a hostile header cannot buy unbounded HMAC/Ed25519 work.
+const MAX_SIGNATURE_ENTRIES: usize = 8;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -64,9 +68,9 @@ struct Secrets {
 /// One webhook subscription's receiving end, looked up by the token in its callback path.
 struct Route {
     secrets: Mutex<Secrets>,
-    /// The server-derived subscription id, once `events/subscribe` has answered. A delivery naming a
-    /// different one is refused; before it is known (the verification challenge arrives *during*
-    /// the subscribe request) it is not checked.
+    /// The server-derived subscription id, once `events/subscribe` has answered. From then on every
+    /// delivery must name it in `X-MCP-Subscription-Id`; before it is known (the verification
+    /// challenge arrives *during* the subscribe request) it is not checked.
     subscription_id: Mutex<Option<String>>,
     /// The server-identity keys enforced for this subscription (see the module's key policy).
     server_keys: Mutex<Vec<ed25519_dalek::VerifyingKey>>,
@@ -140,7 +144,7 @@ pub(super) fn verify_signature(
     body: &[u8],
     header: &str,
 ) -> bool {
-    for part in header.split_whitespace() {
+    for part in header.split_whitespace().take(MAX_SIGNATURE_ENTRIES) {
         let Some(b64) = part.strip_prefix("v1,") else {
             continue;
         };
@@ -181,6 +185,7 @@ pub(super) fn verify_server_signature(
     msg.extend_from_slice(body);
     header
         .split_whitespace()
+        .take(MAX_SIGNATURE_ENTRIES)
         .filter_map(|part| part.strip_prefix("v1a,"))
         .filter_map(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
         .filter_map(|raw| ed25519_dalek::Signature::from_slice(&raw).ok())
@@ -209,6 +214,14 @@ fn key_to_b64(k: &ed25519_dalek::VerifyingKey) -> String {
     base64::engine::general_purpose::STANDARD.encode(k.as_bytes())
 }
 
+/// The raw key of a `whsec_…` secret.
+fn decode_secret(wire: &str) -> Option<Vec<u8>> {
+    base64::engine::general_purpose::STANDARD
+        .decode(wire.strip_prefix("whsec_")?)
+        .ok()
+        .filter(|raw| raw.len() >= 24)
+}
+
 fn key_from_b64(s: &str) -> Option<ed25519_dalek::VerifyingKey> {
     let raw = base64::engine::general_purpose::STANDARD.decode(s).ok()?;
     ed25519_dalek::VerifyingKey::from_bytes(&<[u8; 32]>::try_from(raw.as_slice()).ok()?).ok()
@@ -228,13 +241,14 @@ pub(super) fn timestamp_fresh(ts_secs: i64, now: i64) -> bool {
 ///   which a legitimate first delivery finds nothing.
 /// - missing Standard Webhooks headers → 400; a timestamp more than five minutes off, in either
 ///   direction → 400; no valid `v1,` signature under the current or previous secret → 401; a
-///   missing or invalid `v1a,` where the server's identity is enforced → 401; a mismatched
-///   `X-MCP-Subscription-Id` → 401.
+///   missing or invalid `v1a,` where the server's identity is enforced → 401; a missing or
+///   mismatched `X-MCP-Subscription-Id` once the subscription id is known → 401.
 /// - `verification` → 200 echoing `{"challenge"}`.
 /// - an event → **200 only once it is durably stored** with the session's state (and so will reach
 ///   the model, across a restart if need be — the draft's "SHOULD NOT 2xx before durably
-///   persisted"); a duplicate → 200; **503** (retryable) when the session's pending queue is full
-///   or the store does not answer in time.
+///   persisted"); a duplicate → 200 once the record of it is durable too; **503** (retryable)
+///   when the session's pending queue is full, the store cannot be written, or it does not answer
+///   in time.
 pub async fn receive_webhook(
     token: &str,
     headers: &[(String, String)],
@@ -289,9 +303,9 @@ pub async fn receive_webhook(
         );
     }
     if let Some(expected) = route.subscription_id.lock().ok().and_then(|id| id.clone())
-        && header("x-mcp-subscription-id").is_some_and(|got| got != expected)
+        && header("x-mcp-subscription-id") != Some(expected.as_str())
     {
-        return WebhookReply::error(401, "Unauthorized", "subscription id mismatch");
+        return WebhookReply::error(401, "Unauthorized", "missing or mismatched subscription id");
     }
     let Ok(payload) = serde_json::from_slice::<Value>(body) else {
         return WebhookReply::error(400, "Bad Request", "body is not JSON");
@@ -323,12 +337,16 @@ pub async fn receive_webhook(
     }
 }
 
-/// Removes a route from the table however its task ends.
-struct RouteGuard(String);
+/// Removes a route from the table however its task ends (an abort included) — only if the entry
+/// is still this task's own.
+struct RouteGuard(String, Arc<Route>);
 
 impl Drop for RouteGuard {
     fn drop(&mut self) {
-        routes().remove(&self.0);
+        let mut routes = routes();
+        if routes.get(&self.0).is_some_and(|r| Arc::ptr_eq(r, &self.1)) {
+            routes.remove(&self.0);
+        }
     }
 }
 
@@ -429,7 +447,26 @@ pub(super) async fn run_webhook(
         }
         return;
     };
-    let fresh = random_bytes::<16>().and_then(|t| Ok((hex::encode(t), new_secret()?)));
+    // The callback survives restarts: the same token and the secret the server last confirmed, so
+    // a delivery the server retries while this process was down still finds its route and
+    // verifies. Fresh only for a new subscription, or when another live route already holds the
+    // token (a replacement of this same subscription, still confirming).
+    let key = spec.key();
+    let persisted = hub
+        .store
+        .sub(&key)
+        .and_then(|s| s.webhook)
+        .filter(|w| !route_exists(&w.token))
+        .and_then(|w| {
+            Some((
+                w.token.clone(),
+                (w.secret.clone(), decode_secret(&w.secret)?),
+            ))
+        });
+    let fresh = match persisted {
+        Some(p) => Ok(p),
+        None => random_bytes::<16>().and_then(|t| Ok((hex::encode(t), new_secret()?))),
+    };
     let (token, (mut secret_wire, secret_raw)) = match fresh {
         Ok(v) => v,
         Err(e) => {
@@ -451,7 +488,7 @@ pub(super) async fn run_webhook(
         tx,
     });
     routes().insert(token.clone(), route.clone());
-    let _guard = RouteGuard(token);
+    let _guard = RouteGuard(token.clone(), route.clone());
 
     let ttl_ms = webhook_ttl().as_millis() as u64;
     let subscribe_params = |secret: &str, cursor: Option<String>| {
@@ -479,18 +516,23 @@ pub(super) async fn run_webhook(
                 match msg {
                     Some(WebhookMsg::Event(event, ack)) => {
                         let status = match hub.deliver(&spec, McpEventDelivery::Webhook, &state, event) {
-                            Delivery::Accepted | Delivery::Duplicate => {
-                                hub.store.commit().await;
-                                200
-                            }
+                            // 2xx only once durable; otherwise the server retries (and the retry,
+                            // now a duplicate in memory, is acked once the record is written).
+                            Delivery::Accepted | Delivery::Duplicate => match hub.store.commit().await {
+                                Ok(()) => 200,
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "webhook delivery not stored; answering 503");
+                                    503
+                                }
+                            },
                             Delivery::Full => 503,
                         };
                         let _ = ack.send(status);
                     }
                     Some(WebhookMsg::Gap(env, ack)) => {
                         hub.gap(&spec, &state, &env);
-                        hub.store.commit().await;
-                        let _ = ack.send(200);
+                        let status = if hub.store.commit().await.is_ok() { 200 } else { 503 };
+                        let _ = ack.send(status);
                     }
                     Some(WebhookMsg::Terminated(env, ack)) => {
                         // The subscription no longer exists server-side; nothing to unsubscribe.
@@ -538,7 +580,16 @@ pub(super) async fn run_webhook(
             Ok(conn) => {
                 // Before every subscribe/refresh, so the verification challenge is already
                 // checked and a key rotation is picked up (see the module's key policy).
-                if let Err(e) = update_server_keys(&hub, &conn, &route, first).await {
+                let keys = tokio::select! {
+                    r = update_server_keys(&hub, &conn, &route, first) => r,
+                    () = cancel.cancelled() => {
+                        if !first {
+                            webhook_unsubscribe(&hub, &spec, &url).await;
+                        }
+                        return;
+                    }
+                };
+                if let Err(e) = keys {
                     if let Some(tx) = ready.take() {
                         let _ = tx.send(Err(e));
                     }
@@ -566,6 +617,13 @@ pub(super) async fn run_webhook(
                     pending = None;
                     secret_wire = secret_for_call;
                 }
+                hub.store.set_webhook(
+                    &key,
+                    Some(super::state::PersistedWebhook {
+                        token: token.clone(),
+                        secret: secret_wire.clone(),
+                    }),
+                );
                 let refresh_before = grant
                     .get("refreshBefore")
                     .and_then(Value::as_str)
@@ -797,8 +855,38 @@ mod tests {
         )
         .await;
         assert_eq!(r.status, 401);
+        // Once the subscription id is known, a delivery that does not name it is refused too.
+        let mut unnamed = headers("e1", &now, sign(&secret, "e1", &now, event), "sub_1");
+        unnamed.retain(|(k, _)| k != "X-MCP-Subscription-Id");
+        let r = receive_webhook("tok-unit", &unnamed, event).await;
+        assert_eq!(r.status, 401, "a delivery without X-MCP-Subscription-Id");
         assert_eq!(receive_webhook("tok-missing", &[], event).await.status, 410);
         routes().remove("tok-unit");
+    }
+
+    /// Only the first few signature entries are looked at: a valid one buried behind a pile of
+    /// junk does not buy the sender unbounded verification work.
+    #[test]
+    fn signature_entries_past_the_cap_are_ignored() {
+        let secret = b"0123456789abcdef0123456789abcdef";
+        let body = br#"{"eventId":"e1"}"#;
+        let good = sign(secret, "e1", "100", body);
+        let junk = "v1,AAAA ".repeat(MAX_SIGNATURE_ENTRIES - 1);
+        assert!(verify_signature(
+            secret,
+            "e1",
+            "100",
+            body,
+            &format!("{junk}{good}")
+        ));
+        let too_much = "v1,AAAA ".repeat(MAX_SIGNATURE_ENTRIES);
+        assert!(!verify_signature(
+            secret,
+            "e1",
+            "100",
+            body,
+            &format!("{too_much}{good}")
+        ));
     }
 
     #[test]
