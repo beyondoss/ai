@@ -318,6 +318,9 @@ struct SessionHandle {
     /// `true` exactly while the session's [`serve_session`] loop is running a `prompt`. The reaper reads
     /// it so a detached-but-mid-run background session is never reaped out from under an in-flight turn.
     running: Arc<AtomicBool>,
+    /// `true` while the session holds a live MCP Events subscription (and `--mcp-events-reapable`
+    /// is off): a background trigger, so the idle reaper leaves the session alone.
+    keep_alive: Arc<AtomicBool>,
     /// Why this session ended, shared with its [`ExitGuard`]. Written by whoever stops it, read once
     /// as the task exits — so the reason is recorded by the code that knows it, rather than guessed
     /// at the point of exit where every ending looks alike.
@@ -385,6 +388,7 @@ type SessionBody = Box<
             Option<Arc<ServiceSession>>,
             mpsc::Receiver<String>,
             SharedOutConn,
+            Arc<AtomicBool>,
             Arc<AtomicBool>,
         ) -> BoxFuture<'static, ()>
         + Send
@@ -476,25 +480,27 @@ fn session_cfg(base: &ServeConfig, id: &str, service: Option<Arc<ServiceSession>
 /// `serve_session`, not shared. The process runtime itself is `current_thread` by default (see
 /// `main.rs::build_runtime`).
 fn serve_session_body(base: ServeConfig) -> SessionBody {
-    Box::new(move |id, service, input_rx, out_conn, running| {
-        let cfg = session_cfg(&base, id, service);
-        let id = id.to_owned();
-        // Kept past the move into `serve_session` so a session that fails to *start* can still be
-        // reported: without this the only trace of "your sandbox is unreachable" was a line on the
-        // replica's stderr, and the client saw a socket that accepted its commands and answered
-        // nothing.
-        let out_err = out_conn.clone();
-        Box::pin(async move {
-            if let Err(e) = serve_session(cfg, input_rx, out_conn, running).await {
-                eprintln!("serve: session {id} ended: {e}");
-                lock_ignoring_poison(&out_err).broadcast(OutFrame::Value(json!({
-                    "type": "error",
-                    "session_id": id,
-                    "error": e.to_string(),
-                })));
-            }
-        })
-    })
+    Box::new(
+        move |id, service, input_rx, out_conn, running, keep_alive| {
+            let cfg = session_cfg(&base, id, service);
+            let id = id.to_owned();
+            // Kept past the move into `serve_session` so a session that fails to *start* can still be
+            // reported: without this the only trace of "your sandbox is unreachable" was a line on the
+            // replica's stderr, and the client saw a socket that accepted its commands and answered
+            // nothing.
+            let out_err = out_conn.clone();
+            Box::pin(async move {
+                if let Err(e) = serve_session(cfg, input_rx, out_conn, running, keep_alive).await {
+                    eprintln!("serve: session {id} ended: {e}");
+                    lock_ignoring_poison(&out_err).broadcast(OutFrame::Value(json!({
+                        "type": "error",
+                        "session_id": id,
+                        "error": e.to_string(),
+                    })));
+                }
+            })
+        },
+    )
 }
 
 /// Take the advisory lock on a session directory, off the runtime: both the `create_dir_all` and the
@@ -898,6 +904,7 @@ impl Supervisor {
         // Shared with the session loop: `true` only while it's running a `prompt`. The reaper reads
         // this handle-side clone to never reclaim a mid-run background session.
         let running = Arc::new(AtomicBool::new(false));
+        let keep_alive = Arc::new(AtomicBool::new(false));
         let exited = CancellationToken::new();
         table.sessions.insert(
             id.to_owned(),
@@ -910,6 +917,7 @@ impl Supervisor {
                 attached: 1,
                 last_detached_at: None,
                 running: running.clone(),
+                keep_alive: keep_alive.clone(),
                 end_reason: Arc::clone(&end_reason),
             },
         );
@@ -939,7 +947,14 @@ impl Supervisor {
         let lock_path = service.map(|svc| svc.session_path());
         let (started_tx, started_rx) = oneshot::channel();
         let started = lock_path.is_some().then_some(started_rx);
-        let body = (self.body)(id, service.cloned(), input_rx, out_conn.clone(), running);
+        let body = (self.body)(
+            id,
+            service.cloned(),
+            input_rx,
+            out_conn.clone(),
+            running,
+            keep_alive,
+        );
         let session_id = id.to_owned();
         // For the failure paths below: whoever attached to the `Starting` slot while the lock was
         // being taken is told why nothing started.
@@ -1402,7 +1417,9 @@ impl Supervisor {
 ///
 /// Otherwise the session is alive, and the ordinary conditions apply: **detached** (`attached == 0`) for
 /// at least `timeout`, and not mid-`prompt` — a detached background run is exactly what this design
-/// exists to keep alive, so `running` is never reaped out from under an in-flight turn.
+/// exists to keep alive, so `running` is never reaped out from under an in-flight turn. Nor is a
+/// session with a live MCP Events subscription (`keep_alive`): its triggers fire with no client
+/// attached, which is the point of them.
 fn is_reapable(h: &SessionHandle, timeout: Duration) -> bool {
     match h.phase.input() {
         None => false,
@@ -1411,6 +1428,7 @@ fn is_reapable(h: &SessionHandle, timeout: Duration) -> bool {
             h.attached == 0
                 && h.last_detached_at.is_some_and(|d| d.elapsed() >= timeout)
                 && !h.running.load(Ordering::Relaxed)
+                && !h.keep_alive.load(Ordering::Acquire)
         }
     }
 }
@@ -1597,6 +1615,9 @@ pub async fn serve_ws(
     // on stderr (the protocol never uses stderr): `h2c` against an h1-only gateway fails *every*
     // request, so an operator who flipped this on must see the mode they're running.
     cfg.shared_http = build_shared_h2_client(&cfg)?;
+    if let Some(callback) = &cfg.mcp_events_callback_url {
+        crate::tools::mcp_events::enable_receiver_document(callback);
+    }
     match cfg.upstream_http2 {
         UpstreamHttp2::Off => {
             eprintln!("serve: upstream-http2=off — each session opens its own connection pool")
@@ -1856,6 +1877,16 @@ where
             drain_http_body(&mut stream, &head, &leftover).await;
         }
         let _ = handle_health(supervisor, &mut stream, &head).await;
+        return Ok(());
+    }
+
+    // MCP Events receiver document (draft endpoint-verification path (d)): a public, static
+    // statement of which paths accept deliveries, so a server can verify without a challenge.
+    if head.path == crate::tools::mcp_events::RECEIVER_DOCUMENT_PATH
+        && let Some(doc) = crate::tools::mcp_events::receiver_document()
+    {
+        drain_http_body(&mut stream, &head, &leftover).await;
+        let _ = write_http_ok(&mut stream, 200, "OK", None, doc).await;
         return Ok(());
     }
 
@@ -2730,6 +2761,7 @@ mod tests {
             attached,
             last_detached_at: detached_ago.and_then(|d| Instant::now().checked_sub(d)),
             running: Arc::new(AtomicBool::new(false)),
+            keep_alive: Arc::new(AtomicBool::new(false)),
             end_reason: Arc::new(Mutex::new(crate::metrics::SessionEnd::Client)),
         };
         (h, input_rx)
@@ -2893,22 +2925,24 @@ mod tests {
             table: Arc::default(),
             session_dir: None,
             service: None,
-            body: Box::new(move |_id, _service, mut input_rx, _out, _running| {
-                let probe = probe.clone();
-                Box::pin(async move {
-                    let now = probe.running_now.fetch_add(1, Ordering::SeqCst) + 1;
-                    probe.peak.fetch_max(now, Ordering::SeqCst);
-                    let nth = probe.started.fetch_add(1, Ordering::SeqCst);
-                    if first_ends_itself && nth == 0 {
-                        drop(input_rx);
-                    } else {
-                        while input_rx.recv().await.is_some() {}
-                    }
-                    probe.exiting.fetch_add(1, Ordering::SeqCst);
-                    probe.release.cancelled().await;
-                    probe.running_now.fetch_sub(1, Ordering::SeqCst);
-                })
-            }),
+            body: Box::new(
+                move |_id, _service, mut input_rx, _out, _running, _keep_alive| {
+                    let probe = probe.clone();
+                    Box::pin(async move {
+                        let now = probe.running_now.fetch_add(1, Ordering::SeqCst) + 1;
+                        probe.peak.fetch_max(now, Ordering::SeqCst);
+                        let nth = probe.started.fetch_add(1, Ordering::SeqCst);
+                        if first_ends_itself && nth == 0 {
+                            drop(input_rx);
+                        } else {
+                            while input_rx.recv().await.is_some() {}
+                        }
+                        probe.exiting.fetch_add(1, Ordering::SeqCst);
+                        probe.release.cancelled().await;
+                        probe.running_now.fetch_sub(1, Ordering::SeqCst);
+                    })
+                },
+            ),
         })
     }
 

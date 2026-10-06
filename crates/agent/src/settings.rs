@@ -1343,6 +1343,11 @@ pub struct McpEventSubscription {
     /// for P1"). Trusted, unlike the event payload itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
+    /// The draft's `maxAgeMs`: when resuming from a persisted cursor, replay no further back than
+    /// this many milliseconds (the server starts from the later of the cursor and `now − maxAgeMs`
+    /// and says `truncated`). `None` replays everything the server still has.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_age_ms: Option<u64>,
 }
 
 /// The three delivery modes the draft defines.

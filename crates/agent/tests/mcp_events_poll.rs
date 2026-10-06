@@ -300,3 +300,47 @@ fn a_server_with_no_events_configured_is_never_asked_about_events() {
         "no events/* request without configuration: {methods}"
     );
 }
+
+#[test]
+fn a_session_bound_legacy_http_server_is_reached_through_its_own_session_and_gets_max_age() {
+    // A pre-2026-07-28 streamable-HTTP server: `initialize` mints an `Mcp-Session-Id` and every
+    // later request without it is refused. Events must go through the connection that holds it.
+    let (_fx, mcp_url, fixture) =
+        common::mcp_events_fixture::spawn_http_fixture(&[("MCP_FIXTURE_LEGACY_SESSION", "1")]);
+    let home = tempfile::tempdir().unwrap();
+    let server = json!({
+        "name": "legacy",
+        "transport": "http",
+        "url": mcp_url,
+        "events": [{ "name": "ticket.updated", "delivery": "poll", "action": "notify", "max_age_ms": 60000 }],
+    });
+    let mut s = start(json!([server]), home);
+    let listed = wait_active(&mut s.stdin, &mut s.frames, 1);
+    assert_eq!(
+        listed["data"]["available"][0]["supported"], true,
+        "{listed:#}"
+    );
+    emit(
+        &fixture,
+        json!({ "event_id": "legacy-1", "data": { "n": 1 } }),
+    );
+    let f = s
+        .frames
+        .wait(Duration::from_secs(20), "the legacy server's event", |f| {
+            f["type"] == "mcp_event"
+        });
+    assert_eq!(f["event"]["eventId"], "legacy-1");
+    let st = state(&fixture);
+    assert_eq!(
+        st["sessionless_rejections"], 0,
+        "nothing went out without the session: {st:#}"
+    );
+    let poll = st["requests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["method"] == "events/poll")
+        .cloned()
+        .unwrap();
+    assert_eq!(poll["params"]["maxAgeMs"], 60000, "{poll:#}");
+}

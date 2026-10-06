@@ -89,6 +89,10 @@ struct State {
     cancelled: Vec<Value>,
     verifications: Vec<Value>,
     deliveries: Vec<Value>,
+    /// Every `events/*` request seen over HTTP, with its params.
+    requests: Vec<Value>,
+    /// Legacy mode: requests refused for lacking the session id.
+    sessionless_rejections: u64,
 }
 
 fn env_flag(name: &str) -> bool {
@@ -195,6 +199,17 @@ fn matches(o: &Occ, name: &str, project: &Option<String>) -> bool {
     o.name == name && (project.is_none() || project == &o.project)
 }
 
+/// Whether `seq` is replayed for a client at `cursor`. With `MCP_FIXTURE_REPLAY_INCLUSIVE=1` the
+/// event *at* the cursor is sent again too — legal at-least-once behaviour that a client's
+/// `eventId` dedup has to absorb.
+fn after(seq: u64, cursor: u64) -> bool {
+    if env_flag("MCP_FIXTURE_REPLAY_INCLUSIVE") {
+        seq >= cursor
+    } else {
+        seq > cursor
+    }
+}
+
 fn project_of(params: &Value) -> Option<String> {
     params
         .pointer("/arguments/project")
@@ -218,6 +233,10 @@ type RpcErr = (i64, String, Option<Value>);
 /// `_meta.serverInfo` to every result. Mirrored here because that is exactly what broke rmcp's
 /// decoding of custom results (see `mcp_events::rescue_line`) — a fixture without it hid the bug.
 fn like_a_2026_server(mut result: Value) -> Value {
+    // A legacy (pre-2026) server predates per-result `serverInfo`.
+    if env_flag("MCP_FIXTURE_LEGACY_SESSION") {
+        return result;
+    }
     if let Value::Object(m) = &mut result {
         m.entry("resultType").or_insert(json!("complete"));
         m.entry("_meta").or_insert(json!({
@@ -236,6 +255,26 @@ fn sign(secret: &[u8], id: &str, ts: &str, body: &[u8]) -> String {
     mac.update(format!("{id}.{ts}.").as_bytes());
     mac.update(body);
     base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
+}
+
+/// The server's Ed25519 webhook-signing key, when `MCP_FIXTURE_ED25519_SEED` (64 hex chars) is
+/// set: published at `/.well-known/mcp-webhook-jwks.json`, and used to add a Standard Webhooks
+/// `v1a,` signature to every delivery.
+fn server_key() -> Option<ed25519_dalek::SigningKey> {
+    let seed = hex::decode(std::env::var("MCP_FIXTURE_ED25519_SEED").ok()?).ok()?;
+    Some(ed25519_dalek::SigningKey::from_bytes(
+        &<[u8; 32]>::try_from(seed.as_slice()).ok()?,
+    ))
+}
+
+fn jwks() -> Value {
+    match server_key() {
+        Some(k) => json!({ "keys": [{
+            "kty": "OKP", "crv": "Ed25519", "kid": "fixture-1", "use": "sig",
+            "x": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(k.verifying_key().as_bytes()),
+        }] }),
+        None => Value::Null,
+    }
 }
 
 fn decode_secret(s: &str) -> Option<Vec<u8>> {
@@ -285,6 +324,39 @@ async fn http_post(url: &str, headers: &[(String, String)], body: &[u8]) -> (u16
     (status, body)
 }
 
+/// A minimal HTTP/1.1 GET. Returns `(status, body)`; status 0 when the connection failed.
+async fn http_get(url: &str) -> (u16, Vec<u8>) {
+    let Some(rest) = url.strip_prefix("http://") else {
+        return (0, Vec::new());
+    };
+    let (hostport, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+    let Ok(Ok(mut stream)) =
+        tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(hostport)).await
+    else {
+        return (0, Vec::new());
+    };
+    let req = format!("GET {path} HTTP/1.1\r\nHost: {hostport}\r\nConnection: close\r\n\r\n");
+    if stream.write_all(req.as_bytes()).await.is_err() {
+        return (0, Vec::new());
+    }
+    let mut buf = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut buf)).await;
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    let status = text
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let body = text
+        .split_once("\r\n\r\n")
+        .map(|(_, b)| b.as_bytes().to_vec())
+        .unwrap_or_default();
+    (status, body)
+}
+
 /// POST a signed body to a webhook subscriber. `generations` picks which of the subscription's
 /// secrets sign it (Standard Webhooks multi-signature).
 async fn post_signed(
@@ -313,6 +385,21 @@ async fn post_signed(
             format!("v1,{sig}")
         })
         .collect();
+    let mut sigs = sigs;
+    if let Some(key) = server_key()
+        && tamper != Some("no_v1a")
+    {
+        use ed25519_dalek::Signer;
+        let mut msg = format!("{msg_id}.{ts}.").into_bytes();
+        msg.extend_from_slice(&body);
+        if tamper == Some("v1a") {
+            msg.extend_from_slice(b"tampered");
+        }
+        sigs.push(format!(
+            "v1a,{}",
+            base64::engine::general_purpose::STANDARD.encode(key.sign(&msg).to_bytes())
+        ));
+    }
     let headers = vec![
         ("webhook-id".to_owned(), msg_id.to_owned()),
         ("webhook-timestamp".to_owned(), ts),
@@ -402,7 +489,7 @@ async fn rpc(
             let pending: Vec<&Occ> = st
                 .log
                 .iter()
-                .filter(|o| o.seq > cursor && matches(o, &name, &project))
+                .filter(|o| after(o.seq, cursor) && matches(o, &name, &project))
                 .collect();
             let batch: Vec<&Occ> = pending.iter().take(max).copied().collect();
             let new_cursor = if pending.len() > max {
@@ -501,6 +588,51 @@ async fn subscribe(
         .unwrap()
         .verified
         .contains(&(principal.clone(), url.clone()));
+    // `MCP_FIXTURE_VERIFY_VIA_WELL_KNOWN=1`: verify by the receiver-published document instead of
+    // a challenge POST — the callback's origin serves `/.well-known/mcp-webhook-receiver.json`
+    // listing path prefixes that accept deliveries.
+    if needs_verify && env_flag("MCP_FIXTURE_VERIFY_VIA_WELL_KNOWN") {
+        let (origin, path) = match url
+            .strip_prefix("http://")
+            .and_then(|r| r.find('/').map(|i| (r, i)))
+        {
+            Some((r, i)) => (format!("http://{}", &r[..i]), r[i..].to_owned()),
+            None => (url.clone(), "/".to_owned()),
+        };
+        let (status, body) =
+            http_get(&format!("{origin}/.well-known/mcp-webhook-receiver.json")).await;
+        let covered = status == 200
+            && serde_json::from_slice::<Value>(&body)
+                .ok()
+                .and_then(|v| v["receivers"].as_array().cloned())
+                .is_some_and(|r| {
+                    r.iter()
+                        .filter_map(Value::as_str)
+                        .any(|p| path.starts_with(p))
+                });
+        state
+            .lock()
+            .unwrap()
+            .verifications
+            .push(json!({"url": url, "status": status, "ok": covered, "via": "well-known"}));
+        if !covered {
+            return Err((
+                -32015,
+                "CallbackEndpointError".into(),
+                Some(json!({"reason": "challenge_failed"})),
+            ));
+        }
+        state
+            .lock()
+            .unwrap()
+            .verified
+            .insert((principal.clone(), url.clone()));
+    }
+    let needs_verify = !state
+        .lock()
+        .unwrap()
+        .verified
+        .contains(&(principal.clone(), url.clone()));
     if needs_verify {
         let nonce = hex::encode(Sha256::digest(format!("{}{}", now_ms(), url).as_bytes()));
         let msg_id = format!("msg_verification_{}", &nonce[..12]);
@@ -541,6 +673,7 @@ async fn subscribe(
             .insert((principal.clone(), url.clone()));
     }
     let key = format!("{principal}|{url}|{name}|{}", canonical_args(&params));
+    let key_for_replay = key.clone();
     let id = format!("sub_{}", &hex::encode(Sha256::digest(key.as_bytes()))[..16]);
     let max_ttl = env_u64("MCP_FIXTURE_MAX_TTL_MS", 3_600_000) as i64;
     let granted = match params.get("ttlMs") {
@@ -558,6 +691,15 @@ async fn subscribe(
         .hooks
         .get(&key)
         .map(|_| json!({"active": true, "lastDeliveryAt": null, "lastError": null}));
+    // A fresh subscription carrying a cursor (a client that restarted) is replayed from it: the
+    // response's watermark stays at the cursor, and the backlog follows asynchronously.
+    let replay_from = (!live)
+        .then(|| {
+            params["cursor"]
+                .as_str()
+                .and_then(|c| c.parse::<u64>().ok())
+        })
+        .flatten();
     match st.hooks.get_mut(&key) {
         Some(hook) if live => {
             hook.refreshes += 1;
@@ -589,9 +731,39 @@ async fn subscribe(
     let mut result = json!({
         "id": id,
         "refreshBefore": expires.map(iso),
-        "cursor": head.to_string(),
+        "cursor": replay_from.unwrap_or(head).to_string(),
         "truncated": false,
     });
+    if let Some(cursor) = replay_from {
+        let state = state.clone();
+        let key = key_for_replay.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let backlog: Vec<(Occ, String, String, Vec<Vec<u8>>)> = {
+                let st = state.lock().unwrap();
+                let Some(h) = st.hooks.get(&key) else { return };
+                st.log
+                    .iter()
+                    .filter(|o| after(o.seq, cursor) && matches(o, &h.name, &h.project))
+                    .map(|o| {
+                        (
+                            o.clone(),
+                            h.url.clone(),
+                            h.id.clone(),
+                            signing_secrets(h, None),
+                        )
+                    })
+                    .collect()
+            };
+            for (o, url, id, secrets) in backlog {
+                let (status, _) =
+                    post_signed(&url, &id, &o.event_id, &secrets, &occ_json(&o, true), None).await;
+                state.lock().unwrap().deliveries.push(
+                    json!({"event_id": o.event_id, "url": url, "status": status, "replay": true}),
+                );
+            }
+        });
+    }
     if let Some(s) = status {
         result["deliveryStatus"] = s;
     }
@@ -696,6 +868,7 @@ async fn control(state: &Shared, method: &str, path: &str, body: &[u8]) -> (u16,
                     "methods": st.methods, "hooks": hooks, "unsubscribes": st.unsubscribes,
                     "cancelled": st.cancelled, "verifications": st.verifications,
                     "deliveries": st.deliveries, "streams": st.streams.len(), "log": st.log.len(),
+                "requests": st.requests, "sessionless_rejections": st.sessionless_rejections,
                 }),
             )
         }
@@ -881,8 +1054,18 @@ async fn read_request(stream: &mut TcpStream) -> Option<Request> {
 }
 
 async fn respond(stream: &mut TcpStream, status: u16, content_type: &str, body: &[u8]) {
+    respond_with(stream, status, content_type, "", body).await;
+}
+
+async fn respond_with(
+    stream: &mut TcpStream,
+    status: u16,
+    content_type: &str,
+    extra_headers: &str,
+    body: &[u8],
+) {
     let head = format!(
-        "HTTP/1.1 {status} X\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status} X\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n{extra_headers}\r\n",
         body.len()
     );
     let _ = stream.write_all(head.as_bytes()).await;
@@ -905,6 +1088,19 @@ async fn handle_http(state: Shared, mut stream: TcpStream) {
         .await;
         return;
     }
+    if req.path == "/.well-known/mcp-webhook-jwks.json" {
+        let doc = jwks();
+        if doc.is_null() {
+            return respond(&mut stream, 404, "text/plain", b"no keys").await;
+        }
+        return respond(
+            &mut stream,
+            200,
+            "application/json",
+            doc.to_string().as_bytes(),
+        )
+        .await;
+    }
     if req.path != "/mcp" {
         respond(&mut stream, 404, "text/plain", b"not found").await;
         return;
@@ -917,6 +1113,50 @@ async fn handle_http(state: Shared, mut stream: TcpStream) {
     let msg: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
     let method = msg["method"].as_str().unwrap_or("").to_owned();
     let params = msg.get("params").cloned().unwrap_or(Value::Null);
+    // `MCP_FIXTURE_LEGACY_SESSION=1`: a pre-2026 streamable-HTTP server — no `server/discover`, an
+    // `initialize` that mints an `Mcp-Session-Id`, and every later request refused without it. A
+    // stateless direct request cannot reach it; only the connection's own session can.
+    let legacy = env_flag("MCP_FIXTURE_LEGACY_SESSION");
+    if legacy {
+        if method == "initialize" {
+            let id = msg.get("id").cloned().unwrap_or(Value::Null);
+            let body = json!({"jsonrpc": "2.0", "id": id, "result": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": { "tools": {}, "events": { "listChanged": true } },
+                "serverInfo": { "name": "mcp-fixture-events-server", "version": "0.0.0" }
+            }});
+            return respond_with(
+                &mut stream,
+                200,
+                "application/json",
+                "Mcp-Session-Id: fixture-session\r\n",
+                body.to_string().as_bytes(),
+            )
+            .await;
+        }
+        if method == "server/discover" {
+            let id = msg.get("id").cloned().unwrap_or(Value::Null);
+            let body = json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32601, "message": "Method not found"}});
+            return respond(
+                &mut stream,
+                200,
+                "application/json",
+                body.to_string().as_bytes(),
+            )
+            .await;
+        }
+        if req.headers.get("mcp-session-id").map(String::as_str) != Some("fixture-session") {
+            state.lock().unwrap().sessionless_rejections += 1;
+            return respond(&mut stream, 400, "text/plain", b"missing Mcp-Session-Id").await;
+        }
+    }
+    if method.starts_with("events/") {
+        state
+            .lock()
+            .unwrap()
+            .requests
+            .push(json!({ "method": method, "params": params }));
+    }
     let Some(id) = msg.get("id").cloned() else {
         if method == "notifications/cancelled" {
             cancel_stream(&state, &params["requestId"]);
@@ -925,7 +1165,7 @@ async fn handle_http(state: Shared, mut stream: TcpStream) {
     };
     // Stateless streamable HTTP (2026-07-28) requires `Mcp-Method` to match the body, as the
     // official Python SDK enforces — so a client that forgets it fails here, not in production.
-    if req.headers.get("mcp-method").map(String::as_str) != Some(method.as_str()) {
+    if !legacy && req.headers.get("mcp-method").map(String::as_str) != Some(method.as_str()) {
         let body = json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32020, "message": "mcp-method header does not match the request body's method"}});
         return respond(
             &mut stream,

@@ -302,7 +302,7 @@
 //!     arguments?, delivery?, action?, instructions?}` / `{type:"mcp_events_unsubscribe", server,
 //!     name, arguments?}` — MCP Events (a **draft** extension; see [`crate::tools::mcp_events`]):
 //!     list what each server offers and this session's subscriptions, subscribe (an idempotent
-//!     upsert), unsubscribe (idempotent, `data: {removed}`). Idle-only; refused in service mode.
+//!     upsert), unsubscribe (idempotent, `data: {removed}`). Run as spawned tasks, accepted mid-run too; refused in service mode.
 //!
 //! While a `prompt` runs, the loop keeps reading stdin so an `abort` can cancel it, or `steer` /
 //! `follow_up` (with a `message`) can queue input: a `steer` is injected mid-run at the next tool
@@ -700,6 +700,10 @@ pub struct ServeConfig {
     /// [`crate::tools::mcp_events`]). `None` disables webhook delivery; poll and push still work.
     /// `main.rs` refuses it without `--listen`/`--listen-uds`, since nothing would receive them.
     pub mcp_events_callback_url: Option<String>,
+    /// `--mcp-events-reapable`: let the daemon's idle reaper stop a detached session even while it
+    /// holds live MCP Events subscriptions. Off by default — a subscription is a background trigger,
+    /// and reaping its session would silently end it.
+    pub mcp_events_reapable: bool,
     /// Agent definitions discovered at startup (see [`crate::agents`]) — the delegable personas the
     /// `subagent` tool accepts, advertised in `<available_agents>`. Discovered once, like `mcp_tools`,
     /// rather than re-walked on every registry rebuild. Empty when subagents aren't configured.
@@ -2588,7 +2592,8 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
 
     // Stdio has no supervisor and no reaper, so the `running` flag is inert here — a throwaway.
     let running = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let sig = serve_session(cfg, input_rx, out_conn, running)
+    let keep_alive = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let sig = serve_session(cfg, input_rx, out_conn, running, keep_alive)
         .await
         .map_err(|e| e.to_string())?;
     // The session has ended (and dropped its `out_conn` clones), so `conn_rx` is now closed — this
@@ -2617,6 +2622,9 @@ pub(crate) async fn serve_session(
     // reaper reads this to never reap a session with an in-flight background run (see
     // [`crate::serve_ws`]); the stdio wrapper passes a throwaway it never observes.
     running: Arc<std::sync::atomic::AtomicBool>,
+    // Set by the MCP Events hub while this session holds a live subscription; the daemon's idle
+    // reaper leaves such a session alone (unless `--mcp-events-reapable`). Inert over stdio.
+    keep_alive: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<Option<Signal>, Box<dyn std::error::Error + Send + Sync>> {
     let mut timing = crate::timing::StartupTiming::new();
     // On the blocking pool, not here: this is the replica's worst head-of-line blocker (a full
@@ -2766,6 +2774,12 @@ pub(crate) async fn serve_session(
                 callback_url: cfg.mcp_events_callback_url.clone(),
                 emit,
                 running: running.clone(),
+                keep_alive: (!cfg.mcp_events_reapable).then(|| keep_alive.clone()),
+                // Beside the transcript, so the position persists with the session: a restart
+                // resumes from the cursor instead of from "now".
+                state_path: persistence
+                    .session_file()
+                    .map(|p| p.with_extension("mcp-events.json")),
                 session_id: persistence.session_id().to_string(),
             },
         );
@@ -3917,6 +3931,32 @@ pub(crate) async fn serve_session(
     // actually fires (there's no concurrent access to guard against — this is all one async task's own
     // sequential control flow, just interleaved via `select!`, so a bare local suffices).
     let mut shutdown_cause: Option<Signal> = None;
+    // MCP Events injections that arrived while the loop was busy with something that cannot take a
+    // prompt (a host `bash`, a branch summary, a retry backoff): replayed, in order, the moment it is
+    // idle again — never refused as busy. See `mcp_events::is_injection`.
+    let mut deferred_events: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    // `mcp_events_*` commands run as spawned tasks, accepted from every loop, idle or busy; their
+    // responses go out through a *weak* handle on the writer so a straggler cannot hold teardown.
+    let events_cmds = mcp_events.as_ref().map(|hub| {
+        let tx = out_tx.downgrade();
+        hub.commands(Arc::new(move |frame: Value| {
+            if let Some(tx) = tx.upgrade() {
+                let _ = tx.send(OutFrame::Value(frame));
+            }
+        }))
+    });
+    let dispatch_events = |id: Option<String>, ctype: &str, c: &Value| match &events_cmds {
+        Some(d) => d.dispatch(id, ctype, c.clone()),
+        None => {
+            let _ = out_tx.send(response(
+                id,
+                ctype,
+                false,
+                None,
+                Some("no MCP server is connected, so there are no MCP events to subscribe to"),
+            ));
+        }
+    };
     // At most one `login` in flight at a time, tracked here so a concurrent second `login` is
     // rejected and `submit_code`/`abort_login` know what to reach. Shared with the detached task
     // `login` spawns (see that arm below) — cleared back to `None` by that task itself once the
@@ -3951,23 +3991,27 @@ pub(crate) async fn serve_session(
             })));
             break;
         }
-        let line = tokio::select! {
-            biased;
-            // Idle between commands: nothing is in flight, so a shutdown request needs no drain —
-            // just stop reading and fall out to the writer join below.
-            sig = shutdown.wait() => {
-                shutdown_cause = Some(sig);
-                break;
+        let line = if let Some(deferred) = deferred_events.pop_front() {
+            deferred
+        } else {
+            tokio::select! {
+                biased;
+                // Idle between commands: nothing is in flight, so a shutdown request needs no drain —
+                // just stop reading and fall out to the writer join below.
+                sig = shutdown.wait() => {
+                    shutdown_cause = Some(sig);
+                    break;
+                }
+                // A closed `input_rx` (the stdio reader hit EOF and dropped its sender, or a WebSocket
+                // supervisor deliberately dropped this session's retained sender to tear it down) ends the
+                // session gracefully — the same clean-shutdown path stdin EOF always drove. A merely
+                // *detached* WebSocket connection does NOT close `input_rx` (the supervisor keeps the
+                // sender), so this arm simply pends across a reconnect rather than firing.
+                maybe_line = input_rx.recv() => match maybe_line {
+                    Some(l) => l,
+                    None => break,
+                },
             }
-            // A closed `input_rx` (the stdio reader hit EOF and dropped its sender, or a WebSocket
-            // supervisor deliberately dropped this session's retained sender to tear it down) ends the
-            // session gracefully — the same clean-shutdown path stdin EOF always drove. A merely
-            // *detached* WebSocket connection does NOT close `input_rx` (the supervisor keeps the
-            // sender), so this arm simply pends across a reconnect rather than firing.
-            maybe_line = input_rx.recv() => match maybe_line {
-                Some(l) => l,
-                None => break,
-            },
         };
         let line = line.trim();
         if line.is_empty() {
@@ -4536,6 +4580,13 @@ pub(crate) async fn serve_session(
                                             // case its `message` is routed through the same `Steering`
                                             // queue as an explicit `steer`/`follow_up` command, rather than
                                             // forcing the client to re-encode it as a different command type.
+                                            // An injected event follow-up runs as its own prompt once this run is
+                                            // over (it is what the coalescer would have sent then anyway).
+                                            "prompt" if crate::tools::mcp_events::is_injection(&c)
+                                                && c.get("streaming_behavior").and_then(Value::as_str) != Some("steer") =>
+                                            {
+                                                deferred_events.push_back(l.to_string());
+                                            }
                                             "prompt" => {
                                                 match (
                                                     c.get("streaming_behavior").and_then(Value::as_str),
@@ -4548,6 +4599,10 @@ pub(crate) async fn serve_session(
                                                             parse_images(c.get("images")),
                                                         );
                                                         let queued = steering.push_steer(m);
+                                                        if !queued && crate::tools::mcp_events::is_injection(&c) {
+                                                            deferred_events.push_back(l.to_string());
+                                                            continue;
+                                                        }
                                                         // Fix 5 (pi-parity gap): same queue-content
                                                         // visibility the dedicated `steer`/`follow_up`
                                                         // commands' own acks now carry — including a
@@ -4778,6 +4833,7 @@ pub(crate) async fn serve_session(
                                                 cancel.cancel();
                                                 pending_deferred.push((cid, c.clone()));
                                             }
+                                            events_cmd if events_cmd.starts_with("mcp_events_") => dispatch_events(cid, events_cmd, &c),
                                             other => {
                                                 let _ = out_tx.send(response(cid, other, false, None, Some("busy: a prompt is running; only `abort`/`abort_retry`/`steer`/`follow_up`, `compact`/`switch_session`/`fork`/`clone`/`new_session` (which self-abort-and-proceed), or a handful of read-only commands (get_state/get_session_stats/get_messages/get_commands/list_branches/get_tree/list_sessions/list_all_sessions/get_available_models), are accepted")));
                                             }
@@ -4971,6 +5027,10 @@ pub(crate) async fn serve_session(
                                                     pending_deferred.push((cid, c.clone()));
                                                     break;
                                                 }
+                                                "prompt" if crate::tools::mcp_events::is_injection(&c) => {
+                                                    deferred_events.push_back(l.to_string());
+                                                }
+                                                events_cmd if events_cmd.starts_with("mcp_events_") => dispatch_events(cid, events_cmd, &c),
                                                 other => {
                                                     let _ = out_tx.send(response(cid, other, false, None, Some("busy: retrying after a transient error; only `abort`/`abort_retry`/`compact`/`switch_session`/`fork`/`clone`/`new_session` are accepted")));
                                                 }
@@ -6992,6 +7052,10 @@ pub(crate) async fn serve_session(
                                                 branch_cancel.cancel();
                                                 let _ = out_tx.send(response(cid, "abort", true, None, None));
                                             }
+                                            "prompt" if crate::tools::mcp_events::is_injection(&c) => {
+                                                deferred_events.push_back(l.to_string());
+                                            }
+                                            events_cmd if events_cmd.starts_with("mcp_events_") => dispatch_events(cid, events_cmd, &c),
                                             other => {
                                                 let _ = out_tx.send(response(cid, other, false, None, Some("busy: a branch switch is summarizing; only `abort` is accepted until it settles")));
                                             }
@@ -7258,6 +7322,10 @@ pub(crate) async fn serve_session(
                                             cancel.cancel();
                                             let _ = out_tx.send(response(cid, "abort_bash", true, None, None));
                                         }
+                                        "prompt" if crate::tools::mcp_events::is_injection(&c) => {
+                                            deferred_events.push_back(l.to_string());
+                                        }
+                                        events_cmd if events_cmd.starts_with("mcp_events_") => dispatch_events(cid, events_cmd, &c),
                                         other => {
                                             let _ = out_tx.send(response(cid, other, false, None, Some("busy: a host bash command is running; only `abort_bash`/`abort` are accepted")));
                                         }
@@ -7618,16 +7686,9 @@ pub(crate) async fn serve_session(
                     }
                 }
             }
-            events_cmd if events_cmd.starts_with("mcp_events_") => match &mcp_events {
-                Some(hub) => emit!(OutFrame::Value(hub.command(id, events_cmd, &cmd).await)),
-                None => emit!(response(
-                    id,
-                    events_cmd,
-                    false,
-                    None,
-                    Some("no MCP server is connected, so there are no MCP events to subscribe to")
-                )),
-            },
+            events_cmd if events_cmd.starts_with("mcp_events_") => {
+                dispatch_events(id, events_cmd, &cmd)
+            }
             other => {
                 emit!(response(id, other, false, None, Some("unknown command")));
             }

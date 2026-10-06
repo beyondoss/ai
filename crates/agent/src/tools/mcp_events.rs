@@ -33,8 +33,11 @@
 //! a queue of runs. The payload is framed as untrusted data.
 //!
 //! **Lifetime.** Subscriptions belong to the `serve_session` task — the slot, not the transcript —
-//! and end with it. Cursors and the dedup window live in memory: a restarted process subscribes from
-//! "now" (`cursor: null`) and does not replay what happened while it was down.
+//! and end with it. While one is live the session is exempt from the daemon's idle reaper (unless
+//! `--mcp-events-reapable`), so triggers fire with no client attached. Cursors and the dedup window
+//! persist beside the transcript ([`StateStore`]), so a restarted session resumes from its cursor.
+//! An injection that lands while the session is busy with a non-prompt command is deferred, never
+//! refused ([`is_injection`]); `mcp_events_*` commands run as spawned tasks ([`McpEventsCommands`]).
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -63,6 +66,31 @@ pub const SPEC_COMMIT: &str = "6682596d65eec778fe0b8b1f43b4e89d2fe2c546";
 /// Where webhook deliveries land on `serve`'s HTTP listener: `<prefix><token>`, one token per
 /// subscription. The token routes; the HMAC authenticates.
 pub const WEBHOOK_PATH_PREFIX: &str = "/_beyond/mcp-events/";
+
+/// The receiver-published verification document (the draft's endpoint-verification path (d)):
+/// `{"receivers": ["<callback base path>/_beyond/mcp-events/"]}`, served by `serve`'s listener at
+/// `/.well-known/mcp-webhook-receiver.json` once [`enable_receiver_document`] has run. A server
+/// that supports this path may then verify the callback without a challenge POST.
+static RECEIVER_DOCUMENT: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+
+/// Publish the receiver document for `callback_url` (`--mcp-events-callback-url`). Its path
+/// prefix is the callback base's own path, so a base of `https://edge.example/agent` declares
+/// `/agent/_beyond/mcp-events/`. Idempotent.
+pub fn enable_receiver_document(callback_url: &str) {
+    let base_path = url::Url::parse(callback_url)
+        .map(|u| u.path().trim_end_matches('/').to_owned())
+        .unwrap_or_default();
+    let doc = json!({ "receivers": [format!("{base_path}{WEBHOOK_PATH_PREFIX}")] });
+    let _ = RECEIVER_DOCUMENT.set(doc.to_string().into_bytes());
+}
+
+/// The receiver document's bytes, if webhook delivery is configured.
+pub fn receiver_document() -> Option<&'static [u8]> {
+    RECEIVER_DOCUMENT.get().map(Vec::as_slice)
+}
+
+/// Where the receiver document is served.
+pub const RECEIVER_DOCUMENT_PATH: &str = "/.well-known/mcp-webhook-receiver.json";
 
 /// Standard Webhooks' replay window.
 const TIMESTAMP_TOLERANCE_SECS: i64 = 300;
@@ -479,6 +507,35 @@ impl Conn {
             req = req.header(k, v);
         }
         req.body(body.to_string())
+    }
+
+    /// The server's webhook-signing keys, published as a JWKS at
+    /// `<server origin>/.well-known/mcp-webhook-jwks.json` — one of the two locations the pinned
+    /// draft names (the other, SEP-2127 server cards, is not published yet). Fetched from the same
+    /// origin the client already dials for MCP, never from a delivery. `Some(vec![])` when the
+    /// server publishes none (it does not do server identity); `None` when the fetch failed.
+    /// stdio servers have no origin, so none.
+    async fn server_signing_keys(&self) -> Option<Vec<ed25519_dalek::VerifyingKey>> {
+        let crate::tools::mcp::EventsPeer::Http { url, .. } = &self.peer else {
+            return Some(Vec::new());
+        };
+        let http = self.http.as_ref()?;
+        let jwks = url::Url::parse(url)
+            .ok()?
+            .join("/.well-known/mcp-webhook-jwks.json")
+            .ok()?;
+        let resp = tokio::time::timeout(Duration::from_secs(5), http.get(jwks).send())
+            .await
+            .ok()?
+            .ok()?;
+        match resp.status().as_u16() {
+            200 => {
+                let doc: Value = resp.json().await.ok()?;
+                Some(ed25519_keys_from_jwks(&doc))
+            }
+            404 | 410 => Some(Vec::new()),
+            _ => None,
+        }
     }
 
     /// One unary `events/*` request.
@@ -929,6 +986,19 @@ impl SubSpec {
     fn arguments(&self) -> Value {
         Value::Object(self.sub.arguments.clone())
     }
+
+    /// The `{name, arguments, cursor, maxAgeMs?}` every mode's request starts from.
+    fn params(&self, cursor: Option<String>) -> Value {
+        let mut p = json!({
+            "name": self.sub.name,
+            "arguments": self.arguments(),
+            "cursor": cursor,
+        });
+        if let Some(max_age) = self.sub.max_age_ms {
+            p["maxAgeMs"] = json!(max_age);
+        }
+        p
+    }
 }
 
 /// Bounded "seen" set: the newest [`DEDUP_WINDOW`] event ids.
@@ -965,12 +1035,16 @@ struct SubStatus {
     last_error: Option<String>,
     refresh_before: Option<String>,
     subscription_id: Option<String>,
+    /// The last webhook `deliveryStatus` the server reported on a refresh, verbatim.
+    delivery_status: Option<Value>,
 }
 
 #[derive(Default)]
 struct SubState {
     status: Mutex<SubStatus>,
     dedup: Mutex<Dedup>,
+    /// Where this subscription's cursor and dedup window persist, if the session persists.
+    persist: Option<(StateStore, String)>,
 }
 
 impl SubState {
@@ -991,7 +1065,184 @@ impl SubState {
     fn set_cursor_from(&self, v: &Value) {
         let cursor = v.get("cursor").and_then(Value::as_str).map(str::to_owned);
         self.with(|s| s.cursor = cursor);
+        self.save();
     }
+
+    /// A fresh state for `key`, resuming its persisted cursor and dedup window if there are any.
+    fn resume(store: Option<&StateStore>, key: &str) -> Self {
+        let mut state = SubState::default();
+        if let Some(store) = store {
+            if let Some(saved) = store.get(key) {
+                state.with(|s| s.cursor = saved.cursor.clone());
+                if let Ok(mut d) = state.dedup.lock() {
+                    for id in &saved.recent {
+                        d.first_sighting(id);
+                    }
+                }
+            }
+            state.persist = Some((store.clone(), key.to_owned()));
+        }
+        state
+    }
+
+    /// Record the current cursor and dedup window; the store writes them out shortly after.
+    fn save(&self) {
+        let Some((store, key)) = &self.persist else {
+            return;
+        };
+        let recent = self
+            .dedup
+            .lock()
+            .map(|d| d.order.iter().cloned().collect())
+            .unwrap_or_default();
+        store.update(
+            key,
+            PersistedSub {
+                cursor: self.cursor(),
+                recent,
+            },
+        );
+    }
+}
+
+/// One subscription's persisted position: the last safe cursor and the newest event ids seen.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+struct PersistedSub {
+    cursor: Option<String>,
+    #[serde(default)]
+    recent: Vec<String>,
+}
+
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct PersistedFile {
+    #[serde(default)]
+    spec_commit: String,
+    #[serde(default)]
+    subscriptions: std::collections::BTreeMap<String, PersistedSub>,
+}
+
+struct StoreInner {
+    path: std::path::PathBuf,
+    entries: Mutex<std::collections::BTreeMap<String, PersistedSub>>,
+    dirty: tokio::sync::Notify,
+    stop: CancellationToken,
+}
+
+/// A session's MCP Events state file (`<session>.mcp-events.json`, beside the transcript). Written
+/// the way the session store writes: a private temp file, `fsync`, `rename`, then the directory
+/// `fsync` — a reader (or a restart) sees the old file or the new one, never a torn one. Writes
+/// are coalesced (one per 100 ms at most) and run on the blocking pool.
+#[derive(Clone)]
+struct StateStore {
+    inner: Arc<StoreInner>,
+}
+
+impl StateStore {
+    fn open(path: std::path::PathBuf) -> Self {
+        let entries = std::fs::read(&path)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<PersistedFile>(&b).ok())
+            .map(|f| f.subscriptions)
+            .unwrap_or_default();
+        let store = Self {
+            inner: Arc::new(StoreInner {
+                path,
+                entries: Mutex::new(entries),
+                dirty: tokio::sync::Notify::new(),
+                stop: CancellationToken::new(),
+            }),
+        };
+        let writer = store.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    () = writer.inner.dirty.notified() => {}
+                    () = writer.inner.stop.cancelled() => return,
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                writer.write().await;
+            }
+        });
+        store
+    }
+
+    fn get(&self, key: &str) -> Option<PersistedSub> {
+        self.inner.entries.lock().ok()?.get(key).cloned()
+    }
+
+    fn update(&self, key: &str, entry: PersistedSub) {
+        if let Ok(mut e) = self.inner.entries.lock() {
+            if e.get(key) == Some(&entry) {
+                return;
+            }
+            e.insert(key.to_owned(), entry);
+        }
+        self.inner.dirty.notify_one();
+    }
+
+    /// An explicit unsubscribe forgets the position; a session ending keeps it, to resume from.
+    fn remove(&self, key: &str) {
+        if let Ok(mut e) = self.inner.entries.lock()
+            && e.remove(key).is_none()
+        {
+            return;
+        }
+        self.inner.dirty.notify_one();
+    }
+
+    async fn write(&self) {
+        let file = PersistedFile {
+            spec_commit: SPEC_COMMIT.to_owned(),
+            subscriptions: self
+                .inner
+                .entries
+                .lock()
+                .map(|e| e.clone())
+                .unwrap_or_default(),
+        };
+        let Ok(bytes) = serde_json::to_vec(&file) else {
+            return;
+        };
+        let path = self.inner.path.clone();
+        let result = tokio::task::spawn_blocking(move || write_atomic(&path, &bytes)).await;
+        if let Ok(Err(e)) = result {
+            tracing::warn!(error = %e, "could not persist MCP Events state");
+        }
+    }
+
+    /// Stop the writer and write the final state, awaited.
+    async fn flush(&self) {
+        self.inner.stop.cancel();
+        self.write().await;
+    }
+}
+
+fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let tmp = path.with_extension(format!("json.{}.tmp", crate::tools::temp_suffix()));
+    let write = (|| -> std::io::Result<()> {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            opts.mode(0o600);
+        }
+        let mut f = opts.open(&tmp)?;
+        f.write_all(bytes)?;
+        f.flush()?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, path)?;
+        if let Some(dir) = path.parent() {
+            std::fs::File::open(dir)?.sync_all()?;
+        }
+        Ok(())
+    })();
+    if write.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    write
 }
 
 struct Active {
@@ -1019,6 +1270,7 @@ impl Active {
                 "last_error": s.last_error,
                 "refresh_before": s.refresh_before,
                 "subscription_id": s.subscription_id,
+                "delivery_status": s.delivery_status,
             })
         })
     }
@@ -1049,6 +1301,13 @@ pub struct McpEventsConfig {
     pub emit: Emitter,
     /// `serve_session`'s "a prompt is running" flag.
     pub running: Arc<AtomicBool>,
+    /// Set while this session holds a live subscription, so the daemon's idle reaper leaves it
+    /// alone and background triggers outlive a disconnected client. `None` (`--mcp-events-reapable`)
+    /// leaves the reaper's ordinary rules in force.
+    pub keep_alive: Option<Arc<AtomicBool>>,
+    /// Where this session's cursors and dedup window persist (beside its transcript), so a
+    /// restart resumes from the cursor. `None` without session persistence.
+    pub state_path: Option<std::path::PathBuf>,
     /// For log lines only.
     pub session_id: String,
 }
@@ -1067,6 +1326,11 @@ struct Hub {
     shutdown: CancellationToken,
     /// For direct HTTP events requests; built on first use, never for a stdio-only session.
     http: std::sync::OnceLock<reqwest::Client>,
+    keep_alive: Option<Arc<AtomicBool>>,
+    /// Persisted cursor + dedup window per subscription key, and its writer.
+    store: Option<StateStore>,
+    /// `mcp_events_*` commands in flight — spawned so none ever blocks the session's command loop.
+    command_tasks: Mutex<tokio::task::JoinSet<()>>,
 }
 
 /// A session's MCP Events client: its subscriptions, its coalescer, and the injection path into
@@ -1114,6 +1378,9 @@ impl McpEventsHub {
             dropped: AtomicU64::new(0),
             shutdown: CancellationToken::new(),
             http: std::sync::OnceLock::new(),
+            keep_alive: cfg.keep_alive,
+            store: cfg.state_path.map(StateStore::open),
+            command_tasks: Mutex::new(tokio::task::JoinSet::new()),
         });
         let coalescer = tokio::spawn(coalesce(inject_rx, weak, cfg.running, hub.shutdown.clone()));
         (
@@ -1160,76 +1427,6 @@ impl McpEventsHub {
         });
     }
 
-    /// Answer one `mcp_events_*` command with a complete `response` frame.
-    pub async fn command(&self, id: Option<String>, ctype: &str, cmd: &Value) -> Value {
-        let result = match ctype {
-            "mcp_events_list" => Ok(self.list(cmd.get("server").and_then(Value::as_str)).await),
-            "mcp_events_subscribe" => match parse_spec(cmd) {
-                Ok(spec) => Hub::subscribe(&self.hub, spec).await,
-                Err(e) => Err(e),
-            },
-            "mcp_events_unsubscribe" => match parse_key(cmd) {
-                Ok(spec) => Ok(json!({ "removed": self.hub.unsubscribe(&spec.key()).await })),
-                Err(e) => Err(e),
-            },
-            _ => Err(format!("unknown command `{ctype}`")),
-        };
-        let mut m = Map::new();
-        m.insert("type".into(), json!("response"));
-        if let Some(id) = id {
-            m.insert("id".into(), json!(id));
-        }
-        m.insert("command".into(), json!(ctype));
-        match result {
-            Ok(data) => {
-                m.insert("success".into(), json!(true));
-                m.insert("data".into(), data);
-            }
-            Err(e) => {
-                m.insert("success".into(), json!(false));
-                m.insert("error".into(), json!(e));
-            }
-        }
-        Value::Object(m)
-    }
-
-    async fn list(&self, only: Option<&str>) -> Value {
-        let subscriptions: Vec<Value> = {
-            let subs = self.hub.lock_subs();
-            let mut v: Vec<(String, Value)> = subs
-                .iter()
-                .map(|(k, a)| (k.clone(), a.status_json()))
-                .collect();
-            v.sort_by(|a, b| a.0.cmp(&b.0));
-            v.into_iter().map(|(_, s)| s).collect()
-        };
-        let mut available = Vec::new();
-        for server in self.hub.catalog.snapshot().into_iter().map(|s| s.name) {
-            if only.is_some_and(|o| o != server) {
-                continue;
-            }
-            match self.hub.discover(&server).await {
-                Ok(events) => available.push(json!({
-                    "server": server,
-                    "supported": true,
-                    "events": *events,
-                })),
-                Err(e) => available.push(json!({
-                    "server": server,
-                    "supported": false,
-                    "error": e,
-                })),
-            }
-        }
-        json!({
-            "spec_commit": SPEC_COMMIT,
-            "webhook": self.hub.callback_url.is_some(),
-            "subscriptions": subscriptions,
-            "available": available,
-            "dropped": self.hub.dropped.load(Ordering::Relaxed),
-        })
-    }
-
     /// Unsubscribe everything (best effort, bounded) and stop the coalescer. Called once, at the end
     /// of `serve_session`.
     pub async fn shutdown(mut self) {
@@ -1247,7 +1444,66 @@ impl McpEventsHub {
         if let Some(c) = self.coalescer.take() {
             let _ = c.await;
         }
+        let mut tasks = std::mem::take(
+            &mut *self
+                .hub
+                .command_tasks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
+        if let Some(k) = &self.hub.keep_alive {
+            k.store(false, Ordering::Release);
+        }
+        if let Some(store) = &self.hub.store {
+            store.flush().await;
+        }
     }
+
+    /// The handle `serve` dispatches `mcp_events_*` commands through, from any loop, idle or busy.
+    /// `send` delivers the finished `response` frame.
+    pub fn commands(&self, send: Emitter) -> McpEventsCommands {
+        McpEventsCommands {
+            hub: self.hub.clone(),
+            send,
+        }
+    }
+}
+
+/// Runs `mcp_events_*` commands as spawned tasks: the network round trips (discovery, a
+/// subscribe's verification challenge) never hold the session's command loop, and the commands
+/// are accepted mid-run like the other non-transcript commands.
+#[derive(Clone)]
+pub struct McpEventsCommands {
+    hub: Arc<Hub>,
+    send: Emitter,
+}
+
+impl McpEventsCommands {
+    pub fn dispatch(&self, id: Option<String>, ctype: &str, cmd: Value) {
+        let hub = self.hub.clone();
+        let send = self.send.clone();
+        let ctype = ctype.to_owned();
+        let mut tasks = self
+            .hub
+            .command_tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while tasks.try_join_next().is_some() {}
+        tasks.spawn(async move {
+            let frame = Hub::command(&hub, id, &ctype, &cmd).await;
+            send(frame);
+        });
+    }
+}
+
+/// `true` for a `prompt` the events coalescer injected. A busy loop that cannot take a prompt
+/// (a host `bash`, a branch summary, a retry backoff) defers it to run once idle instead of
+/// refusing it.
+pub fn is_injection(cmd: &Value) -> bool {
+    cmd.get("type").and_then(Value::as_str) == Some("prompt")
+        && cmd.get("mcp_events").and_then(Value::as_bool) == Some(true)
 }
 
 fn parse_key(cmd: &Value) -> Result<SubSpec, String> {
@@ -1274,6 +1530,7 @@ fn parse_key(cmd: &Value) -> Result<SubSpec, String> {
             delivery: None,
             action: McpEventAction::default(),
             instructions: None,
+            max_age_ms: None,
         },
     })
 }
@@ -1296,10 +1553,81 @@ fn parse_spec(cmd: &Value) -> Result<SubSpec, String> {
         .get("instructions")
         .and_then(Value::as_str)
         .map(str::to_owned);
+    spec.sub.max_age_ms = cmd.get("max_age_ms").and_then(Value::as_u64);
     Ok(spec)
 }
 
 impl Hub {
+    /// Answer one `mcp_events_*` command with a complete `response` frame.
+    async fn command(hub: &Arc<Hub>, id: Option<String>, ctype: &str, cmd: &Value) -> Value {
+        let result = match ctype {
+            "mcp_events_list" => Ok(hub.list(cmd.get("server").and_then(Value::as_str)).await),
+            "mcp_events_subscribe" => match parse_spec(cmd) {
+                Ok(spec) => Hub::subscribe(hub, spec).await,
+                Err(e) => Err(e),
+            },
+            "mcp_events_unsubscribe" => match parse_key(cmd) {
+                Ok(spec) => Ok(json!({ "removed": hub.unsubscribe(&spec.key(), true).await })),
+                Err(e) => Err(e),
+            },
+            _ => Err(format!("unknown command `{ctype}`")),
+        };
+        let mut m = Map::new();
+        m.insert("type".into(), json!("response"));
+        if let Some(id) = id {
+            m.insert("id".into(), json!(id));
+        }
+        m.insert("command".into(), json!(ctype));
+        match result {
+            Ok(data) => {
+                m.insert("success".into(), json!(true));
+                m.insert("data".into(), data);
+            }
+            Err(e) => {
+                m.insert("success".into(), json!(false));
+                m.insert("error".into(), json!(e));
+            }
+        }
+        Value::Object(m)
+    }
+
+    async fn list(&self, only: Option<&str>) -> Value {
+        let subscriptions: Vec<Value> = {
+            let subs = self.lock_subs();
+            let mut v: Vec<(String, Value)> = subs
+                .iter()
+                .map(|(k, a)| (k.clone(), a.status_json()))
+                .collect();
+            v.sort_by(|a, b| a.0.cmp(&b.0));
+            v.into_iter().map(|(_, s)| s).collect()
+        };
+        let mut available = Vec::new();
+        for server in self.catalog.snapshot().into_iter().map(|s| s.name) {
+            if only.is_some_and(|o| o != server) {
+                continue;
+            }
+            match self.discover(&server).await {
+                Ok(events) => available.push(json!({
+                    "server": server,
+                    "supported": true,
+                    "events": *events,
+                })),
+                Err(e) => available.push(json!({
+                    "server": server,
+                    "supported": false,
+                    "error": e,
+                })),
+            }
+        }
+        json!({
+            "spec_commit": SPEC_COMMIT,
+            "webhook": self.callback_url.is_some(),
+            "subscriptions": subscriptions,
+            "available": available,
+            "dropped": self.dropped.load(Ordering::Relaxed),
+        })
+    }
+
     fn lock_subs(&self) -> std::sync::MutexGuard<'_, HashMap<String, Active>> {
         self.subs
             .lock()
@@ -1419,7 +1747,9 @@ impl Hub {
             .unwrap_or_default();
         let mode = choose_mode(spec.sub.delivery, &offered, hub.callback_url.is_some())?;
 
-        let state = reuse.clone().unwrap_or_default();
+        let state = reuse
+            .clone()
+            .unwrap_or_else(|| Arc::new(SubState::resume(hub.store.as_ref(), &key)));
         let prior_state = state.with(|s| std::mem::replace(&mut s.state, "starting"));
         let cancel = hub.shutdown.child_token();
         let (ready_tx, ready_rx) = oneshot::channel::<Result<(), String>>();
@@ -1483,6 +1813,7 @@ impl Hub {
         };
         let status = active.status_json();
         hub.lock_subs().insert(key, active);
+        hub.refresh_keep_alive();
         (hub.emit)(json!({
             "type": "mcp_event_status",
             "kind": "subscribed",
@@ -1493,14 +1824,30 @@ impl Hub {
 
     /// Stop one subscription, unsubscribing (webhook) or cancelling (push) on the way. `false` when
     /// there was nothing to stop — which is still success: unsubscribe is idempotent.
-    async fn unsubscribe(&self, key: &str) -> bool {
+    /// `forget` (an explicit unsubscribe) also drops the persisted cursor and dedup window.
+    async fn unsubscribe(&self, key: &str, forget: bool) -> bool {
         let _op = self.ops.lock().await;
+        if forget && let Some(store) = &self.store {
+            store.remove(key);
+        }
         let Some(active) = self.lock_subs().remove(key) else {
             return false;
         };
+        self.refresh_keep_alive();
         active.cancel.cancel();
         let _ = tokio::time::timeout(SHUTDOWN_GRACE, active.task).await;
         true
+    }
+
+    /// Keep the session exempt from the idle reaper exactly while a subscription is live.
+    fn refresh_keep_alive(&self) {
+        if let Some(k) = &self.keep_alive {
+            let live = self
+                .lock_subs()
+                .values()
+                .any(|a| !a.task.is_finished() && a.state.with(|s| s.state != "terminated"));
+            k.store(live, Ordering::Release);
+        }
     }
 
     /// The one path every occurrence takes, whatever mode carried it.
@@ -1521,9 +1868,11 @@ impl Hub {
             }
         }
         // Poll carries the cursor on the response, not the occurrence; for push/webhook the
-        // occurrence's own cursor is the safe watermark.
+        // occurrence's own cursor is the safe watermark. Either way the dedup window is saved.
         if mode != McpEventDelivery::Poll && event.as_object().is_some() {
             state.set_cursor_from(&event);
+        } else {
+            state.save();
         }
         state.with(|s| s.delivered += 1);
         (self.emit)(json!({
@@ -1569,6 +1918,7 @@ impl Hub {
             s.state = "terminated";
             s.last_error = Some(error.to_string());
         });
+        self.refresh_keep_alive();
         self.status_event(spec, "terminated", json!({ "error": error }));
     }
 }
@@ -1646,18 +1996,17 @@ async fn run_poll(
         }
         let result = match &conn {
             Some(c) => {
-                let params = json!({
-                    "name": spec.sub.name,
-                    "arguments": spec.arguments(),
-                    "cursor": state.cursor(),
-                    "maxEvents": 50,
-                });
+                let mut params = spec.params(state.cursor());
+                params["maxEvents"] = json!(50);
                 tokio::select! {
                     r = c.call("events/poll", params, RPC_TIMEOUT) => r,
                     () = cancel.cancelled() => return,
                 }
             }
-            None => Err(RpcError::local(format!("mcp server `{}` is not reachable", spec.server))),
+            None => Err(RpcError::local(format!(
+                "mcp server `{}` is not reachable",
+                spec.server
+            ))),
         };
         if result.is_err() {
             conn = None;
@@ -1670,10 +2019,8 @@ async fn run_poll(
                     s.state = "active";
                     s.last_error = None;
                 });
-                state.set_cursor_from(&page);
-                if page.get("truncated").and_then(Value::as_bool) == Some(true) {
-                    hub.status_event(&spec, "gap", json!({ "cursor": state.cursor() }));
-                }
+                // Events first, cursor after: a crash in between redelivers (and dedup drops) rather
+                // than persisting a cursor past events nobody saw.
                 for event in page
                     .get("events")
                     .and_then(Value::as_array)
@@ -1681,6 +2028,10 @@ async fn run_poll(
                     .unwrap_or_default()
                 {
                     hub.deliver(&spec, McpEventDelivery::Poll, &state, event);
+                }
+                state.set_cursor_from(&page);
+                if page.get("truncated").and_then(Value::as_bool) == Some(true) {
+                    hub.status_event(&spec, "gap", json!({ "cursor": state.cursor() }));
                 }
                 if page.get("hasMore").and_then(Value::as_bool) == Some(true) {
                     Duration::ZERO
@@ -1853,12 +2204,7 @@ async fn push_once(
     ready: &mut Option<oneshot::Sender<Result<(), String>>>,
     failures: &mut u32,
 ) -> StreamEnd {
-    let params = json!({
-        "name": spec.sub.name,
-        "arguments": spec.arguments(),
-        "cursor": state.cursor(),
-    });
-    let mut stream = match conn.open_stream(params).await {
+    let mut stream = match conn.open_stream(spec.params(state.cursor())).await {
         Ok(s) => s,
         Err(e) => return stream_error(hub, spec, state, ready, e),
     };
@@ -1946,6 +2292,10 @@ struct Route {
     /// different one is refused; before it is known (the verification challenge arrives *during*
     /// the subscribe request) it is not checked.
     subscription_id: Mutex<Option<String>>,
+    /// The server's published Ed25519 webhook-signing keys (see [`Conn::server_signing_keys`]).
+    /// Non-empty means server identity is enforced: every delivery must also carry a `v1a,`
+    /// signature one of them verifies. Empty means the server publishes none, and `v1a,` is ignored.
+    server_keys: Mutex<Vec<ed25519_dalek::VerifyingKey>>,
     tx: mpsc::Sender<WebhookMsg>,
 }
 
@@ -2024,6 +2374,48 @@ fn verify_signature(secret: &[u8], msg_id: &str, ts: &str, body: &[u8], header: 
     false
 }
 
+/// Standard Webhooks `v1a,`: an Ed25519 signature over the same `id.timestamp.body` the HMAC
+/// covers, from the server's own key. Accepts if any listed `v1a,` signature verifies under any
+/// published key (rotation publishes the new key beside the old).
+fn verify_server_signature(
+    keys: &[ed25519_dalek::VerifyingKey],
+    msg_id: &str,
+    ts: &str,
+    body: &[u8],
+    header: &str,
+) -> bool {
+    let mut msg = Vec::with_capacity(msg_id.len() + ts.len() + body.len() + 2);
+    msg.extend_from_slice(msg_id.as_bytes());
+    msg.push(b'.');
+    msg.extend_from_slice(ts.as_bytes());
+    msg.push(b'.');
+    msg.extend_from_slice(body);
+    header
+        .split_whitespace()
+        .filter_map(|part| part.strip_prefix("v1a,"))
+        .filter_map(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
+        .filter_map(|raw| ed25519_dalek::Signature::from_slice(&raw).ok())
+        .any(|sig| keys.iter().any(|k| k.verify_strict(&msg, &sig).is_ok()))
+}
+
+/// Parse a JWKS document's Ed25519 keys (`kty: OKP`, `crv: Ed25519`, base64url `x`).
+fn ed25519_keys_from_jwks(doc: &Value) -> Vec<ed25519_dalek::VerifyingKey> {
+    doc.get("keys")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|k| k.get("kty") == Some(&json!("OKP")) && k.get("crv") == Some(&json!("Ed25519")))
+        .filter_map(|k| k.get("x").and_then(Value::as_str))
+        .filter_map(|x| {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(x.trim_end_matches('='))
+                .ok()
+        })
+        .filter_map(|raw| <[u8; 32]>::try_from(raw.as_slice()).ok())
+        .filter_map(|raw| ed25519_dalek::VerifyingKey::from_bytes(&raw).ok())
+        .collect()
+}
+
 /// Handle one POST to [`WEBHOOK_PATH_PREFIX`]`<token>`. Called by `serve`'s listener with the raw
 /// body bytes — the signature is over them exactly as received, never over re-serialized JSON.
 ///
@@ -2071,6 +2463,18 @@ pub fn receive_webhook(token: &str, headers: &[(String, String)], body: &[u8]) -
     };
     if !verified {
         return WebhookReply::error(401, "Unauthorized", "invalid signature");
+    }
+    let keys = route
+        .server_keys
+        .lock()
+        .map(|k| k.clone())
+        .unwrap_or_default();
+    if !keys.is_empty() && !verify_server_signature(&keys, msg_id, ts, body, sig) {
+        return WebhookReply::error(
+            401,
+            "Unauthorized",
+            "missing or invalid v1a server signature",
+        );
     }
     if let Some(expected) = route.subscription_id.lock().ok().and_then(|id| id.clone())
         && header("x-mcp-subscription-id").is_some_and(|got| got != expected)
@@ -2154,6 +2558,7 @@ async fn run_webhook(
             previous: None,
         }),
         subscription_id: Mutex::new(None),
+        server_keys: Mutex::new(Vec::new()),
         tx,
     });
     routes().insert(token.clone(), route.clone());
@@ -2161,13 +2566,10 @@ async fn run_webhook(
 
     let ttl_ms = webhook_ttl().as_millis() as u64;
     let subscribe_params = |secret: &str, cursor: Option<String>| {
-        json!({
-            "name": spec.sub.name,
-            "arguments": spec.arguments(),
-            "delivery": { "mode": "webhook", "url": url, "secret": secret },
-            "cursor": cursor,
-            "ttlMs": ttl_ms,
-        })
+        let mut p = spec.params(cursor);
+        p["delivery"] = json!({ "mode": "webhook", "url": url, "secret": secret });
+        p["ttlMs"] = json!(ttl_ms);
+        p
     };
 
     let mut next_refresh = Duration::ZERO;
@@ -2235,6 +2637,13 @@ async fn run_webhook(
         };
         let result = match hub.conn(&spec.server).await {
             Ok(conn) => {
+                // Before every subscribe/refresh, so the verification challenge is already checked
+                // and a server's key rotation is picked up. A failed fetch keeps what we had.
+                if let Some(keys) = conn.server_signing_keys().await
+                    && let Ok(mut slot) = route.server_keys.lock()
+                {
+                    *slot = keys;
+                }
                 let call_fut = conn.call(
                     "events/subscribe",
                     subscribe_params(&secret_for_call, state.cursor()),
@@ -2279,6 +2688,7 @@ async fn run_webhook(
                 if grant.get("truncated").and_then(Value::as_bool) == Some(true) {
                     hub.status_event(&spec, "gap", json!({ "cursor": state.cursor() }));
                 }
+                state.with(|s| s.delivery_status = grant.get("deliveryStatus").cloned());
                 if let Some(ds) = grant.get("deliveryStatus")
                     && (ds.get("active").and_then(Value::as_bool) == Some(false)
                         || ds.get("lastError").is_some_and(|e| !e.is_null()))
@@ -2417,6 +2827,7 @@ async fn send_injection(
         "id": format!("mcp_events:{seq}"),
         "message": render_injection(events, dropped),
         "streaming_behavior": behavior,
+        "mcp_events": true,
     })
     .to_string();
     tx.send(line).await.is_ok()
@@ -2617,6 +3028,7 @@ mod tests {
                     previous: Some(previous.clone()),
                 }),
                 subscription_id: Mutex::new(Some("sub_1".into())),
+                server_keys: Mutex::new(Vec::new()),
                 tx,
             }),
         );
@@ -2716,6 +3128,51 @@ mod tests {
             let line = untouched.to_string();
             assert_eq!(rescue_line(line.clone()), line);
         }
+    }
+
+    #[test]
+    fn v1a_server_signatures_verify_against_published_keys_only() {
+        use ed25519_dalek::{Signer, SigningKey};
+        let key = SigningKey::from_bytes(&[7u8; 32]);
+        let other = SigningKey::from_bytes(&[9u8; 32]);
+        let jwks = json!({"keys": [{
+            "kty": "OKP", "crv": "Ed25519", "kid": "k1",
+            "x": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key.verifying_key().as_bytes()),
+        }]});
+        let keys = ed25519_keys_from_jwks(&jwks);
+        assert_eq!(keys.len(), 1);
+        let body = br#"{"eventId":"e1"}"#;
+        let sig = |k: &SigningKey| {
+            format!(
+                "v1a,{}",
+                base64::engine::general_purpose::STANDARD
+                    .encode(k.sign(b"e1.100.{\"eventId\":\"e1\"}").to_bytes())
+            )
+        };
+        assert!(verify_server_signature(
+            &keys,
+            "e1",
+            "100",
+            body,
+            &format!("v1,AAAA {}", sig(&key))
+        ));
+        assert!(!verify_server_signature(
+            &keys,
+            "e1",
+            "100",
+            body,
+            &sig(&other)
+        ));
+        assert!(!verify_server_signature(
+            &keys,
+            "e1",
+            "101",
+            body,
+            &sig(&key)
+        ));
+        assert!(!verify_server_signature(
+            &keys, "e1", "100", body, "v1,AAAA"
+        ));
     }
 
     #[test]

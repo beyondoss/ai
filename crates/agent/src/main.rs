@@ -798,6 +798,11 @@ enum Command {
         /// delivery is off and subscriptions use push or poll.
         #[usage(long, env = "AI_AGENT_MCP_EVENTS_CALLBACK_URL")]
         mcp_events_callback_url: Option<String>,
+        /// MCP Events: let the idle reaper (`--session-idle-timeout`) stop a detached session even
+        /// while it holds live event subscriptions. By default such a session is exempt — its
+        /// subscriptions are background triggers, and reaping it would silently end them.
+        #[usage(long, env = "AI_AGENT_MCP_EVENTS_REAPABLE")]
+        mcp_events_reapable: bool,
         /// Address this exact session: reattach to it if it already exists, or create it under exactly
         /// this id if it doesn't. Gives a caller a known, predictable name to route on rather than
         /// parsing an id back out of `get_state`/the startup `{"kind":"session", id, …}` banner.
@@ -1948,6 +1953,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             drain_grace,
             mcp_allow_private,
             mcp_events_callback_url,
+            mcp_events_reapable,
             session_id,
             r#continue: continue_session,
             no_session_persistence,
@@ -2427,6 +2433,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 max_live_sessions,
                 mcp_http,
                 mcp_events_callback_url,
+                mcp_events_reapable,
                 metrics: metrics.clone(),
                 // The process `main` built: it owns the signal handler. `serve_ws::session_cfg`
                 // flips this for each session it spawns.

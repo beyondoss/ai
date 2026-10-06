@@ -417,3 +417,53 @@ fn raw_post(port: u16, path: &str, body: &[u8]) -> u16 {
         .and_then(|c| c.parse().ok())
         .unwrap_or(0)
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_server_can_verify_the_callback_through_the_receiver_document_instead_of_a_challenge() {
+    let (_fx, mcp_url, fixture) = spawn_http_fixture(&[
+        ("MCP_FIXTURE_ALLOW_HTTP_CALLBACK", "1"),
+        ("MCP_FIXTURE_VERIFY_VIA_WELL_KNOWN", "1"),
+    ]);
+    let d = start_daemon(json!([webhook_server(
+        &mcp_url,
+        json!([{ "name": "ticket.updated", "delivery": "webhook", "action": "notify" }])
+    )]));
+    // The listener publishes which paths accept deliveries.
+    let (status, body) = raw_get(d.port, "/.well-known/mcp-webhook-receiver.json");
+    assert_eq!(status, 200);
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap(),
+        json!({ "receivers": ["/_beyond/mcp-events/"] })
+    );
+    let mut ws = ws_connect(d.port, Some("wellknown1")).await;
+    wait_active(&mut ws).await;
+    let v = &state(&fixture)["verifications"][0];
+    assert_eq!(v["via"], "well-known", "{v:#}");
+    assert_eq!(v["ok"], true);
+    let r = emit(&fixture, json!({ "event_id": "wk-1", "data": {} }));
+    assert_eq!(r["deliveries"][0]["status"], 200, "{r:#}");
+    next(&mut ws, Duration::from_secs(20), "wk-1", |f| {
+        f["event"]["eventId"] == "wk-1"
+    })
+    .await;
+}
+
+/// One raw GET to the daemon's listener; returns the status code and body.
+fn raw_get(port: u16, path: &str) -> (u16, String) {
+    use std::io::{Read, Write};
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    write!(s, "GET {path} HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+    let mut buf = String::new();
+    let _ = s.read_to_string(&mut buf);
+    let status = buf
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(0);
+    (
+        status,
+        buf.split_once("\r\n\r\n")
+            .map(|(_, b)| b.to_owned())
+            .unwrap_or_default(),
+    )
+}

@@ -1884,7 +1884,7 @@ impl McpCatalog {
 
     /// How to reach `server` for MCP Events requests, redialing a reaped process first.
     ///
-    /// - **stdio**: rmcp's own connection. The handle keeps the process alive (the reaper never
+    /// - **stdio**, and a pre-`2026-07-28` (session-bound) HTTP server: rmcp's own connection. The handle keeps the process alive (the reaper never
     ///   reaps a client somebody holds), so an open push stream pins its server while it is open.
     /// - **streamable HTTP**: the URL, credential headers and negotiated protocol version, for
     ///   direct stateless requests — rmcp's typed result union would drop a custom result that
@@ -1901,7 +1901,14 @@ impl McpCatalog {
             .upgrade()
             .ok_or_else(|| format!("mcp server `{server}` is no longer connected"))?;
         let client = conn.client().await?;
-        let McpTransport::Http { url, .. } = &conn.config.transport else {
+        // Direct requests only for a stateless (`2026-07-28`) server. An older streamable-HTTP
+        // server may bind requests to the `Mcp-Session-Id` rmcp negotiated — only rmcp's own
+        // connection carries it — and it does not attach `_meta` to results, so rmcp's own path
+        // decodes them intact.
+        let stateless = client
+            .peer_info()
+            .is_some_and(|i| i.protocol_version >= ProtocolVersion::V_2026_07_28);
+        let (McpTransport::Http { url, .. }, true) = (&conn.config.transport, stateless) else {
             return Ok(EventsPeer::Rmcp {
                 peer: client.peer().clone(),
                 router: client.service().events.clone(),
