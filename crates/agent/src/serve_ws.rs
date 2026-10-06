@@ -1859,6 +1859,18 @@ where
         return Ok(());
     }
 
+    // MCP Events webhook deliveries (draft extension). Ahead of the grant check: the caller is an
+    // MCP server, not a tenant, and it authenticates with the subscription's HMAC signature, which
+    // `mcp_events::receive_webhook` verifies over the raw body.
+    if let Some(token) = head
+        .path
+        .strip_prefix(crate::tools::mcp_events::WEBHOOK_PATH_PREFIX)
+    {
+        let token = token.to_owned();
+        handle_mcp_event_webhook(&mut stream, &head, leftover, &token).await;
+        return Ok(());
+    }
+
     if head.path != WS_PATH {
         refuse(&mut stream, &head, &leftover, HttpError::NotFound).await;
         return Ok(());
@@ -2164,6 +2176,35 @@ where
         WebSocketStream::from_partially_read(stream, leftover, Role::Server, Some(config)).await;
     supervisor.attach(pinned, service, ws).await;
     Ok(())
+}
+
+/// POST `/_beyond/mcp-events/<token>`: one MCP Events webhook delivery. Everything past reading the
+/// body is `mcp_events::receive_webhook`'s.
+async fn handle_mcp_event_webhook<S>(
+    stream: &mut S,
+    head: &HttpHead,
+    leftover: Vec<u8>,
+    token: &str,
+) where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    if head.method != "POST" {
+        refuse(stream, head, &leftover, HttpError::MethodNotAllowed).await;
+        return;
+    }
+    let Some(len) = head.content_length else {
+        let _ = write_http_err(stream, &HttpError::LengthRequired, None).await;
+        return;
+    };
+    let body = match read_http_body(stream, &leftover, len).await {
+        Ok(body) => body,
+        Err(e) => {
+            let _ = write_http_err(stream, &e, None).await;
+            return;
+        }
+    };
+    let reply = crate::tools::mcp_events::receive_webhook(token, &head.headers, &body);
+    let _ = write_http_ok(stream, reply.status, reply.reason, None, &reply.body).await;
 }
 
 /// POST `/_beyond/agent`: inject one command into the session and return its `ack` or `response`.

@@ -298,6 +298,11 @@
 //!     status (`logged_in`/`logged_out`/`needs_reauth`, the last meaning the most recent refresh
 //!     attempt failed but the credential is still on disk) for `provider`, or every known provider
 //!     when omitted → `data: {provider, status}` or `data: {providers: [{provider, status}…]}`
+//!   - `{type:"mcp_events_list", server?}` / `{type:"mcp_events_subscribe", server, name,
+//!     arguments?, delivery?, action?, instructions?}` / `{type:"mcp_events_unsubscribe", server,
+//!     name, arguments?}` — MCP Events (a **draft** extension; see [`crate::tools::mcp_events`]):
+//!     list what each server offers and this session's subscriptions, subscribe (an idempotent
+//!     upsert), unsubscribe (idempotent, `data: {removed}`). Idle-only; refused in service mode.
 //!
 //! While a `prompt` runs, the loop keeps reading stdin so an `abort` can cancel it, or `steer` /
 //! `follow_up` (with a `message`) can queue input: a `steer` is injected mid-run at the next tool
@@ -328,7 +333,12 @@
 //! zero or more unsolicited updates for an in-flight `login`, correlated via `id` (see `login` above)
 //! — or `{type:"session_superseded", session_id, tenant?}`, the last frame of a session whose storage
 //! another owner has taken over (service mode's shared mounts): reconnect to the same id, which lands
-//! on whoever owns it now.
+//! on whoever owns it now. — or `{type:"mcp_event", server, name, arguments, delivery, action,
+//! event}`, one per MCP Events occurrence a subscription of this session received (after `eventId`
+//! dedup), and `{type:"mcp_event_status", kind, …}` for its lifecycle (`subscribed`, `error`, `gap`,
+//! `terminated`, `delivery_status`). An event whose action is not `notify` is also injected as a
+//! `prompt` command with `id: "mcp_events:<n>"` and `streaming_behavior` `follow_up`/`steer`, so its
+//! `ack`/`response` frames carry that id.
 //!
 //! `{type:"catchup", data:{messages, leaf_id}, turn_in_flight, turn_truncated}` is pushed **once,
 //! unsolicited, on attach** over the WebSocket/UDS transports (nothing is sent to a fresh session with
@@ -685,6 +695,11 @@ pub struct ServeConfig {
     /// Catalog of connected MCP servers (resources/prompts metadata + live handles for
     /// `mcp_complete`). Built alongside `mcp_tools` by `connect_all`.
     pub mcp_catalog: crate::tools::mcp::McpCatalog,
+    /// `--mcp-events-callback-url`: the externally reachable base URL that routes to this daemon's
+    /// listener, used as the base of MCP Events webhook callback URLs (see
+    /// [`crate::tools::mcp_events`]). `None` disables webhook delivery; poll and push still work.
+    /// `main.rs` refuses it without `--listen`/`--listen-uds`, since nothing would receive them.
+    pub mcp_events_callback_url: Option<String>,
     /// Agent definitions discovered at startup (see [`crate::agents`]) — the delegable personas the
     /// `subagent` tool accepts, advertised in `<available_agents>`. Discovered once, like `mcp_tools`,
     /// rather than re-walked on every registry rebuild. Empty when subagents aren't configured.
@@ -2730,6 +2745,33 @@ pub(crate) async fn serve_session(
         cfg.mcp_tools = tools;
         cfg.mcp_catalog = catalog;
         timing.mark("connect session MCP connectors");
+    }
+    // MCP Events (draft extension): only when a server is connected at all, and never in service
+    // mode — a grant connector has no `events` configuration, and the `mcp_events_*` commands are
+    // refused there outright (`service::refused_command`). The hub interposes on `input_rx` so an
+    // arriving event can be injected as an ordinary `prompt` command; with no servers there is
+    // nothing to interpose for, and the channel stays exactly as it was.
+    let mut mcp_events = None;
+    if service.is_none() && !cfg.mcp_catalog.is_empty() {
+        let out = Arc::downgrade(&out_conn);
+        let emit: crate::tools::mcp_events::Emitter = Arc::new(move |frame: Value| {
+            if let Some(out) = out.upgrade() {
+                lock_ignoring_poison(&out).broadcast(OutFrame::Value(frame));
+            }
+        });
+        let (rx, hub) = crate::tools::mcp_events::McpEventsHub::attach(
+            input_rx,
+            crate::tools::mcp_events::McpEventsConfig {
+                catalog: cfg.mcp_catalog.clone(),
+                callback_url: cfg.mcp_events_callback_url.clone(),
+                emit,
+                running: running.clone(),
+                session_id: persistence.session_id().to_string(),
+            },
+        );
+        input_rx = rx;
+        hub.start_configured();
+        mcp_events = Some(hub);
     }
     // Where this session's tools run, resolved once at start. The precedence, most specific first:
     //
@@ -7576,10 +7618,25 @@ pub(crate) async fn serve_session(
                     }
                 }
             }
+            events_cmd if events_cmd.starts_with("mcp_events_") => match &mcp_events {
+                Some(hub) => emit!(OutFrame::Value(hub.command(id, events_cmd, &cmd).await)),
+                None => emit!(response(
+                    id,
+                    events_cmd,
+                    false,
+                    None,
+                    Some("no MCP server is connected, so there are no MCP events to subscribe to")
+                )),
+            },
             other => {
                 emit!(response(id, other, false, None, Some("unknown command")));
             }
         }
+    }
+    // Unsubscribe (webhook) / cancel (push) every MCP Events subscription before the session goes:
+    // best effort and bounded, so a dead server cannot hold the teardown.
+    if let Some(hub) = mcp_events.take() {
+        hub.shutdown().await;
     }
 
     // A `login` still in flight owns a detached task holding its own clone of `out_tx` — and the writer

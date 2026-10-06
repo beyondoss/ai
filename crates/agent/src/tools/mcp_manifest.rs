@@ -185,6 +185,7 @@ mod tests {
     fn stdio(name: &str, command: &str, args: &[&str]) -> McpServerConfig {
         McpServerConfig {
             name: name.into(),
+            events: Vec::new(),
             transport: McpTransport::Stdio {
                 command: command.into(),
                 args: args.iter().map(|s| (*s).to_string()).collect(),
@@ -232,6 +233,7 @@ mod tests {
         let s = stdio("s", "cmd", &[]);
         let h = McpServerConfig {
             name: "s".into(),
+            events: Vec::new(),
             transport: McpTransport::Http {
                 url: "https://example.com/mcp".into(),
                 headers: Default::default(),

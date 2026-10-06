@@ -1313,6 +1313,58 @@ pub struct McpServerConfig {
     pub name: String,
     #[serde(flatten)]
     pub transport: McpTransport,
+    /// MCP Events subscriptions (a **draft** extension — see `tools::mcp_events`) this server's
+    /// events should be delivered on: every `serve` session subscribes to each at start and
+    /// unsubscribes at its end. Absent or empty means the server is never asked about events at all.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub events: Vec<McpEventSubscription>,
+}
+
+/// One MCP Events subscription declared on a configured server (`mcp_servers[].events[]`).
+///
+/// Implements the Triggers & Events Working Group's *draft* design sketch (no SEP yet; pinned in
+/// `tools::mcp_events`). `name` + `arguments` say what to listen for; `delivery` forces a mode
+/// (otherwise the client picks webhook > push > poll from what the server offers and this process
+/// can receive); `action` says what an arriving event does to the session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpEventSubscription {
+    /// The event type's `name`, as the server's `events/list` advertises it.
+    pub name: String,
+    /// Subscription arguments, validated by the server against the event's `inputSchema`.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub arguments: serde_json::Map<String, serde_json::Value>,
+    /// Force one delivery mode. `None` negotiates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<McpEventDelivery>,
+    /// What an event does once it arrives. Every event is always emitted as an `mcp_event` frame.
+    #[serde(default)]
+    pub action: McpEventAction,
+    /// Operator-written guidance shown to the model alongside the event ("triage it; page me only
+    /// for P1"). Trusted, unlike the event payload itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+}
+
+/// The three delivery modes the draft defines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpEventDelivery {
+    Poll,
+    Push,
+    Webhook,
+}
+
+/// What an arriving event does to the session that holds the subscription.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpEventAction {
+    /// Only the `mcp_event` frame; the model never sees it.
+    Notify,
+    /// Queue it for the model: start a run when idle, or wait for the current run to stop.
+    #[default]
+    FollowUp,
+    /// Hand it to the model at the next tool turn of a run in flight (or start one when idle).
+    Steer,
 }
 
 /// How to reach one [`McpServerConfig`] — tagged by its own `"transport"` field in JSON (`"stdio"` or
@@ -2848,6 +2900,7 @@ mod tests {
     fn resolved_env_substitutes_a_dollar_var_reference() {
         let cfg = McpServerConfig {
             name: "s".into(),
+            events: Vec::new(),
             transport: McpTransport::Stdio {
                 command: "x".into(),
                 args: vec![],
@@ -2865,6 +2918,7 @@ mod tests {
     fn resolved_env_drops_an_entry_that_resolves_to_an_unset_var() {
         let cfg = McpServerConfig {
             name: "s".into(),
+            events: Vec::new(),
             transport: McpTransport::Stdio {
                 command: "x".into(),
                 args: vec![],
@@ -2881,6 +2935,7 @@ mod tests {
     fn resolved_env_is_empty_for_an_http_server() {
         let cfg = McpServerConfig {
             name: "s".into(),
+            events: Vec::new(),
             transport: McpTransport::Http {
                 url: "https://example.com".into(),
                 headers: std::collections::BTreeMap::new(),
@@ -2893,6 +2948,7 @@ mod tests {
     fn resolved_headers_substitutes_a_dollar_var_reference() {
         let cfg = McpServerConfig {
             name: "s".into(),
+            events: Vec::new(),
             transport: McpTransport::Http {
                 url: "https://example.com".into(),
                 headers: [("Authorization".to_string(), "Bearer $TOKEN".to_string())].into(),
@@ -2910,6 +2966,7 @@ mod tests {
     fn resolved_headers_is_empty_for_a_stdio_server() {
         let cfg = McpServerConfig {
             name: "s".into(),
+            events: Vec::new(),
             transport: McpTransport::Stdio {
                 command: "x".into(),
                 args: vec![],
@@ -2924,6 +2981,7 @@ mod tests {
         let global = Settings {
             mcp_servers: Some(vec![McpServerConfig {
                 name: "global-server".into(),
+                events: Vec::new(),
                 transport: McpTransport::Stdio {
                     command: "g".into(),
                     args: vec![],
@@ -2935,6 +2993,7 @@ mod tests {
         let project = Settings {
             mcp_servers: Some(vec![McpServerConfig {
                 name: "project-server".into(),
+                events: Vec::new(),
                 transport: McpTransport::Stdio {
                     command: "p".into(),
                     args: vec![],
@@ -2963,6 +3022,7 @@ mod tests {
         let global = Settings {
             mcp_servers: Some(vec![McpServerConfig {
                 name: "global-server".into(),
+                events: Vec::new(),
                 transport: McpTransport::Stdio {
                     command: "g".into(),
                     args: vec![],

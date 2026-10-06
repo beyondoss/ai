@@ -67,6 +67,7 @@ async fn within(limit: Duration, mut f: impl FnMut() -> bool) -> bool {
 fn fixture_config(tag: &str) -> McpServerConfig {
     McpServerConfig {
         name: "fixture".into(),
+        events: Vec::new(),
         transport: McpTransport::Stdio {
             command: FIXTURE.into(),
             // The fixture ignores argv entirely; this exists purely to be visible in /proc.

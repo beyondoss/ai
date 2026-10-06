@@ -791,6 +791,13 @@ enum Command {
         /// do); a production replica never should.
         #[usage(long, env = "AI_AGENT_MCP_ALLOW_PRIVATE")]
         mcp_allow_private: bool,
+        /// MCP Events (draft extension): the externally reachable base URL that routes to this
+        /// daemon's `--listen`/`--listen-uds` listener, e.g. `https://agent.example.com`. Webhook
+        /// callbacks are `<this>/_beyond/mcp-events/<token>`, so a server can deliver events to a
+        /// session. Servers require `https`; terminate TLS in front of the listener. Unset, webhook
+        /// delivery is off and subscriptions use push or poll.
+        #[usage(long, env = "AI_AGENT_MCP_EVENTS_CALLBACK_URL")]
+        mcp_events_callback_url: Option<String>,
         /// Address this exact session: reattach to it if it already exists, or create it under exactly
         /// this id if it doesn't. Gives a caller a known, predictable name to route on rather than
         /// parsing an id back out of `get_state`/the startup `{"kind":"session", id, …}` banner.
@@ -1940,6 +1947,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             metrics_listen,
             drain_grace,
             mcp_allow_private,
+            mcp_events_callback_url,
             session_id,
             r#continue: continue_session,
             no_session_persistence,
@@ -2053,6 +2061,19 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 && listen.is_none()
                 && listen_uds.is_none()
                 && std::env::var_os("LISTEN_FDS").is_some();
+            // Webhook callbacks arrive on the daemon's HTTP listener; over stdio nothing would
+            // receive them, and a server would fail its verification challenge on every subscribe.
+            if mcp_events_callback_url.is_some()
+                && listen.is_none()
+                && listen_uds.is_none()
+                && !systemd_activated
+            {
+                return Err(
+                    "--mcp-events-callback-url requires --listen, --listen-uds, or systemd socket \
+                     activation: webhook deliveries arrive on serve's HTTP listener"
+                        .into(),
+                );
+            }
             if service {
                 if grant_verifier.is_none() {
                     return Err(
@@ -2405,6 +2426,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 service: None,
                 max_live_sessions,
                 mcp_http,
+                mcp_events_callback_url,
                 metrics: metrics.clone(),
                 // The process `main` built: it owns the signal handler. `serve_ws::session_cfg`
                 // flips this for each session it spawns.

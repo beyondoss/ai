@@ -17,6 +17,7 @@ pub mod fs;
 pub mod grep;
 pub mod ls;
 pub mod mcp;
+pub mod mcp_events;
 pub mod mcp_host;
 pub mod mcp_manifest;
 pub mod memory;

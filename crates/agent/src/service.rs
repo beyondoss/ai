@@ -626,6 +626,9 @@ pub fn refused_command(command: &str) -> Option<&'static str> {
         "switch_session" => {
             "refused in service mode: connect at ?session_id=<id> with a grant for that session"
         }
+        "mcp_events_list" | "mcp_events_subscribe" | "mcp_events_unsubscribe" => {
+            "refused in service mode: MCP Events subscriptions are not supported for grant connectors"
+        }
         _ => return None,
     })
 }

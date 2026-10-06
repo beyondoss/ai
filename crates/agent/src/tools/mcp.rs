@@ -75,10 +75,10 @@ use rmcp::service::{
     ClientLifecycleMode, ClientServiceExt, NotificationContext, Peer, RequestContext,
     RunningService,
 };
+use rmcp::transport::ConfigureCommandExt;
 use rmcp::transport::streamable_http_client::{
     StreamableHttpClientTransport, StreamableHttpClientTransportConfig,
 };
-use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
 use rmcp::{ClientHandler, ErrorData as McpError, RoleClient};
 use serde_json::{Map, Value, json};
 
@@ -211,6 +211,9 @@ struct McpHandler {
     sinks: Arc<std::sync::Mutex<HashMap<ProgressToken, ToolProgress>>>,
     /// In-flight tool-call progress sinks (LIFO). See [`Self::push_active`].
     active: Arc<std::sync::Mutex<Vec<ToolProgress>>>,
+    /// Where this connection's `notifications/events/*` go (MCP Events draft — see
+    /// [`crate::tools::mcp_events`]). Empty, and so free, unless a push stream is open.
+    events: crate::tools::mcp_events::NotificationRouter,
 }
 
 impl McpHandler {
@@ -220,6 +223,7 @@ impl McpHandler {
             host,
             sinks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             active: Arc::new(std::sync::Mutex::new(Vec::new())),
+            events: crate::tools::mcp_events::NotificationRouter::default(),
         }
     }
 
@@ -302,6 +306,23 @@ impl ClientHandler for McpHandler {
         _context: RequestContext<RoleClient>,
     ) -> Result<CreateMessageResult, McpError> {
         self.host.sampling.create_message(params).await
+    }
+
+    async fn on_custom_notification(
+        &self,
+        notification: rmcp::model::CustomNotification,
+        context: NotificationContext<RoleClient>,
+    ) {
+        // rmcp moves `_meta` off the notification before dispatch. In 3.2.0 it swaps the whole
+        // extension map out first, so the metadata lands in `context.extensions` and
+        // `context.meta` is left empty; read both, so a fixed rmcp keeps working.
+        let subscription_id = context.meta.subscription_id().or_else(|| {
+            context
+                .extensions
+                .get::<rmcp::model::NotificationMetaObject>()
+                .and_then(rmcp::model::NotificationMetaObject::subscription_id)
+        });
+        self.events.route(notification, subscription_id);
     }
 }
 
@@ -445,8 +466,8 @@ struct McpTool {
 /// dead weight until someone actually calls it. So the process is reaped after
 /// [`IDLE_REAP_AFTER`] without a call, and re-spawned on the next one.
 ///
-/// Dropping the client is what kills the child: rmcp's `ChildWithCleanup` reaps the process in its
-/// `Drop`. There is no separate shutdown to call, and no zombie left behind.
+/// Dropping the client is what kills the child: rmcp drops the stdio transport, and the stdout pump in
+/// `mcp_events::stdio_transport` kills and reaps the process. No separate shutdown, no zombie.
 /// A connected server: the client, and the process group to sweep when it goes away.
 ///
 /// The group is kept beside the client rather than on the connection because it belongs to *this*
@@ -1129,6 +1150,7 @@ pub async fn connect_granted(
         jobs.push((
             McpServerConfig {
                 name: connector.name.clone(),
+                events: Vec::new(),
                 transport: McpTransport::Http {
                     url: connector.url.clone(),
                     headers: BTreeMap::new(),
@@ -1343,7 +1365,7 @@ async fn connect_one(
 /// and a well-behaved browser server closes its browser on the way out. The group sweep is the
 /// backstop for everything that doesn't.
 ///
-/// `stderr` is left at `TokioChildProcess`'s own default (`Stdio::inherit()`), not captured — a
+/// `stderr` is inherited (`Stdio::inherit()`, set in `mcp_events::stdio_transport`), not captured — a
 /// deliberate choice, not an oversight: a server that fails to start or crashes typically explains why
 /// on its own stderr, and inheriting it means that reaches the operator's own console (this process's
 /// stderr) immediately, the same way a connect failure's `tracing::warn!` does.
@@ -1354,7 +1376,7 @@ async fn connect_stdio(
     args: &[String],
 ) -> Result<(McpClient, Option<u32>), String> {
     let env = config.resolved_env();
-    let child = TokioChildProcess::new(tokio::process::Command::new(command).configure(|cmd| {
+    let cmd = tokio::process::Command::new(command).configure(|cmd| {
         cmd.args(args);
         for (k, v) in &env {
             cmd.env(k, v);
@@ -1369,20 +1391,22 @@ async fn connect_stdio(
         // while the next call starts a second browser. A group leader here is what makes
         // [`kill_process_group`] able to catch them.
         cmd.process_group(0);
-    }))
-    .map_err(|e| format!("failed to spawn `{command}`: {e}"))?;
-    // Read before the transport is consumed; this is also the group id, since the child leads it.
-    let pgid = child.id();
+    });
+    // Spawned here rather than by rmcp's `TokioChildProcess` so the server's stdout passes through
+    // `mcp_events::stdio_transport`, which keeps rmcp 3.x from silently dropping custom results
+    // (see `mcp_events::rescue_line`). Killed when rmcp drops the transport, as before.
+    let (pgid, transport) = crate::tools::mcp_events::stdio_transport(cmd)
+        .map_err(|e| format!("failed to spawn `{command}`: {e}"))?;
 
     let client = McpHandler::new(&config.name, dial.host.clone())
-        .serve_with_lifecycle(child, client_lifecycle())
+        .serve_with_lifecycle(transport, client_lifecycle())
         .await
         .map_err(|e| format!("MCP handshake over stdio failed: {e}"))?;
     Ok((client, pgid))
 }
 
 /// The other way a server goes away: the last tool holding the connection is dropped (a `serve`
-/// registry rebuild, a finished `run`, process exit). rmcp kills the server itself on drop; this adds
+/// registry rebuild, a finished `run`, process exit). The stdio transport kills the server on drop; this adds
 /// the sweep, so that path reclaims as much as a reap does.
 impl Drop for McpConnection {
     fn drop(&mut self) {
@@ -1840,6 +1864,84 @@ impl McpCatalog {
             .collect()
     }
 
+    /// Every configured server's declared MCP Events subscriptions (`mcp_servers[].events`), for
+    /// the servers still connected. Read off the connection's own config, so it is exactly what was
+    /// dialed — nothing is re-read from disk.
+    pub fn event_subscriptions(&self) -> Vec<(String, Vec<crate::settings::McpEventSubscription>)> {
+        self.snapshot()
+            .into_iter()
+            .filter_map(|s| {
+                let conn = s.conn.upgrade()?;
+                (!conn.config.events.is_empty()).then(|| (s.name, conn.config.events.clone()))
+            })
+            .collect()
+    }
+
+    /// Whether any server is connected at all — the cheap gate `serve` uses before wiring events.
+    pub fn is_empty(&self) -> bool {
+        self.snapshot().is_empty()
+    }
+
+    /// How to reach `server` for MCP Events requests, redialing a reaped process first.
+    ///
+    /// - **stdio**: rmcp's own connection. The handle keeps the process alive (the reaper never
+    ///   reaps a client somebody holds), so an open push stream pins its server while it is open.
+    /// - **streamable HTTP**: the URL, credential headers and negotiated protocol version, for
+    ///   direct stateless requests — rmcp's typed result union would drop a custom result that
+    ///   carries `_meta` (see `mcp_events::rescue_line`), and over HTTP there is no byte stream of
+    ///   ours to repair it on.
+    pub(crate) async fn events_peer(&self, server: &str) -> Result<EventsPeer, String> {
+        let entry = self
+            .snapshot()
+            .into_iter()
+            .find(|s| s.name == server)
+            .ok_or_else(|| format!("unknown MCP server `{server}`"))?;
+        let conn = entry
+            .conn
+            .upgrade()
+            .ok_or_else(|| format!("mcp server `{server}` is no longer connected"))?;
+        let client = conn.client().await?;
+        let McpTransport::Http { url, .. } = &conn.config.transport else {
+            return Ok(EventsPeer::Rmcp {
+                peer: client.peer().clone(),
+                router: client.service().events.clone(),
+                _live: ClientHold(client),
+            });
+        };
+        let mut headers: Vec<(HeaderName, HeaderValue)> = Vec::new();
+        match &conn.dial.http {
+            Some(http) => headers.extend(
+                http.headers
+                    .iter()
+                    .map(|h| (h.name.clone(), h.value.clone())),
+            ),
+            None => {
+                for (k, v) in conn.config.resolved_headers() {
+                    if let (Ok(k), Ok(v)) = (
+                        HeaderName::from_bytes(k.as_bytes()),
+                        HeaderValue::from_str(&v),
+                    ) {
+                        headers.push((k, v));
+                    }
+                }
+                if let Some(token) = oauth_bearer_token(&conn.config.name, url).await
+                    && let Ok(v) = HeaderValue::from_str(&format!("Bearer {token}"))
+                {
+                    headers.push((http::header::AUTHORIZATION, v));
+                }
+            }
+        }
+        Ok(EventsPeer::Http {
+            url: url.clone(),
+            router: client.service().events.clone(),
+            headers,
+            protocol_version: client
+                .peer_info()
+                .map(|i| i.protocol_version.to_string())
+                .unwrap_or_else(|| ProtocolVersion::V_2026_07_28.to_string()),
+        })
+    }
+
     /// `completion/complete` against a live (or reconnected) server.
     pub async fn complete(
         &self,
@@ -1861,6 +1963,28 @@ impl McpCatalog {
             .await
             .map_err(|e| format!("mcp server `{server}` completion/complete failed: {e}"))
     }
+}
+
+/// Keeps a client (and so its process) alive; deliberately opaque outside this module.
+pub(crate) struct ClientHold(#[expect(dead_code, reason = "held for its Drop")] Arc<McpClient>);
+
+/// One server's connection, as the MCP Events client needs it. See [`McpCatalog::events_peer`].
+pub(crate) enum EventsPeer {
+    /// stdio: the raw peer for `events/*` requests, the router its `notifications/events/*` arrive
+    /// on, and a hold on the client so the idle reaper leaves it alone while this is alive.
+    Rmcp {
+        peer: Peer<RoleClient>,
+        router: crate::tools::mcp_events::NotificationRouter,
+        _live: ClientHold,
+    },
+    /// Streamable HTTP: where and how to POST `events/*` directly. `router` still carries
+    /// `notifications/events/list_changed`, which arrives on rmcp's own connection.
+    Http {
+        url: String,
+        router: crate::tools::mcp_events::NotificationRouter,
+        headers: Vec<(HeaderName, HeaderValue)>,
+        protocol_version: String,
+    },
 }
 
 async fn tools_from_client(

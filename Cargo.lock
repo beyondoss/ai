@@ -421,6 +421,7 @@ dependencies = [
  "grep-searcher",
  "hex",
  "hkdf",
+ "hmac",
  "htmd",
  "http",
  "httparse",
