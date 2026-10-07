@@ -365,37 +365,27 @@ async fn service_mode_dials_a_sessions_own_apps_pool_from_its_grant() {
         ],
         turn_tool_use("toolu_svc_x", "mcp__wx__show_weather", "{}"),
     );
-    // The replica takes a TCP port picked by `free_port` — another test can grab it first, so retry
-    // a start whose port turned out not to be ours.
-    let mut attempt = 0;
-    let (_svc, mut ws) = loop {
-        attempt += 1;
-        let svc = Service::start_with(
-            &base,
-            &["s1"],
-            Options {
-                extra_args: vec!["--mcp-allow-private".into()],
-                ..Default::default()
-            },
-        )
-        .await;
-        let mut claims = svc.claims("tenant-a", "s1.apps", &svc.shards[0].0);
-        claims.mcp = [("wx".to_string(), fixture.url.clone())]
-            .into_iter()
-            .collect();
-        let token = svc.minter.mint(&claims, &svc.secrets());
-        match tokio_tungstenite::connect_async(common::ws_request(
-            svc.port,
-            Some("s1.apps"),
-            &svc.header(&token),
-        ))
-        .await
-        {
-            Ok((ws, _)) => break (svc, ws),
-            Err(e) if attempt < 3 => eprintln!("replica start {attempt} unusable: {e}"),
-            Err(e) => panic!("replica never accepted a session: {e}"),
-        }
-    };
+    let svc = Service::start_with(
+        &base,
+        &["s1"],
+        Options {
+            extra_args: vec!["--mcp-allow-private".into()],
+            ..Default::default()
+        },
+    )
+    .await;
+    let mut claims = svc.claims("tenant-a", "s1.apps", &svc.shards[0].0);
+    claims.mcp = [("wx".to_string(), fixture.url.clone())]
+        .into_iter()
+        .collect();
+    let token = svc.minter.mint(&claims, &svc.secrets());
+    let (mut ws, _) = tokio_tungstenite::connect_async(common::ws_request(
+        svc.port,
+        Some("s1.apps"),
+        &svc.header(&token),
+    ))
+    .await
+    .expect("the replica accepts the session");
 
     // The session's own connector is dialed again, with the extension advertised.
     assert_eq!(

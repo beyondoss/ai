@@ -148,7 +148,9 @@
 //!     active tip and advance the tip to it → `data: {id}` (the new entry's id); `data` defaults to `{}`
 //!     when omitted, `kind` identifies the shape of `data` to whatever produced it (this crate never
 //!     interprets either) — `SessionStore::append_custom`, fully built and tested but previously
-//!     unreachable from any RPC command; same persistence-required error as `set_label`
+//!     unreachable from any RPC command; same persistence-required error as `set_label`. A kind the
+//!     agent writes itself (`session_store::HOST_CUSTOM_KINDS`) is refused, so a client cannot forge
+//!     one
 //!   - `{type:"export_html", output_path?}` render the active session's transcript as a single
 //!     self-contained HTML file → `data: {path}`. `output_path` defaults to a timestamped
 //!     `session-<unix-seconds>.html` in the current directory; parent directories are created as
@@ -2380,7 +2382,7 @@ pub(crate) async fn scan_session_dirs(
             .flat_map(|dir| crate::session_store::scan_session_dir_in(dir, &layout))
             .collect();
         let mut metas = crate::session_store::scan_listings_in(paths, &layout, &on_progress);
-        metas.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        metas.sort_by(crate::session_store::by_recency);
         metas
     })
     .await
@@ -5112,7 +5114,7 @@ pub(crate) async fn serve_session(
                                             // must be answerable mid-run. `accepted:false` tells the losing
                                             // client in a multi-attach race that its answer arrived too late.
                                             "approve" => {
-                                                let _ = out_tx.send(handle_approve(cid, &c, &pending_approvals));
+                                                let _ = out_tx.send(handle_approve(cid, &c, &pending_approvals, approval.is_some()));
                                             }
                                             "elicit" => {
                                                 let _ = out_tx.send(handle_elicit(cid, &c, Some(&pending_elicitations)));
@@ -6581,6 +6583,18 @@ pub(crate) async fn serve_session(
                 )),
             },
             "append_custom" => match cmd.get("kind").and_then(Value::as_str) {
+                // The host's own journal kinds: an entry of one is trusted when the session is
+                // replayed (a task to resume, a result to deliver), so a client must not be able to
+                // write one.
+                Some(kind) if crate::session_store::is_host_custom_kind(kind) => emit!(response(
+                    id,
+                    "append_custom",
+                    false,
+                    None,
+                    Some(&format!(
+                        "custom entry kind `{kind}` is reserved for entries the agent writes itself"
+                    ))
+                )),
                 Some(kind) => {
                     let data = cmd.get("data").cloned().unwrap_or_else(|| json!({}));
                     match persistence.append_custom(kind, data) {
@@ -6624,7 +6638,12 @@ pub(crate) async fn serve_session(
             // Reachable while idle only for a stale/duplicate answer (`accepted:false`): a real question
             // can only be outstanding while a run is in flight, which is the busy arm above.
             "approve" => {
-                emit!(handle_approve(id, &cmd, &pending_approvals));
+                emit!(handle_approve(
+                    id,
+                    &cmd,
+                    &pending_approvals,
+                    approval.is_some()
+                ));
             }
             "get_todos" => {
                 // Straight from the session while idle — no mirror needed, and no chance of one going
@@ -10301,7 +10320,17 @@ fn approval_resolved_frame(
 /// `accepted` is `false` when the `request_id` names no outstanding question — it was already answered
 /// by another attached client, it timed out, or the run was aborted. That is not an error: it is the
 /// answer a client races and loses.
-fn handle_approve(id: Option<String>, cmd: &Value, pending: &PendingApprovals) -> OutFrame {
+///
+/// `tool_gate` is whether this session asks about tool calls (`--approve`). Without one, the only
+/// questions it can raise are MCP skills' — so an answer that matches none of them is refused with a
+/// pointer to `--approve` rather than acknowledged, since a client sending it is most likely expecting
+/// tool approvals this session will never ask for.
+fn handle_approve(
+    id: Option<String>,
+    cmd: &Value,
+    pending: &PendingApprovals,
+    tool_gate: bool,
+) -> OutFrame {
     let Some(request_id) = cmd.get("request_id").and_then(Value::as_str) else {
         return response(id, "approve", false, None, Some("missing `request_id`"));
     };
@@ -10310,6 +10339,18 @@ fn handle_approve(id: Option<String>, cmd: &Value, pending: &PendingApprovals) -
         Err(e) => return response(id, "approve", false, None, Some(&e)),
     };
     let accepted = resolve_approval(pending, request_id, decision);
+    if !accepted && !tool_gate {
+        return response(
+            id,
+            "approve",
+            false,
+            None,
+            Some(
+                "no such question: this session asks only about MCP skills; tool approvals need \
+                 `--approve`",
+            ),
+        );
+    }
     response(
         id,
         "approve",
@@ -13097,7 +13138,7 @@ mod tests {
     async fn git_branch_reports_none_outside_a_git_repository() {
         // Task #25 (pi-parity fix): a lookup failure (no repo here at all) must report `None`, never
         // an error surfaced to the RPC caller.
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::isolated_tempdir();
         assert_eq!(git_branch(dir.path()).await, None);
     }
 

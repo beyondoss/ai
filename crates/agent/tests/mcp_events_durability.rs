@@ -19,8 +19,7 @@ use common::mcp_events_fixture::{
     ws_next, ws_wait_active,
 };
 use common::{
-    BIN, SpawnGuarded, free_port, serve_dir_cmd, spawn_model_server_routed, turn_text, ws_connect,
-    ws_send,
+    BIN, SpawnGuarded, serve_dir_cmd, spawn_model_server_routed, turn_text, ws_connect, ws_send,
 };
 use serde_json::{Value, json};
 
@@ -38,8 +37,7 @@ async fn a_follow_up_held_during_a_run_survives_sigterm_and_reaches_the_model_on
     );
     let (base, bodies) = spawn_model_server_routed(vec![], turn_text("handled"));
 
-    let port = free_port();
-    let mut first = spawn_daemon(home.path(), &base, port, &[]);
+    let (mut first, port) = spawn_daemon(home.path(), &base, &[]);
     let mut ws = ws_connect(port, Some(EVENTS_SESSION)).await;
     ws_wait_active(&mut ws).await;
     // A long run is in flight, so the follow-up is held — not yet seen by the model.
@@ -85,8 +83,7 @@ async fn a_follow_up_held_during_a_run_survives_sigterm_and_reaches_the_model_on
     assert_eq!(saved[0]["event"]["eventId"], "durable-1", "{saved:#?}");
 
     // Restart: the pending event is injected, once.
-    let port = free_port();
-    let _second = spawn_daemon(home.path(), &base, port, &[]);
+    let (_second, _) = spawn_daemon(home.path(), &base, &[]);
     eventually(
         Duration::from_secs(30),
         "the model to receive the held event",

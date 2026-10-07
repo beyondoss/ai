@@ -26,7 +26,9 @@
 //! longer exists; it cannot make a call silently do the wrong thing.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
@@ -175,14 +177,53 @@ pub fn load(dir: &ManifestDir, config: &McpServerConfig) -> Option<ServerManifes
         })
 }
 
+/// Read the store, apply `change`, and write it back if `change` says it changed anything — under
+/// the cross-process [`FileLock`], since several connections (and agents) update one file: a skills
+/// refresh on one server racing a connect on another must not drop either's entry. Best-effort like
+/// everything here: a lock that cannot be had skips the write, which costs a server spawn at the next
+/// boot, never a wrong answer.
+fn update_store(dir: &ManifestDir, change: impl FnOnce(&mut Store) -> bool) {
+    let Ok(_lock) = FileLock::acquire(&dir.file()) else {
+        return;
+    };
+    let mut all = read_store(dir);
+    if change(&mut all) {
+        write_store(dir, &all);
+    }
+}
+
 /// Drop `config`'s cached manifest, if any — for a server whose answer must not be cached here (a
 /// skills listing marked `cacheScope: "private"`). Best-effort, like [`store`].
 pub fn forget(dir: &ManifestDir, config: &McpServerConfig) {
-    let mut all = read_store(dir);
-    if all.remove(&config.name).is_none() {
+    update_store(dir, |all| all.remove(&config.name).is_some());
+}
+
+/// Replace only the skills listing in `config`'s cached manifest — for a listing re-fetched after
+/// connect (`ttlMs` ran out, or the server said it changed), which would otherwise reach the cache
+/// only at the next live connect, leaving a restart to advertise the stale one. A `private` listing
+/// (`cacheScope: "private"`) forgets the server instead, as at connect. Without a manifest already
+/// recorded for this exact invocation there is nothing to amend: the next live connect writes a
+/// whole one. Best-effort, like [`store`].
+pub fn store_skills(
+    dir: &ManifestDir,
+    config: &McpServerConfig,
+    skills: Vec<crate::tools::mcp_skills::SkillEntry>,
+    skill_diagnostics: Vec<String>,
+    private: bool,
+) {
+    if private {
+        forget(dir, config);
         return;
     }
-    write_store(dir, &all);
+    let key = invocation_key(config);
+    update_store(dir, |all| {
+        let Some(manifest) = all.get_mut(&config.name).filter(|m| m.key == key) else {
+            return false;
+        };
+        manifest.skills = Some(skills);
+        manifest.skill_diagnostics = skill_diagnostics;
+        true
+    });
 }
 
 /// Record what `config`'s server advertises. Best-effort: a cache that cannot be written costs a
@@ -196,19 +237,18 @@ pub fn store(
     skills: Option<Vec<crate::tools::mcp_skills::SkillEntry>>,
     skill_diagnostics: Vec<String>,
 ) {
-    let mut all = read_store(dir);
-    all.insert(
-        config.name.clone(),
-        ServerManifest {
-            key: invocation_key(config),
-            tools,
-            resources,
-            prompts,
-            skills,
-            skill_diagnostics,
-        },
-    );
-    write_store(dir, &all);
+    let manifest = ServerManifest {
+        key: invocation_key(config),
+        tools,
+        resources,
+        prompts,
+        skills,
+        skill_diagnostics,
+    };
+    update_store(dir, |all| {
+        all.insert(config.name.clone(), manifest);
+        true
+    });
 }
 
 fn write_store(dir: &ManifestDir, all: &Store) {
@@ -220,10 +260,72 @@ fn write_store(dir: &ManifestDir, all: &Store) {
         let _ = std::fs::create_dir_all(parent);
     }
     // Write-then-rename: a crash mid-write must not leave a truncated manifest that reads as a
-    // *different* tool set. A miss is fine; a plausible-looking wrong answer is not.
-    let tmp = path.with_extension("json.tmp");
-    if std::fs::write(&tmp, &bytes).is_ok() {
-        let _ = std::fs::rename(&tmp, &path);
+    // *different* tool set. A miss is fine; a plausible-looking wrong answer is not. The temporary
+    // name is this writer's own, so a writer that lost the lock to a stale-lock break still cannot
+    // rename another's half-written file into place.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_extension(format!("json.{}.{seq}.tmp", std::process::id()));
+    if std::fs::write(&tmp, &bytes).is_ok() && std::fs::rename(&tmp, &path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(5);
+const STALE_LOCK_AGE: Duration = Duration::from_secs(10);
+
+/// A cross-process advisory lock via atomic lockfile creation — `mcp_auth_store.rs::FileLock`'s
+/// pattern (itself `trust_store.rs`'s and `settings.rs`'s), duplicated rather than shared like each of
+/// those. Held for one read-modify-write of the manifest; a lockfile older than [`STALE_LOCK_AGE`] is
+/// a crashed holder's and is broken.
+struct FileLock {
+    path: PathBuf,
+}
+
+impl FileLock {
+    fn acquire(store_path: &Path) -> std::io::Result<Self> {
+        let mut os = store_path.as_os_str().to_owned();
+        os.push(".lock");
+        let lock_path = PathBuf::from(os);
+        if let Some(parent) = lock_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let deadline = Instant::now() + LOCK_TIMEOUT;
+        loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&lock_path)
+            {
+                Ok(_) => return Ok(Self { path: lock_path }),
+                Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+                    let stale = std::fs::metadata(&lock_path)
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| SystemTime::now().duration_since(t).ok())
+                        .is_some_and(|age| age > STALE_LOCK_AGE);
+                    if stale {
+                        let _ = std::fs::remove_file(&lock_path);
+                        continue;
+                    }
+                    if Instant::now() >= deadline {
+                        return Err(std::io::Error::new(
+                            ErrorKind::TimedOut,
+                            format!("timed out waiting for {}", lock_path.display()),
+                        ));
+                    }
+                    std::thread::sleep(LOCK_RETRY_INTERVAL);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
     }
 }
 
@@ -241,6 +343,70 @@ mod tests {
                 env: Default::default(),
             },
         }
+    }
+
+    /// Connects and skills refreshes on many servers at once — the manifest is one file they all
+    /// read, change and write back — lose nobody's entry and nobody's refresh.
+    #[test]
+    fn concurrent_stores_and_skills_refreshes_lose_no_update() {
+        const SERVERS: usize = 24;
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = ManifestDir::at(dir.path());
+        let configs: Vec<McpServerConfig> = (0..SERVERS)
+            .map(|i| stdio(&format!("s{i}"), "npx", &[&format!("server-{i}")]))
+            .collect();
+        let race = |work: &(dyn Fn(usize) + Sync)| {
+            let barrier = std::sync::Barrier::new(SERVERS);
+            std::thread::scope(|scope| {
+                for i in 0..SERVERS {
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        work(i);
+                    });
+                }
+            });
+        };
+        race(&|i| {
+            store(
+                &manifest,
+                &configs[i],
+                vec![],
+                vec![],
+                vec![],
+                Some(vec![]),
+                vec![],
+            );
+        });
+        for (i, c) in configs.iter().enumerate() {
+            assert!(load(&manifest, c).is_some(), "s{i}'s connect was lost");
+        }
+        race(&|i| {
+            store_skills(
+                &manifest,
+                &configs[i],
+                vec![],
+                vec![format!("refreshed-{i}")],
+                false,
+            );
+        });
+        for (i, c) in configs.iter().enumerate() {
+            let m = load(&manifest, c).unwrap_or_else(|| panic!("s{i}'s entry was lost"));
+            assert_eq!(
+                m.skill_diagnostics,
+                [format!("refreshed-{i}")],
+                "s{i}'s refresh was lost"
+            );
+        }
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n != FILE)
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "no lock or temporary file is left: {leftovers:?}"
+        );
     }
 
     #[test]

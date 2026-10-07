@@ -14,7 +14,7 @@ use common::mcp_events_fixture::{
     EVENTS_SESSION, control, daemon_sessions, emit, eventually, runs_for_event, spawn_daemon,
     spawn_http_fixture, state, write_settings, ws_list, ws_next,
 };
-use common::{free_port, spawn_model_server_routed, turn_text, ws_connect, ws_send};
+use common::{spawn_model_server_routed, turn_text, ws_connect, ws_send};
 use serde_json::json;
 
 fn hooks(mcp_url: &str) -> serde_json::Value {
@@ -33,8 +33,7 @@ async fn configured_subscriptions_are_owned_by_one_session_and_one_event_runs_th
     let home = tempfile::tempdir().unwrap();
     write_settings(home.path(), hooks(&mcp_url));
     let (base, bodies) = spawn_model_server_routed(vec![], turn_text("handled"));
-    let port = free_port();
-    let _d = spawn_daemon(home.path(), &base, port, &[]);
+    let (_d, port) = spawn_daemon(home.path(), &base, &[]);
 
     // Two ordinary clients, connected before the event.
     let mut a = ws_connect(port, Some("plain-a")).await;
@@ -98,8 +97,7 @@ async fn plain_sessions_stay_reapable_while_the_events_session_is_kept_alive() {
     let home = tempfile::tempdir().unwrap();
     write_settings(home.path(), hooks(&mcp_url));
     let (base, _bodies) = spawn_model_server_routed(vec![], turn_text("noted"));
-    let port = free_port();
-    let _d = spawn_daemon(home.path(), &base, port, &["--session-idle-timeout", "1"]);
+    let (_d, port) = spawn_daemon(home.path(), &base, &["--session-idle-timeout", "1"]);
     eventually(
         Duration::from_secs(20),
         "the events session's subscription",
@@ -140,8 +138,7 @@ async fn a_session_whose_only_subscription_terminated_becomes_reapable() {
     servers[0]["events"] = json!([]);
     write_settings(home.path(), servers);
     let (base, _bodies) = spawn_model_server_routed(vec![], turn_text("noted"));
-    let port = free_port();
-    let _d = spawn_daemon(home.path(), &base, port, &["--session-idle-timeout", "1"]);
+    let (_d, port) = spawn_daemon(home.path(), &base, &["--session-idle-timeout", "1"]);
     let mut ws = ws_connect(port, Some("runtime")).await;
     ws_send(
         &mut ws,
@@ -180,8 +177,7 @@ async fn a_configured_subscription_the_server_ends_is_resubscribed() {
     let home = tempfile::tempdir().unwrap();
     write_settings(home.path(), hooks(&mcp_url));
     let (base, _bodies) = spawn_model_server_routed(vec![], turn_text("noted"));
-    let port = free_port();
-    let _d = spawn_daemon(home.path(), &base, port, &["--session-idle-timeout", "1"]);
+    let (_d, port) = spawn_daemon(home.path(), &base, &["--session-idle-timeout", "1"]);
     let subscribes = || {
         state(&fixture)["methods"]
             .as_array()
@@ -221,8 +217,7 @@ async fn configured_subscriptions_that_fail_at_boot_are_retried_and_kept_alive()
     let home = tempfile::tempdir().unwrap();
     write_settings(home.path(), hooks(&mcp_url));
     let (base, _bodies) = spawn_model_server_routed(vec![], turn_text("noted"));
-    let port = free_port();
-    let _d = spawn_daemon(home.path(), &base, port, &["--session-idle-timeout", "1"]);
+    let (_d, port) = spawn_daemon(home.path(), &base, &["--session-idle-timeout", "1"]);
     tokio::time::sleep(Duration::from_millis(4000)).await;
     assert!(state(&fixture)["hooks"].as_array().unwrap().is_empty());
     assert_eq!(
@@ -254,8 +249,7 @@ async fn unsubscribing_a_configured_subscription_while_its_server_is_down_stops_
     let home = tempfile::tempdir().unwrap();
     write_settings(home.path(), hooks(&mcp_url));
     let (base, _bodies) = spawn_model_server_routed(vec![], turn_text("noted"));
-    let port = free_port();
-    let _d = spawn_daemon(home.path(), &base, port, &[]);
+    let (_d, port) = spawn_daemon(home.path(), &base, &[]);
     let mut ws = ws_connect(port, Some(EVENTS_SESSION)).await;
     // Let the first attempt fail.
     tokio::time::sleep(Duration::from_millis(1500)).await;

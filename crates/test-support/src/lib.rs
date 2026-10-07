@@ -158,8 +158,100 @@ fn read_http_request(stream: &mut TcpStream) -> String {
     }
 }
 
+/// A phrase only the agent's session-title request carries (the opening of
+/// `agent_core::session_title::SESSION_TITLE_SYSTEM`); `session_title_request_is_recognised` in the
+/// agent's tests keeps it in step.
+pub const SESSION_TITLE_MARKER: &str = "You write short titles for saved conversations";
+
+/// The title a scripted server gives every session-title request.
+pub const SCRIPTED_SESSION_TITLE: &str = "Scripted test session";
+
+/// Whether a raw request is the session-title call `serve` makes after a session's first run.
+pub fn is_session_title_request(req: &str) -> bool {
+    req.contains(SESSION_TITLE_MARKER)
+}
+
+fn reply(stream: &mut TcpStream, resp: &str) {
+    let http = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{resp}"
+    );
+    let _ = stream.write_all(http.as_bytes());
+    let _ = stream.flush();
+}
+
+/// The next *conversation* request on a scripted server, with its raw text.
+///
+/// A scripted (in-order) server is a script of the conversation's turns. The session-title request
+/// is not one of them: `serve` makes it once, after a session's first successful run, in the
+/// background of whatever the test does next. Let it take a scripted reply and every later turn is
+/// off by one — the next prompt gets the reply meant for the title, and a test written against the
+/// conversation hangs waiting for a turn that already went to the title (or fails on a reply meant
+/// for a different turn). So title requests are answered here, with [`SCRIPTED_SESSION_TITLE`], and
+/// neither consume the script nor appear in the record, which holds the conversation's requests
+/// exactly. A test about titles scripts and observes them on a routed server, matching
+/// [`SESSION_TITLE_MARKER`].
+fn accept_scripted(
+    listener: &TcpListener,
+    recorder: Option<&Mutex<Vec<String>>>,
+) -> Option<(TcpStream, String)> {
+    let base = listener
+        .local_addr()
+        .ok()
+        .map(|a| format!("http://{a}"))
+        .unwrap_or_default();
+    loop {
+        let (mut stream, _) = listener.accept().ok()?;
+        // Drain the *whole* request before answering. Closing a socket with unread data in its
+        // receive buffer makes the kernel send an RST instead of a FIN, which discards whatever the
+        // peer had not yet read — including the response just written.
+        let req = read_http_request(&mut stream);
+        if is_session_title_request(&req) {
+            *title_counts()
+                .lock()
+                .unwrap()
+                .entry(base.clone())
+                .or_default() += 1;
+            reply(&mut stream, &turn_text(SCRIPTED_SESSION_TITLE));
+            continue;
+        }
+        if let Some(recorder) = recorder {
+            recorder.lock().unwrap().push(req.clone());
+        }
+        return Some((stream, req));
+    }
+}
+
+/// Title requests answered so far, per scripted server (by base URL).
+fn title_counts() -> &'static Mutex<std::collections::HashMap<String, usize>> {
+    static COUNTS: std::sync::OnceLock<Mutex<std::collections::HashMap<String, usize>>> =
+        std::sync::OnceLock::new();
+    COUNTS.get_or_init(Default::default)
+}
+
+/// How many session-title requests the scripted server at `base` has answered itself. They are kept
+/// out of the conversation's record, so this is where a change in how often `serve` asks for a
+/// title — once per session, after its first successful run — shows.
+pub fn title_calls(base: &str) -> usize {
+    title_counts()
+        .lock()
+        .unwrap()
+        .get(base)
+        .copied()
+        .unwrap_or(0)
+}
+
+/// After a script runs out: keep answering title requests (one can arrive after the last turn),
+/// and refuse anything else by closing the connection unanswered, as a closed listener would.
+fn serve_titles_only(listener: TcpListener, recorder: Option<Arc<Mutex<Vec<String>>>>) {
+    while let Some((stream, _)) = accept_scripted(&listener, recorder.as_deref()) {
+        drop(stream);
+    }
+}
+
 /// Spawn a model server answering `responses` in order, recording each full raw request (headers +
 /// body). Returns the base URL and the shared record of requests.
+///
+/// Session-title requests do not consume a response (see [`accept_scripted`]).
 pub fn spawn_model_server(responses: Vec<String>) -> (String, Arc<Mutex<Vec<String>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -167,16 +259,12 @@ pub fn spawn_model_server(responses: Vec<String>) -> (String, Arc<Mutex<Vec<Stri
     let recorder = requests.clone();
     thread::spawn(move || {
         for resp in responses {
-            if let Ok((mut stream, _)) = listener.accept() {
-                let req = read_http_request(&mut stream);
-                recorder.lock().unwrap().push(req);
-                let http = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{resp}"
-                );
-                let _ = stream.write_all(http.as_bytes());
-                let _ = stream.flush();
-            }
+            let Some((mut stream, _)) = accept_scripted(&listener, Some(&recorder)) else {
+                return;
+            };
+            reply(&mut stream, &resp);
         }
+        serve_titles_only(listener, Some(recorder));
     });
     (format!("http://{addr}"), requests)
 }
@@ -333,22 +421,14 @@ pub fn spawn_model_server_with_stalled_response(
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     thread::spawn(move || {
+        // Session-title requests do not consume a scripted response (see [`accept_scripted`]).
         for resp in fast {
-            if let Ok((mut stream, _)) = listener.accept() {
-                // Drain the *whole* request before answering. Closing a socket with unread data
-                // in its receive buffer makes the kernel send an RST instead of a FIN, which
-                // discards whatever the peer had not yet read — including the response just
-                // written. That is how a perfectly good mock turns into "error sending request".
-                let _ = read_http_request(&mut stream);
-                let http = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{resp}"
-                );
-                let _ = stream.write_all(http.as_bytes());
-                let _ = stream.flush();
-            }
+            let Some((mut stream, _)) = accept_scripted(&listener, None) else {
+                return;
+            };
+            reply(&mut stream, &resp);
         }
-        if let Ok((mut stream, _)) = listener.accept() {
-            let _ = read_http_request(&mut stream);
+        if let Some((mut stream, _)) = accept_scripted(&listener, None) {
             let preamble = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n\
                 data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}\n\n";
             let _ = stream.write_all(preamble.as_bytes());
@@ -366,19 +446,12 @@ pub fn spawn_model_server_with_stalled_response(
             let _ = stream.flush();
         }
         for resp in after {
-            if let Ok((mut stream, _)) = listener.accept() {
-                // Drain the *whole* request before answering. Closing a socket with unread data
-                // in its receive buffer makes the kernel send an RST instead of a FIN, which
-                // discards whatever the peer had not yet read — including the response just
-                // written. That is how a perfectly good mock turns into "error sending request".
-                let _ = read_http_request(&mut stream);
-                let http = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{resp}"
-                );
-                let _ = stream.write_all(http.as_bytes());
-                let _ = stream.flush();
-            }
+            let Some((mut stream, _)) = accept_scripted(&listener, None) else {
+                return;
+            };
+            reply(&mut stream, &resp);
         }
+        serve_titles_only(listener, None);
     });
     format!("http://{addr}")
 }

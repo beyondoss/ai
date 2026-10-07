@@ -807,7 +807,14 @@ impl Subagent {
             }
         };
 
-        let mut registry = self.build_child_registry(def, &root);
+        // One id per spawned child: it disambiguates the prompt-cache key *and* names this child in an
+        // approval request, so a UI can say "reviewer#7 wants to run bash" rather than "something does".
+        let spawn_id = CHILD_SEQ.fetch_add(1, Ordering::Relaxed);
+        let origin = crate::approval::ApprovalOrigin::Subagent {
+            agent: def.name.clone(),
+            spawn_id: spawn_id.to_string(),
+        };
+        let mut registry = self.build_child_registry(def, &root, &origin);
         // The parent asked for typed data back. Registered *after* `build_child_registry`'s own
         // `--tools` filter, like every other explicitly-requested tool, and *before* the system prompt is
         // built so `has_structured_output` picks it up and the child is actually told the contract.
@@ -853,10 +860,6 @@ impl Subagent {
             .unwrap_or_else(|| self.ctx.parent_model.clone());
         let transport = (self.ctx.factory)(&model)?;
 
-        // One id per spawned child: it disambiguates the prompt-cache key *and* names this child in an
-        // approval request, so a UI can say "reviewer#7 wants to run bash" rather than "something does".
-        let spawn_id = CHILD_SEQ.fetch_add(1, Ordering::Relaxed);
-
         let mut agent = Agent::new(transport, model)
             .with_tools(registry)
             .with_system(system)
@@ -890,10 +893,7 @@ impl Subagent {
         agent = agent.with_hooks(Arc::new(ChildHooks {
             policy: policy.clone(),
             approval: self.ctx.approval.clone(),
-            origin: crate::approval::ApprovalOrigin::Subagent {
-                agent: def.name.clone(),
-                spawn_id: spawn_id.to_string(),
-            },
+            origin,
             mcp: self.ctx.mcp_enabled.clone(),
         }));
         // Deliberately no `.with_checkpoint_hook`: `Agent::new`'s `NoCheckpoint` default is correct. A
@@ -1026,11 +1026,20 @@ impl Subagent {
 
     /// The child's tool set: rooted at `root`, restricted to its effective tools, and carrying a
     /// depth-incremented `subagent` only when the definition asked for one *and* the cap allows it.
-    fn build_child_registry(&self, def: &AgentDef, root: &Path) -> ToolRegistry {
+    fn build_child_registry(
+        &self,
+        def: &AgentDef,
+        root: &Path,
+        origin: &crate::approval::ApprovalOrigin,
+    ) -> ToolRegistry {
         // Read through the gate *now*, not when the ctx was built: `set_mcp_enabled` is a live
-        // session command, and a child must see the kit its parent has at this moment.
-        let mcp_tools =
-            crate::tools::mcp::filter_by_enabled(&self.ctx.mcp_tools, &self.ctx.mcp_enabled);
+        // session command, and a child must see the kit its parent has at this moment. Its skill
+        // tools are bound in its own name, so a load it makes asks the user as this child.
+        let mcp_tools = crate::tools::mcp::filter_by_enabled_as(
+            &self.ctx.mcp_tools,
+            &self.ctx.mcp_enabled,
+            origin,
+        );
         let mut registry = super::default_registry_with_config(&super::ToolConfig {
             bash_timeout_ms: self.ctx.tool_cfg.bash_timeout_ms,
             bash_shell_path: self.ctx.tool_cfg.bash_shell_path.as_deref(),

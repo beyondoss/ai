@@ -18,36 +18,34 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use common::{
-    ChildGuard, ISOLATED_HOME, SpawnGuarded, TestWs, free_port, spawn_model_server, turn_text,
-    wait_for_port, ws_connect, ws_read_until_response, ws_send,
+    ChildGuard, ISOLATED_HOME, TestWs, spawn_listening, spawn_model_server, turn_text, ws_connect,
+    ws_read_until_response, ws_send,
 };
 use serde_json::json;
 
 const BIN: &str = env!("CARGO_BIN_EXE_beyond-ai-agent");
 
-fn serve_ws(base: &str, session_dir: &str, port: u16) -> ChildGuard {
-    Command::new(BIN)
-        .args([
-            "serve",
-            "--listen",
-            &format!("127.0.0.1:{port}"),
-            "--gateway-url",
-            base,
-            "--key",
-            "bai_v1.test",
-            "--model",
-            "claude-test",
-            "--session-dir",
-            session_dir,
-            // Keep every session for the measurement window; we hold the sockets anyway.
-            "--session-idle-timeout",
-            "0",
-        ])
-        .env("HOME", ISOLATED_HOME)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn_guarded()
+fn serve_ws(base: &str, session_dir: &str) -> (ChildGuard, u16) {
+    spawn_listening(
+        Command::new(BIN)
+            .args([
+                "serve",
+                "--gateway-url",
+                base,
+                "--key",
+                "bai_v1.test",
+                "--model",
+                "claude-test",
+                "--session-dir",
+                session_dir,
+                // Keep every session for the measurement window; we hold the sockets anyway.
+                "--session-idle-timeout",
+                "0",
+            ])
+            .env("HOME", ISOLATED_HOME)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null()),
+    )
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -143,9 +141,7 @@ async fn ping_all(sockets: &mut [TestWs], rounds: usize) -> Vec<Duration> {
 async fn idle_sessions_do_not_take_a_thread_each() {
     let (base, _r) = spawn_model_server(vec![turn_text("unused")]);
     let dir = tempfile::tempdir().unwrap();
-    let port = free_port();
-    let mut child = serve_ws(&base, dir.path().to_str().unwrap(), port);
-    wait_for_port(port);
+    let (mut child, port) = serve_ws(&base, dir.path().to_str().unwrap());
 
     let pid = child.id();
     // One throwaway connection so the daemon has completed its first accept/handshake path.
@@ -207,9 +203,7 @@ async fn idle_sessions_do_not_take_a_thread_each() {
 async fn density_sweep() {
     let (base, _r) = spawn_model_server(vec![turn_text("unused")]);
     let dir = tempfile::tempdir().unwrap();
-    let port = free_port();
-    let mut child = serve_ws(&base, dir.path().to_str().unwrap(), port);
-    wait_for_port(port);
+    let (mut child, port) = serve_ws(&base, dir.path().to_str().unwrap());
     let pid = child.id();
 
     let ticks_per_sec: u64 = 100; // Linux USER_HZ; RSS/thread counts are the load-bearing columns.

@@ -10,6 +10,7 @@
 mod common;
 
 use std::io::{BufReader, Write};
+use std::time::Duration;
 
 use common::{
     SpawnGuarded, read_until_response, serve_dir_cmd, spawn_model_server,
@@ -29,11 +30,15 @@ fn only_session(frames: &[Value]) -> Value {
 fn a_session_names_itself_from_its_opening_exchange() {
     let dir = tempfile::tempdir().unwrap();
     let dir_str = dir.path().to_string_lossy().into_owned();
-    // Two turns: the prompt, then the title call it triggers.
-    let (base, _bodies) = spawn_model_server(vec![
+    // The prompt's turn, and the title call it triggers — matched by the title request's own
+    // system prompt (a scripted server answers title calls itself, off the conversation script).
+    let (base, _bodies) = spawn_model_server_routed(
+        vec![(
+            common::SESSION_TITLE_MARKER.to_string(),
+            turn_text("Fixing the parser"),
+        )],
         turn_text("here is the answer"),
-        turn_text("Fixing the parser"),
-    ]);
+    );
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_dir_cmd(bin, &base, &dir_str).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
@@ -103,4 +108,67 @@ fn an_unusable_title_is_attempted_once_and_costs_the_session_nothing() {
 
     drop(stdin);
     child.wait().unwrap();
+}
+
+/// The scripted servers recognise the title request by a phrase of its system prompt. If the prompt
+/// is reworded, this fails here — not as a conversation test elsewhere hanging on an off-by-one.
+#[test]
+fn the_scripted_servers_recognise_the_real_title_request() {
+    assert!(
+        agent_core::session_title::SESSION_TITLE_SYSTEM.starts_with(common::SESSION_TITLE_MARKER)
+    );
+}
+
+/// A scripted (in-order) server is a script of the conversation. The title call `serve` makes after
+/// the first run must not take the second prompt's reply — before the harness answered title calls
+/// itself, this second prompt got the reply scripted for it one call late and the test hung. And it
+/// is made once: a session is titled after its first run, not on every turn — counted, since the
+/// harness keeps title calls out of the record.
+#[test]
+fn a_title_call_does_not_consume_the_conversation_script() {
+    let dir = tempfile::tempdir().unwrap();
+    let dir_str = dir.path().to_string_lossy().into_owned();
+    let (base, bodies) = spawn_model_server(vec![
+        turn_text("FIRST-REPLY"),
+        turn_text("SECOND-REPLY"),
+        turn_text("THIRD-REPLY"),
+    ]);
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_dir_cmd(bin, &base, &dir_str).spawn_guarded();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout =
+        common::frames_with_deadline(child.stdout.take().unwrap(), Duration::from_secs(20));
+    let mut texts = Vec::new();
+    for message in ["one", "two", "three"] {
+        writeln!(stdin, "{}", json!({ "type": "prompt", "message": message })).unwrap();
+        stdin.flush().unwrap();
+        let frames = read_until_response(&mut stdout, "prompt");
+        let done = frames.last().unwrap();
+        assert_eq!(done["success"], true, "{done}");
+        writeln!(stdin, "{}", json!({ "type": "get_last_assistant_text" })).unwrap();
+        stdin.flush().unwrap();
+        let frames = read_until_response(&mut stdout, "get_last_assistant_text");
+        texts.push(frames.last().unwrap()["data"]["text"].clone());
+    }
+    writeln!(stdin, "{}", json!({ "type": "list_sessions" })).unwrap();
+    stdin.flush().unwrap();
+    let session = only_session(&read_until_response(&mut stdout, "list_sessions"));
+    drop(stdin);
+    child.wait().unwrap();
+    assert_eq!(
+        texts,
+        [
+            json!("FIRST-REPLY"),
+            json!("SECOND-REPLY"),
+            json!("THIRD-REPLY")
+        ]
+    );
+    assert_eq!(session["title"], common::SCRIPTED_SESSION_TITLE);
+    // The record is the conversation's: three turns, not the title call answered beside them.
+    assert_eq!(bodies.lock().unwrap().len(), 3);
+    assert_eq!(
+        common::title_calls(&base),
+        1,
+        "one title call per session, after its first run"
+    );
 }

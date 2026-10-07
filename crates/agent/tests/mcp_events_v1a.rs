@@ -15,8 +15,8 @@ use common::mcp_events_fixture::{
     write_settings, ws_next, ws_wait_active,
 };
 use common::{
-    BIN, SpawnGuarded, TestWs, free_port, serve_dir_cmd, spawn_model_server_routed, turn_text,
-    wait_for_port, ws_connect, ws_next_frame, ws_send,
+    BIN, HeldPort, SpawnGuarded, TestWs, serve_dir_cmd, spawn_model_server_routed, turn_text,
+    ws_connect, ws_next_frame, ws_send,
 };
 use serde_json::{Value, json};
 
@@ -48,20 +48,19 @@ async fn deliveries_must_carry_a_valid_v1a_signature_when_the_server_publishes_a
         }]),
     );
     let (base, _bodies) = spawn_model_server_routed(vec![], turn_text("noted"));
-    let port = free_port();
-    let _d = serve_dir_cmd(BIN, &base, &home.path().join("s").to_string_lossy())
-        .args([
-            "--listen",
-            &format!("127.0.0.1:{port}"),
-            "--mcp-events-callback-url",
-            &format!("http://127.0.0.1:{port}"),
-        ])
-        .env("HOME", home.path())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn_guarded();
-    wait_for_port(port);
+    let held = HeldPort::bind();
+    let port = held.port();
+    let mut cmd = serve_dir_cmd(BIN, &base, &home.path().join("s").to_string_lossy());
+    cmd.args([
+        "--mcp-events-callback-url",
+        &format!("http://127.0.0.1:{port}"),
+    ])
+    .env("HOME", home.path())
+    .stdout(Stdio::null())
+    .stderr(Stdio::null());
+    held.hand_to(&mut cmd);
+    let _d = cmd.spawn_guarded();
+    drop((cmd, held));
     let mut ws = ws_connect(port, Some("mcp-events")).await;
     // The verification challenge itself was v1a-signed and checked: the subscribe succeeds.
     let mut active = false;
@@ -122,8 +121,7 @@ async fn once_keys_are_seen_a_server_that_stops_publishing_is_still_held_to_them
     let home = tempfile::tempdir().unwrap();
     write_settings(home.path(), hooks(&mcp_url));
     let (base, _bodies) = spawn_model_server_routed(vec![], turn_text("noted"));
-    let port = free_port();
-    let _d = spawn_daemon(home.path(), &base, port, &[]);
+    let (_d, port) = spawn_daemon(home.path(), &base, &[]);
     let mut ws = ws_connect(port, Some(EVENTS_SESSION)).await;
     ws_wait_active(&mut ws).await;
 
@@ -189,8 +187,7 @@ async fn a_failing_jwks_fetch_refuses_the_first_subscribe_instead_of_enforcing_n
         }]),
     );
     let (base, _bodies) = spawn_model_server_routed(vec![], turn_text("noted"));
-    let port = free_port();
-    let _d = spawn_daemon(home.path(), &base, port, &[]);
+    let (_d, port) = spawn_daemon(home.path(), &base, &[]);
     let mut ws = ws_connect(port, Some("identity-refused")).await;
     ws_send(
         &mut ws,
@@ -238,11 +235,9 @@ async fn a_jwks_body_that_stalls_is_timed_out_and_leaves_nothing_behind() {
         }]),
     );
     let (base, _bodies) = spawn_model_server_routed(vec![], turn_text("noted"));
-    let port = free_port();
-    let _d = common::mcp_events_fixture::spawn_daemon_env(
+    let (_d, port) = common::mcp_events_fixture::spawn_daemon_env(
         home.path(),
         &base,
-        port,
         &[],
         &[("BEYOND_AI_AGENT_MCP_EVENTS_JWKS_TIMEOUT_MS", "300")],
     );

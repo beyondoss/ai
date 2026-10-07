@@ -33,6 +33,8 @@ pub mod service;
 pub mod session_store;
 pub mod settings;
 pub mod skills;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod timing;
 pub mod tools;
 #[cfg(test)]

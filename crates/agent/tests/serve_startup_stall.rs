@@ -23,8 +23,8 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use common::{
-    ChildGuard, ISOLATED_HOME, SpawnGuarded, TestWs, free_port, spawn_model_server, wait_for_port,
-    ws_connect, ws_read_until_response, ws_send,
+    ChildGuard, ISOLATED_HOME, TestWs, spawn_listening, spawn_model_server, ws_connect,
+    ws_read_until_response, ws_send,
 };
 use serde_json::json;
 
@@ -44,30 +44,28 @@ const MAX_RPC: Duration = Duration::from_millis(1_000);
 /// short enough that the open is still in flight when the measured RPC lands.
 const OPEN_IN_FLIGHT: Duration = Duration::from_millis(300);
 
-fn serve_ws_child(base: &str, session_dir: &str, port: u16) -> ChildGuard {
-    Command::new(env!("CARGO_BIN_EXE_beyond-ai-agent"))
-        .args([
-            "serve",
-            "--listen",
-            &format!("127.0.0.1:{port}"),
-            "--gateway-url",
-            base,
-            "--key",
-            "bai_v1.test",
-            "--model",
-            "claude-test",
-            "--session-dir",
-            session_dir,
-        ])
-        .env("HOME", ISOLATED_HOME)
-        .env(
-            "BEYOND_AI_AGENT_TEST_SLOW_SESSION_OPEN_MS",
-            SLOW_OPEN_MS.to_string(),
-        )
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn_guarded()
+fn serve_ws_child(base: &str, session_dir: &str) -> (ChildGuard, u16) {
+    spawn_listening(
+        Command::new(env!("CARGO_BIN_EXE_beyond-ai-agent"))
+            .args([
+                "serve",
+                "--gateway-url",
+                base,
+                "--key",
+                "bai_v1.test",
+                "--model",
+                "claude-test",
+                "--session-dir",
+                session_dir,
+            ])
+            .env("HOME", ISOLATED_HOME)
+            .env(
+                "BEYOND_AI_AGENT_TEST_SLOW_SESSION_OPEN_MS",
+                SLOW_OPEN_MS.to_string(),
+            )
+            .stdin(Stdio::null())
+            .stdout(Stdio::null()),
+    )
 }
 
 /// Round-trip one command and return how long the reply took. `get_todos` is answered straight out of
@@ -91,9 +89,7 @@ async fn timed_rpc(ws: &mut TestWs, id: &str) -> Duration {
 async fn one_session_opening_does_not_stall_another_sessions_rpc() {
     let (base, _requests) = spawn_model_server(vec![]);
     let dir = tempfile::tempdir().unwrap();
-    let port = free_port();
-    let _child = serve_ws_child(&base, dir.path().to_str().unwrap(), port);
-    wait_for_port(port);
+    let (_child, port) = serve_ws_child(&base, dir.path().to_str().unwrap());
 
     // The observer session, driven to a reply first so its own (equally stalled) open is behind us —
     // what this measures is one session answering *while another opens*, not a session opening.

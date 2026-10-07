@@ -41,6 +41,8 @@
 //!   reached.
 //! - `MCP_SKILLS_FIXTURE_TTL_MS` (default `0`) and `MCP_SKILLS_FIXTURE_CACHE_SCOPE` (default
 //!   `public`): the caching hints on `skills/list` / `skills/get`.
+//! - `MCP_SKILLS_FIXTURE_PRIVATE_FLAG=<path>`: while that file exists, the scope is `private`, so a
+//!   test can turn a listing private after connect.
 //!
 //! Also served: `skill://git-workflow/nested-helper/SKILL.md`, a skill nested inside `git-workflow`
 //! (whose manifest lists its file, as completeness requires); and two skills over the spec's
@@ -139,8 +141,14 @@ fn cache_hints() -> (u64, String) {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
-    let scope =
-        std::env::var("MCP_SKILLS_FIXTURE_CACHE_SCOPE").unwrap_or_else(|_| "public".to_string());
+    let private_now = std::env::var("MCP_SKILLS_FIXTURE_PRIVATE_FLAG")
+        .is_ok_and(|p| std::path::Path::new(&p).exists());
+    let scope = match private_now {
+        true => "private".to_string(),
+        false => {
+            std::env::var("MCP_SKILLS_FIXTURE_CACHE_SCOPE").unwrap_or_else(|_| "public".to_string())
+        }
+    };
     (ttl, scope)
 }
 

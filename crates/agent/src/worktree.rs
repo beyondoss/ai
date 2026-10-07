@@ -1108,7 +1108,7 @@ mod tests {
 
     #[tokio::test]
     async fn preflight_rejects_a_non_repo_and_a_repo_with_no_commits() {
-        let plain = tempfile::tempdir().unwrap();
+        let plain = crate::test_support::isolated_tempdir();
         let err = preflight(&Git::Local, plain.path()).await.unwrap_err();
         assert!(err.contains("not inside one"), "{err}");
 

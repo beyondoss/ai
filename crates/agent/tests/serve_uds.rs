@@ -14,15 +14,15 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use common::{
-    ChildGuard, ISOLATED_HOME, SpawnGuarded, free_port, spawn_model_server, turn_text,
-    wait_for_port, ws_connect, ws_connect_uds, ws_read_until_response, ws_send,
+    ChildGuard, ISOLATED_HOME, SpawnGuarded, spawn_listening, spawn_model_server, turn_text,
+    ws_connect, ws_connect_uds, ws_read_until_response, ws_send,
 };
 use serde_json::json;
 
 /// Spawn `serve --listen-uds <sock>` (and optionally `--listen <tcp>`) against `base` (the mock
 /// gateway), persisting per-session files under `session_dir`. In listener mode stdio is unused, so
 /// null it.
-fn serve_uds_child(base: &str, session_dir: &str, sock: &str, tcp: Option<u16>) -> ChildGuard {
+fn uds_cmd(base: &str, session_dir: &str, sock: &str) -> Command {
     let mut c = Command::new(env!("CARGO_BIN_EXE_beyond-ai-agent"));
     c.args([
         "serve",
@@ -37,14 +37,21 @@ fn serve_uds_child(base: &str, session_dir: &str, sock: &str, tcp: Option<u16>) 
         "--session-dir",
         session_dir,
     ]);
-    if let Some(port) = tcp {
-        c.args(["--listen", &format!("127.0.0.1:{port}")]);
-    }
     c.env("HOME", ISOLATED_HOME)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn_guarded()
+        .stderr(Stdio::null());
+    c
+}
+
+/// `serve --listen-uds <sock>` alone.
+fn serve_uds_child(base: &str, session_dir: &str, sock: &str) -> ChildGuard {
+    uds_cmd(base, session_dir, sock).spawn_guarded()
+}
+
+/// `serve --listen-uds <sock>` and a TCP listener beside it, with the TCP port.
+fn serve_uds_and_tcp_child(base: &str, session_dir: &str, sock: &str) -> (ChildGuard, u16) {
+    spawn_listening(&mut uds_cmd(base, session_dir, sock))
 }
 
 /// Block until the UDS at `path` accepts a connection, or panic after ~5s. The socket *file* appearing
@@ -66,12 +73,7 @@ async fn uds_get_state_then_prompt_streams_ack_event_response() {
     let (base, _requests) = spawn_model_server(vec![turn_text("hello there")]);
     let dir = tempfile::tempdir().unwrap();
     let sock = dir.path().join("agent.sock");
-    let mut child = serve_uds_child(
-        &base,
-        dir.path().to_str().unwrap(),
-        sock.to_str().unwrap(),
-        None,
-    );
+    let mut child = serve_uds_child(&base, dir.path().to_str().unwrap(), sock.to_str().unwrap());
     wait_for_uds(&sock).await;
 
     let mut ws = ws_connect_uds(&sock, None).await;
@@ -120,14 +122,8 @@ async fn uds_cross_transport_reattach_shares_supervisor() {
     let (base, _requests) = spawn_model_server(vec![turn_text("crossreply")]);
     let dir = tempfile::tempdir().unwrap();
     let sock = dir.path().join("agent.sock");
-    let port = free_port();
-    let mut child = serve_uds_child(
-        &base,
-        dir.path().to_str().unwrap(),
-        sock.to_str().unwrap(),
-        Some(port),
-    );
-    wait_for_port(port);
+    let (mut child, port) =
+        serve_uds_and_tcp_child(&base, dir.path().to_str().unwrap(), sock.to_str().unwrap());
     wait_for_uds(&sock).await;
 
     // Create the session over TCP and run a prompt to completion.
@@ -176,12 +172,7 @@ async fn uds_socket_has_owner_only_permissions() {
     let (base, _requests) = spawn_model_server(vec![]);
     let dir = tempfile::tempdir().unwrap();
     let sock = dir.path().join("agent.sock");
-    let mut child = serve_uds_child(
-        &base,
-        dir.path().to_str().unwrap(),
-        sock.to_str().unwrap(),
-        None,
-    );
+    let mut child = serve_uds_child(&base, dir.path().to_str().unwrap(), sock.to_str().unwrap());
     wait_for_uds(&sock).await;
 
     let mode = std::fs::metadata(&sock).unwrap().permissions().mode();
@@ -212,12 +203,7 @@ async fn uds_stale_socket_file_is_reclaimed() {
     }
     assert!(sock.exists(), "the stale socket node should be on disk");
 
-    let mut child = serve_uds_child(
-        &base,
-        dir.path().to_str().unwrap(),
-        sock.to_str().unwrap(),
-        None,
-    );
+    let mut child = serve_uds_child(&base, dir.path().to_str().unwrap(), sock.to_str().unwrap());
     wait_for_uds(&sock).await;
 
     // It serves normally after reclaiming the stale node.

@@ -9,13 +9,13 @@
 
 mod common;
 
-use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use common::service::Service;
 use common::{
-    BIN, SpawnGuarded, free_port, spawn_model_server, turn_text, ws_connect_with_headers,
+    BIN, SpawnGuarded, spawn_model_server, turn_text, ws_connect_with_headers,
     ws_read_until_response, ws_send,
 };
 use serde_json::{Value, json};
@@ -58,7 +58,8 @@ fn keys() -> Keys {
 }
 
 /// The minimal valid `--service` command line, for a test to spoil one piece of.
-fn service_cmd(k: &Keys, port: u16) -> Command {
+/// Every use is a startup that must fail; were one to succeed, port 0 is still the kernel's to pick.
+fn service_cmd(k: &Keys) -> Command {
     let mut c = Command::new(BIN);
     c.args([
         "serve",
@@ -68,7 +69,7 @@ fn service_cmd(k: &Keys, port: u16) -> Command {
         "--model",
         "claude-test",
         "--listen",
-        &format!("127.0.0.1:{port}"),
+        "127.0.0.1:0",
         "--grant-key",
         &k.flag,
         "--seal-key",
@@ -83,7 +84,6 @@ fn service_cmd(k: &Keys, port: u16) -> Command {
 #[test]
 fn service_mode_demands_a_verifier_a_shard_and_a_listener() {
     let k = keys();
-    let port = free_port();
 
     let base: Vec<String> = vec![
         "serve".into(),
@@ -91,7 +91,7 @@ fn service_mode_demands_a_verifier_a_shard_and_a_listener() {
         "--model".into(),
         "claude-test".into(),
     ];
-    let listen = ["--listen".to_string(), format!("127.0.0.1:{port}")];
+    let listen = ["--listen".to_string(), "127.0.0.1:0".to_string()];
     let verifier = [
         "--grant-key".to_string(),
         k.flag.clone(),
@@ -124,7 +124,7 @@ fn service_mode_demands_a_verifier_a_shard_and_a_listener() {
 fn a_shard_must_be_a_name_and_an_absolute_path() {
     let k = keys();
     for bad in ["a", "a=relative/path", "a.b=/tmp", "=/tmp"] {
-        let mut c = service_cmd(&k, free_port());
+        let mut c = service_cmd(&k);
         // Append a second `--shard`; the bad one is what fails.
         c.arg("--shard").arg(bad);
         let err = startup_error(&mut c);
@@ -159,7 +159,7 @@ fn every_refused_flag_fails_at_startup() {
         vec!["--bash-shell-path".into(), "/bin/sh".into()],
     ];
     for flag in &refused {
-        let mut c = service_cmd(&k, free_port());
+        let mut c = service_cmd(&k);
         c.args(flag);
         let err = startup_error(&mut c);
         assert!(
@@ -174,7 +174,7 @@ fn every_refused_flag_fails_at_startup() {
 #[test]
 fn an_ambient_agent_key_refuses_startup() {
     let k = keys();
-    let mut c = service_cmd(&k, free_port());
+    let mut c = service_cmd(&k);
     c.env("AI_AGENT_KEY", "bai_v1.the-replicas-own-key");
     let err = startup_error(&mut c);
     assert!(err.contains("--key") && err.contains("--service"), "{err}");
@@ -186,7 +186,7 @@ fn an_ambient_agent_key_refuses_startup() {
 #[cfg(feature = "code-mode")]
 fn code_mode_is_refused() {
     let k = keys();
-    let mut c = service_cmd(&k, free_port());
+    let mut c = service_cmd(&k);
     c.arg("--code-mode");
     let err = startup_error(&mut c);
     assert!(err.contains("--code-mode"), "{err}");
@@ -409,10 +409,18 @@ async fn the_replica_announces_service_mode_and_its_shards() {
             .unwrap(),
     );
     let _ = svc.child.kill();
-    let mut stderr = String::new();
-    if let Some(mut pipe) = svc.child.stderr.take() {
-        let _ = pipe.read_to_string(&mut stderr);
-    }
+    let _ = svc.child.wait();
+    // Copied to the log line by line as the replica writes it; give the copy a moment to catch up.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let stderr = loop {
+        let stderr = std::fs::read_to_string(&svc.stderr_log).unwrap_or_default();
+        let complete =
+            stderr.contains("service mode") && stderr.contains("s1") && stderr.contains("s2");
+        if complete || std::time::Instant::now() > deadline {
+            break stderr;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
     assert!(stderr.contains("service mode"), "{stderr}");
     assert!(stderr.contains("s1") && stderr.contains("s2"), "{stderr}");
 }

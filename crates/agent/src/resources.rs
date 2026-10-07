@@ -1832,7 +1832,7 @@ mod tests {
 
     #[tokio::test]
     async fn load_context_files_via_walks_home_then_every_ancestor_nearest_last() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_support::isolated_tempdir();
         let home = tmp.path().join("home");
         let repo = tmp.path().join("box/repo");
         let ws = repo.join("app");
@@ -1853,7 +1853,7 @@ mod tests {
 
     #[tokio::test]
     async fn load_context_files_via_treats_an_empty_file_as_absent() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_support::isolated_tempdir();
         let ws = tmp.path().join("ws");
         fs::create_dir_all(&ws).unwrap();
         fs::write(ws.join("AGENTS.md"), "   \n").unwrap();

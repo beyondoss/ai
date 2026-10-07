@@ -13,39 +13,37 @@ use std::process::{Command, Stdio};
 
 use common::skills_env::{BIN, Env, bash, last_message_text, read_skill, system_text};
 use common::{
-    ChildGuard, SpawnGuarded, free_port, spawn_model_server, spawn_model_server_routed, turn_text,
-    turn_tool_use, wait_for_port, ws_connect, ws_read_until_response, ws_send,
+    ChildGuard, SpawnGuarded, spawn_listening, spawn_model_server, spawn_model_server_routed,
+    turn_text, turn_tool_use, ws_connect, ws_read_until_response, ws_send,
 };
 use serde_json::json;
 
 const GIT: &str = "skill://git-workflow/SKILL.md";
 const GUIDE: &str = "skill://git-workflow/references/GUIDE.md";
 
-fn daemon(env: &Env, base: &str, port: u16) -> ChildGuard {
+fn daemon(env: &Env, base: &str) -> (ChildGuard, u16) {
     let sessions = env.dir.path().join("sessions");
-    Command::new(BIN)
-        .args([
-            "serve",
-            "--listen",
-            &format!("127.0.0.1:{port}"),
-            "--gateway-url",
-            base,
-            "--key",
-            "bai_v1.test",
-            "--model",
-            "claude-test",
-            "--session-dir",
-            sessions.to_str().unwrap(),
-            // Approvals are not what this proves; the loaded-skill state is.
-            "--approve-mcp-skills",
-        ])
-        .env("HOME", &env.home)
-        .env("BEYOND_AI_AGENT_MCP_IDLE_SECS", "0")
-        .current_dir(&env.cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn_guarded()
+    spawn_listening(
+        Command::new(BIN)
+            .args([
+                "serve",
+                "--gateway-url",
+                base,
+                "--key",
+                "bai_v1.test",
+                "--model",
+                "claude-test",
+                "--session-dir",
+                sessions.to_str().unwrap(),
+                // Approvals are not what this proves; the loaded-skill state is.
+                "--approve-mcp-skills",
+            ])
+            .env("HOME", &env.home)
+            .env("BEYOND_AI_AGENT_MCP_IDLE_SECS", "0")
+            .current_dir(&env.cwd)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null()),
+    )
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -67,9 +65,7 @@ async fn a_daemon_session_cannot_read_a_skill_another_session_loaded() {
         ],
         turn_text("fallback"),
     );
-    let port = free_port();
-    let _daemon = daemon(&env, &base, port);
-    wait_for_port(port);
+    let (_daemon, port) = daemon(&env, &base);
     let mut a = ws_connect(port, Some("skills-alpha")).await;
     let mut b = ws_connect(port, Some("skills-bravo")).await;
 

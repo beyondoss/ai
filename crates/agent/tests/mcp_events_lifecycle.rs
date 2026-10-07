@@ -8,43 +8,20 @@
 
 mod common;
 
-use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use common::mcp_events_fixture::{
-    Frames, emit, eventually, model_requests_with, send, spawn_http_fixture, state, wait_active,
-    write_settings,
+    Frames, emit, eventually, model_requests_with, send, spawn_daemon, spawn_http_fixture, state,
+    wait_active, write_settings,
 };
 use common::{
-    BIN, ChildGuard, SpawnGuarded, TestWs, free_port, serve_cmd, serve_dir_cmd,
-    spawn_model_server_routed, turn_text, wait_for_port, ws_connect, ws_next_frame, ws_send,
+    BIN, ChildGuard, SpawnGuarded, TestWs, serve_cmd, spawn_model_server_routed, turn_text,
+    ws_connect, ws_next_frame, ws_send,
 };
 use serde_json::{Value, json};
 
 type Bodies = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
-
-fn daemon(home: &Path, base: &str, port: u16, extra: &[&str]) -> ChildGuard {
-    let mut cmd = serve_dir_cmd(BIN, base, &home.join("sessions").to_string_lossy());
-    cmd.args([
-        "--listen",
-        &format!("127.0.0.1:{port}"),
-        "--mcp-events-callback-url",
-        &format!("http://127.0.0.1:{port}"),
-    ])
-    .args(extra)
-    .env("HOME", home)
-    .env("BEYOND_AI_AGENT_MCP_EVENTS_COALESCE_MS", "300")
-    .env("BEYOND_AI_AGENT_MCP_IDLE_SECS", "0")
-    .stdin(Stdio::null())
-    .stdout(Stdio::null())
-    .stderr(Stdio::from(
-        std::fs::File::create(home.join(format!("serve-{port}.stderr"))).unwrap(),
-    ));
-    let child = cmd.spawn_guarded();
-    wait_for_port(port);
-    child
-}
 
 fn hooks_server(mcp_url: &str, action: &str) -> Value {
     json!([{
@@ -140,10 +117,9 @@ async fn an_event_arriving_while_detached_is_delivered_and_seen_on_reattach() {
     let home = tempfile::tempdir().unwrap();
     write_settings(home.path(), hooks_server(&mcp_url, "follow_up"));
     let (base, bodies) = spawn_model_server_routed(vec![], turn_text("handled while away"));
-    let port = free_port();
     // A 1 s idle timeout: without the keep-alive this session would be reaped (and unsubscribed)
     // long before the event below arrives.
-    let _d = daemon(home.path(), &base, port, &["--session-idle-timeout", "1"]);
+    let (_d, port) = spawn_daemon(home.path(), &base, &["--session-idle-timeout", "1"]);
 
     let mut ws = ws_connect(port, Some("mcp-events")).await;
     ws_wait_active(&mut ws).await;
@@ -189,11 +165,9 @@ async fn mcp_events_reapable_lets_the_reaper_end_a_detached_sessions_subscriptio
     let home = tempfile::tempdir().unwrap();
     write_settings(home.path(), hooks_server(&mcp_url, "notify"));
     let (base, _bodies) = spawn_model_server_routed(vec![], turn_text("noted"));
-    let port = free_port();
-    let _d = daemon(
+    let (_d, port) = spawn_daemon(
         home.path(),
         &base,
-        port,
         &["--session-idle-timeout", "1", "--mcp-events-reapable"],
     );
     let mut ws = ws_connect(port, Some("mcp-events")).await;
@@ -222,8 +196,7 @@ async fn a_restarted_daemon_resumes_webhook_delivery_from_its_persisted_cursor_w
     write_settings(home.path(), hooks_server(&mcp_url, "notify"));
     let (base, _bodies) = spawn_model_server_routed(vec![], turn_text("noted"));
 
-    let port = free_port();
-    let mut first = daemon(home.path(), &base, port, &[]);
+    let (mut first, port) = spawn_daemon(home.path(), &base, &[]);
     let mut ws = ws_connect(port, Some("mcp-events")).await;
     ws_wait_active(&mut ws).await;
     emit(&fixture, json!({ "event_id": "r-1", "data": { "n": 1 } }));
@@ -255,8 +228,7 @@ async fn a_restarted_daemon_resumes_webhook_delivery_from_its_persisted_cursor_w
     emit(&fixture, json!({ "event_id": "r-2", "data": { "n": 2 } }));
     emit(&fixture, json!({ "event_id": "r-3", "data": { "n": 3 } }));
 
-    let port = free_port();
-    let _second = daemon(home.path(), &base, port, &[]);
+    let (_second, port) = spawn_daemon(home.path(), &base, &[]);
     let mut ws = ws_connect(port, Some("mcp-events")).await;
     let got = collect(&mut ws, Duration::from_secs(6), |f| {
         f["type"] == "mcp_event"
