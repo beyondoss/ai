@@ -237,7 +237,7 @@ async fn mid_upload_resetter() -> (
     tokio::task::JoinHandle<()>,
 ) {
     use tokio::io::AsyncReadExt;
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = beyond_ai_test_support::ports::tokio_listener().await;
     let addr = listener.local_addr().unwrap();
     let resets = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let counter = resets.clone();
@@ -315,7 +315,7 @@ async fn a_reset_during_the_upload_fails_over() {
 async fn a_reset_before_a_small_body_is_sent_fails_over() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let (pubkey, sk) = test_keypair(1);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = beyond_ai_test_support::ports::tokio_listener().await;
     let primary = listener.local_addr().unwrap();
     let resets = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let counter = resets.clone();

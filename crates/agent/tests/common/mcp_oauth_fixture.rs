@@ -227,7 +227,7 @@ impl OAuthFixture {
     /// seconds remain, so anything below 30 is refreshed on the very next read without any waiting;
     /// a test that wants a token to stay put must pass something comfortably above it.
     pub fn spawn(expires_in_secs: u64) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = beyond_ai_test_support::ports::listener();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let fixture = Self {
             url: format!("{base}/mcp"),

@@ -69,6 +69,7 @@ fn service_cmd(k: &Keys) -> Command {
         "--model",
         "claude-test",
         "--listen",
+        // port-0: the child binds it and keeps it (and every use is a startup meant to fail).
         "127.0.0.1:0",
         "--grant-key",
         &k.flag,
@@ -91,6 +92,7 @@ fn service_mode_demands_a_verifier_a_shard_and_a_listener() {
         "--model".into(),
         "claude-test".into(),
     ];
+    // port-0: the child binds it and keeps it (and every use is a startup meant to fail).
     let listen = ["--listen".to_string(), "127.0.0.1:0".to_string()];
     let verifier = [
         "--grant-key".to_string(),

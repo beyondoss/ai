@@ -442,12 +442,11 @@ impl Tool for Web {
 mod tests {
     use super::*;
     use std::io::{Read, Write};
-    use std::net::TcpListener;
 
     /// A one-shot loopback HTTP/1.1 server that replies with `response` to the first connection, and
     /// records the raw request line + headers it received. Returns `(port, join_handle_for_request)`.
     fn one_shot(response: &'static str) -> (u16, std::thread::JoinHandle<String>) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = beyond_ai_test_support::ports::listener();
         let port = listener.local_addr().unwrap().port();
         let handle = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();

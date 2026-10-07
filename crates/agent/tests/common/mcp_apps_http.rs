@@ -57,7 +57,7 @@ fn advertises_ui(request: &Value) -> bool {
 }
 
 pub fn spawn_http_apps_fixture() -> HttpAppsFixture {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let listener = beyond_ai_test_support::ports::listener();
     let addr = listener.local_addr().unwrap();
     let ui_requests = Arc::new(AtomicUsize::new(0));
     let plain_requests = Arc::new(AtomicUsize::new(0));

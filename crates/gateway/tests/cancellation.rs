@@ -230,7 +230,7 @@ async fn closes_reused_connections_unread() -> (u16, std::sync::Arc<std::sync::a
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     const OK: &str = r#"{"id":"c","object":"chat.completion","model":"gpt-4o-mini","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":11,"completion_tokens":7,"total_tokens":18}}"#;
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = beyond_ai_test_support::ports::tokio_listener().await;
     let port = listener.local_addr().unwrap().port();
     let fired = std::sync::Arc::new(AtomicUsize::new(0));
     let count = fired.clone();
@@ -413,7 +413,7 @@ async fn a_catalog_walk_resends_a_reused_connection_reset_before_reading() {
 /// and how many connections it has accepted.
 async fn silent_upstream() -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
     use tokio::io::AsyncReadExt;
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = beyond_ai_test_support::ports::tokio_listener().await;
     let port = listener.local_addr().unwrap().port();
     let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let counter = accepted.clone();

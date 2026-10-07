@@ -9,7 +9,6 @@
 mod common;
 
 use std::io::{Read, Write};
-use std::net::TcpListener;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -67,7 +66,7 @@ impl Collector {
     }
 
     fn spawn_tcp(held: bool) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = beyond_ai_test_support::ports::listener();
         let addr = listener.local_addr().unwrap();
         let posts = Arc::new(Mutex::new(Vec::new()));
         let hold = Arc::new(Hold {

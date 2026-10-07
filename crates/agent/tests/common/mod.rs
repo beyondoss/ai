@@ -218,6 +218,7 @@ pub fn spawn_listening(cmd: &mut Command) -> (ChildGuard, u16) {
 
 /// [`spawn_listening`], also copying the child's stderr to `log` — for a test that reads it back.
 pub fn spawn_listening_logged(cmd: &mut Command, log: Option<std::fs::File>) -> (ChildGuard, u16) {
+    // port-0: the child binds it, keeps it, and announces the port it got (read below).
     cmd.args(["--listen", "127.0.0.1:0"]).stderr(Stdio::piped());
     let mut child = ChildGuard::spawn(cmd);
     let stderr = child.stderr.take().expect("stderr is piped");
@@ -279,7 +280,7 @@ pub struct HeldPort {
 
 impl HeldPort {
     pub fn bind() -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = beyond_ai_test_support::ports::listener();
         let port = listener.local_addr().unwrap().port();
         Self { listener, port }
     }

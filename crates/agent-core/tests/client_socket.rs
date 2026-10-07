@@ -7,7 +7,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::io::{Read, Write};
-use std::net::TcpListener;
 use std::thread;
 
 use agent_core::message::StreamEvent;
@@ -17,7 +16,7 @@ use futures::StreamExt;
 
 /// Spawn a one-shot server that returns `body` as an SSE response, and return its base URL.
 fn spawn_sse_server(body: &'static str) -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let listener = beyond_ai_test_support::ports::listener();
     let addr = listener.local_addr().expect("addr");
     thread::spawn(move || {
         if let Ok((mut stream, _)) = listener.accept() {
@@ -102,7 +101,7 @@ data: {\"type\":\"message_stop\"}\n\
 async fn gateway_client_reassembles_utf8_split_across_chunks() {
     use std::time::Duration;
 
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let listener = beyond_ai_test_support::ports::listener();
     let addr = listener.local_addr().expect("addr");
     thread::spawn(move || {
         if let Ok((mut stream, _)) = listener.accept() {
@@ -145,7 +144,7 @@ async fn gateway_client_reassembles_utf8_split_across_chunks() {
 
 #[tokio::test]
 async fn gateway_client_surfaces_http_error() {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let listener = beyond_ai_test_support::ports::listener();
     let addr = listener.local_addr().expect("addr");
     thread::spawn(move || {
         if let Ok((mut stream, _)) = listener.accept() {
@@ -175,7 +174,7 @@ async fn gateway_client_gives_actionable_guidance_on_a_401() {
     // "gateway returned 401: <body>" — identical formatting to any other 4xx, with no hint at what to
     // actually do about it. Unlike a 403 (still just a generic error, see the test above), 401
     // specifically must name the actual cause and point at the fix.
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let listener = beyond_ai_test_support::ports::listener();
     let addr = listener.local_addr().expect("addr");
     thread::spawn(move || {
         if let Ok((mut stream, _)) = listener.accept() {
@@ -215,7 +214,7 @@ async fn gateway_client_bounds_memory_on_an_oversized_error_body() {
     // memory ahead of the display truncation. `Content-Length` is set so the body isn't itself framed
     // as an SSE stream — this exercises the non-2xx error path, not `LineFramer`.
     const BODY_LEN: usize = 3 * 1024 * 1024; // comfortably over the 1MB read cap
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let listener = beyond_ai_test_support::ports::listener();
     let addr = listener.local_addr().expect("addr");
     thread::spawn(move || {
         if let Ok((mut stream, _)) = listener.accept() {
@@ -262,7 +261,7 @@ async fn gateway_client_bounds_memory_on_an_oversized_error_body() {
 /// Capture the raw bytes of the first request a one-shot server receives, then answer with a minimal
 /// empty-body SSE response. Returns the shared buffer the caller reads after driving the request.
 fn spawn_request_capturing_server() -> (String, std::sync::Arc<std::sync::Mutex<String>>) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let listener = beyond_ai_test_support::ports::listener();
     let addr = listener.local_addr().expect("addr");
     let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
     let captured2 = captured.clone();
@@ -365,7 +364,7 @@ async fn gateway_client_retries_transient_503_then_succeeds() {
     // The server returns a retryable 503 on the first connection and the real SSE body on the second.
     // The client must transparently retry and deliver the events — a transient gateway hiccup should
     // not vaporize the request.
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let listener = beyond_ai_test_support::ports::listener();
     let addr = listener.local_addr().expect("addr");
     thread::spawn(move || {
         // First attempt: 503 with a tiny Retry-After so the backoff stays fast.
@@ -417,7 +416,7 @@ async fn gateway_client_retries_a_connection_reset_mid_send_then_succeeds() {
     // then dropped with zero bytes written back — exactly that reset-after-connect shape, not a 503 or
     // a timeout — so this is real coverage for a genuinely different failure mode than the sibling test
     // above, not a duplicate of it.
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let listener = beyond_ai_test_support::ports::listener();
     let addr = listener.local_addr().expect("addr");
     thread::spawn(move || {
         // First attempt: accept, then drop immediately — a connection reset mid-send, not a timeout and

@@ -18,7 +18,7 @@
 mod common;
 
 use std::io::{BufRead, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use std::thread;
@@ -1977,7 +1977,7 @@ fn smoke_split_turn_compaction_fires_mid_turn_live() {
 /// the proxy's own base URL. Blocking/threaded, matching this file's existing synchronous style (no
 /// tokio runtime is otherwise running in this test binary).
 fn spawn_flaky_proxy(real_target: &str, fail_first_n: usize) -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let listener = beyond_ai_test_support::ports::listener();
     let addr = listener.local_addr().unwrap();
     let real_addr = real_target
         .trim_start_matches("http://")

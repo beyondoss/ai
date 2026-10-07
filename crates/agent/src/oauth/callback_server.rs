@@ -236,11 +236,17 @@ fn respond(request: tiny_http::Request, success: bool) {
 mod tests {
     use super::*;
 
+    /// A server on a port the kernel picks: what `agent mcp login` binds, and what is under test.
+    fn on_any_port() -> CallbackServer {
+        // port-0: the CallbackServer under test holds its listener for its whole life.
+        CallbackServer::bind("127.0.0.1", 0).unwrap()
+    }
+
     /// Port `0` binds a port the kernel picks, and [`CallbackServer::port`] says which: the listener is
     /// on it from the start, and a callback sent there arrives.
     #[tokio::test]
     async fn port_zero_binds_a_real_port_and_reports_it() {
-        let server = CallbackServer::bind("127.0.0.1", 0).unwrap();
+        let server = on_any_port();
         let port = server.port();
         assert_ne!(port, 0);
         assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_ok());
@@ -248,7 +254,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_matching_callback_resolves_with_the_code() {
-        let server = CallbackServer::bind("127.0.0.1", 0).unwrap();
+        let server = on_any_port();
         let port = server.port();
         let client = tokio::spawn(async move {
             // Give the server a moment to be actively waiting.
@@ -272,7 +278,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_state_mismatch_does_not_resolve_and_the_server_keeps_listening() {
-        let server = CallbackServer::bind("127.0.0.1", 0).unwrap();
+        let server = on_any_port();
         let port = server.port();
         let cancel = CancellationToken::new();
         let cancel_for_client = cancel.clone();
@@ -308,7 +314,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancellation_resolves_with_none() {
-        let server = CallbackServer::bind("127.0.0.1", 0).unwrap();
+        let server = on_any_port();
         let cancel = CancellationToken::new();
         let cancel_clone = cancel.clone();
         tokio::spawn(async move {
@@ -356,7 +362,7 @@ mod tests {
 
     #[tokio::test]
     async fn binding_an_already_used_port_fails() {
-        let first = CallbackServer::bind("127.0.0.1", 0).unwrap();
+        let first = on_any_port();
         let port = first.port();
         let second = CallbackServer::bind("127.0.0.1", port);
         assert!(matches!(second, Err(OAuthError::PortBindFailed { .. })));

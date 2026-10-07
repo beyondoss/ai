@@ -1347,7 +1347,7 @@ mod tests {
     /// A loopback server answering 401 to any request without `Bearer fresh`, 200 otherwise;
     /// records each request's `Authorization`.
     async fn bearer_server() -> (String, Arc<Mutex<Vec<String>>>) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = beyond_ai_test_support::ports::tokio_listener().await;
         let url = format!("http://{}/mcp", listener.local_addr().unwrap());
         let seen = Arc::new(Mutex::new(Vec::new()));
         let record = seen.clone();

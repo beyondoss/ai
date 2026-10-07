@@ -25,7 +25,6 @@ use hyper::{Request, Response};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
 use store::Connection;
-use tokio::net::TcpListener;
 use tokio::time::{sleep, timeout};
 use tokio_rustls::TlsAcceptor;
 
@@ -873,7 +872,7 @@ impl MockUpstream {
     pub async fn start(mode: Mode) -> Self {
         // Bind `:0` and read the port back, keeping the listener open the whole time — no
         // pick-release-rebind window for another test to slip into (this is an in-process server).
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = beyond_ai_test_support::ports::tokio_listener().await;
         let port = listener.local_addr().unwrap().port();
         let captured: Arc<Mutex<Option<Captured>>> = Arc::new(Mutex::new(None));
         let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -919,7 +918,7 @@ impl MockUpstream {
         // no default), pick ring to match the gateway. Idempotent across multiple mocks in one process.
         let _ = rustls::crypto::ring::default_provider().install_default();
 
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = beyond_ai_test_support::ports::tokio_listener().await;
         let port = listener.local_addr().unwrap().port();
 
         let ck = rcgen::generate_simple_self_signed(vec![
@@ -1733,7 +1732,7 @@ impl ScriptedUpstream {
     /// `script(body, n)` decides the reply to the `n`th (0-based) fully received request.
     pub async fn start(script: impl Fn(&[u8], usize) -> Vec<Step> + Send + Sync + 'static) -> Self {
         let script: Script = Arc::new(script);
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = beyond_ai_test_support::ports::tokio_listener().await;
         let port = listener.local_addr().unwrap().port();
         let bodies: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
         let seen = Arc::clone(&bodies);
@@ -2111,7 +2110,7 @@ impl ReplyUpstream {
         script: impl Fn(usize, &ScriptReq) -> Reply + Send + Sync + 'static,
     ) -> Self {
         let script: ReplyScript = Arc::new(script);
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = beyond_ai_test_support::ports::tokio_listener().await;
         let port = listener.local_addr().unwrap().port();
         let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counter = hits.clone();

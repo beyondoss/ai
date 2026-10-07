@@ -11,13 +11,65 @@
 //! - **`nats-server`** is started with `-p -1 --ports_file_dir <dir>` and writes the port it got to a
 //!   file ([`nats_port_from`]).
 //! - **A port where nothing listens** is held bound, never listening ([`DeadPort`]).
+//! - **An in-process server** listens on a port it holds for its whole life ([`listener`],
+//!   [`tokio_listener`]); a socket configured before it listens starts from [`bound_socket`].
+//!
+//! This is the one module that writes port 0: everywhere else, the workspace lint
+//! (`crates/agent/tests/ports_lint.rs`) fails on a zero port outside an annotated, allow-listed site.
+//! A port is only ever read from a socket that stays held, so nothing here can hand out a port that
+//! another process takes first.
 //!
 //! Reading a child's ports back needs Linux: its `LISTEN` sockets come from `/proc`, and the
 //! gateway's metrics listener sits on `127.0.0.2`, which Linux routes to loopback with no setup.
 //! Elsewhere the read-back fails at once and says so ([`require_proc`]), never a timeout.
 
-use std::net::{SocketAddr, SocketAddrV4};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::Path;
+
+/// A loopback listener on a port the kernel picks, held for as long as the value lives.
+#[track_caller]
+pub fn listener() -> std::net::TcpListener {
+    std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind a loopback port")
+}
+
+/// [`listener`], for tokio. Call it inside a runtime.
+pub async fn tokio_listener() -> tokio::net::TcpListener {
+    tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind a loopback port")
+}
+
+/// A TCP socket bound to a loopback port the kernel picks, not yet listening — for a test that sets
+/// its own backlog (`listen(0)`) or holds a port that refuses connections ([`DeadPort`]).
+#[track_caller]
+pub fn bound_socket() -> tokio::net::TcpSocket {
+    let socket = tokio::net::TcpSocket::new_v4().expect("a TCP socket");
+    socket
+        .bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("bind a loopback port");
+    socket
+}
+
+/// [`bound_socket`] with `SO_REUSEPORT` set before the bind, so that a second socket that also sets it
+/// can bind and listen on the same port while this one keeps holding it. A test uses this to take a
+/// listener down and bring it back on the same port, with no gap in which another process could take
+/// the port.
+///
+/// **Linux semantics.** A socket may share the port only if it too set the option (and runs as the
+/// same user), and the kernel's port-0 search skips ports a reuseport group holds. The suites that
+/// use this run on Linux CI, which is where it is relied on. On the BSDs and macOS the option means
+/// something different (any later socket with the option may share the port, and the last one bound
+/// may take the traffic), so the hold would be weaker there. There is no portable alternative: an
+/// ordinary socket bound to the port cannot coexist with the listener that has to bind it too.
+#[track_caller]
+pub fn bound_reuseport_socket() -> tokio::net::TcpSocket {
+    let socket = tokio::net::TcpSocket::new_v4().expect("a TCP socket");
+    socket.set_reuseport(true).expect("SO_REUSEPORT");
+    socket
+        .bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("bind a loopback port");
+    socket
+}
 
 /// The gateway's two listeners, as config lines: each on a port the kernel picks. Each at its own
 /// loopback address, because Pingora keys a server's listeners by their address string — two
@@ -143,10 +195,7 @@ pub struct DeadPort {
 
 impl DeadPort {
     pub fn bind() -> Self {
-        let socket = tokio::net::TcpSocket::new_v4().expect("a TCP socket");
-        socket
-            .bind(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .expect("bind a loopback port");
+        let socket = bound_socket();
         let port = socket.local_addr().expect("its address").port();
         Self {
             _socket: socket,

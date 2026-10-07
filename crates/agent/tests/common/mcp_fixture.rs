@@ -59,7 +59,7 @@ impl HttpMcpFixture {
 
 /// Start one fixture on a loopback port. The thread runs for the test process's life.
 pub fn spawn_http_mcp_fixture() -> HttpMcpFixture {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let listener = beyond_ai_test_support::ports::listener();
     let addr = listener.local_addr().unwrap();
     let requests = Arc::new(Mutex::new(Vec::new()));
     let recorder = requests.clone();

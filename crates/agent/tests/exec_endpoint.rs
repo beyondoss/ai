@@ -26,7 +26,7 @@ async fn mock_provider(
     root: std::path::PathBuf,
     seen: Arc<AtomicUsize>,
 ) -> (String, Arc<AtomicUsize>) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = beyond_ai_test_support::ports::tokio_listener().await;
     let addr = listener.local_addr().unwrap();
     let hits = seen.clone();
     tokio::spawn(async move {
@@ -235,7 +235,7 @@ async fn an_unreachable_endpoint_fails_loudly_rather_than_looking_empty() {
 #[tokio::test]
 async fn auth_headers_reach_the_endpoint() {
     // Every real provider needs some form of auth; which form is theirs to decide.
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = beyond_ai_test_support::ports::tokio_listener().await;
     let addr = listener.local_addr().unwrap();
     let (tx, rx) = std::sync::mpsc::channel::<String>();
     tokio::spawn(async move {

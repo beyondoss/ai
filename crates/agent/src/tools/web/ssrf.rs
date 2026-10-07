@@ -221,6 +221,7 @@ impl Resolve for SsrfResolver {
         let policy = Arc::clone(&self.policy);
         let host = name.as_str().to_string();
         Box::pin(async move {
+            // port-0: a DNS lookup, not a bind — only the addresses it returns are used.
             let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), 0))
                 .await
                 .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?

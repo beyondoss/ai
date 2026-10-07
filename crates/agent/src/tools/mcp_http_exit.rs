@@ -306,7 +306,7 @@ mod tests {
     /// A loopback server that answers every request 200 and records each request's first line and
     /// `Mcp-Session-Id`.
     async fn server() -> (String, Arc<Mutex<Vec<String>>>) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = beyond_ai_test_support::ports::tokio_listener().await;
         let url = format!("http://{}/mcp", listener.local_addr().unwrap());
         let seen = Arc::new(Mutex::new(Vec::new()));
         let record = seen.clone();
@@ -382,7 +382,7 @@ mod tests {
             ..Registry::default()
         });
         // A listener that accepts and never answers.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = beyond_ai_test_support::ports::tokio_listener().await;
         let url = format!("http://{}/mcp", listener.local_addr().unwrap());
         let _accepting = tokio::spawn(async move {
             let mut held = Vec::new();

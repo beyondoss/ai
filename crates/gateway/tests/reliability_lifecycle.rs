@@ -144,7 +144,7 @@ async fn h2_upstream(head_delay: Duration, freeze: bool) -> (u16, tokio::task::J
     use hyper_util::rt::{TokioExecutor, TokioIo};
     use std::sync::Arc;
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = beyond_ai_test_support::ports::tokio_listener().await;
     let port = listener.local_addr().unwrap().port();
     let ck = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
     let key = rustls::pki_types::PrivateKeyDer::Pkcs8(ck.key_pair.serialize_der().into());

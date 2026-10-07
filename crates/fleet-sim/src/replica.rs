@@ -101,9 +101,9 @@ impl Replica {
             gateway_url,
             "--model",
             "claude-test",
-            // A port the kernel picks, read back below: never one picked free and released, which
-            // another process can take before the replica binds it.
             "--listen",
+            // port-0: the replica binds it and keeps it; the port is read back below. Never one
+            // picked free and released, which another process can take before the replica binds it.
             "127.0.0.1:0",
             "--grant-key",
             grant_key_flag,
@@ -121,6 +121,7 @@ impl Replica {
         }
         if with_metrics {
             // Loopback only, which the flag enforces — the scrape describes every tenant here.
+            // port-0: the replica binds it and keeps it.
             c.arg("--metrics-listen").arg("127.0.0.1:0");
         }
         // The replica's own `$HOME` must not be reachable: in service mode a host default is a
