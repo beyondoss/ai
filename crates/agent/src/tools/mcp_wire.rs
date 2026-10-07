@@ -677,8 +677,10 @@ mod tests {
     /// Every POST now goes through [`HttpClient::post_bounded`] instead of `rmcp`'s own
     /// `reqwest` client — so for an ordinary request (a tool call) the two must agree on every
     /// response shape `rmcp` acts on: auth required, insufficient scope, an expired session,
-    /// accepted, a JSON answer (with its `Mcp-Session-Id`), and an SSE stream. One divergence is
-    /// deliberate, and pinned last: a 401 with no challenge is still `AuthRequired` here.
+    /// accepted, a JSON answer (with its `Mcp-Session-Id`), and an SSE stream. Of the two deliberate
+    /// divergences, this pins the 401 one last (a 401 with no challenge is still `AuthRequired`
+    /// here); the other — a non-JSON-RPC success answering a request — is pinned in
+    /// `a_json_success_that_is_not_json_rpc_is_accepted_for_a_notification_but_fails_a_request`.
     #[tokio::test]
     async fn an_ordinary_request_is_answered_as_rmcps_own_client_would() {
         use futures::StreamExt as _;

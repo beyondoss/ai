@@ -4354,21 +4354,19 @@ carries no `auth_header` of its own); direct `events/*` POSTs (`mcp_events::wire
 likewise read the current token per request, not the one their headers were built with. **One rule
 on both paths:** any **401** from a server with a login — with or without a `WWW-Authenticate`
 challenge, whatever its body (every POST, for every server, is answered by
-`mcp_wire::HttpClient::post_bounded`, which decides from the status — the one deliberate divergence
-from rmcp's own client, which reads a 401 carrying a JSON-RPC error body as an ordinary error
+`mcp_wire::HttpClient::post_bounded`, which decides from the status — a deliberate divergence from rmcp's own client (see below), which reads a 401 carrying a JSON-RPC error body as an ordinary error
 response; pinned in `an_ordinary_request_is_answered_as_rmcps_own_client_would`) — makes `ServerAuth::after_rejection` force a refresh through the same `AuthorizationManager`
 and `McpAuthStore` `mcp-login` uses (so the new token is persisted), and the request is retried
 **once**; a second 401 is returned as the server's answer. That covers `tools/call`, `resources/*`,
 `prompts/*`, `skills/*`, MCP App view reads, the handshake, the standalone stream and `events/*`. A 403
 (`InsufficientScope`) never refreshes.
 
-**`post_bounded` answers what rmcp's client would, with one deliberate difference.** Since an OAuth
-server's POSTs no longer reach rmcp's client, `post_bounded` carries its semantics: `Mcp-Session-Id`
+**`post_bounded` answers what rmcp's client would, with two deliberate differences.** Since no server's POSTs reach rmcp's client any more, `post_bounded` carries its semantics: `Mcp-Session-Id`
 in and out, a 404 on a session as `SessionExpired` (rmcp re-initializes and retries), an SSE response
 handed back as a stream, 202/204 — or an empty 200 to a notification or reply — as accepted, a JSON 200
 that is not a JSON-RPC message, for a notification or reply, as accepted, a non-JSON success as an
 error (rmcp's unexpected content type), and a 4xx to `server/discover` as the legacy server's cue to
-`initialize`. **The difference:** a JSON 200 that is not a JSON-RPC message, answering a _request_,
+`initialize`. **The differences:** any 401 is `AuthRequired` (above; rmcp reads one with a JSON-RPC body as an error response — pinned in `an_ordinary_request_is_answered_as_rmcps_own_client_would`); and a JSON 200 that is not a JSON-RPC message, answering a _request_,
 is an error here. rmcp calls it accepted and then waits for a response that cannot come (a request is
 answered on its own POST, as JSON or an SSE stream carrying it) until the request's timeout; failing
 at once with the body in the error is the honest answer. Pinned end to end against the OAuth fixture
