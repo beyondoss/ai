@@ -60,40 +60,205 @@ async fn a_silent_websocket_fails_the_read_at_its_deadline() {
     server.abort();
 }
 
-/// No test reads a child's stdout except through `common::child_frames`: in the `serve_*` and `mcp_*`
-/// suites and `tests/common`, the only code that touches a child's stdout pipe is that one helper. A
-/// reader without the deadline is not discouraged but unreachable — there is no `ChildStdout` to wrap.
-///
-/// Matched on code with comments dropped and all whitespace removed, so line breaks and formatting
-/// cannot hide a use.
+/// What may not appear in a scanned file: every way to reach a child's stdout pipe other than
+/// `common::child_frames`. Matched on code with comments dropped and whitespace removed, so line
+/// breaks and formatting cannot hide a use. `Output`'s `stdout` (captured bytes) and harness fields
+/// that happen to be named `stdout` (a `Frames`) are not the pipe and are not flagged.
+fn violations(source: &str) -> Vec<String> {
+    let code: String = source
+        .lines()
+        .map(|line| line.split("//").next().unwrap_or(""))
+        .collect::<String>()
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    let mut found = Vec::new();
+    let mut flag = |what: &str, n: usize| {
+        if n > 0 {
+            found.push(format!("{what} x{n}"));
+        }
+    };
+    // The pipe's type, and the guard's escape hatch for tests about the pipe itself.
+    flag("`ChildStdout`", code.matches("ChildStdout").count());
+    flag("`raw_stdout`", code.matches(".raw_stdout(").count());
+    // Field access through `Option`'s methods on the child.
+    for method in [
+        "take", "as_mut", "as_ref", "unwrap", "expect", "replace", "insert",
+    ] {
+        let pattern = format!(".stdout.{method}(");
+        flag(&format!("`{pattern}`"), code.matches(&pattern).count());
+    }
+    flag(
+        "assignment to `.stdout`",
+        count(&code, ".stdout=", |rest| !rest.starts_with('=')),
+    );
+    // The field taken by a free function: `std::mem::take(&mut child.stdout)`,
+    // `Option::take(&mut child.stdout)`, `mem::replace(&mut child.stdout, ..)`, `mem::swap(..)`.
+    for f in ["take(", "replace(", "swap("] {
+        flag(
+            &format!("`{f}&mut ….stdout`"),
+            code.match_indices(&format!("{f}&mut"))
+                .filter(|(i, m)| {
+                    let arg = &code[i + m.len()..];
+                    let end = arg.find([',', ')']).unwrap_or(arg.len());
+                    arg[..end].ends_with(".stdout")
+                })
+                .count(),
+        );
+    }
+    // A `Child` (or the guard) destructured with its `stdout` field.
+    for ty in ["Child{", "ChildGuard{"] {
+        flag(
+            &format!("`{ty}..stdout..}}` pattern"),
+            code.match_indices(ty)
+                .filter(|(i, m)| {
+                    let body = &code[i + m.len()..];
+                    let end = body.find('}').unwrap_or(body.len());
+                    body[..end].split([',', ':']).any(|f| f == "stdout")
+                })
+                .count(),
+        );
+    }
+    // An unguarded spawn: a raw `Child`, whose `stdout` is still on it.
+    flag("unguarded `.spawn()`", code.matches(".spawn()").count());
+    found
+}
+
+fn count(code: &str, pattern: &str, keep: impl Fn(&str) -> bool) -> usize {
+    code.match_indices(pattern)
+        .filter(|(i, m)| keep(&code[i + m.len()..]))
+        .count()
+}
+
+/// `tests/common/mod.rs` with the guard's own implementation — the one place that touches the
+/// pipe — cut out: the `ChildGuard` struct and impl, and `child_frames_within`.
+fn without_the_guard(source: &str) -> String {
+    let mut out = source.to_string();
+    for start in [
+        "pub struct ChildGuard {",
+        "impl ChildGuard {",
+        "pub fn child_frames_within(",
+    ] {
+        let at = out
+            .find(start)
+            .unwrap_or_else(|| panic!("`{start}` is in tests/common/mod.rs"));
+        let open = at + out[at..].find('{').unwrap();
+        let mut depth = 0;
+        let mut end = open;
+        for (i, c) in out[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = open + i + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        out.replace_range(at..end, "");
+    }
+    out
+}
+
+/// Every bypass form is caught — on one line or spread over several, in any spelling.
+#[test]
+fn the_lint_catches_every_way_to_the_pipe() {
+    for bypass in [
+        "let out = child.stdout.take().unwrap();",
+        "let out = child\n    .stdout\n    .take()\n    .unwrap();",
+        "let out = std::mem::take(&mut child.stdout);",
+        "let out = mem::take(\n    &mut child.stdout,\n);",
+        "let out = Option::take(&mut child.stdout);",
+        "let out = std::mem::replace(&mut child.stdout, None);",
+        "std::mem::swap(&mut child.stdout, &mut mine);",
+        "let out = child.stdout.as_mut().unwrap();",
+        "child.stdout = None;",
+        "let std::process::Child { stdout, .. } = raw;",
+        "let Child { stdin, stdout: out, .. } = raw;",
+        "let ChildGuard { stdout, .. } = guard;",
+        "fn f(out: std::process::ChildStdout) {}",
+        "let raw = Command::new(\"x\").stdout(Stdio::piped()).spawn().unwrap();",
+        "let pipe = child.raw_stdout();",
+    ] {
+        assert!(!violations(bypass).is_empty(), "missed: {bypass:?}");
+    }
+}
+
+/// What is not the pipe stays allowed: an `Output`'s captured bytes, a harness field named `stdout`
+/// holding `Frames`, a `Command`'s stdout configuration, and anything in a comment.
+#[test]
+fn the_lint_leaves_what_is_not_the_pipe_alone() {
+    for fine in [
+        "let text = String::from_utf8_lossy(&output.stdout);",
+        "assert!(output.stdout.is_empty());",
+        "read_until(&mut s.stdout, \"x\", |f| true);",
+        "read_until_response(&mut self.stdout, &name);",
+        "cmd.stdout(Stdio::piped());",
+        "let frames = common::child_frames(&mut child);",
+        "let child = cmd.spawn_guarded();",
+        "// child.stdout.take() would be wrong here",
+        "let held = HeldPort::bind(); let child = held.spawn(&cmd, Stdio::null());",
+    ] {
+        assert_eq!(violations(fine), Vec::<String>::new(), "{fine:?}");
+    }
+}
+
+/// And at run time: the guard holds the pipe, so every form reachable on a guarded child finds
+/// nothing — only `child_frames` reads it.
+#[test]
+fn a_guarded_childs_stdout_field_is_empty_however_it_is_reached() {
+    let mut child = common::ChildGuard::spawn(
+        Command::new("sh")
+            .args(["-c", "echo PIPED"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null()),
+    );
+    assert!(child.stdout.is_none());
+    assert!(child.stdout.as_mut().is_none());
+    assert!(child.stdout.take().is_none());
+    assert!(std::mem::take(&mut child.stdout).is_none());
+    assert!(Option::take(&mut child.stdout).is_none());
+    let mut line = String::new();
+    std::io::BufRead::read_line(&mut common::child_frames(&mut child), &mut line).unwrap();
+    assert_eq!(line.trim(), "PIPED");
+}
+
+/// No test reaches a child's stdout pipe except through `common::child_frames`, in the `serve_*` and
+/// `mcp_*` suites — top-level files and directory modules alike — and `tests/common`.
 #[test]
 fn only_child_frames_touches_a_childs_stdout() {
-    const FORBIDDEN: &[&str] = &[
-        "ChildStdout",
-        ".stdout.take(",
-        ".stdout.as_mut(",
-        ".stdout.as_ref(",
-        ".stdout.unwrap(",
-        ".stdout.expect(",
-        ".stdout=",
-    ];
     let tests = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
-    let mut files: Vec<_> = std::fs::read_dir(&tests)
-        .unwrap()
-        .map(|e| e.unwrap().path())
-        .filter(|p| {
-            let name = p.file_name().unwrap().to_string_lossy().into_owned();
-            (name.starts_with("serve_") || name.starts_with("mcp_"))
-                && name.ends_with(".rs")
-                // This file names what it looks for.
-                && name != "serve_harness_deadlines.rs"
-        })
-        .collect();
-    files.extend(
-        std::fs::read_dir(tests.join("common"))
-            .unwrap()
-            .map(|e| e.unwrap().path())
-            .filter(|p| p.extension().is_some_and(|e| e == "rs")),
+    fn rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                rust_files(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(&tests).unwrap() {
+        let path = entry.unwrap().path();
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let in_scope = name.starts_with("serve_") || name.starts_with("mcp_") || name == "common";
+        if !in_scope || name == "serve_harness_deadlines.rs" {
+            // This file spells out what it looks for.
+            continue;
+        }
+        if path.is_dir() {
+            rust_files(&path, &mut files);
+        } else if name.ends_with(".rs") {
+            files.push(path);
+        }
+    }
+    assert!(
+        files.iter().any(|f| f.ends_with("mcp_tasks_env/mod.rs")),
+        "directory modules are scanned"
     );
     assert!(
         files.len() > 80,
@@ -103,32 +268,18 @@ fn only_child_frames_touches_a_childs_stdout() {
     let mut readers = 0;
     let mut found = Vec::new();
     for path in &files {
-        let code: String = std::fs::read_to_string(path)
-            .unwrap()
-            .lines()
-            .map(|line| line.split("//").next().unwrap_or(""))
-            .collect::<String>()
-            .chars()
-            .filter(|c| !c.is_whitespace())
-            .collect();
-        readers += code.matches("child_frames(").count();
-        // The helper itself takes the pipe, once.
-        let allowed = usize::from(path.ends_with("common/mod.rs"));
-        for pattern in FORBIDDEN {
-            let n = code.matches(pattern).count();
-            let n = if *pattern == ".stdout.take(" {
-                n.saturating_sub(allowed)
-            } else {
-                n
-            };
-            if n > 0 {
-                found.push(format!("{}: `{pattern}` x{n}", path.display()));
-            }
+        let mut source = std::fs::read_to_string(path).unwrap();
+        if path.ends_with("common/mod.rs") {
+            source = without_the_guard(&source);
+        }
+        readers += source.matches("child_frames(").count();
+        for v in violations(&source) {
+            found.push(format!("{}: {v}", path.display()));
         }
     }
     assert!(
         found.is_empty(),
-        "a child's stdout read other than through common::child_frames:\n{}",
+        "a child's stdout reached other than through common::child_frames:\n{}",
         found.join("\n")
     );
     assert!(

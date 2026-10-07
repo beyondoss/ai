@@ -71,6 +71,8 @@ pub fn try_lock(lock_path: &Path) -> std::io::Result<Option<FileLock>> {
             opts.mode(0o600);
         }
         let file = opts.open(lock_path)?;
+        #[cfg(test)]
+        tests::between_open_and_lock(lock_path);
         match file.try_lock() {
             Ok(()) => {}
             Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
@@ -109,6 +111,59 @@ fn same_file(file: &File, path: &Path) -> std::io::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+
+    /// Run (on this thread) after `try_lock` opens the file and before it locks it.
+    type Hook = Box<dyn FnMut(&Path)>;
+
+    thread_local! {
+        static BETWEEN: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn between_open_and_lock(path: &Path) {
+        BETWEEN.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().as_mut() {
+                hook(path);
+            }
+        });
+    }
+
+    /// The file at the path replaced between the open and the lock — a directory holding it renamed
+    /// away, a crashed holder's file swapped for a fresh one — must not leave the caller "holding" a
+    /// lock on a file nobody else will ever open. `try_lock` sees the inode moved and starts over, and
+    /// the lock it returns is on the file now at the path.
+    #[cfg(unix)]
+    #[test]
+    fn a_lock_file_replaced_between_open_and_lock_is_not_the_one_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.lock");
+        let opens = std::rc::Rc::new(std::cell::Cell::new(0));
+        let counted = opens.clone();
+        let fresh = dir.path().join("fresh");
+        BETWEEN.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |path: &Path| {
+                counted.set(counted.get() + 1);
+                if counted.get() == 1 {
+                    std::fs::write(&fresh, b"").unwrap();
+                    std::fs::rename(&fresh, path).unwrap();
+                }
+            }));
+        });
+        let held = try_lock(&path).unwrap().expect("taken on the second look");
+        BETWEEN.with(|hook| *hook.borrow_mut() = None);
+        assert_eq!(opens.get(), 2, "the moved inode sent it round again");
+        // The file at the path is the locked one: another open file description cannot lock it.
+        let other = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        assert!(
+            matches!(other.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
+            "the lock held is on the file now at the path"
+        );
+        drop(held);
+    }
 
     /// One holder at a time within the process (the registry), and the lock is free again once the
     /// holder drops it.

@@ -79,7 +79,7 @@ fn run_json_mode_exits_cleanly_instead_of_panicking_when_stdout_is_closed_early(
     // Read exactly the leading `{"kind":"session",...}` header line — proving the write path up to
     // (and including) that line still works normally — then close our end, simulating `head -1`
     // hanging up right after taking its one line.
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = BufReader::new(child.raw_stdout());
     let mut header = String::new();
     stdout.read_line(&mut header).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(header.trim()).unwrap();
@@ -127,7 +127,7 @@ fn run_text_mode_exits_cleanly_instead_of_panicking_when_stdout_is_closed_early(
 
     // Text mode has no leading header line — read a small, bounded prefix of the streamed text (well
     // under the 64KiB pipe buffer) so we know the child has started writing, then close our end.
-    let mut stdout = child.stdout.take().unwrap();
+    let mut stdout = child.raw_stdout();
     let mut prefix = [0u8; 64];
     stdout.read_exact(&mut prefix).unwrap();
     assert!(prefix.iter().all(|&b| b == b'x'));

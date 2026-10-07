@@ -130,7 +130,7 @@ pub struct Frames {
 }
 
 impl Frames {
-    pub fn new(child: &mut std::process::Child, stderr: Option<PathBuf>) -> Self {
+    pub fn new(child: &mut ChildGuard, stderr: Option<PathBuf>) -> Self {
         Self {
             frames: super::child_frames(child),
             seen: Vec::new(),

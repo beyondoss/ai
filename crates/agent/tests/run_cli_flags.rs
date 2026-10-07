@@ -3,7 +3,7 @@
 
 mod common;
 
-use std::io::{BufReader, Write};
+use std::io::Write;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -783,7 +783,7 @@ fn serve_binary_reasoning_effort_off_flag_starts_with_reasoning_off_not_the_medi
         .args(["--reasoning-effort", "off"])
         .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     writeln!(stdin, "{}", json!({ "type": "get_state" })).unwrap();
     stdin.flush().unwrap();

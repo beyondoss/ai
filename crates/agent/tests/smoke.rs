@@ -17,7 +17,7 @@
 
 mod common;
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
@@ -411,7 +411,7 @@ fn smoke_prompt_cache_produces_hits() {
         &["--session-file", session_file.to_str().unwrap()],
     );
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     writeln!(
         stdin,
@@ -469,7 +469,7 @@ fn smoke_thinking_with_tools_replays_signature() {
         &["--thinking", "2000"],
     );
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     writeln!(
         stdin,
@@ -536,7 +536,7 @@ fn smoke_adaptive_thinking_with_tools_replays_signature() {
         &["--thinking", "2000"],
     );
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     writeln!(
         stdin,
@@ -614,7 +614,7 @@ fn smoke_openai_responses_reasoning_replays_signature() {
         &["--reasoning-effort", "low"],
     );
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     writeln!(
         stdin,
@@ -785,7 +785,7 @@ fn smoke_auto_compaction_fires_live() {
             ],
         );
         let mut stdin = child.stdin.take().unwrap();
-        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let mut stdout = common::child_frames(&mut child);
 
         // Drive several turns; scan every frame across all of them for a `compacted` event. Turn 1
         // writes the prefix; a later turn crosses the threshold at its start and compacts.
@@ -944,7 +944,7 @@ fn smoke_concurrent_multi_tool_calls_round_trip() {
 
         let mut child = serve_child(gw_port, dir.path(), p.model, &[]);
         let mut stdin = child.stdin.take().unwrap();
-        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let mut stdout = common::child_frames(&mut child);
 
         writeln!(
             stdin,
@@ -1029,7 +1029,7 @@ fn smoke_abort_cancels_a_live_run() {
 
         let mut child = serve_child(gw_port, dir.path(), p.model, &[]);
         let mut stdin = child.stdin.take().unwrap();
-        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let mut stdout = common::child_frames(&mut child);
 
         writeln!(
             stdin,
@@ -1115,7 +1115,7 @@ fn smoke_follow_up_injects_into_a_live_run() {
 
         let mut child = serve_child(gw_port, dir.path(), p.model, &[]);
         let mut stdin = child.stdin.take().unwrap();
-        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let mut stdout = common::child_frames(&mut child);
 
         let follow_up_marker = "LINGONBERRY-5567";
         writeln!(
@@ -1197,7 +1197,7 @@ fn smoke_branch_summary_generated_live() {
             &["--session-file", session_file.to_str().unwrap()],
         );
         let mut stdin = child.stdin.take().unwrap();
-        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let mut stdout = common::child_frames(&mut child);
 
         // Build a two-turn linear history (no tools — keep it cheap and deterministic).
         for msg in [
@@ -1303,7 +1303,7 @@ fn smoke_anthropic_multi_turn_plain_text_does_not_400_live() {
 
     let mut child = serve_child(gw_port, dir.path(), "claude-haiku-4-5", &[]);
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     let mut responses = Vec::new();
     for word in ["ONE", "TWO", "THREE"] {
@@ -1368,7 +1368,7 @@ fn smoke_set_model_scrubs_thinking_across_providers() {
         &["--thinking", "2000"],
     );
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     writeln!(
         stdin,
@@ -1503,7 +1503,7 @@ fn smoke_session_resumes_across_a_process_restart_live() {
         );
         {
             let mut stdin = child.stdin.take().unwrap();
-            let mut stdout = BufReader::new(child.stdout.take().unwrap());
+            let mut stdout = common::child_frames(&mut child);
             writeln!(
                 stdin,
                 "{}",
@@ -1535,7 +1535,7 @@ fn smoke_session_resumes_across_a_process_restart_live() {
             &["--session-file", session_file.to_str().unwrap()],
         );
         let mut stdin2 = child2.stdin.take().unwrap();
-        let mut stdout2 = BufReader::new(child2.stdout.take().unwrap());
+        let mut stdout2 = common::child_frames(&mut child2);
         writeln!(
             stdin2,
             "{}",
@@ -1608,7 +1608,7 @@ fn smoke_fork_creates_an_independent_branch_live() {
             &["--session-dir", session_dir.to_str().unwrap()],
         );
         let mut stdin = child.stdin.take().unwrap();
-        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let mut stdout = common::child_frames(&mut child);
 
         for msg in [
             "Reply with ONLY the word ONE.",
@@ -1793,7 +1793,7 @@ fn smoke_manual_compact_honors_custom_instructions_live() {
             &["--compaction-keep-recent-tokens", "1"],
         );
         let mut stdin = child.stdin.take().unwrap();
-        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let mut stdout = common::child_frames(&mut child);
 
         for msg in [
             "Reply with ONLY the word ONE.",
@@ -1906,7 +1906,7 @@ fn smoke_split_turn_compaction_fires_mid_turn_live() {
             ],
         );
         let mut stdin = child.stdin.take().unwrap();
-        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let mut stdout = common::child_frames(&mut child);
 
         writeln!(
             stdin,
@@ -2041,7 +2041,7 @@ fn smoke_whole_run_auto_retry_recovers_from_a_real_dropped_connection_live() {
 
         let mut child = serve_child_with_gateway_url(&proxy_url, dir.path(), p.model, &[]);
         let mut stdin = child.stdin.take().unwrap();
-        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let mut stdout = common::child_frames(&mut child);
 
         let started = std::time::Instant::now();
         writeln!(
