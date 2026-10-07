@@ -51,12 +51,37 @@ use serde_json::json;
 const MAX_UNRESPONSIVE: Duration = Duration::from_millis(20);
 
 /// How long this thread has waited on a run queue (preempted, runnable but not running) so far —
-/// the second field of `/proc/thread-self/schedstat`. Zero where the kernel does not report it.
-fn run_queue_wait() -> Duration {
+/// the second field of `/proc/thread-self/schedstat`. `None` where the kernel does not report it
+/// (off Linux, or without scheduler statistics): the responsiveness probe is then **skipped**, not
+/// run on plain wall clock, which a loaded host would make flake.
+fn run_queue_wait() -> Option<Duration> {
     std::fs::read_to_string("/proc/thread-self/schedstat")
         .ok()
         .and_then(|s| s.split_whitespace().nth(1)?.parse::<u64>().ok())
-        .map_or(Duration::ZERO, Duration::from_nanos)
+        .map(Duration::from_nanos)
+}
+
+/// One ticker sample: when, and the thread's run-queue wait so far (if the kernel reports it).
+type Sample = (Instant, Option<Duration>);
+
+/// The worst gap between consecutive ticker samples with the run-queue wait between them taken out;
+/// `None` when any sample had no run-queue figure (see [`run_queue_wait`]).
+fn worst_stretch(samples: &[Sample]) -> Option<Duration> {
+    samples
+        .windows(2)
+        .map(|w| {
+            let (waited_then, waited_now) = (w[0].1?, w[1].1?);
+            Some((w[1].0 - w[0].0).saturating_sub(waited_now.saturating_sub(waited_then)))
+        })
+        .try_fold(Duration::ZERO, |worst, gap| Some(worst.max(gap?)))
+}
+
+/// Why a responsiveness probe did not run, said once per probe.
+fn skip_without_schedstat(tool: &str) {
+    eprintln!(
+        "SKIP {tool}: /proc/thread-self/schedstat is unavailable here, so the responsiveness probe \
+         cannot take preemption out of its measurement and is not run (the CPU probe still is)"
+    );
 }
 
 /// Held for each test's whole run, setup included. Under `cargo test` the tests share one process,
@@ -71,9 +96,9 @@ async fn one_at_a_time() -> tokio::sync::MutexGuard<'static, ()> {
 }
 
 /// The worst stretch, preemption excluded, that the runtime thread went without polling a ticker
-/// task while `work` ran on the same `current_thread` runtime.
-async fn stalls<F: Future>(work: F) -> (F::Output, Duration) {
-    let samples: Arc<Mutex<Vec<(Instant, Duration)>>> = Arc::default();
+/// task while `work` ran on the same `current_thread` runtime; `None` without schedstat.
+async fn stalls<F: Future>(work: F) -> (F::Output, Option<Duration>) {
+    let samples: Arc<Mutex<Vec<Sample>>> = Arc::default();
     let stop = Arc::new(AtomicBool::new(false));
     let ticker = tokio::spawn({
         let samples = samples.clone();
@@ -97,12 +122,7 @@ async fn stalls<F: Future>(work: F) -> (F::Output, Duration) {
         .push((Instant::now(), run_queue_wait()));
     stop.store(true, Ordering::Relaxed);
     ticker.abort();
-    let samples = samples.lock().unwrap();
-    let worst = samples
-        .windows(2)
-        .map(|w| (w[1].0 - w[0].0).saturating_sub(w[1].1.saturating_sub(w[0].1)))
-        .max()
-        .unwrap_or(Duration::ZERO);
+    let worst = worst_stretch(&samples.lock().unwrap());
     (out, worst)
 }
 
@@ -125,6 +145,10 @@ macro_rules! assert_responsive_least {
         let mut least = Duration::MAX;
         for _ in 0..3 {
             let (_, worst) = stalls($attempt).await;
+            let Some(worst) = worst else {
+                skip_without_schedstat($tool);
+                return;
+            };
             least = least.min(worst);
             if least < MAX_UNRESPONSIVE {
                 break;
@@ -372,6 +396,9 @@ async fn the_responsiveness_probe_catches_a_tool_that_blocks_without_cpu() {
         cpu.cpu
     );
     let ((), worst) = stalls(blocking()).await;
+    let Some(worst) = worst else {
+        return skip_without_schedstat("the probe's own teeth");
+    };
     assert!(
         worst >= Duration::from_millis(100),
         "the responsiveness probe must: worst stretch {worst:?}"
@@ -755,5 +782,31 @@ async fn edit_does_no_per_byte_work_on_the_runtime_thread() {
         "an 8x larger file cost the runtime thread {:?} against {:?}: per-byte work is on it",
         cost[1],
         cost[0]
+    );
+}
+
+/// Without scheduler statistics the responsiveness probe reports "unavailable" (and its tests
+/// skip, saying so) rather than measuring plain wall clock, which counts every preemption and would
+/// make a loaded host's run flake.
+#[test]
+fn the_responsiveness_probe_is_unavailable_without_schedstat_not_wall_clock() {
+    let t = Instant::now();
+    let later = t + Duration::from_millis(50);
+    assert_eq!(
+        worst_stretch(&[(t, None), (later, None)]),
+        None,
+        "no run-queue figure: no measurement"
+    );
+    assert_eq!(
+        worst_stretch(&[(t, Some(Duration::ZERO)), (later, None)]),
+        None
+    );
+    // With it, the run-queue wait is taken out.
+    assert_eq!(
+        worst_stretch(&[
+            (t, Some(Duration::from_millis(1))),
+            (later, Some(Duration::from_millis(31)))
+        ]),
+        Some(Duration::from_millis(20))
     );
 }

@@ -54,6 +54,8 @@ pub struct Web {
     client: std::sync::OnceLock<reqwest::Client>,
     /// The binary that answers the isolated parse (`None`: the usual lookup, see `isolate::parse`).
     parser: Option<std::path::PathBuf>,
+    /// Builds the hardened client ([`build_client`]; a test swaps in one that fails).
+    build: fn(Duration, EgressPolicy) -> Result<reqwest::Client, String>,
 }
 
 impl Web {
@@ -74,6 +76,7 @@ impl Web {
                 .unwrap_or(DEFAULT_TIMEOUT),
             client: std::sync::OnceLock::new(),
             parser: None,
+            build: build_client,
         }
     }
 
@@ -84,22 +87,41 @@ impl Web {
     /// Built on the blocking pool: the first build initializes the TLS provider and loads the root
     /// certificates (tens of milliseconds of CPU, and file reads on some hosts), which must not hold
     /// the runtime thread this session shares with others.
-    async fn client(&self) -> &reqwest::Client {
+    ///
+    /// **Fails closed.** If the hardened client cannot be built (the builder errs, or panics), the
+    /// call fails: there is no fallback to a default client, which would have no SSRF resolver, no
+    /// timeout and would follow redirects itself. Nothing is cached, so a later call tries again.
+    async fn client(&self) -> Result<&reqwest::Client, ToolError> {
         if let Some(client) = self.client.get() {
-            return client;
+            return Ok(client);
         }
-        let (timeout, policy) = (self.timeout, self.policy.clone());
-        let built = tokio::task::spawn_blocking(move || build_client(timeout, policy))
+        let (timeout, policy, build) = (self.timeout, self.policy.clone(), self.build);
+        let built = tokio::task::spawn_blocking(move || build(timeout, policy))
             .await
-            .unwrap_or_else(|_| reqwest::Client::new());
-        self.client.get_or_init(|| built)
+            .map_err(|e| format!("building it panicked: {e}"))
+            .and_then(|built| built)
+            .map_err(|e| {
+                ToolError::Execution(format!(
+                    "web: cannot build the hardened HTTP client, so no request was made: {e}"
+                ))
+            })?;
+        Ok(self.client.get_or_init(|| built))
+    }
+
+    /// Builder-style: build the client with `build` instead (a test injects a failing one).
+    #[cfg(test)]
+    fn with_client_builder(
+        mut self,
+        build: fn(Duration, EgressPolicy) -> Result<reqwest::Client, String>,
+    ) -> Self {
+        self.build = build;
+        self
     }
 }
 
-fn build_client(timeout: Duration, policy: EgressPolicy) -> reqwest::Client {
+fn build_client(timeout: Duration, policy: EgressPolicy) -> Result<reqwest::Client, String> {
     // Before *any* builder call: with reqwest's `rustls-no-provider`, a missing process-wide
-    // provider panics inside `build()` rather than returning `Err`, so the `unwrap_or_else`
-    // fallback below could never catch it (and its `Client::new()` would panic too).
+    // provider panics inside `build()` rather than returning `Err`.
     agent_core::ensure_provider();
     reqwest::Client::builder()
         .user_agent(USER_AGENT)
@@ -108,10 +130,7 @@ fn build_client(timeout: Duration, policy: EgressPolicy) -> reqwest::Client {
         .redirect(reqwest::redirect::Policy::none())
         .dns_resolver(SsrfResolver::new(policy))
         .build()
-        // The builder only fails if the TLS backend can't initialize — fatal and identical for
-        // every call, so a fallback default client that will error consistently on use beats
-        // panicking.
-        .unwrap_or_else(|_| reqwest::Client::new())
+        .map_err(|e| e.to_string())
 }
 
 /// One request/response round trip's outcome, before mode-specific rendering.
@@ -142,7 +161,10 @@ impl Web {
         let start = Instant::now();
         let mut redirects = 0;
         loop {
-            let mut rb = self.client().await.request(req.method.clone(), url.clone());
+            let mut rb = self
+                .client()
+                .await?
+                .request(req.method.clone(), url.clone());
             for (k, v) in &req.headers {
                 rb = rb.header(k, v);
             }
@@ -487,6 +509,37 @@ fn render(
 mod tests {
     use super::*;
     use std::io::{Read, Write};
+
+    /// Fails closed: when the hardened client cannot be built — the builder errs or panics — the
+    /// call fails and no request goes out at all (no fallback to a default client, which would have
+    /// no SSRF resolver, no timeout, and would follow redirects itself).
+    #[tokio::test]
+    async fn a_client_that_cannot_be_built_fails_the_call_and_sends_nothing() {
+        fn errs(_: Duration, _: EgressPolicy) -> Result<reqwest::Client, String> {
+            Err("injected build failure".into())
+        }
+        fn panics(_: Duration, _: EgressPolicy) -> Result<reqwest::Client, String> {
+            panic!("injected build panic")
+        }
+        for build in [errs as fn(_, _) -> _, panics] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let url = format!(
+                "http://127.0.0.1:{}/",
+                listener.local_addr().unwrap().port()
+            );
+            let tool = Web::new(true, &[], None).with_client_builder(build);
+            let e = tool
+                .run(serde_json::json!({ "url": url }))
+                .await
+                .unwrap_err();
+            assert!(e.to_string().contains("no request was made"), "{e}");
+            assert!(
+                matches!(listener.accept(), Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock),
+                "a request went out through an unhardened client"
+            );
+        }
+    }
 
     /// A one-shot loopback HTTP/1.1 server that replies with `response` to the first connection, and
     /// records the raw request line + headers it received. Returns `(port, join_handle_for_request)`.

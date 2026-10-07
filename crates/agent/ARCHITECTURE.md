@@ -933,7 +933,7 @@ The harness layers several capabilities over the bare tools + loop:
   Proxy / TypedArrays / MapSet) runs it against `tools.<server>.<method>(input)` Promises. Built-in
   coding tools stay direct. Nested calls honor `--exclude-tools` / `--deny-tool`. Budgets: 30s wall
   clock, 64 nested calls, 256 KiB result, **4 MiB JS heap**, **128 KiB JS stack**, and **one QuickJS
-  runtime per process** (a `serve` daemon never holds two heaps at once). QuickJS evaluates synchronously, so evaluation runs on the blocking pool under a local executor, never on the runtime thread other sessions share: a spinning script holds a pool thread until its interrupt (deadline, cancellation, or the call being dropped — a guard trips it) fires, and the one-heap slot is released when the evaluation really ends. Nested host calls are spawned back onto the session's runtime and raced against cancellation. An allow-list of built-ins
+  runtime per process** (a `serve` daemon never holds two heaps at once). QuickJS evaluates synchronously, so evaluation runs on the blocking pool under a local executor, never on the runtime thread other sessions share: a spinning script holds a pool thread until its interrupt (deadline, cancellation, or the call being dropped — a guard trips it) fires, and the one-heap slot is released when the evaluation really ends. Nested host calls are spawned back onto the session's runtime, under the script's deadline (which so holds across a nested await, not only while JS runs), and aborted by the same guard however the run ends — cancelled or dropped — so no host tool runs on after it. An allow-list of built-ins
   (`--tools read,bash`) still keeps `execute` so the deferred catalog is reachable; `--exclude-tools
   execute` (or `--no-tools`) drops it. Subagents inherit the parent's flag so a child cannot
   re-advertise the catalog the parent deferred. QuickJS is a cargo feature (`code-mode`) because idle
@@ -2104,7 +2104,7 @@ the model reads. Body/time caps are ax's: 20 MB, 30 s.
 **Egress safety is the load-bearing part** (`web/ssrf.rs`). ax is a local CLI a human runs; this is a
 server fetching URLs the _model_ chose. Because the tool is read-only (in `READ_ONLY_TOOLS`, so
 `--approve all` never prompts on it — the operator's choice), the SSRF filter is the **sole** boundary
-between the model and an internal fetch. It is deny-by-default, in two layers:
+between the model and an internal fetch. So it **fails closed**: if the hardened client (resolver, timeout, no redirects) cannot be built — the builder errs or panics — the call fails and nothing is sent; there is no fallback to a default client (`a_client_that_cannot_be_built_fails_the_call_and_sends_nothing`). The MCP Events direct-HTTP client fails closed the same way. It is deny-by-default, in two layers:
 
 - **A validating `reqwest::dns::Resolve`.** reqwest connects to exactly what the resolver returns, so
   checking every resolved `SocketAddr` validates the _actual_ connection IP — on the initial request and

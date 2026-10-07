@@ -194,12 +194,43 @@ mod runtime {
 
     /// Sets the evaluation's cancel flag when dropped, so its interrupt handler stops the script at
     /// its next check however `execute` ends (returned, cancelled, or dropped mid-await).
-    struct InterruptOnDrop(Arc<AtomicBool>);
+    /// …and aborts every nested host call still in flight, so a dropped `execute` (an abort that
+    /// drops the tool future without cancelling its token) leaves no host tool running on, and the
+    /// evaluation — and the JS slot it holds — ends at once rather than when that call would have.
+    struct InterruptOnDrop {
+        cancelled: Arc<AtomicBool>,
+        nested: NestedCalls,
+    }
 
     impl Drop for InterruptOnDrop {
         fn drop(&mut self) {
-            self.0.store(true, Ordering::Relaxed);
+            self.cancelled.store(true, Ordering::Relaxed);
+            for call in lock_nested(&self.nested).drain(..) {
+                call.abort();
+            }
         }
+    }
+
+    /// The nested host calls of one evaluation (finished ones included; aborting those is a no-op).
+    type NestedCalls = Arc<std::sync::Mutex<Vec<tokio::task::AbortHandle>>>;
+
+    fn lock_nested(
+        nested: &NestedCalls,
+    ) -> std::sync::MutexGuard<'_, Vec<tokio::task::AbortHandle>> {
+        nested
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// How a script's host calls reach the session: its runtime (where host tools' connections
+    /// and timers live), the calls in flight, and the script's deadline — which holds across a
+    /// nested call too, not only while JS runs (the interrupt handler only fires then).
+    #[derive(Clone)]
+    struct Bridge {
+        host: tokio::runtime::Handle,
+        nested: NestedCalls,
+        deadline: std::time::Instant,
+        timed_out: Arc<AtomicBool>,
     }
 
     /// The model-facing Code Mode tool.
@@ -268,13 +299,22 @@ mod runtime {
                 .map_err(|_| ToolError::Execution("code mode runtime slot closed".into()))?;
             // However `execute` ends — cancelled, or its future dropped by an abort — the evaluation
             // is interrupted at its next check rather than left running to the deadline.
-            let _interrupt = InterruptOnDrop(cancelled.clone());
+            let nested: NestedCalls = Arc::default();
+            let _interrupt = InterruptOnDrop {
+                cancelled: cancelled.clone(),
+                nested: nested.clone(),
+            };
 
             // QuickJS evaluates synchronously: a busy script (`while (true) {}`) holds whatever thread
             // runs it until the interrupt fires. So it runs on the blocking pool, driven by a local
             // executor, never on the runtime thread this session shares with others (their progress,
             // their aborts). Host calls go back to this runtime (`install_bridge`).
-            let runtime = tokio::runtime::Handle::current();
+            let bridge = Bridge {
+                host: tokio::runtime::Handle::current(),
+                nested,
+                deadline,
+                timed_out: timed_out.clone(),
+            };
             let run = tokio::task::spawn_blocking({
                 let (timed_out, cancelled, progress) =
                     (timed_out.clone(), cancelled.clone(), progress.clone());
@@ -292,7 +332,7 @@ mod runtime {
                         timed_out,
                         cancelled,
                         progress,
-                        runtime,
+                        bridge,
                     ))
                 }
             });
@@ -378,7 +418,7 @@ mod runtime {
         timed_out: Arc<AtomicBool>,
         cancelled: Arc<AtomicBool>,
         progress: ToolProgress,
-        host: tokio::runtime::Handle,
+        bridge: Bridge,
     ) -> Result<String, ToolError> {
         let catalog_json = serde_json::to_string(catalog.as_ref()).map_err(|e| {
             ToolError::Execution(format!("code mode catalog serialize failed: {e}"))
@@ -419,7 +459,7 @@ mod runtime {
         .map_err(js_err)?;
 
         ctx.async_with(async move |ctx| -> Result<String, ToolError> {
-            install_bridge(&ctx, tools, calls, max_calls, progress, host)?;
+            install_bridge(&ctx, tools, calls, max_calls, progress, bridge)?;
             ctx.globals()
                 .set("__catalogJson", catalog_json)
                 .map_err(js_err)?;
@@ -439,7 +479,7 @@ mod runtime {
         calls: Arc<AtomicUsize>,
         max_calls: usize,
         progress: ToolProgress,
-        host: tokio::runtime::Handle,
+        bridge: Bridge,
     ) -> Result<(), ToolError> {
         let func = Function::new(
             ctx.clone(),
@@ -447,20 +487,34 @@ mod runtime {
                 let tools = tools.clone();
                 let calls = calls.clone();
                 let progress = progress.clone();
-                let host = host.clone();
+                let bridge = bridge.clone();
                 async move {
                     // The evaluation runs on a blocking-pool thread; the host tool runs on the
-                    // session's runtime, where its connections and timers live. Raced against
-                    // cancellation, so an abort does not wait on a slow nested call.
-                    let nested = host.spawn(invoke_nested(
+                    // session's runtime, where its connections and timers live — under the
+                    // script's deadline (past it the call is dropped and the script times out),
+                    // registered so a dropped `execute` aborts it, and raced against cancellation
+                    // so an abort does not wait on it.
+                    let call = invoke_nested(
                         tools,
                         calls,
                         max_calls,
                         name,
                         input.0.unwrap_or_else(|| "{}".into()),
                         progress.clone(),
-                    ));
-                    let abort = nested.abort_handle();
+                    );
+                    let (deadline, timed_out) = (bridge.deadline, bridge.timed_out.clone());
+                    let nested = bridge.host.spawn(async move {
+                        match tokio::time::timeout_at(deadline.into(), call).await {
+                            Ok(answer) => answer,
+                            Err(_) => {
+                                timed_out.store(true, Ordering::Relaxed);
+                                envelope("code mode timed out during a nested tool call", true)
+                            }
+                        }
+                    });
+                    // Aborted by `execute`'s `InterruptOnDrop` however the run ends (cancelled,
+                    // dropped): the one place a nested call is stopped.
+                    lock_nested(&bridge.nested).push(nested.abort_handle());
                     let answer =
                         match futures::future::select(nested, Box::pin(progress.cancelled())).await
                         {
@@ -469,7 +523,6 @@ mod runtime {
                                 envelope(format!("nested tool call failed: {e}"), true)
                             }
                             futures::future::Either::Right(_) => {
-                                abort.abort();
                                 envelope("code mode cancelled", true)
                             }
                         };
@@ -706,6 +759,120 @@ mod runtime {
                     stack_size: 128 * 1024,
                 },
             )
+        }
+
+        /// A host tool that takes `delay` and then leaves a mark — the side effect a nested call
+        /// must not have once its run was cancelled, dropped, or past its deadline.
+        struct Slow {
+            delay: Duration,
+            done: Arc<AtomicBool>,
+        }
+
+        #[async_trait]
+        impl Tool for Slow {
+            fn name(&self) -> &str {
+                "mcp__slow__work"
+            }
+            fn description(&self) -> &str {
+                "slow"
+            }
+            fn input_schema(&self) -> Value {
+                json!({ "type": "object", "properties": {} })
+            }
+            async fn run(&self, _input: Value) -> Result<ToolOutput, ToolError> {
+                tokio::time::sleep(self.delay).await;
+                self.done.store(true, Ordering::SeqCst);
+                Ok("done".into())
+            }
+        }
+
+        fn slow(delay: Duration, timeout: Duration) -> (Execute, Arc<AtomicBool>) {
+            let done = Arc::new(AtomicBool::new(false));
+            let tool = Execute::with_limits(
+                vec![Arc::new(Slow {
+                    delay,
+                    done: done.clone(),
+                })],
+                Limits {
+                    timeout,
+                    max_calls: 16,
+                    max_output: 16 * 1024,
+                    memory_limit: 4 * 1024 * 1024,
+                    stack_size: 128 * 1024,
+                },
+            );
+            (tool, done)
+        }
+
+        const CALL_SLOW: &str = "return await tools.slow.work({});";
+
+        /// Cancelling a run while its script awaits a nested call aborts that call: the host tool
+        /// does not go on to finish (and leave its side effect) after the cancel.
+        #[tokio::test]
+        async fn cancelling_a_run_aborts_its_nested_call() {
+            let (tool, done) = slow(Duration::from_millis(500), Duration::from_secs(30));
+            let token = CancellationToken::new();
+            let (tx, _rx) = futures::channel::mpsc::unbounded();
+            let progress = ToolProgress::new(tx, "x".into(), NAME.into(), token.clone());
+            let cancel = tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                token.cancel();
+            });
+            let err = tool
+                .run_streaming(json!({ "code": CALL_SLOW }), &progress)
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("cancelled"), "{err}");
+            cancel.await.unwrap();
+            tokio::time::sleep(Duration::from_millis(900)).await;
+            assert!(
+                !done.load(Ordering::SeqCst),
+                "the nested call ran on after the cancel"
+            );
+        }
+
+        /// Dropping `execute` without cancelling its token (an abort that drops the tool future)
+        /// aborts its nested call too, and frees the JS slot at once rather than when the call
+        /// would have finished.
+        #[tokio::test]
+        async fn dropping_execute_aborts_its_nested_call_and_frees_the_slot() {
+            let (tool, done) = slow(Duration::from_secs(5), Duration::from_secs(30));
+            let dropped =
+                tokio::time::timeout(Duration::from_millis(150), run_code(&tool, CALL_SLOW)).await;
+            assert!(
+                dropped.is_err(),
+                "still awaiting the nested call when dropped"
+            );
+            let quick =
+                tokio::time::timeout(Duration::from_secs(2), run_code(&tool, "return 'next';"))
+                    .await
+                    .expect("the slot is free: the dropped run's nested call was aborted")
+                    .unwrap();
+            assert_eq!(quick, "next");
+            assert!(
+                !done.load(Ordering::SeqCst),
+                "the nested call ran on after the drop"
+            );
+        }
+
+        /// The script's deadline holds while it awaits a nested call, not only while JS runs: the
+        /// call is dropped at the deadline and the run fails as timed out.
+        #[tokio::test]
+        async fn the_deadline_holds_across_a_nested_call() {
+            let (tool, done) = slow(Duration::from_secs(5), Duration::from_millis(300));
+            let started = std::time::Instant::now();
+            let err = run_code(&tool, CALL_SLOW).await.unwrap_err();
+            assert!(err.to_string().contains("timed out"), "{err}");
+            assert!(
+                started.elapsed() < Duration::from_secs(3),
+                "{:?}",
+                started.elapsed()
+            );
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert!(
+                !done.load(Ordering::SeqCst),
+                "the nested call ran past the deadline"
+            );
         }
 
         async fn run_code(tool: &Execute, code: &str) -> Result<String, ToolError> {
