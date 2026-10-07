@@ -772,7 +772,7 @@ mod tests {
 
     #[test]
     fn root_is_inside_git_repo_is_false_with_no_git_dir_anywhere() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::isolated_tempdir();
         let nested = dir.path().join("src");
         std::fs::create_dir_all(&nested).unwrap();
         assert!(!root_is_inside_git_repo(&nested));

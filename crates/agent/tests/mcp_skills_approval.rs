@@ -346,3 +346,48 @@ fn serve_asks_per_call_before_a_cross_origin_read() {
     let bodies = turn_bodies(&bodies.lock().unwrap());
     assert!(tool_result(&bodies, "NOTES-BODY").contains("NOTES-BODY"));
 }
+
+/// A skill a subagent chooses is asked about in that subagent's name — the same provenance its
+/// code-execution questions carry — not as the session's own agent.
+#[test]
+fn a_subagents_skill_load_is_asked_about_in_its_own_name() {
+    let env = Env::new(json!({}));
+    let agents = env.home.join(".claude/agents");
+    std::fs::create_dir_all(&agents).unwrap();
+    std::fs::write(
+        agents.join("helper.md"),
+        "---\nname: helper\ndescription: helps\n---\nYou are HELPER-MARKER.\n",
+    )
+    .unwrap();
+    let (mut serve, _bodies) = serve_with(
+        &env,
+        vec![
+            // The parent, once the child has answered.
+            ("CHILD-LOADED", turn_text("parent done")),
+            // The child, after its load (allowed or not).
+            ("GIT-WORKFLOW-BODY", turn_text("CHILD-LOADED")),
+            ("did not approve loading", turn_text("CHILD-LOADED")),
+            // The child's first turn: it chooses the skill.
+            ("HELPER-MARKER", read_skill("c1", GIT)),
+            (
+                "delegate-load",
+                common::turn_tool_use(
+                    "d1",
+                    "subagent",
+                    &json!({ "agent": "helper", "task": "load the git skill" }).to_string(),
+                ),
+            ),
+        ],
+    );
+    serve.send(json!({ "type": "prompt", "message": "delegate-load" }));
+    let q = next_question(&mut serve);
+    assert_eq!(q["mcp_skill"]["purpose"], "activate", "{q}");
+    assert_eq!(
+        q["origin"]["agent"], "helper",
+        "the question must name the subagent that chose the skill: {q}"
+    );
+    assert!(q["origin"]["spawn_id"].is_string(), "{q}");
+    serve.approve(&q, "allow", "once");
+    serve.read_until(|f| is_response(f, "prompt"));
+    serve.finish();
+}

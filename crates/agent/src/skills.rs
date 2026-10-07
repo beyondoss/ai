@@ -1513,7 +1513,7 @@ mod tests {
 
     #[test]
     fn find_git_repo_root_returns_none_when_no_git_repo_encloses_it() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_support::isolated_tempdir();
         let deep = tmp.path().join("a/b/c");
         fs::create_dir_all(&deep).unwrap();
         assert_eq!(find_git_repo_root(&deep), None);
@@ -1541,7 +1541,7 @@ mod tests {
     #[test]
     fn collect_ancestor_agents_skill_dirs_walks_to_the_filesystem_root_when_no_git_repo_encloses_it()
      {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_support::isolated_tempdir();
         let start = tmp.path().join("a/b");
         fs::create_dir_all(&start).unwrap();
         let dirs = collect_ancestor_agents_skill_dirs(&start);

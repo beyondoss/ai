@@ -185,6 +185,33 @@ pub fn forget(dir: &ManifestDir, config: &McpServerConfig) {
     write_store(dir, &all);
 }
 
+/// Replace only the skills listing in `config`'s cached manifest — for a listing re-fetched after
+/// connect (`ttlMs` ran out, or the server said it changed), which would otherwise reach the cache
+/// only at the next live connect, leaving a restart to advertise the stale one. A `private` listing
+/// (`cacheScope: "private"`) forgets the server instead, as at connect. Without a manifest already
+/// recorded for this exact invocation there is nothing to amend: the next live connect writes a
+/// whole one. Best-effort, like [`store`].
+pub fn store_skills(
+    dir: &ManifestDir,
+    config: &McpServerConfig,
+    skills: Vec<crate::tools::mcp_skills::SkillEntry>,
+    skill_diagnostics: Vec<String>,
+    private: bool,
+) {
+    if private {
+        forget(dir, config);
+        return;
+    }
+    let mut all = read_store(dir);
+    let key = invocation_key(config);
+    let Some(manifest) = all.get_mut(&config.name).filter(|m| m.key == key) else {
+        return;
+    };
+    manifest.skills = Some(skills);
+    manifest.skill_diagnostics = skill_diagnostics;
+    write_store(dir, &all);
+}
+
 /// Record what `config`'s server advertises. Best-effort: a cache that cannot be written costs a
 /// server spawn on the next boot, which is the behavior without it.
 pub fn store(

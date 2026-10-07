@@ -2380,7 +2380,7 @@ pub(crate) async fn scan_session_dirs(
             .flat_map(|dir| crate::session_store::scan_session_dir_in(dir, &layout))
             .collect();
         let mut metas = crate::session_store::scan_listings_in(paths, &layout, &on_progress);
-        metas.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        metas.sort_by(crate::session_store::by_recency);
         metas
     })
     .await
@@ -4378,6 +4378,10 @@ pub(crate) async fn serve_session(
                 mcp_enabled
                     .skill_session()
                     .restore_from_transcript(&session.messages);
+                // ...and the MCP-skill approvals its user gave, persisted with it.
+                mcp_enabled.skill_session().restore_decisions(
+                    &persistence.active_custom(crate::tools::mcp_skills::APPROVAL_ENTRY_KIND),
+                );
                 // The session's MCP Apps connections moved since the agent was built (an apps dial
                 // landed, or went into backoff): rebuild, so this turn advertises what is up now.
                 let apps_generation_now = mcp_enabled.apps().map(|view| view.generation());
@@ -5065,7 +5069,7 @@ pub(crate) async fn serve_session(
                                             // must be answerable mid-run. `accepted:false` tells the losing
                                             // client in a multi-attach race that its answer arrived too late.
                                             "approve" => {
-                                                let _ = out_tx.send(handle_approve(cid, &c, &pending_approvals));
+                                                let _ = out_tx.send(handle_approve(cid, &c, &pending_approvals, approval.is_some()));
                                             }
                                             "elicit" => {
                                                 let _ = out_tx.send(handle_elicit(cid, &c, Some(&pending_elicitations)));
@@ -5231,6 +5235,18 @@ pub(crate) async fn serve_session(
                     // session-id check, but this session would lose them).
                     while let Ok((kind, data)) = mcp_task_rx.try_recv() {
                         journal_mcp!(kind, data);
+                    }
+                    // So are the MCP-skill approvals given during it: persisted with this session,
+                    // so resuming it does not ask again about the same content.
+                    for (key, allow) in mcp_enabled.skill_session().take_unjournaled() {
+                        journal_mcp!(
+                            crate::tools::mcp_skills::APPROVAL_ENTRY_KIND,
+                            json!({
+                                "sessionId": persistence.session_id(),
+                                "key": key,
+                                "allow": allow,
+                            })
+                        );
                     }
 
                     // Whether this attempt is about to be retried. Decided *here*, before the persist
@@ -6576,7 +6592,12 @@ pub(crate) async fn serve_session(
             // Reachable while idle only for a stale/duplicate answer (`accepted:false`): a real question
             // can only be outstanding while a run is in flight, which is the busy arm above.
             "approve" => {
-                emit!(handle_approve(id, &cmd, &pending_approvals));
+                emit!(handle_approve(
+                    id,
+                    &cmd,
+                    &pending_approvals,
+                    approval.is_some()
+                ));
             }
             "get_todos" => {
                 // Straight from the session while idle — no mirror needed, and no chance of one going
@@ -10253,7 +10274,17 @@ fn approval_resolved_frame(
 /// `accepted` is `false` when the `request_id` names no outstanding question — it was already answered
 /// by another attached client, it timed out, or the run was aborted. That is not an error: it is the
 /// answer a client races and loses.
-fn handle_approve(id: Option<String>, cmd: &Value, pending: &PendingApprovals) -> OutFrame {
+///
+/// `tool_gate` is whether this session asks about tool calls (`--approve`). Without one, the only
+/// questions it can raise are MCP skills' — so an answer that matches none of them is refused with a
+/// pointer to `--approve` rather than acknowledged, since a client sending it is most likely expecting
+/// tool approvals this session will never ask for.
+fn handle_approve(
+    id: Option<String>,
+    cmd: &Value,
+    pending: &PendingApprovals,
+    tool_gate: bool,
+) -> OutFrame {
     let Some(request_id) = cmd.get("request_id").and_then(Value::as_str) else {
         return response(id, "approve", false, None, Some("missing `request_id`"));
     };
@@ -10262,6 +10293,18 @@ fn handle_approve(id: Option<String>, cmd: &Value, pending: &PendingApprovals) -
         Err(e) => return response(id, "approve", false, None, Some(&e)),
     };
     let accepted = resolve_approval(pending, request_id, decision);
+    if !accepted && !tool_gate {
+        return response(
+            id,
+            "approve",
+            false,
+            None,
+            Some(
+                "no such question: this session asks only about MCP skills; tool approvals need \
+                 `--approve`",
+            ),
+        );
+    }
     response(
         id,
         "approve",
@@ -12900,7 +12943,7 @@ mod tests {
     async fn git_branch_reports_none_outside_a_git_repository() {
         // Task #25 (pi-parity fix): a lookup failure (no repo here at all) must report `None`, never
         // an error surfaced to the RPC caller.
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::isolated_tempdir();
         assert_eq!(git_branch(dir.path()).await, None);
     }
 

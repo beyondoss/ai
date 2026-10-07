@@ -3,6 +3,8 @@
 //! - A skill published after connect gets listed: on a list-changed notification, or once the
 //!   listing's `ttlMs` runs out — and not before (`ttlMs` is honoured, not polled past).
 //! - A `cacheScope: "private"` listing is never written to the on-disk manifest cache.
+//! - A listing re-fetched after connect is written back to that cache at once (or, now private,
+//!   forgotten), so a restart does not advertise the listing the server replaced.
 //! - Skills over the spec's per-skill limits (512 files / 16 MiB) are declined, and every entry left
 //!   out — over-limit, dynamic — is surfaced through the skills diagnostics (`get_commands`'
 //!   `collisions`, `run`'s warnings), as is a name one server lists twice.
@@ -182,5 +184,67 @@ fn entries_left_out_are_surfaced_in_get_commands_and_run_warnings() {
             .contains("warning: mcp server `docs`: `skill://huge/SKILL.md`: declined"),
         "{}",
         out.stderr
+    );
+}
+
+fn cached_manifest(env: &Env) -> String {
+    std::fs::read_to_string(env.home.join(".claude/mcp-manifest.json")).unwrap_or_default()
+}
+
+/// A listing re-fetched mid-session reaches the on-disk cache then, not at the next live connect:
+/// a restart that answers from the cache offers the skill published meanwhile.
+#[test]
+fn a_refreshed_listing_is_written_back_to_the_manifest_cache() {
+    let env = Env::new(json!({
+        "MCP_SKILLS_FIXTURE_LATE_FLAG": "LATE",
+        "MCP_SKILLS_FIXTURE_TTL_MS": "0",
+    }));
+    let flag = env.cwd.join("LATE");
+    let (mut serve, _bodies) = routed_serve(&env, vec![]);
+    prompt(&mut serve, "first-turn");
+    assert!(cached_manifest(&env).contains("skill://git-workflow/SKILL.md"));
+    assert!(!cached_manifest(&env).contains("skill://late/SKILL.md"));
+    std::fs::write(&flag, "published").unwrap();
+    prompt(&mut serve, "second-turn");
+    // Written while the session is still up, by the re-list itself.
+    assert!(
+        cached_manifest(&env).contains("skill://late/SKILL.md"),
+        "the refreshed listing must be written back: {}",
+        cached_manifest(&env)
+    );
+    serve.finish();
+
+    // And a restart answering from the cache (it starts no server) offers it.
+    env.clear_log();
+    let (mut serve, bodies) = routed_serve(&env, vec![]);
+    prompt(&mut serve, "after-restart");
+    serve.finish();
+    assert!(
+        !env.log().contains(&"start -".to_string()),
+        "the restart answered from the cache: {:?}",
+        env.log()
+    );
+    let bodies = bodies.lock().unwrap().clone();
+    assert!(system_of(&bodies, "after-restart").contains("<name>docs:late</name>"));
+}
+
+/// A listing that turns private on a re-fetch is dropped from the cache, as one private at connect
+/// is never written.
+#[test]
+fn a_listing_that_turns_private_on_refresh_is_forgotten_by_the_cache() {
+    let env = Env::new(json!({
+        "MCP_SKILLS_FIXTURE_PRIVATE_FLAG": "PRIVATE",
+        "MCP_SKILLS_FIXTURE_TTL_MS": "0",
+    }));
+    let (mut serve, _bodies) = routed_serve(&env, vec![]);
+    prompt(&mut serve, "first-turn");
+    assert!(cached_manifest(&env).contains("skill://git-workflow/SKILL.md"));
+    std::fs::write(env.cwd.join("PRIVATE"), "now").unwrap();
+    prompt(&mut serve, "second-turn");
+    serve.finish();
+    assert!(
+        !cached_manifest(&env).contains("skill://"),
+        "a now-private listing must not stay on disk: {}",
+        cached_manifest(&env)
     );
 }

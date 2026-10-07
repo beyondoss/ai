@@ -160,8 +160,9 @@ pub fn gateway_bin() -> PathBuf {
 // rather than re-imported at each call site: every test that already says `common::turn_text`
 // keeps working, and there is one implementation of the wire format rather than two.
 pub use beyond_ai_test_support::{
-    spawn_model_server, spawn_model_server_routed, spawn_model_server_with_stalled_response, sse,
-    turn_refusal, turn_text, turn_text_responses, turn_tool_use,
+    SCRIPTED_SESSION_TITLE, SESSION_TITLE_MARKER, spawn_model_server, spawn_model_server_routed,
+    spawn_model_server_with_stalled_response, sse, turn_refusal, turn_text, turn_text_responses,
+    turn_tool_use,
 };
 
 /// A free localhost port (bind `:0`, read it back, release). A subprocess must bind it promptly;

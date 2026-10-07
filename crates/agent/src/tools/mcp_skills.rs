@@ -655,6 +655,9 @@ pub struct ServerSkills {
     /// The newest entry known per skill URI — the listing's, a `skills/get` refresh of it, or a skill
     /// learned by URI alone — with how long it stays current.
     known: Mutex<HashMap<String, (SkillEntry, Option<Instant>)>>,
+    /// Where this server's manifest is cached, if anywhere: a refreshed listing is written back there
+    /// (see [`super::mcp_manifest::store_skills`]).
+    manifest: Option<super::mcp_manifest::ManifestDir>,
 }
 
 /// A skill loaded and verified, ready to enter the model's context.
@@ -664,12 +667,13 @@ struct Loaded {
 }
 
 /// Who asked for a skill to be activated.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Consent {
     /// The user named it (`/skill:<server>:<name>`): that is the explicit consent activation needs.
     User,
-    /// The model chose it: activation waits for the user's approval.
-    Model,
+    /// A model chose it — the session's own agent or a subagent, as the approval question says:
+    /// activation waits for the user's approval.
+    Model(ApprovalOrigin),
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -683,6 +687,7 @@ impl ServerSkills {
         conn: Arc<McpConnection>,
         listing: Listing,
         changed: Arc<AtomicU64>,
+        manifest: Option<super::mcp_manifest::ManifestDir>,
     ) -> Self {
         let known = listing
             .entries
@@ -697,6 +702,7 @@ impl ServerSkills {
             changed,
             listing: Mutex::new(listing),
             known: Mutex::new(known),
+            manifest,
         }
     }
 
@@ -738,6 +744,17 @@ impl ServerSkills {
             for e in &listing.entries {
                 known.insert(e.uri.clone(), (e.clone(), listing.fresh_until));
             }
+        }
+        // The cache must not keep advertising what the server just replaced — nor keep at all a
+        // listing it now marks private.
+        if let Some(dir) = &self.manifest {
+            super::mcp_manifest::store_skills(
+                dir,
+                self.conn.config(),
+                listing.entries.clone(),
+                listing.diagnostics.clone(),
+                listing.private,
+            );
         }
         *lock(&self.listing) = listing;
         true
@@ -845,7 +862,7 @@ impl ServerSkills {
         let client = self.client().await?;
         let reload = session.is_active(&self.server, uri);
         let (entry, refreshed) = self.current_entry(&client, uri, reload).await?;
-        session.authorize_activation(self, &entry, consent).await?;
+        session.authorize_activation(self, &entry, &consent).await?;
         let (entry, body) = match self.fetch_skill_md(&client, &entry).await {
             Ok(body) => (entry, body),
             // Stale (or tampered) against the held entry: refresh once and retry under the current
@@ -860,7 +877,7 @@ impl ServerSkills {
                 lock(&self.known).insert(uri.to_string(), (current.clone(), until));
                 // A changed manifest revokes an approval bound to the old one.
                 session
-                    .authorize_activation(self, &current, consent)
+                    .authorize_activation(self, &current, &consent)
                     .await?;
                 let body = self.fetch_skill_md(&client, &current).await?;
                 (current, body)
@@ -942,7 +959,12 @@ impl ServerSkills {
     }
 
     /// One call of the loading tool, on behalf of `session`. See [`McpSkillTool`]'s description.
-    async fn handle(&self, session: &SkillSession, uri: &str) -> Result<ToolOutput, String> {
+    async fn handle(
+        &self,
+        session: &SkillSession,
+        uri: &str,
+        origin: &ApprovalOrigin,
+    ) -> Result<ToolOutput, String> {
         let mut is_known = lock(&self.known).contains_key(uri);
         // A SKILL.md the session can already read as part of a loaded skill: it may be a nested skill
         // nobody listed. Passing a SKILL.md URI asks for a load, so ask the server; only if it says
@@ -962,7 +984,9 @@ impl ServerSkills {
             }
         }
         if is_known {
-            let loaded = self.load(session, uri, Consent::Model, true).await?;
+            let loaded = self
+                .load(session, uri, Consent::Model(origin.clone()), true)
+                .await?;
             return Ok(text_output(self.render(&loaded, "")));
         }
         if let Some((entry, listed)) = session.owner(&self.server, uri) {
@@ -981,7 +1005,9 @@ impl ServerSkills {
         if uri.ends_with("/SKILL.md") {
             // A skill this host never saw listed — handed over by the user, the server's
             // instructions, or another skill. `skills/get` vets it; an unknown URI is an error.
-            let loaded = self.load(session, uri, Consent::Model, true).await?;
+            let loaded = self
+                .load(session, uri, Consent::Model(origin.clone()), true)
+                .await?;
             return Ok(text_output(self.render(&loaded, "")));
         }
         Err(format!(
@@ -1103,7 +1129,16 @@ struct SessionState {
     active: HashMap<(String, String), Active>,
     /// Remembered "session"-scoped decisions, by key (which embeds the manifest fingerprint).
     decisions: HashMap<String, bool>,
+    /// Decisions remembered since the host last [took them](SkillSession::take_unjournaled) to
+    /// persist with the session.
+    unjournaled: Vec<(String, bool)>,
 }
+
+/// The session custom-entry kind a remembered MCP-skill approval is persisted under:
+/// `{"sessionId", "key", "allow"}`. The key embeds the content fingerprint it was given for (the
+/// skill's manifest; for a code-execution answer, every active skill's), so a restored approval
+/// covers exactly the content approved and a changed skill is asked about again.
+pub const APPROVAL_ENTRY_KIND: &str = "mcp_skill_approval";
 
 /// The tag a loaded MCP skill enters context under ([`ServerSkills::render`]); what the acting window
 /// is rebuilt from ([`SkillSession::restore_from_transcript`]).
@@ -1187,6 +1222,36 @@ impl SkillSession {
         *lock(&self.state) = SessionState::default();
     }
 
+    /// Remember a decision for the session, and queue it to be persisted with it.
+    fn remember(&self, key: String, allow: bool) {
+        let mut state = lock(&self.state);
+        if state.decisions.insert(key.clone(), allow) != Some(allow) {
+            state.unjournaled.push((key, allow));
+        }
+    }
+
+    /// The decisions remembered since the last call, for the host to persist with the session
+    /// ([`APPROVAL_ENTRY_KIND`]).
+    pub fn take_unjournaled(&self) -> Vec<(String, bool)> {
+        std::mem::take(&mut lock(&self.state).unjournaled)
+    }
+
+    /// Restore decisions persisted with the session ([`APPROVAL_ENTRY_KIND`] entries' data, oldest
+    /// first, so a later answer for the same key wins). A session resumed, switched to or reopened
+    /// after a restart is not asked again about content it already approved — and, since each key
+    /// embeds its content fingerprint, is asked again about content that changed.
+    pub fn restore_decisions(&self, entries: &[Value]) {
+        let mut state = lock(&self.state);
+        for entry in entries {
+            if let (Some(key), Some(allow)) = (
+                entry.get("key").and_then(Value::as_str),
+                entry.get("allow").and_then(Value::as_bool),
+            ) {
+                state.decisions.insert(key.to_string(), allow);
+            }
+        }
+    }
+
     /// Rebuild the acting window from a transcript: every MCP skill whose `SKILL.md` is still in the
     /// session's context — a skill-tool result, or a `/skill:` expansion — is one the model is acting
     /// on, whether this process loaded it or the session was resumed, switched to, forked or reopened
@@ -1268,10 +1333,18 @@ impl SkillSession {
     }
 
     /// The session-bound loading tool replacing `tool`, if `tool` is one of the registered servers'.
-    pub(crate) fn bind(self: &Arc<Self>, tool: &Arc<dyn Tool>) -> Option<Arc<dyn Tool>> {
+    /// Bound for the agent `origin` (the session's own, or a subagent), so the activation questions
+    /// its loads raise say which agent asked.
+    pub(crate) fn bind_as(
+        self: &Arc<Self>,
+        tool: &Arc<dyn Tool>,
+        origin: &ApprovalOrigin,
+    ) -> Option<Arc<dyn Tool>> {
         let sources = lock(&self.sources);
         let source = sources.iter().find(|s| s.tool == tool.name())?;
-        Some(Arc::new(McpSkillTool::new(source.clone(), self.clone())))
+        Some(Arc::new(
+            McpSkillTool::new(source.clone(), self.clone()).with_origin(origin.clone()),
+        ))
     }
 
     fn is_active(&self, server: &str, uri: &str) -> bool {
@@ -1337,7 +1410,7 @@ impl SkillSession {
         match gate.request(request, &CancellationToken::new()).await {
             Ok(decision) => {
                 if remember && decision.scope == ApprovalScope::Session {
-                    lock(&self.state).decisions.insert(key, decision.allow);
+                    self.remember(key, decision.allow);
                 }
                 Ok(decision.allow)
             }
@@ -1357,14 +1430,17 @@ impl SkillSession {
         &self,
         source: &ServerSkills,
         entry: &SkillEntry,
-        consent: Consent,
+        consent: &Consent,
     ) -> Result<(), String> {
         let fingerprint = entry.fingerprint();
         let key = format!("activate\0{}\0{}\0{fingerprint}", source.server, entry.uri);
-        if consent == Consent::User {
-            lock(&self.state).decisions.insert(key, true);
-            return Ok(());
-        }
+        let origin = match consent {
+            Consent::User => {
+                self.remember(key, true);
+                return Ok(());
+            }
+            Consent::Model(origin) => origin.clone(),
+        };
         let nested_in = source.enclosing(&entry.uri);
         let files: Vec<Value> = entry
             .files
@@ -1375,7 +1451,7 @@ impl SkillSession {
             tool: source.tool.clone(),
             summary: json!({ "uri": entry.uri }),
             scope_key: format!("mcp-skill:{}:{}@{fingerprint}", source.server, entry.uri),
-            origin: ApprovalOrigin::Main,
+            origin,
             context: Some(json!({
                 "purpose": "activate",
                 "server": source.server,
@@ -1596,6 +1672,7 @@ pub(crate) fn attach(
     conn: &Arc<McpConnection>,
     listing: Listing,
     tools: &mut Vec<Arc<dyn Tool>>,
+    manifest: Option<&super::mcp_manifest::ManifestDir>,
 ) -> Arc<ServerSkills> {
     let skills = Arc::new(ServerSkills::new(
         server,
@@ -1603,6 +1680,7 @@ pub(crate) fn attach(
         conn.clone(),
         listing,
         conn.skills_changed(),
+        manifest.cloned(),
     ));
     tools.push(Arc::new(McpSkillTool::new(
         skills.clone(),
@@ -1618,6 +1696,8 @@ pub(crate) struct McpSkillTool {
     description: String,
     skills: Arc<ServerSkills>,
     session: Arc<SkillSession>,
+    /// The agent this binding serves, named in the activation questions its loads raise.
+    origin: ApprovalOrigin,
 }
 
 impl McpSkillTool {
@@ -1636,7 +1716,13 @@ impl McpSkillTool {
             description,
             skills,
             session,
+            origin: ApprovalOrigin::Main,
         }
+    }
+
+    fn with_origin(mut self, origin: ApprovalOrigin) -> Self {
+        self.origin = origin;
+        self
     }
 }
 
@@ -1671,7 +1757,7 @@ impl Tool for McpSkillTool {
             .filter(|u| !u.is_empty())
             .ok_or_else(|| ToolError::InvalidInput("`uri` (a string) is required".into()))?;
         self.skills
-            .handle(&self.session, uri)
+            .handle(&self.session, uri, &self.origin)
             .await
             .map_err(ToolError::Execution)
     }

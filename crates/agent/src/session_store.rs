@@ -339,11 +339,19 @@ pub fn search_sessions(sessions: Vec<SessionMeta>, query: Option<&str>) -> Vec<S
         })
         .collect();
     ranked.sort_by(|(a_meta, a_rank), (b_meta, b_rank)| {
-        a_rank
-            .cmp(b_rank)
-            .then_with(|| b_meta.updated_at.cmp(&a_meta.updated_at))
+        a_rank.cmp(b_rank).then_with(|| by_recency(a_meta, b_meta))
     });
     ranked.into_iter().map(|(m, _)| m).collect()
+}
+
+/// Most recently active first; ties (same second — `updated_at` has one-second resolution, so a
+/// burst of sessions shares one) broken by id, so a listing has one order however the directory
+/// happened to be scanned. Without the tie-break, `offset` paging over sessions written in the same
+/// second could serve one session twice and skip another.
+pub(crate) fn by_recency(a: &SessionMeta, b: &SessionMeta) -> std::cmp::Ordering {
+    b.updated_at
+        .cmp(&a.updated_at)
+        .then_with(|| a.id.cmp(&b.id))
 }
 
 /// One persisted line. Internally tagged on `type`. A `Message` entry flattens the wrapped
@@ -2877,7 +2885,7 @@ impl SessionRepo {
             );
         }
         let mut metas = scan_listings(paths, &on_progress);
-        metas.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        metas.sort_by(by_recency);
         Ok(metas)
     }
 
@@ -2933,7 +2941,7 @@ impl SessionRepo {
             }
         }
         let mut metas = scan_listings_in(paths, self.layout(), &on_progress);
-        metas.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        metas.sort_by(by_recency);
         Ok(metas)
     }
 

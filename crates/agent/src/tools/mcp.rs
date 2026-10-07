@@ -646,6 +646,16 @@ pub fn server_name_from_registered(tool_name: &str) -> Option<&str> {
 /// A session that declared it renders MCP Apps sees its apps view's tools instead of `tools` — the
 /// same servers, dialed with the extension advertised (see [`crate::tools::mcp_apps`]).
 pub fn filter_by_enabled(tools: &[Arc<dyn Tool>], enabled: &McpEnabledSet) -> Vec<Arc<dyn Tool>> {
+    filter_by_enabled_as(tools, enabled, &crate::approval::ApprovalOrigin::Main)
+}
+
+/// [`filter_by_enabled`] for the agent `origin` — a subagent's registry — so a skill load it makes
+/// asks the user in that subagent's name.
+pub fn filter_by_enabled_as(
+    tools: &[Arc<dyn Tool>],
+    enabled: &McpEnabledSet,
+    origin: &crate::approval::ApprovalOrigin,
+) -> Vec<Arc<dyn Tool>> {
     // A declared session sees the apps flavor's tools for every server whose apps connection is up,
     // and the plain tools for every other one — a server whose apps dial failed (or has not landed
     // yet) keeps working as a text tool rather than vanishing.
@@ -663,7 +673,12 @@ pub fn filter_by_enabled(tools: &[Arc<dyn Tool>], enabled: &McpEnabledSet) -> Ve
             Some(server) => enabled.allows(server),
             None => true,
         })
-        .map(|t| enabled.skills.bind(t).unwrap_or_else(|| t.clone()))
+        .map(|t| {
+            enabled
+                .skills
+                .bind_as(t, origin)
+                .unwrap_or_else(|| t.clone())
+        })
         .collect()
 }
 
@@ -959,6 +974,11 @@ impl McpConnection {
             .await
             .as_ref()
             .map(|live| live.client.clone())
+    }
+
+    /// The server's configuration — what its manifest is cached under.
+    pub(crate) fn config(&self) -> &McpServerConfig {
+        &self.config
     }
 
     /// The flag a list-changed notification raises on this connection, whichever dial received it.
@@ -2114,6 +2134,7 @@ fn tools_from_manifest(
     dial: &Dial,
     manifest: crate::tools::mcp_manifest::ServerManifest,
     idle_reap_after: Duration,
+    manifest_dir: &crate::tools::mcp_manifest::ManifestDir,
 ) -> (Vec<Arc<dyn Tool>>, McpServerCatalog) {
     let conn = Arc::new(McpConnection::dormant(
         config.clone(),
@@ -2201,6 +2222,7 @@ fn tools_from_manifest(
             &conn,
             crate::tools::mcp_skills::Listing::cached(entries, diagnostics),
             &mut tools,
+            Some(manifest_dir),
         )
     });
     let catalog = McpServerCatalog {
@@ -2222,13 +2244,21 @@ async fn connect_one(
     manifest_dir: Option<&crate::tools::mcp_manifest::ManifestDir>,
 ) -> Result<(Vec<Arc<dyn Tool>>, McpServerCatalog), String> {
     // Cache hit: advertise from the manifest and start nothing.
-    if let Some(manifest) = manifest_dir.and_then(|d| crate::tools::mcp_manifest::load(d, config)) {
+    if let Some(dir) = manifest_dir
+        && let Some(manifest) = crate::tools::mcp_manifest::load(dir, config)
+    {
         tracing::debug!(
             server = %config.name,
             tools = manifest.tools.len(),
             "advertising MCP tools from the cached manifest; not starting the server"
         );
-        return Ok(tools_from_manifest(config, dial, manifest, idle_reap_after));
+        return Ok(tools_from_manifest(
+            config,
+            dial,
+            manifest,
+            idle_reap_after,
+            dir,
+        ));
     }
     let (client, proc) = connect_one_client(config, dial).await?;
     tools_from_client(config, dial, client, proc, idle_reap_after, manifest_dir).await
@@ -3173,8 +3203,9 @@ async fn tools_from_client(
         }));
     }
 
-    let skills = skill_listing
-        .map(|listing| crate::tools::mcp_skills::attach(&config.name, &conn, listing, &mut tools));
+    let skills = skill_listing.map(|listing| {
+        crate::tools::mcp_skills::attach(&config.name, &conn, listing, &mut tools, manifest_dir)
+    });
     Ok((
         tools,
         McpServerCatalog {

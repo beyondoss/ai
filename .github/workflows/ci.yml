@@ -64,12 +64,13 @@ jobs:
     # groups are stable, reproducible locally with the same `-E` expression, and a red shard names
     # the area outright.
     #
-    # agent-serve is deliberately not in this matrix. On this PR every harness for
-    # `binary(~serve)` compiled in ~2–4m then froze the runner: the test step stayed
-    # `in_progress` past job/step timeouts, logs never uploaded, and `needs.test`
-    # became `cancelled` so Check went red. The same 32 binaries pass under
-    # sequential `cargo test` locally in ~4 minutes. Leaving them in the required
-    # fan-in only reproduces the 30:00 death.
+    # agent-serve was left out of this matrix from #39 on, after its harnesses froze the runner (the
+    # test step stuck `in_progress` past every timeout). Out of CI they rotted unseen: by 2026-10 48
+    # of them failed or hung on main, almost all because the session-title request `serve` began
+    # making after a first run took a reply from the in-order mock model's script, shifting every
+    # later turn by one. With that fixed in the harness, and the runner-freezing causes since
+    # addressed (systemd-scoped test step, nextest terminate-after and global-timeout below), they
+    # run again — as their own shard, so a hang there names itself instead of hiding another's.
     name: test (${{ matrix.name }})
     runs-on: ubuntu-latest
     timeout-minutes: 25
@@ -102,6 +103,9 @@ jobs:
             extra: "--features code-mode"
           - name: agent-rest
             filter: package(beyond-ai-agent) and kind(test) and not binary(~serve) and not binary(exec_endpoint_live)
+            extra: ""
+          - name: agent-serve
+            filter: package(beyond-ai-agent) and kind(test) and binary(~serve)
             extra: ""
           - name: core-providers
             filter: package(beyond-ai-agent-core) or package(beyond-ai-providers)

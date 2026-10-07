@@ -4,12 +4,16 @@
 //! got here: resumed by a later `run --session-id`, switched back to in `serve`, forked, or reopened
 //! after `serve` restarted. The code-execution gate must be on for it each time; the spec lets the
 //! window be longer than the skill's time in context, never shorter.
+//!
+//! The user's approvals come back with it: persisted with the session, bound to the content they
+//! were given for, so a reopened session is not asked again about an unchanged skill — and is about
+//! a changed one.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod common;
 
-use common::skills_env::{Env, Serve, bash, is_response, last_message_text};
+use common::skills_env::{Env, Serve, bash, is_response, last_message_text, read_skill};
 use common::{spawn_model_server_routed, turn_text};
 use serde_json::{Value, json};
 
@@ -165,5 +169,58 @@ fn a_restarted_serve_reopening_the_session_is_gated() {
         "the session was reopened: {state:#?}"
     );
     expect_gated(&mut serve);
+    serve.finish();
+}
+
+/// The model's next activation question, or `None` if the prompt finished without one.
+fn activation_question(serve: &mut Serve) -> Option<Value> {
+    let frames = serve.read_until(|f| f["type"] == "approval_request" || is_response(f, "prompt"));
+    let last = frames.last().unwrap().clone();
+    (last["type"] == "approval_request").then_some(last)
+}
+
+#[test]
+fn a_skill_approval_survives_a_restart_for_unchanged_content_only() {
+    let env = Env::new(json!({ "MCP_SKILLS_FIXTURE_VERSION_FILE": "V2" }));
+    const GIT: &str = "skill://git-workflow/SKILL.md";
+    // Each prompt has the model load the skill once, under its own tool-call id.
+    let (base, _bodies) = spawn_model_server_routed(
+        vec![
+            ("\"tool_use_id\":\"t3\"".into(), turn_text("done three")),
+            ("load-three".into(), read_skill("t3", GIT)),
+            ("\"tool_use_id\":\"t2\"".into(), turn_text("done two")),
+            ("load-two".into(), read_skill("t2", GIT)),
+            ("\"tool_use_id\":\"t1\"".into(), turn_text("done one")),
+            ("load-one".into(), read_skill("t1", GIT)),
+        ],
+        turn_text("ok"),
+    );
+    let session_file = env.dir.path().join("approvals.jsonl");
+
+    // 1. Asked once; approved for the session.
+    let mut serve = env.serve_on(&base, &session_file, &[]);
+    serve.send(json!({ "type": "prompt", "message": "load-one" }));
+    let q = activation_question(&mut serve).expect("the first load is asked about");
+    assert_eq!(q["mcp_skill"]["purpose"], "activate", "{q}");
+    serve.approve(&q, "allow", "session");
+    serve.read_until(|f| is_response(f, "prompt"));
+    serve.finish();
+
+    // 2. A new process reopening the session: the same content is not asked about again.
+    let mut serve = env.serve_on(&base, &session_file, &[]);
+    serve.send(json!({ "type": "prompt", "message": "load-two" }));
+    assert_eq!(
+        activation_question(&mut serve),
+        None,
+        "a restored approval for unchanged content must not ask again"
+    );
+
+    // 3. The skill changes (an honest new manifest): the old approval does not cover it.
+    std::fs::write(env.cwd.join("V2"), "v2").unwrap();
+    serve.send(json!({ "type": "prompt", "message": "load-three" }));
+    let q = activation_question(&mut serve).expect("a changed skill is asked about again");
+    assert_eq!(q["mcp_skill"]["purpose"], "activate", "{q}");
+    serve.approve(&q, "deny", "once");
+    serve.read_until(|f| is_response(f, "prompt"));
     serve.finish();
 }
