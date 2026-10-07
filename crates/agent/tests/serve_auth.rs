@@ -177,7 +177,20 @@ fn login_acks_then_a_second_concurrent_login_is_rejected_then_abort_login_cancel
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
 
-    let mut child = serve_cmd_with_real_home(bin, &session_file, home.path()).spawn_guarded();
+    // Anthropic's callback port is fixed (53692: its registered redirect URI), so every login on a
+    // host binds the same one — two copies of this suite running at once collide on it. A loopback
+    // address of this process's own (Linux routes all of 127/8 to loopback) keeps the port fixed and
+    // the bind private; the login never completes here, so nothing dials it.
+    let pid = std::process::id();
+    let host = format!(
+        "127.{}.{}.{}",
+        1 + pid % 254,
+        (pid >> 8) & 0xff,
+        1 + (pid >> 16) % 254
+    );
+    let mut child = serve_cmd_with_real_home(bin, &session_file, home.path())
+        .env("AI_AGENT_OAUTH_CALLBACK_HOST", &host)
+        .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = common::child_frames(&mut child);
 
