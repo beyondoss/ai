@@ -166,7 +166,30 @@ pub struct OAuthFixture {
     /// Hold each rejected `tools/call` until this many have arrived (or 5 s pass), so concurrent
     /// requests with a stale token are all in flight before any is answered.
     pub hold_rejections_until: Arc<AtomicU32>,
+    /// Answer a rejected request's 401 with an `application/json` JSON-RPC error body and no
+    /// `WWW-Authenticate` challenge (what rmcp's own client reads as an ordinary error response).
+    pub reject_with_json_body: Arc<AtomicBool>,
+    /// Speak sessions: `initialize` issues an `Mcp-Session-Id`, every later POST must carry a live
+    /// one (`400` without, `404` for an expired one), `GET` opens the standalone SSE stream, and
+    /// `DELETE` ends the session.
+    pub sessions: Arc<AtomicBool>,
+    /// Expire every live session right after this many `tools/call`s have been answered (0: never).
+    pub expire_sessions_after_calls: Arc<AtomicU32>,
+    /// Answer requests with `text/event-stream` (one `data:` event) instead of JSON.
+    pub sse_responses: Arc<AtomicBool>,
+    /// Answer `server/discover` with this `(status line, body)` — a legacy server's 4xx.
+    pub discover_reply: Arc<Mutex<Option<(String, String)>>>,
+    /// Answer notifications with an empty `200 OK` (no content type) instead of `202 Accepted`.
+    pub notifications_empty_200: Arc<AtomicBool>,
+    /// What arrived: `initialize`s, `GET` streams, `DELETE`s, POSTs refused for a missing or
+    /// expired session, and the `Mcp-Session-Id` each `tools/call` carried.
+    pub initializes: Arc<AtomicU32>,
+    pub get_streams: Arc<AtomicU32>,
+    pub deletes: Arc<AtomicU32>,
+    pub session_refusals: Arc<AtomicU32>,
+    pub call_sessions: Arc<Mutex<Vec<Option<String>>>>,
     issued: Arc<Mutex<HashSet<String>>>,
+    live_sessions: Arc<Mutex<HashSet<String>>>,
 }
 
 impl OAuthFixture {
@@ -191,7 +214,19 @@ impl OAuthFixture {
             fail_refresh: Arc::default(),
             refresh_reply: Arc::default(),
             hold_rejections_until: Arc::default(),
+            reject_with_json_body: Arc::default(),
+            sessions: Arc::default(),
+            expire_sessions_after_calls: Arc::default(),
+            sse_responses: Arc::default(),
+            discover_reply: Arc::default(),
+            notifications_empty_200: Arc::default(),
+            initializes: Arc::default(),
+            get_streams: Arc::default(),
+            deletes: Arc::default(),
+            session_refusals: Arc::default(),
+            call_sessions: Arc::default(),
             issued: Arc::default(),
+            live_sessions: Arc::default(),
         };
         let state = Arc::new(Shared {
             fixture: fixture.clone(),
@@ -335,21 +370,85 @@ impl Shared {
         if req.path == "/mcp" && req.method == "POST" {
             return self.mcp(&mut stream, &req);
         }
+        if req.path == "/mcp" && (req.method == "GET" || req.method == "DELETE") {
+            return self.stream_or_delete(&mut stream, &req);
+        }
         write_response(&mut stream, "404 Not Found", "", b"");
     }
 
-    /// The protected resource: anything without a currently-valid bearer token is answered 401 with
-    /// a `WWW-Authenticate` challenge, as a real OAuth-gated MCP server does.
+    /// Whether a request carries a currently-valid bearer token.
+    fn authorized(&self, req: &ParsedRequest) -> bool {
+        req.headers
+            .get("authorization")
+            .and_then(|h| h.strip_prefix("Bearer "))
+            .is_some_and(|token| self.fixture.issued.lock().unwrap().contains(token))
+    }
+
+    /// 401 for a request whose token is not valid: with a `WWW-Authenticate` challenge, or (when
+    /// `reject_with_json_body`) an `application/json` JSON-RPC error answering `id` and no challenge.
+    fn unauthorized(&self, stream: &mut TcpStream, id: &Value) {
+        if self.fixture.reject_with_json_body.load(Ordering::SeqCst) {
+            let body = serde_json::to_vec(&json!({ "jsonrpc": "2.0", "id": id,
+                "error": { "code": -32001, "message": "unauthorized: token expired" } }))
+            .unwrap();
+            return write_response(
+                stream,
+                "401 Unauthorized",
+                "Content-Type: application/json\r\n",
+                &body,
+            );
+        }
+        write_response(
+            stream,
+            "401 Unauthorized",
+            &format!(
+                "WWW-Authenticate: Bearer resource=\"{}/mcp\"\r\n",
+                self.base
+            ),
+            b"",
+        );
+    }
+
+    /// The standalone SSE stream (`GET`, held open a few seconds) and session end (`DELETE`), for a
+    /// fixture that speaks sessions; `405` otherwise, as a session-less server answers.
+    fn stream_or_delete(&self, stream: &mut TcpStream, req: &ParsedRequest) {
+        let f = &self.fixture;
+        if !f.sessions.load(Ordering::SeqCst) {
+            return write_response(stream, "405 Method Not Allowed", "", b"");
+        }
+        if !self.authorized(req) {
+            return self.unauthorized(stream, &Value::Null);
+        }
+        let live = req
+            .headers
+            .get("mcp-session-id")
+            .is_some_and(|s| f.live_sessions.lock().unwrap().contains(s));
+        if !live {
+            return write_response(stream, "404 Not Found", "", b"");
+        }
+        if req.method == "DELETE" {
+            f.deletes.fetch_add(1, Ordering::SeqCst);
+            if let Some(s) = req.headers.get("mcp-session-id") {
+                f.live_sessions.lock().unwrap().remove(s);
+            }
+            return write_response(stream, "200 OK", "", b"");
+        }
+        f.get_streams.fetch_add(1, Ordering::SeqCst);
+        let _ = stream.write_all(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\r\n: open\n\n",
+        );
+        let _ = stream.flush();
+        thread::sleep(Duration::from_secs(5));
+    }
+
+    /// The protected resource: anything without a currently-valid bearer token is answered 401, as
+    /// a real OAuth-gated MCP server does — before the session is looked at, as auth comes first.
     fn mcp(&self, stream: &mut TcpStream, req: &ParsedRequest) {
         let f = &self.fixture;
         let request: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
         let method = request.get("method").and_then(Value::as_str).unwrap_or("");
-        let authorized = req
-            .headers
-            .get("authorization")
-            .and_then(|h| h.strip_prefix("Bearer "))
-            .is_some_and(|token| f.issued.lock().unwrap().contains(token));
-        if !authorized {
+        let id = request.get("id").cloned().unwrap_or(Value::Null);
+        if !self.authorized(req) {
             if method == "tools/call" {
                 f.rejected_calls.fetch_add(1, Ordering::SeqCst);
                 let want = f.hold_rejections_until.load(Ordering::SeqCst);
@@ -361,23 +460,49 @@ impl Shared {
                     .wait_timeout_while(arrived, Duration::from_secs(5), |n| *n < want)
                     .unwrap();
             }
-            return write_response(
-                stream,
-                "401 Unauthorized",
-                &format!(
-                    "WWW-Authenticate: Bearer resource=\"{}/mcp\"\r\n",
-                    self.base
-                ),
-                b"",
-            );
+            return self.unauthorized(stream, &id);
         }
         if let Some(auth) = req.headers.get("authorization") {
             f.seen_auth_headers.lock().unwrap().push(auth.clone());
         }
-        if request.get("id").is_none() {
-            return write_response(stream, "202 Accepted", "", b"");
+        let sessions = f.sessions.load(Ordering::SeqCst);
+        let session = req.headers.get("mcp-session-id").cloned();
+        if method == "server/discover"
+            && let Some((status, body)) = f.discover_reply.lock().unwrap().clone()
+        {
+            return write_response(
+                stream,
+                &status,
+                "Content-Type: text/plain\r\n",
+                body.as_bytes(),
+            );
         }
-        let id = request.get("id").cloned().unwrap_or(Value::Null);
+        // Every POST but `initialize` (and the discovery probe before it) belongs to a session.
+        if sessions && !matches!(method, "initialize" | "server/discover") {
+            match &session {
+                None => {
+                    f.session_refusals.fetch_add(1, Ordering::SeqCst);
+                    return write_response(
+                        stream,
+                        "400 Bad Request",
+                        "",
+                        b"missing Mcp-Session-Id",
+                    );
+                }
+                Some(s) if !f.live_sessions.lock().unwrap().contains(s) => {
+                    f.session_refusals.fetch_add(1, Ordering::SeqCst);
+                    return write_response(stream, "404 Not Found", "", b"");
+                }
+                Some(_) => {}
+            }
+        }
+        if request.get("id").is_none() {
+            return if f.notifications_empty_200.load(Ordering::SeqCst) {
+                write_response(stream, "200 OK", "", b"")
+            } else {
+                write_response(stream, "202 Accepted", "", b"")
+            };
+        }
         // A pre-`2026-07-28` server: `server/discover` (and anything else unknown) is "method not
         // found", which is what sends rmcp to the legacy `initialize` handshake.
         if !matches!(method, "initialize" | "tools/list" | "tools/call") {
@@ -388,12 +513,21 @@ impl Shared {
                          "error": { "code": -32601, "message": format!("method not found: {method}") } }),
             );
         }
+        let mut extra = String::new();
         let result = match method {
-            "initialize" => json!({
-                "protocolVersion": "2025-06-18",
-                "capabilities": { "tools": {} },
-                "serverInfo": { "name": "mcp-fixture-oauth-server", "version": "0.0.0" },
-            }),
+            "initialize" => {
+                let n = f.initializes.fetch_add(1, Ordering::SeqCst);
+                if sessions {
+                    let id = format!("session-{n}");
+                    f.live_sessions.lock().unwrap().insert(id.clone());
+                    extra = format!("Mcp-Session-Id: {id}\r\n");
+                }
+                json!({
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": { "tools": {} },
+                    "serverInfo": { "name": "mcp-fixture-oauth-server", "version": "0.0.0" },
+                })
+            }
             "tools/list" => json!({ "tools": [{
                 "name": "echo",
                 "description": "Echoes back its `text` argument.",
@@ -403,27 +537,40 @@ impl Shared {
                     "required": ["text"],
                 },
             }] }),
-            "tools/call" => {
+            _ => {
+                f.call_sessions.lock().unwrap().push(session.clone());
                 let text = request
                     .pointer("/params/arguments/text")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
                 json!({ "content": [{ "type": "text", "text": text }], "isError": false })
             }
-            other => json!({
-                "content": [{ "type": "text", "text": format!("unhandled method {other}") }],
-                "isError": true,
-            }),
         };
-        write_json(
-            stream,
-            "200 OK",
-            &json!({ "jsonrpc": "2.0", "id": id, "result": result }),
-        );
+        let message = json!({ "jsonrpc": "2.0", "id": id, "result": result });
+        if f.sse_responses.load(Ordering::SeqCst) {
+            let body = format!("data: {message}\n\n");
+            write_response(
+                stream,
+                "200 OK",
+                &format!("{extra}Content-Type: text/event-stream\r\n"),
+                body.as_bytes(),
+            );
+        } else {
+            let body = serde_json::to_vec(&message).unwrap();
+            write_response(
+                stream,
+                "200 OK",
+                &format!("{extra}Content-Type: application/json\r\n"),
+                &body,
+            );
+        }
         if method == "tools/call" {
             let calls = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
             if calls == f.revoke_after_calls.load(Ordering::SeqCst) {
                 f.revoke_all();
+            }
+            if calls == f.expire_sessions_after_calls.load(Ordering::SeqCst) {
+                f.live_sessions.lock().unwrap().clear();
             }
         }
     }
@@ -514,4 +661,91 @@ pub fn mcp_login(home: &Path, server: &str) {
         "mcp-login failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+/// A logged-in `$HOME` for a fresh fixture whose tokens stay valid for an hour unless revoked.
+pub fn logged_in() -> (tempfile::TempDir, OAuthFixture) {
+    let home = tempfile::tempdir().unwrap();
+    let fixture = OAuthFixture::spawn(3600);
+    write_global_settings(
+        home.path(),
+        json!([{ "name": "protected", "transport": "http", "url": fixture.url, "headers": {} }]),
+    );
+    mcp_login(home.path(), "protected");
+    (home, fixture)
+}
+
+pub fn echo(id: &str, text: &str) -> String {
+    super::turn_tool_use(
+        id,
+        "mcp__protected__echo",
+        &json!({ "text": text }).to_string(),
+    )
+}
+
+/// One assistant turn calling `echo` once per text, all at once.
+pub fn echoes(texts: &[&str]) -> String {
+    let mut events = vec![
+        json!({ "type": "message_start", "message": { "usage": { "input_tokens": 10, "output_tokens": 1 } } }),
+    ];
+    for (i, text) in texts.iter().enumerate() {
+        events.push(json!({ "type": "content_block_start", "index": i, "content_block": { "type": "tool_use", "id": format!("toolu_p{i}"), "name": "mcp__protected__echo", "input": {} } }));
+        events.push(json!({ "type": "content_block_delta", "index": i, "delta": { "type": "input_json_delta", "partial_json": json!({ "text": text }).to_string() } }));
+        events.push(json!({ "type": "content_block_stop", "index": i }));
+    }
+    events.push(json!({ "type": "message_delta", "delta": { "stop_reason": "tool_use" }, "usage": { "output_tokens": 8 } }));
+    events.push(json!({ "type": "message_stop" }));
+    super::sse(&events)
+}
+
+/// Run one `agent run` against `home` with the scripted model turns; the model request bodies.
+pub fn run(home: &std::path::Path, turns: Vec<String>) -> Vec<String> {
+    let (base, bodies) = super::spawn_model_server(turns);
+    let cwd = tempfile::tempdir().unwrap();
+    let out = super::run_cmd(super::BIN)
+        .env("HOME", home)
+        .args([
+            "run",
+            "call the protected echo tool",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--max-steps",
+            "8",
+            "--no-session-persistence",
+        ])
+        .current_dir(cwd.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "run failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    bodies.lock().unwrap().clone()
+}
+
+/// The tool results in a recorded model request (headers + body): `(tool_use_id, text, is_error)`.
+pub fn tool_results(request: &str) -> Vec<(String, String, bool)> {
+    let body = request.split_once("\r\n\r\n").map_or(request, |(_, b)| b);
+    let v: Value = serde_json::from_str(body).unwrap();
+    let mut out = Vec::new();
+    for m in v["messages"].as_array().unwrap() {
+        for b in m["content"].as_array().into_iter().flatten() {
+            if b["type"] == "tool_result" {
+                let text = match &b["content"] {
+                    Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                out.push((
+                    b["tool_use_id"].as_str().unwrap_or_default().to_owned(),
+                    text,
+                    b["is_error"].as_bool().unwrap_or(false),
+                ));
+            }
+        }
+    }
+    out
 }

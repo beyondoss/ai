@@ -356,10 +356,16 @@ impl HttpClient {
         let parsed = serde_json::from_str::<Value>(&body).ok();
         let Some(value) = parsed.filter(|v| v.get("result").is_some() || v.get("error").is_some())
         else {
-            // As rmcp's client: a success that is not a JSON-RPC message, for anything but a
-            // request, is an acceptance; a 4xx to `server/discover` is the legacy server's way of
-            // saying it has none.
-            if status.is_success() && !is_request {
+            // As rmcp's client: a JSON success that is not a JSON-RPC message, for a notification
+            // or a reply, is an acceptance. For a *request* rmcp would call it accepted too and then
+            // wait for an answer that never comes, until the request times out; a request must
+            // be answered with its response (or an SSE stream carrying it), so here it fails at
+            // once instead. A 4xx to `server/discover` is the legacy server's way of saying it
+            // has none.
+            let json = content_type
+                .as_deref()
+                .is_some_and(|ct| ct.starts_with("application/json"));
+            if status.is_success() && !is_request && json {
                 return Ok(StreamableHttpPostResponse::Accepted);
             }
             if status.is_client_error() && !session_was_attached && is_discover(&message) {
@@ -760,6 +766,58 @@ mod tests {
         while let Some(chunk) = bounded.next().await {
             assert!(chunk.is_ok(), "{chunk:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_json_success_that_is_not_json_rpc_is_accepted_for_a_notification_but_fails_a_request()
+     {
+        agent_core::ensure_provider();
+        let oauth = HttpClient {
+            client: reqwest::Client::new(),
+            oauth: true,
+        };
+        let not_json_rpc: &'static [u8] = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}";
+        // A notification: accepted, as rmcp's client does.
+        let notification: ClientJsonRpcMessage = serde_json::from_value(
+            json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+        )
+        .unwrap();
+        let url = canned(not_json_rpc, false).await;
+        let got = oauth
+            .post_message(url.into(), notification, None, None, HashMap::new())
+            .await
+            .unwrap();
+        assert!(
+            matches!(got, StreamableHttpPostResponse::Accepted),
+            "{got:?}"
+        );
+        // A request: rmcp would also call it accepted, then wait out the request's whole timeout
+        // for a response that is not coming. Stricter on purpose: it fails now, naming the body.
+        let url = canned(not_json_rpc, false).await;
+        let e = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            oauth.post_message(url.into(), skills_list(), None, None, HashMap::new()),
+        )
+        .await
+        .expect("answered at once, not left to time out")
+        .unwrap_err();
+        assert!(format!("{e}").contains("{\"ok\":true}"), "{e}");
+        // Not JSON at all, for a notification: an error, as rmcp's unexpected-content-type is.
+        let notification: ClientJsonRpcMessage = serde_json::from_value(
+            json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+        )
+        .unwrap();
+        let url = canned(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 6\r\nConnection: close\r\n\r\n<html>",
+            false,
+        )
+        .await;
+        assert!(
+            oauth
+                .post_message(url.into(), notification, None, None, HashMap::new())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
