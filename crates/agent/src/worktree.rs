@@ -164,6 +164,47 @@ async fn ensure_base_dir(git: &Git, repo_root: &Path) -> PathBuf {
 /// rather than hanging the parent's fan-out.
 const REMOTE_GIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// Copies each path argument (relative to the cwd) to the same path under `$1`. A fixed script: the
+/// paths ride as positional parameters, never as text a shell parses. `[ -f ]` follows symlinks, as
+/// `Path::is_file` does on the local side.
+///
+/// Its cost is the processes it forks, about a millisecond each, so it forks as few as it can:
+/// `${f%/*}` takes the parent without a `dirname`, and `mkdir` runs only when the parent changes,
+/// which `ls-files` order (sorted, so siblings are adjacent) makes once per directory. What remains is
+/// one `cp` per file.
+const COPY_FILES_SCRIPT: &str = r#"dst=$1; shift; last=
+for f; do
+  [ -f "$f" ] || continue
+  case $f in */*) d=${f%/*}; [ "$d" = "$last" ] || { mkdir -p -- "$dst/$d" || exit 1; last=$d; } ;; esac
+  cp -- "$f" "$dst/$f" || exit 1
+done"#;
+
+/// Path bytes per [`COPY_FILES_SCRIPT`] invocation. Far under Linux's `ARG_MAX` (2 MiB with the
+/// default stack limit) and any exec endpoint's request cap, while still covering thousands of
+/// typical paths in one round trip.
+const COPY_ARGV_BUDGET: usize = 128 * 1024;
+
+/// Split `items` into runs whose total length (plus one byte each, for the NUL argv separator) stays
+/// within `budget`. An item longer than the budget gets a run of its own rather than being dropped.
+fn argv_chunks(items: Vec<String>, budget: usize) -> Vec<Vec<String>> {
+    let mut chunks = Vec::new();
+    let mut cur = Vec::new();
+    let mut used = 0;
+    for item in items {
+        let len = item.len() + 1;
+        if !cur.is_empty() && used + len > budget {
+            chunks.push(std::mem::take(&mut cur));
+            used = 0;
+        }
+        used += len;
+        cur.push(item);
+    }
+    if !cur.is_empty() {
+        chunks.push(cur);
+    }
+    chunks
+}
+
 /// Where `git` runs for a worktree.
 ///
 /// Worktree isolation is a sequence of `git` invocations against a checkout — `worktree add`, a diff,
@@ -181,8 +222,9 @@ pub enum Git {
     /// A sandbox, reached through the session's exec endpoint.
     Remote {
         runner: std::sync::Arc<dyn crate::tools::exec::CommandRunner>,
-        /// The same sandbox's filesystem. Seeding copies the parent's untracked files into the new
-        /// checkout, and those bytes have to move within the sandbox, not through this process.
+        /// The same sandbox's filesystem, for creating the worktree base directory. Seeding's file
+        /// copy does not go through it: per-file backend calls are a round trip each, so that runs
+        /// as one batched script on `runner` instead (see `copy_files`).
         backend: std::sync::Arc<dyn crate::tools::fs::FsBackend>,
         /// Identifies the owner of the worktrees this runner creates, in place of a PID.
         ///
@@ -240,18 +282,6 @@ impl Git {
                 .create_dir_all(path)
                 .await
                 .map_err(|e| format!("mkdir {}: {e}", path.display())),
-        }
-    }
-
-    /// Is `path` a regular file? Used to skip a symlink or a path that vanished between `ls-files`
-    /// and the copy — a spawn must not fail over one.
-    async fn is_file(&self, path: &Path) -> bool {
-        match self {
-            Self::Local => path.is_file(),
-            Self::Remote { backend, .. } => matches!(
-                backend.stat(path).await,
-                Ok(Some(m)) if m.kind == crate::tools::fs::FileKind::File
-            ),
         }
     }
 
@@ -380,22 +410,64 @@ impl Git {
         }
     }
 
-    /// Copy one file. Within one filesystem in both modes — for a sandbox the bytes go out and back
-    /// through the backend rather than through this process's own disk.
-    async fn copy_file(&self, src: &Path, dst: &Path) -> Result<(), String> {
+    /// Copy `files` (relative to `src`) to the same relative paths under `dst`, creating parent
+    /// directories, and skipping any entry that is not a regular file once symlinks are followed: a
+    /// symlink to nothing, or a path deleted since it was listed. A spawn must not fail over one.
+    ///
+    /// **One batch, not one call per file.** Seeding copies every untracked file in the parent, and a
+    /// per-file stat/mkdir/read/write was four sandbox round trips each — 4,000 sequential execs for a
+    /// working tree with 1,000 new files. Remotely this is one fixed script per argv-sized chunk of
+    /// paths; locally it is one blocking task, so the syscalls stay off the async workers.
+    async fn copy_files(&self, src: &Path, dst: &Path, files: Vec<String>) -> Result<(), String> {
         match self {
-            Self::Local => std::fs::copy(src, dst)
-                .map(|_| ())
-                .map_err(|e| format!("copy {}: {e}", src.display())),
-            Self::Remote { backend, .. } => {
-                let bytes = backend
-                    .read_bytes(src, 0, usize::MAX)
-                    .await
-                    .map_err(|e| format!("read {}: {e}", src.display()))?;
-                backend
-                    .write_bytes(dst, &bytes)
-                    .await
-                    .map_err(|e| format!("write {}: {e}", dst.display()))
+            Self::Local => {
+                let (src, dst) = (src.to_path_buf(), dst.to_path_buf());
+                tokio::task::spawn_blocking(move || {
+                    for rel in &files {
+                        let from = src.join(rel);
+                        if !from.is_file() {
+                            continue;
+                        }
+                        let to = dst.join(rel);
+                        if let Some(parent) = to.parent() {
+                            std::fs::create_dir_all(parent)
+                                .map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+                        }
+                        std::fs::copy(&from, &to)
+                            .map_err(|e| format!("copy {}: {e}", from.display()))?;
+                    }
+                    Ok(())
+                })
+                .await
+                .map_err(|e| format!("copy task failed: {e}"))?
+            }
+            Self::Remote { runner, .. } => {
+                for chunk in argv_chunks(files, COPY_ARGV_BUDGET) {
+                    let mut args = vec![
+                        "-c".to_string(),
+                        COPY_FILES_SCRIPT.to_string(),
+                        "sh".to_string(),
+                        dst.display().to_string(),
+                    ];
+                    args.extend(chunk);
+                    let res = runner
+                        .run(
+                            "sh",
+                            &args,
+                            Some(&src.display().to_string()),
+                            REMOTE_GIT_TIMEOUT,
+                        )
+                        .await
+                        .map_err(|e| format!("copy into {}: {e}", dst.display()))?;
+                    if res.code != Some(0) {
+                        return Err(format!(
+                            "copy into {} failed: {}",
+                            dst.display(),
+                            res.stderr.trim()
+                        ));
+                    }
+                }
+                Ok(())
             }
         }
     }
@@ -691,19 +763,15 @@ impl Worktree {
                 &["ls-files", "--others", "--exclude-standard", "-z"],
             )
             .await?;
-        for raw in listed.split(|b| *b == 0).filter(|s| !s.is_empty()) {
-            let rel =
-                Path::new(std::str::from_utf8(raw).map_err(|e| format!("non-utf8 path: {e}"))?);
-            let src = self.repo_root.join(rel);
-            let dst = self.path.join(rel);
-            // A symlink or a file deleted between `ls-files` and now: skip rather than fail the spawn.
-            if !self.git.is_file(&src).await {
-                continue;
-            }
-            if let Some(parent) = dst.parent() {
-                self.git.create_dir_all(parent).await?;
-            }
-            self.git.copy_file(&src, &dst).await?;
+        let files = listed
+            .split(|b| *b == 0)
+            .filter(|s| !s.is_empty())
+            .map(|raw| String::from_utf8(raw.to_vec()).map_err(|e| format!("non-utf8 path: {e}")))
+            .collect::<Result<Vec<_>, _>>()?;
+        if !files.is_empty() {
+            self.git
+                .copy_files(&self.repo_root, &self.path, files)
+                .await?;
         }
 
         // The baseline. `-A` stages the copied untracked files too, so the child's later delta is
@@ -1346,6 +1414,100 @@ mod tests {
 "
         );
         wt.remove().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn seeding_copies_awkward_untracked_paths_on_both_arms() {
+        // The remote arm hands these to a shell script as positional parameters; a path that a shell
+        // would split, expand, or read as a flag must arrive as itself. The local arm must agree.
+        let awkward = [
+            "deep/er/nested.txt",
+            "with space.txt",
+            "-leading-dash.txt",
+            "it's $HOME `x`.txt",
+            "new\nline.txt",
+            "dir\nwith newline/f.txt",
+        ];
+        for git in [Git::Local, remote_git()] {
+            let repo = repo().await;
+            for (i, rel) in awkward.iter().enumerate() {
+                let p = repo.path().join(rel);
+                std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+                std::fs::write(&p, format!("body {i}\n")).unwrap();
+            }
+            std::os::unix::fs::symlink("with space.txt", repo.path().join("to-file")).unwrap();
+            std::os::unix::fs::symlink("nowhere", repo.path().join("dangling")).unwrap();
+
+            let root = preflight(&git, repo.path()).await.unwrap();
+            let wt = Worktree::create(&git, &root, "awkward").await.unwrap();
+            for (i, rel) in awkward.iter().enumerate() {
+                assert_eq!(
+                    std::fs::read_to_string(wt.path().join(rel)).unwrap(),
+                    format!("body {i}\n"),
+                    "{git:?}: {rel:?}"
+                );
+            }
+            // `is_file` follows symlinks on both arms: a link to a file is copied as its content, a
+            // dangling one is skipped rather than failing the spawn.
+            assert_eq!(
+                std::fs::read_to_string(wt.path().join("to-file")).unwrap(),
+                "body 1\n",
+                "{git:?}"
+            );
+            assert!(
+                std::fs::symlink_metadata(wt.path().join("dangling")).is_err(),
+                "{git:?}"
+            );
+            wt.remove().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_seeding_spans_several_argv_chunks() {
+        // Enough path bytes to need more than one `COPY_FILES_SCRIPT` call: a chunk boundary must
+        // neither drop nor duplicate a file.
+        let repo = repo().await;
+        let name = "n".repeat(100);
+        let count = COPY_ARGV_BUDGET / name.len() + 50;
+        let dir = repo.path().join("many");
+        std::fs::create_dir(&dir).unwrap();
+        for i in 0..count {
+            std::fs::write(dir.join(format!("{name}{i}")), i.to_string()).unwrap();
+        }
+        let git = remote_git();
+        let root = preflight(&git, repo.path()).await.unwrap();
+        let wt = Worktree::create(&git, &root, "chunks").await.unwrap();
+        assert_eq!(
+            std::fs::read_dir(wt.path().join("many")).unwrap().count(),
+            count
+        );
+        assert_eq!(
+            std::fs::read_to_string(wt.path().join(format!("many/{name}{}", count - 1))).unwrap(),
+            (count - 1).to_string()
+        );
+        wt.remove().await.unwrap();
+    }
+
+    #[test]
+    fn argv_chunks_stay_within_budget_and_keep_every_item_in_order() {
+        let items: Vec<String> = (0..10).map(|i| format!("{i:03}")).collect(); // 4 bytes each
+        let chunks = argv_chunks(items.clone(), 10);
+        assert_eq!(
+            chunks.iter().map(Vec::len).collect::<Vec<_>>(),
+            [2, 2, 2, 2, 2]
+        );
+        assert_eq!(chunks.concat(), items);
+        // An item over budget gets a chunk of its own instead of vanishing.
+        let big = vec!["a".into(), "x".repeat(50), "b".into()];
+        assert_eq!(
+            argv_chunks(big.clone(), 10),
+            [
+                vec![big[0].clone()],
+                vec![big[1].clone()],
+                vec![big[2].clone()]
+            ]
+        );
+        assert!(argv_chunks(Vec::new(), 10).is_empty());
     }
 
     #[tokio::test]
