@@ -95,7 +95,7 @@ impl NotificationRouter {
             // which is unknowable — so each is told an event may have been dropped, rather than
             // none. Anything else without a subscription id is dropped, as before.
             if params.get("$oversized") == Some(&Value::Bool(true)) {
-                self.to_every_stream(method, &params);
+                self.to_every_stream(method, params);
                 return;
             }
             tracing::debug!(
@@ -120,11 +120,32 @@ impl NotificationRouter {
         }
     }
 
-    /// Deliver one message to every open stream, with the same overflow rule as [`Self::route`].
-    fn to_every_stream(&self, method: &str, params: &Value) {
+    /// Deliver an over-cap stand-in to every open stream, with the same overflow rule as
+    /// [`Self::route`], stamped with one id for the one dropped message (`$dropped_id`) so a session
+    /// holding several of these streams tells its model once. With no push stream open there is
+    /// nothing it could have been an event for — and when its method was never seen
+    /// (`$ambiguous`) it was likelier something else (a request whose id and method lay past the
+    /// window): it is logged, not reported as a gap.
+    fn to_every_stream(&self, method: &str, mut params: Value) {
+        static DROPPED: AtomicU64 = AtomicU64::new(1);
         let Ok(mut inner) = self.inner.lock() else {
             return;
         };
+        if inner.streams.is_empty() {
+            tracing::warn!(
+                method,
+                ambiguous = params.get("$ambiguous").is_some(),
+                "dropped an over-cap MCP message whose method and routing lay past the size-cap \
+                 window, with no push stream open to report it to"
+            );
+            return;
+        }
+        if let Value::Object(p) = &mut params {
+            p.insert(
+                "$dropped_id".into(),
+                Value::from(DROPPED.fetch_add(1, Ordering::Relaxed)),
+            );
+        }
         inner.streams.retain(|_, slot| {
             let msg = StreamMsg {
                 method: method.to_owned(),
@@ -1230,6 +1251,34 @@ mod tests {
         assert_eq!(rx.try_recv().unwrap().params["i"], 1);
         router.route(n(3), Some(id)); // never forwarded past the drop
         assert!(rx.try_recv().is_err());
+    }
+
+    /// An over-cap stand-in with no routing goes to every open stream, stamped with one id for the
+    /// one dropped message; with no stream open it goes nowhere (and is logged).
+    #[test]
+    fn an_unrouted_stand_in_reaches_every_stream_once_with_one_id() {
+        let stand_in = || {
+            CustomNotification::new(
+                "notifications/events/event",
+                Some(json!({ "$oversized": true, "$ambiguous": true })),
+            )
+        };
+        let router = NotificationRouter::default();
+        router.route(stand_in(), None); // no stream: nothing to deliver to, nothing panics
+        let (tx_a, mut rx_a) = mpsc::channel(4);
+        let (tx_b, mut rx_b) = mpsc::channel(4);
+        router.register(RequestId::Number(1), tx_a, Arc::default());
+        router.register(RequestId::Number(2), tx_b, Arc::default());
+        router.route(stand_in(), None);
+        let (a, b) = (rx_a.try_recv().unwrap(), rx_b.try_recv().unwrap());
+        assert!(a.params["$dropped_id"].is_u64(), "{:?}", a.params);
+        assert_eq!(a.params["$dropped_id"], b.params["$dropped_id"]);
+        router.route(stand_in(), None);
+        assert_ne!(
+            rx_a.try_recv().unwrap().params["$dropped_id"],
+            a.params["$dropped_id"],
+            "a second dropped message is a second id"
+        );
     }
 
     /// A loopback server answering 401 to any request without `Bearer fresh`, 200 otherwise;

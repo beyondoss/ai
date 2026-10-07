@@ -496,6 +496,10 @@ struct Hub {
     /// `mcp_events_*` commands in flight — spawned so none ever blocks the session's command loop.
     command_tasks: Mutex<tokio::task::JoinSet<()>>,
     owns_configured: bool,
+    /// The last few over-cap messages a stdio connection reported to every push stream at once
+    /// (`$dropped_id`): each is told to the model once, however many of this session's
+    /// subscriptions it reached.
+    dropped_seen: Mutex<std::collections::VecDeque<u64>>,
 }
 
 /// A session's MCP Events client: its subscriptions, its coalescer, and the injection path into
@@ -553,6 +557,7 @@ impl McpEventsHub {
             store,
             command_tasks: Mutex::new(tokio::task::JoinSet::new()),
             owns_configured: cfg.owns_configured,
+            dropped_seen: Mutex::new(std::collections::VecDeque::new()),
         });
         let weak_hub = Arc::downgrade(&hub);
         let on_change: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
@@ -1390,10 +1395,39 @@ impl Hub {
         if let Some(cursor) = stand_in.get("cursor") {
             carrier["cursor"] = cursor.clone();
         }
-        self.gap(spec, state, &carrier);
+        // Taken for an event without its method seen: said so, not asserted.
+        if stand_in.get("$ambiguous") == Some(&json!(true)) {
+            carrier["possibly_not_an_event"] = json!(true);
+        }
+        // One dropped message reported to several of this session's subscriptions: each keeps
+        // its own state, the model is told once.
+        let tell_model = match stand_in.get("$dropped_id").and_then(Value::as_u64) {
+            Some(id) => {
+                let mut seen = self
+                    .dropped_seen
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let first = !seen.contains(&id);
+                if first {
+                    if seen.len() == 64 {
+                        seen.pop_front();
+                    }
+                    seen.push_back(id);
+                }
+                first
+            }
+            None => true,
+        };
+        self.gap_with(spec, state, &carrier, tell_model);
     }
 
     fn gap(&self, spec: &SubSpec, state: &SubState, carrier: &Value) {
+        self.gap_with(spec, state, carrier, true);
+    }
+
+    /// Record a gap: the subscription's position, its status frame, and — when `tell_model` —
+    /// the notice queued for the model.
+    fn gap_with(&self, spec: &SubSpec, state: &SubState, carrier: &Value, tell_model: bool) {
         if carrier
             .as_object()
             .is_some_and(|o| o.contains_key("cursor"))
@@ -1402,19 +1436,22 @@ impl Hub {
         }
         let reason = carrier.get("reason").and_then(Value::as_str);
         let event_id = carrier.get("eventId").filter(|v| !v.is_null()).cloned();
-        self.status_event(
-            spec,
-            "gap",
-            json!({ "cursor": state.cursor(), "reason": reason, "event_id": event_id }),
-        );
-        if spec.sub.action != McpEventAction::Notify {
+        let possibly_not = carrier.get("possibly_not_an_event") == Some(&json!(true));
+        let mut status =
+            json!({ "cursor": state.cursor(), "reason": reason, "event_id": event_id });
+        if possibly_not {
+            status["possibly_not_an_event"] = json!(true);
+        }
+        self.status_event(spec, "gap", status);
+        if tell_model && spec.sub.action != McpEventAction::Notify {
             let queued = self.store.push_pending(PendingEvent::new(
                 spec.sub.action,
                 spec.server.clone(),
                 spec.sub.name.clone(),
                 spec.arguments(),
                 spec.sub.instructions.clone(),
-                json!({ "gap": true, "cursor": state.cursor(), "reason": reason, "eventId": event_id }),
+                json!({ "gap": true, "cursor": state.cursor(), "reason": reason, "eventId": event_id,
+                        "possibly_not_an_event": possibly_not }),
             ));
             if !queued {
                 tracing::warn!("pending queue full; a gap notice was not queued for the model");
@@ -2285,8 +2322,13 @@ fn render_injection(batch: u64, events: &[PendingEvent]) -> String {
     for e in events {
         if e.event.get("gap") == Some(&json!(true)) {
             if e.event.get("reason") == Some(&json!("oversized")) {
+                let what = if e.event.get("possibly_not_an_event") == Some(&json!(true)) {
+                    "A message — possibly not an event — "
+                } else {
+                    "An event "
+                };
                 out.push_str(&format!(
-                    "\n[gap] An event for `{}` on `{}`{} was larger than the message-size limit and \
+                    "\n[gap] {what}for `{}` on `{}`{} was larger than the message-size limit and \
                      was dropped unread. If it matters, re-check the authoritative state with tools.\n",
                     e.name,
                     e.server,
@@ -2480,6 +2522,20 @@ mod tests {
         assert!(injection_batch(&line).is_some());
         shutdown.cancel();
         let _ = task.await;
+    }
+
+    /// An over-cap gap whose message was taken for an event without its method seen says it may
+    /// not have been one.
+    #[test]
+    fn an_ambiguous_oversized_gap_says_it_may_not_have_been_an_event() {
+        let gap = |possibly: bool| {
+            pending(
+                McpEventAction::Steer,
+                json!({ "gap": true, "reason": "oversized", "possibly_not_an_event": possibly }),
+            )
+        };
+        assert!(render_injection(1, &[gap(true)]).contains("possibly not an event"));
+        assert!(!render_injection(1, &[gap(false)]).contains("possibly not an event"));
     }
 
     /// Every injection's text names its batch on its first line — for anyone reading the
