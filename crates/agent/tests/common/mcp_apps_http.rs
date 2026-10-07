@@ -18,15 +18,26 @@ use std::thread;
 use serde_json::{Value, json};
 
 const VIEW_URI: &str = "ui://apps-http/weather";
+const HUGE_URI: &str = "ui://apps-http/huge";
+/// The unadvertised oversized view `huge_view` serves: far past any host's view cap, and past what
+/// loopback socket buffers absorb, so a client that refuses it unread leaves most of it unsent.
+pub const HUGE_VIEW_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct HttpAppsFixture {
     pub url: String,
     ui_requests: Arc<AtomicUsize>,
     plain_requests: Arc<AtomicUsize>,
+    huge_sent: Arc<AtomicUsize>,
 }
 
 impl HttpAppsFixture {
+    /// How many bytes of `huge_view`'s view the last read actually got onto the wire before the
+    /// client stopped reading (`HUGE_VIEW_BYTES` plus framing when read whole).
+    pub fn huge_bytes_sent(&self) -> usize {
+        self.huge_sent.load(Ordering::SeqCst)
+    }
+
     /// Requests whose client advertised `io.modelcontextprotocol/ui`.
     pub fn ui_requests(&self) -> usize {
         self.ui_requests.load(Ordering::SeqCst)
@@ -51,6 +62,8 @@ pub fn spawn_http_apps_fixture() -> HttpAppsFixture {
     let ui_requests = Arc::new(AtomicUsize::new(0));
     let plain_requests = Arc::new(AtomicUsize::new(0));
     let (ui, plain) = (ui_requests.clone(), plain_requests.clone());
+    let huge_sent = Arc::new(AtomicUsize::new(0));
+    let huge = huge_sent.clone();
     thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { continue };
@@ -112,18 +125,55 @@ pub fn spawn_http_apps_fixture() -> HttpAppsFixture {
                         "description": "Show the weather.",
                         "inputSchema": { "type": "object", "properties": {} },
                     });
+                    let mut tools = vec![];
                     if has_ui {
                         tool["_meta"] = json!({ "ui": { "resourceUri": VIEW_URI } });
+                        tools.push(json!({
+                            "name": "huge_view",
+                            "description": "A tool whose (unadvertised) view is 64 MiB.",
+                            "inputSchema": { "type": "object", "properties": {} },
+                            "_meta": { "ui": { "resourceUri": HUGE_URI } },
+                        }));
                     }
-                    json!({ "tools": [tool] })
+                    tools.insert(0, tool);
+                    json!({ "tools": tools })
                 }
                 "resources/list" => json!({ "resources": [] }),
                 "prompts/list" => json!({ "prompts": [] }),
+                "resources/read" if request.pointer("/params/uri") == Some(&json!(HUGE_URI)) => {
+                    let text = "x".repeat(HUGE_VIEW_BYTES);
+                    let body = json!({ "jsonrpc": "2.0", "id": id, "result": { "contents": [{
+                        "uri": HUGE_URI, "mimeType": "text/html;profile=mcp-app", "text": text,
+                    }] } });
+                    let encoded = serde_json::to_vec(&body).unwrap();
+                    let header = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        encoded.len()
+                    );
+                    huge.store(0, Ordering::SeqCst);
+                    if stream.write_all(header.as_bytes()).is_ok() {
+                        let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(3)));
+                        for chunk in encoded.chunks(64 * 1024) {
+                            match stream.write_all(chunk) {
+                                Ok(()) => {
+                                    huge.fetch_add(chunk.len(), Ordering::SeqCst);
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                    }
+                    continue;
+                }
                 "resources/read" => json!({ "contents": [{
                     "uri": VIEW_URI,
                     "mimeType": "text/html;profile=mcp-app",
                     "text": "<!DOCTYPE html><html><body>service view</body></html>",
                 }] }),
+                "tools/call" if request.pointer("/params/name") == Some(&json!("huge_view")) => {
+                    json!({
+                        "content": [{ "type": "text", "text": "huge-view-text" }],
+                    })
+                }
                 "tools/call" => json!({
                     "content": [{ "type": "text", "text": "service-weather" }],
                     "structuredContent": { "where": "service" },
@@ -144,6 +194,7 @@ pub fn spawn_http_apps_fixture() -> HttpAppsFixture {
         }
     });
     HttpAppsFixture {
+        huge_sent,
         url: format!("http://{addr}/mcp"),
         ui_requests,
         plain_requests,

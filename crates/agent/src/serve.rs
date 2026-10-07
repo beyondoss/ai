@@ -3585,30 +3585,73 @@ pub(crate) async fn serve_session(
     // Cheap enough to call every pass: `Session::messages` is an `Arc`, so an unchanged transcript costs
     // one pointer comparison. Only a genuine change pays for `active_ids()`.
     let mut last_history: Arc<Vec<agent_core::Message>> = Arc::new(Vec::new());
-    // The attached MCP App view context last written to this session's sidecar (see
-    // `mcp_apps::context_file`) — restored onto a freshly loaded transcript (startup, a session
-    // switch) and rewritten when it changes, so a view's context rides the same turn across a
-    // restart. Not in service mode: a tenant's view text is never written outside its sealed store.
+    // MCP App view state kept beside the session (see `mcp_apps::Sidecar`): the attached view
+    // context and the view replay store. Loaded when the session here changes (startup, a switch, a
+    // fork or clone) and rewritten when either moves, so both survive a daemon restart — sealed with
+    // the tenant's key in service mode, never in the clear. `app_state_for` is the session file they
+    // were last loaded for.
+    let mut app_state_for: Option<std::path::PathBuf> = None;
     let mut saved_app_context = String::from("[]");
+    let mut saved_app_views: u64 = 0;
     macro_rules! sync_history {
         () => {{
             let changed = !Arc::ptr_eq(&session.messages, &last_history);
             if changed {
                 last_history = session.messages.clone();
             }
-            if service.is_none()
-                && let Some(file) = persistence.session_file()
-            {
-                let path = crate::tools::mcp_apps::context_file(file);
-                if changed && session.request_blocks.is_empty() {
-                    crate::tools::mcp_apps::restore_context(&path, &mut session);
-                    saved_app_context = crate::tools::mcp_apps::context_records(&session);
+            if let Some(file) = persistence.session_file().map(std::path::Path::to_path_buf) {
+                let seal = service
+                    .as_ref()
+                    .map(|svc| (Arc::clone(svc.codec()), persistence.session_id().to_string()));
+                let ctx = crate::tools::mcp_apps::Sidecar::new(
+                    &file,
+                    crate::tools::mcp_apps::Sidecar::CONTEXT,
+                    seal.clone(),
+                );
+                let views = crate::tools::mcp_apps::Sidecar::new(
+                    &file,
+                    crate::tools::mcp_apps::Sidecar::VIEWS,
+                    seal,
+                );
+                if app_state_for.as_deref() != Some(file.as_path()) {
+                    app_state_for = Some(file.clone());
+                    if let Some(records) = ctx.read() {
+                        crate::tools::mcp_apps::attach_context_records(&records, &mut session);
+                    }
+                    // Forces one write, so context carried in by a fork/clone lands in its sidecar.
+                    saved_app_context = String::new();
+                    let mut fanout = lock_ignoring_poison(&out_conn);
+                    if let Some(bytes) = views.read() {
+                        fanout.restore_app_views(&bytes);
+                    }
+                    saved_app_views = fanout.app_views_version();
+                } else if changed && session.request_blocks.is_empty() {
+                    // The same session's transcript was reloaded (a branch switch): re-attach.
+                    crate::tools::mcp_apps::attach_context_records(
+                        saved_app_context.as_bytes(),
+                        &mut session,
+                    );
                 }
-                let records = crate::tools::mcp_apps::context_records(&session);
-                if records != saved_app_context {
-                    match crate::tools::mcp_apps::save_context(&path, &records) {
-                        Ok(()) => saved_app_context = records,
-                        Err(e) => eprintln!("serve: could not save MCP App view context: {e}"),
+                // A store another owner took over is not ours to write.
+                if !persistence.superseded() {
+                    let records = crate::tools::mcp_apps::context_records(&session);
+                    if records != saved_app_context {
+                        let body = (records != "[]").then_some(records.as_bytes());
+                        match ctx.write(body) {
+                            Ok(()) => saved_app_context = records,
+                            Err(e) => eprintln!("serve: could not save MCP App view context: {e}"),
+                        }
+                    }
+                    let (version, snapshot) = {
+                        let fanout = lock_ignoring_poison(&out_conn);
+                        let version = fanout.app_views_version();
+                        (version, (version != saved_app_views).then(|| fanout.app_views_snapshot()))
+                    };
+                    if let Some(snapshot) = snapshot {
+                        match views.write(snapshot.as_deref()) {
+                            Ok(()) => saved_app_views = version,
+                            Err(e) => eprintln!("serve: could not save MCP App views: {e}"),
+                        }
                     }
                 }
             }
@@ -3856,7 +3899,9 @@ pub(crate) async fn serve_session(
                 continue;
             }
             match persistence.fork(upto, target_id, before, starting_level) {
-                Ok((s, restored_model, restored_level)) => {
+                Ok((mut s, restored_model, restored_level)) => {
+                    // The fork keeps the view context of the turns it copies (see `mcp_apps::carry_context`).
+                    crate::tools::mcp_apps::carry_context(&session, &mut s);
                     session = s;
                     repoint_session_memory!();
                     reset_exec_endpoint!();
@@ -3948,7 +3993,9 @@ pub(crate) async fn serve_session(
                 continue;
             }
             match persistence.fork(usize::MAX, None, false, starting_level) {
-                Ok((s, restored_model, restored_level)) => {
+                Ok((mut s, restored_model, restored_level)) => {
+                    // The clone keeps the view context its turns carried (see `mcp_apps::carry_context`).
+                    crate::tools::mcp_apps::carry_context(&session, &mut s);
                     session = s;
                     repoint_session_memory!();
                     reset_exec_endpoint!();
@@ -5990,6 +6037,7 @@ pub(crate) async fn serve_session(
                         cfg.no_tools,
                         app_sink.clone(),
                         app_redact.clone(),
+                        lock_ignoring_poison(&out_conn).app_view_servers(),
                     ) {
                         Ok(pool) => {
                             apps_generation = mcp_enabled.apps().map(|view| view.generation());
@@ -10924,11 +10972,15 @@ pub(crate) struct OutFanout {
     /// [`APP_VIEWS_MAX`]/[`APP_VIEWS_MAX_BYTES`], oldest view dropped first.
     app_views: std::collections::VecDeque<AppViewFrames>,
     app_views_bytes: usize,
+    /// Bumped on every change to `app_views`, so the idle loop persists the store only when it moved.
+    app_views_version: u64,
 }
 
 /// One MCP App view's frames, for replay on attach (see [`OutFanout::app_views`]).
 struct AppViewFrames {
     app_id: String,
+    /// The server whose tool opened the view — what a restored view's bridge requests bind to.
+    server: String,
     /// The frames as sent — final JSON text, so their size is exact ([`OutFrame::approx_len`]) and a
     /// replay is a copy, not a re-serialization.
     open: Bytes,
@@ -11142,6 +11194,11 @@ impl OutFanout {
                 if bytes <= APP_VIEWS_MAX_BYTES {
                     self.app_views.push_back(AppViewFrames {
                         app_id,
+                        server: frame
+                            .get("server")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned(),
                         open: bytes_line.clone(),
                         result: None,
                         bytes,
@@ -11158,14 +11215,7 @@ impl OutFanout {
             "mcp_app_teardown" => self.app_views.retain(|v| v.app_id != app_id),
             _ => {}
         }
-        self.app_views_bytes = self.app_views.iter().map(|v| v.bytes).sum();
-        while self.app_views.len() > APP_VIEWS_MAX
-            || (self.app_views_bytes > APP_VIEWS_MAX_BYTES && self.app_views.len() > 1)
-        {
-            if let Some(dropped) = self.app_views.pop_front() {
-                self.app_views_bytes -= dropped.bytes;
-            }
-        }
+        self.trim_app_views();
         let recording = std::mem::replace(&mut self.recording, false);
         self.broadcast(raw);
         self.recording = recording;
@@ -11175,6 +11225,99 @@ impl OutFanout {
     pub(crate) fn clear_app_views(&mut self) {
         self.app_views.clear();
         self.app_views_bytes = 0;
+        self.app_views_version += 1;
+    }
+
+    /// Re-impose the store's bounds (newest views kept) and note that it changed.
+    fn trim_app_views(&mut self) {
+        self.app_views_bytes = self.app_views.iter().map(|v| v.bytes).sum();
+        while self.app_views.len() > APP_VIEWS_MAX
+            || (self.app_views_bytes > APP_VIEWS_MAX_BYTES && self.app_views.len() > 1)
+        {
+            if let Some(dropped) = self.app_views.pop_front() {
+                self.app_views_bytes -= dropped.bytes;
+            }
+        }
+        self.app_views_version += 1;
+    }
+
+    /// The replay store's version — see `app_views_version`.
+    pub(crate) fn app_views_version(&self) -> u64 {
+        self.app_views_version
+    }
+
+    /// The kept views' `(app_id, server)` — what a fresh `set_mcp_apps` seeds its open-view map with,
+    /// so a view restored after a restart can still call back.
+    pub(crate) fn app_view_servers(&self) -> Vec<(String, String)> {
+        self.app_views
+            .iter()
+            .map(|v| (v.app_id.clone(), v.server.clone()))
+            .collect()
+    }
+
+    /// The replay store as the views sidecar records it (`None` when empty): one object per view,
+    /// oldest first, carrying the frames exactly as sent.
+    pub(crate) fn app_views_snapshot(&self) -> Option<Vec<u8>> {
+        if self.app_views.is_empty() {
+            return None;
+        }
+        let parse = |b: &Bytes| serde_json::from_slice::<Value>(b).unwrap_or(Value::Null);
+        let views: Vec<Value> = self
+            .app_views
+            .iter()
+            .map(|v| {
+                json!({
+                    "app_id": v.app_id,
+                    "server": v.server,
+                    "open": parse(&v.open),
+                    "result": v.result.as_ref().map(parse),
+                })
+            })
+            .collect();
+        serde_json::to_vec(&views).ok()
+    }
+
+    /// Replace the replay store with a views sidecar's contents (see [`Self::app_views_snapshot`]),
+    /// re-bounded by the same budget. Malformed entries are skipped.
+    pub(crate) fn restore_app_views(&mut self, bytes: &[u8]) {
+        let Ok(Value::Array(views)) = serde_json::from_slice::<Value>(bytes) else {
+            return;
+        };
+        self.app_views.clear();
+        for v in views {
+            let (Some(app_id), Some(open)) = (v["app_id"].as_str(), v.get("open")) else {
+                continue;
+            };
+            if open["type"] != "mcp_app_open" {
+                continue;
+            }
+            let Ok(open) = serde_json::to_vec(open) else {
+                continue;
+            };
+            let result = v
+                .get("result")
+                .filter(|r| !r.is_null())
+                .and_then(|r| serde_json::to_vec(r).ok())
+                .map(Bytes::from);
+            let bytes = open.len() + result.as_ref().map_or(0, Bytes::len);
+            self.app_views.push_back(AppViewFrames {
+                app_id: app_id.to_owned(),
+                server: v["server"].as_str().unwrap_or_default().to_owned(),
+                open: Bytes::from(open),
+                result,
+                bytes,
+            });
+        }
+        self.trim_app_views();
+        // A connection may already be attached (the daemon attaches before the session's first
+        // idle pass, where this runs): replay the restored views to it now, as an attach would.
+        for view in &self.app_views {
+            for frame in std::iter::once(&view.open).chain(view.result.as_ref()) {
+                for (_, tx) in &self.sinks {
+                    let _ = tx.try_send(app_replay_frame(frame));
+                }
+            }
+        }
     }
 
     /// A run is starting: record what it broadcasts, for replay to anyone who attaches mid-turn.
@@ -11602,6 +11745,60 @@ async fn write_frame(out: &mut tokio::io::Stdout, line: &[u8]) -> std::io::Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A views sidecar of `n` views, oldest first, each opening `html_bytes` of HTML.
+    fn views_sidecar(n: usize, html_bytes: usize) -> Vec<u8> {
+        let html = "h".repeat(html_bytes);
+        let views: Vec<Value> = (0..n)
+            .map(|i| {
+                json!({
+                    "app_id": format!("app-{i:02}"),
+                    "server": "s",
+                    "open": { "type": "mcp_app_open", "app_id": format!("app-{i:02}"), "html": html },
+                    "result": { "type": "mcp_app_result", "app_id": format!("app-{i:02}") },
+                })
+            })
+            .collect();
+        serde_json::to_vec(&views).unwrap()
+    }
+
+    fn kept_ids(fanout: &OutFanout) -> Vec<String> {
+        fanout
+            .app_view_servers()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect()
+    }
+
+    #[test]
+    fn a_restored_views_sidecar_is_re_bounded_to_the_view_count() {
+        // A sidecar written by an older binary, or edited on disk, may hold more than the store
+        // keeps: the restore re-imposes the bound, newest views kept.
+        let mut fanout = OutFanout::default();
+        fanout.restore_app_views(&views_sidecar(APP_VIEWS_MAX + 4, 16));
+        let want: Vec<String> = (4..APP_VIEWS_MAX + 4)
+            .map(|i| format!("app-{i:02}"))
+            .collect();
+        assert_eq!(kept_ids(&fanout), want);
+        // And what it would write back is the bounded store, not the oversized input.
+        let snapshot: Vec<Value> =
+            serde_json::from_slice(&fanout.app_views_snapshot().unwrap()).unwrap();
+        assert_eq!(snapshot.len(), APP_VIEWS_MAX);
+    }
+
+    #[test]
+    fn a_restored_views_sidecar_is_re_bounded_to_the_byte_budget() {
+        // Four 3 MiB views are 12 MiB: over the 8 MiB budget, so only the newest two survive.
+        let mut fanout = OutFanout::default();
+        fanout.restore_app_views(&views_sidecar(4, 3 * 1024 * 1024));
+        assert_eq!(kept_ids(&fanout), ["app-02", "app-03"]);
+        let snapshot = fanout.app_views_snapshot().unwrap();
+        assert!(
+            snapshot.len() <= APP_VIEWS_MAX_BYTES,
+            "{} bytes kept",
+            snapshot.len()
+        );
+    }
 
     #[test]
     fn pending_login_guard_resets_the_slot_even_when_the_task_panics() {

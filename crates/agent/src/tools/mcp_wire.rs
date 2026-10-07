@@ -8,7 +8,9 @@
 //! raw bytes before `rmcp` parses them. For stdio that is the one stdio transport
 //! ([`crate::tools::mcp_stdio`]); for streamable HTTP it is [`HttpClient`] here, which wraps the
 //! `reqwest` client `rmcp` drives and answers `skills/*` POSTs itself (with the exact URI, session,
-//! auth and standard headers the transport handed it), delegating everything else untouched.
+//! auth and standard headers the transport handed it), delegating everything else untouched. The
+//! same request path ([`HttpClient::post_bounded`]) serves `mcp_view_http`'s capped MCP App view
+//! reads.
 //!
 //! Delete this module when the upstream fix ships.
 
@@ -47,10 +49,11 @@ const DEFAULT_MAX_SKILLS_EVENT: usize = 32 * 1024 * 1024;
 const RESERVED_HEADERS: [&str; 3] = ["accept", "mcp-session-id", "last-event-id"];
 
 /// Bound an SSE byte stream: an event (bytes since the last blank line) larger than `max` ends the
-/// stream with an error rather than buffering without limit.
+/// stream with an error rather than buffering without limit, and sets `over`.
 fn bounded<S>(
     stream: S,
     max: usize,
+    over: Arc<std::sync::atomic::AtomicBool>,
 ) -> impl futures::Stream<Item = Result<bytes::Bytes, std::io::Error>>
 where
     S: futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>>,
@@ -62,12 +65,42 @@ where
             Err(e) => return std::future::ready(Some(Err(std::io::Error::other(e)))),
         };
         if state.feed(&chunk) > max {
+            over.store(true, std::sync::atomic::Ordering::Relaxed);
             return std::future::ready(Some(Err(std::io::Error::other(format!(
                 "an SSE event exceeded the maximum size of {max} bytes"
             )))));
         }
         std::future::ready(Some(Ok(chunk)))
     })
+}
+
+/// How large a response [`HttpClient::post_bounded`] reads, and what one larger becomes.
+pub(crate) struct Limit {
+    /// The largest JSON body, or SSE event, read.
+    pub(crate) max: usize,
+    pub(crate) over: OverLimit,
+}
+
+/// What a response over its size limit becomes.
+#[derive(Clone)]
+pub(crate) enum OverLimit {
+    /// A transport error: the request fails as any undeliverable one does.
+    Fail,
+    /// A JSON-RPC error answering the request with this id, so the caller sees an ordinary failed
+    /// request (an MCP App view read, which then falls back to text).
+    Refuse(Value),
+}
+
+/// The JSON-RPC error a refused response is replaced with.
+fn refusal(id: &Value, max: usize) -> Result<ServerJsonRpcMessage, serde_json::Error> {
+    serde_json::from_value(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": -32000,
+            "message": format!("MCP message over {max} bytes refused by the host"),
+        },
+    }))
 }
 
 /// Where SSE events end, tracked byte by byte across chunks: an event ends at a blank line, whatever
@@ -109,43 +142,47 @@ impl EventBoundary {
 }
 
 /// A non-SSE response body, read up to `max` bytes — a server cannot make the client buffer without
-/// limit by sending a huge (or endless) JSON body.
+/// limit by sending a huge (or endless) JSON body. `None` once it passes `max` (the rest unread).
 async fn capped_body(
     response: reqwest::Response,
     max: usize,
-) -> Result<String, StreamableHttpError<reqwest::Error>> {
+) -> Result<Option<String>, StreamableHttpError<reqwest::Error>> {
     use futures::StreamExt as _;
     let mut body = Vec::new();
     let mut chunks = response.bytes_stream();
     while let Some(chunk) = chunks.next().await {
         let chunk = chunk.map_err(StreamableHttpError::Client)?;
         if body.len() + chunk.len() > max {
-            return Err(StreamableHttpError::UnexpectedServerResponse(Cow::Owned(
-                format!("a skills response body exceeded the maximum size of {max} bytes"),
-            )));
+            return Ok(None);
         }
         body.extend_from_slice(&chunk);
     }
-    Ok(String::from_utf8_lossy(&body).into_owned())
+    Ok(Some(String::from_utf8_lossy(&body).into_owned()))
 }
 
 impl HttpClient {
-    /// One `skills/*` POST, built and its status interpreted the way `rmcp`'s own `reqwest` client
-    /// does — reserved headers refused, 401/403 surfaced as the auth errors `rmcp` acts on, a 404 on a
-    /// session as `SessionExpired` so it re-initializes — with the result rescued before `rmcp`
-    /// parses it. An SSE response is handed back **as a stream**, each event rescued as it
-    /// arrives: `rmcp` reads it incrementally, routes any server→client message on it, and stops at
-    /// the response, so a server that keeps the stream open costs nothing.
-    async fn post_skills(
+    /// One POST this module answers itself — a `skills/*` request, or an MCP App view read
+    /// (`mcp_view_http`) — built and its status interpreted the way `rmcp`'s own `reqwest` client
+    /// does: reserved headers refused, 401/403 with a `WWW-Authenticate` surfaced as the
+    /// `AuthRequired`/`InsufficientScope` errors `rmcp` and its callers act on, a 404 on a session as
+    /// `SessionExpired` so it re-initializes. The result is rescued before `rmcp` parses it. An SSE
+    /// response is handed back **as a stream**, each event rescued as it arrives: `rmcp` reads it
+    /// incrementally, routes every server→client message on it (progress, requests, logs), and stops
+    /// at the response, so a server that keeps the stream open costs nothing.
+    ///
+    /// Nothing is buffered past `limit.max`: a JSON body (refused up front by its `Content-Length`
+    /// when it declares one) or one SSE event over it becomes what `limit.over` says.
+    pub(crate) async fn post_bounded(
         &self,
         uri: Arc<str>,
         message: ClientJsonRpcMessage,
         session_id: Option<Arc<str>>,
         auth_header: Option<String>,
         custom_headers: HashMap<HeaderName, HeaderValue>,
-        max_sse_event_size: usize,
+        limit: Limit,
     ) -> Result<StreamableHttpPostResponse, StreamableHttpError<reqwest::Error>> {
         use futures::StreamExt as _;
+        let Limit { max, over } = limit;
         let mut request = self
             .0
             .post(uri.as_ref())
@@ -217,9 +254,11 @@ impl HttpClient {
             .is_some_and(|ct| ct.starts_with("text/event-stream"))
             && status.is_success()
         {
+            let overflowed = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let events = sse_stream::SseStream::from_bytes_stream(bounded(
                 response.bytes_stream(),
-                max_sse_event_size,
+                max,
+                overflowed.clone(),
             ))
             .map(|event| {
                 event.map(|mut event| {
@@ -230,11 +269,58 @@ impl HttpClient {
                     }
                     event
                 })
-            })
-            .boxed();
+            });
+            let events = match over {
+                OverLimit::Fail => events.boxed(),
+                // The event over the limit becomes the refusal, and the stream ends there.
+                OverLimit::Refuse(id) => {
+                    let refused = sse_stream::Sse {
+                        event: None,
+                        data: Some(serde_json::to_string(&refusal(&id, max)?)?),
+                        id: None,
+                        retry: None,
+                    };
+                    events
+                        .scan(false, move |ended, event| {
+                            if *ended {
+                                return std::future::ready(None);
+                            }
+                            if event.is_err()
+                                && overflowed.load(std::sync::atomic::Ordering::Relaxed)
+                            {
+                                *ended = true;
+                                tracing::warn!(max, "refused an MCP message streamed over its cap");
+                                return std::future::ready(Some(Ok(refused.clone())));
+                            }
+                            std::future::ready(Some(event))
+                        })
+                        .boxed()
+                }
+            };
             return Ok(StreamableHttpPostResponse::Sse(events, session));
         }
-        let body = capped_body(response, max_sse_event_size).await?;
+        let declared_over = response
+            .content_length()
+            .is_some_and(|len| usize::try_from(len).map_or(true, |len| len > max));
+        let body = if declared_over {
+            None
+        } else {
+            capped_body(response, max).await?
+        };
+        let Some(body) = body else {
+            return match over {
+                OverLimit::Fail => Err(StreamableHttpError::UnexpectedServerResponse(Cow::Owned(
+                    format!("a response body exceeded the maximum size of {max} bytes"),
+                ))),
+                OverLimit::Refuse(id) => {
+                    tracing::warn!(max, "refused an MCP message over its cap");
+                    Ok(StreamableHttpPostResponse::Json(
+                        refusal(&id, max)?,
+                        session,
+                    ))
+                }
+            };
+        };
         let body = match crate::tools::mcp_stdio::rescue(body.as_bytes()) {
             Some(rescued) => String::from_utf8_lossy(&rescued).into_owned(),
             None => body,
@@ -279,13 +365,16 @@ impl StreamableHttpClient for HttpClient {
     ) -> Result<StreamableHttpPostResponse, StreamableHttpError<Self::Error>> {
         if is_skills_request(&message) {
             return self
-                .post_skills(
+                .post_bounded(
                     uri,
                     message,
                     session_id,
                     auth_header,
                     custom_headers,
-                    DEFAULT_MAX_SKILLS_EVENT,
+                    Limit {
+                        max: DEFAULT_MAX_SKILLS_EVENT,
+                        over: OverLimit::Fail,
+                    },
                 )
                 .await;
         }
@@ -305,13 +394,16 @@ impl StreamableHttpClient for HttpClient {
     ) -> Result<StreamableHttpPostResponse, StreamableHttpError<Self::Error>> {
         if is_skills_request(&message) {
             return self
-                .post_skills(
+                .post_bounded(
                     uri,
                     message,
                     session_id,
                     auth_header,
                     custom_headers,
-                    max_sse_event_size,
+                    Limit {
+                        max: max_sse_event_size,
+                        over: OverLimit::Fail,
+                    },
                 )
                 .await;
         }
@@ -587,7 +679,7 @@ mod tests {
             Ok(bytes::Bytes::from_static(b"\r\ndata: bbbbbbbbbb\r\n")),
             Ok(bytes::Bytes::from_static(b"\r\ndata: cccccccccc\r\n\r\n")),
         ]);
-        let mut bounded = std::pin::pin!(bounded(source, 24));
+        let mut bounded = std::pin::pin!(bounded(source, 24, Default::default()));
         while let Some(chunk) = bounded.next().await {
             assert!(chunk.is_ok(), "{chunk:?}");
         }
@@ -622,7 +714,7 @@ mod tests {
             Ok::<_, reqwest::Error>(bytes::Bytes::from_static(b"data: aaaaaaaa")),
             Ok(bytes::Bytes::from_static(b"aaaaaaaaaaa")),
         ]);
-        let mut bounded = std::pin::pin!(bounded(source, 16));
+        let mut bounded = std::pin::pin!(bounded(source, 16, Default::default()));
         assert!(bounded.next().await.unwrap().is_ok());
         assert!(bounded.next().await.unwrap().is_err());
     }

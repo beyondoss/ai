@@ -23,6 +23,7 @@ pub mod mcp_host;
 pub mod mcp_manifest;
 pub mod mcp_skills;
 pub mod mcp_stdio;
+pub(crate) mod mcp_view_http;
 pub(crate) mod mcp_wire;
 pub mod memory;
 pub mod output;
