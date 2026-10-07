@@ -18,10 +18,24 @@ fn ungated_seam_names(path: &str, source: &str) -> Vec<String> {
         if !code.contains("BEYOND_AI_AGENT_TEST_") {
             continue;
         }
-        // A gated match arm: the attribute sits right above the arm.
-        let arm_gated = lines[i.saturating_sub(3)..i]
-            .iter()
-            .any(|l| l.trim() == "#[cfg(debug_assertions)]");
+        // A gated match arm or statement: the attribute sits directly above the start of the arm or
+        // statement this line belongs to (walking back over its own continuation lines), not merely
+        // somewhere close above — an attribute on the *previous* statement gates that one only.
+        let mut start = i;
+        while start > 0 {
+            let prev = lines[start - 1].split("//").next().unwrap_or("").trim_end();
+            let ends_item = prev.is_empty()
+                || prev.ends_with(';')
+                || prev.ends_with('{')
+                || prev.ends_with('}')
+                || prev.ends_with(',')
+                || prev.trim_start().starts_with("#[");
+            if ends_item {
+                break;
+            }
+            start -= 1;
+        }
+        let arm_gated = start > 0 && lines[start - 1].trim() == "#[cfg(debug_assertions)]";
         // A gated function: the nearest enclosing `fn` (less indented than this line) carries it.
         let indent = line.len() - line.trim_start().len();
         let fn_gated = (0..i)
@@ -112,4 +126,23 @@ fn dispatch(cmd: &str) {
 }
 ";
     assert!(ungated_seam_names("f.rs", gated_arm).is_empty());
+    // A gated statement, spanning lines, inside an ungated function.
+    let gated_statement = "\
+async fn body() {
+    #[cfg(debug_assertions)]
+    if let Some(ms) = std::env::var(
+        \"BEYOND_AI_AGENT_TEST_SLOW_X_MS\",
+    ).ok() {}
+}
+";
+    assert!(ungated_seam_names("f.rs", gated_statement).is_empty());
+    // The attribute gates the statement under it, not the call site after that.
+    let gated_neighbour = "\
+async fn body() {
+    #[cfg(debug_assertions)]
+    let x = 1;
+    delay(\"BEYOND_AI_AGENT_TEST_SLOW_X_MS\").await;
+}
+";
+    assert_eq!(ungated_seam_names("f.rs", gated_neighbour).len(), 1);
 }

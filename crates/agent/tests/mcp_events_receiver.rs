@@ -296,6 +296,99 @@ async fn a_retry_that_beats_the_resubscribe_after_a_restart_is_told_to_retry_not
     eventually(Duration::from_secs(20), "the model run", || {
         (runs_for_event(&bodies, "retried early") >= 1).then_some(())
     });
+    // Restored: the window is closed, and a token nothing holds is told to stop, at once.
+    assert_eq!(dead_token_status(held.port()), 410);
+}
+
+/// A delivery to a callback token no subscription holds: the status the daemon answers.
+fn dead_token_status(port: u16) -> u16 {
+    raw_request(
+        port,
+        "POST /_beyond/mcp-events/0000000000000000000000000000dead HTTP/1.1\r\nHost: x\r\n\
+         Content-Length: 2\r\nConnection: close\r\n\r\n",
+        b"{}",
+        Duration::from_secs(10),
+    )
+}
+
+/// A daemon whose only subscriptions are runtime ones (`mcp_events_subscribe`) holds the restart
+/// window too: a retried delivery that lands before the session holding the subscription has read
+/// its state (held off by a debug seam) gets `503`, not `410`; once restored, the retry lands, and
+/// a token nothing holds is `410` again at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn with_only_runtime_subscriptions_an_early_retry_is_told_to_retry_not_to_stop() {
+    let (_fx, mcp_url, fixture) = spawn_http_fixture(&[("MCP_FIXTURE_ALLOW_HTTP_CALLBACK", "1")]);
+    let home = tempfile::tempdir().unwrap();
+    let mut servers = hooks(&mcp_url, "notify");
+    servers[0]["events"] = json!([]);
+    write_settings(home.path(), servers);
+    let (base, _bodies) = spawn_model_server_routed(vec![], turn_text("noted"));
+    let held = HeldPort::bind();
+    let port = held.port();
+    let mut first = daemon(home.path(), &base, &held, &[]);
+    let mut ws = ws_connect(port, Some("runtime-owner")).await;
+    ws_send(
+        &mut ws,
+        json!({ "type": "mcp_events_subscribe", "id": "s", "server": "hooks", "name": "ticket.updated",
+                "delivery": "webhook", "action": "notify" }),
+    )
+    .await;
+    let r = ws_next(&mut ws, Duration::from_secs(20), "the subscribe", |f| {
+        f["type"] == "response" && f["id"] == "s"
+    })
+    .await;
+    assert_eq!(r["success"], true, "{r:#}");
+    eventually(
+        Duration::from_secs(10),
+        "the runtime spec and its callback on disk",
+        || {
+            std::fs::read_dir(home.path().join("sessions"))
+                .ok()?
+                .map(|e| e.unwrap().path())
+                .filter(|p| p.to_string_lossy().ends_with(".mcp-events.json"))
+                .any(|p| {
+                    let text = std::fs::read_to_string(p).unwrap_or_default();
+                    text.contains("\"runtime\"") && text.contains("\"token\"")
+                })
+                .then_some(())
+        },
+    );
+    drop(ws);
+    first.kill().unwrap();
+    let _ = first.wait();
+    let down = held.down();
+    let r = emit(
+        &fixture,
+        json!({ "event_id": "early-1", "data": { "summary": "retried early" } }),
+    );
+    assert_ne!(r["deliveries"][0]["status"], 200, "{r:#}");
+    drop(down);
+    let _second = daemon(
+        home.path(),
+        &base,
+        &held,
+        &[("BEYOND_AI_AGENT_TEST_SLOW_EVENTS_RESTORE_MS", "1500")],
+    );
+    let r = control(
+        &fixture,
+        "POST",
+        "/control/redeliver",
+        Some(&json!({ "event_id": "early-1" })),
+    );
+    assert_eq!(
+        r["deliveries"][0]["status"], 503,
+        "resuming: retry, not stop: {r:#}"
+    );
+    eventually(Duration::from_secs(30), "the retry to land", || {
+        let r = control(
+            &fixture,
+            "POST",
+            "/control/redeliver",
+            Some(&json!({ "event_id": "early-1" })),
+        );
+        (r["deliveries"][0]["status"] == 200).then_some(())
+    });
+    assert_eq!(dead_token_status(port), 410);
 }
 
 /// A runtime subscription (`mcp_events_subscribe`) survives a restart like a configured one: the

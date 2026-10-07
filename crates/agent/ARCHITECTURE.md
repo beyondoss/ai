@@ -4589,8 +4589,15 @@ mcp_events_subscribe (any session) ──► owned by that session
   Persisted tokens of every subscription the session will subscribe again — configured ones, and
   runtime ones being restored (below) — are held from the moment the state is read (up to 10 min): a
   retry that arrives before its subscription has re-registered gets `503` (retry), never `410` (which
-  the draft treats as "stop"). A runtime subscription the server ended is not restored, so its token
-  is not held and its old callback answers `410`.
+  the draft treats as "stop"). Before any state is read, a daemon with a callback URL answers every
+  unknown token `503` from its start until each session it starts to restore callbacks (the events
+  session, and every session holding runtime subscriptions) has read its state and held its tokens
+  (`webhook::restore_pending` / `restored`, also bounded at 10 min); after that an unknown token is
+  `410` at once. A runtime subscription the server ended is not restored, so its token is not held
+  and its old callback answers `410`. No subscription makes a request — configured, restored after a
+  restart or a panic, or resubscribing — until the session can take the server's questions (its
+  elicitation and sampling gates are installed: `McpEventsHub::start`), since a server may ask during
+  the very first `events/poll`.
   After a _graceful_ shutdown the subscription was unsubscribed, so an event type the server cannot
   replay from a cursor loses what it emitted while the daemon was down; one with replay resumes from
   the persisted cursor. Refresh runs at ¾ of the way to `refreshBefore` (an unparseable one refreshes after
