@@ -709,3 +709,51 @@ async fn code_mode_abort_interrupts_a_spinning_script_promptly() {
         .unwrap();
     assert_eq!(next.text, "next");
 }
+
+/// All the CPU this (`current_thread`) runtime's thread spends while `work` runs — in `work`'s own
+/// polls and in any task it spawns onto this runtime — so per-byte work moved into a spawned task
+/// is seen too.
+async fn runtime_thread_cpu<F: Future>(work: F) -> Duration {
+    let start = thread_cpu();
+    work.await;
+    thread_cpu() - start
+}
+
+/// `edit`'s cost on the runtime thread does not grow with the file: validating it as UTF-8 and
+/// handing its new contents to the writer are per-byte work, done on the blocking pool (the writer
+/// takes the buffer, it does not copy it here).
+#[tokio::test(flavor = "current_thread")]
+async fn edit_does_no_per_byte_work_on_the_runtime_thread() {
+    let _serial = one_at_a_time().await;
+    let dir = tempfile::tempdir().unwrap();
+    let tool = edit::Edit::new(dir.path());
+    let mut cost = Vec::new();
+    for lines in [80_000usize, 640_000] {
+        let path = dir.path().join(format!("subject_{lines}.rs"));
+        let src = big_ascii_source(lines);
+        let p = path.to_str().unwrap().to_string();
+        // The least of three, each on a fresh copy: per-byte work shows on every run.
+        let mut least = Duration::MAX;
+        for _ in 0..3 {
+            std::fs::write(&path, &src).unwrap();
+            let spent = runtime_thread_cpu(async {
+                tool.run(json!({ "path": p, "old_string": "let x_40001 = compute(i, 40001)", "new_string": "let x_40001 = compute(i, 40001) /* edited */" }))
+                    .await
+                    .unwrap();
+            })
+            .await;
+            least = least.min(spent);
+        }
+        eprintln!(
+            "PROBE edit {} MB: runtime thread {least:?}",
+            src.len() >> 20
+        );
+        cost.push(least);
+    }
+    assert!(
+        cost[1] < cost[0] + Duration::from_micros(600),
+        "an 8x larger file cost the runtime thread {:?} against {:?}: per-byte work is on it",
+        cost[1],
+        cost[0]
+    );
+}

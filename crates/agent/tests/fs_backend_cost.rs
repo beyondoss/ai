@@ -86,7 +86,7 @@ impl FsBackend for Counting {
     async fn write_if_unchanged(
         &self,
         path: &Path,
-        bytes: &[u8],
+        bytes: Vec<u8>,
         expected: Option<std::time::SystemTime>,
     ) -> Result<bool, FsError> {
         self.tick();

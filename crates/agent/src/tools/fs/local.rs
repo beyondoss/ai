@@ -121,11 +121,10 @@ impl FsBackend for LocalFs {
     async fn write_if_unchanged(
         &self,
         path: &Path,
-        bytes: &[u8],
+        bytes: Vec<u8>,
         expected: Option<std::time::SystemTime>,
     ) -> Result<bool, FsError> {
         let path = path.to_path_buf();
-        let bytes = bytes.to_vec();
         blocking("write", move || {
             let current = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
             if current != expected {

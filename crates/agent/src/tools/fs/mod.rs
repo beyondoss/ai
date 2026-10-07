@@ -286,10 +286,13 @@ pub trait FsBackend: Send + Sync {
     /// This is one method rather than a stat-then-write by the caller because the check and the write
     /// have to be as close together as the backend can make them; splitting it across the trait would
     /// put a guaranteed round trip inside the race window it exists to narrow.
+    ///
+    /// Owned, like [`write_bytes`](Self::write_bytes)'s: a backend that writes from another thread
+    /// takes the buffer as it is, rather than copying the whole file on the caller's (runtime) thread.
     async fn write_if_unchanged(
         &self,
         path: &Path,
-        bytes: &[u8],
+        bytes: Vec<u8>,
         expected: Option<std::time::SystemTime>,
     ) -> Result<bool, FsError>;
 

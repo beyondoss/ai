@@ -362,7 +362,7 @@ impl FsBackend for ShellFs {
     async fn write_if_unchanged(
         &self,
         path: &Path,
-        bytes: &[u8],
+        bytes: Vec<u8>,
         expected: Option<std::time::SystemTime>,
     ) -> Result<bool, FsError> {
         // Two round trips, and therefore a genuinely wider race window than `LocalFs`'s single
@@ -374,7 +374,7 @@ impl FsBackend for ShellFs {
         if !mtimes_match(current, expected) {
             return Ok(false);
         }
-        self.write_slice(path, bytes).await?;
+        self.write_slice(path, &bytes).await?;
         Ok(true)
     }
 
