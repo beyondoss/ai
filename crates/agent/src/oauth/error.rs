@@ -46,6 +46,14 @@ pub enum OAuthError {
     #[error("login cancelled")]
     LoginCancelled,
 
+    /// `AI_AGENT_OAUTH_CALLBACK_HOST` named something other than a loopback address.
+    #[error(
+        "AI_AGENT_OAUTH_CALLBACK_HOST={0:?} is not a loopback address: the OAuth callback listener \
+         receives an authorization code, so it binds only to loopback (an address in 127.0.0.0/8, \
+         ::1, or localhost)"
+    )]
+    InvalidCallbackHost(String),
+
     #[error("failed to bind local OAuth callback listener on {host}:{port}: {detail}")]
     PortBindFailed {
         host: String,

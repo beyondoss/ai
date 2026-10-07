@@ -478,9 +478,9 @@ fn session_cfg(base: &ServeConfig, id: &str, service: Option<Arc<ServiceSession>
 }
 
 /// Latency at one of a session's race windows, simulated: sleeps the milliseconds in `var`, if set. A
-/// seam for tests that must hold such a window open on demand (a session ending just as a client
-/// waits on it, a connection registering late) instead of hoping a loaded host does. `#[cfg]`-gated
-/// like `serve.rs`'s `simulated_slow_open`, so a release binary has no latency-injection path.
+/// seam for tests that must hold such a window open on demand instead of hoping a loaded host does.
+/// Only ever called from the `#[cfg(debug_assertions)]` seams below, which name their variables — so
+/// a release binary has neither a latency-injection path nor any of the names.
 #[cfg(debug_assertions)]
 async fn simulated_delay(var: &str) {
     if let Ok(ms) = std::env::var(var)
@@ -490,8 +490,23 @@ async fn simulated_delay(var: &str) {
     }
 }
 
+/// A failed session's `error` broadcast held back after its loop ended.
+#[cfg(debug_assertions)]
+async fn simulated_slow_session_end() {
+    simulated_delay("BEYOND_AI_AGENT_TEST_SLOW_SESSION_END_MS").await;
+}
+
 #[cfg(not(debug_assertions))]
-async fn simulated_delay(_var: &str) {}
+async fn simulated_slow_session_end() {}
+
+/// A connection's output registered late.
+#[cfg(debug_assertions)]
+async fn simulated_slow_attach() {
+    simulated_delay("BEYOND_AI_AGENT_TEST_SLOW_ATTACH_MS").await;
+}
+
+#[cfg(not(debug_assertions))]
+async fn simulated_slow_attach() {}
 
 /// The production [`SessionBody`]: run [`serve_session`] on the session's derived config.
 ///
@@ -514,7 +529,7 @@ fn serve_session_body(base: ServeConfig) -> SessionBody {
             Box::pin(async move {
                 if let Err(e) = serve_session(cfg, input_rx, out_conn, running, keep_alive).await {
                     eprintln!("serve: session {id} ended: {e}");
-                    simulated_delay("BEYOND_AI_AGENT_TEST_SLOW_SESSION_END_MS").await;
+                    simulated_slow_session_end().await;
                     lock_ignoring_poison(&out_err).end(OutFrame::Value(json!({
                         "type": "error",
                         "session_id": id,
@@ -1126,7 +1141,7 @@ impl Supervisor {
             out_conn,
             exited,
         } = pinned;
-        simulated_delay("BEYOND_AI_AGENT_TEST_SLOW_ATTACH_MS").await;
+        simulated_slow_attach().await;
 
         // Register this connection's send channel as one of the session's output sinks — the session
         // broadcasts every frame to all registered sinks. Keep the `sink_id` to remove it on disconnect.

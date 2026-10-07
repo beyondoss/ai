@@ -616,8 +616,7 @@ run as pure unit tests with `MockTransport` — no network, no live model, no ga
 It is **not a plugin host**. pi has a real extension system (`core/extensions/`): dynamically loaded
 third-party code that subscribes to typed lifecycle events (including `session_compact`) and can call
 back into session actions (`navigateTree`, `fork`, `newSession`, …). This crate's equivalent seams —
-`AgentHooks` (tool-call gate/rewrite) and `CheckpointHook` (mid-run persistence points) — are Rust
-traits with exactly one implementation chosen by the embedder at compile time, not a runtime-loadable,
+`AgentHooks` (tool-call gate/rewrite) and `CheckpointHook` (mid-run persistence points; `checkpoint` returns whether the snapshot is durable, and the one before a tool dispatch **fails closed** — a failed write there ends the run with `Error::Checkpoint`, every call of that turn answered in memory as not run, and no tool runs; every other checkpoint is best-effort, logged and superseded by the host's end-of-run persist) — are Rust traits with exactly one implementation chosen by the embedder at compile time, not a runtime-loadable,
 subscribable, third-party extension surface. Evaluated and deliberately **not** extended to cover
 compaction or branch-navigation as hookable lifecycle events: nothing in this codebase dynamically
 loads untrusted code, there is no extension marketplace or third-party-author story to serve, and

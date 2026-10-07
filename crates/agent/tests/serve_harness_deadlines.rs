@@ -303,13 +303,41 @@ fn only_child_frames_touches_a_childs_stdout() {
 /// fine. Comments are dropped and whitespace normalised first ([`normalised`]), so formatting cannot
 /// hide a case.
 fn released_ports(source: &str) -> Vec<String> {
+    released_ports_with(source, &[])
+}
+
+/// Every source's findings, with address readers ([`address_readers`]) collected across all of them
+/// first — so a socket handed to a helper defined in another file (`common::port_of(&l)`) is still a
+/// port read, not a socket held.
+fn released_ports_in(sources: &[&str]) -> Vec<String> {
+    let readers: Vec<String> = sources
+        .iter()
+        .flat_map(|s| address_readers(&normalised(s)))
+        .collect();
+    sources
+        .iter()
+        .flat_map(|s| released_ports_with(s, &readers))
+        .collect()
+}
+
+fn released_ports_with(source: &str, other_readers: &[String]) -> Vec<String> {
     let code = normalised(source);
-    // Names holding a port-0 address (`let a = "127.0.0.1:0";`), and same-file functions that only
-    // read the address of the socket they are given (`fn port_of(l: &TcpListener) -> u16`).
+    // Names holding a port-0 address (`let a = "127.0.0.1:0";`) or a zero port (`const ANY: u16 =
+    // 0;`), and functions or closures that only read the address of the socket they are given
+    // (`fn port_of(l: &TcpListener) -> u16`, `let port_of = |l| l.local_addr()…`).
     let zero_names = zero_address_names(&code);
-    let readers = address_readers(&code);
-    let is_zero =
-        |args: &str| binds_port_zero(args) || zero_names.iter().any(|n| mentions_ident(args, n));
+    let zero_ports = zero_port_names(&code);
+    let mut readers = address_readers(&code);
+    readers.extend(other_readers.iter().cloned());
+    let is_zero = |args: &str| {
+        binds_port_zero(args)
+            || zero_names.iter().any(|n| mentions_ident(args, n))
+            || zero_ports.iter().any(|n| {
+                [")", "))"]
+                    .iter()
+                    .any(|end| args.contains(&format!(",{n}{end}")))
+            })
+    };
     let mut found = Vec::new();
     // Temporaries: the bind's own statement reads the address.
     for ty in ["TcpListener::bind(", "TcpSocket::bind(", "UdpSocket::bind("] {
@@ -349,7 +377,10 @@ fn released_ports(source: &str) -> Vec<String> {
         }
         for name in names {
             let rest = scope_after(after_stmt, &name);
-            let uses = uses_of(rest, &name, &readers);
+            let uses: Vec<&str> = uses_of(rest, &name, &readers)
+                .into_iter()
+                .map(through_option)
+                .collect();
             let reads_port = uses
                 .iter()
                 .any(|u| u.starts_with(".local_addr()") || *u == "read");
@@ -442,8 +473,44 @@ fn zero_address_names(code: &str) -> Vec<String> {
     names
 }
 
-/// Same-file functions of one parameter that do nothing with it but read its address: passing a
-/// socket to one (`port_of(&l)`) is reading its port, not holding it.
+/// Names bound to a zero port number: `const ANY: u16 = 0;`, `let p = 0u16;`.
+fn zero_port_names(code: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for kw in ["let ", "const ", "static "] {
+        for (at, _) in code.match_indices(kw) {
+            if code[..at].chars().last().is_some_and(is_ident) {
+                continue;
+            }
+            let Some((found, init, _)) = let_binding(&code[at + kw.len()..]) else {
+                continue;
+            };
+            if ["0", "0u16", "0_u16"].contains(&init) {
+                names.extend(found);
+            }
+        }
+    }
+    names
+}
+
+/// A use with `Option` access in front of it seen through: `l.as_ref().unwrap().local_addr()` reads
+/// the address as surely as `l.local_addr()` does, for a listener held in an `Option`.
+fn through_option(mut u: &str) -> &str {
+    loop {
+        if let Some(rest) = [".as_ref()", ".as_mut()", ".as_deref()", ".unwrap()"]
+            .iter()
+            .find_map(|p| u.strip_prefix(p))
+        {
+            u = rest;
+        } else if u.starts_with(".expect(") {
+            u = &u[matching_paren(u, 7)..];
+        } else {
+            return u;
+        }
+    }
+}
+
+/// Functions of one parameter — and closures bound to a name — that do nothing with it but read its
+/// address: passing a socket to one (`port_of(&l)`) is reading its port, not holding it.
 fn address_readers(code: &str) -> Vec<String> {
     let mut readers = Vec::new();
     for (at, _) in code.match_indices("fn ") {
@@ -486,6 +553,33 @@ fn address_readers(code: &str) -> Vec<String> {
         }
         let uses = uses_of(&rest[body_open..body_end], &param, &[]);
         if !param.is_empty()
+            && !uses.is_empty()
+            && uses.iter().all(|u| u.starts_with(".local_addr()"))
+        {
+            readers.push(name);
+        }
+    }
+    // `let port_of = |l| l.local_addr()…;` (or `|l: &TcpListener| { … }`).
+    for (at, _) in code.match_indices("let ") {
+        if code[..at].chars().last().is_some_and(is_ident) {
+            continue;
+        }
+        let rest = &code[at + 4..];
+        let name: String = rest.chars().take_while(|c| is_ident(*c)).collect();
+        let Some(after) = rest[name.len()..]
+            .strip_prefix("=|")
+            .or_else(|| rest[name.len()..].strip_prefix("=move|"))
+        else {
+            continue;
+        };
+        let Some(bar) = after.find('|') else { continue };
+        let param: String = after[..bar].chars().take_while(|c| is_ident(*c)).collect();
+        let body = &after[bar + 1..];
+        let body = &body[..body.find(';').unwrap_or(body.len())];
+        let uses = uses_of(body, &param, &[]);
+        if !name.is_empty()
+            && !param.is_empty()
+            && !after[..bar].contains(',')
             && !uses.is_empty()
             && uses.iter().all(|u| u.starts_with(".local_addr()"))
         {
@@ -610,7 +704,13 @@ fn uses_of<'a>(code: &'a str, name: &str, readers: &[String]) -> Vec<&'a str> {
                 "drop"
             } else if after.starts_with(')')
                 && readers.iter().any(|r| {
-                    before.ends_with(&format!("{r}(&")) || before.ends_with(&format!("{r}("))
+                    [format!("{r}(&"), format!("{r}(")].iter().any(|call| {
+                        before.ends_with(call.as_str())
+                            && !before[..before.len() - call.len()]
+                                .chars()
+                                .last()
+                                .is_some_and(is_ident)
+                    })
                 })
             {
                 "read"
@@ -623,6 +723,22 @@ fn uses_of<'a>(code: &'a str, name: &str, readers: &[String]) -> Vec<&'a str> {
 
 fn excerpt(s: &str) -> &str {
     &s[..s.len().min(60)]
+}
+
+/// A helper that only reads the address, defined in one file (`tests/common`) and called from
+/// another, is a port read like a local one.
+#[test]
+fn the_released_port_lint_sees_helpers_in_other_files() {
+    let common = "pub fn port_of(l: &TcpListener) -> u16 { l.local_addr().unwrap().port() }";
+    let suite = "let l = TcpListener::bind(\"127.0.0.1:0\").unwrap();\nlet p = common::port_of(&l);\ndrop(l);";
+    assert!(
+        released_ports(suite).is_empty(),
+        "alone, the helper is unknown"
+    );
+    assert!(
+        !released_ports_in(&[common, suite]).is_empty(),
+        "with the file that defines it, the release is caught"
+    );
 }
 
 /// The lint recognises the shape — a port-0 socket whose port is read and which is then let go —
@@ -654,6 +770,13 @@ fn the_released_port_lint_catches_what_it_should() {
         "let l = TcpListener::bind(\"127.0.0.1:0\").unwrap();\nlet p = l.local_addr().unwrap().port();\nlet _ = l;",
         // A self-rebind on the way.
         "let l = TcpListener::bind(\"127.0.0.1:0\").unwrap();\nlet l = l;\nlet p = l.local_addr().unwrap().port();\ndrop(l);",
+        // A closure that only reads the address.
+        "let port_of = |l: &TcpListener| l.local_addr().unwrap().port();\nlet l = TcpListener::bind(\"127.0.0.1:0\").unwrap();\nlet p = port_of(&l);\ndrop(l);",
+        // A listener held in an `Option`.
+        "let l = Some(TcpListener::bind(\"127.0.0.1:0\").unwrap());\nlet p = l.as_ref().unwrap().local_addr().unwrap().port();\ndrop(l);",
+        "let l = Some(TcpListener::bind(\"127.0.0.1:0\").unwrap());\nlet p = l.as_ref().expect(\"bound\").local_addr().unwrap().port();",
+        // A zero port in a const.
+        "const ANY: u16 = 0;\nlet p = TcpListener::bind((\"127.0.0.1\", ANY)).unwrap().local_addr().unwrap().port();",
         // socket2.
         "let s = Socket::new(Domain::IPV4, Type::STREAM, None)?;\ns.bind(&\"127.0.0.1:0\".parse::<std::net::SocketAddr>()?.into())?;\nlet p = s.local_addr()?.as_socket().unwrap().port();\ndrop(s);",
     ] {
@@ -677,6 +800,8 @@ fn the_released_port_lint_catches_what_it_should() {
         "let listener = TcpListener::bind(\"127.0.0.1:0\").unwrap();\nlet addr = listener.local_addr().unwrap();\nthread::spawn(move || { for s in listener.incoming() { drop(s); } });",
         // Re-bound by a statement that consumes the old binding.
         "let listener = std::net::TcpListener::bind(\"127.0.0.1:0\").unwrap();\nlet port = listener.local_addr().unwrap().port();\nlet listener = tokio::net::TcpListener::from_std(listener).unwrap();",
+        // A helper whose name merely ends in a reader's name.
+        "fn port_of(l: &TcpListener) -> u16 { l.local_addr().unwrap().port() }\nfn my_port_of(l: &TcpListener) { serve(l) }\nlet l = TcpListener::bind(\"127.0.0.1:0\").unwrap();\nlet p = l.local_addr().unwrap().port();\nmy_port_of(&l);",
     ] {
         assert_eq!(released_ports(fine), Vec::<String>::new(), "{fine:?}");
     }
@@ -715,11 +840,20 @@ fn no_test_picks_a_port_and_releases_it() {
             "the scan covers the {krate} crate"
         );
     }
+    let sources: Vec<String> = files
+        .iter()
+        .map(|path| std::fs::read_to_string(path).unwrap_or_default())
+        .collect();
+    // Readers from every file: a helper in `tests/common` is called from the suites.
+    let readers: Vec<String> = sources
+        .iter()
+        .flat_map(|s| address_readers(&normalised(s)))
+        .collect();
     let found: Vec<String> = files
         .iter()
-        .flat_map(|path| {
-            let source = std::fs::read_to_string(path).unwrap_or_default();
-            released_ports(&source)
+        .zip(&sources)
+        .flat_map(|(path, source)| {
+            released_ports_with(source, &readers)
                 .into_iter()
                 .map(move |what| format!("{}: {what}", path.display()))
         })

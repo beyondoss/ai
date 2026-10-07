@@ -280,6 +280,41 @@ fn login_acks_then_a_second_concurrent_login_is_rejected_then_abort_login_cancel
     child.wait().unwrap();
 }
 
+/// The callback listener receives an authorization code, so its host override is loopback-only: a
+/// `login` with `AI_AGENT_OAUTH_CALLBACK_HOST=0.0.0.0` fails with a clear error before binding, and
+/// never listens on every interface.
+#[test]
+fn a_non_loopback_callback_host_is_refused_with_a_clear_error() {
+    let home = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd_with_real_home(bin, &session_file, home.path())
+        .env("AI_AGENT_OAUTH_CALLBACK_HOST", "0.0.0.0")
+        .spawn_guarded();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = common::child_frames(&mut child);
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "id": "1", "type": "login", "provider": "anthropic" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let response = read_one_frame_matching(&mut stdout, |v| {
+        v["type"] == "response" && v["command"] == "login" && v["id"] == "1"
+    });
+    drop(stdin);
+    let _ = child.kill();
+    let _ = child.wait();
+    assert_eq!(response["success"], false, "{response:#?}");
+    let error = response["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("0.0.0.0") && error.contains("not a loopback address"),
+        "{response:#?}"
+    );
+}
+
 /// Read frames until one matches `pred`, returning it. Unlike `read_until_response`, doesn't stop at
 /// the first `response` for a given command — needed here since several distinct commands' frames
 /// interleave (`login`'s own eventual `response` arrives well after `abort_login`'s).

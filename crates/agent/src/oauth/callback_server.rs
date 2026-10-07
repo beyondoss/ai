@@ -20,6 +20,39 @@ use super::error::OAuthError;
 /// concern.
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 
+/// The host a fixed-port OAuth callback listener binds: `127.0.0.1`, or `AI_AGENT_OAUTH_CALLBACK_HOST`
+/// when set — a loopback address only (see [`loopback_callback_host`]). Checked before any bind, so a
+/// bad value is a clear error rather than a bind failure a caller might quietly fall back from.
+pub(crate) fn callback_host() -> Result<String, OAuthError> {
+    loopback_callback_host(
+        std::env::var("AI_AGENT_OAUTH_CALLBACK_HOST")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// [`callback_host`] for an explicit value. Loopback only — an address in `127.0.0.0/8`, `::1` (bare
+/// or bracketed), or `localhost` — because the listener receives an authorization code: on
+/// `0.0.0.0` or a routable address anyone who can reach the machine could race the browser to it.
+pub(crate) fn loopback_callback_host(value: Option<&str>) -> Result<String, OAuthError> {
+    let Some(host) = value else {
+        return Ok("127.0.0.1".to_string());
+    };
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    let loopback = host.eq_ignore_ascii_case("localhost")
+        || bare
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    if loopback {
+        Ok(bare.to_string())
+    } else {
+        Err(OAuthError::InvalidCallbackHost(host.to_string()))
+    }
+}
+
 pub struct CallbackServer {
     server: Arc<tiny_http::Server>,
 }
@@ -286,6 +319,39 @@ mod tests {
             .wait_for_callback("/callback", "irrelevant".to_string(), cancel)
             .await;
         assert_eq!(code, None);
+    }
+
+    /// The callback host is loopback or nothing: an authorization code must not be receivable from
+    /// another machine.
+    #[test]
+    fn the_callback_host_must_be_loopback() {
+        assert_eq!(loopback_callback_host(None).unwrap(), "127.0.0.1");
+        for ok in [
+            "127.0.0.1",
+            "127.12.34.56",
+            "::1",
+            "[::1]",
+            "localhost",
+            "LOCALHOST",
+        ] {
+            assert!(loopback_callback_host(Some(ok)).is_ok(), "{ok}");
+        }
+        for bad in [
+            "0.0.0.0",
+            "::",
+            "10.0.0.1",
+            "192.168.1.5",
+            "example.com",
+            "",
+            "127.0.0.1.evil",
+        ] {
+            let err = loopback_callback_host(Some(bad)).unwrap_err();
+            assert!(
+                matches!(&err, OAuthError::InvalidCallbackHost(h) if h == bad),
+                "{bad}: {err}"
+            );
+            assert!(err.to_string().contains("not a loopback address"), "{err}");
+        }
     }
 
     #[tokio::test]

@@ -3934,17 +3934,19 @@ struct DirectCheckpoint(Arc<std::sync::Mutex<Option<SessionStore>>>);
 
 #[async_trait::async_trait]
 impl agent_core::CheckpointHook for DirectCheckpoint {
-    async fn checkpoint(&self, session: &Session) {
-        // Best-effort, matching `serve`'s own checkpoint hook: the run itself must not fail just
-        // because incremental persistence couldn't (a real I/O failure here is still surfaced —
-        // eprintln, not silently swallowed — and the next successful persist, or `persist_run_tail`
-        // after the turn ends, will catch up whatever this attempt missed).
+    /// Append what is new, and say whether it landed — matching `serve`'s own checkpoint hook. The
+    /// agent acts on a failure only before a tool dispatch, where it fails closed (the tool does not
+    /// run: `agent_core::CheckpointHook`); anywhere else the next successful persist, or
+    /// `persist_run_tail` after the turn ends, catches up whatever this attempt missed.
+    async fn checkpoint(&self, session: &Session) -> Result<(), String> {
         let mut guard = self.0.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(store) = guard.as_mut()
             && let Err(e) = store.append_new(&session.messages)
         {
             eprintln!("run: failed to persist checkpoint: {e}");
+            return Err(e.to_string());
         }
+        Ok(())
     }
 }
 
