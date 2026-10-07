@@ -372,6 +372,12 @@
 //! megabyte file body is not fanned out to a phone); `scope_key` is what an `"session"`-scoped answer
 //! would be remembered against, shown so the user can see exactly what they are agreeing to; `origin` is
 //! `"main"` or `{agent, spawn_id}` naming the subagent child that is asking.
+//! A question from an MCP-served skill (SEP-2640 — activating a model-chosen skill, code execution
+//! while one is active, or a read from another server while one is active; asked whatever `--approve`
+//! says, unless `--approve-mcp-skills`) carries an extra `mcp_skill` object: `{purpose:"activate",
+//! server, uri, name, description, frontmatter, manifest, files, manifest_files, nested_in}`,
+//! `{purpose:"execute", active_skills:[{server, uri, name, manifest}]}` or
+//! `{purpose:"cross_origin_read", from_servers, to_server}`.
 //! `{type:"approval_resolved", request_id, decision, scope?, reason?}` follows, broadcast to everyone, so
 //! the clients that *didn't* answer can dismiss the prompt — a login is a single-client RPC and needs no
 //! such frame, but an approval fans out to N clients of which exactly one wins. `reason` is
@@ -746,6 +752,11 @@ pub struct ServeConfig {
     /// static deny-lists above still win first — they need no round trip, and asking a person to approve
     /// what the operator already forbade is a way to social-engineer past them. See [`crate::approval`].
     pub approve: crate::approval::GatedSet,
+    /// `--approve-mcp-skills`: approve every MCP-served skill's activation, and code execution while
+    /// one is active, in advance — for a headless daemon with no one to ask. Off by default: those
+    /// questions go to the attached clients as `approval_request` frames carrying an `mcp_skill`
+    /// object (see `tools::mcp_skills::SkillSession`).
+    pub approve_mcp_skills: bool,
     /// How long an unanswered `approval_request` waits before it is denied (`--approval-timeout`).
     /// `None` waits forever, which is only safe with a reliably-attached client: `running` stays `true`
     /// for the whole prompt, so a question nobody answers pins the session until an `abort`.
@@ -2812,6 +2823,9 @@ pub(crate) async fn serve_session(
         hub.start_configured();
         mcp_events = Some(hub);
     }
+    // SEP-2640 skills from every connected server, seen through this session's MCP gate.
+    let mcp_skills =
+        crate::tools::mcp_skills::McpSkills::new(&cfg.mcp_catalog, mcp_enabled.clone());
     // Where this session's tools run, resolved once at start. The precedence, most specific first:
     //
     //   1. **the grant**, in service mode. It *is* the sandbox; nothing else is consulted.
@@ -3016,9 +3030,10 @@ pub(crate) async fn serve_session(
     macro_rules! reset_mcp_enabled {
         () => {{
             // Same cross-tenant rule as exec: an incoming session must not inherit the previous
-            // session's MCP kit. Default back to all configured servers enabled — and to no MCP
-            // Apps: the incoming session's client re-declares (`set_mcp_apps`) if it renders them.
-            mcp_enabled.set(None);
+            // session's MCP kit — its enablement, nor the skills it loaded or approved. Default back
+            // to all configured servers enabled — and to no MCP Apps: the incoming session's client
+            // re-declares (`set_mcp_apps`) if it renders them.
+            mcp_enabled.reset_session();
             *lock_ignoring_poison(&apps_epoch) += 1;
             crate::tools::mcp_apps::close(&mcp_enabled, "session_switched");
             lock_ignoring_poison(&out_conn).clear_app_views();
@@ -3036,17 +3051,25 @@ pub(crate) async fn serve_session(
     // eight simultaneous questions. `pending_approvals` is the map the `approve` command resolves
     // against — held here rather than inside the gate so both the busy and idle command loops can reach
     // it while a run is blocked inside the gate itself.
-    let (approval, pending_approvals) = if cfg.approve.is_off() {
-        (None, None)
-    } else {
-        let (gate, pending) = ServeApprovalGate::new(
-            out_conn.clone(),
-            cfg.approval_timeout,
-            persistence.session_id(),
-        );
-        let runtime = crate::approval::ApprovalRuntime::new(gate, cfg.approve.clone());
-        (Some(runtime), Some(pending))
-    };
+    //
+    // The gate itself always exists: MCP-served skills ask through it (activation, and code execution
+    // while one is active) whatever `--approve` says. Only the per-tool runtime is `--approve`'s.
+    let (approval_gate, pending) = ServeApprovalGate::new(
+        out_conn.clone(),
+        cfg.approval_timeout,
+        persistence.session_id(),
+    );
+    mcp_enabled.skill_session().set_gate(approval_gate.clone());
+    mcp_enabled
+        .skill_session()
+        .set_preapproved(cfg.approve_mcp_skills);
+    // `--no-skills`: no MCP-served skills listed, offered or expanded either.
+    mcp_enabled
+        .skill_session()
+        .set_listing_suppressed(cfg.no_skills);
+    let pending_approvals = pending;
+    let approval = (!cfg.approve.is_off())
+        .then(|| crate::approval::ApprovalRuntime::new(approval_gate, cfg.approve.clone()));
 
     /// The approval memory is session-scoped (see [`crate::approval::SessionMemory`]), so an
     /// "always allow" granted in the outgoing conversation must not carry into the incoming one —
@@ -3395,7 +3418,7 @@ pub(crate) async fn serve_session(
     let mut agent = build_agent(
         &exec_cell,
         client.clone(),
-        &full_system(&static_system, &cwd),
+        &full_system(&static_system, &cwd, &mcp_skills),
         &cfg,
         &current_model,
         current_thinking,
@@ -3427,6 +3450,9 @@ pub(crate) async fn serve_session(
             crate::tools::mcp_apps::take_undelivered_context(&enabled)
         })));
     }
+    // Steers/follow-ups received mid-run, in order, until queued — see `PendingSteers`.
+    let (steer_done_tx, mut steer_done_rx) = mpsc::unbounded_channel::<SteerExpanded>();
+    let mut pending_steers = PendingSteers::new(steer_done_tx);
     // Task 1 (pi-parity fix, pass 19): the persisted `agent settings --steering-mode`/
     // `--follow-up-mode` defaults (or an explicit `serve --steering-mode`/`--follow-up-mode` flag),
     // already resolved by `main.rs` into `cfg.steering_mode`/`cfg.follow_up_mode` — previously only
@@ -3634,7 +3660,7 @@ pub(crate) async fn serve_session(
                     agent = build_agent(
                         &exec_cell,
                         client.clone(),
-                        &full_system(&static_system, &cwd),
+                        &full_system(&static_system, &cwd, &mcp_skills),
                         &cfg,
                         &current_model,
                         current_thinking,
@@ -3720,7 +3746,7 @@ pub(crate) async fn serve_session(
                             agent = build_agent(
                                 &exec_cell,
                                 client.clone(),
-                                &full_system(&static_system, &cwd),
+                                &full_system(&static_system, &cwd, &mcp_skills),
                                 &cfg,
                                 &current_model,
                                 current_thinking,
@@ -3864,7 +3890,7 @@ pub(crate) async fn serve_session(
                         agent = build_agent(
                             &exec_cell,
                             client.clone(),
-                            &full_system(&static_system, &cwd),
+                            &full_system(&static_system, &cwd, &mcp_skills),
                             &cfg,
                             &current_model,
                             current_thinking,
@@ -3954,7 +3980,7 @@ pub(crate) async fn serve_session(
                         agent = build_agent(
                             &exec_cell,
                             client.clone(),
-                            &full_system(&static_system, &cwd),
+                            &full_system(&static_system, &cwd, &mcp_skills),
                             &cfg,
                             &current_model,
                             current_thinking,
@@ -4317,7 +4343,7 @@ pub(crate) async fn serve_session(
                         agent = build_agent(
                             &exec_cell,
                             client.clone(),
-                            &full_system(&static_system, &cwd),
+                            &full_system(&static_system, &cwd, &mcp_skills),
                             &cfg,
                             &current_model,
                             current_thinking,
@@ -4343,6 +4369,15 @@ pub(crate) async fn serve_session(
                 // Refresh the cheap, time-varying part of the system prompt (the date) every turn —
                 // the expensive discovery-based static half only changes on `set_model`/`set_thinking`/
                 // `reload`, so it's cached rather than recomputed here.
+                // A skills listing whose `ttlMs` ran out, or that a server said changed, is re-listed
+                // now — when it is needed — so a skill published after connect is offered this turn.
+                mcp_skills.refresh().await;
+                // The session may be one this process never ran (a switch, a fork, a restart) whose
+                // transcript still holds an MCP skill's SKILL.md: the model is acting on it, so the
+                // code-execution gate must be too.
+                mcp_enabled
+                    .skill_session()
+                    .restore_from_transcript(&session.messages);
                 // The session's MCP Apps connections moved since the agent was built (an apps dial
                 // landed, or went into backoff): rebuild, so this turn advertises what is up now.
                 let apps_generation_now = mcp_enabled.apps().map(|view| view.generation());
@@ -4351,7 +4386,7 @@ pub(crate) async fn serve_session(
                     agent = build_agent(
                         &exec_cell,
                         client.clone(),
-                        &full_system(&static_system, &cwd),
+                        &full_system(&static_system, &cwd, &mcp_skills),
                         &cfg,
                         &current_model,
                         current_thinking,
@@ -4370,7 +4405,7 @@ pub(crate) async fn serve_session(
                         &mcp_enabled,
                     );
                 }
-                agent.set_system(full_system(&static_system, &cwd));
+                agent.set_system(full_system(&static_system, &cwd, &mcp_skills));
                 // A `prompt` with no (or non-string) `message` is a malformed command: running an
                 // empty user turn would spend a model call on nothing and still report success.
                 let Some(message) = cmd.get("message").and_then(Value::as_str) else {
@@ -4383,7 +4418,8 @@ pub(crate) async fn serve_session(
                     ));
                     continue;
                 };
-                let message = expand_message(message, &skills, &prompt_templates);
+                let message =
+                    expand_message(message, &skills, &prompt_templates, &mcp_skills).await;
                 // Optional image attachments: `images: [{media_type, data}]` (base64). Builds a
                 // multimodal user turn; absent or empty → a plain text turn.
                 let images = parse_images(cmd.get("images"));
@@ -4719,6 +4755,11 @@ pub(crate) async fn serve_session(
                             tokio::select! {
                                 biased;
                                 r = &mut run => break r,
+                                // A `/skill:` steer's expansion finished: queue it, and anything that
+                                // arrived after it, in order.
+                                Some(done) = steer_done_rx.recv() => {
+                                    pending_steers.expanded(done, &mcp_skills, &steering, &out_tx);
+                                }
                                 // A shutdown request mid-run gets the same treatment as stdin closing:
                                 // cancel and let the run unwind so the code below can persist before we
                                 // fall out of the outer loop (`!stdin_open` breaks it, further down).
@@ -4842,30 +4883,15 @@ pub(crate) async fn serve_session(
                                                         // reach the model unexpanded/dropped just
                                                         // because it arrived on a different command
                                                         // type.
-                                                        let m = expand_message(m, &skills, &prompt_templates);
-                                                        let m = agent_core::SteeringMessage::new(
-                                                            m,
-                                                            parse_images(c.get("images")),
-                                                        );
                                                         // `steer` redirects mid-run (injected at the next
                                                         // tool turn); `follow_up` waits for the stop
-                                                        // boundary. Two separate lanes.
-                                                        let queued = if cmd == "steer" {
-                                                            steering.push_steer(m)
-                                                        } else {
-                                                            steering.push(m)
-                                                        };
-                                                        // Fix 5 (pi-parity gap): the pushing client
-                                                        // learns what's actually queued from its own
-                                                        // ack, same round trip — see `queue_content`'s
-                                                        // own doc comment for why this doesn't also
-                                                        // need a separate unsolicited event. A lane at
-                                                        // its cap refuses the newest message, so the ack
-                                                        // has to say so: acking `true` for a message that
-                                                        // was dropped is the one outcome a client can't
-                                                        // recover from, since it has no other signal that
-                                                        // its instruction never reached the model.
-                                                        let _ = out_tx.send(response(cid, cmd, queued, Some(queue_content(&steering)), (!queued).then_some(STEERING_QUEUE_FULL)));
+                                                        // boundary. Two separate lanes. The pushing
+                                                        // client learns what's actually queued from its
+                                                        // own ack (Fix 5), including a full lane's
+                                                        // refusal. See `PendingSteers` for why an
+                                                        // MCP `/skill:` is expanded off this loop.
+                                                        let lane = if cmd == "steer" { SteerLane::Steer } else { SteerLane::FollowUp };
+                                                        pending_steers.receive(cid, m, parse_images(c.get("images")), lane, SteerAck::Command(if cmd == "steer" { "steer" } else { "follow_up" }), &skills, &prompt_templates, &mcp_skills, &steering, &out_tx);
                                                     }
                                                     None => {
                                                         let _ = out_tx.send(response(cid, cmd, false, None, Some("missing `message`")));
@@ -4891,41 +4917,31 @@ pub(crate) async fn serve_session(
                                                     c.get("message").and_then(Value::as_str),
                                                 ) {
                                                     (Some("steer"), Some(m)) => {
-                                                        let m = expand_message(m, &skills, &prompt_templates);
-                                                        let m = agent_core::SteeringMessage::new(
-                                                            m,
-                                                            parse_images(c.get("images")),
-                                                        );
-                                                        let queued = steering.push_steer(m);
+                                                        // An MCP Events injection is host-authored text, never a
+                                                        // `/skill:`: queued at once, so its delivery bookkeeping
+                                                        // (and deferral on a full lane) stays exact.
                                                         if let Some(batch) = crate::tools::mcp_events::injection_batch(&c) {
+                                                            let text = crate::skills::expand_if_skill_invocation(m, &skills);
+                                                            let text = crate::prompts::expand_if_slash(&text, &prompt_templates);
+                                                            let m = agent_core::SteeringMessage::new(text, parse_images(c.get("images")));
+                                                            let queued = steering.push_steer(m);
                                                             if !queued {
                                                                 deferred_events.push_back(l.to_string());
                                                                 continue;
                                                             }
                                                             steered_injections.push(batch);
+                                                            let mut data = queue_content(&steering);
+                                                            data["queued_as"] = json!("steer");
+                                                            let _ = out_tx.send(response(cid, "prompt", true, Some(data), None));
+                                                            continue;
                                                         }
                                                         // Fix 5 (pi-parity gap): same queue-content
                                                         // visibility the dedicated `steer`/`follow_up`
-                                                        // commands' own acks now carry — including a
-                                                        // full lane's refusal (see the `steer` arm).
-                                                        let mut data = queue_content(&steering);
-                                                        if queued {
-                                                            data["queued_as"] = json!("steer");
-                                                        }
-                                                        let _ = out_tx.send(response(cid, "prompt", queued, Some(data), (!queued).then_some(STEERING_QUEUE_FULL)));
+                                                        // commands' own acks carry, plus `queued_as`.
+                                                        pending_steers.receive(cid, m, parse_images(c.get("images")), SteerLane::Steer, SteerAck::Prompt, &skills, &prompt_templates, &mcp_skills, &steering, &out_tx);
                                                     }
                                                     (Some("follow_up"), Some(m)) => {
-                                                        let m = expand_message(m, &skills, &prompt_templates);
-                                                        let m = agent_core::SteeringMessage::new(
-                                                            m,
-                                                            parse_images(c.get("images")),
-                                                        );
-                                                        let queued = steering.push(m);
-                                                        let mut data = queue_content(&steering);
-                                                        if queued {
-                                                            data["queued_as"] = json!("follow_up");
-                                                        }
-                                                        let _ = out_tx.send(response(cid, "prompt", queued, Some(data), (!queued).then_some(STEERING_QUEUE_FULL)));
+                                                        pending_steers.receive(cid, m, parse_images(c.get("images")), SteerLane::FollowUp, SteerAck::Prompt, &skills, &prompt_templates, &mcp_skills, &steering, &out_tx);
                                                     }
                                                     _ => {
                                                         let _ = out_tx.send(response(cid, "prompt", false, None, Some("busy: a prompt is running; only `abort`/`steer`/`follow_up`, or a `prompt` with `streaming_behavior: \"steer\"|\"follow_up\"`, are accepted")));
@@ -5028,10 +5044,12 @@ pub(crate) async fn serve_session(
                                                 let mut commands: Vec<Value> = skills.iter().map(|s| {
                                                     json!({ "name": format!("skill:{}", s.name), "source": "skill", "description": s.description, "scope": s.scope, "path": s.path })
                                                 }).collect();
+                                                commands.extend(mcp_skills.commands());
                                                 commands.extend(prompt_templates.iter().map(|t| {
                                                     json!({ "name": t.name, "source": "prompt", "description": t.description, "scope": t.scope, "path": t.path })
                                                 }));
-                                                let collisions: Vec<&crate::skills::Collision> = skill_collisions.iter().chain(prompt_collisions.iter()).collect();
+                                                let mcp_diagnostics = mcp_skills.diagnostics(&skills);
+                                                let collisions: Vec<&crate::skills::Collision> = skill_collisions.iter().chain(prompt_collisions.iter()).chain(mcp_diagnostics.iter()).collect();
                                                 let _ = out_tx.send(response(cid, "get_commands", true, Some(json!({ "commands": commands, "collisions": collisions })), None));
                                             }
                                             "list_branches" => {
@@ -5047,7 +5065,7 @@ pub(crate) async fn serve_session(
                                             // must be answerable mid-run. `accepted:false` tells the losing
                                             // client in a multi-attach race that its answer arrived too late.
                                             "approve" => {
-                                                let _ = out_tx.send(handle_approve(cid, &c, pending_approvals.as_ref()));
+                                                let _ = out_tx.send(handle_approve(cid, &c, &pending_approvals));
                                             }
                                             "elicit" => {
                                                 let _ = out_tx.send(handle_elicit(cid, &c, Some(&pending_elicitations)));
@@ -5179,6 +5197,18 @@ pub(crate) async fn serve_session(
                     for cid in pending_abort_acks.drain(..) {
                         let _ = out_tx.send(response(cid, "abort", true, None, None));
                     }
+                    // Steers still waiting on a skill belong to this run, which is over: cancel them
+                    // (before any `new_session`/`switch_session`/`fork`/`clone` waiting behind it runs)
+                    // and say so; anything ready behind them is queued in order.
+                    pending_steers
+                        .end_run(
+                            matches!(&attempt_result, Err(agent_core::Error::Cancelled)),
+                            &mcp_skills,
+                            &steering,
+                            &out_tx,
+                        )
+                        .await;
+                    while steer_done_rx.try_recv().is_ok() {}
 
                     // A checkpoint sent right as the run above ended (see `agent_core::Agent`'s final,
                     // unconditional post-run `checkpoint.checkpoint(session)`) races the `r = &mut run`
@@ -5583,7 +5613,7 @@ pub(crate) async fn serve_session(
             cmd_type @ ("steer" | "follow_up") => {
                 match cmd.get("message").and_then(Value::as_str) {
                     Some(m) => {
-                        let m = expand_message(m, &skills, &prompt_templates);
+                        let m = expand_message(m, &skills, &prompt_templates, &mcp_skills).await;
                         let m =
                             agent_core::SteeringMessage::new(m, parse_images(cmd.get("images")));
                         let queued = if cmd_type == "steer" {
@@ -5776,7 +5806,7 @@ pub(crate) async fn serve_session(
                         agent = build_agent(
                             &exec_cell,
                             client.clone(),
-                            &full_system(&static_system, &cwd),
+                            &full_system(&static_system, &cwd, &mcp_skills),
                             &cfg,
                             &current_model,
                             current_thinking,
@@ -5926,7 +5956,7 @@ pub(crate) async fn serve_session(
                         agent = build_agent(
                             &exec_cell,
                             client.clone(),
-                            &full_system(&static_system, &cwd),
+                            &full_system(&static_system, &cwd, &mcp_skills),
                             &cfg,
                             &current_model,
                             current_thinking,
@@ -5966,7 +5996,7 @@ pub(crate) async fn serve_session(
                             agent = build_agent(
                                 &exec_cell,
                                 client.clone(),
-                                &full_system(&static_system, &cwd),
+                                &full_system(&static_system, &cwd, &mcp_skills),
                                 &cfg,
                                 &current_model,
                                 current_thinking,
@@ -6323,7 +6353,7 @@ pub(crate) async fn serve_session(
                 // already call elsewhere in this function rather than keeping a long-lived registry
                 // variable around), plus `session`'s own running token totals — previously omitted
                 // entirely via the plainer `export_html_with_entries`.
-                let system_prompt = full_system(&static_system, &cwd);
+                let system_prompt = full_system(&static_system, &cwd, &mcp_skills);
                 let tool_defs = build_tools(&cfg, cfg.image_auto_resize, &exec_cell, &mcp_enabled)
                     .definitions();
                 let usage = crate::export::UsageTotals {
@@ -6546,7 +6576,7 @@ pub(crate) async fn serve_session(
             // Reachable while idle only for a stale/duplicate answer (`accepted:false`): a real question
             // can only be outstanding while a run is in flight, which is the busy arm above.
             "approve" => {
-                emit!(handle_approve(id, &cmd, pending_approvals.as_ref()));
+                emit!(handle_approve(id, &cmd, &pending_approvals));
             }
             "get_todos" => {
                 // Straight from the session while idle — no mirror needed, and no chance of one going
@@ -6589,6 +6619,8 @@ pub(crate) async fn serve_session(
                         })
                     })
                     .collect();
+                // MCP-served skills (`scope: "mcp"`, `path` = the SKILL.md URI) of enabled servers.
+                commands.extend(mcp_skills.commands());
                 commands.extend(prompt_templates.iter().map(|t| {
                     json!({
                         "name": t.name,
@@ -6600,9 +6632,13 @@ pub(crate) async fn serve_session(
                 }));
                 // Every shadowed name (a skill or template defined at more than one path) is otherwise
                 // silently resolved with no way for a client to notice — surfaced here instead.
+                // MCP skills' diagnostics too: entries declined (invalid, dynamic, over the
+                // per-skill limits), same-name entries, and on-disk name clashes.
+                let mcp_diagnostics = mcp_skills.diagnostics(&skills);
                 let collisions: Vec<&crate::skills::Collision> = skill_collisions
                     .iter()
                     .chain(prompt_collisions.iter())
+                    .chain(mcp_diagnostics.iter())
                     .collect();
                 emit!(response(
                     id,
@@ -6708,7 +6744,7 @@ pub(crate) async fn serve_session(
                 agent = build_agent(
                     &exec_cell,
                     client.clone(),
-                    &full_system(&static_system, &cwd),
+                    &full_system(&static_system, &cwd, &mcp_skills),
                     &cfg,
                     &current_model,
                     current_thinking,
@@ -6801,7 +6837,7 @@ pub(crate) async fn serve_session(
                                     agent = build_agent(
                                         &exec_cell,
                                         client.clone(),
-                                        &full_system(&static_system, &cwd),
+                                        &full_system(&static_system, &cwd, &mcp_skills),
                                         &cfg,
                                         &current_model,
                                         current_thinking,
@@ -6860,7 +6896,7 @@ pub(crate) async fn serve_session(
                         agent = build_agent(
                             &exec_cell,
                             client.clone(),
-                            &full_system(&static_system, &cwd),
+                            &full_system(&static_system, &cwd, &mcp_skills),
                             &cfg,
                             &current_model,
                             current_thinking,
@@ -6891,7 +6927,7 @@ pub(crate) async fn serve_session(
                         agent = build_agent(
                             &exec_cell,
                             client.clone(),
-                            &full_system(&static_system, &cwd),
+                            &full_system(&static_system, &cwd, &mcp_skills),
                             &cfg,
                             &current_model,
                             current_thinking,
@@ -6960,7 +6996,7 @@ pub(crate) async fn serve_session(
                                 agent = build_agent(
                                     &exec_cell,
                                     client.clone(),
-                                    &full_system(&static_system, &cwd),
+                                    &full_system(&static_system, &cwd, &mcp_skills),
                                     &cfg,
                                     &current_model,
                                     current_thinking,
@@ -7067,7 +7103,7 @@ pub(crate) async fn serve_session(
                                 agent = build_agent(
                                     &exec_cell,
                                     client.clone(),
-                                    &full_system(&static_system, &cwd),
+                                    &full_system(&static_system, &cwd, &mcp_skills),
                                     &cfg,
                                     &current_model,
                                     current_thinking,
@@ -7125,7 +7161,7 @@ pub(crate) async fn serve_session(
                         agent = build_agent(
                             &exec_cell,
                             client.clone(),
-                            &full_system(&static_system, &cwd),
+                            &full_system(&static_system, &cwd, &mcp_skills),
                             &cfg,
                             &current_model,
                             current_thinking,
@@ -7182,7 +7218,7 @@ pub(crate) async fn serve_session(
                     agent = build_agent(
                         &exec_cell,
                         client.clone(),
-                        &full_system(&static_system, &cwd),
+                        &full_system(&static_system, &cwd, &mcp_skills),
                         &cfg,
                         &current_model,
                         current_thinking,
@@ -7222,7 +7258,7 @@ pub(crate) async fn serve_session(
                     agent = build_agent(
                         &exec_cell,
                         client.clone(),
-                        &full_system(&static_system, &cwd),
+                        &full_system(&static_system, &cwd, &mcp_skills),
                         &cfg,
                         &current_model,
                         current_thinking,
@@ -7271,7 +7307,7 @@ pub(crate) async fn serve_session(
                     agent = build_agent(
                         &exec_cell,
                         client.clone(),
-                        &full_system(&static_system, &cwd),
+                        &full_system(&static_system, &cwd, &mcp_skills),
                         &cfg,
                         &current_model,
                         current_thinking,
@@ -7313,7 +7349,7 @@ pub(crate) async fn serve_session(
                     agent = build_agent(
                         &exec_cell,
                         client.clone(),
-                        &full_system(&static_system, &cwd),
+                        &full_system(&static_system, &cwd, &mcp_skills),
                         &cfg,
                         &current_model,
                         current_thinking,
@@ -7601,7 +7637,7 @@ pub(crate) async fn serve_session(
                                 agent = build_agent(
                                     &exec_cell,
                                     client.clone(),
-                                    &full_system(&static_system, &cwd),
+                                    &full_system(&static_system, &cwd, &mcp_skills),
                                     &cfg,
                                     &current_model,
                                     current_thinking,
@@ -8206,8 +8242,21 @@ pub(crate) async fn serve_session(
 /// the full prompt text an `Agent` should carry. Cheap: `static_system` is already-computed text and
 /// `dynamic_footer` does no filesystem discovery, so this is safe to call every turn (see the `prompt`
 /// arm's per-turn refresh) as well as at every `build_agent` rebuild.
-fn full_system(static_system: &str, cwd: &std::path::Path) -> String {
-    format!("{static_system}{}", crate::resources::dynamic_footer(cwd))
+fn full_system(
+    static_system: &str,
+    cwd: &std::path::Path,
+    mcp_skills: &crate::tools::mcp_skills::McpSkills,
+) -> String {
+    // MCP-served skills are rendered here rather than baked into `static_system`: which of them are
+    // visible follows the session's live `set_mcp_enabled` gate, and this runs at every rebuild and
+    // every turn, so a gate change (or a session switch resetting it) can never leave the listing
+    // stale.
+    let mcp = mcp_skills.format_available();
+    let sep = if mcp.is_empty() { "" } else { "\n\n" };
+    format!(
+        "{static_system}{sep}{mcp}{}",
+        crate::resources::dynamic_footer(cwd)
+    )
 }
 
 /// The `output_schema`/`output_description` a `prompt` command asks for, as the pair the session
@@ -8595,6 +8644,7 @@ fn build_agent(
     agent = agent.with_hooks(Arc::new(ServeHooks {
         policy,
         approval: approval.cloned(),
+        mcp: mcp_enabled.clone(),
     }));
     agent
 }
@@ -8616,6 +8666,9 @@ struct ServeHooks {
     /// `None` unless `--approve` asked for one. Static deny still wins first; see
     /// [`crate::approval::gated_before_tool_call`], whose decision order is load-bearing.
     approval: Option<crate::approval::ApprovalRuntime>,
+    /// The session's MCP state, for the SEP-2640 code-execution gate: while the session is acting on
+    /// an MCP-served skill, `bash`/`execute` run only with the user's approval.
+    mcp: crate::tools::mcp::McpEnabledSet,
 }
 
 #[async_trait::async_trait]
@@ -8627,16 +8680,24 @@ impl AgentHooks for ServeHooks {
         session: &Session,
         cancel: &CancellationToken,
     ) -> Option<String> {
-        crate::approval::gated_before_tool_call(
+        let origin = crate::approval::ApprovalOrigin::Main;
+        if let Some(reason) = crate::approval::gated_before_tool_call(
             &self.policy,
             self.approval.as_ref(),
-            &crate::approval::ApprovalOrigin::Main,
+            &origin,
             name,
             input,
             session,
             cancel,
         )
         .await
+        {
+            return Some(reason);
+        }
+        self.mcp
+            .skill_session()
+            .gate_tool_call(name, input, &origin, cancel)
+            .await
     }
 
     async fn before_provider_request(&self, req: &mut agent_core::transport::ModelRequest) {
@@ -9199,13 +9260,284 @@ fn last_assistant_text(session: &Session) -> String {
 /// a message queued through `steer`/`follow_up` must get the same expansion a fresh `prompt` would, or
 /// a `/skill:name`/`/name` invocation sent through one of those paths silently reaches the model
 /// unexpanded instead of triggering the skill/template it names.
-fn expand_message(
+///
+/// An MCP-served skill (`/skill:<server>:<name>`) is tried first, and is the one case that awaits: its
+/// `SKILL.md` is fetched now, at the user's invocation, never prefetched (see `tools::mcp_skills`).
+async fn expand_message(
     message: &str,
     skills: &[crate::skills::Skill],
     prompt_templates: &[crate::prompts::PromptTemplate],
+    mcp_skills: &crate::tools::mcp_skills::McpSkills,
 ) -> String {
+    if let Some(expanded) = mcp_skills.expand_invocation(message, skills).await {
+        return expanded;
+    }
     let message = crate::skills::expand_if_skill_invocation(message, skills);
     crate::prompts::expand_if_slash(&message, prompt_templates)
+}
+
+/// Which steering lane a message queued during a run goes to.
+#[derive(Clone, Copy)]
+enum SteerLane {
+    /// Injected at the next tool turn.
+    Steer,
+    /// Held for the stop boundary.
+    FollowUp,
+}
+
+/// How a message queued during a run is acknowledged: as the `steer`/`follow_up` command it was, or
+/// as a `prompt` with `streaming_behavior` (whose ack also says `queued_as`).
+#[derive(Clone, Copy)]
+enum SteerAck {
+    Command(&'static str),
+    Prompt,
+}
+
+/// One steer/follow_up that arrived during a run, in arrival order, until it can be queued.
+struct PendingSteer {
+    seq: u64,
+    id: Option<String>,
+    images: Vec<agent_core::ImageSource>,
+    lane: SteerLane,
+    ack: SteerAck,
+    state: PendingState,
+}
+
+enum PendingState {
+    /// Expanded, waiting only for the entries ahead of it.
+    Ready(String),
+    /// An MCP `/skill:` being fetched on its own task, which reports back by `seq`.
+    Expanding(tokio::task::JoinHandle<()>),
+    /// Fetched; the acting window opens only if (and when) the text is actually queued.
+    Expanded(String, Option<crate::tools::mcp_skills::PendingActivation>),
+}
+
+/// What an expansion task reports: its `seq`, and its text plus the activation to apply when queued.
+type SteerExpanded = (
+    u64,
+    String,
+    Option<crate::tools::mcp_skills::PendingActivation>,
+);
+
+/// The steers and follow-ups received during the current run, kept in arrival order.
+///
+/// An MCP-served `/skill:` must be fetched from its server before it can be queued — up to the
+/// expansion timeout. That is never awaited in the busy loop (it would stop polling the run and
+/// reading `abort`/`approve`): it runs on a task of its own, which reports back through a channel the
+/// loop selects on. Everything here is bound to the run it arrived in:
+///
+/// - **Order.** Each message takes its place at receipt; one is queued (and acked) only once every
+///   message ahead of it has been, so a plain steer sent after a `/skill:` never overtakes it.
+/// - **Run end.** When the run ends — finished, aborted, or cancelled by `new_session`,
+///   `switch_session`, `fork`, `clone` — [`Self::end_run`] cancels every expansion still in flight
+///   (awaiting it, so it is gone before the next command runs) and acks it as not queued, with the
+///   reason. Messages behind it are queued in order if the run finished; if it was cancelled, the
+///   run already dropped its steer and follow-up lanes (`clear_run_scoped`), so they are acked as
+///   not queued too — run-scoped, like every steer the cancellation dropped — and an expansion that
+///   had finished but was still waiting its turn activates nothing.
+/// - **No activation across sessions.** An expansion opens no acting window itself; the skill is
+///   activated in the session's view only when its text is queued — in the run, and so the session,
+///   it came from.
+struct PendingSteers {
+    queue: std::collections::VecDeque<PendingSteer>,
+    next_seq: u64,
+    done_tx: mpsc::UnboundedSender<SteerExpanded>,
+}
+
+impl PendingSteers {
+    fn new(done_tx: mpsc::UnboundedSender<SteerExpanded>) -> Self {
+        Self {
+            queue: std::collections::VecDeque::new(),
+            next_seq: 0,
+            done_tx,
+        }
+    }
+
+    /// Take a message's place in line; queue whatever is now ready, in order.
+    #[allow(clippy::too_many_arguments)]
+    fn receive(
+        &mut self,
+        id: Option<String>,
+        message: &str,
+        images: Vec<agent_core::ImageSource>,
+        lane: SteerLane,
+        ack: SteerAck,
+        skills: &[crate::skills::Skill],
+        prompt_templates: &[crate::prompts::PromptTemplate],
+        mcp_skills: &crate::tools::mcp_skills::McpSkills,
+        steering: &agent_core::Steering,
+        out_tx: &mpsc::UnboundedSender<OutFrame>,
+    ) {
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        let state = if mcp_skills.claims_invocation(message, skills) {
+            let (message, skills) = (message.to_string(), skills.to_vec());
+            let (mcp, done_tx) = (mcp_skills.clone(), self.done_tx.clone());
+            PendingState::Expanding(tokio::spawn(async move {
+                let (text, activation) = mcp
+                    .expand_invocation_deferred(&message, &skills)
+                    .await
+                    .unwrap_or((message, None));
+                let _ = done_tx.send((seq, text, activation));
+            }))
+        } else {
+            let text = crate::skills::expand_if_skill_invocation(message, skills);
+            PendingState::Ready(crate::prompts::expand_if_slash(&text, prompt_templates))
+        };
+        self.queue.push_back(PendingSteer {
+            seq,
+            id,
+            images,
+            lane,
+            ack,
+            state,
+        });
+        self.flush(mcp_skills, steering, out_tx);
+    }
+
+    /// An expansion finished. One from an earlier run (cancelled, its slot gone) is ignored.
+    fn expanded(
+        &mut self,
+        done: SteerExpanded,
+        mcp_skills: &crate::tools::mcp_skills::McpSkills,
+        steering: &agent_core::Steering,
+        out_tx: &mpsc::UnboundedSender<OutFrame>,
+    ) {
+        let (seq, text, activation) = done;
+        if let Some(entry) = self.queue.iter_mut().find(|e| e.seq == seq)
+            && matches!(entry.state, PendingState::Expanding(_))
+        {
+            entry.state = PendingState::Expanded(text, activation);
+        }
+        self.flush(mcp_skills, steering, out_tx);
+    }
+
+    /// Queue (and ack) every message at the front that is ready, stopping at the first that isn't.
+    fn flush(
+        &mut self,
+        mcp_skills: &crate::tools::mcp_skills::McpSkills,
+        steering: &agent_core::Steering,
+        out_tx: &mpsc::UnboundedSender<OutFrame>,
+    ) {
+        while self
+            .queue
+            .front()
+            .is_some_and(|e| !matches!(e.state, PendingState::Expanding(_)))
+        {
+            let Some(entry) = self.queue.pop_front() else {
+                break;
+            };
+            let (text, activation) = match entry.state {
+                PendingState::Ready(text) => (text, None),
+                PendingState::Expanded(text, activation) => (text, activation),
+                PendingState::Expanding(_) => unreachable!("checked above"),
+            };
+            let queued = queue_steer(
+                entry.id,
+                text,
+                entry.images,
+                entry.lane,
+                entry.ack,
+                steering,
+                out_tx,
+            );
+            if queued && let Some(activation) = activation {
+                mcp_skills.apply_activation(activation);
+            }
+        }
+    }
+
+    /// The run is over: cancel what is still being fetched (and wait until it is gone), ack it as not
+    /// queued, and queue the rest in order — or, when the run was `cancelled` (its lanes already
+    /// cleared), ack the rest as not queued too.
+    async fn end_run(
+        &mut self,
+        cancelled: bool,
+        mcp_skills: &crate::tools::mcp_skills::McpSkills,
+        steering: &agent_core::Steering,
+        out_tx: &mpsc::UnboundedSender<OutFrame>,
+    ) {
+        while let Some(entry) = self.queue.pop_front() {
+            let refuse = |entry: PendingSteer, why: &str| {
+                let command = match entry.ack {
+                    SteerAck::Command(command) => command,
+                    SteerAck::Prompt => "prompt",
+                };
+                let _ = out_tx.send(response(
+                    entry.id,
+                    command,
+                    false,
+                    Some(queue_content(steering)),
+                    Some(why),
+                ));
+            };
+            match entry.state {
+                PendingState::Expanding(task) => {
+                    task.abort();
+                    let _ = task.await;
+                    refuse(
+                        PendingSteer {
+                            state: PendingState::Ready(String::new()),
+                            ..entry
+                        },
+                        STEER_RUN_ENDED,
+                    );
+                }
+                _ if cancelled => refuse(entry, STEER_RUN_ABORTED),
+                state => {
+                    self.queue.push_front(PendingSteer { state, ..entry });
+                    self.flush(mcp_skills, steering, out_tx);
+                }
+            }
+        }
+    }
+}
+
+/// Why a `/skill:` steer was not queued: its run ended while its skill was still being fetched.
+const STEER_RUN_ENDED: &str =
+    "not queued: the run it was sent to ended before its skill finished loading";
+
+/// Why a steer waiting behind a `/skill:` was not queued: its run was cancelled, which drops every
+/// steer and follow-up that run had queued.
+const STEER_RUN_ABORTED: &str = "not queued: the run it was sent to was cancelled";
+
+/// Push one steering message onto its lane and acknowledge it with what is now queued. Returns
+/// whether it was queued (a full lane refuses it, and the ack says so).
+fn queue_steer(
+    id: Option<String>,
+    text: String,
+    images: Vec<agent_core::ImageSource>,
+    lane: SteerLane,
+    ack: SteerAck,
+    steering: &agent_core::Steering,
+    out_tx: &mpsc::UnboundedSender<OutFrame>,
+) -> bool {
+    let m = agent_core::SteeringMessage::new(text, images);
+    let queued = match lane {
+        SteerLane::Steer => steering.push_steer(m),
+        SteerLane::FollowUp => steering.push(m),
+    };
+    let mut data = queue_content(steering);
+    let command = match ack {
+        SteerAck::Command(command) => command,
+        SteerAck::Prompt => {
+            if queued {
+                data["queued_as"] = json!(match lane {
+                    SteerLane::Steer => "steer",
+                    SteerLane::FollowUp => "follow_up",
+                });
+            }
+            "prompt"
+        }
+    };
+    let _ = out_tx.send(response(
+        id,
+        command,
+        queued,
+        Some(data),
+        (!queued).then_some(STEERING_QUEUE_FULL),
+    ));
+    queued
 }
 
 /// Parse a `prompt`'s optional `images` array into base64 image sources. Each entry is
@@ -9872,6 +10204,9 @@ fn approval_request_frame(request_id: &str, req: &crate::approval::ApprovalReque
     m.insert("summary".into(), req.summary.clone());
     m.insert("scope_key".into(), json!(req.scope_key));
     m.insert("origin".into(), req.origin.to_json());
+    if let Some(context) = &req.context {
+        m.insert("mcp_skill".into(), context.clone());
+    }
     m.insert(
         "options".into(),
         json!(["allow_once", "allow_session", "deny_once", "deny_session"]),
@@ -9918,22 +10253,13 @@ fn approval_resolved_frame(
 /// `accepted` is `false` when the `request_id` names no outstanding question — it was already answered
 /// by another attached client, it timed out, or the run was aborted. That is not an error: it is the
 /// answer a client races and loses.
-fn handle_approve(id: Option<String>, cmd: &Value, pending: Option<&PendingApprovals>) -> OutFrame {
+fn handle_approve(id: Option<String>, cmd: &Value, pending: &PendingApprovals) -> OutFrame {
     let Some(request_id) = cmd.get("request_id").and_then(Value::as_str) else {
         return response(id, "approve", false, None, Some("missing `request_id`"));
     };
     let decision = match parse_approval_decision(cmd) {
         Ok(d) => d,
         Err(e) => return response(id, "approve", false, None, Some(&e)),
-    };
-    let Some(pending) = pending else {
-        return response(
-            id,
-            "approve",
-            false,
-            None,
-            Some("this session has no approval gate (see `--approve`)"),
-        );
     };
     let accepted = resolve_approval(pending, request_id, decision);
     response(

@@ -40,6 +40,8 @@ pub mod mcp_events_fixture;
 pub mod mcp_fixture;
 /// A running `serve --service` replica, for the service-mode suites.
 pub mod service;
+/// The MCP Skills (SEP-2640) suites' isolated `$HOME` + skills-fixture harness.
+pub mod skills_env;
 
 /// Deterministic dev signing public key (standard base64), for a gateway `[signing_keys] 1 = …`.
 pub const DEV_PUBKEY_B64: &str = "6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw=";
