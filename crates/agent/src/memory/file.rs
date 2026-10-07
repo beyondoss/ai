@@ -173,16 +173,12 @@ impl Store {
         }
     }
 
-    /// The store-wide lock path guarding every mutation (one lock for the whole store keeps cross-file
-    /// operations like `rename` and index updates consistent).
-    fn lock_path(&self) -> PathBuf {
-        self.dir.join(".memory.lock")
-    }
-
-    /// Acquire the store lock, having ensured the store directory exists.
+    /// Acquire the store-wide lock guarding every mutation (one lock for the whole store keeps
+    /// cross-file operations like `rename` and index updates consistent), having ensured the store
+    /// directory exists.
     fn lock(&self) -> Result<StoreLock, MemoryError> {
         fs::create_dir_all(&self.dir).map_err(|e| MemoryError::Backend(e.to_string()))?;
-        StoreLock::acquire(&self.lock_path()).map_err(|e| MemoryError::Backend(e.to_string()))
+        StoreLock::acquire(&self.dir, LOCK_TIMEOUT).map_err(|e| MemoryError::Backend(e.to_string()))
     }
 
     /// Decode what a document's bytes say — sealed or not.
@@ -544,57 +540,41 @@ impl MemoryBackend for FileBackend {
     }
 }
 
-// ---- StoreLock: a cross-process advisory lock, duplicated per this crate's store convention --------
+// ---- StoreLock: the store-wide lock, a `file_lock` lock -----------------------------------------------
 
 const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(20);
 
-/// Held for the length of one mutation. Released by closing the descriptor on `Drop`, so a panicked or
-/// early-returning holder frees it — and so does a holder that is killed outright.
-///
-/// The lock is the file descriptor, not the file's existence. The previous `create_new`-as-a-mutex
-/// scheme had to guess when an abandoned lock file was stale (a fixed 10-second age), which is both a
-/// stall for anyone waiting and a silent lock break for anyone slower than the guess. `flock` has no
-/// such ambiguity: the kernel releases it when the holder's descriptor closes, crash included. The lock
-/// file itself is left behind deliberately — unlinking it while holding the lock is the classic race,
-/// where a waiter ends up locking an inode that is no longer the one at the path.
+/// Held for the length of one mutation: [`crate::file_lock`]'s lock on `<memdir>/.memory` — an OFD
+/// lock on `.memory.beyond-lock`, plus, for binaries before it, the `flock` on `.memory.lock` they
+/// took. The kernel releases it when the holder exits, crash included, so there is no staleness to
+/// guess. Being a `file_lock` lock is what keeps it a lock: no other descriptor (a model `read` of
+/// the file) releases it, and `write_atomic` refuses to rename over either file — a model `write` or
+/// `edit` that replaced `.memory.lock` would leave the next mutation locking a different inode, and
+/// two mutations running at once.
 struct StoreLock {
-    _file: fs::File,
+    _lock: crate::file_lock::FileLock,
 }
 
 impl StoreLock {
-    fn acquire(lock_path: &Path) -> io::Result<Self> {
-        if let Some(parent) = lock_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        // Read+write, because a network filesystem may emulate `flock` with POSIX record locks, which
-        // require a writable descriptor.
-        let mut opts = fs::OpenOptions::new();
-        opts.read(true).write(true).create(true).truncate(false);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        let file = opts.open(lock_path)?;
-        let deadline = Instant::now() + LOCK_TIMEOUT;
+    /// Poll for the lock (the store directory must exist) until `timeout`.
+    fn acquire(dir: &Path, timeout: Duration) -> io::Result<Self> {
+        let key = dir.join(".memory");
+        let deadline = Instant::now() + timeout;
         loop {
-            match file.try_lock() {
-                Ok(()) => return Ok(Self { _file: file }),
-                Err(fs::TryLockError::WouldBlock) => {
-                    if Instant::now() >= deadline {
-                        return Err(io::Error::new(
-                            ErrorKind::TimedOut,
-                            format!(
-                                "timed out waiting for memory store lock at {}",
-                                lock_path.display()
-                            ),
-                        ));
-                    }
-                    std::thread::sleep(LOCK_RETRY_INTERVAL);
-                }
-                Err(fs::TryLockError::Error(e)) => return Err(e),
+            if let Some(lock) = crate::file_lock::try_lock(crate::file_lock::Target::File(&key))? {
+                return Ok(Self { _lock: lock });
             }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    ErrorKind::TimedOut,
+                    format!(
+                        "timed out waiting for memory store lock in {}",
+                        dir.display()
+                    ),
+                ));
+            }
+            std::thread::sleep(LOCK_RETRY_INTERVAL);
         }
     }
 }
@@ -680,6 +660,65 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(zero, MemoryError::NotUnique { count: 0, .. }));
+    }
+
+    /// A model `write` to the store's lock file while a mutation holds the lock is refused — were it
+    /// renamed over, the next mutation would lock a different inode and run alongside this one. So a
+    /// second mutation still waits: here it times out rather than getting the lock.
+    #[cfg(unix)]
+    #[test]
+    fn the_store_lock_file_is_not_replaced_and_mutations_stay_serialized() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("memory");
+        fs::create_dir_all(&store).unwrap();
+        let held = StoreLock::acquire(&store, LOCK_TIMEOUT).unwrap();
+        for name in [".memory.lock", ".memory.beyond-lock", ".MEMORY.LOCK"] {
+            let path = store.join(name);
+            if name == ".MEMORY.LOCK" && !path.exists() {
+                continue; // case-sensitive filesystem: a different, ordinary file
+            }
+            assert!(
+                crate::tools::write_atomic(path.to_str().unwrap(), b"x").is_err(),
+                "{name} must not be replaced"
+            );
+        }
+        let second = StoreLock::acquire(&store, Duration::from_millis(100));
+        assert!(
+            second.is_err_and(|e| e.kind() == ErrorKind::TimedOut),
+            "a second mutation waits for the first"
+        );
+        drop(held);
+        StoreLock::acquire(&store, Duration::from_millis(100)).expect("free once released");
+    }
+
+    /// Concurrent mutations through the backend are serialized: none of them loses another's update.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_mutations_lose_no_update() {
+        let (_d, b) = backend();
+        b.create(&p("/memories/log.md"), "start\n").await.unwrap();
+        let b = Arc::new(b);
+        let tasks: Vec<_> = (0..16)
+            .map(|i| {
+                let b = b.clone();
+                tokio::spawn(async move {
+                    b.insert(&p("/memories/log.md"), 1, &format!("line {i}"))
+                        .await
+                        .unwrap();
+                })
+            })
+            .collect();
+        for t in tasks {
+            t.await.unwrap();
+        }
+        let View::Document(text) = b.view(&p("/memories/log.md"), None).await.unwrap() else {
+            panic!("not a document")
+        };
+        for i in 0..16 {
+            assert!(
+                text.contains(&format!("line {i}\n")),
+                "line {i} lost:\n{text}"
+            );
+        }
     }
 
     #[tokio::test]
