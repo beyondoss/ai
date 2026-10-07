@@ -111,6 +111,10 @@ struct State {
     /// `MCP_FIXTURE_NESTED_DURING=poll|stream`: the client's answers to the nested
     /// `elicitation/create` raised during that `events/*` request.
     nested_answers: Vec<Value>,
+    /// `MCP_FIXTURE_NESTED_ON_SIGNAL=1`: the nested request is held until `POST
+    /// /control/raise_nested` sets this — so a test raises it once its client is attached, rather
+    /// than guessing a delay.
+    nested_released: bool,
     /// `MCP_FIXTURE_FORBID_FIRST=<n>`: the first `n` `events/poll`/`events/subscribe` requests are
     /// refused with `-32012` (forbidden) — credentials that are refreshed and then work.
     forbid_left: u64,
@@ -1058,6 +1062,10 @@ async fn control(state: &Shared, method: &str, path: &str, body: &[u8]) -> (u16,
                 None => (404, json!({"error": "no such event"})),
             }
         }
+        ("POST", "/control/raise_nested") => {
+            state.lock().unwrap().nested_released = true;
+            (200, json!({ "ok": true }))
+        }
         ("POST", "/control/jwks") => {
             let mut st = state.lock().unwrap();
             st.jwks_status = req["status"].as_u64().map(|s| s as u16);
@@ -1592,6 +1600,11 @@ async fn nested_elicitation(state: &Shared, out: &Stdout, waiters: &Waiters, dur
     let delay = env_u64("MCP_FIXTURE_NESTED_DELAY_MS", 0);
     if delay > 0 {
         tokio::time::sleep(Duration::from_millis(delay)).await;
+    }
+    if env_flag("MCP_FIXTURE_NESTED_ON_SIGNAL") {
+        while !state.lock().unwrap().nested_released {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
     let id = format!("nested-{during}");
     let (tx, rx) = tokio::sync::oneshot::channel();

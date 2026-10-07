@@ -933,7 +933,7 @@ The harness layers several capabilities over the bare tools + loop:
   Proxy / TypedArrays / MapSet) runs it against `tools.<server>.<method>(input)` Promises. Built-in
   coding tools stay direct. Nested calls honor `--exclude-tools` / `--deny-tool`. Budgets: 30s wall
   clock, 64 nested calls, 256 KiB result, **4 MiB JS heap**, **128 KiB JS stack**, and **one QuickJS
-  runtime per process** (a `serve` daemon never holds two heaps at once). An allow-list of built-ins
+  runtime per process** (a `serve` daemon never holds two heaps at once). QuickJS evaluates synchronously, so evaluation runs on the blocking pool under a local executor, never on the runtime thread other sessions share: a spinning script holds a pool thread until its interrupt (deadline, cancellation, or the call being dropped — a guard trips it) fires, and the one-heap slot is released when the evaluation really ends. Nested host calls are spawned back onto the session's runtime and raced against cancellation. An allow-list of built-ins
   (`--tools read,bash`) still keeps `execute` so the deferred catalog is reachable; `--exclude-tools
   execute` (or `--no-tools`) drops it. Subagents inherit the parent's flag so a child cannot
   re-advertise the catalog the parent deferred. QuickJS is a cargo feature (`code-mode`) because idle
@@ -2487,7 +2487,7 @@ standing in for `serve_session` so the test decides exactly when an exiting task
 `#[tokio::main]` builds one, and that's what this binary used to inherit. Session tasks now share
 that process runtime (`serve_ws` `tokio::spawn`s each `serve_session`; the future is `Send`).
 CPU-bound tool work (`grep`/`find`/image resize) is `spawn_blocking`, which a current-thread
-runtime still has a blocking pool for. Extra workers cost per-thread stacks and mimalloc heaps, on
+runtime still has a blocking pool for. So is anything that blocks the thread without using CPU: `web` builds its client and spawns and waits on its isolated parser child there, `bash`'s stale-spill sweep of the system temp directory runs there, `memory` merges and renders large search results there, and Code Mode evaluates there. `tests/tool_reactor_stall.rs` holds every tool that needs no external service to it with two probes on a `current_thread` runtime — the CPU the runtime thread spends inside the tool's polls, and the worst gap of a ticker task on the same runtime with run-queue wait (`/proc/thread-self/schedstat`) taken out, so wall-clock blocking (a sleep, blocking disk or NFS I/O, a contended `std` mutex) is caught and host load is not. Extra workers cost per-thread stacks and mimalloc heaps, on
 a binary whose idle RSS in a 768 MB guest is already the density budget.
 
 **The default now splits by mode** (`main.rs::build_runtime`): `current_thread` for a local daemon,
@@ -4837,7 +4837,7 @@ mcp_events_subscribe (any session) ──► owned by that session
   session-bound HTTP server goes through rmcp's own connection, which carries its `Mcp-Session-Id`.
   A server→client request (an elicitation, a sampling request) raised during an `events/*` request
   is attributed to the session that owns it over rmcp — the same rule as during a `tools/call`
-  (`track_call`) — and, over direct HTTP, where nothing could route it to a session, answered at once
+  (`track_call`); a session starts its hub only after its elicitation and sampling gates are installed, so one raised during the very first `events/*` request reaches its client rather than the default gate's decline — and, over direct HTTP, where nothing could route it to a session, answered at once
   with an error rather than left unanswered (`tests/mcp_events_nested.rs`). That answer is POSTed
   with the same `Accept` (`application/json, text/event-stream`) as every events request — a
   streamable-HTTP server refuses an answer without it `406` and keeps waiting (the fixture enforces
