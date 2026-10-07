@@ -743,7 +743,20 @@ impl SseReader {
     pub(super) async fn next(&mut self) -> Option<Value> {
         loop {
             if let Some((end, sep_end)) = find_event_end(&self.buf, self.scanned.max(self.start)) {
-                let parsed = parse_sse_event(&self.buf[self.start..end]);
+                let event = &self.buf[self.start..end];
+                // One read can bring a whole over-cap event at once: it is held to the cap all the
+                // same — stood in for if it is an events notification, else the stream ends.
+                let parsed = if event.len() > self.max {
+                    match crate::tools::mcp_stdio::oversized_stand_in(&sse_data_head(event, 4096)) {
+                        Some(stand_in) => Some(stand_in),
+                        None => {
+                            self.error = Some(format!("an SSE event exceeded {} bytes", self.max));
+                            return None;
+                        }
+                    }
+                } else {
+                    parse_sse_event(event)
+                };
                 self.start = sep_end;
                 self.scanned = sep_end;
                 match parsed {
@@ -760,6 +773,16 @@ impl SseReader {
             // A separator is at most four bytes, so one could still start in the last three.
             self.scanned = self.scanned.max(self.buf.len().saturating_sub(3));
             if self.buf.len() > self.max {
+                // An over-cap MCP Events notification is skipped, not read: its bounded head names
+                // it (and, before the payload, its cursor), and a small stand-in takes its place —
+                // see `mcp_stdio::oversized_stand_in`. Anything else ends the stream with an error.
+                let head = sse_data_head(&self.buf, 4096);
+                if let Some(stand_in) = crate::tools::mcp_stdio::oversized_stand_in(&head) {
+                    if !self.skip_rest_of_event().await {
+                        return None;
+                    }
+                    return Some(stand_in);
+                }
                 self.error = Some(format!("an SSE event exceeded {} bytes", self.max));
                 return None;
             }
@@ -769,6 +792,44 @@ impl SseReader {
             }
         }
     }
+
+    /// Discard the rest of the event in progress (the buffer holds only its start), reading on to
+    /// its end without keeping it. `false` if the stream ended first.
+    async fn skip_rest_of_event(&mut self) -> bool {
+        // Only the last three bytes can begin a separator that the next chunk completes.
+        let mut tail: Vec<u8> = self.buf[self.buf.len().saturating_sub(3)..].to_vec();
+        self.buf.clear();
+        self.start = 0;
+        self.scanned = 0;
+        loop {
+            let Ok(Some(chunk)) = self.resp.chunk().await else {
+                return false;
+            };
+            tail.extend_from_slice(&chunk);
+            if let Some((_, sep_end)) = find_event_end(&tail, 0) {
+                self.buf.extend_from_slice(&tail[sep_end..]);
+                return true;
+            }
+            let keep = tail.len().saturating_sub(3);
+            tail.drain(..keep);
+        }
+    }
+}
+
+/// The start of an SSE event's first `data:` payload, at most `max` bytes of it.
+fn sse_data_head(event: &[u8], max: usize) -> Vec<u8> {
+    let at = event
+        .windows(5)
+        .position(|w| w == b"data:")
+        .map_or(event.len(), |i| i + 5);
+    let rest = &event[at..];
+    let rest = rest.strip_prefix(b" ").unwrap_or(rest);
+    let end = rest
+        .iter()
+        .position(|&b| b == b'\n' || b == b'\r')
+        .unwrap_or(rest.len())
+        .min(max);
+    rest[..end].to_vec()
 }
 
 /// One SSE event's `data:` lines, joined and parsed as JSON. `None` for an event with no data or
@@ -1084,6 +1145,29 @@ mod tests {
             "draining {n} events took {:?}",
             started.elapsed()
         );
+    }
+
+    /// An over-cap events notification in an SSE stream is skipped to its end without being held,
+    /// and stands in as a small `$oversized` message; the stream goes on to the next event.
+    #[tokio::test]
+    async fn an_oversized_sse_event_is_skipped_and_the_stream_goes_on() {
+        let big = format!(
+            r#"data: {{"jsonrpc":"2.0","method":"notifications/events/event","params":{{"cursor":"7","data":"{}"}}}}"#,
+            "x".repeat(50_000)
+        );
+        let body = format!(
+            "{big}\n\ndata: {}\n\n",
+            r#"{"jsonrpc":"2.0","method":"notifications/events/event","params":{"cursor":"8"}}"#
+        );
+        let resp = reqwest::Response::from(http::Response::new(body));
+        let mut reader = SseReader::with_max(resp, 4096);
+        let first = reader.next().await.unwrap();
+        assert_eq!(first["params"]["$oversized"], true);
+        assert_eq!(first["params"]["cursor"], "7");
+        assert!(first["params"].get("data").is_none());
+        let second = reader.next().await.unwrap();
+        assert_eq!(second["params"]["cursor"], "8");
+        assert!(reader.error.is_none());
     }
 
     #[test]

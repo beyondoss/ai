@@ -165,34 +165,101 @@ fn an_over_cap_unary_sse_answer_on_the_events_wire_is_refused() {
     );
 }
 
-/// An `events/stream` event over the cap ends the stream with an error rather than being read
-/// whole; the subscription retries (with backoff — a server that keeps resending the same giant event
-/// keeps failing, it does not take the host's memory), and the session stays responsive.
-#[test]
-fn an_over_cap_event_on_an_events_stream_is_refused_not_read_whole() {
-    let (_c, mut stdin, mut frames, control, _home, _fx) = events_serve(
-        &[("MCP_FIXTURE_HEARTBEAT_MS", "200")],
-        json!([{ "name": "ticket.updated", "delivery": "push", "action": "notify" }]),
-    );
+/// An `events/stream` event over the cap is skipped, not read and not reconnected into: its bounded
+/// head names it (and its cursor), it is reported as a gap — to the client and to the model — and the
+/// next event on the same stream is delivered. Over streamable HTTP (SSE) and over stdio.
+fn an_over_cap_push_event_is_skipped_and_reported(stdio: bool) {
+    let events = json!([{ "name": "ticket.updated", "delivery": "push", "action": "follow_up" }]);
+    let home = tempfile::tempdir().unwrap();
+    let control_file = home.path().join("control");
+    let http_fixture = (!stdio).then(|| spawn_http_fixture(&[("MCP_FIXTURE_HEARTBEAT_MS", "200")]));
+    let server = match &http_fixture {
+        Some((_fx, mcp_url, _control)) => {
+            json!({ "name": "tickets", "transport": "http", "url": mcp_url, "events": events })
+        }
+        None => stdio_server(
+            "tickets",
+            &control_file,
+            json!({ "MCP_FIXTURE_HEARTBEAT_MS": "200" }),
+            events,
+        ),
+    };
+    write_settings(home.path(), json!([server]));
+    let (base, bodies) = spawn_model_server_routed(vec![], turn_text("noted"));
+    let mut cmd = serve_cmd(BIN, &base, &home.path().join("s.jsonl").to_string_lossy());
+    fast_knobs(&mut cmd)
+        .env("HOME", home.path())
+        .env("BEYOND_AI_AGENT_MCP_MAX_MESSAGE_BYTES", "65536")
+        .stderr(Stdio::null());
+    let mut child = cmd.spawn_guarded();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut frames = Frames::new(child.stdout.take().unwrap(), None);
+    let control = match &http_fixture {
+        Some((_, _, control)) => control.clone(),
+        None => common::mcp_events_fixture::wait_control_file(&control_file),
+    };
     common::mcp_events_fixture::wait_active(&mut stdin, &mut frames, 1);
+    let streams = |control: &str| {
+        common::mcp_events_fixture::state(control)["methods"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| *m == "events/stream")
+            .count()
+    };
+    let streams_before = streams(&control);
     common::mcp_events_fixture::emit(
         &control,
         json!({ "event_id": "huge-1", "data": { "blob": "x".repeat(200_000) } }),
     );
-    let status = frames.wait(Duration::from_secs(20), "the stream's refusal", |f| {
-        f["type"] == "mcp_event_status"
-            && f["kind"] == "error"
-            && f.to_string().contains("exceeded")
+    common::mcp_events_fixture::emit(
+        &control,
+        json!({ "event_id": "small-1", "data": { "ok": true } }),
+    );
+    let gap = frames.wait(
+        Duration::from_secs(20),
+        "the gap for the dropped event",
+        |f| f["type"] == "mcp_event_status" && f["kind"] == "gap",
+    );
+    assert_eq!(gap["reason"], "oversized", "{gap:#}");
+    // The fixture serializes `cursor` ahead of the payload (and `eventId` after it): the cursor is
+    // kept, the id is not known.
+    assert!(
+        gap["cursor"].is_string(),
+        "the skipped event's cursor is kept: {gap:#}"
+    );
+    let f = frames.wait(Duration::from_secs(20), "the next event", |f| {
+        f["type"] == "mcp_event" && f["event"]["eventId"] == "small-1"
     });
-    assert!(status.to_string().contains("65536"), "{status:#}");
-    send(&mut stdin, json!({ "type": "mcp_events_list", "id": "l" }));
-    let l = frames.response("l");
-    assert_eq!(l["success"], true, "the session stays responsive: {l:#}");
+    assert_eq!(f["event"]["data"]["ok"], true);
     assert!(
         !frames
             .seen
             .iter()
             .any(|f| f["type"] == "mcp_event" && f["event"]["eventId"] == "huge-1"),
-        "the over-cap event was never delivered"
+        "the over-cap event was never read"
     );
+    common::mcp_events_fixture::eventually(Duration::from_secs(20), "the model told", || {
+        bodies
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|b| b.contains("larger than the message-size limit"))
+            .then_some(())
+    });
+    assert_eq!(
+        streams(&control),
+        streams_before,
+        "skipped in place: the stream was not reconnected into the same event"
+    );
+}
+
+#[test]
+fn an_over_cap_push_event_over_http_is_skipped_and_reported_and_the_next_is_delivered() {
+    an_over_cap_push_event_is_skipped_and_reported(false);
+}
+
+#[test]
+fn an_over_cap_push_event_over_stdio_is_skipped_and_reported_and_the_next_is_delivered() {
+    an_over_cap_push_event_is_skipped_and_reported(true);
 }

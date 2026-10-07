@@ -359,6 +359,90 @@ pub(crate) fn scan_head(head: &[u8]) -> Head {
     }
 }
 
+/// A small stand-in for an over-cap **MCP Events notification** (`notifications/events/*`), built
+/// from the bounded head of the message — the oversized one itself is never held. The stand-in is
+/// the same notification with `params` cut down to the members that appear, whole, before the
+/// head runs out (the event's `_meta` routing, `cursor`, `eventId`, `name`, … — whatever precedes the
+/// payload) plus `"$oversized": true`, so the events client can skip that event, keep its cursor and
+/// tell the model it was dropped, rather than reconnecting into the same giant event forever.
+/// `None` for anything else (it is dropped as before).
+pub(crate) fn oversized_stand_in(head: &[u8]) -> Option<Value> {
+    let ws = |mut i: usize| {
+        while head.get(i).is_some_and(u8::is_ascii_whitespace) {
+            i += 1;
+        }
+        i
+    };
+    let mut i = ws(0);
+    if head.get(i) != Some(&b'{') {
+        return None;
+    }
+    i += 1;
+    let mut method: Option<String> = None;
+    loop {
+        i = ws(i);
+        if head.get(i) != Some(&b'"') {
+            return None;
+        }
+        let key_end = string_end(head, i)?;
+        let key = &head[i + 1..key_end - 1];
+        i = ws(key_end);
+        if head.get(i) != Some(&b':') {
+            return None;
+        }
+        i = ws(i + 1);
+        if key == b"params" {
+            let method = method.filter(|m| m.starts_with("notifications/events/"))?;
+            let mut params = serde_json::Map::new();
+            if head.get(i) == Some(&b'{') {
+                let mut j = i + 1;
+                loop {
+                    j = ws(j);
+                    if head.get(j) != Some(&b'"') {
+                        break;
+                    }
+                    let Some(k_end) = string_end(head, j) else {
+                        break;
+                    };
+                    let Ok(k) = serde_json::from_slice::<String>(&head[j..k_end]) else {
+                        break;
+                    };
+                    j = ws(k_end);
+                    if head.get(j) != Some(&b':') {
+                        break;
+                    }
+                    j = ws(j + 1);
+                    let Some(v_end) = value_end(head, j) else {
+                        break;
+                    };
+                    let value = &head[j..v_end];
+                    // Scalars, and the small `_meta` (routing); a whole nested payload is skipped.
+                    let keep = !matches!(value.first(), Some(b'{' | b'[')) || k == "_meta";
+                    if keep && let Ok(v) = serde_json::from_slice::<Value>(value) {
+                        params.insert(k, v);
+                    }
+                    j = ws(v_end);
+                    if head.get(j) != Some(&b',') {
+                        break;
+                    }
+                    j += 1;
+                }
+            }
+            params.insert("$oversized".into(), Value::Bool(true));
+            return Some(json!({ "jsonrpc": "2.0", "method": method, "params": params }));
+        }
+        let end = value_end(head, i)?;
+        if key == b"method" {
+            method = serde_json::from_slice::<String>(&head[i..end]).ok();
+        }
+        i = ws(end);
+        if head.get(i) != Some(&b',') {
+            return None;
+        }
+        i += 1;
+    }
+}
+
 /// The index just past the JSON string opening at `buf[at]`, if it closes within `buf`.
 fn string_end(buf: &[u8], at: usize) -> Option<usize> {
     let mut j = at + 1;
@@ -419,6 +503,8 @@ pub(crate) enum Inbound {
         reply_to: Option<String>,
         method: Option<String>,
         cap: usize,
+        /// For an over-cap MCP Events notification, its stand-in ([`oversized_stand_in`]).
+        stand_in: Option<Value>,
     },
     Eof,
 }
@@ -439,19 +525,22 @@ pub(crate) async fn read_capped<R: tokio::io::AsyncBufRead + Unpin>(
     let mut head: Option<Head> = None;
     // Set once the line is over its cap. The rest is discarded unread.
     let mut discarding: Option<Head> = None;
-    let refused = |head: Head, cap: usize| {
+    // An over-cap events notification's stand-in, built from its head before that is let go.
+    let mut stand_in: Option<Value> = None;
+    let refused = |head: Head, cap: usize, stand_in: Option<Value>| {
         caps.take(head.reply_to());
         Inbound::Refused {
             reply_to: head.reply_to().map(str::to_owned),
             method: head.method,
             cap,
+            stand_in,
         }
     };
     loop {
         let avail = reader.fill_buf().await?;
         if avail.is_empty() {
             return Ok(match discarding {
-                Some(head) => refused(head, cap),
+                Some(head) => refused(head, cap, stand_in.take()),
                 None if buf.is_empty() => Inbound::Eof,
                 None => Inbound::Line(buf),
             });
@@ -472,7 +561,11 @@ pub(crate) async fn read_capped<R: tokio::io::AsyncBufRead + Unpin>(
             }
             // Over the window means scanned above, so `head` is always `Some` here.
             if buf.len() > cap.max(ID_WINDOW) || (done && buf.len() > cap) {
-                discarding = Some(head.take().unwrap_or_default());
+                let scanned = head.take().unwrap_or_default();
+                if scanned.reply_to().is_none() {
+                    stand_in = oversized_stand_in(&buf[..buf.len().min(ID_WINDOW)]);
+                }
+                discarding = Some(scanned);
                 buf = Vec::new();
             }
         }
@@ -480,7 +573,7 @@ pub(crate) async fn read_capped<R: tokio::io::AsyncBufRead + Unpin>(
         reader.consume(n);
         if done {
             return Ok(match discarding {
-                Some(head) => refused(head, cap),
+                Some(head) => refused(head, cap, stand_in.take()),
                 None => {
                     caps.take(head.as_ref().and_then(Head::reply_to));
                     Inbound::Line(buf)
@@ -599,7 +692,18 @@ pub(crate) fn stdio_transport(
                     reply_to,
                     method,
                     cap,
+                    stand_in,
                 }) => {
+                    // An over-cap MCP Events notification goes on as its small stand-in, so the
+                    // subscription can skip the event and report it dropped.
+                    if let Some(stand_in) = stand_in {
+                        let mut line = stand_in.to_string().into_bytes();
+                        line.push(b'\n');
+                        if pump_side.write_all(&line).await.is_err() {
+                            break;
+                        }
+                        continue;
+                    }
                     // Answer in the server's place only for a response that provably answers a host
                     // request. A server→client request or notification is dropped (its id is the
                     // server's, and an error under it could fail an unrelated host request), as is a
@@ -712,7 +816,8 @@ mod tests {
             Inbound::Refused {
                 reply_to: Some("7".into()),
                 method: None,
-                cap: view_cap
+                cap: view_cap,
+                stand_in: None,
             }
         );
         assert!(
@@ -748,7 +853,8 @@ mod tests {
             Inbound::Refused {
                 reply_to: None,
                 method: None,
-                cap: 100_000
+                cap: 100_000,
+                stand_in: None,
             }
         );
         assert!(peak <= 100_000 + 8192, "held {peak}");
@@ -765,7 +871,8 @@ mod tests {
             Inbound::Refused {
                 reply_to: Some("\"abc\"".into()),
                 method: None,
-                cap: 100_000
+                cap: 100_000,
+                stand_in: None,
             }
         );
         // A plain response under the cap passes untouched, and an untracked large one is not
@@ -802,7 +909,8 @@ mod tests {
             Inbound::Refused {
                 reply_to: None,
                 method: Some("notifications/progress".into()),
-                cap: 100_000
+                cap: 100_000,
+                stand_in: None,
             }
         );
         // Nor when the nested id comes before the top-level members, in a response with no id.
@@ -837,7 +945,8 @@ mod tests {
             Inbound::Refused {
                 reply_to: None,
                 method: Some("sampling/createMessage".into()),
-                cap: 100_000
+                cap: 100_000,
+                stand_in: None,
             }
         );
         // And it never steals a tight cap registered for the host's own request with that id.
@@ -1051,5 +1160,39 @@ mod tests {
             !alive(orphan),
             "the panic surfaced with the server's grandchild {orphan} still running"
         );
+    }
+
+    /// An over-cap events notification's stand-in keeps what its head shows whole — routing, cursor,
+    /// id — and none of the payload; anything that is not an events notification gets none.
+    #[test]
+    fn an_oversized_events_notification_gets_a_stand_in_from_its_head() {
+        let head = br#"{"jsonrpc":"2.0","method":"notifications/events/event","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":"s1"},"cursor":"41","eventId":"e9","data":{"blob":"xxxxxxxxxx"#;
+        let stand_in = oversized_stand_in(head).unwrap();
+        assert_eq!(stand_in["method"], "notifications/events/event");
+        assert_eq!(stand_in["params"]["cursor"], "41");
+        assert_eq!(stand_in["params"]["eventId"], "e9");
+        assert_eq!(stand_in["params"]["$oversized"], true);
+        assert_eq!(
+            stand_in["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"],
+            "s1"
+        );
+        assert!(stand_in["params"].get("data").is_none(), "no payload");
+        // Members past the head are simply unknown.
+        let late = br#"{"jsonrpc":"2.0","method":"notifications/events/event","params":{"data":{"blob":"xxxx"#;
+        let stand_in = oversized_stand_in(late).unwrap();
+        assert!(stand_in["params"].get("cursor").is_none());
+        for other in [
+            &br#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"progress":1"#[..],
+            br#"{"jsonrpc":"2.0","id":3,"result":{"x":"yyyy"#,
+            br#"{"jsonrpc":"2.0","params":{"cursor":"1"},"method":"notifications/events/event"}"#,
+            b"not json",
+        ] {
+            assert_eq!(
+                oversized_stand_in(other),
+                None,
+                "{}",
+                String::from_utf8_lossy(other)
+            );
+        }
     }
 }

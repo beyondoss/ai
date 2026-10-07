@@ -1364,6 +1364,29 @@ impl Hub {
     /// The server says events may have been skipped (`truncated`, a `gap` envelope): adopt its
     /// fresh cursor, tell attached clients, and — unless `notify` — tell the model too, so it can
     /// re-check authoritative state.
+    /// An event too large to accept was skipped (see the `$oversized` stand-in): note its id so a
+    /// replay of it is not reported twice, keep its cursor if known, and record a gap that says so.
+    fn oversized(&self, spec: &SubSpec, state: &SubState, stand_in: &Value) {
+        let event_id = stand_in.get("eventId").and_then(Value::as_str);
+        if let Some(id) = event_id
+            && let Ok(mut d) = state.dedup.lock()
+            && !d.first_sighting(id)
+        {
+            return;
+        }
+        tracing::warn!(
+            server = %spec.server,
+            event = %spec.sub.name,
+            event_id,
+            "skipped an MCP event over the message-size cap"
+        );
+        let mut carrier = json!({ "reason": "oversized", "eventId": event_id });
+        if let Some(cursor) = stand_in.get("cursor") {
+            carrier["cursor"] = cursor.clone();
+        }
+        self.gap(spec, state, &carrier);
+    }
+
     fn gap(&self, spec: &SubSpec, state: &SubState, carrier: &Value) {
         if carrier
             .as_object()
@@ -1371,7 +1394,13 @@ impl Hub {
         {
             state.set_cursor_from(carrier);
         }
-        self.status_event(spec, "gap", json!({ "cursor": state.cursor() }));
+        let reason = carrier.get("reason").and_then(Value::as_str);
+        let event_id = carrier.get("eventId").filter(|v| !v.is_null()).cloned();
+        self.status_event(
+            spec,
+            "gap",
+            json!({ "cursor": state.cursor(), "reason": reason, "event_id": event_id }),
+        );
         if spec.sub.action != McpEventAction::Notify {
             let queued = self.store.push_pending(PendingEvent::new(
                 spec.sub.action,
@@ -1379,7 +1408,7 @@ impl Hub {
                 spec.sub.name.clone(),
                 spec.arguments(),
                 spec.sub.instructions.clone(),
-                json!({ "gap": true, "cursor": state.cursor() }),
+                json!({ "gap": true, "cursor": state.cursor(), "reason": reason, "eventId": event_id }),
             ));
             if !queued {
                 tracing::warn!("pending queue full; a gap notice was not queued for the model");
@@ -1986,6 +2015,13 @@ fn on_stream_msg(
                 state.set_cursor_from(&msg.params);
             }
         }
+        // An event over the message-size cap, skipped by the transport: only its stand-in arrived
+        // (`mcp_stdio::oversized_stand_in`). It is not reconnected into — the stream goes on — its
+        // cursor is kept when its head carried one (else the next heartbeat's applies), and the
+        // model is told an event was dropped.
+        "notifications/events/event" if msg.params.get("$oversized") == Some(&json!(true)) => {
+            hub.oversized(spec, state, &msg.params);
+        }
         "notifications/events/event" => {
             if hub.deliver(spec, McpEventDelivery::Push, state, msg.params) == Delivery::Full {
                 // Nothing of it was recorded: reconnecting from the cursor brings it back.
@@ -2241,6 +2277,20 @@ fn render_injection(batch: u64, events: &[PendingEvent]) -> String {
     }
     for e in events {
         if e.event.get("gap") == Some(&json!(true)) {
+            if e.event.get("reason") == Some(&json!("oversized")) {
+                out.push_str(&format!(
+                    "\n[gap] An event for `{}` on `{}`{} was larger than the message-size limit and \
+                     was dropped unread. If it matters, re-check the authoritative state with tools.\n",
+                    e.name,
+                    e.server,
+                    e.event
+                        .get("eventId")
+                        .and_then(Value::as_str)
+                        .map(|id| format!(" (event id `{}`)", id.replace('`', "")))
+                        .unwrap_or_default()
+                ));
+                continue;
+            }
             out.push_str(&format!(
                 "\n[gap] The server reported that events for `{}` on `{}` may have been missed \
                  (its history did not reach back far enough). If it matters, re-check the \
