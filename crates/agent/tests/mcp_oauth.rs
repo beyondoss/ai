@@ -327,7 +327,7 @@ fn mcp_login_established_credential_is_honored_by_serve_too_not_just_run() {
         .env("HOME", home.path())
         .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
     writeln!(
         stdin,
         "{}",

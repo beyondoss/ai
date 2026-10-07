@@ -35,7 +35,7 @@ fn serve_startup_model_override_header_reaches_the_wire_request() {
         .env("AI_AGENT_CONFIG_DIR", &config_dir)
         .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     writeln!(stdin, "{}", json!({ "type": "prompt", "message": "hi" })).unwrap();
     stdin.flush().unwrap();
@@ -79,7 +79,7 @@ fn serve_set_model_to_an_overridden_model_carries_that_models_own_header_on_the_
         .env("AI_AGENT_CONFIG_DIR", &config_dir)
         .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     writeln!(stdin, "{}", json!({ "type": "prompt", "message": "hi" })).unwrap();
     stdin.flush().unwrap();

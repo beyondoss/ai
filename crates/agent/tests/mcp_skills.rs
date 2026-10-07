@@ -423,7 +423,7 @@ fn serve_get_commands_and_the_mcp_gate_cover_skills() {
 /// this is the HTTP half of that regression, the stdio half being every test above.
 #[test]
 fn skills_work_over_streamable_http() {
-    use std::io::{BufRead, BufReader};
+    use std::io::BufRead;
     let env = Env::new(json!({}));
     let mut server = std::process::Command::new(FIXTURE)
         .arg("--http")
@@ -433,7 +433,7 @@ fn skills_work_over_streamable_http() {
         .stderr(Stdio::null())
         .spawn_guarded();
     let mut url = String::new();
-    BufReader::new(server.stdout.take().unwrap())
+    common::child_frames(&mut server)
         .read_line(&mut url)
         .unwrap();
     std::fs::write(

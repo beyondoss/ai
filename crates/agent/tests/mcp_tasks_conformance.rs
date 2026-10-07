@@ -11,7 +11,7 @@
 
 mod common;
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -87,7 +87,7 @@ impl Env {
             .env("BEYOND_AI_AGENT_MCP_IDLE_SECS", "0");
         let mut child = cmd.spawn_guarded();
         let mut stdin = child.stdin.take().unwrap();
-        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let mut stdout = common::child_frames(&mut child);
         writeln!(stdin, "{}", json!({ "type": "prompt", "message": "go" })).unwrap();
         stdin.flush().unwrap();
         let frames = read_until_response(&mut stdout, "prompt");
@@ -151,10 +151,7 @@ fn run_handles_both_shapes_declares_capability_and_honours_latest_poll_interval(
         .stderr(Stdio::piped())
         .spawn_guarded();
     let mut stdout = String::new();
-    child
-        .stdout
-        .take()
-        .unwrap()
+    common::child_frames(&mut child)
         .read_to_string(&mut stdout)
         .unwrap();
     let status = child.wait().unwrap();
@@ -225,7 +222,7 @@ fn serve_deduplicates_input_requests_across_polls() {
         .env("BEYOND_AI_AGENT_MCP_IDLE_SECS", "0");
     let mut child = cmd.spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
     writeln!(stdin, "{}", json!({ "type": "prompt", "message": "go" })).unwrap();
     stdin.flush().unwrap();
 
@@ -481,7 +478,7 @@ fn serve_subagent_polls_a_task_to_completion() {
         .current_dir(&project);
     let mut child = cmd.spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
     writeln!(stdin, "{}", json!({ "type": "prompt", "message": "go" })).unwrap();
     stdin.flush().unwrap();
     read_until_response(&mut stdout, "prompt");

@@ -7,7 +7,7 @@
 
 mod common;
 
-use std::io::{BufReader, Write};
+use std::io::Write;
 use std::path::Path;
 
 use common::{
@@ -62,7 +62,7 @@ fn serve_streams_mcp_progress_before_tool_end() {
     cmd.env("BEYOND_AI_AGENT_MCP_IDLE_SECS", "0");
     let mut child = cmd.spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     writeln!(
         stdin,

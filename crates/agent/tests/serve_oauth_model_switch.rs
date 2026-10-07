@@ -88,7 +88,7 @@ fn set_model_across_oauth_providers_rederives_credential_and_routing() {
         .stderr(Stdio::null())
         .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     // First turn: the Anthropic-OAuth-resolved model, no `--key` given at all — proves the initial
     // resolution still works with no explicit credential (matches `oauth_e2e.rs`'s existing coverage).

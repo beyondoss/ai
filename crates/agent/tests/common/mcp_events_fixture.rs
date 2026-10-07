@@ -6,11 +6,10 @@
 
 #![allow(dead_code)]
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::process::{ChildStdout, Command, Stdio};
-use std::sync::mpsc;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -77,7 +76,7 @@ pub fn spawn_http_fixture(envs: &[(&str, &str)]) -> (ChildGuard, String, String)
     }
     let mut child = cmd.spawn_guarded();
     let mut line = String::new();
-    BufReader::new(child.stdout.take().unwrap())
+    super::child_frames(&mut child)
         .read_line(&mut line)
         .unwrap();
     let v: Value = serde_json::from_str(line.trim()).expect("fixture banner");
@@ -122,29 +121,18 @@ pub fn fast_knobs(cmd: &mut Command) -> &mut Command {
         .env("BEYOND_AI_AGENT_MCP_IDLE_SECS", "0")
 }
 
-/// Frames from a `serve` child's stdout, read on a thread so every wait can be bounded.
+/// Frames from a `serve` child's stdout ([`super::child_frames`]), each wait bounded by its caller.
 pub struct Frames {
-    rx: mpsc::Receiver<Value>,
+    frames: super::Frames,
     /// Everything received so far, in order.
     pub seen: Vec<Value>,
     stderr: Option<PathBuf>,
 }
 
 impl Frames {
-    pub fn new(stdout: ChildStdout, stderr: Option<PathBuf>) -> Self {
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            for line in BufReader::new(stdout).lines() {
-                let Ok(line) = line else { break };
-                if let Ok(v) = serde_json::from_str::<Value>(line.trim())
-                    && tx.send(v).is_err()
-                {
-                    break;
-                }
-            }
-        });
+    pub fn new(child: &mut ChildGuard, stderr: Option<PathBuf>) -> Self {
         Self {
-            rx,
+            frames: super::child_frames(child),
             seen: Vec::new(),
             stderr,
         }
@@ -167,7 +155,7 @@ impl Frames {
         let deadline = Instant::now() + timeout;
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
-            match self.rx.recv_timeout(left) {
+            match self.frames.next_frame(left) {
                 Ok(v) => {
                     self.seen.push(v.clone());
                     if pred(&v) {
@@ -188,11 +176,18 @@ impl Frames {
             if left.is_zero() {
                 return out;
             }
-            if let Ok(v) = self.rx.recv_timeout(left) {
-                self.seen.push(v.clone());
-                if pred(&v) {
-                    out.push(v);
+            match self.frames.next_frame(left) {
+                Ok(v) => {
+                    self.seen.push(v.clone());
+                    if pred(&v) {
+                        out.push(v);
+                    }
                 }
+                Err(super::NoFrame::Closed) => {
+                    std::thread::sleep(left);
+                    return out;
+                }
+                Err(super::NoFrame::TimedOut) => {}
             }
         }
     }

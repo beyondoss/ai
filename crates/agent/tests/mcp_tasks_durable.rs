@@ -13,7 +13,6 @@
 mod common;
 mod mcp_tasks_env;
 
-use std::io::BufReader;
 use std::time::Duration;
 
 use common::{read_until_response, spawn_model_server, turn_text, turn_tool_use};
@@ -24,7 +23,7 @@ fn single_prompt(env: &Env, turns: Vec<String>) -> Vec<Value> {
     let (base, _bodies) = spawn_model_server(turns);
     let mut child = env.serve(&base);
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
     prompt(&mut stdin, "go");
     let frames = read_until_response(&mut stdout, "prompt");
     drop(stdin);
@@ -126,7 +125,7 @@ fn http_dropped_tasks_update_is_resent_not_reasked() {
     ]);
     let mut child = env.serve(&base);
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
     prompt(&mut stdin, "go");
     let mut frames = read_until(&mut stdout, "the elicitation", |f| {
         f["type"] == "elicitation_request"
@@ -192,7 +191,7 @@ fn abort_during_redial_cancels_through_the_fresh_connection() {
     )]);
     let mut child = env.serve(&base);
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
     prompt(&mut stdin, "go");
     wait_for("the crashing poll", || !env.methods("tasks/get").is_empty());
     // Past the first backoff (200 ms), so the redial is under way (the restart takes 1.5 s).
@@ -222,7 +221,7 @@ fn serve_in_task_sampling_round_trips_through_the_host() {
     ]);
     let mut child = env.serve(&base);
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
     prompt(&mut stdin, "go");
     let mut frames = read_until(&mut stdout, "a sampling_request", |f| {
         f["type"] == "sampling_request"

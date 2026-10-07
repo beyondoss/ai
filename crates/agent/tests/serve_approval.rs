@@ -126,7 +126,7 @@ fn an_allowed_call_actually_runs() {
 
     let mut child = serve_approving(&base, &session_file, &["--approve", "writes"]);
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     send(
         &mut stdin,
@@ -175,7 +175,7 @@ fn a_denied_call_does_not_run_and_the_model_is_told_why() {
 
     let mut child = serve_approving(&base, &session_file, &["--approve", "writes"]);
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     send(
         &mut stdin,
@@ -223,7 +223,7 @@ fn an_ungated_tool_is_never_asked_about() {
 
     let mut child = serve_approving(&base, &session_file, &["--approve", "writes"]);
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     send(
         &mut stdin,
@@ -257,7 +257,7 @@ fn a_static_deny_short_circuits_without_ever_asking() {
         &["--approve", "all", "--deny-tool", "bash"],
     );
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     send(&mut stdin, json!({ "type": "prompt", "message": "run it" }));
     let frames = read_until_response(&mut stdout, "prompt");
@@ -286,7 +286,7 @@ fn count_questions(paths: &[&str], decision: &str, scope: &str, session_file: &s
     let (base, _b) = spawn_model_server(turns);
     let mut child = serve_approving(&base, session_file, &["--approve", "writes"]);
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     let mut asked = 0;
     for _ in paths {
@@ -392,7 +392,7 @@ fn an_abort_unblocks_a_pending_question_promptly() {
         &["--approve", "writes", "--approval-timeout", "0"],
     );
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     send(&mut stdin, json!({ "type": "prompt", "message": "write" }));
     read_until_type(&mut stdout, "approval_request");
@@ -422,7 +422,7 @@ fn an_unanswered_question_times_out_and_denies() {
         &["--approve", "writes", "--approval-timeout", "1"],
     );
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     send(&mut stdin, json!({ "type": "prompt", "message": "write" }));
     read_until_type(&mut stdout, "approval_request");
@@ -451,7 +451,7 @@ fn an_unknown_request_id_is_not_accepted() {
 
     let mut child = serve_approving(&base, &session_file, &["--approve", "all"]);
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     approve(&mut stdin, "no-such-request", "allow", "once");
     let frames = read_until_response(&mut stdout, "approve");
@@ -469,7 +469,7 @@ fn a_malformed_approve_is_rejected_and_a_session_without_a_gate_says_so() {
 
     let mut child = serve_approving(&base, &session_file, &["--approve", "all"]);
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     send(
         &mut stdin,
@@ -494,7 +494,7 @@ fn a_malformed_approve_is_rejected_and_a_session_without_a_gate_says_so() {
     let (base, _b) = spawn_model_server(vec![]);
     let mut child = serve_approving(&base, &session_file, &[]);
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
     approve(&mut stdin, "x", "allow", "once");
     let resp = last(&read_until_response(&mut stdout, "approve")).clone();
     assert_eq!(resp["success"], false);
@@ -537,7 +537,7 @@ fn two_gated_calls_in_one_turn_are_asked_about_one_at_a_time() {
 
     let mut child = serve_approving(&base, &session_file, &["--approve", "writes"]);
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     send(
         &mut stdin,
@@ -893,7 +893,7 @@ fn an_always_allow_does_not_survive_a_new_session() {
         .stderr(Stdio::null())
         .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     // Grant it for the whole session — the strongest remembered decision there is.
     send(

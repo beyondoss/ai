@@ -3,7 +3,7 @@
 
 mod common;
 
-use std::io::{BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 
 use common::{ISOLATED_HOME, SpawnGuarded, run_cmd, spawn_model_server, turn_text};
@@ -223,7 +223,7 @@ fn serve_binary_uses_the_stored_default_model_when_no_flag_or_env_var_is_given()
         .stderr(Stdio::null())
         .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     writeln!(stdin, "{}", json!({ "type": "prompt", "message": "hi" })).unwrap();
     stdin.flush().unwrap();
@@ -275,7 +275,7 @@ fn serve_binary_stored_session_dir_default_does_not_override_an_explicit_session
         .stderr(Stdio::null())
         .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     writeln!(stdin, "{}", json!({ "type": "prompt", "message": "hi" })).unwrap();
     stdin.flush().unwrap();
@@ -744,7 +744,7 @@ fn serve_binary_explicit_bash_shell_path_flag_wins_over_a_stored_default() {
         .stderr(Stdio::null())
         .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
     writeln!(stdin, "{}", json!({ "type": "prompt", "message": "hi" })).unwrap();
     stdin.flush().unwrap();
     common::read_until_response(&mut stdout, "prompt");
@@ -872,7 +872,7 @@ fn serve_binary_stored_default_models_list_scopes_cycle_model_with_no_explicit_f
         .stderr(Stdio::null())
         .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     writeln!(stdin, "{}", json!({ "type": "cycle_model" })).unwrap();
     stdin.flush().unwrap();
@@ -925,7 +925,7 @@ fn serve_binary_explicit_models_flag_wins_over_a_stored_default_models_list() {
         .stderr(Stdio::null())
         .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     writeln!(stdin, "{}", json!({ "type": "cycle_model" })).unwrap();
     stdin.flush().unwrap();
@@ -1241,7 +1241,7 @@ fn serve_binary_stored_steering_mode_and_follow_up_mode_seed_a_fresh_processs_in
             .stderr(Stdio::null())
             .spawn_guarded();
         let mut stdin = child.stdin.take().unwrap();
-        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let mut stdout = common::child_frames(&mut child);
 
         writeln!(
             stdin,
@@ -1286,7 +1286,7 @@ fn serve_binary_stored_steering_mode_and_follow_up_mode_seed_a_fresh_processs_in
         .stderr(Stdio::null())
         .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     writeln!(stdin, "{}", json!({ "type": "get_state" })).unwrap();
     stdin.flush().unwrap();

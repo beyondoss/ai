@@ -4830,10 +4830,6 @@ const SEAL_TAG_LEN: usize = 16;
 /// unlinking an older segment, or an NFS file handle going stale.
 const SEG_READ_RETRIES: usize = 5;
 
-/// How many times [`acquire_session_lock`] re-opens after finding it locked a file that is no longer
-/// the one at the path (a session directory renamed into `.trash/` mid-acquire).
-const LOCK_RETRIES: usize = 5;
-
 /// `ESTALE`. Not an `io::ErrorKind` variant, so it is matched on the raw errno.
 const ESTALE: i32 = 116;
 
@@ -6171,31 +6167,9 @@ fn log_stamp(path: &Path, segmented: bool) -> Option<Stamp> {
 
 // ---- The session lock --------------------------------------------------------------------------
 
-/// A held advisory lock on one session. Dropping it closes the descriptor (releasing the lock) and
-/// frees the in-process registration.
-pub struct SessionLock {
-    _file: File,
-    _registration: LockRegistration,
-}
-
-/// "This process already has this session open." Closing *any* descriptor to a POSIX-locked file
-/// drops the lock, so a second open in the same process would quietly release the first one's hold —
-/// this makes the second attempt report "held" instead.
-struct LockRegistration(PathBuf);
-
-impl Drop for LockRegistration {
-    fn drop(&mut self) {
-        held_session_locks()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&self.0);
-    }
-}
-
-fn held_session_locks() -> &'static Mutex<HashSet<PathBuf>> {
-    static HELD: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
-    HELD.get_or_init(|| Mutex::new(HashSet::new()))
-}
+/// A held advisory lock on one session ([`crate::file_lock::FileLock`]). Dropping it releases the
+/// lock.
+pub type SessionLock = crate::file_lock::FileLock;
 
 /// Take the advisory lock for the session at `session_path` — the session directory for the segmented
 /// layout, the `.jsonl` file otherwise. `Ok(None)` means someone else holds it *right now*.
@@ -6211,6 +6185,8 @@ fn held_session_locks() -> &'static Mutex<HashSet<PathBuf>> {
 ///   renamed into `.trash/` between the open and the lock is caught rather than silently "locked";
 /// - a session is opened **once per process**, because closing *any* descriptor to a POSIX-locked file
 ///   drops the lock — a second open in the same process would quietly release the first one's hold.
+///
+/// All three are [`crate::file_lock::try_lock`]'s; this only names the session's lock file.
 pub fn acquire_session_lock(session_path: &Path) -> std::io::Result<Option<SessionLock>> {
     let lock_path = if session_path.is_dir() {
         session_path.join("lock")
@@ -6219,59 +6195,7 @@ pub fn acquire_session_lock(session_path: &Path) -> std::io::Result<Option<Sessi
         name.push(".lock");
         PathBuf::from(name)
     };
-    {
-        let mut held = held_session_locks()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !held.insert(lock_path.clone()) {
-            return Ok(None);
-        }
-    }
-    // Registered from here on, so every path out of this function frees the entry.
-    let registration = LockRegistration(lock_path.clone());
-    for _ in 0..LOCK_RETRIES {
-        let mut opts = OpenOptions::new();
-        opts.read(true).write(true).create(true).truncate(false);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        let file = opts.open(&lock_path)?;
-        match file.try_lock() {
-            Ok(()) => {}
-            Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
-            Err(std::fs::TryLockError::Error(e)) => return Err(e),
-        }
-        if same_file(&file, &lock_path)? {
-            return Ok(Some(SessionLock {
-                _file: file,
-                _registration: registration,
-            }));
-        }
-        // The file we locked is no longer the file at that path — the session directory moved (a
-        // delete into `.trash/`) between the open and the lock. Drop it and look again.
-        drop(file);
-    }
-    Ok(None)
-}
-
-/// Whether the open descriptor and `path` still name the same inode.
-fn same_file(file: &File, path: &Path) -> std::io::Result<bool> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let a = file.metadata()?;
-        let Ok(b) = fs::metadata(path) else {
-            return Ok(false);
-        };
-        Ok(a.dev() == b.dev() && a.ino() == b.ino())
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (file, path);
-        Ok(true)
-    }
+    crate::file_lock::try_lock(&lock_path)
 }
 
 #[cfg(test)]
@@ -11859,29 +11783,5 @@ mod tests {
 
         // A directory with no segments has no stamp at all — it is not a session.
         assert!(log_stamp(&dir.path().join("nothing"), true).is_none());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn same_file_catches_a_path_whose_inode_moved() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("lock");
-        fs::write(&path, b"").unwrap();
-        let held = File::open(&path).unwrap();
-        assert!(same_file(&held, &path).unwrap());
-
-        // Another file takes the path — what a session directory renamed into `.trash/` looks like
-        // from the lock's point of view.
-        let other = dir.path().join("other");
-        fs::write(&other, b"").unwrap();
-        fs::rename(&other, &path).unwrap();
-        assert!(
-            !same_file(&held, &path).unwrap(),
-            "the descriptor no longer names the file at that path"
-        );
-
-        // And a path that is simply gone is not the same file either.
-        fs::remove_file(&path).unwrap();
-        assert!(!same_file(&held, &path).unwrap());
     }
 }

@@ -23,7 +23,7 @@ fn three_sessions() -> (tempfile::TempDir, common::ChildGuard, common::Frames) {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_dir_cmd(bin, &base, &dir_str).spawn_guarded();
     // One reader for the child's life: it owns stdout, so it is handed back with the child.
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
     {
         let mut stdin = child.stdin.take().unwrap();
         for (i, marker) in ["alpha-one", "beta-two", "gamma-three"].iter().enumerate() {

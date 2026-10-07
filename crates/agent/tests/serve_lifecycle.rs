@@ -194,7 +194,7 @@ fn serve_prompt_posts_started_then_succeeded_with_command_id_and_summary() {
         .args(["--lifecycle-header", "X-Tenant: acme"])
         .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     send(
         &mut stdin,
@@ -238,7 +238,7 @@ fn serve_unix_socket_posts_started_then_succeeded() {
 
     let mut child = serve_life(&base, &session_file, &collector.url).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     send(
         &mut stdin,
@@ -273,7 +273,7 @@ fn serve_client_stop_posts_started_then_terminal() {
 
     let mut child = serve_life(&base, &session_file, &collector.url).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     send(
         &mut stdin,
@@ -328,7 +328,7 @@ fn serve_todo_and_tool_progress_carries_tools_and_todos() {
         .args(["--lifecycle-heartbeat-secs", "0"])
         .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     send(
         &mut stdin,
@@ -375,7 +375,7 @@ fn serve_two_prompts_mint_two_run_ids_each_with_one_terminal() {
 
     let mut child = serve_life(&base, &session_file, &collector.url).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     send(
         &mut stdin,
@@ -418,7 +418,7 @@ fn serve_unconfigured_posts_nothing() {
 
     let mut child = serve_cmd(BIN, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     send(&mut stdin, json!({ "type": "prompt", "message": "hi" }));
     read_until_response(&mut stdout, "prompt");
@@ -444,7 +444,7 @@ fn serve_lifecycle_url_from_env_without_the_flag() {
         .env("AI_AGENT_LIFECYCLE_URL", &collector.url)
         .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     send(
         &mut stdin,
@@ -495,7 +495,7 @@ fn serve_refusal_is_succeeded_with_refused() {
 
     let mut child = serve_life(&base, &session_file, &collector.url).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     send(
         &mut stdin,
@@ -525,7 +525,7 @@ fn a_slow_lifecycle_consumer_does_not_delay_the_prompt_response() {
 
     let mut child = serve_life(&base, &session_file, &collector.url).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     send(
         &mut stdin,

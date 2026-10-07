@@ -14,6 +14,7 @@ pub mod auth_credential_source;
 pub mod auth_store;
 pub mod exec_endpoint;
 pub mod export;
+pub mod file_lock;
 pub mod gateway_credential;
 pub mod grant;
 pub mod lifecycle;

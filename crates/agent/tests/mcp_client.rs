@@ -14,7 +14,7 @@
 
 mod common;
 
-use std::io::{BufReader, Write};
+use std::io::Write;
 use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -788,7 +788,7 @@ fn mcp_stdio_tool_is_discovered_and_callable_through_serve_too() {
         .env("HOME", home.path())
         .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     writeln!(
         stdin,

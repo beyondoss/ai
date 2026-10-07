@@ -23,7 +23,7 @@ fn serve_injects_project_instructions_into_system_prompt() {
     cmd.current_dir(dir.path()); // CLAUDE.md is discovered relative to cwd
     let mut child = cmd.spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     writeln!(stdin, "{}", json!({ "type": "prompt", "message": "hi" })).unwrap();
     stdin.flush().unwrap();
@@ -54,7 +54,7 @@ fn serve_caches_the_static_system_prompt_until_reload() {
     cmd.current_dir(dir.path());
     let mut child = cmd.spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     // Turn 1: the marker as it existed at startup.
     writeln!(stdin, "{}", json!({ "type": "prompt", "message": "one" })).unwrap();
@@ -130,7 +130,7 @@ fn serve_gates_skills_and_prompts_on_project_trust() {
         cmd.current_dir(dir.path()).env("HOME", home.path());
         let mut child = cmd.spawn_guarded();
         let mut stdin = child.stdin.take().unwrap();
-        let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+        let mut stdout = common::child_frames(&mut child);
 
         writeln!(stdin, "{}", json!({ "type": "get_commands" })).unwrap();
         stdin.flush().unwrap();
@@ -170,7 +170,7 @@ fn serve_gates_skills_and_prompts_on_project_trust() {
             .env("HOME", home.path());
         let mut child = cmd.spawn_guarded();
         let mut stdin = child.stdin.take().unwrap();
-        let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+        let mut stdout = common::child_frames(&mut child);
 
         writeln!(stdin, "{}", json!({ "type": "get_commands" })).unwrap();
         stdin.flush().unwrap();
@@ -228,7 +228,7 @@ fn serve_force_untrusted_overrides_a_persisted_trust_grant() {
         cmd.current_dir(dir.path()).env("HOME", home.path());
         let mut child = cmd.spawn_guarded();
         let mut stdin = child.stdin.take().unwrap();
-        let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+        let mut stdout = common::child_frames(&mut child);
 
         writeln!(stdin, "{}", json!({ "type": "get_commands" })).unwrap();
         stdin.flush().unwrap();
@@ -258,7 +258,7 @@ fn serve_force_untrusted_overrides_a_persisted_trust_grant() {
             .env("HOME", home.path());
         let mut child = cmd.spawn_guarded();
         let mut stdin = child.stdin.take().unwrap();
-        let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+        let mut stdout = common::child_frames(&mut child);
 
         writeln!(stdin, "{}", json!({ "type": "get_commands" })).unwrap();
         stdin.flush().unwrap();
@@ -308,7 +308,7 @@ fn serve_untrusted_project_still_advertises_and_invokes_a_user_global_skill() {
     cmd.current_dir(dir.path()).env("HOME", home.path());
     let mut child = cmd.spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     writeln!(stdin, "{}", json!({ "type": "get_commands" })).unwrap();
     stdin.flush().unwrap();
@@ -371,7 +371,7 @@ fn serve_get_commands_reports_a_cross_root_skill_collision() {
         .env("HOME", home.path());
     let mut child = cmd.spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     writeln!(stdin, "{}", json!({ "type": "get_commands" })).unwrap();
     stdin.flush().unwrap();
@@ -451,7 +451,7 @@ fn serve_get_commands_reports_scope_and_path_per_entry() {
         .env("HOME", home.path());
     let mut child = cmd.spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     writeln!(stdin, "{}", json!({ "type": "get_commands" })).unwrap();
     stdin.flush().unwrap();
@@ -512,7 +512,7 @@ fn serve_get_commands_reports_the_prompt_templates_own_description_not_its_argum
         .env("HOME", home.path());
     let mut child = cmd.spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     writeln!(stdin, "{}", json!({ "type": "get_commands" })).unwrap();
     stdin.flush().unwrap();
@@ -555,7 +555,7 @@ fn serve_warns_on_stderr_when_an_untrusted_projects_gated_resources_are_skipped(
     cmd.stderr(Stdio::piped());
     let mut child = cmd.spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     writeln!(stdin, "{}", json!({ "type": "prompt", "message": "hi" })).unwrap();
     stdin.flush().unwrap();

@@ -44,7 +44,7 @@ fn serve_switches_model_and_thinking_at_runtime() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     // The known-model list is returned and non-empty, each entry a structured capability object (F-M2:
     // pi's `Model<any>` shape — `id`/`contextWindow`/`reasoning`, minus pricing — not a bare id string).
@@ -143,7 +143,7 @@ fn serve_cycle_model_advances_and_wraps() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     writeln!(stdin, "{}", json!({ "type": "get_available_models" })).unwrap();
     stdin.flush().unwrap();
@@ -202,7 +202,7 @@ fn serve_set_model_and_cycle_model_responses_carry_capability_info() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     writeln!(
         stdin,
@@ -251,7 +251,7 @@ fn serve_set_model_colon_suffix_resolves_the_id_and_sets_reasoning_effort() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     writeln!(
         stdin,
@@ -305,7 +305,7 @@ fn serve_cycle_model_scoped_by_the_models_flag_cycles_only_the_scope_but_lists_t
         .stderr(Stdio::null())
         .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     // `get_available_models` is deliberately NOT scoped by `--models` — that flag only narrows
     // `cycle_model`'s own candidate list (asserted below). A client's model *picker* still needs to
@@ -384,7 +384,7 @@ fn serve_models_flag_expands_a_glob_against_the_known_catalog() {
         .stderr(Stdio::null())
         .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     // Pin to the first claude-* entry in catalog order so cycling from a known position is
     // unambiguous, then walk the whole scoped cycle and confirm it's exactly the claude-* subset of
@@ -455,7 +455,7 @@ fn serve_models_flag_pattern_level_suffix_pins_that_models_thinking_level_on_cyc
         .stderr(Stdio::null())
         .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     // Pin to the unpinned scoped entry first so cycling onto the pinned one is unambiguous.
     writeln!(
@@ -521,7 +521,7 @@ fn serve_models_flag_rejects_an_invalid_thinking_level_suffix_as_part_of_the_lit
         .stderr(Stdio::null())
         .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     writeln!(stdin, "{}", json!({ "type": "cycle_model" })).unwrap();
     stdin.flush().unwrap();
@@ -544,7 +544,7 @@ fn serve_cycle_thinking_level_advances_through_the_ladder_and_wraps() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     // Fix 1 (pi-parity gap): a fresh session with no `--reasoning-effort` now starts at "medium"
     // (pi's own `DEFAULT_THINKING_LEVEL`), not "off" — `claude-test` (this test's model) supports
@@ -586,7 +586,7 @@ fn serve_set_reasoning_effort_sets_the_portable_level_directly() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     writeln!(
         stdin,
@@ -649,7 +649,7 @@ fn serve_set_reasoning_effort_wins_over_a_stale_set_thinking_override() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     writeln!(
         stdin,
@@ -695,7 +695,7 @@ fn serve_starts_clamped_not_off_for_a_model_that_cannot_disable_reasoning() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_cmd_with_model(bin, &base, &session_file, "gpt-5-codex").spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     writeln!(stdin, "{}", json!({ "type": "get_state" })).unwrap();
     stdin.flush().unwrap();
@@ -728,7 +728,7 @@ fn serve_model_flag_off_suffix_starts_with_reasoning_off_not_the_medium_default(
     let mut child =
         serve_cmd_with_model(bin, &base, &session_file, "claude-haiku-4-5:off").spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     writeln!(stdin, "{}", json!({ "type": "get_state" })).unwrap();
     stdin.flush().unwrap();
@@ -760,7 +760,7 @@ fn serve_set_model_reclamps_off_when_switching_onto_a_non_disableable_model() {
     // new model's own floor, not silently carrying it across the switch.
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     writeln!(
         stdin,
@@ -817,7 +817,7 @@ fn serve_cycle_thinking_level_never_gets_stuck_for_a_model_without_xhigh_or_off(
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_cmd_with_model(bin, &base, &session_file, "gpt-5-codex").spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     // Fix 1 (pi-parity gap): starts at "medium" now, not "minimal" (see the dedicated startup test
     // above) — gpt-5-codex's floor (minimal) is already below "medium", so nothing clamps it further.
@@ -855,7 +855,7 @@ fn serve_switch_model_retargets_the_next_turn_of_an_in_flight_prompt() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     writeln!(stdin, "{}", json!({ "type": "prompt", "message": "start" })).unwrap();
     stdin.flush().unwrap();
@@ -914,7 +914,7 @@ fn serve_switch_model_while_idle_is_a_no_op_pointing_at_set_model() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     writeln!(
         stdin,
@@ -950,7 +950,7 @@ fn serve_max_tokens_flag_reaches_the_wire_request_and_survives_a_model_switch() 
         .args(["--max-tokens", "777"])
         .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     writeln!(stdin, "{}", json!({ "type": "prompt", "message": "hi" })).unwrap();
     stdin.flush().unwrap();

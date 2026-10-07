@@ -7,8 +7,7 @@
 mod common;
 mod mcp_tasks_env;
 
-use std::io::BufReader;
-use std::process::{ChildStdin, ChildStdout};
+use std::process::ChildStdin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -22,7 +21,7 @@ use serde_json::{Value, json};
 struct Serve {
     child: ChildGuard,
     stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    stdout: common::Frames,
     bodies: Arc<Mutex<Vec<String>>>,
 }
 
@@ -30,7 +29,7 @@ fn serve(env: &Env, turns: Vec<String>) -> Serve {
     let (base, bodies) = spawn_model_server(turns);
     let mut child = env.serve(&base);
     let stdin = child.stdin.take().unwrap();
-    let stdout = BufReader::new(child.stdout.take().unwrap());
+    let stdout = common::child_frames(&mut child);
     Serve {
         child,
         stdin,
@@ -373,7 +372,7 @@ fn serve_repo(env: &Env, turns: Vec<String>, id: &str) -> Serve {
         .args(["--session-id", id]);
     let mut child = common::SpawnGuarded::spawn_guarded(&mut cmd);
     let stdin = child.stdin.take().unwrap();
-    let stdout = BufReader::new(child.stdout.take().unwrap());
+    let stdout = common::child_frames(&mut child);
     Serve {
         child,
         stdin,

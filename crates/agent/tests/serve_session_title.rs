@@ -41,7 +41,7 @@ fn a_session_names_itself_from_its_opening_exchange() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_dir_cmd(bin, &base, &dir_str).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     writeln!(
         stdin,
@@ -75,7 +75,7 @@ fn an_unusable_title_is_attempted_once_and_costs_the_session_nothing() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_dir_cmd(bin, &base, &dir_str).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     for msg in ["first", "second"] {
         writeln!(stdin, "{}", json!({ "type": "prompt", "message": msg })).unwrap();
@@ -135,7 +135,7 @@ fn a_title_call_does_not_consume_the_conversation_script() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_dir_cmd(bin, &base, &dir_str).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
     let mut texts = Vec::new();
     for message in ["one", "two", "three"] {
         writeln!(stdin, "{}", json!({ "type": "prompt", "message": message })).unwrap();

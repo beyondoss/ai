@@ -85,40 +85,67 @@ pub const ISOLATED_HOME: &str = "/nonexistent-beyond-ai-agent-test-home";
 /// Derefs to [`Child`], so `child.stdin.take()`, `child.kill()`, and `child.wait()` all keep working
 /// unchanged; an explicit `wait()` before the drop is fine (the drop's `kill` on an already-reaped pid
 /// fails harmlessly and is ignored).
-pub struct ChildGuard(Option<std::process::Child>);
+///
+/// **The child's stdout pipe is not on the `Child`.** The guard takes it at spawn and keeps it, so
+/// `child.stdout` is always `None` — through `.take()`, `std::mem::take`, `Option::take`, `as_mut` or
+/// anything else — and the pipe comes back only through [`child_frames`] (a reader with
+/// [`FRAME_DEADLINE`]) or, for a test about the pipe itself, [`ChildGuard::raw_stdout`]. A test cannot
+/// build a frame reader that hangs instead of failing, however it reaches for the pipe.
+pub struct ChildGuard {
+    child: Option<std::process::Child>,
+    stdout: Option<std::process::ChildStdout>,
+}
 
 impl ChildGuard {
     /// Spawn `cmd` under the guard. Panics with the command's name on failure, matching the
     /// `.spawn().unwrap()` this replaces.
     pub fn spawn(cmd: &mut Command) -> Self {
-        Self(Some(cmd.spawn().unwrap_or_else(|e| {
-            panic!("failed to spawn {:?}: {e}", cmd.get_program())
-        })))
+        let mut child = cmd
+            .spawn()
+            .unwrap_or_else(|e| panic!("failed to spawn {:?}: {e}", cmd.get_program()));
+        let stdout = child.stdout.take();
+        Self {
+            child: Some(child),
+            stdout,
+        }
+    }
+
+    /// The raw stdout pipe, for a test about the pipe itself — closing the read end early to see
+    /// how the child handles `EPIPE`, which a reader thread draining it would defeat. Never a frame
+    /// reader: [`child_frames`] is, and `tests/serve_harness_deadlines.rs` forbids this in the
+    /// `serve_*`/`mcp_*` suites and `tests/common`.
+    pub fn raw_stdout(&mut self) -> std::process::ChildStdout {
+        self.stdout
+            .take()
+            .expect("the child's stdout is piped and not yet taken")
     }
 
     /// [`Child::wait_with_output`], which consumes the child and so can't come through `Deref`. Taking
     /// the child out disarms the guard — safe precisely because this call reaps the process itself.
+    /// The held stdout pipe (if no reader took it) is handed back first, so it is captured as usual.
     pub fn wait_with_output(mut self) -> std::io::Result<std::process::Output> {
-        self.0.take().expect("child taken").wait_with_output()
+        let mut child = self.child.take().expect("child taken");
+        child.stdout = self.stdout.take();
+        child.wait_with_output()
     }
 }
 
 impl std::ops::Deref for ChildGuard {
     type Target = std::process::Child;
     fn deref(&self) -> &Self::Target {
-        self.0.as_ref().expect("child taken")
+        self.child.as_ref().expect("child taken")
     }
 }
 
 impl std::ops::DerefMut for ChildGuard {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        self.0.as_mut().expect("child taken")
+        self.child.as_mut().expect("child taken")
     }
 }
 
 impl Drop for ChildGuard {
     fn drop(&mut self) {
-        if let Some(mut child) = self.0.take() {
+        if let Some(mut child) = self.child.take() {
             let _ = child.kill();
             let _ = child.wait();
         }
@@ -383,7 +410,7 @@ pub fn wait_for_port(port: u16) {
 /// port 402s every managed request, which is why [`wait_for_allowance_ready`] exists alongside this.
 struct SharedNats {
     port: u16,
-    child: Child,
+    child: ChildGuard,
 }
 
 impl SharedNats {
@@ -403,8 +430,8 @@ impl SharedNats {
             ])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn nats-server (on PATH? run via mise)");
+            // Fails naming `nats-server`: it must be on PATH (run via mise).
+            .spawn_guarded();
         let deadline = Instant::now() + Duration::from_secs(20);
         while Instant::now() < deadline {
             if TcpStream::connect(("127.0.0.1", port)).is_ok() {
@@ -484,7 +511,7 @@ pub fn read_until_response(reader: &mut impl BufRead, command: &str) -> Vec<Valu
     frames
 }
 
-/// How long a test waits for a `serve` child's next frame — on stdout ([`serve_frames`]), over a
+/// How long a test waits for a `serve` child's next frame — on stdout ([`child_frames`]), over a
 /// WebSocket ([`ws_next_frame`]), or through [`skills_env::Serve`] — before failing. Long enough for
 /// any honest wait on a loaded CI runner; far short of the runner's own kill, which says nothing
 /// about where the test stopped. A stall, not slowness, is what it catches: a scripted reply taken by
@@ -502,14 +529,26 @@ pub struct Frames {
     deadline: Duration,
 }
 
-/// [`Frames`] over a `serve` child's stdout, with [`FRAME_DEADLINE`]. Every stdio frame reader in the
-/// `serve_*` suites is one of these.
-pub fn serve_frames(out: impl Read + Send + 'static) -> Frames {
-    frames_with_deadline(out, FRAME_DEADLINE)
+/// [`Frames`] over `child`'s stdout (which must be piped, and is taken), with [`FRAME_DEADLINE`].
+///
+/// The **only** way a test reads a child's stdout as frames: the pipe lives in the [`ChildGuard`],
+/// not on the `Child`, so there is nothing else to wrap; and `tests/serve_harness_deadlines.rs` fails
+/// on any `ChildStdout`, unguarded spawn or `raw_stdout` in the `serve_*` and `mcp_*` suites and
+/// `tests/common`. One for a child's whole life — it owns the pipe.
+pub fn child_frames(child: &mut ChildGuard) -> Frames {
+    child_frames_within(child, FRAME_DEADLINE)
 }
 
-/// [`Frames`] over `out`, with its own per-line deadline.
-pub fn frames_with_deadline(out: impl Read + Send + 'static, deadline: Duration) -> Frames {
+/// [`child_frames`] with its own per-line deadline.
+pub fn child_frames_within(child: &mut ChildGuard, deadline: Duration) -> Frames {
+    let out = child
+        .stdout
+        .take()
+        .expect("the child's stdout is piped, and read through one `child_frames`");
+    frames_over(out, deadline)
+}
+
+fn frames_over(out: impl Read + Send + 'static, deadline: Duration) -> Frames {
     let (tx, lines) = std::sync::mpsc::channel();
     thread::spawn(move || {
         let mut out = std::io::BufReader::new(out);

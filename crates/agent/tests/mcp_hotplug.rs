@@ -6,7 +6,7 @@
 
 mod common;
 
-use std::io::{BufReader, Write};
+use std::io::Write;
 use std::path::Path;
 
 use common::{
@@ -85,7 +85,7 @@ fn set_mcp_enabled_changes_advertised_tools_and_model_request() {
     cmd.env("BEYOND_AI_AGENT_MCP_IDLE_SECS", "0");
     let mut child = cmd.spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     // Default: both servers enabled.
     writeln!(stdin, "{}", json!({ "id": "g0", "type": "get_mcp" })).unwrap();
@@ -262,7 +262,7 @@ fn disabled_mcp_tool_is_not_callable() {
     cmd.env("BEYOND_AI_AGENT_MCP_IDLE_SECS", "0");
     let mut child = cmd.spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     writeln!(
         stdin,
@@ -316,7 +316,7 @@ fn new_session_resets_mcp_enablement() {
     cmd.env("BEYOND_AI_AGENT_MCP_IDLE_SECS", "0");
     let mut child = cmd.spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     writeln!(
         stdin,

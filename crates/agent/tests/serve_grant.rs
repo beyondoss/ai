@@ -42,7 +42,7 @@ fn serve(dir: &Path) -> Command {
 fn assert_serves(cmd: &mut Command) {
     let mut child = cmd.spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
     writeln!(stdin, "{}", json!({ "type": "get_state", "id": "g1" })).unwrap();
     let frames = read_until_response(&mut stdout, "get_state");
     assert_eq!(frames.last().unwrap()["success"], true, "{frames:#?}");

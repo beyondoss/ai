@@ -44,7 +44,7 @@ fn serve_runs_a_subagent_and_streams_its_progress() {
         .stderr(std::process::Stdio::piped())
         .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     writeln!(
         stdin,
@@ -122,7 +122,7 @@ fn reload_makes_a_newly_added_agent_delegable_without_a_restart() {
         .stderr(std::process::Stdio::piped())
         .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     // First prompt: no agents defined yet.
     writeln!(
