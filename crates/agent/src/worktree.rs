@@ -427,7 +427,7 @@ impl Git {
                         let from = src.join(rel);
                         // A lock file is left behind: a copy of one is not a lock (see
                         // `file_lock`).
-                        if !from.is_file() || crate::file_lock::is_lock_file(&from) {
+                        if !from.is_file() || crate::file_lock::is_record_lock_file(&from) {
                             continue;
                         }
                         let to = dst.join(rel);
