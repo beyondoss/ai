@@ -4333,16 +4333,23 @@ transport makes goes through `OAuthHttp`, which attaches the server's _current_ 
 carries no `auth_header` of its own); direct `events/*` POSTs (`mcp_events::wire`'s `Conn::send`)
 likewise read the current token per request, not the one their headers were built with. **One rule
 on both paths:** any **401** from a server with a login — with or without a `WWW-Authenticate`
-challenge — makes `ServerAuth::after_rejection` force a refresh through the same `AuthorizationManager`
+challenge, whatever its body (for such a server every POST is answered by
+`mcp_wire::HttpClient::post_bounded`, which decides from the status; rmcp's own client reads a 401
+carrying a JSON-RPC error body as an ordinary error response) — makes `ServerAuth::after_rejection` force a refresh through the same `AuthorizationManager`
 and `McpAuthStore` `mcp-login` uses (so the new token is persisted), and the request is retried
 **once**; a second 401 is returned as the server's answer. That covers `tools/call`, `resources/*`,
 `prompts/*`, `skills/*`, MCP App view reads, the handshake, the standalone stream and `events/*`. A 403
 (`InsufficientScope`) never refreshes. **Single flight:** the refresh runs under the token's lock, and
 a caller whose rejected token has already been replaced takes the replacement without refreshing, so
 concurrent 401s cost one refresh (a second refresh with a rotated-away refresh token would fail). **A
-failed refresh is remembered:** a _definitive_ one (`invalid_grant`, or no refresh token) for good,
-with an error naming `agent mcp-login <name>`; a _transient_ one (the authorization server unreachable,
-a 5xx) for a backoff of 30 s doubling to 5 min, after which a rejection refreshes again. Tested in
+failed refresh is remembered:** a _definitive_ one for good, with an error naming `agent mcp-login
+<name>` — any RFC 6749 §5.2 error code from the token endpoint (`invalid_grant`, `invalid_client`,
+`unauthorized_client`, `unsupported_grant_type`, `invalid_scope`, `invalid_request`), a token endpoint
+that is not there (404/405/410), or no refresh token, classified from the endpoint's own answer (the
+OAuth HTTP goes through `RecordingOAuthHttp`, since rmcp's refresh error keeps neither status nor
+code); a _transient_ one (the authorization server unreachable, a 5xx, a 429) for a backoff of 30 s
+doubling to 5 min, after which a rejection refreshes again. A reload clears a remembered failure
+only when the stored token actually changed. Tested in
 `tests/mcp_oauth_refresh.rs` (a token revoked between two tool calls of one run, a failing refresh,
 three concurrent 401s) against the shared fixture in `tests/common/mcp_oauth_fixture.rs`, and by unit
 tests in `mcp_oauth.rs` and `mcp_events/wire.rs` (backoff, the reload race, a bare 401, a 403, the

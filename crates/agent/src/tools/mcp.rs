@@ -2413,9 +2413,11 @@ async fn connect_http(
     // so a rejected OAuth token is refreshed and the request retried once — see `mcp_oauth`.
     let transport = StreamableHttpClientTransport::with_client(
         crate::tools::mcp_oauth::OAuthHttp::new(
-            crate::tools::mcp_view_http::ViewCappedHttp::new(crate::tools::mcp_wire::HttpClient(
+            crate::tools::mcp_view_http::ViewCappedHttp::new(crate::tools::mcp_wire::HttpClient {
                 client,
-            )),
+                // With a login, every POST is answered where its 401 status is still visible.
+                oauth: auth.is_some(),
+            }),
             auth,
         ),
         transport_config,

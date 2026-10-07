@@ -220,7 +220,7 @@ mod tests {
     fn client(cap: usize) -> ViewCappedHttp {
         agent_core::ensure_provider();
         ViewCappedHttp {
-            inner: crate::tools::mcp_wire::HttpClient(reqwest::Client::new()),
+            inner: crate::tools::mcp_wire::HttpClient::new(reqwest::Client::new()),
             cap,
         }
     }

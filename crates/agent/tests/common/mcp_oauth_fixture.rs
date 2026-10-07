@@ -161,6 +161,8 @@ pub struct OAuthFixture {
     pub revoke_after_calls: Arc<AtomicU32>,
     /// Answer `refresh_token` grants with `400 invalid_grant`.
     pub fail_refresh: Arc<AtomicBool>,
+    /// Answer `refresh_token` grants with this `(status line, body)` instead.
+    pub refresh_reply: Arc<Mutex<Option<(String, String)>>>,
     /// Hold each rejected `tools/call` until this many have arrived (or 5 s pass), so concurrent
     /// requests with a stale token are all in flight before any is answered.
     pub hold_rejections_until: Arc<AtomicU32>,
@@ -187,6 +189,7 @@ impl OAuthFixture {
             rejected_calls: Arc::default(),
             revoke_after_calls: Arc::default(),
             fail_refresh: Arc::default(),
+            refresh_reply: Arc::default(),
             hold_rejections_until: Arc::default(),
             issued: Arc::default(),
         };
@@ -297,6 +300,14 @@ impl Shared {
                         &mut stream,
                         "400 Bad Request",
                         &json!({ "error": "invalid_grant", "error_description": "revoked" }),
+                    );
+                }
+                if let Some((status, body)) = f.refresh_reply.lock().unwrap().clone() {
+                    return write_response(
+                        &mut stream,
+                        &status,
+                        "Content-Type: application/json\r\n",
+                        body.as_bytes(),
                     );
                 }
             } else if grant_type != "authorization_code" {
