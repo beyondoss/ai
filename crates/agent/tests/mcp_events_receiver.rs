@@ -700,3 +700,88 @@ async fn a_session_with_runtime_subscriptions_is_restarted_after_a_panic() {
     );
     assert_eq!(daemon_sessions(port).await.get("watcher"), Some(&true));
 }
+
+/// Make a runtime webhook subscription in session `runtime-owner` on a first daemon, wait for its
+/// spec and callback on disk, then kill that daemon: what a restart finds to restore.
+async fn persist_a_runtime_subscription(
+    home: &std::path::Path,
+    base: &str,
+    held: &HeldPort,
+    mcp_url: &str,
+) {
+    let mut servers = hooks(mcp_url, "notify");
+    servers[0]["events"] = json!([]);
+    write_settings(home, servers);
+    let mut first = daemon(home, base, held, &[]);
+    let mut ws = ws_connect(held.port(), Some("runtime-owner")).await;
+    ws_send(
+        &mut ws,
+        json!({ "type": "mcp_events_subscribe", "id": "s", "server": "hooks", "name": "ticket.updated",
+                "delivery": "webhook", "action": "notify" }),
+    )
+    .await;
+    let r = ws_next(&mut ws, Duration::from_secs(20), "the subscribe", |f| {
+        f["type"] == "response" && f["id"] == "s"
+    })
+    .await;
+    assert_eq!(r["success"], true, "{r:#}");
+    eventually(
+        Duration::from_secs(10),
+        "the runtime spec and its callback on disk",
+        || {
+            std::fs::read_dir(home.join("sessions"))
+                .ok()?
+                .map(|e| e.unwrap().path())
+                .filter(|p| p.to_string_lossy().ends_with(".mcp-events.json"))
+                .any(|p| {
+                    let text = std::fs::read_to_string(p).unwrap_or_default();
+                    text.contains("\"runtime\"") && text.contains("\"token\"")
+                })
+                .then_some(())
+        },
+    );
+    drop(ws);
+    first.kill().unwrap();
+    let _ = first.wait();
+}
+
+/// The restore window must not wait on a session that will never reserve anything. Here the
+/// session holding the runtime subscription gets no events hub on the restart (its server is no
+/// longer configured): a token nothing holds is `410` again within moments, not after the window's
+/// ten-minute bound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restoring_session_with_no_events_hub_closes_the_restore_window() {
+    let (_fx, mcp_url, _fixture) = spawn_http_fixture(&[("MCP_FIXTURE_ALLOW_HTTP_CALLBACK", "1")]);
+    let home = tempfile::tempdir().unwrap();
+    let (base, _bodies) = spawn_model_server_routed(vec![], turn_text("noted"));
+    let held = HeldPort::bind();
+    persist_a_runtime_subscription(home.path(), &base, &held, &mcp_url).await;
+    write_settings(home.path(), json!([]));
+    let _second = daemon(home.path(), &base, &held, &[]);
+    eventually(Duration::from_secs(10), "a dead token answered 410", || {
+        (dead_token_status(held.port()) == 410).then_some(())
+    });
+}
+
+/// Likewise for a listed session that fails to start (here its transcript no longer opens).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restoring_session_that_fails_to_start_closes_the_restore_window() {
+    let (_fx, mcp_url, _fixture) = spawn_http_fixture(&[("MCP_FIXTURE_ALLOW_HTTP_CALLBACK", "1")]);
+    let home = tempfile::tempdir().unwrap();
+    let (base, _bodies) = spawn_model_server_routed(vec![], turn_text("noted"));
+    let held = HeldPort::bind();
+    persist_a_runtime_subscription(home.path(), &base, &held, &mcp_url).await;
+    let transcript = std::fs::read_dir(home.path().join("sessions"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| {
+            let name = p.file_name().unwrap().to_string_lossy().into_owned();
+            name.ends_with("runtime-owner.jsonl")
+        })
+        .expect("the session's transcript");
+    std::fs::write(&transcript, b"not a session file\n").unwrap();
+    let _second = daemon(home.path(), &base, &held, &[]);
+    eventually(Duration::from_secs(10), "a dead token answered 410", || {
+        (dead_token_status(held.port()) == 410).then_some(())
+    });
+}

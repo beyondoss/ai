@@ -5,7 +5,13 @@
 //! shipped one. Each lives in a function (or a match arm) under `#[cfg(debug_assertions)]`, with a
 //! no-op twin for release, so a release binary has no injection path and carries none of the names.
 //! A name written at a call site instead — `delay("BEYOND_AI_AGENT_TEST_…")` into a gated helper —
-//! still compiles into release as a string the binary carries; this test fails on that.
+//! still compiles into release as a string the binary carries.
+//!
+//! **The authority is the release binary itself**: CI's `build (release)` job runs
+//! `scripts/scan-release-seams.sh` on every release binary it built (`mise check:release-seams`),
+//! and fails on any `BEYOND_AI_AGENT_TEST_` string the compiler kept, however the source spelled it
+//! (`concat!`, a `//` inside a string literal, anything a text heuristic misreads). The source check
+//! here is only the fast early warning; the scanner's own behaviour is pinned below.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 /// Where a seam name may appear: in a function, or a match arm, marked `#[cfg(debug_assertions)]`.
@@ -145,4 +151,41 @@ async fn body() {
 }
 ";
     assert_eq!(ungated_seam_names("f.rs", gated_neighbour).len(), 1);
+}
+
+/// The artifact scanner CI trusts: it fails on a binary that carries seam names — this test's own
+/// debug build of the agent does, by design — and passes one that does not. A name assembled at
+/// compile time (`concat!`) is a contiguous string in the artifact, so it is caught the same way.
+#[test]
+fn the_release_artifact_scan_fails_on_any_seam_name() {
+    let script =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/scan-release-seams.sh");
+    let scan = |artifact: &std::path::Path| {
+        std::process::Command::new("sh")
+            .arg(&script)
+            .arg(artifact)
+            .output()
+            .unwrap()
+    };
+    let debug = scan(std::path::Path::new(env!("CARGO_BIN_EXE_beyond-ai-agent")));
+    assert_eq!(debug.status.code(), Some(1), "{debug:?}");
+    assert!(
+        String::from_utf8_lossy(&debug.stderr).contains("BEYOND_AI_AGENT_TEST_SLOW_CHECKPOINT_MS"),
+        "{debug:?}"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let clean = dir.path().join("clean");
+    std::fs::write(
+        &clean,
+        b"\x7fELF BEYOND_AI_AGENT_MCP_IDLE_SECS nothing to see",
+    )
+    .unwrap();
+    assert_eq!(scan(&clean).status.code(), Some(0));
+    let assembled = dir.path().join("assembled");
+    std::fs::write(
+        &assembled,
+        concat!("\x7fELF ", "BEYOND_AI_AGENT_", "TEST_", "SLOW_X_MS").as_bytes(),
+    )
+    .unwrap();
+    assert_eq!(scan(&assembled).status.code(), Some(1));
 }

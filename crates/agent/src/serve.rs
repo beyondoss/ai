@@ -2931,6 +2931,10 @@ pub(crate) async fn serve_session(
         // server may raise a nested request during the very first `events/poll`, and asked before
         // then it would be declined as having no client.
         mcp_events = Some(hub);
+    } else {
+        // No events hub, so nothing of this session's will be restored: the daemon's restore
+        // window (`mcp_events::restore_pending`) must not wait on it.
+        crate::tools::mcp_events::restored(persistence.session_id());
     }
     // SEP-2640 skills from every connected server, seen through this session's MCP gate.
     let mcp_skills =

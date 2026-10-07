@@ -136,9 +136,10 @@ pub fn restore_pending(sessions: impl IntoIterator<Item = String>) {
     });
 }
 
-/// `session` has reserved every token it persisted. Once every session restore was waiting on has,
-/// unknown tokens are `410` again.
-pub(super) fn restored(session: &str) {
+/// `session` has reserved every token it persisted — or will not: it failed to start, ended with no
+/// events hub, or panicked. Once every session restore was waiting on is done either way, unknown
+/// tokens are `410` again, rather than for the rest of [`RESERVE_FOR`].
+pub fn restored(session: &str) {
     let mut state = restoring_state();
     if let Some(r) = state.as_mut() {
         r.sessions.remove(session);

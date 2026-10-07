@@ -529,6 +529,9 @@ fn serve_session_body(base: ServeConfig) -> SessionBody {
             Box::pin(async move {
                 if let Err(e) = serve_session(cfg, input_rx, out_conn, running, keep_alive).await {
                     eprintln!("serve: session {id} ended: {e}");
+                    // Failed (to start, or later): whatever it would still have restored, the
+                    // restore window does not wait on it.
+                    crate::tools::mcp_events::restored(&id);
                     simulated_slow_session_end().await;
                     lock_ignoring_poison(&out_err).end(OutFrame::Value(json!({
                         "type": "error",
@@ -1894,10 +1897,14 @@ pub async fn serve_ws(
                 supervisor.unpin(&p.id, p.incarnation);
                 eprintln!("serve: MCP Events session `{id}` owns the configured subscriptions");
             }
-            Err(e) => eprintln!(
-                "serve: could not start the MCP Events session `{id}`: {}",
-                HttpError::from(e)
-            ),
+            Err(e) => {
+                eprintln!(
+                    "serve: could not start the MCP Events session `{id}`: {}",
+                    HttpError::from(e)
+                );
+                // It will reserve nothing: the restore window must not wait on it.
+                crate::tools::mcp_events::restored(&id);
+            }
         }
     }
 
@@ -1915,6 +1922,10 @@ pub async fn serve_ws(
             let mut backoff: std::collections::HashMap<String, (u32, std::time::Instant)> =
                 std::collections::HashMap::new();
             while let Some(id) = panicked_rx.recv().await {
+                // A panicked incarnation reserves nothing more, and one that panics on every start
+                // never will: the restore window does not wait on it. (Tokens it already reserved
+                // stay held; a restart reserves its own again.)
+                crate::tools::mcp_events::restored(&id);
                 let holds_runtime = match &session_dir {
                     Some(dir) => {
                         let dir = dir.clone();
@@ -1974,10 +1985,13 @@ pub async fn serve_ws(
                     supervisor.unpin(&p.id, p.incarnation);
                     eprintln!("serve: restored session `{id}` for its MCP Events subscriptions");
                 }
-                Err(e) => eprintln!(
-                    "serve: could not restore session `{id}` for its MCP Events subscriptions: {}",
-                    HttpError::from(e)
-                ),
+                Err(e) => {
+                    eprintln!(
+                        "serve: could not restore session `{id}` for its MCP Events subscriptions: {}",
+                        HttpError::from(e)
+                    );
+                    crate::tools::mcp_events::restored(&id);
+                }
             }
         }
     }

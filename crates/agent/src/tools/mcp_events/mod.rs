@@ -54,7 +54,9 @@ use crate::settings::{McpEventAction, McpEventDelivery, McpEventSubscription};
 use crate::tools::mcp::McpCatalog;
 
 use state::{PendingEvent, PersistedSub, StateStore};
-pub use webhook::{MAX_WEBHOOK_BODY, WebhookReply, receive_webhook, restore_pending, route_exists};
+pub use webhook::{
+    MAX_WEBHOOK_BODY, WebhookReply, receive_webhook, restore_pending, restored, route_exists,
+};
 pub use wire::NotificationRouter;
 use wire::{Conn, RpcError, StreamMsg};
 
