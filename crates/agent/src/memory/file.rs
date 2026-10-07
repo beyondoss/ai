@@ -691,6 +691,53 @@ mod tests {
         StoreLock::acquire(&store, Duration::from_millis(100)).expect("free once released");
     }
 
+    /// Mixed rollout: an older binary locks the store with an `flock` on `.memory.lock` and nothing
+    /// else. While one holds it, this binary's store lock waits (and times out); while this binary
+    /// holds the store lock, the old binary's own non-blocking `flock` is refused.
+    #[cfg(unix)]
+    #[test]
+    fn the_store_lock_and_an_old_binarys_flock_exclude_each_other() {
+        use std::io::{BufRead as _, BufReader, Write as _};
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("memory");
+        fs::create_dir_all(&store).unwrap();
+        // An old binary: one `flock` attempt on each line of stdin, answering what it got.
+        let Ok(mut old) = std::process::Command::new("python3")
+            .args([
+                "-c",
+                "import fcntl,sys\nf=open(sys.argv[1],'a+')\nfor cmd in sys.stdin:\n    cmd=cmd.strip()\n    if cmd=='lock':\n        try:\n            fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB)\n            print('locked',flush=True)\n        except BlockingIOError:\n            print('refused',flush=True)\n    else:\n        fcntl.flock(f,fcntl.LOCK_UN)\n        print('unlocked',flush=True)",
+            ])
+            .arg(store.join(".memory.lock"))
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+        else {
+            eprintln!("no python3: skipping the mixed-rollout check");
+            return;
+        };
+        let mut stdin = old.stdin.take().unwrap();
+        let mut stdout = BufReader::new(old.stdout.take().unwrap());
+        let mut ask = |cmd: &str| {
+            writeln!(stdin, "{cmd}").unwrap();
+            let mut line = String::new();
+            stdout.read_line(&mut line).unwrap();
+            line.trim().to_owned()
+        };
+        assert_eq!(ask("lock"), "locked");
+        let ours = StoreLock::acquire(&store, Duration::from_millis(300));
+        assert!(
+            ours.is_err_and(|e| e.kind() == ErrorKind::TimedOut),
+            "the old binary's flock holds the store"
+        );
+        assert_eq!(ask("unlock"), "unlocked");
+        let held = StoreLock::acquire(&store, Duration::from_millis(300)).expect("free now");
+        assert_eq!(ask("lock"), "refused", "ours holds the old binary out");
+        drop(held);
+        assert_eq!(ask("lock"), "locked", "and lets it in once released");
+        drop(stdin);
+        old.wait().unwrap();
+    }
+
     /// Concurrent mutations through the backend are serialized: none of them loses another's update.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_mutations_lose_no_update() {

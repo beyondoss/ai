@@ -740,6 +740,27 @@ pub(crate) mod tests {
         assert!(!is_lock_file(&key), "released");
     }
 
+    /// The legacy lock file's inode is in the held set too, not only the record lock file's: a hard
+    /// link to it under an innocent name reads as a lock file while it is held, and as an ordinary file
+    /// once released.
+    #[cfg(unix)]
+    #[test]
+    fn a_hard_link_to_a_held_legacy_lock_file_is_not_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = dir.path().join("s1");
+        std::fs::create_dir_all(&session).unwrap();
+        let target = Target::Dir(&session);
+        let held = try_lock(target).unwrap().unwrap();
+        let alias = dir.path().join("notes.txt");
+        std::fs::hard_link(target.legacy_path().unwrap(), &alias).unwrap();
+        assert!(
+            crate::tools::write_atomic(alias.to_str().unwrap(), b"x").is_err(),
+            "a link to the held legacy lock file is refused"
+        );
+        drop(held);
+        crate::tools::write_atomic(alias.to_str().unwrap(), b"x").unwrap();
+    }
+
     /// Asking whether a file is a lock file takes no lock on it, so another program's own
     /// non-blocking `flock` on that file never fails because of us. (A test lock taken to ask made
     /// 2071 of 20000 of its attempts fail.)
