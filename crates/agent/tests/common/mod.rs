@@ -484,7 +484,7 @@ pub fn read_until_response(reader: &mut impl BufRead, command: &str) -> Vec<Valu
     frames
 }
 
-/// How long a test waits for a `serve` child's next frame — on stdout ([`serve_frames`]), over a
+/// How long a test waits for a `serve` child's next frame — on stdout ([`child_frames`]), over a
 /// WebSocket ([`ws_next_frame`]), or through [`skills_env::Serve`] — before failing. Long enough for
 /// any honest wait on a loaded CI runner; far short of the runner's own kill, which says nothing
 /// about where the test stopped. A stall, not slowness, is what it catches: a scripted reply taken by
@@ -502,14 +502,25 @@ pub struct Frames {
     deadline: Duration,
 }
 
-/// [`Frames`] over a `serve` child's stdout, with [`FRAME_DEADLINE`]. Every stdio frame reader in the
-/// `serve_*` suites is one of these.
-pub fn serve_frames(out: impl Read + Send + 'static) -> Frames {
-    frames_with_deadline(out, FRAME_DEADLINE)
+/// [`Frames`] over `child`'s stdout (which must be piped, and is taken), with [`FRAME_DEADLINE`].
+///
+/// The **only** way a test reads a child's stdout: `tests/serve_harness_deadlines.rs` fails on any
+/// other `.stdout.take()`/`ChildStdout` in the `serve_*` and `mcp_*` suites and `tests/common`, so a
+/// reader without a deadline cannot come back. One for a child's whole life — it owns the pipe.
+pub fn child_frames(child: &mut std::process::Child) -> Frames {
+    child_frames_within(child, FRAME_DEADLINE)
 }
 
-/// [`Frames`] over `out`, with its own per-line deadline.
-pub fn frames_with_deadline(out: impl Read + Send + 'static, deadline: Duration) -> Frames {
+/// [`child_frames`] with its own per-line deadline.
+pub fn child_frames_within(child: &mut std::process::Child, deadline: Duration) -> Frames {
+    let out = child
+        .stdout
+        .take()
+        .expect("the child's stdout is piped, and read through one `child_frames`");
+    frames_over(out, deadline)
+}
+
+fn frames_over(out: impl Read + Send + 'static, deadline: Duration) -> Frames {
     let (tx, lines) = std::sync::mpsc::channel();
     thread::spawn(move || {
         let mut out = std::io::BufReader::new(out);

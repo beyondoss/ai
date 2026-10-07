@@ -47,7 +47,7 @@ fn start(extra_args: &[&str]) -> Serve {
         .stderr(Stdio::from(std::fs::File::create(&stderr).unwrap()));
     let mut child = cmd.spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut frames = Frames::new(child.stdout.take().unwrap(), Some(stderr));
+    let mut frames = Frames::new(&mut child, Some(stderr));
     let fixture = wait_control_file(&control_file);
     wait_active(&mut stdin, &mut frames, 1);
     Serve {

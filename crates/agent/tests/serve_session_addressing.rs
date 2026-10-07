@@ -58,7 +58,7 @@ impl Serve {
     fn start(cmd: &mut Command) -> Self {
         let mut child = cmd.spawn_guarded();
         let stdin = child.stdin.take().expect("stdin");
-        let stdout = common::serve_frames(child.stdout.take().expect("stdout"));
+        let stdout = common::child_frames(&mut child);
         Self {
             child,
             stdin,

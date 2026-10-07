@@ -21,7 +21,7 @@ fn serve_set_auto_compaction_toggles_and_rejects_a_non_boolean() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     writeln!(
         stdin,
@@ -72,7 +72,7 @@ fn serve_no_compaction_flag_starts_with_auto_compaction_disabled() {
         .args(["--no-compaction"])
         .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     writeln!(stdin, "{}", json!({ "type": "get_state" })).unwrap();
     stdin.flush().unwrap();
@@ -104,7 +104,7 @@ fn serve_set_auto_compaction_persists_across_a_restart() {
         .env("HOME", home.path())
         .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
     writeln!(
         stdin,
         "{}",
@@ -125,7 +125,7 @@ fn serve_set_auto_compaction_persists_across_a_restart() {
         .env("HOME", home.path())
         .spawn_guarded();
     let mut stdin2 = child2.stdin.take().unwrap();
-    let mut stdout2 = common::serve_frames(child2.stdout.take().unwrap());
+    let mut stdout2 = common::child_frames(&mut child2);
     writeln!(stdin2, "{}", json!({ "type": "get_state" })).unwrap();
     stdin2.flush().unwrap();
     let frames2 = read_until_response(&mut stdout2, "get_state");
@@ -176,7 +176,7 @@ fn serve_compact_forwards_custom_instructions_to_the_summarization_call() {
         .stderr(Stdio::null())
         .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     for msg in ["hello", "again"] {
         writeln!(stdin, "{}", json!({ "type": "prompt", "message": msg })).unwrap();
@@ -244,7 +244,7 @@ fn serve_compact_reports_too_small_reason_for_a_session_with_nothing_to_compact(
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     // No `prompt` at all yet — the session is empty, well under `find_split_cut`'s minimum.
     writeln!(stdin, "{}", json!({ "type": "compact" })).unwrap();
@@ -301,7 +301,7 @@ fn serve_compact_reports_already_compacted_reason_when_nothing_new_followed_the_
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     writeln!(stdin, "{}", json!({ "type": "compact" })).unwrap();
     stdin.flush().unwrap();
@@ -388,7 +388,7 @@ fn serve_proactively_compacts_a_resumed_large_session_on_its_very_next_prompt() 
         .stderr(Stdio::null())
         .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     // The very first prompt this (freshly-spawned, freshly-resumed) process ever sends.
     writeln!(
@@ -459,7 +459,7 @@ fn serve_compact_preserves_pre_compaction_entries_in_get_tree() {
         .stderr(Stdio::null())
         .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     for msg in ["pre-compaction-hello", "pre-compaction-again"] {
         writeln!(stdin, "{}", json!({ "type": "prompt", "message": msg })).unwrap();
@@ -542,7 +542,7 @@ fn serve_compact_reports_first_kept_entry_id_naming_a_real_pre_compaction_entry(
         .stderr(Stdio::null())
         .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     for msg in ["pre-compaction-hello", "pre-compaction-again"] {
         writeln!(stdin, "{}", json!({ "type": "prompt", "message": msg })).unwrap();
@@ -614,7 +614,7 @@ fn serve_set_auto_retry_toggles_and_rejects_a_non_boolean() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     writeln!(
         stdin,
@@ -665,7 +665,7 @@ fn serve_set_auto_retry_false_fails_immediately_instead_of_retrying_a_dropped_st
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     writeln!(
         stdin,
@@ -717,7 +717,7 @@ fn serve_auto_retries_a_whole_run_after_mid_stream_retry_is_exhausted() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     writeln!(stdin, "{}", json!({ "type": "prompt", "message": "hi" })).unwrap();
     stdin.flush().unwrap();
@@ -813,7 +813,7 @@ fn serve_persists_the_retried_attempts_assistant_message_not_only_in_memory() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     writeln!(stdin, "{}", json!({ "type": "prompt", "message": "hi" })).unwrap();
     stdin.flush().unwrap();
@@ -841,7 +841,7 @@ fn serve_persists_the_retried_attempts_assistant_message_not_only_in_memory() {
     // Reload the very same session file in a fresh process and ask again.
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
     writeln!(stdin, "{}", json!({ "type": "get_messages" })).unwrap();
     stdin.flush().unwrap();
     let frames = read_until_response(&mut stdout, "get_messages");
@@ -894,7 +894,7 @@ fn serve_whole_run_retry_recovery_attempt_can_itself_dispatch_tool_calls() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     writeln!(stdin, "{}", json!({ "type": "prompt", "message": "hi" })).unwrap();
     stdin.flush().unwrap();
@@ -947,7 +947,7 @@ fn serve_whole_run_retry_succeeds_on_its_second_attempt_not_its_first() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     writeln!(stdin, "{}", json!({ "type": "prompt", "message": "hi" })).unwrap();
     stdin.flush().unwrap();
@@ -1010,7 +1010,7 @@ fn serve_abort_retry_interrupts_a_pending_whole_run_retry_backoff() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     writeln!(stdin, "{}", json!({ "type": "prompt", "message": "hi" })).unwrap();
     stdin.flush().unwrap();
@@ -1113,7 +1113,7 @@ fn serve_abort_retry_interrupts_a_pending_whole_run_retry_backoff() {
     // And it must survive a reload, not just live in memory.
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
     writeln!(stdin, "{}", json!({ "type": "get_messages" })).unwrap();
     stdin.flush().unwrap();
     let frames = read_until_response(&mut stdout, "get_messages");
@@ -1144,7 +1144,7 @@ fn serve_auto_retry_exhausts_all_attempts_and_reports_failure() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     writeln!(stdin, "{}", json!({ "type": "prompt", "message": "hi" })).unwrap();
     stdin.flush().unwrap();
@@ -1222,7 +1222,7 @@ fn serve_idle_timeout_ms_flag_causes_a_stalled_response_to_fail_quickly() {
         .args(["--idle-timeout-ms", "200", "--retry-max-retries", "0"])
         .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     // Whole-run auto-retry defaults on; disable it too so a single failed attempt surfaces
     // immediately instead of being retried (this test is about the idle timeout firing at all, not

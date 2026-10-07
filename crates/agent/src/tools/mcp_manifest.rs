@@ -180,20 +180,23 @@ pub fn load(dir: &ManifestDir, config: &McpServerConfig) -> Option<ServerManifes
 const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(5);
 
-/// The manifest's write lock, waited for up to [`LOCK_TIMEOUT`]: the repo's session lock
-/// ([`crate::session_store::acquire_session_lock`]) on `<manifest>.lock` — a kernel file lock, which
+/// The manifest's write lock, waited for up to [`LOCK_TIMEOUT`]: [`crate::file_lock`] on
+/// `<manifest>.lock` — a kernel file lock, which
 /// the kernel releases when its holder exits, however it exits. So there is no staleness to judge and
 /// no lockfile to break: a crashed writer's leftover file is simply unlocked, and two waiters cannot
 /// both take it. (A create-new lockfile with an age-based break could: both judge it stale, both
 /// remove and recreate it, both "hold" it.) Blocking — call it off the async runtime.
-fn lock_store(dir: &ManifestDir) -> Option<crate::session_store::SessionLock> {
+fn lock_store(dir: &ManifestDir) -> Option<crate::file_lock::FileLock> {
     let path = dir.file();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).ok()?;
     }
+    let mut lock_path = path.into_os_string();
+    lock_path.push(".lock");
+    let lock_path = PathBuf::from(lock_path);
     let deadline = Instant::now() + LOCK_TIMEOUT;
     loop {
-        match crate::session_store::acquire_session_lock(&path) {
+        match crate::file_lock::try_lock(&lock_path) {
             Ok(Some(lock)) => return Some(lock),
             Ok(None) if Instant::now() < deadline => std::thread::sleep(LOCK_RETRY_INTERVAL),
             Ok(None) | Err(_) => return None,
@@ -218,12 +221,21 @@ fn update_store(dir: &ManifestDir, change: impl FnOnce(&mut Store) -> bool) {
 }
 
 /// [`update_store`] on the blocking pool, so waiting for another writer never holds an async worker.
+/// A write that panics leaves the cache as it was (the rename never happened) — still best-effort,
+/// but said at warn, since it is a bug and not a busy lock.
 async fn update_store_off_runtime(
     dir: &ManifestDir,
     change: impl FnOnce(&mut Store) -> bool + Send + 'static,
 ) {
+    let path = dir.file();
     let dir = dir.clone();
-    let _ = tokio::task::spawn_blocking(move || update_store(&dir, change)).await;
+    if let Err(e) = tokio::task::spawn_blocking(move || update_store(&dir, change)).await {
+        tracing::warn!(
+            manifest = %path.display(),
+            error = %e,
+            "MCP manifest write failed; the cache is left as it was"
+        );
+    }
 }
 
 /// Drop `config`'s cached manifest, if any — for a server whose answer must not be cached here (a
@@ -387,6 +399,63 @@ mod tests {
             leftovers.is_empty(),
             "no temporary file is left: {leftovers:?}"
         );
+    }
+
+    /// A write that panics is reported at warn — not discarded — and leaves the cache untouched.
+    #[test]
+    fn a_write_that_panics_is_logged_and_leaves_the_cache_as_it_was() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = ManifestDir::at(dir.path());
+        let config = stdio("s", "npx", &["server"]);
+        block_on(store(
+            &manifest,
+            &config,
+            vec![],
+            vec![],
+            vec![],
+            Some(vec![]),
+            vec![],
+        ));
+        let before = std::fs::read(dir.path().join(FILE)).unwrap();
+        let capture = crate::tracing_test::capture(|| {
+            block_on(update_store_off_runtime(&manifest, |_| {
+                panic!("a bug in a manifest write")
+            }));
+        });
+        assert!(
+            capture
+                .messages()
+                .iter()
+                .any(|m| m.contains("MCP manifest write failed")),
+            "{:?}",
+            capture.messages()
+        );
+        assert_eq!(std::fs::read(dir.path().join(FILE)).unwrap(), before);
+        // And the lock went with the panicking writer.
+        assert!(lock_store(&manifest).is_some());
+    }
+
+    /// The manifest's lock and a session's are one primitive ([`crate::file_lock`]) on different
+    /// files: holding one never stands in for, or blocks, the other.
+    #[test]
+    fn the_manifest_lock_is_its_own_file_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = ManifestDir::at(dir.path());
+        let held = lock_store(&manifest).unwrap();
+        assert!(
+            crate::file_lock::try_lock(&dir.path().join(format!("{FILE}.lock")))
+                .unwrap()
+                .is_none(),
+            "it is crate::file_lock on <manifest>.lock"
+        );
+        let session = dir.path().join(FILE);
+        assert!(
+            crate::session_store::acquire_session_lock(&session.with_extension("jsonl"))
+                .unwrap()
+                .is_some(),
+            "a session's lock is a different file"
+        );
+        drop(held);
     }
 
     /// Run one async writer to completion on a runtime of its own (each test thread is a separate

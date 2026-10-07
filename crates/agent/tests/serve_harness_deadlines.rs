@@ -2,7 +2,7 @@
 //! reply taken by the wrong request, a question nobody will answer — used to leave a test blocked in
 //! a read until the runner killed it, minutes later and with nothing said about where it stopped.
 //! Every reader now has one shared deadline (`common::FRAME_DEADLINE`): stdout through
-//! `common::serve_frames`, WebSockets through `common::ws_next_frame`, and `skills_env::Serve`.
+//! `common::child_frames`, WebSockets through `common::ws_next_frame`, and `skills_env::Serve`.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod common;
@@ -19,8 +19,7 @@ fn a_silent_stdout_fails_the_read_at_its_deadline() {
             .stdout(Stdio::piped())
             .stderr(Stdio::null()),
     );
-    let mut frames =
-        common::frames_with_deadline(child.stdout.take().unwrap(), Duration::from_millis(300));
+    let mut frames = common::child_frames_within(&mut child, Duration::from_millis(300));
     let started = Instant::now();
     let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         common::read_until_response(&mut frames, "prompt")
@@ -61,41 +60,79 @@ async fn a_silent_websocket_fails_the_read_at_its_deadline() {
     server.abort();
 }
 
-/// Every `serve_*` suite reads its child's stdout through `serve_frames`, and `skills_env` through
-/// the same `Frames` — none through a bare `BufReader`, which has no deadline.
+/// No test reads a child's stdout except through `common::child_frames`: in the `serve_*` and `mcp_*`
+/// suites and `tests/common`, the only code that touches a child's stdout pipe is that one helper. A
+/// reader without the deadline is not discouraged but unreachable — there is no `ChildStdout` to wrap.
+///
+/// Matched on code with comments dropped and all whitespace removed, so line breaks and formatting
+/// cannot hide a use.
 #[test]
-fn every_serve_suite_reads_frames_with_the_shared_deadline() {
+fn only_child_frames_touches_a_childs_stdout() {
+    const FORBIDDEN: &[&str] = &[
+        "ChildStdout",
+        ".stdout.take(",
+        ".stdout.as_mut(",
+        ".stdout.as_ref(",
+        ".stdout.unwrap(",
+        ".stdout.expect(",
+        ".stdout=",
+    ];
     let tests = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
-    let mut readers = 0;
-    let mut bare = Vec::new();
     let mut files: Vec<_> = std::fs::read_dir(&tests)
         .unwrap()
         .map(|e| e.unwrap().path())
         .filter(|p| {
             let name = p.file_name().unwrap().to_string_lossy().into_owned();
-            // This file names the pattern it looks for.
-            name.starts_with("serve_")
+            (name.starts_with("serve_") || name.starts_with("mcp_"))
                 && name.ends_with(".rs")
+                // This file names what it looks for.
                 && name != "serve_harness_deadlines.rs"
         })
         .collect();
-    files.push(tests.join("common/skills_env.rs"));
-    for path in files {
-        let text = std::fs::read_to_string(&path).unwrap();
-        readers += text.matches("serve_frames(").count();
-        for (n, line) in text.lines().enumerate() {
-            if line.contains("BufReader::new(") && line.contains("stdout") {
-                bare.push(format!("{}:{}: {}", path.display(), n + 1, line.trim()));
+    files.extend(
+        std::fs::read_dir(tests.join("common"))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|e| e == "rs")),
+    );
+    assert!(
+        files.len() > 80,
+        "the scan found the suites: {}",
+        files.len()
+    );
+    let mut readers = 0;
+    let mut found = Vec::new();
+    for path in &files {
+        let code: String = std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| line.split("//").next().unwrap_or(""))
+            .collect::<String>()
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        readers += code.matches("child_frames(").count();
+        // The helper itself takes the pipe, once.
+        let allowed = usize::from(path.ends_with("common/mod.rs"));
+        for pattern in FORBIDDEN {
+            let n = code.matches(pattern).count();
+            let n = if *pattern == ".stdout.take(" {
+                n.saturating_sub(allowed)
+            } else {
+                n
+            };
+            if n > 0 {
+                found.push(format!("{}: `{pattern}` x{n}", path.display()));
             }
         }
     }
     assert!(
-        bare.is_empty(),
-        "stdout read without a deadline:\n{}",
-        bare.join("\n")
+        found.is_empty(),
+        "a child's stdout read other than through common::child_frames:\n{}",
+        found.join("\n")
     );
     assert!(
-        readers > 200,
-        "the suites read through serve_frames ({readers} readers)"
+        readers > 250,
+        "the suites read through child_frames ({readers})"
     );
 }

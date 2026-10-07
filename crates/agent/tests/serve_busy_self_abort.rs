@@ -30,7 +30,7 @@ fn spawn_and_warm_up(
 ) -> (ChildGuard, ChildStdin, common::Frames) {
     let mut child = serve_dir_cmd(bin, base, session_dir).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
     writeln!(
         stdin,
         "{}",
@@ -99,7 +99,7 @@ fn serve_busy_compact_self_aborts_and_proceeds_in_one_round_trip() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_dir_cmd(bin, &base, &session_dir).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     let (prompt_resp, compact_resp) = run_busy_then(
         &mut stdin,

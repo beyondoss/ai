@@ -32,7 +32,7 @@ fn start(
         .env("BEYOND_AI_AGENT_MCP_IDLE_SECS", idle_secs);
     let mut child = cmd.spawn_guarded();
     let stdin = child.stdin.take().unwrap();
-    let frames = Frames::new(child.stdout.take().unwrap(), None);
+    let frames = Frames::new(&mut child, None);
     (child, stdin, frames)
 }
 

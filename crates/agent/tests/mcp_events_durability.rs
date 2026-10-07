@@ -133,7 +133,7 @@ fn poll_does_not_advance_its_cursor_past_events_it_could_not_accept() {
         .env("BEYOND_AI_AGENT_MCP_IDLE_SECS", "0");
     let mut child = cmd.spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut frames = Frames::new(child.stdout.take().unwrap(), None);
+    let mut frames = Frames::new(&mut child, None);
     wait_active(&mut stdin, &mut frames, 1);
 
     for n in 1..=3 {
@@ -189,7 +189,7 @@ fn the_events_state_follows_the_session_to_a_new_transcript() {
         .env("BEYOND_AI_AGENT_MCP_IDLE_SECS", "0");
     let mut child = cmd.spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut frames = Frames::new(child.stdout.take().unwrap(), None);
+    let mut frames = Frames::new(&mut child, None);
     wait_active(&mut stdin, &mut frames, 1);
     send(&mut stdin, json!({ "type": "new_session", "id": "ns" }));
     let ns = frames.response("ns");
@@ -262,7 +262,7 @@ fn polling_serve(
         .env("BEYOND_AI_AGENT_MCP_EVENTS_COALESCE_MS", "100");
     let mut child = cmd.spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut frames = Frames::new(child.stdout.take().unwrap(), None);
+    let mut frames = Frames::new(&mut child, None);
     wait_active(&mut stdin, &mut frames, 1);
     (child, stdin, frames, bodies)
 }

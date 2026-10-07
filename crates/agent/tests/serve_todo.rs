@@ -63,7 +63,7 @@ fn get_todos_is_null_before_the_model_has_made_a_plan() {
 
     let mut child = serve_cmd(BIN, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     assert_eq!(get_todos(&mut stdin, &mut stdout), Value::Null);
     kill(child);
@@ -84,7 +84,7 @@ fn get_todos_reads_the_last_call_out_of_the_live_transcript_when_idle() {
 
     let mut child = serve_cmd(BIN, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     send(
         &mut stdin,
@@ -122,7 +122,7 @@ fn get_todos_answers_from_the_live_mirror_while_a_run_is_still_in_flight() {
 
     let mut child = serve_cmd(BIN, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     send(
         &mut stdin,
@@ -176,7 +176,7 @@ fn a_compaction_carries_the_plan_into_the_summary_and_get_todos_still_finds_it()
         .args(["--compaction-keep-recent-tokens", "1"])
         .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     send(
         &mut stdin,
@@ -231,7 +231,7 @@ fn the_plan_survives_a_serve_restart_past_a_compaction() {
             .args(["--compaction-keep-recent-tokens", "1"])
             .spawn_guarded();
         let mut stdin = child.stdin.take().unwrap();
-        let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+        let mut stdout = common::child_frames(&mut child);
 
         send(
             &mut stdin,
@@ -248,7 +248,7 @@ fn the_plan_survives_a_serve_restart_past_a_compaction() {
     let (base2, _b2) = spawn_model_server(vec![]);
     let mut child = serve_cmd(BIN, &base2, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     assert_eq!(
         get_todos(&mut stdin, &mut stdout),

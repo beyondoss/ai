@@ -43,7 +43,7 @@ fn start(mcp_servers: Value, extra_env: &[(&str, &str)]) -> Serve {
     }
     let mut child = cmd.spawn_guarded();
     let stdin = child.stdin.take().unwrap();
-    let frames = Frames::new(child.stdout.take().unwrap(), Some(stderr));
+    let frames = Frames::new(&mut child, Some(stderr));
     Serve {
         _child: child,
         stdin,

@@ -3,7 +3,7 @@
 
 mod common;
 
-use std::io::{BufReader, Write};
+use std::io::Write;
 use std::path::Path;
 
 use common::{
@@ -78,7 +78,7 @@ fn get_mcp_lists_resources_and_prompts_and_tools_call_them() {
     cmd.env("BEYOND_AI_AGENT_MCP_IDLE_SECS", "0");
     let mut child = cmd.spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     writeln!(stdin, "{}", json!({ "id": "g", "type": "get_mcp" })).unwrap();
     let g_frames = read_until_response(&mut stdout, "get_mcp");
@@ -150,7 +150,7 @@ fn mcp_complete_returns_fixture_suggestions() {
     cmd.env("BEYOND_AI_AGENT_MCP_IDLE_SECS", "0");
     let mut child = cmd.spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     writeln!(
         stdin,

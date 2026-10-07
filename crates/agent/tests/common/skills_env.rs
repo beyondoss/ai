@@ -208,7 +208,7 @@ impl Serve {
     pub fn spawn(cmd: &mut Command) -> Self {
         let mut child = cmd.spawn_guarded();
         let stdin = child.stdin.take().unwrap();
-        let frames = super::serve_frames(child.stdout.take().unwrap());
+        let frames = super::child_frames(&mut child);
         Self {
             child,
             stdin,

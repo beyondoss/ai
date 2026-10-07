@@ -29,7 +29,7 @@ fn serve_streams_tool_progress_from_a_running_bash() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     writeln!(
         stdin,
@@ -84,7 +84,7 @@ fn serve_exclude_tools_removes_a_tool_from_the_advertised_set() {
     cmd.args(["--exclude-tools", "bash"]);
     let mut child = cmd.spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     writeln!(stdin, "{}", json!({ "type": "prompt", "message": "hi" })).unwrap();
     stdin.flush().unwrap();
@@ -119,7 +119,7 @@ fn serve_no_tools_sends_no_tools_field_at_all() {
     cmd.args(["--no-tools"]);
     let mut child = cmd.spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     writeln!(stdin, "{}", json!({ "type": "prompt", "message": "hi" })).unwrap();
     stdin.flush().unwrap();
@@ -146,7 +146,7 @@ fn serve_bash_runs_a_host_command_independent_of_the_model() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     writeln!(
         stdin,
@@ -186,7 +186,7 @@ fn serve_bash_records_its_result_into_session_context_by_default() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     writeln!(
         stdin,
@@ -227,7 +227,7 @@ fn serve_bash_exclude_from_context_is_recorded_but_hidden_from_the_model() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     writeln!(
         stdin,
@@ -307,7 +307,7 @@ fn serve_bash_is_rejected_when_the_tool_is_excluded() {
     cmd.args(["--exclude-tools", "bash"]);
     let mut child = cmd.spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     writeln!(
         stdin,
@@ -348,7 +348,7 @@ fn serve_bash_rpc_command_is_blocked_by_deny_bash_pattern() {
     cmd.args(["--deny-bash-pattern", "touch"]);
     let mut child = cmd.spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     writeln!(
         stdin,
@@ -390,7 +390,7 @@ fn serve_bash_shell_path_overrides_the_auto_resolved_shell() {
     cmd.args(["--bash-shell-path", "/bin/sh"]);
     let mut child = cmd.spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     // `$BASH_VERSION` is set only by bash itself; `/bin/sh` on this host is dash, which leaves it
     // unset — the POSIX `${VAR:-default}` expansion below works identically under both, so the
@@ -423,7 +423,7 @@ fn serve_bash_command_prefix_flag_runs_before_the_given_command() {
     cmd.args(["--bash-command-prefix", "export PREFIX_VAR=from-prefix"]);
     let mut child = cmd.spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     writeln!(
         stdin,
@@ -476,7 +476,7 @@ fn serve_sequential_tools_flag_is_accepted_and_both_calls_still_run() {
     cmd.args(["--sequential-tools"]);
     let mut child = cmd.spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     writeln!(
         stdin,
@@ -528,7 +528,7 @@ fn serve_abort_bash_cancels_a_running_host_command() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     writeln!(
         stdin,
@@ -579,7 +579,7 @@ fn serve_abort_bash_returns_the_partial_output_streamed_before_cancellation() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     // Two writes: `bash` throttles progress snapshots to one per `UPDATE_THROTTLE` (100ms) after an
     // initial empty update, so a lone `printf` microseconds later never streams and the next snapshot
@@ -655,7 +655,7 @@ fn serve_bash_terminal_response_carries_structured_exit_code_and_truncation_fiel
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     writeln!(stdin, "{}", json!({ "type": "bash", "command": "exit 7" })).unwrap();
     stdin.flush().unwrap();
@@ -715,7 +715,7 @@ fn serve_deny_tool_flag_blocks_a_model_invoked_call_end_to_end() {
         .args(["--deny-tool", "bash"])
         .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     writeln!(
         stdin,
@@ -771,7 +771,7 @@ fn serve_deny_path_flag_blocks_a_model_invoked_write_end_to_end() {
         .args(["--deny-path", "*.env"])
         .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     writeln!(
         stdin,
@@ -833,7 +833,7 @@ fn serve_block_images_flag_forces_a_read_tool_image_to_a_text_placeholder() {
         .current_dir(dir.path())
         .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     writeln!(
         stdin,
@@ -886,7 +886,7 @@ fn serve_no_image_auto_resize_flag_skips_downscaling_an_oversized_image() {
         .current_dir(dir.path())
         .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     writeln!(
         stdin,
@@ -974,7 +974,7 @@ fn serve_set_image_auto_resize_toggles_the_wire_layer_mid_session_without_a_rest
         .current_dir(dir.path())
         .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     writeln!(
         stdin,

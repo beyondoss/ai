@@ -8,7 +8,7 @@
 
 mod common;
 
-use std::io::{BufReader, Write};
+use std::io::Write;
 use std::path::Path;
 
 use common::{
@@ -88,7 +88,7 @@ fn disabling_a_server_takes_its_tools_away_from_a_subagent_too() {
         .current_dir(&project);
     let mut child = cmd.spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::child_frames(&mut child);
 
     writeln!(
         stdin,
