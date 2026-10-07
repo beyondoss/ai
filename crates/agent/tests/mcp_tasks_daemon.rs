@@ -13,33 +13,31 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use common::{
-    ChildGuard, SpawnGuarded, TestWs, free_port, spawn_model_server_routed, turn_text,
-    turn_tool_use, wait_for_port, ws_connect, ws_next_frame, ws_send,
+    ChildGuard, TestWs, spawn_listening, spawn_model_server_routed, turn_text, turn_tool_use,
+    ws_connect, ws_next_frame, ws_send,
 };
 use mcp_tasks_env::Env;
 use serde_json::{Value, json};
 
-fn daemon(env: &Env, base: &str, port: u16) -> ChildGuard {
-    Command::new(common::BIN)
-        .args([
-            "serve",
-            "--listen",
-            &format!("127.0.0.1:{port}"),
-            "--gateway-url",
-            base,
-            "--key",
-            "bai_v1.test",
-            "--model",
-            "claude-test",
-            "--session-dir",
-            env.dir.path().join("sessions").to_str().unwrap(),
-        ])
-        .env("HOME", &env.home)
-        .env("BEYOND_AI_AGENT_MCP_IDLE_SECS", "0")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn_guarded()
+fn daemon(env: &Env, base: &str) -> (ChildGuard, u16) {
+    spawn_listening(
+        Command::new(common::BIN)
+            .args([
+                "serve",
+                "--gateway-url",
+                base,
+                "--key",
+                "bai_v1.test",
+                "--model",
+                "claude-test",
+                "--session-dir",
+                env.dir.path().join("sessions").to_str().unwrap(),
+            ])
+            .env("HOME", &env.home)
+            .env("BEYOND_AI_AGENT_MCP_IDLE_SECS", "0")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null()),
+    )
 }
 
 /// Frames until `pred` matches (that frame last), failing after 30 s.
@@ -128,9 +126,7 @@ async fn daemon_routes_mcp_questions_to_the_session_whose_call_asked() {
         ],
         turn_text("fallback"),
     );
-    let port = free_port();
-    let _daemon = daemon(&env, &base, port);
-    wait_for_port(port);
+    let (_daemon, port) = daemon(&env, &base);
 
     let mut a = ws_connect(port, Some("mcp-alpha")).await;
     // Bravo starts second: under a process-wide hub its gates would answer for alpha too.
@@ -270,9 +266,7 @@ fn concurrent_routes() -> Vec<(String, String)> {
 /// is still in flight then. Returns both sessions' frames for the next 3.5 s.
 async fn alpha_asks_while_bravo_holds(env: &Env) -> (TestWs, Vec<Value>, Vec<Value>, ChildGuard) {
     let (base, _requests) = spawn_model_server_routed(concurrent_routes(), turn_text("fallback"));
-    let port = free_port();
-    let daemon = daemon(env, &base, port);
-    wait_for_port(port);
+    let (daemon, port) = daemon(env, &base);
     let mut a = ws_connect(port, Some("route-alpha")).await;
     let mut b = ws_connect(port, Some("route-bravo")).await;
     ws_send(

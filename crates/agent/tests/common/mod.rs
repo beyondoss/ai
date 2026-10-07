@@ -161,18 +161,183 @@ pub fn gateway_bin() -> PathBuf {
 // keeps working, and there is one implementation of the wire format rather than two.
 pub use beyond_ai_test_support::{
     SCRIPTED_SESSION_TITLE, SESSION_TITLE_MARKER, spawn_model_server, spawn_model_server_routed,
-    spawn_model_server_with_stalled_response, sse, turn_refusal, turn_text, turn_text_responses,
-    turn_tool_use,
+    spawn_model_server_with_stalled_response, sse, title_calls, turn_refusal, turn_text,
+    turn_text_responses, turn_tool_use,
 };
 
-/// A free localhost port (bind `:0`, read it back, release). A subprocess must bind it promptly;
-/// there's a small TOCTOU window, acceptable for tests.
+/// A free localhost port (bind `:0`, read it back, release) — for a subprocess that can neither
+/// report the port it bound nor adopt one it is handed (the gateway, `nats-server`). It has a window:
+/// between the release and the child's bind any other process can take the port, and under parallel
+/// suites one did, handing a test's connections to another test's server. A `serve` child never needs
+/// this: use [`spawn_listening`], or [`HeldPort`] when the port must be known before it starts.
 pub fn free_port() -> u16 {
     TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
         .unwrap()
         .port()
+}
+
+/// The line `serve` prints on stderr once its `--listen` socket is bound (`serve_ws::serve_ws`).
+const LISTENING: &str = "serve: websocket listening on ";
+
+/// The port in `serve`'s listening announcement, if `line` is one.
+fn announced_port(line: &str) -> Option<u16> {
+    let addr = line.strip_prefix(LISTENING)?.split_whitespace().next()?;
+    addr.parse::<std::net::SocketAddr>().ok().map(|a| a.port())
+}
+
+/// Spawn a `serve` command listening on a port the kernel picks, and return that port: appends
+/// `--listen 127.0.0.1:0` and reads the bound address back from the line `serve` announces it with.
+/// The port is `serve`'s from the moment it exists, so — unlike [`free_port`], which releases the
+/// port it picked and hopes the child binds it first — no other process can take it. When this
+/// returns the listener is up, so there is nothing to wait for.
+///
+/// Takes the child's stderr to read that line; everything it writes is forwarded line by line to the
+/// test's (captured) stderr, so a child's panic or startup error is shown with a failing test instead
+/// of being discarded. A child that exits without announcing fails here, with what it said.
+pub fn spawn_listening(cmd: &mut Command) -> (ChildGuard, u16) {
+    spawn_listening_logged(cmd, None)
+}
+
+/// [`spawn_listening`], also copying the child's stderr to `log` — for a test that reads it back.
+pub fn spawn_listening_logged(cmd: &mut Command, log: Option<std::fs::File>) -> (ChildGuard, u16) {
+    cmd.args(["--listen", "127.0.0.1:0"]).stderr(Stdio::piped());
+    let mut child = ChildGuard::spawn(cmd);
+    let stderr = child.stderr.take().expect("stderr is piped");
+    let (tx, rx) = std::sync::mpsc::channel::<Result<u16, String>>();
+    // Spawned threads inherit the test's output capture, so `eprintln!` here lands in it.
+    thread::spawn(move || {
+        let mut log = log;
+        let mut pending = Some((tx, String::new()));
+        for line in std::io::BufReader::new(stderr).lines() {
+            let Ok(line) = line else { break };
+            eprintln!("[serve] {line}");
+            if let Some(f) = log.as_mut() {
+                let _ = writeln!(f, "{line}");
+            }
+            if let Some((tx, said)) = pending.as_mut() {
+                match announced_port(&line) {
+                    Some(port) => {
+                        let _ = tx.send(Ok(port));
+                        pending = None;
+                    }
+                    None => {
+                        said.push_str(&line);
+                        said.push('\n');
+                    }
+                }
+            }
+        }
+        if let Some((tx, said)) = pending {
+            let _ = tx.send(Err(said));
+        }
+    });
+    match rx.recv_timeout(Duration::from_secs(60)) {
+        Ok(Ok(port)) => (child, port),
+        Ok(Err(said)) => panic!("serve exited without listening; it said:\n{said}"),
+        Err(e) => panic!("serve did not announce its listener within 60s ({e})"),
+    }
+}
+
+/// A loopback port the test holds from before `serve` starts, for a test that has to name the port
+/// in `serve`'s own arguments (an MCP Events callback URL pointing back at the daemon), so cannot
+/// learn it afterwards. The test binds the listener and hands it to `serve` as a socket-activated
+/// one (`LISTEN_FDS`, exactly as systemd does) — so the port is never released between being chosen
+/// and being served, and no other process can take it. Held for as long as this value lives, so a
+/// daemon restarted on the same port gets the same socket ([`HeldPort::down`] covers the gap).
+///
+/// It is passed as the child's stdin (inetd's convention, `LISTEN_FDS_FIRST_FD=0`): std's `dup2` onto
+/// a standard stream is the one way to give a child a descriptor without `unsafe`, which the workspace
+/// forbids, and `serve` never reads stdin once it serves a listener. Drop it once the daemon is up
+/// unless it will be restarted: while the test holds the socket, a daemon that died leaves it
+/// listening, and a client would wait on it instead of being refused.
+pub struct HeldPort {
+    listener: TcpListener,
+    port: u16,
+}
+
+impl HeldPort {
+    pub fn bind() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        Self { listener, port }
+    }
+
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// Make this socket `cmd`'s listener. Call it after anything else that sets stdin, and pass no
+    /// `--listen`/`--listen-uds` (either turns socket activation off).
+    pub fn hand_to(&self, cmd: &mut Command) {
+        let fd = std::os::fd::OwnedFd::from(self.listener.try_clone().unwrap());
+        cmd.stdin(Stdio::from(fd))
+            .env("LISTEN_FDS", "1")
+            .env("LISTEN_FDS_FIRST_FD", "0")
+            .env_remove("LISTEN_PID");
+    }
+
+    /// Between a daemon's death and its restart: until the guard drops, every connection is accepted
+    /// and closed at once, so a client fails promptly — as against a stopped daemon — rather than
+    /// waiting in the backlog of a socket the test still holds.
+    pub fn down(&self) -> PortDown {
+        let listener = self.listener.try_clone().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopping = stop.clone();
+        let thread = thread::spawn(move || {
+            while !stopping.load(std::sync::atomic::Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((conn, _)) => drop(conn),
+                    Err(_) => thread::sleep(Duration::from_millis(5)),
+                }
+            }
+        });
+        PortDown {
+            stop,
+            thread: Some(thread),
+        }
+    }
+}
+
+/// See [`HeldPort::down`].
+pub struct PortDown {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for PortDown {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+/// A loopback port nothing listens on, held for as long as the value lives: bound but never
+/// listening, so a connection is refused, and taken, so no other process can start listening there
+/// in the meantime — which a released "dead" port from [`free_port`] cannot promise.
+pub struct DeadPort {
+    _socket: tokio::net::TcpSocket,
+    port: u16,
+}
+
+impl DeadPort {
+    pub fn bind() -> Self {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let port = socket.local_addr().unwrap().port();
+        Self {
+            _socket: socket,
+            port,
+        }
+    }
+
+    pub fn port(&self) -> u16 {
+        self.port
+    }
 }
 
 /// Block until `port` accepts a TCP connection, or panic after ~5s.
@@ -291,6 +456,74 @@ pub fn read_until_response(reader: &mut impl BufRead, command: &str) -> Vec<Valu
         }
     }
     frames
+}
+
+/// A `serve` child's stdout, read line by line on its own thread, that fails rather than hangs: a
+/// read that sees no new line within `deadline` panics, naming the deadline. Hand it to
+/// [`read_until_response`]/[`read_until_event`] like any `BufRead`. Without one, a run that stalls —
+/// a scripted reply consumed by the wrong request, say — leaves the test blocked in `read_line` until
+/// the runner's own timeout kills it, with nothing said about where it stopped.
+pub struct Frames {
+    lines: std::sync::mpsc::Receiver<String>,
+    current: Vec<u8>,
+    pos: usize,
+    deadline: Duration,
+}
+
+/// [`Frames`] over `out`.
+pub fn frames_with_deadline(out: impl Read + Send + 'static, deadline: Duration) -> Frames {
+    let (tx, lines) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let mut out = std::io::BufReader::new(out);
+        loop {
+            let mut line = String::new();
+            match out.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) if tx.send(line).is_err() => break,
+                Ok(_) => {}
+            }
+        }
+    });
+    Frames {
+        lines,
+        current: Vec::new(),
+        pos: 0,
+        deadline,
+    }
+}
+
+impl Read for Frames {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let available = self.fill_buf()?;
+        let n = available.len().min(buf.len());
+        buf[..n].copy_from_slice(&available[..n]);
+        self.consume(n);
+        Ok(n)
+    }
+}
+
+impl BufRead for Frames {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        if self.pos >= self.current.len() {
+            match self.lines.recv_timeout(self.deadline) {
+                Ok(line) => {
+                    self.current = line.into_bytes();
+                    self.pos = 0;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(&[]),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!(
+                    "serve wrote nothing for {:?}: the run is stalled (a scripted reply taken by \
+                     the wrong request — the session-title call, say — leaves it waiting forever)",
+                    self.deadline
+                ),
+            }
+        }
+        Ok(&self.current[self.pos..])
+    }
+
+    fn consume(&mut self, n: usize) {
+        self.pos += n;
+    }
 }
 
 /// Read stdout frames from a `serve` child until an `event` frame whose body satisfies `matches`
@@ -489,13 +722,12 @@ pub fn ws_request(
     request
 }
 
-/// A `serve --service` child: a grant verifier, one or more `--shard <name>=<path>` mounts, and a
-/// listener. Deliberately *not* built on [`serve_cmd`] — that passes `--key` and `--session-file`,
-/// both of which service mode refuses at startup.
+/// A `serve --service` child: a grant verifier and one or more `--shard <name>=<path>` mounts. Spawn
+/// it with [`spawn_listening`], which adds the listener. Deliberately *not* built on [`serve_cmd`] —
+/// that passes `--key` and `--session-file`, both of which service mode refuses at startup.
 pub fn serve_service_cmd(
     bin: &str,
     base: &str,
-    port: u16,
     grant_key_flag: &str,
     seal_key: &std::path::Path,
     shards: &[(&str, &std::path::Path)],
@@ -509,8 +741,6 @@ pub fn serve_service_cmd(
         base,
         "--model",
         "claude-test",
-        "--listen",
-        &format!("127.0.0.1:{port}"),
         "--grant-key",
         grant_key_flag,
         "--seal-key",
@@ -521,8 +751,7 @@ pub fn serve_service_cmd(
     }
     c.env("HOME", ISOLATED_HOME)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
+        .stdout(Stdio::null());
     c
 }
 

@@ -714,9 +714,10 @@ fn mcp_http_streamable_a_server_that_refuses_the_connection_is_skipped_fail_soft
     // handshake itself failing, not a spawn failure), which is otherwise completely untested.
     let home = tempfile::tempdir().unwrap();
     let cwd = tempfile::tempdir().unwrap();
-    // A free port nothing is listening on — connecting to it fails fast with connection-refused, unlike
-    // an unroutable address, which would hang until a timeout.
-    let dead_port = common::free_port();
+    // A port nothing is listening on — connecting to it fails fast with connection-refused, unlike
+    // an unroutable address, which would hang until a timeout. Held, so nothing can start to.
+    let dead = common::DeadPort::bind();
+    let dead_port = dead.port();
     let fixture = spawn_http_mcp_fixture();
     let url = fixture.url.clone();
     write_global_settings(

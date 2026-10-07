@@ -24,9 +24,9 @@ use std::process::{Command, Output, Stdio};
 use std::thread;
 
 use common::{
-    ChildGuard, DEV_PUBKEY_B64, DEV_TOKEN, SpawnGuarded, free_port, gateway_bin, unused_nats_port,
-    wait_for_allowance_ready, wait_for_port, ws_connect, ws_connect_uds, ws_next_frame,
-    ws_read_until_response, ws_send,
+    ChildGuard, DEV_PUBKEY_B64, DEV_TOKEN, SpawnGuarded, free_port, gateway_bin, spawn_listening,
+    unused_nats_port, wait_for_allowance_ready, wait_for_port, ws_connect, ws_connect_uds,
+    ws_next_frame, ws_read_until_response, ws_send,
 };
 use serde_json::{Value, json};
 
@@ -2097,34 +2097,26 @@ fn smoke_whole_run_auto_retry_recovers_from_a_real_dropped_connection_live() {
 /// Spawn a `serve --listen` child against the gateway on `gw_port`, persisting per-session files under
 /// `session_dir`, bound to WebSocket `ws_port`. The WebSocket transport uses stdio for nothing, so null
 /// it. Mirrors [`serve_child`] but for the `serve_ws` path.
-fn serve_ws_child(
-    gw_port: u16,
-    cwd: &Path,
-    model: &str,
-    session_dir: &Path,
-    ws_port: u16,
-) -> ChildGuard {
-    Command::new(env!("CARGO_BIN_EXE_beyond-ai-agent"))
-        .args([
-            "serve",
-            "--listen",
-            &format!("127.0.0.1:{ws_port}"),
-            "--gateway-url",
-            &format!("http://127.0.0.1:{gw_port}"),
-            "--key",
-            DEV_TOKEN,
-            "--model",
-            model,
-            "--max-steps",
-            "6",
-            "--session-dir",
-            session_dir.to_str().unwrap(),
-        ])
-        .current_dir(cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .spawn_guarded()
+fn serve_ws_child(gw_port: u16, cwd: &Path, model: &str, session_dir: &Path) -> (ChildGuard, u16) {
+    spawn_listening(
+        Command::new(env!("CARGO_BIN_EXE_beyond-ai-agent"))
+            .args([
+                "serve",
+                "--gateway-url",
+                &format!("http://127.0.0.1:{gw_port}"),
+                "--key",
+                DEV_TOKEN,
+                "--model",
+                model,
+                "--max-steps",
+                "6",
+                "--session-dir",
+                session_dir.to_str().unwrap(),
+            ])
+            .current_dir(cwd)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null()),
+    )
 }
 
 /// (iv) Live end-to-end over the **WebSocket** transport: a real prompt drives a real tool round-trip
@@ -2146,9 +2138,7 @@ async fn smoke_ws_prompt_round_trip_live() {
         std::fs::write(dir.path().join("marker.txt"), format!("{token}\n")).unwrap();
         let (gw_port, mut gateway) = boot_gateway(dir.path(), p.pool, &key);
         let session_dir = dir.path().join("sessions");
-        let ws_port = free_port();
-        let mut child = serve_ws_child(gw_port, dir.path(), p.model, &session_dir, ws_port);
-        wait_for_port(ws_port);
+        let (mut child, ws_port) = serve_ws_child(gw_port, dir.path(), p.model, &session_dir);
 
         let mut ws = ws_connect(ws_port, None).await;
         ws_send(
@@ -2213,9 +2203,7 @@ async fn smoke_ws_run_survives_reconnect_live() {
         let dir = tempfile::tempdir().unwrap();
         let (gw_port, mut gateway) = boot_gateway(dir.path(), p.pool, &key);
         let session_dir = dir.path().join("sessions");
-        let ws_port = free_port();
-        let mut child = serve_ws_child(gw_port, dir.path(), p.model, &session_dir, ws_port);
-        wait_for_port(ws_port);
+        let (mut child, ws_port) = serve_ws_child(gw_port, dir.path(), p.model, &session_dir);
 
         // ws1 starts a run that runs `bash sleep 8` (a wide, real in-flight window), waits until the
         // tool is actually running, then drops mid-run.
@@ -2410,32 +2398,28 @@ async fn smoke_h2c_shared_pool_live() {
         std::fs::write(dir.path().join("marker.txt"), format!("{token}\n")).unwrap();
         let (gw_port, mut gateway) = boot_gateway(dir.path(), p.pool, &key);
         let session_dir = dir.path().join("sessions");
-        let ws_port = free_port();
         // serve with the shared h2c client. The gateway (this branch) accepts downstream h2c.
-        let mut child = Command::new(env!("CARGO_BIN_EXE_beyond-ai-agent"))
-            .args([
-                "serve",
-                "--listen",
-                &format!("127.0.0.1:{ws_port}"),
-                "--upstream-http2",
-                "h2c",
-                "--gateway-url",
-                &format!("http://127.0.0.1:{gw_port}"),
-                "--key",
-                DEV_TOKEN,
-                "--model",
-                p.model,
-                "--max-steps",
-                "6",
-                "--session-dir",
-                session_dir.to_str().unwrap(),
-            ])
-            .current_dir(dir.path())
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .spawn_guarded();
-        wait_for_port(ws_port);
+        let (mut child, ws_port) = spawn_listening(
+            Command::new(env!("CARGO_BIN_EXE_beyond-ai-agent"))
+                .args([
+                    "serve",
+                    "--upstream-http2",
+                    "h2c",
+                    "--gateway-url",
+                    &format!("http://127.0.0.1:{gw_port}"),
+                    "--key",
+                    DEV_TOKEN,
+                    "--model",
+                    p.model,
+                    "--max-steps",
+                    "6",
+                    "--session-dir",
+                    session_dir.to_str().unwrap(),
+                ])
+                .current_dir(dir.path())
+                .stdin(Stdio::null())
+                .stdout(Stdio::null()),
+        );
 
         // Two concurrent sessions, both reading the marker through the ONE shared h2c client.
         let mut a = ws_connect(ws_port, Some("h2csessa")).await;
@@ -2491,9 +2475,7 @@ async fn smoke_multi_attach_both_see_live_stream() {
         std::fs::write(dir.path().join("marker.txt"), format!("{token}\n")).unwrap();
         let (gw_port, mut gateway) = boot_gateway(dir.path(), p.pool, &key);
         let session_dir = dir.path().join("sessions");
-        let ws_port = free_port();
-        let mut child = serve_ws_child(gw_port, dir.path(), p.model, &session_dir, ws_port);
-        wait_for_port(ws_port);
+        let (mut child, ws_port) = serve_ws_child(gw_port, dir.path(), p.model, &session_dir);
 
         const SID: &str = "multiattachlive1";
         // Two devices on ONE session, at the same time.

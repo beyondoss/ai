@@ -344,14 +344,33 @@ pub fn search_sessions(sessions: Vec<SessionMeta>, query: Option<&str>) -> Vec<S
     ranked.into_iter().map(|(m, _)| m).collect()
 }
 
+/// Custom-entry kinds the agent writes itself, and acts on when a session is replayed: an MCP task to
+/// resume and a resumed task's result (`crate::mcp_resume`), and `mcp_skill_approval`, which is no
+/// longer written (an approval read back from disk is one a model with file-write tools could have
+/// planted, so approvals are never persisted) but stays reserved so no client can make an older
+/// reader trust one. A client's `append_custom` of any of these is refused. A new host-written kind
+/// belongs here.
+pub const HOST_CUSTOM_KINDS: &[&str] = &[
+    crate::mcp_resume::TASK_ENTRY_KIND,
+    crate::mcp_resume::RESULT_ENTRY_KIND,
+    "mcp_skill_approval",
+];
+
+/// Whether `kind` is one of [`HOST_CUSTOM_KINDS`].
+pub fn is_host_custom_kind(kind: &str) -> bool {
+    HOST_CUSTOM_KINDS.contains(&kind)
+}
+
 /// Most recently active first; ties (same second — `updated_at` has one-second resolution, so a
-/// burst of sessions shares one) broken by id, so a listing has one order however the directory
-/// happened to be scanned. Without the tie-break, `offset` paging over sessions written in the same
-/// second could serve one session twice and skip another.
+/// burst of sessions shares one) broken by id, descending, so a listing has one order however the
+/// directory happened to be scanned. Without the tie-break, `offset` paging over sessions written in
+/// the same second could serve one session twice and skip another. Descending, because a generated
+/// id ([`new_id`]) leads with its creation time in fixed-width hex nanoseconds: within the second the
+/// newest still comes first. (A client-chosen id has no such meaning, but still one stable order.)
 pub(crate) fn by_recency(a: &SessionMeta, b: &SessionMeta) -> std::cmp::Ordering {
     b.updated_at
         .cmp(&a.updated_at)
-        .then_with(|| a.id.cmp(&b.id))
+        .then_with(|| b.id.cmp(&a.id))
 }
 
 /// One persisted line. Internally tagged on `type`. A `Message` entry flattens the wrapped
@@ -8837,6 +8856,32 @@ mod tests {
         m.preview = Some(body.to_string());
         m.updated_at = updated_at;
         m
+    }
+
+    /// Sessions active in the same second (one-second `updated_at`) still have one order, and it is
+    /// newest-first: a generated id leads with its creation time, so the later one sorts first. With
+    /// no tie-break (or an ascending one) `offset` paging over them could repeat or skip a session.
+    #[test]
+    fn same_second_sessions_list_newest_first_in_one_stable_order() {
+        let ids: Vec<String> = (0..4).map(|_| new_id()).collect();
+        let mut metas: Vec<SessionMeta> = ids
+            .iter()
+            .map(|id| meta_for_search(id, None, "x", 100))
+            .collect();
+        metas.push(meta_for_search("older", None, "x", 99));
+        // Oldest first in, whatever the scan order was.
+        metas.sort_by(by_recency);
+        let got: Vec<&str> = metas.iter().map(|m| m.id.as_str()).collect();
+        let mut want: Vec<&str> = ids.iter().rev().map(String::as_str).collect();
+        want.push("older");
+        assert_eq!(got, want);
+        // The same order from any starting order.
+        metas.reverse();
+        metas.sort_by(by_recency);
+        assert_eq!(
+            metas.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            want
+        );
     }
 
     #[test]

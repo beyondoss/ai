@@ -7,17 +7,13 @@
 
 mod common;
 
-use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use common::mcp_events_fixture::{
-    EVENTS_SESSION, control, emit, eventually, raw_request, runs_for_event, spawn_http_fixture,
-    state, write_settings, ws_next, ws_wait_active,
+    EVENTS_SESSION, control, emit, eventually, raw_request, runs_for_event, spawn_daemon_env,
+    spawn_daemon_on, spawn_http_fixture, state, write_settings, ws_next, ws_wait_active,
 };
-use common::{
-    BIN, ChildGuard, SpawnGuarded, free_port, serve_dir_cmd, spawn_model_server_routed, turn_text,
-    wait_for_port, ws_connect, ws_send,
-};
+use common::{ChildGuard, HeldPort, spawn_model_server_routed, turn_text, ws_connect, ws_send};
 use serde_json::{Value, json};
 
 fn hooks(mcp_url: &str, action: &str) -> Value {
@@ -28,26 +24,9 @@ fn hooks(mcp_url: &str, action: &str) -> Value {
     }])
 }
 
-fn daemon(home: &std::path::Path, base: &str, port: u16, env: &[(&str, &str)]) -> ChildGuard {
-    let mut cmd = serve_dir_cmd(BIN, base, &home.join("sessions").to_string_lossy());
-    cmd.args([
-        "--listen",
-        &format!("127.0.0.1:{port}"),
-        "--mcp-events-callback-url",
-        &format!("http://127.0.0.1:{port}"),
-    ])
-    .env("HOME", home)
-    .env("BEYOND_AI_AGENT_MCP_EVENTS_COALESCE_MS", "300")
-    .env("BEYOND_AI_AGENT_MCP_IDLE_SECS", "0")
-    .envs(env.iter().copied())
-    .stdin(Stdio::null())
-    .stdout(Stdio::null())
-    .stderr(Stdio::from(
-        std::fs::File::create(home.join(format!("serve-{port}.stderr"))).unwrap(),
-    ));
-    let child = cmd.spawn_guarded();
-    wait_for_port(port);
-    child
+/// A daemon on `held`, so a restart keeps the callback URL every subscription points at.
+fn daemon(home: &std::path::Path, base: &str, held: &HeldPort, env: &[(&str, &str)]) -> ChildGuard {
+    spawn_daemon_on(home, base, held, &[], env)
 }
 
 /// The events session's state snapshot, once it exists.
@@ -79,11 +58,10 @@ async fn the_pending_queue_is_bounded_in_bytes_and_answers_503_past_it() {
     let home = tempfile::tempdir().unwrap();
     write_settings(home.path(), hooks(&mcp_url, "follow_up"));
     let (base, _bodies) = spawn_model_server_routed(vec![], turn_text("noted"));
-    let port = free_port();
-    let _d = daemon(
+    let (_d, port) = spawn_daemon_env(
         home.path(),
         &base,
-        port,
+        &[],
         &[("BEYOND_AI_AGENT_MCP_EVENTS_MAX_PENDING_BYTES", "8000")],
     );
     let mut ws = ws_connect(port, Some(EVENTS_SESSION)).await;
@@ -111,8 +89,7 @@ async fn a_delivery_that_cannot_be_stored_gets_503_and_lands_on_retry() {
     let home = tempfile::tempdir().unwrap();
     write_settings(home.path(), hooks(&mcp_url, "follow_up"));
     let (base, bodies) = spawn_model_server_routed(vec![], turn_text("noted"));
-    let port = free_port();
-    let _d = daemon(home.path(), &base, port, &[]);
+    let (_d, port) = spawn_daemon_env(home.path(), &base, &[], &[]);
     let mut ws = ws_connect(port, Some(EVENTS_SESSION)).await;
     ws_wait_active(&mut ws).await;
     // The pending log cannot be written: its place is taken by a directory.
@@ -147,11 +124,10 @@ async fn a_delivery_body_that_never_finishes_is_timed_out() {
     let home = tempfile::tempdir().unwrap();
     write_settings(home.path(), hooks(&mcp_url, "notify"));
     let (base, _bodies) = spawn_model_server_routed(vec![], turn_text("noted"));
-    let port = free_port();
-    let _d = daemon(
+    let (_d, port) = spawn_daemon_env(
         home.path(),
         &base,
-        port,
+        &[],
         &[("BEYOND_AI_AGENT_MCP_EVENTS_BODY_TIMEOUT_MS", "500")],
     );
     let mut ws = ws_connect(port, Some(EVENTS_SESSION)).await;
@@ -185,8 +161,8 @@ async fn the_callback_survives_a_crash_so_retried_deliveries_still_land() {
     let home = tempfile::tempdir().unwrap();
     write_settings(home.path(), hooks(&mcp_url, "follow_up"));
     let (base, bodies) = spawn_model_server_routed(vec![], turn_text("noted"));
-    let port = free_port();
-    let mut first = daemon(home.path(), &base, port, &[]);
+    let held = HeldPort::bind();
+    let mut first = daemon(home.path(), &base, &held, &[]);
     let url = eventually(Duration::from_secs(20), "the subscription", || {
         state(&fixture)["hooks"][0]["url"]
             .as_str()
@@ -204,6 +180,8 @@ async fn the_callback_survives_a_crash_so_retried_deliveries_still_land() {
     });
     first.kill().unwrap();
     let _ = first.wait();
+    // Down, as a crashed daemon is — but still held, so the restart gets the same port.
+    let down = held.down();
     // While it is down the server's delivery fails.
     let r = emit(
         &fixture,
@@ -211,7 +189,8 @@ async fn the_callback_survives_a_crash_so_retried_deliveries_still_land() {
     );
     assert_ne!(r["deliveries"][0]["status"], 200, "{r:#}");
 
-    let _second = daemon(home.path(), &base, port, &[]);
+    drop(down);
+    let _second = daemon(home.path(), &base, &held, &[]);
     eventually(Duration::from_secs(20), "the resubscribe", || {
         let hooks = state(&fixture)["hooks"].as_array().unwrap().clone();
         (hooks.len() == 1 && hooks[0]["refreshes"].as_u64().unwrap_or(0) >= 1
@@ -256,8 +235,8 @@ async fn a_retry_that_beats_the_resubscribe_after_a_restart_is_told_to_retry_not
     let home = tempfile::tempdir().unwrap();
     write_settings(home.path(), hooks(&mcp_url, "follow_up"));
     let (base, bodies) = spawn_model_server_routed(vec![], turn_text("noted"));
-    let port = free_port();
-    let mut first = daemon(home.path(), &base, port, &[]);
+    let held = HeldPort::bind();
+    let mut first = daemon(home.path(), &base, &held, &[]);
     eventually(Duration::from_secs(30), "the subscription", || {
         (state(&fixture)["hooks"].as_array().unwrap().len() == 1).then_some(())
     });
@@ -272,13 +251,16 @@ async fn a_retry_that_beats_the_resubscribe_after_a_restart_is_told_to_retry_not
     });
     first.kill().unwrap();
     let _ = first.wait();
+    // Down, as a crashed daemon is — but still held, so the restart gets the same port.
+    let down = held.down();
     let r = emit(
         &fixture,
         json!({ "event_id": "early-1", "data": { "summary": "retried early" } }),
     );
     assert_ne!(r["deliveries"][0]["status"], 200, "{r:#}");
 
-    let _second = daemon(home.path(), &base, port, &[]);
+    drop(down);
+    let _second = daemon(home.path(), &base, &held, &[]);
     // The state is read at once; discovery takes 3 s, so the route is not back yet.
     tokio::time::sleep(Duration::from_millis(800)).await;
     let r = control(
@@ -315,8 +297,9 @@ async fn after_a_restart_a_runtime_subscriptions_old_callback_is_gone_not_held()
     let home = tempfile::tempdir().unwrap();
     write_settings(home.path(), hooks(&mcp_url, "notify"));
     let (base, _bodies) = spawn_model_server_routed(vec![], turn_text("noted"));
-    let port = free_port();
-    let mut first = daemon(home.path(), &base, port, &[]);
+    let held = HeldPort::bind();
+    let port = held.port();
+    let mut first = daemon(home.path(), &base, &held, &[]);
     let mut ws = ws_connect(port, Some(EVENTS_SESSION)).await;
     ws_wait_active(&mut ws).await;
     ws_send(
@@ -351,7 +334,10 @@ async fn after_a_restart_a_runtime_subscriptions_old_callback_is_gone_not_held()
     drop(ws);
     first.kill().unwrap();
     let _ = first.wait();
-    let _second = daemon(home.path(), &base, port, &[]);
+    // Down, as a crashed daemon is — but still held, so the restart gets the same port.
+    let down = held.down();
+    drop(down);
+    let _second = daemon(home.path(), &base, &held, &[]);
     // The configured one comes back on its old callback.
     eventually(
         Duration::from_secs(20),

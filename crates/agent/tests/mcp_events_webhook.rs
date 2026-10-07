@@ -18,8 +18,8 @@ use common::mcp_events_fixture::{
     control, emit, eventually, model_requests_with, spawn_http_fixture, state, write_settings,
 };
 use common::{
-    BIN, ChildGuard, SpawnGuarded, TestWs, free_port, serve_dir_cmd, spawn_model_server_routed,
-    turn_text, wait_for_port, ws_connect, ws_next_frame, ws_send,
+    BIN, ChildGuard, DeadPort, HeldPort, SpawnGuarded, TestWs, serve_dir_cmd, spawn_listening,
+    spawn_model_server_routed, turn_text, ws_connect, ws_next_frame, ws_send,
 };
 use serde_json::{Value, json};
 
@@ -35,12 +35,12 @@ fn start_daemon(mcp_servers: Value) -> Daemon {
     write_settings(home.path(), mcp_servers);
     let (base, bodies) = spawn_model_server_routed(vec![], turn_text("noted"));
     let sessions = home.path().join("sessions");
-    let port = free_port();
+    // The callback URL names the port before the daemon starts.
+    let held = HeldPort::bind();
+    let port = held.port();
     let stderr = home.path().join("serve.stderr");
     let mut cmd = serve_dir_cmd(BIN, &base, &sessions.to_string_lossy());
     cmd.args([
-        "--listen",
-        &format!("127.0.0.1:{port}"),
         "--mcp-events-callback-url",
         &format!("http://127.0.0.1:{port}"),
     ])
@@ -50,8 +50,8 @@ fn start_daemon(mcp_servers: Value) -> Daemon {
     .stdin(Stdio::null())
     .stdout(Stdio::null())
     .stderr(Stdio::from(std::fs::File::create(&stderr).unwrap()));
+    held.hand_to(&mut cmd);
     let child = cmd.spawn_guarded();
-    wait_for_port(port);
     Daemon {
         child,
         port,
@@ -319,22 +319,18 @@ async fn a_callback_url_nothing_answers_fails_the_challenge_and_the_subscribe() 
     let home = tempfile::tempdir().unwrap();
     write_settings(home.path(), json!([webhook_server(&mcp_url, json!([]))]));
     let (base, _bodies) = spawn_model_server_routed(vec![], turn_text("noted"));
-    let port = free_port();
-    let dead = free_port();
+    // Points somewhere nothing listens (and, held, nothing can start to): the server's verification
+    // POST cannot land.
+    let dead = DeadPort::bind();
     let mut cmd = serve_dir_cmd(BIN, &base, &home.path().join("s").to_string_lossy());
     cmd.args([
-        "--listen",
-        &format!("127.0.0.1:{port}"),
-        // Points somewhere nothing listens: the server's verification POST cannot land.
         "--mcp-events-callback-url",
-        &format!("http://127.0.0.1:{dead}"),
+        &format!("http://127.0.0.1:{}", dead.port()),
     ])
     .env("HOME", home.path())
     .stdin(Stdio::null())
-    .stdout(Stdio::null())
-    .stderr(Stdio::null());
-    let _child = cmd.spawn_guarded();
-    wait_for_port(port);
+    .stdout(Stdio::null());
+    let (_child, port) = spawn_listening(&mut cmd);
     let mut ws = ws_connect(port, Some("dead-callback")).await;
     ws_send(
         &mut ws,

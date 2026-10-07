@@ -280,18 +280,12 @@ async fn the_grant_header_is_not_echoed_in_the_handshake_response() {
 async fn a_daemon_without_service_mode_ignores_the_grant_header() {
     let (base, _requests) = spawn_model_server(vec![]);
     let dir = tempfile::tempdir().unwrap();
-    let port = common::free_port();
     let mut cmd = common::serve_dir_cmd(
         common::BIN,
         &base,
         &dir.path().join("sessions").to_string_lossy(),
     );
-    cmd.arg("--listen").arg(format!("127.0.0.1:{port}"));
-    let _child = {
-        use common::SpawnGuarded as _;
-        cmd.spawn_guarded()
-    };
-    common::wait_for_port(port);
+    let (_child, port) = common::spawn_listening(&mut cmd);
 
     let mut ws = ws_connect_with_headers(port, Some("plain"), &[("x-beyond-grant", "nonsense")])
         .await

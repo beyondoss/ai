@@ -10,33 +10,31 @@ mod common;
 use std::process::{Command, Stdio};
 
 use common::{
-    ChildGuard, ISOLATED_HOME, SpawnGuarded, free_port, spawn_model_server, turn_text,
-    wait_for_port, ws_connect, ws_read_until_response, ws_send,
+    ChildGuard, ISOLATED_HOME, spawn_listening, spawn_model_server, turn_text, ws_connect,
+    ws_read_until_response, ws_send,
 };
 use serde_json::{Value, json};
 
-/// Spawn a `serve --listen 127.0.0.1:<port>` child against `base` (the mock gateway), persisting
+/// Spawn a listening `serve` child (and its port) against `base` (the mock gateway), persisting
 /// per-session files under `session_dir`.
-fn serve_ws_child(base: &str, session_dir: &str, port: u16) -> ChildGuard {
-    Command::new(env!("CARGO_BIN_EXE_beyond-ai-agent"))
-        .args([
-            "serve",
-            "--listen",
-            &format!("127.0.0.1:{port}"),
-            "--gateway-url",
-            base,
-            "--key",
-            "bai_v1.test",
-            "--model",
-            "claude-test",
-            "--session-dir",
-            session_dir,
-        ])
-        .env("HOME", ISOLATED_HOME)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn_guarded()
+fn serve_ws_child(base: &str, session_dir: &str) -> (ChildGuard, u16) {
+    spawn_listening(
+        Command::new(env!("CARGO_BIN_EXE_beyond-ai-agent"))
+            .args([
+                "serve",
+                "--gateway-url",
+                base,
+                "--key",
+                "bai_v1.test",
+                "--model",
+                "claude-test",
+                "--session-dir",
+                session_dir,
+            ])
+            .env("HOME", ISOLATED_HOME)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null()),
+    )
 }
 
 /// Prompt a fresh session `id` to completion so it persists under the daemon's `--session-dir`, then
@@ -93,9 +91,7 @@ async fn list_daemon_sessions_reports_live_sessions_with_listing_fields() {
     // A turn apiece for the two sessions.
     let (base, _requests) = spawn_model_server(vec![turn_text("one"), turn_text("two")]);
     let dir = tempfile::tempdir().unwrap();
-    let port = free_port();
-    let mut child = serve_ws_child(&base, dir.path().to_str().unwrap(), port);
-    wait_for_port(port);
+    let (mut child, port) = serve_ws_child(&base, dir.path().to_str().unwrap());
 
     prompt_session(port, "aaaaaaaaaaaaaaaa").await;
     prompt_session(port, "bbbbbbbbbbbbbbbb").await;
@@ -131,10 +127,7 @@ async fn list_daemon_sessions_reports_persisted_sessions_as_not_live_after_resta
     let (base, _requests) = spawn_model_server(vec![turn_text("one"), turn_text("two")]);
     let dir = tempfile::tempdir().unwrap();
     let dir_str = dir.path().to_str().unwrap().to_string();
-    let port = free_port();
-
-    let mut child = serve_ws_child(&base, &dir_str, port);
-    wait_for_port(port);
+    let (mut child, port) = serve_ws_child(&base, &dir_str);
     prompt_session(port, "aaaaaaaaaaaaaaaa").await;
     prompt_session(port, "bbbbbbbbbbbbbbbb").await;
 
@@ -147,9 +140,7 @@ async fn list_daemon_sessions_reports_persisted_sessions_as_not_live_after_resta
     let _ = child.kill();
     let _ = child.wait();
 
-    let port2 = free_port();
-    let mut child2 = serve_ws_child(&base, &dir_str, port2);
-    wait_for_port(port2);
+    let (mut child2, port2) = serve_ws_child(&base, &dir_str);
 
     let cold = list_daemon_sessions(port2).await;
     for id in ["aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb"] {

@@ -13,8 +13,8 @@ use std::process::{Command, Stdio};
 
 use common::service::{Options, Service};
 use common::{
-    BIN, ChildGuard, ISOLATED_HOME, SpawnGuarded, free_port, spawn_model_server, turn_text,
-    wait_for_port, ws_connect_with_headers, ws_read_until_response, ws_send,
+    BIN, ISOLATED_HOME, spawn_listening, spawn_model_server, turn_text, ws_connect_with_headers,
+    ws_read_until_response, ws_send,
 };
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -302,27 +302,23 @@ async fn readyz_does_not_interfere_with_a_session_attach() {
 async fn health_exists_on_a_non_service_daemon() {
     let (base, _requests) = spawn_model_server(vec![]);
     let dir = tempfile::tempdir().unwrap();
-    let port = free_port();
-    let _child: ChildGuard = Command::new(BIN)
-        .args([
-            "serve",
-            "--listen",
-            &format!("127.0.0.1:{port}"),
-            "--gateway-url",
-            &base,
-            "--key",
-            "bai_v1.test",
-            "--model",
-            "claude-test",
-            "--session-dir",
-            &dir.path().to_string_lossy(),
-        ])
-        .env("HOME", ISOLATED_HOME)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn_guarded();
-    wait_for_port(port);
+    let (_child, port) = spawn_listening(
+        Command::new(BIN)
+            .args([
+                "serve",
+                "--gateway-url",
+                &base,
+                "--key",
+                "bai_v1.test",
+                "--model",
+                "claude-test",
+                "--session-dir",
+                &dir.path().to_string_lossy(),
+            ])
+            .env("HOME", ISOLATED_HOME)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null()),
+    );
 
     let (status, response) = get(port, "/livez", &[]).await;
     assert_eq!(status, 200, "{response}");

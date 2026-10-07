@@ -13,8 +13,8 @@ use std::process::{ChildStdin, Command, Stdio};
 use std::time::Duration;
 
 use common::{
-    ChildGuard, ISOLATED_HOME, SpawnGuarded, free_port, read_until_response, spawn_model_server,
-    turn_text, turn_tool_use, wait_for_port, ws_connect, ws_next_frame, ws_send,
+    ChildGuard, ISOLATED_HOME, SpawnGuarded, read_until_response, spawn_listening,
+    spawn_model_server, turn_text, turn_tool_use, ws_connect, ws_next_frame, ws_send,
 };
 use serde_json::{Value, json};
 
@@ -587,27 +587,25 @@ fn two_gated_calls_in_one_turn_are_asked_about_one_at_a_time() {
 
 // ---- multi-attach, over the real WebSocket transport ------------------------------------------------
 
-fn serve_ws_approving(base: &str, session_dir: &str, port: u16, extra: &[&str]) -> ChildGuard {
-    Command::new(BIN)
-        .args([
-            "serve",
-            "--listen",
-            &format!("127.0.0.1:{port}"),
-            "--gateway-url",
-            base,
-            "--key",
-            "bai_v1.test",
-            "--model",
-            "claude-test",
-            "--session-dir",
-            session_dir,
-        ])
-        .args(extra)
-        .env("HOME", ISOLATED_HOME)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn_guarded()
+fn serve_ws_approving(base: &str, session_dir: &str, extra: &[&str]) -> (ChildGuard, u16) {
+    spawn_listening(
+        Command::new(BIN)
+            .args([
+                "serve",
+                "--gateway-url",
+                base,
+                "--key",
+                "bai_v1.test",
+                "--model",
+                "claude-test",
+                "--session-dir",
+                session_dir,
+            ])
+            .args(extra)
+            .env("HOME", ISOLATED_HOME)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null()),
+    )
 }
 
 /// How long any single frame may take to arrive before the test calls the socket stuck.
@@ -694,14 +692,11 @@ async fn every_attached_client_sees_the_question_and_the_first_answer_wins() {
         write_turn("tu_1", target.to_str().unwrap()),
         turn_text("wrote it"),
     ]);
-    let port = free_port();
-    let child = serve_ws_approving(
+    let (child, port) = serve_ws_approving(
         &base,
         dir.path().to_str().unwrap(),
-        port,
         &["--approve", "writes"],
     );
-    wait_for_port(port);
 
     // Phone and TUI on the same session — they coexist, neither evicts the other.
     const SID: &str = "approvalshared1";
@@ -754,15 +749,12 @@ async fn a_question_with_no_client_left_to_answer_it_is_denied_rather_than_hung(
         write_turn("tu_1", target.to_str().unwrap()),
         turn_text("could not write"),
     ]);
-    let port = free_port();
-    let child = serve_ws_approving(
+    let (child, port) = serve_ws_approving(
         &base,
         dir.path().to_str().unwrap(),
-        port,
         // Wait forever: only the no-client check can free this.
         &["--approve", "writes", "--approval-timeout", "0"],
     );
-    wait_for_port(port);
 
     const SID: &str = "approvaldetach1";
     let mut ws = Client::new(ws_connect(port, Some(SID)).await);

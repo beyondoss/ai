@@ -12,35 +12,32 @@ mod common;
 use std::process::{Command, Stdio};
 
 use common::{
-    ChildGuard, ISOLATED_HOME, SpawnGuarded, free_port, spawn_model_server,
-    spawn_model_server_routed, turn_text, turn_tool_use, wait_for_port, ws_connect,
-    ws_read_until_response, ws_send,
+    ChildGuard, ISOLATED_HOME, spawn_listening, spawn_model_server, spawn_model_server_routed,
+    turn_text, turn_tool_use, ws_connect, ws_read_until_response, ws_send,
 };
 use serde_json::{Value, json};
 
 const BIN: &str = env!("CARGO_BIN_EXE_beyond-ai-agent");
 
-fn serve_ws(base: &str, session_dir: &str, port: u16, extra: &[&str]) -> ChildGuard {
-    Command::new(BIN)
-        .args([
-            "serve",
-            "--listen",
-            &format!("127.0.0.1:{port}"),
-            "--gateway-url",
-            base,
-            "--key",
-            "bai_v1.test",
-            "--model",
-            "claude-test",
-            "--session-dir",
-            session_dir,
-        ])
-        .args(extra)
-        .env("HOME", ISOLATED_HOME)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn_guarded()
+fn serve_ws(base: &str, session_dir: &str, extra: &[&str]) -> (ChildGuard, u16) {
+    spawn_listening(
+        Command::new(BIN)
+            .args([
+                "serve",
+                "--gateway-url",
+                base,
+                "--key",
+                "bai_v1.test",
+                "--model",
+                "claude-test",
+                "--session-dir",
+                session_dir,
+            ])
+            .args(extra)
+            .env("HOME", ISOLATED_HOME)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null()),
+    )
 }
 
 fn dump(frames: &[Value]) -> String {
@@ -82,9 +79,7 @@ async fn concurrent_sessions_do_not_leak_transcripts() {
         turn_text("unexpected-fallback"),
     );
     let dir = tempfile::tempdir().unwrap();
-    let port = free_port();
-    let mut child = serve_ws(&base, dir.path().to_str().unwrap(), port, &[]);
-    wait_for_port(port);
+    let (mut child, port) = serve_ws(&base, dir.path().to_str().unwrap(), &[]);
 
     let mut a = ws_connect(port, Some("iso-alpha")).await;
     let mut b = ws_connect(port, Some("iso-bravo")).await;
@@ -181,9 +176,7 @@ async fn concurrent_sessions_do_not_leak_exec_endpoints() {
         turn_text("second"),
     ]);
     let dir = tempfile::tempdir().unwrap();
-    let port = free_port();
-    let mut child = serve_ws(&base, dir.path().to_str().unwrap(), port, &[]);
-    wait_for_port(port);
+    let (mut child, port) = serve_ws(&base, dir.path().to_str().unwrap(), &[]);
 
     let mut a = ws_connect(port, Some("exec-alpha")).await;
     let mut b = ws_connect(port, Some("exec-bravo")).await;
@@ -281,9 +274,7 @@ async fn concurrent_sessions_do_not_leak_session_memory() {
         turn_text("bob-read"),
     ]);
     let dir = tempfile::tempdir().unwrap();
-    let port = free_port();
-    let mut child = serve_ws(&base, dir.path().to_str().unwrap(), port, &[]);
-    wait_for_port(port);
+    let (mut child, port) = serve_ws(&base, dir.path().to_str().unwrap(), &[]);
 
     let mut a = ws_connect(port, Some("mem-alpha")).await;
     let mut b = ws_connect(port, Some("mem-bravo")).await;
@@ -369,14 +360,11 @@ async fn concurrent_sessions_do_not_leak_approvals() {
         ),
         turn_text("wrote-b"),
     ]);
-    let port = free_port();
-    let mut child = serve_ws(
+    let (mut child, port) = serve_ws(
         &base,
         dir.path().to_str().unwrap(),
-        port,
         &["--approve", "writes"],
     );
-    wait_for_port(port);
 
     let mut a = ws_connect(port, Some("appr-alpha")).await;
     let mut b = ws_connect(port, Some("appr-bravo")).await;
@@ -464,9 +452,7 @@ async fn concurrent_sessions_persist_to_distinct_files() {
         turn_text("unexpected-fallback"),
     );
     let dir = tempfile::tempdir().unwrap();
-    let port = free_port();
-    let mut child = serve_ws(&base, dir.path().to_str().unwrap(), port, &[]);
-    wait_for_port(port);
+    let (mut child, port) = serve_ws(&base, dir.path().to_str().unwrap(), &[]);
 
     let mut a = ws_connect(port, Some("persist-alpha")).await;
     let mut b = ws_connect(port, Some("persist-bravo")).await;

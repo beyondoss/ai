@@ -13,34 +13,32 @@ mod common;
 use std::process::{Command, Stdio};
 
 use common::{
-    ChildGuard, ISOLATED_HOME, SpawnGuarded, free_port, spawn_model_server, turn_text,
-    wait_for_port, ws_connect, ws_read_until_response, ws_send,
+    ChildGuard, ISOLATED_HOME, spawn_listening, spawn_model_server, turn_text, ws_connect,
+    ws_read_until_response, ws_send,
 };
 use serde_json::json;
 
 /// Spawn a `serve --listen` child with a shared upstream client in `--upstream-http2 <mode>`.
-fn serve_ws_child_shared(base: &str, session_dir: &str, port: u16, http2_mode: &str) -> ChildGuard {
-    Command::new(env!("CARGO_BIN_EXE_beyond-ai-agent"))
-        .args([
-            "serve",
-            "--listen",
-            &format!("127.0.0.1:{port}"),
-            "--upstream-http2",
-            http2_mode,
-            "--gateway-url",
-            base,
-            "--key",
-            "bai_v1.test",
-            "--model",
-            "claude-test",
-            "--session-dir",
-            session_dir,
-        ])
-        .env("HOME", ISOLATED_HOME)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn_guarded()
+fn serve_ws_child_shared(base: &str, session_dir: &str, http2_mode: &str) -> (ChildGuard, u16) {
+    spawn_listening(
+        Command::new(env!("CARGO_BIN_EXE_beyond-ai-agent"))
+            .args([
+                "serve",
+                "--upstream-http2",
+                http2_mode,
+                "--gateway-url",
+                base,
+                "--key",
+                "bai_v1.test",
+                "--model",
+                "claude-test",
+                "--session-dir",
+                session_dir,
+            ])
+            .env("HOME", ISOLATED_HOME)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null()),
+    )
 }
 
 /// Two distinct sessions, driven concurrently through the one shared `--upstream-http2 auto` client,
@@ -53,9 +51,7 @@ async fn shared_client_two_concurrent_sessions_both_complete() {
     let (base, _requests) =
         spawn_model_server(vec![turn_text("alpha reply"), turn_text("bravo reply")]);
     let dir = tempfile::tempdir().unwrap();
-    let port = free_port();
-    let mut child = serve_ws_child_shared(&base, dir.path().to_str().unwrap(), port, "auto");
-    wait_for_port(port);
+    let (mut child, port) = serve_ws_child_shared(&base, dir.path().to_str().unwrap(), "auto");
 
     let mut a = ws_connect(port, Some("alpha")).await;
     let mut b = ws_connect(port, Some("bravo")).await;

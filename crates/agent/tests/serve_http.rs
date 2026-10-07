@@ -12,33 +12,31 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use common::{
-    ChildGuard, ISOLATED_HOME, SpawnGuarded, WS_PATH, free_port, spawn_model_server, turn_text,
-    wait_for_port, ws_connect, ws_read_until_response, ws_send,
+    ChildGuard, ISOLATED_HOME, WS_PATH, spawn_listening, spawn_model_server, turn_text, ws_connect,
+    ws_read_until_response, ws_send,
 };
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-fn serve_ws_child(base: &str, session_dir: &str, port: u16) -> ChildGuard {
-    Command::new(env!("CARGO_BIN_EXE_beyond-ai-agent"))
-        .args([
-            "serve",
-            "--listen",
-            &format!("127.0.0.1:{port}"),
-            "--gateway-url",
-            base,
-            "--key",
-            "bai_v1.test",
-            "--model",
-            "claude-test",
-            "--session-dir",
-            session_dir,
-        ])
-        .env("HOME", ISOLATED_HOME)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn_guarded()
+fn serve_ws_child(base: &str, session_dir: &str) -> (ChildGuard, u16) {
+    spawn_listening(
+        Command::new(env!("CARGO_BIN_EXE_beyond-ai-agent"))
+            .args([
+                "serve",
+                "--gateway-url",
+                base,
+                "--key",
+                "bai_v1.test",
+                "--model",
+                "claude-test",
+                "--session-dir",
+                session_dir,
+            ])
+            .env("HOME", ISOLATED_HOME)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null()),
+    )
 }
 
 struct HttpReply {
@@ -159,9 +157,7 @@ async fn wait_for_assistant(port: u16, session_id: &str) -> Value {
 async fn http_post_get_state_mints_a_session_and_returns_the_protocol_frame() {
     let (base, _requests) = spawn_model_server(vec![turn_text("unused")]);
     let dir = tempfile::tempdir().unwrap();
-    let port = free_port();
-    let mut child = serve_ws_child(&base, dir.path().to_str().unwrap(), port);
-    wait_for_port(port);
+    let (mut child, port) = serve_ws_child(&base, dir.path().to_str().unwrap());
 
     let reply = post_cmd(port, None, json!({ "type": "get_state", "id": "s1" })).await;
     assert_eq!(reply.status, 200, "{}", reply.body);
@@ -195,9 +191,7 @@ async fn http_post_get_state_mints_a_session_and_returns_the_protocol_frame() {
 async fn http_post_prompt_is_accepted_and_the_run_outlives_the_request() {
     let (base, _requests) = spawn_model_server(vec![turn_text("hello from post")]);
     let dir = tempfile::tempdir().unwrap();
-    let port = free_port();
-    let mut child = serve_ws_child(&base, dir.path().to_str().unwrap(), port);
-    wait_for_port(port);
+    let (mut child, port) = serve_ws_child(&base, dir.path().to_str().unwrap());
 
     let reply = post_cmd(
         port,
@@ -237,9 +231,7 @@ async fn http_post_prompt_is_accepted_and_the_run_outlives_the_request() {
 async fn http_post_prompt_without_message_is_a_protocol_error_not_accepted() {
     let (base, _requests) = spawn_model_server(vec![turn_text("unused")]);
     let dir = tempfile::tempdir().unwrap();
-    let port = free_port();
-    let mut child = serve_ws_child(&base, dir.path().to_str().unwrap(), port);
-    wait_for_port(port);
+    let (mut child, port) = serve_ws_child(&base, dir.path().to_str().unwrap());
 
     let reply = post_cmd(
         port,
@@ -268,9 +260,7 @@ async fn http_post_prompt_without_message_is_a_protocol_error_not_accepted() {
 async fn http_post_list_daemon_sessions_does_not_require_a_session() {
     let (base, _requests) = spawn_model_server(vec![turn_text("one")]);
     let dir = tempfile::tempdir().unwrap();
-    let port = free_port();
-    let mut child = serve_ws_child(&base, dir.path().to_str().unwrap(), port);
-    wait_for_port(port);
+    let (mut child, port) = serve_ws_child(&base, dir.path().to_str().unwrap());
 
     let created = post_cmd(
         port,
@@ -317,9 +307,7 @@ async fn http_post_list_daemon_sessions_does_not_require_a_session() {
 async fn a_refused_request_still_gets_its_answer_with_a_large_body_in_flight() {
     let (base, _requests) = spawn_model_server(vec![turn_text("unused")]);
     let dir = tempfile::tempdir().unwrap();
-    let port = free_port();
-    let mut child = serve_ws_child(&base, dir.path().to_str().unwrap(), port);
-    wait_for_port(port);
+    let (mut child, port) = serve_ws_child(&base, dir.path().to_str().unwrap());
 
     let body = vec![b'x'; 256 * 1024];
 
@@ -336,9 +324,7 @@ async fn a_refused_request_still_gets_its_answer_with_a_large_body_in_flight() {
 async fn http_wrong_path_is_404_and_wrong_method_is_405() {
     let (base, _requests) = spawn_model_server(vec![turn_text("unused")]);
     let dir = tempfile::tempdir().unwrap();
-    let port = free_port();
-    let mut child = serve_ws_child(&base, dir.path().to_str().unwrap(), port);
-    wait_for_port(port);
+    let (mut child, port) = serve_ws_child(&base, dir.path().to_str().unwrap());
 
     let (status, _headers, _body) =
         http_exchange(port, "POST", "/nope", Some(b"{\"type\":\"get_state\"}")).await;
@@ -369,9 +355,7 @@ async fn http_wrong_path_is_404_and_wrong_method_is_405() {
 async fn http_get_without_upgrade_is_426() {
     let (base, _requests) = spawn_model_server(vec![turn_text("unused")]);
     let dir = tempfile::tempdir().unwrap();
-    let port = free_port();
-    let mut child = serve_ws_child(&base, dir.path().to_str().unwrap(), port);
-    wait_for_port(port);
+    let (mut child, port) = serve_ws_child(&base, dir.path().to_str().unwrap());
 
     let (status, headers, _body) = http_exchange(port, "GET", WS_PATH, None).await;
     assert_eq!(status, 426);

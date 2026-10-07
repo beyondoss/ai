@@ -12,33 +12,31 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use common::{
-    ChildGuard, ISOLATED_HOME, SpawnGuarded, free_port, spawn_model_server, turn_text,
-    turn_tool_use, wait_for_port, ws_connect, ws_next_frame, ws_read_until_response, ws_send,
+    ChildGuard, ISOLATED_HOME, spawn_listening, spawn_model_server, turn_text, turn_tool_use,
+    ws_connect, ws_next_frame, ws_read_until_response, ws_send,
 };
 use serde_json::json;
 
-/// Spawn a `serve --listen 127.0.0.1:<port>` child against `base` (the mock gateway), persisting
+/// Spawn a listening `serve` child (and its port) against `base` (the mock gateway), persisting
 /// per-session files under `session_dir`. In `--listen` mode stdio is unused, so null it.
-fn serve_ws_child(base: &str, session_dir: &str, port: u16) -> ChildGuard {
-    Command::new(env!("CARGO_BIN_EXE_beyond-ai-agent"))
-        .args([
-            "serve",
-            "--listen",
-            &format!("127.0.0.1:{port}"),
-            "--gateway-url",
-            base,
-            "--key",
-            "bai_v1.test",
-            "--model",
-            "claude-test",
-            "--session-dir",
-            session_dir,
-        ])
-        .env("HOME", ISOLATED_HOME)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn_guarded()
+fn serve_ws_child(base: &str, session_dir: &str) -> (ChildGuard, u16) {
+    spawn_listening(
+        Command::new(env!("CARGO_BIN_EXE_beyond-ai-agent"))
+            .args([
+                "serve",
+                "--gateway-url",
+                base,
+                "--key",
+                "bai_v1.test",
+                "--model",
+                "claude-test",
+                "--session-dir",
+                session_dir,
+            ])
+            .env("HOME", ISOLATED_HOME)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null()),
+    )
 }
 
 /// (i) DoD: a full session over the socket — `get_state` answers with a `session_id`, and a `prompt`
@@ -47,9 +45,7 @@ fn serve_ws_child(base: &str, session_dir: &str, port: u16) -> ChildGuard {
 async fn ws_get_state_then_prompt_streams_ack_event_response() {
     let (base, _requests) = spawn_model_server(vec![turn_text("hello there")]);
     let dir = tempfile::tempdir().unwrap();
-    let port = free_port();
-    let mut child = serve_ws_child(&base, dir.path().to_str().unwrap(), port);
-    wait_for_port(port);
+    let (mut child, port) = serve_ws_child(&base, dir.path().to_str().unwrap());
 
     let mut ws = ws_connect(port, None).await;
 
@@ -101,9 +97,7 @@ async fn ws_run_survives_dropped_connection_and_reattaches() {
         turn_text("alldone"),
     ]);
     let dir = tempfile::tempdir().unwrap();
-    let port = free_port();
-    let mut child = serve_ws_child(&base, dir.path().to_str().unwrap(), port);
-    wait_for_port(port);
+    let (mut child, port) = serve_ws_child(&base, dir.path().to_str().unwrap());
 
     // Connection #1 starts the prompt and waits until the run is provably in flight — the `bash`
     // tool_start event means turn 1 finished and the 2s sleep is now running — then drops mid-run.
@@ -175,9 +169,7 @@ async fn ws_two_connections_both_receive_the_stream() {
     let (base, _requests) =
         spawn_model_server(vec![turn_text("firstreply"), turn_text("secondreply")]);
     let dir = tempfile::tempdir().unwrap();
-    let port = free_port();
-    let mut child = serve_ws_child(&base, dir.path().to_str().unwrap(), port);
-    wait_for_port(port);
+    let (mut child, port) = serve_ws_child(&base, dir.path().to_str().unwrap());
 
     // Both connect to the SAME session id — they coexist (no eviction).
     let mut ws1 = ws_connect(port, Some(SID)).await;
@@ -271,9 +263,7 @@ async fn ws_distinct_sessions_run_concurrently_and_stay_isolated() {
         turn_text("done"),
     ]);
     let dir = tempfile::tempdir().unwrap();
-    let port = free_port();
-    let mut child = serve_ws_child(&base, dir.path().to_str().unwrap(), port);
-    wait_for_port(port);
+    let (mut child, port) = serve_ws_child(&base, dir.path().to_str().unwrap());
 
     let mut a = ws_connect(port, Some("alpha")).await;
     let mut b = ws_connect(port, Some("bravo")).await;
@@ -357,9 +347,7 @@ async fn ws_sigterm_persists_in_flight_session_and_exits() {
         turn_text("done"),
     ]);
     let dir = tempfile::tempdir().unwrap();
-    let port = free_port();
-    let mut child = serve_ws_child(&base, dir.path().to_str().unwrap(), port);
-    wait_for_port(port);
+    let (mut child, port) = serve_ws_child(&base, dir.path().to_str().unwrap());
     let pid = child.id();
 
     let mut ws = ws_connect(port, Some(SID)).await;

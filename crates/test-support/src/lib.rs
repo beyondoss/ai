@@ -194,6 +194,11 @@ fn accept_scripted(
     listener: &TcpListener,
     recorder: Option<&Mutex<Vec<String>>>,
 ) -> Option<(TcpStream, String)> {
+    let base = listener
+        .local_addr()
+        .ok()
+        .map(|a| format!("http://{a}"))
+        .unwrap_or_default();
     loop {
         let (mut stream, _) = listener.accept().ok()?;
         // Drain the *whole* request before answering. Closing a socket with unread data in its
@@ -201,6 +206,11 @@ fn accept_scripted(
         // peer had not yet read — including the response just written.
         let req = read_http_request(&mut stream);
         if is_session_title_request(&req) {
+            *title_counts()
+                .lock()
+                .unwrap()
+                .entry(base.clone())
+                .or_default() += 1;
             reply(&mut stream, &turn_text(SCRIPTED_SESSION_TITLE));
             continue;
         }
@@ -209,6 +219,25 @@ fn accept_scripted(
         }
         return Some((stream, req));
     }
+}
+
+/// Title requests answered so far, per scripted server (by base URL).
+fn title_counts() -> &'static Mutex<std::collections::HashMap<String, usize>> {
+    static COUNTS: std::sync::OnceLock<Mutex<std::collections::HashMap<String, usize>>> =
+        std::sync::OnceLock::new();
+    COUNTS.get_or_init(Default::default)
+}
+
+/// How many session-title requests the scripted server at `base` has answered itself. They are kept
+/// out of the conversation's record, so this is where a change in how often `serve` asks for a
+/// title — once per session, after its first successful run — shows.
+pub fn title_calls(base: &str) -> usize {
+    title_counts()
+        .lock()
+        .unwrap()
+        .get(base)
+        .copied()
+        .unwrap_or(0)
 }
 
 /// After a script runs out: keep answering title requests (one can arrive after the last turn),

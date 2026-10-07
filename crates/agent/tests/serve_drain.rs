@@ -18,8 +18,8 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use common::{
-    ChildGuard, ISOLATED_HOME, SpawnGuarded, free_port, spawn_model_server, turn_text,
-    turn_tool_use, wait_for_port, ws_connect, ws_next_frame,
+    ChildGuard, ISOLATED_HOME, spawn_listening, spawn_model_server, turn_text, turn_tool_use,
+    ws_connect, ws_next_frame,
 };
 use futures::SinkExt;
 use serde_json::{Value, json};
@@ -29,29 +29,27 @@ use tokio_tungstenite::tungstenite::Message;
 
 const BIN: &str = env!("CARGO_BIN_EXE_beyond-ai-agent");
 
-fn serve_ws(base: &str, session_dir: &str, port: u16, drain_grace: &str) -> ChildGuard {
-    Command::new(BIN)
-        .args([
-            "serve",
-            "--listen",
-            &format!("127.0.0.1:{port}"),
-            "--gateway-url",
-            base,
-            "--key",
-            "bai_v1.test",
-            "--model",
-            "claude-test",
-            "--session-dir",
-            session_dir,
-            "--session-idle-timeout",
-            "0",
-            "--drain-grace",
-            drain_grace,
-        ])
-        .env("HOME", ISOLATED_HOME)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn_guarded()
+fn serve_ws(base: &str, session_dir: &str, drain_grace: &str) -> (ChildGuard, u16) {
+    spawn_listening(
+        Command::new(BIN)
+            .args([
+                "serve",
+                "--gateway-url",
+                base,
+                "--key",
+                "bai_v1.test",
+                "--model",
+                "claude-test",
+                "--session-dir",
+                session_dir,
+                "--session-idle-timeout",
+                "0",
+                "--drain-grace",
+                drain_grace,
+            ])
+            .env("HOME", ISOLATED_HOME)
+            .stdout(Stdio::null()),
+    )
 }
 
 /// One bare HTTP GET, returning (status, body).
@@ -119,9 +117,7 @@ async fn a_draining_replica_refuses_new_sessions_but_keeps_serving_the_ones_it_o
         ),
         turn_text("done"),
     ]);
-    let port = free_port();
-    let child = serve_ws(&base, dir.path().to_str().unwrap(), port, "30");
-    wait_for_port(port);
+    let (child, port) = serve_ws(&base, dir.path().to_str().unwrap(), "30");
     let pid = child.id();
 
     // A session this replica owns, mid-run.
@@ -207,9 +203,7 @@ async fn a_drain_lets_an_in_flight_run_finish_and_persists_it() {
         ),
         turn_text("finished after the signal"),
     ]);
-    let port = free_port();
-    let mut child = serve_ws(&base, dir.path().to_str().unwrap(), port, "30");
-    wait_for_port(port);
+    let (mut child, port) = serve_ws(&base, dir.path().to_str().unwrap(), "30");
     let pid = child.id();
 
     let mut ws = ws_connect(port, Some("drain-inflight")).await;
@@ -267,9 +261,7 @@ async fn without_a_grace_a_signal_still_shuts_down_at_once() {
     // Ctrl-C on a laptop daemon ends it now, not in thirty seconds.
     let dir = tempfile::tempdir().unwrap();
     let (base, _bodies) = spawn_model_server(vec![]);
-    let port = free_port();
-    let mut child = serve_ws(&base, dir.path().to_str().unwrap(), port, "0");
-    wait_for_port(port);
+    let (mut child, _) = serve_ws(&base, dir.path().to_str().unwrap(), "0");
     let pid = child.id();
 
     let began = Instant::now();

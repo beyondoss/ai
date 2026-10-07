@@ -391,3 +391,29 @@ fn a_subagents_skill_load_is_asked_about_in_its_own_name() {
     serve.read_until(|f| is_response(f, "prompt"));
     serve.finish();
 }
+
+/// A `/skill:` the user typed is consent for that one load, not a standing approval: when the model
+/// loads the same skill later, the user is asked.
+#[test]
+fn a_typed_skill_invocation_does_not_approve_the_models_later_loads() {
+    let env = Env::new(json!({}));
+    let (mut serve, _bodies) = serve_with(
+        &env,
+        vec![
+            ("\"tool_use_id\":\"t1\"", turn_text("done")),
+            ("load-it-again", read_skill("t1", GIT)),
+        ],
+    );
+    let frames = serve.call(
+        json!({ "type": "prompt", "message": "/skill:docs:git-workflow load it" }),
+        "prompt",
+    );
+    assert_eq!(frames.last().unwrap()["success"], true, "{frames:#?}");
+    serve.send(json!({ "type": "prompt", "message": "load-it-again" }));
+    let q = next_question(&mut serve);
+    assert_eq!(q["mcp_skill"]["purpose"], "activate", "{q}");
+    assert_eq!(q["mcp_skill"]["uri"], GIT, "{q}");
+    serve.approve(&q, "deny", "once");
+    serve.read_until(|f| is_response(f, "prompt"));
+    serve.finish();
+}

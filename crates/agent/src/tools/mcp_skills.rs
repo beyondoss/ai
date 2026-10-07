@@ -1127,18 +1127,11 @@ struct Active {
 struct SessionState {
     /// Skills the session is acting on, by `(server, SKILL.md uri)`.
     active: HashMap<(String, String), Active>,
-    /// Remembered "session"-scoped decisions, by key (which embeds the manifest fingerprint).
+    /// Remembered "session"-scoped decisions, by key (which embeds the manifest fingerprint). Held in
+    /// memory for this process's life of the session and never persisted: anything on disk that
+    /// grants an approval is something a model with file-write tools can write itself.
     decisions: HashMap<String, bool>,
-    /// Decisions remembered since the host last [took them](SkillSession::take_unjournaled) to
-    /// persist with the session.
-    unjournaled: Vec<(String, bool)>,
 }
-
-/// The session custom-entry kind a remembered MCP-skill approval is persisted under:
-/// `{"sessionId", "key", "allow"}`. The key embeds the content fingerprint it was given for (the
-/// skill's manifest; for a code-execution answer, every active skill's), so a restored approval
-/// covers exactly the content approved and a changed skill is asked about again.
-pub const APPROVAL_ENTRY_KIND: &str = "mcp_skill_approval";
 
 /// The tag a loaded MCP skill enters context under ([`ServerSkills::render`]); what the acting window
 /// is rebuilt from ([`SkillSession::restore_from_transcript`]).
@@ -1222,34 +1215,9 @@ impl SkillSession {
         *lock(&self.state) = SessionState::default();
     }
 
-    /// Remember a decision for the session, and queue it to be persisted with it.
+    /// Remember a decision for the rest of the session.
     fn remember(&self, key: String, allow: bool) {
-        let mut state = lock(&self.state);
-        if state.decisions.insert(key.clone(), allow) != Some(allow) {
-            state.unjournaled.push((key, allow));
-        }
-    }
-
-    /// The decisions remembered since the last call, for the host to persist with the session
-    /// ([`APPROVAL_ENTRY_KIND`]).
-    pub fn take_unjournaled(&self) -> Vec<(String, bool)> {
-        std::mem::take(&mut lock(&self.state).unjournaled)
-    }
-
-    /// Restore decisions persisted with the session ([`APPROVAL_ENTRY_KIND`] entries' data, oldest
-    /// first, so a later answer for the same key wins). A session resumed, switched to or reopened
-    /// after a restart is not asked again about content it already approved — and, since each key
-    /// embeds its content fingerprint, is asked again about content that changed.
-    pub fn restore_decisions(&self, entries: &[Value]) {
-        let mut state = lock(&self.state);
-        for entry in entries {
-            if let (Some(key), Some(allow)) = (
-                entry.get("key").and_then(Value::as_str),
-                entry.get("allow").and_then(Value::as_bool),
-            ) {
-                state.decisions.insert(key.to_string(), allow);
-            }
-        }
+        lock(&self.state).decisions.insert(key, allow);
     }
 
     /// Rebuild the acting window from a transcript: every MCP skill whose `SKILL.md` is still in the
@@ -1421,7 +1389,9 @@ impl SkillSession {
     }
 
     /// Activation needs the user's consent, bound to the entry's manifest. A user's own
-    /// `/skill:` invocation *is* that consent. A nested skill is no exception — its approval is its
+    /// `/skill:` invocation *is* that consent — for that invocation only: it is not remembered, so a
+    /// later load the model chooses is asked about like any other (typing `/skill:x` once is not "let
+    /// the model load x whenever it likes"). A nested skill is no exception — its approval is its
     /// own, keyed by its own URI, so approving the enclosing skill never covers it — and the
     /// question says it is nested, so the user knows what they are agreeing to. The question carries
     /// the entry's frontmatter and file manifest, so a client can show the user what they would load
@@ -1435,10 +1405,7 @@ impl SkillSession {
         let fingerprint = entry.fingerprint();
         let key = format!("activate\0{}\0{}\0{fingerprint}", source.server, entry.uri);
         let origin = match consent {
-            Consent::User => {
-                self.remember(key, true);
-                return Ok(());
-            }
+            Consent::User => return Ok(()),
             Consent::Model(origin) => origin.clone(),
         };
         let nested_in = source.enclosing(&entry.uri);

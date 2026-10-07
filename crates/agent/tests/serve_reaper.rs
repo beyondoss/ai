@@ -11,34 +11,32 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use common::{
-    ChildGuard, ISOLATED_HOME, SpawnGuarded, free_port, spawn_model_server, turn_text,
-    turn_tool_use, wait_for_port, ws_connect, ws_next_frame, ws_read_until_response, ws_send,
+    ChildGuard, ISOLATED_HOME, spawn_listening, spawn_model_server, turn_text, turn_tool_use,
+    ws_connect, ws_next_frame, ws_read_until_response, ws_send,
 };
 use serde_json::{Value, json};
 
 /// Spawn a `serve --listen` child with the idle reaper armed at `idle_secs` (`0` disables reaping).
-fn serve_reaper_child(base: &str, session_dir: &str, port: u16, idle_secs: u64) -> ChildGuard {
-    Command::new(env!("CARGO_BIN_EXE_beyond-ai-agent"))
-        .args([
-            "serve",
-            "--listen",
-            &format!("127.0.0.1:{port}"),
-            "--gateway-url",
-            base,
-            "--key",
-            "bai_v1.test",
-            "--model",
-            "claude-test",
-            "--session-dir",
-            session_dir,
-            "--session-idle-timeout",
-            &idle_secs.to_string(),
-        ])
-        .env("HOME", ISOLATED_HOME)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn_guarded()
+fn serve_reaper_child(base: &str, session_dir: &str, idle_secs: u64) -> (ChildGuard, u16) {
+    spawn_listening(
+        Command::new(env!("CARGO_BIN_EXE_beyond-ai-agent"))
+            .args([
+                "serve",
+                "--gateway-url",
+                base,
+                "--key",
+                "bai_v1.test",
+                "--model",
+                "claude-test",
+                "--session-dir",
+                session_dir,
+                "--session-idle-timeout",
+                &idle_secs.to_string(),
+            ])
+            .env("HOME", ISOLATED_HOME)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null()),
+    )
 }
 
 /// Send `list_daemon_sessions` on a fresh connection and return the `data.sessions` array.
@@ -64,9 +62,7 @@ async fn idle_session_is_reaped_but_its_turn_persists() {
     let (base, _requests) =
         spawn_model_server(vec![turn_text("committedreply"), turn_text("again")]);
     let dir = tempfile::tempdir().unwrap();
-    let port = free_port();
-    let mut child = serve_reaper_child(&base, dir.path().to_str().unwrap(), port, 1);
-    wait_for_port(port);
+    let (mut child, port) = serve_reaper_child(&base, dir.path().to_str().unwrap(), 1);
 
     // Connect, prompt to completion (persists), then disconnect.
     {
@@ -119,9 +115,7 @@ async fn zero_idle_timeout_disables_the_reaper() {
     const SID: &str = "neverreaped001";
     let (base, _requests) = spawn_model_server(vec![turn_text("pinnedreply")]);
     let dir = tempfile::tempdir().unwrap();
-    let port = free_port();
-    let mut child = serve_reaper_child(&base, dir.path().to_str().unwrap(), port, 0);
-    wait_for_port(port);
+    let (mut child, port) = serve_reaper_child(&base, dir.path().to_str().unwrap(), 0);
 
     {
         let mut ws = ws_connect(port, Some(SID)).await;
@@ -159,9 +153,7 @@ async fn attached_session_past_timeout_is_not_reaped() {
     const SID: &str = "attachedsession1";
     let (base, _requests) = spawn_model_server(vec![turn_text("stillhere")]);
     let dir = tempfile::tempdir().unwrap();
-    let port = free_port();
-    let mut child = serve_reaper_child(&base, dir.path().to_str().unwrap(), port, 1);
-    wait_for_port(port);
+    let (mut child, port) = serve_reaper_child(&base, dir.path().to_str().unwrap(), 1);
 
     // Attach and prompt to completion, but KEEP the connection open.
     let mut ws = ws_connect(port, Some(SID)).await;
@@ -210,9 +202,7 @@ async fn detached_but_mid_run_session_is_not_reaped() {
         turn_text("finishedmidrun"),
     ]);
     let dir = tempfile::tempdir().unwrap();
-    let port = free_port();
-    let mut child = serve_reaper_child(&base, dir.path().to_str().unwrap(), port, 1);
-    wait_for_port(port);
+    let (mut child, port) = serve_reaper_child(&base, dir.path().to_str().unwrap(), 1);
 
     // Start the run; wait until the bash tool is actually running, then drop the connection (detached,
     // but the run keeps going on the server).

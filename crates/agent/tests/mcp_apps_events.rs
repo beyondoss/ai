@@ -11,9 +11,7 @@ use std::time::Duration;
 use common::mcp_events_fixture::{
     emit, eventually, runs_for_event, spawn_daemon, spawn_http_fixture, state, write_settings,
 };
-use common::{
-    free_port, spawn_model_server_routed, turn_text, ws_connect, ws_read_until_response, ws_send,
-};
+use common::{spawn_model_server_routed, turn_text, ws_connect, ws_read_until_response, ws_send};
 use serde_json::json;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -31,8 +29,7 @@ async fn a_declared_apps_session_leaves_events_on_the_plain_connection_one_run_p
         }]),
     );
     let (base, bodies) = spawn_model_server_routed(vec![], turn_text("handled"));
-    let port = free_port();
-    let _d = spawn_daemon(home.path(), &base, port, &[]);
+    let (_d, port) = spawn_daemon(home.path(), &base, &[]);
 
     // The events session subscribes on its own, over the plain connection.
     eventually(

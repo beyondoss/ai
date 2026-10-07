@@ -2626,3 +2626,48 @@ fn serve_switch_session_response_carries_reasoning_effort_like_its_three_sibling
     drop(stdin);
     child.wait().unwrap();
 }
+
+/// The kinds the agent writes itself — trusted when a session is replayed (an MCP task to resume, its
+/// result) — are refused from a client, and nothing lands in the tree; any other kind is accepted.
+#[test]
+fn serve_append_custom_refuses_the_kinds_the_agent_writes_itself() {
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+    let (base, _bodies) = spawn_model_server(vec![turn_text("hi there")]);
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    writeln!(stdin, "{}", json!({ "type": "prompt", "message": "hi" })).unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "prompt");
+
+    for kind in ["mcp_task", "mcp_task_result", "mcp_skill_approval"] {
+        writeln!(
+            stdin,
+            "{}",
+            json!({ "type": "append_custom", "kind": kind, "data": {"sessionId": "x"} })
+        )
+        .unwrap();
+        stdin.flush().unwrap();
+        let frames = read_until_response(&mut stdout, "append_custom");
+        let resp = frames.last().unwrap();
+        assert_eq!(resp["success"], false, "{kind}: {resp:#?}");
+        assert!(
+            resp["error"].as_str().unwrap().contains("reserved"),
+            "{kind}: {resp:#?}"
+        );
+    }
+    writeln!(stdin, "{}", json!({ "type": "get_tree" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "get_tree");
+    let nodes = frames.last().unwrap()["data"]["nodes"].as_array().unwrap();
+    assert!(
+        nodes
+            .iter()
+            .all(|n| !n["preview"].as_str().unwrap_or("").starts_with("[custom:")),
+        "a refused entry must not reach the tree: {nodes:#?}"
+    );
+    drop(stdin);
+    child.wait().unwrap();
+}

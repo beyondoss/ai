@@ -21,34 +21,32 @@ mod common;
 use std::process::{Command, Stdio};
 
 use common::{
-    ChildGuard, ISOLATED_HOME, SpawnGuarded, free_port, spawn_model_server, turn_text,
-    turn_tool_use, wait_for_port, ws_connect, ws_next_frame, ws_read_until_response, ws_send,
+    ChildGuard, ISOLATED_HOME, spawn_listening, spawn_model_server, turn_text, turn_tool_use,
+    ws_connect, ws_next_frame, ws_read_until_response, ws_send,
 };
 use serde_json::{Value, json};
 
 /// Marker text the model commits in turn 1 — the history a re-attaching client must get back.
 const COMMITTED: &str = "COMMITTED_BEFORE_DROP";
 
-fn serve_ws_child(base: &str, session_dir: &str, port: u16) -> ChildGuard {
-    Command::new(env!("CARGO_BIN_EXE_beyond-ai-agent"))
-        .args([
-            "serve",
-            "--listen",
-            &format!("127.0.0.1:{port}"),
-            "--gateway-url",
-            base,
-            "--key",
-            "bai_v1.test",
-            "--model",
-            "claude-test",
-            "--session-dir",
-            session_dir,
-        ])
-        .env("HOME", ISOLATED_HOME)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn_guarded()
+fn serve_ws_child(base: &str, session_dir: &str) -> (ChildGuard, u16) {
+    spawn_listening(
+        Command::new(env!("CARGO_BIN_EXE_beyond-ai-agent"))
+            .args([
+                "serve",
+                "--gateway-url",
+                base,
+                "--key",
+                "bai_v1.test",
+                "--model",
+                "claude-test",
+                "--session-dir",
+                session_dir,
+            ])
+            .env("HOME", ISOLATED_HOME)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null()),
+    )
 }
 
 /// Drive a session to the state both tests need: one **committed** turn in history (containing
@@ -59,16 +57,14 @@ fn serve_ws_child(base: &str, session_dir: &str, port: u16) -> ChildGuard {
 /// calls `bash sleep 5` (the in-flight window); its second turn ends the run.
 async fn session_with_history_and_a_run_in_flight(
     dir: &str,
-    port: u16,
     sid: &str,
-) -> (ChildGuard, String) {
+) -> (ChildGuard, String, u16) {
     let (base, _requests) = spawn_model_server(vec![
         turn_text(COMMITTED),
         turn_tool_use("t1", "bash", &json!({ "command": "sleep 5" }).to_string()),
         turn_text("AFTER_THE_SLEEP"),
     ]);
-    let child = serve_ws_child(&base, dir, port);
-    wait_for_port(port);
+    let (child, port) = serve_ws_child(&base, dir);
 
     let mut ws1 = ws_connect(port, Some(sid)).await;
 
@@ -107,7 +103,7 @@ async fn session_with_history_and_a_run_in_flight(
     assert!(in_flight, "the second prompt should reach the bash sleep");
 
     drop(ws1); // the mobile network drops mid-run
-    (child, sid.to_string())
+    (child, sid.to_string(), port)
 }
 
 /// A frame that carries the committed history back to the client — whatever shape it arrives in
@@ -132,9 +128,8 @@ fn is_live_event(f: &Value) -> bool {
 async fn reattach_midrun_can_fetch_missed_history() {
     const SID: &str = "reattachcatchup1";
     let dir = tempfile::tempdir().unwrap();
-    let port = free_port();
-    let (mut child, sid) =
-        session_with_history_and_a_run_in_flight(dir.path().to_str().unwrap(), port, SID).await;
+    let (mut child, sid, port) =
+        session_with_history_and_a_run_in_flight(dir.path().to_str().unwrap(), SID).await;
 
     let mut ws2 = ws_connect(port, Some(&sid)).await;
     ws_send(&mut ws2, json!({ "type": "get_messages" })).await;
@@ -171,9 +166,8 @@ async fn reattach_midrun_can_fetch_missed_history() {
 async fn reattach_delivers_history_before_live_frames() {
     const SID: &str = "reattachcatchup2";
     let dir = tempfile::tempdir().unwrap();
-    let port = free_port();
-    let (mut child, sid) =
-        session_with_history_and_a_run_in_flight(dir.path().to_str().unwrap(), port, SID).await;
+    let (mut child, sid, port) =
+        session_with_history_and_a_run_in_flight(dir.path().to_str().unwrap(), SID).await;
 
     // Re-attach and just *listen*, issuing no command at all. Everything that arrives, arrives because
     // the server sent it — which is the point: catch-up must not be a thing the client has to ask for
@@ -210,9 +204,8 @@ async fn reattach_delivers_history_before_live_frames() {
 async fn reattach_catchup_frame_has_the_get_messages_payload_shape() {
     const SID: &str = "reattachcatchup3";
     let dir = tempfile::tempdir().unwrap();
-    let port = free_port();
-    let (mut child, sid) =
-        session_with_history_and_a_run_in_flight(dir.path().to_str().unwrap(), port, SID).await;
+    let (mut child, sid, port) =
+        session_with_history_and_a_run_in_flight(dir.path().to_str().unwrap(), SID).await;
 
     let mut ws2 = ws_connect(port, Some(&sid)).await;
     let first = ws_next_frame(&mut ws2).await.expect("a first frame");
@@ -252,11 +245,10 @@ async fn reattach_catchup_frame_has_the_get_messages_payload_shape() {
 async fn reattach_replays_the_in_flight_turn_not_just_committed_history() {
     const SID: &str = "reattachcatchup4";
     let dir = tempfile::tempdir().unwrap();
-    let port = free_port();
     // The driving connection saw `tool_start{bash}` before it dropped (that is how the helper knows the
     // run is in flight) — so that frame is, by construction, one this reconnecting client missed.
-    let (mut child, sid) =
-        session_with_history_and_a_run_in_flight(dir.path().to_str().unwrap(), port, SID).await;
+    let (mut child, sid, port) =
+        session_with_history_and_a_run_in_flight(dir.path().to_str().unwrap(), SID).await;
 
     let mut ws2 = ws_connect(port, Some(&sid)).await;
 

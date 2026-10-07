@@ -18,7 +18,7 @@ use beyond_ai_agent::session_store::{Layout, RepoOptions, SessionRepo, TenantCod
 
 use super::exec_mock::ExecMock;
 use super::grant::{Claims, Minter, Secrets};
-use super::{ChildGuard, SpawnGuarded, free_port, serve_service_cmd, wait_for_port};
+use super::{ChildGuard, serve_service_cmd, spawn_listening, spawn_listening_logged};
 
 /// The header value every exec request from a service session must carry — the grant's sealed
 /// `exec_headers`. A test asserts both that it *reaches the sandbox* and that it never appears in a
@@ -39,6 +39,8 @@ pub struct Service {
     /// `<shard name>` → directory, in `--shard` flag order.
     pub shards: Vec<(String, PathBuf)>,
     pub child: ChildGuard,
+    /// Everything the replica wrote to stderr (the operator's channel), as it writes it.
+    pub stderr_log: PathBuf,
     /// The model server this replica was pointed at, so a [`Peer`] can share it.
     pub model_base: String,
     /// Held so every directory above outlives the replica.
@@ -87,7 +89,6 @@ impl Service {
             })
             .collect();
         let minter = Minter::new(dir.path());
-        let port = free_port();
         let flag_shards: Vec<(&str, &Path)> = shards
             .iter()
             .map(|(n, p)| (n.as_str(), p.as_path()))
@@ -95,7 +96,6 @@ impl Service {
         let mut cmd = serve_service_cmd(
             super::BIN,
             model_base,
-            port,
             &minter.grant_key_flag(),
             minter.seal_key(),
             &flag_shards,
@@ -107,8 +107,9 @@ impl Service {
         for (k, v) in &opts.env {
             cmd.env(k, v);
         }
-        let child = cmd.spawn_guarded();
-        wait_for_port(port);
+        let stderr_log = dir.path().join("replica.stderr");
+        let log = std::fs::File::create(&stderr_log).unwrap();
+        let (child, port) = spawn_listening_logged(&mut cmd, Some(log));
         Self {
             port,
             minter,
@@ -117,6 +118,7 @@ impl Service {
             sandbox_home,
             shards,
             child,
+            stderr_log,
             model_base: model_base.to_string(),
             dir,
         }
@@ -130,18 +132,15 @@ impl Service {
             .iter()
             .map(|(n, p)| (n.as_str(), p.as_path()))
             .collect();
-        let port = free_port();
         let mut cmd = serve_service_cmd(
             super::BIN,
             &self.model_base,
-            port,
             &self.minter.grant_key_flag(),
             self.minter.seal_key(),
             &flag_shards,
         );
         cmd.args(extra_args);
-        let child = cmd.spawn_guarded();
-        wait_for_port(port);
+        let (child, port) = spawn_listening(&mut cmd);
         Peer { port, child }
     }
 

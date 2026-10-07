@@ -258,24 +258,37 @@ pub fn model_requests_with(bodies: &std::sync::Mutex<Vec<String>>, needle: &str)
 /// The daemon session that owns configured subscriptions by default.
 pub const EVENTS_SESSION: &str = "mcp-events";
 
-/// A `serve --listen` daemon on `port` with `--mcp-events-callback-url` pointing back at it.
-pub fn spawn_daemon(home: &Path, base: &str, port: u16, extra: &[&str]) -> ChildGuard {
-    spawn_daemon_env(home, base, port, extra, &[])
+/// A listening `serve` daemon with `--mcp-events-callback-url` pointing back at it, and its port. The
+/// callback URL names the port before the daemon starts, so the port is a [`super::HeldPort`].
+pub fn spawn_daemon(home: &Path, base: &str, extra: &[&str]) -> (ChildGuard, u16) {
+    spawn_daemon_env(home, base, extra, &[])
 }
 
 /// [`spawn_daemon`] with extra environment.
 pub fn spawn_daemon_env(
     home: &Path,
     base: &str,
-    port: u16,
+    extra: &[&str],
+    env: &[(&str, &str)],
+) -> (ChildGuard, u16) {
+    let held = super::HeldPort::bind();
+    // `held` drops on return: the daemon's is the only copy, so if it dies the port is refused.
+    (spawn_daemon_on(home, base, &held, extra, env), held.port())
+}
+
+/// [`spawn_daemon_env`] on a port the test holds — to restart a daemon where its callback URL, and
+/// so every subscription's, still points.
+pub fn spawn_daemon_on(
+    home: &Path,
+    base: &str,
+    held: &super::HeldPort,
     extra: &[&str],
     env: &[(&str, &str)],
 ) -> ChildGuard {
+    let port = held.port();
     let mut cmd = super::serve_dir_cmd(super::BIN, base, &home.join("sessions").to_string_lossy());
     cmd.envs(env.iter().copied());
     cmd.args([
-        "--listen",
-        &format!("127.0.0.1:{port}"),
         "--mcp-events-callback-url",
         &format!("http://127.0.0.1:{port}"),
     ])
@@ -288,9 +301,8 @@ pub fn spawn_daemon_env(
     .stderr(Stdio::from(
         std::fs::File::create(home.join(format!("serve-{port}.stderr"))).unwrap(),
     ));
-    let child = cmd.spawn_guarded();
-    super::wait_for_port(port);
-    child
+    held.hand_to(&mut cmd);
+    cmd.spawn_guarded()
 }
 
 /// The next WebSocket frame matching `pred`, or a panic naming `what` after `timeout`.

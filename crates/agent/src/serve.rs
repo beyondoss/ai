@@ -148,7 +148,9 @@
 //!     active tip and advance the tip to it → `data: {id}` (the new entry's id); `data` defaults to `{}`
 //!     when omitted, `kind` identifies the shape of `data` to whatever produced it (this crate never
 //!     interprets either) — `SessionStore::append_custom`, fully built and tested but previously
-//!     unreachable from any RPC command; same persistence-required error as `set_label`
+//!     unreachable from any RPC command; same persistence-required error as `set_label`. A kind the
+//!     agent writes itself (`session_store::HOST_CUSTOM_KINDS`) is refused, so a client cannot forge
+//!     one
 //!   - `{type:"export_html", output_path?}` render the active session's transcript as a single
 //!     self-contained HTML file → `data: {path}`. `output_path` defaults to a timestamped
 //!     `session-<unix-seconds>.html` in the current directory; parent directories are created as
@@ -4378,10 +4380,6 @@ pub(crate) async fn serve_session(
                 mcp_enabled
                     .skill_session()
                     .restore_from_transcript(&session.messages);
-                // ...and the MCP-skill approvals its user gave, persisted with it.
-                mcp_enabled.skill_session().restore_decisions(
-                    &persistence.active_custom(crate::tools::mcp_skills::APPROVAL_ENTRY_KIND),
-                );
                 // The session's MCP Apps connections moved since the agent was built (an apps dial
                 // landed, or went into backoff): rebuild, so this turn advertises what is up now.
                 let apps_generation_now = mcp_enabled.apps().map(|view| view.generation());
@@ -5235,18 +5233,6 @@ pub(crate) async fn serve_session(
                     // session-id check, but this session would lose them).
                     while let Ok((kind, data)) = mcp_task_rx.try_recv() {
                         journal_mcp!(kind, data);
-                    }
-                    // So are the MCP-skill approvals given during it: persisted with this session,
-                    // so resuming it does not ask again about the same content.
-                    for (key, allow) in mcp_enabled.skill_session().take_unjournaled() {
-                        journal_mcp!(
-                            crate::tools::mcp_skills::APPROVAL_ENTRY_KIND,
-                            json!({
-                                "sessionId": persistence.session_id(),
-                                "key": key,
-                                "allow": allow,
-                            })
-                        );
                     }
 
                     // Whether this attempt is about to be retried. Decided *here*, before the persist
@@ -6549,6 +6535,18 @@ pub(crate) async fn serve_session(
                 )),
             },
             "append_custom" => match cmd.get("kind").and_then(Value::as_str) {
+                // The host's own journal kinds: an entry of one is trusted when the session is
+                // replayed (a task to resume, a result to deliver), so a client must not be able to
+                // write one.
+                Some(kind) if crate::session_store::is_host_custom_kind(kind) => emit!(response(
+                    id,
+                    "append_custom",
+                    false,
+                    None,
+                    Some(&format!(
+                        "custom entry kind `{kind}` is reserved for entries the agent writes itself"
+                    ))
+                )),
                 Some(kind) => {
                     let data = cmd.get("data").cloned().unwrap_or_else(|| json!({}));
                     match persistence.append_custom(kind, data) {
