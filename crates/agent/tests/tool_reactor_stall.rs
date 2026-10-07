@@ -1,7 +1,7 @@
 // Test target: `.unwrap()` asserts preconditions; that's the point.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-//! A tool must not pin the async runtime for the duration of its file I/O and CPU work.
+//! A tool must not pin the async runtime: not with its CPU work, and not by blocking the thread.
 //!
 //! `serve_ws` runs every session as a task on one **shared** runtime, so a tool that does its work
 //! inline — rather than handing it to `spawn_blocking` — stalls a worker that other sessions also
@@ -9,26 +9,112 @@
 //! stdin/WebSocket command loop that carries `abort` and `steer`. `serve.rs`'s `persist_blocking`
 //! already moved `sync_all` off the reactor for exactly this reason, and its doc comment says so.
 //!
-//! **The probe measures CPU, not wall time.** Each tool call is polled on a `current_thread`
-//! runtime, and the probe adds up the *thread CPU time* the runtime thread spends inside the tool
-//! future's `poll`s: the time the tool holds the executor doing its own work. Work handed to
-//! `spawn_blocking` is charged to a pool thread, not to this one. The bar is relative to a baseline
-//! taken in the same run: the CPU the runtime thread spends doing the same work inline. An inline
-//! tool holds the executor for about the whole baseline; a yielding one for a small fraction of it.
+//! Two probes, each on a `current_thread` runtime, check two different things:
 //!
-//! Thread CPU time does not advance while the thread is preempted. So a loaded host can make a run
-//! slower, but cannot make a yielding tool look like a blocking one. A wall-clock probe (a ticker's
-//! worst gap) could, and did: it counts every preemption anywhere in the call.
-//! `the_probe_catches_a_tool_that_works_inline` keeps the probe's teeth honest.
+//! - **CPU held** ([`held`]): the *thread CPU time* the runtime thread spends inside the tool
+//!   future's `poll`s, against a baseline of the same work done inline in the same run. It catches
+//!   a tool doing its CPU work on the executor. It cannot see a tool that blocks the thread without
+//!   using CPU — `std::thread::sleep`, blocking disk or NFS I/O, a contended `std` mutex — since a
+//!   blocked thread accrues no CPU time.
+//! - **Responsiveness** ([`stalls`]): a ticker task on the same runtime, waking every millisecond
+//!   while the tool runs; the worst gap between its ticks is how long the runtime could not poll
+//!   anything else, by CPU work or by blocking alike. Each gap has the time the thread spent
+//!   *waiting on a run queue* (preempted: `/proc/thread-self/schedstat`) taken out, so a loaded host
+//!   cannot make a yielding tool look like a blocking one — the trap a plain wall-clock ticker fell
+//!   into before. What is left is time the thread ran, or blocked, without returning to the
+//!   executor; it must stay under [`MAX_UNRESPONSIVE`].
+//!
+//! Every tool in `beyond_ai_agent::tools` that runs without an external service is put through the
+//! responsiveness probe with a workload large enough that inline work would show
+//! (`*_keeps_the_runtime_responsive`); the CPU probe covers the file tools. MCP tools are
+//! network clients over rmcp's async transports, and `subagent` runs a nested agent loop on the same
+//! runtime: neither is probed here. `the_probe_catches_a_tool_that_works_inline` and
+//! `the_responsiveness_probe_catches_a_tool_that_blocks_without_cpu` keep both probes' teeth
+//! honest.
 
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
 use agent_core::Tool;
-use beyond_ai_agent::tools::{edit, ls, write};
+use beyond_ai_agent::tools::{bash, edit, find, grep, ls, memory, read, todo, web, write};
 use serde_json::json;
+
+/// The longest the runtime may go without polling anything else while a tool runs, preemption
+/// excluded. A tool's own poll (parsing its input, handing work off, assembling the result) takes
+/// well under a millisecond; every workload below would block for far longer if done inline.
+const MAX_UNRESPONSIVE: Duration = Duration::from_millis(20);
+
+/// How long this thread has waited on a run queue (preempted, runnable but not running) so far —
+/// the second field of `/proc/thread-self/schedstat`. Zero where the kernel does not report it.
+fn run_queue_wait() -> Duration {
+    std::fs::read_to_string("/proc/thread-self/schedstat")
+        .ok()
+        .and_then(|s| s.split_whitespace().nth(1)?.parse::<u64>().ok())
+        .map_or(Duration::ZERO, Duration::from_nanos)
+}
+
+/// Held for each test's whole run, setup included. Under `cargo test` the tests share one process,
+/// and one test's large allocations and frees (building a tree of thousands of files, a 4 MB source)
+/// make another's runtime thread wait in the kernel on the shared address space — time that is
+/// neither preemption nor the tool's, and would read as a stall. (`nextest`, which CI uses, runs each
+/// test in its own process anyway.)
+static ONE_TEST_AT_A_TIME: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+async fn one_at_a_time() -> tokio::sync::MutexGuard<'static, ()> {
+    ONE_TEST_AT_A_TIME.lock().await
+}
+
+/// The worst stretch, preemption excluded, that the runtime thread went without polling a ticker
+/// task while `work` ran on the same `current_thread` runtime.
+async fn stalls<F: Future>(work: F) -> (F::Output, Duration) {
+    let samples: Arc<Mutex<Vec<(Instant, Duration)>>> = Arc::default();
+    let stop = Arc::new(AtomicBool::new(false));
+    let ticker = tokio::spawn({
+        let samples = samples.clone();
+        let stop = stop.clone();
+        async move {
+            while !stop.load(Ordering::Relaxed) {
+                samples
+                    .lock()
+                    .unwrap()
+                    .push((Instant::now(), run_queue_wait()));
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        }
+    });
+    // Let the ticker take its first sample before the work starts.
+    tokio::task::yield_now().await;
+    let out = work.await;
+    samples
+        .lock()
+        .unwrap()
+        .push((Instant::now(), run_queue_wait()));
+    stop.store(true, Ordering::Relaxed);
+    ticker.abort();
+    let samples = samples.lock().unwrap();
+    let worst = samples
+        .windows(2)
+        .map(|w| (w[1].0 - w[0].0).saturating_sub(w[1].1.saturating_sub(w[0].1)))
+        .max()
+        .unwrap_or(Duration::ZERO);
+    (out, worst)
+}
+
+fn assert_responsive(tool: &str, worst: Duration, why: &str) {
+    eprintln!("PROBE {tool}: worst unresponsive stretch {worst:?}");
+    assert!(
+        worst < MAX_UNRESPONSIVE,
+        "`{tool}` kept the current_thread runtime from polling anything else for {worst:?} \
+         (preemption excluded): every other task on this worker — other sessions, the abort/steer \
+         command loop — waited that long. {why}"
+    );
+}
 
 /// CPU time consumed by the calling thread so far.
 fn thread_cpu() -> Duration {
@@ -136,6 +222,7 @@ const NEW: &str = "    let x_40001 = compute(i, 40001) + adjust(); // edited";
 
 #[tokio::test(flavor = "current_thread")]
 async fn edit_does_not_stall_the_runtime() {
+    let _serial = one_at_a_time().await;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("subject.rs");
     // An inline `edit` spends tens of ms here (read + normalize + match + splice + write).
@@ -171,6 +258,7 @@ async fn edit_does_not_stall_the_runtime() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn write_does_not_stall_the_runtime() {
+    let _serial = one_at_a_time().await;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("out.rs");
     let src = big_ascii_source(SUBJECT_LINES);
@@ -210,6 +298,7 @@ fn wide_dir() -> tempfile::TempDir {
 
 #[tokio::test(flavor = "current_thread")]
 async fn ls_does_not_stall_the_runtime() {
+    let _serial = one_at_a_time().await;
     let dir = wide_dir();
     let baseline = inline_cpu(|| assert_eq!(scan(dir.path()), 5_000));
 
@@ -234,6 +323,7 @@ async fn ls_does_not_stall_the_runtime() {
 /// whole baseline, and never yields, so `assert_yields` would fail it.
 #[tokio::test(flavor = "current_thread")]
 async fn the_probe_catches_a_tool_that_works_inline() {
+    let _serial = one_at_a_time().await;
     let dir = wide_dir();
     let baseline = inline_cpu(|| assert_eq!(scan(dir.path()), 5_000));
     let held = held(async { scan(dir.path()) }).await;
@@ -243,4 +333,358 @@ async fn the_probe_catches_a_tool_that_works_inline() {
         "an inline scan held {:?} against a {baseline:?} baseline",
         held.cpu
     );
+}
+
+/// The responsiveness probe has teeth where the CPU probe has none: a tool that yields once and
+/// then blocks the thread without using CPU (here `std::thread::sleep`, standing in for blocking
+/// disk or NFS I/O or a contended `std` mutex) holds almost no CPU, so the CPU probe passes it —
+/// and the runtime still could not poll anything for the whole sleep.
+#[tokio::test(flavor = "current_thread")]
+async fn the_responsiveness_probe_catches_a_tool_that_blocks_without_cpu() {
+    let _serial = one_at_a_time().await;
+    let blocking = || async {
+        tokio::task::yield_now().await;
+        std::thread::sleep(Duration::from_millis(150));
+    };
+    let cpu = held(blocking()).await;
+    assert!(cpu.pendings > 0);
+    assert!(
+        cpu.cpu < Duration::from_millis(20),
+        "the CPU probe cannot see it: {:?}",
+        cpu.cpu
+    );
+    let ((), worst) = stalls(blocking()).await;
+    assert!(
+        worst >= Duration::from_millis(100),
+        "the responsiveness probe must: worst stretch {worst:?}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn edit_keeps_the_runtime_responsive() {
+    let _serial = one_at_a_time().await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("subject.rs");
+    std::fs::write(&path, big_ascii_source(80_000)).unwrap();
+    let tool = edit::Edit::new(dir.path());
+    let p = path.to_str().unwrap().to_string();
+    let (_, worst) = stalls(async {
+        tool.run(json!({ "path": p, "old_string": OLD, "new_string": NEW }))
+            .await
+            .unwrap()
+    })
+    .await;
+    assert_responsive("edit", worst, "Its file I/O belongs on `spawn_blocking`.");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn write_keeps_the_runtime_responsive() {
+    let _serial = one_at_a_time().await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("out.rs");
+    let input = json!({ "path": path.to_str().unwrap(), "content": big_ascii_source(80_000) });
+    let tool = write::Write::new(dir.path());
+    let (_, worst) = stalls(async { tool.run(input).await.unwrap() }).await;
+    assert_responsive("write", worst, "Its file I/O belongs on `spawn_blocking`.");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn ls_keeps_the_runtime_responsive() {
+    let _serial = one_at_a_time().await;
+    let dir = wide_dir();
+    let d = dir.path().to_str().unwrap().to_string();
+    let (_, worst) = stalls(async {
+        ls::Ls::default()
+            .run(json!({ "path": d, "limit": 5000 }))
+            .await
+            .unwrap()
+    })
+    .await;
+    assert_responsive(
+        "ls",
+        worst,
+        "Its directory scan belongs on `spawn_blocking`.",
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn read_keeps_the_runtime_responsive() {
+    let _serial = one_at_a_time().await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("big.rs");
+    std::fs::write(&path, big_ascii_source(80_000)).unwrap();
+    let p = path.to_str().unwrap().to_string();
+    let tool = read::Read::new(dir.path());
+    let (_, worst) = stalls(async {
+        tool.run(json!({ "path": p, "offset": 70_000, "limit": 2000 }))
+            .await
+            .unwrap()
+    })
+    .await;
+    assert_responsive("read", worst, "Its file I/O belongs on `spawn_blocking`.");
+}
+
+/// A tree of `files` source files, for the search tools.
+fn source_tree(files: usize) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    for i in 0..files {
+        let sub = dir.path().join(format!("d{}", i % 50));
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join(format!("f{i}.rs")), big_ascii_source(200)).unwrap();
+    }
+    dir
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn grep_keeps_the_runtime_responsive() {
+    let _serial = one_at_a_time().await;
+    let dir = source_tree(2_000);
+    let tool = grep::Grep::new(dir.path());
+    let (_, worst) = stalls(async {
+        tool.run(json!({ "pattern": "x_199 = compute", "limit": 5000 }))
+            .await
+            .unwrap()
+    })
+    .await;
+    assert_responsive(
+        "grep",
+        worst,
+        "Its walk and match belong on `spawn_blocking`.",
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn find_keeps_the_runtime_responsive() {
+    let _serial = one_at_a_time().await;
+    let dir = source_tree(2_000);
+    let tool = find::Find::new(dir.path());
+    let (_, worst) = stalls(async {
+        tool.run(json!({ "pattern": "**/*.rs", "limit": 5000 }))
+            .await
+            .unwrap()
+    })
+    .await;
+    assert_responsive("find", worst, "Its walk belongs on `spawn_blocking`.");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn bash_keeps_the_runtime_responsive() {
+    let _serial = one_at_a_time().await;
+    let dir = tempfile::tempdir().unwrap();
+    let tool = bash::Bash::real().with_root(dir.path());
+    let (out, worst) = stalls(async {
+        tool.run(json!({ "command": "sleep 0.3; seq 1 20000" }))
+            .await
+            .unwrap()
+    })
+    .await;
+    assert!(out.text.contains("20000"), "{}", out.text);
+    assert_responsive(
+        "bash",
+        worst,
+        "Waiting on the child and reading its output must be async.",
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn todo_keeps_the_runtime_responsive() {
+    let _serial = one_at_a_time().await;
+    let tool = todo::Todo::new();
+    let todos: Vec<_> = (0..500)
+        .map(|i| json!({ "content": format!("task {i}"), "activeForm": format!("doing task {i}"), "status": "pending" }))
+        .collect();
+    let (_, worst) = stalls(async { tool.run(json!({ "todos": todos })).await.unwrap() }).await;
+    assert_responsive("todo", worst, "It is in-memory; nothing here should block.");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn memory_keeps_the_runtime_responsive() {
+    let _serial = one_at_a_time().await;
+    let dir = tempfile::tempdir().unwrap();
+    // Every line a hit: a search returning hundreds of thousands of lines, whose rendering (and
+    // freeing) inline would hold the runtime for tens of milliseconds.
+    for i in 0..2_000 {
+        std::fs::write(
+            dir.path().join(format!("note_{i}.md")),
+            format!(
+                "# note {i}\n{}",
+                "some remembered fact about the project\n".repeat(200)
+            ),
+        )
+        .unwrap();
+    }
+    let backend = Arc::new(beyond_ai_agent::memory::file::FileBackend::at(
+        dir.path().to_path_buf(),
+    ));
+    std::fs::write(dir.path().join("big.md"), big_ascii_source(80_000)).unwrap();
+    let tool = memory::Memory::new(backend);
+    let (_, worst) = stalls(async {
+        tool.run(json!({ "command": "search", "query": "remembered fact" }))
+            .await
+            .unwrap()
+    })
+    .await;
+    assert_responsive(
+        "memory search",
+        worst,
+        "Its file I/O, and rendering a large hit list, belong on `spawn_blocking`.",
+    );
+    let (_, worst) = stalls(async {
+        tool.run(json!({ "command": "view", "path": "/memories/big.md" }))
+            .await
+            .unwrap()
+    })
+    .await;
+    assert_responsive(
+        "memory view",
+        worst,
+        "Its file I/O, and rendering a large document, belong on `spawn_blocking`.",
+    );
+}
+
+/// A local HTTP server answering every request with `body` as HTML.
+async fn html_server(body: String) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let listener = tokio::net::TcpListener::from_std(listener.into_std().unwrap()).unwrap();
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let body = body.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+                    let mut buf = [0u8; 4096];
+                    let _ = stream.read(&mut buf).await;
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(head.as_bytes()).await;
+                    let _ = stream.write_all(body.as_bytes()).await;
+                });
+            }
+        });
+    });
+    format!("http://{addr}/")
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn web_keeps_the_runtime_responsive() {
+    let _serial = one_at_a_time().await;
+    let mut html = String::from("<html><body>");
+    for i in 0..20_000 {
+        html.push_str(&format!(
+            "<p>paragraph {i} with <a href='/x{i}'>a link</a></p>"
+        ));
+    }
+    html.push_str("</body></html>");
+    let url = html_server(html).await;
+    // The isolated parse runs in the agent binary's `__web-parse` child, not in this test binary.
+    let tool =
+        web::Web::new(true, &[], None).with_parser_binary(env!("CARGO_BIN_EXE_beyond-ai-agent"));
+    // The first call builds the client (TLS provider, root certificates); every call parses the
+    // page in an isolated child and waits on it.
+    for call in ["web (first call)", "web"] {
+        let (out, worst) = stalls(async {
+            tool.run(json!({ "url": url, "mode": "markdown" }))
+                .await
+                .unwrap()
+        })
+        .await;
+        assert!(
+            out.text.contains("paragraph"),
+            "{}",
+            &out.text[..out.text.len().min(300)]
+        );
+        assert_responsive(
+            call,
+            worst,
+            "Fetching is async; building the client, and parsing in (and waiting on) the isolated \
+             child, belong on the blocking pool.",
+        );
+    }
+}
+
+/// `execute` (Code Mode) runs QuickJS's synchronous evaluation: a busy script must hold a
+/// blocking-pool thread, never the runtime thread — whatever else this worker runs (other sessions,
+/// their progress and aborts) keeps being polled while it spins.
+#[cfg(feature = "code-mode")]
+#[tokio::test(flavor = "current_thread")]
+async fn code_mode_keeps_the_runtime_responsive_while_a_script_spins() {
+    let _serial = one_at_a_time().await;
+    let tool = beyond_ai_agent::tools::code_mode::Execute::new(vec![]);
+    let spin =
+        json!({ "code": "let x = 0; for (let i = 0; i < 400000; i++) { x += i % 7; } return x;" });
+    let started = Instant::now();
+    let (out, worst) = stalls(async { tool.run(spin.clone()).await.unwrap() }).await;
+    let ran = started.elapsed();
+    eprintln!("PROBE execute ran {ran:?}");
+    assert!(!out.text.is_empty());
+    assert!(
+        ran > Duration::from_millis(100),
+        "the script must spin long enough to show: {ran:?}"
+    );
+    assert_responsive(
+        "execute",
+        worst,
+        "QuickJS evaluates synchronously; it belongs on the blocking pool.",
+    );
+    let held = held(async { tool.run(spin).await.unwrap() }).await;
+    assert!(
+        held.cpu < Duration::from_millis(20),
+        "`execute` spent {:?} of the runtime thread's CPU on a script that spins for {ran:?}",
+        held.cpu
+    );
+}
+
+/// An abort still stops a spinning script promptly — by its cancellation token, or by the call
+/// being dropped — and frees the process's one JS slot, so the next `execute` runs at once rather
+/// than after the 30 s deadline.
+#[cfg(feature = "code-mode")]
+#[tokio::test(flavor = "current_thread")]
+async fn code_mode_abort_interrupts_a_spinning_script_promptly() {
+    use agent_core::tool::ToolProgress;
+    let _serial = one_at_a_time().await;
+    let tool = beyond_ai_agent::tools::code_mode::Execute::new(vec![]);
+    let forever = json!({ "code": "while (true) {}" });
+    let quick = json!({ "code": "return 'next';" });
+
+    // Cancelled through the call's token, from another task on this runtime.
+    let token = tokio_util::sync::CancellationToken::new();
+    let (tx, _rx) = futures::channel::mpsc::unbounded();
+    let progress = ToolProgress::new(tx, "x".into(), "execute".into(), token.clone());
+    let canceller = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        token.cancel();
+    });
+    let started = Instant::now();
+    let err = tool
+        .run_streaming(forever.clone(), &progress)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("cancelled"), "{err}");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+    canceller.await.unwrap();
+    let next = tokio::time::timeout(Duration::from_secs(5), tool.run(quick.clone()))
+        .await
+        .expect("the slot is free again: the cancelled script was interrupted")
+        .unwrap();
+    assert_eq!(next.text, "next");
+
+    // Dropped mid-run, as an abort that drops the tool future does.
+    let dropped = tokio::time::timeout(Duration::from_millis(200), tool.run(forever)).await;
+    assert!(dropped.is_err(), "still spinning when dropped");
+    let next = tokio::time::timeout(Duration::from_secs(5), tool.run(quick))
+        .await
+        .expect("the slot is free again: the dropped script was interrupted")
+        .unwrap();
+    assert_eq!(next.text, "next");
 }

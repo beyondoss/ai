@@ -192,6 +192,16 @@ mod runtime {
         }
     }
 
+    /// Sets the evaluation's cancel flag when dropped, so its interrupt handler stops the script at
+    /// its next check however `execute` ends (returned, cancelled, or dropped mid-await).
+    struct InterruptOnDrop(Arc<AtomicBool>);
+
+    impl Drop for InterruptOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+
     /// The model-facing Code Mode tool.
     pub struct Execute {
         tools: Arc<BTreeMap<String, Arc<dyn Tool>>>,
@@ -248,19 +258,44 @@ mod runtime {
             let code = code.to_string();
             let progress = progress.clone();
 
-            let run = run_js(
-                tools,
-                catalog,
-                code,
-                calls,
-                max_calls,
-                memory_limit,
-                stack_size,
-                deadline,
-                timed_out.clone(),
-                cancelled.clone(),
-                progress.clone(),
-            );
+            // Take the process-wide slot *before* allocating a runtime, so two `serve` sessions never
+            // hold two QuickJS heaps at once. `acquire` is cancel-safe; a cancelled `execute` drops
+            // the wait without starving the holder. The permit then travels with the evaluation and
+            // is released when it really ends — after an interrupt, not merely when `execute` returns.
+            let permit = JS_SLOT
+                .acquire()
+                .await
+                .map_err(|_| ToolError::Execution("code mode runtime slot closed".into()))?;
+            // However `execute` ends — cancelled, or its future dropped by an abort — the evaluation
+            // is interrupted at its next check rather than left running to the deadline.
+            let _interrupt = InterruptOnDrop(cancelled.clone());
+
+            // QuickJS evaluates synchronously: a busy script (`while (true) {}`) holds whatever thread
+            // runs it until the interrupt fires. So it runs on the blocking pool, driven by a local
+            // executor, never on the runtime thread this session shares with others (their progress,
+            // their aborts). Host calls go back to this runtime (`install_bridge`).
+            let runtime = tokio::runtime::Handle::current();
+            let run = tokio::task::spawn_blocking({
+                let (timed_out, cancelled, progress) =
+                    (timed_out.clone(), cancelled.clone(), progress.clone());
+                move || {
+                    let _permit = permit;
+                    futures::executor::block_on(run_js(
+                        tools,
+                        catalog,
+                        code,
+                        calls,
+                        max_calls,
+                        memory_limit,
+                        stack_size,
+                        deadline,
+                        timed_out,
+                        cancelled,
+                        progress,
+                        runtime,
+                    ))
+                }
+            });
 
             tokio::select! {
                 biased;
@@ -269,6 +304,9 @@ mod runtime {
                     Err(ToolError::Execution("code mode cancelled".into()))
                 }
                 result = run => {
+                    let result = result.unwrap_or_else(|e| {
+                        Err(ToolError::Execution(format!("code mode evaluation failed: {e}")))
+                    });
                     if timed_out.load(Ordering::Relaxed) {
                         Err(ToolError::Execution(format!(
                             "code mode timed out after {}ms",
@@ -340,15 +378,8 @@ mod runtime {
         timed_out: Arc<AtomicBool>,
         cancelled: Arc<AtomicBool>,
         progress: ToolProgress,
+        host: tokio::runtime::Handle,
     ) -> Result<String, ToolError> {
-        // Take the process-wide slot *before* allocating a runtime, so two `serve` sessions never
-        // hold two QuickJS heaps at once. `acquire` is cancel-safe; a cancelled `execute` drops the
-        // wait without starving the holder.
-        let _permit = JS_SLOT
-            .acquire()
-            .await
-            .map_err(|_| ToolError::Execution("code mode runtime slot closed".into()))?;
-
         let catalog_json = serde_json::to_string(catalog.as_ref()).map_err(|e| {
             ToolError::Execution(format!("code mode catalog serialize failed: {e}"))
         })?;
@@ -388,7 +419,7 @@ mod runtime {
         .map_err(js_err)?;
 
         ctx.async_with(async move |ctx| -> Result<String, ToolError> {
-            install_bridge(&ctx, tools, calls, max_calls, progress)?;
+            install_bridge(&ctx, tools, calls, max_calls, progress, host)?;
             ctx.globals()
                 .set("__catalogJson", catalog_json)
                 .map_err(js_err)?;
@@ -408,6 +439,7 @@ mod runtime {
         calls: Arc<AtomicUsize>,
         max_calls: usize,
         progress: ToolProgress,
+        host: tokio::runtime::Handle,
     ) -> Result<(), ToolError> {
         let func = Function::new(
             ctx.clone(),
@@ -415,18 +447,33 @@ mod runtime {
                 let tools = tools.clone();
                 let calls = calls.clone();
                 let progress = progress.clone();
+                let host = host.clone();
                 async move {
-                    Ok::<String, rquickjs::Error>(
-                        invoke_nested(
-                            tools,
-                            calls,
-                            max_calls,
-                            name,
-                            input.0.unwrap_or_else(|| "{}".into()),
-                            progress,
-                        )
-                        .await,
-                    )
+                    // The evaluation runs on a blocking-pool thread; the host tool runs on the
+                    // session's runtime, where its connections and timers live. Raced against
+                    // cancellation, so an abort does not wait on a slow nested call.
+                    let nested = host.spawn(invoke_nested(
+                        tools,
+                        calls,
+                        max_calls,
+                        name,
+                        input.0.unwrap_or_else(|| "{}".into()),
+                        progress.clone(),
+                    ));
+                    let abort = nested.abort_handle();
+                    let answer =
+                        match futures::future::select(nested, Box::pin(progress.cancelled())).await
+                        {
+                            futures::future::Either::Left((Ok(answer), _)) => answer,
+                            futures::future::Either::Left((Err(e), _)) => {
+                                envelope(format!("nested tool call failed: {e}"), true)
+                            }
+                            futures::future::Either::Right(_) => {
+                                abort.abort();
+                                envelope("code mode cancelled", true)
+                            }
+                        };
+                    Ok::<String, rquickjs::Error>(answer)
                 }
             }),
         )

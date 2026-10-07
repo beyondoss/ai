@@ -52,9 +52,18 @@ pub struct Web {
     /// startup, for a tool a given session may never call. `OnceLock` keeps `new` trivial and builds the
     /// client exactly once, on demand.
     client: std::sync::OnceLock<reqwest::Client>,
+    /// The binary that answers the isolated parse (`None`: the usual lookup, see `isolate::parse`).
+    parser: Option<std::path::PathBuf>,
 }
 
 impl Web {
+    /// Builder-style: parse in this binary's `__web-parse` child instead of the usual lookup — for an
+    /// embedder (or a test) whose own executable is not the agent.
+    pub fn with_parser_binary(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.parser = Some(path.into());
+        self
+    }
+
     /// Configure the tool. `allow_private`/`allow_hosts` come from `--web-allow-private`/
     /// `--web-allow-host`; `timeout_ms` from `--web-timeout-ms` (else 30 s). The client is built lazily.
     pub fn new(allow_private: bool, allow_hosts: &[String], timeout_ms: Option<u64>) -> Self {
@@ -64,31 +73,45 @@ impl Web {
                 .map(Duration::from_millis)
                 .unwrap_or(DEFAULT_TIMEOUT),
             client: std::sync::OnceLock::new(),
+            parser: None,
         }
     }
 
     /// The owned client, built on first use. `redirect::Policy::none()` — we follow redirects ourselves
     /// so the SSRF URL check runs on each hop — plus the [`SsrfResolver`], so every connection (initial
     /// and any hop) validates the *resolved* IP.
-    fn client(&self) -> &reqwest::Client {
-        self.client.get_or_init(|| {
-            // Before *any* builder call: with reqwest's `rustls-no-provider`, a missing process-wide
-            // provider panics inside `build()` rather than returning `Err`, so the `unwrap_or_else`
-            // fallback below could never catch it (and its `Client::new()` would panic too).
-            agent_core::ensure_provider();
-            reqwest::Client::builder()
-                .user_agent(USER_AGENT)
-                .connect_timeout(Duration::from_secs(10))
-                .timeout(self.timeout)
-                .redirect(reqwest::redirect::Policy::none())
-                .dns_resolver(SsrfResolver::new(self.policy.clone()))
-                .build()
-                // The builder only fails if the TLS backend can't initialize — fatal and identical for
-                // every call, so a fallback default client that will error consistently on use beats
-                // panicking.
-                .unwrap_or_else(|_| reqwest::Client::new())
-        })
+    ///
+    /// Built on the blocking pool: the first build initializes the TLS provider and loads the root
+    /// certificates (tens of milliseconds of CPU, and file reads on some hosts), which must not hold
+    /// the runtime thread this session shares with others.
+    async fn client(&self) -> &reqwest::Client {
+        if let Some(client) = self.client.get() {
+            return client;
+        }
+        let (timeout, policy) = (self.timeout, self.policy.clone());
+        let built = tokio::task::spawn_blocking(move || build_client(timeout, policy))
+            .await
+            .unwrap_or_else(|_| reqwest::Client::new());
+        self.client.get_or_init(|| built)
     }
+}
+
+fn build_client(timeout: Duration, policy: EgressPolicy) -> reqwest::Client {
+    // Before *any* builder call: with reqwest's `rustls-no-provider`, a missing process-wide
+    // provider panics inside `build()` rather than returning `Err`, so the `unwrap_or_else`
+    // fallback below could never catch it (and its `Client::new()` would panic too).
+    agent_core::ensure_provider();
+    reqwest::Client::builder()
+        .user_agent(USER_AGENT)
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .dns_resolver(SsrfResolver::new(policy))
+        .build()
+        // The builder only fails if the TLS backend can't initialize — fatal and identical for
+        // every call, so a fallback default client that will error consistently on use beats
+        // panicking.
+        .unwrap_or_else(|_| reqwest::Client::new())
 }
 
 /// One request/response round trip's outcome, before mode-specific rendering.
@@ -119,7 +142,7 @@ impl Web {
         let start = Instant::now();
         let mut redirects = 0;
         loop {
-            let mut rb = self.client().request(req.method.clone(), url.clone());
+            let mut rb = self.client().await.request(req.method.clone(), url.clone());
             for (k, v) in &req.headers {
                 rb = rb.header(k, v);
             }
@@ -407,9 +430,31 @@ impl Tool for Web {
         let req = parse_request(&input)?;
         let fetched = self.fetch(&req).await?;
 
-        let text = match req.mode {
+        // Rendering is work over a body of up to megabytes, and every parsing mode spawns and waits on
+        // its isolated child (up to its timeout): all of it on the blocking pool, so the runtime
+        // thread this session shares with others is never held for it.
+        let mode = req.mode;
+        let input = input.clone();
+        let parser = self.parser.clone();
+        let text =
+            tokio::task::spawn_blocking(move || render(mode, &input, &fetched, parser.as_deref()))
+                .await
+                .map_err(|e| ToolError::Execution(format!("web: render task failed: {e}")))??;
+        Ok(text.into())
+    }
+}
+
+/// The tool's output for one fetched response. Blocking (see [`isolate::parse`]).
+fn render(
+    mode: Mode,
+    input: &Value,
+    fetched: &Fetched,
+    parser: Option<&std::path::Path>,
+) -> Result<String, ToolError> {
+    {
+        let text = match mode {
             // `fetch` always reports the status itself.
-            Mode::Fetch => render_fetch(&fetched),
+            Mode::Fetch => render_fetch(fetched),
             // The parsing modes work on the body regardless of status (an error page is still HTML), but
             // a model asking to `extract` from a 500 would otherwise get empty rows with no clue why —
             // so prepend the status when it isn't a success.
@@ -425,7 +470,7 @@ impl Tool for Web {
                 // Every parsing mode runs in a locked-down child: this is the one tool whose
                 // input is bytes an arbitrary web server chose, and `scraper`/`htmd` reach a large
                 // `unsafe` surface with them. See `isolate`'s module comment.
-                let parsed = isolate::parse(other, &input, &fetched.text())?;
+                let parsed = isolate::parse(parser, other, input, &fetched.text())?;
                 let rendered = match other {
                     Mode::Markdown => finalize(parsed, fetched.truncated),
                     _ => parsed,
@@ -434,7 +479,7 @@ impl Tool for Web {
                 out
             }
         };
-        Ok(text.into())
+        Ok(text)
     }
 }
 

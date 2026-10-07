@@ -89,8 +89,20 @@ enum Response {
 /// exactly as they would in-process. A child that crashes, is killed by its seccomp filter, or times
 /// out is reported as an execution error naming the cause — never silently retried in-process, which
 /// would defeat the point of the isolation.
-pub(super) fn parse(mode: Mode, input: &Value, html: &str) -> Result<String, ToolError> {
-    let exe = parser_binary()?;
+///
+/// Blocking — it spawns the child and waits on it (up to [`PARSE_TIMEOUT`]) — so it is called on the
+/// blocking pool, never on a runtime thread. `exe` overrides the parser binary (else
+/// `BEYOND_AI_AGENT_WEB_PARSER`, else this executable).
+pub(super) fn parse(
+    exe: Option<&std::path::Path>,
+    mode: Mode,
+    input: &Value,
+    html: &str,
+) -> Result<String, ToolError> {
+    let exe = match exe {
+        Some(exe) => exe.to_path_buf(),
+        None => parser_binary()?,
+    };
 
     let mut cmd = Command::new(exe);
     cmd.arg(SUBCOMMAND)
