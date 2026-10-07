@@ -34,7 +34,7 @@ use crate::settings::{McpServerConfig, McpTransport};
 
 /// Bumped whenever the cached shape changes. Part of the key, so an older manifest is simply a miss
 /// rather than something that has to be migrated.
-const MANIFEST_VERSION: u32 = 2;
+const MANIFEST_VERSION: u32 = 3;
 
 /// One server's advertised tools / resources / prompts, as they were when last discovered.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -56,6 +56,10 @@ pub struct CachedTool {
     pub remote_name: String,
     pub description: String,
     pub input_schema: serde_json::Value,
+    /// The tool's MCP Apps `_meta.ui` (view resource, visibility). Recorded only in the apps
+    /// manifest ([`ManifestDir::for_apps`]); absent from every plain one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ui: Option<crate::tools::mcp_apps::ToolUi>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -64,6 +68,10 @@ pub struct CachedResource {
     pub name: String,
     pub uri: String,
     pub description: String,
+    /// The size the server advertised, if it did — lets the host refuse an oversized MCP App view
+    /// without reading it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -105,24 +113,34 @@ pub fn invocation_key(config: &McpServerConfig) -> String {
 /// That actually happened: a reaping test started passing for the wrong reason because a previous
 /// run had left a manifest behind.
 #[derive(Debug, Clone)]
-pub struct ManifestDir(PathBuf);
+pub struct ManifestDir(PathBuf, &'static str);
 
 impl ManifestDir {
     /// The real location, under the agent's own state directory. It describes the *machine's*
     /// configured servers, so it belongs beside the other agent state rather than in a session.
     pub fn from_home() -> Option<Self> {
-        std::env::var_os("HOME").map(|h| Self(PathBuf::from(h).join(".claude")))
+        std::env::var_os("HOME").map(|h| Self(PathBuf::from(h).join(".claude"), FILE))
     }
 
     /// An explicit directory — what tests use, and what an embedder can point wherever it likes.
     pub fn at(dir: impl Into<PathBuf>) -> Self {
-        Self(dir.into())
+        Self(dir.into(), FILE)
+    }
+
+    /// The same directory's manifest for connections that advertise MCP Apps. A file of its own,
+    /// not a key in the shared one: a server may list different tools once the extension is
+    /// advertised, and the two flavors must never overwrite each other's answer.
+    pub fn for_apps(&self) -> Self {
+        Self(self.0.clone(), APPS_FILE)
     }
 
     fn file(&self) -> PathBuf {
-        self.0.join("mcp-manifest.json")
+        self.0.join(self.1)
     }
 }
+
+const FILE: &str = "mcp-manifest.json";
+const APPS_FILE: &str = "mcp-manifest-apps.json";
 
 type Store = BTreeMap<String, ServerManifest>;
 

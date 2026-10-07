@@ -885,8 +885,9 @@ impl Agent {
                 current_model.clone(),
                 // `Arc` pointer clone, not a deep copy of the transcript. The wire-shaped copy is
                 // `dialect::build_body` turning this history into a `serde_json::Value` (then
-                // immediately into compact JSON bytes — see `GatewayClient::stream`).
-                session.messages.clone(),
+                // immediately into compact JSON bytes — see `GatewayClient::stream`). With
+                // request-only blocks attached, the one place they join the history.
+                session.request_messages(),
                 self.max_tokens,
             )
             .with_tools(current_tool_defs.clone())
@@ -1257,6 +1258,12 @@ impl Agent {
                             msg.text, msg.images,
                         ));
                     }
+                }
+                // A user turn just started, so host-held context rides it — as a block of its own
+                // on the request, never in the user's text and never persisted (see
+                // `Session::attach_request_block`). With nothing injected it waited, above.
+                if let Some(context) = steering.take_turn_context() {
+                    session.attach_request_block(context);
                 }
                 sink(AgentEvent::Steered { messages: count });
                 // A plain user message ends the visible history here — a valid, resumable checkpoint
@@ -1811,6 +1818,12 @@ impl Agent {
                 }
             }
             session.push(Message::tool_results(result_blocks));
+            // Host-held context (an MCP App's `ui/update-model-context`) rides this same turn, as a
+            // request-only block of its own — see `Steering::set_turn_context` and
+            // `Session::attach_request_block`.
+            if let Some(context) = steering.take_turn_context() {
+                session.attach_request_block(context);
+            }
             // A tool round-trip just landed: assistant `tool_use` and its matching `tool_result`s are
             // both committed now, so this is a valid, resumable checkpoint (see `CheckpointHook`) — the
             // one mid-run point a crash between here and the run's eventual end would otherwise lose.
@@ -9256,6 +9269,83 @@ mod tests {
             seen["count"],
             json!(7),
             "the sequential-execution-path hook must also see the coerced numeric value: {seen:?}"
+        );
+    }
+
+    /// A turn-context source that yields `text` once, then nothing.
+    fn context_once(text: &str) -> crate::steering::TurnContextSource {
+        let pending = Arc::new(std::sync::Mutex::new(Some(text.to_string())));
+        Arc::new(move || pending.lock().ok().and_then(|mut p| p.take()))
+    }
+
+    #[tokio::test]
+    async fn turn_context_at_a_stop_boundary_is_a_request_block_not_the_follow_ups_text() {
+        let (agent, mock) = agent_with(
+            vec![turn::text("first reply"), turn::text("second reply")],
+            ToolRegistry::new(),
+        );
+        let mut session = Session::new();
+        session.user("hello");
+        let steering = Steering::new();
+        steering.push("the follow-up");
+        steering.set_turn_context(Some(context_once("CTX-BLOCK")));
+        agent
+            .run_events_steered(&mut session, |_| {}, CancellationToken::new(), steering)
+            .await
+            .unwrap();
+
+        // Persisted: the follow-up exactly as queued — no context spliced in, none stored.
+        assert_eq!(
+            session.messages[2].content,
+            vec![ContentBlock::text("the follow-up")]
+        );
+        // Sent: the context as a block of its own after the follow-up's text.
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].messages.iter().all(|m| m.content.len() == 1));
+        assert_eq!(
+            requests[1].messages[2].content,
+            vec![
+                ContentBlock::text("the follow-up"),
+                ContentBlock::text("CTX-BLOCK")
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_context_at_a_tool_results_boundary_is_a_request_block_never_persisted() {
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(EchoTool));
+        let (agent, mock) = agent_with(
+            vec![
+                turn::tool_call("tu_1", "echo", r#"{"text":"pong"}"#),
+                turn::text("done"),
+            ],
+            tools,
+        );
+        let mut session = Session::new();
+        session.user("hi");
+        let steering = Steering::new();
+        steering.set_turn_context(Some(context_once("CTX-BLOCK")));
+        agent
+            .run_events_steered(&mut session, |_| {}, CancellationToken::new(), steering)
+            .await
+            .unwrap();
+
+        // The tool-results turn holds only tool results; the context never reaches history.
+        let results = &session.messages[2];
+        assert!(
+            results
+                .content
+                .iter()
+                .all(|b| matches!(b, ContentBlock::ToolResult { .. })),
+            "{results:?}"
+        );
+        // The request after the tool round carries it, as the turn's last block.
+        let requests = mock.requests();
+        assert_eq!(
+            requests[1].messages[2].content.last(),
+            Some(&ContentBlock::text("CTX-BLOCK"))
         );
     }
 

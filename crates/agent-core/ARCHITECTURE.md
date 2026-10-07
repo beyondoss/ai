@@ -66,6 +66,18 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
   with images becomes a real `Message::user_with_images` turn instead of a plain-text one; a mid-run
   steer's images are appended as `ContentBlock::Image` blocks after its text block, onto the same
   tool-results turn its text rides on.
+- **Host-held turn context** — `Steering::set_turn_context(source)` installs a host callback the loop
+  pulls at every boundary that starts a user turn: after a tool-results turn mid-run, and after the
+  follow-up/steer turns injected at a stop boundary (never at a plain stop with nothing queued, so the
+  context alone never makes the model answer again). The source _takes_ what it returns, so each piece
+  reaches the model once. What it returns is attached with `Session::attach_request_block` — a
+  **request-only block**: appended, as its own content block, to that turn in every later request
+  (`Session::request_messages`, the one place requests read history) but never to `Session::messages`,
+  so it is not persisted, not part of the user's text, and not read by anything else (a title, an
+  export). Each block is pinned to its message by value, so it rides the same turn in every request —
+  keeping the request history byte-stable for the prompt cache — follows it through compaction
+  (`apply_summary` re-indexes kept blocks), and lapses if that message is rewritten or dropped.
+  `serve` uses this for MCP App views' `ui/update-model-context`.
 - **Mid-run model switching** — `Steering::request_model_switch(model, thinking?)` (pi's
   `prepareNextTurn`/`nextTurnSnapshot` equivalent) retargets every subsequent turn of a run already in
   flight, applied at the same turn boundary a graceful stop is checked — never mid-turn, so the request

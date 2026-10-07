@@ -1029,6 +1029,14 @@ pub fn apply_summary(session: &mut Session, first_kept: usize, summary: &str, to
     )));
     new_messages.extend_from_slice(kept);
     session.messages = Arc::new(new_messages);
+    // Request-only blocks on kept messages move with them; ones on summarized messages go with them.
+    for b in &mut session.request_blocks {
+        b.index = (b.index + 1).wrapping_sub(first_kept);
+    }
+    let messages = &session.messages;
+    session
+        .request_blocks
+        .retain(|b| messages.get(b.index).is_some_and(|m| *m == b.anchor));
     session.last_input_tokens = 0;
     // Rebase against the freshly-shrunk message list — a stale index from before the splice would
     // otherwise either panic (out of bounds) or, worse, silently under/over-count `trailing_tokens`

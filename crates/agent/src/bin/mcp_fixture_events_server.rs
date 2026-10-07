@@ -81,6 +81,9 @@ struct Hook {
 struct State {
     log: Vec<Occ>,
     methods: Vec<String>,
+    /// The subset of `methods` whose client advertised MCP Apps (`io.modelcontextprotocol/ui`) —
+    /// how a test tells an apps-flavored connection's requests from a plain one's.
+    ui_methods: Vec<String>,
     streams: HashMap<u64, StreamSub>,
     next_stream: u64,
     hooks: HashMap<String, Hook>,
@@ -444,6 +447,12 @@ async fn rpc(
     let events_down = {
         let mut st = state.lock().unwrap();
         st.methods.push(method.to_owned());
+        if params
+            .pointer("/_meta/io.modelcontextprotocol~1clientCapabilities/extensions/io.modelcontextprotocol~1ui")
+            .is_some()
+        {
+            st.ui_methods.push(method.to_owned());
+        }
         st.events_down
     };
     let no_events = env_flag("MCP_FIXTURE_NO_EVENTS");
@@ -915,7 +924,7 @@ async fn control(state: &Shared, method: &str, path: &str, body: &[u8]) -> (u16,
             (
                 200,
                 json!({
-                    "methods": st.methods, "hooks": hooks, "unsubscribes": st.unsubscribes,
+                    "methods": st.methods, "ui_methods": st.ui_methods, "hooks": hooks, "unsubscribes": st.unsubscribes,
                     "cancelled": st.cancelled, "verifications": st.verifications,
                     "deliveries": st.deliveries, "streams": st.streams.len(), "log": st.log.len(),
                 "requests": st.requests, "sessionless_rejections": st.sessionless_rejections,
