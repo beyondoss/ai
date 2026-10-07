@@ -235,3 +235,88 @@ fn a_flood_of_server_requests_on_an_events_stream_is_answered_one_at_a_time() {
         "answered one at a time, not a task per request"
     );
 }
+
+/// A runtime subscription restored when its session starts again (a restart here; a panic restart
+/// takes the same path) waits for the session to take questions too, like a configured one: its
+/// first `events/poll` raises a nested elicitation while a debug seam holds the session's gates off,
+/// and the question still reaches the session's client rather than being declined.
+#[test]
+fn a_restored_runtime_subscription_asks_only_once_the_session_takes_questions() {
+    let home = tempfile::tempdir().unwrap();
+    let control_file = home.path().join("control");
+    let session = home.path().join("s.jsonl");
+    let settings = |nested: bool| {
+        let mut env = json!({ "MCP_FIXTURE_HEARTBEAT_MS": "200" });
+        if nested {
+            env["MCP_FIXTURE_NESTED_DURING"] = json!("poll");
+        }
+        write_settings(
+            home.path(),
+            json!([stdio_server("tickets", &control_file, env, json!([]))]),
+        );
+    };
+    let spawn = |extra: &[(&str, &str)]| {
+        let (base, _bodies) = spawn_model_server_routed(vec![], turn_text("noted"));
+        let mut cmd = serve_cmd(BIN, &base, &session.to_string_lossy());
+        cmd.env("HOME", home.path())
+            .env("BEYOND_AI_AGENT_MCP_IDLE_SECS", "0")
+            .env("BEYOND_AI_AGENT_MCP_EVENTS_POLL_FLOOR_MS", "100")
+            .envs(extra.iter().copied())
+            .stderr(Stdio::null());
+        cmd.spawn_guarded()
+    };
+
+    // First run: a runtime subscription, polled, with no question asked.
+    settings(false);
+    let mut child = spawn(&[]);
+    let mut stdin = child.stdin.take().unwrap();
+    let mut frames = Frames::new(&mut child, None);
+    send(
+        &mut stdin,
+        json!({ "type": "mcp_events_subscribe", "id": "s", "server": "tickets",
+                "name": "ticket.updated", "delivery": "poll", "action": "notify" }),
+    );
+    assert_eq!(frames.response("s")["success"], true);
+    let control = wait_control_file(&control_file);
+    eventually(
+        Duration::from_secs(20),
+        "the runtime subscription polled",
+        || {
+            let polls = state(&control)["methods"]
+                .as_array()?
+                .iter()
+                .filter(|m| *m == "events/poll")
+                .count();
+            (polls > 0).then_some(())
+        },
+    );
+    drop(stdin);
+    child.wait().unwrap();
+    let _ = std::fs::remove_file(&control_file);
+
+    // Second run: restored from the state, and its server asks during the first poll, while the
+    // session is still installing the gates that would take the question.
+    settings(true);
+    let mut child = spawn(&[("BEYOND_AI_AGENT_TEST_SLOW_GATE_INSTALL_MS", "1500")]);
+    let mut stdin = child.stdin.take().unwrap();
+    let mut frames = Frames::new(&mut child, None);
+    let control = wait_control_file(&control_file);
+    let ask = frames.wait(
+        Duration::from_secs(30),
+        "the restored subscription's nested elicitation",
+        |f| f["type"] == "elicitation_request",
+    );
+    send(
+        &mut stdin,
+        json!({ "type": "elicit", "request_id": ask["request_id"], "action": "accept",
+                "content": { "ok": true } }),
+    );
+    let answers = eventually(Duration::from_secs(20), "the server's answer", || {
+        let a = state(&control)["nested_answers"].as_array()?.clone();
+        (!a.is_empty()).then_some(a)
+    });
+    assert_eq!(
+        answers[0]["answer"]["result"]["action"], "accept",
+        "the session's client answered, not a decline: {answers:#?}"
+    );
+}

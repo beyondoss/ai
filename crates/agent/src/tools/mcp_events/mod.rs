@@ -496,6 +496,12 @@ struct Hub {
     /// `mcp_events_*` commands in flight — spawned so none ever blocks the session's command loop.
     command_tasks: Mutex<tokio::task::JoinSet<()>>,
     owns_configured: bool,
+    /// Cancelled once the session can take a server's questions (its elicitation and sampling gates
+    /// are installed; see [`McpEventsHub::start`]). Every subscription waits for it before its first
+    /// request — configured ones, runtime ones restored after a restart or a panic, resubscriptions —
+    /// since a server may ask during the very first `events/poll`, and asked before then the
+    /// question would be declined as having no client.
+    questions_ready: CancellationToken,
     /// The last few over-cap messages a stdio connection reported to every push stream at once
     /// (`$dropped_id`): each is told to the model once, however many of this session's
     /// subscriptions it reached.
@@ -557,6 +563,7 @@ impl McpEventsHub {
             store,
             command_tasks: Mutex::new(tokio::task::JoinSet::new()),
             owns_configured: cfg.owns_configured,
+            questions_ready: CancellationToken::new(),
             dropped_seen: Mutex::new(std::collections::VecDeque::new()),
         });
         let weak_hub = Arc::downgrade(&hub);
@@ -569,22 +576,14 @@ impl McpEventsHub {
         // session will subscribe again — configured ones (re-created from settings) and runtime
         // ones (restored from the state) — so a delivery the server retried across a restart gets
         // `503` (retry), not `410` (stop), until the subscription has re-registered; then restore
-        // the runtime ones. (`start_configured` runs right after `attach`, before this does.)
+        // the runtime ones, which make no request before `start` (see `Hub::questions_ready`).
         {
             let weak_hub = Arc::downgrade(&hub);
             tokio::spawn(async move {
                 let Some(store) = weak_hub.upgrade().map(|h| h.store.clone()) else {
                     return;
                 };
-                // Debug builds: a test can hold the state read off, to show what a delivery that
-                // arrives before it is told (retry, not stop).
-                #[cfg(debug_assertions)]
-                if let Some(ms) = std::env::var("BEYOND_AI_AGENT_TEST_SLOW_EVENTS_RESTORE_MS")
-                    .ok()
-                    .and_then(|v| v.parse::<u64>().ok())
-                {
-                    tokio::time::sleep(Duration::from_millis(ms)).await;
-                }
+                simulated_slow_restore().await;
                 store.loaded().await;
                 let Some(hub) = weak_hub.upgrade() else {
                     return;
@@ -611,11 +610,9 @@ impl McpEventsHub {
                         }
                     }
                 }
-                // The daemon held every unknown token at `503` until this session's tokens were
-                // reserved (`webhook::restore_pending`); they are now.
-                if hub.owns_configured {
-                    webhook::restored();
-                }
+                // The daemon may be holding every unknown token at `503` until this session's
+                // tokens are reserved (`webhook::restore_pending`); they are now.
+                webhook::restored(&hub.session_id);
                 for (key, spec) in runtime {
                     hub.restoring
                         .lock()
@@ -646,7 +643,11 @@ impl McpEventsHub {
     /// a failed subscribe is retried with capped backoff for as long as the session runs, and so is
     /// a subscription the server later ends. Failures surface as `mcp_event_status` frames and on
     /// stderr, and stay visible in `mcp_events_list`.
-    pub fn start_configured(&self) {
+    /// The session can take a server's questions now: let every subscription make its first
+    /// request (see `Hub::questions_ready`), and start the configured ones this session owns. Call
+    /// once the session's elicitation and sampling gates are installed.
+    pub fn start(&self) {
+        self.hub.questions_ready.cancel();
         if !self.hub.owns_configured {
             return;
         }
@@ -773,6 +774,21 @@ impl McpEventsHub {
         }
     }
 }
+
+/// Debug builds: a test can hold a session's state read off, to show what a delivery that arrives
+/// before it is told (retry, not stop), and that a restored subscription still asks nothing early.
+#[cfg(debug_assertions)]
+async fn simulated_slow_restore() {
+    if let Some(ms) = std::env::var("BEYOND_AI_AGENT_TEST_SLOW_EVENTS_RESTORE_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        tokio::time::sleep(Duration::from_millis(ms)).await;
+    }
+}
+
+#[cfg(not(debug_assertions))]
+async fn simulated_slow_restore() {}
 
 /// The ids of (at most `max`) the sessions in `dir` whose events state holds runtime subscriptions
 /// still worth restoring (see [`state::runtime_still_wanted`]) — for a daemon to start at boot, so
@@ -1523,8 +1539,14 @@ impl Hub {
         hub.refresh_keep_alive();
         let weak = Arc::downgrade(hub);
         let shutdown = hub.shutdown.clone();
+        let ready = hub.questions_ready.clone();
         let resumed = !delay.is_zero() && !restoring;
         tokio::spawn(async move {
+            // Not a request before the session can take the server's questions.
+            tokio::select! {
+                () = ready.cancelled() => {}
+                () = shutdown.cancelled() => return,
+            }
             let mut delay = delay;
             let mut failures = 0u32;
             let mut forbidden_streak = 0u32;

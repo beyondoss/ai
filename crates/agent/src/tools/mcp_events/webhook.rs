@@ -105,35 +105,55 @@ fn reserved() -> std::sync::MutexGuard<'static, HashMap<String, std::time::Insta
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Until when *every* unknown token is answered `503` (retry) rather than `410` (stop): from a
-/// daemon's start until its MCP Events session has read its persisted state and reserved the tokens
-/// in it ([`restore_pending`], [`restored`]). Without it, a delivery the server retried across a
-/// restart that lands before the state is read would be told to stop for good.
-static RESTORING_UNTIL: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+/// While set, *every* unknown token is answered `503` (retry) rather than `410` (stop): from a
+/// daemon's start until each session it starts to restore persisted callbacks (the events session,
+/// and every session holding runtime subscriptions) has read its state and reserved the tokens in it
+/// ([`restore_pending`], [`restored`]), and for at most [`RESERVE_FOR`]. Without it, a delivery the
+/// server retried across a restart that lands before the state is read would be told to stop for
+/// good.
+static RESTORING: Mutex<Option<Restoring>> = Mutex::new(None);
 
-fn restoring_until() -> std::sync::MutexGuard<'static, Option<std::time::Instant>> {
-    RESTORING_UNTIL
+struct Restoring {
+    until: std::time::Instant,
+    /// The sessions still to reserve their tokens.
+    sessions: std::collections::HashSet<String>,
+}
+
+fn restoring_state() -> std::sync::MutexGuard<'static, Option<Restoring>> {
+    RESTORING
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// A daemon whose events session will restore persisted callbacks is starting: answer unknown
-/// tokens `503` until it has ([`restored`]), or for at most [`RESERVE_FOR`].
-pub fn restore_pending() {
-    *restoring_until() = Some(std::time::Instant::now() + RESERVE_FOR);
+/// A daemon is starting `sessions` to restore their persisted callbacks: answer unknown tokens
+/// `503` until each has reserved its own ([`restored`]), or for at most [`RESERVE_FOR`]. Nothing to
+/// restore, nothing held.
+pub fn restore_pending(sessions: impl IntoIterator<Item = String>) {
+    let sessions: std::collections::HashSet<String> = sessions.into_iter().collect();
+    *restoring_state() = (!sessions.is_empty()).then(|| Restoring {
+        until: std::time::Instant::now() + RESERVE_FOR,
+        sessions,
+    });
 }
 
-/// The events session has reserved every token it persisted: unknown tokens are `410` again.
-pub(super) fn restored() {
-    *restoring_until() = None;
+/// `session` has reserved every token it persisted. Once every session restore was waiting on has,
+/// unknown tokens are `410` again.
+pub(super) fn restored(session: &str) {
+    let mut state = restoring_state();
+    if let Some(r) = state.as_mut() {
+        r.sessions.remove(session);
+        if r.sessions.is_empty() {
+            *state = None;
+        }
+    }
 }
 
 fn restoring() -> bool {
-    let mut until = restoring_until();
-    match *until {
-        Some(t) if t > std::time::Instant::now() => true,
+    let mut state = restoring_state();
+    match state.as_ref() {
+        Some(r) if r.until > std::time::Instant::now() => true,
         Some(_) => {
-            *until = None;
+            *state = None;
             false
         }
         None => false,

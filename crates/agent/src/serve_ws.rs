@@ -1855,10 +1855,36 @@ pub async fn serve_ws(
     let mut shutdown = crate::serve::ShutdownSignal::new()?;
 
     let events_session_id = events_session.clone();
-    if events_session.is_some() && cfg_has_callback {
-        // Until the events session has read its state, a delivery for a callback it persisted
-        // must be told to retry, not to stop (see `mcp_events::restore_pending`).
-        crate::tools::mcp_events::restore_pending();
+    // Sessions holding runtime MCP Events subscriptions (`mcp_events_subscribe`), started below
+    // after the events session. Listed now so the restore window covers them too.
+    let runtime_sessions: Vec<String> = match supervisor.session_dir.clone() {
+        Some(dir) => {
+            let events_id = events_session_id.clone();
+            tokio::task::spawn_blocking(move || {
+                // Bounded: a pile of old sessions cannot all be woken at every boot.
+                crate::tools::mcp_events::sessions_with_runtime_subscriptions(
+                    std::path::Path::new(&dir),
+                    crate::tools::mcp_events::max_restored_sessions(),
+                )
+            })
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|id| Some(id.as_str()) != events_id.as_deref())
+            .collect()
+        }
+        None => Vec::new(),
+    };
+    if cfg_has_callback {
+        // Until every session started to restore persisted callbacks has read its state, a
+        // delivery for one of them must be told to retry, not to stop (see
+        // `mcp_events::restore_pending`). Configured subscriptions and runtime ones alike.
+        crate::tools::mcp_events::restore_pending(
+            events_session
+                .iter()
+                .cloned()
+                .chain(runtime_sessions.iter().cloned()),
+        );
     }
     if let Some(id) = events_session {
         // Pinned and at once unpinned: the session starts exactly as if a client had connected and
@@ -1941,21 +1967,8 @@ pub async fn serve_ws(
     // Sessions holding runtime MCP Events subscriptions (`mcp_events_subscribe`) are started too,
     // the same way, so those subscriptions are restored after a restart without waiting for their
     // client to come back. Never in service mode.
-    if let Some(dir) = supervisor.session_dir.clone() {
-        let events_id = events_session_id.clone();
-        let ids = tokio::task::spawn_blocking(move || {
-            // Bounded: a pile of old sessions cannot all be woken at every boot.
-            crate::tools::mcp_events::sessions_with_runtime_subscriptions(
-                std::path::Path::new(&dir),
-                crate::tools::mcp_events::max_restored_sessions(),
-            )
-        })
-        .await
-        .unwrap_or_default();
-        for id in ids
-            .into_iter()
-            .filter(|id| Some(id.as_str()) != events_id.as_deref())
-        {
+    {
+        for id in runtime_sessions {
             match supervisor.pin(Some(id.clone()), None).await {
                 Ok(p) => {
                     supervisor.unpin(&p.id, p.incarnation);

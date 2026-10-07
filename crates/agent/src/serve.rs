@@ -3204,7 +3204,7 @@ pub(crate) async fn serve_session(
     );
     mcp_host.sampling.install(sampling_gate);
     if let Some(hub) = &mcp_events {
-        hub.start_configured();
+        hub.start();
     }
     // Where an MCP App view's `mcp_app_open`/`mcp_app_result` frames go: this session's fanout,
     // held weakly like the elicitation gate's, so a view-bearing tool cannot keep it alive.
