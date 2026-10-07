@@ -380,3 +380,80 @@ fn a_panic_inside_serve_exits_promptly_and_still_sweeps() {
     );
     drop(stdin);
 }
+
+/// In a daemon, a panic inside one session is contained to it: that session's clients get an
+/// `error` frame and the session ends, the daemon keeps serving the others, and a later SIGTERM
+/// still exits promptly with the stdio servers swept.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_panic_in_a_daemon_session_ends_that_session_only() {
+    let home = tempfile::tempdir().unwrap();
+    let pidfile = home.path().join("orphan.pid");
+    write_settings(
+        home.path(),
+        json!([stdio_server(
+            "tools",
+            &home.path().join("control"),
+            json!({ "MCP_FIXTURE_ORPHAN_PIDFILE": pidfile.to_string_lossy() }),
+            json!([])
+        )]),
+    );
+    let (base, _bodies) = spawn_model_server_routed(vec![], turn_text("noted"));
+    let port = common::free_port();
+    let mut daemon = common::mcp_events_fixture::spawn_daemon_env(
+        home.path(),
+        &base,
+        port,
+        &[],
+        &[
+            ("BEYOND_AI_AGENT_TEST_PANICS", "1"),
+            ("BEYOND_AI_AGENT_MCP_IDLE_SECS", "0"),
+        ],
+    );
+    let mut victim = common::ws_connect(port, Some("victim")).await;
+    let mut survivor = common::ws_connect(port, Some("survivor")).await;
+    for ws in [&mut victim, &mut survivor] {
+        common::ws_send(ws, json!({ "type": "get_mcp", "id": "m" })).await;
+        common::mcp_events_fixture::ws_next(ws, Duration::from_secs(20), "get_mcp", |f| {
+            f["type"] == "response" && f["id"] == "m"
+        })
+        .await;
+    }
+    let orphan: u32 = eventually(Duration::from_secs(10), "the orphan's pid", || {
+        std::fs::read_to_string(&pidfile).ok()?.trim().parse().ok()
+    });
+
+    common::ws_send(&mut victim, json!({ "type": "__test_panic", "id": "boom" })).await;
+    let err = common::mcp_events_fixture::ws_next(
+        &mut victim,
+        Duration::from_secs(20),
+        "the panicking session's error frame",
+        |f| f["type"] == "error",
+    )
+    .await;
+    assert_eq!(err["session_id"], "victim", "{err:#}");
+    assert!(
+        err["error"].as_str().unwrap().contains("internal error"),
+        "{err:#}"
+    );
+
+    // The daemon, and every other session, carry on.
+    common::ws_send(&mut survivor, json!({ "type": "get_state", "id": "s" })).await;
+    let state = common::mcp_events_fixture::ws_next(
+        &mut survivor,
+        Duration::from_secs(20),
+        "the other session still answering",
+        |f| f["type"] == "response" && f["id"] == "s",
+    )
+    .await;
+    assert_eq!(state["success"], true, "{state:#}");
+    assert!(
+        daemon.try_wait().unwrap().is_none(),
+        "the daemon is still up"
+    );
+
+    common::mcp_events_fixture::sigterm_and_wait(&mut daemon);
+    assert!(
+        !alive(orphan),
+        "the daemon exited and left its stdio server's grandchild {orphan} running"
+    );
+}

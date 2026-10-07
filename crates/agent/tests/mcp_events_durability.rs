@@ -434,4 +434,21 @@ fn a_steered_batch_summarized_away_by_a_mid_run_compaction_is_not_injected_again
         1,
         "the model received the first event once, and it was not injected again"
     );
+    // And it is recorded as delivered, durably: nothing is pending on disk, and the log holds the
+    // `done` records that say so.
+    let state_file = std::fs::read_dir(&sessions)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.to_string_lossy().ends_with(".mcp-events.json"))
+        .expect("the session's events state");
+    eventually(
+        Duration::from_secs(10),
+        "the pending queue on disk to drain",
+        || pending_on_disk(&state_file).is_empty().then_some(()),
+    );
+    let log = std::fs::read_to_string(state_file.with_extension("log")).unwrap();
+    assert!(
+        log.lines().filter(|l| l.contains("\"done\"")).count() >= 2,
+        "both events have durable `done` records: {log}"
+    );
 }

@@ -335,3 +335,49 @@ async fn a_permanently_refused_configured_subscription_is_reported_and_does_not_
         "a refused subscription does not keep its session alive"
     );
 }
+
+/// The session that owns the configured subscriptions is restarted after a panic, so configured
+/// triggers keep working without waiting for a daemon restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_events_session_is_restarted_after_a_panic() {
+    let (_fx, mcp_url, fixture) = spawn_http_fixture(&[]);
+    let home = tempfile::tempdir().unwrap();
+    write_settings(
+        home.path(),
+        json!([{
+            "name": "tickets", "transport": "http", "url": mcp_url,
+            "events": [{ "name": "ticket.updated", "delivery": "poll", "action": "follow_up" }],
+        }]),
+    );
+    let (base, bodies) = spawn_model_server_routed(vec![], turn_text("noted"));
+    let port = free_port();
+    let _d = common::mcp_events_fixture::spawn_daemon_env(
+        home.path(),
+        &base,
+        port,
+        &[],
+        &[
+            ("BEYOND_AI_AGENT_TEST_PANICS", "1"),
+            ("BEYOND_AI_AGENT_MCP_EVENTS_POLL_FLOOR_MS", "100"),
+        ],
+    );
+    let mut ws = ws_connect(port, Some(EVENTS_SESSION)).await;
+    common::ws_send(&mut ws, json!({ "type": "__test_panic", "id": "boom" })).await;
+    ws_next(&mut ws, Duration::from_secs(20), "the error frame", |f| {
+        f["type"] == "error"
+    })
+    .await;
+    drop(ws);
+    // Back on its own: a configured event emitted now reaches the model.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    emit(
+        &fixture,
+        json!({ "event_id": "after-panic-1", "data": { "summary": "after the panic" } }),
+    );
+    eventually(
+        Duration::from_secs(20),
+        "the event reaching the model",
+        || (runs_for_event(&bodies, "after the panic") >= 1).then_some(()),
+    );
+    assert_eq!(daemon_sessions(port).await.get(EVENTS_SESSION), Some(&true));
+}

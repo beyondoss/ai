@@ -142,3 +142,46 @@ async fn in_a_daemon_a_nested_elicitation_during_an_events_poll_reaches_the_even
     .unwrap_or(false);
     assert!(!stray, "another session's client was asked");
 }
+
+/// Over direct HTTP (a stateless `2026-07-28` server) nothing routes a server→client request to a
+/// session, so it is answered at once with an error — never left unanswered, holding the server.
+fn nested_over_direct_http(during: &str, delivery: &str) {
+    let (_fx, mcp_url, control) = common::mcp_events_fixture::spawn_http_fixture(&[
+        ("MCP_FIXTURE_NESTED_DURING", during),
+        ("MCP_FIXTURE_HEARTBEAT_MS", "200"),
+    ]);
+    let home = tempfile::tempdir().unwrap();
+    write_settings(
+        home.path(),
+        json!([{
+            "name": "tickets", "transport": "http", "url": mcp_url,
+            "events": [{ "name": "ticket.updated", "delivery": delivery, "action": "notify" }],
+        }]),
+    );
+    let (base, _bodies) = spawn_model_server_routed(vec![], turn_text("noted"));
+    let mut cmd = serve_cmd(BIN, &base, &home.path().join("s.jsonl").to_string_lossy());
+    cmd.env("HOME", home.path())
+        .env("BEYOND_AI_AGENT_MCP_IDLE_SECS", "0")
+        .env("BEYOND_AI_AGENT_MCP_EVENTS_POLL_FLOOR_MS", "100")
+        .stderr(Stdio::null());
+    let _child = cmd.spawn_guarded();
+    let answers = eventually(Duration::from_secs(15), "the server's answer", || {
+        let a = state(&control)["nested_answers"].as_array()?.clone();
+        (!a.is_empty()).then_some(a)
+    });
+    assert_eq!(answers[0]["during"], during);
+    assert!(
+        answers[0]["answer"]["error"].is_object(),
+        "refused at once, not left to time out: {answers:#?}"
+    );
+}
+
+#[test]
+fn over_direct_http_a_nested_request_during_an_events_poll_is_refused_not_ignored() {
+    nested_over_direct_http("poll", "poll");
+}
+
+#[test]
+fn over_direct_http_a_nested_request_during_an_events_stream_is_refused_not_ignored() {
+    nested_over_direct_http("stream", "push");
+}

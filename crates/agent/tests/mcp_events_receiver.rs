@@ -10,8 +10,9 @@ mod common;
 use std::time::{Duration, Instant};
 
 use common::mcp_events_fixture::{
-    EVENTS_SESSION, control, emit, eventually, raw_request, runs_for_event, spawn_daemon_env,
-    spawn_daemon_on, spawn_http_fixture, state, write_settings, ws_next, ws_wait_active,
+    EVENTS_SESSION, control, daemon_sessions, emit, eventually, raw_request, runs_for_event,
+    spawn_daemon_env, spawn_daemon_on, spawn_http_fixture, state, write_settings, ws_next,
+    ws_wait_active,
 };
 use common::{ChildGuard, HeldPort, spawn_model_server_routed, turn_text, ws_connect, ws_send};
 use serde_json::{Value, json};
@@ -368,4 +369,89 @@ async fn a_runtime_subscription_is_restored_after_a_restart_without_its_client()
         "the owning session's model run",
         || (runs_for_event(&bodies, "restored runtime") >= 1).then_some(()),
     );
+}
+
+/// A runtime subscription whose server is gone from settings does not pin its session forever: the
+/// restore after a restart is refused for good (an unknown server), the subscription is forgotten,
+/// the session is reaped like any idle one, and the next restart does not bring it back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_runtime_subscription_to_a_removed_server_is_forgotten_not_resurrected() {
+    let (_fx, mcp_url, _fixture) = spawn_http_fixture(&[("MCP_FIXTURE_ALLOW_HTTP_CALLBACK", "1")]);
+    let home = tempfile::tempdir().unwrap();
+    let mut servers = hooks(&mcp_url, "notify");
+    servers[0]["events"] = json!([]);
+    write_settings(home.path(), servers.clone());
+    let (base, _bodies) = spawn_model_server_routed(vec![], turn_text("noted"));
+    let port = free_port();
+    let mut first = daemon(home.path(), &base, port, &[]);
+    let mut ws = ws_connect(port, Some("orphaned")).await;
+    ws_send(
+        &mut ws,
+        json!({ "type": "mcp_events_subscribe", "id": "s", "server": "hooks", "name": "ticket.updated",
+                "delivery": "webhook", "action": "notify" }),
+    )
+    .await;
+    let r = ws_next(&mut ws, Duration::from_secs(20), "the subscribe", |f| {
+        f["type"] == "response" && f["id"] == "s"
+    })
+    .await;
+    assert_eq!(r["success"], true, "{r:#}");
+    let has_runtime = |home: &std::path::Path| {
+        std::fs::read_dir(home.join("sessions"))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.to_string_lossy().ends_with(".mcp-events.json"))
+            .any(|p| {
+                std::fs::read_to_string(p)
+                    .unwrap_or_default()
+                    .contains("\"runtime\"")
+            })
+    };
+    eventually(Duration::from_secs(10), "the runtime spec on disk", || {
+        has_runtime(home.path()).then_some(())
+    });
+    drop(ws);
+    common::mcp_events_fixture::sigterm_and_wait(&mut first);
+
+    // The server is renamed: nothing called `hooks` exists any more.
+    servers[0]["name"] = json!("hooks-renamed");
+    write_settings(home.path(), servers);
+    let port = free_port();
+    let mut second = common::mcp_events_fixture::spawn_daemon(
+        home.path(),
+        &base,
+        port,
+        &["--session-idle-timeout", "1"],
+    );
+    let mut reaped = false;
+    for _ in 0..100 {
+        if daemon_sessions(port).await.get("orphaned") == Some(&false) {
+            reaped = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(reaped, "nothing keeps the session alive: it is reaped");
+    assert!(
+        !has_runtime(home.path()),
+        "the dead subscription is forgotten"
+    );
+    common::mcp_events_fixture::sigterm_and_wait(&mut second);
+
+    // And a further restart does not resurrect it.
+    let port = free_port();
+    let _third = common::mcp_events_fixture::spawn_daemon(
+        home.path(),
+        &base,
+        port,
+        &["--session-idle-timeout", "1"],
+    );
+    for _ in 0..15 {
+        assert_ne!(
+            daemon_sessions(port).await.get("orphaned"),
+            Some(&true),
+            "not started again at boot"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
 }

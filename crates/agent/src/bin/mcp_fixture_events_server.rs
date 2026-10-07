@@ -111,6 +111,55 @@ struct State {
     /// `MCP_FIXTURE_NESTED_DURING=poll|stream`: the client's answers to the nested
     /// `elicitation/create` raised during that `events/*` request.
     nested_answers: Vec<Value>,
+    /// `MCP_FIXTURE_FORBID_FIRST=<n>`: the first `n` `events/poll`/`events/subscribe` requests are
+    /// refused with `-32012` (forbidden) — credentials that are refreshed and then work.
+    forbid_left: u64,
+    /// Answers the client POSTed to requests this server raised over HTTP (`id` and no `method`).
+    client_answers: Vec<Value>,
+    /// Whether the HTTP nested request (`MCP_FIXTURE_NESTED_DURING`) has been raised.
+    http_nested_done: bool,
+}
+
+/// The nested `elicitation/create` this server raises toward the client during an `events/*`
+/// request (`MCP_FIXTURE_NESTED_DURING`).
+fn nested_request(during: &str) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": format!("nested-{during}"),
+        "method": "elicitation/create",
+        "params": {
+            "mode": "form",
+            "message": format!("Approve during events/{during}?"),
+            "requestedSchema": { "type": "object", "properties": { "ok": { "type": "boolean" } } },
+        },
+    })
+}
+
+/// Over HTTP: wait for the client's answer to the nested request, and record it (or a timeout).
+async fn await_http_answer(state: &Shared, during: &str) {
+    let id = json!(format!("nested-{during}"));
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let answer = loop {
+        let found = state
+            .lock()
+            .unwrap()
+            .client_answers
+            .iter()
+            .find(|a| a["id"] == id)
+            .cloned();
+        if let Some(a) = found {
+            break a;
+        }
+        if std::time::Instant::now() > deadline {
+            break json!({ "timeout": true });
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    state
+        .lock()
+        .unwrap()
+        .nested_answers
+        .push(json!({ "during": during, "answer": answer }));
 }
 
 fn env_flag(name: &str) -> bool {
@@ -447,16 +496,20 @@ async fn rpc(
     params: Value,
     principal: Option<String>,
 ) -> Result<Value, RpcErr> {
-    let events_down = {
+    let (events_down, forbidden) = {
         let mut st = state.lock().unwrap();
         st.methods.push(method.to_owned());
+        let forbidden = matches!(method, "events/poll" | "events/subscribe") && st.forbid_left > 0;
+        if forbidden {
+            st.forbid_left -= 1;
+        }
         if params
             .pointer("/_meta/io.modelcontextprotocol~1clientCapabilities/extensions/io.modelcontextprotocol~1ui")
             .is_some()
         {
             st.ui_methods.push(method.to_owned());
         }
-        st.events_down
+        (st.events_down, forbidden)
     };
     let no_events = env_flag("MCP_FIXTURE_NO_EVENTS");
     let capabilities = if no_events {
@@ -482,18 +535,7 @@ async fn rpc(
             "name": "echo",
             "description": "Echoes back its `text` argument.",
             "inputSchema": { "type": "object", "properties": { "text": { "type": "string" } } }
-        }, {
-            "name": "blob",
-            "description": "Returns a text result of `bytes` bytes.",
-            "inputSchema": { "type": "object", "properties": { "bytes": { "type": "integer" } } }
         }] })),
-        "tools/call" if params["name"] == "blob" => {
-            let n = params
-                .pointer("/arguments/bytes")
-                .and_then(Value::as_u64)
-                .unwrap_or(0) as usize;
-            Ok(json!({ "content": [{ "type": "text", "text": "x".repeat(n) }], "isError": false }))
-        }
         "tools/call" => {
             let text = params
                 .pointer("/arguments/text")
@@ -507,6 +549,7 @@ async fn rpc(
         m if m.starts_with("events/") && events_down => {
             Err(err(-32603, &format!("temporarily unavailable: {m}")))
         }
+        m if forbidden => Err(err(-32012, &format!("forbidden: {m}"))),
         "events/list" => {
             // `MCP_FIXTURE_LIST_DELAY_MS`: a slow server, for concurrency tests.
             let delay = env_u64("MCP_FIXTURE_LIST_DELAY_MS", 0);
@@ -1322,6 +1365,11 @@ async fn handle_http(state: Shared, mut stream: TcpStream) {
         }
         return respond(&mut stream, 202, "text/plain", b"").await;
     };
+    // An answer to a request this server raised: kept for whoever is waiting on it.
+    if msg.get("method").is_none() {
+        state.lock().unwrap().client_answers.push(msg.clone());
+        return respond(&mut stream, 202, "text/plain", b"").await;
+    }
     // Stateless streamable HTTP (2026-07-28) requires `Mcp-Method` to match the body, as the
     // official Python SDK enforces — so a client that forgets it fails here, not in production.
     if !legacy && req.headers.get("mcp-method").map(String::as_str) != Some(method.as_str()) {
@@ -1339,13 +1387,49 @@ async fn handle_http(state: Shared, mut stream: TcpStream) {
         .get("authorization")
         .and_then(|a| a.strip_prefix("Bearer "))
         .map(str::to_owned);
+    let nested_during = std::env::var("MCP_FIXTURE_NESTED_DURING").unwrap_or_default();
+    let raise_nested = |during: &str| {
+        nested_during == during
+            && !std::mem::replace(&mut state.lock().unwrap().http_nested_done, true)
+    };
+    // `MCP_FIXTURE_NESTED_DURING=poll` over HTTP: the first `events/poll` is answered as an SSE
+    // stream that raises the nested request first, and carries the result only after the client
+    // has answered it (or the wait has timed out).
+    if method == "events/poll" && raise_nested("poll") {
+        let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
+        let _ = stream.write_all(head.as_bytes()).await;
+        let _ = stream
+            .write_all(format!("data: {}\n\n", nested_request("poll")).as_bytes())
+            .await;
+        let _ = stream.flush().await;
+        await_http_answer(&state, "poll").await;
+        let body = match rpc(&state, &method, params, principal).await {
+            Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": like_a_2026_server(result)}),
+            Err((code, message, data)) => {
+                json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message, "data": data}})
+            }
+        };
+        let _ = stream
+            .write_all(format!("data: {body}\n\n").as_bytes())
+            .await;
+        return;
+    }
     if method == "events/stream" {
+        let nested = raise_nested("stream");
         match open_stream(&state, &params, id.clone()) {
             Ok((key, mut rx)) => {
                 let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
                 if stream.write_all(head.as_bytes()).await.is_err() {
                     state.lock().unwrap().streams.remove(&key);
                     return;
+                }
+                if nested {
+                    let _ = stream
+                        .write_all(format!("data: {}\n\n", nested_request("stream")).as_bytes())
+                        .await;
+                    let _ = stream.flush().await;
+                    let state = state.clone();
+                    tokio::spawn(async move { await_http_answer(&state, "stream").await });
                 }
                 let terminated_end = loop {
                     let Some(frame) = rx.recv().await else {
@@ -1561,6 +1645,7 @@ async fn main() {
     let stdio = std::env::args().any(|a| a == "--stdio");
     let state: Shared = Arc::new(Mutex::new(State {
         events_down: env_flag("MCP_FIXTURE_EVENTS_DOWN"),
+        forbid_left: env_u64("MCP_FIXTURE_FORBID_FIRST", 0),
         ..State::default()
     }));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -1843,6 +1843,14 @@ impl Agent {
             // both committed now, so this is a valid, resumable checkpoint (see `CheckpointHook`) — the
             // one mid-run point a crash between here and the run's eventual end would otherwise lose.
             self.checkpoint_guarded(session).await;
+            // Reported before any way out of the loop below: the steered messages are in the
+            // checkpointed transcript now, whether or not the run goes on.
+            if steered_count > 0 {
+                sink(AgentEvent::Steered {
+                    messages: steered_count,
+                    tags: steered_tags,
+                });
+            }
             if terminate {
                 // A tool requested completion (e.g. an `attempt_completion`/`exit` tool) and the whole
                 // batch agreed. The results are already recorded; end the run as if the model had
@@ -1852,12 +1860,6 @@ impl Agent {
                     steps: session.steps,
                 });
                 return Ok(());
-            }
-            if steered_count > 0 {
-                sink(AgentEvent::Steered {
-                    messages: steered_count,
-                    tags: steered_tags,
-                });
             }
             // A graceful-stop request is honored here too, after this turn's tool results (and any
             // folded-in steer text) are already committed — the same turn-boundary contract as the
@@ -4912,6 +4914,57 @@ mod tests {
             session.messages.last().map(|m| m.content.first()),
             Some(Some(ContentBlock::ToolResult { .. }))
         ));
+    }
+
+    /// A steer folded into the tool-results turn of a batch that ends the run (`terminate`) did
+    /// reach the model's transcript: its `Steered` event, with its tag, is still reported.
+    #[tokio::test]
+    async fn a_steer_folded_into_a_terminating_batch_is_still_reported() {
+        struct ExitTool;
+        #[async_trait]
+        impl Tool for ExitTool {
+            fn name(&self) -> &str {
+                "exit"
+            }
+            fn description(&self) -> &str {
+                "End the run."
+            }
+            fn input_schema(&self) -> Value {
+                serde_json::json!({ "type": "object" })
+            }
+            async fn run(
+                &self,
+                _: Value,
+            ) -> std::result::Result<crate::tool::ToolOutput, crate::error::ToolError> {
+                Ok(crate::tool::ToolOutput::text("done").with_terminate(true))
+            }
+        }
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(ExitTool));
+        let (agent, _mock) = agent_with(vec![turn::tool_call("tu_1", "exit", "{}")], tools);
+        let mut session = Session::new();
+        session.user("finish up");
+        let steering = Steering::new();
+        steering.push_steer(SteeringMessage::new("one more thing", Vec::new()).with_tag(42));
+        let mut tags = Vec::new();
+        agent
+            .run_events_steered(
+                &mut session,
+                |ev| {
+                    if let AgentEvent::Steered { tags: t, .. } = ev {
+                        tags.extend(t);
+                    }
+                },
+                CancellationToken::new(),
+                steering,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            tags,
+            vec![42],
+            "the steer reached the transcript and is reported"
+        );
     }
 
     #[tokio::test]

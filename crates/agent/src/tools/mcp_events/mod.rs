@@ -166,6 +166,10 @@ fn healthy_for() -> Duration {
 /// Longest wait between attempts to (re)establish a configured subscription.
 const CONFIGURED_RETRY_CAP: Duration = Duration::from_secs(60);
 
+/// How many times in a row a server may answer "forbidden" (`-32012`) — each attempt with
+/// credentials resolved afresh — before the subscription is treated as refused for good.
+const MAX_FORBIDDEN_RETRIES: u32 = 5;
+
 /// How long a subscription the server refused for good waits before it is tried again — rarely, in
 /// case the server's configuration changed (`BEYOND_AI_AGENT_MCP_EVENTS_REFUSED_RETRY_MS`).
 fn refused_retry() -> Duration {
@@ -518,9 +522,14 @@ impl McpEventsHub {
     ) -> (mpsc::Receiver<String>, Self) {
         let (tx, rx) = mpsc::channel::<String>(crate::serve::IN_CHANNEL_BOUND);
         let weak = tx.downgrade();
+        let store = StateStore::open(cfg.state_path, max_pending(), max_pending_bytes());
+        let client_store = store.clone();
         tokio::spawn(async move {
             let mut input_rx = input_rx;
             while let Some(line) = input_rx.recv().await {
+                // Only a client's own commands pass here (injections go around), so this is what
+                // "a client was here" means for runtime subscriptions' time to live.
+                client_store.touch_client(now_unix_ms());
                 if tx.send(line).await.is_err() {
                     break;
                 }
@@ -541,7 +550,7 @@ impl McpEventsHub {
             keep_alive: cfg.keep_alive,
             unestablished: Mutex::new(HashMap::new()),
             restoring: Mutex::new(HashSet::new()),
-            store: StateStore::open(cfg.state_path, max_pending(), max_pending_bytes()),
+            store,
             command_tasks: Mutex::new(tokio::task::JoinSet::new()),
             owns_configured: cfg.owns_configured,
         });
@@ -566,6 +575,13 @@ impl McpEventsHub {
                 let Some(hub) = weak_hub.upgrade() else {
                     return;
                 };
+                // Runtime subscriptions whose session has heard from no client for longer than
+                // their time to live are forgotten, not restored.
+                if !state::runtime_still_wanted(store.last_client_ms(), now_unix_ms()) {
+                    for (key, _) in store.runtime_specs() {
+                        store.set_runtime(&key, None);
+                    }
+                }
                 let runtime: Vec<(String, SubSpec)> = store
                     .runtime_specs()
                     .into_iter()
@@ -738,13 +754,15 @@ impl McpEventsHub {
     }
 }
 
-/// The ids of the sessions in `dir` whose events state holds runtime subscriptions to restore — for
-/// a daemon to start at boot, so those subscriptions come back without waiting for a client to
-/// reattach. Reads only the small snapshot files (`<created>_<id>.mcp-events.json`); blocking.
-pub fn sessions_with_runtime_subscriptions(dir: &std::path::Path) -> Vec<String> {
+/// The ids of (at most `max`) the sessions in `dir` whose events state holds runtime subscriptions
+/// still worth restoring (see [`state::runtime_still_wanted`]) — for a daemon to start at boot, so
+/// those subscriptions come back without waiting for a client to reattach. Reads only the small
+/// snapshot files (`<created>_<id>.mcp-events.json`); blocking.
+pub fn sessions_with_runtime_subscriptions(dir: &std::path::Path, max: usize) -> Vec<String> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
+    let now = now_unix_ms();
     let mut ids = Vec::new();
     for entry in entries.flatten() {
         let name = entry.file_name();
@@ -757,22 +775,26 @@ pub fn sessions_with_runtime_subscriptions(dir: &std::path::Path) -> Vec<String>
         let Some((_, id)) = stem.split_once('_') else {
             continue;
         };
-        let has_runtime = std::fs::read(entry.path())
-            .ok()
-            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
-            .and_then(|v| {
-                v.get("subscriptions")?.as_object().map(|subs| {
-                    subs.values()
-                        .any(|s| s.get("runtime").is_some_and(|r| !r.is_null()))
-                })
-            })
-            .unwrap_or(false);
-        if has_runtime {
+        if std::fs::read(entry.path()).is_ok_and(|b| state::snapshot_wants_restore(&b, now)) {
             ids.push(id.to_owned());
         }
     }
     ids.sort();
+    if ids.len() > max {
+        eprintln!(
+            "serve: {} sessions hold runtime MCP Events subscriptions; restoring {max} of them at boot \
+             (the rest come back when their clients do)",
+            ids.len()
+        );
+        ids.truncate(max);
+    }
     ids
+}
+
+/// The most sessions a daemon starts at boot to restore runtime MCP Events subscriptions
+/// (`BEYOND_AI_AGENT_MCP_EVENTS_MAX_RESTORED_SESSIONS`, default 32).
+pub fn max_restored_sessions() -> usize {
+    env_u64("BEYOND_AI_AGENT_MCP_EVENTS_MAX_RESTORED_SESSIONS", 32) as usize
 }
 
 /// Records steered injection batches as delivered from inside a run's (synchronous) event sink.
@@ -1123,6 +1145,13 @@ impl Hub {
             }
         };
 
+        // A server that is not (or no longer) configured will not appear by retrying.
+        if !hub.catalog.snapshot().iter().any(|s| s.name == spec.server) {
+            return Err(SubError::permanent(format!(
+                "unknown MCP server `{}`",
+                spec.server
+            )));
+        }
         let events = hub.discover(&spec.server).await?;
         let descriptor = events
             .iter()
@@ -1412,6 +1441,7 @@ impl Hub {
         tokio::spawn(async move {
             let mut delay = delay;
             let mut failures = 0u32;
+            let mut forbidden_streak = 0u32;
             loop {
                 tokio::select! {
                     () = tokio::time::sleep(delay) => {}
@@ -1440,10 +1470,22 @@ impl Hub {
                         }
                         break;
                     }
-                    Err(e) => {
+                    Err(mut e) => {
+                        // Forbidden: every attempt dials afresh (credentials re-resolved); only a
+                        // refusal that keeps coming back is taken as final.
+                        if e.forbidden {
+                            forbidden_streak += 1;
+                            e.permanent |= forbidden_streak >= MAX_FORBIDDEN_RETRIES;
+                        } else {
+                            forbidden_streak = 0;
+                        }
                         let kind = if e.permanent {
                             delay = refused_retry();
                             "refused"
+                        } else if e.forbidden {
+                            // A short backoff: a refreshed credential should work at once.
+                            delay = backoff(forbidden_streak - 1, Duration::from_secs(5));
+                            "error"
                         } else {
                             failures += 1;
                             delay = backoff(failures, CONFIGURED_RETRY_CAP);
@@ -1476,6 +1518,13 @@ impl Hub {
                             kind,
                             json!({ "error": e.message, "retry_in_ms": delay.as_millis() as u64 }),
                         );
+                        // A runtime subscription being restored that the server now refuses for
+                        // good (its server gone from settings, say) is forgotten: it is not
+                        // retried, not restored again, and keeps nothing alive.
+                        if restoring && e.permanent {
+                            hub.store.set_runtime(&key, None);
+                            break;
+                        }
                     }
                 }
             }
@@ -1631,6 +1680,9 @@ async fn stop_task(task: tokio::task::JoinHandle<()>) {
 struct SubError {
     pub(super) message: String,
     pub(super) permanent: bool,
+    /// Access refused (`-32012`): retried, with credentials re-resolved, until it has failed
+    /// [`MAX_FORBIDDEN_RETRIES`] times in a row.
+    pub(super) forbidden: bool,
 }
 
 impl SubError {
@@ -1638,6 +1690,7 @@ impl SubError {
         Self {
             message: message.into(),
             permanent: true,
+            forbidden: false,
         }
     }
 
@@ -1645,6 +1698,7 @@ impl SubError {
         Self {
             message: e.to_string(),
             permanent: e.is_permanent(),
+            forbidden: e.is_forbidden(),
         }
     }
 
@@ -1661,6 +1715,7 @@ impl From<String> for SubError {
         Self {
             message,
             permanent: false,
+            forbidden: false,
         }
     }
 }

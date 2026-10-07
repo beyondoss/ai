@@ -127,6 +127,36 @@ struct Snapshot {
     /// in `webhook`).
     #[serde(default)]
     server_keys: BTreeMap<String, Vec<String>>,
+    /// When a client last sent this session a command (unix ms; coarse — updated at most once a
+    /// minute). Runtime subscriptions are not restored once it is older than their time to live.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_client_ms: Option<i64>,
+}
+
+/// How long a runtime subscription outlives its session's last client command before it is no
+/// longer restored after a restart (`BEYOND_AI_AGENT_MCP_EVENTS_RUNTIME_TTL_MS`, default 7 days).
+pub(super) fn runtime_ttl_ms() -> i64 {
+    std::env::var("BEYOND_AI_AGENT_MCP_EVENTS_RUNTIME_TTL_MS")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(7 * 24 * 3_600_000)
+}
+
+/// Whether a snapshot's runtime subscriptions are still worth restoring: its session heard from a
+/// client within [`runtime_ttl_ms`] (or the state predates the record, and gets the benefit of the
+/// doubt once — the next client command records it).
+pub(super) fn runtime_still_wanted(last_client_ms: Option<i64>, now_ms: i64) -> bool {
+    last_client_ms.is_none_or(|t| now_ms.saturating_sub(t) <= runtime_ttl_ms())
+}
+
+/// What a daemon reads at boot to decide whether to start a session: does its events state hold
+/// runtime subscriptions still worth restoring? (Snapshot only; blocking.)
+pub(super) fn snapshot_wants_restore(bytes: &[u8], now_ms: i64) -> bool {
+    let Ok(snap) = serde_json::from_slice::<Snapshot>(bytes) else {
+        return false;
+    };
+    runtime_still_wanted(snap.last_client_ms, now_ms)
+        && snap.subscriptions.values().any(|s| s.runtime.is_some())
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -160,6 +190,7 @@ struct Data {
     snapshot_dirty: bool,
     /// Bytes in the log file on disk.
     log_len: u64,
+    last_client_ms: Option<i64>,
 }
 
 impl Data {
@@ -300,6 +331,28 @@ impl StateStore {
             d.snapshot_dirty = true;
         }
         self.dirty();
+    }
+
+    /// A client sent this session a command just now. Recorded at most once a minute, and only
+    /// while there is runtime state the record matters for.
+    pub(super) fn touch_client(&self, now_ms: i64) {
+        {
+            let mut d = lock(&self.inner.data);
+            if !d.subs.values().any(|s| s.runtime.is_some())
+                || d.last_client_ms
+                    .is_some_and(|t| now_ms.saturating_sub(t) < 60_000)
+            {
+                return;
+            }
+            d.last_client_ms = Some(now_ms);
+            d.snapshot_dirty = true;
+        }
+        self.dirty();
+    }
+
+    /// When a client last sent this session a command (see [`Self::touch_client`]).
+    pub(super) fn last_client_ms(&self) -> Option<i64> {
+        lock(&self.inner.data).last_client_ms
     }
 
     /// Every persisted runtime subscription spec, as `(subscription key, spec)`.
@@ -593,6 +646,7 @@ async fn writer(
         d.pending_bytes = l.pending.iter().map(|p| p.size).sum();
         d.subs = l.snapshot.subscriptions;
         d.server_keys = l.snapshot.server_keys;
+        d.last_client_ms = l.snapshot.last_client_ms;
         d.pending = l.pending;
         d.log_len = l.log_len;
     }
@@ -701,6 +755,7 @@ async fn flush(data: &Arc<Mutex<Data>>) -> Result<(), String> {
                 spec_commit: SPEC_COMMIT.to_owned(),
                 subscriptions: d.subs.clone(),
                 server_keys: d.server_keys.clone(),
+                last_client_ms: d.last_client_ms,
             }
         });
         (path, log_write, snapshot)
@@ -811,6 +866,7 @@ async fn relocate(data: &Arc<Mutex<Data>>, target: Option<PathBuf>) {
                     spec_commit: SPEC_COMMIT.to_owned(),
                     subscriptions: d.subs.clone(),
                     server_keys: d.server_keys.clone(),
+                    last_client_ms: d.last_client_ms,
                 }),
                 Some(log),
             )
@@ -1282,5 +1338,50 @@ mod tests {
             ids.contains(&"x".to_owned()),
             "the event pushed before the failure is on disk"
         );
+    }
+
+    /// Runtime subscriptions expire: once their session has heard from no client for longer than
+    /// the time to live, they are not restored, and a daemon does not start that session at boot.
+    #[test]
+    fn runtime_subscriptions_expire_without_a_client() {
+        let day = 24 * 3_600_000;
+        let now = 100 * day;
+        assert!(runtime_still_wanted(Some(now - day), now));
+        assert!(
+            !runtime_still_wanted(Some(now - 8 * day), now),
+            "a week is the default"
+        );
+        assert!(
+            runtime_still_wanted(None, now),
+            "older state gets one chance"
+        );
+        let snap = |last: i64| {
+            serde_json::json!({
+                "subscriptions": { "k": { "cursor": null, "runtime": { "server": "s", "name": "n" } } },
+                "last_client_ms": last,
+            })
+            .to_string()
+        };
+        assert!(snapshot_wants_restore(snap(now - day).as_bytes(), now));
+        assert!(!snapshot_wants_restore(snap(now - 8 * day).as_bytes(), now));
+        let no_runtime =
+            serde_json::json!({ "subscriptions": { "k": { "cursor": null } } }).to_string();
+        assert!(!snapshot_wants_restore(no_runtime.as_bytes(), now));
+    }
+
+    /// A client's commands are recorded (coarsely) only while there is runtime state to expire.
+    #[tokio::test]
+    async fn client_activity_is_recorded_only_while_it_matters() {
+        let s = StateStore::open(None, 10, u64::MAX);
+        s.loaded().await;
+        s.touch_client(1_000_000);
+        assert_eq!(s.last_client_ms(), None, "nothing to expire yet");
+        s.set_runtime("k", Some(serde_json::json!({ "server": "s" })));
+        s.touch_client(1_000_000);
+        assert_eq!(s.last_client_ms(), Some(1_000_000));
+        s.touch_client(1_030_000);
+        assert_eq!(s.last_client_ms(), Some(1_000_000), "at most once a minute");
+        s.touch_client(1_070_000);
+        assert_eq!(s.last_client_ms(), Some(1_070_000));
     }
 }

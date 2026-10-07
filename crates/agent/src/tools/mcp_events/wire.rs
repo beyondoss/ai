@@ -168,11 +168,17 @@ impl RpcError {
     }
 
     /// A refusal retrying will not change: the request is wrong (`-32602`), the server does not
-    /// speak the extension (`-32601`), the event or the access does not exist (`-32011`, `-32012`),
-    /// or the mode is unsupported (`-32014`) — unless it is the draft's "re-discover" signal.
+    /// speak the extension (`-32601`), the event does not exist (`-32011`), or the mode is
+    /// unsupported (`-32014`) — unless it is the draft's "re-discover" signal. `-32012` (forbidden)
+    /// is not: credentials expire and are refreshed, so it is retried (see [`Self::is_forbidden`]).
     pub(super) fn is_permanent(&self) -> bool {
-        matches!(self.code, Some(-32601 | -32602 | -32011 | -32012 | -32014))
-            && !self.wants_rediscovery()
+        matches!(self.code, Some(-32601 | -32602 | -32011 | -32014)) && !self.wants_rediscovery()
+    }
+
+    /// Access refused (`-32012`): retried with fresh credentials on a short backoff, and treated as
+    /// a permanent refusal only after repeated failures.
+    pub(super) fn is_forbidden(&self) -> bool {
+        self.code == Some(-32012)
     }
 
     /// The draft's "re-discover and resubscribe" signals: the event type was removed
@@ -478,6 +484,9 @@ impl Conn {
                         if msg.get("id") == Some(&want) {
                             return rpc_outcome(msg);
                         }
+                        if is_server_request(&msg) {
+                            refuse_server_request(http, url, headers, protocol_version, &msg).await;
+                        }
                     }
                     Err(RpcError::local(format!(
                         "{method}: the stream ended without a response"
@@ -573,9 +582,22 @@ impl Conn {
                 }
                 // Backpressure, not loss: the reader awaits channel space, so TCP flow control
                 // slows the server rather than anything being dropped.
+                let refuse_with = (
+                    http.clone(),
+                    url.clone(),
+                    headers.clone(),
+                    protocol_version.clone(),
+                );
                 let reader = tokio::spawn(async move {
                     let mut events = SseReader::new(resp);
                     while let Some(msg) = events.next().await {
+                        if is_server_request(&msg) {
+                            let (http, url, headers, version) = refuse_with.clone();
+                            tokio::spawn(async move {
+                                refuse_server_request(&http, &url, &headers, &version, &msg).await;
+                            });
+                            continue;
+                        }
                         if msg.get("id") == Some(&want) {
                             let fin = match rpc_outcome(msg) {
                                 Ok(v) => StreamMsg::final_ok(v),
@@ -623,6 +645,46 @@ impl Conn {
                 })
             }
         }
+    }
+}
+
+/// A server→client *request* (it has a `method` and an `id`) arriving on an `events/*` response.
+fn is_server_request(msg: &Value) -> bool {
+    msg.get("method").is_some() && msg.get("id").is_some_and(|id| !id.is_null())
+}
+
+/// Refuse a server→client request that arrived on a direct-HTTP `events/*` response. Over direct
+/// HTTP nothing routes it to a session (rmcp never sees the exchange), so rather than leave the
+/// server waiting forever on an answer that will never come, it is answered at once with an error.
+/// (Over rmcp the same request is attributed to the owning session, like one raised during a
+/// `tools/call`.)
+async fn refuse_server_request(
+    http: &reqwest::Client,
+    url: &str,
+    headers: &[(http::HeaderName, http::HeaderValue)],
+    protocol_version: &str,
+    msg: &Value,
+) {
+    let method = msg.get("method").and_then(Value::as_str).unwrap_or("?");
+    let body = json!({
+        "jsonrpc": "2.0",
+        "id": msg["id"],
+        "error": {
+            "code": -32601,
+            "message": format!("`{method}` is not served during an events request over direct HTTP"),
+        },
+    });
+    let mut req = http
+        .post(url)
+        .header("Content-Type", "application/json")
+        .header("MCP-Protocol-Version", protocol_version);
+    for (k, v) in headers {
+        req = req.header(k, v);
+    }
+    if let Ok(Err(e)) =
+        tokio::time::timeout(Duration::from_secs(5), req.body(body.to_string()).send()).await
+    {
+        tracing::debug!(error = %e, method, "could not refuse a server request");
     }
 }
 

@@ -4617,11 +4617,6 @@ pub(crate) async fn serve_session(
                 // the run is over — see `mcp_events_finish` below.
                 let own_injection = crate::tools::mcp_events::injection_batch(&cmd);
                 let mut steered_injections: Vec<u64> = Vec::new();
-                // The steered batches the model has received: recorded — durably, in the events
-                // state — from the run's `Steered` event, the moment the transcript holding them is
-                // checkpointed, never re-derived from the transcript afterwards (a compaction may
-                // have summarized them away by then).
-                let steered_received: Arc<std::sync::Mutex<Vec<u64>>> = Arc::default();
                 let result = 'retry: loop {
                     tokens_before.store(0, Ordering::Relaxed);
                     refused.store(false, Ordering::Relaxed);
@@ -4675,18 +4670,18 @@ pub(crate) async fn serve_session(
                     }
                     let life_obs = life.clone();
                     let attempt_result = {
-                        let received_sink = steered_received.clone();
+                        // A steered MCP Events batch is delivered the moment the model receives it: the
+                        // run's `Steered` event reports its tag after the transcript holding it is
+                        // checkpointed, and it is recorded — durably — right then, never re-derived
+                        // from the transcript afterwards (a compaction may have summarized it away).
                         let receipts_sink = mcp_events.as_ref().map(|hub| hub.receipts());
                         let mut sink = move |ev: AgentEvent| {
                             if let AgentEvent::Steered { tags, .. } = &ev
-                                && !tags.is_empty()
+                                && let Some(receipts) = &receipts_sink
                             {
-                                if let Some(receipts) = &receipts_sink {
-                                    for tag in tags {
-                                        receipts.received(*tag);
-                                    }
+                                for tag in tags {
+                                    receipts.received(*tag);
                                 }
-                                lock_ignoring_poison(&received_sink).extend(tags.iter().copied());
                             }
                             // Set on `CompactionStart`, cleared on literally anything else — see
                             // `is_compacting`'s own declaration above for why that's exact, not a
@@ -5627,12 +5622,10 @@ pub(crate) async fn serve_session(
                             returned.push(b)
                         }
                     }
-                    let received = std::mem::take(&mut *lock_ignoring_poison(&steered_received));
-                    for b in steered_injections.drain(..) {
-                        if !received.contains(&b) {
-                            returned.push(b);
-                        }
-                    }
+                    // A steered batch the model received has already left the pending queue (see
+                    // `receipts_sink`); returning it is a no-op. One it never received — an abort
+                    // cleared the steer lane — goes back to pending.
+                    returned.append(&mut steered_injections);
                     hub.finish_run(&delivered, &returned).await;
                 }
                 if running.swap(false, Ordering::Relaxed)
