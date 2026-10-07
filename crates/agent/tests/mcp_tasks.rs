@@ -416,8 +416,12 @@ fn serve_abort_sends_tasks_cancel_for_sticky_task() {
     let cancel_deadline = Instant::now() + Duration::from_secs(3);
     let mut cancelled_id = None;
     while Instant::now() < cancel_deadline {
-        if cancel_flag.exists() {
-            cancelled_id = Some(std::fs::read_to_string(&cancel_flag).unwrap());
+        // The fixture renames the flag into place whole; reading until it has content also
+        // covers a fixture that ever wrote it in place.
+        if let Ok(id) = std::fs::read_to_string(&cancel_flag)
+            && !id.is_empty()
+        {
+            cancelled_id = Some(id);
             break;
         }
         std::thread::sleep(Duration::from_millis(50));

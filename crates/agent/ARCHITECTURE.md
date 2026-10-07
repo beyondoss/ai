@@ -3559,13 +3559,17 @@ the task, not the connection or the process, as the unit of work.
   and the owning `sessionId`. Journal writes come from the run's event sink and from the background
   resumer. They are drained by the idle loop, the busy loop and at run end, and a write whose
   `sessionId` is not the session being persisted to is dropped. The journal sits beside the
-  pre-dispatch checkpoint, which already persisted the assistant's `tool_use`.
+  pre-dispatch checkpoint, which already persisted the assistant's `tool_use`. Headless `run`
+  journals the same entries with its persisted session (`RunJournal`, from its event sink).
 - **Pending.** A journaled task is pending when three things hold: its record belongs to this session,
   its `tool_use` is anywhere on the active path, and nothing answers it, neither a `tool_result` nor
   a journaled `mcp_task_result`. Requiring this session's record means only the session that created
-  a task may resume it. A fork copies messages, not custom entries, so it inherits no journal; even a
-  copied journal under another session id is ignored. The call then gets the generic "interrupted"
-  repair.
+  a task may resume it. A fork copies messages, not custom entries, so it inherits no journal; a
+  journal that does travel under another session id (a session file copied or restored under a new
+  id) is ignored. The call then gets the generic "interrupted" repair. A record must also describe the
+  call it names (`mcp__<server>__<tool>` equal to the call's tool) and name a configured server, and a
+  client's `append_custom` cannot write the journal's kinds (`mcp_task`, `mcp_task_result`): a forged
+  record would otherwise have the resumer poll a task id of the client's choosing.
 - **Resume, in the background.** When a session is loaded, and the moment a command switches to
   another one (`switch_session`, `new_session`, `fork`, `clone`), `mcp_resume::Resumer` polls each of
   that session's pending tasks to a terminal status through its `McpCatalog`. The previous session's
@@ -3573,6 +3577,17 @@ the task, not the connection or the process, as the unit of work.
   reaches the clients.
   - The `ttlMs` backstop counts from `createdAtMs`. A TTL that ran out while the agent was down
     resolves as expired without contacting the server, even if the server is gone.
+  - A server that cannot be reached is not an answer. The resume redials a few times (250 ms
+    doubling, about 5 s); if it still cannot connect, or the connection is lost for good mid-poll,
+    the call gets a placeholder `tool_result` reading `[MCP task result pending] …` (the model is
+    told the result is pending), no result is journaled, and an `mcp_task_placeholder` entry marks
+    that call's `tool_result` as a placeholder, so the task stays pending. A placeholder is known by
+    that mark, never by its text: a real result that happens to begin the same way is an answer. A
+    later prompt (a fresh resumer, when the last one finished with a server unreachable) or start
+    (`serve`, or `run --continue`) tries again, and the real result replaces the placeholder where it
+    sits. A configured server that could not be dialed at startup is kept dormant in the catalog for
+    this.
+    Only a terminal status, a JSON-RPC error such as `-32602`, or an expired TTL resolves a call.
   - Answered keys are seeded from the record, so the user is never asked twice.
   - In-task input reaches the session's host.
   - Its progress streams as `tool_progress`, starting with a "resuming" notice. That notice is not
@@ -3594,9 +3609,46 @@ the task, not the connection or the process, as the unit of work.
   The session store applies every journaled result on the active path when it materializes
   messages (`session_store::materialize`), so `get_messages`, the HTML export and `run --continue`
   show exactly what `serve` sent the model. The file stays append-only and ids stay stable.
+- **`run --continue`.** `run` resumes too: before its turn, it polls each pending task of the session it
+  opened (journaled by `run` or `serve`) to its result, in turn, with a line on stderr (it has no
+  client to stream progress to; Ctrl-C ends the wait as it ends the run), journals each result, and
+  splices it into the turn it sends.
 - **Privacy.** Custom entries never reach the model. A task id can be a bearer token for the
-  server's stored state. The session file keeps it in the clear because resume needs it, and the file
-  is as private as the conversation it holds. The HTML export withholds `mcp_task*` entries.
+  server's stored state. Resume needs it, so the session keeps it, exactly as private as the
+  conversation it holds. A local session file is created `0600`, and every append tightens an
+  existing file whose mode is looser (an older version's, a restore's, a `chmod`) before writing.
+  In service mode the journal goes through the tenant-keyed sealed segments with the rest of the
+  transcript (`tests/session_segments_sealing.rs`). The HTML export withholds `mcp_task*` entries.
+- **Journal authentication** (`mcp_resume::JournalAuth`, held by the session's store, which seals
+  what it journals and replays only what passes). The key goes where the session goes, never with
+  the machine, so a session resumes on another replica, another machine, a fresh `$HOME` or after
+  an upgrade.
+  - Service mode (segments sealed under the tenant key): no MAC at all. The storage already
+    authenticates every line, which is strictly stronger, and any replica holding the tenant key
+    reads the journal (`tests/mcp_tasks_service.rs`).
+  - Local: every entry carries a `mac`, an HMAC-SHA256 over its kind and content, keyed by 32 random
+    bytes in a `0600` sidecar beside the session (`<session>.jsonl.mcp-task-journal.json`: a suffix
+    on the whole file name, so `work.1` and `work.2` never share a key; or inside a segmented
+    session's directory), made by the session's first journal write, so a session that never
+    journals a task gets no extra file. Every first writer (threads, other processes) agrees on one
+    key: it is made under an exclusive lock on the sidecar and re-read once the lock is held, and
+    every journal write adopts the key on disk. A key under the earlier `with_extension` name
+    (`<session>.mcp-task-journal.json`) is read, and carried over by the next journal write. It is one of the session's sidecars, so it moves,
+    trashes and restores with it. On replay an entry without a valid `mac` is ignored: a line appended to the
+    `.jsonl` by a model with `write`/`edit` neither causes a poll nor is delivered as a result.
+  - A session without a key (from before per-session keys, or that has not journaled yet) is read
+    as before: its entries are accepted, and opening it writes nothing. Its next journal write makes
+    the key and records the MACs of the entries already there as accepted, so a task that resumed
+    before still resumes. Entries written after that must carry a `mac`.
+  - The residual risk, honestly: locally the key is a file the agent's user can read, and a session
+    that never journaled has no key yet, so a model that can also read files, or that targets such a
+    session, can forge an entry. A model with `write` can also delete the key or corrupt it
+    (overwrite it with anything that does not parse): the session is then keyless (what is there is
+    accepted), and its next journal write makes a new key that accepts every line already in the
+    file, planted ones included; and the transcript itself is unauthenticated (a model
+    that can write the file can plant an ordinary `tool_result`). Locally the seal turns "append a
+    line" into a deliberate read-then-forge; it does not close forgery. In service mode the store is
+    out of the tools' reach (they run in the tenant's sandbox), and forgery is closed.
 
 **MCP Apps.** A service session's apps pool (`ServiceSession::mcp_apps_pool`) dials the same grant
 connectors a second time, with `io.modelcontextprotocol/ui` advertised, the first time the session's

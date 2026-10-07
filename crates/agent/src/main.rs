@@ -3666,6 +3666,9 @@ async fn run_turn_once(
     // on `Compacted`. Both are no-ops without a session mount.
     let pressure_armed = std::sync::atomic::AtomicBool::new(true);
     let session_steers = |ev: &agent_core::AgentEvent| {
+        if let Some(journal) = RUN_JOURNAL.get() {
+            journal.observe(ev);
+        }
         if !session_memory_active {
             return;
         }
@@ -3792,6 +3795,141 @@ async fn run_turn_once(
 /// `persist_run_tail`, after `run_turn` returns), so a crash mid-turn — after several tool
 /// round-trips already ran real commands or edited real files — lost all record of them, with the
 /// session file (if any) unable to distinguish that from "nothing happened yet".
+/// `run`'s MCP task journal: the same `mcp_task` custom entries `serve` writes (see
+/// `beyond_ai_agent::mcp_resume`), so a `run` that dies mid-task can be resumed by
+/// `run --continue` (or by `serve`). Process-wide because `run` drives exactly one session per
+/// process; set once, when that session is persisted.
+static RUN_JOURNAL: std::sync::OnceLock<RunJournal> = std::sync::OnceLock::new();
+
+struct RunJournal {
+    store: Arc<std::sync::Mutex<Option<SessionStore>>>,
+    session_id: String,
+}
+
+impl RunJournal {
+    /// Journal a task record a tool emitted (`tool_progress` `details.mcpTask`).
+    fn observe(&self, ev: &agent_core::AgentEvent) {
+        let agent_core::AgentEvent::ToolProgress {
+            id,
+            details: Some(details),
+            ..
+        } = ev
+        else {
+            return;
+        };
+        let Some(record) = details.get(tools::mcp::MCP_TASK_DETAILS_KEY) else {
+            return;
+        };
+        self.append(
+            beyond_ai_agent::mcp_resume::TASK_ENTRY_KIND,
+            beyond_ai_agent::mcp_resume::task_entry(record, id, &self.session_id),
+        );
+    }
+
+    fn append(&self, kind: &str, data: serde_json::Value) {
+        let mut guard = self.store.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(store) = guard.as_mut()
+            && let Err(e) = store.append_journal(kind, data)
+        {
+            eprintln!("run: failed to journal an MCP task: {e}");
+        }
+    }
+}
+
+/// Resolve the MCP tasks a previous process left in flight on this session (journaled by `run` or
+/// `serve`), before the next turn, so the model sees what actually happened. `run` has no client to
+/// keep company while it waits, so each is polled to its result in turn, with a line on stderr;
+/// Ctrl-C ends the wait as it ends the run. Every result is journaled as it lands, and returned for
+/// the caller to splice into the turn it is about to send, with the journal's placeholder marks
+/// (the calls whose `tool_result` on the path is only a "result pending" placeholder).
+async fn resume_mcp_tasks_for_run(
+    journal: Option<&RunJournal>,
+    session: &Session,
+    catalog: &tools::mcp::McpCatalog,
+) -> (
+    Vec<beyond_ai_agent::mcp_resume::Resolved>,
+    std::collections::HashSet<String>,
+) {
+    use beyond_ai_agent::mcp_resume::{
+        PLACEHOLDER_ENTRY_KIND, RESULT_ENTRY_KIND, Resolved, TASK_ENTRY_KIND,
+    };
+    let Some(journal) = journal else {
+        return Default::default();
+    };
+    let (tasks, results, mut placeholders) = {
+        let guard = journal.store.lock().unwrap_or_else(|e| e.into_inner());
+        match guard.as_ref() {
+            Some(store) => (
+                store.active_journal(TASK_ENTRY_KIND),
+                beyond_ai_agent::mcp_resume::results(&store.active_journal(RESULT_ENTRY_KIND)),
+                beyond_ai_agent::mcp_resume::placeholder_ids(
+                    &store.active_journal(PLACEHOLDER_ENTRY_KIND),
+                ),
+            ),
+            None => return Default::default(),
+        }
+    };
+    let mut pending = beyond_ai_agent::mcp_resume::pending(
+        &session.messages,
+        &tasks,
+        &results,
+        &placeholders,
+        &journal.session_id,
+    );
+    // Only a configured server is ever polled.
+    pending.retain(|p| catalog.has_server(&p.record.server));
+    let mut resolved = Vec::with_capacity(pending.len());
+    for task in pending {
+        eprintln!(
+            "[resuming MCP task {} ({}) left in flight by a previous run]",
+            task.record.task_id, task.name
+        );
+        let result = match catalog
+            .resume_task(task.record.clone(), &tools::mcp::host(), None)
+            .await
+        {
+            Ok(output) => Resolved {
+                tool_use_id: task.tool_use_id,
+                name: task.name,
+                content: output.text,
+                is_error: false,
+                images: output.images,
+                pending: false,
+            },
+            // The server is unreachable: the turn is told the result is pending, and the task
+            // stays journaled for the next `run --continue`.
+            Err(tools::mcp::ResumeError::Unreachable(why)) => {
+                eprintln!("[MCP task {} is still pending: {why}]", task.record.task_id);
+                journal.append(
+                    PLACEHOLDER_ENTRY_KIND,
+                    beyond_ai_agent::mcp_resume::placeholder_entry(
+                        &task.tool_use_id,
+                        &journal.session_id,
+                    ),
+                );
+                placeholders.insert(task.tool_use_id.clone());
+                resolved.push(beyond_ai_agent::mcp_resume::pending_placeholder(
+                    &task, &why,
+                ));
+                continue;
+            }
+            Err(tools::mcp::ResumeError::Final(e)) => Resolved {
+                tool_use_id: task.tool_use_id,
+                name: task.name,
+                content: e.to_string(),
+                is_error: true,
+                images: Vec::new(),
+                pending: false,
+            },
+        };
+        let mut data = serde_json::to_value(&result).unwrap_or_default();
+        data["sessionId"] = serde_json::json!(journal.session_id);
+        journal.append(RESULT_ENTRY_KIND, data);
+        resolved.push(result);
+    }
+    (resolved, placeholders)
+}
+
 struct DirectCheckpoint(Arc<std::sync::Mutex<Option<SessionStore>>>);
 
 #[async_trait::async_trait]
@@ -4828,6 +4966,16 @@ async fn run_task(
     // crash mid-turn — after several tool round-trips already ran real commands/edited real files —
     // lost all record of them with no session trace at all.
     let store = Arc::new(std::sync::Mutex::new(store));
+    let run_journal = store
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_some()
+        .then(|| {
+            RUN_JOURNAL.get_or_init(|| RunJournal {
+                store: store.clone(),
+                session_id: meta.id.clone(),
+            })
+        });
     // Matches `serve`'s own `build_agent`: defaults to the model's own capability-table context
     // window when `--context-window` isn't given, then applies the reserve/keep-recent overrides.
     let mut compaction = agent_core::CompactionConfig {
@@ -4980,6 +5128,8 @@ async fn run_task(
         .restore_from_transcript(&session.messages);
     let initial_message =
         expand_message(&initial_message, &skills, &prompt_templates, &mcp_skills).await;
+    let (resumed, placeholders) =
+        resume_mcp_tasks_for_run(run_journal, &session, &mcp_catalog).await;
     if initial_images.is_empty() {
         session.user(initial_message);
     } else {
@@ -4987,6 +5137,11 @@ async fn run_task(
             initial_message,
             initial_images,
         ));
+    }
+    if !resumed.is_empty() {
+        // Into the turn just pushed: the call it answers is at the tip.
+        let messages: &mut Vec<agent_core::Message> = Arc::make_mut(&mut session.messages);
+        beyond_ai_agent::mcp_resume::splice(messages, &resumed, &placeholders);
     }
     let life = lifecycle.enabled().then(|| {
         beyond_ai_agent::lifecycle::Run::begin(

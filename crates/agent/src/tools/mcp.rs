@@ -1269,7 +1269,9 @@ async fn drive_tool_call(
                     cancel_on_drop: true,
                     fresh: true,
                 };
-                return await_task(conn, client, host, record, seed, progress).await;
+                return await_task(conn, client, host, record, seed, progress)
+                    .await
+                    .map_err(ToolError::from);
             }
             other => {
                 return Err(ToolError::Execution(format!(
@@ -1485,6 +1487,48 @@ impl Drop for TaskCancelOnDrop {
     }
 }
 
+/// Why polling a task stopped short of a result.
+enum TaskFailure {
+    /// The connection could not be recovered: the task may well still be alive on the server.
+    ConnectionLost(String),
+    /// A definitive outcome: a terminal status, a JSON-RPC error, an expired TTL.
+    Final(ToolError),
+}
+
+impl From<ToolError> for TaskFailure {
+    fn from(e: ToolError) -> Self {
+        Self::Final(e)
+    }
+}
+
+impl From<TaskFailure> for ToolError {
+    fn from(f: TaskFailure) -> Self {
+        match f {
+            TaskFailure::ConnectionLost(why) => ToolError::Execution(why),
+            TaskFailure::Final(e) => e,
+        }
+    }
+}
+
+/// Why a journaled task could not be resolved now (see [`McpCatalog::resume_task`]).
+#[derive(Debug)]
+pub enum ResumeError {
+    /// The server could not be reached. Not an answer: the task stays pending and journaled, and
+    /// is tried again on a later prompt or start.
+    Unreachable(String),
+    /// The call's definitive answer (an error result the model is told).
+    Final(ToolError),
+}
+
+impl std::fmt::Display for ResumeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unreachable(why) => f.write_str(why),
+            Self::Final(e) => write!(f, "{e}"),
+        }
+    }
+}
+
 /// How polling starts: from a fresh `CreateTaskResult`, or (resume) from a journaled record.
 struct TaskSeed {
     poll_interval_ms: Option<u64>,
@@ -1583,7 +1627,7 @@ async fn await_task(
     mut record: McpTaskRecord,
     seed: TaskSeed,
     progress: Option<&ToolProgress>,
-) -> Result<CallToolResult, ToolError> {
+) -> Result<CallToolResult, TaskFailure> {
     let task_id = record.task_id.clone();
     let server_name = record.server.clone();
     let remote_name = record.tool.clone();
@@ -1604,7 +1648,7 @@ async fn await_task(
     let mut pending_update: Option<(Vec<String>, InputResponses)> = None;
     let mut losses: u32 = 0;
     let lost = |losses: u32, e: &ServiceError| {
-        ToolError::Execution(format!(
+        TaskFailure::ConnectionLost(format!(
             "mcp task `{task_id}` on `{server_name}`/`{remote_name}`: connection lost {losses} times in a row, giving up: {e}"
         ))
     };
@@ -1642,7 +1686,7 @@ async fn await_task(
                         client = recover(conn, client, loss, losses).await;
                         continue;
                     }
-                    None => return Err(tool_call_err(server_name, remote_name, e)),
+                    None => return Err(tool_call_err(server_name, remote_name, e).into()),
                 },
             }
         }
@@ -1657,7 +1701,8 @@ async fn await_task(
                 return Err(ToolError::Execution(format!(
                     "mcp task `{task_id}` on `{server_name}`/`{remote_name}` did not finish within its ttlMs ({} ms)",
                     ttl.as_millis()
-                )));
+                ))
+                .into());
             }
             wait = wait.min(ttl - elapsed);
         }
@@ -1681,7 +1726,7 @@ async fn await_task(
                     client = recover(conn, client, loss, losses).await;
                     continue;
                 }
-                None => return Err(tool_call_err(server_name, remote_name, e)),
+                None => return Err(tool_call_err(server_name, remote_name, e).into()),
             },
         };
         let detailed = info.task;
@@ -1748,18 +1793,21 @@ async fn await_task(
                 return Err(ToolError::Execution(format!(
                     "mcp task `{task_id}` on `{server_name}`/`{remote_name}` failed: {}",
                     Value::Object(error)
-                )));
+                ))
+                .into());
             }
             TaskPayload::Cancelled => {
                 cancel.finish();
                 return Err(ToolError::Execution(format!(
                     "mcp task `{task_id}` on `{server_name}`/`{remote_name}` was cancelled"
-                )));
+                ))
+                .into());
             }
             other => {
                 return Err(ToolError::Execution(format!(
                     "mcp task `{task_id}` on `{server_name}`/`{remote_name}` returned unknown payload: {other:?}"
-                )));
+                ))
+                .into());
             }
         }
     }
@@ -1767,16 +1815,20 @@ async fn await_task(
 
 impl McpCatalog {
     /// Resume polling a journaled task after a restart (see [`McpTaskRecord`]) through this
-    /// catalog's live (or redialed) connection to `record.server`, to its terminal result. Never
-    /// cancels the task when dropped. A server that no longer knows the task answers `-32602`,
-    /// and that is the call's answer. `host` answers any in-task input; `progress` receives the
-    /// task's status and record updates.
+    /// catalog's connection to `record.server` (live, redialed, or one that could not be dialed at
+    /// startup), to its terminal result. Never cancels the task when dropped.
+    ///
+    /// Only a definitive outcome answers the call: the task's terminal status, a JSON-RPC error
+    /// such as `-32602` (the server no longer knows it), or its `ttlMs` running out. A server that
+    /// cannot be reached, after a bounded few redials, is [`ResumeError::Unreachable`]: the task
+    /// may be alive, so it stays pending and is tried again later. `host` answers any in-task
+    /// input; `progress` receives the task's status and record updates.
     pub async fn resume_task(
         &self,
         record: McpTaskRecord,
         host: &McpHost,
         progress: Option<&ToolProgress>,
-    ) -> Result<ToolOutput, ToolError> {
+    ) -> Result<ToolOutput, ResumeError> {
         let server = record.server.clone();
         let tool = record.tool.clone();
         // A TTL that ran out while the process was down needs no server (nor its configuration)
@@ -1784,20 +1836,15 @@ impl McpCatalog {
         if let Some(ttl) = record.ttl_ms
             && unix_ms().saturating_sub(record.created_at_ms) >= ttl
         {
-            return Err(ToolError::Execution(format!(
+            return Err(ResumeError::Final(ToolError::Execution(format!(
                 "mcp task `{}` on `{server}`/`{tool}` did not finish within its ttlMs ({ttl} ms)",
                 record.task_id
-            )));
+            ))));
         }
-        let entry = self
-            .snapshot()
-            .into_iter()
-            .find(|s| s.name == server)
-            .ok_or_else(|| {
-                ToolError::Execution(format!("mcp server `{server}` is not configured any more"))
-            })?;
-        let conn = entry.conn.upgrade().ok_or_else(|| {
-            ToolError::Execution(format!("mcp server `{server}` is no longer connected"))
+        let conn = self.connection(&server).ok_or_else(|| {
+            ResumeError::Final(ToolError::Execution(format!(
+                "mcp server `{server}` is not configured any more"
+            )))
         })?;
         let seed = TaskSeed {
             // Unknown until the first poll answers; ask promptly, then follow the server.
@@ -1806,12 +1853,50 @@ impl McpCatalog {
             cancel_on_drop: false,
             fresh: false,
         };
-        let client = conn.client().await.map_err(|e| {
-            ToolError::Execution(format!("mcp server `{server}` is not reachable: {e}"))
+        let client = dial_with_backoff(&conn).await.map_err(|e| {
+            ResumeError::Unreachable(format!("mcp server `{server}` is not reachable: {e}"))
         })?;
-        let result = await_task(&conn, client, host, record, seed, progress).await?;
-        tool_output_from_result(&server, &tool, result)
+        match await_task(&conn, client, host, record, seed, progress).await {
+            Ok(result) => {
+                tool_output_from_result(&server, &tool, result).map_err(ResumeError::Final)
+            }
+            Err(TaskFailure::ConnectionLost(why)) => Err(ResumeError::Unreachable(why)),
+            Err(TaskFailure::Final(e)) => Err(ResumeError::Final(e)),
+        }
     }
+
+    /// The connection to `server`: a connected one's, or the dormant one kept for a configured
+    /// server that could not be dialed at startup (so a resume can still reach it once it is back).
+    fn connection(&self, server: &str) -> Option<Arc<McpConnection>> {
+        self.snapshot()
+            .into_iter()
+            .find(|s| s.name == server)
+            .and_then(|s| s.conn.upgrade())
+            .or_else(|| {
+                self.unconnected
+                    .lock()
+                    .ok()
+                    .and_then(|u| u.get(server).cloned())
+            })
+    }
+}
+
+/// Dial a connection, retrying a few times with backoff (250 ms doubling, about 5 s in all): a
+/// server that is restarting is not gone.
+async fn dial_with_backoff(conn: &McpConnection) -> Result<Arc<McpClient>, String> {
+    let mut delay = Duration::from_millis(250);
+    let mut last = String::new();
+    for attempt in 0..5 {
+        if attempt > 0 {
+            tokio::time::sleep(delay).await;
+            delay = (delay * 2).min(Duration::from_secs(2));
+        }
+        match conn.client().await {
+            Ok(client) => return Ok(client),
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
 }
 
 pub(crate) fn tool_output_from_result(
@@ -2048,6 +2133,7 @@ async fn connect_many(
     let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
     let mut catalogs = Vec::new();
     let mut warnings = Vec::new();
+    let mut unconnected = HashMap::new();
     for (name, result) in connect_each(jobs, idle_reap_after, manifest_dir).await {
         match result {
             Ok((server_tools, catalog)) => {
@@ -2061,10 +2147,24 @@ async fn connect_many(
                     "failed to connect to MCP server; its tools will not be available"
                 );
                 warnings.push(format!("mcp server `{name}`: {e}"));
+                if let Some((config, dial)) = jobs.iter().find(|(c, _)| c.name == name) {
+                    unconnected.insert(
+                        name.clone(),
+                        Arc::new(McpConnection::dormant(
+                            config.clone(),
+                            dial.clone(),
+                            idle_reap_after,
+                        )),
+                    );
+                }
             }
         }
     }
-    (tools, McpCatalog::new(catalogs), warnings)
+    let catalog = McpCatalog::new(catalogs);
+    if let Ok(mut u) = catalog.unconnected.lock() {
+        *u = unconnected;
+    }
+    (tools, catalog, warnings)
 }
 
 /// Dial every job concurrently, keeping each server's outcome separate.
@@ -2728,6 +2828,10 @@ pub struct McpPromptInfo {
 #[derive(Clone, Default)]
 pub struct McpCatalog {
     servers: Arc<std::sync::Mutex<Vec<McpServerCatalog>>>,
+    /// Configured servers that could not be dialed at startup, kept dormant: they offer no tools,
+    /// but a journaled task on one can still be resumed once it is back (see
+    /// [`Self::resume_task`]).
+    unconnected: Arc<std::sync::Mutex<HashMap<String, Arc<McpConnection>>>>,
     /// The session this view of the catalog belongs to (see [`Self::for_session`]): the host its
     /// non-tool requests (`events/*`, `completion/complete`) are registered under, so a nested
     /// request raised during one is attributed to that session or refused, never guessed.
@@ -2738,14 +2842,25 @@ impl McpCatalog {
     pub fn new(servers: Vec<McpServerCatalog>) -> Self {
         Self {
             servers: Arc::new(std::sync::Mutex::new(servers)),
+            unconnected: Arc::default(),
             session_host: None,
         }
+    }
+
+    /// Whether `server` is one of this catalog's configured servers (connected or not).
+    pub fn has_server(&self, server: &str) -> bool {
+        self.snapshot().iter().any(|s| s.name == server)
+            || self
+                .unconnected
+                .lock()
+                .is_ok_and(|u| u.contains_key(server))
     }
 
     /// This catalog (the same servers, shared) as session `host` uses it.
     pub fn for_session(&self, host: Arc<McpHost>) -> Self {
         Self {
             servers: self.servers.clone(),
+            unconnected: self.unconnected.clone(),
             session_host: Some(host),
         }
     }

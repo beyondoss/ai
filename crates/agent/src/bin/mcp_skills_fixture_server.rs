@@ -469,7 +469,7 @@ fn handle(method: &str, params: &Value) -> Result<Value, (i64, String)> {
         }] })),
         "tools/call" if params.get("name").and_then(Value::as_str) == Some("publish_late") => {
             if let Ok(path) = std::env::var("MCP_SKILLS_FIXTURE_LATE_FLAG") {
-                let _ = std::fs::write(path, "published");
+                write_atomically(&path, "published");
             }
             Ok(
                 json!({ "content": [{ "type": "text", "text": "LATE-PUBLISHED" }], "isError": false }),
@@ -819,5 +819,15 @@ async fn serve_http() {
     tokio::select! {
         () = accept => {}
         () = eof => {}
+    }
+}
+
+/// Write a file a test reads, all at once: to a temporary sibling, then `rename` it into place. A
+/// reader polling for the file (or its content) can otherwise see it created but still empty,
+/// between `write`'s create and its write.
+fn write_atomically(path: &str, contents: &str) {
+    let tmp = format!("{path}.tmp-{}", std::process::id());
+    if std::fs::write(&tmp, contents).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
     }
 }
