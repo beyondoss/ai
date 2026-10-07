@@ -65,7 +65,7 @@ pub fn spawn_nats(store: &std::path::Path) -> Result<(std::process::Child, u16),
         .map_err(|e| format!("nats-server: {e}"))?;
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
-        if let Some(port) = beyond_ai_test_support::ports::nats_port_from(&ports) {
+        if let Some(port) = beyond_ai_test_support::ports::nats_port_from(&ports, child.id()) {
             return Ok((child, port));
         }
         if let Ok(Some(status)) = child.try_wait() {

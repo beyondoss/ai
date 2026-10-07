@@ -477,6 +477,22 @@ fn session_cfg(base: &ServeConfig, id: &str, service: Option<Arc<ServiceSession>
     c
 }
 
+/// Latency at one of a session's race windows, simulated: sleeps the milliseconds in `var`, if set. A
+/// seam for tests that must hold such a window open on demand (a session ending just as a client
+/// waits on it, a connection registering late) instead of hoping a loaded host does. `#[cfg]`-gated
+/// like `serve.rs`'s `simulated_slow_open`, so a release binary has no latency-injection path.
+#[cfg(debug_assertions)]
+async fn simulated_delay(var: &str) {
+    if let Ok(ms) = std::env::var(var)
+        && let Ok(ms) = ms.parse::<u64>()
+    {
+        tokio::time::sleep(Duration::from_millis(ms)).await;
+    }
+}
+
+#[cfg(not(debug_assertions))]
+async fn simulated_delay(_var: &str) {}
+
 /// The production [`SessionBody`]: run [`serve_session`] on the session's derived config.
 ///
 /// `serve_session` is `Send` (its event sink is `FnMut + Send`, and the error type is
@@ -498,7 +514,8 @@ fn serve_session_body(base: ServeConfig) -> SessionBody {
             Box::pin(async move {
                 if let Err(e) = serve_session(cfg, input_rx, out_conn, running, keep_alive).await {
                     eprintln!("serve: session {id} ended: {e}");
-                    lock_ignoring_poison(&out_err).broadcast(OutFrame::Value(json!({
+                    simulated_delay("BEYOND_AI_AGENT_TEST_SLOW_SESSION_END_MS").await;
+                    lock_ignoring_poison(&out_err).end(OutFrame::Value(json!({
                         "type": "error",
                         "session_id": id,
                         "error": e.to_string(),
@@ -615,7 +632,7 @@ fn report_start_failure(
     };
     // The spawning connection is answered by `started`; this reaches anyone who attached to the
     // `Starting` slot while the lock was being taken.
-    lock_ignoring_poison(out_conn).broadcast(OutFrame::Value(json!({
+    lock_ignoring_poison(out_conn).end(OutFrame::Value(json!({
         "type": "error",
         "session_id": id,
         "error": message,
@@ -694,6 +711,9 @@ struct Pinned {
     incarnation: u64,
     input_tx: mpsc::Sender<String>,
     out_conn: SharedOutConn,
+    /// Fired once the session's task has finished — every frame it will ever send is broadcast by
+    /// then. See the read loop's `input_tx.closed()` arm in `attach`.
+    exited: CancellationToken,
 }
 
 /// A freshly spawned session task's report to the pin that spawned it, sent before it goes live: it
@@ -705,7 +725,13 @@ enum TryPin {
     /// Attached (spawning the session if the id was free): its incarnation, input, and output. The
     /// `Started` receiver is present exactly when this look *spawned* the session and that spawn has
     /// start-up work to finish first — the pin awaits it, so a refusal is still an HTTP status.
-    Attached(u64, mpsc::Sender<String>, SharedOutConn, Option<Started>),
+    Attached(
+        u64,
+        mpsc::Sender<String>,
+        SharedOutConn,
+        CancellationToken,
+        Option<Started>,
+    ),
     /// The id's previous task is still exiting. Wait for this latch, then look again.
     Wait(CancellationToken),
     /// A live session owns this id, and it belongs to another tenant.
@@ -800,7 +826,7 @@ impl Supervisor {
         let deadline = tokio::time::Instant::now() + grace;
         loop {
             match self.try_pin(&id, service.as_ref()) {
-                TryPin::Attached(incarnation, input_tx, out_conn, started) => {
+                TryPin::Attached(incarnation, input_tx, out_conn, exited, started) => {
                     // A spawn with start-up work reports before it goes live. Waiting here is what
                     // turns "another replica holds this session" into a 503 the client can act on;
                     // the task frees the id itself on the way out, so there is nothing to unpin.
@@ -817,6 +843,7 @@ impl Supervisor {
                         incarnation,
                         input_tx,
                         out_conn,
+                        exited,
                     });
                 }
                 TryPin::Forbidden => return Err(PinError::Forbidden),
@@ -870,7 +897,13 @@ impl Supervisor {
                     h.last_detached_at = None;
                     // No `Started`: this task is already running (or already past its own lock), so
                     // there is nothing for the caller to wait on.
-                    TryPin::Attached(h.incarnation, input_tx, h.out_conn.clone(), None)
+                    TryPin::Attached(
+                        h.incarnation,
+                        input_tx,
+                        h.out_conn.clone(),
+                        h.exited.clone(),
+                        None,
+                    )
                 }
                 // Stopping — or attachable in name only: a closed input means its loop already ended on
                 // its own (SIGTERM, an internal error) and the task is on its way out, possibly still
@@ -939,6 +972,7 @@ impl Supervisor {
             m.sessions_live.inc();
             m.sessions_spawned.inc();
         }
+        let exited_for_pin = exited.clone();
         let exit = ExitGuard {
             table: Arc::clone(&self.table),
             id: id.to_owned(),
@@ -1036,7 +1070,7 @@ impl Supervisor {
                     eprintln!(
                         "serve: session {session_id} panicked ({message}); it has ended, the daemon carries on"
                     );
-                    lock_ignoring_poison(&panic_conn).broadcast(OutFrame::Value(json!({
+                    lock_ignoring_poison(&panic_conn).end(OutFrame::Value(json!({
                         "type": "error",
                         "session_id": session_id,
                         "error": format!("the session ended after an internal error: {message}"),
@@ -1053,7 +1087,7 @@ impl Supervisor {
             // Only once the body's state is gone: free the id, then wake whoever waits on it.
             drop(exit);
         });
-        TryPin::Attached(incarnation, input_tx, out_conn, started)
+        TryPin::Attached(incarnation, input_tx, out_conn, exited_for_pin, started)
     }
 
     /// One fewer attached connection; if that was the last, start the idle reaper's clock. A no-op for
@@ -1091,7 +1125,9 @@ impl Supervisor {
             incarnation,
             input_tx,
             out_conn,
+            exited,
         } = pinned;
+        simulated_delay("BEYOND_AI_AGENT_TEST_SLOW_ATTACH_MS").await;
 
         // Register this connection's send channel as one of the session's output sinks — the session
         // broadcasts every frame to all registered sinks. Keep the `sink_id` to remove it on disconnect.
@@ -1183,6 +1219,13 @@ impl Supervisor {
                 // silent connection indefinitely. The connection also leaked for as long as the
                 // client held it, since nothing on this side was watching.
                 _ = input_tx.closed() => {
+                    // The loop dropped its input, but the task may not be done saying why: a session
+                    // that fails returns from its loop first and broadcasts the reason after. Wait for
+                    // the task itself to finish — then every frame it will send is queued to this
+                    // connection — before flushing and closing; flushing at the first sign raced that
+                    // broadcast, and under load the client got a bare close and no reason. Bounded,
+                    // so a task stuck on its way out (a slow lock release) cannot hold this open.
+                    let _ = tokio::time::timeout(JOIN_GRACE, exited.cancelled()).await;
                     session_ended = true;
                     break;
                 }
@@ -2542,6 +2585,7 @@ where
         incarnation,
         input_tx,
         out_conn,
+        exited: _,
     } = supervisor
         .pin(requested_id, service)
         .await
