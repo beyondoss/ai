@@ -4339,7 +4339,23 @@ carrying a JSON-RPC error body as an ordinary error response) — makes `ServerA
 and `McpAuthStore` `mcp-login` uses (so the new token is persisted), and the request is retried
 **once**; a second 401 is returned as the server's answer. That covers `tools/call`, `resources/*`,
 `prompts/*`, `skills/*`, MCP App view reads, the handshake, the standalone stream and `events/*`. A 403
-(`InsufficientScope`) never refreshes. **Single flight:** the refresh runs under the token's lock, and
+(`InsufficientScope`) never refreshes.
+
+**`post_bounded` answers what rmcp's client would, with one deliberate difference.** Since an OAuth
+server's POSTs no longer reach rmcp's client, `post_bounded` carries its semantics: `Mcp-Session-Id`
+in and out, a 404 on a session as `SessionExpired` (rmcp re-initializes and retries), an SSE response
+handed back as a stream, 202/204 — or an empty 200 to a notification or reply — as accepted, a JSON 200
+that is not a JSON-RPC message, for a notification or reply, as accepted, a non-JSON success as an
+error (rmcp's unexpected content type), and a 4xx to `server/discover` as the legacy server's cue to
+`initialize`. **The difference:** a JSON 200 that is not a JSON-RPC message, answering a _request_,
+is an error here. rmcp calls it accepted and then waits for a response that cannot come (a request is
+answered on its own POST, as JSON or an SSE stream carrying it) until the request's timeout; failing
+at once with the body in the error is the honest answer. Pinned end to end against the OAuth fixture
+— which speaks sessions (and their 404 expiry), SSE responses, the `GET` stream and `DELETE` — in
+`tests/mcp_oauth_routing.rs` (a 401 with a JSON-RPC body through a real dial, the legacy
+`server/discover` 4xx, an empty-200 notification, sessions with SSE, an expired session), and the
+request/notification difference in `mcp_wire`'s
+`a_json_success_that_is_not_json_rpc_is_accepted_for_a_notification_but_fails_a_request`. **Single flight:** the refresh runs under the token's lock, and
 a caller whose rejected token has already been replaced takes the replacement without refreshing, so
 concurrent 401s cost one refresh (a second refresh with a rotated-away refresh token would fail). **A
 failed refresh is remembered:** a _definitive_ one for good, with an error naming `agent mcp-login
