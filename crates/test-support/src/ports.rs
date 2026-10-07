@@ -11,6 +11,10 @@
 //! - **`nats-server`** is started with `-p -1 --ports_file_dir <dir>` and writes the port it got to a
 //!   file ([`nats_port_from`]).
 //! - **A port where nothing listens** is held bound, never listening ([`DeadPort`]).
+//!
+//! Reading a child's ports back needs Linux: its `LISTEN` sockets come from `/proc`, and the
+//! gateway's metrics listener sits on `127.0.0.2`, which Linux routes to loopback with no setup.
+//! Elsewhere the read-back fails at once and says so ([`require_proc`]), never a timeout.
 
 use std::net::{SocketAddr, SocketAddrV4};
 use std::path::Path;
@@ -19,6 +23,8 @@ use std::path::Path;
 /// loopback address, because Pingora keys a server's listeners by their address string — two
 /// `127.0.0.1:0` collide (one listener comes up, and shutdown closes its descriptor twice) — and the
 /// address is also how [`gateway_ports`] tells the client listener from the metrics one.
+///
+/// Linux only: `127.0.0.2` is loopback there without configuration; see [`require_proc`].
 pub const GATEWAY_LISTENERS: &str = "listen = \"127.0.0.1:0\"\nmetrics_listen = \"127.0.0.2:0\"\n";
 
 /// Where a gateway configured with [`GATEWAY_LISTENERS`] listens.
@@ -48,6 +54,7 @@ fn pick_gateway_ports(bound: &[SocketAddrV4]) -> Option<GatewayPorts> {
 /// The IPv4 addresses `pid` itself holds sockets in `LISTEN` on. `/proc/<pid>/net/tcp` lists every
 /// socket in the network namespace, so it is filtered to the inodes among `pid`'s descriptors.
 pub fn listening_on(pid: u32) -> Vec<SocketAddrV4> {
+    require_proc();
     let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
         return Vec::new();
     };
@@ -81,6 +88,30 @@ pub fn listening_on(pid: u32) -> Vec<SocketAddrV4> {
             Some(SocketAddrV4::new(addr.to_ne_bytes().into(), port))
         })
         .collect()
+}
+
+/// Fail now, naming the reason, where reading a child's ports cannot work — instead of every caller
+/// polling an empty socket table until its startup deadline and reporting a "did not come up".
+#[track_caller]
+pub fn require_proc() {
+    #[cfg(not(target_os = "linux"))]
+    panic!(
+        "unsupported platform: reading a child's ports needs Linux (/proc for its LISTEN sockets, \
+         and 127.0.0.2 on loopback for the gateway's metrics listener)"
+    );
+    #[cfg(target_os = "linux")]
+    require_proc_at(Path::new("/proc/self/net/tcp"));
+}
+
+#[cfg(target_os = "linux")]
+#[track_caller]
+fn require_proc_at(table: &Path) {
+    assert!(
+        std::fs::read_to_string(table).is_ok(),
+        "unsupported environment: {} is not readable, and a child's ports are read from /proc \
+         (mount procfs, or run these tests where it is)",
+        table.display()
+    );
 }
 
 /// The client port in the `<name>_<pid>.ports` file `nats-server --ports_file_dir <dir>` writes
@@ -147,6 +178,21 @@ mod tests {
         assert_eq!(ports.metrics, SocketAddr::V4(metrics));
         assert!(pick_gateway_ports(&[proxy]).is_none(), "metrics not up yet");
         assert!(pick_gateway_ports(&[metrics]).is_none(), "proxy not up yet");
+    }
+
+    /// Without a readable socket table the read-back fails at once, saying what is missing.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[should_panic(expected = "unsupported environment")]
+    fn a_missing_socket_table_fails_at_once_and_says_why() {
+        require_proc_at(Path::new("/proc/no-such-table"));
+    }
+
+    /// Here it is readable, so the check passes.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_socket_table_is_readable_here() {
+        require_proc();
     }
 
     /// A dead port refuses connections, and while it is held nobody can listen there.

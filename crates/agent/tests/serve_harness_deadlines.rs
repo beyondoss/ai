@@ -288,71 +288,222 @@ fn only_child_frames_touches_a_childs_stdout() {
     );
 }
 
-/// What a source file must not contain: a port picked free and released for something else to bind —
-/// `free_port(`, or a listener bound as a temporary whose port is read and which is dropped at once
-/// (`TcpListener::bind(..).unwrap().local_addr()…`, in any spelling). Comments are dropped and
-/// whitespace removed first, so formatting cannot hide one.
-fn released_ports(source: &str) -> Vec<&'static str> {
-    let code: String = source
-        .lines()
-        .map(|line| line.split("//").next().unwrap_or(""))
-        .collect::<String>()
-        .chars()
-        .filter(|c| !c.is_whitespace())
-        .collect();
+/// Every place `source` binds a socket to port 0, reads the port the kernel gave it, and lets the
+/// socket go without using it for anything else — the port then handed on for something else to bind,
+/// which any process can take first. Recognised by what happens to the socket, not by a helper's
+/// name:
+///
+/// - a **temporary**: `TcpListener::bind(…:0)…local_addr()` in one expression, the listener dropped
+///   at the end of it (`.unwrap()`, `?`, `.and_then(|l| l.local_addr())` in between, any spelling);
+/// - a **named** socket (`let l = TcpListener::bind(…:0)?` or `let s = TcpSocket::new_v4()?` then
+///   `s.bind(…0…)`) whose only uses until the end of its block — or until the name is bound again —
+///   are reading its address, configuring it, binding it, or `drop(l)`.
+///
+/// A socket that is also accepted on, listened on, converted, stored or passed anywhere is held, and
+/// fine. Comments are dropped and whitespace normalised first ([`normalised`]), so formatting cannot
+/// hide a case.
+fn released_ports(source: &str) -> Vec<String> {
+    let code = normalised(source);
     let mut found = Vec::new();
-    if code.contains("free_port(") {
-        found.push("`free_port(`");
-    }
+    // Temporaries: the bind's own statement reads the address.
     for ty in ["TcpListener::bind(", "TcpSocket::bind(", "UdpSocket::bind("] {
         for (at, _) in code.match_indices(ty) {
-            // From the bind to the end of its statement: a temporary listener reaches
-            // `.local_addr()` in the same expression, without being given a name.
             let stmt = &code[at..];
             let stmt = &stmt[..stmt.find(';').unwrap_or(stmt.len())];
-            let open = stmt.find('(').unwrap();
-            let mut depth = 0;
-            let mut close = stmt.len();
-            for (i, c) in stmt[open..].char_indices() {
-                match c {
-                    '(' => depth += 1,
-                    ')' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            close = open + i + 1;
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
+            let close = matching_paren(stmt, stmt.find('(').unwrap());
+            if binds_port_zero(&stmt[..close]) && stmt[close..].contains(".local_addr()") {
+                found.push(format!("a temporary listener's port ({})", excerpt(stmt)));
             }
-            // A held listener reads its address in a later statement; a temporary one in this one.
-            let chained = stmt[close..].contains(".local_addr()");
-            if chained {
-                found.push("a temporary listener's port");
-            }
+        }
+    }
+    // Named sockets: follow the name to the end of its scope.
+    for (at, _) in code.match_indices("let ") {
+        if code[..at]
+            .chars()
+            .last()
+            .is_some_and(|c| c.is_alphanumeric() || c == '_')
+        {
+            continue;
+        }
+        let after = &code[at + 4..];
+        let after = after.strip_prefix("mut ").unwrap_or(after);
+        let name: String = after
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        let Some(eq) = after.find('=') else { continue };
+        if name.is_empty()
+            || !after[name.len()..eq]
+                .chars()
+                .all(|c| c.is_alphanumeric() || "<>_:& ".contains(c))
+        {
+            continue;
+        }
+        let stmt_end = after.find(';').unwrap_or(after.len());
+        let init = &after[eq + 1..stmt_end];
+        let rest = scope_after(&after[stmt_end..], &name);
+        let bound_zero_here = (init.contains("TcpListener::bind(")
+            || init.contains("UdpSocket::bind("))
+            && binds_port_zero(init);
+        let socket_here =
+            init.contains("TcpSocket::new_v4(") || init.contains("TcpSocket::new_v6(");
+        if !bound_zero_here && !socket_here {
+            continue;
+        }
+        let uses = uses_of(rest, &name);
+        let reads_port = uses.iter().any(|u| u.starts_with(".local_addr()"));
+        let bound_zero = bound_zero_here
+            || uses
+                .iter()
+                .any(|u| u.starts_with(".bind(") && binds_port_zero(&u[..matching_paren(u, 5)]));
+        let let_go = uses.iter().all(|u| {
+            u.starts_with(".local_addr()")
+                || u.starts_with(".bind(")
+                || u.starts_with(".set_")
+                || *u == "drop"
+        });
+        if bound_zero && reads_port && let_go {
+            found.push(format!(
+                "`{name}`: bound to port 0, its port read, then let go"
+            ));
         }
     }
     found
 }
 
-/// The lint catches the released-port shapes, and leaves a held listener alone.
+/// The index just past the `)` matching the `(` at `open`.
+fn matching_paren(s: &str, open: usize) -> usize {
+    let mut depth = 0;
+    for (i, c) in s[open..].char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return open + i + 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    s.len()
+}
+
+/// Whether a bind's arguments ask for port 0.
+fn binds_port_zero(args: &str) -> bool {
+    args.contains(":0\"") || args.contains(",0)") || args.contains(",0))")
+}
+
+/// `source` without comments, and with whitespace removed except a single space between two
+/// identifier characters (`for x in listener.incoming()` keeps `in listener` apart), so a pattern
+/// matches however the code is laid out.
+fn normalised(source: &str) -> String {
+    let ident = |c: char| c.is_alphanumeric() || c == '_';
+    let code: String = source
+        .lines()
+        .map(|line| line.split("//").next().unwrap_or(""))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut out = String::with_capacity(code.len());
+    let mut pending_space = false;
+    for c in code.chars() {
+        if c.is_whitespace() {
+            pending_space = true;
+            continue;
+        }
+        if pending_space && out.chars().last().is_some_and(ident) && ident(c) {
+            out.push(' ');
+        }
+        pending_space = false;
+        out.push(c);
+    }
+    out
+}
+
+/// The code from a binding to the end of its block, or through the statement that binds `name` again
+/// (whose right-hand side may still use the old binding: `let l = from_std(l)`).
+fn scope_after<'a>(code: &'a str, name: &str) -> &'a str {
+    let mut depth = 0i32;
+    for (i, c) in code.char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth < 0 {
+                    return &code[..i];
+                }
+            }
+            _ => {}
+        }
+        let rebinds = [
+            format!("let {name}="),
+            format!("let mut {name}="),
+            format!("let {name}:"),
+        ];
+        if rebinds.iter().any(|r| code[i..].starts_with(r.as_str())) {
+            let end = code[i..].find(';').map_or(code.len(), |e| i + e);
+            return &code[..end];
+        }
+    }
+    code
+}
+
+/// Every use of identifier `name` in `code`, as the text from the identifier's end — or, for a
+/// `drop(name)`, the text `drop`.
+fn uses_of<'a>(code: &'a str, name: &str) -> Vec<&'a str> {
+    let ident = |c: char| c.is_alphanumeric() || c == '_';
+    code.match_indices(name)
+        .filter(|(i, _)| !code[..*i].chars().last().is_some_and(ident))
+        .filter(|(i, m)| !code[i + m.len()..].chars().next().is_some_and(ident))
+        .filter(|(i, _)| !code[..*i].ends_with('.'))
+        .map(|(i, m)| {
+            if code[..i].ends_with("drop(") && code[i + m.len()..].starts_with(')') {
+                "drop"
+            } else {
+                &code[i + m.len()..]
+            }
+        })
+        .collect()
+}
+
+fn excerpt(s: &str) -> &str {
+    &s[..s.len().min(60)]
+}
+
+/// The lint recognises the shape — a port-0 socket whose port is read and which is then let go —
+/// however it is written, and leaves a socket that is held, served or passed on alone.
 #[test]
 fn the_released_port_lint_catches_what_it_should() {
     for bad in [
-        "let p = free_port();",
+        // A temporary.
         "let p = TcpListener::bind(\"127.0.0.1:0\").unwrap().local_addr().unwrap().port();",
         "let p = std::net::TcpListener::bind(\"127.0.0.1:0\")\n    .and_then(|l| l.local_addr())\n    .unwrap()\n    .port();",
-        "let p = TcpListener::bind(\"127.0.0.1:0\")\n    .await?\n    .local_addr()?\n    .port();",
+        "let p = TcpListener::bind((\"127.0.0.1\", 0)).await?.local_addr()?.port();",
+        // Named, under any name, in a helper or inline.
+        "fn pick() -> u16 { let l = TcpListener::bind(\"127.0.0.1:0\").unwrap(); l.local_addr().unwrap().port() }",
+        "let sock = std::net::TcpListener::bind(\"127.0.0.1:0\")?;\nlet port = sock.local_addr()?.port();\ndrop(sock);\nspawn_child(port);",
+        "let reserve = TcpListener::bind(\"0.0.0.0:0\").unwrap();\nlet n = reserve.local_addr().unwrap().port();\n}\nchild(n);",
+        // A socket bound to port 0 after creation.
+        "let s = TcpSocket::new_v4()?;\ns.set_reuseaddr(true)?;\ns.bind(\"127.0.0.1:0\".parse().unwrap())?;\nlet p = s.local_addr()?.port();\ndrop(s);",
     ] {
         assert!(!released_ports(bad).is_empty(), "missed: {bad:?}");
     }
     for fine in [
-        "let listener = TcpListener::bind(\"127.0.0.1:0\").unwrap();\nlet port = listener.local_addr().unwrap().port();",
-        "// free_port() is gone",
+        // Held and served.
+        "let listener = TcpListener::bind(\"127.0.0.1:0\").await.unwrap();\nlet port = listener.local_addr().unwrap().port();\ntokio::spawn(serve(listener));",
+        // Held in a struct for the test's life.
+        "let socket = TcpSocket::new_v4().unwrap();\nsocket.bind(addr0).unwrap();\nlet port = socket.local_addr().unwrap().port();\nSelf { _socket: socket, port }",
+        "let l = TcpListener::bind(\"127.0.0.1:0\").unwrap();\nlet port = l.local_addr().unwrap().port();\nlet (conn, _) = l.accept().unwrap();",
+        // A fixed port: nothing picked.
+        "let l = TcpListener::bind(\"127.0.0.1:8080\").unwrap();\nlet a = l.local_addr().unwrap();\ndrop(l);",
+        "// let p = TcpListener::bind(\"127.0.0.1:0\").unwrap().local_addr().unwrap().port();",
         "let dead = DeadPort::bind();",
+        // Used right after a keyword, which a whitespace-blind match would glue to it.
+        "let listener = TcpListener::bind(\"127.0.0.1:0\").unwrap();\nlet addr = listener.local_addr().unwrap();\nthread::spawn(move || { for s in listener.incoming() { drop(s); } });",
+        // Re-bound by a statement that consumes the old binding.
+        "let listener = std::net::TcpListener::bind(\"127.0.0.1:0\").unwrap();\nlet port = listener.local_addr().unwrap().port();\nlet listener = tokio::net::TcpListener::from_std(listener).unwrap();",
     ] {
-        assert!(released_ports(fine).is_empty(), "{fine:?}");
+        assert_eq!(released_ports(fine), Vec::<String>::new(), "{fine:?}");
     }
 }
 
