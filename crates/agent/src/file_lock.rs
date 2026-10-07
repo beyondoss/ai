@@ -23,8 +23,16 @@ const RETRIES: usize = 5;
 /// A held lock. Dropping it closes the descriptor (releasing the kernel lock) and frees the
 /// registration.
 pub struct FileLock {
-    _file: File,
+    file: File,
     _registration: Registration,
+}
+
+impl FileLock {
+    /// The locked file, for a holder that writes the lock file's own content. Write through this
+    /// descriptor, never a second open: over NFS, closing *any* descriptor to the file drops the lock.
+    pub fn file(&self) -> &File {
+        &self.file
+    }
 }
 
 /// "This process holds the lock at this path."
@@ -80,7 +88,7 @@ pub fn try_lock(lock_path: &Path) -> std::io::Result<Option<FileLock>> {
         }
         if same_file(&file, lock_path)? {
             return Ok(Some(FileLock {
-                _file: file,
+                file,
                 _registration: registration,
             }));
         }

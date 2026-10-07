@@ -430,7 +430,7 @@ async fn main() {
             && let Ok(marker) = std::env::var("MCP_APPS_FIXTURE_FAIL_FIRST_UI")
             && !std::path::Path::new(&marker).exists()
         {
-            let _ = std::fs::write(&marker, "failed once");
+            write_atomically(&marker, "failed once");
             std::process::exit(3);
         }
         let changes_view = method == "tools/call"
@@ -457,5 +457,15 @@ async fn main() {
             let _ = out.write_all(format!("{envelope}\n").as_bytes()).await;
             let _ = out.flush().await;
         });
+    }
+}
+
+/// Write a file a test reads, all at once: to a temporary sibling, then `rename` it into place. A
+/// reader polling for the file (or its content) can otherwise see it created but still empty,
+/// between `write`'s create and its write.
+fn write_atomically(path: &str, contents: &str) {
+    let tmp = format!("{path}.tmp-{}", std::process::id());
+    if std::fs::write(&tmp, contents).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
     }
 }

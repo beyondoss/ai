@@ -1758,7 +1758,10 @@ async fn main() {
         if let Ok(pidfile) = std::env::var("MCP_FIXTURE_ORPHAN_PIDFILE") {
             let _ = tokio::process::Command::new("sh")
                 .arg("-c")
-                .arg(format!("sleep 600 & echo $! > {pidfile}"))
+                // Written to a temporary name and renamed, so a test never reads a half-written pid.
+                .arg(format!(
+                    "sleep 600 & echo $! > {pidfile}.tmp && mv -f {pidfile}.tmp {pidfile}"
+                ))
                 .status()
                 .await;
         }
@@ -1767,7 +1770,7 @@ async fn main() {
         // to "clean up" (as a server closing a browser would), then record that we got to.
         if let Ok(path) = std::env::var("MCP_FIXTURE_EXIT_MARKER") {
             tokio::time::sleep(Duration::from_millis(500)).await;
-            let _ = std::fs::write(path, "clean exit");
+            write_atomically(&path, "clean exit");
         }
     } else {
         println!(
@@ -1775,5 +1778,15 @@ async fn main() {
             json!({ "mcp": format!("{control}/mcp"), "control": control })
         );
         let _ = accept.await;
+    }
+}
+
+/// Write a file a test reads, all at once: to a temporary sibling, then `rename` it into place. A
+/// reader polling for the file (or its content) can otherwise see it created but still empty,
+/// between `write`'s create and its write.
+fn write_atomically(path: &str, contents: &str) {
+    let tmp = format!("{path}.tmp-{}", std::process::id());
+    if std::fs::write(&tmp, contents).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
     }
 }

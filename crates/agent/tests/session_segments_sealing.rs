@@ -89,6 +89,67 @@ fn transcripts_listings_and_memory_hold_no_plaintext() {
     assert_eq!(session.messages.len(), 1);
 }
 
+/// MCP task handles journaled with a service session (task ids, which a server may treat as bearer
+/// tokens, and resolved results) are sealed with the tenant's key like the rest of the transcript,
+/// and read back intact with it, so a resume works on sealed storage.
+#[test]
+fn mcp_task_journal_entries_are_sealed_and_read_back() {
+    let dir = TempDir::new().unwrap();
+    let repo = sealed_repo(dir.path(), "tenant-a", &DEK);
+    let mut store = repo.create(SessionMeta::with_id("s1", "/w", "m")).unwrap();
+    store.append_new(&[Message::user("start the job")]).unwrap();
+    // Through the journal path, which is where a key would be made if this storage were given one.
+    store
+        .append_journal(
+            "mcp_task",
+            serde_json::json!({
+                "server": "srv", "tool": "job", "taskId": "SECRET-TASK-ID",
+                "createdAtMs": 1, "toolUseId": "toolu_1", "sessionId": "s1",
+            }),
+        )
+        .unwrap();
+    store
+        .append_journal(
+            "mcp_task_result",
+            serde_json::json!({
+                "toolUseId": "toolu_1", "name": "mcp__srv__job",
+                "content": "SECRET-RESULT", "isError": false, "sessionId": "s1",
+            }),
+        )
+        .unwrap();
+    drop(store);
+
+    assert_no_plaintext(dir.path(), &["SECRET-TASK-ID", "SECRET-RESULT"]);
+
+    let (store, _session) = repo.open_or_create_id("s1", "/w", "m").unwrap();
+    // The sealed store authenticates every line itself: the journal needs no key of its own (so no
+    // key file sits beside the session, and any replica holding the tenant key reads it).
+    let tasks = store.active_journal("mcp_task");
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0]["taskId"], "SECRET-TASK-ID");
+    assert_eq!(store.active_journal("mcp_task_result").len(), 1);
+    let names: Vec<String> = std::fs::read_dir(dir.path().join("s1"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        names.iter().all(|n| !n.contains("mcp-task-journal")),
+        "{names:?}"
+    );
+    let beside: Vec<String> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        beside.iter().all(|n| !n.contains("mcp-task-journal")),
+        "{beside:?}"
+    );
+    // Nor is any entry given a MAC: nothing on top of the storage's own seal.
+    assert!(tasks.iter().all(|t| t.get("mac").is_none()), "{tasks:?}");
+}
+
 #[test]
 fn a_base_seals_its_content_too() {
     // Compaction replaces the whole transcript at once. That content is still transcript.

@@ -29,7 +29,8 @@
 //! - `ttl_task`: `ttlMs: 400`, never leaves `working`.
 //! - `blip_task`: over HTTP, polls 2 and 3 have their connection dropped without a response (a
 //!   network blip); completes on poll 5 with `blip-done`.
-//! - `gated_task`: `working` until the file at `MCP_TASKS_FIXTURE_GATE` exists, then `gated-done`.
+//! - `gated_task`: `working` until the file at `MCP_TASKS_FIXTURE_GATE` exists, then `gated-done`
+//!   (or `MCP_TASKS_FIXTURE_GATED_TEXT`).
 //! - `sample_task`: one in-task `sampling/createMessage` (`draft`); completes with `sampled:<text>`.
 //! - `ttl_shift_task`: created with `ttlMs: null`; every poll then says `ttlMs: 300`, never finishing.
 //!   Only a client honouring the *latest* TTL stops (after 60 polls it completes `ttl-ignored`).
@@ -51,7 +52,7 @@
 //! Resource `fixture-tasks://doc`: `resources/read` answers a `CreateTaskResult`, which the client
 //! MUST treat as an invalid response (tasks are defined for `tools/call` only).
 //!
-//! Env: `MCP_TASKS_FIXTURE_LOG` (path), `MCP_TASKS_FIXTURE_LEGACY=1` (answer `server/discover` with
+//! Env: `MCP_TASKS_FIXTURE_KEEP` (path: gated tasks survive a restart), `MCP_TASKS_FIXTURE_LOG` (path), `MCP_TASKS_FIXTURE_LEGACY=1` (answer `server/discover` with
 //! `-32601`, forcing the client onto legacy `initialize`), `MCP_TASKS_FIXTURE_GATE` (path),
 //! `MCP_TASKS_FIXTURE_HTTP_PORT_FILE` (serve Streamable HTTP on `127.0.0.1:<ephemeral>/mcp` instead
 //! of stdio, writing the port to this file; each HTTP log line also records the `Mcp-Method` /
@@ -264,6 +265,9 @@ impl Server {
         if kind == Kind::CrashOnce {
             save_state(&task_id);
         }
+        if kind == Kind::Gated {
+            keep_gated(&self.tasks);
+        }
         // A long interval for `ttl_task`, so only a client that caps its wait by the TTL notices
         // the TTL on time.
         let interval = if kind == Kind::Ttl { 10_000 } else { 60 };
@@ -324,7 +328,8 @@ impl Server {
             Kind::Blip => completed(task_id, ttl, "blip-done"),
             Kind::Gated => {
                 if gate_open() {
-                    completed(task_id, ttl, "gated-done")
+                    let text = std::env::var("MCP_TASKS_FIXTURE_GATED_TEXT");
+                    completed(task_id, ttl, text.as_deref().unwrap_or("gated-done"))
                 } else {
                     task_json(task_id, "working", ttl, 50)
                 }
@@ -477,14 +482,54 @@ fn ask(task_id: &str, ttl: Value, key: &str, message: &str, interval: u64) -> Va
     v
 }
 
+/// Write a file a test reads, all at once: to a temporary sibling, then `rename` it into place. A
+/// reader polling for the file (or its content) can otherwise see it created but still empty,
+/// between `write`'s create and its write.
+fn write_atomically(path: &str, contents: &str) {
+    let tmp = format!("{path}.tmp-{}", std::process::id());
+    if std::fs::write(&tmp, contents).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
+    }
+}
+
 /// `crash_once_task`: remember the task across a process restart.
 fn save_state(task_id: &str) {
     if let Ok(path) = std::env::var("MCP_TASKS_FIXTURE_STATE") {
-        let _ = std::fs::write(path, task_id);
+        write_atomically(&path, task_id);
     }
 }
 
 /// The `crash_once_task` a previous process saved, already past its crash.
+/// `MCP_TASKS_FIXTURE_KEEP=<path>`: the gated tasks this server holds, one id per line, so a
+/// restarted HTTP server still knows them (a server whose tasks outlive its process).
+fn keep_gated(tasks: &HashMap<String, Task>) {
+    if let Ok(path) = std::env::var("MCP_TASKS_FIXTURE_KEEP") {
+        let ids: Vec<&str> = tasks
+            .iter()
+            .filter(|(_, t)| t.kind == Kind::Gated)
+            .map(|(id, _)| id.as_str())
+            .collect();
+        write_atomically(&path, &ids.join("\n"));
+    }
+}
+
+fn load_kept(tasks: &mut HashMap<String, Task>) {
+    let Ok(path) = std::env::var("MCP_TASKS_FIXTURE_KEEP") else {
+        return;
+    };
+    for id in std::fs::read_to_string(path).unwrap_or_default().lines() {
+        tasks.insert(
+            id.to_owned(),
+            Task {
+                kind: Kind::Gated,
+                polls: 0,
+                answers: HashMap::new(),
+                updates: 0,
+            },
+        );
+    }
+}
+
 fn load_state(tasks: &mut HashMap<String, Task>) -> bool {
     let Ok(path) = std::env::var("MCP_TASKS_FIXTURE_STATE") else {
         return false;
@@ -630,6 +675,7 @@ fn envelope(server: &mut Server, id: Value, method: &str, params: &Value) -> Opt
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let mut tasks = HashMap::new();
+    load_kept(&mut tasks);
     if load_state(&mut tasks)
         && let Some(ms) = std::env::var("MCP_TASKS_FIXTURE_RESTART_DELAY_MS")
             .ok()

@@ -64,7 +64,9 @@ impl Env {
         self.settings(json!([self.stdio_with(json!({}))]));
     }
 
-    /// Start the fixture as a standalone HTTP server; returns it and its settings entry.
+    /// Start the fixture as a standalone HTTP server, on a port it picks; returns it and its settings
+    /// entry. Gated tasks survive a restart (`MCP_TASKS_FIXTURE_KEEP`); a restarted server keeps its
+    /// URL behind a [`Relay`].
     pub fn http_server(&self) -> (ChildGuard, Value) {
         let port_file = self.dir.path().join("port");
         let _ = std::fs::remove_file(&port_file);
@@ -72,6 +74,7 @@ impl Env {
             .env("MCP_TASKS_FIXTURE_HTTP_PORT_FILE", &port_file)
             .env("MCP_TASKS_FIXTURE_LOG", &self.log)
             .env("MCP_TASKS_FIXTURE_GATE", &self.gate)
+            .env("MCP_TASKS_FIXTURE_KEEP", self.dir.path().join("kept"))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -246,4 +249,59 @@ pub fn tool_result_sent(request: &str, tool_use_id: &str) -> Value {
         .flat_map(|m| m["content"].as_array().cloned().unwrap_or_default())
         .find(|b| b["type"] == "tool_result" && b["tool_use_id"] == tool_use_id)
         .unwrap_or_else(|| panic!("no tool_result for {tool_use_id} in {body}"))
+}
+
+/// A URL that outlives the HTTP fixture behind it: a loopback listener the test binds and holds for
+/// its whole life, relaying each connection to whichever fixture is up, and closing it at once while
+/// none is. A server "restarted on the same URL" without releasing a port for anything else to take.
+pub struct Relay {
+    pub port: u16,
+    backend: std::sync::Arc<std::sync::Mutex<Option<u16>>>,
+}
+
+impl Relay {
+    pub fn start() -> Self {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let backend = std::sync::Arc::new(std::sync::Mutex::new(None::<u16>));
+        let routes = backend.clone();
+        std::thread::spawn(move || {
+            for client in listener.incoming() {
+                let Ok(client) = client else { continue };
+                let target = *routes.lock().unwrap();
+                let Some(server) =
+                    target.and_then(|p| std::net::TcpStream::connect(("127.0.0.1", p)).ok())
+                else {
+                    continue; // nothing up: the connection closes as it drops
+                };
+                for (mut from, mut to) in [
+                    (client.try_clone().unwrap(), server.try_clone().unwrap()),
+                    (server, client),
+                ] {
+                    std::thread::spawn(move || {
+                        let _ = std::io::copy(&mut from, &mut to);
+                        let _ = to.shutdown(std::net::Shutdown::Write);
+                    });
+                }
+            }
+        });
+        Self { port, backend }
+    }
+
+    /// Relay to the fixture `entry` (from [`Env::http_server`]) from now on, or to nothing.
+    pub fn route_to(&self, entry: Option<&Value>) {
+        let port = entry.map(|e| {
+            let url = e["url"].as_str().unwrap();
+            let port = url.rsplit(':').next().unwrap();
+            port.trim_end_matches("/mcp").parse::<u16>().unwrap()
+        });
+        *self.backend.lock().unwrap() = port;
+    }
+
+    /// `entry` with its URL pointed at the relay.
+    pub fn entry_for(&self, entry: &Value) -> Value {
+        let mut entry = entry.clone();
+        entry["url"] = json!(format!("http://127.0.0.1:{}/mcp", self.port));
+        entry
+    }
 }

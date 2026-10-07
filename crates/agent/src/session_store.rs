@@ -345,7 +345,8 @@ pub fn search_sessions(sessions: Vec<SessionMeta>, query: Option<&str>) -> Vec<S
 }
 
 /// Custom-entry kinds the agent writes itself, and acts on when a session is replayed: an MCP task to
-/// resume and a resumed task's result (`crate::mcp_resume`), and `mcp_skill_approval`, which is no
+/// resume, a resumed task's result and a "result pending" placeholder's mark (`crate::mcp_resume`),
+/// and `mcp_skill_approval`, which is no
 /// longer written (an approval read back from disk is one a model with file-write tools could have
 /// planted, so approvals are never persisted) but stays reserved so no client can make an older
 /// reader trust one. A client's `append_custom` of any of these is refused. A new host-written kind
@@ -353,6 +354,7 @@ pub fn search_sessions(sessions: Vec<SessionMeta>, query: Option<&str>) -> Vec<S
 pub const HOST_CUSTOM_KINDS: &[&str] = &[
     crate::mcp_resume::TASK_ENTRY_KIND,
     crate::mcp_resume::RESULT_ENTRY_KIND,
+    crate::mcp_resume::PLACEHOLDER_ENTRY_KIND,
     "mcp_skill_approval",
 ];
 
@@ -772,27 +774,145 @@ fn branch_summary_message(summary: &str) -> Message {
 /// result journaled on the path (a `mcp_task_result` custom entry, see `crate::mcp_resume`) spliced
 /// in front of the first user turn after the call it answers. The splice is part of the transcript,
 /// not just of the next request, so `get_messages`, the HTML export and `run --continue` agree with
-/// what `serve` sent the model. Custom entries are otherwise invisible here.
-fn materialize(nodes: &HashMap<String, Node>, path: &[String]) -> Vec<Message> {
+/// what `serve` sent the model. Only journal entries `journal` accepts count; custom entries are
+/// otherwise invisible here.
+fn materialize(
+    nodes: &HashMap<String, Node>,
+    path: &[String],
+    journal: &crate::mcp_resume::JournalAuth,
+) -> Vec<Message> {
+    use crate::mcp_resume::{PLACEHOLDER_ENTRY_KIND, RESULT_ENTRY_KIND};
     let mut messages = Vec::new();
     let mut results = Vec::new();
+    let mut placeholders = Vec::new();
     for id in path {
         match nodes.get(id).map(|n| n.content.as_ref()) {
             Some(NodeContent::Message(m)) => messages.push(m.clone()),
             Some(NodeContent::Custom { kind, data })
-                if kind == crate::mcp_resume::RESULT_ENTRY_KIND =>
+                if kind == RESULT_ENTRY_KIND && journal.accepts(kind, data) =>
             {
                 if let Ok(result) = serde_json::from_value(data.clone()) {
                     results.push(result);
                 }
             }
+            Some(NodeContent::Custom { kind, data })
+                if kind == PLACEHOLDER_ENTRY_KIND && journal.accepts(kind, data) =>
+            {
+                placeholders.push(data.clone());
+            }
             _ => {}
         }
     }
     if !results.is_empty() {
-        crate::mcp_resume::splice(&mut messages, &results);
+        let placeholders = crate::mcp_resume::placeholder_ids(&placeholders);
+        crate::mcp_resume::splice(&mut messages, &results, &placeholders);
     }
     messages
+}
+
+/// The journal auth for a session whose log is `log` (see [`crate::mcp_resume::JournalAuth`]):
+/// sealed storage needs none; otherwise the key in the session's own sidecar, if it has one yet. A
+/// session without one (it never journaled a task, or predates per-session keys) is unkeyed until
+/// its first journal write makes one ([`make_journal_key`]). Reading never writes.
+fn journal_auth(log: &Log) -> crate::mcp_resume::JournalAuth {
+    use crate::mcp_resume::JournalAuth;
+    let Some(path) = log.journal_key_path() else {
+        return JournalAuth::Storage;
+    };
+    read_journal_key(&path)
+        .or_else(|| {
+            log.legacy_journal_key_path()
+                .and_then(|p| read_journal_key(&p))
+        })
+        .unwrap_or(JournalAuth::Unkeyed)
+}
+
+fn read_journal_key(path: &Path) -> Option<crate::mcp_resume::JournalAuth> {
+    crate::mcp_resume::JournalAuth::from_sidecar(&fs::read(path).ok()?)
+}
+
+/// How long a first journal write waits for another writer making the same session's key.
+const JOURNAL_KEY_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Make the journal key of a session that has none yet, at its first journal write: the entries it
+/// already holds (`nodes`, any branch; from before per-session keys) stay accepted. `None` when no
+/// key belongs in a sidecar or none could be written (the write then goes out unsealed, as before).
+///
+/// Every first writer (threads of this process, other processes) must end up with the *same* key,
+/// or the loser's entries would be refused on replay. So the key is made under an exclusive lock on
+/// the sidecar itself (`file_lock`), and re-read once the lock is held: whoever got there first has
+/// written it, and everyone after uses theirs. The key is written through the locked descriptor, in
+/// place: no temp file for two writers to share, and none left beside the session. A sidecar that
+/// does not parse (torn, or overwritten) is replaced the same way. A key file under the
+/// pre-suffix name (`legacy_journal_key_path`) is carried over rather than replaced.
+fn make_journal_key(
+    log: &Log,
+    nodes: &HashMap<String, Node>,
+) -> Option<crate::mcp_resume::JournalAuth> {
+    use crate::mcp_resume::JournalAuth;
+    use std::io::{Seek, SeekFrom};
+    let path = log.journal_key_path()?;
+    let failed = |e: &dyn std::fmt::Display| {
+        tracing::warn!(path = %path.display(), error = %e, "MCP task journal key not written");
+    };
+    // Never write a key through a link someone planted at the sidecar's name.
+    if fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
+        failed(&"the sidecar is a symlink");
+        return None;
+    }
+    let deadline = std::time::Instant::now() + JOURNAL_KEY_LOCK_WAIT;
+    let lock = loop {
+        match crate::file_lock::try_lock(&path) {
+            Ok(Some(lock)) => break lock,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            Ok(None) => {
+                failed(&"another writer held its lock too long");
+                return None;
+            }
+            Err(e) => {
+                failed(&e);
+                return None;
+            }
+        }
+    };
+    if let Some(theirs) = read_journal_key(&path) {
+        return Some(theirs);
+    }
+    let (auth, bytes) = match log.legacy_journal_key_path().and_then(|p| {
+        let bytes = fs::read(&p).ok()?;
+        Some((JournalAuth::from_sidecar(&bytes)?, bytes))
+    }) {
+        Some(carried) => carried,
+        None => {
+            let entries = nodes.values().filter_map(|node| match &*node.content {
+                NodeContent::Custom { kind, data } => Some((kind.as_str(), data)),
+                NodeContent::Message(_) => None,
+            });
+            JournalAuth::fresh(entries)?
+        }
+    };
+    let written = (|| -> std::io::Result<()> {
+        let mut file = lock.file();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        }
+        file.set_len(0)?;
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        fsync_dir(&path)
+    })();
+    match written {
+        Ok(()) => Some(auth),
+        Err(e) => {
+            failed(&e);
+            None
+        }
+    }
 }
 
 fn path_from_root(nodes: &HashMap<String, Node>, tip: Option<&str>) -> Vec<String> {
@@ -829,6 +949,9 @@ pub struct SessionStore {
     /// tree logic below never looks inside it: every read goes through `log.lines()` and every write
     /// through `log.append`/`log.replace_all`.
     log: Log,
+    /// How this session's MCP task journal entries are sealed and checked (see
+    /// `crate::mcp_resume::JournalAuth`).
+    journal: crate::mcp_resume::JournalAuth,
     meta: SessionMeta,
     /// How many messages are already on disk (on the active path) — the append cursor.
     persisted: usize,
@@ -898,7 +1021,9 @@ impl SessionStore {
         let mut header = Vec::new();
         write_line(&mut header, &Entry::Session(meta.clone()))?;
         let log = Log::create(path, &meta.id, layout, &header)?;
+        let journal = journal_auth(&log);
         Ok(Self {
+            journal,
             log,
             meta,
             persisted: 0,
@@ -1216,7 +1341,8 @@ impl SessionStore {
         // A custom entry (`NodeContent::Custom`) contributes nothing here — it's a real, positioned
         // node in `active`'s chain (see `Entry::Custom`'s doc comment), but not a message, so
         // `as_message` filters it out of the materialized `Session.messages`/LLM context.
-        let messages: Vec<Message> = materialize(&nodes, &active);
+        let journal = journal_auth(&log);
+        let messages: Vec<Message> = materialize(&nodes, &active, &journal);
         let persisted = messages.len();
         let mut session = Session::new();
         session.messages = Arc::new(messages);
@@ -1281,6 +1407,7 @@ impl SessionStore {
         }
         Ok((
             Self {
+                journal,
                 log,
                 meta,
                 persisted,
@@ -1342,10 +1469,48 @@ impl SessionStore {
     /// The `data` of every custom entry of `kind` on the active path, oldest first — see
     /// [`Self::append_custom`].
     pub fn active_custom(&self, kind: &str) -> Vec<serde_json::Value> {
+        self.active_custom_where(kind, |_| true)
+    }
+
+    /// The MCP task journal entries of `kind` on the active path that this session's journal auth
+    /// accepts (see [`crate::mcp_resume::JournalAuth`]): planted or tampered lines are left out.
+    pub fn active_journal(&self, kind: &str) -> Vec<serde_json::Value> {
+        self.active_custom_where(kind, |data| self.journal.accepts(kind, data))
+    }
+
+    /// Append an MCP task journal entry, sealed for this session (see
+    /// [`crate::mcp_resume::JournalAuth`]); otherwise [`append_custom`](Self::append_custom).
+    pub fn append_journal(
+        &mut self,
+        kind: &str,
+        mut data: serde_json::Value,
+    ) -> std::io::Result<String> {
+        // The key on disk is the session's key: another writer (a thread, another process) may
+        // have made it since this store opened. With none there (none yet, one under the old name
+        // to carry over, or one removed or torn since), make it now. One small read per journal
+        // write.
+        if !self.log.read_only()
+            && let Some(key) = self.log.journal_key_path()
+            && let Some(auth) =
+                read_journal_key(&key).or_else(|| make_journal_key(&self.log, &self.nodes))
+        {
+            self.journal = auth;
+        }
+        self.journal.seal(kind, &mut data);
+        self.append_custom(kind, data)
+    }
+
+    fn active_custom_where(
+        &self,
+        kind: &str,
+        keep: impl Fn(&serde_json::Value) -> bool,
+    ) -> Vec<serde_json::Value> {
         self.active
             .iter()
             .filter_map(|id| match self.nodes.get(id).map(|n| n.content.as_ref()) {
-                Some(NodeContent::Custom { kind: k, data }) if k == kind => Some(data.clone()),
+                Some(NodeContent::Custom { kind: k, data }) if k == kind && keep(data) => {
+                    Some(data.clone())
+                }
                 _ => None,
             })
             .collect()
@@ -2199,7 +2364,7 @@ impl SessionStore {
     /// a redundant marker every time a client re-confirms the current position.
     pub fn switch_active(&mut self, target_id: &str) -> std::io::Result<Vec<Message>> {
         if self.active.last().is_some_and(|id| id == target_id) {
-            return Ok(materialize(&self.nodes, &self.active));
+            return Ok(materialize(&self.nodes, &self.active, &self.journal));
         }
         if !self.nodes.contains_key(target_id) {
             return Err(std::io::Error::new(
@@ -2217,7 +2382,7 @@ impl SessionStore {
         self.log.append(&buf)?;
 
         let active = path_from_root(&self.nodes, Some(target_id));
-        let messages: Vec<Message> = materialize(&self.nodes, &active);
+        let messages: Vec<Message> = materialize(&self.nodes, &active, &self.journal);
         self.persisted = messages.len();
         self.active = active;
         Ok(messages)
@@ -2297,7 +2462,7 @@ impl SessionStore {
         self.branch_summary_details
             .insert(entry_id.clone(), details_for_index);
         self.active = path_from_root(&self.nodes, Some(&entry_id));
-        let messages: Vec<Message> = materialize(&self.nodes, &self.active);
+        let messages: Vec<Message> = materialize(&self.nodes, &self.active, &self.journal);
         self.persisted = messages.len();
         Ok(messages)
     }
@@ -2389,7 +2554,7 @@ impl SessionStore {
         self.branch_summary_details
             .insert(entry_id.clone(), details_for_index);
         self.active = vec![entry_id];
-        let messages: Vec<Message> = materialize(&self.nodes, &self.active);
+        let messages: Vec<Message> = materialize(&self.nodes, &self.active, &self.journal);
         self.persisted = messages.len();
         Ok(messages)
     }
@@ -2719,13 +2884,17 @@ fn move_sibling_memory(session_jsonl: &Path, dst_dir: &Path) {
     {
         let _ = fs::rename(&src_mem, dst_dir.join(name));
     }
-    // The session's sidecar files (MCP Events state, MCP App view state) travel with it too.
-    for ext in SESSION_SIDECARS {
-        let events = session_jsonl.with_extension(ext);
-        if let Some(name) = events.file_name()
-            && events.is_file()
+    // The session's sidecar files (MCP Events state, MCP App view state, the journal key) travel
+    // with it too.
+    let sidecars = SESSION_SIDECARS
+        .iter()
+        .map(|ext| session_jsonl.with_extension(ext))
+        .chain([journal_key_beside(session_jsonl)]);
+    for sidecar in sidecars {
+        if let Some(name) = sidecar.file_name()
+            && sidecar.is_file()
         {
-            let _ = fs::rename(&events, dst_dir.join(name));
+            let _ = fs::rename(&sidecar, dst_dir.join(name));
         }
     }
 }
@@ -2735,14 +2904,25 @@ fn move_sibling_memory(session_jsonl: &Path, dst_dir: &Path) {
 /// the append-only log of undelivered events) and the MCP App view state (`tools::mcp_apps::Sidecar`
 /// — the attached view context, and the view replay store holding each kept view's HTML and full
 /// tool result). Each trashes, restores and is removed with its session: left behind, it would keep
-/// a deleted session's content on disk. (A segmented session keeps its MCP App sidecars inside its
-/// own directory, which moves whole.)
+/// a deleted session's content on disk. The MCP task journal's key ([`journal_key_beside`]) goes
+/// with them too, so its journal resumes wherever the session goes. (A segmented session keeps its
+/// MCP App sidecars and its journal key inside its own directory, which moves whole.)
 const SESSION_SIDECARS: [&str; 4] = [
     "mcp-events.json",
     "mcp-events.log",
     "mcp-app-context.json",
     "mcp-app-views.json",
 ];
+
+/// Where a single-file session's MCP task journal key lives: its whole file name plus a suffix
+/// (`<session>.jsonl.mcp-task-journal.json`), not `with_extension`, so sessions whose names differ
+/// only after their last dot (`work.1`, `work.2`) never share one key.
+fn journal_key_beside(session: &Path) -> PathBuf {
+    let mut name = session.as_os_str().to_owned();
+    name.push(".");
+    name.push(crate::mcp_resume::JournalAuth::SIDECAR);
+    PathBuf::from(name)
+}
 
 /// The MCP Events subset — the only sidecars a segmented session keeps *beside* its directory.
 const MCP_EVENTS_SIDECARS: [&str; 2] = ["mcp-events.json", "mcp-events.log"];
@@ -2757,6 +2937,7 @@ fn remove_sibling_memory(session_jsonl: &Path) {
     for ext in SESSION_SIDECARS {
         let _ = fs::remove_file(session_jsonl.with_extension(ext));
     }
+    let _ = fs::remove_file(journal_key_beside(session_jsonl));
 }
 
 /// A directory of session files. `Clone` is just a `PathBuf` copy — cheap, and lets a caller move an
@@ -4651,6 +4832,24 @@ pub(crate) fn remove_durably(path: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Tighten an existing session file to `0600` before writing more into it. `create_private` sets
+/// the mode when a file is created, but a file that already exists keeps whatever mode it has (an
+/// older version's, a restore's, or a `chmod`), and every append adds transcript, MCP task ids
+/// (which a server may treat as bearer tokens, see `tools::mcp::McpTaskRecord`) included. One
+/// `fstat` per append, beside the append's own `fsync`.
+fn keep_private(file: &File) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if file.metadata()?.permissions().mode() & 0o077 != 0 {
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = file;
+    Ok(())
+}
+
 fn fsync_dir(path: &Path) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         // Opening the directory read-only and `sync_all`ing it flushes its updated entries. Linux/macOS
@@ -5288,6 +5487,29 @@ impl Log {
         }
     }
 
+    /// Where this session's MCP task journal key lives (see `crate::mcp_resume::JournalAuth`):
+    /// beside a single-file session, inside a segmented session's directory, and nowhere for one
+    /// sealed under a tenant codec, whose storage already authenticates every line.
+    fn journal_key_path(&self) -> Option<PathBuf> {
+        match self {
+            Log::File { path, .. } => Some(journal_key_beside(path)),
+            Log::Segmented(s) if s.codec.is_some() => None,
+            Log::Segmented(s) => Some(s.dir.join(crate::mcp_resume::JournalAuth::SIDECAR)),
+        }
+    }
+
+    /// The name a single-file session's journal key had before it became a suffix:
+    /// `with_extension`, which gave `work.1` and `work.2` one key file. Read, and carried over by the
+    /// first journal write, never written.
+    fn legacy_journal_key_path(&self) -> Option<PathBuf> {
+        match self {
+            Log::File { path, .. } => {
+                Some(path.with_extension(crate::mcp_resume::JournalAuth::SIDECAR))
+            }
+            Log::Segmented(_) => None,
+        }
+    }
+
     /// Where this session's `/session` working memory lives.
     ///
     /// For the segmented layout that is `<id>/memory`, *inside* the session directory — not a
@@ -5463,6 +5685,7 @@ impl Log {
         match self {
             Log::File { path, .. } => {
                 let mut f = OpenOptions::new().append(true).open(path)?;
+                keep_private(&f)?;
                 f.write_all(bytes)?;
                 // `flush` only pushes past our buffer into the OS; `sync_all` forces the bytes to
                 // disk, which is what the module's crash-safety claim actually requires. The parent
@@ -5816,6 +6039,7 @@ impl SegLog {
         let before = self.target_len;
         let write = (|| -> std::io::Result<()> {
             let mut f = OpenOptions::new().append(true).open(&path)?;
+            keep_private(&f)?;
             f.write_all(&buf)?;
             f.flush()?;
             f.sync_all()
@@ -6264,6 +6488,311 @@ mod tests {
             mode_of(store.path()),
             0o600,
             "rewrite's temp-file-then-rename must not loosen permissions"
+        );
+    }
+
+    /// A session's first journal write makes its MCP task journal key, beside it (`0600`); a
+    /// session that never journals gets no file. Entries it seals read back after a reopen; a line
+    /// planted into the file without the key does not.
+    #[test]
+    fn a_session_keeps_its_journal_key_beside_it_and_refuses_planted_entries() {
+        use crate::mcp_resume::TASK_ENTRY_KIND;
+        let dir = tmpdir();
+        let path = dir.path().join("s.jsonl");
+        let mut store = SessionStore::create(path.clone(), SessionMeta::new("/w", "m")).unwrap();
+        let key = journal_key_beside(&path);
+        assert!(!key.exists(), "no key until the session journals something");
+        store
+            .append_journal(TASK_ENTRY_KIND, serde_json::json!({ "taskId": "real" }))
+            .unwrap();
+        assert!(key.is_file());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&key).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        store
+            .append_custom(TASK_ENTRY_KIND, serde_json::json!({ "taskId": "planted" }))
+            .unwrap();
+        drop(store);
+        let (store, _) = SessionStore::open(path).unwrap();
+        let tasks = store.active_journal(TASK_ENTRY_KIND);
+        assert_eq!(tasks.len(), 1, "{tasks:?}");
+        assert_eq!(tasks[0]["taskId"], "real");
+        assert_eq!(store.active_custom(TASK_ENTRY_KIND).len(), 2);
+    }
+
+    /// A session from before per-session keys (journal entries, no key file) keeps the entries it
+    /// already has: opening it writes nothing, and its next journal write makes the key with those
+    /// entries accepted. A line planted after that is refused.
+    #[test]
+    fn a_session_without_a_journal_key_keeps_its_existing_entries() {
+        use crate::mcp_resume::{RESULT_ENTRY_KIND, TASK_ENTRY_KIND};
+        let dir = tmpdir();
+        let path = dir.path().join("s.jsonl");
+        let mut store = SessionStore::create(path.clone(), SessionMeta::new("/w", "m")).unwrap();
+        store
+            .append_custom(TASK_ENTRY_KIND, serde_json::json!({ "taskId": "old" }))
+            .unwrap();
+        store
+            .append_custom(RESULT_ENTRY_KIND, serde_json::json!({ "toolUseId": "tu" }))
+            .unwrap();
+        drop(store);
+        let key = journal_key_beside(&path);
+
+        let (mut store, _) = SessionStore::open(path.clone()).unwrap();
+        assert!(!key.exists(), "opening writes no key");
+        assert_eq!(store.active_journal(TASK_ENTRY_KIND).len(), 1);
+        assert_eq!(store.active_journal(RESULT_ENTRY_KIND).len(), 1);
+        store
+            .append_journal(TASK_ENTRY_KIND, serde_json::json!({ "taskId": "new" }))
+            .unwrap();
+        assert!(key.is_file());
+        store
+            .append_custom(TASK_ENTRY_KIND, serde_json::json!({ "taskId": "planted" }))
+            .unwrap();
+        drop(store);
+        let (store, _) = SessionStore::open(path).unwrap();
+        let tasks: Vec<_> = store
+            .active_journal(TASK_ENTRY_KIND)
+            .into_iter()
+            .map(|t| t["taskId"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(tasks, ["old", "new"]);
+        assert_eq!(store.active_journal(RESULT_ENTRY_KIND).len(), 1);
+    }
+
+    /// Deleting a session moves its journal key out of the session directory into `.trash` with
+    /// it; restoring brings it back, and the journal still verifies.
+    #[test]
+    fn a_trashed_session_takes_its_journal_key_along_and_brings_it_back() {
+        use crate::mcp_resume::TASK_ENTRY_KIND;
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo.create(SessionMeta::new("/w", "m")).unwrap();
+        store
+            .append_journal(TASK_ENTRY_KIND, serde_json::json!({ "taskId": "t" }))
+            .unwrap();
+        let id = store.meta().id.clone();
+        let path = store.path().to_path_buf();
+        drop(store);
+        let key = journal_key_beside(&path);
+        assert!(key.is_file());
+
+        repo.delete(&id).unwrap();
+        assert!(!key.exists(), "the key left the session directory");
+        assert!(
+            dir.path()
+                .join(".trash")
+                .join(key.file_name().unwrap())
+                .is_file(),
+            "the key is in the trash beside its session"
+        );
+
+        assert!(repo.restore_session(&id).unwrap());
+        assert!(key.is_file(), "the key came back with its session");
+        let (store, _) = SessionStore::open(path).unwrap();
+        assert_eq!(store.active_journal(TASK_ENTRY_KIND).len(), 1);
+    }
+
+    /// Sessions whose names differ only after their last dot each get their own key: the key's
+    /// name is a suffix on the whole file name, not a replaced extension.
+    #[test]
+    fn sessions_named_alike_keep_separate_journal_keys() {
+        use crate::mcp_resume::TASK_ENTRY_KIND;
+        let dir = tmpdir();
+        let mut keys = Vec::new();
+        for name in ["work.1", "work.2"] {
+            let path = dir.path().join(name);
+            let mut store =
+                SessionStore::create(path.clone(), SessionMeta::new("/w", "m")).unwrap();
+            store
+                .append_journal(TASK_ENTRY_KIND, serde_json::json!({ "taskId": name }))
+                .unwrap();
+            keys.push(fs::read(journal_key_beside(&path)).unwrap());
+        }
+        assert_ne!(keys[0], keys[1], "one key file shared by two sessions");
+        for name in ["work.1", "work.2"] {
+            let (store, _) = SessionStore::open(dir.path().join(name)).unwrap();
+            let tasks = store.active_journal(TASK_ENTRY_KIND);
+            assert_eq!(tasks.len(), 1, "{name}: {tasks:?}");
+            assert_eq!(tasks[0]["taskId"], name);
+        }
+    }
+
+    /// A key under the old `with_extension` name still verifies the entries it sealed, and the next
+    /// journal write carries it over to the suffixed name rather than making a new one.
+    #[test]
+    fn a_journal_key_under_the_old_name_is_carried_over() {
+        use crate::mcp_resume::{JournalAuth, TASK_ENTRY_KIND};
+        let dir = tmpdir();
+        let path = dir.path().join("s.jsonl");
+        let mut store = SessionStore::create(path.clone(), SessionMeta::new("/w", "m")).unwrap();
+        store
+            .append_journal(TASK_ENTRY_KIND, serde_json::json!({ "taskId": "old" }))
+            .unwrap();
+        drop(store);
+        let legacy = path.with_extension(JournalAuth::SIDECAR);
+        fs::rename(journal_key_beside(&path), &legacy).unwrap();
+
+        let (mut store, _) = SessionStore::open(path.clone()).unwrap();
+        assert_eq!(store.active_journal(TASK_ENTRY_KIND).len(), 1);
+        store
+            .append_custom(TASK_ENTRY_KIND, serde_json::json!({ "taskId": "planted" }))
+            .unwrap();
+        store
+            .append_journal(TASK_ENTRY_KIND, serde_json::json!({ "taskId": "new" }))
+            .unwrap();
+        assert_eq!(
+            fs::read(journal_key_beside(&path)).unwrap(),
+            fs::read(&legacy).unwrap(),
+            "the old key is carried over, not replaced"
+        );
+        drop(store);
+        let (store, _) = SessionStore::open(path).unwrap();
+        let tasks: Vec<_> = store
+            .active_journal(TASK_ENTRY_KIND)
+            .into_iter()
+            .map(|t| t["taskId"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(tasks, ["old", "new"]);
+    }
+
+    /// Set by [`concurrent_first_journal_writers_all_use_one_key`] for the child processes it
+    /// runs this test binary as.
+    const WRITER_SESSION: &str = "JOURNAL_KEY_WRITER_SESSION";
+
+    /// One of [`concurrent_first_journal_writers_all_use_one_key`]'s writer processes: waits for
+    /// the go file, opens the session and journals one entry. A no-op when run on its own.
+    #[test]
+    #[ignore = "a child process of concurrent_first_journal_writers_all_use_one_key"]
+    fn journal_key_writer_child() {
+        let Ok(session) = std::env::var(WRITER_SESSION) else {
+            return;
+        };
+        let session = PathBuf::from(session);
+        let id = std::env::var("JOURNAL_KEY_WRITER_ID").unwrap();
+        journal_one_after_go(&session, &id);
+    }
+
+    fn journal_one_after_go(session: &Path, id: &str) {
+        let go = session.with_extension("go");
+        fs::write(session.with_extension(format!("ready.{id}")), b"").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !go.exists() {
+            assert!(std::time::Instant::now() < deadline, "no go");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let (mut store, _) = SessionStore::open(session.to_path_buf()).unwrap();
+        store
+            .append_journal(
+                crate::mcp_resume::TASK_ENTRY_KIND,
+                serde_json::json!({ "taskId": id }),
+            )
+            .unwrap();
+    }
+
+    /// Every first journal writer, threads of this process and other processes alike, ends up
+    /// using the one key on disk, so every entry any of them journals verifies against it. A writer
+    /// that believed in a key that lost the race would have its entries refused on replay.
+    #[test]
+    fn concurrent_first_journal_writers_all_use_one_key() {
+        use crate::mcp_resume::{JournalAuth, TASK_ENTRY_KIND};
+        const PROCESSES: usize = 4;
+        const THREADS: usize = 8;
+        let dir = tmpdir();
+        let path = dir.path().join("s.jsonl");
+        drop(SessionStore::create(path.clone(), SessionMeta::new("/w", "m")).unwrap());
+
+        let exe = std::env::current_exe().unwrap();
+        let children: Vec<_> = (0..PROCESSES)
+            .map(|i| {
+                std::process::Command::new(&exe)
+                    .args([
+                        "session_store::tests::journal_key_writer_child",
+                        "--exact",
+                        "--ignored",
+                        "--test-threads=1",
+                    ])
+                    .env(WRITER_SESSION, &path)
+                    .env("JOURNAL_KEY_WRITER_ID", format!("process-{i}"))
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .unwrap()
+            })
+            .collect();
+        let threads: Vec<_> = (0..THREADS)
+            .map(|i| {
+                let path = path.clone();
+                std::thread::spawn(move || journal_one_after_go(&path, &format!("thread-{i}")))
+            })
+            .collect();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".ready."))
+            .count()
+            < PROCESSES + THREADS
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "writers never got ready"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        fs::write(path.with_extension("go"), b"").unwrap();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        for mut child in children {
+            assert!(child.wait().unwrap().success(), "a writer process failed");
+        }
+
+        let auth = JournalAuth::from_sidecar(&fs::read(journal_key_beside(&path)).unwrap())
+            .expect("one key on disk");
+        let entries: Vec<serde_json::Value> = fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v["type"] == "custom" && v["kind"] == TASK_ENTRY_KIND)
+            .map(|v| v["data"].clone())
+            .collect();
+        assert_eq!(entries.len(), PROCESSES + THREADS);
+        for entry in &entries {
+            assert!(
+                entry.get("mac").is_some() && auth.accepts(TASK_ENTRY_KIND, entry),
+                "sealed under a key that is not the one on disk: {entry}"
+            );
+        }
+    }
+
+    /// A session file that exists with a looser mode (an older version's, a restore's, a
+    /// `chmod`) is tightened to `0600` by the next append: the transcript, and the MCP task ids it
+    /// journals (possible bearer tokens), are never written into a group/world-readable file.
+    #[test]
+    #[cfg(unix)]
+    fn an_append_tightens_a_loosened_session_file_to_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tmpdir();
+        let path = dir.path().join("s.jsonl");
+        let mut store = SessionStore::create(path.clone(), SessionMeta::new("/w", "m")).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        store
+            .append_custom(
+                "mcp_task",
+                serde_json::json!({ "taskId": "SECRET-TASK-ID", "sessionId": "s" }),
+            )
+            .unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "the append must tighten the file before writing a task id into it"
         );
     }
 

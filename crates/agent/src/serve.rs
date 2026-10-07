@@ -2031,12 +2031,25 @@ impl Persistence {
             .unwrap_or(&[])
     }
 
-    /// Custom entries of `kind` on the active path; empty without persistence.
-    fn active_custom(&self, kind: &str) -> Vec<Value> {
+    /// MCP task journal entries of `kind` on the active path that the session accepts (see
+    /// `SessionStore::active_journal`); empty without persistence.
+    fn active_journal(&self, kind: &str) -> Vec<Value> {
         self.store
             .as_ref()
-            .map(|store| store.active_custom(kind))
+            .map(|store| store.active_journal(kind))
             .unwrap_or_default()
+    }
+
+    /// Append an MCP task journal entry, sealed for the session (see
+    /// `SessionStore::append_journal`). Same persistence-required contract as `append_custom`.
+    fn append_journal(&mut self, kind: &str, data: Value) -> std::io::Result<String> {
+        let store = self.store.as_mut().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "no session persistence configured (start serve with --session-file or --session-dir)",
+            )
+        })?;
+        store.append_journal(kind, data)
     }
 
     /// Every user-turn message anywhere in the session's tree — every branch, not just the active path
@@ -3401,7 +3414,7 @@ pub(crate) async fn serve_session(
         ($kind:expr, $data:expr) => {{
             let data: Value = $data;
             if data["sessionId"].as_str() == Some(persistence.session_id()) {
-                match persistence.append_custom($kind, data) {
+                match persistence.append_journal(&$kind, data) {
                     Err(e) if e.kind() != std::io::ErrorKind::Unsupported => {
                         tracing::warn!(error = %e, "MCP task journal entry failed to persist");
                     }
@@ -3522,18 +3535,32 @@ pub(crate) async fn serve_session(
 
     // MCP tasks a previous process left in flight resume now, in the background, not on the next
     // prompt (see `crate::mcp_resume`). Restarted for a session switched to later.
+    //
+    // `$carried`: results the previous resumer already resolved, which count as answers whether or
+    // not their journal writes have landed yet (they travel through `mcp_task_rx`, which a prompt
+    // can overtake), so a restart never polls a finished task again.
     macro_rules! start_mcp_resumer {
-        () => {{
-            let journal = persistence.active_custom(crate::mcp_resume::TASK_ENTRY_KIND);
-            let results = crate::mcp_resume::results(
-                &persistence.active_custom(crate::mcp_resume::RESULT_ENTRY_KIND),
+        () => {
+            start_mcp_resumer!(&[])
+        };
+        ($carried:expr) => {{
+            let journal = persistence.active_journal(crate::mcp_resume::TASK_ENTRY_KIND);
+            let mut results = crate::mcp_resume::results(
+                &persistence.active_journal(crate::mcp_resume::RESULT_ENTRY_KIND),
             );
-            let pending = crate::mcp_resume::pending(
+            results.extend_from_slice($carried);
+            let placeholders = crate::mcp_resume::placeholder_ids(
+                &persistence.active_journal(crate::mcp_resume::PLACEHOLDER_ENTRY_KIND),
+            );
+            let mut pending = crate::mcp_resume::pending(
                 &session.messages,
                 &journal,
                 &results,
+                &placeholders,
                 persistence.session_id(),
             );
+            // Only a configured server is ever polled.
+            pending.retain(|p| cfg.mcp_catalog.has_server(&p.record.server));
             if pending.is_empty() {
                 crate::mcp_resume::Resumer::idle(persistence.session_id())
             } else {
@@ -4474,12 +4501,22 @@ pub(crate) async fn serve_session(
                 let images = parse_images(cmd.get("images"));
                 // MCP tasks a previous process left in flight are waited on and answered before this
                 // turn's model call (see `crate::mcp_resume`), by the first attempt only.
+                // A resumer that finished with a task's server unreachable left that task pending:
+                // a fresh one tries it again now (its finished results carry over).
+                let mut mcp_carried = Vec::new();
                 if mcp_resumer.session_id() != persistence.session_id() {
                     mcp_resumer = start_mcp_resumer!();
+                } else if mcp_resumer.needs_retry() {
+                    mcp_carried = mcp_resumer.finals();
+                    mcp_resumer = start_mcp_resumer!(&mcp_carried);
                 }
                 let mut mcp_resume_first = true;
-                let mcp_journaled = crate::mcp_resume::results(
-                    &persistence.active_custom(crate::mcp_resume::RESULT_ENTRY_KIND),
+                let mut mcp_journaled = crate::mcp_resume::results(
+                    &persistence.active_journal(crate::mcp_resume::RESULT_ENTRY_KIND),
+                );
+                mcp_journaled.extend(mcp_carried);
+                let mcp_placeholders = crate::mcp_resume::placeholder_ids(
+                    &persistence.active_journal(crate::mcp_resume::PLACEHOLDER_ENTRY_KIND),
                 );
                 if images.is_empty() {
                     session.user(message);
@@ -4778,6 +4815,7 @@ pub(crate) async fn serve_session(
                         let resume_first = std::mem::take(&mut mcp_resume_first);
                         let resumer = &mcp_resumer;
                         let journaled = &mcp_journaled;
+                        let placeholders = &mcp_placeholders;
                         let run_cancel = cancel.clone();
                         let run = crate::tools::mcp::with_session_host(mcp_host.clone(), async {
                             if resume_first {
@@ -4785,6 +4823,7 @@ pub(crate) async fn serve_session(
                                     &mut session,
                                     resumer,
                                     journaled,
+                                    placeholders,
                                     &mut sink,
                                     &run_cancel,
                                 )

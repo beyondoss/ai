@@ -69,11 +69,21 @@ fn tasks() -> &'static Mutex<HashMap<String, FixtureTask>> {
     TASKS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Write a file a test reads, all at once: to a temporary sibling, then `rename` it into place. A
+/// reader polling for the file (or its content) can otherwise see it created but still empty,
+/// between `write`'s create and its write.
+fn write_atomically(path: &str, contents: &str) {
+    let tmp = format!("{path}.tmp-{}", std::process::id());
+    if std::fs::write(&tmp, contents).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
+    }
+}
+
 fn record_cancel_flag(task_id: &str) {
     let Ok(path) = std::env::var("MCP_FIXTURE_CANCEL_FLAG") else {
         return;
     };
-    let _ = std::fs::write(path, task_id);
+    write_atomically(&path, task_id);
 }
 
 fn capabilities() -> Value {
@@ -97,7 +107,9 @@ async fn main() {
         tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
     }
     if let Ok(pidfile) = std::env::var("MCP_FIXTURE_ORPHAN_PIDFILE") {
-        let script = format!("sleep 600 & echo $! > {pidfile}");
+        // Written to a temporary name and renamed, so a test never reads a half-written pid.
+        let script =
+            format!("sleep 600 & echo $! > {pidfile}.tmp && mv -f {pidfile}.tmp {pidfile}");
         let _ = tokio::process::Command::new("sh")
             .arg("-c")
             .arg(script)
