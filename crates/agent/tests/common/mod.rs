@@ -38,6 +38,8 @@ pub mod mcp_apps_http;
 pub mod mcp_events_fixture;
 /// A streamable-HTTP MCP server that records every request header it is sent.
 pub mod mcp_fixture;
+/// A real OAuth-protected MCP server with mid-session controls, and the `mcp-login` steps.
+pub mod mcp_oauth_fixture;
 /// A running `serve --service` replica, for the service-mode suites.
 pub mod service;
 /// The MCP Skills (SEP-2640) suites' isolated `$HOME` + skills-fixture harness.
