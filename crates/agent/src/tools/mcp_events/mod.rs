@@ -576,10 +576,11 @@ impl McpEventsHub {
                     return;
                 };
                 // Runtime subscriptions whose session has heard from no client for longer than
-                // their time to live are forgotten, not restored.
+                // their time to live are forgotten — spec, position and webhook callback (token
+                // and secret) alike — not restored.
                 if !state::runtime_still_wanted(store.last_client_ms(), now_unix_ms()) {
                     for (key, _) in store.runtime_specs() {
-                        store.set_runtime(&key, None);
+                        store.forget_sub(&key);
                     }
                 }
                 let runtime: Vec<(String, SubSpec)> = store
@@ -763,7 +764,7 @@ pub fn sessions_with_runtime_subscriptions(dir: &std::path::Path, max: usize) ->
         return Vec::new();
     };
     let now = now_unix_ms();
-    let mut ids = Vec::new();
+    let mut ranked: Vec<(i64, String)> = Vec::new();
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(stem) = name
@@ -775,11 +776,16 @@ pub fn sessions_with_runtime_subscriptions(dir: &std::path::Path, max: usize) ->
         let Some((_, id)) = stem.split_once('_') else {
             continue;
         };
-        if std::fs::read(entry.path()).is_ok_and(|b| state::snapshot_wants_restore(&b, now)) {
-            ids.push(id.to_owned());
+        if let Some(last) = std::fs::read(entry.path())
+            .ok()
+            .and_then(|b| state::snapshot_wants_restore(&b, now))
+        {
+            ranked.push((last, id.to_owned()));
         }
     }
-    ids.sort();
+    // The most recently used first: past the cap, the ones a client touched longest ago wait.
+    ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    let mut ids: Vec<String> = ranked.into_iter().map(|(_, id)| id).collect();
     if ids.len() > max {
         eprintln!(
             "serve: {} sessions hold runtime MCP Events subscriptions; restoring {max} of them at boot \
@@ -1548,10 +1554,10 @@ impl Hub {
                             json!({ "error": e.message, "retry_in_ms": delay.as_millis() as u64 }),
                         );
                         // A runtime subscription being restored that the server now refuses for
-                        // good (its server gone from settings, say) is forgotten: it is not
-                        // retried, not restored again, and keeps nothing alive.
+                        // good (its server gone from settings, say) is forgotten, its webhook
+                        // callback with it: not retried, not restored again, keeping nothing.
                         if restoring && e.permanent {
-                            hub.store.set_runtime(&key, None);
+                            hub.store.forget_sub(&key);
                             break;
                         }
                     }
@@ -1607,9 +1613,10 @@ impl Hub {
             return;
         }
         self.refresh_keep_alive();
-        // A runtime subscription the server ended is over: it is not subscribed again after a
-        // restart either (unless re-discovery brings it back, below).
-        self.store.set_runtime(&spec.key(), None);
+        // A runtime subscription the server ended is over: forgotten — spec, position, webhook
+        // callback (token and secret) — so it is not subscribed again after a restart (unless
+        // re-discovery brings it back, below, as a new subscription).
+        self.store.forget_sub(&spec.key());
         if !error.wants_rediscovery() {
             return;
         }
@@ -2482,5 +2489,32 @@ mod tests {
         let gap = || pending(McpEventAction::Steer, json!({"gap": true, "cursor": "9"}));
         assert!(render_injection(7, &[gap()]).starts_with(&injection_marker(7)));
         assert_ne!(render_injection(7, &[gap()]), render_injection(8, &[gap()]));
+    }
+
+    /// Past the boot cap, the sessions restored are the ones a client used most recently — not
+    /// the first ones alphabetically.
+    #[test]
+    fn the_boot_cap_keeps_the_most_recently_used_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = now_unix_ms();
+        for (id, ago) in [
+            ("a-oldest", 3_000),
+            ("b-newest", 1_000),
+            ("c-middle", 2_000),
+        ] {
+            std::fs::write(
+                dir.path().join(format!("100_{id}.mcp-events.json")),
+                json!({
+                    "subscriptions": { "k": { "cursor": null, "runtime": { "server": "s", "name": "n" } } },
+                    "last_client_ms": now - ago,
+                })
+                .to_string(),
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            sessions_with_runtime_subscriptions(dir.path(), 2),
+            ["b-newest", "c-middle"]
+        );
     }
 }

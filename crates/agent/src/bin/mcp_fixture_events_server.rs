@@ -116,6 +116,10 @@ struct State {
     forbid_left: u64,
     /// Answers the client POSTed to requests this server raised over HTTP (`id` and no `method`).
     client_answers: Vec<Value>,
+    /// Answer POSTs being handled right now, and the most at once (`MCP_FIXTURE_ANSWER_DELAY_MS`
+    /// holds each a while, so concurrent ones overlap).
+    answers_in_flight: u64,
+    answers_max_in_flight: u64,
     /// Whether the HTTP nested request (`MCP_FIXTURE_NESTED_DURING`) has been raised.
     http_nested_done: bool,
 }
@@ -1003,6 +1007,7 @@ async fn control(state: &Shared, method: &str, path: &str, body: &[u8]) -> (u16,
                     "deliveries": st.deliveries, "streams": st.streams.len(), "log": st.log.len(),
                 "requests": st.requests, "sessionless_rejections": st.sessionless_rejections,
                 "jwks_stalled": st.jwks_stalled, "nested_answers": st.nested_answers,
+                "client_answers": st.client_answers.len(), "answers_max_in_flight": st.answers_max_in_flight,
                 }),
             )
         }
@@ -1382,9 +1387,25 @@ async fn handle_http(state: Shared, mut stream: TcpStream) {
         }
         return respond(&mut stream, 202, "text/plain", b"").await;
     };
-    // An answer to a request this server raised: kept for whoever is waiting on it.
+    // An answer to a request this server raised: kept for whoever is waiting on it. Like the
+    // official Python SDK, a POST that does not accept both JSON and SSE is refused `406` (and so
+    // never reaches the waiter).
     if msg.get("method").is_none() {
-        state.lock().unwrap().client_answers.push(msg.clone());
+        let accept = req.headers.get("accept").map(String::as_str).unwrap_or("");
+        if !(accept.contains("application/json") && accept.contains("text/event-stream")) {
+            return respond(&mut stream, 406, "text/plain", b"Not Acceptable").await;
+        }
+        {
+            let mut st = state.lock().unwrap();
+            st.client_answers.push(msg.clone());
+            st.answers_in_flight += 1;
+            st.answers_max_in_flight = st.answers_max_in_flight.max(st.answers_in_flight);
+        }
+        let delay = env_u64("MCP_FIXTURE_ANSWER_DELAY_MS", 0);
+        if delay > 0 {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
+        state.lock().unwrap().answers_in_flight -= 1;
         return respond(&mut stream, 202, "text/plain", b"").await;
     }
     // Stateless streamable HTTP (2026-07-28) requires `Mcp-Method` to match the body, as the
@@ -1460,6 +1481,16 @@ async fn handle_http(state: Shared, mut stream: TcpStream) {
                     let state = state.clone();
                     tokio::spawn(async move { await_http_answer(&state, "stream").await });
                 }
+                // `MCP_FIXTURE_NESTED_FLOOD=<n>`: a hostile server raising `n` requests on the
+                // stream at once.
+                for i in 0..env_u64("MCP_FIXTURE_NESTED_FLOOD", 0) {
+                    let mut request = nested_request("flood");
+                    request["id"] = json!(format!("flood-{i}"));
+                    let _ = stream
+                        .write_all(format!("data: {request}\n\n").as_bytes())
+                        .await;
+                }
+                let _ = stream.flush().await;
                 let terminated_end = loop {
                     let Some(frame) = rx.recv().await else {
                         break false;

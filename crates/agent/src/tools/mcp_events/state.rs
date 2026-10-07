@@ -143,20 +143,29 @@ pub(super) fn runtime_ttl_ms() -> i64 {
 }
 
 /// Whether a snapshot's runtime subscriptions are still worth restoring: its session heard from a
-/// client within [`runtime_ttl_ms`] (or the state predates the record, and gets the benefit of the
-/// doubt once — the next client command records it).
+/// client within [`runtime_ttl_ms`]. A subscription's own creation counts as hearing from one
+/// ([`StateStore::set_runtime`] records it), so a state with runtime subscriptions and no record
+/// at all is not trusted: not wanted.
 pub(super) fn runtime_still_wanted(last_client_ms: Option<i64>, now_ms: i64) -> bool {
-    last_client_ms.is_none_or(|t| now_ms.saturating_sub(t) <= runtime_ttl_ms())
+    last_client_ms.is_some_and(|t| now_ms.saturating_sub(t) <= runtime_ttl_ms())
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 /// What a daemon reads at boot to decide whether to start a session: does its events state hold
 /// runtime subscriptions still worth restoring? (Snapshot only; blocking.)
-pub(super) fn snapshot_wants_restore(bytes: &[u8], now_ms: i64) -> bool {
-    let Ok(snap) = serde_json::from_slice::<Snapshot>(bytes) else {
-        return false;
-    };
-    runtime_still_wanted(snap.last_client_ms, now_ms)
-        && snap.subscriptions.values().any(|s| s.runtime.is_some())
+/// Returns when the session last heard from a client, when it does — for ranking.
+pub(super) fn snapshot_wants_restore(bytes: &[u8], now_ms: i64) -> Option<i64> {
+    let snap = serde_json::from_slice::<Snapshot>(bytes).ok()?;
+    (runtime_still_wanted(snap.last_client_ms, now_ms)
+        && snap.subscriptions.values().any(|s| s.runtime.is_some()))
+    .then_some(snap.last_client_ms)
+    .flatten()
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -323,11 +332,17 @@ impl StateStore {
             if spec.is_none() && !d.subs.contains_key(key) {
                 return;
             }
+            let created = spec.is_some();
             let entry = d.subs.entry(key.to_owned()).or_default();
             if entry.runtime == spec {
                 return;
             }
             entry.runtime = spec;
+            // Creating a runtime subscription is a client's own command: its time to live starts
+            // now, whatever the command channel recorded before there was runtime state.
+            if created {
+                d.last_client_ms = Some(now_ms());
+            }
             d.snapshot_dirty = true;
         }
         self.dirty();
@@ -1352,8 +1367,8 @@ mod tests {
             "a week is the default"
         );
         assert!(
-            runtime_still_wanted(None, now),
-            "older state gets one chance"
+            !runtime_still_wanted(None, now),
+            "no record of a client: not trusted"
         );
         let snap = |last: i64| {
             serde_json::json!({
@@ -1362,11 +1377,17 @@ mod tests {
             })
             .to_string()
         };
-        assert!(snapshot_wants_restore(snap(now - day).as_bytes(), now));
-        assert!(!snapshot_wants_restore(snap(now - 8 * day).as_bytes(), now));
+        assert_eq!(
+            snapshot_wants_restore(snap(now - day).as_bytes(), now),
+            Some(now - day)
+        );
+        assert_eq!(
+            snapshot_wants_restore(snap(now - 8 * day).as_bytes(), now),
+            None
+        );
         let no_runtime =
             serde_json::json!({ "subscriptions": { "k": { "cursor": null } } }).to_string();
-        assert!(!snapshot_wants_restore(no_runtime.as_bytes(), now));
+        assert_eq!(snapshot_wants_restore(no_runtime.as_bytes(), now), None);
     }
 
     /// A client's commands are recorded (coarsely) only while there is runtime state to expire.
@@ -1377,6 +1398,11 @@ mod tests {
         s.touch_client(1_000_000);
         assert_eq!(s.last_client_ms(), None, "nothing to expire yet");
         s.set_runtime("k", Some(serde_json::json!({ "server": "s" })));
+        assert!(
+            s.last_client_ms().is_some_and(|t| t > 1_000_000),
+            "creating a runtime subscription is client activity"
+        );
+        lock(&s.inner.data).last_client_ms = Some(1_000_000 - 120_000);
         s.touch_client(1_000_000);
         assert_eq!(s.last_client_ms(), Some(1_000_000));
         s.touch_client(1_030_000);

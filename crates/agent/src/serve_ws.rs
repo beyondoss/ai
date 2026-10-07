@@ -1812,38 +1812,65 @@ pub async fn serve_ws(
         }
     }
 
-    // The events session is what keeps configured subscriptions running; if it ends in a panic it
-    // is started again — with backoff (1 s doubling to a minute, reset once it has stayed up ten
-    // minutes), so a session that panics on every start cannot spin the daemon. Any other session
-    // that panics simply ends: its clients were told, and it starts again when one comes back.
+    // A session that ends in a panic is started again when it holds MCP Events subscriptions that
+    // must keep running with no client: the events session (configured subscriptions), or one with
+    // runtime subscriptions (`mcp_events_subscribe`) — with backoff per session (1 s doubling to a
+    // minute, reset once it has stayed up ten minutes), so a session that panics on every start
+    // cannot spin the daemon. Any other session that panics simply ends: its clients were told, and
+    // it starts again when one comes back.
     {
         let supervisor = supervisor.clone();
         let events_id = events_session_id.clone();
+        let session_dir = supervisor.session_dir.clone();
         tokio::spawn(async move {
-            let mut attempt = 0u32;
-            let mut last = std::time::Instant::now();
+            let mut backoff: std::collections::HashMap<String, (u32, std::time::Instant)> =
+                std::collections::HashMap::new();
             while let Some(id) = panicked_rx.recv().await {
-                if Some(&id) != events_id.as_ref() {
+                let holds_runtime = match &session_dir {
+                    Some(dir) => {
+                        let dir = dir.clone();
+                        let probe = id.clone();
+                        tokio::task::spawn_blocking(move || {
+                            crate::tools::mcp_events::sessions_with_runtime_subscriptions(
+                                std::path::Path::new(&dir),
+                                usize::MAX,
+                            )
+                            .contains(&probe)
+                        })
+                        .await
+                        .unwrap_or(false)
+                    }
+                    None => false,
+                };
+                if Some(&id) != events_id.as_ref() && !holds_runtime {
                     continue;
                 }
-                if last.elapsed() > std::time::Duration::from_secs(600) {
-                    attempt = 0;
+                let entry = backoff
+                    .entry(id.clone())
+                    .or_insert((0, std::time::Instant::now()));
+                if entry.1.elapsed() > std::time::Duration::from_secs(600) {
+                    entry.0 = 0;
                 }
-                let delay = std::time::Duration::from_secs(1u64 << attempt.min(6))
+                let delay = std::time::Duration::from_secs(1u64 << entry.0.min(6))
                     .min(std::time::Duration::from_secs(60));
-                attempt += 1;
-                tokio::time::sleep(delay).await;
-                last = std::time::Instant::now();
-                match supervisor.pin(Some(id.clone()), None).await {
-                    Ok(p) => {
-                        supervisor.unpin(&p.id, p.incarnation);
-                        eprintln!("serve: restarted the MCP Events session `{id}` after a panic");
+                entry.0 += 1;
+                entry.1 = std::time::Instant::now();
+                let supervisor = supervisor.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    match supervisor.pin(Some(id.clone()), None).await {
+                        Ok(p) => {
+                            supervisor.unpin(&p.id, p.incarnation);
+                            eprintln!(
+                                "serve: restarted session `{id}` after a panic, for its MCP Events subscriptions"
+                            );
+                        }
+                        Err(e) => eprintln!(
+                            "serve: could not restart session `{id}` after a panic: {}",
+                            HttpError::from(e)
+                        ),
                     }
-                    Err(e) => eprintln!(
-                        "serve: could not restart the MCP Events session `{id}`: {}",
-                        HttpError::from(e)
-                    ),
-                }
+                });
             }
         });
     }

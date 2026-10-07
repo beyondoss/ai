@@ -52,10 +52,11 @@ impl HttpClient {
 /// names one); over it, a request is answered with a JSON-RPC error (its caller sees an ordinary
 /// failed request), anything else fails as an undeliverable message does.
 fn ordinary_limit(message: &ClientJsonRpcMessage, max: usize) -> Limit {
-    let id = matches!(message, ClientJsonRpcMessage::Request(_))
-        .then(|| serde_json::to_value(message).ok())
-        .flatten()
-        .and_then(|v| v.get("id").cloned());
+    // Only the id is needed — read straight off the request, not by serializing the message.
+    let id = match message {
+        ClientJsonRpcMessage::Request(request) => serde_json::to_value(&request.id).ok(),
+        _ => None,
+    };
     Limit {
         max: max.min(crate::tools::mcp_stdio::max_message_bytes()),
         over: id.map_or(OverLimit::Fail, OverLimit::Refuse),
@@ -671,6 +672,197 @@ mod tests {
             post(&accepted, None).await.unwrap(),
             StreamableHttpPostResponse::Accepted
         ));
+    }
+
+    /// Every POST now goes through [`HttpClient::post_bounded`] instead of `rmcp`'s own
+    /// `reqwest` client — so for an ordinary request (a tool call) the two must agree on every
+    /// response shape `rmcp` acts on: auth required, insufficient scope, an expired session,
+    /// accepted, a JSON answer (with its `Mcp-Session-Id`), and an SSE stream.
+    #[tokio::test]
+    async fn an_ordinary_request_is_answered_as_rmcps_own_client_would() {
+        use futures::StreamExt as _;
+        agent_core::ensure_provider();
+        let call = || -> ClientJsonRpcMessage {
+            serde_json::from_value(serde_json::json!({
+                "jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": { "name": "x" },
+            }))
+            .unwrap()
+        };
+        let shape =
+            |r: &Result<StreamableHttpPostResponse, StreamableHttpError<reqwest::Error>>| match r {
+                Ok(StreamableHttpPostResponse::Accepted) => "accepted".to_owned(),
+                Ok(StreamableHttpPostResponse::Json(m, session)) => format!(
+                    "json {} session={session:?}",
+                    serde_json::to_value(m).unwrap()["id"]
+                ),
+                Ok(StreamableHttpPostResponse::Sse(_, session)) => {
+                    format!("sse session={session:?}")
+                }
+                Err(StreamableHttpError::AuthRequired(_)) => "auth-required".to_owned(),
+                Err(StreamableHttpError::InsufficientScope(_)) => "insufficient-scope".to_owned(),
+                Err(StreamableHttpError::SessionExpired) => "session-expired".to_owned(),
+                Err(e) => format!("other: {e}"),
+                Ok(_) => "other ok".to_owned(),
+            };
+        let cases: [(&[u8], Option<&str>); 6] = [
+            (b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer realm=\"x\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", None),
+            (b"HTTP/1.1 403 Forbidden\r\nWWW-Authenticate: Bearer scope=\"tools\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", None),
+            (b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", Some("s-1")),
+            (b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", None),
+            (b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMcp-Session-Id: s-9\r\nContent-Length: 48\r\nConnection: close\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"content\":[]}}", None),
+            (b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nMcp-Session-Id: s-9\r\nConnection: close\r\n\r\ndata: {\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"content\":[]}}\n\n", None),
+        ];
+        for (raw, session) in cases {
+            let ours = HttpClient(reqwest::Client::new())
+                .post_message(
+                    canned(raw, false).await.into(),
+                    call(),
+                    session.map(Into::into),
+                    None,
+                    HashMap::new(),
+                )
+                .await;
+            let theirs = reqwest::Client::new()
+                .post_message(
+                    canned(raw, false).await.into(),
+                    call(),
+                    session.map(Into::into),
+                    None,
+                    HashMap::new(),
+                )
+                .await;
+            assert_eq!(
+                shape(&ours),
+                shape(&theirs),
+                "for {}",
+                String::from_utf8_lossy(&raw[..raw.len().min(40)])
+            );
+            // An SSE answer streams the same response through both.
+            if let (
+                Ok(StreamableHttpPostResponse::Sse(mut a, _)),
+                Ok(StreamableHttpPostResponse::Sse(mut b, _)),
+            ) = (ours, theirs)
+            {
+                assert_eq!(
+                    a.next().await.unwrap().unwrap().data,
+                    b.next().await.unwrap().unwrap().data
+                );
+            }
+        }
+    }
+
+    /// …and they send the same request: the bearer token, the session id, `Accept`, the protocol
+    /// version and custom headers, and the body — so a server's auth and session handling sees
+    /// no difference.
+    #[tokio::test]
+    async fn an_ordinary_request_is_sent_as_rmcps_own_client_would() {
+        agent_core::ensure_provider();
+        async fn capture() -> (String, tokio::sync::oneshot::Receiver<String>) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut got = Vec::new();
+                let mut buf = [0u8; 8192];
+                loop {
+                    let n = tokio::io::AsyncReadExt::read(&mut stream, &mut buf)
+                        .await
+                        .unwrap();
+                    got.extend_from_slice(&buf[..n]);
+                    let text = String::from_utf8_lossy(&got).into_owned();
+                    if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                        let len: usize = head
+                            .lines()
+                            .find_map(|l| {
+                                l.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|v| v.trim().parse().unwrap())
+                            })
+                            .unwrap_or(0);
+                        if body.len() >= len || n == 0 {
+                            let _ = tx.send(text);
+                            break;
+                        }
+                    }
+                }
+                let _ = tokio::io::AsyncWriteExt::write_all(
+                    &mut stream,
+                    b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await;
+            });
+            (format!("http://{addr}/mcp"), rx)
+        }
+        // The request line, the headers a server acts on (names lowercased, sorted), and the body.
+        let normalize = |raw: String| {
+            let (head, body) = raw.split_once("\r\n\r\n").unwrap();
+            let mut lines = head.lines();
+            let request_line = lines.next().unwrap().to_owned();
+            let mut headers: Vec<String> = lines
+                .filter_map(|l| l.split_once(':'))
+                .map(|(k, v)| format!("{}: {}", k.to_ascii_lowercase(), v.trim()))
+                .filter(|l| !l.starts_with("host:"))
+                .collect();
+            headers.sort();
+            (request_line, headers, body.to_owned())
+        };
+        let message = || -> ClientJsonRpcMessage {
+            serde_json::from_value(json!({
+                "jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": { "name": "x" },
+            }))
+            .unwrap()
+        };
+        let headers = || {
+            HashMap::from([
+                (
+                    HeaderName::from_static("mcp-protocol-version"),
+                    HeaderValue::from_static("2025-11-25"),
+                ),
+                (
+                    HeaderName::from_static("x-tenant"),
+                    HeaderValue::from_static("t-1"),
+                ),
+            ])
+        };
+        let (url, ours) = capture().await;
+        HttpClient(reqwest::Client::new())
+            .post_message(
+                url.into(),
+                message(),
+                Some("s-1".into()),
+                Some("tok".into()),
+                headers(),
+            )
+            .await
+            .unwrap();
+        let (url, theirs) = capture().await;
+        reqwest::Client::new()
+            .post_message(
+                url.into(),
+                message(),
+                Some("s-1".into()),
+                Some("tok".into()),
+                headers(),
+            )
+            .await
+            .unwrap();
+        let (ours, theirs) = (
+            normalize(ours.await.unwrap()),
+            normalize(theirs.await.unwrap()),
+        );
+        assert_eq!(ours, theirs);
+        for wanted in [
+            "authorization: Bearer tok",
+            "mcp-session-id: s-1",
+            "x-tenant: t-1",
+        ] {
+            assert!(
+                ours.1.iter().any(|h| h == wanted),
+                "{wanted} in {:?}",
+                ours.1
+            );
+        }
     }
 
     #[tokio::test]

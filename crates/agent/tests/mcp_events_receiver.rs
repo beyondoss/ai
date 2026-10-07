@@ -436,6 +436,19 @@ async fn a_runtime_subscription_to_a_removed_server_is_forgotten_not_resurrected
         !has_runtime(home.path()),
         "the dead subscription is forgotten"
     );
+    // …and its webhook callback with it: no token or secret is left in the snapshot.
+    let leftover = std::fs::read_dir(home.path().join("sessions"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.to_string_lossy().ends_with(".mcp-events.json"))
+        .any(|p| {
+            let s = std::fs::read_to_string(p).unwrap_or_default();
+            s.contains("\"webhook\"") || s.contains("whsec_")
+        });
+    assert!(
+        !leftover,
+        "the forgotten subscription's token and secret are purged"
+    );
     common::mcp_events_fixture::sigterm_and_wait(&mut second);
 
     // And a further restart does not resurrect it.
@@ -452,4 +465,137 @@ async fn a_runtime_subscription_to_a_removed_server_is_forgotten_not_resurrected
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
+}
+
+/// A runtime subscription a single client command created (nothing else from that client) still
+/// expires: its creation starts the time to live, so once that has passed with no client it is
+/// not restored after a restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_runtime_subscription_made_by_one_command_expires_with_no_client() {
+    let (_fx, mcp_url, fixture) = spawn_http_fixture(&[("MCP_FIXTURE_ALLOW_HTTP_CALLBACK", "1")]);
+    let home = tempfile::tempdir().unwrap();
+    let mut servers = hooks(&mcp_url, "notify");
+    servers[0]["events"] = json!([]);
+    write_settings(home.path(), servers);
+    let (base, _bodies) = spawn_model_server_routed(vec![], turn_text("noted"));
+    let held = HeldPort::bind();
+    let port = held.port();
+    let mut first = daemon(home.path(), &base, &held, &[]);
+    let mut ws = ws_connect(port, Some("one-shot")).await;
+    ws_send(
+        &mut ws,
+        json!({ "type": "mcp_events_subscribe", "id": "s", "server": "hooks", "name": "ticket.updated",
+                "delivery": "webhook", "action": "notify" }),
+    )
+    .await;
+    let r = ws_next(&mut ws, Duration::from_secs(20), "the subscribe", |f| {
+        f["type"] == "response" && f["id"] == "s"
+    })
+    .await;
+    assert_eq!(r["success"], true, "{r:#}");
+    let subscribes = || {
+        state(&fixture)["methods"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| *m == "events/subscribe")
+            .count()
+    };
+    eventually(Duration::from_secs(10), "the runtime spec on disk", || {
+        std::fs::read_dir(home.path().join("sessions"))
+            .ok()?
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.to_string_lossy().ends_with(".mcp-events.json"))
+            .any(|p| {
+                std::fs::read_to_string(p)
+                    .unwrap_or_default()
+                    .contains("\"runtime\"")
+            })
+            .then_some(())
+    });
+    drop(ws);
+    first.kill().unwrap();
+    let _ = first.wait();
+    let before = subscribes();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let down = held.down();
+    drop(down);
+    let _second = daemon(
+        home.path(),
+        &base,
+        &held,
+        &[("BEYOND_AI_AGENT_MCP_EVENTS_RUNTIME_TTL_MS", "1")],
+    );
+    tokio::time::sleep(Duration::from_millis(3000)).await;
+    assert_eq!(subscribes(), before, "expired: not restored at boot");
+    assert_ne!(
+        daemon_sessions(port).await.get("one-shot"),
+        Some(&true),
+        "and its session is not started"
+    );
+}
+
+/// A session that holds runtime subscriptions and ends in a panic is started again, so they keep
+/// running with no client attached.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_session_with_runtime_subscriptions_is_restarted_after_a_panic() {
+    let (_fx, mcp_url, fixture) = spawn_http_fixture(&[("MCP_FIXTURE_ALLOW_HTTP_CALLBACK", "1")]);
+    let home = tempfile::tempdir().unwrap();
+    let mut servers = hooks(&mcp_url, "notify");
+    servers[0]["events"] = json!([]);
+    write_settings(home.path(), servers);
+    let (base, _bodies) = spawn_model_server_routed(vec![], turn_text("noted"));
+    let held = HeldPort::bind();
+    let port = held.port();
+    let _d = daemon(
+        home.path(),
+        &base,
+        &held,
+        &[("BEYOND_AI_AGENT_TEST_PANICS", "1")],
+    );
+    let mut ws = ws_connect(port, Some("watcher")).await;
+    ws_send(
+        &mut ws,
+        json!({ "type": "mcp_events_subscribe", "id": "s", "server": "hooks", "name": "ticket.updated",
+                "delivery": "webhook", "action": "notify" }),
+    )
+    .await;
+    let r = ws_next(&mut ws, Duration::from_secs(20), "the subscribe", |f| {
+        f["type"] == "response" && f["id"] == "s"
+    })
+    .await;
+    assert_eq!(r["success"], true, "{r:#}");
+    let subscribes = || {
+        state(&fixture)["methods"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| *m == "events/subscribe")
+            .count()
+    };
+    eventually(Duration::from_secs(10), "the runtime spec on disk", || {
+        std::fs::read_dir(home.path().join("sessions"))
+            .ok()?
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.to_string_lossy().ends_with(".mcp-events.json"))
+            .any(|p| {
+                std::fs::read_to_string(p)
+                    .unwrap_or_default()
+                    .contains("\"runtime\"")
+            })
+            .then_some(())
+    });
+    let before = subscribes();
+    ws_send(&mut ws, json!({ "type": "__test_panic", "id": "boom" })).await;
+    ws_next(&mut ws, Duration::from_secs(20), "the error frame", |f| {
+        f["type"] == "error"
+    })
+    .await;
+    drop(ws);
+    eventually(
+        Duration::from_secs(20),
+        "the session back, resubscribed",
+        || (subscribes() > before).then_some(()),
+    );
+    assert_eq!(daemon_sessions(port).await.get("watcher"), Some(&true));
 }

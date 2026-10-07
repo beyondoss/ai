@@ -183,3 +183,38 @@ fn over_direct_http_a_nested_request_during_an_events_poll_is_refused_not_ignore
 fn over_direct_http_a_nested_request_during_an_events_stream_is_refused_not_ignored() {
     nested_over_direct_http("stream", "push");
 }
+
+/// A server that floods requests onto an `events/stream` gets every one answered, but one at a
+/// time: the client never runs more than one answer at once per stream, however many arrive.
+#[test]
+fn a_flood_of_server_requests_on_an_events_stream_is_answered_one_at_a_time() {
+    let (_fx, mcp_url, control) = common::mcp_events_fixture::spawn_http_fixture(&[
+        ("MCP_FIXTURE_NESTED_FLOOD", "20"),
+        ("MCP_FIXTURE_ANSWER_DELAY_MS", "50"),
+        ("MCP_FIXTURE_HEARTBEAT_MS", "200"),
+    ]);
+    let home = tempfile::tempdir().unwrap();
+    write_settings(
+        home.path(),
+        json!([{
+            "name": "tickets", "transport": "http", "url": mcp_url,
+            "events": [{ "name": "ticket.updated", "delivery": "push", "action": "notify" }],
+        }]),
+    );
+    let (base, _bodies) = spawn_model_server_routed(vec![], turn_text("noted"));
+    let mut cmd = serve_cmd(BIN, &base, &home.path().join("s.jsonl").to_string_lossy());
+    cmd.env("HOME", home.path())
+        .env("BEYOND_AI_AGENT_MCP_IDLE_SECS", "0")
+        .stderr(Stdio::null());
+    let _child = cmd.spawn_guarded();
+    eventually(
+        Duration::from_secs(30),
+        "every flooded request answered",
+        || (state(&control)["client_answers"].as_u64()? >= 20).then_some(()),
+    );
+    assert_eq!(
+        state(&control)["answers_max_in_flight"],
+        1,
+        "answered one at a time, not a task per request"
+    );
+}

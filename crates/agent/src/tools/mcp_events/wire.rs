@@ -593,11 +593,11 @@ impl Conn {
                 let reader = tokio::spawn(async move {
                     let mut events = SseReader::new(resp);
                     while let Some(msg) = events.next().await {
+                        // Answered inline — one at a time, each bounded — so a server that floods
+                        // requests onto the stream cannot make the reader spawn without limit.
                         if is_server_request(&msg) {
-                            let (http, url, headers, version) = refuse_with.clone();
-                            tokio::spawn(async move {
-                                refuse_server_request(&http, &url, &headers, &version, &msg).await;
-                            });
+                            let (http, url, headers, version) = &refuse_with;
+                            refuse_server_request(http, url, headers, version, &msg).await;
                             continue;
                         }
                         if msg.get("id") == Some(&want) {
@@ -676,9 +676,12 @@ async fn refuse_server_request(
             "message": format!("`{method}` is not served during an events request over direct HTTP"),
         },
     });
+    // The same `Accept` as every events POST: a streamable-HTTP server (the official Python SDK
+    // among them) answers a POST without it `406` — and then still waits for the answer.
     let mut req = http
         .post(url)
         .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
         .header("MCP-Protocol-Version", protocol_version);
     for (k, v) in headers {
         req = req.header(k, v);
