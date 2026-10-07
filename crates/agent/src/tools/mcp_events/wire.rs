@@ -314,9 +314,10 @@ impl Conn {
         req.body(body.to_string())
     }
 
-    /// Send one direct `events/*` POST. A 401 from a server with an OAuth login refreshes its token
-    /// (once for every concurrent caller — see `mcp_oauth`) and resends **once**; a failed refresh
-    /// is the error, naming `agent mcp-login`.
+    /// Send one direct `events/*` POST. With an OAuth login it carries the server's **current**
+    /// shared token (not the one these headers were built with — a refresh by any connection since
+    /// is used at once), and any 401 refreshes it (once for every concurrent caller — see
+    /// `mcp_oauth`) and resends **once**; a failed refresh is the error.
     #[allow(clippy::too_many_arguments)]
     async fn send(
         http: &reqwest::Client,
@@ -327,32 +328,36 @@ impl Conn {
         method: &str,
         body: &Value,
     ) -> Result<reqwest::Response, RpcError> {
-        let post = |headers: &[(http::HeaderName, http::HeaderValue)]| {
-            Self::http_request(http, url, headers, protocol_version, method, body).send()
-        };
         let failed = |e: reqwest::Error| RpcError::local(format!("POST {method}: {e}"));
-        let resp = post(headers).await.map_err(failed)?;
-        let Some(auth) = auth.filter(|_| resp.status() == reqwest::StatusCode::UNAUTHORIZED) else {
-            return Ok(resp);
+        let Some(auth) = auth else {
+            return Self::http_request(http, url, headers, protocol_version, method, body)
+                .send()
+                .await
+                .map_err(failed);
         };
-        let sent = headers
-            .iter()
-            .find(|(k, _)| k == http::header::AUTHORIZATION)
-            .and_then(|(_, v)| v.to_str().ok()?.strip_prefix("Bearer "))
-            .map(str::to_owned);
+        let post = |token: Option<&str>| {
+            let mut with: Vec<_> = headers
+                .iter()
+                .filter(|(k, _)| k != http::header::AUTHORIZATION)
+                .cloned()
+                .collect();
+            if let Some(v) =
+                token.and_then(|t| http::HeaderValue::from_str(&format!("Bearer {t}")).ok())
+            {
+                with.push((http::header::AUTHORIZATION, v));
+            }
+            Self::http_request(http, url, &with, protocol_version, method, body).send()
+        };
+        let sent = auth.token().await;
+        let resp = post(sent.as_deref()).await.map_err(failed)?;
+        if resp.status() != reqwest::StatusCode::UNAUTHORIZED {
+            return Ok(resp);
+        }
         let fresh = auth
             .after_rejection(sent.as_deref())
             .await
             .map_err(RpcError::local)?;
-        let mut retry: Vec<_> = headers
-            .iter()
-            .filter(|(k, _)| k != http::header::AUTHORIZATION)
-            .cloned()
-            .collect();
-        let bearer = http::HeaderValue::from_str(&format!("Bearer {fresh}"))
-            .map_err(|e| RpcError::local(format!("POST {method}: {e}")))?;
-        retry.push((http::header::AUTHORIZATION, bearer));
-        post(&retry).await.map_err(failed)
+        post(Some(&fresh)).await.map_err(failed)
     }
 
     /// Fetch the server's webhook-signing keys from `<server origin>/.well-known/mcp-webhook-jwks.json`
@@ -1080,8 +1085,11 @@ mod tests {
 
         // A refresh that fails is the error, naming `agent mcp-login`; nothing is resent.
         let (url, seen) = bearer_server().await;
-        let auth =
-            crate::tools::mcp_oauth::ServerAuth::fake("stale", || Err("invalid_grant".into()));
+        let auth = crate::tools::mcp_oauth::ServerAuth::fake("stale", || {
+            Err(crate::tools::mcp_oauth::RefreshError::definitive(
+                "invalid_grant",
+            ))
+        });
         let e = Conn::send(
             &reqwest::Client::new(),
             &url,
@@ -1095,5 +1103,28 @@ mod tests {
         .unwrap_err();
         assert!(e.message.contains("agent mcp-login"), "{}", e.message);
         assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_direct_events_request_sends_the_current_shared_token_not_the_one_it_was_built_with()
+    {
+        // The headers were built (at `events_peer`) with the token of that moment; another
+        // connection has refreshed it since. The request must not spend a 401 on the old one.
+        agent_core::ensure_provider();
+        let (url, seen) = bearer_server().await;
+        let auth = crate::tools::mcp_oauth::ServerAuth::fake("fresh", || Ok("unused".into()));
+        let resp = Conn::send(
+            &reqwest::Client::new(),
+            &url,
+            &bearer("stale"),
+            Some(&auth),
+            "2026-07-28",
+            "events/list",
+            &json!({}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(*seen.lock().unwrap(), ["bearer fresh"]);
     }
 }

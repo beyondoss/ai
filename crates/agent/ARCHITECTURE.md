@@ -4326,21 +4326,27 @@ at all) and _that_ attempt's own failure (if the server does require it) is enri
 
 **Mid-session refresh** (`tools/mcp_oauth.rs`). The token is a `ServerAuth`, one per configured server
 in the process, shared by every connection to it — the plain and apps-flavoured connections and direct
-`events/*` requests — and reloaded from the store at each dial. Every request rmcp's streamable-HTTP
+`events/*` requests. It is reloaded from the store at each dial **under the same lock a refresh
+holds** (a refresh persists before releasing it, so the store read there is never older than the token
+held; a reload that reads nothing keeps the token held). Every request rmcp's streamable-HTTP
 transport makes goes through `OAuthHttp`, which attaches the server's _current_ token (the transport
-carries no `auth_header` of its own); a **401** (`AuthRequired`) on any of them — `tools/call`,
-`resources/*`, `prompts/*`, `skills/*`, MCP App view reads, the handshake, the standalone stream — makes
-`ServerAuth::after_rejection` force a refresh through the same `AuthorizationManager` and
-`McpAuthStore` `mcp-login` uses (so the new token is persisted), and the request is retried **once**;
-a second 401 is returned as the server's answer. Direct `events/*` POSTs (`mcp_events::wire`'s
-`Conn::send`) do the same. **Single flight:** the refresh runs under the token's lock, and a caller
-whose rejected token has already been replaced takes the replacement without refreshing, so concurrent
-401s cost one refresh (a second refresh with a rotated-away refresh token would fail). A 403
-(`InsufficientScope`) passes through untouched. A failed refresh surfaces as an error naming `agent
-mcp-login <name>`, remembered for that token so later rejections of it do not ask the authorization
-server again. Tested in `tests/mcp_oauth_refresh.rs` (a token revoked between two tool calls of one
-run, a failing refresh, three concurrent 401s) against the shared fixture in
-`tests/common/mcp_oauth_fixture.rs`.
+carries no `auth_header` of its own); direct `events/*` POSTs (`mcp_events::wire`'s `Conn::send`)
+likewise read the current token per request, not the one their headers were built with. **One rule
+on both paths:** any **401** from a server with a login — with or without a `WWW-Authenticate`
+challenge — makes `ServerAuth::after_rejection` force a refresh through the same `AuthorizationManager`
+and `McpAuthStore` `mcp-login` uses (so the new token is persisted), and the request is retried
+**once**; a second 401 is returned as the server's answer. That covers `tools/call`, `resources/*`,
+`prompts/*`, `skills/*`, MCP App view reads, the handshake, the standalone stream and `events/*`. A 403
+(`InsufficientScope`) never refreshes. **Single flight:** the refresh runs under the token's lock, and
+a caller whose rejected token has already been replaced takes the replacement without refreshing, so
+concurrent 401s cost one refresh (a second refresh with a rotated-away refresh token would fail). **A
+failed refresh is remembered:** a _definitive_ one (`invalid_grant`, or no refresh token) for good,
+with an error naming `agent mcp-login <name>`; a _transient_ one (the authorization server unreachable,
+a 5xx) for a backoff of 30 s doubling to 5 min, after which a rejection refreshes again. Tested in
+`tests/mcp_oauth_refresh.rs` (a token revoked between two tool calls of one run, a failing refresh,
+three concurrent 401s) against the shared fixture in `tests/common/mcp_oauth_fixture.rs`, and by unit
+tests in `mcp_oauth.rs` and `mcp_events/wire.rs` (backoff, the reload race, a bare 401, a 403, the
+events path's current token).
 
 Tested end to end in `tests/mcp_oauth.rs` against a real, hand-rolled OAuth-protected MCP fixture
 (metadata discovery, dynamic client registration, a real authorize-then-redirect exchange, a token
