@@ -3120,15 +3120,25 @@ POSIX lock, which is why it is not the authoritative half.)
 
 Nothing else needs guarding: the only remaining hazard is _replacing_ a lock file, which an atomic
 write (`tools::write_atomic`) could do by renaming over it — it refuses a lock file as its target
-(`file_lock::is_lock_file`, applied after resolving a symlink): anything named like a record lock
-file, compared without regard to ASCII case, or **any file locked right now** — asked of the file
-itself (`file_lock::is_locked`: `F_OFD_GETLK`, which also reports this process's own other
-descriptions, and a non-blocking test `flock`). Asking the file covers what no name can: an old
-binary's legacy `lock` with no record lock file beside it, a journal key held through
-`Target::Itself`, a spelling a case-insensitive filesystem folds onto a lock file, a hard link. A lock
-file nobody holds needs no protecting, and an unrelated `Cargo.lock` is written as ever. (Verified on
-a casefold ext4 directory as well as here.) A worktree seed leaves record lock files behind (a copy
-of a lock is no lock). A failed session start's directory is taken back through
+(`file_lock::is_lock_file`, applied after resolving a symlink). **It never opens the target and never
+locks it — it only `stat`s.** Opening a FIFO with no writer blocks forever, opening a device can act,
+and a test lock makes another program's own non-blocking lock fail while it is held (2071 of 20000
+attempts, measured). So a target is a lock file only when one of three things says so:
+
+- **Its name**, compared without regard to ASCII case: a record lock file, or a legacy `lock` /
+  `<f>.lock` beside one.
+- **It is a lock this process holds.** `try_lock` puts the (device, inode) of each lock file it holds
+  in a small counted set and `Drop` takes them out once released; `write_atomic` looks the target's
+  `stat` up there. That covers a journal key held through `Target::Itself` under any name, a hard link
+  to one of our own lock files, and a spelling a case-insensitive filesystem folds onto one.
+- **An old binary's legacy lock with no record lock file beside it**, by where it sits: a `lock` in a
+  session directory (one holding `000001.jsonl`, which is never deleted), or a `<f>.lock` beside a
+  session file (`*.jsonl`) or the MCP manifest. Whether anyone holds it is not asked.
+
+Anything else is an ordinary file and an edit of it goes through: a SQLite database another program
+holds mid-transaction, a daemon's pid file, an unrelated `Cargo.lock`, a `lock` in a directory that
+holds no session. (Verified on a casefold ext4 directory as well as here.) A worktree seed leaves
+record lock files behind (a copy of a lock is no lock). A failed session start's directory is taken back through
 `file_lock::dir_holds_only_lock_files` and `FileLock::release_and_remove_files`, which **closes** the
 lock files' descriptors before the directory is removed: an NFS client turns the unlink of a file it
 still has open into a rename to `.nfs*`, which stays until the last close and makes `remove_dir` fail

@@ -105,43 +105,102 @@ pub fn is_record_lock_file(path: &Path) -> bool {
     })
 }
 
-/// Whether an atomic write must not rename a fresh file over `path`: it is named like a record lock
-/// file, or **the file there is locked right now** — by anyone, any kind of lock this module takes.
-/// Replacing a locked file leaves the lock on the old inode, which the path no longer names, so the
-/// next owner would lock the new file.
+/// Whether an atomic write must not rename a fresh file over `path`. Replacing a lock file leaves the
+/// lock on the old inode, which the path no longer names, so the next owner would lock the new file.
 ///
-/// Asking the file itself, not its name, is what covers every case a name cannot: a legacy `lock`
-/// an old binary holds with no record lock file beside it, a journal key held through
-/// [`Target::Itself`], a spelling a case-insensitive filesystem folds onto a lock file, a hard link.
-/// A lock nobody holds is not protected, and needs no protecting.
+/// **This never opens `path`, and never locks it** — it only `stat`s. Opening a FIFO or a device
+/// blocks or acts, and a test lock makes another program's own non-blocking lock fail while it is
+/// held. So a file is a lock file only when one of these says so:
+///
+/// - **Its name**, without regard to ASCII case (a case-insensitive filesystem folds `.BEYOND-LOCK`
+///   onto `.beyond-lock`): a record lock file, or a legacy `lock` / `<f>.lock` beside one.
+/// - **It is a lock this process holds**: its (device, inode) is in the held set [`try_lock`] keeps.
+///   That covers a [`Target::Itself`] key (any name) and any spelling or hard link of this process's
+///   own lock files.
+/// - **An old binary's legacy lock with no record lock file beside it**, by where it sits: a `lock`
+///   in a session directory (one holding `000001.jsonl`, which is never deleted), or a `<f>.lock`
+///   beside a session file (`*.jsonl`) or the MCP manifest. Whether anyone holds it is not asked.
+///
+/// Anything else — a SQLite database another program holds open and locked, a daemon's pid file — is
+/// an ordinary file, and an edit of it goes through.
 pub fn is_lock_file(path: &Path) -> bool {
-    is_record_lock_file(path) || is_locked(path)
+    is_lock_file_by_name(path) || is_held_here(path)
 }
 
-/// Whether anyone holds a lock on the file at `path` right now: an OFD or POSIX lock (`F_OFD_GETLK`,
-/// which reports another description's lock — this process's own included), or an `flock` (a
-/// non-blocking test lock, let go at once). The probe opens its own descriptor, which with OFD locks
-/// releases nothing.
-pub fn is_locked(path: &Path) -> bool {
-    let Ok(file) = OpenOptions::new().read(true).open(path) else {
+fn is_lock_file_by_name(path: &Path) -> bool {
+    if is_record_lock_file(path) {
+        return true;
+    }
+    let Some(name) = path.file_name().and_then(OsStr::to_str) else {
         return false;
     };
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    {
-        let mut probe = whole_file(libc::F_WRLCK);
-        if nix::fcntl::fcntl(&file, nix::fcntl::FcntlArg::F_OFD_GETLK(&mut probe)).is_ok()
-            && probe.l_type != libc::F_UNLCK as libc::c_short
-        {
-            return true;
+    let lower = name.to_ascii_lowercase();
+    if lower == "lock" {
+        return path.with_file_name(RECORD_SUFFIX).exists()
+            || path.with_file_name("000001.jsonl").is_file();
+    }
+    let Some(stem) = lower.strip_suffix(".lock") else {
+        return false;
+    };
+    stem.ends_with(".jsonl")
+        || stem == "mcp-manifest.json"
+        || path
+            .with_file_name(format!("{}{RECORD_SUFFIX}", &name[..stem.len()]))
+            .exists()
+}
+
+type FileId = (u64, u64);
+
+/// The (device, inode) of every lock file this process holds, counted: [`try_lock`] adds a lock's
+/// files once it holds them, and dropping the lock takes them out again once it is released.
+#[cfg(unix)]
+fn held() -> std::sync::MutexGuard<'static, std::collections::HashMap<FileId, usize>> {
+    static HELD: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<FileId, usize>>> =
+        std::sync::OnceLock::new();
+    HELD.get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(unix)]
+fn file_id(meta: &std::fs::Metadata) -> FileId {
+    use std::os::unix::fs::MetadataExt;
+    (meta.dev(), meta.ino())
+}
+
+#[cfg(unix)]
+fn mark_held(files: &[&File], add: bool) {
+    let ids: Vec<FileId> = files
+        .iter()
+        .filter_map(|f| f.metadata().ok())
+        .map(|m| file_id(&m))
+        .collect();
+    let mut held = held();
+    for id in ids {
+        if add {
+            *held.entry(id).or_default() += 1;
+        } else if let std::collections::hash_map::Entry::Occupied(mut e) = held.entry(id) {
+            *e.get_mut() -= 1;
+            if *e.get() == 0 {
+                e.remove();
+            }
         }
     }
-    match file.try_lock() {
-        Ok(()) => {
-            let _ = file.unlock();
-            false
-        }
-        Err(std::fs::TryLockError::WouldBlock) => true,
-        Err(std::fs::TryLockError::Error(_)) => false,
+}
+
+#[cfg(not(unix))]
+fn mark_held(_: &[&File], _: bool) {}
+
+/// Whether the file at `path` is one this process holds a lock on — by `stat`, nothing opened.
+fn is_held_here(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        std::fs::metadata(path).is_ok_and(|m| held().contains_key(&file_id(&m)))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        false
     }
 }
 
@@ -175,6 +234,10 @@ impl FileLock {
         &self.record
     }
 
+    fn files(&self) -> Vec<&File> {
+        std::iter::once(&self.record).chain(&self.legacy).collect()
+    }
+
     /// Release the lock and unlink its files — for a lock directory being taken back. What matters is
     /// that the descriptors are closed before the directory is removed: an NFS client turns the unlink
     /// of a file it still has open into a rename to `.nfs*`, which stays until the last close and keeps
@@ -195,6 +258,8 @@ impl Drop for FileLock {
         if let Some(legacy) = &self.legacy {
             let _ = legacy.unlock();
         }
+        // Out of the held set only once unlocked, so the set never misses a lock still held.
+        mark_held(&self.files(), false);
     }
 }
 
@@ -233,12 +298,14 @@ pub fn try_lock(target: Target<'_>) -> std::io::Result<Option<FileLock>> {
                 continue;
             }
         };
-        return Ok(Some(FileLock {
+        let lock = FileLock {
             record,
             legacy,
             record_path,
             legacy_path,
-        }));
+        };
+        mark_held(&lock.files(), true);
+        return Ok(Some(lock));
     }
     Ok(None)
 }
@@ -557,43 +624,112 @@ pub(crate) mod tests {
         assert!(try_lock(Target::Itself(&key)).unwrap().is_some());
     }
 
-    /// A lock file is recognized by its record name in any case, or by being locked right now: an
-    /// unrelated `Cargo.lock` nobody holds is just a file.
+    /// A lock file is recognized by its name in any case — a record lock file, a legacy one beside a
+    /// record lock file, or an old binary's legacy one where a session or the MCP manifest keeps it —
+    /// and nothing else is: an unrelated `Cargo.lock`, or a `lock` in a directory that holds no
+    /// session, is just a file.
     #[test]
-    fn a_lock_file_is_one_by_name_in_any_case_or_by_being_held() {
+    fn a_lock_file_is_one_by_its_name_in_any_case_or_by_where_it_sits() {
         let dir = tempfile::tempdir().unwrap();
         let session = dir.path().join("s1");
         std::fs::create_dir_all(&session).unwrap();
-        let held = try_lock(Target::Dir(&session)).unwrap().unwrap();
+        drop(try_lock(Target::Dir(&session)).unwrap().unwrap());
         assert!(
             is_lock_file(&session.join("lock")),
-            "the legacy flock is held"
+            "beside a record lock file"
         );
         assert!(is_lock_file(&session.join(".BEYOND-LOCK")), "any case");
+        // An old binary's session directory: a segment and its legacy `lock`, no record lock file.
+        let old = dir.path().join("old");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("000001.jsonl"), "").unwrap();
+        std::fs::write(old.join("lock"), "").unwrap();
+        assert!(
+            is_lock_file(&old.join("lock")),
+            "a lock in a session directory"
+        );
+        assert!(is_lock_file(&old.join("Lock")), "in any case");
+        for beside in ["1700000000_abc.jsonl.lock", "mcp-manifest.json.lock"] {
+            assert!(is_lock_file(&dir.path().join(beside)), "{beside}");
+        }
         std::fs::write(dir.path().join("Cargo.lock"), "").unwrap();
         assert!(!is_lock_file(&dir.path().join("Cargo.lock")));
-        drop(held);
-        assert!(
-            !is_lock_file(&session.join("lock")),
-            "a legacy lock file nobody holds needs no protecting"
-        );
+        let plain = dir.path().join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        std::fs::write(plain.join("lock"), "").unwrap();
+        assert!(!is_lock_file(&plain.join("lock")), "no session here");
     }
 
-    /// The probe asks the file, so a hard link under any name to a held lock file is one too — the
-    /// same answer a case-insensitive filesystem's folded spelling gets.
+    /// A lock this process holds is recognized under any name — a hard link, a key locked itself —
+    /// by its inode, and stops being one once released.
     #[cfg(unix)]
     #[test]
     fn a_held_lock_file_is_recognized_under_any_name() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("x");
         let target = Target::File(&file);
-        let _held = try_lock(target).unwrap().unwrap();
+        let held = try_lock(target).unwrap().unwrap();
         let alias = dir.path().join("INNOCENT.TXT");
         std::fs::hard_link(target.record_path(), &alias).unwrap();
         assert!(is_lock_file(&alias));
         let key = dir.path().join("journal.key");
-        let _key = try_lock(Target::Itself(&key)).unwrap().unwrap();
+        let held_key = try_lock(Target::Itself(&key)).unwrap().unwrap();
         assert!(is_lock_file(&key), "a file locked itself is one while held");
+        drop(held);
+        drop(held_key);
+        assert!(!is_lock_file(&alias), "released");
+        assert!(!is_lock_file(&key), "released");
+    }
+
+    /// Asking whether a file is a lock file takes no lock on it, so another program's own
+    /// non-blocking `flock` on that file never fails because of us. (A test lock taken to ask made
+    /// 2071 of 20000 of its attempts fail.)
+    #[cfg(unix)]
+    #[test]
+    fn asking_never_makes_another_programs_lock_fail() {
+        let dir = tempfile::tempdir().unwrap();
+        let theirs = dir.path().join("daemon.pid");
+        std::fs::write(&theirs, "").unwrap();
+        let Ok(mut other) = Command::new("python3")
+            .args([
+                "-c",
+                "import fcntl,sys\nf=open(sys.argv[1],'a+')\nprint('ready',flush=True)\nfailed=0\nfor _ in range(20000):\n    try:\n        fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB)\n        fcntl.flock(f,fcntl.LOCK_UN)\n    except BlockingIOError:\n        failed+=1\nprint(failed,flush=True)",
+            ])
+            .arg(&theirs)
+            .stdout(Stdio::piped())
+            .spawn()
+        else {
+            eprintln!("no python3: skipping the other-program check");
+            return;
+        };
+        let mut out = BufReader::new(other.stdout.take().unwrap());
+        let mut line = String::new();
+        out.read_line(&mut line).unwrap();
+        assert_eq!(line.trim(), "ready");
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let asker = {
+            let (stop, theirs) = (stop.clone(), theirs.clone());
+            std::thread::spawn(move || {
+                let (mut asked, mut called_lock) = (0u64, 0u64);
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    called_lock += u64::from(is_lock_file(&theirs));
+                    asked += 1;
+                }
+                (asked, called_lock)
+            })
+        };
+        line.clear();
+        out.read_line(&mut line).unwrap();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let (asked, called_lock) = asker.join().unwrap();
+        other.wait().unwrap();
+        assert!(asked > 0);
+        assert_eq!(
+            line.trim(),
+            "0",
+            "its own lock attempts failed while we asked {asked} times"
+        );
+        assert_eq!(called_lock, 0, "its file is not a lock file of ours");
     }
 
     /// An old binary held only the legacy `flock`. While one runs, it must still exclude this binary.
