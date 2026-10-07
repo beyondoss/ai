@@ -520,6 +520,18 @@ impl<C: StreamableHttpClient<Error = reqwest::Error>> OAuthHttp<C> {
                                         StreamableHttpError::UnexpectedServerResponse(m) => {
                                             m.to_string()
                                         }
+                                        // The challenge — and the server's reason, if it sent
+                                        // one, as its `error_description` — kept in the text.
+                                        StreamableHttpError::AuthRequired(a)
+                                            if !a.www_authenticate_header.is_empty() =>
+                                        {
+                                            format!(
+                                                "HTTP 401 Unauthorized (WWW-Authenticate: {})",
+                                                crate::tools::mcp_wire::fenced_server_message(
+                                                    &a.www_authenticate_header
+                                                )
+                                            )
+                                        }
                                         _ => "HTTP 401 Unauthorized".to_owned(),
                                     },
                                     auth.server,

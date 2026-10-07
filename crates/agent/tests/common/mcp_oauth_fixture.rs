@@ -169,6 +169,12 @@ pub struct OAuthFixture {
     /// Answer a rejected request's 401 with an `application/json` JSON-RPC error body and no
     /// `WWW-Authenticate` challenge (what rmcp's own client reads as an ordinary error response).
     pub reject_with_json_body: Arc<AtomicBool>,
+    /// With `reject_with_json_body`: send the `WWW-Authenticate` challenge too.
+    pub challenge_with_json_body: Arc<AtomicBool>,
+    /// Appended to every `WWW-Authenticate` challenge (a hostile server's extra parameters).
+    pub challenge_extra: Arc<Mutex<Option<String>>>,
+    /// With `reject_with_json_body`: this `error.message` instead of the default.
+    pub reject_message: Arc<Mutex<Option<String>>>,
     /// Answer every `tools/call` 401, whatever token it carries — a login the server keeps
     /// refusing (a refresh gets a new token, and that is refused too).
     pub reject_calls: Arc<AtomicBool>,
@@ -224,6 +230,9 @@ impl OAuthFixture {
             refresh_reply: Arc::default(),
             hold_rejections_until: Arc::default(),
             reject_with_json_body: Arc::default(),
+            challenge_with_json_body: Arc::default(),
+            challenge_extra: Arc::default(),
+            reject_message: Arc::default(),
             reject_calls: Arc::default(),
             sessions: Arc::default(),
             expire_sessions_after_calls: Arc::default(),
@@ -398,13 +407,34 @@ impl Shared {
     /// `reject_with_json_body`) an `application/json` JSON-RPC error answering `id` and no challenge.
     fn unauthorized(&self, stream: &mut TcpStream, id: &Value) {
         if self.fixture.reject_with_json_body.load(Ordering::SeqCst) {
+            let message = self
+                .fixture
+                .reject_message
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| "unauthorized: token expired".to_owned());
             let body = serde_json::to_vec(&json!({ "jsonrpc": "2.0", "id": id,
-                "error": { "code": -32001, "message": "unauthorized: token expired" } }))
+                "error": { "code": -32001, "message": message } }))
             .unwrap();
+            let challenge = if self.fixture.challenge_with_json_body.load(Ordering::SeqCst) {
+                format!(
+                    "WWW-Authenticate: Bearer resource=\"{}/mcp\"{}\r\n",
+                    self.base,
+                    self.fixture
+                        .challenge_extra
+                        .lock()
+                        .unwrap()
+                        .clone()
+                        .unwrap_or_default()
+                )
+            } else {
+                String::new()
+            };
             return write_response(
                 stream,
                 "401 Unauthorized",
-                "Content-Type: application/json\r\n",
+                &format!("{challenge}Content-Type: application/json\r\n"),
                 &body,
             );
         }
@@ -412,8 +442,14 @@ impl Shared {
             stream,
             "401 Unauthorized",
             &format!(
-                "WWW-Authenticate: Bearer resource=\"{}/mcp\"\r\n",
-                self.base
+                "WWW-Authenticate: Bearer resource=\"{}/mcp\"{}\r\n",
+                self.base,
+                self.fixture
+                    .challenge_extra
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .unwrap_or_default()
             ),
             b"",
         );

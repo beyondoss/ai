@@ -240,6 +240,12 @@ fn an_over_cap_push_event_is_skipped_and_reported(stdio: bool, params_first: boo
             "the skipped event's cursor is kept: {gap:#}"
         );
     }
+    // Taken for an event without its method seen, the gap says so rather than asserting it.
+    assert_eq!(
+        gap["possibly_not_an_event"].as_bool(),
+        params_first.then_some(true),
+        "{gap:#}"
+    );
     let f = frames.wait(Duration::from_secs(20), "the next event", |f| {
         f["type"] == "mcp_event" && f["event"]["eventId"] == "small-1"
     });
@@ -259,6 +265,15 @@ fn an_over_cap_push_event_is_skipped_and_reported(stdio: bool, params_first: boo
             .any(|b| b.contains("larger than the message-size limit"))
             .then_some(())
     });
+    assert_eq!(
+        bodies
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|b| b.contains("possibly not an event")),
+        params_first,
+        "the model is told when the dropped message may not have been an event"
+    );
     assert_eq!(
         streams(&control),
         streams_before,
@@ -284,4 +299,72 @@ fn an_over_cap_push_event_with_params_first_over_http_is_skipped_and_reported_no
 #[test]
 fn an_over_cap_push_event_with_params_first_over_stdio_is_skipped_and_reported_not_lost() {
     an_over_cap_push_event_is_skipped_and_reported(true, true);
+}
+
+/// One over-cap message a stdio server sends, with its routing past the window, reaches every push
+/// stream on the connection (which one it was for is unknowable) — two subscriptions here. Each
+/// records the gap in its own state, but the model is told once: one dropped message, one notice.
+#[test]
+fn one_over_cap_message_reaching_two_subscriptions_is_one_notice_to_the_model() {
+    let events = json!([
+        { "name": "ticket.updated", "arguments": { "project": "alpha" }, "delivery": "push", "action": "follow_up" },
+        { "name": "ticket.updated", "arguments": { "project": "beta" }, "delivery": "push", "action": "follow_up" },
+    ]);
+    let home = tempfile::tempdir().unwrap();
+    let control_file = home.path().join("control");
+    write_settings(
+        home.path(),
+        json!([stdio_server(
+            "tickets",
+            &control_file,
+            json!({ "MCP_FIXTURE_HEARTBEAT_MS": "200", "MCP_FIXTURE_KEY_ORDER": "params_first" }),
+            events,
+        )]),
+    );
+    let (base, bodies) = spawn_model_server_routed(vec![], turn_text("noted"));
+    let mut cmd = serve_cmd(BIN, &base, &home.path().join("s.jsonl").to_string_lossy());
+    fast_knobs(&mut cmd)
+        .env("HOME", home.path())
+        .env("BEYOND_AI_AGENT_MCP_MAX_MESSAGE_BYTES", "65536")
+        .stderr(Stdio::null());
+    let mut child = cmd.spawn_guarded();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut frames = Frames::new(&mut child, None);
+    let control = common::mcp_events_fixture::wait_control_file(&control_file);
+    common::mcp_events_fixture::wait_active(&mut stdin, &mut frames, 2);
+    common::mcp_events_fixture::emit(
+        &control,
+        json!({ "project": "alpha", "event_id": "huge-1", "data": { "blob": "x".repeat(200_000) } }),
+    );
+    common::mcp_events_fixture::emit(
+        &control,
+        json!({ "project": "alpha", "event_id": "small-1", "data": { "ok": true } }),
+    );
+    frames.wait(Duration::from_secs(20), "the next event", |f| {
+        f["type"] == "mcp_event" && f["event"]["eventId"] == "small-1"
+    });
+    common::mcp_events_fixture::eventually(Duration::from_secs(20), "the model told", || {
+        bodies
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|b| b.contains("larger than the message-size limit"))
+            .then_some(())
+    });
+    // Long enough for a second notice to be coalesced and injected, if one were coming.
+    frames.collect(Duration::from_secs(3), |_| false);
+    let gaps = frames
+        .seen
+        .iter()
+        .filter(|f| f["type"] == "mcp_event_status" && f["kind"] == "gap")
+        .count();
+    assert_eq!(gaps, 2, "each stream records the gap in its own state");
+    let notices = bodies
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|b| b.matches("larger than the message-size limit").count())
+        .max()
+        .unwrap_or(0);
+    assert_eq!(notices, 1, "one dropped message, one notice to the model");
 }
