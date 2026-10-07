@@ -30,7 +30,6 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use common::free_port;
 use libtest_mimic::{Arguments, Failed, Trial};
 use serde_json::Value;
 
@@ -620,13 +619,13 @@ impl Drop for Guard {
     }
 }
 
-fn wait_ready(metrics_port: u16, gw: &mut Child, log: &Path) -> Result<(), Failed> {
+fn wait_ready(metrics: std::net::SocketAddr, gw: &mut Child, log: &Path) -> Result<(), Failed> {
     let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline {
         if let Ok(Some(status)) = gw.try_wait() {
             return Err(format!("gateway exited {status}: {}", tail(log)).into());
         }
-        if let Ok(mut s) = std::net::TcpStream::connect(("127.0.0.1", metrics_port)) {
+        if let Ok(mut s) = std::net::TcpStream::connect(metrics) {
             // `Connection: close` and a read timeout: the admin server keeps an idle connection
             // open for a minute, and reading to EOF without them waits that long.
             let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
@@ -757,34 +756,15 @@ fn attempt_cell(
     checks: &Checks,
     retryable: &mut Option<(Value, bool)>,
 ) -> Result<(), Failed> {
-    let dir = std::env::temp_dir().join(format!(
-        "verify-live-{}-{}",
-        std::process::id(),
-        free_port()
-    ));
+    let dir = std::env::temp_dir().join(format!("verify-live-{}", common::unique_id()));
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
 
-    let nats_port = free_port();
-    let _nats = Guard(
-        Command::new("nats-server")
-            .args([
-                "-js",
-                "-a",
-                "127.0.0.1",
-                "-p",
-                &nats_port.to_string(),
-                "-sd",
-            ])
-            .arg(dir.join("nats"))
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| format!("nats-server: {e}"))?,
-    );
+    let (nats_child, nats_port) = common::spawn_nats(&dir.join("nats"))?;
+    let _nats = Guard(nats_child);
 
-    let (port, metrics_port) = (free_port(), free_port());
+    let listeners = common::GATEWAY_LISTENERS;
     let mut cfg = format!(
-        "listen = \"127.0.0.1:{port}\"\nmetrics_listen = \"127.0.0.1:{metrics_port}\"\n\
+        "{listeners}\
          nats_url = \"nats://127.0.0.1:{nats_port}\"\nconfig_bucket = \"ai-gateway\"\nupstream_tls = true\n\n[pool_keys]\n"
     );
     for (provider, var) in route.pools {
@@ -814,7 +794,11 @@ fn attempt_cell(
             .map_err(|e| format!("gateway: {e}"))?,
     );
     // nats needs a moment before the gateway's first connect; readiness waits for the scan.
-    wait_ready(metrics_port, &mut gw.0, &log_path)?;
+    let common::GatewayPorts {
+        proxy: port,
+        metrics,
+    } = common::gateway_ports(&mut gw.0, &log_path)?;
+    wait_ready(metrics, &mut gw.0, &log_path)?;
 
     let mut cmd = Command::new(interpreter(rt));
     cmd.arg(probe_script(rt));

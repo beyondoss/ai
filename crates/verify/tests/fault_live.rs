@@ -42,7 +42,6 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use common::free_port;
 use fault_proxy::{Delivery, Fault, FaultProxy, Record, Script, Shape};
 use libtest_mimic::{Arguments, Failed, Trial};
 use serde_json::Value;
@@ -382,13 +381,13 @@ impl Drop for Guard {
     }
 }
 
-fn wait_ready(metrics_port: u16, gw: &mut Child, log: &Path) -> Result<(), Failed> {
+fn wait_ready(metrics: std::net::SocketAddr, gw: &mut Child, log: &Path) -> Result<(), Failed> {
     let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline {
         if let Ok(Some(status)) = gw.try_wait() {
             return Err(format!("gateway exited {status}: {}", tail(log)).into());
         }
-        if let Ok(mut s) = std::net::TcpStream::connect(("127.0.0.1", metrics_port)) {
+        if let Ok(mut s) = std::net::TcpStream::connect(metrics) {
             let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
             let _ = s.write_all(b"GET /metrics HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
             let mut body = String::new();
@@ -431,11 +430,9 @@ fn run_trial(
     case: Case,
     keys: &BTreeMap<String, String>,
 ) -> Result<(), Failed> {
-    let [nats_port, port, metrics_port] = [free_port(), free_port(), free_port()];
     // Under the target dir rather than /tmp: nats' JetStream store needs real disk, and a tmpfs
     // shared with other suites can be full. Removed on every exit path, after the processes.
-    let scratch =
-        Scratch(repo_root().join(format!("target/fault-live/{}-{port}", std::process::id())));
+    let scratch = Scratch(repo_root().join(format!("target/fault-live/{}", common::unique_id())));
     let dir = scratch.0.clone();
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let tokio = tokio::runtime::Builder::new_multi_thread()
@@ -460,25 +457,12 @@ fn run_trial(
         None => None,
     };
 
-    let _nats = Guard(
-        Command::new("nats-server")
-            .args([
-                "-js",
-                "-a",
-                "127.0.0.1",
-                "-p",
-                &nats_port.to_string(),
-                "-sd",
-            ])
-            .arg(dir.join("nats"))
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| format!("nats-server: {e}"))?,
-    );
+    let (nats_child, nats_port) = common::spawn_nats(&dir.join("nats"))?;
+    let _nats = Guard(nats_child);
 
+    let listeners = common::GATEWAY_LISTENERS;
     let mut cfg = format!(
-        "listen = \"127.0.0.1:{port}\"\nmetrics_listen = \"127.0.0.1:{metrics_port}\"\n\
+        "{listeners}\
          nats_url = \"nats://127.0.0.1:{nats_port}\"\nconfig_bucket = \"ai-gateway\"\n\
          upstream_tls = true\nupstream_verify_cert = false\n\
          read_timeout_secs = {READ_TIMEOUT_SECS}\n\n[pool_keys]\n"
@@ -513,7 +497,11 @@ fn run_trial(
             .spawn()
             .map_err(|e| format!("gateway: {e}"))?,
     );
-    wait_ready(metrics_port, &mut gw.0, &log_path)?;
+    let common::GatewayPorts {
+        proxy: port,
+        metrics,
+    } = common::gateway_ports(&mut gw.0, &log_path)?;
+    wait_ready(metrics, &mut gw.0, &log_path)?;
 
     let mut probe = Guard(
         Command::new(interpreter(rt))

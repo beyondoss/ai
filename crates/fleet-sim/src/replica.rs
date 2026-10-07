@@ -19,7 +19,6 @@ pub struct Launch<'a> {
     pub name: &'a str,
     pub bin: &'a str,
     pub gateway_url: &'a str,
-    pub port: u16,
     pub grant_key_flag: &'a str,
     pub seal_key: &'a Path,
     pub shards: &'a [(&'a str, &'a Path)],
@@ -28,7 +27,7 @@ pub struct Launch<'a> {
     /// `--max-live-sessions`, when the scenario is about the cap.
     pub max_live_sessions: Option<usize>,
     /// `--metrics-listen`, when the scenario reads the scrape.
-    pub metrics_port: Option<u16>,
+    pub with_metrics: bool,
 }
 
 /// Every replica this process has spawned and not yet reaped.
@@ -59,6 +58,8 @@ pub struct Replica {
     pub name: String,
     /// Where this replica answers. Always loopback for one this process spawned.
     pub addr: Addr,
+    /// Its scrape port, when it was started with one.
+    pub metrics_port: Option<u16>,
     child: Option<Child>,
     /// True when this replica was **attached to**, not spawned: an ECS task, or anything else the
     /// simulator did not start and cannot signal. Its process-shaped methods refuse, and the fleet
@@ -85,13 +86,12 @@ impl Replica {
             name,
             bin,
             gateway_url,
-            port,
             grant_key_flag,
             seal_key,
             shards,
             drain_grace,
             max_live_sessions,
-            metrics_port,
+            with_metrics,
         } = *launch;
         let mut c = Command::new(bin);
         c.args([
@@ -101,8 +101,10 @@ impl Replica {
             gateway_url,
             "--model",
             "claude-test",
+            // A port the kernel picks, read back below: never one picked free and released, which
+            // another process can take before the replica binds it.
             "--listen",
-            &format!("127.0.0.1:{port}"),
+            "127.0.0.1:0",
             "--grant-key",
             grant_key_flag,
             "--seal-key",
@@ -117,9 +119,9 @@ impl Replica {
         if let Some(max) = max_live_sessions {
             c.arg("--max-live-sessions").arg(max.to_string());
         }
-        if let Some(port) = metrics_port {
+        if with_metrics {
             // Loopback only, which the flag enforces — the scrape describes every tenant here.
-            c.arg("--metrics-listen").arg(format!("127.0.0.1:{port}"));
+            c.arg("--metrics-listen").arg("127.0.0.1:0");
         }
         // The replica's own `$HOME` must not be reachable: in service mode a host default is a
         // tenancy bug, and pointing it at a path that does not exist is how the integration tests
@@ -159,12 +161,13 @@ impl Replica {
         }
         let mut replica = Self {
             name: name.to_string(),
-            addr: Addr::local(port),
+            addr: Addr::local(0),
+            metrics_port: None,
             child: Some(child),
             attached: false,
             said,
         };
-        if let Err(e) = replica.wait_until_listening() {
+        if let Err(e) = replica.wait_until_listening(with_metrics) {
             let said = replica.said();
             let _ = replica.kill_hard();
             return Err(if said.trim().is_empty() {
@@ -186,6 +189,7 @@ impl Replica {
         Self {
             name: name.to_string(),
             addr,
+            metrics_port: None,
             child: None,
             attached: true,
             said: std::sync::Arc::new(std::sync::Mutex::new(String::new())),
@@ -197,15 +201,47 @@ impl Replica {
         self.attached
     }
 
-    fn wait_until_listening(&self) -> Result<(), String> {
+    /// Wait for the ports the replica bound, and record them: the websocket port from the line it
+    /// announces it with (`serve: websocket listening on <addr>`, on the stderr drained into `said`),
+    /// and — when it has one — the scrape port as its other `LISTEN` socket, read from its own
+    /// descriptors.
+    fn wait_until_listening(&mut self, with_metrics: bool) -> Result<(), String> {
+        const LISTENING: &str = "serve: websocket listening on ";
+        let pid = self.pid().ok_or("no child")?;
         let deadline = Instant::now() + Duration::from_secs(20);
         while Instant::now() < deadline {
-            if std::net::TcpStream::connect((self.addr.host.as_str(), self.addr.port)).is_ok() {
-                return Ok(());
+            let said = self.said();
+            let ws = said
+                .lines()
+                .find_map(|l| l.strip_prefix(LISTENING))
+                .and_then(|rest| rest.split_whitespace().next())
+                .and_then(|a| a.parse::<std::net::SocketAddr>().ok())
+                .map(|a| a.port());
+            if let Some(ws) = ws {
+                let metrics = beyond_ai_test_support::ports::listening_on(pid)
+                    .into_iter()
+                    .map(|a| a.port())
+                    .find(|&p| p != ws);
+                if !with_metrics || metrics.is_some() {
+                    self.addr = Addr::local(ws);
+                    self.metrics_port = metrics.filter(|_| with_metrics);
+                    return Ok(());
+                }
+            }
+            if let Some(child) = self.child.as_mut()
+                && let Ok(Some(status)) = child.try_wait()
+            {
+                return Err(format!(
+                    "replica {} exited ({status}) before listening",
+                    self.name
+                ));
             }
             std::thread::sleep(Duration::from_millis(25));
         }
-        Err(format!("replica {} never bound {}", self.name, self.addr))
+        Err(format!(
+            "replica {} never announced its listener",
+            self.name
+        ))
     }
 
     /// Whatever the replica has written to stderr so far. Non-consuming and callable at any time —

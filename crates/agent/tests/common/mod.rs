@@ -356,44 +356,7 @@ impl Drop for PortDown {
     }
 }
 
-/// A loopback port nothing listens on, held for as long as the value lives: bound but never
-/// listening, so a connection is refused, and taken, so no other process can start listening there
-/// in the meantime — which a port picked free and released cannot promise.
-pub struct DeadPort {
-    _socket: tokio::net::TcpSocket,
-    port: u16,
-}
-
-impl DeadPort {
-    pub fn bind() -> Self {
-        let socket = tokio::net::TcpSocket::new_v4().unwrap();
-        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
-        let port = socket.local_addr().unwrap().port();
-        Self {
-            _socket: socket,
-            port,
-        }
-    }
-
-    pub fn port(&self) -> u16 {
-        self.port
-    }
-}
-
-/// The gateway's two listeners, as config lines: each on a port the kernel picks, so no other process
-/// can take it between being chosen and being bound. Each at its own loopback address, because Pingora
-/// keys a server's listeners by their address string — two `127.0.0.1:0` collide (one listener comes
-/// up, and shutdown closes its descriptor twice) — and the address is also how [`spawn_gateway`] tells
-/// the client listener from the metrics one.
-pub const GATEWAY_LISTENERS: &str = "listen = \"127.0.0.1:0\"\nmetrics_listen = \"127.0.0.2:0\"\n";
-
-/// Where a gateway started by [`spawn_gateway`] listens.
-pub struct GatewayPorts {
-    /// Client traffic, on `127.0.0.1`.
-    pub proxy: u16,
-    /// `/metrics`, `/livez`, `/readyz`.
-    pub metrics: std::net::SocketAddr,
-}
+pub use beyond_ai_test_support::ports::{DeadPort, GATEWAY_LISTENERS, GatewayPorts};
 
 /// Spawn the gateway (`cmd`: its binary, `run -c <config>`, environment; the config's listeners must be
 /// [`GATEWAY_LISTENERS`]) and return it once both listeners are up, with the ports the kernel gave
@@ -403,62 +366,18 @@ pub fn spawn_gateway(cmd: &mut Command) -> (ChildGuard, GatewayPorts) {
     let mut child = cmd.spawn_guarded();
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
-        let bound = listening_on(child.id());
-        let at = |ip: [u8; 4]| bound.iter().find(|a| a.ip().octets() == ip).copied();
-        if let (Some(proxy), Some(metrics)) = (at([127, 0, 0, 1]), at([127, 0, 0, 2])) {
-            let ports = GatewayPorts {
-                proxy: proxy.port(),
-                metrics: std::net::SocketAddr::V4(metrics),
-            };
+        if let Some(ports) = beyond_ai_test_support::ports::gateway_ports(child.id()) {
             return (child, ports);
         }
         if let Ok(Some(status)) = child.try_wait() {
-            panic!("the gateway exited ({status}) before both listeners were up: {bound:?}");
+            panic!("the gateway exited ({status}) before both listeners were up");
         }
         assert!(
             Instant::now() < deadline,
-            "the gateway's listeners did not come up within 60s: {bound:?}"
+            "the gateway's listeners did not come up within 60s"
         );
         thread::sleep(Duration::from_millis(20));
     }
-}
-
-/// The IPv4 addresses `pid` itself holds sockets in `LISTEN` on: `/proc/<pid>/net/tcp` lists every
-/// socket in the network namespace, so it is filtered to the inodes among `pid`'s descriptors.
-fn listening_on(pid: u32) -> Vec<std::net::SocketAddrV4> {
-    let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
-        return Vec::new();
-    };
-    let inodes: std::collections::HashSet<String> = fds
-        .flatten()
-        .filter_map(|fd| std::fs::read_link(fd.path()).ok())
-        .filter_map(|target| {
-            let target = target.to_string_lossy().into_owned();
-            target
-                .strip_prefix("socket:[")
-                .and_then(|rest| rest.strip_suffix(']'))
-                .map(str::to_owned)
-        })
-        .collect();
-    let Ok(table) = std::fs::read_to_string(format!("/proc/{pid}/net/tcp")) else {
-        return Vec::new();
-    };
-    // Columns: sl, local_address (hex addr:port, the address as the kernel's in-memory word), ...,
-    // st (`0A` is LISTEN), ..., inode (10th).
-    table
-        .lines()
-        .skip(1)
-        .filter_map(|line| {
-            let cols: Vec<&str> = line.split_whitespace().collect();
-            if cols.len() < 10 || cols[3] != "0A" || !inodes.contains(cols[9]) {
-                return None;
-            }
-            let (addr, port) = cols[1].split_once(':')?;
-            let addr = u32::from_str_radix(addr, 16).ok()?;
-            let port = u16::from_str_radix(port, 16).ok()?;
-            Some(std::net::SocketAddrV4::new(addr.to_ne_bytes().into(), port))
-        })
-        .collect()
 }
 
 /// One JetStream server for this test process. Held until exit so many gateway boots can share it.
@@ -490,7 +409,7 @@ impl SharedNats {
             .spawn_guarded();
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
-            if let Some(port) = nats_port_from(&ports) {
+            if let Some(port) = beyond_ai_test_support::ports::nats_port_from(&ports) {
                 return Self {
                     port,
                     _child: child,
@@ -507,14 +426,6 @@ impl SharedNats {
             thread::sleep(Duration::from_millis(20));
         }
     }
-}
-
-/// The client port in the `<name>_<pid>.ports` file nats-server writes into `dir`
-/// (`{"nats":["nats://127.0.0.1:4222"], ...}`), once it is there and complete.
-fn nats_port_from(dir: &std::path::Path) -> Option<u16> {
-    let file = std::fs::read_dir(dir).ok()?.flatten().next()?.path();
-    let ports: Value = serde_json::from_slice(&std::fs::read(file).ok()?).ok()?;
-    ports["nats"][0].as_str()?.rsplit(':').next()?.parse().ok()
 }
 
 /// The shared JetStream server's client port.

@@ -55,12 +55,11 @@ mod common;
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read as _, Write as _};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use base64::Engine as _;
-use common::free_port;
 use libtest_mimic::{Arguments, Failed, Trial};
 use providers::catalog::{
     Candidate, IN_FILE, IN_IMAGE, MODEL_ROUTES, ModelRoute, REASONING, STRUCTURED_OUTPUTS, TOOLS,
@@ -444,26 +443,12 @@ fn boot() -> Result<Gateway, String> {
     let dir = sweep_dir().join(format!("gw-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let nats_port = free_port();
-    let nats = Command::new("nats-server")
-        .args([
-            "-js",
-            "-a",
-            "127.0.0.1",
-            "-p",
-            &nats_port.to_string(),
-            "-sd",
-        ])
-        .arg(dir.join("nats"))
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| format!("nats-server: {e}"))?;
+    let (nats, nats_port) = common::spawn_nats(&dir.join("nats"))?;
     CHILDREN.lock().unwrap().push(nats);
 
-    let (port, metrics_port) = (free_port(), free_port());
+    let listeners = common::GATEWAY_LISTENERS;
     let mut cfg = format!(
-        "listen = \"127.0.0.1:{port}\"\nmetrics_listen = \"127.0.0.1:{metrics_port}\"\n\
+        "{listeners}\
          nats_url = \"nats://127.0.0.1:{nats_port}\"\nconfig_bucket = \"ai-gateway\"\n\
          upstream_tls = true\nsession_pins = false\n\n[pool_keys]\n"
     );
@@ -501,11 +486,17 @@ fn boot() -> Result<Gateway, String> {
         .stderr(f)
         .spawn()
         .map_err(|e| format!("gateway: {e}"))?;
+    let mut gw = gw;
+    let ports = common::gateway_ports(&mut gw, &log);
     CHILDREN.lock().unwrap().push(gw);
+    let common::GatewayPorts {
+        proxy: port,
+        metrics,
+    } = ports?;
 
     let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline {
-        if let Ok(mut s) = std::net::TcpStream::connect(("127.0.0.1", metrics_port)) {
+        if let Ok(mut s) = std::net::TcpStream::connect(metrics) {
             let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
             let _ = s.write_all(b"GET /metrics HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
             let mut body = String::new();

@@ -136,14 +136,12 @@ async fn every_response_carries_a_request_id_and_a_served_one_joins_its_row() {
 /// claim: O3
 #[tokio::test]
 async fn doctor_names_a_failed_check_and_exits_one() {
-    let path = std::env::temp_dir().join(format!("beyond-ai-doctor-{}.toml", free_port()));
+    let path = std::env::temp_dir().join(format!("beyond-ai-doctor-{}.toml", std::process::id()));
     std::fs::write(
         &path,
         format!(
-            "listen = \"127.0.0.1:{}\"\nmetrics_listen = \"127.0.0.1:{}\"\n\
-             nats_url = \"nats://127.0.0.1:{}\"\nupstream_tls = false\n",
-            free_port(),
-            free_port(),
+            "{}nats_url = \"nats://127.0.0.1:{}\"\nupstream_tls = false\n",
+            beyond_ai_test_support::ports::GATEWAY_LISTENERS,
             closed_port()
         ),
     )
@@ -203,7 +201,7 @@ async fn health_and_metrics_answer_on_the_admin_listener() {
     )
     .await;
     assert_eq!(served.status().as_u16(), 200);
-    let resp = reqwest::get(format!("http://127.0.0.1:{}/metrics", gw.metrics_port))
+    let resp = reqwest::get(format!("http://{}/metrics", gw.metrics))
         .await
         .unwrap();
     assert_eq!(resp.status().as_u16(), 200);

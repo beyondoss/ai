@@ -36,7 +36,6 @@ use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use common::free_port;
 use ed25519_dalek::{Signer as _, SigningKey};
 use libtest_mimic::{Arguments, Failed, Trial};
 use providers::by_id;
@@ -403,13 +402,13 @@ impl Drop for Guard {
     }
 }
 
-fn wait_ready(metrics_port: u16, gw: &mut Child, log: &Path) -> Result<(), Failed> {
+fn wait_ready(metrics: std::net::SocketAddr, gw: &mut Child, log: &Path) -> Result<(), Failed> {
     let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline {
         if let Ok(Some(status)) = gw.try_wait() {
             return Err(format!("gateway exited {status}: {}", tail(log)).into());
         }
-        if let Ok(mut s) = TcpStream::connect(("127.0.0.1", metrics_port)) {
+        if let Ok(mut s) = TcpStream::connect(metrics) {
             let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
             let _ = s.write_all(b"GET /metrics HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
             let mut body = String::new();
@@ -467,34 +466,15 @@ fn run_cell(
     extra: &str,
     keys: &BTreeMap<String, String>,
 ) -> Result<(), Failed> {
-    let dir = repo_root().join(format!(
-        "target/verify-tenancy/{}-{}",
-        std::process::id(),
-        free_port()
-    ));
+    let dir = repo_root().join(format!("target/verify-tenancy/{}", common::unique_id()));
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
 
-    let nats_port = free_port();
-    let _nats = Guard(
-        Command::new("nats-server")
-            .args([
-                "-js",
-                "-a",
-                "127.0.0.1",
-                "-p",
-                &nats_port.to_string(),
-                "-sd",
-            ])
-            .arg(dir.join("nats"))
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| format!("nats-server: {e}"))?,
-    );
+    let (nats_child, nats_port) = common::spawn_nats(&dir.join("nats"))?;
+    let _nats = Guard(nats_child);
 
-    let (port, metrics_port) = (free_port(), free_port());
+    let listeners = common::GATEWAY_LISTENERS;
     let mut cfg = format!(
-        "listen = \"127.0.0.1:{port}\"\nmetrics_listen = \"127.0.0.1:{metrics_port}\"\n\
+        "{listeners}\
          nats_url = \"nats://127.0.0.1:{nats_port}\"\nconfig_bucket = \"ai-gateway\"\nupstream_tls = true\n{extra}\n[pool_keys]\n"
     );
     // A provider listed twice holds both keys, in order (a pool mid-rotation).
@@ -532,7 +512,11 @@ fn run_cell(
             .spawn()
             .map_err(|e| format!("gateway: {e}"))?,
     );
-    wait_ready(metrics_port, &mut gw.0, &log_path)?;
+    let common::GatewayPorts {
+        proxy: port,
+        metrics,
+    } = common::gateway_ports(&mut gw.0, &log_path)?;
+    wait_ready(metrics, &mut gw.0, &log_path)?;
 
     let ids = session_keys(route.model);
     // The pool keys, for a scenario that looks for them in what the client was sent (SEC-7).
@@ -640,7 +624,7 @@ fn run_cell(
     // The revoked keys were really presented: the provider's 401 drew the key walk (the primary's
     // revoked key) and the relayed refusal (the steered call's), each counted once.
     if scenario == "key_rotation" {
-        let failures = metric(metrics_port, "ai_key_auth_failures_total");
+        let failures = metric(metrics, "ai_key_auth_failures_total");
         if failures < 2.0 {
             problems.push(format!(
                 "ai_key_auth_failures_total = {failures}: the revoked pool keys were never tried"
@@ -662,8 +646,8 @@ fn run_cell(
 }
 
 /// One unlabeled counter from the gateway's `/metrics` (0 when absent).
-fn metric(metrics_port: u16, name: &str) -> f64 {
-    let Ok(mut s) = TcpStream::connect(("127.0.0.1", metrics_port)) else {
+fn metric(metrics: std::net::SocketAddr, name: &str) -> f64 {
+    let Ok(mut s) = TcpStream::connect(metrics) else {
         return 0.0;
     };
     let _ = s.set_read_timeout(Some(Duration::from_secs(2)));

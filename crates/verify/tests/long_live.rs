@@ -83,7 +83,6 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use common::free_port;
 use libtest_mimic::{Arguments, Failed, Trial};
 use recon::common;
 use recon::{Provider, Totals};
@@ -398,11 +397,7 @@ impl Drop for Gateway {
 
 impl Gateway {
     fn boot(route: Route, keys: &BTreeMap<String, String>) -> Result<Gateway, Failed> {
-        let dir = repo_root().join(format!(
-            "target/verify-long/{}-{}",
-            std::process::id(),
-            free_port()
-        ));
+        let dir = repo_root().join(format!("target/verify-long/{}", common::unique_id()));
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         // Harness homes and repos: outside the user's home, so Claude Code's walk up the parent
         // directories for CLAUDE.md finds nothing of this machine's (under target/ it found the
@@ -412,26 +407,11 @@ impl Gateway {
             dir.file_name().unwrap().to_string_lossy()
         ));
         std::fs::create_dir_all(&tmp).map_err(|e| e.to_string())?;
-        let nats_port = free_port();
-        let nats = Guard(
-            Command::new("nats-server")
-                .args([
-                    "-js",
-                    "-a",
-                    "127.0.0.1",
-                    "-p",
-                    &nats_port.to_string(),
-                    "-sd",
-                ])
-                .arg(dir.join("nats"))
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .map_err(|e| format!("nats-server: {e}"))?,
-        );
-        let (port, metrics_port) = (free_port(), free_port());
+        let (nats_child, nats_port) = common::spawn_nats(&dir.join("nats"))?;
+        let nats = Guard(nats_child);
+        let listeners = common::GATEWAY_LISTENERS;
         let mut cfg = format!(
-            "listen = \"127.0.0.1:{port}\"\nmetrics_listen = \"127.0.0.1:{metrics_port}\"\n\
+            "{listeners}\
              nats_url = \"nats://127.0.0.1:{nats_port}\"\nconfig_bucket = \"ai-gateway\"\n\
              upstream_tls = true\n\n[pool_keys]\n"
         );
@@ -454,7 +434,11 @@ impl Gateway {
                 .spawn()
                 .map_err(|e| format!("gateway: {e}"))?,
         );
-        wait_ready(metrics_port, &mut gw.0, &log)?;
+        let common::GatewayPorts {
+            proxy: port,
+            metrics,
+        } = common::gateway_ports(&mut gw.0, &log)?;
+        wait_ready(metrics, &mut gw.0, &log)?;
         Ok(Gateway {
             _nats: nats,
             _gw: gw,
@@ -540,13 +524,13 @@ impl Gateway {
     }
 }
 
-fn wait_ready(metrics_port: u16, gw: &mut Child, log: &Path) -> Result<(), Failed> {
+fn wait_ready(metrics: std::net::SocketAddr, gw: &mut Child, log: &Path) -> Result<(), Failed> {
     let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline {
         if let Ok(Some(status)) = gw.try_wait() {
             return Err(format!("gateway exited {status}: {}", tail(log)).into());
         }
-        if let Ok(mut s) = std::net::TcpStream::connect(("127.0.0.1", metrics_port)) {
+        if let Ok(mut s) = std::net::TcpStream::connect(metrics) {
             let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
             let _ = s.write_all(b"GET /metrics HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
             let mut body = String::new();

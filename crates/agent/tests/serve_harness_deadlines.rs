@@ -288,40 +288,119 @@ fn only_child_frames_touches_a_childs_stdout() {
     );
 }
 
-/// No agent test picks a port, releases it, and hands it to a child: every child binds its own (port
-/// 0, read back), is handed a socket the test holds (`HeldPort`), or is pointed at one the test holds
-/// bound (`DeadPort`). The released-port helper is gone; this keeps the pattern from coming back.
+/// What a source file must not contain: a port picked free and released for something else to bind —
+/// `free_port(`, or a listener bound as a temporary whose port is read and which is dropped at once
+/// (`TcpListener::bind(..).unwrap().local_addr()…`, in any spelling). Comments are dropped and
+/// whitespace removed first, so formatting cannot hide one.
+fn released_ports(source: &str) -> Vec<&'static str> {
+    let code: String = source
+        .lines()
+        .map(|line| line.split("//").next().unwrap_or(""))
+        .collect::<String>()
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    let mut found = Vec::new();
+    if code.contains("free_port(") {
+        found.push("`free_port(`");
+    }
+    for ty in ["TcpListener::bind(", "TcpSocket::bind(", "UdpSocket::bind("] {
+        for (at, _) in code.match_indices(ty) {
+            // From the bind to the end of its statement: a temporary listener reaches
+            // `.local_addr()` in the same expression, without being given a name.
+            let stmt = &code[at..];
+            let stmt = &stmt[..stmt.find(';').unwrap_or(stmt.len())];
+            let open = stmt.find('(').unwrap();
+            let mut depth = 0;
+            let mut close = stmt.len();
+            for (i, c) in stmt[open..].char_indices() {
+                match c {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            close = open + i + 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            // A held listener reads its address in a later statement; a temporary one in this one.
+            let chained = stmt[close..].contains(".local_addr()");
+            if chained {
+                found.push("a temporary listener's port");
+            }
+        }
+    }
+    found
+}
+
+/// The lint catches the released-port shapes, and leaves a held listener alone.
+#[test]
+fn the_released_port_lint_catches_what_it_should() {
+    for bad in [
+        "let p = free_port();",
+        "let p = TcpListener::bind(\"127.0.0.1:0\").unwrap().local_addr().unwrap().port();",
+        "let p = std::net::TcpListener::bind(\"127.0.0.1:0\")\n    .and_then(|l| l.local_addr())\n    .unwrap()\n    .port();",
+        "let p = TcpListener::bind(\"127.0.0.1:0\")\n    .await?\n    .local_addr()?\n    .port();",
+    ] {
+        assert!(!released_ports(bad).is_empty(), "missed: {bad:?}");
+    }
+    for fine in [
+        "let listener = TcpListener::bind(\"127.0.0.1:0\").unwrap();\nlet port = listener.local_addr().unwrap().port();",
+        "// free_port() is gone",
+        "let dead = DeadPort::bind();",
+    ] {
+        assert!(released_ports(fine).is_empty(), "{fine:?}");
+    }
+}
+
+/// No code in the workspace — any crate's sources, tests or benches — picks a port, releases it and
+/// hands it to something else to bind: every child binds its own (port 0, read back: `serve`'s
+/// announcement, the gateway's own `LISTEN` sockets, `nats-server --ports_file_dir`), is handed a
+/// socket the test holds (`HeldPort`, the forwarder in front of a restartable `nats-server`), or is
+/// pointed at one held bound (`DeadPort`). The released-port helpers are gone from every crate; this
+/// keeps the pattern from coming back.
 #[test]
 fn no_test_picks_a_port_and_releases_it() {
-    let tests = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+    let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .to_path_buf();
     let mut files = Vec::new();
-    let mut dirs = vec![tests];
+    let mut dirs = vec![crates.clone()];
     while let Some(dir) = dirs.pop() {
         for entry in std::fs::read_dir(&dir).unwrap() {
             let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
             if path.is_dir() {
-                dirs.push(path);
-            } else if path.extension().is_some_and(|e| e == "rs")
-                && !path.ends_with("serve_harness_deadlines.rs")
-            {
+                if name != "target" && !name.starts_with('.') {
+                    dirs.push(path);
+                }
+            } else if name.ends_with(".rs") && name != "serve_harness_deadlines.rs" {
                 files.push(path);
             }
         }
     }
+    for krate in ["agent", "gateway", "verify", "fleet-sim", "test-support"] {
+        assert!(
+            files.iter().any(|f| f.starts_with(crates.join(krate))),
+            "the scan covers the {krate} crate"
+        );
+    }
     let found: Vec<String> = files
         .iter()
-        .filter(|path| {
-            let code: String = std::fs::read_to_string(path)
-                .unwrap()
-                .lines()
-                .map(|line| line.split("//").next().unwrap_or(""))
-                .collect();
-            code.contains("free_port(")
+        .flat_map(|path| {
+            let source = std::fs::read_to_string(path).unwrap_or_default();
+            released_ports(&source)
+                .into_iter()
+                .map(move |what| format!("{}: {what}", path.display()))
         })
-        .map(|path| path.display().to_string())
         .collect();
     assert!(
         found.is_empty(),
-        "a released port handed to a child: {found:?}"
+        "a port picked free and released for something else to bind:\n{}",
+        found.join("\n")
     );
 }

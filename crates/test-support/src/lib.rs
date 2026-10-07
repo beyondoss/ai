@@ -17,6 +17,7 @@
 
 pub mod exec_mock;
 pub mod grant;
+pub mod ports;
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
