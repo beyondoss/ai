@@ -94,34 +94,55 @@ fn with_suffix(file: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(name)
 }
 
-/// Whether `path` names a lock file — for copying code that should leave locks behind (a worktree
-/// seed: a copy of a lock file is not a lock), and for an atomic write, which must never rename a
-/// fresh file over one (the lock would stay on the old, now unnamed, inode).
+/// Whether `path` is named like a record lock file — compared without regard to ASCII case, since on
+/// a case-insensitive filesystem (macOS) `.BEYOND-LOCK` is the same file. For copying code that
+/// should leave locks behind (a worktree seed: a copy of a lock file is not a lock).
 pub fn is_record_lock_file(path: &Path) -> bool {
-    path.file_name()
-        .and_then(OsStr::to_str)
-        .is_some_and(|n| n.ends_with(RECORD_SUFFIX))
+    path.file_name().and_then(OsStr::to_str).is_some_and(|n| {
+        n.len() >= RECORD_SUFFIX.len()
+            && n.as_bytes()[n.len() - RECORD_SUFFIX.len()..]
+                .eq_ignore_ascii_case(RECORD_SUFFIX.as_bytes())
+    })
 }
 
-/// Whether `path` is one of this module's lock files: a record lock file, or a legacy one — `lock` /
-/// `<f>.lock` — that sits beside a record lock file (so an unrelated `Cargo.lock` is not one). An
-/// atomic write must never rename a fresh file over either: the lock would stay on the old inode,
-/// which the path no longer names.
+/// Whether an atomic write must not rename a fresh file over `path`: it is named like a record lock
+/// file, or **the file there is locked right now** — by anyone, any kind of lock this module takes.
+/// Replacing a locked file leaves the lock on the old inode, which the path no longer names, so the
+/// next owner would lock the new file.
+///
+/// Asking the file itself, not its name, is what covers every case a name cannot: a legacy `lock`
+/// an old binary holds with no record lock file beside it, a journal key held through
+/// [`Target::Itself`], a spelling a case-insensitive filesystem folds onto a lock file, a hard link.
+/// A lock nobody holds is not protected, and needs no protecting.
 pub fn is_lock_file(path: &Path) -> bool {
-    if is_record_lock_file(path) {
-        return true;
+    is_record_lock_file(path) || is_locked(path)
+}
+
+/// Whether anyone holds a lock on the file at `path` right now: an OFD or POSIX lock (`F_OFD_GETLK`,
+/// which reports another description's lock — this process's own included), or an `flock` (a
+/// non-blocking test lock, let go at once). The probe opens its own descriptor, which with OFD locks
+/// releases nothing.
+pub fn is_locked(path: &Path) -> bool {
+    let Ok(file) = OpenOptions::new().read(true).open(path) else {
+        return false;
+    };
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let mut probe = whole_file(libc::F_WRLCK);
+        if nix::fcntl::fcntl(&file, nix::fcntl::FcntlArg::F_OFD_GETLK(&mut probe)).is_ok()
+            && probe.l_type != libc::F_UNLCK as libc::c_short
+        {
+            return true;
+        }
     }
-    let Some(name) = path.file_name().and_then(OsStr::to_str) else {
-        return false;
-    };
-    let record = if name == "lock" {
-        path.with_file_name(RECORD_SUFFIX)
-    } else if let Some(stem) = name.strip_suffix(".lock") {
-        path.with_file_name(format!("{stem}{RECORD_SUFFIX}"))
-    } else {
-        return false;
-    };
-    record.exists()
+    match file.try_lock() {
+        Ok(()) => {
+            let _ = file.unlock();
+            false
+        }
+        Err(std::fs::TryLockError::WouldBlock) => true,
+        Err(std::fs::TryLockError::Error(_)) => false,
+    }
 }
 
 /// Whether `dir` holds nothing but its own lock files — a lock directory that never became anything
@@ -154,9 +175,10 @@ impl FileLock {
         &self.record
     }
 
-    /// Release the lock and unlink its files — for a lock directory being taken back. Unlocked and
-    /// closed *first*: an NFS client cannot unlink a file it still holds open (it silly-renames it to
-    /// `.nfs*`, which then keeps the directory from being removed).
+    /// Release the lock and unlink its files — for a lock directory being taken back. What matters is
+    /// that the descriptors are closed before the directory is removed: an NFS client turns the unlink
+    /// of a file it still has open into a rename to `.nfs*`, which stays until the last close and keeps
+    /// `remove_dir` failing (ENOTEMPTY). Closing first means the unlinks are real ones.
     pub fn release_and_remove_files(self) {
         let (record_path, legacy_path) = (self.record_path.clone(), self.legacy_path.clone());
         drop(self);
@@ -535,21 +557,43 @@ pub(crate) mod tests {
         assert!(try_lock(Target::Itself(&key)).unwrap().is_some());
     }
 
-    /// A legacy lock file is recognized only beside a record lock file, so an unrelated `Cargo.lock`
-    /// is just a file.
+    /// A lock file is recognized by its record name in any case, or by being locked right now: an
+    /// unrelated `Cargo.lock` nobody holds is just a file.
     #[test]
-    fn a_legacy_lock_file_is_one_only_beside_a_record_lock_file() {
+    fn a_lock_file_is_one_by_name_in_any_case_or_by_being_held() {
         let dir = tempfile::tempdir().unwrap();
         let session = dir.path().join("s1");
         std::fs::create_dir_all(&session).unwrap();
-        let file = dir.path().join("mcp-manifest.json");
-        let _a = try_lock(Target::Dir(&session)).unwrap().unwrap();
-        let _b = try_lock(Target::File(&file)).unwrap().unwrap();
-        assert!(is_lock_file(&session.join("lock")));
-        assert!(is_lock_file(&dir.path().join("mcp-manifest.json.lock")));
+        let held = try_lock(Target::Dir(&session)).unwrap().unwrap();
+        assert!(
+            is_lock_file(&session.join("lock")),
+            "the legacy flock is held"
+        );
+        assert!(is_lock_file(&session.join(".BEYOND-LOCK")), "any case");
         std::fs::write(dir.path().join("Cargo.lock"), "").unwrap();
         assert!(!is_lock_file(&dir.path().join("Cargo.lock")));
-        assert!(!is_lock_file(&dir.path().join("lock")));
+        drop(held);
+        assert!(
+            !is_lock_file(&session.join("lock")),
+            "a legacy lock file nobody holds needs no protecting"
+        );
+    }
+
+    /// The probe asks the file, so a hard link under any name to a held lock file is one too — the
+    /// same answer a case-insensitive filesystem's folded spelling gets.
+    #[cfg(unix)]
+    #[test]
+    fn a_held_lock_file_is_recognized_under_any_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("x");
+        let target = Target::File(&file);
+        let _held = try_lock(target).unwrap().unwrap();
+        let alias = dir.path().join("INNOCENT.TXT");
+        std::fs::hard_link(target.record_path(), &alias).unwrap();
+        assert!(is_lock_file(&alias));
+        let key = dir.path().join("journal.key");
+        let _key = try_lock(Target::Itself(&key)).unwrap().unwrap();
+        assert!(is_lock_file(&key), "a file locked itself is one while held");
     }
 
     /// An old binary held only the legacy `flock`. While one runs, it must still exclude this binary.

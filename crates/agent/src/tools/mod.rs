@@ -177,13 +177,17 @@ pub(crate) fn write_atomic(path: &str, content: &[u8]) -> std::io::Result<()> {
     let p = std::path::Path::new(path);
     let resolved = resolve_symlink_target(p);
     let p = resolved.as_deref().unwrap_or(p);
-    // Never a fresh file renamed over a lock file (reached by name or through a symlink — resolved
-    // just above): the lock would stay on the old inode, which the path no longer names, so the next
-    // owner would lock the new file. Opening one is harmless (see `file_lock`); replacing it is not.
+    // Never a fresh file renamed over a lock file — one named so, or any file locked right now (asked
+    // of the file, so a folded spelling, a legacy lock or a key held `Itself` are all seen): the lock
+    // would stay on the old inode, which the path no longer names. Opening one is harmless (see
+    // `file_lock`); replacing it is not.
     if crate::file_lock::is_lock_file(p) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
-            format!("{} is a lock file; it is not written", p.display()),
+            format!(
+                "{} is a lock file, or locked by a running process; it is not replaced",
+                p.display()
+            ),
         ));
     }
     let name = match p.file_name() {
@@ -924,6 +928,80 @@ mod tests {
         let cargo_lock = dir.path().join("Cargo.lock");
         write_atomic(cargo_lock.to_str().unwrap(), b"[[package]]\n").unwrap();
         assert_eq!(std::fs::read(&cargo_lock).unwrap(), b"[[package]]\n");
+    }
+
+    /// The cases a name cannot see: an old binary's session directory, whose legacy `lock` it holds
+    /// with no record lock file beside it; a journal key held through `Target::Itself`; and a
+    /// record lock file spelled in another case (one file on a case-insensitive filesystem). Each is
+    /// refused while held — asked of the file, not its name.
+    #[test]
+    #[cfg(unix)]
+    fn write_atomic_never_replaces_a_file_locked_right_now() {
+        use std::io::{BufRead as _, BufReader};
+        let dir = tempfile::tempdir().unwrap();
+        // An old binary: an `flock` on `<session>/lock`, nothing else.
+        let old_session = dir.path().join("old");
+        std::fs::create_dir_all(&old_session).unwrap();
+        let legacy = old_session.join("lock");
+        if let Ok(mut old) = std::process::Command::new("python3")
+            .args([
+                "-c",
+                "import fcntl,sys\nf=open(sys.argv[1],'a+')\nfcntl.flock(f,fcntl.LOCK_EX)\nprint('locked',flush=True)\nsys.stdin.read()",
+            ])
+            .arg(&legacy)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+        {
+            let mut line = String::new();
+            BufReader::new(old.stdout.take().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            assert!(
+                write_atomic(legacy.to_str().unwrap(), b"x").is_err(),
+                "an old binary's held lock file is not replaced"
+            );
+            drop(old.stdin.take());
+            old.wait().unwrap();
+            write_atomic(legacy.to_str().unwrap(), b"x").unwrap();
+        }
+        // A journal key locked itself.
+        let key = dir.path().join("journal.key");
+        let held = crate::file_lock::try_lock(crate::file_lock::Target::Itself(&key))
+            .unwrap()
+            .unwrap();
+        assert!(
+            write_atomic(key.to_str().unwrap(), b"x").is_err(),
+            "a key held through Itself is not replaced"
+        );
+        drop(held);
+        // A record lock file in another case.
+        let shouty = dir.path().join("S2.BEYOND-LOCK");
+        assert!(write_atomic(shouty.to_str().unwrap(), b"x").is_err());
+    }
+
+    /// On a case-insensitive filesystem (macOS; a casefold ext4 directory) `LOCK` and `.BEYOND-LOCK`
+    /// are the held lock files themselves. Skipped where the temp dir is case-sensitive.
+    #[test]
+    #[cfg(unix)]
+    fn write_atomic_never_replaces_a_lock_file_through_a_folded_spelling() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Probe"), "").unwrap();
+        if !dir.path().join("PROBE").exists() {
+            return;
+        }
+        let session = dir.path().join("s1");
+        std::fs::create_dir_all(&session).unwrap();
+        let _held = crate::file_lock::try_lock(crate::file_lock::Target::Dir(&session))
+            .unwrap()
+            .unwrap();
+        for folded in ["LOCK", ".BEYOND-LOCK"] {
+            let p = session.join(folded);
+            assert!(
+                write_atomic(p.to_str().unwrap(), b"x").is_err(),
+                "{folded} reaches a held lock file"
+            );
+        }
     }
 
     #[test]

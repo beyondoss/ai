@@ -3120,14 +3120,20 @@ POSIX lock, which is why it is not the authoritative half.)
 
 Nothing else needs guarding: the only remaining hazard is _replacing_ a lock file, which an atomic
 write (`tools::write_atomic`) could do by renaming over it — it refuses a lock file as its target
-(`file_lock::is_lock_file`: the record lock file, or a legacy `lock` / `<f>.lock` sitting beside one,
-so an unrelated `Cargo.lock` is written as ever; applied after resolving a symlink; a hard link's
-rename replaces only the link). A worktree seed leaves lock files behind (a copy of a lock is no
-lock). A failed session start's directory is taken back through `file_lock::dir_holds_only_lock_files`
-and `FileLock::release_and_remove_files`, which unlocks and **closes** the lock files before unlinking
-them: an NFS client silly-renames a file it still holds open to `.nfs*`, which kept the directory from
-being removed (`serve_ws::tests::an_empty_session_directory_is_taken_back_with_its_lock` fails on a
-loopback NFS mount with the old unlink-then-close order, and passes with this one).
+(`file_lock::is_lock_file`, applied after resolving a symlink): anything named like a record lock
+file, compared without regard to ASCII case, or **any file locked right now** — asked of the file
+itself (`file_lock::is_locked`: `F_OFD_GETLK`, which also reports this process's own other
+descriptions, and a non-blocking test `flock`). Asking the file covers what no name can: an old
+binary's legacy `lock` with no record lock file beside it, a journal key held through
+`Target::Itself`, a spelling a case-insensitive filesystem folds onto a lock file, a hard link. A lock
+file nobody holds needs no protecting, and an unrelated `Cargo.lock` is written as ever. (Verified on
+a casefold ext4 directory as well as here.) A worktree seed leaves record lock files behind (a copy
+of a lock is no lock). A failed session start's directory is taken back through
+`file_lock::dir_holds_only_lock_files` and `FileLock::release_and_remove_files`, which **closes** the
+lock files' descriptors before the directory is removed: an NFS client turns the unlink of a file it
+still has open into a rename to `.nfs*`, which stays until the last close and makes `remove_dir` fail
+with ENOTEMPTY (`serve_ws::tests::an_empty_session_directory_is_taken_back_with_its_lock` fails on a
+loopback NFS mount with the old unlink, remove, close order, and passes with this one).
 
 A small file whose holder writes it under its own lock — the MCP task journal key — is locked
 **itself** (`Target::Itself`): no lock file beside it, and the key is re-read and written through the
