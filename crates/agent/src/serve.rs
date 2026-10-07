@@ -1330,6 +1330,21 @@ fn simulated_slow_open() {
 #[cfg(not(debug_assertions))]
 fn simulated_slow_open() {}
 
+/// Latency before a session installs its elicitation and sampling gates, simulated (debug builds
+/// only, like [`simulated_slow_open`]): holds open the window in which a server could ask a question
+/// before the session can take it, so a test can show nothing is asked in it.
+#[cfg(debug_assertions)]
+async fn simulated_slow_gate_install() {
+    if let Ok(ms) = std::env::var("BEYOND_AI_AGENT_TEST_SLOW_GATE_INSTALL_MS")
+        && let Ok(ms) = ms.parse::<u64>()
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+    }
+}
+
+#[cfg(not(debug_assertions))]
+async fn simulated_slow_gate_install() {}
+
 impl Persistence {
     /// Open persistence and select the active session: in repo mode per [`SessionSelect`], in file mode
     /// by opening the named file (or creating it).
@@ -2902,7 +2917,9 @@ pub(crate) async fn serve_session(
             },
         );
         input_rx = rx;
-        hub.start_configured();
+        // Started below, once this session's elicitation and sampling gates are installed: a
+        // server may raise a nested request during the very first `events/poll`, and asked before
+        // then it would be declined as having no client.
         mcp_events = Some(hub);
     }
     // SEP-2640 skills from every connected server, seen through this session's MCP gate.
@@ -3173,6 +3190,7 @@ pub(crate) async fn serve_session(
         }};
     }
 
+    simulated_slow_gate_install().await;
     let (elicit_gate, pending_elicitations) = ServeElicitationGate::new(
         out_conn.clone(),
         cfg.approval_timeout,
@@ -3185,6 +3203,9 @@ pub(crate) async fn serve_session(
         persistence.session_id(),
     );
     mcp_host.sampling.install(sampling_gate);
+    if let Some(hub) = &mcp_events {
+        hub.start_configured();
+    }
     // Where an MCP App view's `mcp_app_open`/`mcp_app_result` frames go: this session's fanout,
     // held weakly like the elicitation gate's, so a view-bearing tool cannot keep it alive.
     let app_sink: crate::tools::mcp_apps::AppSink = {
@@ -4592,6 +4613,14 @@ pub(crate) async fn serve_session(
                 // turn's model call (see `crate::mcp_resume`), by the first attempt only.
                 // A resumer that finished with a task's server unreachable left that task pending:
                 // a fresh one tries it again now (its finished results carry over).
+                //
+                // Journal writes still queued in `mcp_task_rx` are not drained here, and nothing
+                // below depends on them. A finished task's result: a restarted resumer is handed the
+                // old one's results (`mcp_carried`), so it never re-polls. A placeholder mark queued
+                // as this prompt arrives: its placeholder is not on the path yet (this prompt's
+                // `resume_into_turn` splices it, adding the resumer's own placeholder ids to the
+                // journal's), and once a run has put one there, the run-end drain journals its mark
+                // before the next prompt reads the journal.
                 let mut mcp_carried = Vec::new();
                 if mcp_resumer.session_id() != persistence.session_id() {
                     mcp_resumer = start_mcp_resumer!();

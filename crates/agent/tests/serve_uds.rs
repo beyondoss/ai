@@ -195,10 +195,14 @@ async fn uds_stale_socket_file_is_reclaimed() {
     let dir = tempfile::tempdir().unwrap();
     let sock = dir.path().join("agent.sock");
 
-    // Pre-create a *dead* socket node: bind a UnixListener, then drop it. The path now exists on disk
-    // (a socket file) but nothing is listening — exactly the crashed-daemon leftover we must reclaim.
+    // Pre-create a *dead* socket node: the path exists on disk (a socket file) but nothing listens
+    // on it — exactly the crashed-daemon leftover we must reclaim. Bound as a datagram socket, never
+    // a listening one: a listener bound and dropped here can live on for a moment in a child another
+    // test forks in that instant (the descriptor closes only at its `exec`), and a stream connect
+    // landing then succeeds, so the daemon would see a "live" socket and refuse to start. Nothing
+    // can make a stream connect to a datagram node succeed.
     {
-        let stale = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let stale = std::os::unix::net::UnixDatagram::bind(&sock).unwrap();
         drop(stale);
     }
     assert!(sock.exists(), "the stale socket node should be on disk");

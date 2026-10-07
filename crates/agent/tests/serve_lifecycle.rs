@@ -34,31 +34,69 @@ const WAIT: Duration = Duration::from_secs(60);
 struct Collector {
     url: String,
     posts: Arc<Mutex<Vec<(String, String)>>>,
+    /// While set, every POST is recorded but not answered (see [`Collector::spawn_held`]).
+    hold: Arc<Hold>,
     _guard: Option<tempfile::TempDir>,
+}
+
+/// Holds a collector's answers until released, and counts the ones it has sent.
+#[derive(Default)]
+struct Hold {
+    held: Mutex<bool>,
+    released: std::sync::Condvar,
+    answered: std::sync::atomic::AtomicUsize,
+}
+
+impl Hold {
+    fn wait(&self) {
+        let mut held = self.held.lock().unwrap();
+        while *held {
+            held = self.released.wait(held).unwrap();
+        }
+    }
 }
 
 impl Collector {
     fn spawn() -> Self {
-        Self::spawn_with_delay(Duration::ZERO)
+        Self::spawn_tcp(false)
     }
 
-    fn spawn_with_delay(delay: Duration) -> Self {
+    /// A collector that records each POST and then answers nothing until [`Collector::release`].
+    fn spawn_held() -> Self {
+        Self::spawn_tcp(true)
+    }
+
+    fn spawn_tcp(held: bool) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let posts = Arc::new(Mutex::new(Vec::new()));
-        let recorder = posts.clone();
+        let hold = Arc::new(Hold {
+            held: Mutex::new(held),
+            ..Hold::default()
+        });
+        let (recorder, gate) = (posts.clone(), hold.clone());
         thread::spawn(move || {
             for conn in listener.incoming() {
                 let Ok(stream) = conn else { break };
-                let recorder = recorder.clone();
-                thread::spawn(move || handle_post(stream, delay, recorder));
+                let (recorder, gate) = (recorder.clone(), gate.clone());
+                thread::spawn(move || handle_post(stream, &gate, recorder));
             }
         });
         Self {
             url: format!("http://{addr}/lifecycle"),
             posts,
+            hold,
             _guard: None,
         }
+    }
+
+    fn release(&self) {
+        *self.hold.held.lock().unwrap() = false;
+        self.hold.released.notify_all();
+    }
+
+    fn answered(&self) -> usize {
+        self.hold.answered.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     fn bodies(&self) -> Vec<Value> {
@@ -89,17 +127,19 @@ impl Collector {
         let sock = dir.path().join("lifecycle.sock");
         let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
         let posts = Arc::new(Mutex::new(Vec::new()));
-        let recorder = posts.clone();
+        let hold = Arc::new(Hold::default());
+        let (recorder, gate) = (posts.clone(), hold.clone());
         thread::spawn(move || {
             for conn in listener.incoming() {
                 let Ok(stream) = conn else { break };
-                let recorder = recorder.clone();
-                thread::spawn(move || handle_post(stream, Duration::ZERO, recorder));
+                let (recorder, gate) = (recorder.clone(), gate.clone());
+                thread::spawn(move || handle_post(stream, &gate, recorder));
             }
         });
         Self {
             url: format!("unix://{}", sock.display()),
             posts,
+            hold,
             _guard: Some(dir),
         }
     }
@@ -117,7 +157,7 @@ impl Collector {
 
 fn handle_post(
     mut stream: impl Read + Write,
-    delay: Duration,
+    hold: &Hold,
     posts: Arc<Mutex<Vec<(String, String)>>>,
 ) {
     let mut buf = Vec::new();
@@ -156,12 +196,12 @@ fn handle_post(
     let headers = String::from_utf8_lossy(&buf[..split]).into_owned();
     let body = String::from_utf8_lossy(&buf[split.min(buf.len())..]).into_owned();
     posts.lock().unwrap().push((headers, body));
-    if !delay.is_zero() {
-        thread::sleep(delay);
-    }
+    hold.wait();
     let _ =
         stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
     let _ = stream.flush();
+    hold.answered
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 }
 
 fn of_type<'a>(bodies: &'a [Value], kind: &str) -> Vec<&'a Value> {
@@ -517,10 +557,10 @@ fn serve_refusal_is_succeeded_with_refused() {
 fn a_slow_lifecycle_consumer_does_not_delay_the_prompt_response() {
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
-    let collector = Collector::spawn_with_delay(Duration::from_secs(2));
-    // Stall the *model* as well so we can send the prompt and then measure only the control-plane
-    // round trip — but a stalled lifecycle POST must not hold the response. Instant model, slow
-    // collector: if `emit` awaited the network, the prompt response would take ~2s.
+    // The collector answers no lifecycle POST until the test releases it, so the prompt response
+    // can only arrive if `emit` does not wait on the network: proved by order, not by a clock (a
+    // time bound flipped under host load). If it waited, the read below would stall and fail.
+    let collector = Collector::spawn_held();
     let (base, _bodies) = spawn_model_server(vec![turn_text("quick")]);
 
     let mut child = serve_life(&base, &session_file, &collector.url).spawn_guarded();
@@ -531,14 +571,16 @@ fn a_slow_lifecycle_consumer_does_not_delay_the_prompt_response() {
         &mut stdin,
         json!({ "type": "prompt", "id": "fast", "message": "hi" }),
     );
-    let start = Instant::now();
     let frames = read_until_response(&mut stdout, "prompt");
-    let elapsed = start.elapsed();
     assert_eq!(frames.last().unwrap()["success"], true, "{frames:#?}");
-    assert!(
-        elapsed < Duration::from_millis(1500),
-        "prompt response waited on the lifecycle consumer ({elapsed:?})"
+    assert_eq!(
+        collector.answered(),
+        0,
+        "the prompt response came only after the lifecycle consumer answered"
     );
+    collector.release();
+    // The events were really posted (and held), not skipped.
+    collector.wait_until(|b| of_type(b, "succeeded").len() == 1);
 
     drop(stdin);
     child.wait().unwrap();

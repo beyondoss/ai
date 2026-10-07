@@ -17,6 +17,10 @@ use common::{BIN, SpawnGuarded, serve_cmd, spawn_model_server_routed, turn_text}
 use serde_json::json;
 
 fn nested_during(during: &str, delivery: &str) {
+    nested_during_with(during, delivery, &[]);
+}
+
+fn nested_during_with(during: &str, delivery: &str, env: &[(&str, &str)]) {
     let home = tempfile::tempdir().unwrap();
     let control_file = home.path().join("control");
     write_settings(
@@ -33,6 +37,7 @@ fn nested_during(during: &str, delivery: &str) {
     cmd.env("HOME", home.path())
         .env("BEYOND_AI_AGENT_MCP_IDLE_SECS", "0")
         .env("BEYOND_AI_AGENT_MCP_EVENTS_POLL_FLOOR_MS", "100")
+        .envs(env.iter().copied())
         .stderr(Stdio::null());
     let mut child = cmd.spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
@@ -73,6 +78,18 @@ fn nested_during(during: &str, delivery: &str) {
 #[test]
 fn a_nested_elicitation_during_an_events_poll_reaches_the_owning_session() {
     nested_during("poll", "poll");
+}
+
+/// The events hub starts only once the session can take a question. Held open on demand (a debug
+/// seam delays the gates' install), the window in which the first `events/poll` could raise one
+/// before then would have it declined as having no client. A loaded host used to open it by chance.
+#[test]
+fn a_nested_elicitation_on_the_first_poll_waits_for_the_session_to_take_questions() {
+    nested_during_with(
+        "poll",
+        "poll",
+        &[("BEYOND_AI_AGENT_TEST_SLOW_GATE_INSTALL_MS", "1500")],
+    );
 }
 
 #[test]

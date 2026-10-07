@@ -3685,9 +3685,12 @@ the task, not the connection or the process, as the unit of work.
     session's directory), made by the session's first journal write, so a session that never
     journals a task gets no extra file. Every first writer (threads, other processes) agrees on one
     key: it is made under an exclusive lock on the sidecar and re-read once the lock is held, and
-    every journal write adopts the key on disk. A key under the earlier `with_extension` name
-    (`<session>.mcp-task-journal.json`) is read, and carried over by the next journal write. It is one of the session's sidecars, so it moves,
-    trashes and restores with it. On replay an entry without a valid `mac` is ignored: a line appended to the
+    every journal write adopts the key on disk. The lock is an OFD lock on the sidecar itself
+    (`file_lock::Target::Itself`), so another descriptor's open and close cannot release it, NFS
+    included; the holder still re-reads and writes through its locked descriptor, so "re-read, then
+    write" is one step. A key under the earlier `with_extension` name
+    (`<session>.mcp-task-journal.json`) is read, and carried over by the next journal write. Both
+    names are session sidecars, so the key moves, trashes and restores with its session. On replay an entry without a valid `mac` is ignored: a line appended to the
     `.jsonl` by a model with `write`/`edit` neither causes a poll nor is delivered as a result.
   - A session without a key (from before per-session keys, or that has not journaled yet) is read
     as before: its entries are accepted, and opening it writes nothing. Its next journal write makes

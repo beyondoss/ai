@@ -54,7 +54,7 @@ use crate::settings::{McpEventAction, McpEventDelivery, McpEventSubscription};
 use crate::tools::mcp::McpCatalog;
 
 use state::{PendingEvent, PersistedSub, StateStore};
-pub use webhook::{MAX_WEBHOOK_BODY, WebhookReply, receive_webhook, route_exists};
+pub use webhook::{MAX_WEBHOOK_BODY, WebhookReply, receive_webhook, restore_pending, route_exists};
 pub use wire::NotificationRouter;
 use wire::{Conn, RpcError, StreamMsg};
 
@@ -576,6 +576,15 @@ impl McpEventsHub {
                 let Some(store) = weak_hub.upgrade().map(|h| h.store.clone()) else {
                     return;
                 };
+                // Debug builds: a test can hold the state read off, to show what a delivery that
+                // arrives before it is told (retry, not stop).
+                #[cfg(debug_assertions)]
+                if let Some(ms) = std::env::var("BEYOND_AI_AGENT_TEST_SLOW_EVENTS_RESTORE_MS")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                {
+                    tokio::time::sleep(Duration::from_millis(ms)).await;
+                }
                 store.loaded().await;
                 let Some(hub) = weak_hub.upgrade() else {
                     return;
@@ -601,6 +610,11 @@ impl McpEventsHub {
                             webhook::reserve(&token);
                         }
                     }
+                }
+                // The daemon held every unknown token at `503` until this session's tokens were
+                // reserved (`webhook::restore_pending`); they are now.
+                if hub.owns_configured {
+                    webhook::restored();
                 }
                 for (key, spec) in runtime {
                     hub.restoring

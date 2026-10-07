@@ -170,7 +170,14 @@ fn no_skills_suppresses_mcp_skills_too() {
 
 #[test]
 fn a_listing_that_never_ends_is_cut_off_and_said_so() {
-    let env = Env::new(json!({ "MCP_SKILLS_FIXTURE_ENDLESS": "1" }));
+    // The cut-off is the page budget (`MAX_LIST_PAGES`), counted, not timed. The listing stays
+    // fresh for the whole run (`ttlMs`), so the turn does not page through all 64 again under the
+    // refresh's wall-clock bound: on a loaded host that second walk could outlast the bound, and
+    // this test is about the budget, not about refresh timing.
+    let env = Env::new(json!({
+        "MCP_SKILLS_FIXTURE_ENDLESS": "1",
+        "MCP_SKILLS_FIXTURE_TTL_MS": "3600000",
+    }));
     let out = env.run_with("hello", vec![turn_text("ok")], &[]);
     assert!(
         out.stderr.contains("cut off after 64 pages"),
@@ -178,6 +185,11 @@ fn a_listing_that_never_ends_is_cut_off_and_said_so() {
         out.stderr
     );
     assert!(system_text(&out.bodies[0]).contains("<name>docs:git-workflow</name>"));
+    assert_eq!(
+        env.log_of("skills/list").len(),
+        64,
+        "exactly the page budget was walked, once"
+    );
 }
 
 #[test]

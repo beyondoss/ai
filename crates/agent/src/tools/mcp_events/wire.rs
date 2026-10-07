@@ -795,6 +795,10 @@ pub(super) struct SseReader {
     /// The largest event read (see [`max_message_bytes`]).
     max: usize,
     pub(super) error: Option<String>,
+    /// Bytes scanned for a separator plus bytes moved by dropping a consumed prefix: the work that
+    /// must stay linear in what was read (see `many_events_in_one_chunk_drain_in_linear_time`).
+    #[cfg(test)]
+    work: usize,
 }
 
 impl SseReader {
@@ -810,12 +814,21 @@ impl SseReader {
             scanned: 0,
             max,
             error: None,
+            #[cfg(test)]
+            work: 0,
         }
     }
 
     pub(super) async fn next(&mut self) -> Option<Value> {
         loop {
-            if let Some((end, sep_end)) = find_event_end(&self.buf, self.scanned.max(self.start)) {
+            let from = self.scanned.max(self.start);
+            let found = find_event_end(&self.buf, from);
+            #[cfg(test)]
+            {
+                self.work +=
+                    found.map_or(self.buf.len(), |(_, sep_end)| sep_end) - from.min(self.buf.len());
+            }
+            if let Some((end, sep_end)) = found {
                 let event = &self.buf[self.start..end];
                 // One read can bring a whole over-cap event at once: it is held to the cap all the
                 // same — stood in for if it is an events notification, else the stream ends.
@@ -839,6 +852,10 @@ impl SseReader {
             }
             // Need more bytes: drop what has been consumed (at most a partial event remains).
             if self.start > 0 {
+                #[cfg(test)]
+                {
+                    self.work += self.buf.len() - self.start;
+                }
                 self.buf.drain(..self.start);
                 self.scanned = self.scanned.saturating_sub(self.start);
                 self.start = 0;
@@ -1205,18 +1222,21 @@ mod tests {
         // All of it already buffered — one large read, as a fast server on a fast link delivers.
         let resp = reqwest::Response::from(http::Response::new(String::new()));
         let mut reader = SseReader::new(resp);
+        let len = body.len();
         reader.buf = body.into_bytes();
-        let started = std::time::Instant::now();
         let mut seen = 0;
         while let Some(v) = reader.next().await {
             assert_eq!(v["i"], seen);
             seen += 1;
         }
         assert_eq!(seen, n);
+        // Counted, not timed: a clock bound flips under host load. Every byte is scanned about
+        // once and the consumed prefix is dropped once per chunk; dropping it per event, or
+        // rescanning from the event's start, makes this quadratic (~n^2 / 2 bytes).
         assert!(
-            started.elapsed() < Duration::from_secs(3),
-            "draining {n} events took {:?}",
-            started.elapsed()
+            reader.work <= 2 * len,
+            "draining {n} events ({len} bytes) did {} bytes of scanning and moving",
+            reader.work
         );
     }
 

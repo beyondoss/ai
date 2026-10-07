@@ -95,7 +95,15 @@ fn inline_cpu(mut work: impl FnMut()) -> Duration {
 
 /// A yielding tool may hold the executor for at most this fraction of the inline baseline (its own
 /// argument parsing, the hand-off, and assembling the result). An inline one holds about all of it.
+///
+/// That per-call overhead is fixed (a few hundred microseconds in a debug build) while the baseline
+/// scales with the input, so the inputs are sized for a baseline of several milliseconds even on a
+/// fast machine: a 4 MB `write` was under a millisecond on a CI runner, and the fixed overhead alone
+/// came to a third of it.
 const MAX_HELD_FRACTION: f64 = 0.25;
+
+/// Lines of [`big_ascii_source`] for the `edit` and `write` subjects: ~36 MB.
+const SUBJECT_LINES: usize = 640_000;
 
 fn assert_yields(tool: &str, held: &Held, baseline: Duration, why: &str) {
     eprintln!(
@@ -130,8 +138,8 @@ const NEW: &str = "    let x_40001 = compute(i, 40001) + adjust(); // edited";
 async fn edit_does_not_stall_the_runtime() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("subject.rs");
-    // ~4 MB: an inline `edit` spends tens of ms here (read + normalize + match + splice + write).
-    let src = big_ascii_source(80_000);
+    // An inline `edit` spends tens of ms here (read + normalize + match + splice + write).
+    let src = big_ascii_source(SUBJECT_LINES);
     std::fs::write(&path, &src).unwrap();
     let scratch = dir.path().join("baseline.rs");
     let baseline = inline_cpu(|| {
@@ -165,7 +173,7 @@ async fn edit_does_not_stall_the_runtime() {
 async fn write_does_not_stall_the_runtime() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("out.rs");
-    let src = big_ascii_source(80_000);
+    let src = big_ascii_source(SUBJECT_LINES);
     let scratch = dir.path().join("baseline.rs");
     let baseline = inline_cpu(|| std::fs::write(&scratch, &src).unwrap());
 
