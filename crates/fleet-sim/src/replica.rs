@@ -218,10 +218,11 @@ impl Replica {
                 .and_then(|a| a.parse::<std::net::SocketAddr>().ok())
                 .map(|a| a.port());
             if let Some(ws) = ws {
-                let metrics = beyond_ai_test_support::ports::listening_on(pid)
+                let listening: Vec<u16> = beyond_ai_test_support::ports::listening_on(pid)
                     .into_iter()
                     .map(|a| a.port())
-                    .find(|&p| p != ws);
+                    .collect();
+                let metrics = scrape_port_among(&listening, ws);
                 if !with_metrics || metrics.is_some() {
                     self.addr = Addr::local(ws);
                     self.metrics_port = metrics.filter(|_| with_metrics);
@@ -328,5 +329,26 @@ impl Drop for Replica {
             let _ = child.wait();
             forget(pid);
         }
+    }
+}
+
+/// A replica's scrape port, among the ports it listens on: the one that is **not** its websocket
+/// port (`ws`). The order `/proc` lists its sockets in says nothing about which is which, so the first
+/// listener is as likely to be the websocket one.
+fn scrape_port_among(listening: &[u16], ws: u16) -> Option<u16> {
+    listening.iter().copied().find(|&p| p != ws)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The scrape port is the other listener, wherever the websocket one appears in the list.
+    #[test]
+    fn the_scrape_port_is_the_listener_that_is_not_the_websocket() {
+        assert_eq!(scrape_port_among(&[4100, 4200], 4100), Some(4200));
+        assert_eq!(scrape_port_among(&[4200, 4100], 4100), Some(4200));
+        assert_eq!(scrape_port_among(&[4100], 4100), None, "not up yet");
+        assert_eq!(scrape_port_among(&[], 4100), None);
     }
 }

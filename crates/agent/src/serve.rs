@@ -1177,17 +1177,50 @@ async fn open_persistence_blocking(
 /// it's safe to call from deep inside `Agent::run_events_steered`'s hot loop without stalling it. The
 /// `"prompt"` arm's busy-loop (the only place a checkpoint can fire from) drains the receiving half and
 /// does the actual (blocking) append.
-struct ChannelCheckpoint(mpsc::UnboundedSender<Arc<Vec<agent_core::Message>>>);
+struct ChannelCheckpoint(mpsc::UnboundedSender<Checkpoint>);
+
+/// One mid-run checkpoint on its way to the session loop: the transcript snapshot, and the
+/// acknowledgement the loop sends once it is on disk.
+type Checkpoint = (
+    Arc<Vec<agent_core::Message>>,
+    tokio::sync::oneshot::Sender<()>,
+);
 
 #[async_trait::async_trait]
 impl agent_core::CheckpointHook for ChannelCheckpoint {
+    /// Hand the snapshot to the session loop and wait until it is **on disk**. The agent awaits a
+    /// checkpoint before it dispatches a tool, so that wait is what makes "the `tool_use` is durable
+    /// before the tool runs" true: returning as soon as the snapshot was queued let the tool start (and
+    /// do whatever it does) while the write was still pending, and a crash in that window lost the
+    /// record that the model ever asked for it. Every path that drives the agent drains this channel
+    /// while it waits (the prompt loop, a manual `compact`). A snapshot dropped undrained — the loop
+    /// sweeps leftovers when a run ends — resolves the wait without a write, never hangs it.
     async fn checkpoint(&self, session: &Session) {
-        // Best-effort: if the receiving end is gone (a prior run already dropped it — shouldn't happen
-        // while a run is in flight, since the receiver outlives every `"prompt"` arm) there's nothing to
-        // recover, and the run itself must not fail just because incremental persistence couldn't.
-        let _ = self.0.send(session.messages.clone());
+        let (ack, persisted) = tokio::sync::oneshot::channel();
+        // Best-effort: if the receiving end is gone there's nothing to recover, and the run itself
+        // must not fail just because incremental persistence couldn't.
+        if self.0.send((session.messages.clone(), ack)).is_err() {
+            return;
+        }
+        let _ = persisted.await;
     }
 }
+
+/// A slow disk under a checkpoint write, simulated: sleeps `BEYOND_AI_AGENT_TEST_SLOW_CHECKPOINT_MS`
+/// milliseconds before each mid-run checkpoint is written, so a test can hold the window between "the
+/// agent asked for a checkpoint" and "it is on disk" open on demand. `#[cfg]`-gated like
+/// [`simulated_slow_open`]: a release binary has no latency-injection path at all.
+#[cfg(debug_assertions)]
+async fn simulated_slow_checkpoint() {
+    if let Ok(ms) = std::env::var("BEYOND_AI_AGENT_TEST_SLOW_CHECKPOINT_MS")
+        && let Ok(ms) = ms.parse::<u64>()
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+    }
+}
+
+#[cfg(not(debug_assertions))]
+async fn simulated_slow_checkpoint() {}
 
 /// Mint a brand-new `SessionMeta`, using `session_id` in place of a freshly generated one when given
 /// (`ServeConfig::session_id`, already validated by `main.rs` before this is ever called).
@@ -3389,8 +3422,7 @@ pub(crate) async fn serve_session(
     // `Persistence` itself — is what lets the checkpoint hook (called deep inside `agent.
     // run_events_steered`, which holds `&mut session` for the run's whole duration) reach persistence
     // without ever needing to borrow `session` a second time.
-    let (checkpoint_tx, mut checkpoint_rx) =
-        mpsc::unbounded_channel::<Arc<Vec<agent_core::Message>>>();
+    let (checkpoint_tx, mut checkpoint_rx) = mpsc::unbounded_channel::<Checkpoint>();
     let checkpoint: Arc<dyn agent_core::CheckpointHook> =
         Arc::new(ChannelCheckpoint(checkpoint_tx));
     // SEP-2663 journal writes, `(kind, data)` (see `crate::mcp_resume`): task records from the
@@ -4077,12 +4109,12 @@ pub(crate) async fn serve_session(
             let mut compacted_summary: Option<String> = None;
             let mut compacted_tokens_after: Option<u32> = None;
             let mut compacted_first_kept: Option<usize> = None;
-            let result = agent
-                .compact(
-                    &mut session,
-                    agent_core::CompactionReason::Manual,
-                    &CancellationToken::new(),
-                    &mut |ev| {
+            // A compaction ends in a checkpoint, which waits until it is on disk (see
+            // `ChannelCheckpoint`): persist checkpoints while it runs, as the prompt loop does. Scoped
+            // so the compaction's borrows (`session`, the `compacted_*` slots) end with it.
+            let result = {
+                let compaction_cancel = CancellationToken::new();
+                let mut on_event = |ev: AgentEvent| {
                         if let AgentEvent::Compacted {
                             tokens_before,
                             summary,
@@ -4108,10 +4140,31 @@ pub(crate) async fn serve_session(
                         if let Some(frame) = event_frame(ev) {
                             let _ = tx.send(frame);
                         }
-                    },
+                };
+                let compaction = agent.compact(
+                    &mut session,
+                    agent_core::CompactionReason::Manual,
+                    &compaction_cancel,
+                    &mut on_event,
                     custom_instructions,
-                )
-                .await;
+                );
+                tokio::pin!(compaction);
+                loop {
+                    tokio::select! {
+                        biased;
+                        Some((messages, ack)) = checkpoint_rx.recv() => {
+                            simulated_slow_checkpoint().await;
+                            let (p, r) = persist_messages_blocking(persistence, messages).await;
+                            persistence = p;
+                            let _ = ack.send(());
+                            if let Err(e) = r {
+                                tracing::warn!(error = %e, "compaction checkpoint failed to persist");
+                            }
+                        }
+                        r = &mut compaction => break r,
+                    }
+                }
+            };
             match result {
                 Ok(outcome) => {
                     // The tree entry that begins the retained (post-compaction) portion of history —
@@ -4836,9 +4889,13 @@ pub(crate) async fn serve_session(
                                 // right after this loop, below, before it can leak into some later, unrelated
                                 // turn — see that drain's own comment for why "harmless, the final persist
                                 // is a superset" isn't quite true on its own.
-                                Some(messages) = checkpoint_rx.recv() => {
+                                Some((messages, ack)) = checkpoint_rx.recv() => {
+                                    simulated_slow_checkpoint().await;
                                     let (p, r) = persist_messages_blocking(persistence, messages).await;
                                     persistence = p;
+                                    // The agent is waiting on this before it dispatches the next tool
+                                    // (see `ChannelCheckpoint`).
+                                    let _ = ack.send(());
                                     // Note this deliberately does *not* republish the fanout's catch-up
                                     // history, even though a perfectly good snapshot is right here. The
                                     // catch-up's contract is base-plus-frames: `history` is the transcript
@@ -11012,6 +11069,11 @@ pub(crate) struct OutFanout {
     /// view of the current turn starts mid-way and must be reconciled with `get_messages` once the run
     /// ends — rather than silently rendering a turn with a hole in it.
     turn_truncated: bool,
+    /// The frame that ended the session, once one has ([`Self::end`]): why it is gone. Given to every
+    /// sink that registers afterwards, because a connection can attach — its upgrade answered while
+    /// the session was still starting — just after the session failed and broadcast it, and must
+    /// still learn why it is being closed rather than see a bare close.
+    ended: Option<OutFrame>,
     /// The session's open MCP App views — each view's `mcp_app_open` and, once it lands, its
     /// `mcp_app_result` — replayed (marked `replay: true`) to every connection that attaches, so a
     /// client that reconnects can reopen a view and get its result. Kept apart from `turn` because a
@@ -11099,6 +11161,9 @@ const TURN_REPLAY_MAX_BYTES: usize = 4 * 1024 * 1024;
 impl OutFanout {
     /// Register a connection's sink; returns an id to [`remove`](Self::remove) it by on disconnect.
     pub(crate) fn add(&mut self, tx: OutSink) -> u64 {
+        if let Some(ended) = &self.ended {
+            let _ = tx.try_send(ended.clone());
+        }
         let id = self.next_id;
         self.next_id += 1;
         self.sinks.push((id, tx));
@@ -11415,6 +11480,13 @@ impl OutFanout {
     /// happens even with **zero** sinks attached: a fully detached session still has to be able to catch
     /// the next client up on the turn it ran while nobody was watching, which is the whole point of a
     /// session outliving its connection.
+    /// Broadcast the frame that ends the session (why it is gone), and keep it for any connection
+    /// that registers afterwards (see [`Self::ended`]).
+    pub(crate) fn end(&mut self, frame: OutFrame) {
+        self.ended = Some(frame.clone());
+        self.broadcast(frame);
+    }
+
     pub(crate) fn broadcast(&mut self, frame: OutFrame) {
         if self.recording && !self.turn_truncated {
             let len = frame.approx_len();

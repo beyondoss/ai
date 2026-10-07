@@ -304,6 +304,12 @@ fn only_child_frames_touches_a_childs_stdout() {
 /// hide a case.
 fn released_ports(source: &str) -> Vec<String> {
     let code = normalised(source);
+    // Names holding a port-0 address (`let a = "127.0.0.1:0";`), and same-file functions that only
+    // read the address of the socket they are given (`fn port_of(l: &TcpListener) -> u16`).
+    let zero_names = zero_address_names(&code);
+    let readers = address_readers(&code);
+    let is_zero =
+        |args: &str| binds_port_zero(args) || zero_names.iter().any(|n| mentions_ident(args, n));
     let mut found = Vec::new();
     // Temporaries: the bind's own statement reads the address.
     for ty in ["TcpListener::bind(", "TcpSocket::bind(", "UdpSocket::bind("] {
@@ -311,64 +317,182 @@ fn released_ports(source: &str) -> Vec<String> {
             let stmt = &code[at..];
             let stmt = &stmt[..stmt.find(';').unwrap_or(stmt.len())];
             let close = matching_paren(stmt, stmt.find('(').unwrap());
-            if binds_port_zero(&stmt[..close]) && stmt[close..].contains(".local_addr()") {
+            if is_zero(&stmt[..close]) && stmt[close..].contains(".local_addr()") {
                 found.push(format!("a temporary listener's port ({})", excerpt(stmt)));
             }
         }
     }
-    // Named sockets: follow the name to the end of its scope.
-    for (at, _) in code.match_indices("let ") {
-        if code[..at]
-            .chars()
-            .last()
-            .is_some_and(|c| c.is_alphanumeric() || c == '_')
-        {
+    // Named sockets — one name, or each name of a tuple pattern: follow it to the end of its scope.
+    for (at, _) in code.match_indices("let") {
+        if code[..at].chars().last().is_some_and(is_ident) {
             continue;
         }
-        let after = &code[at + 4..];
-        let after = after.strip_prefix("mut ").unwrap_or(after);
-        let name: String = after
-            .chars()
-            .take_while(|c| c.is_alphanumeric() || *c == '_')
-            .collect();
-        let Some(eq) = after.find('=') else { continue };
-        if name.is_empty()
-            || !after[name.len()..eq]
-                .chars()
-                .all(|c| c.is_alphanumeric() || "<>_:& ".contains(c))
-        {
+        // `let x` keeps its space; `let (a, b)` loses it in `normalised`.
+        let after = &code[at + 3..];
+        let Some(after) = after
+            .strip_prefix(' ')
+            .or_else(|| after.starts_with('(').then_some(after))
+        else {
             continue;
-        }
-        let stmt_end = after.find(';').unwrap_or(after.len());
-        let init = &after[eq + 1..stmt_end];
-        let rest = scope_after(&after[stmt_end..], &name);
+        };
+        let Some((names, init, after_stmt)) = let_binding(after) else {
+            continue;
+        };
         let bound_zero_here = (init.contains("TcpListener::bind(")
             || init.contains("UdpSocket::bind("))
-            && binds_port_zero(init);
-        let socket_here =
-            init.contains("TcpSocket::new_v4(") || init.contains("TcpSocket::new_v6(");
+            && is_zero(init);
+        let socket_here = init.contains("TcpSocket::new_v4(")
+            || init.contains("TcpSocket::new_v6(")
+            || init.contains("Socket::new(");
         if !bound_zero_here && !socket_here {
             continue;
         }
-        let uses = uses_of(rest, &name);
-        let reads_port = uses.iter().any(|u| u.starts_with(".local_addr()"));
-        let bound_zero = bound_zero_here
-            || uses
+        for name in names {
+            let rest = scope_after(after_stmt, &name);
+            let uses = uses_of(rest, &name, &readers);
+            let reads_port = uses
                 .iter()
-                .any(|u| u.starts_with(".bind(") && binds_port_zero(&u[..matching_paren(u, 5)]));
-        let let_go = uses.iter().all(|u| {
-            u.starts_with(".local_addr()")
-                || u.starts_with(".bind(")
-                || u.starts_with(".set_")
-                || *u == "drop"
-        });
-        if bound_zero && reads_port && let_go {
-            found.push(format!(
-                "`{name}`: bound to port 0, its port read, then let go"
-            ));
+                .any(|u| u.starts_with(".local_addr()") || *u == "read");
+            let bound_zero = bound_zero_here
+                || uses
+                    .iter()
+                    .any(|u| u.starts_with(".bind(") && is_zero(&u[..matching_paren(u, 5)]));
+            let let_go = uses.iter().all(|u| {
+                u.starts_with(".local_addr()")
+                    || u.starts_with(".bind(")
+                    || u.starts_with(".set_")
+                    || *u == "drop"
+                    || *u == "read"
+            });
+            if bound_zero && reads_port && let_go {
+                found.push(format!(
+                    "`{name}`: bound to port 0, its port read, then let go"
+                ));
+            }
         }
     }
     found
+}
+
+fn is_ident(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// A `let` binding, from just after `let `: the names it binds (one, or each non-`_` name of a tuple
+/// pattern), its initialiser, and the code after its `;`.
+fn let_binding(after: &str) -> Option<(Vec<String>, &str, &str)> {
+    let after = after.strip_prefix("mut ").unwrap_or(after);
+    let (names, pattern_end) = if after.starts_with('(') {
+        let close = matching_paren(after, 0);
+        let names = after[1..close - 1]
+            .split(',')
+            .map(|n| n.trim_start_matches("mut ").trim_start_matches('&'))
+            .filter(|n| !n.is_empty() && *n != "_" && n.chars().all(is_ident))
+            .map(str::to_owned)
+            .collect();
+        (names, close)
+    } else {
+        let name: String = after.chars().take_while(|c| is_ident(*c)).collect();
+        if name.is_empty() {
+            return None;
+        }
+        let len = name.len();
+        (vec![name], len)
+    };
+    let eq = after.find('=')?;
+    if eq < pattern_end
+        || !after[pattern_end..eq]
+            .chars()
+            .all(|c| is_ident(c) || "<>_:& ".contains(c))
+    {
+        return None;
+    }
+    let stmt_end = after.find(';').unwrap_or(after.len());
+    if stmt_end < eq {
+        return None;
+    }
+    Some((names, &after[eq + 1..stmt_end], &after[stmt_end..]))
+}
+
+/// Whether identifier `name` occurs in `code` as a whole identifier.
+fn mentions_ident(code: &str, name: &str) -> bool {
+    code.match_indices(name).any(|(i, m)| {
+        !code[..i].chars().last().is_some_and(is_ident)
+            && !code[i + m.len()..].chars().next().is_some_and(is_ident)
+    })
+}
+
+/// Names a port-0 address is bound to: `let a = "127.0.0.1:0";`, `const A: &str = "…:0";`,
+/// `let a = SocketAddr::from(([127, 0, 0, 1], 0));` — anything not itself a bind.
+fn zero_address_names(code: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for kw in ["let ", "const ", "static "] {
+        for (at, _) in code.match_indices(kw) {
+            if code[..at].chars().last().is_some_and(is_ident) {
+                continue;
+            }
+            let Some((found, init, _)) = let_binding(&code[at + kw.len()..]) else {
+                continue;
+            };
+            if binds_port_zero(init) && !init.contains("bind(") {
+                names.extend(found);
+            }
+        }
+    }
+    names
+}
+
+/// Same-file functions of one parameter that do nothing with it but read its address: passing a
+/// socket to one (`port_of(&l)`) is reading its port, not holding it.
+fn address_readers(code: &str) -> Vec<String> {
+    let mut readers = Vec::new();
+    for (at, _) in code.match_indices("fn ") {
+        if code[..at].chars().last().is_some_and(is_ident) {
+            continue;
+        }
+        let rest = &code[at + 3..];
+        let name: String = rest.chars().take_while(|c| is_ident(*c)).collect();
+        let Some(open) = rest.find('(') else { continue };
+        if open != name.len() {
+            continue;
+        }
+        let close = matching_paren(rest, open);
+        let params = &rest[open + 1..close - 1];
+        if params.contains(',') {
+            continue;
+        }
+        let param: String = params
+            .trim_start_matches("mut ")
+            .chars()
+            .take_while(|c| is_ident(*c))
+            .collect();
+        let Some(body_open) = rest[close..].find('{').map(|i| close + i) else {
+            continue;
+        };
+        let mut depth = 0;
+        let mut body_end = rest.len();
+        for (i, c) in rest[body_open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        body_end = body_open + i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let uses = uses_of(&rest[body_open..body_end], &param, &[]);
+        if !param.is_empty()
+            && !uses.is_empty()
+            && uses.iter().all(|u| u.starts_with(".local_addr()"))
+        {
+            readers.push(name);
+        }
+    }
+    readers
 }
 
 /// The index just past the `)` matching the `(` at `open`.
@@ -389,9 +513,20 @@ fn matching_paren(s: &str, open: usize) -> usize {
     s.len()
 }
 
-/// Whether a bind's arguments ask for port 0.
+/// Whether a bind's arguments (or an address expression) ask for port 0: `"…:0"`, or a `0` (`0u16`,
+/// `0_u16`) as the last element of an address tuple.
 fn binds_port_zero(args: &str) -> bool {
-    args.contains(":0\"") || args.contains(",0)") || args.contains(",0))")
+    if args.contains(":0\"") {
+        return true;
+    }
+    args.match_indices(",0").any(|(i, m)| {
+        let rest = &args[i + m.len()..];
+        let rest = rest
+            .strip_prefix("_u16")
+            .or_else(|| rest.strip_prefix("u16"))
+            .unwrap_or(rest);
+        rest.starts_with(')')
+    })
 }
 
 /// `source` without comments, and with whitespace removed except a single space between two
@@ -440,27 +575,47 @@ fn scope_after<'a>(code: &'a str, name: &str) -> &'a str {
             format!("let mut {name}="),
             format!("let {name}:"),
         ];
-        if rebinds.iter().any(|r| code[i..].starts_with(r.as_str())) {
+        if let Some(r) = rebinds.iter().find(|r| code[i..].starts_with(r.as_str())) {
             let end = code[i..].find(';').map_or(code.len(), |e| i + e);
+            // `let l = l;` moves the same socket under the same name: keep following it.
+            if code[i + r.len()..end] == *name {
+                continue;
+            }
             return &code[..end];
         }
     }
     code
 }
 
-/// Every use of identifier `name` in `code`, as the text from the identifier's end — or, for a
-/// `drop(name)`, the text `drop`.
-fn uses_of<'a>(code: &'a str, name: &str) -> Vec<&'a str> {
-    let ident = |c: char| c.is_alphanumeric() || c == '_';
+/// Every use of identifier `name` in `code`, as the text from the identifier's end — or `drop` for
+/// `drop(name)` / `let _ = name;`, or `read` for passing it to an address reader (`port_of(&name)`).
+/// Binding sites (`let name =`, the right-hand side of a self-rebind `let name = name;`) are not uses.
+fn uses_of<'a>(code: &'a str, name: &str, readers: &[String]) -> Vec<&'a str> {
     code.match_indices(name)
-        .filter(|(i, _)| !code[..*i].chars().last().is_some_and(ident))
-        .filter(|(i, m)| !code[i + m.len()..].chars().next().is_some_and(ident))
+        .filter(|(i, _)| !code[..*i].chars().last().is_some_and(is_ident))
+        .filter(|(i, m)| !code[i + m.len()..].chars().next().is_some_and(is_ident))
         .filter(|(i, _)| !code[..*i].ends_with('.'))
+        .filter(|(i, _)| !code[..*i].ends_with("let ") && !code[..*i].ends_with("let mut "))
+        .filter(|(i, m)| {
+            let self_rebind = code[..*i].ends_with(&format!("let {name}="))
+                || code[..*i].ends_with(&format!("let mut {name}="));
+            !(self_rebind && code[i + m.len()..].starts_with(';'))
+        })
         .map(|(i, m)| {
-            if code[..i].ends_with("drop(") && code[i + m.len()..].starts_with(')') {
+            let after = &code[i + m.len()..];
+            let before = &code[..i];
+            if (before.ends_with("drop(") && after.starts_with(')'))
+                || (before.ends_with("let _=") && after.starts_with(';'))
+            {
                 "drop"
+            } else if after.starts_with(')')
+                && readers.iter().any(|r| {
+                    before.ends_with(&format!("{r}(&")) || before.ends_with(&format!("{r}("))
+                })
+            {
+                "read"
             } else {
-                &code[i + m.len()..]
+                after
             }
         })
         .collect()
@@ -485,6 +640,22 @@ fn the_released_port_lint_catches_what_it_should() {
         "let reserve = TcpListener::bind(\"0.0.0.0:0\").unwrap();\nlet n = reserve.local_addr().unwrap().port();\n}\nchild(n);",
         // A socket bound to port 0 after creation.
         "let s = TcpSocket::new_v4()?;\ns.set_reuseaddr(true)?;\ns.bind(\"127.0.0.1:0\".parse().unwrap())?;\nlet p = s.local_addr()?.port();\ndrop(s);",
+        // A port-0 address held in a variable.
+        "let a = \"127.0.0.1:0\";\nlet l = TcpListener::bind(a).unwrap();\nlet p = l.local_addr().unwrap().port();\ndrop(l);",
+        "const ANY: &str = \"127.0.0.1:0\";\nfn pick() -> u16 { TcpListener::bind(ANY).unwrap().local_addr().unwrap().port() }",
+        // A typed zero.
+        "let p = TcpListener::bind((\"127.0.0.1\", 0u16)).unwrap().local_addr().unwrap().port();",
+        "let p = TcpListener::bind((Ipv4Addr::LOCALHOST, 0_u16)).unwrap().local_addr().unwrap().port();",
+        // The socket handed to a helper that only reads its address.
+        "fn port_of(l: &TcpListener) -> u16 { l.local_addr().unwrap().port() }\nfn pick() -> u16 { let l = TcpListener::bind(\"127.0.0.1:0\").unwrap(); port_of(&l) }",
+        // A tuple pattern.
+        "let (l, _) = (TcpListener::bind(\"127.0.0.1:0\").unwrap(), 1);\nlet p = l.local_addr().unwrap().port();\ndrop(l);",
+        // Dropped by `let _ =`.
+        "let l = TcpListener::bind(\"127.0.0.1:0\").unwrap();\nlet p = l.local_addr().unwrap().port();\nlet _ = l;",
+        // A self-rebind on the way.
+        "let l = TcpListener::bind(\"127.0.0.1:0\").unwrap();\nlet l = l;\nlet p = l.local_addr().unwrap().port();\ndrop(l);",
+        // socket2.
+        "let s = Socket::new(Domain::IPV4, Type::STREAM, None)?;\ns.bind(&\"127.0.0.1:0\".parse::<std::net::SocketAddr>()?.into())?;\nlet p = s.local_addr()?.as_socket().unwrap().port();\ndrop(s);",
     ] {
         assert!(!released_ports(bad).is_empty(), "missed: {bad:?}");
     }
@@ -498,6 +669,10 @@ fn the_released_port_lint_catches_what_it_should() {
         "let l = TcpListener::bind(\"127.0.0.1:8080\").unwrap();\nlet a = l.local_addr().unwrap();\ndrop(l);",
         "// let p = TcpListener::bind(\"127.0.0.1:0\").unwrap().local_addr().unwrap().port();",
         "let dead = DeadPort::bind();",
+        // Handed to a helper that serves it, not one that only reads its address.
+        "fn serve(l: TcpListener) { for c in l.incoming() { drop(c); } }\nlet l = TcpListener::bind(\"127.0.0.1:0\").unwrap();\nlet p = l.local_addr().unwrap().port();\nserve(l);",
+        // A port-0 address that is bound and kept.
+        "let a = \"127.0.0.1:0\";\nlet l = TcpListener::bind(a).unwrap();\nlet p = l.local_addr().unwrap().port();\nspawn(l);",
         // Used right after a keyword, which a whitespace-blind match would glue to it.
         "let listener = TcpListener::bind(\"127.0.0.1:0\").unwrap();\nlet addr = listener.local_addr().unwrap();\nthread::spawn(move || { for s in listener.incoming() { drop(s); } });",
         // Re-bound by a statement that consumes the old binding.

@@ -559,21 +559,25 @@ async fn expect_100_continue_never_stalls() {
 /// A `nats-server` that can be stopped and started again behind the same port and JetStream store,
 /// so its KV contents survive the outage.
 ///
-/// "The same port" is a forwarder this test owns: bound to a port the kernel picked, and held for
-/// the test's whole life, so nothing else can take it during an outage (a server restarted on its old
-/// port could find it gone). Each `nats-server` picks its own port (`-p -1`); the forwarder relays to
-/// whichever one is up, and while none is, it closes every connection at once and cuts the ones it
-/// was relaying — what the gateway would see of a server going away.
+/// "The same port" is a forwarder this test owns. Each `nats-server` picks its own port (`-p -1`);
+/// the forwarder listens on the stable one and relays to whichever server is up. During an outage it
+/// does what a stopped server's port does — **refuses**: nothing listens there, so a connect gets a
+/// reset at the handshake — and cuts the connections it was relaying. The port is still the test's
+/// throughout, held by a socket bound to it with `SO_REUSEPORT` that never listens: another process
+/// binding port 0 is never handed a port a reuseport socket holds, and one binding it explicitly
+/// without reuseport is refused. (A server restarted on its old port could find it taken; closing the
+/// listener without the holder would release it.)
 struct RestartableNats {
     child: Option<Child>,
     /// The forwarder's port: what the gateway and the test dial.
     port: u16,
     dir: std::path::PathBuf,
-    /// The running server's own port, if one is up.
-    upstream: Arc<std::sync::Mutex<Option<u16>>>,
+    /// Bound to `port`, never listening: what keeps the port the test's while nothing listens on it.
+    _holder: tokio::net::TcpSocket,
+    /// While up: the listener on `port` and its accept loop, which relays to the server.
+    forwarder: Option<tokio::task::JoinHandle<()>>,
     /// The connections being relayed, cut on [`Self::down`].
     relays: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
-    forwarder: tokio::task::JoinHandle<()>,
 }
 
 impl RestartableNats {
@@ -583,37 +587,47 @@ impl RestartableNats {
         let dir = std::env::temp_dir().join(format!("beyond-ai-rel13-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
-        let upstream = Arc::new(std::sync::Mutex::new(None::<u16>));
-        let relays = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let forwarder = tokio::spawn({
-            let upstream = upstream.clone();
-            let relays = relays.clone();
-            async move {
-                while let Ok((mut inbound, _)) = listener.accept().await {
-                    let Some(to) = *upstream.lock().unwrap() else {
-                        continue; // down: `inbound` drops, closed at once
-                    };
-                    relays.lock().unwrap().push(tokio::spawn(async move {
-                        if let Ok(mut outbound) = TcpStream::connect(("127.0.0.1", to)).await {
-                            let _ =
-                                tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
-                        }
-                    }));
-                }
-            }
-        });
+        let holder = tokio::net::TcpSocket::new_v4().unwrap();
+        holder.set_reuseport(true).unwrap();
+        holder
+            .bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+            .unwrap();
+        let port = holder.local_addr().unwrap().port();
         RestartableNats {
             child: None,
             port,
             dir,
-            upstream,
-            relays,
-            forwarder,
+            _holder: holder,
+            forwarder: None,
+            relays: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
+    }
+
+    /// Listen on the held port again, relaying to the server on `to`.
+    fn listen(&mut self, to: u16) {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.set_reuseport(true).unwrap();
+        socket
+            .bind(std::net::SocketAddr::from(([127, 0, 0, 1], self.port)))
+            .unwrap();
+        let listener = socket.listen(1024).unwrap();
+        let relays = self.relays.clone();
+        self.forwarder = Some(tokio::spawn(async move {
+            while let Ok((mut inbound, _)) = listener.accept().await {
+                let mut relays = relays.lock().unwrap();
+                relays.retain(|relay| !relay.is_finished());
+                relays.push(tokio::spawn(async move {
+                    if let Ok(mut outbound) = TcpStream::connect(("127.0.0.1", to)).await {
+                        let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                    }
+                }));
+            }
+        }));
+    }
+
+    /// How many relays are tracked right now (finished ones are pruned as new ones start).
+    fn relays_tracked(&self) -> usize {
+        self.relays.lock().unwrap().len()
     }
 
     async fn up(&mut self) {
@@ -631,7 +645,7 @@ impl RestartableNats {
             .expect("spawn nats-server");
         let start = Instant::now();
         let port = loop {
-            if let Some(port) = beyond_ai_test_support::ports::nats_port_from(&ports) {
+            if let Some(port) = beyond_ai_test_support::ports::nats_port_from(&ports, child.id()) {
                 break port;
             }
             if let Ok(Some(status)) = child.try_wait() {
@@ -644,11 +658,25 @@ impl RestartableNats {
             tokio::time::sleep(Duration::from_millis(20)).await;
         };
         self.child = Some(child);
-        *self.upstream.lock().unwrap() = Some(port);
+        self.listen(port);
     }
 
-    fn down(&mut self) {
-        *self.upstream.lock().unwrap() = None;
+    /// Stop listening — once this returns, a connect is refused — then cut what was relayed and stop
+    /// the server. Waits for the accept loop to be gone: aborting it only asks, and a connect landing
+    /// before the listener actually closes would be queued and then reset, not refused.
+    async fn down(&mut self) {
+        if let Some(forwarder) = self.forwarder.take() {
+            forwarder.abort();
+            let _ = forwarder.await;
+        }
+        self.stop();
+    }
+
+    /// Cut what was relayed and stop the server (and, from `Drop`, the accept loop without waiting).
+    fn stop(&mut self) {
+        if let Some(forwarder) = self.forwarder.take() {
+            forwarder.abort();
+        }
         for relay in self.relays.lock().unwrap().drain(..) {
             relay.abort();
         }
@@ -661,10 +689,55 @@ impl RestartableNats {
 
 impl Drop for RestartableNats {
     fn drop(&mut self) {
-        self.down();
-        self.forwarder.abort();
+        self.stop();
         let _ = std::fs::remove_dir_all(&self.dir);
     }
+}
+
+/// The restartable NATS's port behaves like a server's across an outage: refused while it is down
+/// (not accepted and closed), never taken by anyone else meanwhile, and served again once it is back
+/// — with the relays of finished connections not piling up.
+#[tokio::test]
+async fn the_restartable_nats_refuses_while_down_and_keeps_its_port() {
+    let mut nats = RestartableNats::new();
+    nats.up().await;
+    let greeting = |port: u16| async move {
+        use tokio::io::AsyncBufReadExt as _;
+        let stream = TcpStream::connect(("127.0.0.1", port)).await.ok()?;
+        let mut line = String::new();
+        tokio::io::BufReader::new(stream)
+            .read_line(&mut line)
+            .await
+            .ok()?;
+        Some(line)
+    };
+    let hello = greeting(nats.port).await.expect("served while up");
+    assert!(hello.starts_with("INFO "), "{hello}");
+    for _ in 0..5 {
+        assert!(greeting(nats.port).await.is_some());
+    }
+    // Each finished relay is pruned when the next one starts.
+    assert!(
+        nats.relays_tracked() <= 2,
+        "finished relays pile up: {}",
+        nats.relays_tracked()
+    );
+
+    nats.down().await;
+    let refused = TcpStream::connect(("127.0.0.1", nats.port)).await;
+    assert_eq!(
+        refused.err().map(|e| e.kind()),
+        Some(std::io::ErrorKind::ConnectionRefused),
+        "down means refused, as a stopped server's port is"
+    );
+    assert!(
+        std::net::TcpListener::bind(("127.0.0.1", nats.port)).is_err(),
+        "the port stays the test's while nothing listens on it"
+    );
+
+    nats.up().await;
+    let hello = greeting(nats.port).await.expect("served again once back");
+    assert!(hello.starts_with("INFO "), "{hello}");
 }
 
 fn tenant_key(sk: &ed25519_dalek::SigningKey, tenant: u64) -> String {
@@ -679,7 +752,7 @@ async fn a_nats_outage_at_boot_recovers_and_applies_what_it_missed() {
     let mut nats = RestartableNats::new();
     nats.up().await;
     put_kv(nats.port, "blackhole.1301", b"spend").await;
-    nats.down();
+    nats.down().await;
     let (pubkey, sk) = test_keypair(131);
     let mock = MockUpstream::start(Mode::Json).await;
     let gw = Gateway::builder(nats.port, &mock.authority(), &b64(&pubkey))
@@ -721,7 +794,7 @@ async fn a_mid_run_nats_outage_recovers_and_applies_missed_updates() {
     let key = tenant_key(&sk, 1303);
     let path = "/openai/v1/chat/completions";
     assert_eq!(status_of(&gw, path, &key, CHAT).await, 200);
-    nats.down();
+    nats.down().await;
     // Let the watchers notice the disconnect.
     tokio::time::sleep(Duration::from_secs(2)).await;
     assert_eq!(

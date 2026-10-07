@@ -409,7 +409,7 @@ impl SharedNats {
             .spawn_guarded();
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
-            if let Some(port) = beyond_ai_test_support::ports::nats_port_from(&ports) {
+            if let Some(port) = beyond_ai_test_support::ports::nats_port_from(&ports, child.id()) {
                 return Self {
                     port,
                     _child: child,

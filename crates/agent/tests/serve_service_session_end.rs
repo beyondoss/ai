@@ -18,7 +18,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::service::Service;
+use common::service::{Options, Service};
 use common::{TestWs, spawn_model_server, ws_connect_with_headers, ws_send};
 use futures::StreamExt as _;
 use serde_json::{Value, json};
@@ -50,8 +50,45 @@ async fn read_until_closed(ws: &mut TestWs, within: Duration) -> Result<Vec<Valu
 /// socket, not from a timeout it chose itself.
 #[tokio::test]
 async fn a_session_that_fails_to_start_closes_the_socket_instead_of_going_quiet() {
+    failed_start_is_reported_before_the_close(&[]).await;
+}
+
+/// The same failure with the reason late: the session's loop has ended (its input is gone) but the
+/// error that says why is broadcast a second later. The connection must still deliver it before it
+/// closes — it waits for the session task to finish, not just for its input to drop. Flushing at the
+/// first sign raced the broadcast, and under load the client saw a bare close and no reason.
+#[tokio::test]
+async fn the_reason_reaches_the_client_even_when_it_is_broadcast_after_the_loop_ends() {
+    failed_start_is_reported_before_the_close(&[(
+        "BEYOND_AI_AGENT_TEST_SLOW_SESSION_END_MS",
+        "1000",
+    )])
+    .await;
+}
+
+/// The same failure with the connection late: the session fails and says why before this
+/// connection's output is even registered (its upgrade was answered while the session was starting).
+/// The reason is kept and handed to a connection that registers afterwards, so it is still told why.
+#[tokio::test]
+async fn the_reason_reaches_a_connection_that_registers_after_the_session_ended() {
+    failed_start_is_reported_before_the_close(&[("BEYOND_AI_AGENT_TEST_SLOW_ATTACH_MS", "1500")])
+        .await;
+}
+
+async fn failed_start_is_reported_before_the_close(env: &[(&str, &str)]) {
     let (base, _requests) = spawn_model_server(vec![]);
-    let svc = Service::start(&base, &["s1"]).await;
+    let svc = Service::start_with(
+        &base,
+        &["s1"],
+        Options {
+            env: env
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
+            ..Default::default()
+        },
+    )
+    .await;
 
     // Port 1 is not an exec endpoint. The upgrade still succeeds — it is answered once the session's
     // storage lock is held, before the body runs — so the client is attached to a session that is

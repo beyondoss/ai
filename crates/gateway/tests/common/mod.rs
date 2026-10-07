@@ -223,6 +223,7 @@ impl Nats {
     fn spawn_reaped(store_prefix: &str) -> Self {
         const WATCHDOG: &str = r#"nats-server -js -a 127.0.0.1 -p -1 --ports_file_dir "$2" -sd "$3" -n "$4" >/dev/null 2>&1 &
 server=$!
+echo "$server" > "$3/server.pid"
 while kill -0 "$1" 2>/dev/null && kill -0 "$server" 2>/dev/null; do sleep 1; done
 kill "$server" 2>/dev/null
 wait "$server" 2>/dev/null
@@ -259,7 +260,13 @@ rm -rf "$3""#;
         let ports = Self::ports_dir_of(&nats.store_dir);
         let deadline = std::time::Instant::now() + STARTUP_BUDGET;
         loop {
-            if let Some(port) = beyond_ai_test_support::ports::nats_port_from(&ports) {
+            // The server's own pid: the child itself, or — under the watchdog shell — the one it
+            // recorded.
+            let server_pid = std::fs::read_to_string(nats.store_dir.join("server.pid"))
+                .ok()
+                .and_then(|p| p.trim().parse().ok())
+                .unwrap_or_else(|| nats.child.id());
+            if let Some(port) = beyond_ai_test_support::ports::nats_port_from(&ports, server_pid) {
                 nats.port = port;
                 return nats;
             }

@@ -867,6 +867,21 @@ fn serve_streams_events_and_reattaches() {
 
 #[test]
 fn serve_survives_a_hard_crash_mid_run_with_both_round_trips_tool_use_already_durable() {
+    hard_crash_mid_second_round_trip(&[]);
+}
+
+/// The same crash with the checkpoint write held up (a slow disk, simulated: the window between "the
+/// agent asked for a checkpoint" and "it is on disk" held open for 1.5 s). The tool must still not
+/// start until its `tool_use` is on disk: the agent waits for the write, not merely for the
+/// checkpoint to be queued. A checkpoint that only queued the write let the tool run — and `tool_start`
+/// reach the client — first, and a crash then lost the record of the call; under load that window
+/// opened on its own.
+#[test]
+fn a_tool_does_not_start_before_its_tool_use_is_on_disk_even_on_a_slow_disk() {
+    hard_crash_mid_second_round_trip(&[("BEYOND_AI_AGENT_TEST_SLOW_CHECKPOINT_MS", "1500")]);
+}
+
+fn hard_crash_mid_second_round_trip(env: &[(&str, &str)]) {
     // A genuine crash (SIGKILL — no signal handler, no graceful drain, nothing like the SIGTERM path
     // above) partway through a *second* tool round-trip must still leave the *first* round-trip's
     // messages durable on disk: proof that incremental mid-run persistence (H-6), not the final
@@ -895,7 +910,9 @@ fn serve_survives_a_hard_crash_mid_run_with_both_round_trips_tool_use_already_du
     let (base, _bodies) = spawn_model_server(vec![turn1, turn2, turn_text("done")]);
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
 
-    let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
+    let mut child = serve_cmd(bin, &base, &session_file)
+        .envs(env.iter().copied())
+        .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = common::child_frames(&mut child);
     writeln!(stdin, "{}", json!({ "type": "prompt", "message": "go" })).unwrap();

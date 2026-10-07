@@ -114,11 +114,21 @@ fn require_proc_at(table: &Path) {
     );
 }
 
-/// The client port in the `<name>_<pid>.ports` file `nats-server --ports_file_dir <dir>` writes
-/// (`{"nats":["nats://127.0.0.1:4222"], ...}`), once it is there and complete. The server writes it
-/// after it is listening, so the port is then usable.
-pub fn nats_port_from(dir: &Path) -> Option<u16> {
-    let file = std::fs::read_dir(dir).ok()?.flatten().next()?.path();
+/// The client port `nats-server` process `pid` reported with `--ports_file_dir <dir>`: the
+/// `<name>_<pid>.ports` file (`{"nats":["nats://127.0.0.1:4222"], ...}`), once it is there and
+/// complete. The server writes it after it is listening, so the port is then usable. Matched by pid,
+/// not taken as whichever file is in the directory: a reused directory can hold an earlier server's
+/// file, naming a port that server has since let go.
+pub fn nats_port_from(dir: &Path, pid: u32) -> Option<u16> {
+    let suffix = format!("_{pid}.ports");
+    let file = std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| {
+            p.file_name()
+                .is_some_and(|n| n.to_string_lossy().ends_with(&suffix))
+        })?;
     let ports: serde_json::Value = serde_json::from_slice(&std::fs::read(file).ok()?).ok()?;
     ports["nats"][0].as_str()?.rsplit(':').next()?.parse().ok()
 }
@@ -178,6 +188,26 @@ mod tests {
         assert_eq!(ports.metrics, SocketAddr::V4(metrics));
         assert!(pick_gateway_ports(&[proxy]).is_none(), "metrics not up yet");
         assert!(pick_gateway_ports(&[metrics]).is_none(), "proxy not up yet");
+    }
+
+    /// A directory holding an earlier server's ports file gives the port of the server asked about,
+    /// never the stale one.
+    #[test]
+    fn the_ports_file_is_the_one_for_the_server_asked_about() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("nats-server_111.ports"),
+            r#"{"nats":["nats://127.0.0.1:4111"]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("nats-server_222.ports"),
+            r#"{"nats":["nats://127.0.0.1:4222"]}"#,
+        )
+        .unwrap();
+        assert_eq!(nats_port_from(dir.path(), 222), Some(4222));
+        assert_eq!(nats_port_from(dir.path(), 111), Some(4111));
+        assert_eq!(nats_port_from(dir.path(), 333), None, "not written yet");
     }
 
     /// Without a readable socket table the read-back fails at once, saying what is missing.
