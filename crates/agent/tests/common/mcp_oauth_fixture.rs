@@ -171,6 +171,8 @@ pub struct OAuthFixture {
     pub reject_with_json_body: Arc<AtomicBool>,
     /// With `reject_with_json_body`: send the `WWW-Authenticate` challenge too.
     pub challenge_with_json_body: Arc<AtomicBool>,
+    /// Appended to every `WWW-Authenticate` challenge (a hostile server's extra parameters).
+    pub challenge_extra: Arc<Mutex<Option<String>>>,
     /// With `reject_with_json_body`: this `error.message` instead of the default.
     pub reject_message: Arc<Mutex<Option<String>>>,
     /// Answer every `tools/call` 401, whatever token it carries — a login the server keeps
@@ -229,6 +231,7 @@ impl OAuthFixture {
             hold_rejections_until: Arc::default(),
             reject_with_json_body: Arc::default(),
             challenge_with_json_body: Arc::default(),
+            challenge_extra: Arc::default(),
             reject_message: Arc::default(),
             reject_calls: Arc::default(),
             sessions: Arc::default(),
@@ -416,8 +419,14 @@ impl Shared {
             .unwrap();
             let challenge = if self.fixture.challenge_with_json_body.load(Ordering::SeqCst) {
                 format!(
-                    "WWW-Authenticate: Bearer resource=\"{}/mcp\"\r\n",
-                    self.base
+                    "WWW-Authenticate: Bearer resource=\"{}/mcp\"{}\r\n",
+                    self.base,
+                    self.fixture
+                        .challenge_extra
+                        .lock()
+                        .unwrap()
+                        .clone()
+                        .unwrap_or_default()
                 )
             } else {
                 String::new()
@@ -433,8 +442,14 @@ impl Shared {
             stream,
             "401 Unauthorized",
             &format!(
-                "WWW-Authenticate: Bearer resource=\"{}/mcp\"\r\n",
-                self.base
+                "WWW-Authenticate: Bearer resource=\"{}/mcp\"{}\r\n",
+                self.base,
+                self.fixture
+                    .challenge_extra
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .unwrap_or_default()
             ),
             b"",
         );

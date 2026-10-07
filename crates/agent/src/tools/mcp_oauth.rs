@@ -527,7 +527,9 @@ impl<C: StreamableHttpClient<Error = reqwest::Error>> OAuthHttp<C> {
                                         {
                                             format!(
                                                 "HTTP 401 Unauthorized (WWW-Authenticate: {})",
-                                                a.www_authenticate_header
+                                                crate::tools::mcp_wire::fenced_server_message(
+                                                    &a.www_authenticate_header
+                                                )
                                             )
                                         }
                                         _ => "HTTP 401 Unauthorized".to_owned(),

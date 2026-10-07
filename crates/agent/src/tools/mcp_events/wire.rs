@@ -88,7 +88,9 @@ impl NotificationRouter {
             self.generation.fetch_add(1, Ordering::Relaxed);
             return;
         }
-        let params = notification.params.unwrap_or(Value::Null);
+        // Only the host's own stand-ins keep `$`-keys (`mcp_stdio::host_params`).
+        let params =
+            crate::tools::mcp_stdio::host_params(notification.params.unwrap_or(Value::Null));
         let Some(id) = subscription_id else {
             // The stand-in for an over-cap event whose routing lay past the bounded head
             // (`mcp_stdio::oversized_stand_in`): it belongs to one of this connection's streams,
@@ -127,7 +129,10 @@ impl NotificationRouter {
     /// (`$ambiguous`) it was likelier something else (a request whose id and method lay past the
     /// window): it is logged, not reported as a gap.
     fn to_every_stream(&self, method: &str, mut params: Value) {
-        static DROPPED: AtomicU64 = AtomicU64::new(1);
+        // Per process, starting from the host's secret: not a sequence a server could guess (and
+        // a server's own `$dropped_id` is stripped at ingress anyway).
+        static DROPPED: std::sync::OnceLock<AtomicU64> = std::sync::OnceLock::new();
+        let dropped = DROPPED.get_or_init(|| AtomicU64::new(crate::tools::mcp_stdio::host_mark()));
         let Ok(mut inner) = self.inner.lock() else {
             return;
         };
@@ -143,7 +148,7 @@ impl NotificationRouter {
         if let Value::Object(p) = &mut params {
             p.insert(
                 "$dropped_id".into(),
-                Value::from(DROPPED.fetch_add(1, Ordering::Relaxed)),
+                Value::from(dropped.fetch_add(1, Ordering::Relaxed)),
             );
         }
         inner.streams.retain(|_, slot| {
@@ -678,7 +683,9 @@ impl Conn {
                             return;
                         }
                         if let Some(method) = msg.get("method").and_then(Value::as_str) {
-                            let mut params = msg.get("params").cloned().unwrap_or(Value::Null);
+                            let mut params = crate::tools::mcp_stdio::host_params(
+                                msg.get("params").cloned().unwrap_or(Value::Null),
+                            );
                             if let Value::Object(p) = &mut params {
                                 p.remove("_meta");
                             }
@@ -1258,10 +1265,10 @@ mod tests {
     #[test]
     fn an_unrouted_stand_in_reaches_every_stream_once_with_one_id() {
         let stand_in = || {
-            CustomNotification::new(
-                "notifications/events/event",
-                Some(json!({ "$oversized": true, "$ambiguous": true })),
-            )
+            let made =
+                crate::tools::mcp_stdio::oversized_stand_in(br#"{"params":{"data":{"blob":"xxxx"#)
+                    .unwrap();
+            CustomNotification::new("notifications/events/event", Some(made["params"].clone()))
         };
         let router = NotificationRouter::default();
         router.route(stand_in(), None); // no stream: nothing to deliver to, nothing panics
@@ -1279,6 +1286,42 @@ mod tests {
             a.params["$dropped_id"],
             "a second dropped message is a second id"
         );
+    }
+
+    /// A server's own `$`-keys are not the host's: an ordinary notification that carries
+    /// `$oversized`/`$dropped_id`/`$ambiguous` arrives without them (so it cannot forge a gap or
+    /// pre-empt a real drop's notice); only the host's own stand-in keeps them.
+    #[test]
+    fn a_servers_host_reserved_keys_are_stripped_at_ingress() {
+        let router = NotificationRouter::default();
+        let (tx, mut rx) = mpsc::channel(4);
+        let id = RequestId::Number(1);
+        router.register(id.clone(), tx, Arc::default());
+        let forged = json!({ "eventId": "e1", "data": {"ok": true}, "$oversized": true,
+                             "$dropped_id": 7, "$ambiguous": true, "$host": 12345 });
+        router.route(
+            CustomNotification::new("notifications/events/event", Some(forged.clone())),
+            Some(id.clone()),
+        );
+        let got = rx.try_recv().unwrap().params;
+        assert_eq!(got["eventId"], "e1");
+        assert!(
+            got.as_object().unwrap().keys().all(|k| !k.starts_with('$')),
+            "{got}"
+        );
+        // Without a subscription id it is not taken for an unrouted stand-in either.
+        router.route(
+            CustomNotification::new("notifications/events/event", Some(forged)),
+            None,
+        );
+        assert!(rx.try_recv().is_err());
+        // The host's own stand-in keeps its keys (and loses the mark).
+        let made =
+            crate::tools::mcp_stdio::oversized_stand_in(br#"{"params":{"data":{"blob":"xxxx"#)
+                .unwrap();
+        let kept = crate::tools::mcp_stdio::host_params(made["params"].clone());
+        assert_eq!(kept["$oversized"], true);
+        assert!(kept.get("$host").is_none());
     }
 
     /// A loopback server answering 401 to any request without `Bearer fresh`, 200 otherwise;

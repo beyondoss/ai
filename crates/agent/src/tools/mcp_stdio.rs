@@ -440,6 +440,7 @@ pub(crate) fn oversized_stand_in(head: &[u8]) -> Option<Value> {
         }
     };
     params.insert("$oversized".into(), Value::Bool(true));
+    params.insert("$host".into(), Value::from(host_mark()));
     Some(json!({ "jsonrpc": "2.0", "method": method, "params": params }))
 }
 
@@ -492,6 +493,34 @@ fn params_members(head: &[u8], at: usize) -> (serde_json::Map<String, Value>, Op
             _ => return (kept, None),
         }
     }
+}
+
+/// A per-process secret the host stamps into the notifications it makes up itself (an over-cap
+/// event's stand-in, `$host`), so they can be told from a server's: a server never sees it, so its
+/// own `$`-keys cannot pass for the host's. Seeded from the OS's randomness (std's `RandomState`).
+pub(crate) fn host_mark() -> u64 {
+    use std::hash::{BuildHasher as _, Hasher as _};
+    static MARK: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MARK.get_or_init(|| {
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u64(0x6d63_705f_686f_7374);
+        h.finish()
+    })
+}
+
+/// A server notification's `params` with the host-reserved `$`-keys (`$oversized`, `$ambiguous`,
+/// `$dropped_id`, …) stripped — unless it is one the host made up itself (its `$host` is
+/// [`host_mark`]), which keeps them (`$host` itself is dropped either way). Applied wherever
+/// events notifications come in, so a server cannot forge a gap, or pre-empt the notice of a real
+/// drop, with keys of its own.
+pub(crate) fn host_params(mut params: Value) -> Value {
+    if let Value::Object(p) = &mut params {
+        let ours = p.remove("$host").and_then(|v| v.as_u64()) == Some(host_mark());
+        if !ours {
+            p.retain(|k, _| !k.starts_with('$'));
+        }
+    }
+    params
 }
 
 /// The index just past the JSON string opening at `buf[at]`, if it closes within `buf`.

@@ -1226,7 +1226,20 @@ fn tool_call_err(server: &str, remote: &str, e: &ServiceError) -> ToolError {
         _ => std::error::Error::source(e),
     };
     while let Some(c) = cause {
-        let more = c.to_string();
+        // A 401/403's challenge is the server's own header: fenced and cut short like any text a
+        // server supplies, not shown raw (rmcp's display of these errors prints it verbatim).
+        use rmcp::transport::streamable_http_client::{AuthRequiredError, InsufficientScopeError};
+        let fenced = crate::tools::mcp_wire::fenced_server_message;
+        let more = if let Some(a) = c.downcast_ref::<AuthRequiredError>() {
+            format!(
+                "authorization required: {}",
+                fenced(&a.www_authenticate_header)
+            )
+        } else if let Some(s) = c.downcast_ref::<InsufficientScopeError>() {
+            format!("insufficient scope: {}", fenced(&s.www_authenticate_header))
+        } else {
+            c.to_string()
+        };
         if !text.contains(&more) {
             text.push_str(": ");
             text.push_str(&more);
