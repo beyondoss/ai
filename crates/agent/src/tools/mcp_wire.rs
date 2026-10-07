@@ -29,7 +29,28 @@ use serde_json::Value;
 /// The `reqwest` client `rmcp`'s streamable-HTTP transport drives, with `skills/*` answered here so
 /// their results can be [rescued](crate::tools::mcp_stdio::rescue) before `rmcp` parses them.
 #[derive(Clone)]
-pub(crate) struct HttpClient(pub(crate) reqwest::Client);
+pub(crate) struct HttpClient {
+    pub(crate) client: reqwest::Client,
+    /// The server has an `agent mcp-login`: **every** POST is answered here
+    /// ([`HttpClient::post_bounded`]) rather than by rmcp's client, because rmcp turns a 401 whose
+    /// body is a JSON-RPC error into an ordinary error *response* — the status lost before
+    /// `mcp_oauth` could see it and refresh. Here any 401 is `AuthRequired`.
+    pub(crate) oauth: bool,
+}
+
+impl HttpClient {
+    #[cfg(test)]
+    pub(crate) fn new(client: reqwest::Client) -> Self {
+        Self {
+            client,
+            oauth: false,
+        }
+    }
+}
+
+/// The largest JSON body (or SSE event) a POST answered here for an OAuth server may be: the
+/// host's per-message cap, the same as the stdio transport's.
+const OAUTH_MAX_MESSAGE_BYTES: usize = crate::tools::mcp_stdio::DEFAULT_MAX_MESSAGE_BYTES;
 
 fn is_skills_request(message: &ClientJsonRpcMessage) -> bool {
     // The method is the one thing needed; serializing is how to read it without matching every
@@ -184,7 +205,7 @@ impl HttpClient {
         use futures::StreamExt as _;
         let Limit { max, over } = limit;
         let mut request = self
-            .0
+            .client
             .post(uri.as_ref())
             .header(http::header::ACCEPT, "text/event-stream, application/json");
         if let Some(token) = auth_header {
@@ -213,11 +234,13 @@ impl HttpClient {
             .get(http::header::WWW_AUTHENTICATE)
             .and_then(|v| v.to_str().ok())
             .map(str::to_string);
-        if status == reqwest::StatusCode::UNAUTHORIZED
-            && let Some(header) = &www_authenticate
-        {
+        // Any 401 — with or without a challenge, whatever its body — is the server refusing the
+        // credentials, decided here from the status before a body could be read as a response.
+        if status == reqwest::StatusCode::UNAUTHORIZED {
             return Err(StreamableHttpError::AuthRequired(
-                rmcp::transport::streamable_http_client::AuthRequiredError::new(header.clone()),
+                rmcp::transport::streamable_http_client::AuthRequiredError::new(
+                    www_authenticate.unwrap_or_default(),
+                ),
             ));
         }
         if status == reqwest::StatusCode::FORBIDDEN
@@ -238,6 +261,11 @@ impl HttpClient {
         }
         if status == reqwest::StatusCode::NOT_FOUND && session_was_attached {
             return Err(StreamableHttpError::SessionExpired);
+        }
+        let is_request = matches!(message, ClientJsonRpcMessage::Request(_));
+        // As rmcp's client: an empty success for a notification or a reply is an acceptance.
+        if status.is_success() && !is_request && response.content_length() == Some(0) {
+            return Ok(StreamableHttpPostResponse::Accepted);
         }
         let session = response
             .headers()
@@ -328,6 +356,18 @@ impl HttpClient {
         let parsed = serde_json::from_str::<Value>(&body).ok();
         let Some(value) = parsed.filter(|v| v.get("result").is_some() || v.get("error").is_some())
         else {
+            // As rmcp's client: a success that is not a JSON-RPC message, for anything but a
+            // request, is an acceptance; a 4xx to `server/discover` is the legacy server's way of
+            // saying it has none.
+            if status.is_success() && !is_request {
+                return Ok(StreamableHttpPostResponse::Accepted);
+            }
+            if status.is_client_error() && !session_was_attached && is_discover(&message) {
+                return Ok(StreamableHttpPostResponse::Json(
+                    discover_rejected(&message, status, &body)?,
+                    None,
+                ));
+            }
             return Err(StreamableHttpError::UnexpectedServerResponse(Cow::Owned(
                 format!("HTTP {status}: {body}"),
             )));
@@ -335,6 +375,35 @@ impl HttpClient {
         let message: ServerJsonRpcMessage = serde_json::from_value(value)?;
         Ok(StreamableHttpPostResponse::Json(message, session))
     }
+}
+
+fn is_discover(message: &ClientJsonRpcMessage) -> bool {
+    matches!(
+        message,
+        ClientJsonRpcMessage::Request(r)
+            if matches!(r.request, rmcp::model::ClientRequest::DiscoverRequest(_))
+    )
+}
+
+/// rmcp's answer to a legacy server's 4xx for `server/discover`: an `invalid_request` error for its
+/// id, which sends the handshake on to `initialize`.
+fn discover_rejected(
+    message: &ClientJsonRpcMessage,
+    status: reqwest::StatusCode,
+    body: &str,
+) -> Result<ServerJsonRpcMessage, serde_json::Error> {
+    let id = serde_json::to_value(message)?
+        .get("id")
+        .cloned()
+        .unwrap_or(Value::Null);
+    serde_json::from_value(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": -32600,
+            "message": format!("server/discover rejected with HTTP {status}: {body}"),
+        },
+    }))
 }
 
 /// The `scope=` parameter of a `WWW-Authenticate` value, quoted or not.
@@ -363,7 +432,7 @@ impl StreamableHttpClient for HttpClient {
         auth_header: Option<String>,
         custom_headers: HashMap<HeaderName, HeaderValue>,
     ) -> Result<StreamableHttpPostResponse, StreamableHttpError<Self::Error>> {
-        if is_skills_request(&message) {
+        if self.oauth || is_skills_request(&message) {
             return self
                 .post_bounded(
                     uri,
@@ -372,13 +441,17 @@ impl StreamableHttpClient for HttpClient {
                     auth_header,
                     custom_headers,
                     Limit {
-                        max: DEFAULT_MAX_SKILLS_EVENT,
+                        max: if self.oauth {
+                            OAUTH_MAX_MESSAGE_BYTES
+                        } else {
+                            DEFAULT_MAX_SKILLS_EVENT
+                        },
                         over: OverLimit::Fail,
                     },
                 )
                 .await;
         }
-        self.0
+        self.client
             .post_message(uri, message, session_id, auth_header, custom_headers)
             .await
     }
@@ -392,7 +465,7 @@ impl StreamableHttpClient for HttpClient {
         custom_headers: HashMap<HeaderName, HeaderValue>,
         max_sse_event_size: usize,
     ) -> Result<StreamableHttpPostResponse, StreamableHttpError<Self::Error>> {
-        if is_skills_request(&message) {
+        if self.oauth || is_skills_request(&message) {
             return self
                 .post_bounded(
                     uri,
@@ -401,13 +474,17 @@ impl StreamableHttpClient for HttpClient {
                     auth_header,
                     custom_headers,
                     Limit {
-                        max: max_sse_event_size,
+                        max: if self.oauth {
+                            OAUTH_MAX_MESSAGE_BYTES.max(max_sse_event_size)
+                        } else {
+                            max_sse_event_size
+                        },
                         over: OverLimit::Fail,
                     },
                 )
                 .await;
         }
-        self.0
+        self.client
             .post_message_with_max_sse_event_size(
                 uri,
                 message,
@@ -426,7 +503,7 @@ impl StreamableHttpClient for HttpClient {
         auth_header: Option<String>,
         custom_headers: HashMap<HeaderName, HeaderValue>,
     ) -> Result<(), StreamableHttpError<Self::Error>> {
-        self.0
+        self.client
             .delete_session(uri, session_id, auth_header, custom_headers)
             .await
     }
@@ -442,7 +519,7 @@ impl StreamableHttpClient for HttpClient {
         BoxStream<'static, Result<sse_stream::Sse, SseError>>,
         StreamableHttpError<Self::Error>,
     > {
-        self.0
+        self.client
             .get_stream(uri, session_id, last_event_id, auth_header, custom_headers)
             .await
     }
@@ -459,7 +536,7 @@ impl StreamableHttpClient for HttpClient {
         BoxStream<'static, Result<sse_stream::Sse, SseError>>,
         StreamableHttpError<Self::Error>,
     > {
-        self.0
+        self.client
             .get_stream_with_max_sse_event_size(
                 uri,
                 session_id,
@@ -547,7 +624,7 @@ mod tests {
 
     async fn post(url: &str, session: Option<&str>) -> Result<StreamableHttpPostResponse, String> {
         agent_core::ensure_provider();
-        HttpClient(reqwest::Client::new())
+        HttpClient::new(reqwest::Client::new())
             .post_message(
                 url.into(),
                 skills_list(),
@@ -640,7 +717,7 @@ mod tests {
             HeaderName::from_static("mcp-session-id"),
             HeaderValue::from_static("forged"),
         );
-        let e = HttpClient(reqwest::Client::new())
+        let e = HttpClient::new(reqwest::Client::new())
             .post_message(
                 "http://127.0.0.1:9/mcp".into(),
                 skills_list(),
@@ -693,7 +770,7 @@ mod tests {
             false,
         )
         .await;
-        let e = HttpClient(reqwest::Client::new())
+        let e = HttpClient::new(reqwest::Client::new())
             .post_message_with_max_sse_event_size(
                 url.into(),
                 skills_list(),

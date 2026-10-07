@@ -15,16 +15,22 @@
 //!   authorization server that rotates refresh tokens: a second refresh with the spent one would
 //!   fail).
 //! - **One rule for what triggers it:** any 401 from a server with a login — with or without a
-//!   `WWW-Authenticate` challenge, on rmcp's path ([`OAuthHttp`]) and on the direct `events/*` path
-//!   alike. A 403 (`InsufficientScope`) never does: a refresh does not widen scopes.
+//!   `WWW-Authenticate` challenge, whatever its body — on rmcp's path ([`OAuthHttp`]) and on the
+//!   direct `events/*` path alike. For a server with a login every POST is answered by
+//!   `mcp_wire::HttpClient::post_bounded`, which decides from the status (rmcp's own client would
+//!   read a 401 carrying a JSON-RPC error body as an ordinary error response). A 403
+//!   (`InsufficientScope`) never refreshes: a refresh does not widen scopes.
 //! - [`OAuthHttp`] applies that to every request rmcp's streamable-HTTP transport makes —
 //!   `tools/call`, `resources/*`, `prompts/*`, `skills/*`, MCP App view reads, the handshake, the
 //!   standalone SSE stream — retrying each **once**.
 //! - **A failed refresh** is remembered so the authorization server is not asked again on every
-//!   request: a *definitive* one (the refresh token was rejected — `invalid_grant` — or there is
-//!   none) for good, with an error naming `agent mcp-login <server>`; a *transient* one (the
-//!   authorization server unreachable, a 5xx) only for a backoff — 30 s, doubling to 5 min — after
-//!   which a rejection refreshes again.
+//!   request: a *definitive* one for good, with an error naming `agent mcp-login <server>` — any
+//!   RFC 6749 §5.2 error from the token endpoint (`invalid_grant`, `invalid_client`,
+//!   `unauthorized_client`, `unsupported_grant_type`, `invalid_scope`, `invalid_request`), a token
+//!   endpoint that is not there (404/405/410), or no refresh token — read from the endpoint's own
+//!   answer ([`RecordingOAuthHttp`]); a *transient* one (the authorization server unreachable, a
+//!   5xx, a 429) only for a backoff — 30 s, doubling to 5 min — after which a rejection refreshes
+//!   again. A reload clears a remembered failure only when the stored token actually changed.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -70,9 +76,10 @@ impl RefreshError {
     fn from_auth(e: rmcp::transport::auth::AuthError) -> Self {
         use rmcp::transport::auth::AuthError;
         match e {
-            AuthError::TokenRefreshRejected(_) | AuthError::AuthorizationRequired => {
-                Self::definitive(e.to_string())
-            }
+            AuthError::TokenRefreshRejected(_)
+            | AuthError::AuthorizationRequired
+            | AuthError::InvalidScope(_)
+            | AuthError::NoAuthorizationSupport => Self::definitive(e.to_string()),
             other => Self::transient(other.to_string()),
         }
     }
@@ -277,14 +284,17 @@ async fn stored_token(name: &str, url: &str) -> Option<String> {
     }
 }
 
-/// An `AuthorizationManager` for `name` at `url`, restored from the `mcp-login` store.
-async fn manager(
+/// An `AuthorizationManager` for `name` at `url`, restored from the `mcp-login` store, whose OAuth
+/// HTTP goes through `http` (see [`RecordingOAuthHttp`]).
+async fn manager_with(
     name: &str,
     url: &str,
+    http: Arc<RecordingOAuthHttp>,
 ) -> Result<rmcp::transport::auth::AuthorizationManager, RefreshError> {
-    let mut manager = rmcp::transport::auth::AuthorizationManager::new(url)
-        .await
-        .map_err(RefreshError::from_auth)?;
+    let mut manager =
+        rmcp::transport::auth::AuthorizationManager::new_with_oauth_http_client(url, http)
+            .await
+            .map_err(RefreshError::from_auth)?;
     manager.set_credential_store(crate::mcp_auth_store::McpAuthStore::open_default().scoped(name));
     match manager.initialize_from_store().await {
         Ok(true) => Ok(manager),
@@ -293,20 +303,165 @@ async fn manager(
     }
 }
 
+async fn manager(
+    name: &str,
+    url: &str,
+) -> Result<rmcp::transport::auth::AuthorizationManager, RefreshError> {
+    manager_with(name, url, Arc::new(RecordingOAuthHttp::new()?)).await
+}
+
 /// Refresh `name`'s token regardless of its recorded expiry (the server just rejected it), and
-/// persist it. Returns the new access token.
+/// persist it. Returns the new access token. A failure is classified from what the token endpoint
+/// actually answered (see [`classify_token_response`]), not from rmcp's error text.
 async fn refresh(name: &str, url: &str) -> Result<String, RefreshError> {
-    let response = manager(name, url)
-        .await?
-        .refresh_token()
-        .await
-        .map_err(RefreshError::from_auth)?;
+    let http = Arc::new(RecordingOAuthHttp::new()?);
+    let manager = manager_with(name, url, http.clone()).await?;
+    let response = match manager.refresh_token().await {
+        Ok(response) => response,
+        Err(e) => {
+            let seen = http.token_response();
+            return Err(seen
+                .and_then(|(status, body)| classify_token_response(status, &body))
+                .unwrap_or_else(|| RefreshError::from_auth(e)));
+        }
+    };
     // `OAuthTokenResponse`'s accessor trait lives in `oauth2`, which this crate does not name;
     // its serialized form is the RFC 6749 token response.
     serde_json::to_value(&response)
         .ok()
         .and_then(|v| v.get("access_token")?.as_str().map(str::to_owned))
         .ok_or_else(|| RefreshError::transient("the token response carried no access_token"))
+}
+
+/// The RFC 6749 §5.2 error codes: every one says the request itself is wrong for this client —
+/// the grant revoked (`invalid_grant`), the client unknown or not allowed the grant
+/// (`invalid_client`, `unauthorized_client`), the grant type or scope refused
+/// (`unsupported_grant_type`, `invalid_scope`), the request malformed (`invalid_request`). None of
+/// them goes away by asking again; only a new `agent mcp-login` can.
+const DEFINITIVE_OAUTH_ERRORS: [&str; 6] = [
+    "invalid_request",
+    "invalid_client",
+    "invalid_grant",
+    "unauthorized_client",
+    "unsupported_grant_type",
+    "invalid_scope",
+];
+
+/// A refresh failure's class from the token endpoint's answer (`None`: nothing decisive in it,
+/// leave it to rmcp's error): an RFC 6749 §5.2 error code is definitive, as is a token endpoint
+/// that is not there (404/405/410 — the server has no refresh endpoint). Anything else — a 5xx, a
+/// 429, a body that is not an OAuth error — is transient.
+fn classify_token_response(status: u16, body: &[u8]) -> Option<RefreshError> {
+    let code = serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("error")?.as_str().map(str::to_owned));
+    if let Some(code) = code.filter(|c| DEFINITIVE_OAUTH_ERRORS.contains(&c.as_str())) {
+        return Some(RefreshError::definitive(format!(
+            "the authorization server refused the refresh: {code}"
+        )));
+    }
+    if matches!(status, 404 | 405 | 410) {
+        return Some(RefreshError::definitive(format!(
+            "the authorization server has no token endpoint to refresh at (HTTP {status})"
+        )));
+    }
+    (status >= 400)
+        .then(|| RefreshError::transient(format!("the token endpoint answered HTTP {status}")))
+}
+
+/// rmcp's OAuth HTTP, done the same way (redirects as each request asks, its timeout, a 1 MiB body
+/// cap), that also keeps the token endpoint's answer to a `refresh_token` grant: rmcp's own error
+/// for a failed refresh keeps neither the status nor the RFC 6749 error code, and the difference
+/// between "try again later" and "log in again" is in exactly those.
+struct RecordingOAuthHttp {
+    follow: reqwest::Client,
+    stop: reqwest::Client,
+    /// The last `refresh_token` grant's response: status and body.
+    token_response: Mutex<Option<(u16, Vec<u8>)>>,
+}
+
+/// The most an OAuth response body may be (rmcp's own cap).
+const MAX_OAUTH_BODY: usize = 1024 * 1024;
+
+impl RecordingOAuthHttp {
+    fn new() -> Result<Self, RefreshError> {
+        let build = |policy| {
+            reqwest::Client::builder()
+                .redirect(policy)
+                .build()
+                .map_err(|e| RefreshError::transient(e.to_string()))
+        };
+        Ok(Self {
+            follow: build(reqwest::redirect::Policy::default())?,
+            stop: build(reqwest::redirect::Policy::none())?,
+            token_response: Mutex::new(None),
+        })
+    }
+
+    fn token_response(&self) -> Option<(u16, Vec<u8>)> {
+        self.token_response
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+}
+
+impl rmcp::transport::auth::OAuthHttpClient for RecordingOAuthHttp {
+    fn execute(
+        &self,
+        request: rmcp::transport::auth::OAuthHttpRequest,
+    ) -> rmcp::transport::auth::OAuthHttpClientFuture<'_> {
+        use futures::StreamExt as _;
+        use rmcp::transport::auth::{OAuthHttpClientError, OAuthHttpRedirectPolicy};
+        Box::pin(async move {
+            let rmcp::transport::auth::OAuthHttpRequest {
+                request,
+                redirect_policy,
+                timeout,
+                ..
+            } = request;
+            let refresh_grant = request.method() == http::Method::POST
+                && String::from_utf8_lossy(request.body()).contains("grant_type=refresh_token");
+            let client = match redirect_policy {
+                OAuthHttpRedirectPolicy::Stop => &self.stop,
+                _ => &self.follow,
+            };
+            let mut request = reqwest::Request::try_from(request)
+                .map_err(|e| Box::new(e) as OAuthHttpClientError)?;
+            *request.timeout_mut() = timeout;
+            let response = client
+                .execute(request)
+                .await
+                .map_err(|e| Box::new(e) as OAuthHttpClientError)?;
+            let mut builder = http::Response::builder()
+                .status(response.status())
+                .version(response.version());
+            for (name, value) in response.headers() {
+                builder = builder.header(name, value);
+            }
+            let status = response.status().as_u16();
+            let mut body = Vec::new();
+            let mut chunks = response.bytes_stream();
+            while let Some(chunk) = chunks.next().await {
+                let chunk = chunk.map_err(|e| Box::new(e) as OAuthHttpClientError)?;
+                if chunk.len() > MAX_OAUTH_BODY - body.len() {
+                    return Err(Box::<dyn std::error::Error + Send + Sync>::from(format!(
+                        "OAuth HTTP response body exceeds {MAX_OAUTH_BODY} bytes"
+                    )));
+                }
+                body.extend_from_slice(&chunk);
+            }
+            if refresh_grant {
+                *self
+                    .token_response
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = Some((status, body.clone()));
+            }
+            builder
+                .body(body)
+                .map_err(|e| Box::new(e) as OAuthHttpClientError)
+        })
+    }
 }
 
 /// Whether an error from the streamable-HTTP client is the server's 401 — with or without a
@@ -633,6 +788,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_reload_clears_a_remembered_definitive_failure_only_when_the_stored_token_changed() {
+        let refreshes = Arc::new(AtomicU32::new(0));
+        let counter = refreshes.clone();
+        let mut auth = ServerAuth::fake("old", move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Err(RefreshError::definitive("invalid_grant"))
+        });
+        let store = Arc::new(Mutex::new("old".to_owned()));
+        let read = store.clone();
+        Arc::get_mut(&mut auth).unwrap().fake_stored =
+            Some(Arc::new(move || Some(read.lock().unwrap().clone())));
+
+        auth.after_rejection(Some("old")).await.unwrap_err();
+        assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+        // A redial that reloads the *same* token: the refusal still stands, no new refresh.
+        auth.reload().await;
+        let e = auth.after_rejection(Some("old")).await.unwrap_err();
+        assert!(e.contains("agent mcp-login"), "{e}");
+        assert_eq!(
+            refreshes.load(Ordering::SeqCst),
+            1,
+            "an unchanged token must not clear a definitive failure"
+        );
+
+        // A new login put a different token in the store: the old refusal no longer applies.
+        *store.lock().unwrap() = "relogged".into();
+        auth.reload().await;
+        assert_eq!(auth.token().await.as_deref(), Some("relogged"));
+        auth.after_rejection(Some("relogged")).await.unwrap_err();
+        assert_eq!(refreshes.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn the_token_endpoints_answer_classifies_a_refresh_failure() {
+        let definitive = |status, body: &str| {
+            classify_token_response(status, body.as_bytes()).map(|e| e.definitive)
+        };
+        for code in DEFINITIVE_OAUTH_ERRORS {
+            let body = format!(r#"{{"error":"{code}","error_description":"x"}}"#);
+            assert_eq!(definitive(400, &body), Some(true), "{code}");
+        }
+        assert_eq!(definitive(401, r#"{"error":"invalid_client"}"#), Some(true));
+        for missing in [404, 405, 410] {
+            assert_eq!(definitive(missing, "<html>"), Some(true), "{missing}");
+        }
+        for transient in [500, 502, 503, 429] {
+            assert_eq!(definitive(transient, ""), Some(false), "{transient}");
+        }
+        // A server error code that is not one of RFC 6749's is not taken as permanent.
+        assert_eq!(
+            definitive(503, r#"{"error":"temporarily_unavailable"}"#),
+            Some(false)
+        );
+        assert_eq!(definitive(200, "{}"), None);
+    }
+
+    #[tokio::test]
     async fn a_reload_that_reads_nothing_keeps_the_token_held() {
         let mut auth = ServerAuth::fake("fresh", || Ok("unused".into()));
         Arc::get_mut(&mut auth).unwrap().fake_stored = Some(Arc::new(|| None));
@@ -671,8 +883,16 @@ mod tests {
                             body.len()
                         )
                     } else {
+                        let body = extra.split_once("\r\n\r\n").map_or("", |(_, body)| body);
+                        let headers = extra.split_once("\r\n\r\n").map_or(extra, |(h, _)| h);
+                        let headers = if headers.is_empty() || headers.ends_with("\r\n") {
+                            headers.to_owned()
+                        } else {
+                            format!("{headers}\r\n")
+                        };
                         format!(
-                            "HTTP/1.1 {status}\r\n{extra}Content-Length: 0\r\nConnection: close\r\n\r\n"
+                            "HTTP/1.1 {status}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
                         )
                     };
                     let _ = stream.write_all(reply.as_bytes()).await;
@@ -682,12 +902,14 @@ mod tests {
         (url, seen)
     }
 
+    /// The client stack `connect_http` builds for a server with a login.
     fn client(auth: Arc<ServerAuth>) -> OAuthHttp<crate::tools::mcp_view_http::ViewCappedHttp> {
         agent_core::ensure_provider();
         OAuthHttp::new(
-            crate::tools::mcp_view_http::ViewCappedHttp::new(crate::tools::mcp_wire::HttpClient(
-                reqwest::Client::new(),
-            )),
+            crate::tools::mcp_view_http::ViewCappedHttp::new(crate::tools::mcp_wire::HttpClient {
+                client: reqwest::Client::new(),
+                oauth: true,
+            }),
             Some(auth),
         )
     }
@@ -711,6 +933,32 @@ mod tests {
         assert!(
             matches!(response, StreamableHttpPostResponse::Json(..)),
             "{response:?}"
+        );
+        assert_eq!(*seen.lock().unwrap(), ["bearer stale", "bearer fresh"]);
+    }
+
+    #[tokio::test]
+    async fn a_401_whose_body_is_a_json_rpc_error_still_refreshes_and_retries() {
+        // rmcp's own client reads this body as an ordinary error *response* (the 401 lost), so
+        // the transport path would not refresh where the events path does. Decided by status.
+        let (url, seen) = endpoint(
+            "401 Unauthorized",
+            "Content-Type: application/json\r\n\r\n\
+             {\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32001,\"message\":\"token expired\"}}",
+        )
+        .await;
+        let auth = ServerAuth::fake("stale", || Ok("fresh".into()));
+        let response = client(auth)
+            .post_message(url.into(), tools_list(), None, None, HashMap::new())
+            .await
+            .unwrap();
+        let StreamableHttpPostResponse::Json(msg, _) = response else {
+            panic!("the retried request's result is answered as JSON");
+        };
+        let v = serde_json::to_value(&msg).unwrap();
+        assert!(
+            v["result"]["tools"].is_array(),
+            "the retry's result, not the 401's error: {v}"
         );
         assert_eq!(*seen.lock().unwrap(), ["bearer stale", "bearer fresh"]);
     }

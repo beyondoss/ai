@@ -175,6 +175,49 @@ fn a_refresh_that_fails_names_mcp_login_and_is_not_retried() {
     );
 }
 
+/// A refresh the token endpoint answers with `(status, body)`: the call fails naming `agent
+/// mcp-login` — a permanent refusal, not something to back off and retry — and the endpoint is
+/// asked exactly once for the rejected token.
+fn a_permanent_refresh_refusal(status: &str, body: Value) {
+    let (home, fixture) = logged_in();
+    fixture.revoke_after_calls.store(1, Ordering::SeqCst);
+    *fixture.refresh_reply.lock().unwrap() = Some((status.to_owned(), body.to_string()));
+    let bodies = run(
+        home.path(),
+        vec![
+            echo("toolu_1", "first-call"),
+            echo("toolu_2", "after-revocation"),
+            turn_text("done"),
+        ],
+    );
+    let results = tool_results(&bodies[2]);
+    let (_, text, is_error) = results.iter().find(|(i, ..)| i == "toolu_2").unwrap();
+    assert!(
+        *is_error && text.contains("agent mcp-login protected"),
+        "{status} {body}: a permanent refusal must tell the user to log in again: {text}"
+    );
+    assert_eq!(fixture.refresh_grants.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn every_rfc_6749_refusal_is_definitive_and_names_mcp_login() {
+    // RFC 6749 §5.2's codes (`invalid_grant` is the test above); `invalid_client` comes as a 401.
+    for (status, code) in [
+        ("401 Unauthorized", "invalid_client"),
+        ("400 Bad Request", "unauthorized_client"),
+        ("400 Bad Request", "unsupported_grant_type"),
+        ("400 Bad Request", "invalid_scope"),
+        ("400 Bad Request", "invalid_request"),
+    ] {
+        a_permanent_refresh_refusal(status, json!({ "error": code }));
+    }
+}
+
+#[test]
+fn a_token_endpoint_that_is_not_there_is_definitive_and_names_mcp_login() {
+    a_permanent_refresh_refusal("404 Not Found", json!({ "message": "no such route" }));
+}
+
 #[test]
 fn concurrent_rejections_refresh_once() {
     let (home, fixture) = logged_in();
