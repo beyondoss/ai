@@ -63,6 +63,12 @@ async fn within(limit: Duration, mut f: impl FnMut() -> bool) -> bool {
     f()
 }
 
+/// `base` made unique to this test process, so concurrent runs of this suite (or of the whole
+/// test tree) never count one another's fixture processes.
+fn unique_tag(base: &str) -> String {
+    format!("{base}-{}", std::process::id())
+}
+
 /// A fixture server tagged so only this test counts its own processes.
 fn fixture_config(tag: &str) -> McpServerConfig {
     McpServerConfig {
@@ -81,7 +87,7 @@ fn fixture_config(tag: &str) -> McpServerConfig {
 /// it back and still works. Reaping without a working reconnect would just be breakage.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_idle_server_is_reaped_and_reconnects_on_the_next_call() {
-    let tag = "reap-idle-abc123";
+    let tag = &unique_tag("reap-idle-abc123");
     assert_eq!(fixture_processes(tag), 0, "tag must start unused");
 
     // A one-second window: the production default is minutes, which no test can wait out.
@@ -136,7 +142,7 @@ async fn an_idle_server_is_reaped_and_reconnects_on_the_next_call() {
 /// silently becomes "0 means reap instantly".
 #[tokio::test(flavor = "multi_thread")]
 async fn a_zero_window_keeps_the_server_resident() {
-    let tag = "reap-zero-def456";
+    let tag = &unique_tag("reap-zero-def456");
     assert_eq!(fixture_processes(tag), 0, "tag must start unused");
     let (tools, _catalog, warnings) =
         mcp::connect_all(&[fixture_config(tag)], Duration::ZERO, None).await;
@@ -164,7 +170,7 @@ async fn a_zero_window_keeps_the_server_resident() {
 /// Asserted on process count, because a cache that still spawns is just reaping with extra steps.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_cached_manifest_advertises_tools_without_starting_the_server() {
-    let tag = "reap-manifest-ghi789";
+    let tag = &unique_tag("reap-manifest-ghi789");
     let dir = std::env::temp_dir().join(format!("mcp-manifest-test-{tag}"));
     let _ = std::fs::remove_dir_all(&dir);
     let manifest = beyond_ai_agent::tools::mcp_manifest::ManifestDir::at(&dir);
@@ -248,7 +254,7 @@ fn alive(pid: u32) -> bool {
 /// than none, because the next call starts a second browser beside the first.
 #[tokio::test(flavor = "multi_thread")]
 async fn reaping_sweeps_a_grandchild_the_server_forked_away() {
-    let tag = "reap-orphan-jkl012";
+    let tag = &unique_tag("reap-orphan-jkl012");
     let pidfile = std::env::temp_dir().join(format!("mcp-orphan-{tag}.pid"));
     let _ = std::fs::remove_file(&pidfile);
 

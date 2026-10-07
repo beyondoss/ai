@@ -2798,13 +2798,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             manager.set_metadata(resolution.metadata);
 
             // Dynamic client registration means we choose our own redirect URI (unlike `agent
-            // login`'s providers, each registered in advance against a fixed port) — pick a free
-            // local one, same small "check then reuse" window `agent trust`-adjacent tooling already
-            // accepts elsewhere in this codebase for a one-shot interactive command.
-            let port = std::net::TcpListener::bind("127.0.0.1:0")
-                .and_then(|l| l.local_addr())
-                .map_err(|e| format!("failed to allocate a local OAuth callback port: {e}"))?
-                .port();
+            // login`'s providers, each registered in advance against a fixed port). The callback
+            // listener is bound first, on a port the kernel picks, and the URI names the port it got:
+            // picking a free port, releasing it and binding it later let another process take it in
+            // between, and the login then failed before printing its URL.
+            let listener =
+                beyond_ai_agent::oauth::callback_server::CallbackServer::bind("127.0.0.1", 0)
+                    .map_err(|e| {
+                        format!("failed to bind the local OAuth callback listener: {e}")
+                    })?;
+            let port = listener.port();
             let redirect_uri = format!("http://127.0.0.1:{port}/callback");
 
             // rmcp 3.x folds scopes + client name into `AuthorizationRequest`; empty scopes
@@ -2826,11 +2829,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 })
                 .ok_or("the generated authorization URL is missing its `state` parameter")?;
 
-            let listener =
-                beyond_ai_agent::oauth::callback_server::CallbackServer::bind("127.0.0.1", port)
-                    .map_err(|e| {
-                        format!("failed to bind the local OAuth callback listener: {e}")
-                    })?;
             eprintln!("Open this URL in a browser to continue:\n\n  {auth_url}\n");
             let cancel = agent_core::CancellationToken::new();
             let code = listener

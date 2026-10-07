@@ -287,3 +287,41 @@ fn only_child_frames_touches_a_childs_stdout() {
         "the suites read through child_frames ({readers})"
     );
 }
+
+/// No agent test picks a port, releases it, and hands it to a child: every child binds its own (port
+/// 0, read back), is handed a socket the test holds (`HeldPort`), or is pointed at one the test holds
+/// bound (`DeadPort`). The released-port helper is gone; this keeps the pattern from coming back.
+#[test]
+fn no_test_picks_a_port_and_releases_it() {
+    let tests = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+    let mut files = Vec::new();
+    let mut dirs = vec![tests];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else if path.extension().is_some_and(|e| e == "rs")
+                && !path.ends_with("serve_harness_deadlines.rs")
+            {
+                files.push(path);
+            }
+        }
+    }
+    let found: Vec<String> = files
+        .iter()
+        .filter(|path| {
+            let code: String = std::fs::read_to_string(path)
+                .unwrap()
+                .lines()
+                .map(|line| line.split("//").next().unwrap_or(""))
+                .collect();
+            code.contains("free_port(")
+        })
+        .map(|path| path.display().to_string())
+        .collect();
+    assert!(
+        found.is_empty(),
+        "a released port handed to a child: {found:?}"
+    );
+}

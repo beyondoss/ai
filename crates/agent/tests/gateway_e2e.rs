@@ -17,8 +17,8 @@ mod common;
 use std::process::{Command, Stdio};
 
 use common::{
-    DEV_PUBKEY_B64, DEV_TOKEN, SpawnGuarded, free_port, gateway_bin, spawn_model_server, turn_text,
-    turn_tool_use, unused_nats_port, wait_for_allowance_ready, wait_for_port,
+    DEV_PUBKEY_B64, DEV_TOKEN, GATEWAY_LISTENERS, gateway_bin, shared_nats_port, spawn_gateway,
+    spawn_model_server, turn_text, turn_tool_use, wait_for_allowance_ready,
 };
 use serde_json::json;
 
@@ -35,12 +35,9 @@ fn agent_through_real_gateway_to_mock_upstream() {
     let mock_authority = mock_base.strip_prefix("http://").unwrap().to_string();
 
     // Gateway config: Anthropic provider → the mock (plaintext), pool key to swap in, dev signing key.
-    let gw_port = free_port();
-    let metrics_port = free_port();
-    let nats_port = unused_nats_port();
+    let nats_port = shared_nats_port();
     let config = format!(
-        "listen = \"127.0.0.1:{gw_port}\"\n\
-         metrics_listen = \"127.0.0.1:{metrics_port}\"\n\
+        "{GATEWAY_LISTENERS}\
          nats_url = \"nats://127.0.0.1:{nats_port}\"\n\
          config_bucket = \"ai-gateway\"\n\
          upstream_tls = false\n\
@@ -53,16 +50,17 @@ fn agent_through_real_gateway_to_mock_upstream() {
     std::fs::write(&config_path, config).unwrap();
 
     // Boot the real gateway binary.
-    let mut gateway = Command::new(gateway_bin())
-        .arg("run")
-        .arg("-c")
-        .arg(&config_path)
-        .env("AI_LOG", "warn")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn_guarded();
-    wait_for_port(gw_port);
-    wait_for_allowance_ready(metrics_port);
+    let (mut gateway, ports) = spawn_gateway(
+        Command::new(gateway_bin())
+            .arg("run")
+            .arg("-c")
+            .arg(&config_path)
+            .env("AI_LOG", "warn")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    );
+    let gw_port = ports.proxy;
+    wait_for_allowance_ready(ports.metrics);
 
     // Drive the agent through the gateway.
     let output = Command::new(env!("CARGO_BIN_EXE_beyond-ai-agent"))

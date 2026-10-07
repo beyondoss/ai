@@ -41,6 +41,16 @@ impl CallbackServer {
         })
     }
 
+    /// The port actually bound — the kernel's choice when [`Self::bind`] was given port `0`, which is
+    /// how a caller that picks its own redirect URI (MCP OAuth's dynamic registration) gets a port no
+    /// other process can take before the listener is on it.
+    pub fn port(&self) -> u16 {
+        self.server
+            .server_addr()
+            .to_ip()
+            .map_or(0, |addr| addr.port())
+    }
+
     /// Waits for exactly one request on `expected_path` whose `state` query param equals
     /// `expected_state` and which carries a `code`. A request that's on the wrong path, missing
     /// `code`/`state`, carries an `error` param, or has a mismatched `state` gets an HTML error page
@@ -193,18 +203,20 @@ fn respond(request: tiny_http::Request, success: bool) {
 mod tests {
     use super::*;
 
-    fn free_port() -> u16 {
-        std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port()
+    /// Port `0` binds a port the kernel picks, and [`CallbackServer::port`] says which: the listener is
+    /// on it from the start, and a callback sent there arrives.
+    #[tokio::test]
+    async fn port_zero_binds_a_real_port_and_reports_it() {
+        let server = CallbackServer::bind("127.0.0.1", 0).unwrap();
+        let port = server.port();
+        assert_ne!(port, 0);
+        assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_ok());
     }
 
     #[tokio::test]
     async fn a_matching_callback_resolves_with_the_code() {
-        let port = free_port();
-        let server = CallbackServer::bind("127.0.0.1", port).unwrap();
+        let server = CallbackServer::bind("127.0.0.1", 0).unwrap();
+        let port = server.port();
         let client = tokio::spawn(async move {
             // Give the server a moment to be actively waiting.
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -227,8 +239,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_state_mismatch_does_not_resolve_and_the_server_keeps_listening() {
-        let port = free_port();
-        let server = CallbackServer::bind("127.0.0.1", port).unwrap();
+        let server = CallbackServer::bind("127.0.0.1", 0).unwrap();
+        let port = server.port();
         let cancel = CancellationToken::new();
         let cancel_for_client = cancel.clone();
         let client = tokio::spawn(async move {
@@ -263,8 +275,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancellation_resolves_with_none() {
-        let port = free_port();
-        let server = CallbackServer::bind("127.0.0.1", port).unwrap();
+        let server = CallbackServer::bind("127.0.0.1", 0).unwrap();
         let cancel = CancellationToken::new();
         let cancel_clone = cancel.clone();
         tokio::spawn(async move {
@@ -279,8 +290,8 @@ mod tests {
 
     #[tokio::test]
     async fn binding_an_already_used_port_fails() {
-        let port = free_port();
-        let _first = CallbackServer::bind("127.0.0.1", port).unwrap();
+        let first = CallbackServer::bind("127.0.0.1", 0).unwrap();
+        let port = first.port();
         let second = CallbackServer::bind("127.0.0.1", port);
         assert!(matches!(second, Err(OAuthError::PortBindFailed { .. })));
     }
