@@ -398,11 +398,9 @@ async fn a_panic_in_a_daemon_session_ends_that_session_only() {
         )]),
     );
     let (base, _bodies) = spawn_model_server_routed(vec![], turn_text("noted"));
-    let port = common::free_port();
-    let mut daemon = common::mcp_events_fixture::spawn_daemon_env(
+    let (mut daemon, port) = common::mcp_events_fixture::spawn_daemon_env(
         home.path(),
         &base,
-        port,
         &[],
         &[
             ("BEYOND_AI_AGENT_TEST_PANICS", "1"),

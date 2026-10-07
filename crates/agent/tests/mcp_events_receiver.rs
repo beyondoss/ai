@@ -383,8 +383,9 @@ async fn a_runtime_subscription_to_a_removed_server_is_forgotten_not_resurrected
     servers[0]["events"] = json!([]);
     write_settings(home.path(), servers.clone());
     let (base, _bodies) = spawn_model_server_routed(vec![], turn_text("noted"));
-    let port = free_port();
-    let mut first = daemon(home.path(), &base, port, &[]);
+    let held = HeldPort::bind();
+    let port = held.port();
+    let mut first = daemon(home.path(), &base, &held, &[]);
     let mut ws = ws_connect(port, Some("orphaned")).await;
     ws_send(
         &mut ws,
@@ -417,11 +418,9 @@ async fn a_runtime_subscription_to_a_removed_server_is_forgotten_not_resurrected
     // The server is renamed: nothing called `hooks` exists any more.
     servers[0]["name"] = json!("hooks-renamed");
     write_settings(home.path(), servers);
-    let port = free_port();
-    let mut second = common::mcp_events_fixture::spawn_daemon(
+    let (mut second, port) = common::mcp_events_fixture::spawn_daemon(
         home.path(),
         &base,
-        port,
         &["--session-idle-timeout", "1"],
     );
     let mut reaped = false;
@@ -440,11 +439,9 @@ async fn a_runtime_subscription_to_a_removed_server_is_forgotten_not_resurrected
     common::mcp_events_fixture::sigterm_and_wait(&mut second);
 
     // And a further restart does not resurrect it.
-    let port = free_port();
-    let _third = common::mcp_events_fixture::spawn_daemon(
+    let (_third, port) = common::mcp_events_fixture::spawn_daemon(
         home.path(),
         &base,
-        port,
         &["--session-idle-timeout", "1"],
     );
     for _ in 0..15 {

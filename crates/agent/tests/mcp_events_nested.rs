@@ -97,11 +97,9 @@ async fn in_a_daemon_a_nested_elicitation_during_an_events_poll_reaches_the_even
         )]),
     );
     let (base, _bodies) = spawn_model_server_routed(vec![], turn_text("noted"));
-    let port = common::free_port();
-    let _d = common::mcp_events_fixture::spawn_daemon_env(
+    let (_d, port) = common::mcp_events_fixture::spawn_daemon_env(
         home.path(),
         &base,
-        port,
         &[],
         &[("BEYOND_AI_AGENT_MCP_EVENTS_POLL_FLOOR_MS", "100")],
     );

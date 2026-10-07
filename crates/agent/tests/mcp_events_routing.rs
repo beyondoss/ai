@@ -289,8 +289,7 @@ async fn a_permanently_refused_configured_subscription_is_reported_and_does_not_
     servers[0]["events"] = json!([{ "name": "no.such.event", "delivery": "webhook" }]);
     write_settings(home.path(), servers);
     let (base, _bodies) = spawn_model_server_routed(vec![], turn_text("noted"));
-    let port = free_port();
-    let _d = spawn_daemon(home.path(), &base, port, &["--session-idle-timeout", "1"]);
+    let (_d, port) = spawn_daemon(home.path(), &base, &["--session-idle-timeout", "1"]);
     let mut ws = ws_connect(port, Some(EVENTS_SESSION)).await;
     let status = ws_next(&mut ws, Duration::from_secs(20), "the refusal", |f| {
         f["type"] == "mcp_event_status" && f["kind"] == "refused"
@@ -350,11 +349,9 @@ async fn the_events_session_is_restarted_after_a_panic() {
         }]),
     );
     let (base, bodies) = spawn_model_server_routed(vec![], turn_text("noted"));
-    let port = free_port();
-    let _d = common::mcp_events_fixture::spawn_daemon_env(
+    let (_d, port) = common::mcp_events_fixture::spawn_daemon_env(
         home.path(),
         &base,
-        port,
         &[],
         &[
             ("BEYOND_AI_AGENT_TEST_PANICS", "1"),
