@@ -363,6 +363,7 @@ impl Conn {
     ) -> Result<Value, RpcError> {
         match &self.peer {
             crate::tools::mcp::EventsPeer::Rmcp { peer, .. } => {
+                let tracked = self.peer.track_request();
                 let handle = peer
                     .send_request_with_option(
                         custom_request(method, params),
@@ -370,6 +371,9 @@ impl Conn {
                     )
                     .await
                     .map_err(RpcError::from_service)?;
+                if let Some(call) = &tracked {
+                    call.bind(handle.id.clone());
+                }
                 let result = handle
                     .await_response()
                     .await
@@ -435,6 +439,7 @@ impl Conn {
             crate::tools::mcp::EventsPeer::Rmcp { peer, router, .. } => {
                 // No request timeout: the draft says clients SHOULD NOT apply one to
                 // `events/stream`; the heartbeat is the liveness signal instead.
+                let tracked = self.peer.track_request();
                 let handle = peer
                     .send_request_with_option(
                         custom_request("events/stream", params),
@@ -443,9 +448,14 @@ impl Conn {
                     .await
                     .map_err(RpcError::from_service)?;
                 let id = handle.id.clone();
+                if let Some(call) = &tracked {
+                    call.bind(id.clone());
+                }
                 router.register(id.clone(), tx.clone(), overflowed.clone());
                 let response = handle.rx;
                 let finisher = tokio::spawn(async move {
+                    // In flight until the stream's response arrives.
+                    let _tracked = tracked;
                     let fin = match response.await {
                         Ok(Ok(result)) => {
                             StreamMsg::final_ok(serde_json::to_value(result).unwrap_or(Value::Null))

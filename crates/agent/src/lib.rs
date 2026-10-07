@@ -18,6 +18,7 @@ pub mod gateway_credential;
 pub mod grant;
 pub mod lifecycle;
 pub mod mcp_auth_store;
+pub mod mcp_resume;
 pub mod memory;
 pub mod metrics;
 pub mod oauth;

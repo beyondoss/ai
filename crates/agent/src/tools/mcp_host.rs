@@ -109,8 +109,10 @@ impl ElicitationHub {
 /// Host-side LLM sampling for MCP `sampling/createMessage` (SEP-2577-deprecated, still on the wire).
 #[async_trait]
 pub trait SamplingGate: Send + Sync {
+    /// `server` is the asking MCP server's configured name, for the host to show.
     async fn create_message(
         &self,
+        server: &str,
         params: CreateMessageRequestParams,
     ) -> Result<CreateMessageResult, McpError>;
 }
@@ -123,6 +125,7 @@ pub struct RejectSampling;
 impl SamplingGate for RejectSampling {
     async fn create_message(
         &self,
+        _server: &str,
         _params: CreateMessageRequestParams,
     ) -> Result<CreateMessageResult, McpError> {
         Err(McpError::method_not_found::<
@@ -160,6 +163,7 @@ impl SamplingHub {
 
     pub async fn create_message(
         &self,
+        server: &str,
         params: CreateMessageRequestParams,
     ) -> Result<CreateMessageResult, McpError> {
         let gate = self
@@ -168,7 +172,7 @@ impl SamplingHub {
             .ok()
             .map(|g| g.clone())
             .unwrap_or_else(|| Arc::new(RejectSampling) as Arc<dyn SamplingGate>);
-        gate.create_message(params).await
+        gate.create_message(server, params).await
     }
 }
 

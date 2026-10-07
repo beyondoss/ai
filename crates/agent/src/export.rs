@@ -248,6 +248,16 @@ fn render_events_section(out: &mut String, events: &[crate::session_store::Expor
             } => {
                 format!("Label cleared on <code>{}</code>", html_escape(target_id))
             }
+            // An MCP task journal entry carries the task id, which a server may treat as a bearer
+            // token for its stored state: an export is for sharing, so it says only that one exists.
+            crate::session_store::ExportEvent::Custom { kind, .. }
+                if kind.starts_with("mcp_task") =>
+            {
+                format!(
+                    "Custom entry <code>{}</code>: (MCP task handle withheld)",
+                    html_escape(kind)
+                )
+            }
             crate::session_store::ExportEvent::Custom { kind, data } => {
                 format!(
                     "Custom entry <code>{}</code>: {}",
@@ -3333,6 +3343,26 @@ mod tests {
         let html = render_html_with_entries(&meta(), &[], &[], None, &events);
         assert!(!html.contains("<script>"));
         assert!(!html.contains("<img onerror"));
+    }
+
+    #[test]
+    fn render_html_with_entries_withholds_mcp_task_ids() {
+        // F16: an SEP-2663 task id can be a bearer token; the journal keeps it for resume, but an
+        // export (made to be shared) must not carry it.
+        use crate::session_store::ExportEvent;
+        let events = vec![
+            ExportEvent::Custom {
+                kind: "mcp_task".to_string(),
+                data: serde_json::json!({ "taskId": "SECRET-TASK-ID", "server": "s" }),
+            },
+            ExportEvent::Custom {
+                kind: "mcp_task_result".to_string(),
+                data: serde_json::json!({ "toolUseId": "t", "content": "SECRET-TASK-ID done" }),
+            },
+        ];
+        let html = render_html_with_entries(&meta(), &[], &[], None, &events);
+        assert!(!html.contains("SECRET-TASK-ID"), "{html}");
+        assert!(html.contains("MCP task handle withheld"), "{html}");
     }
 
     #[test]

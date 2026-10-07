@@ -741,6 +741,33 @@ fn branch_summary_message(summary: &str) -> Message {
 /// earlier id): without the visited-set check, a cycle would walk forever, growing `rev` unboundedly
 /// rather than degrading to "nothing" the way every other malformed-input case here does. A repeated
 /// id ends the walk at that point (treating whatever was reached as the root) instead of looping.
+/// The messages on `path`, as the model sees them: every message node, with each resolved MCP task
+/// result journaled on the path (a `mcp_task_result` custom entry, see `crate::mcp_resume`) spliced
+/// in front of the first user turn after the call it answers. The splice is part of the transcript,
+/// not just of the next request, so `get_messages`, the HTML export and `run --continue` agree with
+/// what `serve` sent the model. Custom entries are otherwise invisible here.
+fn materialize(nodes: &HashMap<String, Node>, path: &[String]) -> Vec<Message> {
+    let mut messages = Vec::new();
+    let mut results = Vec::new();
+    for id in path {
+        match nodes.get(id).map(|n| n.content.as_ref()) {
+            Some(NodeContent::Message(m)) => messages.push(m.clone()),
+            Some(NodeContent::Custom { kind, data })
+                if kind == crate::mcp_resume::RESULT_ENTRY_KIND =>
+            {
+                if let Ok(result) = serde_json::from_value(data.clone()) {
+                    results.push(result);
+                }
+            }
+            _ => {}
+        }
+    }
+    if !results.is_empty() {
+        crate::mcp_resume::splice(&mut messages, &results);
+    }
+    messages
+}
+
 fn path_from_root(nodes: &HashMap<String, Node>, tip: Option<&str>) -> Vec<String> {
     let mut rev = Vec::new();
     let mut visited = HashSet::new();
@@ -1162,10 +1189,7 @@ impl SessionStore {
         // A custom entry (`NodeContent::Custom`) contributes nothing here — it's a real, positioned
         // node in `active`'s chain (see `Entry::Custom`'s doc comment), but not a message, so
         // `as_message` filters it out of the materialized `Session.messages`/LLM context.
-        let messages: Vec<Message> = active
-            .iter()
-            .filter_map(|id| nodes[id].as_message().cloned())
-            .collect();
+        let messages: Vec<Message> = materialize(&nodes, &active);
         let persisted = messages.len();
         let mut session = Session::new();
         session.messages = Arc::new(messages);
@@ -1286,6 +1310,18 @@ impl SessionStore {
     /// back to [`Self::switch_active`] to navigate to a specific point in the history.
     pub fn active_ids(&self) -> &[String] {
         &self.active
+    }
+
+    /// The `data` of every custom entry of `kind` on the active path, oldest first — see
+    /// [`Self::append_custom`].
+    pub fn active_custom(&self, kind: &str) -> Vec<serde_json::Value> {
+        self.active
+            .iter()
+            .filter_map(|id| match self.nodes.get(id).map(|n| n.content.as_ref()) {
+                Some(NodeContent::Custom { kind: k, data }) if k == kind => Some(data.clone()),
+                _ => None,
+            })
+            .collect()
     }
 
     /// The message at tree entry `id`, anywhere in the whole tree (on or off the active path) —
@@ -2136,11 +2172,7 @@ impl SessionStore {
     /// a redundant marker every time a client re-confirms the current position.
     pub fn switch_active(&mut self, target_id: &str) -> std::io::Result<Vec<Message>> {
         if self.active.last().is_some_and(|id| id == target_id) {
-            return Ok(self
-                .active
-                .iter()
-                .filter_map(|id| self.nodes[id].as_message().cloned())
-                .collect());
+            return Ok(materialize(&self.nodes, &self.active));
         }
         if !self.nodes.contains_key(target_id) {
             return Err(std::io::Error::new(
@@ -2158,10 +2190,7 @@ impl SessionStore {
         self.log.append(&buf)?;
 
         let active = path_from_root(&self.nodes, Some(target_id));
-        let messages: Vec<Message> = active
-            .iter()
-            .filter_map(|id| self.nodes[id].as_message().cloned())
-            .collect();
+        let messages: Vec<Message> = materialize(&self.nodes, &active);
         self.persisted = messages.len();
         self.active = active;
         Ok(messages)
@@ -2241,11 +2270,7 @@ impl SessionStore {
         self.branch_summary_details
             .insert(entry_id.clone(), details_for_index);
         self.active = path_from_root(&self.nodes, Some(&entry_id));
-        let messages: Vec<Message> = self
-            .active
-            .iter()
-            .filter_map(|id| self.nodes[id].as_message().cloned())
-            .collect();
+        let messages: Vec<Message> = materialize(&self.nodes, &self.active);
         self.persisted = messages.len();
         Ok(messages)
     }
@@ -2337,11 +2362,7 @@ impl SessionStore {
         self.branch_summary_details
             .insert(entry_id.clone(), details_for_index);
         self.active = vec![entry_id];
-        let messages: Vec<Message> = self
-            .active
-            .iter()
-            .filter_map(|id| self.nodes[id].as_message().cloned())
-            .collect();
+        let messages: Vec<Message> = materialize(&self.nodes, &self.active);
         self.persisted = messages.len();
         Ok(messages)
     }
