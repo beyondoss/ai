@@ -882,7 +882,7 @@ impl crate::tools::fs::FsBackend for CellFs {
     async fn write_bytes(
         &self,
         path: &std::path::Path,
-        bytes: &[u8],
+        bytes: Vec<u8>,
     ) -> Result<(), crate::tools::fs::FsError> {
         self.inner()?.write_bytes(path, bytes).await
     }

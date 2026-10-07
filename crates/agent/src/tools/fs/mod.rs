@@ -274,8 +274,10 @@ pub trait FsBackend: Send + Sync {
     async fn read_bytes(&self, path: &Path, offset: u64, max: usize) -> Result<Vec<u8>, FsError>;
 
     /// Replace a file's entire contents atomically — a concurrent reader, or a crash mid-write, must
-    /// observe either the old file or the complete new one, never a partial.
-    async fn write_bytes(&self, path: &Path, bytes: &[u8]) -> Result<(), FsError>;
+    /// observe either the old file or the complete new one, never a partial. The bytes are taken by
+    /// value: a backend that hands them to a blocking thread moves them there instead of copying a
+    /// whole file on the async executor.
+    async fn write_bytes(&self, path: &Path, bytes: Vec<u8>) -> Result<(), FsError>;
 
     /// Replace a file's contents **only if** its mtime still equals `expected` — `edit`'s guard against
     /// clobbering a change made between reading the file and writing it back. Returns `false` when the

@@ -70,16 +70,18 @@ impl Tool for Write {
             .map(|p| super::write_key(&self.root, p, &self.backend.world()))
     }
 
-    async fn run(&self, input: Value) -> Result<ToolOutput, ToolError> {
+    async fn run(&self, mut input: Value) -> Result<ToolOutput, ToolError> {
         let path = input
             .get("path")
             .and_then(Value::as_str)
             .ok_or_else(|| ToolError::InvalidInput("missing `path`".into()))?;
         let path = &self.resolve(path);
-        let content = input
-            .get("content")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ToolError::InvalidInput("missing `content`".into()))?;
+        // Taken out of the input, not borrowed: the bytes move to the backend's blocking write
+        // instead of a whole file being copied on the async executor.
+        let content = match input.get_mut("content").map(Value::take) {
+            Some(Value::String(content)) => content,
+            _ => return Err(ToolError::InvalidInput("missing `content`".into())),
+        };
 
         // One `stat` answers both pre-checks, in the order that matters.
         //
@@ -112,8 +114,9 @@ impl Tool for Write {
         // Atomic temp-file + rename: an overwrite killed mid-write must not leave a half-written
         // file — the same guarantee `edit` makes (and which `serve` reattach depends on for the
         // session file). `create_dir_all` above ensures the sibling temp's directory exists.
-        self.backend.write_bytes(p, content.as_bytes()).await?;
-        Ok(format!("wrote {} bytes to {path}", content.len()).into())
+        let len = content.len();
+        self.backend.write_bytes(p, content.into_bytes()).await?;
+        Ok(format!("wrote {len} bytes to {path}").into())
     }
 }
 

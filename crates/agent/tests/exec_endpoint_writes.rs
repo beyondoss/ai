@@ -88,7 +88,7 @@ async fn a_200k_write_through_a_stdin_endpoint_is_one_call_and_byte_exact() {
     let path = dir.path().join("big.bin");
     let bytes = pattern(BIG);
     let before = mock.bodies().len();
-    fs.write_bytes(&path, &bytes).await.unwrap();
+    fs.write_bytes(&path, bytes.clone()).await.unwrap();
 
     let writes = mock.bodies().split_off(before);
     assert_eq!(writes.len(), 1, "one round trip: {:?}", summary(&writes));
@@ -115,7 +115,7 @@ async fn a_200k_write_through_a_v1_endpoint_goes_in_chunks_and_is_byte_exact() {
     std::fs::write(&path, "old content\n").unwrap();
     let bytes = pattern(BIG);
     let before = mock.bodies().len();
-    fs.write_bytes(&path, &bytes).await.unwrap();
+    fs.write_bytes(&path, bytes.clone()).await.unwrap();
 
     let writes = mock.bodies().split_off(before);
     assert_eq!(
@@ -160,7 +160,7 @@ async fn a_write_whose_stdin_never_arrives_fails_instead_of_emptying_the_file() 
     let path = dir.path().join("precious.txt");
     std::fs::write(&path, "old content\n").unwrap();
 
-    let err = fs.write_bytes(&path, &pattern(BIG)).await.unwrap_err();
+    let err = fs.write_bytes(&path, pattern(BIG)).await.unwrap_err();
     assert!(err.to_string().contains("short write"), "{err}");
     assert_eq!(
         std::fs::read_to_string(&path).unwrap(),
@@ -186,7 +186,7 @@ async fn both_write_paths_are_byte_exact_at_every_chunk_boundary() {
         for len in [0, 1, CHUNK - 1, CHUNK, CHUNK + 1, 3 * CHUNK, BIG] {
             let path = dir.path().join(format!("f-{stdin}-{len}"));
             let bytes = pattern(len);
-            fs.write_bytes(&path, &bytes)
+            fs.write_bytes(&path, bytes.clone())
                 .await
                 .unwrap_or_else(|e| panic!("stdin={stdin} len={len}: {e}"));
             assert!(
@@ -261,7 +261,7 @@ async fn a_template_transport_uses_stdin_only_when_it_forwards_it() {
         assert_eq!(fs.capabilities().stdin, expect_stdin, "{name}");
         let path = dir.path().join(name);
         let bytes = pattern(BIG);
-        fs.write_bytes(&path, &bytes)
+        fs.write_bytes(&path, bytes.clone())
             .await
             .unwrap_or_else(|e| panic!("{name}: {e}"));
         assert!(
@@ -323,6 +323,6 @@ async fn a_runner_without_stdin_support_is_probed_as_such_and_still_writes() {
     assert!(!fs.capabilities().stdin);
     let path = dir.path().join("f.bin");
     let bytes = pattern(BIG);
-    fs.write_bytes(&path, &bytes).await.unwrap();
+    fs.write_bytes(&path, bytes.clone()).await.unwrap();
     assert!(std::fs::read(&path).unwrap() == bytes, "not byte-exact");
 }

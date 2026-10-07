@@ -107,9 +107,8 @@ impl FsBackend for LocalFs {
         .await
     }
 
-    async fn write_bytes(&self, path: &Path, bytes: &[u8]) -> Result<(), FsError> {
+    async fn write_bytes(&self, path: &Path, bytes: Vec<u8>) -> Result<(), FsError> {
         let path = path.to_path_buf();
-        let bytes = bytes.to_vec();
         blocking("write", move || {
             // The existing shared helper, unchanged: sibling temp file + `rename`, `create_new` to
             // refuse a planted symlink, existing mode bits preserved across the swap.
