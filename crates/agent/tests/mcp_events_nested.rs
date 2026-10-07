@@ -36,7 +36,7 @@ fn nested_during(during: &str, delivery: &str) {
         .stderr(Stdio::null());
     let mut child = cmd.spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut frames = Frames::new(child.stdout.take().unwrap(), None);
+    let mut frames = Frames::new(&mut child, None);
     let control = wait_control_file(&control_file);
     let ask = frames.wait(
         Duration::from_secs(30),

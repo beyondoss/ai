@@ -351,7 +351,7 @@ fn a_panic_inside_serve_exits_promptly_and_still_sweeps() {
             .env("BEYOND_AI_AGENT_TEST_PANICS", "1");
         let mut child = cmd.spawn_guarded();
         let stdin = child.stdin.take().unwrap();
-        let frames = Frames::new(child.stdout.take().unwrap(), None);
+        let frames = Frames::new(&mut child, None);
         (child, stdin, frames)
     };
     let mut child = _child_guard;

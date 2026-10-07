@@ -390,7 +390,7 @@ fn a_steered_batch_summarized_away_by_a_mid_run_compaction_is_not_injected_again
         ]);
     let mut child = cmd.spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut frames = Frames::new(child.stdout.take().unwrap(), None);
+    let mut frames = Frames::new(&mut child, None);
     wait_active(&mut stdin, &mut frames, 1);
     // Each turn stalls this long: the window in which the second event must be polled, coalesced
     // and steered in before the turn carrying the first ends — wide, so full-suite load on the

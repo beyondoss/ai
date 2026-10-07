@@ -43,7 +43,7 @@ fn run_blobs(home: &std::path::Path, server: Value) -> Vec<String> {
         .stderr(Stdio::null());
     let mut child = cmd.spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut frames = Frames::new(child.stdout.take().unwrap(), None);
+    let mut frames = Frames::new(&mut child, None);
     for (id, msg) in [
         ("p1", "make a blob of 2000000"),
         ("p2", "make a blob of 10"),
@@ -128,7 +128,7 @@ fn events_serve(
         .stderr(Stdio::null());
     let mut child = cmd.spawn_guarded();
     let stdin = child.stdin.take().unwrap();
-    let frames = Frames::new(child.stdout.take().unwrap(), None);
+    let frames = Frames::new(&mut child, None);
     (child, stdin, frames, control, home, fx)
 }
 
@@ -193,7 +193,7 @@ fn an_over_cap_push_event_is_skipped_and_reported(stdio: bool) {
         .stderr(Stdio::null());
     let mut child = cmd.spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut frames = Frames::new(child.stdout.take().unwrap(), None);
+    let mut frames = Frames::new(&mut child, None);
     let control = match &http_fixture {
         Some((_, _, control)) => control.clone(),
         None => common::mcp_events_fixture::wait_control_file(&control_file),
