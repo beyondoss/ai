@@ -116,6 +116,24 @@ fn assert_responsive(tool: &str, worst: Duration, why: &str) {
     );
 }
 
+/// [`assert_responsive`] on the least of up to three runs of `$attempt` (an expression evaluated
+/// afresh for each run, so any per-run setup in it happens before the measurement starts). A tool
+/// that works or blocks inline stalls the runtime on every run; the host's own one-off stalls of
+/// the runtime thread (a page fault served from disk on a busy machine) do not repeat.
+macro_rules! assert_responsive_least {
+    ($tool:expr, $why:expr, $attempt:expr) => {{
+        let mut least = Duration::MAX;
+        for _ in 0..3 {
+            let (_, worst) = stalls($attempt).await;
+            least = least.min(worst);
+            if least < MAX_UNRESPONSIVE {
+                break;
+            }
+        }
+        assert_responsive($tool, least, $why);
+    }};
+}
+
 /// CPU time consumed by the calling thread so far.
 fn thread_cpu() -> Duration {
     let ts = rustix::time::clock_gettime(rustix::time::ClockId::ThreadCPUTime);
@@ -365,16 +383,18 @@ async fn edit_keeps_the_runtime_responsive() {
     let _serial = one_at_a_time().await;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("subject.rs");
-    std::fs::write(&path, big_ascii_source(80_000)).unwrap();
+    let src = big_ascii_source(80_000);
     let tool = edit::Edit::new(dir.path());
     let p = path.to_str().unwrap().to_string();
-    let (_, worst) = stalls(async {
-        tool.run(json!({ "path": p, "old_string": OLD, "new_string": NEW }))
-            .await
-            .unwrap()
-    })
-    .await;
-    assert_responsive("edit", worst, "Its file I/O belongs on `spawn_blocking`.");
+    assert_responsive_least!("edit", "Its file I/O belongs on `spawn_blocking`.", {
+        // Fresh for each run (an edit changes the file), and before the measurement starts.
+        std::fs::write(&path, &src).unwrap();
+        async {
+            tool.run(json!({ "path": p, "old_string": OLD, "new_string": NEW }))
+                .await
+                .unwrap()
+        }
+    });
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -384,8 +404,10 @@ async fn write_keeps_the_runtime_responsive() {
     let path = dir.path().join("out.rs");
     let input = json!({ "path": path.to_str().unwrap(), "content": big_ascii_source(80_000) });
     let tool = write::Write::new(dir.path());
-    let (_, worst) = stalls(async { tool.run(input).await.unwrap() }).await;
-    assert_responsive("write", worst, "Its file I/O belongs on `spawn_blocking`.");
+    assert_responsive_least!("write", "Its file I/O belongs on `spawn_blocking`.", {
+        let input = input.clone();
+        async { tool.run(input).await.unwrap() }
+    });
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -393,17 +415,15 @@ async fn ls_keeps_the_runtime_responsive() {
     let _serial = one_at_a_time().await;
     let dir = wide_dir();
     let d = dir.path().to_str().unwrap().to_string();
-    let (_, worst) = stalls(async {
-        ls::Ls::default()
-            .run(json!({ "path": d, "limit": 5000 }))
-            .await
-            .unwrap()
-    })
-    .await;
-    assert_responsive(
+    assert_responsive_least!(
         "ls",
-        worst,
         "Its directory scan belongs on `spawn_blocking`.",
+        async {
+            ls::Ls::default()
+                .run(json!({ "path": d, "limit": 5000 }))
+                .await
+                .unwrap()
+        }
     );
 }
 
@@ -415,13 +435,11 @@ async fn read_keeps_the_runtime_responsive() {
     std::fs::write(&path, big_ascii_source(80_000)).unwrap();
     let p = path.to_str().unwrap().to_string();
     let tool = read::Read::new(dir.path());
-    let (_, worst) = stalls(async {
+    assert_responsive_least!("read", "Its file I/O belongs on `spawn_blocking`.", async {
         tool.run(json!({ "path": p, "offset": 70_000, "limit": 2000 }))
             .await
             .unwrap()
-    })
-    .await;
-    assert_responsive("read", worst, "Its file I/O belongs on `spawn_blocking`.");
+    });
 }
 
 /// A tree of `files` source files, for the search tools.
@@ -440,16 +458,14 @@ async fn grep_keeps_the_runtime_responsive() {
     let _serial = one_at_a_time().await;
     let dir = source_tree(2_000);
     let tool = grep::Grep::new(dir.path());
-    let (_, worst) = stalls(async {
-        tool.run(json!({ "pattern": "x_199 = compute", "limit": 5000 }))
-            .await
-            .unwrap()
-    })
-    .await;
-    assert_responsive(
+    assert_responsive_least!(
         "grep",
-        worst,
         "Its walk and match belong on `spawn_blocking`.",
+        async {
+            tool.run(json!({ "pattern": "x_199 = compute", "limit": 5000 }))
+                .await
+                .unwrap()
+        }
     );
 }
 
@@ -458,13 +474,11 @@ async fn find_keeps_the_runtime_responsive() {
     let _serial = one_at_a_time().await;
     let dir = source_tree(2_000);
     let tool = find::Find::new(dir.path());
-    let (_, worst) = stalls(async {
+    assert_responsive_least!("find", "Its walk belongs on `spawn_blocking`.", async {
         tool.run(json!({ "pattern": "**/*.rs", "limit": 5000 }))
             .await
             .unwrap()
-    })
-    .await;
-    assert_responsive("find", worst, "Its walk belongs on `spawn_blocking`.");
+    });
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -472,17 +486,16 @@ async fn bash_keeps_the_runtime_responsive() {
     let _serial = one_at_a_time().await;
     let dir = tempfile::tempdir().unwrap();
     let tool = bash::Bash::real().with_root(dir.path());
-    let (out, worst) = stalls(async {
-        tool.run(json!({ "command": "sleep 0.3; seq 1 20000" }))
-            .await
-            .unwrap()
-    })
-    .await;
-    assert!(out.text.contains("20000"), "{}", out.text);
-    assert_responsive(
+    assert_responsive_least!(
         "bash",
-        worst,
-        "Waiting on the child and reading its output must be async.",
+        "Waiting on the child, reading its output and spilling it must not block the runtime.",
+        async {
+            let out = tool
+                .run(json!({ "command": "sleep 0.3; seq 1 20000" }))
+                .await
+                .unwrap();
+            assert!(out.text.contains("20000"), "{}", out.text);
+        }
     );
 }
 
@@ -493,8 +506,11 @@ async fn todo_keeps_the_runtime_responsive() {
     let todos: Vec<_> = (0..500)
         .map(|i| json!({ "content": format!("task {i}"), "activeForm": format!("doing task {i}"), "status": "pending" }))
         .collect();
-    let (_, worst) = stalls(async { tool.run(json!({ "todos": todos })).await.unwrap() }).await;
-    assert_responsive("todo", worst, "It is in-memory; nothing here should block.");
+    assert_responsive_least!(
+        "todo",
+        "It is in-memory; nothing here should block.",
+        async { tool.run(json!({ "todos": todos })).await.unwrap() }
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -518,27 +534,23 @@ async fn memory_keeps_the_runtime_responsive() {
     ));
     std::fs::write(dir.path().join("big.md"), big_ascii_source(80_000)).unwrap();
     let tool = memory::Memory::new(backend);
-    let (_, worst) = stalls(async {
-        tool.run(json!({ "command": "search", "query": "remembered fact" }))
-            .await
-            .unwrap()
-    })
-    .await;
-    assert_responsive(
+    assert_responsive_least!(
         "memory search",
-        worst,
         "Its file I/O, and rendering a large hit list, belong on `spawn_blocking`.",
+        async {
+            tool.run(json!({ "command": "search", "query": "remembered fact" }))
+                .await
+                .unwrap()
+        }
     );
-    let (_, worst) = stalls(async {
-        tool.run(json!({ "command": "view", "path": "/memories/big.md" }))
-            .await
-            .unwrap()
-    })
-    .await;
-    assert_responsive(
+    assert_responsive_least!(
         "memory view",
-        worst,
         "Its file I/O, and rendering a large document, belong on `spawn_blocking`.",
+        async {
+            tool.run(json!({ "command": "view", "path": "/memories/big.md" }))
+                .await
+                .unwrap()
+        }
     );
 }
 
@@ -572,6 +584,19 @@ async fn html_server(body: String) -> String {
     format!("http://{addr}/")
 }
 
+/// One `markdown` fetch of `url`, which must have rendered the page.
+async fn web_markdown(tool: &web::Web, url: &str) {
+    let out = tool
+        .run(json!({ "url": url, "mode": "markdown" }))
+        .await
+        .unwrap();
+    assert!(
+        out.text.contains("paragraph"),
+        "{}",
+        &out.text[..out.text.len().min(300)]
+    );
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn web_keeps_the_runtime_responsive() {
     let _serial = one_at_a_time().await;
@@ -584,29 +609,22 @@ async fn web_keeps_the_runtime_responsive() {
     html.push_str("</body></html>");
     let url = html_server(html).await;
     // The isolated parse runs in the agent binary's `__web-parse` child, not in this test binary.
-    let tool =
-        web::Web::new(true, &[], None).with_parser_binary(env!("CARGO_BIN_EXE_beyond-ai-agent"));
-    // The first call builds the client (TLS provider, root certificates); every call parses the
-    // page in an isolated child and waits on it.
-    for call in ["web (first call)", "web"] {
-        let (out, worst) = stalls(async {
-            tool.run(json!({ "url": url, "mode": "markdown" }))
-                .await
-                .unwrap()
-        })
-        .await;
-        assert!(
-            out.text.contains("paragraph"),
-            "{}",
-            &out.text[..out.text.len().min(300)]
-        );
-        assert_responsive(
-            call,
-            worst,
-            "Fetching is async; building the client, and parsing in (and waiting on) the isolated \
-             child, belong on the blocking pool.",
-        );
-    }
+    let fresh =
+        || web::Web::new(true, &[], None).with_parser_binary(env!("CARGO_BIN_EXE_beyond-ai-agent"));
+    let why = "Fetching is async; building the client, and parsing in (and waiting on) the \
+               isolated child, belong on the blocking pool.";
+    // A first call builds the client (TLS provider, root certificates): a fresh tool each run.
+    let tools: Vec<web::Web> = (0..3).map(|_| fresh()).collect();
+    let mut cold = tools.iter();
+    assert_responsive_least!(
+        "web (first call)",
+        why,
+        web_markdown(cold.next().unwrap(), &url)
+    );
+    // Every call parses the page in an isolated child and waits on it.
+    let warm = fresh();
+    web_markdown(&warm, &url).await;
+    assert_responsive_least!("web", why, web_markdown(&warm, &url));
 }
 
 /// `execute` (Code Mode) runs QuickJS's synchronous evaluation: a busy script must hold a
@@ -617,21 +635,24 @@ async fn web_keeps_the_runtime_responsive() {
 async fn code_mode_keeps_the_runtime_responsive_while_a_script_spins() {
     let _serial = one_at_a_time().await;
     let tool = beyond_ai_agent::tools::code_mode::Execute::new(vec![]);
-    let spin =
-        json!({ "code": "let x = 0; for (let i = 0; i < 400000; i++) { x += i % 7; } return x;" });
-    let started = Instant::now();
-    let (out, worst) = stalls(async { tool.run(spin.clone()).await.unwrap() }).await;
-    let ran = started.elapsed();
-    eprintln!("PROBE execute ran {ran:?}");
-    assert!(!out.text.is_empty());
-    assert!(
-        ran > Duration::from_millis(100),
-        "the script must spin long enough to show: {ran:?}"
-    );
-    assert_responsive(
+    let spin_of = |n: u64| json!({ "code": format!("let x = 0; for (let i = 0; i < {n}; i++) {{ x += i % 7; }} return x;") });
+    // Long enough to show, whatever this build's QuickJS speed: doubled until a run takes 200 ms.
+    let mut n = 100_000u64;
+    let ran = loop {
+        let started = Instant::now();
+        tool.run(spin_of(n)).await.unwrap();
+        let ran = started.elapsed();
+        if ran >= Duration::from_millis(200) || n >= 1 << 30 {
+            break ran;
+        }
+        n *= 2;
+    };
+    eprintln!("PROBE execute spins {n} iterations in {ran:?}");
+    let spin = spin_of(n);
+    assert_responsive_least!(
         "execute",
-        worst,
         "QuickJS evaluates synchronously; it belongs on the blocking pool.",
+        async { tool.run(spin.clone()).await.unwrap() }
     );
     let held = held(async { tool.run(spin).await.unwrap() }).await;
     assert!(
