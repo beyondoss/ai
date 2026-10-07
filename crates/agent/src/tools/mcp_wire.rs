@@ -63,6 +63,28 @@ fn ordinary_limit(message: &ClientJsonRpcMessage, max: usize) -> Limit {
     }
 }
 
+/// The most of a 401's body read for its reason: a JSON-RPC error is a few hundred bytes.
+const MAX_UNAUTHORIZED_BODY: usize = 64 * 1024;
+
+/// The server's reason for a 401, when its body is a JSON-RPC error: `error.message` (with the
+/// code). `None` for an empty, larger or non-JSON-RPC body.
+async fn unauthorized_reason(response: reqwest::Response) -> Option<String> {
+    if response
+        .content_length()
+        .is_some_and(|len| len > MAX_UNAUTHORIZED_BODY as u64)
+    {
+        return None;
+    }
+    let body = capped_body(response, MAX_UNAUTHORIZED_BODY).await.ok()??;
+    let value: Value = serde_json::from_str(&body).ok()?;
+    let error = value.get("error")?;
+    let message = error.get("message")?.as_str()?;
+    Some(match error.get("code").and_then(Value::as_i64) {
+        Some(code) => format!("{message} (JSON-RPC error {code})"),
+        None => message.to_owned(),
+    })
+}
+
 /// Headers a configured custom header may not override (`rmcp`'s own reserved set).
 const RESERVED_HEADERS: [&str; 3] = ["accept", "mcp-session-id", "last-event-id"];
 
@@ -232,8 +254,16 @@ impl HttpClient {
             .and_then(|v| v.to_str().ok())
             .map(str::to_string);
         // Any 401 — with or without a challenge, whatever its body — is the server refusing the
-        // credentials, decided here from the status before a body could be read as a response.
+        // credentials, decided here from the status before a body could be read as a response
+        // (so `mcp_oauth` can refresh a login). The server's own reason survives it: a 401 whose
+        // (small) body is a JSON-RPC error — "invalid API key" — fails as rmcp's bare-401 error
+        // does, `HTTP 401 …`, carrying that message; any other 401 is `AuthRequired`.
         if status == reqwest::StatusCode::UNAUTHORIZED {
+            if let Some(message) = unauthorized_reason(response).await {
+                return Err(StreamableHttpError::UnexpectedServerResponse(Cow::Owned(
+                    format!("HTTP 401 Unauthorized: {message}"),
+                )));
+            }
             return Err(StreamableHttpError::AuthRequired(
                 rmcp::transport::streamable_http_client::AuthRequiredError::new(
                     www_authenticate.unwrap_or_default(),
@@ -753,8 +783,9 @@ mod tests {
             }
         }
         // The deliberate divergence: a 401 with no `WWW-Authenticate` whose body is a JSON-RPC
-        // error. rmcp hands that back as an ordinary error *response*, losing the status; here any
-        // 401 is `AuthRequired`, so `mcp_oauth` can refresh (and any server's caller sees why).
+        // error. rmcp hands that back as an ordinary error *response*, losing the status; here it
+        // is the 401 it is (rmcp's own bare-401 shape, `HTTP 401 …`), so `mcp_oauth` can refresh —
+        // carrying the server's message, so its caller still sees why.
         let raw: &[u8] = b"HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: 69\r\nConnection: close\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":7,\"error\":{\"code\":-32001,\"message\":\"no token\"}}";
         let ours = HttpClient::new(reqwest::Client::new())
             .post_message(
@@ -774,10 +805,12 @@ mod tests {
                 HashMap::new(),
             )
             .await;
-        assert_eq!(shape(&ours), "auth-required");
-        assert_ne!(
-            shape(&theirs),
-            "auth-required",
+        assert_eq!(
+            shape(&ours),
+            "other: unexpected server response: HTTP 401 Unauthorized: no token (JSON-RPC error -32001)"
+        );
+        assert!(
+            !shape(&theirs).contains("HTTP 401"),
             "rmcp's own client: {}",
             shape(&theirs)
         );

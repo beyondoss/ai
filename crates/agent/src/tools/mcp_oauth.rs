@@ -508,8 +508,27 @@ impl<C: StreamableHttpClient<Error = reqwest::Error>> OAuthHttp<C> {
         match call(sent.clone()).await {
             Err(e) if is_unauthorized(&e) => {
                 match auth.after_rejection(sent.as_deref()).await {
-                    // Once: a second 401 is the server's answer, returned as is.
-                    Ok(fresh) => call(Some(fresh)).await,
+                    // Once: a second 401 is the server's answer — with what fixes it, since a
+                    // refreshed token was refused too and only a new login can help.
+                    Ok(fresh) => match call(Some(fresh)).await {
+                        Err(e) if is_unauthorized(&e) => {
+                            Err(StreamableHttpError::UnexpectedServerResponse(
+                                format!(
+                                    "{}; the server refused the refreshed login for `{1}` too: run \
+                                     `agent mcp-login {1}` again",
+                                    match &e {
+                                        StreamableHttpError::UnexpectedServerResponse(m) => {
+                                            m.to_string()
+                                        }
+                                        _ => "HTTP 401 Unauthorized".to_owned(),
+                                    },
+                                    auth.server,
+                                )
+                                .into(),
+                            ))
+                        }
+                        other => other,
+                    },
                     Err(message) => Err(StreamableHttpError::UnexpectedServerResponse(
                         message.into(),
                     )),

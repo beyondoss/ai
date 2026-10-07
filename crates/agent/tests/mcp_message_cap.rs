@@ -167,12 +167,21 @@ fn an_over_cap_unary_sse_answer_on_the_events_wire_is_refused() {
 
 /// An `events/stream` event over the cap is skipped, not read and not reconnected into: its bounded
 /// head names it (and its cursor), it is reported as a gap — to the client and to the model — and the
-/// next event on the same stream is delivered. Over streamable HTTP (SSE) and over stdio.
-fn an_over_cap_push_event_is_skipped_and_reported(stdio: bool) {
+/// next event on the same stream is delivered. Over streamable HTTP (SSE) and over stdio, and in
+/// either key order: JSON does not fix one, so with `params_first` the giant event arrives as
+/// `{"params":{"data":…,"_meta":…,"cursor":…},"method":…}` — nothing that names or routes it is
+/// within the bounded head, and it must still be skipped and reported, not looped on or lost.
+fn an_over_cap_push_event_is_skipped_and_reported(stdio: bool, params_first: bool) {
     let events = json!([{ "name": "ticket.updated", "delivery": "push", "action": "follow_up" }]);
     let home = tempfile::tempdir().unwrap();
     let control_file = home.path().join("control");
-    let http_fixture = (!stdio).then(|| spawn_http_fixture(&[("MCP_FIXTURE_HEARTBEAT_MS", "200")]));
+    let order = if params_first { "params_first" } else { "" };
+    let http_fixture = (!stdio).then(|| {
+        spawn_http_fixture(&[
+            ("MCP_FIXTURE_HEARTBEAT_MS", "200"),
+            ("MCP_FIXTURE_KEY_ORDER", order),
+        ])
+    });
     let server = match &http_fixture {
         Some((_fx, mcp_url, _control)) => {
             json!({ "name": "tickets", "transport": "http", "url": mcp_url, "events": events })
@@ -180,7 +189,7 @@ fn an_over_cap_push_event_is_skipped_and_reported(stdio: bool) {
         None => stdio_server(
             "tickets",
             &control_file,
-            json!({ "MCP_FIXTURE_HEARTBEAT_MS": "200" }),
+            json!({ "MCP_FIXTURE_HEARTBEAT_MS": "200", "MCP_FIXTURE_KEY_ORDER": order }),
             events,
         ),
     };
@@ -222,12 +231,15 @@ fn an_over_cap_push_event_is_skipped_and_reported(stdio: bool) {
         |f| f["type"] == "mcp_event_status" && f["kind"] == "gap",
     );
     assert_eq!(gap["reason"], "oversized", "{gap:#}");
-    // The fixture serializes `cursor` ahead of the payload (and `eventId` after it): the cursor is
-    // kept, the id is not known.
-    assert!(
-        gap["cursor"].is_string(),
-        "the skipped event's cursor is kept: {gap:#}"
-    );
+    // In the usual order the fixture serializes `cursor` ahead of the payload (and `eventId` after
+    // it): the cursor is kept, the id is not known. Payload first, neither is: the position moves
+    // on with the next event or heartbeat instead.
+    if !params_first {
+        assert!(
+            gap["cursor"].is_string(),
+            "the skipped event's cursor is kept: {gap:#}"
+        );
+    }
     let f = frames.wait(Duration::from_secs(20), "the next event", |f| {
         f["type"] == "mcp_event" && f["event"]["eventId"] == "small-1"
     });
@@ -256,10 +268,20 @@ fn an_over_cap_push_event_is_skipped_and_reported(stdio: bool) {
 
 #[test]
 fn an_over_cap_push_event_over_http_is_skipped_and_reported_and_the_next_is_delivered() {
-    an_over_cap_push_event_is_skipped_and_reported(false);
+    an_over_cap_push_event_is_skipped_and_reported(false, false);
 }
 
 #[test]
 fn an_over_cap_push_event_over_stdio_is_skipped_and_reported_and_the_next_is_delivered() {
-    an_over_cap_push_event_is_skipped_and_reported(true);
+    an_over_cap_push_event_is_skipped_and_reported(true, false);
+}
+
+#[test]
+fn an_over_cap_push_event_with_params_first_over_http_is_skipped_and_reported_not_looped_on() {
+    an_over_cap_push_event_is_skipped_and_reported(false, true);
+}
+
+#[test]
+fn an_over_cap_push_event_with_params_first_over_stdio_is_skipped_and_reported_not_lost() {
+    an_over_cap_push_event_is_skipped_and_reported(true, true);
 }

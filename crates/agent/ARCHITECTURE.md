@@ -4357,7 +4357,13 @@ challenge, whatever its body (every POST, for every server, is answered by
 `mcp_wire::HttpClient::post_bounded`, which decides from the status — a deliberate divergence from rmcp's own client (see below), which reads a 401 carrying a JSON-RPC error body as an ordinary error
 response; pinned in `an_ordinary_request_is_answered_as_rmcps_own_client_would`) — makes `ServerAuth::after_rejection` force a refresh through the same `AuthorizationManager`
 and `McpAuthStore` `mcp-login` uses (so the new token is persisted), and the request is retried
-**once**; a second 401 is returned as the server's answer. That covers `tools/call`, `resources/*`,
+**once**; a second 401 is returned as the server's answer, saying to run `agent mcp-login <server>`
+again — on a tool call as at connect, since only a new login helps once a refreshed token is refused
+too. **The server's reason survives the 401:** a 401 whose small body (≤ 64 KiB) is a JSON-RPC
+error fails as rmcp's own bare-401 error does, `HTTP 401 Unauthorized: <message> (JSON-RPC error
+<code>)` — still a 401 to the refresh, and for a server with no login (a static key it stopped
+accepting, say) the tool error the model sees, with the server's "invalid API key" in it rather than a
+bare "Auth required"; any other 401 is `AuthRequired` (`tests/mcp_unauthorized.rs`). That covers `tools/call`, `resources/*`,
 `prompts/*`, `skills/*`, MCP App view reads, the handshake, the standalone stream and `events/*`. A 403
 (`InsufficientScope`) never refreshes.
 
@@ -4366,7 +4372,7 @@ in and out, a 404 on a session as `SessionExpired` (rmcp re-initializes and retr
 handed back as a stream, 202/204 — or an empty 200 to a notification or reply — as accepted, a JSON 200
 that is not a JSON-RPC message, for a notification or reply, as accepted, a non-JSON success as an
 error (rmcp's unexpected content type), and a 4xx to `server/discover` as the legacy server's cue to
-`initialize`. **The differences:** any 401 is `AuthRequired` (above; rmcp reads one with a JSON-RPC body as an error response — pinned in `an_ordinary_request_is_answered_as_rmcps_own_client_would`); and a JSON 200 that is not a JSON-RPC message, answering a _request_,
+`initialize`. **The differences:** any 401 is a 401 (above; rmcp reads one with a JSON-RPC body as an error response — pinned in `an_ordinary_request_is_answered_as_rmcps_own_client_would`); and a JSON 200 that is not a JSON-RPC message, answering a _request_,
 is an error here. rmcp calls it accepted and then waits for a response that cannot come (a request is
 answered on its own POST, as JSON or an SSE stream carrying it) until the request's timeout; failing
 at once with the body in the error is the honest answer. Pinned end to end against the OAuth fixture
@@ -4666,7 +4672,7 @@ mcp_events_subscribe (any session) ──► owned by that session
   passes through the same `rescue`). Stateless
   (`2026-07-28`) streamable-HTTP servers get `events/*` directly over HTTP (`MCP-Protocol-Version`,
   `Mcp-Method`, per-request `_meta`, the server's resolved headers and OAuth bearer), with bodies
-  bounded by the same per-message cap as every MCP transport (`mcp_stdio::max_message_bytes`, `BEYOND_AI_AGENT_MCP_MAX_MESSAGE_BYTES`: a unary JSON body, a unary SSE answer's event, an `events/stream` event — an over-cap answer fails its request, never read whole). An over-cap **event notification** (on a push stream, or from a stdio server) is skipped, not reconnected into: its bounded head is read structurally (`mcp_stdio::oversized_stand_in`, the same top-level member walk as `scan_head`) for its routing, cursor and id, the rest is skipped unread, and a small `$oversized` stand-in takes its place — the subscription keeps that cursor (or the next heartbeat's), records an `oversized` gap (a `gap` frame, and a notice to the model that an event was dropped unread) and carries on (`tests/mcp_message_cap.rs`) — JWKS documents at 64 KiB — and an SSE reader whose scan and drain
+  bounded by the same per-message cap as every MCP transport (`mcp_stdio::max_message_bytes`, `BEYOND_AI_AGENT_MCP_MAX_MESSAGE_BYTES`: a unary JSON body, a unary SSE answer's event, an `events/stream` event — an over-cap answer fails its request, never read whole). An over-cap **event notification** (on a push stream, or from a stdio server) is skipped, not reconnected into: its bounded head is read structurally (`mcp_stdio::oversized_stand_in`, the same top-level member walk as `scan_head`) for its routing, cursor and id — **in any key order**: `method`, `id` and `params` are found wherever they fall within the window, and inside `params` every scalar and `_meta` that appears whole is kept — the rest is skipped unread, and a small `$oversized` stand-in takes its place. When the head does not reach the method (a payload-first `params` fills it), the message is still taken for an event unless the head proves it is a request (an `id`) or a response; over stdio, a stand-in whose routing lay past the head is delivered to every push stream on that connection (each records the gap, since which one it belonged to is unknowable), and on a direct-HTTP stream it is that stream's. In either case the subscription keeps whatever cursor the head showed (or else the next event's or heartbeat's — never reconnecting into the same event), records an `oversized` gap (a `gap` frame, and a notice to the model that an event was dropped unread) and carries on (`tests/mcp_message_cap.rs`, both key orders over both transports) — JWKS documents at 64 KiB — and an SSE reader whose scan and drain
   are both linear (events are parsed in place; the consumed prefix is dropped once per read, not once
   per event); an older,
   session-bound HTTP server goes through rmcp's own connection, which carries its `Mcp-Session-Id`.
