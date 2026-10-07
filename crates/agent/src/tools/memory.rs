@@ -157,6 +157,10 @@ fn render_hits(query: &str, hits: &[Hit]) -> ToolOutput {
     for h in hits {
         // Infallible: writing into a String never errors.
         let _ = writeln!(out, "{}:{}: {}", h.path, h.line, h.text);
+        // Past the cap the rest would only be cut off: stop (one line over is what marks it cut).
+        if out.len() > crate::tools::output::MAX_LISTING_BYTES {
+            break;
+        }
     }
     cap_listing_bytes(&mut out, "narrow the query");
     out.into()
@@ -312,11 +316,19 @@ impl Tool for Memory {
                 let query = str_field(&input, "query")?;
                 // Fan across every mount; each backend labels its hits with its own root, so the merged
                 // listing is unambiguous. Durable first (mount order), then session.
-                let mut hits: Vec<Hit> = Vec::new();
+                let mut per_mount: Vec<Vec<Hit>> = Vec::with_capacity(self.mounts.len());
                 for mount in &self.mounts {
-                    hits.extend(mount.backend.search(query).await.map_err(map_err)?);
+                    per_mount.push(mount.backend.search(query).await.map_err(map_err)?);
                 }
-                Ok(render_hits(query, &hits))
+                // Merging, rendering and freeing a large hit list is work for the blocking pool,
+                // not the runtime thread the session's other tasks are polled on.
+                let query = query.to_owned();
+                tokio::task::spawn_blocking(move || {
+                    let hits: Vec<Hit> = per_mount.into_iter().flatten().collect();
+                    render_hits(&query, &hits)
+                })
+                .await
+                .map_err(|e| ToolError::Execution(format!("memory search: {e}")))
             }
             other => Err(ToolError::InvalidInput(format!(
                 "unknown memory command `{other}` (expected view/create/str_replace/insert/delete/rename/search)"

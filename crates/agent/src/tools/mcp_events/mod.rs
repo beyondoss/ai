@@ -508,6 +508,17 @@ struct Hub {
     dropped_seen: Mutex<std::collections::VecDeque<u64>>,
 }
 
+/// The direct-HTTP events client, or why it could not be built. **Fails closed**: a client that
+/// cannot be built with redirects off is an error for the request, never a fallback to a default
+/// client (which would follow redirects itself, past the URL that was checked).
+fn events_http_client(
+    build: impl FnOnce() -> Result<reqwest::Client, String>,
+) -> Result<reqwest::Client, String> {
+    build().map_err(|e| {
+        format!("cannot build the MCP Events HTTP client, so no request was made: {e}")
+    })
+}
+
 /// A session's MCP Events client: its subscriptions, its coalescer, and the injection path into
 /// the session's own command channel. Owned by `serve_session`; dropping it cancels everything.
 pub struct McpEventsHub {
@@ -1103,18 +1114,20 @@ impl Hub {
     async fn conn(&self, server: &str) -> Result<Conn, String> {
         let peer = self.catalog.events_peer(server).await?;
         let http = match &peer {
-            crate::tools::mcp::EventsPeer::Http { .. } => Some(
-                self.http
-                    .get_or_init(|| {
+            crate::tools::mcp::EventsPeer::Http { .. } => Some(match self.http.get() {
+                Some(client) => client.clone(),
+                None => {
+                    let built = events_http_client(|| {
                         // Before any builder call: `rustls-no-provider` panics without one.
                         agent_core::ensure_provider();
                         reqwest::Client::builder()
                             .redirect(reqwest::redirect::Policy::none())
                             .build()
-                            .unwrap_or_default()
-                    })
-                    .clone(),
-            ),
+                            .map_err(|e| e.to_string())
+                    })?;
+                    self.http.get_or_init(|| built).clone()
+                }
+            }),
             crate::tools::mcp::EventsPeer::Rmcp { .. } => None,
         };
         Ok(Conn { peer, http })
@@ -2572,6 +2585,14 @@ mod tests {
         };
         assert!(render_injection(1, &[gap(true)]).contains("possibly not an event"));
         assert!(!render_injection(1, &[gap(false)]).contains("possibly not an event"));
+    }
+
+    /// The direct-HTTP events client fails closed: one that cannot be built is the request's error,
+    /// never a default client (which would follow redirects past the URL that was checked).
+    #[test]
+    fn an_events_http_client_that_cannot_be_built_fails_closed() {
+        let e = events_http_client(|| Err("injected build failure".into())).unwrap_err();
+        assert!(e.contains("no request was made"), "{e}");
     }
 
     /// Every injection's text names its batch on its first line — for anyone reading the

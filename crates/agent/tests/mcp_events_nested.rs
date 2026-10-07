@@ -100,6 +100,10 @@ fn a_nested_elicitation_during_an_events_stream_reaches_the_owning_session() {
 /// In a daemon the server connection is shared by every session, so "this session" is not a given:
 /// the nested request raised during the events session's `events/poll` must reach a client attached
 /// to *that* session — not the process-wide host, and not another session's client.
+///
+/// The server holds the request until the test says both clients are attached (`raise_nested`),
+/// rather than for a guessed delay: under load an attach can take longer than any delay, and an
+/// elicitation with no client attached is (rightly) declined at once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn in_a_daemon_a_nested_elicitation_during_an_events_poll_reaches_the_events_session() {
     let home = tempfile::tempdir().unwrap();
@@ -109,7 +113,7 @@ async fn in_a_daemon_a_nested_elicitation_during_an_events_poll_reaches_the_even
         json!([stdio_server(
             "tickets",
             &control_file,
-            json!({ "MCP_FIXTURE_NESTED_DURING": "poll", "MCP_FIXTURE_NESTED_DELAY_MS": "1500" }),
+            json!({ "MCP_FIXTURE_NESTED_DURING": "poll", "MCP_FIXTURE_NESTED_ON_SIGNAL": "1" }),
             json!([{ "name": "ticket.updated", "delivery": "poll", "action": "notify" }]),
         )]),
     );
@@ -124,6 +128,20 @@ async fn in_a_daemon_a_nested_elicitation_during_an_events_poll_reaches_the_even
     // Another session's client is attached too; it must not be the one asked.
     let mut other = common::ws_connect(port, Some("bystander")).await;
     let mut ws = common::ws_connect(port, Some(common::mcp_events_fixture::EVENTS_SESSION)).await;
+    // Both attached for certain: each has answered a command on its own session.
+    for (client, id) in [(&mut other, "o"), (&mut ws, "e")] {
+        common::ws_send(client, json!({ "type": "get_state", "id": id })).await;
+        common::mcp_events_fixture::ws_next(client, Duration::from_secs(30), "attached", |f| {
+            f["type"] == "response" && f["id"] == id
+        })
+        .await;
+    }
+    common::mcp_events_fixture::control(
+        &control,
+        "POST",
+        "/control/raise_nested",
+        Some(&json!({})),
+    );
     let ask = common::mcp_events_fixture::ws_next(
         &mut ws,
         Duration::from_secs(30),

@@ -291,20 +291,27 @@ async fn a_permanently_refused_configured_subscription_is_reported_and_does_not_
     let (base, _bodies) = spawn_model_server_routed(vec![], turn_text("noted"));
     let (_d, port) = spawn_daemon(home.path(), &base, &["--session-idle-timeout", "1"]);
     let mut ws = ws_connect(port, Some(EVENTS_SESSION)).await;
-    let status = ws_next(&mut ws, Duration::from_secs(20), "the refusal", |f| {
-        f["type"] == "mcp_event_status" && f["kind"] == "refused"
-    })
-    .await;
+    // The refusal as the session records it, polled for: its `refused` frame goes out once, when
+    // the events session starts at boot — under load, before this client has attached.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let mut n = 0;
+    let l = loop {
+        n += 1;
+        let l = ws_list(&mut ws, &format!("l{n}")).await;
+        if l["data"]["unestablished"][0]["state"] == "refused" {
+            break l;
+        }
+        assert!(std::time::Instant::now() < deadline, "never refused: {l:#}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert_eq!(l["data"]["unestablished"][0]["name"], "no.such.event");
     assert!(
-        status["error"]
+        l["data"]["unestablished"][0]["last_error"]
             .as_str()
             .unwrap()
             .contains("offers no event"),
-        "{status:#}"
+        "{l:#}"
     );
-    let l = ws_list(&mut ws, "l").await;
-    assert_eq!(l["data"]["unestablished"][0]["state"], "refused", "{l:#}");
-    assert_eq!(l["data"]["unestablished"][0]["name"], "no.such.event");
     let lists = || {
         state(&fixture)["methods"]
             .as_array()

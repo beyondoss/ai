@@ -176,15 +176,17 @@ impl Edit {
         let initial_mtime = meta.as_ref().and_then(|m| m.mtime);
 
         let raw_bytes = self.backend.read_bytes(p, 0, MAX_EDIT_BYTES).await?;
-        let raw = String::from_utf8(raw_bytes)
-            .map_err(|_| ToolError::Execution(format!("read {path}: file is not valid UTF-8")))?;
 
         // The match/splice work is pure CPU over an in-memory string and can run for tens of
         // milliseconds on a multi-MB file, so it stays on a blocking worker — inline it would pin a
         // worker of `serve_ws`'s shared runtime (and a `current_thread` test runtime), stalling that
         // session's event pump and abort/steer loop. See `tests/tool_reactor_stall.rs`.
+        // So is validating the bytes as UTF-8 — a pass over every byte of the file.
         let plan_path = path.clone();
         let (content, ok) = match tokio::task::spawn_blocking(move || {
+            let raw = String::from_utf8(raw_bytes).map_err(|_| {
+                ToolError::Execution(format!("read {plan_path}: file is not valid UTF-8"))
+            })?;
             plan_edits(&plan_path, &raw, edits, replace_all)
         })
         .await
@@ -210,7 +212,7 @@ impl Edit {
         let handle = tokio::spawn(async move {
             let _write_lock = write_lock;
             backend
-                .write_if_unchanged(std::path::Path::new(&write_path), &content, initial_mtime)
+                .write_if_unchanged(std::path::Path::new(&write_path), content, initial_mtime)
                 .await
         });
         let unchanged = match handle.await {
@@ -1472,7 +1474,11 @@ mod tests {
             .unwrap();
 
         let wrote = backend
-            .write_if_unchanged(std::path::Path::new(p), restored.as_bytes(), initial_mtime)
+            .write_if_unchanged(
+                std::path::Path::new(p),
+                restored.into_bytes(),
+                initial_mtime,
+            )
             .await
             .unwrap();
         assert!(
@@ -1509,7 +1515,7 @@ mod tests {
         let wrote = backend
             .write_if_unchanged(
                 std::path::Path::new(p),
-                raw.replace("quick", "slow").as_bytes(),
+                raw.replace("quick", "slow").into_bytes(),
                 initial_mtime,
             )
             .await

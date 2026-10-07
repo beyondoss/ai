@@ -236,6 +236,13 @@ const STALE_TEMP_FILE_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 /// best-effort, never fails the caller" convention (see `mark_spill_broken`) — since a missed sweep
 /// just means the next one catches it.
 fn sweep_stale_temp_files(prefix: &str) {
+    #[cfg(test)]
+    if let Some(record) = SWEPT_ON.get() {
+        record
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((prefix.to_owned(), std::thread::current().id()));
+    }
     let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
         return;
     };
@@ -262,6 +269,11 @@ fn sweep_stale_temp_files(prefix: &str) {
         }
     }
 }
+
+/// Which thread each sweep ran on, by prefix (tests only).
+#[cfg(test)]
+static SWEPT_ON: std::sync::OnceLock<std::sync::Mutex<Vec<(String, std::thread::ThreadId)>>> =
+    std::sync::OnceLock::new();
 
 /// Incrementally accumulates streaming output with bounded memory.
 ///
@@ -590,8 +602,17 @@ impl OutputAccumulator {
             return;
         }
         // Sweep abandoned spill files from earlier commands before adding a new one — see
-        // `sweep_stale_temp_files`'s doc comment for why nothing else ever cleans these up.
-        sweep_stale_temp_files(&self.temp_prefix);
+        // `sweep_stale_temp_files`'s doc comment for why nothing else ever cleans these up. It
+        // lists and stats the whole system temp directory (thousands of entries on a busy host,
+        // over NFS on some), so on a runtime it runs on the blocking pool, not on the runtime
+        // thread this command's output is being read on: best-effort, nothing waits for it.
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                let prefix = self.temp_prefix.clone();
+                drop(runtime.spawn_blocking(move || sweep_stale_temp_files(&prefix)));
+            }
+            Err(_) => sweep_stale_temp_files(&self.temp_prefix),
+        }
         let path =
             std::env::temp_dir().join(format!("{}-{}.log", self.temp_prefix, random_hex16()));
         let mut opts = std::fs::OpenOptions::new();
@@ -1043,6 +1064,52 @@ mod tests {
             let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "spill file must be created private");
         }
+    }
+
+    /// On a runtime the stale-spill sweep — a listing and stat of the whole system temp directory —
+    /// runs on the blocking pool, not on the thread reading the command's output (a runtime thread
+    /// other sessions share); with no runtime it runs inline.
+    #[test]
+    fn the_stale_sweep_runs_off_the_runtime_thread() {
+        let swept = SWEPT_ON.get_or_init(Default::default);
+        let spill = |prefix: &str| {
+            let mut acc = OutputAccumulator::with_prefix(prefix);
+            for _ in 0..300u32 {
+                acc.append(&[b'x'; 1024]);
+            }
+            acc.finish();
+            if let Some(path) = acc.snapshot(true).full_output_path {
+                let _ = std::fs::remove_file(path);
+            }
+        };
+        let thread_of = |prefix: &str| {
+            swept
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(p, _)| p == prefix)
+                .map(|(_, t)| *t)
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let runtime_thread = std::thread::current().id();
+        rt.block_on(async { spill("test-sweep-on-runtime") });
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let on = loop {
+            if let Some(t) = thread_of("test-sweep-on-runtime") {
+                break t;
+            }
+            assert!(std::time::Instant::now() < deadline, "the sweep never ran");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_ne!(on, runtime_thread, "swept on the runtime thread");
+        drop(rt);
+        spill("test-sweep-inline");
+        assert_eq!(
+            thread_of("test-sweep-inline"),
+            Some(std::thread::current().id())
+        );
     }
 
     #[test]

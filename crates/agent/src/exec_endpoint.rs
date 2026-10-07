@@ -889,7 +889,7 @@ impl crate::tools::fs::FsBackend for CellFs {
     async fn write_if_unchanged(
         &self,
         path: &std::path::Path,
-        bytes: &[u8],
+        bytes: Vec<u8>,
         expected: Option<std::time::SystemTime>,
     ) -> Result<bool, crate::tools::fs::FsError> {
         self.inner()?
