@@ -192,6 +192,10 @@ http = "1"
 # for why that has to be explicit rather than inferred from crate features).
 rmcp = { version = "3.2.0", default-features = false, features = ["client", "macros", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest-tls-no-provider", "auth", "elicitation"] }
 
+# Names the SSE event type in `tools::mcp_wire`'s `StreamableHttpClient` impl (rmcp re-exports its error
+# but not the event). Already resolved transitively at this exact version via rmcp.
+sse-stream = "0.2.5"
+
 # `serve --listen`'s WebSocket transport (`serve_ws`): the server/`accept_async` side. Only
 # `handshake` is needed here (a plain-`ws://` loopback listener — the edge terminates TLS in front of
 # us, so no TLS feature). Same crate + exact version `agent-core` already depends on for its Codex

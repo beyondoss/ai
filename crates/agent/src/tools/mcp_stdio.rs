@@ -16,9 +16,10 @@
 //!   rebuild, and process exit alike (every exit path of `run` and `serve` calls [`retire_all`] and
 //!   waits for the sweeps).
 //!
-//! **One boundary.** [`rescue`] / [`unwrap_rescued`] are the whole workaround. PR #131 (Skills) carries
-//! its own rmcp `_meta` workaround in `tools/mcp_wire.rs`; unifying the two is meant to be a swap of
-//! these two functions, nothing else.
+//! **One boundary.** [`rescue`] / [`unwrap_rescued`] are the whole workaround, for events and skills
+//! results alike: this transport applies [`rescue`] to every stdio line, and `tools/mcp_wire.rs`'s
+//! `HttpClient` applies it to `skills/*` responses over streamable HTTP; each custom-request caller
+//! undoes it with [`unwrap_rescued`].
 
 use serde_json::{Value, json};
 

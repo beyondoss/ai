@@ -48,6 +48,14 @@ pub struct ServerManifest {
     /// `prompts/list` entries, exposed as `mcp__<server>__prompt__<name>` tools.
     #[serde(default)]
     pub prompts: Vec<CachedPrompt>,
+    /// SEP-2640 `skills/list` entries — `None` when the server does not declare the extension.
+    /// Their digests are the server's at discovery time; a stale one fails verification on load and
+    /// is refreshed through `skills/get` (see `mcp_skills`), so the cache cannot serve wrong content.
+    #[serde(default)]
+    pub skills: Option<Vec<crate::tools::mcp_skills::SkillEntry>>,
+    /// Why entries were left out of that listing, so a boot from the cache still tells the user.
+    #[serde(default)]
+    pub skill_diagnostics: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -159,7 +167,22 @@ pub fn load(dir: &ManifestDir, config: &McpServerConfig) -> Option<ServerManifes
     read_store(dir)
         .remove(&config.name)
         .filter(|m| m.key == key)
-        .filter(|m| !m.tools.is_empty() || !m.resources.is_empty() || !m.prompts.is_empty())
+        .filter(|m| {
+            !m.tools.is_empty()
+                || !m.resources.is_empty()
+                || !m.prompts.is_empty()
+                || m.skills.is_some()
+        })
+}
+
+/// Drop `config`'s cached manifest, if any — for a server whose answer must not be cached here (a
+/// skills listing marked `cacheScope: "private"`). Best-effort, like [`store`].
+pub fn forget(dir: &ManifestDir, config: &McpServerConfig) {
+    let mut all = read_store(dir);
+    if all.remove(&config.name).is_none() {
+        return;
+    }
+    write_store(dir, &all);
 }
 
 /// Record what `config`'s server advertises. Best-effort: a cache that cannot be written costs a
@@ -170,8 +193,9 @@ pub fn store(
     tools: Vec<CachedTool>,
     resources: Vec<CachedResource>,
     prompts: Vec<CachedPrompt>,
+    skills: Option<Vec<crate::tools::mcp_skills::SkillEntry>>,
+    skill_diagnostics: Vec<String>,
 ) {
-    let path = dir.file();
     let mut all = read_store(dir);
     all.insert(
         config.name.clone(),
@@ -180,9 +204,16 @@ pub fn store(
             tools,
             resources,
             prompts,
+            skills,
+            skill_diagnostics,
         },
     );
-    let Ok(bytes) = serde_json::to_vec_pretty(&all) else {
+    write_store(dir, &all);
+}
+
+fn write_store(dir: &ManifestDir, all: &Store) {
+    let path = dir.file();
+    let Ok(bytes) = serde_json::to_vec_pretty(all) else {
         return;
     };
     if let Some(parent) = path.parent() {

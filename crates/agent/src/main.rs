@@ -534,6 +534,12 @@ enum Command {
         /// `--no-skills`/`-ns`.
         #[usage(long)]
         no_skills: bool,
+        /// Approve every MCP-served skill (SEP-2640) in advance: the model may load them, and run code
+        /// while acting on one. `run` has no one to ask, so without this a model-initiated skill load
+        /// and any `bash`/`execute` call while an MCP skill is active are denied (a `/skill:` you type
+        /// yourself still loads — that is your consent — but code execution under it stays denied).
+        #[usage(long, env = "AI_AGENT_APPROVE_MCP_SKILLS")]
+        approve_mcp_skills: bool,
         /// Disable *standard-root* prompt-template discovery/loading (`~/.claude/prompts`,
         /// `<cwd>/.claude/prompts`) — a `/name` invocation in the task message is sent through
         /// unexpanded unless it resolves against a `--prompt-template` path instead. An explicit
@@ -1103,6 +1109,11 @@ enum Command {
         /// on every `reload` too. `-ns` matches pi's own `--no-skills`/`-ns`.
         #[usage(long)]
         no_skills: bool,
+        /// Approve every MCP-served skill (SEP-2640) in advance — activation, and code execution while
+        /// one is active — instead of asking attached clients with `approval_request` frames. For a
+        /// headless daemon with no one to ask; without it, an unattended question is denied.
+        #[usage(long, env = "AI_AGENT_APPROVE_MCP_SKILLS")]
+        approve_mcp_skills: bool,
         /// Disable *standard-root* prompt-template discovery/loading (`~/.claude/prompts`,
         /// `<cwd>/.claude/prompts`) — a `/name` invocation is sent through unexpanded unless it resolves
         /// against a `--prompt-template` path instead. An explicit `--prompt-template <path>` is still
@@ -1862,6 +1873,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             deny_bash_pattern,
             deny_path,
             no_skills,
+            approve_mcp_skills,
             no_prompt_templates,
             no_context_files,
             extra_skill_paths,
@@ -1934,6 +1946,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 deny_bash_pattern,
                 deny_path,
                 no_skills,
+                approve_mcp_skills,
                 no_prompt_templates,
                 no_context_files,
                 extra_skill_paths,
@@ -2034,6 +2047,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             approval_timeout,
             models,
             no_skills,
+            approve_mcp_skills,
             no_prompt_templates,
             extra_skill_paths,
             extra_prompt_template_paths,
@@ -2546,6 +2560,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     .then(|| std::time::Duration::from_secs(approval_timeout)),
                 models: models.unwrap_or_default(),
                 no_skills,
+                approve_mcp_skills,
                 no_prompt_templates,
                 extra_skill_paths,
                 extra_prompt_template_paths,
@@ -3802,11 +3817,18 @@ fn persist_run_tail(
 /// Expand an explicit `/skill:name` invocation first (its own prefix, so it can't collide with a
 /// `/name` prompt template), then fall through to prompt-template expansion — a no-op on whichever
 /// message reaches it unmatched. Mirrors `serve`'s own `"prompt"` handler exactly (see `serve.rs`).
-fn expand_message(
+///
+/// An MCP-served skill (`/skill:<server>:<name>`) is tried first; its `SKILL.md` is fetched now, at the
+/// invocation, never prefetched (see `tools::mcp_skills`).
+async fn expand_message(
     message: &str,
     skills: &[beyond_ai_agent::skills::Skill],
     prompt_templates: &[beyond_ai_agent::prompts::PromptTemplate],
+    mcp_skills: &tools::mcp_skills::McpSkills,
 ) -> String {
+    if let Some(expanded) = mcp_skills.expand_invocation(message, skills).await {
+        return expanded;
+    }
     let message = beyond_ai_agent::skills::expand_if_skill_invocation(message, skills);
     beyond_ai_agent::prompts::expand_if_slash(&message, prompt_templates)
 }
@@ -3871,6 +3893,7 @@ async fn run_task(
     deny_bash_pattern: Vec<String>,
     deny_path: Vec<String>,
     no_skills: bool,
+    approve_mcp_skills: bool,
     no_prompt_templates: bool,
     no_context_files: bool,
     extra_skill_paths: Vec<String>,
@@ -4237,7 +4260,7 @@ async fn run_task(
     // just above. `stored_settings.mcp_servers` is already trust-gated (a project's own
     // `.claude/settings.json` — where a project-tier `mcp_servers` entry would live — only merges in at
     // all when `effective_settings_for_cwd` found `cwd` trusted; the global tier always applies).
-    let (mcp_tools, _mcp_catalog, mcp_warnings) = tools::mcp::connect_all(
+    let (mcp_tools, mcp_catalog, mcp_warnings) = tools::mcp::connect_all(
         stored_settings.mcp_servers.as_deref().unwrap_or(&[]),
         tools::mcp::idle_reap_after_from_env(),
         mcp_manifest_dir().as_ref(),
@@ -4247,6 +4270,24 @@ async fn run_task(
         eprintln!("warning: {warning}");
     }
     timing.mark("connect mcp servers");
+    // SEP-2640 skills the connected servers publish. `run` has no `set_mcp_enabled`, so every
+    // configured server stays enabled and the gate never moves. The one enabled set is shared by the
+    // registry, the hooks and any subagent, so they agree on what this run loaded and approved. There
+    // is no one to ask in `run`: without `--approve-mcp-skills`, approval questions are denied.
+    let mcp_enabled = tools::mcp::McpEnabledSet::new();
+    mcp_enabled
+        .skill_session()
+        .set_preapproved(approve_mcp_skills);
+    // `--no-skills`: no MCP-served skills listed or expanded either.
+    mcp_enabled
+        .skill_session()
+        .set_listing_suppressed(no_skills);
+    let mcp_skills = tools::mcp_skills::McpSkills::new(&mcp_catalog, mcp_enabled.clone());
+    // Skill-loading tools rebound to this run's skill state (see `filter_by_enabled`).
+    let mcp_tools = tools::mcp::filter_by_enabled(&mcp_tools, &mcp_enabled);
+    for diagnostic in mcp_skills.diagnostics(&skills) {
+        eprintln!("warning: {diagnostic}");
+    }
     // Pointing at a remote endpoint swaps *one* thing: where the filesystem tools' I/O lands. The
     // tools, their names, descriptions and schemas are untouched, so the model cannot tell the
     // difference — see `tools::fs`.
@@ -4584,7 +4625,8 @@ async fn run_task(
             mcp_tools: mcp_tools.clone(),
             // `run` has no `set_mcp_enabled` command, so the gate never moves: every configured
             // server stays enabled for the life of the process, which is what the default means.
-            mcp_enabled: tools::mcp::McpEnabledSet::new(),
+            // Shared, so a child sees (and is gated by) the skills this run loaded.
+            mcp_enabled: mcp_enabled.clone(),
             memory_mounts: mounts.clone(),
             tool_cfg: subagent::ChildToolConfig {
                 bash_timeout_ms,
@@ -4672,6 +4714,13 @@ async fn run_task(
             disk_overrides: true,
         },
     );
+    // MCP-served skills get their own origin-tagged `<available_skills origin="mcp">` block, loaded
+    // through their server's `mcp__<server>__skill__read` tool rather than `read` (`serve` renders the
+    // same block per turn, through its session gate).
+    let system = match mcp_skills.format_available() {
+        mcp if mcp.is_empty() => system,
+        mcp => format!("{system}\n\n{mcp}"),
+    };
     timing.mark("build system prompt");
 
     // `--name`, applied uniformly across every path above (mirrors `serve`'s own startup check) —
@@ -4855,10 +4904,13 @@ async fn run_task(
     if block_images {
         agent = agent.with_block_images(true);
     }
+    // Always installed: besides the deny-lists, the hooks carry the SEP-2640 code-execution gate,
+    // which must hold even when no deny-list was given.
     let policy = ToolPolicy::from_lists(&deny_tool, &deny_bash_pattern, &deny_path);
-    if !policy.is_empty() {
-        agent = agent.with_hooks(Arc::new(policy));
-    }
+    agent = agent.with_hooks(Arc::new(tools::mcp_skills::RunHooks {
+        policy,
+        mcp: mcp_enabled.clone(),
+    }));
 
     if json {
         // A leading header line so a `--json` consumer can identify the session before any event
@@ -4910,7 +4962,13 @@ async fn run_task(
     // once that write has actually landed.
     let broken_pipe = AtomicBool::new(false);
 
-    let initial_message = expand_message(&initial_message, &skills, &prompt_templates);
+    // A resumed session (`--session-id`, `--continue`) whose transcript still holds an MCP skill's
+    // SKILL.md is acting on that skill: the code-execution gate is restored with it.
+    mcp_enabled
+        .skill_session()
+        .restore_from_transcript(&session.messages);
+    let initial_message =
+        expand_message(&initial_message, &skills, &prompt_templates, &mcp_skills).await;
     if initial_images.is_empty() {
         session.user(initial_message);
     } else {
@@ -4971,7 +5029,7 @@ async fn run_task(
     }
     let mut stop_reason = unwrap_turn_result(turn_result, &shutdown_cause)?;
     for message in messages {
-        session.user(expand_message(&message, &skills, &prompt_templates));
+        session.user(expand_message(&message, &skills, &prompt_templates, &mcp_skills).await);
         let turn_result = run_turn(
             &agent,
             &mut session,

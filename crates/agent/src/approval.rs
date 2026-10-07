@@ -102,6 +102,10 @@ pub struct ApprovalRequest {
     /// exactly what they are agreeing to for the rest of the session.
     pub scope_key: String,
     pub origin: ApprovalOrigin,
+    /// Why this is being asked, when it is not just "this tool is gated": an MCP-served skill asking
+    /// to be activated, or a code-execution call while one is active (see
+    /// `tools::mcp_skills::SkillSession`). Sent to clients as the frame's `mcp_skill` object.
+    pub context: Option<Value>,
 }
 
 /// Whether a decision applies to this call only, or is remembered for the session.
@@ -397,6 +401,7 @@ pub async fn ask_gate(
         summary: summarize(input),
         scope_key: key,
         origin: origin.clone(),
+        context: None,
     };
     match runtime.gate.request(request, cancel).await {
         Ok(decision) => {

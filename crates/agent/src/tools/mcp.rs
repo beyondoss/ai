@@ -48,6 +48,10 @@
 //! rounds and SEP-2663 task handles complete under protocol `2026-07-28`. Connect uses
 //! [`ClientLifecycleMode::Auto`] preferring `2026-07-28` (discover), with legacy initialize fallback.
 //!
+//! **Skills (SEP-2640).** A server declaring `io.modelcontextprotocol/skills` has its `skills/list`
+//! read at connect and gets one more tool, `mcp__<server>__skill__read`, the verified loading path
+//! for its skills; see [`crate::tools::mcp_skills`].
+//!
 //! Adding a brand-new server config mid-process (vs enabling one already configured at startup) remains
 //! out of scope.
 //!
@@ -160,6 +164,8 @@ struct Dial {
     /// can render apps — see [`crate::tools::mcp_apps`]. Part of the dial, so a redial after a reap
     /// negotiates exactly what the first dial did.
     apps: bool,
+    /// The connection's skills-listing invalidation flag, handed to every handler it dials.
+    skills_changed: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Default for Dial {
@@ -168,6 +174,7 @@ impl Default for Dial {
             host: host(),
             http: None,
             apps: false,
+            skills_changed: Arc::default(),
         }
     }
 }
@@ -207,6 +214,16 @@ fn client_info(apps: bool) -> ClientInfo {
                 crate::tools::mcp_apps::extension_settings(),
             );
     }
+    // SEP-2640 needs nothing from the client side of the handshake (we only issue `skills/*` after
+    // seeing the server declare it), but SEP-2133 lets a client say what it understands, and a
+    // server may choose what to publish by it.
+    capabilities
+        .extensions
+        .get_or_insert_with(Default::default)
+        .insert(
+            crate::tools::mcp_skills::SKILLS_EXTENSION_ID.to_string(),
+            Default::default(),
+        );
     ClientInfo::new(
         capabilities,
         Implementation::new("beyond-ai-agent", env!("CARGO_PKG_VERSION")),
@@ -221,7 +238,7 @@ fn client_info(apps: bool) -> ClientInfo {
 /// progress falls back to the LIFO active sink pushed for the in-flight call (covers the normal
 /// model path). Task `statusMessage` updates also emit on that sink while polling.
 #[derive(Clone)]
-struct McpHandler {
+pub(crate) struct McpHandler {
     server_name: String,
     /// Where this connection's server→client requests (elicitation, sampling) go. Held per
     /// connection rather than read from a process-wide global, so a session that dialed its own
@@ -242,6 +259,9 @@ struct McpHandler {
     /// The calls in flight on this connection, each with the host of the session that made it.
     /// See [`Self::route`].
     calls: Arc<std::sync::Mutex<Vec<ActiveCall>>>,
+    /// Raised by a list-changed notification; the server's SEP-2640 skills listing reads it as
+    /// "re-list on next need" (see `mcp_skills::ServerSkills::refresh_if_due`).
+    skills_changed: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// One request in flight on a connection, and the session (host) it belongs to.
@@ -261,6 +281,7 @@ impl McpHandler {
             active: Arc::new(std::sync::Mutex::new(Vec::new())),
             events: crate::tools::mcp_events::NotificationRouter::default(),
             calls: Arc::new(std::sync::Mutex::new(Vec::new())),
+            skills_changed: Arc::default(),
             apps: false,
             views: Arc::default(),
         }
@@ -269,6 +290,7 @@ impl McpHandler {
     fn for_dial(server_name: impl Into<String>, dial: &Dial) -> Self {
         Self {
             apps: dial.apps,
+            skills_changed: dial.skills_changed.clone(),
             ..Self::new(server_name, dial.host.clone())
         }
     }
@@ -420,10 +442,17 @@ impl ClientHandler for McpHandler {
         client_info(self.apps)
     }
 
+    // The resource list changed: cached MCP Apps views are stale, and so is the SEP-2640 skills
+    // listing. SEP-2640 defines no skills-specific notification (skills are resources, so a server
+    // that changes its catalog says so with `notifications/resources/list_changed`); a
+    // `notifications/skills/list_changed` (the first-class-primitive design the working group did not
+    // adopt) is honoured too, since it can only mean one thing.
     async fn on_resource_list_changed(&self, _context: NotificationContext<RoleClient>) {
         if let Ok(mut views) = self.views.lock() {
             views.clear();
         }
+        self.skills_changed
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     async fn on_progress(
@@ -476,6 +505,11 @@ impl ClientHandler for McpHandler {
         notification: rmcp::model::CustomNotification,
         context: NotificationContext<RoleClient>,
     ) {
+        if notification.method == "notifications/skills/list_changed" {
+            self.skills_changed
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
         // rmcp moves `_meta` off the notification before dispatch. In 3.2.0 it swaps the whole
         // extension map out first, so the metadata lands in `context.extensions` and
         // `context.meta` is left empty; read both, so a fixed rmcp keeps working.
@@ -509,7 +543,7 @@ fn progress_details(params: &ProgressNotificationParam) -> Value {
 }
 
 /// A connected MCP server's live client handle. Shared (via `Arc`) by every tool the server produced.
-type McpClient = RunningService<RoleClient, McpHandler>;
+pub(crate) type McpClient = RunningService<RoleClient, McpHandler>;
 
 /// Session-scoped gate over which configured MCP servers' tools are advertised to the model.
 ///
@@ -523,6 +557,10 @@ pub struct McpEnabledSet {
     /// Held beside the allow-list because both are the same thing — *which* MCP tools this session
     /// sees — and both reset together on a session switch. See [`crate::tools::mcp_apps`].
     apps: Arc<std::sync::Mutex<Option<Arc<crate::tools::mcp_apps::AppsView>>>>,
+    /// The session's SEP-2640 skill state — what it loaded and what its user approved. It rides here
+    /// because this set is already the one MCP object that is per session, reset on a session switch
+    /// and shared (not copied) with the session's subagents; see [`crate::tools::mcp_skills`].
+    skills: Arc<crate::tools::mcp_skills::SkillSession>,
 }
 
 impl McpEnabledSet {
@@ -541,6 +579,18 @@ impl McpEnabledSet {
     /// Current allow-list snapshot (`None` = all enabled).
     pub fn snapshot(&self) -> Option<HashSet<String>> {
         self.inner.lock().ok().and_then(|g| g.clone())
+    }
+
+    /// This session's skill state (loaded skills, approvals, the approval gate).
+    pub fn skill_session(&self) -> &Arc<crate::tools::mcp_skills::SkillSession> {
+        &self.skills
+    }
+
+    /// A session switch: back to every server enabled, and forget what the outgoing session loaded
+    /// and approved — an incoming session inherits neither.
+    pub fn reset_session(&self) {
+        self.set(None);
+        self.skills.reset();
     }
 
     /// Whether tools from `server` should be advertised.
@@ -590,7 +640,8 @@ pub fn server_name_from_registered(tool_name: &str) -> Option<&str> {
     }
 }
 
-/// Keep only MCP tools whose server is currently enabled.
+/// Keep only MCP tools whose server is currently enabled — each skill-loading tool rebound to this
+/// session's skill state, so what one session loaded never stands for another.
 ///
 /// A session that declared it renders MCP Apps sees its apps view's tools instead of `tools` — the
 /// same servers, dialed with the extension advertised (see [`crate::tools::mcp_apps`]).
@@ -612,7 +663,7 @@ pub fn filter_by_enabled(tools: &[Arc<dyn Tool>], enabled: &McpEnabledSet) -> Ve
             Some(server) => enabled.allows(server),
             None => true,
         })
-        .cloned()
+        .map(|t| enabled.skills.bind(t).unwrap_or_else(|| t.clone()))
         .collect()
 }
 
@@ -675,7 +726,7 @@ struct Live {
 /// A stdio server's process, to retire when its connection goes away; `None` for HTTP.
 type ServerProc = Option<Arc<crate::tools::mcp_stdio::ServerProcess>>;
 
-struct McpConnection {
+pub(crate) struct McpConnection {
     config: McpServerConfig,
     /// How this server was dialed the first time — its host hub, and (for a grant connector) the
     /// client and credential headers. Kept so a redial after a reap cannot drift from it.
@@ -867,7 +918,7 @@ impl McpConnection {
     }
 
     /// The live client, connecting first if the process was reaped.
-    async fn client(&self) -> Result<Arc<McpClient>, String> {
+    pub(crate) async fn client(&self) -> Result<Arc<McpClient>, String> {
         self.last_used
             .store(now_secs(), std::sync::atomic::Ordering::Relaxed);
         let mut guard = self.client.lock().await;
@@ -899,13 +950,20 @@ impl McpConnection {
         }
     }
 
-    /// The cached client, if there is one, without dialing.
-    async fn live_client(&self) -> Option<Arc<McpClient>> {
+    /// The client only if one is live right now — never dials. For work that is worth doing while a
+    /// server is up but not worth starting one for (re-listing skills), and that must not count as
+    /// use, so it leaves `last_used` alone.
+    pub(crate) async fn live_client(&self) -> Option<Arc<McpClient>> {
         self.client
             .lock()
             .await
             .as_ref()
             .map(|live| live.client.clone())
+    }
+
+    /// The flag a list-changed notification raises on this connection, whichever dial received it.
+    pub(crate) fn skills_changed(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        self.dial.skills_changed.clone()
     }
 
     /// Drop the process if it has been idle long enough. Returns whether it reaped.
@@ -1229,6 +1287,25 @@ async fn call_tool_tracked(
         ServerResult::CreateTaskResult(result) => Ok(CallToolResponse::Task(result)),
         _ => Err(ServiceError::UnexpectedResponse),
     }
+}
+
+/// Any other request a session makes of a server (the skills extension's `skills/*` and
+/// `resources/read`), tracked like [`call_tool_tracked`] under the calling session's host (the
+/// task-local [`with_session_host`] scope, else the connection's own), so a nested request the server
+/// raises meanwhile is attributed to that session or refused, never guessed.
+pub(crate) async fn request_tracked(
+    client: &McpClient,
+    request: ClientRequest,
+) -> Result<ServerResult, ServiceError> {
+    let call = client
+        .service()
+        .track_call(calling_host(&client.service().host));
+    let handle = client
+        .peer()
+        .send_request_with_option(request, PeerRequestOptions::no_options())
+        .await?;
+    call.bind(handle.id.clone());
+    handle.await_response().await
 }
 
 /// The `tool_progress` `details` key carrying a task's current [`McpTaskRecord`].
@@ -1933,6 +2010,7 @@ fn granted_jobs(
                     headers,
                 }),
                 apps,
+                skills_changed: Arc::default(),
             },
         ));
     }
@@ -2116,6 +2194,15 @@ fn tools_from_manifest(
         }));
     }
 
+    let diagnostics = manifest.skill_diagnostics;
+    let skills = manifest.skills.map(|entries| {
+        crate::tools::mcp_skills::attach(
+            &config.name,
+            &conn,
+            crate::tools::mcp_skills::Listing::cached(entries, diagnostics),
+            &mut tools,
+        )
+    });
     let catalog = McpServerCatalog {
         name: config.name.clone(),
         conn: Arc::downgrade(&conn),
@@ -2123,6 +2210,7 @@ fn tools_from_manifest(
         prompts: prompt_infos,
         protocol_version: None,
         apps,
+        skills,
     };
     (tools, catalog)
 }
@@ -2287,7 +2375,11 @@ async fn connect_http(
     if let Some(token) = &bearer_token {
         transport_config = transport_config.auth_header(token.clone());
     }
-    let transport = StreamableHttpClientTransport::with_client(client, transport_config);
+    // Wrapped so extension results survive rmcp's result decoding — see `mcp_wire`.
+    let transport = StreamableHttpClientTransport::with_client(
+        crate::tools::mcp_wire::HttpClient(client),
+        transport_config,
+    );
 
     McpHandler::for_dial(&config.name, dial)
         .serve_with_lifecycle(transport, client_lifecycle())
@@ -2621,6 +2713,9 @@ pub struct McpServerCatalog {
     /// Set only on a connection that advertised MCP Apps: every tool's `_meta.ui`, and a strong
     /// handle for the app bridge. See [`crate::tools::mcp_apps`].
     pub(crate) apps: Option<Arc<crate::tools::mcp_apps::AppServer>>,
+    /// The server's SEP-2640 skills, when it declares the extension — see
+    /// [`crate::tools::mcp_skills`].
+    pub(crate) skills: Option<Arc<crate::tools::mcp_skills::ServerSkills>>,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -2664,6 +2759,11 @@ impl McpCatalog {
             servers: self.servers.clone(),
             session_host: Some(host),
         }
+    }
+
+    /// The session host this view was made [for](Self::for_session), if any.
+    pub(crate) fn session_host(&self) -> Option<Arc<McpHost>> {
+        self.session_host.clone()
     }
 
     /// The host a request made through this catalog belongs to.
@@ -2861,7 +2961,7 @@ async fn tools_from_client(
         .await
         .map_err(|e| format!("`tools/list` failed: {e}"))?;
     // Fail-soft: a server without resources/prompts capabilities returns an error; treat as empty.
-    let remote_resources = match client.list_all_resources().await {
+    let mut remote_resources = match client.list_all_resources().await {
         Ok(r) => r,
         Err(e) => {
             tracing::debug!(server = %config.name, error = %e, "resources/list unavailable");
@@ -2875,6 +2975,27 @@ async fn tools_from_client(
             Vec::new()
         }
     };
+    // SEP-2640 skills: the listing only — no skill file is read at connect (see `mcp_skills`). A
+    // declared extension's files are reached through the verified skill tool, so they are not also
+    // wrapped as generic resource tools: a tool per file is context spent every turn on an
+    // unverified second route to the same bytes.
+    let skill_listing = match crate::tools::mcp_skills::declared(&client) {
+        true => Some(crate::tools::mcp_skills::discover(&client, &config.name).await),
+        false => None,
+    };
+    if let Some(listing) = &skill_listing {
+        let roots = crate::tools::mcp_skills::skill_roots_among(
+            remote_resources.iter().map(|r| r.uri.as_str()),
+        );
+        remote_resources.retain(|r| {
+            !listing.hides(&r.uri)
+                && !roots.iter().any(|root| {
+                    r.uri
+                        .strip_prefix(root.as_str())
+                        .is_some_and(|rest| rest.starts_with('/'))
+                })
+        });
+    }
     let protocol_version = client
         .peer_info()
         .map(|info| info.protocol_version.to_string());
@@ -2890,7 +3011,15 @@ async fn tools_from_client(
 
     // Record what this server advertises so the *next* boot can skip starting it entirely. Written
     // after a successful `tools/list`, so a server that failed to enumerate never poisons the cache.
-    if let Some(dir) = manifest_dir {
+    //
+    // A skills listing marked `cacheScope: "private"` must not be served outside the authorization
+    // context it was fetched in, and this file outlives that context (a rotated token, a changed
+    // header). Such a server is forgotten instead, so the next boot asks it again.
+    let private_listing = skill_listing.as_ref().is_some_and(|l| l.private);
+    if let (Some(dir), true) = (manifest_dir, private_listing) {
+        crate::tools::mcp_manifest::forget(dir, config);
+    }
+    if let (Some(dir), false) = (manifest_dir, private_listing) {
         crate::tools::mcp_manifest::store(
             dir,
             config,
@@ -2930,6 +3059,11 @@ async fn tools_from_client(
                     input_schema: prompt_input_schema(p.arguments.as_deref()),
                 })
                 .collect(),
+            skill_listing.as_ref().map(|l| l.entries.clone()),
+            skill_listing
+                .as_ref()
+                .map(|l| l.diagnostics.clone())
+                .unwrap_or_default(),
         );
     }
 
@@ -3039,6 +3173,8 @@ async fn tools_from_client(
         }));
     }
 
+    let skills = skill_listing
+        .map(|listing| crate::tools::mcp_skills::attach(&config.name, &conn, listing, &mut tools));
     Ok((
         tools,
         McpServerCatalog {
@@ -3048,6 +3184,7 @@ async fn tools_from_client(
             prompts: prompt_infos,
             protocol_version,
             apps,
+            skills,
         },
     ))
 }

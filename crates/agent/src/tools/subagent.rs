@@ -270,6 +270,9 @@ struct ChildHooks {
     policy: ToolPolicy,
     approval: Option<crate::approval::ApprovalRuntime>,
     origin: crate::approval::ApprovalOrigin,
+    /// The parent session's MCP state (shared, not copied): a child of a session acting on an
+    /// MCP-served skill — which may well be why it was spawned — is under the same code-execution gate.
+    mcp: crate::tools::mcp::McpEnabledSet,
 }
 
 #[async_trait]
@@ -281,7 +284,7 @@ impl agent_core::AgentHooks for ChildHooks {
         session: &agent_core::Session,
         cancel: &agent_core::CancellationToken,
     ) -> Option<String> {
-        crate::approval::gated_before_tool_call(
+        if let Some(reason) = crate::approval::gated_before_tool_call(
             &self.policy,
             self.approval.as_ref(),
             &self.origin,
@@ -291,6 +294,13 @@ impl agent_core::AgentHooks for ChildHooks {
             cancel,
         )
         .await
+        {
+            return Some(reason);
+        }
+        self.mcp
+            .skill_session()
+            .gate_tool_call(name, input, &self.origin, cancel)
+            .await
     }
 }
 
@@ -875,16 +885,17 @@ impl Subagent {
         // The interactive gate is inherited for exactly the same reason the deny-lists are: a child that
         // could run `bash` without the human's approval *is* the bypass. `Agent::with_hooks` holds one
         // object, so the two compose here rather than stacking.
-        if !policy.is_empty() || self.ctx.approval.is_some() {
-            agent = agent.with_hooks(Arc::new(ChildHooks {
-                policy: policy.clone(),
-                approval: self.ctx.approval.clone(),
-                origin: crate::approval::ApprovalOrigin::Subagent {
-                    agent: def.name.clone(),
-                    spawn_id: spawn_id.to_string(),
-                },
-            }));
-        }
+        // Always installed: the SEP-2640 code-execution gate must hold for a child even with no
+        // deny-list and no `--approve`.
+        agent = agent.with_hooks(Arc::new(ChildHooks {
+            policy: policy.clone(),
+            approval: self.ctx.approval.clone(),
+            origin: crate::approval::ApprovalOrigin::Subagent {
+                agent: def.name.clone(),
+                spawn_id: spawn_id.to_string(),
+            },
+            mcp: self.ctx.mcp_enabled.clone(),
+        }));
         // Deliberately no `.with_checkpoint_hook`: `Agent::new`'s `NoCheckpoint` default is correct. A
         // child inheriting the parent's would persist its turns into the parent's session store.
 
@@ -1095,7 +1106,7 @@ impl Subagent {
                 &owned_context_files
             }
         };
-        crate::resources::build_system_prompt_with_context(
+        let mut prompt = crate::resources::build_system_prompt_with_context(
             &crate::resources::PromptOptions {
                 base: None,
                 default_base: &default_base,
@@ -1126,7 +1137,16 @@ impl Subagent {
                 disk_overrides: self.ctx.disk_overrides,
             },
             context_files,
-        )
+        );
+        // The parent session's MCP-served skills, through its live MCP gate — a child has the
+        // loading tools (same registry filter), so it is told what they load.
+        let mcp =
+            crate::tools::mcp_skills::McpSkills::view(&self.ctx.mcp_enabled).format_available();
+        if !mcp.is_empty() {
+            prompt.push_str("\n\n");
+            prompt.push_str(&mcp);
+        }
+        prompt
     }
 }
 
