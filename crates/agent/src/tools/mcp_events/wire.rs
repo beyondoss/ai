@@ -167,6 +167,14 @@ impl RpcError {
         )
     }
 
+    /// A refusal retrying will not change: the request is wrong (`-32602`), the server does not
+    /// speak the extension (`-32601`), the event or the access does not exist (`-32011`, `-32012`),
+    /// or the mode is unsupported (`-32014`) — unless it is the draft's "re-discover" signal.
+    pub(super) fn is_permanent(&self) -> bool {
+        matches!(self.code, Some(-32601 | -32602 | -32011 | -32012 | -32014))
+            && !self.wants_rediscovery()
+    }
+
     /// The draft's "re-discover and resubscribe" signals: the event type was removed
     /// (`-32011`, `data.kind: "event"`) or its schema changed in place (`-32014`,
     /// `data.reason: "schema_changed"`) — not an authorization failure.

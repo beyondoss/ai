@@ -288,24 +288,26 @@ async fn a_retry_that_beats_the_resubscribe_after_a_restart_is_told_to_retry_not
     });
 }
 
-/// Only callbacks that will come back are held after a restart: a configured subscription is
-/// subscribed again, a runtime one is not — so a retried delivery to the runtime one's old callback
-/// gets `410` (stop) at once, rather than `503` (retry) for minutes on end.
+/// A runtime subscription (`mcp_events_subscribe`) survives a restart like a configured one: the
+/// daemon starts the session that holds it at boot — no client has to come back — and subscribes
+/// it again on its old callback, so events reach that session's model as before.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn after_a_restart_a_runtime_subscriptions_old_callback_is_gone_not_held() {
+async fn a_runtime_subscription_is_restored_after_a_restart_without_its_client() {
     let (_fx, mcp_url, fixture) = spawn_http_fixture(&[("MCP_FIXTURE_ALLOW_HTTP_CALLBACK", "1")]);
     let home = tempfile::tempdir().unwrap();
-    write_settings(home.path(), hooks(&mcp_url, "notify"));
-    let (base, _bodies) = spawn_model_server_routed(vec![], turn_text("noted"));
+    // The server is configured, its events are not: nothing here but the runtime subscription.
+    let mut servers = hooks(&mcp_url, "notify");
+    servers[0]["events"] = json!([]);
+    write_settings(home.path(), servers);
+    let (base, bodies) = spawn_model_server_routed(vec![], turn_text("noted"));
     let held = HeldPort::bind();
     let port = held.port();
     let mut first = daemon(home.path(), &base, &held, &[]);
-    let mut ws = ws_connect(port, Some(EVENTS_SESSION)).await;
-    ws_wait_active(&mut ws).await;
+    let mut ws = ws_connect(port, Some("runtime-owner")).await;
     ws_send(
         &mut ws,
         json!({ "type": "mcp_events_subscribe", "id": "s", "server": "hooks", "name": "ticket.updated",
-                "arguments": { "project": "alpha" }, "delivery": "webhook", "action": "notify" }),
+                "delivery": "webhook", "action": "follow_up" }),
     )
     .await;
     let r = ws_next(&mut ws, Duration::from_secs(20), "the subscribe", |f| {
@@ -313,58 +315,57 @@ async fn after_a_restart_a_runtime_subscriptions_old_callback_is_gone_not_held()
     })
     .await;
     assert_eq!(r["success"], true, "{r:#}");
-    let runtime_url = eventually(Duration::from_secs(10), "the runtime hook", || {
-        state(&fixture)["hooks"]
-            .as_array()?
-            .iter()
-            .find(|h| h["project"] == "alpha")
-            .and_then(|h| h["url"].as_str().map(str::to_owned))
+    let url = eventually(Duration::from_secs(10), "the hook", || {
+        state(&fixture)["hooks"][0]["url"]
+            .as_str()
+            .map(str::to_owned)
     });
-    eventually(Duration::from_secs(10), "both callbacks persisted", || {
-        let saved: Value =
-            serde_json::from_slice(&std::fs::read(state_file(home.path())).ok()?).ok()?;
-        (saved["subscriptions"]
-            .as_object()?
-            .values()
-            .filter(|s| s["webhook"]["token"].is_string())
+    let subscribes = || {
+        state(&fixture)["methods"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| *m == "events/subscribe")
             .count()
-            == 2)
+    };
+    eventually(Duration::from_secs(10), "the runtime spec on disk", || {
+        std::fs::read_dir(home.path().join("sessions"))
+            .ok()?
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.to_string_lossy().ends_with(".mcp-events.json"))
+            .any(|p| {
+                std::fs::read_to_string(p)
+                    .unwrap_or_default()
+                    .contains("\"runtime\"")
+            })
             .then_some(())
     });
     drop(ws);
     first.kill().unwrap();
     let _ = first.wait();
+    let before = subscribes();
     // Down, as a crashed daemon is — but still held, so the restart gets the same port.
     let down = held.down();
     drop(down);
     let _second = daemon(home.path(), &base, &held, &[]);
-    // The configured one comes back on its old callback.
     eventually(
         Duration::from_secs(20),
-        "the configured resubscribe",
-        || {
-            let n = state(&fixture)["methods"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter(|m| *m == "events/subscribe")
-                .count();
-            (n >= 3).then_some(())
-        },
-    );
-    let path = runtime_url
-        .split_once(&format!("127.0.0.1:{port}"))
-        .unwrap()
-        .1
-        .to_owned();
-    let status = raw_request(
-        port,
-        &format!("POST {path} HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\n"),
-        b"{}",
-        Duration::from_secs(5),
+        "the subscription, restored with no client",
+        || (subscribes() > before).then_some(()),
     );
     assert_eq!(
-        status, 410,
-        "nothing will resubscribe a runtime subscription: its callback is gone"
+        state(&fixture)["hooks"][0]["url"].as_str().unwrap(),
+        url,
+        "on its old callback"
+    );
+    let r = emit(
+        &fixture,
+        json!({ "event_id": "after-restart-1", "data": { "summary": "restored runtime" } }),
+    );
+    assert_eq!(r["deliveries"][0]["status"], 200, "{r:#}");
+    eventually(
+        Duration::from_secs(20),
+        "the owning session's model run",
+        || (runs_for_event(&bodies, "restored runtime") >= 1).then_some(()),
     );
 }

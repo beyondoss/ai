@@ -342,3 +342,96 @@ fn an_event_whose_run_fails_is_injected_again_up_to_a_bound() {
         "a failed run's event is injected again, up to the bound"
     );
 }
+
+/// A steered batch the model received is delivered, even when a compaction later in the same run
+/// summarizes the turn that carried it out of the transcript: delivery is recorded when the model
+/// receives it (the run's `Steered` event), not re-derived from the transcript at the run's end —
+/// so it is not injected a second time.
+#[test]
+fn a_steered_batch_summarized_away_by_a_mid_run_compaction_is_not_injected_again() {
+    let (_fx, mcp_url, fixture) = spawn_http_fixture(&[]);
+    let home = tempfile::tempdir().unwrap();
+    write_settings(
+        home.path(),
+        json!([{
+            "name": "tickets", "transport": "http", "url": mcp_url,
+            "events": [{ "name": "ticket.updated", "delivery": "poll", "action": "steer" }],
+        }]),
+    );
+    let (base, bodies) = spawn_model_server_routed(
+        vec![
+            // The second event has arrived: finish.
+            ("second, kept".into(), turn_text("done")),
+            // The first has: answer, reporting a context near the window — so once the second is
+            // steered in at that stop boundary, the run compacts before its next turn, keeping only
+            // the newest user turn (the second's) and summarizing the first's away.
+            (
+                "first, summarized away".into(),
+                turn_text("ok2").replace("\"input_tokens\":12", "\"input_tokens\":900"),
+            ),
+        ],
+        turn_text("ok"),
+    );
+    let sessions = home.path().join("sessions");
+    let mut cmd = serve_dir_cmd(BIN, &base, &sessions.to_string_lossy());
+    cmd.env("HOME", home.path())
+        .env("BEYOND_AI_AGENT_MCP_EVENTS_POLL_FLOOR_MS", "100")
+        .env("BEYOND_AI_AGENT_MCP_EVENTS_COALESCE_MS", "100")
+        // A tiny window: the big event pushes the transcript over the threshold, so the run
+        // compacts after the steered turn and keeps only the newest part.
+        .args([
+            "--context-window",
+            "1000",
+            "--compaction-reserve-tokens",
+            "700",
+            "--compaction-keep-recent-tokens",
+            "1",
+            "--no-session-memory",
+        ]);
+    let mut child = cmd.spawn_guarded();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut frames = Frames::new(child.stdout.take().unwrap(), None);
+    wait_active(&mut stdin, &mut frames, 1);
+    send(
+        &mut stdin,
+        json!({ "type": "prompt", "id": "long", "message": beyond_ai_test_support::stall_prompt(2500) }),
+    );
+    frames.wait(Duration::from_secs(10), "the run's ack", |f| {
+        f["type"] == "ack" && f["id"] == "long"
+    });
+    // The first event: steered in, it reaches the model at the stop boundary after the first
+    // (stalled) turn — as its own user turn.
+    emit(
+        &fixture,
+        json!({ "event_id": "compacted-1", "data": { "summary": "first, summarized away", "detail": "d".repeat(3000) } }),
+    );
+    eventually(Duration::from_secs(20), "the turn that carries it", || {
+        bodies
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|b| b.contains("first, summarized away"))
+            .then_some(())
+    });
+    // The second, while that turn stalls: steered in at the stop boundary after it, as the newest
+    // user turn. The compaction that follows keeps only that turn.
+    emit(
+        &fixture,
+        json!({ "event_id": "compacted-2", "data": { "summary": "second, kept" } }),
+    );
+    let done = frames.response("long");
+    assert_eq!(done["success"], true, "{done:#}");
+    assert!(
+        frames
+            .seen
+            .iter()
+            .any(|f| f["type"] == "event" && f["event"]["kind"] == "compaction_start"),
+        "the run compacted after the steered turns"
+    );
+    std::thread::sleep(Duration::from_millis(3000));
+    assert_eq!(
+        runs_for_event(&bodies, "first, summarized away"),
+        1,
+        "the model received the first event once, and it was not injected again"
+    );
+}

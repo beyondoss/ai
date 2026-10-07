@@ -61,6 +61,10 @@ pub(super) struct PersistedSub {
     pub(super) recent: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) webhook: Option<PersistedWebhook>,
+    /// A runtime subscription's whole spec (`mcp_events_subscribe`'s command), so the session
+    /// subscribes it again after a restart. `None` for a configured one (settings re-create it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) runtime: Option<Value>,
 }
 
 /// An event a server has been told was received (its cursor advanced, its webhook acked) that the
@@ -245,6 +249,9 @@ impl StateStore {
             if entry.webhook.is_none() {
                 entry.webhook = d.subs.get(key).and_then(|s| s.webhook.clone());
             }
+            if entry.runtime.is_none() {
+                entry.runtime = d.subs.get(key).and_then(|s| s.runtime.clone());
+            }
             if d.subs.get(key) == Some(&entry) {
                 return;
             }
@@ -274,6 +281,33 @@ impl StateStore {
             .subs
             .iter()
             .filter_map(|(k, s)| s.webhook.as_ref().map(|w| (k.clone(), w.token.clone())))
+            .collect()
+    }
+
+    /// Record (or with `None`, drop) a runtime subscription's spec, to subscribe again after a
+    /// restart.
+    pub(super) fn set_runtime(&self, key: &str, spec: Option<Value>) {
+        {
+            let mut d = lock(&self.inner.data);
+            if spec.is_none() && !d.subs.contains_key(key) {
+                return;
+            }
+            let entry = d.subs.entry(key.to_owned()).or_default();
+            if entry.runtime == spec {
+                return;
+            }
+            entry.runtime = spec;
+            d.snapshot_dirty = true;
+        }
+        self.dirty();
+    }
+
+    /// Every persisted runtime subscription spec, as `(subscription key, spec)`.
+    pub(super) fn runtime_specs(&self) -> Vec<(String, Value)> {
+        lock(&self.inner.data)
+            .subs
+            .iter()
+            .filter_map(|(k, s)| s.runtime.clone().map(|r| (k.clone(), r)))
             .collect()
     }
 
@@ -907,6 +941,7 @@ mod tests {
                 cursor: Some("7".into()),
                 recent: vec!["a".into()],
                 webhook: None,
+                runtime: None,
             },
         );
         let writer = store.take_writer().unwrap();

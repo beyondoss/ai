@@ -62,7 +62,12 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
   A queued message is a `SteeringMessage` (text plus optional image attachments), not a bare `String` —
   the same shape a fresh `prompt` accepts, so `steer`/`follow_up` aren't a lesser channel that silently
   drops attachments a `prompt` would have kept. `From<&str>`/`From<String>` build a text-only message,
-  so every plain-text `push`/`push_steer` call site keeps compiling unchanged. On drain, a follow-up
+  so every plain-text `push`/`push_steer` call site keeps compiling unchanged. A message may carry an
+  opaque `tag` (`SteeringMessage::with_tag`); the `Steered` event that reports its injection lists the
+  tags injected (`AgentEvent::Steered::tags`, not serialized), emitted after the transcript holding
+  them is checkpointed on both paths — so a host learns exactly which of its queued messages reached
+  the model, whatever later happens to the transcript (`serve` records MCP Events delivery this way).
+  On drain, a follow-up
   with images becomes a real `Message::user_with_images` turn instead of a plain-text one; a mid-run
   steer's images are appended as `ContentBlock::Image` blocks after its text block, onto the same
   tool-results turn its text rides on.

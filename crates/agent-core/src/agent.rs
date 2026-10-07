@@ -66,8 +66,15 @@ pub enum AgentEvent {
     },
     /// One model turn completed.
     TurnEnd { stop_reason: StopReason, step: u32 },
-    /// Queued steering/follow-up messages were injected at a stop boundary; the run continues.
-    Steered { messages: usize },
+    /// Queued steering/follow-up messages were injected (folded into a tool-results turn, or at a
+    /// stop boundary) and the transcript holding them checkpointed; the run continues. `tags` are
+    /// the [`crate::steering::SteeringMessage::tag`]s of the messages injected, for the host that
+    /// queued them (not serialized).
+    Steered {
+        messages: usize,
+        #[serde(skip)]
+        tags: Vec<u64>,
+    },
     /// The run finished normally (the model ended its turn and no steering was queued).
     AgentEnd { steps: u32 },
     /// A compaction round has begun — [`Agent::compact`] confirmed a worthwhile prefix exists and is
@@ -1250,6 +1257,7 @@ impl Agent {
                     return Ok(());
                 }
                 let count = injected.len();
+                let tags: Vec<u64> = injected.iter().filter_map(|m| m.tag).collect();
                 for msg in injected {
                     if msg.images.is_empty() {
                         session.user(msg.text);
@@ -1265,10 +1273,16 @@ impl Agent {
                 if let Some(context) = steering.take_turn_context() {
                     session.attach_request_block(context);
                 }
-                sink(AgentEvent::Steered { messages: count });
                 // A plain user message ends the visible history here — a valid, resumable checkpoint
-                // (see `CheckpointHook`) before the next model call.
+                // (see `CheckpointHook`) before the next model call. Checkpointed *before* the
+                // `Steered` event, as on the tool-results path below: a host that records delivery
+                // on that event (by its tags) must find the messages already in the persisted
+                // transcript.
                 self.checkpoint_guarded(session).await;
+                sink(AgentEvent::Steered {
+                    messages: count,
+                    tags,
+                });
                 continue;
             }
 
@@ -1811,6 +1825,7 @@ impl Agent {
             // lane, injected only at the stop boundary below.
             let steered = steering.drain_steer();
             let steered_count = steered.len();
+            let steered_tags: Vec<u64> = steered.iter().filter_map(|m| m.tag).collect();
             for msg in steered {
                 result_blocks.push(ContentBlock::text(msg.text));
                 for source in msg.images {
@@ -1841,6 +1856,7 @@ impl Agent {
             if steered_count > 0 {
                 sink(AgentEvent::Steered {
                     messages: steered_count,
+                    tags: steered_tags,
                 });
             }
             // A graceful-stop request is honored here too, after this turn's tool results (and any
@@ -9582,6 +9598,43 @@ mod tests {
                 .any(|b| matches!(b, ContentBlock::ToolUse { .. })),
             "the refused tool_use block is still committed to the transcript, just never dispatched"
         );
+    }
+
+    /// A queued message's tag comes back in the `Steered` event that reports it reached the model —
+    /// mid-run (folded into a tool-results turn) and at a stop boundary alike — so the host that
+    /// queued it knows exactly what was received, whatever later happens to the transcript.
+    #[tokio::test]
+    async fn a_steered_message_reports_its_tag_when_it_reaches_the_model() {
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(EchoTool));
+        let (agent, _mock) = agent_with(
+            vec![
+                turn::tool_call("tu_1", "echo", r#"{"text":"pong"}"#),
+                turn::text("acknowledged"),
+                turn::text("and again"),
+            ],
+            tools,
+        );
+        let mut session = Session::new();
+        session.user("start");
+        let steering = Steering::new();
+        steering.push_steer(SteeringMessage::new("mid-run", Vec::new()).with_tag(7));
+        steering.push(SteeringMessage::new("at the stop", Vec::new()).with_tag(8));
+        let mut tags = Vec::new();
+        agent
+            .run_events_steered(
+                &mut session,
+                |ev| {
+                    if let AgentEvent::Steered { tags: t, .. } = ev {
+                        tags.extend(t);
+                    }
+                },
+                CancellationToken::new(),
+                steering,
+            )
+            .await
+            .unwrap();
+        assert_eq!(tags, vec![7, 8]);
     }
 
     #[tokio::test]

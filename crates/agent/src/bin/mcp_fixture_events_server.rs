@@ -108,6 +108,9 @@ struct State {
     jwks_stall: bool,
     /// How many JWKS requests are stalled right now (they hold their connection open).
     jwks_stalled: u64,
+    /// `MCP_FIXTURE_NESTED_DURING=poll|stream`: the client's answers to the nested
+    /// `elicitation/create` raised during that `events/*` request.
+    nested_answers: Vec<Value>,
 }
 
 fn env_flag(name: &str) -> bool {
@@ -479,7 +482,18 @@ async fn rpc(
             "name": "echo",
             "description": "Echoes back its `text` argument.",
             "inputSchema": { "type": "object", "properties": { "text": { "type": "string" } } }
+        }, {
+            "name": "blob",
+            "description": "Returns a text result of `bytes` bytes.",
+            "inputSchema": { "type": "object", "properties": { "bytes": { "type": "integer" } } }
         }] })),
+        "tools/call" if params["name"] == "blob" => {
+            let n = params
+                .pointer("/arguments/bytes")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as usize;
+            Ok(json!({ "content": [{ "type": "text", "text": "x".repeat(n) }], "isError": false }))
+        }
         "tools/call" => {
             let text = params
                 .pointer("/arguments/text")
@@ -928,7 +942,7 @@ async fn control(state: &Shared, method: &str, path: &str, body: &[u8]) -> (u16,
                     "cancelled": st.cancelled, "verifications": st.verifications,
                     "deliveries": st.deliveries, "streams": st.streams.len(), "log": st.log.len(),
                 "requests": st.requests, "sessionless_rejections": st.sessionless_rejections,
-                "jwks_stalled": st.jwks_stalled,
+                "jwks_stalled": st.jwks_stalled, "nested_answers": st.nested_answers,
                 }),
             )
         }
@@ -1399,8 +1413,52 @@ async fn write_line(out: &Stdout, v: &Value) -> bool {
     out.write_all(&line).await.is_ok() && out.flush().await.is_ok()
 }
 
+/// Raise a nested `elicitation/create` toward the client and record its answer (or an error) in
+/// `nested_answers`. Answers come back through `waiters`, routed by `run_stdio`.
+async fn nested_elicitation(state: &Shared, out: &Stdout, waiters: &Waiters, during: &str) {
+    // `MCP_FIXTURE_NESTED_DELAY_MS`: hold the request (and so the `events/*` call it rides) a
+    // while first, so a client can attach before it is raised.
+    let delay = env_u64("MCP_FIXTURE_NESTED_DELAY_MS", 0);
+    if delay > 0 {
+        tokio::time::sleep(Duration::from_millis(delay)).await;
+    }
+    let id = format!("nested-{during}");
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    waiters.lock().unwrap().insert(json!(id).to_string(), tx);
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "elicitation/create",
+        "params": {
+            "mode": "form",
+            "message": format!("Approve during events/{during}?"),
+            "requestedSchema": {
+                "type": "object",
+                "properties": { "ok": { "type": "boolean" } },
+            },
+        },
+    });
+    if !write_line(out, &request).await {
+        return;
+    }
+    let answer = match tokio::time::timeout(Duration::from_secs(30), rx).await {
+        Ok(Ok(msg)) => msg,
+        _ => json!({ "timeout": true }),
+    };
+    state
+        .lock()
+        .unwrap()
+        .nested_answers
+        .push(json!({ "during": during, "answer": answer }));
+}
+
+type Waiters = Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<Value>>>>;
+
 async fn run_stdio(state: Shared) {
     let out: Stdout = Arc::new(tokio::sync::Mutex::new(tokio::io::stdout()));
+    let waiters: Waiters = Arc::default();
+    let nested_during = std::env::var("MCP_FIXTURE_NESTED_DURING").unwrap_or_default();
+    let nested_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
     // `MCP_FIXTURE_GARBAGE_STDOUT=1`: a server that prints a line that is not UTF-8 before it
     // speaks MCP (a stray banner from a native library, say). A client must skip it, not die.
     if env_flag("MCP_FIXTURE_GARBAGE_STDOUT") {
@@ -1422,9 +1480,44 @@ async fn run_stdio(state: Shared) {
             continue;
         };
         if msg.get("method").is_none() {
-            continue; // a response to something we never asked
+            // An answer to a request this server raised, if it is one we are waiting for.
+            if let Some(tx) = waiters.lock().unwrap().remove(&id.to_string()) {
+                let _ = tx.send(msg.clone());
+            }
+            continue;
+        }
+        // `MCP_FIXTURE_NESTED_DURING=poll`: the first `events/poll` is answered only after the
+        // client has answered a nested elicitation raised while it is in flight.
+        if method == "events/poll"
+            && nested_during == "poll"
+            && !nested_done.swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            let (state, out, waiters) = (state.clone(), out.clone(), waiters.clone());
+            tokio::spawn(async move {
+                nested_elicitation(&state, &out, &waiters, "poll").await;
+                let reply = match rpc(&state, "events/poll", params, None).await {
+                    Ok(result) => {
+                        json!({"jsonrpc": "2.0", "id": id, "result": like_a_2026_server(result)})
+                    }
+                    Err((code, message, data)) => {
+                        json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message, "data": data}})
+                    }
+                };
+                write_line(&out, &reply).await;
+            });
+            continue;
         }
         if method == "events/stream" {
+            if nested_during == "stream"
+                && !nested_done.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                let (state, out, waiters) = (state.clone(), out.clone(), waiters.clone());
+                tokio::spawn(async move {
+                    // Raised while the stream request is open (after its first notifications).
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    nested_elicitation(&state, &out, &waiters, "stream").await;
+                });
+            }
             match open_stream(&state, &params, id.clone()) {
                 Ok((key, mut rx)) => {
                     let out = out.clone();

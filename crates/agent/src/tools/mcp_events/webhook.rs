@@ -32,8 +32,8 @@ use crate::settings::McpEventDelivery;
 
 use super::wire::{KeyFetch, RpcError, parse_rfc3339_ms};
 use super::{
-    Delivery, Hub, RPC_TIMEOUT, SubSpec, SubState, WEBHOOK_PATH_PREFIX, backoff, now_unix,
-    now_unix_ms, ready_ok, webhook_ttl,
+    Delivery, Hub, RPC_TIMEOUT, ReadyTx, SubError, SubSpec, SubState, WEBHOOK_PATH_PREFIX, backoff,
+    now_unix, now_unix_ms, ready_ok, webhook_ttl,
 };
 
 /// Standard Webhooks' replay window, in seconds, either side of now.
@@ -486,12 +486,14 @@ pub(super) async fn run_webhook(
     spec: Arc<SubSpec>,
     state: Arc<SubState>,
     cancel: CancellationToken,
-    ready: oneshot::Sender<Result<(), String>>,
+    ready: ReadyTx,
 ) {
     let mut ready = Some(ready);
     let Some(base) = hub.callback_url.clone() else {
         if let Some(tx) = ready.take() {
-            let _ = tx.send(Err("webhook delivery is not configured".into()));
+            let _ = tx.send(Err(SubError::permanent(
+                "webhook delivery is not configured",
+            )));
         }
         return;
     };
@@ -519,7 +521,7 @@ pub(super) async fn run_webhook(
         Ok(v) => v,
         Err(e) => {
             if let Some(tx) = ready.take() {
-                let _ = tx.send(Err(e));
+                let _ = tx.send(Err(e.into()));
             }
             return;
         }
@@ -640,7 +642,7 @@ pub(super) async fn run_webhook(
                 };
                 if let Err(e) = keys {
                     if let Some(tx) = ready.take() {
-                        let _ = tx.send(Err(e));
+                        let _ = tx.send(Err(e.into()));
                     }
                     return;
                 }
@@ -724,7 +726,7 @@ pub(super) async fn run_webhook(
             }
             Err(e) => {
                 if let Some(tx) = ready.take() {
-                    let _ = tx.send(Err(e.to_string()));
+                    let _ = tx.send(Err(SubError::from_rpc(&e)));
                     return;
                 }
                 if e.is_terminal() && e.code != Some(-32015) {

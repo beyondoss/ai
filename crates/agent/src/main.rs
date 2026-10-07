@@ -1662,7 +1662,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The ordinary way out (`run` finishing, every subcommand that returns) and a panic unwinding
     // out of `run` both pass through this guard's `Drop`: the same cleanup as `exit_process`.
     let _sweep = tools::mcp_stdio::ExitSweep;
-    build_runtime(is_service_mode())?.block_on(run())
+    let runtime = build_runtime(is_service_mode())?;
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| runtime.block_on(run()))) {
+        Ok(result) => result,
+        // A panic out of `run` (the panic hook has already reported it). Dropping the runtime
+        // here would wait for every blocking task — and `serve`'s stdin reader is one, parked on a
+        // read that may never return — so the process would hang instead of exiting. Abandon the
+        // runtime's threads, sweep (the same cleanup as every exit), and go, with Rust's own
+        // panic status.
+        Err(_) => {
+            runtime.shutdown_background();
+            tools::mcp_stdio::sweep_before_exit();
+            std::process::exit(101);
+        }
+    }
 }
 
 /// What every way out of the process does first: retire every stdio MCP server still running

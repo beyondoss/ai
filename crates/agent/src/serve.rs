@@ -4617,7 +4617,11 @@ pub(crate) async fn serve_session(
                 // the run is over — see `mcp_events_finish` below.
                 let own_injection = crate::tools::mcp_events::injection_batch(&cmd);
                 let mut steered_injections: Vec<u64> = Vec::new();
-                let messages_before_run = session.messages.len();
+                // The steered batches the model has received: recorded — durably, in the events
+                // state — from the run's `Steered` event, the moment the transcript holding them is
+                // checkpointed, never re-derived from the transcript afterwards (a compaction may
+                // have summarized them away by then).
+                let steered_received: Arc<std::sync::Mutex<Vec<u64>>> = Arc::default();
                 let result = 'retry: loop {
                     tokens_before.store(0, Ordering::Relaxed);
                     refused.store(false, Ordering::Relaxed);
@@ -4671,7 +4675,19 @@ pub(crate) async fn serve_session(
                     }
                     let life_obs = life.clone();
                     let attempt_result = {
+                        let received_sink = steered_received.clone();
+                        let receipts_sink = mcp_events.as_ref().map(|hub| hub.receipts());
                         let mut sink = move |ev: AgentEvent| {
+                            if let AgentEvent::Steered { tags, .. } = &ev
+                                && !tags.is_empty()
+                            {
+                                if let Some(receipts) = &receipts_sink {
+                                    for tag in tags {
+                                        receipts.received(*tag);
+                                    }
+                                }
+                                lock_ignoring_poison(&received_sink).extend(tags.iter().copied());
+                            }
                             // Set on `CompactionStart`, cleared on literally anything else — see
                             // `is_compacting`'s own declaration above for why that's exact, not a
                             // conservative approximation.
@@ -4972,7 +4988,8 @@ pub(crate) async fn serve_session(
                                                         if let Some(batch) = crate::tools::mcp_events::injection_batch(&c) {
                                                             let text = crate::skills::expand_if_skill_invocation(m, &skills);
                                                             let text = crate::prompts::expand_if_slash(&text, &prompt_templates);
-                                                            let m = agent_core::SteeringMessage::new(text, parse_images(c.get("images")));
+                                                            let m = agent_core::SteeringMessage::new(text, parse_images(c.get("images")))
+                                                                .with_tag(batch);
                                                             let queued = steering.push_steer(m);
                                                             if !queued {
                                                                 deferred_events.push_back(l.to_string());
@@ -5593,10 +5610,10 @@ pub(crate) async fn serve_session(
 
                 // A batch is delivered only once the model has it in a transcript that persisted:
                 // the run's own prompt when the run did not fail (an abort still leaves the prompt
-                // in the transcript the next run reads); a steered one only if it actually made it
-                // into the transcript (found by its batch id) — an abort clears the steer lane
-                // (`clear_run_scoped`) before the model sees what is queued there. Everything else
-                // goes back to pending, to be injected again.
+                // in the transcript the next run reads); a steered one exactly when the run's
+                // `Steered` event reported it (already recorded then — see `steered_received`) — an
+                // abort clears the steer lane (`clear_run_scoped`) before the model sees what is
+                // queued there. Everything else goes back to pending, to be injected again.
                 if let Some(hub) = &mcp_events
                     && (own_injection.is_some() || !steered_injections.is_empty())
                 {
@@ -5610,21 +5627,9 @@ pub(crate) async fn serve_session(
                             returned.push(b)
                         }
                     }
-                    // Compaction can shrink the transcript mid-run; then look at all of it.
-                    let since = if session.messages.len() >= messages_before_run {
-                        messages_before_run
-                    } else {
-                        0
-                    };
+                    let received = std::mem::take(&mut *lock_ignoring_poison(&steered_received));
                     for b in steered_injections.drain(..) {
-                        if run_ok
-                            && crate::tools::mcp_events::transcript_has_injection(
-                                &session.messages[since..],
-                                b,
-                            )
-                        {
-                            delivered.push(b);
-                        } else {
+                        if !received.contains(&b) {
                             returned.push(b);
                         }
                     }
@@ -6108,6 +6113,15 @@ pub(crate) async fn serve_session(
                         None,
                         Some("missing boolean `enabled`")
                     )),
+                }
+            }
+            // Test-only, in debug builds and only with `BEYOND_AI_AGENT_TEST_PANICS` set: panic right
+            // here, inside the session loop, so the way a panic leaves `serve` can be tested.
+            #[cfg(debug_assertions)]
+            "__test_panic" if std::env::var_os("BEYOND_AI_AGENT_TEST_PANICS").is_some() => {
+                #[allow(clippy::panic)]
+                {
+                    panic!("test panic requested inside serve");
                 }
             }
             "get_state" => {

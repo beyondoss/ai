@@ -249,7 +249,8 @@ fn a_server_without_the_extension_is_reported_and_its_tools_are_unchanged() {
     let status = s
         .frames
         .wait(Duration::from_secs(20), "the subscribe failure", |f| {
-            f["type"] == "mcp_event_status" && f["kind"] == "error"
+            // Permanent: the server does not speak the extension.
+            f["type"] == "mcp_event_status" && f["kind"] == "refused"
         });
     assert!(
         status["error"]

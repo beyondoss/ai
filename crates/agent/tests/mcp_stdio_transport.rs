@@ -326,3 +326,57 @@ fn a_run_refused_for_bad_configuration_after_connecting_still_sweeps() {
         "`run` refused its configuration and left its stdio server's grandchild {orphan} running"
     );
 }
+
+/// A panic inside `serve` (here: in the session loop, while the stdin reader is parked on a read
+/// that never returns) must not hang the process in runtime teardown: it exits promptly, and its
+/// stdio servers are still swept.
+#[test]
+fn a_panic_inside_serve_exits_promptly_and_still_sweeps() {
+    let home = tempfile::tempdir().unwrap();
+    let pidfile = home.path().join("orphan.pid");
+    let (_child_guard, mut stdin, mut frames) = {
+        write_settings(
+            home.path(),
+            json!([stdio_server(
+                "tools",
+                &home.path().join("control"),
+                json!({ "MCP_FIXTURE_ORPHAN_PIDFILE": pidfile.to_string_lossy() }),
+                json!([])
+            )]),
+        );
+        let (base, _bodies) = spawn_model_server_routed(vec![], turn_text("noted"));
+        let mut cmd = serve_cmd(BIN, &base, &home.path().join("s.jsonl").to_string_lossy());
+        cmd.env("HOME", home.path())
+            .env("BEYOND_AI_AGENT_MCP_IDLE_SECS", "0")
+            .env("BEYOND_AI_AGENT_TEST_PANICS", "1");
+        let mut child = cmd.spawn_guarded();
+        let stdin = child.stdin.take().unwrap();
+        let frames = Frames::new(child.stdout.take().unwrap(), None);
+        (child, stdin, frames)
+    };
+    let mut child = _child_guard;
+    send(&mut stdin, json!({ "type": "get_mcp", "id": "m" }));
+    frames.response("m");
+    let orphan: u32 = eventually(Duration::from_secs(10), "the orphan's pid", || {
+        std::fs::read_to_string(&pidfile).ok()?.trim().parse().ok()
+    });
+    // stdin stays open: the reader thread stays parked on its read.
+    send(&mut stdin, json!({ "type": "__test_panic", "id": "boom" }));
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "serve hung after a panic instead of exiting"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(!status.success(), "a panic is a failure exit");
+    assert!(
+        !alive(orphan),
+        "serve panicked and left its stdio server's grandchild {orphan} running"
+    );
+    drop(stdin);
+}
