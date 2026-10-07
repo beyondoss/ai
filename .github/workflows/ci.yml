@@ -299,6 +299,9 @@ jobs:
       - uses: jdx/mise-action@v4
       - uses: Swatinem/rust-cache@v2
       - run: mise build:rs:release
+      # The authority on "no test seam ships": the release binaries themselves, scanned for the
+      # seam prefix (a grep over what was just built; seconds).
+      - run: mise check:release-seams
   # Mutation testing on what this PR changed: every line the diff touches in the gateway and the
   # catalog is mutated, and a mutant the tests don't catch fails the job. Cost scales with the diff
   # (each mutant is a rebuild plus a test run), so the mutants are split across 8 runners: a typical
