@@ -18,7 +18,7 @@ use common::{
     SpawnGuarded, read_until_response, serve_dir_cmd, spawn_model_server, turn_text, turn_tool_use,
 };
 use serde_json::{Value, json};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, Write};
 
 const BIN: &str = env!("CARGO_BIN_EXE_beyond-ai-agent");
 
@@ -70,7 +70,7 @@ fn a_session_endpoint_is_set_over_the_protocol_and_cleared_on_session_switch() {
     let mut child = serve_dir_cmd(BIN, &base, sessions.path().to_str().unwrap()).spawn_guarded();
 
     let mut stdin = child.stdin.take().unwrap();
-    let mut out = BufReader::new(child.stdout.take().unwrap());
+    let mut out = common::serve_frames(child.stdout.take().unwrap());
     let mut send = |v: Value| {
         writeln!(stdin, "{v}").unwrap();
         stdin.flush().unwrap();
@@ -152,7 +152,7 @@ fn clearing_the_endpoint_returns_the_session_to_the_host() {
     let mut child = serve_dir_cmd(BIN, &base, sessions.path().to_str().unwrap()).spawn_guarded();
 
     let mut stdin = child.stdin.take().unwrap();
-    let mut out = BufReader::new(child.stdout.take().unwrap());
+    let mut out = common::serve_frames(child.stdout.take().unwrap());
     let mut send = |v: Value| {
         writeln!(stdin, "{v}").unwrap();
         stdin.flush().unwrap();
@@ -192,7 +192,7 @@ fn a_malformed_endpoint_is_rejected_without_attaching_anything() {
     let mut child = serve_dir_cmd(BIN, &base, sessions.path().to_str().unwrap()).spawn_guarded();
 
     let mut stdin = child.stdin.take().unwrap();
-    let mut out = BufReader::new(child.stdout.take().unwrap());
+    let mut out = common::serve_frames(child.stdout.take().unwrap());
     let mut send = |v: Value| {
         writeln!(stdin, "{v}").unwrap();
         stdin.flush().unwrap();
@@ -241,7 +241,7 @@ fn a_resumed_session_reattaches_its_endpoint_and_a_sibling_does_not_inherit_it()
 
     let mut child = serve_dir_cmd(BIN, &base, sessions.path().to_str().unwrap()).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut out = BufReader::new(child.stdout.take().unwrap());
+    let mut out = common::serve_frames(child.stdout.take().unwrap());
     let mut send = |v: Value| {
         writeln!(stdin, "{v}").unwrap();
         stdin.flush().unwrap();
@@ -321,7 +321,7 @@ fn a_cold_restart_reattaches_the_session_endpoint_and_outranks_the_process_defau
         let mut child =
             serve_dir_cmd(BIN, &base, sessions.path().to_str().unwrap()).spawn_guarded();
         let mut stdin = child.stdin.take().unwrap();
-        let mut out = BufReader::new(child.stdout.take().unwrap());
+        let mut out = common::serve_frames(child.stdout.take().unwrap());
         let mut send = |v: Value| {
             writeln!(stdin, "{v}").unwrap();
             stdin.flush().unwrap();
@@ -358,7 +358,7 @@ fn a_cold_restart_reattaches_the_session_endpoint_and_outranks_the_process_defau
         ])
         .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut out = BufReader::new(child.stdout.take().unwrap());
+    let mut out = common::serve_frames(child.stdout.take().unwrap());
     let mut send = |v: Value| {
         writeln!(stdin, "{v}").unwrap();
         stdin.flush().unwrap();

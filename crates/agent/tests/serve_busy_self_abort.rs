@@ -9,8 +9,8 @@
 
 mod common;
 
-use std::io::{BufReader, Write};
-use std::process::{ChildStdin, ChildStdout};
+use std::io::Write;
+use std::process::ChildStdin;
 use std::time::Duration;
 
 use common::{
@@ -27,10 +27,10 @@ fn spawn_and_warm_up(
     bin: &str,
     base: &str,
     session_dir: &str,
-) -> (ChildGuard, ChildStdin, BufReader<ChildStdout>) {
+) -> (ChildGuard, ChildStdin, common::Frames) {
     let mut child = serve_dir_cmd(bin, base, session_dir).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
     writeln!(
         stdin,
         "{}",
@@ -49,7 +49,7 @@ fn spawn_and_warm_up(
 /// self-abort-and-proceeded command's — see `serve.rs`'s `pending_deferred` doc comment for why).
 fn run_busy_then(
     stdin: &mut ChildStdin,
-    stdout: &mut BufReader<ChildStdout>,
+    stdout: &mut common::Frames,
     busy_cmd: &Value,
 ) -> (Value, Value) {
     writeln!(
@@ -99,7 +99,7 @@ fn serve_busy_compact_self_aborts_and_proceeds_in_one_round_trip() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_dir_cmd(bin, &base, &session_dir).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     let (prompt_resp, compact_resp) = run_busy_then(
         &mut stdin,

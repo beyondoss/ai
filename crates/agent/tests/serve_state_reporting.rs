@@ -6,14 +6,10 @@ mod common;
 use std::io::{BufRead, Write};
 
 use common::{
-    SpawnGuarded, frames_with_deadline, read_until_event, read_until_response, serve_cmd,
-    serve_dir_cmd, spawn_model_server, turn_text, turn_tool_use,
+    SpawnGuarded, read_until_event, read_until_response, serve_cmd, serve_dir_cmd,
+    spawn_model_server, turn_text, turn_tool_use,
 };
 use serde_json::{Value, json};
-
-/// How long a test waits for `serve`'s next frame before failing. Every run here is a few scripted
-/// turns and a sub-second `sleep`; a stall (not slowness) is what this catches.
-const FRAME_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
 
 #[test]
 fn serve_get_session_stats_reports_the_same_field_set_idle_or_mid_turn() {
@@ -45,7 +41,7 @@ fn serve_get_session_stats_reports_the_same_field_set_idle_or_mid_turn() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = frames_with_deadline(child.stdout.take().unwrap(), FRAME_DEADLINE);
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     writeln!(
         stdin,
@@ -113,7 +109,7 @@ fn serve_get_state_and_get_session_stats_answer_live_during_a_prompt() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = frames_with_deadline(child.stdout.take().unwrap(), FRAME_DEADLINE);
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     writeln!(stdin, "{}", json!({ "type": "prompt", "message": "go" })).unwrap();
     stdin.flush().unwrap();
@@ -174,7 +170,7 @@ fn serve_get_tree_since_works_from_the_busy_loop_mid_prompt() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = frames_with_deadline(child.stdout.take().unwrap(), FRAME_DEADLINE);
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     writeln!(stdin, "{}", json!({ "type": "prompt", "message": "first" })).unwrap();
     stdin.flush().unwrap();
@@ -248,7 +244,7 @@ fn serve_get_state_reports_pending_tool_ids_while_a_tool_is_running() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = frames_with_deadline(child.stdout.take().unwrap(), FRAME_DEADLINE);
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     writeln!(stdin, "{}", json!({ "type": "prompt", "message": "go" })).unwrap();
     stdin.flush().unwrap();
@@ -302,7 +298,7 @@ fn serve_get_state_reports_runtime_settings_and_queue_depth() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = frames_with_deadline(child.stdout.take().unwrap(), FRAME_DEADLINE);
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     // Defaults, nothing queued yet. Fix 1 (pi-parity gap): `claude-test` (this test's model, via
     // `serve_cmd`) supports reasoning, so a fresh process with no `--reasoning-effort` now starts at
@@ -365,7 +361,7 @@ fn serve_steer_and_follow_up_expose_the_actual_queued_text_not_just_a_count() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = frames_with_deadline(child.stdout.take().unwrap(), FRAME_DEADLINE);
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     writeln!(
         stdin,
@@ -434,7 +430,7 @@ fn serve_reports_cwd_stale_false_for_a_freshly_created_session() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = frames_with_deadline(child.stdout.take().unwrap(), FRAME_DEADLINE);
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     let mut ready = String::new();
     stdout.read_line(&mut ready).unwrap();
@@ -472,7 +468,7 @@ fn serve_reports_cwd_stale_true_when_the_recorded_directory_no_longer_exists() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_cmd(bin, &base, &session_file.to_string_lossy()).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = frames_with_deadline(child.stdout.take().unwrap(), FRAME_DEADLINE);
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     let mut ready = String::new();
     stdout.read_line(&mut ready).unwrap();
@@ -516,7 +512,7 @@ fn serve_switch_session_reports_cwd_stale_for_the_newly_active_session() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_dir_cmd(bin, &base, &session_dir.to_string_lossy()).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = frames_with_deadline(child.stdout.take().unwrap(), FRAME_DEADLINE);
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     // The freshly (auto-)created active session must not be stale.
     let mut ready = String::new();
@@ -569,7 +565,7 @@ fn serve_switch_session_restores_the_reopened_sessions_own_model() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_dir_cmd(bin, &base, &session_dir.to_string_lossy()).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = frames_with_deadline(child.stdout.take().unwrap(), FRAME_DEADLINE);
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     let mut ready = String::new();
     stdout.read_line(&mut ready).unwrap();
@@ -616,7 +612,7 @@ fn serve_get_session_stats_reports_context_usage_after_a_real_turn() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = frames_with_deadline(child.stdout.take().unwrap(), FRAME_DEADLINE);
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     writeln!(stdin, "{}", json!({ "type": "get_session_stats" })).unwrap();
     stdin.flush().unwrap();
@@ -658,7 +654,7 @@ fn serve_set_session_name_and_get_last_assistant_text() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = frames_with_deadline(child.stdout.take().unwrap(), FRAME_DEADLINE);
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     // No name set yet, no assistant reply yet.
     writeln!(stdin, "{}", json!({ "type": "get_state" })).unwrap();
@@ -745,7 +741,7 @@ fn serve_set_session_name_strips_newlines_and_pushes_a_session_info_changed_fram
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = frames_with_deadline(child.stdout.take().unwrap(), FRAME_DEADLINE);
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     writeln!(
         stdin,
@@ -813,7 +809,7 @@ fn get_state_reports_session_file_and_is_streaming_idle_vs_mid_run() {
     // startup, before any turn ever ran).
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = frames_with_deadline(child.stdout.take().unwrap(), FRAME_DEADLINE);
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
     writeln!(stdin, "{}", json!({ "type": "get_state" })).unwrap();
     stdin.flush().unwrap();
     let idle_frames = read_until_response(&mut stdout, "get_state");

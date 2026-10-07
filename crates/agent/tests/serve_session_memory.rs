@@ -7,7 +7,7 @@
 
 mod common;
 
-use std::io::{BufReader, Write};
+use std::io::Write;
 use std::path::Path;
 use std::process::ChildStdin;
 
@@ -85,7 +85,7 @@ fn a_fact_written_to_session_survives_compaction_and_is_recovered_after_the_remi
         .args(["--compaction-keep-recent-tokens", "1"])
         .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     // --- Prompt 1: write the fact to /session. -------------------------------------------------------
     send(
@@ -176,7 +176,7 @@ fn no_session_memory_omits_the_session_root_but_keeps_durable() {
         .args(["--no-session-memory"])
         .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
     send(&mut stdin, json!({ "type": "prompt", "message": "hello" }));
     read_until_response(&mut stdout, "prompt");
 
@@ -226,7 +226,7 @@ fn a_pressure_nudge_fires_before_compaction_within_the_same_prompt() {
         ])
         .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     send(&mut stdin, json!({ "type": "prompt", "message": "first" }));
     let p1 = read_until_response(&mut stdout, "prompt");
@@ -292,7 +292,7 @@ fn below_the_pressure_point_and_under_no_session_memory_no_nudge_fires() {
             .args(extra)
             .spawn_guarded();
         let mut stdin = child.stdin.take().unwrap();
-        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let mut stdout = common::serve_frames(child.stdout.take().unwrap());
         send(&mut stdin, json!({ "type": "prompt", "message": "first" }));
         read_until_response(&mut stdout, "prompt");
         let before = bodies.lock().unwrap().len();

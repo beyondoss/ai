@@ -3050,7 +3050,7 @@ async fn tools_from_client(
     // header). Such a server is forgotten instead, so the next boot asks it again.
     let private_listing = skill_listing.as_ref().is_some_and(|l| l.private);
     if let (Some(dir), true) = (manifest_dir, private_listing) {
-        crate::tools::mcp_manifest::forget(dir, config);
+        crate::tools::mcp_manifest::forget(dir, config).await;
     }
     if let (Some(dir), false) = (manifest_dir, private_listing) {
         crate::tools::mcp_manifest::store(
@@ -3097,7 +3097,8 @@ async fn tools_from_client(
                 .as_ref()
                 .map(|l| l.diagnostics.clone())
                 .unwrap_or_default(),
-        );
+        )
+        .await;
     }
 
     let apps = dial.apps.then(|| {

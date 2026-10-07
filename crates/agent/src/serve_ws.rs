@@ -1534,15 +1534,43 @@ async fn bind_uds(
     Ok(listener)
 }
 
+/// Whether `LISTEN_PID` says the passed sockets are this process's: systemd's protocol sets it to the
+/// pid it execs, so a descriptor list inherited by anything else (a child of the activated process,
+/// a shell that exported the variables) is not taken. Required, not merely checked when present:
+/// `listenfd` skips the check when `LISTEN_PID` is unset, and every real activator (systemd,
+/// `systemd-socket-activate`) sets it — so an unset one means the variables did not come from
+/// activation, and adopting whatever descriptors happen to sit at those numbers would be a guess.
+#[cfg(unix)]
+fn check_listen_pid(listen_pid: Option<&str>, ours: u32) -> Result<(), String> {
+    match listen_pid {
+        Some(pid) if pid.trim().parse::<u32>().ok() == Some(ours) => Ok(()),
+        Some(pid) => Err(format!(
+            "LISTEN_FDS is set, but LISTEN_PID={pid} names another process (this is {ours}): the \
+             sockets were passed to that process, not to this one; refusing them"
+        )),
+        None => Err(
+            "LISTEN_FDS is set without LISTEN_PID: socket activation always names the process its \
+             sockets are for, so these did not come from it; refusing them"
+                .to_string(),
+        ),
+    }
+}
+
 /// Adopt the listener socket systemd passed via socket activation (`LISTEN_FDS`/`LISTEN_PID`). Returns
-/// `(tcp, uds)` — whichever transport systemd activated. `listenfd::ListenFd::from_env` reads the env
-/// honoring the `LISTEN_PID == getpid()` guard (so we never grab a parent's fds), and hands back the
-/// inherited std listeners; we set them non-blocking and wrap as tokio listeners. Tries a unix socket
-/// first (the local-daemon case), then TCP. Errors if systemd set `LISTEN_FDS` but passed nothing we
-/// can serve. Must run on a tokio runtime — `from_std` registers the listener with the reactor.
+/// `(tcp, uds)` — whichever transport systemd activated. The sockets are taken only when `LISTEN_PID`
+/// is set and names this process ([`check_listen_pid`]; `listenfd` alone would also take them when it
+/// is unset), so we never grab a parent's fds; `listenfd::ListenFd::from_env` then hands back the
+/// inherited std listeners, marked close-on-exec, and we set them non-blocking and wrap them as tokio
+/// listeners. Tries a unix socket first (the local-daemon case), then TCP. Errors if systemd set
+/// `LISTEN_FDS` but passed nothing we can serve. Must run on a tokio runtime — `from_std` registers
+/// the listener with the reactor.
 #[cfg(unix)]
 fn adopt_systemd_listeners()
 -> Result<(Option<TcpListener>, Option<UnixListener>), Box<dyn std::error::Error>> {
+    check_listen_pid(
+        std::env::var("LISTEN_PID").ok().as_deref(),
+        std::process::id(),
+    )?;
     let mut fds = listenfd::ListenFd::from_env();
     // `.ok().flatten()` so a wrong-type fd (e.g. asking for unix when it's tcp) falls through rather
     // than propagating — we then try the other type.
@@ -2823,6 +2851,22 @@ async fn write_http_err<S: AsyncWrite + Unpin>(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    /// Passed sockets are this process's only when `LISTEN_PID` says so — unset is not "anyone's".
+    #[cfg(unix)]
+    #[test]
+    fn passed_sockets_are_taken_only_when_listen_pid_names_this_process() {
+        assert!(check_listen_pid(Some("4242"), 4242).is_ok());
+        assert!(check_listen_pid(Some(" 4242\n"), 4242).is_ok());
+        let other = check_listen_pid(Some("1"), 4242).unwrap_err();
+        assert!(
+            other.contains("LISTEN_PID=1") && other.contains("4242"),
+            "{other}"
+        );
+        let unset = check_listen_pid(None, 4242).unwrap_err();
+        assert!(unset.contains("without LISTEN_PID"), "{unset}");
+        assert!(check_listen_pid(Some("not-a-pid"), 4242).is_err());
+    }
 
     /// Build a `Live` handle with no session behind it. The input receiver is returned and must be held
     /// to keep the session "alive"; dropping it is how a test models a session whose loop ended.

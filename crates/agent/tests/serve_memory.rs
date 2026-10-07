@@ -5,7 +5,7 @@
 
 mod common;
 
-use std::io::{BufReader, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{ChildStdin, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -84,7 +84,7 @@ fn one_prompt(
 ) -> (Vec<String>, Vec<Value>) {
     let mut child = serve_mem_cmd(base, session_file, home, work, extra).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
     send(&mut stdin, json!({ "type": "prompt", "message": message }));
     let frames = read_until_response(&mut stdout, "prompt");
     let recorded = bodies.lock().unwrap().clone();
@@ -124,7 +124,7 @@ fn persists_across_a_restart_then_injects_the_index_and_recalls() {
     let mut child =
         serve_mem_cmd(&base_a, &session_a, home.path(), work.path(), &[]).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
     send(
         &mut stdin,
         json!({ "type": "prompt", "message": "remember the deploy command" }),
@@ -202,7 +202,7 @@ fn a_memory_written_mid_session_refreshes_the_injected_index_on_the_next_rebuild
 
     let mut child = serve_mem_cmd(&base, &session, home.path(), work.path(), &[]).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     send(
         &mut stdin,

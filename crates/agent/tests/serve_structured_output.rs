@@ -7,7 +7,7 @@
 
 mod common;
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, Write};
 use std::process::ChildStdin;
 
 use common::{
@@ -62,7 +62,7 @@ fn a_prompt_with_a_schema_returns_the_validated_payload_on_its_terminal_response
 
     let mut child = serve_cmd(BIN, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     let resp = prompt(
         &mut stdin,
@@ -92,7 +92,7 @@ fn a_prompt_without_a_schema_carries_neither_the_tool_nor_the_field() {
 
     let mut child = serve_cmd(BIN, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     let resp = prompt(
         &mut stdin,
@@ -125,7 +125,7 @@ fn a_run_that_never_calls_the_tool_reports_a_null_payload_rather_than_omitting_t
 
     let mut child = serve_cmd(BIN, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     let resp = prompt(
         &mut stdin,
@@ -145,7 +145,7 @@ fn a_malformed_schema_is_rejected_before_the_prompt_is_ever_acknowledged() {
 
     let mut child = serve_cmd(BIN, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     // Not an object schema: a tool's arguments are always an object, so this can never be satisfied.
     send(
@@ -194,7 +194,7 @@ fn a_schema_installed_by_one_prompt_does_not_leak_into_the_next() {
 
     let mut child = serve_cmd(BIN, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     let first = prompt(
         &mut stdin,
@@ -248,7 +248,7 @@ fn a_second_prompt_reusing_the_same_schema_still_reports_only_its_own_answer() {
 
     let mut child = serve_cmd(BIN, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     let ask = json!({ "type": "prompt", "message": "review", "output_schema": schema() });
 
@@ -288,7 +288,7 @@ fn changing_the_schema_between_prompts_rebuilds_the_tool() {
 
     let mut child = serve_cmd(BIN, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     let first = prompt(
         &mut stdin,
@@ -329,7 +329,7 @@ fn a_schema_violation_is_fed_back_over_the_wire_and_the_model_corrects_itself() 
 
     let mut child = serve_cmd(BIN, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     let resp = prompt(
         &mut stdin,

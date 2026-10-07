@@ -754,7 +754,8 @@ impl ServerSkills {
                 listing.entries.clone(),
                 listing.diagnostics.clone(),
                 listing.private,
-            );
+            )
+            .await;
         }
         *lock(&self.listing) = listing;
         true

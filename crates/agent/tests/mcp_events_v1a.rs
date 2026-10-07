@@ -15,8 +15,8 @@ use common::mcp_events_fixture::{
     write_settings, ws_next, ws_wait_active,
 };
 use common::{
-    BIN, HeldPort, SpawnGuarded, TestWs, serve_dir_cmd, spawn_model_server_routed, turn_text,
-    ws_connect, ws_next_frame, ws_send,
+    BIN, HeldPort, TestWs, serve_dir_cmd, spawn_model_server_routed, turn_text, ws_connect,
+    ws_next_frame, ws_send,
 };
 use serde_json::{Value, json};
 
@@ -55,12 +55,9 @@ async fn deliveries_must_carry_a_valid_v1a_signature_when_the_server_publishes_a
         "--mcp-events-callback-url",
         &format!("http://127.0.0.1:{port}"),
     ])
-    .env("HOME", home.path())
-    .stdout(Stdio::null())
-    .stderr(Stdio::null());
-    held.hand_to(&mut cmd);
-    let _d = cmd.spawn_guarded();
-    drop((cmd, held));
+    .env("HOME", home.path());
+    let _d = held.spawn(&cmd, Stdio::null());
+    drop(held);
     let mut ws = ws_connect(port, Some("mcp-events")).await;
     // The verification challenge itself was v1a-signed and checked: the subscribe succeeds.
     let mut active = false;

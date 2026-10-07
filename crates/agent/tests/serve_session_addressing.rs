@@ -10,7 +10,7 @@
 
 mod common;
 
-use std::io::{BufReader, Write};
+use std::io::Write;
 use std::process::{Command, Stdio};
 
 use common::{
@@ -51,14 +51,14 @@ fn serve_selecting(bin: &str, base: &str, session_dir: &str, extra: &[&str]) -> 
 struct Serve {
     child: ChildGuard,
     stdin: std::process::ChildStdin,
-    stdout: BufReader<std::process::ChildStdout>,
+    stdout: common::Frames,
 }
 
 impl Serve {
     fn start(cmd: &mut Command) -> Self {
         let mut child = cmd.spawn_guarded();
         let stdin = child.stdin.take().expect("stdin");
-        let stdout = BufReader::new(child.stdout.take().expect("stdout"));
+        let stdout = common::serve_frames(child.stdout.take().expect("stdout"));
         Self {
             child,
             stdin,
