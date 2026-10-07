@@ -148,6 +148,11 @@ htmd = "0.5"
 # Already resolved transitively at this exact version (tokio → signal-hook-registry → errno), so
 # depending on it directly adds nothing to the build graph.
 libc = "0.2"
+# The session and manifest locks are open file description locks (`fcntl(F_OFD_SETLK)`, see
+# `file_lock`): owned by the one `open` that took them, so no other descriptor of the file can release
+# them, and released explicitly so a forked child's copy cannot keep them. Already in the build graph
+# at this version (transitively); its safe `fcntl` keeps the `unsafe` out of this crate, which forbids it.
+nix = { version = "0.31", default-features = false, features = ["fs"] }
 # `export_html`'s markdown rendering (headers/bold/lists/code fences) for message text — pure Rust, no
 # vendored JS. Deliberately not paired with a syntax-highlighting crate (e.g. `syntect`): that pulls in
 # several MB of bundled syntax/theme data and would slow every build of this CLI, including `run`/

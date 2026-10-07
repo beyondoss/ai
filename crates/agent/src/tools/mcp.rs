@@ -148,6 +148,9 @@ struct HttpDial {
     /// The daemon's `mcp_http` client: ALPN, the `web` tool's SSRF resolver, and deliberately not
     /// the gateway's h2c pool — a tenant's connector is not the gateway.
     client: reqwest::Client,
+    /// The egress policy that client enforces, for the fresh client that ends this connection's
+    /// session on the way out of the process (`mcp_http_exit`).
+    policy: Arc<crate::tools::web::ssrf::EgressPolicy>,
     headers: Vec<SecretHeader>,
 }
 
@@ -453,6 +456,9 @@ impl ClientHandler for McpHandler {
         }
         self.skills_changed
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // rmcp runs this on a task of its own, after (or before) the response that followed the
+        // notification on the wire; this line is how an operator — or a test — knows it has run.
+        tracing::debug!(server = %self.server_name, "resources/list_changed handled: view cache cleared");
     }
 
     async fn on_progress(
@@ -2112,6 +2118,7 @@ fn granted_jobs(
                 host: host.clone(),
                 http: Some(HttpDial {
                     client: egress.client.clone(),
+                    policy: egress.policy.clone(),
                     headers,
                 }),
                 apps,
@@ -2511,13 +2518,21 @@ async fn connect_http(
     // Wrapped so extension results survive rmcp's result decoding — see `mcp_wire` — so an MCP
     // App view's read is refused over its cap without being read whole — see `mcp_view_http` — and
     // so a rejected OAuth token is refreshed and the request retried once — see `mcp_oauth`.
+    // The session this connection opens is ended on the way out of the process if nothing ended
+    // it before — see `mcp_http_exit`.
+    let exit = crate::tools::mcp_http_exit::HttpSession::new(
+        url,
+        auth.clone(),
+        dial.http.as_ref().map(|h| h.policy.clone()),
+    );
     let transport = StreamableHttpClientTransport::with_client(
         crate::tools::mcp_oauth::OAuthHttp::new(
             crate::tools::mcp_view_http::ViewCappedHttp::new(crate::tools::mcp_wire::HttpClient {
                 client,
             }),
             auth,
-        ),
+        )
+        .ending_session_on_exit(exit),
         transport_config,
     );
 
@@ -3346,6 +3361,7 @@ mod tests {
         agent_core::ensure_provider();
         let dial = HttpDial {
             client: reqwest::Client::new(),
+            policy: Arc::default(),
             headers: vec![header],
         };
         assert!(!format!("{dial:?}").contains("tenant-token"));

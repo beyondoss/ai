@@ -191,12 +191,9 @@ fn lock_store(dir: &ManifestDir) -> Option<crate::file_lock::FileLock> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).ok()?;
     }
-    let mut lock_path = path.into_os_string();
-    lock_path.push(".lock");
-    let lock_path = PathBuf::from(lock_path);
     let deadline = Instant::now() + LOCK_TIMEOUT;
     loop {
-        match crate::file_lock::try_lock(&lock_path) {
+        match crate::file_lock::try_lock(crate::file_lock::Target::File(&path)) {
             Ok(Some(lock)) => return Some(lock),
             Ok(None) if Instant::now() < deadline => std::thread::sleep(LOCK_RETRY_INTERVAL),
             Ok(None) | Err(_) => return None,
@@ -393,7 +390,11 @@ mod tests {
         let leftovers: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-            .filter(|n| n != FILE && *n != format!("{FILE}.lock"))
+            .filter(|n| {
+                n != FILE
+                    && *n != format!("{FILE}.lock")
+                    && !crate::file_lock::is_record_lock_file(std::path::Path::new(n))
+            })
             .collect();
         assert!(
             leftovers.is_empty(),
@@ -443,10 +444,10 @@ mod tests {
         let manifest = ManifestDir::at(dir.path());
         let held = lock_store(&manifest).unwrap();
         assert!(
-            crate::file_lock::try_lock(&dir.path().join(format!("{FILE}.lock")))
+            crate::file_lock::try_lock(crate::file_lock::Target::File(&dir.path().join(FILE)))
                 .unwrap()
                 .is_none(),
-            "it is crate::file_lock on <manifest>.lock"
+            "it is crate::file_lock on the manifest file"
         );
         let session = dir.path().join(FILE);
         assert!(

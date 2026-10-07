@@ -12,8 +12,8 @@ mod common;
 use std::time::Duration;
 
 use common::mcp_apps::{
-    Ws, app_request, command, daemon, daemon_with, declare_apps, home_with_fixture, of_type,
-    prompt, tool_end_text, view_id, views_model,
+    Ws, app_request, command, daemon, daemon_opts, daemon_with, declare_apps, home_with_fixture,
+    of_type, prompt, tool_end_text, view_id, views_model,
 };
 use common::{
     body_json, spawn_model_server_routed, turn_text, turn_tool_use, ws_next_frame, ws_send,
@@ -371,7 +371,20 @@ async fn view_html_is_cached_per_connection_until_the_server_says_resources_chan
         call("toolu_1"),
     );
     let sessions = tempfile::tempdir().unwrap();
-    let daemon = daemon(&home.home, &base, sessions.path(), "0").await;
+    // The daemon's debug log says when `list_changed` has been handled (rmcp runs the handler on a
+    // task of its own, so the response to `change_view` can arrive first): the wait below is for
+    // that line, not for a guessed interval.
+    let log = sessions.path().join("serve.stderr");
+    let daemon = daemon_opts(
+        &home.home,
+        &base,
+        sessions.path(),
+        "0",
+        &[],
+        &[("RUST_LOG", "beyond_ai_agent::tools::mcp=debug")],
+        Some(&log),
+    )
+    .await;
     let mut ws = daemon.connect("cache").await;
     declare_apps(&mut ws).await;
 
@@ -402,8 +415,22 @@ async fn view_html_is_cached_per_connection_until_the_server_says_resources_chan
     )
     .await;
     assert_eq!(r["data"]["result"]["content"][0]["text"], "view-v2", "{r}");
-    // `list_changed` is handled on the client's own task; give it a moment to land.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Wait until the client has handled `list_changed` on its own task.
+    let handled = |log: &std::path::Path| {
+        std::fs::read_to_string(log)
+            .unwrap_or_default()
+            .matches("resources/list_changed handled")
+            .count()
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while handled(&log) == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "list_changed was never handled: {}",
+            std::fs::read_to_string(&log).unwrap_or_default()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     let three = prompt(&mut ws, "zq3x").await;
     assert!(html(&three).contains("weather v2"), "{}", html(&three));
     assert_eq!(home.reads_of(VIEW_URI), 2);

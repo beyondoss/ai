@@ -20,6 +20,7 @@ pub mod mcp;
 pub mod mcp_apps;
 pub mod mcp_events;
 pub mod mcp_host;
+pub mod mcp_http_exit;
 pub mod mcp_manifest;
 pub(crate) mod mcp_oauth;
 pub mod mcp_skills;
@@ -176,6 +177,15 @@ pub(crate) fn write_atomic(path: &str, content: &[u8]) -> std::io::Result<()> {
     let p = std::path::Path::new(path);
     let resolved = resolve_symlink_target(p);
     let p = resolved.as_deref().unwrap_or(p);
+    // Never a fresh file renamed over a lock file (reached by name or through a symlink — resolved
+    // just above): the lock would stay on the old inode, which the path no longer names, so the next
+    // owner would lock the new file. Opening one is harmless (see `file_lock`); replacing it is not.
+    if crate::file_lock::is_lock_file(p) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("{} is a lock file; it is not written", p.display()),
+        ));
+    }
     let name = match p.file_name() {
         Some(name) => name,
         None => return Err(std::io::Error::other(format!("invalid path: {path}"))),
@@ -884,6 +894,36 @@ mod tests {
         );
         // The original target is untouched by the failed write.
         assert!(target.is_dir());
+    }
+
+    /// Never a fresh file renamed over a lock file — the record one or, during mixed rollout, the
+    /// legacy one an older binary locks — directly or through a symlink: the lock would be left on
+    /// an inode the path no longer names. An unrelated `*.lock` (a `Cargo.lock`) is written as ever.
+    #[test]
+    #[cfg(unix)]
+    fn write_atomic_never_replaces_a_lock_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = dir.path().join("s1");
+        std::fs::create_dir_all(&session).unwrap();
+        let _held = crate::file_lock::try_lock(crate::file_lock::Target::Dir(&session))
+            .unwrap()
+            .unwrap();
+        let legacy = session.join("lock");
+        let link = dir.path().join("innocent.txt");
+        std::os::unix::fs::symlink(&legacy, &link).unwrap();
+        let before = std::fs::metadata(&legacy).unwrap();
+        for target in [&legacy, &link] {
+            assert!(
+                write_atomic(target.to_str().unwrap(), b"x").is_err(),
+                "{} must not be replaced",
+                target.display()
+            );
+        }
+        use std::os::unix::fs::MetadataExt as _;
+        assert_eq!(std::fs::metadata(&legacy).unwrap().ino(), before.ino());
+        let cargo_lock = dir.path().join("Cargo.lock");
+        write_atomic(cargo_lock.to_str().unwrap(), b"[[package]]\n").unwrap();
+        assert_eq!(std::fs::read(&cargo_lock).unwrap(), b"[[package]]\n");
     }
 
     #[test]

@@ -146,6 +146,9 @@ pub fn write_json(stream: &mut TcpStream, status: &str, value: &Value) {
     write_response(stream, status, "Content-Type: application/json\r\n", &body);
 }
 
+/// One request's `(Authorization, Mcp-Session-Id)`.
+pub type HeaderPair = (Option<String>, Option<String>);
+
 /// A running OAuth-protected MCP server and its controls. See the module doc.
 #[derive(Clone)]
 pub struct OAuthFixture {
@@ -184,6 +187,8 @@ pub struct OAuthFixture {
     pub discover_reply: Arc<Mutex<Option<(String, String)>>>,
     /// Answer notifications with an empty `200 OK` (no content type) instead of `202 Accepted`.
     pub notifications_empty_200: Arc<AtomicBool>,
+    /// Never answer a `DELETE` (hold the connection 30 s).
+    pub hang_deletes: Arc<AtomicBool>,
     /// What arrived: `initialize`s, `GET` streams, `DELETE`s, POSTs refused for a missing or
     /// expired session, and the `Mcp-Session-Id` each `tools/call` carried.
     pub initializes: Arc<AtomicU32>,
@@ -191,6 +196,10 @@ pub struct OAuthFixture {
     pub deletes: Arc<AtomicU32>,
     pub session_refusals: Arc<AtomicU32>,
     pub call_sessions: Arc<Mutex<Vec<Option<String>>>>,
+    /// Each `DELETE`'s `(Authorization, Mcp-Session-Id)`.
+    pub delete_requests: Arc<Mutex<Vec<HeaderPair>>>,
+    /// The client's answers to server→client requests (JSON-RPC responses POSTed back), by id.
+    pub client_answers: Arc<Mutex<Vec<Value>>>,
     issued: Arc<Mutex<HashSet<String>>>,
     live_sessions: Arc<Mutex<HashSet<String>>>,
 }
@@ -230,11 +239,14 @@ impl OAuthFixture {
             sse_responses: Arc::default(),
             discover_reply: Arc::default(),
             notifications_empty_200: Arc::default(),
+            hang_deletes: Arc::default(),
             initializes: Arc::default(),
             get_streams: Arc::default(),
             deletes: Arc::default(),
             session_refusals: Arc::default(),
             call_sessions: Arc::default(),
+            delete_requests: Arc::default(),
+            client_answers: Arc::default(),
             issued: Arc::default(),
             live_sessions: Arc::default(),
         };
@@ -426,6 +438,17 @@ impl Shared {
         if !f.sessions.load(Ordering::SeqCst) {
             return write_response(stream, "405 Method Not Allowed", "", b"");
         }
+        if req.method == "DELETE" {
+            f.delete_requests.lock().unwrap().push((
+                req.headers.get("authorization").cloned(),
+                req.headers.get("mcp-session-id").cloned(),
+            ));
+            if f.hang_deletes.load(Ordering::SeqCst) {
+                // A server that never answers the session's end.
+                thread::sleep(Duration::from_secs(30));
+                return;
+            }
+        }
         if !self.authorized(req) {
             return self.unauthorized(stream, &Value::Null);
         }
@@ -507,6 +530,14 @@ impl Shared {
                 Some(_) => {}
             }
         }
+        // The client answering a server→client request (no `method`, a `result` or `error`).
+        if method.is_empty() && (request.get("result").is_some() || request.get("error").is_some())
+        {
+            f.client_answers.lock().unwrap().push(request.clone());
+            let (_, cv) = &self.gate;
+            cv.notify_all();
+            return write_response(stream, "202 Accepted", "", b"");
+        }
         if request.get("id").is_none() {
             return if f.notifications_empty_200.load(Ordering::SeqCst) {
                 write_response(stream, "200 OK", "", b"")
@@ -547,7 +578,15 @@ impl Shared {
                     "properties": { "text": { "type": "string" } },
                     "required": ["text"],
                 },
+            }, {
+                "name": "ask_user",
+                "description": "Asks the user for their name, then greets them.",
+                "inputSchema": { "type": "object", "properties": {} },
             }] }),
+            _ if request.pointer("/params/name").and_then(Value::as_str) == Some("ask_user") => {
+                f.call_sessions.lock().unwrap().push(session.clone());
+                return self.ask_user(stream, &request, &id, &extra);
+            }
             _ => {
                 f.call_sessions.lock().unwrap().push(session.clone());
                 let text = request
@@ -584,6 +623,61 @@ impl Shared {
                 f.live_sessions.lock().unwrap().clear();
             }
         }
+    }
+
+    /// `ask_user`, answered the way a real streamable-HTTP server does it: an SSE stream on the
+    /// call's own POST, **flushed event by event** — a progress notification, then an
+    /// `elicitation/create` request to the client — and the response only once the client's answer
+    /// to that request has arrived (POSTed back on another connection). A client that buffered the
+    /// stream to its end would never see the question, and the call would hang to the 10 s cap.
+    fn ask_user(&self, stream: &mut TcpStream, request: &Value, id: &Value, extra: &str) {
+        let f = &self.fixture;
+        let token = request.pointer("/params/_meta/progressToken").cloned();
+        let ask_id = format!("srv-elicit-{}", self.calls.fetch_add(1, Ordering::SeqCst));
+        let _ = stream.write_all(
+            format!("HTTP/1.1 200 OK\r\n{extra}Content-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        );
+        let mut event = |message: Value| {
+            let _ = stream.write_all(format!("data: {message}\n\n").as_bytes());
+            let _ = stream.flush();
+        };
+        if let Some(token) = token {
+            event(
+                json!({ "jsonrpc": "2.0", "method": "notifications/progress",
+                "params": { "progressToken": token, "progress": 1, "total": 2,
+                            "message": "asking the user" } }),
+            );
+        }
+        thread::sleep(Duration::from_millis(50));
+        event(
+            json!({ "jsonrpc": "2.0", "id": ask_id, "method": "elicitation/create",
+            "params": { "message": "What is your name?",
+                        "requestedSchema": { "type": "object",
+                            "properties": { "name": { "type": "string" } },
+                            "required": ["name"] } } }),
+        );
+        // Wait for the answer, on another connection, before ending this stream.
+        let answered =
+            |answers: &Vec<Value>| answers.iter().find(|a| a["id"] == json!(ask_id)).cloned();
+        let (count, cv) = &self.gate;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut answer = answered(&f.client_answers.lock().unwrap());
+        while answer.is_none() && std::time::Instant::now() < deadline {
+            let guard = count.lock().unwrap();
+            let _ = cv.wait_timeout(guard, Duration::from_millis(100)).unwrap();
+            answer = answered(&f.client_answers.lock().unwrap());
+        }
+        let text = match answer {
+            Some(a) if a["result"]["action"] == "accept" => format!(
+                "hello-{}",
+                a["result"]["content"]["name"].as_str().unwrap_or("?")
+            ),
+            Some(a) => format!("not answered: {}", a["result"]["action"]),
+            None => "no answer before the stream had to end".to_owned(),
+        };
+        event(json!({ "jsonrpc": "2.0", "id": id,
+            "result": { "content": [{ "type": "text", "text": text }], "isError": false } }));
     }
 }
 

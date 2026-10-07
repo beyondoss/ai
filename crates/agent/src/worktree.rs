@@ -425,7 +425,9 @@ impl Git {
                 tokio::task::spawn_blocking(move || {
                     for rel in &files {
                         let from = src.join(rel);
-                        if !from.is_file() {
+                        // A lock file is left behind: a copy of one is not a lock (see
+                        // `file_lock`).
+                        if !from.is_file() || crate::file_lock::is_lock_file(&from) {
                             continue;
                         }
                         let to = dst.join(rel);
@@ -1227,6 +1229,53 @@ mod tests {
             !wt.path().join("secret.txt").exists(),
             "an ignored file must not be copied into the worktree"
         );
+    }
+
+    /// A lock file sitting untracked in the repo is left behind by the seed (a copy of a lock is no
+    /// lock), and copying a hard link to it — an in-process open and close of the lock file — does
+    /// not release it (see `file_lock`).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn seeding_never_copies_a_held_lock_file_and_leaves_it_held() {
+        let repo = repo().await;
+        let state = repo.path().join("state");
+        let lock = crate::file_lock::try_lock(crate::file_lock::Target::File(&state))
+            .unwrap()
+            .unwrap();
+        let record = std::fs::read_dir(repo.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| crate::file_lock::is_record_lock_file(p))
+            .unwrap();
+        std::fs::hard_link(&record, repo.path().join("innocent.txt")).unwrap();
+        std::fs::write(repo.path().join("brand-new.rs"), "fn main() {}\n").unwrap();
+
+        let root = preflight(&Git::Local, repo.path()).await.unwrap();
+        let wt = Worktree::create(&Git::Local, &root, "scout-0")
+            .await
+            .unwrap();
+        assert!(wt.path().join("brand-new.rs").exists(), "seeding ran");
+        let copied: Vec<_> = std::fs::read_dir(wt.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .collect();
+        assert!(
+            !copied
+                .iter()
+                .any(|p| crate::file_lock::is_record_lock_file(p)),
+            "the record lock file was copied: {copied:?}"
+        );
+        // A hard link to it is just a file to copy — and copying it (an open and a close of the lock
+        // file) leaves the lock held.
+        assert!(wt.path().join("innocent.txt").exists());
+        if let Some(held) = crate::file_lock::tests::held_for_another_process(
+            crate::file_lock::Target::File(&state),
+        ) {
+            assert!(held, "seeding the worktree left the lock held");
+        }
+        drop(lock);
     }
 
     #[tokio::test]
