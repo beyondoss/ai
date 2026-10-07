@@ -1131,7 +1131,8 @@ async fn persist_messages_blocking(
     messages: Arc<Vec<agent_core::Message>>,
 ) -> (Persistence, std::io::Result<()>) {
     match tokio::task::spawn_blocking(move || {
-        let r = simulated_checkpoint_write().and_then(|()| persistence.persist_messages(&messages));
+        let r = simulated_checkpoint_write(&persistence.meta.id)
+            .and_then(|()| persistence.persist_messages(&messages));
         (persistence, r)
     })
     .await
@@ -1227,19 +1228,28 @@ async fn write_then_ack<T>(
 /// A slow or failing disk under a checkpoint write, simulated, **inside** the write itself: sleeps
 /// `BEYOND_AI_AGENT_TEST_SLOW_CHECKPOINT_MS` milliseconds, then fails the write when
 /// `BEYOND_AI_AGENT_TEST_FAIL_CHECKPOINT` says so — `all` fails every checkpoint write, a number `n`
-/// only the `n`th (1-based, per process). Inside the write, not before it, so an
+/// only the `n`th (1-based) **of each session**, counted by session id, so on a daemon one session's
+/// writes never shift which write of another's fails. Inside the write, not before it, so an
 /// acknowledgement sent ahead of the write would precede the slow part — which is the mistake the
 /// slow-disk test is there to catch. `#[cfg]`-gated like [`simulated_slow_open`], names and all: a
 /// release binary has no fault-injection path and carries none of these variable names.
 #[cfg(debug_assertions)]
-fn simulated_checkpoint_write() -> std::io::Result<()> {
+fn simulated_checkpoint_write(session: &str) -> std::io::Result<()> {
     if let Ok(ms) = std::env::var("BEYOND_AI_AGENT_TEST_SLOW_CHECKPOINT_MS")
         && let Ok(ms) = ms.parse::<u64>()
     {
         std::thread::sleep(std::time::Duration::from_millis(ms));
     }
-    static WRITES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let n = WRITES.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    static WRITES: std::sync::Mutex<std::collections::BTreeMap<String, usize>> =
+        std::sync::Mutex::new(std::collections::BTreeMap::new());
+    let n = {
+        let mut writes = WRITES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let n = writes.entry(session.to_owned()).or_default();
+        *n += 1;
+        *n
+    };
     let fail = match std::env::var("BEYOND_AI_AGENT_TEST_FAIL_CHECKPOINT").as_deref() {
         Ok("all") => true,
         Ok(which) => which.parse::<usize>().is_ok_and(|which| which == n),
@@ -1252,7 +1262,7 @@ fn simulated_checkpoint_write() -> std::io::Result<()> {
 }
 
 #[cfg(not(debug_assertions))]
-fn simulated_checkpoint_write() -> std::io::Result<()> {
+fn simulated_checkpoint_write(_session: &str) -> std::io::Result<()> {
     Ok(())
 }
 

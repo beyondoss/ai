@@ -661,7 +661,7 @@ mod tests {
     /// One canned HTTP response per connection, from a loopback listener; `hold` keeps the
     /// connection open afterwards (an SSE stream the server never ends).
     async fn canned(response: &'static [u8], hold: bool) -> String {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = beyond_ai_test_support::ports::tokio_listener().await;
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             while let Ok((mut stream, _)) = listener.accept().await {
@@ -891,7 +891,7 @@ mod tests {
     async fn an_ordinary_request_is_sent_as_rmcps_own_client_would() {
         agent_core::ensure_provider();
         async fn capture() -> (String, tokio::sync::oneshot::Receiver<String>) {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let listener = beyond_ai_test_support::ports::tokio_listener().await;
             let addr = listener.local_addr().unwrap();
             let (tx, rx) = tokio::sync::oneshot::channel();
             tokio::spawn(async move {

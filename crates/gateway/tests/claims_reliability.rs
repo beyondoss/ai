@@ -75,7 +75,7 @@ struct RawUpstream {
 
 impl RawUpstream {
     async fn start() -> Self {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = beyond_ai_test_support::ports::tokio_listener().await;
         let port = listener.local_addr().unwrap().port();
         let events = Arc::new(Mutex::new(Vec::new()));
         let conns = Arc::new(AtomicUsize::new(0));
@@ -568,13 +568,9 @@ async fn expect_100_continue_never_stalls() {
 /// without reuseport is refused. (A server restarted on its old port could find it taken; closing the
 /// listener without the holder would release it.)
 ///
-/// **Linux semantics.** That holding relies on Linux's `SO_REUSEPORT`: a socket may share a port only
-/// if it too set the option (and runs as the same user), and the kernel's port-0 search skips ports a
-/// reuseport group holds. The gateway suites run on Linux CI, which is where this is relied on. On
-/// the BSDs and macOS the option means something different (it lets any later socket with the option
-/// share the port, and the last one bound may take the traffic), so the hold would be weaker there —
-/// and there is no portable non-reuseport alternative: an ordinary socket bound to the port cannot
-/// coexist with the listener that has to be bound to it while the server is up.
+/// **Linux semantics.** The holder is `ports::bound_reuseport_socket`, which relies on Linux's
+/// `SO_REUSEPORT`; its documentation says what differs elsewhere, and why there is no portable
+/// alternative.
 struct RestartableNats {
     child: Option<Child>,
     /// The forwarder's port: what the gateway and the test dial.
@@ -595,11 +591,7 @@ impl RestartableNats {
         let dir = std::env::temp_dir().join(format!("beyond-ai-rel13-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let holder = tokio::net::TcpSocket::new_v4().unwrap();
-        holder.set_reuseport(true).unwrap();
-        holder
-            .bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
-            .unwrap();
+        let holder = beyond_ai_test_support::ports::bound_reuseport_socket();
         let port = holder.local_addr().unwrap().port();
         RestartableNats {
             child: None,
@@ -1461,7 +1453,7 @@ async fn counting_h2_upstream(
     use hyper::service::service_fn;
     use hyper_util::rt::{TokioExecutor, TokioIo};
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = beyond_ai_test_support::ports::tokio_listener().await;
     let port = listener.local_addr().unwrap().port();
     let ck = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
     let key = rustls::pki_types::PrivateKeyDer::Pkcs8(ck.key_pair.serialize_der().into());
@@ -1637,7 +1629,7 @@ async fn goaway_upstream() -> (u16, Arc<AtomicUsize>, tokio::task::JoinHandle<()
     use hyper::service::service_fn;
     use hyper_util::rt::{TokioExecutor, TokioIo};
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = beyond_ai_test_support::ports::tokio_listener().await;
     let port = listener.local_addr().unwrap().port();
     let ck = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
     let key = rustls::pki_types::PrivateKeyDer::Pkcs8(ck.key_pair.serialize_der().into());
@@ -1736,7 +1728,7 @@ async fn refusing_h2_upstream(
     tokio::task::JoinHandle<()>,
 ) {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = beyond_ai_test_support::ports::tokio_listener().await;
     let port = listener.local_addr().unwrap().port();
     let ck = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
     let key = rustls::pki_types::PrivateKeyDer::Pkcs8(ck.key_pair.serialize_der().into());

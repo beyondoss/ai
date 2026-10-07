@@ -254,7 +254,7 @@ fn serve_titles_only(listener: TcpListener, recorder: Option<Arc<Mutex<Vec<Strin
 ///
 /// Session-title requests do not consume a response (see [`accept_scripted`]).
 pub fn spawn_model_server(responses: Vec<String>) -> (String, Arc<Mutex<Vec<String>>>) {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let listener = crate::ports::listener();
     let addr = listener.local_addr().unwrap();
     let requests = Arc::new(Mutex::new(Vec::new()));
     let recorder = requests.clone();
@@ -311,7 +311,8 @@ pub fn spawn_model_server_routed_unrecorded_on(
     routes: Vec<(String, String)>,
     fallback: String,
 ) -> String {
-    spawn_model_server_routed_at(bind, routes, fallback, false).0
+    let listener = TcpListener::bind(bind).unwrap();
+    spawn_model_server_routed_at(listener, routes, fallback, false).0
 }
 
 fn spawn_model_server_routed_inner(
@@ -319,16 +320,15 @@ fn spawn_model_server_routed_inner(
     fallback: String,
     record: bool,
 ) -> (String, Arc<Mutex<Vec<String>>>) {
-    spawn_model_server_routed_at("127.0.0.1:0", routes, fallback, record)
+    spawn_model_server_routed_at(crate::ports::listener(), routes, fallback, record)
 }
 
 fn spawn_model_server_routed_at(
-    bind: &str,
+    listener: TcpListener,
     routes: Vec<(String, String)>,
     fallback: String,
     record: bool,
 ) -> (String, Arc<Mutex<Vec<String>>>) {
-    let listener = TcpListener::bind(bind).unwrap();
     let addr = listener.local_addr().unwrap();
     let requests = Arc::new(Mutex::new(Vec::new()));
     let recorder = requests.clone();
@@ -419,7 +419,7 @@ pub fn spawn_model_server_with_stalled_response(
     stall: std::time::Duration,
     after: Vec<String>,
 ) -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let listener = crate::ports::listener();
     let addr = listener.local_addr().unwrap();
     thread::spawn(move || {
         // Session-title requests do not consume a scripted response (see [`accept_scripted`]).

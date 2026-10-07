@@ -112,7 +112,7 @@ struct EchoUpstream {
 
 impl EchoUpstream {
     async fn start(mode: Echo) -> Self {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = beyond_ai_test_support::ports::tokio_listener().await;
         let port = listener.local_addr().unwrap().port();
         let task = tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {

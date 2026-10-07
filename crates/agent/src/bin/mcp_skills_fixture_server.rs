@@ -736,6 +736,7 @@ async fn main() {
 /// life the same way it does a stdio server's.
 async fn serve_http() {
     use tokio::io::AsyncReadExt;
+    // port-0: held for the server's life; the port it got is announced to the test.
     let Ok(listener) = tokio::net::TcpListener::bind("127.0.0.1:0").await else {
         eprintln!("mcp_skills_fixture_server: cannot bind a loopback port");
         return;

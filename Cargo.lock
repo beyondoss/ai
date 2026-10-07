@@ -470,6 +470,7 @@ dependencies = [
  "async-stream",
  "async-trait",
  "beyond-ai-providers",
+ "beyond-ai-test-support",
  "bytes",
  "divan",
  "futures",

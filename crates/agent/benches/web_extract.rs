@@ -20,7 +20,6 @@
 
 use std::hint::black_box;
 use std::io::{Read, Write};
-use std::net::TcpListener;
 use std::sync::OnceLock;
 
 use agent_core::Tool;
@@ -74,7 +73,7 @@ fn page_html() -> &'static str {
 fn fixture() -> &'static str {
     static BASE: OnceLock<String> = OnceLock::new();
     BASE.get_or_init(|| {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = beyond_ai_test_support::ports::listener();
         let addr = listener.local_addr().unwrap();
         let body = page_html();
         let response = format!(

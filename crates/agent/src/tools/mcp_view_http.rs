@@ -191,7 +191,7 @@ mod tests {
     /// [`canned`], written in `parts` with a pause between, so each reaches the client as a chunk
     /// of its own (an event split across reads, as a large one always is).
     async fn canned_in_parts(parts: &'static [&'static [u8]]) -> String {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = beyond_ai_test_support::ports::tokio_listener().await;
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             while let Ok((mut stream, _)) = listener.accept().await {

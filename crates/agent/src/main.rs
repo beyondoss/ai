@@ -2816,6 +2816,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             // picking a free port, releasing it and binding it later let another process take it in
             // between, and the login then failed before printing its URL.
             let listener =
+                // port-0: the listener is held for the whole login; the redirect URI names its port.
                 beyond_ai_agent::oauth::callback_server::CallbackServer::bind("127.0.0.1", 0)
                     .map_err(|e| {
                         format!("failed to bind the local OAuth callback listener: {e}")

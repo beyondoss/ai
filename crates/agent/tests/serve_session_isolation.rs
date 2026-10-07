@@ -521,3 +521,61 @@ async fn concurrent_sessions_persist_to_distinct_files() {
     let _ = child.kill();
     let _ = child.wait();
 }
+
+/// `BEYOND_AI_AGENT_TEST_FAIL_CHECKPOINT=n` counts each session's checkpoint writes on its own. On a
+/// daemon a process-wide count would let one session's writes decide which write of another's fails.
+/// Here each session's second write (the one before its tool) must fail, so neither tool runs. With
+/// a shared count, bravo's writes would be the daemon's third and fourth: bravo's tool would run,
+/// and its `prompt` would succeed.
+#[tokio::test]
+async fn an_injected_checkpoint_failure_counts_each_sessions_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let marker = |name: &str| dir.path().join(format!("{name}-ran"));
+    let touch = |name: &str| {
+        turn_tool_use(
+            "toolu_1",
+            "bash",
+            &json!({ "command": format!("touch {}", marker(name).display()) }).to_string(),
+        )
+    };
+    let (base, _requests) = spawn_model_server(vec![touch("alpha"), touch("bravo")]);
+    let sessions = tempfile::tempdir().unwrap();
+    let (_daemon, port) = spawn_listening(
+        Command::new(BIN)
+            .args([
+                "serve",
+                "--gateway-url",
+                &base,
+                "--key",
+                "bai_v1.test",
+                "--model",
+                "claude-test",
+                "--session-dir",
+                &sessions.path().to_string_lossy(),
+            ])
+            // Write 1 of a session is its prompt's checkpoint; write 2 is the one before its tool.
+            .env("BEYOND_AI_AGENT_TEST_FAIL_CHECKPOINT", "2")
+            .env("HOME", ISOLATED_HOME)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null()),
+    );
+    // One after the other, so the writes are ordered: alpha's two, then bravo's two.
+    for name in ["alpha", "bravo"] {
+        let mut ws = ws_connect(port, Some(&format!("ckpt-{name}"))).await;
+        ws_send(&mut ws, json!({ "type": "prompt", "message": "go" })).await;
+        let frames = ws_read_until_response(&mut ws, "prompt").await;
+        let response = frames.last().unwrap();
+        assert_eq!(response["success"], false, "{name}: {}", dump(&frames));
+        assert!(
+            response["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("simulated checkpoint write failure")),
+            "{name}: {}",
+            dump(&frames)
+        );
+        assert!(
+            !marker(name).exists(),
+            "{name}'s tool ran: its own second checkpoint write was not the one that failed"
+        );
+    }
+}

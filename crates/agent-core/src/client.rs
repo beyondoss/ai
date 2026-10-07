@@ -2082,7 +2082,7 @@ mod tests {
 
     #[tokio::test]
     async fn oauth_credential_adds_anthropics_identity_headers() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = beyond_ai_test_support::ports::listener();
         let addr = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
             use std::io::{Read, Write};
@@ -2131,7 +2131,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_static_credential_never_sends_oauth_headers() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = beyond_ai_test_support::ports::listener();
         let addr = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
             use std::io::{Read, Write};
@@ -2174,7 +2174,7 @@ mod tests {
     /// the wire, as opposed to anything this crate constructs itself.
     #[tokio::test]
     async fn a_connection_dropped_mid_body_is_tagged_as_a_mid_stream_network_error() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = beyond_ai_test_support::ports::listener();
         let addr = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
             use std::io::{Read, Write};
@@ -2222,7 +2222,7 @@ mod tests {
     /// than being a dead field, since the default [`READ_TIMEOUT`] (600s) would never trip in a test.
     #[tokio::test]
     async fn with_idle_timeout_overrides_the_default_read_timeout() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = beyond_ai_test_support::ports::listener();
         let addr = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
             use std::io::{Read, Write};
@@ -2304,7 +2304,7 @@ mod tests {
     /// `anthropic-version` for a self-hosted/proxied endpoint that speaks a different wire version).
     #[tokio::test]
     async fn extra_headers_are_merged_onto_the_request_and_win_on_a_name_collision() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = beyond_ai_test_support::ports::listener();
         let addr = listener.local_addr().unwrap();
         let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
         let captured_clone = captured.clone();
@@ -2366,7 +2366,7 @@ mod tests {
             }
         }
 
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = beyond_ai_test_support::ports::listener();
         let addr = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
             use std::io::{Read, Write};
@@ -2424,7 +2424,7 @@ mod tests {
             }
         }
 
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = beyond_ai_test_support::ports::listener();
         let addr = listener.local_addr().unwrap();
         let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
         let captured_clone = captured.clone();
@@ -2473,7 +2473,7 @@ mod tests {
             }
         }
 
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = beyond_ai_test_support::ports::listener();
         let addr = listener.local_addr().unwrap();
         let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
         let captured_clone = captured.clone();
@@ -2519,7 +2519,7 @@ mod tests {
             }
         }
 
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = beyond_ai_test_support::ports::listener();
         let addr = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
             use std::io::{Read, Write};
@@ -2567,7 +2567,7 @@ mod tests {
     /// this shutdown was actually a transport fault.
     #[tokio::test]
     async fn a_clean_early_close_before_the_terminal_event_is_not_tagged_as_a_network_error() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = beyond_ai_test_support::ports::listener();
         let addr = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
             use std::io::{Read, Write};
@@ -2613,7 +2613,7 @@ mod tests {
     /// never fix.
     #[tokio::test]
     async fn a_429_with_quota_exhaustion_body_is_not_retried() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = beyond_ai_test_support::ports::listener();
         let addr = listener.local_addr().unwrap();
         let request_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let count = request_count.clone();
@@ -2657,7 +2657,7 @@ mod tests {
     /// normal retry treatment `is_quota_exhausted` doesn't touch.
     #[tokio::test]
     async fn a_429_with_a_plain_rate_limit_body_is_retried() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = beyond_ai_test_support::ports::listener();
         let addr = listener.local_addr().unwrap();
         let request_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let count = request_count.clone();
@@ -2719,7 +2719,7 @@ mod tests {
     /// headers when compat.sendSessionAffinityHeaders is enabled" case.
     #[tokio::test]
     async fn session_affinity_headers_are_sent_for_a_fireworks_chat_completions_request() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = beyond_ai_test_support::ports::listener();
         let addr = listener.local_addr().unwrap();
         let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
         let captured_clone = captured.clone();
@@ -2769,7 +2769,7 @@ mod tests {
     /// provider got these headers indiscriminately.
     #[tokio::test]
     async fn session_affinity_headers_are_absent_for_a_non_fireworks_chat_completions_request() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = beyond_ai_test_support::ports::listener();
         let addr = listener.local_addr().unwrap();
         let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
         let captured_clone = captured.clone();
@@ -2821,7 +2821,7 @@ mod tests {
     /// dedicated negative test above for that).
     #[tokio::test]
     async fn session_affinity_headers_are_suppressed_when_no_cache_is_set() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = beyond_ai_test_support::ports::listener();
         let addr = listener.local_addr().unwrap();
         let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
         let captured_clone = captured.clone();
@@ -2876,7 +2876,7 @@ mod tests {
     /// never reach the wire with that call still unanswered.
     #[tokio::test]
     async fn an_orphaned_tool_use_from_a_cancelled_mid_argument_stream_never_reaches_the_wire() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = beyond_ai_test_support::ports::listener();
         let addr = listener.local_addr().unwrap();
         let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
         let captured_clone = captured.clone();
@@ -2937,7 +2937,7 @@ mod tests {
     /// matching `tool_use` id) rather than on substrings, so it fails for the right reason.
     #[tokio::test]
     async fn an_aborted_turns_tool_use_never_reaches_the_wire_as_a_dangling_tool_result() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = beyond_ai_test_support::ports::listener();
         let addr = listener.local_addr().unwrap();
         let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
         let captured_clone = captured.clone();
@@ -3022,7 +3022,7 @@ mod tests {
     #[tokio::test]
     async fn prefixed_route_override_reaches_the_gateway_under_the_provider_prefix_with_static_headers()
      {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = beyond_ai_test_support::ports::listener();
         let addr = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
             use std::io::{Read, Write};
@@ -3108,7 +3108,7 @@ mod tests {
     /// Anthropic's own OAuth identity-spoofing headers (this is a Copilot host, not Anthropic's).
     #[tokio::test]
     async fn direct_route_override_bypasses_the_gateway_base_url_and_attaches_copilot_headers() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = beyond_ai_test_support::ports::listener();
         let addr = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
             use std::io::{Read, Write};
@@ -3192,7 +3192,7 @@ mod tests {
     #[tokio::test]
     async fn a_copilot_routed_claude_model_gets_the_browser_access_header_but_not_claude_code_identity()
      {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = beyond_ai_test_support::ports::listener();
         let addr = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
             use std::io::{Read, Write};
@@ -3259,7 +3259,7 @@ mod tests {
     /// Chat Completions body (`"messages"`), never a Responses body (`"input"`).
     #[tokio::test]
     async fn a_copilot_routed_gpt_4_1_builds_a_chat_completions_body_not_a_responses_body() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = beyond_ai_test_support::ports::listener();
         let addr = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
             use std::io::{Read, Write};
@@ -3318,7 +3318,7 @@ mod tests {
     /// Responses dialect when reached through any route but Copilot's.
     #[tokio::test]
     async fn a_non_copilot_gpt_4_1_still_builds_a_responses_body() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = beyond_ai_test_support::ports::listener();
         let addr = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
             use std::io::{Read, Write};
@@ -3352,7 +3352,7 @@ mod tests {
     /// proves the wiring from a real Copilot-routed credential through to that flag.
     #[tokio::test]
     async fn copilot_routed_gpt5_2_omits_the_explicit_reasoning_disable_end_to_end() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = beyond_ai_test_support::ports::listener();
         let addr = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
             use std::io::{Read, Write};
@@ -3404,7 +3404,7 @@ mod tests {
     /// for the header shape — this proves it also suppresses `prompt_cache_retention` end to end.
     #[tokio::test]
     async fn azure_routed_request_omits_prompt_cache_retention_end_to_end() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = beyond_ai_test_support::ports::listener();
         let addr = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
             use std::io::{Read, Write};
@@ -3459,7 +3459,7 @@ mod tests {
     /// reasoning-"off" wire value for) would incorrectly send the native `{"effort":"none"}` signal.
     #[tokio::test]
     async fn entra_id_shaped_config_with_only_deployment_name_still_suppresses_reasoning_disable() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = beyond_ai_test_support::ports::listener();
         let addr = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
             use std::io::{Read, Write};
@@ -3526,7 +3526,7 @@ mod tests {
     /// (`{base_url}/responses`, base_url already carrying `/openai/v1`).
     #[tokio::test]
     async fn direct_route_with_custom_auth_header_sends_bare_key_and_omits_authorization() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = beyond_ai_test_support::ports::listener();
         let addr = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
             use std::io::{Read, Write};
@@ -3594,7 +3594,7 @@ mod tests {
     /// `inferCopilotInitiator`/`hasCopilotVisionInput`.
     #[tokio::test]
     async fn copilot_dynamic_headers_reflect_the_turns_own_messages() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = beyond_ai_test_support::ports::listener();
         let addr = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
             use std::io::{Read, Write};
@@ -3665,7 +3665,7 @@ mod tests {
     /// `input`, with `parallel_tool_calls`/`text.verbosity` always present, on the real wire body.
     #[tokio::test]
     async fn codex_routed_request_sends_instructions_and_parallel_tool_calls_end_to_end() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = beyond_ai_test_support::ports::listener();
         let addr = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
             use std::io::{Read, Write};
@@ -3760,7 +3760,7 @@ mod tests {
     /// third-party provider (Kimi-Coding) would hit.
     #[tokio::test]
     async fn dialect_override_forces_anthropic_wire_for_a_model_id_that_fails_the_name_heuristic() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = beyond_ai_test_support::ports::listener();
         let addr = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
             use std::io::{Read, Write};
@@ -3817,7 +3817,7 @@ mod tests {
     /// Anthropic's `anthropic-version` header.
     #[tokio::test]
     async fn without_a_dialect_override_the_same_model_id_builds_chat_completions_wire() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = beyond_ai_test_support::ports::listener();
         let addr = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
             use std::io::{Read, Write};
@@ -3861,7 +3861,7 @@ mod tests {
     /// OpenAI-wire endpoint, a hard 400.
     #[tokio::test]
     async fn aggregator_host_from_a_byo_override_resolves_a_real_bare_id_host_collision() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = beyond_ai_test_support::ports::listener();
         let addr = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
             use std::io::{Read, Write};
@@ -3914,7 +3914,7 @@ mod tests {
     #[tokio::test]
     async fn without_an_aggregator_host_the_same_bare_id_keeps_the_host_agnostic_anthropic_default()
     {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = beyond_ai_test_support::ports::listener();
         let addr = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
             use std::io::{Read, Write};
@@ -3947,7 +3947,7 @@ mod tests {
     /// URL — an Azure resource pinned to a dated `api-version` needs this on every request.
     #[tokio::test]
     async fn direct_route_query_param_is_appended_to_the_built_url() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = beyond_ai_test_support::ports::listener();
         let addr = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
             use std::io::{Read, Write};
@@ -3999,7 +3999,7 @@ mod tests {
     /// Azure deployment name doesn't have to match the app-level model id.
     #[tokio::test]
     async fn deployment_name_override_replaces_the_wire_level_model_field() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = beyond_ai_test_support::ports::listener();
         let addr = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
             use std::io::{Read, Write};
@@ -4060,7 +4060,7 @@ mod tests {
     /// a Bearer-prefixed value (unlike Azure's).
     #[tokio::test]
     async fn auth_header_prefix_is_prepended_to_the_credential_value() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = beyond_ai_test_support::ports::listener();
         let addr = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
             use std::io::{Read, Write};

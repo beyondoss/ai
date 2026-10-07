@@ -2456,7 +2456,7 @@ fn run_binary_idle_timeout_ms_flag_causes_a_stalled_response_to_fail_quickly() {
     // Task #19 (pi-parity feature): `with_idle_timeout` previously had zero callers. A server that
     // answers headers plus one partial event, then goes silent well past a deliberately shrunk
     // `--idle-timeout-ms`, must fail quickly instead of hanging on the default (~600s) read timeout.
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let listener = beyond_ai_test_support::ports::listener();
     let addr = listener.local_addr().unwrap();
     std::thread::spawn(move || {
         use std::io::{Read as _, Write as _};
@@ -2522,7 +2522,7 @@ fn run_binary_retry_max_backoff_ms_flag_caps_the_exponential_backoff_between_ret
     // third succeeds. With `--retry-base-delay-ms` deliberately large (500ms) but
     // `--retry-max-backoff-ms` deliberately small (20ms), both waits between attempts must be capped
     // at ~20ms — total elapsed well under the ~1500ms (500ms + 1000ms) the uncapped schedule would take.
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let listener = beyond_ai_test_support::ports::listener();
     let addr = listener.local_addr().unwrap();
     let success_body = turn_text("ok");
     std::thread::spawn(move || {

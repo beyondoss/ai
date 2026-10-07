@@ -91,6 +91,8 @@ rustls = { version = "0.23", default-features = false, features = ["ring"] }
 zstd = "0.13"
 
 [dev-dependencies]
+# Loopback listeners for the socket tests (`ports`): the one place a test binds port 0.
+beyond-ai-test-support = { path = "../test-support" }
 # Bench harness for the streaming decode hot path. `divan` (the workspace's `bench:unit` pin, matching
 # gateway/agent) measures **allocations** natively via its `AllocProfiler` global allocator alongside
 # timing — so the per-SSE-event allocation cost the decode findings target is visible, not inferred.

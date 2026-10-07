@@ -359,6 +359,7 @@ fn spawn_serve(bin: &str, flavor: Flavor, gateway: &str, cwd: &Path) -> ServePro
         .args([
             "serve",
             "--listen",
+            // port-0: the child binds it, keeps it, and announces the port it got.
             "127.0.0.1:0",
             "--gateway-url",
             gateway,
@@ -477,7 +478,7 @@ fn parse_listen_port(line: &str) -> Option<u16> {
 /// Unbounded Anthropic-SSE mock: every request gets the same one-turn text reply, concurrently.
 /// Prompt load would serialize behind a FIFO mock and measure the mock, not `serve`.
 fn spawn_mock_gateway() -> String {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let listener = beyond_ai_test_support::ports::listener();
     listener.set_nonblocking(true).unwrap();
     let addr = listener.local_addr().unwrap();
     let body = anthropic_text_turn("ok");

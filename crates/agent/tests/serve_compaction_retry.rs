@@ -1198,7 +1198,7 @@ fn serve_idle_timeout_ms_flag_causes_a_stalled_response_to_fail_quickly() {
     // partial event, then goes silent well past a deliberately shrunk `--idle-timeout-ms`, must fail
     // the `prompt` quickly instead of hanging on the default (~600s) read timeout — `run`'s identical
     // `run_binary_idle_timeout_ms_flag_causes_a_stalled_response_to_fail_quickly`.
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let listener = beyond_ai_test_support::ports::listener();
     let addr = listener.local_addr().unwrap();
     std::thread::spawn(move || {
         use std::io::Read as _;

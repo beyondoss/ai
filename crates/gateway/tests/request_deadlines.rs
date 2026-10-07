@@ -260,7 +260,7 @@ async fn request_max_secs_zero_disables_the_ceiling() {
 /// and how many connections it has accepted.
 async fn silent_upstream() -> (u16, Arc<AtomicUsize>) {
     use tokio::io::AsyncReadExt;
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = beyond_ai_test_support::ports::tokio_listener().await;
     let port = listener.local_addr().unwrap().port();
     let accepted = Arc::new(AtomicUsize::new(0));
     let counter = accepted.clone();
@@ -547,8 +547,7 @@ async fn a_large_body_re_run_keeps_the_requests_deadline() {
 /// A listener whose accept queue is full: a connect to it hangs (the kernel drops the SYN) until
 /// the connector's own timeout. Returns its authority and the connections that filled it.
 async fn unaccepting_upstream() -> (String, Vec<tokio::net::TcpStream>) {
-    let sock = tokio::net::TcpSocket::new_v4().unwrap();
-    sock.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let sock = beyond_ai_test_support::ports::bound_socket();
     let addr = sock.local_addr().unwrap();
     let listener = sock.listen(0).unwrap();
     let mut held = Vec::new();

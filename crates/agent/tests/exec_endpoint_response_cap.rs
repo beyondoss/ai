@@ -28,7 +28,7 @@ where
     F: Fn(tokio::net::TcpStream) -> Fut + Send + Sync + 'static,
     Fut: std::future::Future<Output = ()> + Send + 'static,
 {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = beyond_ai_test_support::ports::tokio_listener().await;
     let url = format!("http://{}/exec", listener.local_addr().unwrap());
     let respond = Arc::new(respond);
     tokio::spawn(async move {

@@ -760,6 +760,7 @@ async fn serve_stdio(server: Server) {
 /// (or `202` for a notification), one request per connection. No SSE stream: `GET` is `405`, which
 /// the transport allows for a server that never pushes.
 async fn serve_http(server: Arc<Mutex<Server>>, port_file: &str) {
+    // port-0: held for the server's life; the port is announced through the port file.
     let Ok(listener) = tokio::net::TcpListener::bind("127.0.0.1:0").await else {
         return;
     };

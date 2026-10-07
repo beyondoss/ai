@@ -1735,6 +1735,7 @@ async fn main() {
         forbid_left: env_u64("MCP_FIXTURE_FORBID_FIRST", 0),
         ..State::default()
     }));
+    // port-0: held for the server's life; the address is announced through the control file.
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let control = format!("http://{addr}");

@@ -65,7 +65,12 @@ impl ExecMock {
     /// A sandbox: commands run with `cwd` defaulting to `root` and `HOME` set to `home`, so `$HOME`
     /// (what `serve --service`'s startup probe asks for) is the sandbox's, never the replica's.
     pub async fn start_with_home(root: &Path, home: Option<&Path>, honors_stdin: bool) -> Self {
-        Self::start_on("127.0.0.1:0", root, home, honors_stdin).await
+        Self::serve(
+            crate::ports::tokio_listener().await,
+            root,
+            home,
+            honors_stdin,
+        )
     }
 
     /// As [`Self::start_with_home`], bound where the caller says.
@@ -81,6 +86,16 @@ impl ExecMock {
         honors_stdin: bool,
     ) -> Self {
         let listener = tokio::net::TcpListener::bind(bind).await.unwrap();
+        Self::serve(listener, root, home, honors_stdin)
+    }
+
+    /// Serve on `listener`, which the endpoint holds for as long as it runs.
+    fn serve(
+        listener: tokio::net::TcpListener,
+        root: &Path,
+        home: Option<&Path>,
+        honors_stdin: bool,
+    ) -> Self {
         let url = format!("http://{}/exec", listener.local_addr().unwrap());
         let requests = Arc::new(Mutex::new(Vec::new()));
         let root = root.to_path_buf();

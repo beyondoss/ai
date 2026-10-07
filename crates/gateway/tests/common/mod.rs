@@ -25,7 +25,6 @@ use hyper::{Request, Response};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
 use store::Connection;
-use tokio::net::TcpListener;
 use tokio::time::{sleep, timeout};
 use tokio_rustls::TlsAcceptor;
 
@@ -168,13 +167,24 @@ pub fn test_keypair(seed: u8) -> (Vec<u8>, ed25519_dalek::SigningKey) {
 // --- nats-server (JetStream) ------------------------------------------------
 
 pub struct Nats {
-    child: Child,
-    /// The port it chose (`-p -1`) and reported (`--ports_file_dir`); `0` until [`Nats::spawn_ready`]
-    /// has read it.
+    server: NatsProcess,
+    /// The port it chose (`-p -1`) and reported (`--ports_file_dir`).
     pub port: u16,
+}
+
+/// A started `nats-server`, before its port is known: stopped, and its store removed, on drop.
+struct NatsProcess {
+    child: Child,
     store_dir: std::path::PathBuf,
     /// The `server_name` it was started with, unique to this test process.
     name: String,
+}
+
+impl Drop for NatsProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = std::fs::remove_dir_all(&self.store_dir);
+    }
 }
 
 impl Nats {
@@ -194,7 +204,7 @@ impl Nats {
         store_dir.join("ports")
     }
 
-    fn spawn(store_prefix: &str) -> Self {
+    fn spawn(store_prefix: &str) -> NatsProcess {
         let (store_dir, name) = Self::layout(store_prefix);
         let child = Command::new("nats-server")
             .args(["-js", "-a", "127.0.0.1", "-p", "-1", "-n", &name])
@@ -206,9 +216,8 @@ impl Nats {
             .stderr(std::process::Stdio::null())
             .spawn()
             .expect("spawn nats-server (on PATH? run via mise)");
-        Nats {
+        NatsProcess {
             child,
-            port: 0,
             store_dir,
             name,
         }
@@ -220,7 +229,7 @@ impl Nats {
     /// busy machine). A shell watchdog polls this test process and stops the server, and removes its
     /// store, within a second of the process exiting, however it exits. The shell exits as soon as
     /// the server does, so a server that failed to start shows as an exited `child` here too.
-    fn spawn_reaped(store_prefix: &str) -> Self {
+    fn spawn_reaped(store_prefix: &str) -> NatsProcess {
         const WATCHDOG: &str = r#"nats-server -js -a 127.0.0.1 -p -1 --ports_file_dir "$2" -sd "$3" -n "$4" >/dev/null 2>&1 &
 server=$!
 echo "$server" > "$3/server.pid"
@@ -243,9 +252,8 @@ rm -rf "$3""#;
             .stderr(std::process::Stdio::null())
             .spawn()
             .expect("spawn nats-server (on PATH? run via mise)");
-        Nats {
+        NatsProcess {
             child,
-            port: 0,
             store_dir,
             name,
         }
@@ -255,7 +263,7 @@ rm -rf "$3""#;
     /// writes only after it is listening. The port was never anyone else's, so there is nothing to
     /// lose to another process and nothing to respawn: a server that exits, or that is not up within
     /// [`STARTUP_BUDGET`], fails the test.
-    fn spawn_ready(spawn: fn(&str) -> Self, store_prefix: &str) -> Self {
+    fn spawn_ready(spawn: fn(&str) -> NatsProcess, store_prefix: &str) -> Self {
         let mut nats = spawn(store_prefix);
         let ports = Self::ports_dir_of(&nats.store_dir);
         let deadline = std::time::Instant::now() + STARTUP_BUDGET;
@@ -267,8 +275,7 @@ rm -rf "$3""#;
                 .and_then(|p| p.trim().parse().ok())
                 .unwrap_or_else(|| nats.child.id());
             if let Some(port) = beyond_ai_test_support::ports::nats_port_from(&ports, server_pid) {
-                nats.port = port;
-                return nats;
+                return Nats { server: nats, port };
             }
             if let Ok(Some(status)) = nats.child.try_wait() {
                 panic!(
@@ -295,15 +302,8 @@ rm -rf "$3""#;
 impl Nats {
     /// Kill the server mid-test (for fail-open coverage). Idempotent with `Drop`.
     pub fn stop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-impl Drop for Nats {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = std::fs::remove_dir_all(&self.store_dir);
+        let _ = self.server.child.kill();
+        let _ = self.server.child.wait();
     }
 }
 
@@ -873,7 +873,7 @@ impl MockUpstream {
     pub async fn start(mode: Mode) -> Self {
         // Bind `:0` and read the port back, keeping the listener open the whole time — no
         // pick-release-rebind window for another test to slip into (this is an in-process server).
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = beyond_ai_test_support::ports::tokio_listener().await;
         let port = listener.local_addr().unwrap().port();
         let captured: Arc<Mutex<Option<Captured>>> = Arc::new(Mutex::new(None));
         let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -919,7 +919,7 @@ impl MockUpstream {
         // no default), pick ring to match the gateway. Idempotent across multiple mocks in one process.
         let _ = rustls::crypto::ring::default_provider().install_default();
 
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = beyond_ai_test_support::ports::tokio_listener().await;
         let port = listener.local_addr().unwrap().port();
 
         let ck = rcgen::generate_simple_self_signed(vec![
@@ -1733,7 +1733,7 @@ impl ScriptedUpstream {
     /// `script(body, n)` decides the reply to the `n`th (0-based) fully received request.
     pub async fn start(script: impl Fn(&[u8], usize) -> Vec<Step> + Send + Sync + 'static) -> Self {
         let script: Script = Arc::new(script);
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = beyond_ai_test_support::ports::tokio_listener().await;
         let port = listener.local_addr().unwrap().port();
         let bodies: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
         let seen = Arc::clone(&bodies);
@@ -2111,7 +2111,7 @@ impl ReplyUpstream {
         script: impl Fn(usize, &ScriptReq) -> Reply + Send + Sync + 'static,
     ) -> Self {
         let script: ReplyScript = Arc::new(script);
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = beyond_ai_test_support::ports::tokio_listener().await;
         let port = listener.local_addr().unwrap().port();
         let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counter = hits.clone();
