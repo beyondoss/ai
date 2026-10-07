@@ -3086,8 +3086,9 @@ coherent across a tenant's sessions.
 ### Locks
 
 `acquire_session_lock(path)` is `file_lock::try_lock` on the session — `Target::Dir` for a session
-directory, `Target::File` for a `.jsonl` (the MCP manifest's write lock is the same primitive on the
-manifest file). `Ok(None)` means someone holds it right now. It is **liveness only** — correctness is
+directory, `Target::File` for a `.jsonl`. The MCP manifest's write lock and the memory store's lock
+are the same primitive, `Target::File` on the manifest file and on `<memdir>/.memory`; the memory
+store's legacy `flock` is the `.memory.lock` older binaries took. `Ok(None)` means someone holds it right now. It is **liveness only** — correctness is
 the epoch fence, which needs no lock — so a lock lost to a crash or a partition costs a retry, never
 history.
 
@@ -3127,19 +3128,22 @@ attempts, measured). So a target is a lock file only when one of three things sa
 
 - **Its name**, compared without regard to ASCII case: a record lock file, or a legacy `lock` /
   `<f>.lock` beside one.
-- **It is a lock this process holds.** `try_lock` puts the (device, inode) of each lock file it holds
-  in a small counted set and `Drop` takes them out once released; `write_atomic` looks the target's
+- **It is a lock this process holds.** `try_lock` puts the (device, inode) of each lock file in a
+  small counted set **before** it tries to lock it, takes it out again if the attempt fails, and
+  `Drop` takes it out only after unlocking — so no moment exists when a lock is held but reads as not
+  held (a brief false "held" mid-acquire is the safe direction). `write_atomic` looks the target's
   `stat` up there. That covers a journal key held through `Target::Itself` under any name, a hard link
   to one of our own lock files, and a spelling a case-insensitive filesystem folds onto one.
 - **An old binary's legacy lock with no record lock file beside it**, by where it sits: a `lock` in a
   session directory (one holding `000001.jsonl`, which is never deleted), or a `<f>.lock` beside a
-  session file (`*.jsonl`) or the MCP manifest. Whether anyone holds it is not asked.
+  session file (`*.jsonl`), the MCP manifest or the memory store's `.memory`. Whether anyone holds it
+  is not asked.
 
 Anything else is an ordinary file and an edit of it goes through: a SQLite database another program
 holds mid-transaction, a daemon's pid file, an unrelated `Cargo.lock`, a `lock` in a directory that
 holds no session. (Verified on a casefold ext4 directory as well as here.) A worktree seed leaves
-record lock files behind (a copy of a lock is no lock). A failed session start's directory is taken back through
-`file_lock::dir_holds_only_lock_files` and `FileLock::release_and_remove_files`, which **closes** the
+record lock files behind (a copy of a lock is no lock). A failed session start's directory is taken
+back through `file_lock::dir_holds_only_lock_files` and `FileLock::release_and_remove_files`, which **closes** the
 lock files' descriptors before the directory is removed: an NFS client turns the unlink of a file it
 still has open into a rename to `.nfs*`, which stays until the last close and makes `remove_dir` fail
 with ENOTEMPTY (`serve_ws::tests::an_empty_session_directory_is_taken_back_with_its_lock` fails on a

@@ -2,8 +2,8 @@
 //!
 //! The kernel releases the lock when its holder exits, however it exits, so there is no staleness to
 //! judge and no lockfile to break: a crashed holder's leftover file is simply unlocked. Used for a
-//! session's liveness lock (`session_store::acquire_session_lock`) and the MCP manifest cache's write
-//! lock (`tools::mcp_manifest`). Non-blocking: [`try_lock`] answers at once (bar a short retry, below),
+//! session's liveness lock (`session_store::acquire_session_lock`), the MCP manifest cache's write
+//! lock (`tools::mcp_manifest`) and the memory store's lock (`memory::file`). Non-blocking: [`try_lock`] answers at once (bar a short retry, below),
 //! and a caller that wants to wait polls it off the async runtime.
 //!
 //! **The lock is an open file description (OFD) lock** on Linux (`fcntl(F_OFD_SETLK)`, whole file,
@@ -119,7 +119,8 @@ pub fn is_record_lock_file(path: &Path) -> bool {
 ///   own lock files.
 /// - **An old binary's legacy lock with no record lock file beside it**, by where it sits: a `lock`
 ///   in a session directory (one holding `000001.jsonl`, which is never deleted), or a `<f>.lock`
-///   beside a session file (`*.jsonl`) or the MCP manifest. Whether anyone holds it is not asked.
+///   beside a session file (`*.jsonl`), the MCP manifest or the memory store's `.memory`. Whether
+///   anyone holds it is not asked.
 ///
 /// Anything else — a SQLite database another program holds open and locked, a daemon's pid file — is
 /// an ordinary file, and an edit of it goes through.
@@ -144,6 +145,7 @@ fn is_lock_file_by_name(path: &Path) -> bool {
     };
     stem.ends_with(".jsonl")
         || stem == "mcp-manifest.json"
+        || stem == ".memory"
         || path
             .with_file_name(format!("{}{RECORD_SUFFIX}", &name[..stem.len()]))
             .exists()
@@ -151,8 +153,8 @@ fn is_lock_file_by_name(path: &Path) -> bool {
 
 type FileId = (u64, u64);
 
-/// The (device, inode) of every lock file this process holds, counted: [`try_lock`] adds a lock's
-/// files once it holds them, and dropping the lock takes them out again once it is released.
+/// The (device, inode) of every lock file this process holds or is acquiring, counted (see
+/// [`Marks`]).
 #[cfg(unix)]
 fn held() -> std::sync::MutexGuard<'static, std::collections::HashMap<FileId, usize>> {
     static HELD: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<FileId, usize>>> =
@@ -168,28 +170,43 @@ fn file_id(meta: &std::fs::Metadata) -> FileId {
     (meta.dev(), meta.ino())
 }
 
-#[cfg(unix)]
-fn mark_held(files: &[&File], add: bool) {
-    let ids: Vec<FileId> = files
-        .iter()
-        .filter_map(|f| f.metadata().ok())
-        .map(|m| file_id(&m))
-        .collect();
-    let mut held = held();
-    for id in ids {
-        if add {
-            *held.entry(id).or_default() += 1;
-        } else if let std::collections::hash_map::Entry::Occupied(mut e) = held.entry(id) {
-            *e.get_mut() -= 1;
-            if *e.get() == 0 {
-                e.remove();
+/// The held-set entries one acquire made, taken out again when it is dropped. An acquire marks each
+/// lock file **before** it tries to lock it, and an acquire that fails drops its marks — so there is
+/// no moment when a lock is held but its file reads as not held. (A brief false "held" while an
+/// acquire is in flight is the safe direction.) A [`FileLock`] keeps its marks until it is dropped,
+/// which is after it has unlocked.
+#[derive(Default)]
+struct Marks(Vec<FileId>);
+
+impl Marks {
+    fn mark(&mut self, file: &File) {
+        #[cfg(unix)]
+        if let Ok(meta) = file.metadata() {
+            let id = file_id(&meta);
+            *held().entry(id).or_default() += 1;
+            self.0.push(id);
+        }
+        #[cfg(not(unix))]
+        let _ = file;
+    }
+}
+
+impl Drop for Marks {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if !self.0.is_empty() {
+            let mut held = held();
+            for id in self.0.drain(..) {
+                if let std::collections::hash_map::Entry::Occupied(mut e) = held.entry(id) {
+                    *e.get_mut() -= 1;
+                    if *e.get() == 0 {
+                        e.remove();
+                    }
+                }
             }
         }
     }
 }
-
-#[cfg(not(unix))]
-fn mark_held(_: &[&File], _: bool) {}
 
 /// Whether the file at `path` is one this process holds a lock on — by `stat`, nothing opened.
 fn is_held_here(path: &Path) -> bool {
@@ -224,6 +241,8 @@ pub struct FileLock {
     legacy: Option<File>,
     record_path: PathBuf,
     legacy_path: Option<PathBuf>,
+    /// Dropped after [`FileLock`]'s own `Drop` has unlocked, so the set never misses a held lock.
+    _marks: Marks,
 }
 
 impl FileLock {
@@ -232,10 +251,6 @@ impl FileLock {
     /// writing through the descriptor that holds it keeps "re-read, then write" one step.)
     pub fn file(&self) -> &File {
         &self.record
-    }
-
-    fn files(&self) -> Vec<&File> {
-        std::iter::once(&self.record).chain(&self.legacy).collect()
     }
 
     /// Release the lock and unlink its files — for a lock directory being taken back. What matters is
@@ -258,8 +273,6 @@ impl Drop for FileLock {
         if let Some(legacy) = &self.legacy {
             let _ = legacy.unlock();
         }
-        // Out of the held set only once unlocked, so the set never misses a lock still held.
-        mark_held(&self.files(), false);
     }
 }
 
@@ -274,7 +287,9 @@ pub fn try_lock(target: Target<'_>) -> std::io::Result<Option<FileLock>> {
     let record_path = target.record_path();
     let legacy_path = target.legacy_path();
     for _ in 0..RETRIES {
+        let mut marks = Marks::default();
         let record = open_lock_file(&record_path)?;
+        marks.mark(&record);
         #[cfg(test)]
         tests::between_open_and_lock(&record_path);
         if !try_lock_description(&record)? {
@@ -285,7 +300,11 @@ pub fn try_lock(target: Target<'_>) -> std::io::Result<Option<FileLock>> {
             unlock(&record);
             continue;
         }
-        let legacy = match legacy_path.as_deref().map(take_legacy_flock).transpose()? {
+        let legacy = match legacy_path
+            .as_deref()
+            .map(|path| take_legacy_flock(path, &mut marks))
+            .transpose()?
+        {
             None => None,
             Some(Legacy::Taken(file)) => Some(file),
             // An old binary holds it: held.
@@ -298,14 +317,13 @@ pub fn try_lock(target: Target<'_>) -> std::io::Result<Option<FileLock>> {
                 continue;
             }
         };
-        let lock = FileLock {
+        return Ok(Some(FileLock {
             record,
             legacy,
             record_path,
             legacy_path,
-        };
-        mark_held(&lock.files(), true);
-        return Ok(Some(lock));
+            _marks: marks,
+        }));
     }
     Ok(None)
 }
@@ -377,8 +395,9 @@ enum Legacy {
 }
 
 /// The legacy `flock` older binaries take (see the module doc), retried for [`LEGACY_RETRY`].
-fn take_legacy_flock(path: &Path) -> std::io::Result<Legacy> {
+fn take_legacy_flock(path: &Path, marks: &mut Marks) -> std::io::Result<Legacy> {
     let file = open_lock_file(path)?;
+    marks.mark(&file);
     let deadline = Instant::now() + LEGACY_RETRY;
     loop {
         match file.try_lock() {
@@ -624,6 +643,42 @@ pub(crate) mod tests {
         assert!(try_lock(Target::Itself(&key)).unwrap().is_some());
     }
 
+    /// No moment exists when a lock is held but its file reads as not held: an acquire marks the lock
+    /// file before it tries to lock it. A failed attempt takes its mark out again, so a key a
+    /// competing acquire could not get is ordinary once its holder lets go.
+    #[cfg(unix)]
+    #[test]
+    fn a_lock_file_reads_as_held_from_before_it_is_locked_until_after_it_is_released() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().join("journal.key");
+        let seen = std::rc::Rc::new(std::cell::Cell::new(None));
+        let saw = seen.clone();
+        BETWEEN.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |path: &Path| {
+                saw.set(Some(is_lock_file(path)));
+            }));
+        });
+        let held = try_lock(Target::Itself(&key)).unwrap().unwrap();
+        assert_eq!(seen.get(), Some(true), "held before the lock is taken");
+        seen.set(None);
+        assert!(
+            try_lock(Target::Itself(&key)).unwrap().is_none(),
+            "a competing acquire fails"
+        );
+        BETWEEN.with(|hook| *hook.borrow_mut() = None);
+        assert_eq!(
+            seen.get(),
+            Some(true),
+            "and was held throughout its attempt"
+        );
+        assert!(is_lock_file(&key));
+        drop(held);
+        assert!(
+            !is_lock_file(&key),
+            "the failed attempt took its mark out again"
+        );
+    }
+
     /// A lock file is recognized by its name in any case — a record lock file, a legacy one beside a
     /// record lock file, or an old binary's legacy one where a session or the MCP manifest keeps it —
     /// and nothing else is: an unrelated `Cargo.lock`, or a `lock` in a directory that holds no
@@ -649,7 +704,11 @@ pub(crate) mod tests {
             "a lock in a session directory"
         );
         assert!(is_lock_file(&old.join("Lock")), "in any case");
-        for beside in ["1700000000_abc.jsonl.lock", "mcp-manifest.json.lock"] {
+        for beside in [
+            "1700000000_abc.jsonl.lock",
+            "mcp-manifest.json.lock",
+            ".memory.lock",
+        ] {
             assert!(is_lock_file(&dir.path().join(beside)), "{beside}");
         }
         std::fs::write(dir.path().join("Cargo.lock"), "").unwrap();
