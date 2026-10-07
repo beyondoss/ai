@@ -10,8 +10,9 @@ mod common;
 use std::time::{Duration, Instant};
 
 use common::mcp_events_fixture::{
-    EVENTS_SESSION, control, emit, eventually, raw_request, runs_for_event, spawn_daemon_env,
-    spawn_daemon_on, spawn_http_fixture, state, write_settings, ws_next, ws_wait_active,
+    EVENTS_SESSION, control, daemon_sessions, emit, eventually, raw_request, runs_for_event,
+    spawn_daemon_env, spawn_daemon_on, spawn_http_fixture, state, write_settings, ws_next,
+    ws_wait_active,
 };
 use common::{ChildGuard, HeldPort, spawn_model_server_routed, turn_text, ws_connect, ws_send};
 use serde_json::{Value, json};
@@ -132,10 +133,11 @@ async fn a_delivery_body_that_never_finishes_is_timed_out() {
     );
     let mut ws = ws_connect(port, Some(EVENTS_SESSION)).await;
     ws_wait_active(&mut ws).await;
-    let url = state(&fixture)["hooks"][0]["url"]
-        .as_str()
-        .unwrap()
-        .to_owned();
+    let url = eventually(Duration::from_secs(10), "the hook", || {
+        state(&fixture)["hooks"][0]["url"]
+            .as_str()
+            .map(str::to_owned)
+    });
     let path = url.split_once(&format!("127.0.0.1:{port}")).unwrap().1;
     let started = Instant::now();
     let status = raw_request(
@@ -288,24 +290,26 @@ async fn a_retry_that_beats_the_resubscribe_after_a_restart_is_told_to_retry_not
     });
 }
 
-/// Only callbacks that will come back are held after a restart: a configured subscription is
-/// subscribed again, a runtime one is not — so a retried delivery to the runtime one's old callback
-/// gets `410` (stop) at once, rather than `503` (retry) for minutes on end.
+/// A runtime subscription (`mcp_events_subscribe`) survives a restart like a configured one: the
+/// daemon starts the session that holds it at boot — no client has to come back — and subscribes
+/// it again on its old callback, so events reach that session's model as before.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn after_a_restart_a_runtime_subscriptions_old_callback_is_gone_not_held() {
+async fn a_runtime_subscription_is_restored_after_a_restart_without_its_client() {
     let (_fx, mcp_url, fixture) = spawn_http_fixture(&[("MCP_FIXTURE_ALLOW_HTTP_CALLBACK", "1")]);
     let home = tempfile::tempdir().unwrap();
-    write_settings(home.path(), hooks(&mcp_url, "notify"));
-    let (base, _bodies) = spawn_model_server_routed(vec![], turn_text("noted"));
+    // The server is configured, its events are not: nothing here but the runtime subscription.
+    let mut servers = hooks(&mcp_url, "notify");
+    servers[0]["events"] = json!([]);
+    write_settings(home.path(), servers);
+    let (base, bodies) = spawn_model_server_routed(vec![], turn_text("noted"));
     let held = HeldPort::bind();
     let port = held.port();
     let mut first = daemon(home.path(), &base, &held, &[]);
-    let mut ws = ws_connect(port, Some(EVENTS_SESSION)).await;
-    ws_wait_active(&mut ws).await;
+    let mut ws = ws_connect(port, Some("runtime-owner")).await;
     ws_send(
         &mut ws,
         json!({ "type": "mcp_events_subscribe", "id": "s", "server": "hooks", "name": "ticket.updated",
-                "arguments": { "project": "alpha" }, "delivery": "webhook", "action": "notify" }),
+                "delivery": "webhook", "action": "follow_up" }),
     )
     .await;
     let r = ws_next(&mut ws, Duration::from_secs(20), "the subscribe", |f| {
@@ -313,58 +317,285 @@ async fn after_a_restart_a_runtime_subscriptions_old_callback_is_gone_not_held()
     })
     .await;
     assert_eq!(r["success"], true, "{r:#}");
-    let runtime_url = eventually(Duration::from_secs(10), "the runtime hook", || {
-        state(&fixture)["hooks"]
-            .as_array()?
-            .iter()
-            .find(|h| h["project"] == "alpha")
-            .and_then(|h| h["url"].as_str().map(str::to_owned))
+    let url = eventually(Duration::from_secs(10), "the hook", || {
+        state(&fixture)["hooks"][0]["url"]
+            .as_str()
+            .map(str::to_owned)
     });
-    eventually(Duration::from_secs(10), "both callbacks persisted", || {
-        let saved: Value =
-            serde_json::from_slice(&std::fs::read(state_file(home.path())).ok()?).ok()?;
-        (saved["subscriptions"]
-            .as_object()?
-            .values()
-            .filter(|s| s["webhook"]["token"].is_string())
+    let subscribes = || {
+        state(&fixture)["methods"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| *m == "events/subscribe")
             .count()
-            == 2)
+    };
+    eventually(Duration::from_secs(10), "the runtime spec on disk", || {
+        std::fs::read_dir(home.path().join("sessions"))
+            .ok()?
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.to_string_lossy().ends_with(".mcp-events.json"))
+            .any(|p| {
+                std::fs::read_to_string(p)
+                    .unwrap_or_default()
+                    .contains("\"runtime\"")
+            })
             .then_some(())
     });
     drop(ws);
     first.kill().unwrap();
     let _ = first.wait();
+    let before = subscribes();
     // Down, as a crashed daemon is — but still held, so the restart gets the same port.
     let down = held.down();
     drop(down);
     let _second = daemon(home.path(), &base, &held, &[]);
-    // The configured one comes back on its old callback.
     eventually(
         Duration::from_secs(20),
-        "the configured resubscribe",
-        || {
-            let n = state(&fixture)["methods"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter(|m| *m == "events/subscribe")
-                .count();
-            (n >= 3).then_some(())
-        },
-    );
-    let path = runtime_url
-        .split_once(&format!("127.0.0.1:{port}"))
-        .unwrap()
-        .1
-        .to_owned();
-    let status = raw_request(
-        port,
-        &format!("POST {path} HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\n"),
-        b"{}",
-        Duration::from_secs(5),
+        "the subscription, restored with no client",
+        || (subscribes() > before).then_some(()),
     );
     assert_eq!(
-        status, 410,
-        "nothing will resubscribe a runtime subscription: its callback is gone"
+        state(&fixture)["hooks"][0]["url"].as_str().unwrap(),
+        url,
+        "on its old callback"
     );
+    let r = emit(
+        &fixture,
+        json!({ "event_id": "after-restart-1", "data": { "summary": "restored runtime" } }),
+    );
+    assert_eq!(r["deliveries"][0]["status"], 200, "{r:#}");
+    eventually(
+        Duration::from_secs(20),
+        "the owning session's model run",
+        || (runs_for_event(&bodies, "restored runtime") >= 1).then_some(()),
+    );
+}
+
+/// A runtime subscription whose server is gone from settings does not pin its session forever: the
+/// restore after a restart is refused for good (an unknown server), the subscription is forgotten,
+/// the session is reaped like any idle one, and the next restart does not bring it back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_runtime_subscription_to_a_removed_server_is_forgotten_not_resurrected() {
+    let (_fx, mcp_url, _fixture) = spawn_http_fixture(&[("MCP_FIXTURE_ALLOW_HTTP_CALLBACK", "1")]);
+    let home = tempfile::tempdir().unwrap();
+    let mut servers = hooks(&mcp_url, "notify");
+    servers[0]["events"] = json!([]);
+    write_settings(home.path(), servers.clone());
+    let (base, _bodies) = spawn_model_server_routed(vec![], turn_text("noted"));
+    let held = HeldPort::bind();
+    let port = held.port();
+    let mut first = daemon(home.path(), &base, &held, &[]);
+    let mut ws = ws_connect(port, Some("orphaned")).await;
+    ws_send(
+        &mut ws,
+        json!({ "type": "mcp_events_subscribe", "id": "s", "server": "hooks", "name": "ticket.updated",
+                "delivery": "webhook", "action": "notify" }),
+    )
+    .await;
+    let r = ws_next(&mut ws, Duration::from_secs(20), "the subscribe", |f| {
+        f["type"] == "response" && f["id"] == "s"
+    })
+    .await;
+    assert_eq!(r["success"], true, "{r:#}");
+    let has_runtime = |home: &std::path::Path| {
+        std::fs::read_dir(home.join("sessions"))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.to_string_lossy().ends_with(".mcp-events.json"))
+            .any(|p| {
+                std::fs::read_to_string(p)
+                    .unwrap_or_default()
+                    .contains("\"runtime\"")
+            })
+    };
+    eventually(Duration::from_secs(10), "the runtime spec on disk", || {
+        has_runtime(home.path()).then_some(())
+    });
+    drop(ws);
+    common::mcp_events_fixture::sigterm_and_wait(&mut first);
+
+    // The server is renamed: nothing called `hooks` exists any more.
+    servers[0]["name"] = json!("hooks-renamed");
+    write_settings(home.path(), servers);
+    let (mut second, port) = common::mcp_events_fixture::spawn_daemon(
+        home.path(),
+        &base,
+        &["--session-idle-timeout", "1"],
+    );
+    let mut reaped = false;
+    for _ in 0..100 {
+        if daemon_sessions(port).await.get("orphaned") == Some(&false) {
+            reaped = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(reaped, "nothing keeps the session alive: it is reaped");
+    assert!(
+        !has_runtime(home.path()),
+        "the dead subscription is forgotten"
+    );
+    // …and its webhook callback with it: no token or secret is left in the snapshot.
+    let leftover = std::fs::read_dir(home.path().join("sessions"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.to_string_lossy().ends_with(".mcp-events.json"))
+        .any(|p| {
+            let s = std::fs::read_to_string(p).unwrap_or_default();
+            s.contains("\"webhook\"") || s.contains("whsec_")
+        });
+    assert!(
+        !leftover,
+        "the forgotten subscription's token and secret are purged"
+    );
+    common::mcp_events_fixture::sigterm_and_wait(&mut second);
+
+    // And a further restart does not resurrect it.
+    let (_third, port) = common::mcp_events_fixture::spawn_daemon(
+        home.path(),
+        &base,
+        &["--session-idle-timeout", "1"],
+    );
+    for _ in 0..15 {
+        assert_ne!(
+            daemon_sessions(port).await.get("orphaned"),
+            Some(&true),
+            "not started again at boot"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// A runtime subscription a single client command created (nothing else from that client) still
+/// expires: its creation starts the time to live, so once that has passed with no client it is
+/// not restored after a restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_runtime_subscription_made_by_one_command_expires_with_no_client() {
+    let (_fx, mcp_url, fixture) = spawn_http_fixture(&[("MCP_FIXTURE_ALLOW_HTTP_CALLBACK", "1")]);
+    let home = tempfile::tempdir().unwrap();
+    let mut servers = hooks(&mcp_url, "notify");
+    servers[0]["events"] = json!([]);
+    write_settings(home.path(), servers);
+    let (base, _bodies) = spawn_model_server_routed(vec![], turn_text("noted"));
+    let held = HeldPort::bind();
+    let port = held.port();
+    let mut first = daemon(home.path(), &base, &held, &[]);
+    let mut ws = ws_connect(port, Some("one-shot")).await;
+    ws_send(
+        &mut ws,
+        json!({ "type": "mcp_events_subscribe", "id": "s", "server": "hooks", "name": "ticket.updated",
+                "delivery": "webhook", "action": "notify" }),
+    )
+    .await;
+    let r = ws_next(&mut ws, Duration::from_secs(20), "the subscribe", |f| {
+        f["type"] == "response" && f["id"] == "s"
+    })
+    .await;
+    assert_eq!(r["success"], true, "{r:#}");
+    let subscribes = || {
+        state(&fixture)["methods"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| *m == "events/subscribe")
+            .count()
+    };
+    eventually(Duration::from_secs(10), "the runtime spec on disk", || {
+        std::fs::read_dir(home.path().join("sessions"))
+            .ok()?
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.to_string_lossy().ends_with(".mcp-events.json"))
+            .any(|p| {
+                std::fs::read_to_string(p)
+                    .unwrap_or_default()
+                    .contains("\"runtime\"")
+            })
+            .then_some(())
+    });
+    drop(ws);
+    first.kill().unwrap();
+    let _ = first.wait();
+    let before = subscribes();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let down = held.down();
+    drop(down);
+    let _second = daemon(
+        home.path(),
+        &base,
+        &held,
+        &[("BEYOND_AI_AGENT_MCP_EVENTS_RUNTIME_TTL_MS", "1")],
+    );
+    tokio::time::sleep(Duration::from_millis(3000)).await;
+    assert_eq!(subscribes(), before, "expired: not restored at boot");
+    assert_ne!(
+        daemon_sessions(port).await.get("one-shot"),
+        Some(&true),
+        "and its session is not started"
+    );
+}
+
+/// A session that holds runtime subscriptions and ends in a panic is started again, so they keep
+/// running with no client attached.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_session_with_runtime_subscriptions_is_restarted_after_a_panic() {
+    let (_fx, mcp_url, fixture) = spawn_http_fixture(&[("MCP_FIXTURE_ALLOW_HTTP_CALLBACK", "1")]);
+    let home = tempfile::tempdir().unwrap();
+    let mut servers = hooks(&mcp_url, "notify");
+    servers[0]["events"] = json!([]);
+    write_settings(home.path(), servers);
+    let (base, _bodies) = spawn_model_server_routed(vec![], turn_text("noted"));
+    let held = HeldPort::bind();
+    let port = held.port();
+    let _d = daemon(
+        home.path(),
+        &base,
+        &held,
+        &[("BEYOND_AI_AGENT_TEST_PANICS", "1")],
+    );
+    let mut ws = ws_connect(port, Some("watcher")).await;
+    ws_send(
+        &mut ws,
+        json!({ "type": "mcp_events_subscribe", "id": "s", "server": "hooks", "name": "ticket.updated",
+                "delivery": "webhook", "action": "notify" }),
+    )
+    .await;
+    let r = ws_next(&mut ws, Duration::from_secs(20), "the subscribe", |f| {
+        f["type"] == "response" && f["id"] == "s"
+    })
+    .await;
+    assert_eq!(r["success"], true, "{r:#}");
+    let subscribes = || {
+        state(&fixture)["methods"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| *m == "events/subscribe")
+            .count()
+    };
+    eventually(Duration::from_secs(10), "the runtime spec on disk", || {
+        std::fs::read_dir(home.path().join("sessions"))
+            .ok()?
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.to_string_lossy().ends_with(".mcp-events.json"))
+            .any(|p| {
+                std::fs::read_to_string(p)
+                    .unwrap_or_default()
+                    .contains("\"runtime\"")
+            })
+            .then_some(())
+    });
+    let before = subscribes();
+    ws_send(&mut ws, json!({ "type": "__test_panic", "id": "boom" })).await;
+    ws_next(&mut ws, Duration::from_secs(20), "the error frame", |f| {
+        f["type"] == "error"
+    })
+    .await;
+    drop(ws);
+    eventually(
+        Duration::from_secs(20),
+        "the session back, resubscribed",
+        || (subscribes() > before).then_some(()),
+    );
+    assert_eq!(daemon_sessions(port).await.get("watcher"), Some(&true));
 }

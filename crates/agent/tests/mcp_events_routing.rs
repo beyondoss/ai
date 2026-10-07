@@ -277,3 +277,104 @@ async fn unsubscribing_a_configured_subscription_while_its_server_is_down_stops_
         state(&fixture)
     );
 }
+
+/// A configured subscription the server refuses for good (here: an event it does not offer) is
+/// not hammered every minute forever: it is reported as `refused` — in `mcp_events_list` and as an
+/// `mcp_event_status` frame — retried only rarely, and it does not keep the events session alive.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_permanently_refused_configured_subscription_is_reported_and_does_not_keep_the_session() {
+    let (_fx, mcp_url, fixture) = spawn_http_fixture(&[("MCP_FIXTURE_ALLOW_HTTP_CALLBACK", "1")]);
+    let home = tempfile::tempdir().unwrap();
+    let mut servers = hooks(&mcp_url);
+    servers[0]["events"] = json!([{ "name": "no.such.event", "delivery": "webhook" }]);
+    write_settings(home.path(), servers);
+    let (base, _bodies) = spawn_model_server_routed(vec![], turn_text("noted"));
+    let (_d, port) = spawn_daemon(home.path(), &base, &["--session-idle-timeout", "1"]);
+    let mut ws = ws_connect(port, Some(EVENTS_SESSION)).await;
+    let status = ws_next(&mut ws, Duration::from_secs(20), "the refusal", |f| {
+        f["type"] == "mcp_event_status" && f["kind"] == "refused"
+    })
+    .await;
+    assert!(
+        status["error"]
+            .as_str()
+            .unwrap()
+            .contains("offers no event"),
+        "{status:#}"
+    );
+    let l = ws_list(&mut ws, "l").await;
+    assert_eq!(l["data"]["unestablished"][0]["state"], "refused", "{l:#}");
+    assert_eq!(l["data"]["unestablished"][0]["name"], "no.such.event");
+    let lists = || {
+        state(&fixture)["methods"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| *m == "events/list")
+            .count()
+    };
+    let before = lists();
+    tokio::time::sleep(Duration::from_millis(5000)).await;
+    assert!(
+        lists() <= before + 1,
+        "a permanent refusal is not retried on the transient backoff"
+    );
+    // Nothing else keeps the events session: once detached, the reaper takes it.
+    drop(ws);
+    let mut reaped = false;
+    for _ in 0..100 {
+        if daemon_sessions(port).await.get(EVENTS_SESSION) == Some(&false) {
+            reaped = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(
+        reaped,
+        "a refused subscription does not keep its session alive"
+    );
+}
+
+/// The session that owns the configured subscriptions is restarted after a panic, so configured
+/// triggers keep working without waiting for a daemon restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_events_session_is_restarted_after_a_panic() {
+    let (_fx, mcp_url, fixture) = spawn_http_fixture(&[]);
+    let home = tempfile::tempdir().unwrap();
+    write_settings(
+        home.path(),
+        json!([{
+            "name": "tickets", "transport": "http", "url": mcp_url,
+            "events": [{ "name": "ticket.updated", "delivery": "poll", "action": "follow_up" }],
+        }]),
+    );
+    let (base, bodies) = spawn_model_server_routed(vec![], turn_text("noted"));
+    let (_d, port) = common::mcp_events_fixture::spawn_daemon_env(
+        home.path(),
+        &base,
+        &[],
+        &[
+            ("BEYOND_AI_AGENT_TEST_PANICS", "1"),
+            ("BEYOND_AI_AGENT_MCP_EVENTS_POLL_FLOOR_MS", "100"),
+        ],
+    );
+    let mut ws = ws_connect(port, Some(EVENTS_SESSION)).await;
+    common::ws_send(&mut ws, json!({ "type": "__test_panic", "id": "boom" })).await;
+    ws_next(&mut ws, Duration::from_secs(20), "the error frame", |f| {
+        f["type"] == "error"
+    })
+    .await;
+    drop(ws);
+    // Back on its own: a configured event emitted now reaches the model.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    emit(
+        &fixture,
+        json!({ "event_id": "after-panic-1", "data": { "summary": "after the panic" } }),
+    );
+    eventually(
+        Duration::from_secs(20),
+        "the event reaching the model",
+        || (runs_for_event(&bodies, "after the panic") >= 1).then_some(()),
+    );
+    assert_eq!(daemon_sessions(port).await.get(EVENTS_SESSION), Some(&true));
+}

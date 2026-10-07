@@ -18,12 +18,14 @@ use tokio::sync::mpsc;
 
 use super::env_ms;
 
-/// Most bytes one SSE event (one JSON-RPC message on a push stream) may be. The draft keeps
-/// delivery bodies at or under 256 KiB; anything far past that is a broken or hostile server.
-pub(super) const MAX_SSE_EVENT_BYTES: usize = 1024 * 1024;
-/// Most bytes a unary `events/*` response body may be.
-pub(super) const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
-/// Most bytes a server's webhook JWKS document may be.
+/// Most bytes one message on the direct-HTTP events wire — a unary response body, or one SSE event
+/// (a JSON-RPC message on a push stream or a unary SSE answer) — may be: the same per-message cap
+/// every MCP transport applies ([`crate::tools::mcp_stdio::max_message_bytes`],
+/// `BEYOND_AI_AGENT_MCP_MAX_MESSAGE_BYTES`).
+fn max_message_bytes() -> usize {
+    crate::tools::mcp_stdio::max_message_bytes()
+}
+/// Most bytes a server's webhook JWKS document may be (a key document, not an MCP message).
 pub(super) const MAX_JWKS_BYTES: usize = 64 * 1024;
 
 /// How many notifications one push stream may have queued before its consumer catches up. Past it
@@ -167,6 +169,20 @@ impl RpcError {
         )
     }
 
+    /// A refusal retrying will not change: the request is wrong (`-32602`), the server does not
+    /// speak the extension (`-32601`), the event does not exist (`-32011`), or the mode is
+    /// unsupported (`-32014`) — unless it is the draft's "re-discover" signal. `-32012` (forbidden)
+    /// is not: credentials expire and are refreshed, so it is retried (see [`Self::is_forbidden`]).
+    pub(super) fn is_permanent(&self) -> bool {
+        matches!(self.code, Some(-32601 | -32602 | -32011 | -32014)) && !self.wants_rediscovery()
+    }
+
+    /// Access refused (`-32012`): retried with fresh credentials on a short backoff, and treated as
+    /// a permanent refusal only after repeated failures.
+    pub(super) fn is_forbidden(&self) -> bool {
+        self.code == Some(-32012)
+    }
+
     /// The draft's "re-discover and resubscribe" signals: the event type was removed
     /// (`-32011`, `data.kind: "event"`) or its schema changed in place (`-32014`,
     /// `data.reason: "schema_changed"`) — not an authorization failure.
@@ -294,6 +310,8 @@ impl Conn {
         json!({ "jsonrpc": "2.0", "id": format!("beyond-events-{id}"), "method": method, "params": params })
     }
 
+    /// One direct POST. `method` is empty for an answer (a JSON-RPC response has no method, so it
+    /// carries no `Mcp-Method`).
     fn http_request(
         http: &reqwest::Client,
         url: &str,
@@ -306,8 +324,10 @@ impl Conn {
             .post(url)
             .header("Content-Type", "application/json")
             .header("Accept", "application/json, text/event-stream")
-            .header("MCP-Protocol-Version", protocol_version)
-            .header("Mcp-Method", method);
+            .header("MCP-Protocol-Version", protocol_version);
+        if !method.is_empty() {
+            req = req.header("Mcp-Method", method);
+        }
         for (k, v) in headers {
             req = req.header(k, v);
         }
@@ -457,7 +477,7 @@ impl Conn {
                     let sse = is_sse(&resp);
                     let status = resp.status();
                     if !sse {
-                        let bytes = read_capped(resp, MAX_RESPONSE_BYTES)
+                        let bytes = read_capped(resp, max_message_bytes())
                             .await
                             .map_err(|e| RpcError::local(format!("{method}: {e}")))?;
                         let msg: Value = serde_json::from_slice(&bytes).map_err(|_| {
@@ -469,6 +489,17 @@ impl Conn {
                     while let Some(msg) = events.next().await {
                         if msg.get("id") == Some(&want) {
                             return rpc_outcome(msg);
+                        }
+                        if is_server_request(&msg) {
+                            refuse_server_request(
+                                http,
+                                url,
+                                headers,
+                                auth.as_deref(),
+                                protocol_version,
+                                &msg,
+                            )
+                            .await;
                         }
                     }
                     Err(RpcError::local(format!(
@@ -555,7 +586,7 @@ impl Conn {
                 .await?;
                 if !is_sse(&resp) {
                     // A JSON answer to a stream request is an immediate error (or a result).
-                    let bytes = read_capped(resp, MAX_RESPONSE_BYTES)
+                    let bytes = read_capped(resp, max_message_bytes())
                         .await
                         .map_err(|e| RpcError::local(format!("events/stream: {e}")))?;
                     let msg: Value = serde_json::from_slice(&bytes)
@@ -565,9 +596,31 @@ impl Conn {
                 }
                 // Backpressure, not loss: the reader awaits channel space, so TCP flow control
                 // slows the server rather than anything being dropped.
+                let refuse_with = (
+                    http.clone(),
+                    url.clone(),
+                    headers.clone(),
+                    auth.clone(),
+                    protocol_version.clone(),
+                );
                 let reader = tokio::spawn(async move {
                     let mut events = SseReader::new(resp);
                     while let Some(msg) = events.next().await {
+                        // Answered inline — one at a time, each bounded — so a server that floods
+                        // requests onto the stream cannot make the reader spawn without limit.
+                        if is_server_request(&msg) {
+                            let (http, url, headers, auth, version) = &refuse_with;
+                            refuse_server_request(
+                                http,
+                                url,
+                                headers,
+                                auth.as_deref(),
+                                version,
+                                &msg,
+                            )
+                            .await;
+                            continue;
+                        }
                         if msg.get("id") == Some(&want) {
                             let fin = match rpc_outcome(msg) {
                                 Ok(v) => StreamMsg::final_ok(v),
@@ -618,6 +671,43 @@ impl Conn {
     }
 }
 
+/// A server→client *request* (it has a `method` and an `id`) arriving on an `events/*` response.
+fn is_server_request(msg: &Value) -> bool {
+    msg.get("method").is_some() && msg.get("id").is_some_and(|id| !id.is_null())
+}
+
+/// Refuse a server→client request that arrived on a direct-HTTP `events/*` response. Over direct
+/// HTTP nothing routes it to a session (rmcp never sees the exchange), so rather than leave the
+/// server waiting forever on an answer that will never come, it is answered at once with an error.
+/// (Over rmcp the same request is attributed to the owning session, like one raised during a
+/// `tools/call`.)
+async fn refuse_server_request(
+    http: &reqwest::Client,
+    url: &str,
+    headers: &[(http::HeaderName, http::HeaderValue)],
+    auth: Option<&crate::tools::mcp_oauth::ServerAuth>,
+    protocol_version: &str,
+    msg: &Value,
+) {
+    let method = msg.get("method").and_then(Value::as_str).unwrap_or("?");
+    let body = json!({
+        "jsonrpc": "2.0",
+        "id": msg["id"],
+        "error": {
+            "code": -32601,
+            "message": format!("`{method}` is not served during an events request over direct HTTP"),
+        },
+    });
+    // Sent as every events POST is (`Conn::send`): the same `Accept` — a streamable-HTTP server
+    // (the official Python SDK among them) answers a POST without it `406`, and then still waits
+    // for the answer — and, with an OAuth login, the server's current token, refreshed and resent
+    // once on a 401, so a refresh since the stream opened cannot leave the server waiting either.
+    let send = Conn::send(http, url, headers, auth, protocol_version, "", &body);
+    if let Ok(Err(e)) = tokio::time::timeout(Duration::from_secs(5), send).await {
+        tracing::debug!(error = %e, method, "could not refuse a server request");
+    }
+}
+
 fn is_sse(resp: &reqwest::Response) -> bool {
     resp.headers()
         .get(reqwest::header::CONTENT_TYPE)
@@ -635,7 +725,7 @@ fn rpc_outcome(msg: Value) -> Result<Value, RpcError> {
 
 /// Minimal `text/event-stream` reader: yields each event's `data:` payload parsed as JSON.
 ///
-/// Bounded and linear: an event larger than [`MAX_SSE_EVENT_BYTES`] ends the stream (with
+/// Bounded and linear: an event larger than the per-message cap ends the stream (with
 /// [`Self::error`] saying why) instead of growing the buffer, and the separator scan resumes where
 /// it stopped rather than rescanning the whole buffer on every chunk.
 pub(super) struct SseReader {
@@ -647,16 +737,23 @@ pub(super) struct SseReader {
     start: usize,
     /// How far into `buf` no separator can start — the next scan begins here.
     scanned: usize,
+    /// The largest event read (see [`max_message_bytes`]).
+    max: usize,
     pub(super) error: Option<String>,
 }
 
 impl SseReader {
     pub(super) fn new(resp: reqwest::Response) -> Self {
+        Self::with_max(resp, max_message_bytes())
+    }
+
+    pub(super) fn with_max(resp: reqwest::Response, max: usize) -> Self {
         Self {
             resp,
             buf: Vec::new(),
             start: 0,
             scanned: 0,
+            max,
             error: None,
         }
     }
@@ -664,7 +761,20 @@ impl SseReader {
     pub(super) async fn next(&mut self) -> Option<Value> {
         loop {
             if let Some((end, sep_end)) = find_event_end(&self.buf, self.scanned.max(self.start)) {
-                let parsed = parse_sse_event(&self.buf[self.start..end]);
+                let event = &self.buf[self.start..end];
+                // One read can bring a whole over-cap event at once: it is held to the cap all the
+                // same — stood in for if it is an events notification, else the stream ends.
+                let parsed = if event.len() > self.max {
+                    match crate::tools::mcp_stdio::oversized_stand_in(&sse_data_head(event, 4096)) {
+                        Some(stand_in) => Some(stand_in),
+                        None => {
+                            self.error = Some(format!("an SSE event exceeded {} bytes", self.max));
+                            return None;
+                        }
+                    }
+                } else {
+                    parse_sse_event(event)
+                };
                 self.start = sep_end;
                 self.scanned = sep_end;
                 match parsed {
@@ -680,8 +790,18 @@ impl SseReader {
             }
             // A separator is at most four bytes, so one could still start in the last three.
             self.scanned = self.scanned.max(self.buf.len().saturating_sub(3));
-            if self.buf.len() > MAX_SSE_EVENT_BYTES {
-                self.error = Some(format!("an SSE event exceeded {MAX_SSE_EVENT_BYTES} bytes"));
+            if self.buf.len() > self.max {
+                // An over-cap MCP Events notification is skipped, not read: its bounded head names
+                // it (and, before the payload, its cursor), and a small stand-in takes its place —
+                // see `mcp_stdio::oversized_stand_in`. Anything else ends the stream with an error.
+                let head = sse_data_head(&self.buf, 4096);
+                if let Some(stand_in) = crate::tools::mcp_stdio::oversized_stand_in(&head) {
+                    if !self.skip_rest_of_event().await {
+                        return None;
+                    }
+                    return Some(stand_in);
+                }
+                self.error = Some(format!("an SSE event exceeded {} bytes", self.max));
                 return None;
             }
             match self.resp.chunk().await {
@@ -690,6 +810,44 @@ impl SseReader {
             }
         }
     }
+
+    /// Discard the rest of the event in progress (the buffer holds only its start), reading on to
+    /// its end without keeping it. `false` if the stream ended first.
+    async fn skip_rest_of_event(&mut self) -> bool {
+        // Only the last three bytes can begin a separator that the next chunk completes.
+        let mut tail: Vec<u8> = self.buf[self.buf.len().saturating_sub(3)..].to_vec();
+        self.buf.clear();
+        self.start = 0;
+        self.scanned = 0;
+        loop {
+            let Ok(Some(chunk)) = self.resp.chunk().await else {
+                return false;
+            };
+            tail.extend_from_slice(&chunk);
+            if let Some((_, sep_end)) = find_event_end(&tail, 0) {
+                self.buf.extend_from_slice(&tail[sep_end..]);
+                return true;
+            }
+            let keep = tail.len().saturating_sub(3);
+            tail.drain(..keep);
+        }
+    }
+}
+
+/// The start of an SSE event's first `data:` payload, at most `max` bytes of it.
+fn sse_data_head(event: &[u8], max: usize) -> Vec<u8> {
+    let at = event
+        .windows(5)
+        .position(|w| w == b"data:")
+        .map_or(event.len(), |i| i + 5);
+    let rest = &event[at..];
+    let rest = rest.strip_prefix(b" ").unwrap_or(rest);
+    let end = rest
+        .iter()
+        .position(|&b| b == b'\n' || b == b'\r')
+        .unwrap_or(rest.len())
+        .min(max);
+    rest[..end].to_vec()
 }
 
 /// One SSE event's `data:` lines, joined and parsed as JSON. `None` for an event with no data or
@@ -970,9 +1128,9 @@ mod tests {
 
     #[tokio::test]
     async fn an_oversized_sse_event_ends_the_stream_instead_of_buffering_it() {
-        let body = format!("data: {}", "x".repeat(MAX_SSE_EVENT_BYTES + 10));
+        let body = format!("data: {}", "x".repeat(4096 + 10));
         let resp = reqwest::Response::from(http::Response::new(body));
-        let mut reader = SseReader::new(resp);
+        let mut reader = SseReader::with_max(resp, 4096);
         assert!(reader.next().await.is_none());
         assert!(reader.error.unwrap().contains("exceeded"));
         // A normal event still parses.
@@ -1005,6 +1163,29 @@ mod tests {
             "draining {n} events took {:?}",
             started.elapsed()
         );
+    }
+
+    /// An over-cap events notification in an SSE stream is skipped to its end without being held,
+    /// and stands in as a small `$oversized` message; the stream goes on to the next event.
+    #[tokio::test]
+    async fn an_oversized_sse_event_is_skipped_and_the_stream_goes_on() {
+        let big = format!(
+            r#"data: {{"jsonrpc":"2.0","method":"notifications/events/event","params":{{"cursor":"7","data":"{}"}}}}"#,
+            "x".repeat(50_000)
+        );
+        let body = format!(
+            "{big}\n\ndata: {}\n\n",
+            r#"{"jsonrpc":"2.0","method":"notifications/events/event","params":{"cursor":"8"}}"#
+        );
+        let resp = reqwest::Response::from(http::Response::new(body));
+        let mut reader = SseReader::with_max(resp, 4096);
+        let first = reader.next().await.unwrap();
+        assert_eq!(first["params"]["$oversized"], true);
+        assert_eq!(first["params"]["cursor"], "7");
+        assert!(first["params"].get("data").is_none());
+        let second = reader.next().await.unwrap();
+        assert_eq!(second["params"]["cursor"], "8");
+        assert!(reader.error.is_none());
     }
 
     #[test]
@@ -1126,5 +1307,39 @@ mod tests {
         .unwrap();
         assert_eq!(resp.status(), 200);
         assert_eq!(*seen.lock().unwrap(), ["bearer fresh"]);
+    }
+
+    #[tokio::test]
+    async fn a_refused_server_request_is_answered_with_the_current_token_and_refreshed_on_401() {
+        // The refusal is sent the way every events POST is: the current shared token, not the
+        // one the stream's headers were built with, and a 401 refreshes and resends once — a
+        // refusal the server rejects leaves it waiting on an answer that never comes.
+        agent_core::ensure_provider();
+        let request = json!({ "jsonrpc": "2.0", "id": 3, "method": "elicitation/create" });
+        let (url, seen) = bearer_server().await;
+        let auth = crate::tools::mcp_oauth::ServerAuth::fake("fresh", || Ok("unused".into()));
+        refuse_server_request(
+            &reqwest::Client::new(),
+            &url,
+            &bearer("stale"),
+            Some(&auth),
+            "2026-07-28",
+            &request,
+        )
+        .await;
+        assert_eq!(*seen.lock().unwrap(), ["bearer fresh"]);
+
+        let (url, seen) = bearer_server().await;
+        let auth = crate::tools::mcp_oauth::ServerAuth::fake("stale", || Ok("fresh".into()));
+        refuse_server_request(
+            &reqwest::Client::new(),
+            &url,
+            &bearer("stale"),
+            Some(&auth),
+            "2026-07-28",
+            &request,
+        )
+        .await;
+        assert_eq!(*seen.lock().unwrap(), ["bearer stale", "bearer fresh"]);
     }
 }

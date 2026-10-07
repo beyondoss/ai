@@ -409,6 +409,9 @@ struct Supervisor {
     /// transition already flows through.
     metrics: Option<Arc<crate::metrics::Metrics>>,
     body: SessionBody,
+    /// Told the id of every session that ended in a panic (see `TryPin` in `start`), so the daemon
+    /// can bring back one it depends on — the MCP Events session.
+    panicked: tokio::sync::mpsc::UnboundedSender<String>,
 }
 
 /// What service mode needs at the *supervisor* level, as opposed to per session: the keyring every
@@ -962,6 +965,8 @@ impl Supervisor {
         // For the failure paths below: whoever attached to the `Starting` slot while the lock was
         // being taken is told why nothing started.
         let starting_conn = out_conn.clone();
+        let panic_conn = out_conn.clone();
+        let panicked = self.panicked.clone();
         let metrics_for_lock = self.metrics.clone();
         tokio::spawn(async move {
             let mut lock = None;
@@ -1013,7 +1018,31 @@ impl Supervisor {
             }
             let _ = started_tx.send(Ok(()));
             if exit.go_live() {
-                body.await;
+                // A panic in one session is contained to that session: its future unwinds — every
+                // in-flight MCP call and run is dropped, its events hub cancelled and its state
+                // written by their `Drop`s — its clients get an `error` frame and their connections
+                // end with it, and the daemon goes on serving every other session. Sound here
+                // because a session shares nothing with others that a half-finished update could
+                // leave broken: shared state is behind `lock_ignoring_poison`'s plain
+                // replace-the-value locks, and MCP server processes are the process's (swept on its
+                // exit), not the session's.
+                use futures::FutureExt as _;
+                if let Err(payload) = std::panic::AssertUnwindSafe(body).catch_unwind().await {
+                    let message = payload
+                        .downcast_ref::<&str>()
+                        .map(|s| (*s).to_owned())
+                        .or_else(|| payload.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "a panic".to_owned());
+                    eprintln!(
+                        "serve: session {session_id} panicked ({message}); it has ended, the daemon carries on"
+                    );
+                    lock_ignoring_poison(&panic_conn).broadcast(OutFrame::Value(json!({
+                        "type": "error",
+                        "session_id": session_id,
+                        "error": format!("the session ended after an internal error: {message}"),
+                    })));
+                    let _ = panicked.send(session_id.clone());
+                }
             } else {
                 drop(body);
             }
@@ -1753,6 +1782,7 @@ pub async fn serve_ws(
     // mode.
     let events_session = (!cfg.service_mode && !cfg.mcp_catalog.event_subscriptions().is_empty())
         .then(|| cfg.mcp_events_session.clone());
+    let (panicked_tx, mut panicked_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let supervisor = Arc::new(Supervisor {
         table: Arc::default(),
         // Service mode lists per tenant, from the shards, never from one process-wide directory.
@@ -1762,9 +1792,11 @@ pub async fn serve_ws(
         service,
         metrics: cfg.metrics.clone(),
         body: serve_session_body(cfg),
+        panicked: panicked_tx,
     });
     let mut shutdown = crate::serve::ShutdownSignal::new()?;
 
+    let events_session_id = events_session.clone();
     if let Some(id) = events_session {
         // Pinned and at once unpinned: the session starts exactly as if a client had connected and
         // left. It stays because its subscriptions keep it alive, not because anything holds it.
@@ -1777,6 +1809,100 @@ pub async fn serve_ws(
                 "serve: could not start the MCP Events session `{id}`: {}",
                 HttpError::from(e)
             ),
+        }
+    }
+
+    // A session that ends in a panic is started again when it holds MCP Events subscriptions that
+    // must keep running with no client: the events session (configured subscriptions), or one with
+    // runtime subscriptions (`mcp_events_subscribe`) — with backoff per session (1 s doubling to a
+    // minute, reset once it has stayed up ten minutes), so a session that panics on every start
+    // cannot spin the daemon. Any other session that panics simply ends: its clients were told, and
+    // it starts again when one comes back.
+    {
+        let supervisor = supervisor.clone();
+        let events_id = events_session_id.clone();
+        let session_dir = supervisor.session_dir.clone();
+        tokio::spawn(async move {
+            let mut backoff: std::collections::HashMap<String, (u32, std::time::Instant)> =
+                std::collections::HashMap::new();
+            while let Some(id) = panicked_rx.recv().await {
+                let holds_runtime = match &session_dir {
+                    Some(dir) => {
+                        let dir = dir.clone();
+                        let probe = id.clone();
+                        tokio::task::spawn_blocking(move || {
+                            crate::tools::mcp_events::sessions_with_runtime_subscriptions(
+                                std::path::Path::new(&dir),
+                                usize::MAX,
+                            )
+                            .contains(&probe)
+                        })
+                        .await
+                        .unwrap_or(false)
+                    }
+                    None => false,
+                };
+                if Some(&id) != events_id.as_ref() && !holds_runtime {
+                    continue;
+                }
+                let entry = backoff
+                    .entry(id.clone())
+                    .or_insert((0, std::time::Instant::now()));
+                if entry.1.elapsed() > std::time::Duration::from_secs(600) {
+                    entry.0 = 0;
+                }
+                let delay = std::time::Duration::from_secs(1u64 << entry.0.min(6))
+                    .min(std::time::Duration::from_secs(60));
+                entry.0 += 1;
+                entry.1 = std::time::Instant::now();
+                let supervisor = supervisor.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    match supervisor.pin(Some(id.clone()), None).await {
+                        Ok(p) => {
+                            supervisor.unpin(&p.id, p.incarnation);
+                            eprintln!(
+                                "serve: restarted session `{id}` after a panic, for its MCP Events subscriptions"
+                            );
+                        }
+                        Err(e) => eprintln!(
+                            "serve: could not restart session `{id}` after a panic: {}",
+                            HttpError::from(e)
+                        ),
+                    }
+                });
+            }
+        });
+    }
+
+    // Sessions holding runtime MCP Events subscriptions (`mcp_events_subscribe`) are started too,
+    // the same way, so those subscriptions are restored after a restart without waiting for their
+    // client to come back. Never in service mode.
+    if let Some(dir) = supervisor.session_dir.clone() {
+        let events_id = events_session_id.clone();
+        let ids = tokio::task::spawn_blocking(move || {
+            // Bounded: a pile of old sessions cannot all be woken at every boot.
+            crate::tools::mcp_events::sessions_with_runtime_subscriptions(
+                std::path::Path::new(&dir),
+                crate::tools::mcp_events::max_restored_sessions(),
+            )
+        })
+        .await
+        .unwrap_or_default();
+        for id in ids
+            .into_iter()
+            .filter(|id| Some(id.as_str()) != events_id.as_deref())
+        {
+            match supervisor.pin(Some(id.clone()), None).await {
+                Ok(p) => {
+                    supervisor.unpin(&p.id, p.incarnation);
+                    eprintln!("serve: restored session `{id}` for its MCP Events subscriptions");
+                }
+                Err(e) => eprintln!(
+                    "serve: could not restore session `{id}` for its MCP Events subscriptions: {}",
+                    HttpError::from(e)
+                ),
+            }
         }
     }
 
@@ -3048,6 +3174,7 @@ mod tests {
             table: Arc::default(),
             session_dir: None,
             service: None,
+            panicked: tokio::sync::mpsc::unbounded_channel().0,
             body: Box::new(
                 move |_id, _service, mut input_rx, _out, _running, _keep_alive| {
                     let probe = probe.clone();

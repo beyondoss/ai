@@ -1,6 +1,6 @@
 //! An MCP server with an `agent mcp-login` is spoken to over this crate's own POST path
-//! (`mcp_wire::HttpClient::post_bounded`, chosen in `connect_http` by `oauth: auth.is_some()`) instead
-//! of rmcp's client — so that path has to carry everything a streamable-HTTP server does: sessions
+//! (`mcp_wire::HttpClient::post_bounded`, which answers every streamable-HTTP POST) instead of
+//! rmcp's client — so that path has to carry everything a streamable-HTTP server does: sessions
 //! (`Mcp-Session-Id`, a 404 for an expired one), SSE responses, the standalone `GET` stream, the
 //! legacy handshake's cues. Each test here drives a real dial (`agent run`) against the OAuth fixture
 //! speaking that feature, and pins one piece of the routing.
@@ -25,8 +25,8 @@ fn result_of(bodies: &[String], request: usize, id: &str) -> (String, bool) {
 
 #[test]
 fn a_401_carrying_a_json_rpc_error_body_refreshes_through_a_real_dial() {
-    // rmcp's own client reads this 401 as an ordinary error *response*; only the OAuth routing
-    // (`oauth: auth.is_some()` in `connect_http`) sees the status and refreshes.
+    // rmcp's own client reads this 401 as an ordinary error *response*; only `post_bounded`
+    // (every POST's path) sees the status, so the OAuth layer refreshes.
     let (home, fixture) = logged_in();
     fixture.reject_with_json_body.store(true, Ordering::SeqCst);
     fixture.revoke_after_calls.store(1, Ordering::SeqCst);

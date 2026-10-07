@@ -249,7 +249,8 @@ fn a_server_without_the_extension_is_reported_and_its_tools_are_unchanged() {
     let status = s
         .frames
         .wait(Duration::from_secs(20), "the subscribe failure", |f| {
-            f["type"] == "mcp_event_status" && f["kind"] == "error"
+            // Permanent: the server does not speak the extension.
+            f["type"] == "mcp_event_status" && f["kind"] == "refused"
         });
     assert!(
         status["error"]
@@ -517,4 +518,53 @@ fn a_slow_server_does_not_serialize_subscriptions_to_others() {
     );
     assert_eq!(first["success"], true);
     assert_eq!(s.frames.response("slow")["success"], true);
+}
+
+/// "Forbidden" (`-32012`) is how a server answers an expired credential: retried, with credentials
+/// resolved afresh, on a short backoff — and the subscription comes up once they work.
+#[test]
+fn a_forbidden_subscribe_is_retried_and_comes_up_once_credentials_work() {
+    let home = tempfile::tempdir().unwrap();
+    let control_file = home.path().join("control");
+    let server = stdio_server(
+        "tickets",
+        &control_file,
+        json!({ "MCP_FIXTURE_FORBID_FIRST": "2" }),
+        json!([{ "name": "ticket.updated", "delivery": "poll", "action": "notify" }]),
+    );
+    let mut s = start(json!([server]), home);
+    wait_active(&mut s.stdin, &mut s.frames, 1);
+    assert!(
+        !s.frames
+            .seen
+            .iter()
+            .any(|f| f["type"] == "mcp_event_status" && f["kind"] == "refused"),
+        "a forbidden answer is not a permanent refusal"
+    );
+}
+
+/// A server that keeps answering "forbidden" is taken as refusing for good — after a few attempts,
+/// not on the first.
+#[test]
+fn a_subscribe_forbidden_over_and_over_is_eventually_refused() {
+    let home = tempfile::tempdir().unwrap();
+    let control_file = home.path().join("control");
+    let server = stdio_server(
+        "tickets",
+        &control_file,
+        json!({ "MCP_FIXTURE_FORBID_FIRST": "1000" }),
+        json!([{ "name": "ticket.updated", "delivery": "poll", "action": "notify" }]),
+    );
+    let mut s = start(json!([server]), home);
+    let control = wait_control_file(&control_file);
+    s.frames.wait(Duration::from_secs(40), "the refusal", |f| {
+        f["type"] == "mcp_event_status" && f["kind"] == "refused"
+    });
+    let polls = state(&control)["methods"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| *m == "events/poll")
+        .count();
+    assert!(polls >= 5, "tried {polls} times before giving up");
 }

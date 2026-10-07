@@ -80,6 +80,10 @@ use crate::tool::ToolRegistry;
 pub struct SteeringMessage {
     pub text: String,
     pub images: Vec<ImageSource>,
+    /// An opaque id the queuer chose, reported back in [`crate::AgentEvent::Steered`] at the moment
+    /// the message reaches the model — so a host can tell exactly which of its queued messages the
+    /// model received, whatever later happens to the transcript (a compaction, say).
+    pub tag: Option<u64>,
 }
 
 impl SteeringMessage {
@@ -88,7 +92,14 @@ impl SteeringMessage {
         Self {
             text: text.into(),
             images,
+            tag: None,
         }
+    }
+
+    /// The same message, tagged (see [`Self::tag`]).
+    pub fn with_tag(mut self, tag: u64) -> Self {
+        self.tag = Some(tag);
+        self
     }
 }
 
@@ -97,6 +108,7 @@ impl From<&str> for SteeringMessage {
         Self {
             text: text.to_string(),
             images: Vec::new(),
+            tag: None,
         }
     }
 }
@@ -106,6 +118,7 @@ impl From<String> for SteeringMessage {
         Self {
             text,
             images: Vec::new(),
+            tag: None,
         }
     }
 }

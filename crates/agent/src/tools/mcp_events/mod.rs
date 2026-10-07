@@ -42,7 +42,7 @@ pub mod webhook;
 mod wire;
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -165,6 +165,16 @@ fn healthy_for() -> Duration {
 }
 /// Longest wait between attempts to (re)establish a configured subscription.
 const CONFIGURED_RETRY_CAP: Duration = Duration::from_secs(60);
+
+/// How many times in a row a server may answer "forbidden" (`-32012`) — each attempt with
+/// credentials resolved afresh — before the subscription is treated as refused for good.
+const MAX_FORBIDDEN_RETRIES: u32 = 5;
+
+/// How long a subscription the server refused for good waits before it is tried again — rarely, in
+/// case the server's configuration changed (`BEYOND_AI_AGENT_MCP_EVENTS_REFUSED_RETRY_MS`).
+fn refused_retry() -> Duration {
+    env_ms("BEYOND_AI_AGENT_MCP_EVENTS_REFUSED_RETRY_MS", 3_600_000)
+}
 
 fn now_unix() -> i64 {
     SystemTime::now()
@@ -362,6 +372,7 @@ impl SubState {
                 cursor: self.cursor(),
                 recent,
                 webhook: None,
+                runtime: None,
             },
         );
     }
@@ -400,6 +411,16 @@ impl Active {
             })
         })
     }
+}
+
+/// A subscription this session means to have that is not up right now (see
+/// `Hub::unestablished`).
+struct Unestablished {
+    spec: SubSpec,
+    last_error: Option<String>,
+    /// The server refused for good (see [`SubError`]): retried only every
+    /// [`refused_retry`], and not counted as live.
+    permanent: bool,
 }
 
 /// What [`Hub::deliver`] did with one occurrence.
@@ -463,10 +484,14 @@ struct Hub {
     /// For direct HTTP events requests; built on first use, never for a stdio-only session.
     http: std::sync::OnceLock<reqwest::Client>,
     keep_alive: Option<Arc<AtomicBool>>,
-    /// Configured subscriptions not currently up — starting, or retrying after a failure or a
-    /// termination. They count as live for the keep-alive: a daemon whose servers are all briefly
-    /// down must not have its events session reaped.
-    starting: AtomicUsize,
+    /// Subscriptions this session means to have that are not up right now — configured ones
+    /// starting or retrying, runtime ones being restored after a restart — and why. Those still
+    /// expected to come up count as live for the keep-alive (a daemon whose servers are all briefly
+    /// down must not have its events session reaped); a permanent refusal does not.
+    unestablished: Mutex<HashMap<String, Unestablished>>,
+    /// Keys of runtime subscriptions being restored after a restart (until each is up again or
+    /// explicitly unsubscribed).
+    restoring: Mutex<HashSet<String>>,
     store: StateStore,
     /// `mcp_events_*` commands in flight — spawned so none ever blocks the session's command loop.
     command_tasks: Mutex<tokio::task::JoinSet<()>>,
@@ -497,9 +522,14 @@ impl McpEventsHub {
     ) -> (mpsc::Receiver<String>, Self) {
         let (tx, rx) = mpsc::channel::<String>(crate::serve::IN_CHANNEL_BOUND);
         let weak = tx.downgrade();
+        let store = StateStore::open(cfg.state_path, max_pending(), max_pending_bytes());
+        let client_store = store.clone();
         tokio::spawn(async move {
             let mut input_rx = input_rx;
             while let Some(line) = input_rx.recv().await {
+                // Only a client's own commands pass here (injections go around), so this is what
+                // "a client was here" means for runtime subscriptions' time to live.
+                client_store.touch_client(now_unix_ms());
                 if tx.send(line).await.is_err() {
                     break;
                 }
@@ -518,8 +548,9 @@ impl McpEventsHub {
             shutdown: CancellationToken::new(),
             http: std::sync::OnceLock::new(),
             keep_alive: cfg.keep_alive,
-            starting: AtomicUsize::new(0),
-            store: StateStore::open(cfg.state_path, max_pending(), max_pending_bytes()),
+            unestablished: Mutex::new(HashMap::new()),
+            restoring: Mutex::new(HashSet::new()),
+            store,
             command_tasks: Mutex::new(tokio::task::JoinSet::new()),
             owns_configured: cfg.owns_configured,
         });
@@ -529,12 +560,12 @@ impl McpEventsHub {
                 hub.refresh_keep_alive();
             }
         });
-        // Persisted webhook callbacks of *configured* subscriptions — the ones this session will
-        // subscribe again — are held from the moment the state is read, so a delivery the server
-        // retried across a restart gets `503` (retry), not `410` (stop), until the subscription has
-        // re-registered. A runtime subscription is not resubscribed after a restart, so its token
-        // is not held: `410` is the truth for it.
-        if hub.callback_url.is_some() {
+        // Once the state is read: hold the persisted webhook callbacks of every subscription this
+        // session will subscribe again — configured ones (re-created from settings) and runtime
+        // ones (restored from the state) — so a delivery the server retried across a restart gets
+        // `503` (retry), not `410` (stop), until the subscription has re-registered; then restore
+        // the runtime ones. (`start_configured` runs right after `attach`, before this does.)
+        {
             let weak_hub = Arc::downgrade(&hub);
             tokio::spawn(async move {
                 let Some(store) = weak_hub.upgrade().map(|h| h.store.clone()) else {
@@ -544,15 +575,34 @@ impl McpEventsHub {
                 let Some(hub) = weak_hub.upgrade() else {
                     return;
                 };
-                let configured = hub
-                    .configured
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .clone();
-                for (key, token) in store.webhook_tokens() {
-                    if configured.contains(&key) {
-                        webhook::reserve(&token);
+                // Runtime subscriptions whose session has heard from no client for longer than
+                // their time to live are forgotten — spec, position and webhook callback (token
+                // and secret) alike — not restored.
+                if !state::runtime_still_wanted(store.last_client_ms(), now_unix_ms()) {
+                    for (key, _) in store.runtime_specs() {
+                        store.forget_sub(&key);
                     }
+                }
+                let runtime: Vec<(String, SubSpec)> = store
+                    .runtime_specs()
+                    .into_iter()
+                    .filter(|(key, _)| !hub.is_configured(key))
+                    .filter_map(|(key, cmd)| parse_spec(&cmd).ok().map(|spec| (key, spec)))
+                    .filter(|(key, spec)| spec.key() == *key)
+                    .collect();
+                if hub.callback_url.is_some() {
+                    for (key, token) in store.webhook_tokens() {
+                        if hub.is_configured(&key) || runtime.iter().any(|(k, _)| *k == key) {
+                            webhook::reserve(&token);
+                        }
+                    }
+                }
+                for (key, spec) in runtime {
+                    hub.restoring
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(key);
+                    Hub::keep_subscribed(&hub, spec, Duration::ZERO, true);
                 }
             });
         }
@@ -592,7 +642,7 @@ impl McpEventsHub {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .insert(spec.key());
-                Hub::keep_subscribed(&self.hub, spec, Duration::ZERO);
+                Hub::keep_subscribed(&self.hub, spec, Duration::ZERO, false);
             }
         }
     }
@@ -632,6 +682,14 @@ impl McpEventsHub {
                 tracing::warn!(error = %e, "could not record delivered MCP events yet");
             }
             self.hub.refresh_keep_alive();
+        }
+    }
+
+    /// The handle a run's event sink records steered batches through, the moment the model receives
+    /// them (see [`Receipts::received`]).
+    pub fn receipts(&self) -> Receipts {
+        Receipts {
+            hub: self.hub.clone(),
         }
     }
 
@@ -693,6 +751,81 @@ impl McpEventsHub {
         McpEventsCommands {
             hub: self.hub.clone(),
             send,
+        }
+    }
+}
+
+/// The ids of (at most `max`) the sessions in `dir` whose events state holds runtime subscriptions
+/// still worth restoring (see [`state::runtime_still_wanted`]) — for a daemon to start at boot, so
+/// those subscriptions come back without waiting for a client to reattach. Reads only the small
+/// snapshot files (`<created>_<id>.mcp-events.json`); blocking.
+pub fn sessions_with_runtime_subscriptions(dir: &std::path::Path, max: usize) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let now = now_unix_ms();
+    let mut ranked: Vec<(i64, String)> = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(stem) = name
+            .to_str()
+            .and_then(|n| n.strip_suffix(".mcp-events.json"))
+        else {
+            continue;
+        };
+        let Some((_, id)) = stem.split_once('_') else {
+            continue;
+        };
+        if let Some(last) = std::fs::read(entry.path())
+            .ok()
+            .and_then(|b| state::snapshot_wants_restore(&b, now))
+        {
+            ranked.push((last, id.to_owned()));
+        }
+    }
+    // The most recently used first: past the cap, the ones a client touched longest ago wait.
+    ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    let mut ids: Vec<String> = ranked.into_iter().map(|(_, id)| id).collect();
+    if ids.len() > max {
+        eprintln!(
+            "serve: {} sessions hold runtime MCP Events subscriptions; restoring {max} of them at boot \
+             (the rest come back when their clients do)",
+            ids.len()
+        );
+        ids.truncate(max);
+    }
+    ids
+}
+
+/// The most sessions a daemon starts at boot to restore runtime MCP Events subscriptions
+/// (`BEYOND_AI_AGENT_MCP_EVENTS_MAX_RESTORED_SESSIONS`, default 32).
+pub fn max_restored_sessions() -> usize {
+    env_u64("BEYOND_AI_AGENT_MCP_EVENTS_MAX_RESTORED_SESSIONS", 32) as usize
+}
+
+/// Records steered injection batches as delivered from inside a run's (synchronous) event sink.
+#[derive(Clone)]
+pub struct Receipts {
+    hub: Arc<Hub>,
+}
+
+impl Receipts {
+    /// The model received `batch`: the run's `Steered` event reported it, after the transcript
+    /// holding it was checkpointed. Its events leave the pending queue now, and the record of that
+    /// is written at once — whatever a later compaction does to the transcript, the batch is never
+    /// injected again.
+    pub fn received(&self, batch: u64) {
+        if self.hub.store.delivered(batch) {
+            let store = self.hub.store.clone();
+            let hub = Arc::downgrade(&self.hub);
+            tokio::spawn(async move {
+                if let Err(e) = store.commit().await {
+                    tracing::warn!(error = %e, "could not record a received MCP events batch yet");
+                }
+                if let Some(hub) = hub.upgrade() {
+                    hub.refresh_keep_alive();
+                }
+            });
         }
     }
 }
@@ -773,6 +906,20 @@ fn parse_key(cmd: &Value) -> Result<SubSpec, String> {
     })
 }
 
+/// A spec as the `mcp_events_subscribe` command that would create it — what a runtime
+/// subscription is remembered as (see `PersistedSub::runtime`), and parsed back by [`parse_spec`].
+fn spec_command(spec: &SubSpec) -> Value {
+    json!({
+        "server": spec.server,
+        "name": spec.sub.name,
+        "arguments": spec.arguments(),
+        "delivery": spec.sub.delivery.map(mode_str),
+        "action": action_str(spec.sub.action),
+        "instructions": spec.sub.instructions,
+        "max_age_ms": spec.sub.max_age_ms,
+    })
+}
+
 fn parse_spec(cmd: &Value) -> Result<SubSpec, String> {
     let mut spec = parse_key(cmd)?;
     spec.sub.delivery = match cmd.get("delivery") {
@@ -801,7 +948,18 @@ impl Hub {
         let result = match ctype {
             "mcp_events_list" => Ok(hub.list(cmd.get("server").and_then(Value::as_str)).await),
             "mcp_events_subscribe" => match parse_spec(cmd) {
-                Ok(spec) => Hub::subscribe(hub, spec).await,
+                Ok(spec) => {
+                    let result = Hub::subscribe(hub, spec.clone())
+                        .await
+                        .map_err(|e| e.message);
+                    // A runtime subscription is remembered, so the session subscribes it again
+                    // after a restart. (A configured one is re-created from settings.)
+                    if result.is_ok() && !hub.is_configured(&spec.key()) {
+                        hub.store
+                            .set_runtime(&spec.key(), Some(spec_command(&spec)));
+                    }
+                    result
+                }
                 Err(e) => Err(e),
             },
             "mcp_events_unsubscribe" => match parse_key(cmd) {
@@ -853,15 +1011,39 @@ impl Hub {
                 Err(e) => available.push(json!({
                     "server": server,
                     "supported": false,
-                    "error": e,
+                    "error": e.message,
                 })),
             }
         }
+        let unestablished: Vec<Value> = {
+            let u = self
+                .unestablished
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut v: Vec<(&String, &Unestablished)> = u.iter().collect();
+            v.sort_by(|a, b| a.0.cmp(b.0));
+            v.into_iter()
+                .map(|(_, u)| {
+                    json!({
+                        "server": u.spec.server,
+                        "name": u.spec.sub.name,
+                        "arguments": u.spec.arguments(),
+                        "state": match (&u.last_error, u.permanent) {
+                            (_, true) => "refused",
+                            (Some(_), false) => "retrying",
+                            (None, false) => "starting",
+                        },
+                        "last_error": u.last_error,
+                    })
+                })
+                .collect()
+        };
         json!({
             "spec_commit": SPEC_COMMIT,
             "webhook": self.callback_url.is_some(),
             "owns_configured": self.owns_configured,
             "subscriptions": subscriptions,
+            "unestablished": unestablished,
             "available": available,
             "pending": self.store.pending_len(),
         })
@@ -904,7 +1086,7 @@ impl Hub {
     }
 
     /// `events/list`, all pages, cached until the server says `list_changed`.
-    async fn discover(&self, server: &str) -> Result<Arc<Vec<Value>>, String> {
+    async fn discover(&self, server: &str) -> Result<Arc<Vec<Value>>, SubError> {
         let conn = self.conn(server).await?;
         let generation = conn.generation();
         if let Some((g, events)) = self
@@ -927,10 +1109,10 @@ impl Hub {
                 .call("events/list", params, RPC_TIMEOUT)
                 .await
                 .map_err(|e| match e.code {
-                    Some(-32601) => format!(
+                    Some(-32601) => SubError::permanent(format!(
                         "server `{server}` does not support the MCP Events extension (events/list: method not found)"
-                    ),
-                    _ => format!("events/list on `{server}` failed: {e}"),
+                    )),
+                    _ => SubError::from_rpc(&e).context(&format!("events/list on `{server}` failed")),
                 })?;
             if let Some(list) = page.get("events").and_then(Value::as_array) {
                 events.extend(list.iter().cloned());
@@ -954,7 +1136,7 @@ impl Hub {
     /// delivery/action/instructions replaces the old subscription **only once the new one is
     /// confirmed**: a replacement that fails leaves the old one running, untouched. The two share
     /// one cursor and dedup window, so the brief overlap cannot double-deliver.
-    async fn subscribe(hub: &Arc<Hub>, spec: SubSpec) -> Result<Value, String> {
+    async fn subscribe(hub: &Arc<Hub>, spec: SubSpec) -> Result<Value, SubError> {
         let key = spec.key();
         let lock = hub.key_lock(&key);
         let _held = lock.lock().await;
@@ -969,6 +1151,13 @@ impl Hub {
             }
         };
 
+        // A server that is not (or no longer) configured will not appear by retrying.
+        if !hub.catalog.snapshot().iter().any(|s| s.name == spec.server) {
+            return Err(SubError::permanent(format!(
+                "unknown MCP server `{}`",
+                spec.server
+            )));
+        }
         let events = hub.discover(&spec.server).await?;
         let descriptor = events
             .iter()
@@ -978,12 +1167,12 @@ impl Hub {
                     .iter()
                     .filter_map(|e| e.get("name").and_then(Value::as_str))
                     .collect();
-                format!(
+                SubError::permanent(format!(
                     "server `{}` offers no event `{}` (it offers: {})",
                     spec.server,
                     spec.sub.name,
                     names.join(", ")
-                )
+                ))
             })?;
         let offered: Vec<McpEventDelivery> = descriptor
             .get("delivery")
@@ -994,7 +1183,8 @@ impl Hub {
                     .collect()
             })
             .unwrap_or_default();
-        let mode = choose_mode(spec.sub.delivery, &offered, hub.callback_url.is_some())?;
+        let mode = choose_mode(spec.sub.delivery, &offered, hub.callback_url.is_some())
+            .map_err(SubError::permanent)?;
 
         hub.store.loaded().await;
         let state = match &reuse {
@@ -1003,7 +1193,7 @@ impl Hub {
         };
         let prior_state = state.with(|s| std::mem::replace(&mut s.state, "starting"));
         let cancel = hub.shutdown.child_token();
-        let (ready_tx, ready_rx) = oneshot::channel::<Result<(), String>>();
+        let (ready_tx, ready_rx) = oneshot::channel::<Result<(), SubError>>();
         let spec_arc = Arc::new(spec.clone());
         let task = {
             let hub = hub.clone();
@@ -1026,11 +1216,13 @@ impl Hub {
         let outcome = match ready {
             Ok(Ok(Ok(()))) => Ok(()),
             Ok(Ok(Err(e))) => Err(e),
-            Ok(Err(_)) => Err("the subscription task ended before it was ready".to_owned()),
-            Err(_) => Err(format!(
+            Ok(Err(_)) => Err(SubError::from(
+                "the subscription task ended before it was ready",
+            )),
+            Err(_) => Err(SubError::from(format!(
                 "no confirmation within {}s",
                 READY_TIMEOUT.as_secs()
-            )),
+            ))),
         };
         if let Err(e) = outcome {
             cancel.cancel();
@@ -1038,12 +1230,12 @@ impl Hub {
             if reuse.is_some() {
                 state.with(|s| s.state = prior_state);
             }
-            return Err(format!(
-                "subscribing to `{}` on `{}` ({}) failed: {e}",
+            return Err(e.context(&format!(
+                "subscribing to `{}` on `{}` ({}) failed",
                 spec.sub.name,
                 spec.server,
                 mode_str(mode)
-            ));
+            )));
         }
         let replaced = hub.lock_subs().remove(&key);
         if let Some(old) = replaced {
@@ -1088,6 +1280,10 @@ impl Hub {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .remove(key);
+            self.restoring
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(key);
         }
         let Some(active) = self.lock_subs().remove(key) else {
             return false;
@@ -1102,7 +1298,12 @@ impl Hub {
     /// trigger needs: a live subscription, configured ones still starting, or undelivered events.
     fn refresh_keep_alive(&self) {
         if let Some(k) = &self.keep_alive {
-            let live = self.starting.load(Ordering::Acquire) > 0
+            let live = self
+                .unestablished
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .values()
+                .any(|u| !u.permanent)
                 || self.store.pending_len() > 0
                 || self.lock_subs().values().any(Active::live);
             k.store(live, Ordering::Release);
@@ -1169,6 +1370,29 @@ impl Hub {
     /// The server says events may have been skipped (`truncated`, a `gap` envelope): adopt its
     /// fresh cursor, tell attached clients, and — unless `notify` — tell the model too, so it can
     /// re-check authoritative state.
+    /// An event too large to accept was skipped (see the `$oversized` stand-in): note its id so a
+    /// replay of it is not reported twice, keep its cursor if known, and record a gap that says so.
+    fn oversized(&self, spec: &SubSpec, state: &SubState, stand_in: &Value) {
+        let event_id = stand_in.get("eventId").and_then(Value::as_str);
+        if let Some(id) = event_id
+            && let Ok(mut d) = state.dedup.lock()
+            && !d.first_sighting(id)
+        {
+            return;
+        }
+        tracing::warn!(
+            server = %spec.server,
+            event = %spec.sub.name,
+            event_id,
+            "skipped an MCP event over the message-size cap"
+        );
+        let mut carrier = json!({ "reason": "oversized", "eventId": event_id });
+        if let Some(cursor) = stand_in.get("cursor") {
+            carrier["cursor"] = cursor.clone();
+        }
+        self.gap(spec, state, &carrier);
+    }
+
     fn gap(&self, spec: &SubSpec, state: &SubState, carrier: &Value) {
         if carrier
             .as_object()
@@ -1176,7 +1400,13 @@ impl Hub {
         {
             state.set_cursor_from(carrier);
         }
-        self.status_event(spec, "gap", json!({ "cursor": state.cursor() }));
+        let reason = carrier.get("reason").and_then(Value::as_str);
+        let event_id = carrier.get("eventId").filter(|v| !v.is_null()).cloned();
+        self.status_event(
+            spec,
+            "gap",
+            json!({ "cursor": state.cursor(), "reason": reason, "event_id": event_id }),
+        );
         if spec.sub.action != McpEventAction::Notify {
             let queued = self.store.push_pending(PendingEvent::new(
                 spec.sub.action,
@@ -1184,7 +1414,7 @@ impl Hub {
                 spec.sub.name.clone(),
                 spec.arguments(),
                 spec.sub.instructions.clone(),
-                json!({ "gap": true, "cursor": state.cursor() }),
+                json!({ "gap": true, "cursor": state.cursor(), "reason": reason, "eventId": event_id }),
             ));
             if !queued {
                 tracing::warn!("pending queue full; a gap notice was not queued for the model");
@@ -1206,32 +1436,60 @@ impl Hub {
         (self.emit)(frame);
     }
 
-    /// Keep a configured subscription up: subscribe after `delay`, and on failure retry with
-    /// capped backoff — forever, until the session ends. It counts as live (for the keep-alive)
-    /// the whole time it is not up.
-    fn keep_subscribed(hub: &Arc<Hub>, spec: SubSpec, delay: Duration) {
-        hub.starting.fetch_add(1, Ordering::AcqRel);
+    fn is_configured(&self, key: &str) -> bool {
+        self.configured
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(key)
+    }
+
+    fn is_restoring(&self, key: &str) -> bool {
+        self.restoring
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(key)
+    }
+
+    /// Keep a subscription up: subscribe after `delay`, and on failure try again — a configured one
+    /// forever (until the session ends or it is explicitly unsubscribed), a `restoring` runtime one
+    /// until it is back. A transient failure retries with backoff capped at
+    /// [`CONFIGURED_RETRY_CAP`] and keeps the session alive meanwhile; a **permanent** refusal (see
+    /// [`SubError`]) is reported as `refused`, retried only every [`refused_retry`], and does not
+    /// keep the session alive.
+    fn keep_subscribed(hub: &Arc<Hub>, spec: SubSpec, delay: Duration, restoring: bool) {
+        let key = spec.key();
+        hub.unestablished
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                key.clone(),
+                Unestablished {
+                    spec: spec.clone(),
+                    last_error: None,
+                    permanent: false,
+                },
+            );
         hub.refresh_keep_alive();
         let weak = Arc::downgrade(hub);
         let shutdown = hub.shutdown.clone();
-        let resumed = !delay.is_zero();
+        let resumed = !delay.is_zero() && !restoring;
         tokio::spawn(async move {
             let mut delay = delay;
             let mut failures = 0u32;
+            let mut forbidden_streak = 0u32;
             loop {
                 tokio::select! {
                     () = tokio::time::sleep(delay) => {}
                     () = shutdown.cancelled() => break,
                 }
                 let Some(hub) = weak.upgrade() else { return };
-                // An explicit unsubscribe while this was waiting ends the effort: it is no longer
-                // configured to be kept up.
-                if !hub
-                    .configured
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .contains(&spec.key())
-                {
+                // An explicit unsubscribe while this was waiting ends the effort.
+                let wanted = if restoring {
+                    hub.is_restoring(&key)
+                } else {
+                    hub.is_configured(&key)
+                };
+                if !wanted {
                     break;
                 }
                 if resumed {
@@ -1247,26 +1505,75 @@ impl Hub {
                         }
                         break;
                     }
-                    Err(e) => {
-                        failures += 1;
-                        delay = backoff(failures, CONFIGURED_RETRY_CAP);
+                    Err(mut e) => {
+                        // Forbidden: every attempt dials afresh (credentials re-resolved); only a
+                        // refusal that keeps coming back is taken as final.
+                        if e.forbidden {
+                            forbidden_streak += 1;
+                            e.permanent |= forbidden_streak >= MAX_FORBIDDEN_RETRIES;
+                        } else {
+                            forbidden_streak = 0;
+                        }
+                        let kind = if e.permanent {
+                            delay = refused_retry();
+                            "refused"
+                        } else if e.forbidden {
+                            // A short backoff: a refreshed credential should work at once.
+                            delay = backoff(forbidden_streak - 1, Duration::from_secs(5));
+                            "error"
+                        } else {
+                            failures += 1;
+                            delay = backoff(failures, CONFIGURED_RETRY_CAP);
+                            "error"
+                        };
+                        if let Some(u) = hub
+                            .unestablished
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .get_mut(&key)
+                        {
+                            u.last_error = Some(e.message.clone());
+                            u.permanent = e.permanent;
+                        }
+                        hub.refresh_keep_alive();
                         eprintln!(
-                            "warning: session {}: mcp events: `{}` on `{}`: {e} (retrying in {}s)",
+                            "warning: session {}: mcp events: `{}` on `{}`: {e} ({}; retrying in {}s)",
                             hub.session_id,
                             spec.sub.name,
                             spec.server,
+                            if e.permanent {
+                                "refused"
+                            } else {
+                                "unavailable"
+                            },
                             delay.as_secs()
                         );
                         hub.status_event(
                             &spec,
-                            "error",
-                            json!({ "error": e, "retry_in_ms": delay.as_millis() as u64 }),
+                            kind,
+                            json!({ "error": e.message, "retry_in_ms": delay.as_millis() as u64 }),
                         );
+                        // A runtime subscription being restored that the server now refuses for
+                        // good (its server gone from settings, say) is forgotten, its webhook
+                        // callback with it: not retried, not restored again, keeping nothing.
+                        if restoring && e.permanent {
+                            hub.store.forget_sub(&key);
+                            break;
+                        }
                     }
                 }
             }
             if let Some(hub) = weak.upgrade() {
-                hub.starting.fetch_sub(1, Ordering::AcqRel);
+                hub.unestablished
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&key);
+                if restoring {
+                    hub.restoring
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .remove(&key);
+                }
                 hub.refresh_keep_alive();
             }
         });
@@ -1302,10 +1609,14 @@ impl Hub {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .contains(&spec.key());
         if configured {
-            Hub::keep_subscribed(self, spec.clone(), Duration::from_secs(1));
+            Hub::keep_subscribed(self, spec.clone(), Duration::from_secs(1), false);
             return;
         }
         self.refresh_keep_alive();
+        // A runtime subscription the server ended is over: forgotten — spec, position, webhook
+        // callback (token and secret) — so it is not subscribed again after a restart (unless
+        // re-discovery brings it back, below, as a new subscription).
+        self.store.forget_sub(&spec.key());
         if !error.wants_rediscovery() {
             return;
         }
@@ -1337,8 +1648,12 @@ impl Hub {
                 d.remove(&spec.server);
             }
             match Hub::subscribe(&hub, spec.clone()).await {
-                Ok(_) => hub.resubscribed(&spec),
-                Err(e) => hub.status_event(&spec, "error", json!({ "error": e })),
+                Ok(_) => {
+                    hub.store
+                        .set_runtime(&spec.key(), Some(spec_command(&spec)));
+                    hub.resubscribed(&spec);
+                }
+                Err(e) => hub.status_event(&spec, "error", json!({ "error": e.message })),
             }
         });
     }
@@ -1394,12 +1709,74 @@ async fn stop_task(task: tokio::task::JoinHandle<()>) {
     }
 }
 
+/// Why a subscribe failed, and whether trying again could help. A **permanent** refusal (the server
+/// does not offer the event, does not speak the extension, rejects the request as invalid, or no
+/// delivery mode fits) is retried only rarely, and does not keep a session alive.
+#[derive(Debug, Clone)]
+struct SubError {
+    pub(super) message: String,
+    pub(super) permanent: bool,
+    /// Access refused (`-32012`): retried, with credentials re-resolved, until it has failed
+    /// [`MAX_FORBIDDEN_RETRIES`] times in a row.
+    pub(super) forbidden: bool,
+}
+
+impl SubError {
+    fn permanent(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            permanent: true,
+            forbidden: false,
+        }
+    }
+
+    fn from_rpc(e: &RpcError) -> Self {
+        Self {
+            message: e.to_string(),
+            permanent: e.is_permanent(),
+            forbidden: e.is_forbidden(),
+        }
+    }
+
+    fn context(self, prefix: &str) -> Self {
+        Self {
+            message: format!("{prefix}: {}", self.message),
+            ..self
+        }
+    }
+}
+
+impl From<String> for SubError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            permanent: false,
+            forbidden: false,
+        }
+    }
+}
+
+impl From<&str> for SubError {
+    fn from(message: &str) -> Self {
+        message.to_owned().into()
+    }
+}
+
+impl std::fmt::Display for SubError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+/// How a subscription task reports its first success or failure to `subscribe`.
+type ReadyTx = oneshot::Sender<Result<(), SubError>>;
+
 /// Exponential backoff, 1 s doubling to a cap.
 fn backoff(attempt: u32, cap: Duration) -> Duration {
     Duration::from_secs(1u64 << attempt.min(6)).min(cap)
 }
 
-fn ready_ok(ready: &mut Option<oneshot::Sender<Result<(), String>>>) {
+fn ready_ok(ready: &mut Option<ReadyTx>) {
     if let Some(tx) = ready.take() {
         let _ = tx.send(Ok(()));
     }
@@ -1414,7 +1791,7 @@ async fn run_poll(
     spec: Arc<SubSpec>,
     state: Arc<SubState>,
     cancel: CancellationToken,
-    ready: oneshot::Sender<Result<(), String>>,
+    ready: ReadyTx,
 ) {
     let mut ready = Some(ready);
     let mut failures = 0u32;
@@ -1508,7 +1885,7 @@ async fn run_poll(
             }
             Err(e) => {
                 if let Some(tx) = ready.take() {
-                    let _ = tx.send(Err(e.to_string()));
+                    let _ = tx.send(Err(SubError::from_rpc(&e)));
                     return;
                 }
                 if e.is_terminal() {
@@ -1552,7 +1929,7 @@ async fn run_push(
     spec: Arc<SubSpec>,
     state: Arc<SubState>,
     cancel: CancellationToken,
-    ready: oneshot::Sender<Result<(), String>>,
+    ready: ReadyTx,
 ) {
     let mut ready = Some(ready);
     let mut failures = 0u32;
@@ -1584,7 +1961,7 @@ async fn run_push(
             }
             StreamEnd::Reconnect(why) => {
                 if let Some(tx) = ready.take() {
-                    let _ = tx.send(Err(why));
+                    let _ = tx.send(Err(why.into()));
                     return;
                 }
                 failures += 1;
@@ -1607,11 +1984,11 @@ fn stream_error(
     hub: &Arc<Hub>,
     spec: &SubSpec,
     state: &SubState,
-    ready: &mut Option<oneshot::Sender<Result<(), String>>>,
+    ready: &mut Option<ReadyTx>,
     e: RpcError,
 ) -> StreamEnd {
     if let Some(tx) = ready.take() {
-        let _ = tx.send(Err(e.to_string()));
+        let _ = tx.send(Err(SubError::from_rpc(&e)));
         return StreamEnd::Terminated;
     }
     if e.is_terminal() {
@@ -1627,7 +2004,7 @@ fn on_stream_msg(
     hub: &Arc<Hub>,
     spec: &SubSpec,
     state: &SubState,
-    ready: &mut Option<oneshot::Sender<Result<(), String>>>,
+    ready: &mut Option<ReadyTx>,
     failures: &mut u32,
     msg: StreamMsg,
 ) -> Option<StreamEnd> {
@@ -1645,6 +2022,13 @@ fn on_stream_msg(
                 state.set_cursor_from(&msg.params);
             }
         }
+        // An event over the message-size cap, skipped by the transport: only its stand-in arrived
+        // (`mcp_stdio::oversized_stand_in`). It is not reconnected into — the stream goes on — its
+        // cursor is kept when its head carried one (else the next heartbeat's applies), and the
+        // model is told an event was dropped.
+        "notifications/events/event" if msg.params.get("$oversized") == Some(&json!(true)) => {
+            hub.oversized(spec, state, &msg.params);
+        }
         "notifications/events/event" => {
             if hub.deliver(spec, McpEventDelivery::Push, state, msg.params) == Delivery::Full {
                 // Nothing of it was recorded: reconnecting from the cursor brings it back.
@@ -1660,7 +2044,9 @@ fn on_stream_msg(
         "notifications/events/terminated" => {
             let error = msg.params.get("error").cloned().unwrap_or(Value::Null);
             if let Some(tx) = ready.take() {
-                let _ = tx.send(Err(format!("terminated: {error}")));
+                let _ = tx.send(Err(
+                    SubError::from_rpc(&RpcError::from_json(&error)).context("terminated")
+                ));
             } else {
                 hub.ended(spec, state, RpcError::from_json(&error));
             }
@@ -1681,7 +2067,7 @@ async fn push_once(
     state: &SubState,
     cancel: &CancellationToken,
     conn: &Conn,
-    ready: &mut Option<oneshot::Sender<Result<(), String>>>,
+    ready: &mut Option<ReadyTx>,
     failures: &mut u32,
 ) -> StreamEnd {
     let mut stream = match conn.open_stream(spec.params(state.cursor())).await {
@@ -1874,19 +2260,6 @@ fn injection_marker(batch: u64) -> String {
     format!("[MCP events · batch {batch}]")
 }
 
-/// Whether the injection carrying `batch` is in `messages` as a user turn — how a steered batch is
-/// known to have reached the model. Found by its batch id, not its content. (A compaction during
-/// the run that summarized the steered turn away hides it: the batch is then re-injected.)
-pub fn transcript_has_injection(messages: &[agent_core::Message], batch: u64) -> bool {
-    let marker = injection_marker(batch);
-    messages.iter().rev().any(|m| {
-        m.role == agent_core::Role::User
-            && m.content.iter().any(|b| {
-                matches!(b, agent_core::ContentBlock::Text { text, .. } if text.starts_with(&marker))
-            })
-    })
-}
-
 fn render_injection(batch: u64, events: &[PendingEvent]) -> String {
     let occurrences = events
         .iter()
@@ -1911,6 +2284,20 @@ fn render_injection(batch: u64, events: &[PendingEvent]) -> String {
     }
     for e in events {
         if e.event.get("gap") == Some(&json!(true)) {
+            if e.event.get("reason") == Some(&json!("oversized")) {
+                out.push_str(&format!(
+                    "\n[gap] An event for `{}` on `{}`{} was larger than the message-size limit and \
+                     was dropped unread. If it matters, re-check the authoritative state with tools.\n",
+                    e.name,
+                    e.server,
+                    e.event
+                        .get("eventId")
+                        .and_then(Value::as_str)
+                        .map(|id| format!(" (event id `{}`)", id.replace('`', "")))
+                        .unwrap_or_default()
+                ));
+                continue;
+            }
             out.push_str(&format!(
                 "\n[gap] The server reported that events for `{}` on `{}` may have been missed \
                  (its history did not reach back far enough). If it matters, re-check the \
@@ -2095,20 +2482,39 @@ mod tests {
         let _ = task.await;
     }
 
-    /// A steered batch is recognised in the transcript by its id. Two injections with identical
-    /// content (two gap notices) are told apart: only the one that reached the model counts.
+    /// Every injection's text names its batch on its first line — for anyone reading the
+    /// transcript; delivery itself is tracked by tag (`AgentEvent::Steered`), not by text.
     #[test]
-    fn a_steered_batch_is_found_by_its_id_not_its_content() {
+    fn an_injection_names_its_batch() {
         let gap = || pending(McpEventAction::Steer, json!({"gap": true, "cursor": "9"}));
-        let seven = render_injection(7, &[gap()]);
-        let eight = render_injection(8, &[gap()]);
-        let in_transcript = vec![agent_core::Message::user(seven)];
-        assert!(transcript_has_injection(&in_transcript, 7));
-        assert!(
-            !transcript_has_injection(&in_transcript, 8),
-            "an identical batch that never reached the model is not delivered"
+        assert!(render_injection(7, &[gap()]).starts_with(&injection_marker(7)));
+        assert_ne!(render_injection(7, &[gap()]), render_injection(8, &[gap()]));
+    }
+
+    /// Past the boot cap, the sessions restored are the ones a client used most recently — not
+    /// the first ones alphabetically.
+    #[test]
+    fn the_boot_cap_keeps_the_most_recently_used_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = now_unix_ms();
+        for (id, ago) in [
+            ("a-oldest", 3_000),
+            ("b-newest", 1_000),
+            ("c-middle", 2_000),
+        ] {
+            std::fs::write(
+                dir.path().join(format!("100_{id}.mcp-events.json")),
+                json!({
+                    "subscriptions": { "k": { "cursor": null, "runtime": { "server": "s", "name": "n" } } },
+                    "last_client_ms": now - ago,
+                })
+                .to_string(),
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            sessions_with_runtime_subscriptions(dir.path(), 2),
+            ["b-newest", "c-middle"]
         );
-        assert!(!transcript_has_injection(&in_transcript, 70));
-        let _ = eight;
     }
 }
