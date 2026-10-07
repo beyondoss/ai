@@ -278,3 +278,9 @@ harness = false
 [[bench]]
 name = "serve_runtime"
 harness = false
+
+# Subagent `Worktree::create` scaled by the parent's untracked-file count, local and remote (an
+# injected per-exec hop over `ShellFs`). Custom harness: a scaling table with exec counts.
+[[bench]]
+name = "worktree_seed"
+harness = false

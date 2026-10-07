@@ -2355,6 +2355,9 @@ other.
   `Worktree::create` copies the parent's tracked modifications and untracked-but-not-ignored files into
   the worktree and commits them as a throwaway baseline. `child_delta` diffs against that baseline, so
   the patch is _only_ what the child changed — the parent's own WIP isn't replayed onto it.
+  The untracked copy is one batch, never a call per file: one blocking task locally, and in a sandbox
+  one fixed `sh` script per argv-sized chunk of paths. Per-file backend calls were four sandbox round
+  trips each, so seeding cost grew with the untracked count times the exec latency (`benches/worktree_seed.rs`).
 - **Merge-back.** On child success, `apply_patch` re-checks every path in the diff against the parent's
   `--deny-path` globs (mapped back to the main tree) — `git apply` is not a tool call and never reaches
   `ToolPolicy`, so this is the only place that check can live — then applies with `git apply --3way`. A
