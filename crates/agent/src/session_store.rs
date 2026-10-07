@@ -877,7 +877,11 @@ fn make_journal_key(
             }
         }
     };
-    if let Some(theirs) = read_journal_key(&path) {
+    // Re-read through the locked descriptor: a second open and close would drop the lock on NFS.
+    let mut on_disk = Vec::new();
+    if lock.file().read_to_end(&mut on_disk).is_ok()
+        && let Some(theirs) = JournalAuth::from_sidecar(&on_disk)
+    {
         return Some(theirs);
     }
     let (auth, bytes) = match log.legacy_journal_key_path().and_then(|p| {
@@ -2889,7 +2893,12 @@ fn move_sibling_memory(session_jsonl: &Path, dst_dir: &Path) {
     let sidecars = SESSION_SIDECARS
         .iter()
         .map(|ext| session_jsonl.with_extension(ext))
-        .chain([journal_key_beside(session_jsonl)]);
+        .chain([
+            journal_key_beside(session_jsonl),
+            // A key under the old name not yet carried over: without it a restored session would
+            // read as keyless.
+            session_jsonl.with_extension(crate::mcp_resume::JournalAuth::SIDECAR),
+        ]);
     for sidecar in sidecars {
         if let Some(name) = sidecar.file_name()
             && sidecar.is_file()
@@ -2938,6 +2947,7 @@ fn remove_sibling_memory(session_jsonl: &Path) {
         let _ = fs::remove_file(session_jsonl.with_extension(ext));
     }
     let _ = fs::remove_file(journal_key_beside(session_jsonl));
+    let _ = fs::remove_file(session_jsonl.with_extension(crate::mcp_resume::JournalAuth::SIDECAR));
 }
 
 /// A directory of session files. `Clone` is just a `PathBuf` copy — cheap, and lets a caller move an
@@ -6759,6 +6769,44 @@ mod tests {
         assert!(key.is_file(), "the key came back with its session");
         let (store, _) = SessionStore::open(path).unwrap();
         assert_eq!(store.active_journal(TASK_ENTRY_KIND).len(), 1);
+    }
+
+    /// A key still under the old name (not yet carried over) is trashed and restored with its
+    /// session too: left behind, the restored session would read as keyless.
+    #[test]
+    fn a_trashed_session_takes_an_old_name_key_along() {
+        use crate::mcp_resume::{JournalAuth, TASK_ENTRY_KIND};
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo.create(SessionMeta::new("/w", "m")).unwrap();
+        store
+            .append_journal(TASK_ENTRY_KIND, serde_json::json!({ "taskId": "t" }))
+            .unwrap();
+        let id = store.meta().id.clone();
+        let path = store.path().to_path_buf();
+        drop(store);
+        let legacy = path.with_extension(JournalAuth::SIDECAR);
+        fs::rename(journal_key_beside(&path), &legacy).unwrap();
+
+        repo.delete(&id).unwrap();
+        assert!(
+            !legacy.exists(),
+            "the old-name key left the session directory"
+        );
+        assert!(
+            dir.path()
+                .join(".trash")
+                .join(legacy.file_name().unwrap())
+                .is_file()
+        );
+        assert!(repo.restore_session(&id).unwrap());
+        assert!(legacy.is_file(), "the old-name key came back");
+        let (store, _) = SessionStore::open(path).unwrap();
+        assert_eq!(store.active_journal(TASK_ENTRY_KIND).len(), 1);
+        assert!(
+            matches!(store.journal, JournalAuth::Keyed { .. }),
+            "the restored session is keyed, not keyless"
+        );
     }
 
     /// Sessions whose names differ only after their last dot each get their own key: the key's

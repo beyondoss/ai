@@ -226,8 +226,10 @@ async fn the_callback_survives_a_crash_so_retried_deliveries_still_land() {
 }
 
 /// After a restart, a delivery the server retries can arrive before the subscription has
-/// re-registered its route (here discovery is slow). It must get `503` — retry — not `410`, which
-/// tells the server to give up; once the route is back, the retry lands.
+/// re-registered its route (here discovery is slow), and even before the daemon has read the state
+/// that names its callback (held off on demand by a debug seam; a loaded host used to open that
+/// window by chance). It must get `503` — retry — not `410`, which tells the server to give up;
+/// once the route is back, the retry lands.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_retry_that_beats_the_resubscribe_after_a_restart_is_told_to_retry_not_to_stop() {
     let (_fx, mcp_url, fixture) = spawn_http_fixture(&[
@@ -262,9 +264,15 @@ async fn a_retry_that_beats_the_resubscribe_after_a_restart_is_told_to_retry_not
     assert_ne!(r["deliveries"][0]["status"], 200, "{r:#}");
 
     drop(down);
-    let _second = daemon(home.path(), &base, &held, &[]);
-    // The state is read at once; discovery takes 3 s, so the route is not back yet.
-    tokio::time::sleep(Duration::from_millis(800)).await;
+    let _second = daemon(
+        home.path(),
+        &base,
+        &held,
+        &[("BEYOND_AI_AGENT_TEST_SLOW_EVENTS_RESTORE_MS", "1500")],
+    );
+    // At once: the state is not read for 1.5 s, and discovery takes 3 s after that, so neither
+    // the token's reservation nor its route exists yet. The port is held, so the delivery waits
+    // in its backlog until the daemon accepts it.
     let r = control(
         &fixture,
         "POST",

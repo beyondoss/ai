@@ -105,6 +105,41 @@ fn reserved() -> std::sync::MutexGuard<'static, HashMap<String, std::time::Insta
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// Until when *every* unknown token is answered `503` (retry) rather than `410` (stop): from a
+/// daemon's start until its MCP Events session has read its persisted state and reserved the tokens
+/// in it ([`restore_pending`], [`restored`]). Without it, a delivery the server retried across a
+/// restart that lands before the state is read would be told to stop for good.
+static RESTORING_UNTIL: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+
+fn restoring_until() -> std::sync::MutexGuard<'static, Option<std::time::Instant>> {
+    RESTORING_UNTIL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// A daemon whose events session will restore persisted callbacks is starting: answer unknown
+/// tokens `503` until it has ([`restored`]), or for at most [`RESERVE_FOR`].
+pub fn restore_pending() {
+    *restoring_until() = Some(std::time::Instant::now() + RESERVE_FOR);
+}
+
+/// The events session has reserved every token it persisted: unknown tokens are `410` again.
+pub(super) fn restored() {
+    *restoring_until() = None;
+}
+
+fn restoring() -> bool {
+    let mut until = restoring_until();
+    match *until {
+        Some(t) if t > std::time::Instant::now() => true,
+        Some(_) => {
+            *until = None;
+            false
+        }
+        None => false,
+    }
+}
+
 /// Hold a persisted callback token until its subscription re-registers (see [`RESERVED`]).
 pub(super) fn reserve(token: &str) {
     if routes().contains_key(token) {
@@ -133,7 +168,7 @@ fn is_reserved(token: &str) -> bool {
 /// Whether `token` names a live subscription, or one expected back after a restart — the
 /// listener's cheap check before it reads a body.
 pub fn route_exists(token: &str) -> bool {
-    routes().contains_key(token) || is_reserved(token)
+    routes().contains_key(token) || is_reserved(token) || restoring()
 }
 
 /// CSPRNG bytes. A failure is an error, never a fallback to something predictable.
@@ -296,7 +331,7 @@ pub async fn receive_webhook(
     body: &[u8],
 ) -> WebhookReply {
     let Some(route) = routes().get(token).cloned() else {
-        if is_reserved(token) {
+        if is_reserved(token) || restoring() {
             return WebhookReply::error(
                 503,
                 "Service Unavailable",

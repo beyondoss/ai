@@ -59,6 +59,23 @@ async fn get(port: u16, path: &str, headers: &[(&str, &str)]) -> (u16, String) {
     exchange(stream, "GET", path, headers).await
 }
 
+/// `GET /readyz`, once the answer has settled. The shard probe is a real `create` and `unlink` with a
+/// one-second deadline, and on a loaded host a probe can run past it: that caller is answered
+/// "shard probe timed out", while the probe goes on and its answer lands in the memo for the next
+/// caller. That answer says nothing about what a test checks, so it is waited out. Any other answer,
+/// a 503 for any other reason included, is returned at once.
+async fn readyz(port: u16, headers: &[(&str, &str)]) -> (u16, String) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let (status, response) = get(port, "/readyz", headers).await;
+        let timed_out = status == 503 && body_of(&response)["reason"] == "shard probe timed out";
+        if !timed_out || std::time::Instant::now() > deadline {
+            return (status, response);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
 fn body_of(response: &str) -> Value {
     let body = response
         .split_once("\r\n\r\n")
@@ -95,13 +112,13 @@ async fn readyz_is_200_when_every_shard_is_writable() {
     let (base, _requests) = spawn_model_server(vec![]);
     let svc = Service::start(&base, &["s1", "s2"]).await;
 
-    let (status, response) = get(svc.port, "/readyz", &[]).await;
+    let (status, response) = readyz(svc.port, &[]).await;
     assert_eq!(status, 200, "{response}");
     assert_eq!(body_of(&response)["status"], "ready");
 
     // Repeated probes are served from the memo and stay correct.
     for _ in 0..3 {
-        let (status, _) = get(svc.port, "/readyz", &[]).await;
+        let (status, _) = readyz(svc.port, &[]).await;
         assert_eq!(status, 200);
     }
 
@@ -125,7 +142,7 @@ async fn readyz_is_503_and_names_the_missing_shard() {
     let gone = svc.shard("s2").to_path_buf();
     std::fs::remove_dir_all(&gone).unwrap();
 
-    let (status, response) = get(svc.port, "/readyz", &[]).await;
+    let (status, response) = readyz(svc.port, &[]).await;
     assert_eq!(status, 503, "{response}");
     let reason = body_of(&response)["reason"]
         .as_str()
@@ -160,7 +177,7 @@ async fn readyz_is_503_when_a_shard_is_read_only() {
     let ro = svc.shard("s2").to_path_buf();
     std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).unwrap();
 
-    let (status, response) = get(svc.port, "/readyz", &[]).await;
+    let (status, response) = readyz(svc.port, &[]).await;
     // Restore before asserting, so a failure still lets the temp dir clean itself up.
     std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755)).unwrap();
 
@@ -227,7 +244,7 @@ async fn health_answers_over_a_unix_socket() {
     assert_eq!(body_of(&response)["status"], "ready");
 
     // Same process, same shards: the TCP listener agrees.
-    let (status, _) = get(svc.port, "/readyz", &[]).await;
+    let (status, _) = readyz(svc.port, &[]).await;
     assert_eq!(status, 200);
 }
 
@@ -254,7 +271,7 @@ async fn a_grant_is_never_required_and_never_echoed() {
 
     // A grant far past the header cap is dropped unread on this path too — still a 200, not a 401.
     let huge = "A".repeat(13 * 1024);
-    let (status, response) = get(svc.port, "/readyz", &[("x-beyond-grant", &huge)]).await;
+    let (status, response) = readyz(svc.port, &[("x-beyond-grant", &huge)]).await;
     assert_eq!(status, 200, "{response}");
     assert!(!response.contains("AAAA"), "{response}");
 }
@@ -266,7 +283,7 @@ async fn readyz_does_not_interfere_with_a_session_attach() {
     let (base, _requests) = spawn_model_server(vec![turn_text("hi")]);
     let svc = Service::start(&base, &["s1"]).await;
 
-    let (status, _) = get(svc.port, "/readyz", &[]).await;
+    let (status, _) = readyz(svc.port, &[]).await;
     assert_eq!(status, 200);
 
     let token = svc.token("t1", "s1.alpha");
@@ -274,7 +291,7 @@ async fn readyz_does_not_interfere_with_a_session_attach() {
         .await
         .expect("attach with a valid grant");
 
-    let (status, _) = get(svc.port, "/readyz", &[]).await;
+    let (status, _) = readyz(svc.port, &[]).await;
     assert_eq!(status, 200, "a probe mid-session must not fail");
 
     ws_send(
@@ -291,7 +308,7 @@ async fn readyz_does_not_interfere_with_a_session_attach() {
 
     // And the probe still only ever reports on shards — no session directory is walked, so a live
     // session leaves no trace in the answer.
-    let (status, response) = get(svc.port, "/readyz", &[]).await;
+    let (status, response) = readyz(svc.port, &[]).await;
     assert_eq!(status, 200);
     assert!(!response.contains("s1.alpha"), "{response}");
 }
@@ -324,7 +341,7 @@ async fn health_exists_on_a_non_service_daemon() {
     assert_eq!(status, 200, "{response}");
     assert_eq!(body_of(&response)["status"], "alive");
 
-    let (status, response) = get(port, "/readyz", &[]).await;
+    let (status, response) = readyz(port, &[]).await;
     assert_eq!(status, 200, "{response}");
     assert_eq!(body_of(&response)["status"], "ready");
 

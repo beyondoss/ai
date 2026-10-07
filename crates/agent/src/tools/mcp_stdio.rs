@@ -115,15 +115,32 @@ pub(crate) fn retire(server: &std::sync::Arc<ServerProcess>) {
 /// Every streamable-HTTP MCP session still open is ended too (`mcp_http_exit`): its `DELETE`s go out
 /// first, in parallel and bounded by [`CLOSE_DEADLINE`](crate::tools::mcp_http_exit::CLOSE_DEADLINE),
 /// overlapping the stdio grace.
+///
+/// The wait is a bound, so a loaded host can stall a sweep thread past it. Whatever the threads
+/// managed by then, every server still running is killed here, on the exiting thread, before it
+/// returns: the guarantee that nothing is left running rests on that, not on the threads' timing.
 pub fn sweep_before_exit() {
     let http_closed =
         crate::tools::mcp_http_exit::begin_close_all(crate::tools::mcp_http_exit::CLOSE_DEADLINE);
-    retire_all();
+    let live = retire_all();
     http_closed();
     #[cfg(unix)]
-    crate::tools::exec::wait_for_pending_group_kills(
-        SHUTDOWN_GRACE + std::time::Duration::from_secs(2),
-    );
+    {
+        crate::tools::exec::wait_for_pending_group_kills(
+            SHUTDOWN_GRACE + std::time::Duration::from_secs(2),
+        );
+        for server in &live {
+            if !server.exited() {
+                // Not reaped, so the pid is still this server's.
+                let _ = lock(&server.child).start_kill();
+            }
+            if let Some(pgid) = server.pgid {
+                crate::tools::exec::kill_group_members(pgid);
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    drop(live);
 }
 
 /// Runs [`sweep_before_exit`] when dropped — at the end of `main`, and while a panic unwinds out of
@@ -139,7 +156,7 @@ impl Drop for ExitSweep {
 /// Retire every stdio server still running — for the way out of the process, where a connection
 /// some owner still holds would otherwise never be dropped. Follow it with
 /// [`crate::tools::exec::wait_for_pending_group_kills`] ([`sweep_before_exit`] does both).
-pub fn retire_all() {
+pub fn retire_all() -> Vec<std::sync::Arc<ServerProcess>> {
     let live: Vec<_> = lock(&LIVE)
         .iter()
         .filter_map(std::sync::Weak::upgrade)
@@ -147,6 +164,7 @@ pub fn retire_all() {
     for server in &live {
         retire(server);
     }
+    live
 }
 
 /// The key a rescued result is wrapped under on its way through rmcp; see [`rescue`].
@@ -1224,11 +1242,26 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         };
+        // Running, and not yet sent SIGKILL. A process that has been sent SIGKILL may not have been
+        // scheduled to die yet on a loaded host, so "killed" is read from the kernel: gone, a
+        // zombie, or SIGKILL pending (bit 8 of its pending masks). That is the sweep's guarantee;
+        // when the corpse is reaped is the scheduler's business.
         let alive = |pid: u32| {
-            std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|s| {
-                s.rsplit_once(") ")
-                    .is_some_and(|(_, rest)| !rest.starts_with('Z'))
-            })
+            let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
+                return false;
+            };
+            let field = |name: &str| {
+                status
+                    .lines()
+                    .find_map(|l| l.strip_prefix(name))
+                    .map(|v| v.trim().to_owned())
+                    .unwrap_or_default()
+            };
+            let kill_pending = ["SigPnd:", "ShdPnd:"]
+                .iter()
+                .any(|f| u64::from_str_radix(&field(f), 16).is_ok_and(|mask| mask & (1 << 8) != 0));
+            let state = field("State:");
+            !kill_pending && !state.starts_with('Z') && !state.starts_with('X')
         };
         assert!(alive(orphan));
         let held = (server, transport);

@@ -1824,6 +1824,7 @@ pub async fn serve_ws(
     // mode.
     let events_session = (!cfg.service_mode && !cfg.mcp_catalog.event_subscriptions().is_empty())
         .then(|| cfg.mcp_events_session.clone());
+    let cfg_has_callback = cfg.mcp_events_callback_url.is_some();
     let (panicked_tx, mut panicked_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let supervisor = Arc::new(Supervisor {
         table: Arc::default(),
@@ -1839,6 +1840,11 @@ pub async fn serve_ws(
     let mut shutdown = crate::serve::ShutdownSignal::new()?;
 
     let events_session_id = events_session.clone();
+    if events_session.is_some() && cfg_has_callback {
+        // Until the events session has read its state, a delivery for a callback it persisted
+        // must be told to retry, not to stop (see `mcp_events::restore_pending`).
+        crate::tools::mcp_events::restore_pending();
+    }
     if let Some(id) = events_session {
         // Pinned and at once unpinned: the session starts exactly as if a client had connected and
         // left. It stays because its subscriptions keep it alive, not because anything holds it.
