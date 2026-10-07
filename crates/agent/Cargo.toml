@@ -123,9 +123,16 @@ grep-searcher = "0.1"
 ignore = "0.4"
 regex = "1"
 
-# `edit`'s fuzzy fallback matcher: NFKC folding so a model's reconstructed `old_string` (smart quotes,
-# full-width/ligature chars) still lands against the on-disk bytes.
+# Unicode by rule. `unicode-normalization`: `edit`'s fuzzy fallback matcher (NFKC folding, so a
+# model's reconstructed `old_string` with smart quotes or full-width/ligature chars still lands against
+# the on-disk bytes), and the fence's NFKC check. `unicode-general-category` and `unicode-security`:
+# `mcp_wire::fenced_server_message`, the one place an MCP server's (or authorization server's) text
+# crosses into model-visible output — General_Category to drop every invisible, format, private-use
+# and unassigned character (already resolved transitively at this version), and UTS #39 confusable
+# skeletons to catch every lookalike of the fence's own `<` `>` `/` `"`, not just the ones listed.
+unicode-general-category = "1.1"
 unicode-normalization = "0.1"
+unicode-security = "0.1.2"
 
 # Every filesystem tool's `path` normalization: decoding a `file://` URL argument (`tools::normalize_path`)
 # needs the same percent-decoding `fileURLToPath` does. Already present transitively (`reqwest`/`url`);

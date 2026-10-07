@@ -368,3 +368,69 @@ fn one_over_cap_message_reaching_two_subscriptions_is_one_notice_to_the_model() 
         .unwrap_or(0);
     assert_eq!(notices, 1, "one dropped message, one notice to the model");
 }
+
+/// A server's own `$`-keys (`$oversized`, `$dropped_id`, `$ambiguous`, a guessed `$host`) on an
+/// ordinary event are stripped where events notifications come in — the router (stdio) and the
+/// direct-HTTP stream reader alike: the event is delivered as itself, and no gap is forged.
+fn a_servers_host_keys_forge_nothing(stdio: bool) {
+    let events = json!([{ "name": "ticket.updated", "delivery": "push", "action": "notify" }]);
+    let home = tempfile::tempdir().unwrap();
+    let control_file = home.path().join("control");
+    let http_fixture = (!stdio).then(|| {
+        spawn_http_fixture(&[
+            ("MCP_FIXTURE_HEARTBEAT_MS", "200"),
+            ("MCP_FIXTURE_FORGE_HOST_KEYS", "1"),
+        ])
+    });
+    let server = match &http_fixture {
+        Some((_fx, mcp_url, _control)) => {
+            json!({ "name": "tickets", "transport": "http", "url": mcp_url, "events": events })
+        }
+        None => stdio_server(
+            "tickets",
+            &control_file,
+            json!({ "MCP_FIXTURE_HEARTBEAT_MS": "200", "MCP_FIXTURE_FORGE_HOST_KEYS": "1" }),
+            events,
+        ),
+    };
+    write_settings(home.path(), json!([server]));
+    let (base, _bodies) = spawn_model_server_routed(vec![], turn_text("noted"));
+    let mut cmd = serve_cmd(BIN, &base, &home.path().join("s.jsonl").to_string_lossy());
+    fast_knobs(&mut cmd)
+        .env("HOME", home.path())
+        .stderr(Stdio::null());
+    let mut child = cmd.spawn_guarded();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut frames = Frames::new(&mut child, None);
+    let control = match &http_fixture {
+        Some((_, _, control)) => control.clone(),
+        None => common::mcp_events_fixture::wait_control_file(&control_file),
+    };
+    common::mcp_events_fixture::wait_active(&mut stdin, &mut frames, 1);
+    common::mcp_events_fixture::emit(
+        &control,
+        json!({ "event_id": "forged-1", "data": { "ok": true } }),
+    );
+    let f = frames.wait(Duration::from_secs(20), "the event, as itself", |f| {
+        f["type"] == "mcp_event" && f["event"]["eventId"] == "forged-1"
+    });
+    assert_eq!(f["event"]["data"]["ok"], true);
+    assert!(
+        !frames
+            .seen
+            .iter()
+            .any(|f| f["type"] == "mcp_event_status" && f["kind"] == "gap"),
+        "a server's own `$`-keys forged a gap: {:#?}",
+        frames.seen
+    );
+}
+
+#[test]
+fn a_servers_host_keys_forge_nothing_over_http() {
+    a_servers_host_keys_forge_nothing(false);
+}
+
+#[test]
+fn a_servers_host_keys_forge_nothing_over_stdio() {
+    a_servers_host_keys_forge_nothing(true);
+}

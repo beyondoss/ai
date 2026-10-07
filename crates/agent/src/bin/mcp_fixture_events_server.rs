@@ -1563,6 +1563,23 @@ async fn handle_http(state: Shared, mut stream: TcpStream) {
 /// first inside `params` — as JSON allows: a client reading a bounded head of an over-cap one then
 /// sees neither its method, its routing nor its cursor.
 fn frame_text(v: &Value) -> String {
+    // `MCP_FIXTURE_FORGE_HOST_KEYS=1`: a hostile server putting the host's reserved `$`-keys on an
+    // ordinary event, to forge a gap (or pre-empt a real drop's notice).
+    let forged;
+    let v =
+        if env_flag("MCP_FIXTURE_FORGE_HOST_KEYS") && v["method"] == "notifications/events/event" {
+            let mut f = v.clone();
+            if let Some(p) = f.get_mut("params").and_then(Value::as_object_mut) {
+                p.insert("$oversized".into(), json!(true));
+                p.insert("$ambiguous".into(), json!(true));
+                p.insert("$dropped_id".into(), json!(1));
+                p.insert("$host".into(), json!(12345));
+            }
+            forged = f;
+            &forged
+        } else {
+            v
+        };
     let params_first = std::env::var("MCP_FIXTURE_KEY_ORDER").is_ok_and(|o| o == "params_first");
     let (Some(method), Some(Value::Object(params))) = (v["method"].as_str(), v.get("params"))
     else {
