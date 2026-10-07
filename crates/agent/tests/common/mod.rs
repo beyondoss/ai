@@ -30,6 +30,10 @@ pub const BIN: &str = env!("CARGO_BIN_EXE_beyond-ai-agent");
 pub mod exec_mock;
 /// A `bsg_v1` session-grant minter, written independently of `src/grant.rs`.
 pub mod grant;
+/// The MCP Apps suites' harness: fixture `$HOME`, daemon, renderer-side commands.
+pub mod mcp_apps;
+/// A streamable-HTTP MCP Apps server, for service mode's grant connectors.
+pub mod mcp_apps_http;
 /// The MCP Events fixture's control API and a bounded frame reader, for the `mcp_events_*` suites.
 pub mod mcp_events_fixture;
 /// A streamable-HTTP MCP server that records every request header it is sent.
@@ -461,7 +465,7 @@ pub async fn ws_refusal(
     }
 }
 
-fn ws_request(
+pub fn ws_request(
     port: u16,
     session_id: Option<&str>,
     headers: &[(&str, &str)],

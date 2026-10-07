@@ -249,9 +249,34 @@ pub struct Steering {
     /// Set by [`request_tool_set`](Self::request_tool_set); consumed by the loop at the same turn
     /// boundary as `model_switch` (see that field's doc comment).
     tool_switch: Arc<Mutex<Option<ToolRegistry>>>,
+    /// Where the loop pulls host-held context at each mid-run boundary — see
+    /// [`set_turn_context`](Self::set_turn_context). A setting, like the queue modes: `clear()`
+    /// leaves it installed.
+    turn_context: Arc<Mutex<Option<TurnContextSource>>>,
 }
 
+/// Produces the context a host wants the model to see from the next turn on, taking it as it does
+/// (`None` when there is nothing new). See [`Steering::set_turn_context`].
+pub type TurnContextSource = Arc<dyn Fn() -> Option<String> + Send + Sync>;
+
 impl Steering {
+    /// Install (or with `None`, remove) a source of host-held context the loop pulls at every turn
+    /// boundary that carries a user turn: folded into the tool-results turn mid-run, and onto the
+    /// first injected follow-up/steer at a stop boundary. Never pulled at a plain stop with nothing
+    /// queued, so a context update alone never makes the model answer again — it waits for the next
+    /// user turn there. The source *takes* what it returns, so each update reaches the model once.
+    pub fn set_turn_context(&self, source: Option<TurnContextSource>) {
+        if let Ok(mut guard) = self.turn_context.lock() {
+            *guard = source;
+        }
+    }
+
+    /// Pull the installed source, if any.
+    pub(crate) fn take_turn_context(&self) -> Option<String> {
+        let source = self.turn_context.lock().ok().and_then(|g| g.clone())?;
+        source()
+    }
+
     /// Empty steering queues.
     pub fn new() -> Self {
         Self::default()
@@ -1154,5 +1179,25 @@ mod tests {
             None,
             "the plain two-arg request must not implicitly set a thinking-level override"
         );
+    }
+
+    #[test]
+    fn a_turn_context_source_is_pulled_survives_clear_and_can_be_removed() {
+        let steering = Steering::new();
+        assert_eq!(steering.take_turn_context(), None);
+        let pending = Arc::new(Mutex::new(Some("ctx".to_string())));
+        let source = pending.clone();
+        steering.set_turn_context(Some(Arc::new(move || source.lock().unwrap().take())));
+        // A setting, not run state: a session switch's `clear()` keeps it installed.
+        steering.clear();
+        assert_eq!(steering.take_turn_context().as_deref(), Some("ctx"));
+        assert_eq!(
+            steering.take_turn_context(),
+            None,
+            "the source takes what it returns"
+        );
+        steering.set_turn_context(None);
+        *pending.lock().unwrap() = Some("again".into());
+        assert_eq!(steering.take_turn_context(), None);
     }
 }

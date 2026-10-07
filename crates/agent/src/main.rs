@@ -2382,6 +2382,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 (mcp_tools, mcp_catalog)
             };
+            // The same servers, dialed again with MCP Apps advertised — in the background, the first
+            // time a session's client declares it renders apps (`set_mcp_apps`); never otherwise.
+            // Service mode has none here: a tenant's apps pool is built per session, from its grant.
+            let mcp_apps = (!service).then(|| {
+                tools::mcp::apps_pool(
+                    stored_settings.mcp_servers.as_deref().unwrap_or(&[]),
+                    tools::mcp::idle_reap_after_from_env(),
+                    mcp_manifest_dir(),
+                )
+            });
             // The one client every *session's own* connectors dial through, in service mode. Built
             // here, once: a `reqwest::Client` is a connection pool, and a replica holding many
             // thousands of sessions cannot afford one each. Deliberately its own client rather than
@@ -2516,6 +2526,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 no_tools,
                 mcp_tools,
                 mcp_catalog,
+                mcp_apps,
                 // Discovered by `serve_session` itself, after it resolves project trust (a project-local
                 // definition is trust-gated, like a skill) — not here, where the interactive trust grant
                 // hasn't happened yet.

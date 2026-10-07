@@ -10,7 +10,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::compaction::CompactionProvenance;
-use crate::message::{ContentBlock, Message, TokenUsage};
+use crate::message::{ContentBlock, Message, Role, TokenUsage};
 
 /// The state of one agent run.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -73,6 +73,26 @@ pub struct Session {
     /// 0`) for a session that's never been compacted, so older persisted sessions round-trip unchanged.
     #[serde(default)]
     pub compaction: CompactionProvenance,
+    /// Blocks a host attached to one message **for the model only** — added to that message in every
+    /// request ([`Session::request_messages`]) but never to `messages` itself, so they are not
+    /// persisted, not shown in the transcript, and not read by anything that reads the conversation
+    /// (a title request, an export). Never serialized. Each is pinned to the message it was attached
+    /// to by value, so it rides the same message in every later request — keeping the request's
+    /// history byte-stable for the prompt cache — and silently lapses if that message is ever
+    /// rewritten or dropped.
+    #[serde(skip)]
+    pub request_blocks: Vec<RequestBlock>,
+}
+
+/// One block attached for the model to a message of a [`Session`] — see
+/// [`Session::request_blocks`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct RequestBlock {
+    /// Where the message sat when the block was attached.
+    pub index: usize,
+    /// The message itself, as it was — the block applies only while `messages[index]` still is it.
+    pub anchor: Message,
+    pub block: ContentBlock,
 }
 
 /// Serialize the shared history as a plain `[Message]` array — the `Arc`/`Vec` wrapper is an
@@ -101,6 +121,48 @@ impl Session {
     /// Append a message to the history. Copy-on-write via `Arc::make_mut`: in place when the history
     /// is solely owned here (the steady state between turns), cloning only if a request still holds
     /// the prior snapshot.
+    /// Attach `text` to the newest message, if it is a user turn, as a block of its own for the
+    /// model — never in the user's own text, never persisted (see [`Self::request_blocks`]). Returns
+    /// whether it was attached.
+    pub fn attach_request_block(&mut self, text: impl Into<Arc<str>>) -> bool {
+        let Some(last) = self.messages.last() else {
+            return false;
+        };
+        if last.role != Role::User {
+            return false;
+        }
+        let index = self.messages.len() - 1;
+        let anchor = last.clone();
+        // Drop blocks whose message is gone, so this list can't outgrow the history.
+        let messages = &self.messages;
+        self.request_blocks
+            .retain(|b| messages.get(b.index).is_some_and(|m| *m == b.anchor));
+        self.request_blocks.push(RequestBlock {
+            index,
+            anchor,
+            block: ContentBlock::text(text),
+        });
+        true
+    }
+
+    /// The history as a model request sends it: `messages`, with every still-valid
+    /// [request block](Self::request_blocks) appended to its message. A pointer clone when there are
+    /// none (the common case).
+    pub fn request_messages(&self) -> Arc<Vec<Message>> {
+        if self.request_blocks.is_empty() {
+            return self.messages.clone();
+        }
+        let mut out: Vec<Message> = (*self.messages).clone();
+        for b in &self.request_blocks {
+            if self.messages.get(b.index) == Some(&b.anchor)
+                && let Some(m) = out.get_mut(b.index)
+            {
+                m.content.push(b.block.clone());
+            }
+        }
+        Arc::new(out)
+    }
+
     pub fn push(&mut self, message: Message) {
         Arc::make_mut(&mut self.messages).push(message);
     }
@@ -541,5 +603,49 @@ mod tests {
             }])
         });
         assert!(!native.needs_cross_model_scrub("gpt-5"));
+    }
+
+    #[test]
+    fn a_request_block_rides_its_message_in_every_request_and_is_never_persisted() {
+        let mut s = Session::new();
+        s.user("first");
+        assert!(s.attach_request_block("ctx-block"));
+        s.push(Message::assistant(vec![ContentBlock::text("reply")]));
+        s.user("second");
+        let req = s.request_messages();
+        // On the message it was attached to, as a block of its own; the user's text untouched.
+        assert_eq!(req[0].content.len(), 2);
+        assert_eq!(req[0].content[0], ContentBlock::text("first"));
+        assert_eq!(req[0].content[1], ContentBlock::text("ctx-block"));
+        assert_eq!(req[2].content.len(), 1);
+        // Never in the history, never serialized.
+        assert_eq!(s.messages[0].content.len(), 1);
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(!json.contains("ctx-block"), "{json}");
+        // Not on an assistant turn.
+        s.push(Message::assistant(vec![ContentBlock::text("r2")]));
+        assert!(!s.attach_request_block("nope"));
+    }
+
+    #[test]
+    fn a_request_block_lapses_when_its_message_is_rewritten_and_follows_compaction() {
+        let mut s = Session::new();
+        s.user("one");
+        s.push(Message::assistant(vec![ContentBlock::text("a1")]));
+        s.user("two");
+        s.attach_request_block("ctx-two");
+        // Compaction keeping messages[2..]: the block moves with "two".
+        crate::compaction::apply_summary(&mut s, 2, "summary", 10);
+        let req = s.request_messages();
+        assert_eq!(req[1].content.last(), Some(&ContentBlock::text("ctx-two")));
+        // Rewritten: the anchor no longer matches, so the block lapses rather than land elsewhere.
+        let mut messages = (*s.messages).clone();
+        messages[1] = Message::user("rewritten");
+        s.messages = Arc::new(messages);
+        let req = s.request_messages();
+        assert!(
+            req.iter()
+                .all(|m| !m.content.contains(&ContentBlock::text("ctx-two")))
+        );
     }
 }

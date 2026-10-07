@@ -17,6 +17,7 @@ pub mod fs;
 pub mod grep;
 pub mod ls;
 pub mod mcp;
+pub mod mcp_apps;
 pub mod mcp_events;
 pub mod mcp_host;
 pub mod mcp_manifest;
@@ -718,21 +719,29 @@ pub fn apply_filter(
     exclude: Option<&[String]>,
     no_tools: bool,
 ) {
+    reg.retain(|name| filter_allows(name, tools, exclude, no_tools));
+}
+
+/// Whether [`apply_filter`] keeps a tool named `name` — the one predicate, so a caller that runs a
+/// tool outside the registry (an MCP App view's `tools/call`) applies exactly the model's filter.
+pub fn filter_allows(
+    name: &str,
+    tools: Option<&[String]>,
+    exclude: Option<&[String]>,
+    no_tools: bool,
+) -> bool {
     if no_tools {
-        reg.retain(|_| false);
-        return;
+        return false;
     }
-    if let Some(allow) = tools {
-        reg.retain(|name| allow.iter().any(|a| a == name));
+    if tools.is_some_and(|allow| !allow.iter().any(|a| a == name)) {
+        return false;
     }
-    if let Some(deny) = exclude {
-        reg.retain(|name| !deny.iter().any(|d| d == name));
+    if exclude.is_some_and(|deny| deny.iter().any(|d| d == name)) {
+        return false;
     }
     // No `--tools` allow-list: drop opt-in built-ins (`web`). `--tools web` is how it comes back;
     // `--exclude-tools` alone must not re-advertise it.
-    if tools.is_none() && !no_tools {
-        reg.retain(|name| !OPTIONAL_BUILTINS.contains(&name));
-    }
+    !(tools.is_none() && OPTIONAL_BUILTINS.contains(&name))
 }
 
 #[cfg(test)]

@@ -60,8 +60,8 @@ pub use models::{
     ModelCaps, ThinkingLevel, capabilities, clamp_thinking_level, next_available_thinking_level,
     thinking_for_level,
 };
-pub use session::Session;
-pub use steering::{ModelSwitch, QueueMode, Steering, SteeringMessage};
+pub use session::{RequestBlock, Session};
+pub use steering::{ModelSwitch, QueueMode, Steering, SteeringMessage, TurnContextSource};
 pub use tls::ensure_provider;
 pub use tool::{Tool, ToolOutput, ToolProgress, ToolRegistry, ToolUpdate};
 pub use transport::{

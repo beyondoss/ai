@@ -155,6 +155,11 @@ struct Dial {
     /// `None` for a settings-configured server: it resolves its own headers and may carry an OAuth
     /// bearer token from this host's store. A grant connector has neither.
     http: Option<HttpDial>,
+    /// Whether this connection advertises the MCP Apps extension (`io.modelcontextprotocol/ui`) on
+    /// its handshake. Only ever true for a connection dialed for a session whose client declared it
+    /// can render apps — see [`crate::tools::mcp_apps`]. Part of the dial, so a redial after a reap
+    /// negotiates exactly what the first dial did.
+    apps: bool,
 }
 
 impl Default for Dial {
@@ -162,6 +167,7 @@ impl Default for Dial {
         Self {
             host: host(),
             http: None,
+            apps: false,
         }
     }
 }
@@ -185,14 +191,24 @@ fn client_lifecycle() -> ClientLifecycleMode {
     }
 }
 
-fn client_info() -> ClientInfo {
+fn client_info(apps: bool) -> ClientInfo {
+    let mut capabilities = ClientCapabilities::builder()
+        .enable_elicitation()
+        .enable_sampling()
+        .enable_roots()
+        .enable_tasks()
+        .build();
+    if apps {
+        capabilities
+            .extensions
+            .get_or_insert_with(Default::default)
+            .insert(
+                crate::tools::mcp_apps::EXTENSION_ID.to_string(),
+                crate::tools::mcp_apps::extension_settings(),
+            );
+    }
     ClientInfo::new(
-        ClientCapabilities::builder()
-            .enable_elicitation()
-            .enable_sampling()
-            .enable_roots()
-            .enable_tasks()
-            .build(),
+        capabilities,
         Implementation::new("beyond-ai-agent", env!("CARGO_PKG_VERSION")),
     )
     .with_protocol_version(ProtocolVersion::V_2026_07_28)
@@ -217,6 +233,12 @@ struct McpHandler {
     /// Where this connection's `notifications/events/*` go (MCP Events draft — see
     /// [`crate::tools::mcp_events`]). Empty, and so free, unless a push stream is open.
     events: crate::tools::mcp_events::NotificationRouter,
+    /// Advertise MCP Apps on the handshake — see [`Dial::apps`].
+    apps: bool,
+    /// MCP App view HTML by `ui://` URI, read once per connection and dropped when the server says
+    /// its resources changed (`notifications/resources/list_changed`). On the handler, so a redial
+    /// (a new process, perhaps new HTML) starts empty.
+    views: Arc<std::sync::Mutex<HashMap<String, Arc<rmcp::model::ReadResourceResult>>>>,
     /// The calls in flight on this connection, each with the host of the session that made it.
     /// See [`Self::route`].
     calls: Arc<std::sync::Mutex<Vec<ActiveCall>>>,
@@ -239,6 +261,15 @@ impl McpHandler {
             active: Arc::new(std::sync::Mutex::new(Vec::new())),
             events: crate::tools::mcp_events::NotificationRouter::default(),
             calls: Arc::new(std::sync::Mutex::new(Vec::new())),
+            apps: false,
+            views: Arc::default(),
+        }
+    }
+
+    fn for_dial(server_name: impl Into<String>, dial: &Dial) -> Self {
+        Self {
+            apps: dial.apps,
+            ..Self::new(server_name, dial.host.clone())
         }
     }
 
@@ -386,7 +417,13 @@ impl Drop for ActiveProgressGuard {
 
 impl ClientHandler for McpHandler {
     fn get_info(&self) -> ClientInfo {
-        client_info()
+        client_info(self.apps)
+    }
+
+    async fn on_resource_list_changed(&self, _context: NotificationContext<RoleClient>) {
+        if let Ok(mut views) = self.views.lock() {
+            views.clear();
+        }
     }
 
     async fn on_progress(
@@ -482,6 +519,10 @@ type McpClient = RunningService<RoleClient, McpHandler>;
 #[derive(Clone, Default)]
 pub struct McpEnabledSet {
     inner: Arc<std::sync::Mutex<Option<HashSet<String>>>>,
+    /// This session's MCP Apps view, when its client declared it can render apps (`set_mcp_apps`).
+    /// Held beside the allow-list because both are the same thing — *which* MCP tools this session
+    /// sees — and both reset together on a session switch. See [`crate::tools::mcp_apps`].
+    apps: Arc<std::sync::Mutex<Option<Arc<crate::tools::mcp_apps::AppsView>>>>,
 }
 
 impl McpEnabledSet {
@@ -509,12 +550,24 @@ impl McpEnabledSet {
             Some(set) => set.contains(server),
         }
     }
+
+    /// Install (or with `None`, clear) this session's MCP Apps view.
+    pub fn set_apps(&self, view: Option<Arc<crate::tools::mcp_apps::AppsView>>) {
+        if let Ok(mut guard) = self.apps.lock() {
+            *guard = view;
+        }
+    }
+
+    /// This session's MCP Apps view, if its client declared it can render apps.
+    pub fn apps(&self) -> Option<Arc<crate::tools::mcp_apps::AppsView>> {
+        self.apps.lock().ok().and_then(|g| g.clone())
+    }
 }
 
 /// The prefix every MCP-discovered tool's registered name carries — `mcp__<server>__<tool>` — so it
 /// can never collide with a built-in tool. Matches the convention Claude Code itself uses for the
 /// identical problem.
-fn registered_name(server: &str, remote_tool: &str) -> String {
+pub(crate) fn registered_name(server: &str, remote_tool: &str) -> String {
     format!("mcp__{server}__{remote_tool}")
 }
 
@@ -538,7 +591,21 @@ pub fn server_name_from_registered(tool_name: &str) -> Option<&str> {
 }
 
 /// Keep only MCP tools whose server is currently enabled.
+///
+/// A session that declared it renders MCP Apps sees its apps view's tools instead of `tools` — the
+/// same servers, dialed with the extension advertised (see [`crate::tools::mcp_apps`]).
 pub fn filter_by_enabled(tools: &[Arc<dyn Tool>], enabled: &McpEnabledSet) -> Vec<Arc<dyn Tool>> {
+    // A declared session sees the apps flavor's tools for every server whose apps connection is up,
+    // and the plain tools for every other one — a server whose apps dial failed (or has not landed
+    // yet) keeps working as a text tool rather than vanishing.
+    let merged;
+    let tools = match enabled.apps() {
+        Some(view) => {
+            merged = view.tools_over(tools);
+            &merged[..]
+        }
+        None => tools,
+    };
     tools
         .iter()
         .filter(|t| match server_name_from_registered(t.name()) {
@@ -930,33 +997,144 @@ impl McpTool {
                 )));
             }
         };
-        let mut params = CallToolRequestParams::new(self.remote_name.clone());
-        if let Some(arguments) = arguments {
-            params = params.with_arguments(arguments);
-        }
-
-        let client = self.conn.client().await.map_err(|e| {
-            ToolError::Execution(format!(
-                "mcp server `{}` is not reachable: {e}",
-                self.server_name
-            ))
-        })?;
-
-        // The questions this call raises go to the session that made it (see [`calling_host`]).
-        let host = calling_host(&client.service().host);
-        let _active = progress.map(|p| client.service().push_active(p.clone()));
-        let result = drive_tool_call(
+        let result = call_tool_raw(
             &self.conn,
-            client.clone(),
-            &host,
             &self.server_name,
             &self.remote_name,
-            params,
+            arguments,
             progress,
         )
         .await?;
-
         tool_output_from_result(&self.server_name, &self.remote_name, result)
+    }
+}
+
+/// One `tools/call` on `conn`, returning the server's whole result — `structuredContent` and
+/// `_meta` included, which the model never sees but an MCP App view does.
+async fn call_tool_raw(
+    conn: &Arc<McpConnection>,
+    server_name: &str,
+    remote_name: &str,
+    arguments: Option<Map<String, Value>>,
+    progress: Option<&ToolProgress>,
+) -> Result<CallToolResult, ToolError> {
+    let mut params = CallToolRequestParams::new(remote_name.to_string());
+    if let Some(arguments) = arguments {
+        params = params.with_arguments(arguments);
+    }
+    let client = conn.client().await.map_err(|e| {
+        ToolError::Execution(format!("mcp server `{server_name}` is not reachable: {e}"))
+    })?;
+    // The questions this call raises go to the session that made it (see [`calling_host`]) —
+    // tracked per call, so a nested request is attributed to that session or refused.
+    let host = calling_host(&client.service().host);
+    let _active = progress.map(|p| client.service().push_active(p.clone()));
+    drive_tool_call(
+        conn,
+        client.clone(),
+        &host,
+        server_name,
+        remote_name,
+        params,
+        progress,
+    )
+    .await
+}
+
+/// The session host the current task runs under (`with_session_host`), if any — for work an MCP
+/// App spawns off its call's task (a view read) that must still answer to that session.
+pub(crate) fn current_session_host() -> Option<Arc<McpHost>> {
+    SESSION_HOST.try_with(Arc::clone).ok()
+}
+
+/// A strong handle on one server's connection, for the MCP Apps host bridge
+/// ([`crate::tools::mcp_apps`]): the model-side tools are not the only thing that calls a server
+/// once a view can call it back.
+#[derive(Clone)]
+pub(crate) struct McpServerHandle {
+    name: String,
+    conn: Arc<McpConnection>,
+}
+
+impl McpServerHandle {
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub(crate) async fn call_tool(
+        &self,
+        remote_name: &str,
+        arguments: Option<Map<String, Value>>,
+        progress: Option<&ToolProgress>,
+    ) -> Result<CallToolResult, ToolError> {
+        call_tool_raw(&self.conn, &self.name, remote_name, arguments, progress).await
+    }
+
+    /// An MCP App view's `resources/read`, served from this connection's cache when it can be — the
+    /// spec lets a host cache view templates, and a view is re-read on every call of its tool
+    /// otherwise. Invalidated by the server's `resources/list_changed` and by any redial.
+    pub(crate) async fn read_view(
+        &self,
+        uri: &str,
+    ) -> Result<Arc<rmcp::model::ReadResourceResult>, String> {
+        let client = self.conn.client().await?;
+        let views = client.service().views.clone();
+        if let Some(hit) = views.lock().ok().and_then(|v| v.get(uri).cloned()) {
+            return Ok(hit);
+        }
+        // Tracked like every call: a nested request the server raises meanwhile is attributed to
+        // the calling session (or refused when that is ambiguous).
+        let _call = client
+            .service()
+            .track_call(calling_host(&client.service().host));
+        let read = Arc::new(
+            client
+                .read_resource(ReadResourceRequestParams::new(uri.to_string()))
+                .await
+                .map_err(|e| {
+                    format!(
+                        "mcp server `{}` resources/read `{uri}` failed: {e}",
+                        self.name
+                    )
+                })?,
+        );
+        // Never cache a view this host would refuse anyway: one oversized read must not pin its
+        // bytes for the connection's life.
+        let size: usize = read
+            .contents
+            .iter()
+            .map(|c| match c {
+                ResourceContents::TextResourceContents { text, .. } => text.len(),
+                ResourceContents::BlobResourceContents { blob, .. } => blob.len(),
+                #[allow(unreachable_patterns)]
+                _ => 0,
+            })
+            .sum();
+        if size <= crate::tools::mcp_apps::MAX_VIEW_BYTES
+            && let Ok(mut v) = views.lock()
+        {
+            v.insert(uri.to_string(), read.clone());
+        }
+        Ok(read)
+    }
+
+    pub(crate) async fn read_resource(
+        &self,
+        uri: &str,
+    ) -> Result<rmcp::model::ReadResourceResult, String> {
+        let client = self.conn.client().await?;
+        let _call = client
+            .service()
+            .track_call(calling_host(&client.service().host));
+        client
+            .read_resource(ReadResourceRequestParams::new(uri.to_string()))
+            .await
+            .map_err(|e| {
+                format!(
+                    "mcp server `{}` resources/read `{uri}` failed: {e}",
+                    self.name
+                )
+            })
     }
 }
 
@@ -1539,7 +1717,7 @@ impl McpCatalog {
     }
 }
 
-fn tool_output_from_result(
+pub(crate) fn tool_output_from_result(
     server_name: &str,
     remote_name: &str,
     result: CallToolResult,
@@ -1608,6 +1786,47 @@ pub async fn connect_all(
     connect_many(&jobs, idle_reap_after, manifest_dir).await
 }
 
+/// The same servers as [`connect_all`], dialed **with MCP Apps advertised** — lazily, on the first
+/// `get`, which is the first session whose client declares it can render apps. A separate set of
+/// connections rather than a flag on the shared ones: the extension is negotiated once, on the
+/// handshake, and a server may answer `tools/list` differently once it is advertised, so a headless
+/// session sharing an apps-flavored connection would be told about views nobody will render.
+pub fn apps_pool(
+    configs: &[McpServerConfig],
+    idle_reap_after: Duration,
+    manifest_dir: Option<crate::tools::mcp_manifest::ManifestDir>,
+) -> crate::tools::mcp_apps::McpAppsPool {
+    let jobs: Vec<(McpServerConfig, Dial)> = configs
+        .iter()
+        .map(|config| {
+            (
+                config.clone(),
+                Dial {
+                    apps: true,
+                    ..Dial::default()
+                },
+            )
+        })
+        .collect();
+    // Its own manifest file: an apps-flavored server may advertise a different tool list.
+    let manifest_dir = manifest_dir.map(|d| d.for_apps());
+    crate::tools::mcp_apps::McpAppsPool::new(move |only: Option<Vec<String>>| {
+        let jobs: Vec<_> = jobs
+            .iter()
+            .filter(|(c, _)| only.as_ref().is_none_or(|o| o.contains(&c.name)))
+            .cloned()
+            .collect();
+        let manifest_dir = manifest_dir.clone();
+        Box::pin(async move { connect_each(&jobs, idle_reap_after, manifest_dir.as_ref()).await })
+    })
+}
+
+/// One server's dial outcome: its tools and catalog, or why it failed.
+pub(crate) type ServerConnect = (
+    String,
+    Result<(Vec<Arc<dyn Tool>>, McpServerCatalog), String>,
+);
+
 /// Connect **one session's own** MCP connectors, named and credentialed by its
 /// [session grant](crate::grant), and isolated from every other session on this replica.
 ///
@@ -1633,11 +1852,61 @@ pub async fn connect_granted(
     host: Arc<McpHost>,
     idle_reap_after: Duration,
 ) -> (Vec<Arc<dyn Tool>>, McpCatalog, Vec<String>) {
+    let (jobs, refused, mut warnings) =
+        granted_jobs(connectors, secrets, egress, host, false, None);
+    warnings.extend(
+        refused
+            .into_iter()
+            .map(|(name, e)| format!("mcp connector `{name}`: {e}")),
+    );
+    let (tools, catalog, connect_warnings) = connect_many(&jobs, idle_reap_after, None).await;
+    warnings.extend(connect_warnings);
+    (tools, catalog, warnings)
+}
+
+/// [`connect_granted`], per connector — the shape a session's apps pool retries failed connectors
+/// in (`only` restricts it to those). A connector the egress policy refuses is a failure too, so the
+/// session's client is told rather than the connector silently missing.
+pub(crate) async fn connect_granted_each(
+    connectors: &[crate::grant::McpConnector],
+    secrets: &BTreeMap<String, Vec<crate::grant::SecretHeader>>,
+    egress: &McpEgress,
+    host: Arc<McpHost>,
+    idle_reap_after: Duration,
+    only: Option<&[String]>,
+) -> Vec<ServerConnect> {
+    let (jobs, refused, warnings) = granted_jobs(connectors, secrets, egress, host, true, only);
+    for warning in &warnings {
+        tracing::warn!(%warning, "MCP Apps: a connector header was refused");
+    }
+    let mut out: Vec<ServerConnect> = refused.into_iter().map(|(n, e)| (n, Err(e))).collect();
+    out.extend(connect_each(&jobs, idle_reap_after, None).await);
+    out
+}
+
+/// A grant's connectors as dial jobs: `(jobs, refused by egress, header warnings)`.
+#[allow(clippy::type_complexity)]
+fn granted_jobs(
+    connectors: &[crate::grant::McpConnector],
+    secrets: &BTreeMap<String, Vec<crate::grant::SecretHeader>>,
+    egress: &McpEgress,
+    host: Arc<McpHost>,
+    apps: bool,
+    only: Option<&[String]>,
+) -> (
+    Vec<(McpServerConfig, Dial)>,
+    Vec<(String, String)>,
+    Vec<String>,
+) {
     let mut jobs = Vec::with_capacity(connectors.len());
+    let mut refused = Vec::new();
     let mut warnings = Vec::new();
     for connector in connectors {
+        if only.is_some_and(|o| !o.contains(&connector.name)) {
+            continue;
+        }
         if let Err(e) = egress.check(&connector.url) {
-            warnings.push(format!("mcp connector `{}`: {e}", connector.name));
+            refused.push((connector.name.clone(), e));
             continue;
         }
         let mut headers = Vec::new();
@@ -1663,12 +1932,11 @@ pub async fn connect_granted(
                     client: egress.client.clone(),
                     headers,
                 }),
+                apps,
             },
         ));
     }
-    let (tools, catalog, connect_warnings) = connect_many(&jobs, idle_reap_after, None).await;
-    warnings.extend(connect_warnings);
-    (tools, catalog, warnings)
+    (jobs, refused, warnings)
 }
 
 /// Dial every job concurrently and fold the results — each connect is independent I/O with no data
@@ -1679,15 +1947,10 @@ async fn connect_many(
     idle_reap_after: Duration,
     manifest_dir: Option<&crate::tools::mcp_manifest::ManifestDir>,
 ) -> (Vec<Arc<dyn Tool>>, McpCatalog, Vec<String>) {
-    let results = futures::future::join_all(
-        jobs.iter()
-            .map(|(config, dial)| connect_one(config, dial, idle_reap_after, manifest_dir)),
-    )
-    .await;
     let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
     let mut catalogs = Vec::new();
     let mut warnings = Vec::new();
-    for ((config, _), result) in jobs.iter().zip(results) {
+    for (name, result) in connect_each(jobs, idle_reap_after, manifest_dir).await {
         match result {
             Ok((server_tools, catalog)) => {
                 tools.extend(server_tools);
@@ -1695,15 +1958,32 @@ async fn connect_many(
             }
             Err(e) => {
                 tracing::warn!(
-                    server = %config.name,
+                    server = %name,
                     error = %e,
                     "failed to connect to MCP server; its tools will not be available"
                 );
-                warnings.push(format!("mcp server `{}`: {e}", config.name));
+                warnings.push(format!("mcp server `{name}`: {e}"));
             }
         }
     }
     (tools, McpCatalog::new(catalogs), warnings)
+}
+
+/// Dial every job concurrently, keeping each server's outcome separate.
+async fn connect_each(
+    jobs: &[(McpServerConfig, Dial)],
+    idle_reap_after: Duration,
+    manifest_dir: Option<&crate::tools::mcp_manifest::ManifestDir>,
+) -> Vec<ServerConnect> {
+    let results = futures::future::join_all(
+        jobs.iter()
+            .map(|(config, dial)| connect_one(config, dial, idle_reap_after, manifest_dir)),
+    )
+    .await;
+    jobs.iter()
+        .map(|(config, _)| config.name.clone())
+        .zip(results)
+        .collect()
 }
 
 /// Dial one server and complete the MCP handshake, without listing anything. Split out of
@@ -1764,9 +2044,26 @@ fn tools_from_manifest(
     ));
     register_for_reaping(&conn, idle_reap_after);
 
+    let apps = dial.apps.then(|| {
+        crate::tools::mcp_apps::AppServer::new(
+            McpServerHandle {
+                name: config.name.clone(),
+                conn: conn.clone(),
+            },
+            manifest
+                .tools
+                .iter()
+                .map(|t| (t.remote_name.clone(), t.ui.clone().unwrap_or_default())),
+            manifest
+                .resources
+                .iter()
+                .filter_map(|r| r.size.map(|size| (r.uri.clone(), size))),
+        )
+    });
     let mut tools: Vec<Arc<dyn Tool>> = manifest
         .tools
         .into_iter()
+        .filter(|t| t.ui.as_ref().is_none_or(|ui| ui.model_visible()))
         .map(|t| {
             Arc::new(McpTool {
                 name: registered_name(&config.name, &t.remote_name),
@@ -1781,6 +2078,10 @@ fn tools_from_manifest(
 
     let mut resource_infos = Vec::with_capacity(manifest.resources.len());
     for resource in manifest.resources {
+        // A `ui://` resource is an MCP App's HTML: a renderer's input, never the model's.
+        if crate::tools::mcp_apps::is_ui_uri(&resource.uri) {
+            continue;
+        }
         let tool_name = registered_resource_name(&config.name, &resource.name);
         resource_infos.push(McpResourceInfo {
             uri: resource.uri.clone(),
@@ -1821,6 +2122,7 @@ fn tools_from_manifest(
         resources: resource_infos,
         prompts: prompt_infos,
         protocol_version: None,
+        apps,
     };
     (tools, catalog)
 }
@@ -1901,7 +2203,7 @@ async fn connect_stdio(
     let (proc, transport) = crate::tools::mcp_stdio::stdio_transport(cmd)
         .map_err(|e| format!("failed to spawn `{command}`: {e}"))?;
 
-    let client = McpHandler::new(&config.name, dial.host.clone())
+    let client = McpHandler::for_dial(&config.name, dial)
         .serve_with_lifecycle(transport, client_lifecycle())
         .await
         .map_err(|e| format!("MCP handshake over stdio failed: {e}"))?;
@@ -1987,7 +2289,7 @@ async fn connect_http(
     }
     let transport = StreamableHttpClientTransport::with_client(client, transport_config);
 
-    McpHandler::new(&config.name, dial.host.clone())
+    McpHandler::for_dial(&config.name, dial)
         .serve_with_lifecycle(transport, client_lifecycle())
         .await
         .map_err(|e| {
@@ -2316,6 +2618,9 @@ pub struct McpServerCatalog {
     pub prompts: Vec<McpPromptInfo>,
     /// Negotiated peer protocol version, when known.
     pub protocol_version: Option<String>,
+    /// Set only on a connection that advertised MCP Apps: every tool's `_meta.ui`, and a strong
+    /// handle for the app bridge. See [`crate::tools::mcp_apps`].
+    pub(crate) apps: Option<Arc<crate::tools::mcp_apps::AppServer>>,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -2595,6 +2900,10 @@ async fn tools_from_client(
                     remote_name: t.name.to_string(),
                     description: t.description.as_deref().unwrap_or_default().to_string(),
                     input_schema: t.schema_as_json_value(),
+                    // Both flavors: a server may send `_meta.ui` whether or not it was negotiated
+                    // (the official SDK's `registerAppTool` always does), and an app-only tool
+                    // must stay hidden from the model either way.
+                    ui: crate::tools::mcp_apps::ToolUi::from_meta(t.meta.as_deref()),
                 })
                 .collect(),
             remote_resources
@@ -2602,6 +2911,7 @@ async fn tools_from_client(
                 .map(|r| crate::tools::mcp_manifest::CachedResource {
                     name: r.name.clone(),
                     uri: r.uri.clone(),
+                    size: r.size,
                     description: r.description.clone().unwrap_or_else(|| {
                         format!(
                             "MCP resource `{}` ({}) from server `{}`",
@@ -2623,8 +2933,32 @@ async fn tools_from_client(
         );
     }
 
+    let apps = dial.apps.then(|| {
+        crate::tools::mcp_apps::AppServer::new(
+            McpServerHandle {
+                name: config.name.clone(),
+                conn: conn.clone(),
+            },
+            remote_tools.iter().map(|t| {
+                (
+                    t.name.to_string(),
+                    crate::tools::mcp_apps::ToolUi::from_meta(t.meta.as_deref())
+                        .unwrap_or_default(),
+                )
+            }),
+            remote_resources
+                .iter()
+                .filter_map(|r| r.size.map(|size| (r.uri.clone(), size))),
+        )
+    });
     let mut tools: Vec<Arc<dyn Tool>> = remote_tools
         .into_iter()
+        // Spec: "Host MUST NOT include tools in the agent's tool list when their visibility does not
+        // include `model`" — whichever flavor of connection listed them.
+        .filter(|t| {
+            crate::tools::mcp_apps::ToolUi::from_meta(t.meta.as_deref())
+                .is_none_or(|ui| ui.model_visible())
+        })
         .map(|remote_tool| {
             let description = remote_tool
                 .description
@@ -2650,6 +2984,10 @@ async fn tools_from_client(
 
     let mut resource_infos = Vec::new();
     for resource in &remote_resources {
+        // A `ui://` resource is an MCP App's HTML: a renderer's input, never the model's.
+        if crate::tools::mcp_apps::is_ui_uri(&resource.uri) {
+            continue;
+        }
         let tool_name = registered_resource_name(&config.name, &resource.name);
         let description = resource
             .description
@@ -2709,6 +3047,7 @@ async fn tools_from_client(
             resources: resource_infos,
             prompts: prompt_infos,
             protocol_version,
+            apps,
         },
     ))
 }

@@ -713,6 +713,11 @@ pub struct ServeConfig {
     /// Whether *this* session owns the configured subscriptions: `true` for the stdio `serve`
     /// (its only session); set per session by `serve_ws::session_cfg` in the daemon.
     pub mcp_events_owner: bool,
+    /// The same servers dialed with MCP Apps advertised, for a session whose client declares it
+    /// renders apps (`set_mcp_apps`) — see [`crate::tools::mcp_apps`]. Process-wide (shared through
+    /// this `Clone`) for the operator's configured servers; replaced per session in service mode.
+    /// `None` = this process cannot host apps.
+    pub mcp_apps: Option<crate::tools::mcp_apps::McpAppsPool>,
     /// Agent definitions discovered at startup (see [`crate::agents`]) — the delegable personas the
     /// `subagent` tool accepts, advertised in `<available_agents>`. Discovered once, like `mcp_tools`,
     /// rather than re-walked on every registry rebuild. Empty when subagents aren't configured.
@@ -2762,6 +2767,7 @@ pub(crate) async fn serve_session(
     // a session, not a connect report.
     if let Some(svc) = &service {
         let (tools, catalog, warnings) = svc.mcp(cfg.mcp_http.as_ref(), mcp_host.clone()).await;
+        cfg.mcp_apps = Some(svc.mcp_apps_pool(cfg.mcp_http.clone(), mcp_host.clone()));
         for warning in &warnings {
             eprintln!("warning: session {}: {warning}", persistence.session_id());
         }
@@ -3001,11 +3007,21 @@ pub(crate) async fn serve_session(
         };
     }
 
+    // Bumped by every `set_mcp_apps` and session switch. A declaration's deferred answer is sent
+    // only if nothing bumped it since — checked and sent under this lock, which a withdrawal also
+    // holds while it answers — so `enabled: true` can never arrive after the withdrawal that
+    // superseded it.
+    let apps_epoch: Arc<std::sync::Mutex<u64>> = Arc::new(std::sync::Mutex::new(0));
+
     macro_rules! reset_mcp_enabled {
         () => {{
             // Same cross-tenant rule as exec: an incoming session must not inherit the previous
-            // session's MCP kit. Default back to all configured servers enabled.
+            // session's MCP kit. Default back to all configured servers enabled — and to no MCP
+            // Apps: the incoming session's client re-declares (`set_mcp_apps`) if it renders them.
             mcp_enabled.set(None);
+            *lock_ignoring_poison(&apps_epoch) += 1;
+            crate::tools::mcp_apps::close(&mcp_enabled, "session_switched");
+            lock_ignoring_poison(&out_conn).clear_app_views();
         }};
     }
 
@@ -3064,6 +3080,74 @@ pub(crate) async fn serve_session(
         persistence.session_id(),
     );
     mcp_host.sampling.install(sampling_gate);
+    // Where an MCP App view's `mcp_app_open`/`mcp_app_result` frames go: this session's fanout,
+    // held weakly like the elicitation gate's, so a view-bearing tool cannot keep it alive.
+    let app_sink: crate::tools::mcp_apps::AppSink = {
+        let out = Arc::downgrade(&out_conn);
+        Arc::new(move |frame: Value| {
+            if let Some(out) = out.upgrade() {
+                lock_ignoring_poison(&out).broadcast_app(frame);
+            }
+        })
+    };
+    // Service mode strips replica paths from what a tenant's client sees — a view's cancelled reason
+    // included (it is an error string from the transport).
+    let app_redact: crate::tools::mcp_apps::Redactor = match &service {
+        Some(svc) => {
+            let svc = svc.clone();
+            Arc::new(move |text: &str| svc.redact(text))
+        }
+        None => Arc::new(|text: &str| text.to_owned()),
+    };
+    // A bridge request with nobody left to answer is cancelled (see `mcp_apps::handle_request`).
+    let app_detached: crate::tools::mcp_apps::Detached = {
+        let out = Arc::downgrade(&out_conn);
+        Arc::new(move || {
+            out.upgrade()
+                .is_none_or(|out| lock_ignoring_poison(&out).is_empty())
+        })
+    };
+    // A view's `tools/call` passes exactly the model's tool filter.
+    let app_filter = crate::tools::mcp_apps::ToolFilter {
+        tools: cfg.tools.clone(),
+        exclude: cfg.exclude_tools.clone(),
+        no_tools: cfg.no_tools,
+        deny: cfg.deny_tool.clone(),
+    };
+    // The pool generation this session's agent was last built against (`None`: not declared). A
+    // prompt rebuilds when it moved — an apps dial landed, or went into backoff.
+    let mut apps_generation: Option<u64> = None;
+    // `mcp_app_request` proxies a view's call to its server, which may take as long as any tool
+    // call. Spawned, so neither command loop (busy or idle) waits on it.
+    macro_rules! spawn_app_request {
+        ($id:expr, $cmd:expr, $out_tx:expr) => {{
+            let id = $id;
+            let cmd = $cmd;
+            let enabled = mcp_enabled.clone();
+            let filter = app_filter.clone();
+            let approval = approval.clone();
+            let detached = app_detached.clone();
+            let service = service.clone();
+            let out_tx = $out_tx.clone();
+            let session_host = mcp_host.clone();
+            tokio::spawn(async move {
+                // Scoped to this session's host, like a run: a question the server asks during a
+                // view's call is answered by this session (or refused when ambiguous).
+                let request = crate::tools::mcp_apps::handle_request(enabled, filter, approval, detached, cmd);
+                let frame = match crate::tools::mcp::with_session_host(session_host, request).await {
+                    Ok(result) => response(
+                        id,
+                        "mcp_app_request",
+                        true,
+                        Some(json!({ "result": result })),
+                        None,
+                    ),
+                    Err(e) => response(id, "mcp_app_request", false, None, Some(&e)),
+                };
+                let _ = out_tx.send(redact_frame(service.as_deref(), frame));
+            });
+        }};
+    }
 
     // `structured_output` is installed per-`prompt` (see that arm's `output_schema` handling), not at
     // startup: one session can answer one request in prose and the next as typed JSON. The `OutputSlot`
@@ -3335,6 +3419,14 @@ pub(crate) async fn serve_session(
     // command. Cleared on every session switch (`new_session`/`switch_session`/`fork`/`switch_branch`)
     // so a message meant for the old session's next turn can't leak into the newly switched-to one.
     let steering = agent_core::Steering::new();
+    // An MCP App's `ui/update-model-context` sent while a run is in flight reaches the model at the
+    // run's next turn boundary (and rides a steered/follow-up turn), not only the next idle prompt.
+    {
+        let enabled = mcp_enabled.clone();
+        steering.set_turn_context(Some(Arc::new(move || {
+            crate::tools::mcp_apps::take_undelivered_context(&enabled)
+        })));
+    }
     // Task 1 (pi-parity fix, pass 19): the persisted `agent settings --steering-mode`/
     // `--follow-up-mode` defaults (or an explicit `serve --steering-mode`/`--follow-up-mode` flag),
     // already resolved by `main.rs` into `cfg.steering_mode`/`cfg.follow_up_mode` — previously only
@@ -3467,11 +3559,32 @@ pub(crate) async fn serve_session(
     // Cheap enough to call every pass: `Session::messages` is an `Arc`, so an unchanged transcript costs
     // one pointer comparison. Only a genuine change pays for `active_ids()`.
     let mut last_history: Arc<Vec<agent_core::Message>> = Arc::new(Vec::new());
+    // The attached MCP App view context last written to this session's sidecar (see
+    // `mcp_apps::context_file`) — restored onto a freshly loaded transcript (startup, a session
+    // switch) and rewritten when it changes, so a view's context rides the same turn across a
+    // restart. Not in service mode: a tenant's view text is never written outside its sealed store.
+    let mut saved_app_context = String::from("[]");
     macro_rules! sync_history {
         () => {{
             let changed = !Arc::ptr_eq(&session.messages, &last_history);
             if changed {
                 last_history = session.messages.clone();
+            }
+            if service.is_none()
+                && let Some(file) = persistence.session_file()
+            {
+                let path = crate::tools::mcp_apps::context_file(file);
+                if changed && session.request_blocks.is_empty() {
+                    crate::tools::mcp_apps::restore_context(&path, &mut session);
+                    saved_app_context = crate::tools::mcp_apps::context_records(&session);
+                }
+                let records = crate::tools::mcp_apps::context_records(&session);
+                if records != saved_app_context {
+                    match crate::tools::mcp_apps::save_context(&path, &records) {
+                        Ok(()) => saved_app_context = records,
+                        Err(e) => eprintln!("serve: could not save MCP App view context: {e}"),
+                    }
+                }
             }
             let mut fanout = lock_ignoring_poison(&out_conn);
             if changed {
@@ -4230,6 +4343,33 @@ pub(crate) async fn serve_session(
                 // Refresh the cheap, time-varying part of the system prompt (the date) every turn —
                 // the expensive discovery-based static half only changes on `set_model`/`set_thinking`/
                 // `reload`, so it's cached rather than recomputed here.
+                // The session's MCP Apps connections moved since the agent was built (an apps dial
+                // landed, or went into backoff): rebuild, so this turn advertises what is up now.
+                let apps_generation_now = mcp_enabled.apps().map(|view| view.generation());
+                if apps_generation_now != apps_generation {
+                    apps_generation = apps_generation_now;
+                    agent = build_agent(
+                        &exec_cell,
+                        client.clone(),
+                        &full_system(&static_system, &cwd),
+                        &cfg,
+                        &current_model,
+                        current_thinking,
+                        current_level,
+                        current_auto_compaction,
+                        current_auto_retry,
+                        current_block_images,
+                        current_image_auto_resize,
+                        persistence.session_id(),
+                        &write_locks,
+                        &checkpoint,
+                        subagent_ctx.as_ref(),
+                        structured_output.as_ref(),
+                        memory_tool.as_ref(),
+                        approval.as_ref(),
+                        &mcp_enabled,
+                    );
+                }
                 agent.set_system(full_system(&static_system, &cwd));
                 // A `prompt` with no (or non-string) `message` is a malformed command: running an
                 // empty user turn would spend a model call on nothing and still report success.
@@ -4260,6 +4400,15 @@ pub(crate) async fn serve_session(
                     session.user(message);
                 } else {
                     session.push(agent_core::Message::user_with_images(message, images));
+                }
+                // MCP App views' new model context rides this turn as a request-only block of its
+                // own — untrusted data, labelled as such, never in the user's text, never persisted,
+                // and never in the system prompt, whose bytes (and so the prompt cache) it would
+                // otherwise churn on every update. See `Session::attach_request_block`.
+                if let Some(context) =
+                    crate::tools::mcp_apps::take_undelivered_context(&mcp_enabled)
+                {
+                    session.attach_request_block(context);
                 }
                 // Acknowledge immediately — the turn is queued and about to start — rather than
                 // leaving a client with no signal until the (possibly much later) terminal response.
@@ -4650,6 +4799,8 @@ pub(crate) async fn serve_session(
                                             // `waitForIdle()` before acking `abort`.
                                             "abort" => {
                                                 cancel.cancel();
+                                                // A view's bridge requests are the user's work too.
+                                                crate::tools::mcp_apps::cancel_requests(&mcp_enabled);
                                                 pending_abort_acks.push(cid);
                                             }
                                             "stop_after_turn" => {
@@ -4904,6 +5055,8 @@ pub(crate) async fn serve_session(
                                             "sample" => {
                                                 let _ = out_tx.send(handle_sample(cid, &c, &pending_samplings));
                                             }
+                                            // A view is interactive while the model runs, too.
+                                            "mcp_app_request" => spawn_app_request!(cid, c.clone(), out_tx),
                                             "get_tree" => {
                                                 // Same `since` handling as the idle-loop arm below — see
                                                 // `nodes_since`'s own doc comment (Task #48, pi-parity gap).
@@ -5459,7 +5612,8 @@ pub(crate) async fn serve_session(
             }
             "abort" => {
                 // No run is in flight (a mid-run abort is handled inside the `prompt` arm above), so
-                // there is nothing to cancel — acknowledge idempotently.
+                // the only work to cancel is a view's bridge requests — acknowledge idempotently.
+                crate::tools::mcp_apps::cancel_requests(&mcp_enabled);
                 emit!(response(id, "abort", true, None, None));
             }
             "abort_retry" => {
@@ -5695,6 +5849,10 @@ pub(crate) async fn serve_session(
                         "resources": resources,
                         "prompts": prompts,
                         "servers": servers,
+                        "apps": mcp_enabled.apps().map(|view| json!({
+                            "spec": crate::tools::mcp_apps::SPEC_REVISION,
+                            "servers": view.servers(),
+                        })),
                     })),
                     None
                 ));
@@ -5750,6 +5908,127 @@ pub(crate) async fn serve_session(
             }
             "sample" => {
                 emit!(handle_sample(id, &cmd, &pending_samplings));
+            }
+            "mcp_app_request" => spawn_app_request!(id, cmd.clone(), out_tx),
+            "set_mcp_apps" => {
+                // A client declares (or withdraws) that it renders MCP Apps for this session. The
+                // tool set changes, so — like `set_mcp_enabled` — the agent is rebuilt. Declaring
+                // answers once the apps connections have dialed, from a task of its own: the
+                // command loop never waits on a dial, and until it lands the session keeps its
+                // plain tools (a prompt rebuilds onto the apps flavor when it does).
+                match cmd.get("enabled").and_then(Value::as_bool) {
+                    Some(false) => {
+                        let mut epoch = lock_ignoring_poison(&apps_epoch);
+                        *epoch += 1;
+                        crate::tools::mcp_apps::close(&mcp_enabled, "mcp_apps_disabled");
+                        lock_ignoring_poison(&out_conn).clear_app_views();
+                        apps_generation = None;
+                        agent = build_agent(
+                            &exec_cell,
+                            client.clone(),
+                            &full_system(&static_system, &cwd),
+                            &cfg,
+                            &current_model,
+                            current_thinking,
+                            current_level,
+                            current_auto_compaction,
+                            current_auto_retry,
+                            current_block_images,
+                            current_image_auto_resize,
+                            persistence.session_id(),
+                            &write_locks,
+                            &checkpoint,
+                            subagent_ctx.as_ref(),
+                            structured_output.as_ref(),
+                            memory_tool.as_ref(),
+                            approval.as_ref(),
+                            &mcp_enabled,
+                        );
+                        emit!(response(
+                            id,
+                            "set_mcp_apps",
+                            true,
+                            Some(json!({ "enabled": false })),
+                            None
+                        ));
+                        drop(epoch);
+                    }
+                    Some(true) => match crate::tools::mcp_apps::configure(
+                        cfg.mcp_apps.as_ref(),
+                        &mcp_enabled,
+                        &cmd,
+                        cfg.no_tools,
+                        app_sink.clone(),
+                        app_redact.clone(),
+                    ) {
+                        Ok(pool) => {
+                            apps_generation = mcp_enabled.apps().map(|view| view.generation());
+                            agent = build_agent(
+                                &exec_cell,
+                                client.clone(),
+                                &full_system(&static_system, &cwd),
+                                &cfg,
+                                &current_model,
+                                current_thinking,
+                                current_level,
+                                current_auto_compaction,
+                                current_auto_retry,
+                                current_block_images,
+                                current_image_auto_resize,
+                                persistence.session_id(),
+                                &write_locks,
+                                &checkpoint,
+                                subagent_ctx.as_ref(),
+                                structured_output.as_ref(),
+                                memory_tool.as_ref(),
+                                approval.as_ref(),
+                                &mcp_enabled,
+                            );
+                            let out_tx = out_tx.clone();
+                            let service = service.clone();
+                            let epoch = apps_epoch.clone();
+                            let mine = {
+                                let mut e = lock_ignoring_poison(&apps_epoch);
+                                *e += 1;
+                                *e
+                            };
+                            tokio::spawn(async move {
+                                let status = pool.ensure().await;
+                                let current = lock_ignoring_poison(&epoch);
+                                let frame = if *current == mine {
+                                    response(
+                                        id,
+                                        "set_mcp_apps",
+                                        true,
+                                        Some(crate::tools::mcp_apps::configured(status)),
+                                        None,
+                                    )
+                                } else {
+                                    response(
+                                        id,
+                                        "set_mcp_apps",
+                                        false,
+                                        None,
+                                        Some(
+                                            "superseded: a later set_mcp_apps (or session switch) \
+                                             replaced this declaration",
+                                        ),
+                                    )
+                                };
+                                let _ = out_tx.send(redact_frame(service.as_deref(), frame));
+                                drop(current);
+                            });
+                        }
+                        Err(e) => emit!(response(id, "set_mcp_apps", false, None, Some(&e))),
+                    },
+                    None => emit!(response(
+                        id,
+                        "set_mcp_apps",
+                        false,
+                        None,
+                        Some("missing boolean `enabled`")
+                    )),
+                }
             }
             "get_state" => {
                 let mut data = session_stats(&session, &current_model);
@@ -10311,7 +10590,77 @@ pub(crate) struct OutFanout {
     /// view of the current turn starts mid-way and must be reconciled with `get_messages` once the run
     /// ends — rather than silently rendering a turn with a hole in it.
     turn_truncated: bool,
+    /// The session's open MCP App views — each view's `mcp_app_open` and, once it lands, its
+    /// `mcp_app_result` — replayed (marked `replay: true`) to every connection that attaches, so a
+    /// client that reconnects can reopen a view and get its result. Kept apart from `turn` because a
+    /// view outlives the turn that opened it: the turn recording is dropped when the run ends, and
+    /// committed history carries the tool's text, not its view. Bounded by
+    /// [`APP_VIEWS_MAX`]/[`APP_VIEWS_MAX_BYTES`], oldest view dropped first.
+    app_views: std::collections::VecDeque<AppViewFrames>,
+    app_views_bytes: usize,
 }
+
+/// One MCP App view's frames, for replay on attach (see [`OutFanout::app_views`]).
+struct AppViewFrames {
+    app_id: String,
+    /// The frames as sent — final JSON text, so their size is exact ([`OutFrame::approx_len`]) and a
+    /// replay is a copy, not a re-serialization.
+    open: Bytes,
+    result: Option<Bytes>,
+    bytes: usize,
+}
+
+/// Sends on capacity reserved up front, so they cannot be lost to a channel that later fills; for
+/// an unbounded sink (or if the reservation itself fails), a plain send.
+struct ReservedSends<'a> {
+    tx: &'a OutSink,
+    permits: Vec<mpsc::Permit<'a, OutFrame>>,
+}
+
+impl<'a> ReservedSends<'a> {
+    fn new(tx: &'a OutSink, n: usize) -> Self {
+        let permits = match tx {
+            OutSink::Bounded(sender) if n > 0 => sender
+                .try_reserve_many(n)
+                .map(Iterator::collect)
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        Self { tx, permits }
+    }
+
+    fn send(&mut self, frame: OutFrame) {
+        match self.permits.pop() {
+            Some(permit) => permit.send(frame),
+            None => {
+                let _ = self.tx.try_send(frame);
+            }
+        }
+    }
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// A kept app frame, marked `replay: true` for the connection it is replayed to.
+fn app_replay_frame(raw: &Bytes) -> OutFrame {
+    let mut line = Vec::with_capacity(raw.len() + 16);
+    line.extend_from_slice(b"{\"replay\":true,");
+    line.extend_from_slice(raw.get(1..).unwrap_or_default());
+    OutFrame::Raw(Bytes::from(line))
+}
+
+/// How many MCP App views a session keeps for replay. A view is one tool call's UI; a client
+/// reconnecting needs the recent ones, not the whole session's history of them.
+const APP_VIEWS_MAX: usize = 16;
+/// The byte budget for those views (a view's HTML is commonly a few hundred KiB, single-file bundled).
+const APP_VIEWS_MAX_BYTES: usize = 8 * 1024 * 1024;
+// The views are replayed right after the catch-up, into a connection's empty bounded channel, so
+// they always fit: a frame there cannot be lost to a full buffer.
+const _: () = assert!(crate::serve_ws::OUT_CHANNEL_BOUND > 1 + 2 * APP_VIEWS_MAX);
+// One view never exceeds the budget on its own (the agent refuses larger views outright).
+const _: () = assert!(crate::tools::mcp_apps::MAX_VIEW_BYTES < APP_VIEWS_MAX_BYTES);
 
 /// How much of an in-flight turn's output a session will hold for replay to a connection that attaches
 /// mid-turn (see [`OutFanout::turn`]). A cap is required, not optional: a single tool-heavy turn can emit
@@ -10386,15 +10735,120 @@ impl OutFanout {
                 "turn_truncated": self.turn_truncated,
             })));
         }
+        // The session's open MCP App views, each in its place: a view opened by a tool call in the
+        // turn being replayed goes right after that call's `tool_start`, so a renderer never sees a
+        // view before the call it belongs to; a view from an earlier turn (whose `tool_start` is in
+        // the catch-up's history) goes first. Every view frame is sent on capacity reserved up front,
+        // while the channel is still all but empty (see the assertion beside `APP_VIEWS_MAX`), so a
+        // long turn recording overflowing the buffer can drop turn frames but never a view.
+        let anchors: Vec<Option<usize>> = self
+            .app_views
+            .iter()
+            .map(|view| {
+                let needle = format!(
+                    "\"kind\":\"tool_start\",\"id\":{}",
+                    serde_json::to_string(&view.app_id).unwrap_or_default()
+                );
+                self.turn.iter().position(|frame| match frame {
+                    OutFrame::Raw(line) => contains_bytes(line, needle.as_bytes()),
+                    OutFrame::Value(_) => false,
+                })
+            })
+            .collect();
+        let view_frames: usize = self
+            .app_views
+            .iter()
+            .map(|v| 1 + usize::from(v.result.is_some()))
+            .sum();
+        let mut reserved = ReservedSends::new(&tx, view_frames);
+        let send_view = |view: &AppViewFrames, reserved: &mut ReservedSends<'_>| {
+            for frame in std::iter::once(&view.open).chain(view.result.as_ref()) {
+                reserved.send(app_replay_frame(frame));
+            }
+        };
+        for (view, anchor) in self.app_views.iter().zip(&anchors) {
+            if anchor.is_none() {
+                send_view(view, &mut reserved);
+            }
+        }
         // Replay the in-flight turn *after* the catch-up and *before* the sink goes live: the base
         // transcript, then every frame since the run began, then the live stream — byte-identical to
         // what a client that never dropped has seen. All three inside this one critical section, so a
         // concurrent `broadcast` can neither interleave with the replay nor slip in between it and the
         // registration below.
-        for frame in &self.turn {
+        for (index, frame) in self.turn.iter().enumerate() {
             let _ = tx.try_send(frame.clone());
+            for (view, anchor) in self.app_views.iter().zip(&anchors) {
+                if *anchor == Some(index) {
+                    send_view(view, &mut reserved);
+                }
+            }
         }
+        drop(reserved);
         self.add(tx)
+    }
+
+    /// Broadcast an MCP App frame (`mcp_app_open` / `mcp_app_result`) and keep it for replay on
+    /// attach (see [`Self::app_views`]). Not recorded into `turn`: the view store replays it, and
+    /// replaying it from both would open the view twice.
+    pub(crate) fn broadcast_app(&mut self, frame: Value) {
+        let app_id = frame
+            .get("app_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let kind = frame
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let Ok(line) = serde_json::to_vec(&frame) else {
+            return;
+        };
+        let raw = OutFrame::Raw(Bytes::from(line));
+        let OutFrame::Raw(bytes_line) = &raw else {
+            return;
+        };
+        let bytes = raw.approx_len();
+        match kind.as_str() {
+            "mcp_app_open" => {
+                self.app_views.retain(|v| v.app_id != app_id);
+                if bytes <= APP_VIEWS_MAX_BYTES {
+                    self.app_views.push_back(AppViewFrames {
+                        app_id,
+                        open: bytes_line.clone(),
+                        result: None,
+                        bytes,
+                    });
+                }
+            }
+            "mcp_app_result" => {
+                if let Some(view) = self.app_views.iter_mut().find(|v| v.app_id == app_id) {
+                    view.bytes += bytes;
+                    view.result = Some(bytes_line.clone());
+                }
+            }
+            // The view is gone for good: nothing to reopen on the next attach.
+            "mcp_app_teardown" => self.app_views.retain(|v| v.app_id != app_id),
+            _ => {}
+        }
+        self.app_views_bytes = self.app_views.iter().map(|v| v.bytes).sum();
+        while self.app_views.len() > APP_VIEWS_MAX
+            || (self.app_views_bytes > APP_VIEWS_MAX_BYTES && self.app_views.len() > 1)
+        {
+            if let Some(dropped) = self.app_views.pop_front() {
+                self.app_views_bytes -= dropped.bytes;
+            }
+        }
+        let recording = std::mem::replace(&mut self.recording, false);
+        self.broadcast(raw);
+        self.recording = recording;
+    }
+
+    /// Forget every kept MCP App view — the session they belonged to is no longer the one here.
+    pub(crate) fn clear_app_views(&mut self) {
+        self.app_views.clear();
+        self.app_views_bytes = 0;
     }
 
     /// A run is starting: record what it broadcasts, for replay to anyone who attaches mid-turn.

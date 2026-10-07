@@ -113,6 +113,13 @@ impl ToolProgress {
         self.write_lock.clone()
     }
 
+    /// The id of the tool call this handle reports for — the model's `tool_use` id, the same one
+    /// every `tool_start`/`tool_end` event carries — so a tool that emits something *beside* its
+    /// result (an MCP App view) can name the call it belongs to.
+    pub fn call_id(&self) -> &str {
+        &self.id
+    }
+
     /// Emit a progress snapshot (the full output so far) plus optional `details`. Best-effort: if the
     /// run has already finished (the receiver is gone), the update is dropped rather than erroring.
     pub fn emit(&self, snapshot: impl Into<String>, details: Option<Value>) {

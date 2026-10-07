@@ -75,6 +75,9 @@ pub enum ApprovalOrigin {
     Main,
     /// A `subagent` child: which persona, and which spawn of it.
     Subagent { agent: String, spawn_id: String },
+    /// An MCP App view calling its server's tool through the host bridge (`mcp_app_request`) — the
+    /// user acted inside the view, not the model, and the question says so.
+    App { server: String, app_id: String },
 }
 
 impl ApprovalOrigin {
@@ -82,6 +85,9 @@ impl ApprovalOrigin {
         match self {
             Self::Main => json!("main"),
             Self::Subagent { agent, spawn_id } => json!({ "agent": agent, "spawn_id": spawn_id }),
+            Self::App { server, app_id } => {
+                json!({ "app": { "server": server, "app_id": app_id } })
+            }
         }
     }
 }
@@ -356,11 +362,25 @@ pub async fn gated_before_tool_call(
         return Some(reason);
     }
     let runtime = runtime?;
+    let key = scope_key(name, input, policy.root(), &policy.world());
+    ask_gate(runtime, origin, name, input, key, cancel).await
+}
+
+/// Steps 2–5 of [`gated_before_tool_call`] — the gated-set check, the session memory, the question,
+/// and fail-closed — for a caller that has no `Session` to hand the static policy (an MCP App's
+/// `tools/call`, which checks `--deny-tool` itself first). One gate, one memory: an "always allow"
+/// given to the model's call of a tool answers the app's call of it too, and vice versa.
+pub async fn ask_gate(
+    runtime: &ApprovalRuntime,
+    origin: &ApprovalOrigin,
+    name: &str,
+    input: &Value,
+    key: String,
+    cancel: &CancellationToken,
+) -> Option<String> {
     if !runtime.gated.is_gated(name) {
         return None;
     }
-
-    let key = scope_key(name, input, policy.root(), &policy.world());
     let mem_key = memory_key(name, &key);
     match runtime.memory.lookup(&mem_key) {
         Some(true) => return None,

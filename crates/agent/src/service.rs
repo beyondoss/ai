@@ -527,6 +527,36 @@ impl ServiceSession {
         .await
     }
 
+    /// This session's connectors dialed again **with MCP Apps advertised**, lazily, the first time
+    /// its client declares it can render apps (`set_mcp_apps`). Per session like [`Self::mcp`]: a
+    /// tenant's connections, apps-flavored or not, are never shared with another session.
+    pub fn mcp_apps_pool(
+        self: &Arc<Self>,
+        egress: Option<crate::tools::mcp::McpEgress>,
+        host: Arc<crate::tools::mcp_host::McpHost>,
+    ) -> crate::tools::mcp_apps::McpAppsPool {
+        let session = Arc::clone(self);
+        crate::tools::mcp_apps::McpAppsPool::new(move |only: Option<Vec<String>>| {
+            let session = Arc::clone(&session);
+            let egress = egress.clone();
+            let host = host.clone();
+            Box::pin(async move {
+                let Some(egress) = egress else {
+                    return Vec::new();
+                };
+                crate::tools::mcp::connect_granted_each(
+                    &session.grant.mcp,
+                    &session.grant.secrets.mcp_headers,
+                    &egress,
+                    host,
+                    crate::tools::mcp::idle_reap_after_from_env(),
+                    only.as_deref(),
+                )
+                .await
+            })
+        })
+    }
+
     /// Strip replica-host paths out of `text` — an error from the storage layer names the file it
     /// failed on, and a tenant has no business learning this replica's mount layout. Shard roots
     /// become `<store>`; the replica's own `$HOME`/cwd become `<host>`.
