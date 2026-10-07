@@ -314,6 +314,52 @@ impl Conn {
         req.body(body.to_string())
     }
 
+    /// Send one direct `events/*` POST. With an OAuth login it carries the server's **current**
+    /// shared token (not the one these headers were built with — a refresh by any connection since
+    /// is used at once), and any 401 refreshes it (once for every concurrent caller — see
+    /// `mcp_oauth`) and resends **once**; a failed refresh is the error.
+    #[allow(clippy::too_many_arguments)]
+    async fn send(
+        http: &reqwest::Client,
+        url: &str,
+        headers: &[(http::HeaderName, http::HeaderValue)],
+        auth: Option<&crate::tools::mcp_oauth::ServerAuth>,
+        protocol_version: &str,
+        method: &str,
+        body: &Value,
+    ) -> Result<reqwest::Response, RpcError> {
+        let failed = |e: reqwest::Error| RpcError::local(format!("POST {method}: {e}"));
+        let Some(auth) = auth else {
+            return Self::http_request(http, url, headers, protocol_version, method, body)
+                .send()
+                .await
+                .map_err(failed);
+        };
+        let post = |token: Option<&str>| {
+            let mut with: Vec<_> = headers
+                .iter()
+                .filter(|(k, _)| k != http::header::AUTHORIZATION)
+                .cloned()
+                .collect();
+            if let Some(v) =
+                token.and_then(|t| http::HeaderValue::from_str(&format!("Bearer {t}")).ok())
+            {
+                with.push((http::header::AUTHORIZATION, v));
+            }
+            Self::http_request(http, url, &with, protocol_version, method, body).send()
+        };
+        let sent = auth.token().await;
+        let resp = post(sent.as_deref()).await.map_err(failed)?;
+        if resp.status() != reqwest::StatusCode::UNAUTHORIZED {
+            return Ok(resp);
+        }
+        let fresh = auth
+            .after_rejection(sent.as_deref())
+            .await
+            .map_err(RpcError::local)?;
+        post(Some(&fresh)).await.map_err(failed)
+    }
+
     /// Fetch the server's webhook-signing keys from `<server origin>/.well-known/mcp-webhook-jwks.json`
     /// — the standalone-JWKS location the pinned draft names (its alternative, SEP-2127 server
     /// cards, is not published yet). Always from the origin the client already dials for MCP, never
@@ -386,6 +432,7 @@ impl Conn {
             crate::tools::mcp::EventsPeer::Http {
                 url,
                 headers,
+                auth,
                 protocol_version,
                 ..
             } => {
@@ -397,11 +444,16 @@ impl Conn {
                 let body = Self::http_body(id, method, params, protocol_version);
                 let want = body["id"].clone();
                 let fut = async {
-                    let resp =
-                        Self::http_request(http, url, headers, protocol_version, method, &body)
-                            .send()
-                            .await
-                            .map_err(|e| RpcError::local(format!("POST {method}: {e}")))?;
+                    let resp = Self::send(
+                        http,
+                        url,
+                        headers,
+                        auth.as_deref(),
+                        protocol_version,
+                        method,
+                        &body,
+                    )
+                    .await?;
                     let sse = is_sse(&resp);
                     let status = resp.status();
                     if !sse {
@@ -479,6 +531,7 @@ impl Conn {
             crate::tools::mcp::EventsPeer::Http {
                 url,
                 headers,
+                auth,
                 protocol_version,
                 ..
             } => {
@@ -490,17 +543,16 @@ impl Conn {
                 let body = Self::http_body(id, "events/stream", params, protocol_version);
                 let want = body["id"].clone();
                 // No timeout on the stream itself, for the same reason as above.
-                let resp = Self::http_request(
+                let resp = Self::send(
                     http,
                     url,
                     headers,
+                    auth.as_deref(),
                     protocol_version,
                     "events/stream",
                     &body,
                 )
-                .send()
-                .await
-                .map_err(|e| RpcError::local(format!("POST events/stream: {e}")))?;
+                .await?;
                 if !is_sse(&resp) {
                     // A JSON answer to a stream request is an immediate error (or a result).
                     let bytes = read_capped(resp, MAX_RESPONSE_BYTES)
@@ -970,5 +1022,109 @@ mod tests {
         assert_eq!(rx.try_recv().unwrap().params["i"], 1);
         router.route(n(3), Some(id)); // never forwarded past the drop
         assert!(rx.try_recv().is_err());
+    }
+
+    /// A loopback server answering 401 to any request without `Bearer fresh`, 200 otherwise;
+    /// records each request's `Authorization`.
+    async fn bearer_server() -> (String, Arc<Mutex<Vec<String>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let record = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let record = record.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+                    let mut buf = vec![0u8; 16384];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let head = String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase();
+                    let auth = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("authorization: "))
+                        .unwrap_or_default()
+                        .to_owned();
+                    record.lock().unwrap().push(auth.clone());
+                    let reply: &[u8] = if auth == "bearer fresh" {
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}"
+                    } else {
+                        b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    };
+                    let _ = stream.write_all(reply).await;
+                });
+            }
+        });
+        (url, seen)
+    }
+
+    fn bearer(token: &str) -> Vec<(http::HeaderName, http::HeaderValue)> {
+        vec![(
+            http::header::AUTHORIZATION,
+            http::HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        )]
+    }
+
+    #[tokio::test]
+    async fn a_direct_events_request_answered_401_refreshes_the_token_and_is_resent_once() {
+        agent_core::ensure_provider();
+        let (url, seen) = bearer_server().await;
+        let auth = crate::tools::mcp_oauth::ServerAuth::fake("stale", || Ok("fresh".into()));
+        let resp = Conn::send(
+            &reqwest::Client::new(),
+            &url,
+            &bearer("stale"),
+            Some(&auth),
+            "2026-07-28",
+            "events/list",
+            &json!({}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(*seen.lock().unwrap(), ["bearer stale", "bearer fresh"]);
+
+        // A refresh that fails is the error, naming `agent mcp-login`; nothing is resent.
+        let (url, seen) = bearer_server().await;
+        let auth = crate::tools::mcp_oauth::ServerAuth::fake("stale", || {
+            Err(crate::tools::mcp_oauth::RefreshError::definitive(
+                "invalid_grant",
+            ))
+        });
+        let e = Conn::send(
+            &reqwest::Client::new(),
+            &url,
+            &bearer("stale"),
+            Some(&auth),
+            "2026-07-28",
+            "events/list",
+            &json!({}),
+        )
+        .await
+        .unwrap_err();
+        assert!(e.message.contains("agent mcp-login"), "{}", e.message);
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_direct_events_request_sends_the_current_shared_token_not_the_one_it_was_built_with()
+    {
+        // The headers were built (at `events_peer`) with the token of that moment; another
+        // connection has refreshed it since. The request must not spend a 401 on the old one.
+        agent_core::ensure_provider();
+        let (url, seen) = bearer_server().await;
+        let auth = crate::tools::mcp_oauth::ServerAuth::fake("fresh", || Ok("unused".into()));
+        let resp = Conn::send(
+            &reqwest::Client::new(),
+            &url,
+            &bearer("stale"),
+            Some(&auth),
+            "2026-07-28",
+            "events/list",
+            &json!({}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(*seen.lock().unwrap(), ["bearer fresh"]);
     }
 }

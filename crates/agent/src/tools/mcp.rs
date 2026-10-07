@@ -1933,7 +1933,7 @@ pub(crate) type ServerConnect = (
 /// - **Headers are pre-resolved.** `secrets` come straight off the grant into [`SecretHeader`] and
 ///   never through `resolve_config_value` — see that type's doc comment for what a `!command` header
 ///   would do on a replica.
-/// - **No OAuth.** [`oauth_bearer_token`] keys the host's own credential store *by server name*, so a
+/// - **No OAuth.** [`ServerAuth::load`](crate::tools::mcp_oauth::ServerAuth::load) keys the host's own credential store *by server name*, so a
 ///   tenant connector named after an operator's login would inherit the operator's token.
 /// - **No manifest cache.** That cache is keyed by name + url and shared by the whole replica.
 /// - **Egress is checked.** The URL goes through the `web` tool's SSRF layer (and so does every
@@ -2364,7 +2364,7 @@ async fn connect_http(
     url: &str,
 ) -> Result<McpClient, String> {
     let mut custom_headers: HashMap<HeaderName, HeaderValue> = HashMap::new();
-    let mut bearer_token = None;
+    let mut auth = None;
     let client = match &dial.http {
         Some(http) => {
             for header in &http.headers {
@@ -2391,26 +2391,33 @@ async fn connect_http(
                 custom_headers.insert(name, value);
             }
             // A previously `agent mcp-login`'d server gets its (auto-refreshed, if needed) bearer
-            // token attached; a server nobody has logged into (the common case — most MCP servers
+            // token attached — and refreshed again mid-session if the server rejects it (see
+            // `mcp_oauth`); a server nobody has logged into (the common case — most MCP servers
             // need no auth at all, or use `headers` above for a static credential) connects exactly
             // as before.
-            bearer_token = oauth_bearer_token(&config.name, url).await;
+            auth = crate::tools::mcp_oauth::ServerAuth::load(&config.name, url).await;
             agent_core::ensure_provider();
             reqwest::Client::new()
         }
     };
 
-    let mut transport_config = StreamableHttpClientTransportConfig::with_uri(url.to_string())
+    let bearer_token = match &auth {
+        Some(auth) => auth.token().await,
+        None => None,
+    };
+    // No `auth_header` here: the OAuth layer attaches the server's *current* token to each request.
+    let transport_config = StreamableHttpClientTransportConfig::with_uri(url.to_string())
         .custom_headers(custom_headers);
-    if let Some(token) = &bearer_token {
-        transport_config = transport_config.auth_header(token.clone());
-    }
-    // Wrapped so extension results survive rmcp's result decoding — see `mcp_wire` — and so an MCP
-    // App view's read is refused over its cap without being read whole — see `mcp_view_http`.
+    // Wrapped so extension results survive rmcp's result decoding — see `mcp_wire` — so an MCP
+    // App view's read is refused over its cap without being read whole — see `mcp_view_http` — and
+    // so a rejected OAuth token is refreshed and the request retried once — see `mcp_oauth`.
     let transport = StreamableHttpClientTransport::with_client(
-        crate::tools::mcp_view_http::ViewCappedHttp::new(crate::tools::mcp_wire::HttpClient(
-            client,
-        )),
+        crate::tools::mcp_oauth::OAuthHttp::new(
+            crate::tools::mcp_view_http::ViewCappedHttp::new(crate::tools::mcp_wire::HttpClient(
+                client,
+            )),
+            auth,
+        ),
         transport_config,
     );
 
@@ -2489,57 +2496,6 @@ impl McpEgress {
                 ),
             },
         )
-    }
-}
-
-/// A currently-valid bearer access token for `server_name`'s MCP OAuth login, if one exists —
-/// `agent mcp-login {server_name}` establishes it (see that command's own doc comment); this only
-/// ever *reads and refreshes* an already-established one via
-/// [`AuthorizationManager::initialize_from_store`]/[`AuthorizationManager::get_access_token`], the
-/// same [`ScopedMcpCredentialStore`](crate::mcp_auth_store::ScopedMcpCredentialStore) `mcp-login`
-/// wrote to — a refresh (silent, automatic, and re-persisted by `rmcp` itself) is indistinguishable
-/// here from a token that never needed refreshing at all.
-///
-/// Returns `None` — not an error — for every case short of "found a token I could actually attach":
-/// no login has ever happened for this server (the overwhelmingly common case, so this stays a single
-/// cheap file check via [`McpAuthStore::has_credential`] rather than always paying a metadata-discovery
-/// round trip), or a stored credential exists but can no longer be used (refresh token revoked/expired
-/// with no way to recover). Either way, [`connect_http`] proceeds with an unauthenticated connect
-/// attempt and lets *that* failure (or success, for a server that turns out not to need auth after
-/// all) be the actual signal — this function never itself decides a missing/dead credential is fatal.
-async fn oauth_bearer_token(server_name: &str, url: &str) -> Option<String> {
-    let store = crate::mcp_auth_store::McpAuthStore::open_default();
-    if !store.has_credential(server_name) {
-        return None;
-    }
-    let mut manager = match rmcp::transport::auth::AuthorizationManager::new(url).await {
-        Ok(manager) => manager,
-        Err(e) => {
-            tracing::warn!(server = %server_name, error = %e, "failed to set up MCP OAuth for a stored login");
-            return None;
-        }
-    };
-    manager.set_credential_store(store.scoped(server_name));
-    match manager.initialize_from_store().await {
-        Ok(true) => {}
-        // `has_credential` above already confirmed a credential exists, so this shouldn't happen in
-        // practice — treated the same as "no credential" rather than as an error either way.
-        Ok(false) => return None,
-        Err(e) => {
-            tracing::warn!(server = %server_name, error = %e, "failed to restore a stored MCP OAuth login");
-            return None;
-        }
-    }
-    match manager.get_access_token().await {
-        Ok(token) => Some(token),
-        Err(e) => {
-            tracing::warn!(
-                server = %server_name,
-                error = %e,
-                "stored MCP OAuth login could not be refreshed; run `agent mcp-login {server_name}` again"
-            );
-            None
-        }
     }
 }
 
@@ -2874,6 +2830,7 @@ impl McpCatalog {
             });
         };
         let mut headers: Vec<(HeaderName, HeaderValue)> = Vec::new();
+        let mut auth = None;
         match &conn.dial.http {
             Some(http) => headers.extend(
                 http.headers
@@ -2889,7 +2846,9 @@ impl McpCatalog {
                         headers.push((k, v));
                     }
                 }
-                if let Some(token) = oauth_bearer_token(&conn.config.name, url).await
+                auth = crate::tools::mcp_oauth::ServerAuth::load(&conn.config.name, url).await;
+                if let Some(auth) = &auth
+                    && let Some(token) = auth.token().await
                     && let Ok(v) = HeaderValue::from_str(&format!("Bearer {token}"))
                 {
                     headers.push((http::header::AUTHORIZATION, v));
@@ -2900,6 +2859,7 @@ impl McpCatalog {
             url: url.clone(),
             router: client.service().events.clone(),
             headers,
+            auth,
             protocol_version: client
                 .peer_info()
                 .map(|i| i.protocol_version.to_string())
@@ -2951,6 +2911,9 @@ pub(crate) enum EventsPeer {
         url: String,
         router: crate::tools::mcp_events::NotificationRouter,
         headers: Vec<(HeaderName, HeaderValue)>,
+        /// The server's OAuth login, if any: a 401 refreshes it and the request is retried once
+        /// (see `mcp_oauth`).
+        auth: Option<Arc<crate::tools::mcp_oauth::ServerAuth>>,
         protocol_version: String,
     },
 }

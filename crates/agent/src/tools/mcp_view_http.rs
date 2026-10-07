@@ -319,6 +319,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_view_cap_holds_on_the_method_rmcp_actually_calls_whatever_event_size_it_allows() {
+        // rmcp's worker sends every request through `post_message_with_max_sse_event_size`, with
+        // its own (much larger) event limit. The view cap must still apply there.
+        let url = canned_in_parts(&[
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n",
+            b"data: {\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"contents\":[{\"uri\":\"ui://w/v\",\"text\":\"vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv",
+            b"vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv\"}]}}\n\n",
+        ])
+        .await;
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client(128).post_message_with_max_sse_event_size(
+                url.as_str().into(),
+                view_read(),
+                None,
+                None,
+                HashMap::new(),
+                1 << 30,
+            ),
+        )
+        .await
+        .expect("the view read must return while the stream is still open")
+        .unwrap();
+        let StreamableHttpPostResponse::Sse(mut events, _) = response else {
+            panic!("an SSE view read is handed to rmcp as a stream");
+        };
+        let refused = events.next().await.unwrap().unwrap();
+        let msg: ServerJsonRpcMessage = serde_json::from_str(&refused.data.unwrap()).unwrap();
+        assert_eq!(
+            error_id(&msg),
+            Some(json!(7)),
+            "a view over the cap must be refused even when rmcp allows larger events: {msg:?}"
+        );
+        assert!(events.next().await.is_none());
+    }
+
+    #[tokio::test]
     async fn a_json_view_over_the_cap_is_refused_by_its_content_length_or_as_it_streams() {
         let url = canned(
             b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 999999\r\n\r\n{",
