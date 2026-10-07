@@ -52,7 +52,6 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use common::free_port;
 use libtest_mimic::{Arguments, Failed, Trial};
 use serde_json::{Value, json};
 
@@ -2364,32 +2363,13 @@ fn gateway(provider: Provider, pool: &str) -> Result<Arc<Gateway>, Failed> {
 }
 
 fn boot(provider: &str, pool: &str) -> Result<Gateway, Failed> {
-    let dir = scratch().join(format!(
-        "gw-{provider}-{}-{}",
-        std::process::id(),
-        free_port()
-    ));
+    let dir = scratch().join(format!("gw-{provider}-{}", common::unique_id()));
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let nats_port = free_port();
-    let nats = Guard(
-        Command::new("nats-server")
-            .args([
-                "-js",
-                "-a",
-                "127.0.0.1",
-                "-p",
-                &nats_port.to_string(),
-                "-sd",
-            ])
-            .arg(dir.join("nats"))
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| format!("nats-server: {e}"))?,
-    );
-    let (port, metrics_port) = (free_port(), free_port());
+    let (nats_child, nats_port) = common::spawn_nats(&dir.join("nats"))?;
+    let nats = Guard(nats_child);
+    let listeners = common::GATEWAY_LISTENERS;
     let cfg = format!(
-        "listen = \"127.0.0.1:{port}\"\nmetrics_listen = \"127.0.0.1:{metrics_port}\"\n\
+        "{listeners}\
          nats_url = \"nats://127.0.0.1:{nats_port}\"\nconfig_bucket = \"ai-gateway\"\n\
          upstream_tls = true\n\n[pool_keys]\n{provider} = [{pool:?}]\n\n\
          [signing_keys]\n1 = \"{DEV_PUBKEY_B64}\"\n{}",
@@ -2409,7 +2389,11 @@ fn boot(provider: &str, pool: &str) -> Result<Gateway, Failed> {
             .spawn()
             .map_err(|e| format!("gateway: {e}"))?,
     );
-    wait_ready(metrics_port, &mut gw.0, &log)?;
+    let common::GatewayPorts {
+        proxy: port,
+        metrics,
+    } = common::gateway_ports(&mut gw.0, &log)?;
+    wait_ready(metrics, &mut gw.0, &log)?;
     // The config holds the pool key; the gateway has read it.
     let _ = std::fs::remove_file(&cfg_path);
     Ok(Gateway {
@@ -2420,13 +2404,13 @@ fn boot(provider: &str, pool: &str) -> Result<Gateway, Failed> {
     })
 }
 
-fn wait_ready(metrics_port: u16, gw: &mut Child, log: &Path) -> Result<(), Failed> {
+fn wait_ready(metrics: std::net::SocketAddr, gw: &mut Child, log: &Path) -> Result<(), Failed> {
     let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline {
         if let Ok(Some(status)) = gw.try_wait() {
             return Err(format!("gateway exited {status}: {}", tail(log)).into());
         }
-        if let Ok(mut s) = std::net::TcpStream::connect(("127.0.0.1", metrics_port)) {
+        if let Ok(mut s) = std::net::TcpStream::connect(metrics) {
             let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
             let _ = s.write_all(b"GET /metrics HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
             let mut body = String::new();

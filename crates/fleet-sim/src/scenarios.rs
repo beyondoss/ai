@@ -510,29 +510,22 @@ impl Fleet {
         let mut metrics = Vec::new();
         for i in 0..replicas {
             let name = format!("r{}", i + 1);
-            let port = free_port()?;
-            let metrics_port = if with_metrics {
-                Some(free_port()?)
-            } else {
-                None
-            };
             let replica = Replica::start(&crate::replica::Launch {
                 name: &name,
                 bin: &agent,
                 gateway_url: &gateway_url,
-                port,
                 grant_key_flag: &edge.grant_key_flag(),
                 seal_key: edge.seal_key(),
                 shards: &substrate.shard_args_for(i),
                 drain_grace: Some(30),
                 max_live_sessions,
-                metrics_port,
+                with_metrics,
             })?;
             targets.push(Target {
                 name,
-                addr: Addr::local(port),
+                addr: replica.addr.clone(),
             });
-            metrics.push(metrics_port);
+            metrics.push(replica.metrics_port);
             started.push(replica);
         }
         edge.set_targets(targets);
@@ -626,19 +619,17 @@ impl Fleet {
             return Ok(());
         }
         let name = self.replicas[idx].name.clone();
-        let port = free_port()?;
         let shard_args = self.substrate.shard_args_for(idx);
         let replica = Replica::start(&crate::replica::Launch {
             name: &name,
             bin: &agent_binary()?,
             gateway_url: &self.gateway_url,
-            port,
             grant_key_flag: &self.edge.grant_key_flag(),
             seal_key: self.edge.seal_key(),
             shards: &shard_args,
             drain_grace: Some(30),
             max_live_sessions: None,
-            metrics_port: None,
+            with_metrics: false,
         })?;
         self.replicas[idx] = replica;
         let targets = self
@@ -701,13 +692,6 @@ fn agent_binary() -> Result<String, String> {
         ));
     }
     Ok(agent.display().to_string())
-}
-
-fn free_port() -> Result<u16, String> {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| format!("bind: {e}"))?;
-    l.local_addr()
-        .map(|a| a.port())
-        .map_err(|e| format!("addr: {e}"))
 }
 
 /// **C4** — a replica that does not own a session refuses it rather than serving a second copy, and
@@ -1284,23 +1268,18 @@ pub async fn unmounted_shard_is_misdirected(
         Ok(a) => a,
         Err(e) => return Outcome::failed_with(e),
     };
-    let port = match free_port() {
-        Ok(p) => p,
-        Err(e) => return Outcome::failed_with(e),
-    };
     let all = substrate.shard_args_for(0);
     let only_first = &all[..1];
     let replica = match Replica::start(&crate::replica::Launch {
         name: "r1",
         bin: &agent,
         gateway_url: &gateway_url,
-        port,
         grant_key_flag: &edge.grant_key_flag(),
         seal_key: edge.seal_key(),
         shards: only_first,
         drain_grace: None,
         max_live_sessions: None,
-        metrics_port: None,
+        with_metrics: false,
     }) {
         Ok(r) => r,
         Err(e) => return Outcome::failed_with(e),

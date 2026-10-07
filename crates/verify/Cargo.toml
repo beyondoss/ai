@@ -17,8 +17,10 @@ serde_json.workspace = true
 toml = "0.8"
 
 [dev-dependencies]
+# Port read-back for test subprocesses (`ports`): no port is picked free, released and rebound.
 base64.workspace = true
 beyond-ai-providers = { path = "../providers" }
+beyond-ai-test-support = { path = "../test-support" }
 ed25519-dalek = "2.2"
 # The FLT-1 fault proxy (`tests/common/fault_proxy.rs`): terminates the gateway's TLS with a
 # throwaway cert and re-originates TLS to the real provider, injecting scripted faults in between.

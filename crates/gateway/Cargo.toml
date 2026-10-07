@@ -74,6 +74,8 @@ tracing-subscriber.workspace = true
 zeroize = "1"
 
 [dev-dependencies]
+# Port read-back for test subprocesses (`ports`): no port is picked free, released and rebound.
+beyond-ai-test-support = { path = "../test-support" }
 # Bench harnesses. Best tool per job: `divan` for the unit micro-bench (it measures allocations
 # natively via AllocProfiler, alongside timing); `criterion` for the e2e macro-bench (`async_tokio`
 # drives the round-trips, and its saved-baseline comparison tracks latency/RPS over time).

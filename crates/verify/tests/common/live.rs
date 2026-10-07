@@ -1,7 +1,7 @@
 //! What every live suite shares, so a single `mise run verify:live` is a trustworthy proof:
 //!
-//! - [`free_port`]: a loopback port no other live process on this host is handed while this
-//!   process lives.
+//! - [`spawn_nats`] and [`gateway_ports`]: a nats-server and a gateway that pick their own ports
+//!   and report them, so no port is picked free, released and rebound — none can be taken between.
 //! - [`live_traffic`] and [`isolated`]: a reconciliation window and any other live traffic never
 //!   overlap, on this host.
 //! - [`sdk_retry`] and [`judge`]: a provider that stays unavailable through the stock SDKs' own
@@ -13,9 +13,7 @@
 
 use std::cell::RefCell;
 use std::fs::{File, OpenOptions, TryLockError};
-use std::net::TcpListener;
 use std::path::PathBuf;
-use std::sync::Mutex;
 use std::time::Duration;
 
 /// The dev gateway's `[id_signing_keys]` table (kid `1`: 32 bytes of 7), appended after
@@ -39,50 +37,76 @@ fn lock_file(dir: &str, name: &str) -> File {
 
 // --- Ports ----------------------------------------------------------------------------------------
 
-/// Ports are handed out from here up to the kernel's ephemeral range. Above it, a port can be any
-/// process's outbound connection the moment after a bind check releases it; below this, the
-/// well-known service ports (5432, 6379, 8080, 9090) a host may start later.
-const PORT_FLOOR: u16 = 20_000;
+#[allow(unused_imports)] // not every suite uses both
+pub use beyond_ai_test_support::ports::{GATEWAY_LISTENERS, GatewayPorts};
 
-/// The first port of the kernel's ephemeral range (`ip_local_port_range`; Linux's default 32768).
-fn ephemeral_floor() -> u16 {
-    std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range")
-        .ok()
-        .and_then(|s| s.split_whitespace().next()?.parse().ok())
-        .filter(|&p| p > PORT_FLOOR)
-        .unwrap_or(32_768)
+/// A name unique to this process and call, for a scratch directory.
+pub fn unique_id() -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{}-{n}", std::process::id())
 }
 
-/// A loopback port for a gateway, its admin listener or a nats-server, reserved for the life of
-/// this process.
-///
-/// A bind check alone races: two processes can both find a port free, release it, and hand it to
-/// two servers. Pingora binds with `SO_REUSEPORT`, so two gateways then share it silently (a
-/// request lands on the other one, or a readiness check passes on a stranger's admin listener);
-/// a nats-server holding it instead makes Pingora give up after its bind retries. So a port is
-/// first reserved with an exclusive `flock` on `$TMPDIR/beyond-verify-ports/<port>`, held until
-/// this process exits (the kernel drops it even on SIGKILL), and only then bind-checked, which
-/// catches what isn't ours (another service, or a gateway orphaned by a killed test). Every live
-/// suite in every worktree on the host takes its ports here, so none can be handed one twice.
-pub fn free_port() -> u16 {
-    static HELD: Mutex<Vec<File>> = Mutex::new(Vec::new());
-    let ceiling = ephemeral_floor();
-    let span = u32::from(ceiling - PORT_FLOOR);
-    // Start each process somewhere else in the range, so processes rarely probe the same files.
-    let start = std::process::id().wrapping_mul(0x9E37_79B1) % span;
-    for i in 0..span {
-        let port = PORT_FLOOR + ((start + i) % span) as u16;
-        let f = lock_file("beyond-verify-ports", &port.to_string());
-        // Another process (or this one, on an earlier call: a lock is per open file) holds it.
-        if f.try_lock().is_err() {
-            continue;
+/// Start a JetStream `nats-server` storing under `store`, on a port it picks itself (`-p -1`), and
+/// return it with that port once it is listening (it writes the port via `--ports_file_dir`, after
+/// binding). The caller owns the child.
+pub fn spawn_nats(store: &std::path::Path) -> Result<(std::process::Child, u16), String> {
+    let ports = store.join("ports");
+    let _ = std::fs::remove_dir_all(&ports);
+    std::fs::create_dir_all(&ports).map_err(|e| e.to_string())?;
+    let mut child = std::process::Command::new("nats-server")
+        .args(["-js", "-a", "127.0.0.1", "-p", "-1", "-sd"])
+        .arg(store)
+        .arg("--ports_file_dir")
+        .arg(&ports)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("nats-server: {e}"))?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(port) = beyond_ai_test_support::ports::nats_port_from(&ports) {
+            return Ok((child, port));
         }
-        if TcpListener::bind(("127.0.0.1", port)).is_ok() {
-            HELD.lock().unwrap().push(f);
-            return port;
+        if let Ok(Some(status)) = child.try_wait() {
+            return Err(format!("nats-server exited {status} before listening"));
         }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("nats-server did not report a port within 30s".into());
+        }
+        std::thread::sleep(Duration::from_millis(20));
     }
-    panic!("no free loopback port in {PORT_FLOOR}..{ceiling}");
+}
+
+/// The ports a gateway configured with [`GATEWAY_LISTENERS`] bound, once both of its listeners are
+/// up, read from its own `LISTEN` sockets. `log` is quoted if it exits or never comes up.
+pub fn gateway_ports(
+    gw: &mut std::process::Child,
+    log: &std::path::Path,
+) -> Result<GatewayPorts, String> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(ports) = beyond_ai_test_support::ports::gateway_ports(gw.id()) {
+            return Ok(ports);
+        }
+        let tail = || {
+            let s = std::fs::read_to_string(log).unwrap_or_default();
+            let start = s.len().saturating_sub(2000);
+            s.get(start..).unwrap_or_default().to_owned()
+        };
+        if let Ok(Some(status)) = gw.try_wait() {
+            return Err(format!(
+                "gateway exited {status} before listening: {}",
+                tail()
+            ));
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!("gateway listeners never came up: {}", tail()));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 // --- Isolation ------------------------------------------------------------------------------------

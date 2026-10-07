@@ -556,54 +556,102 @@ async fn expect_100_continue_never_stalls() {
 
 // --- NATS outages --------------------------------------------------------------------------------
 
-/// A `nats-server` that can be stopped and started again on the same port and JetStream store,
+/// A `nats-server` that can be stopped and started again behind the same port and JetStream store,
 /// so its KV contents survive the outage.
+///
+/// "The same port" is a forwarder this test owns: bound to a port the kernel picked, and held for
+/// the test's whole life, so nothing else can take it during an outage (a server restarted on its old
+/// port could find it gone). Each `nats-server` picks its own port (`-p -1`); the forwarder relays to
+/// whichever one is up, and while none is, it closes every connection at once and cuts the ones it
+/// was relaying — what the gateway would see of a server going away.
 struct RestartableNats {
     child: Option<Child>,
+    /// The forwarder's port: what the gateway and the test dial.
     port: u16,
     dir: std::path::PathBuf,
+    /// The running server's own port, if one is up.
+    upstream: Arc<std::sync::Mutex<Option<u16>>>,
+    /// The connections being relayed, cut on [`Self::down`].
+    relays: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    forwarder: tokio::task::JoinHandle<()>,
 }
 
 impl RestartableNats {
     fn new() -> Self {
-        let port = free_port();
-        let dir = std::env::temp_dir().join(format!("beyond-ai-rel13-{port}"));
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("beyond-ai-rel13-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+        let upstream = Arc::new(std::sync::Mutex::new(None::<u16>));
+        let relays = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let forwarder = tokio::spawn({
+            let upstream = upstream.clone();
+            let relays = relays.clone();
+            async move {
+                while let Ok((mut inbound, _)) = listener.accept().await {
+                    let Some(to) = *upstream.lock().unwrap() else {
+                        continue; // down: `inbound` drops, closed at once
+                    };
+                    relays.lock().unwrap().push(tokio::spawn(async move {
+                        if let Ok(mut outbound) = TcpStream::connect(("127.0.0.1", to)).await {
+                            let _ =
+                                tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                        }
+                    }));
+                }
+            }
+        });
         RestartableNats {
             child: None,
             port,
             dir,
+            upstream,
+            relays,
+            forwarder,
         }
     }
 
     async fn up(&mut self) {
-        let child = Command::new("nats-server")
-            .args([
-                "-js",
-                "-a",
-                "127.0.0.1",
-                "-p",
-                &self.port.to_string(),
-                "-sd",
-            ])
-            .arg(&self.dir)
+        let ports = self.dir.join("ports");
+        let _ = std::fs::remove_dir_all(&ports);
+        std::fs::create_dir_all(&ports).unwrap();
+        let mut child = Command::new("nats-server")
+            .args(["-js", "-a", "127.0.0.1", "-p", "-1", "-sd"])
+            .arg(self.dir.join("store"))
+            .arg("--ports_file_dir")
+            .arg(&ports)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
             .expect("spawn nats-server");
-        self.child = Some(child);
         let start = Instant::now();
-        while TcpStream::connect(("127.0.0.1", self.port)).await.is_err() {
+        let port = loop {
+            if let Some(port) = beyond_ai_test_support::ports::nats_port_from(&ports) {
+                break port;
+            }
+            if let Ok(Some(status)) = child.try_wait() {
+                panic!("nats-server exited ({status}) before listening");
+            }
             assert!(
                 start.elapsed() < Duration::from_secs(20),
                 "nats-server did not come up"
             );
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        self.child = Some(child);
+        *self.upstream.lock().unwrap() = Some(port);
     }
 
     fn down(&mut self) {
+        *self.upstream.lock().unwrap() = None;
+        for relay in self.relays.lock().unwrap().drain(..) {
+            relay.abort();
+        }
         if let Some(mut c) = self.child.take() {
             let _ = c.kill();
             let _ = c.wait();
@@ -614,6 +662,7 @@ impl RestartableNats {
 impl Drop for RestartableNats {
     fn drop(&mut self) {
         self.down();
+        self.forwarder.abort();
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
