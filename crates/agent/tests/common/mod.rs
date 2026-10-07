@@ -194,19 +194,6 @@ pub use beyond_ai_test_support::{
     turn_text_responses, turn_tool_use,
 };
 
-/// A free localhost port (bind `:0`, read it back, release) — for a subprocess that can neither
-/// report the port it bound nor adopt one it is handed (the gateway, `nats-server`). It has a window:
-/// between the release and the child's bind any other process can take the port, and under parallel
-/// suites one did, handing a test's connections to another test's server. A `serve` child never needs
-/// this: use [`spawn_listening`], or [`HeldPort`] when the port must be known before it starts.
-pub fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 /// The line `serve` prints on stderr once its `--listen` socket is bound (`serve_ws::serve_ws`).
 const LISTENING: &str = "serve: websocket listening on ";
 
@@ -218,9 +205,9 @@ fn announced_port(line: &str) -> Option<u16> {
 
 /// Spawn a `serve` command listening on a port the kernel picks, and return that port: appends
 /// `--listen 127.0.0.1:0` and reads the bound address back from the line `serve` announces it with.
-/// The port is `serve`'s from the moment it exists, so — unlike [`free_port`], which releases the
-/// port it picked and hopes the child binds it first — no other process can take it. When this
-/// returns the listener is up, so there is nothing to wait for.
+/// The port is `serve`'s from the moment it exists, so — unlike picking a free port, releasing it and
+/// hoping the child binds it first — no other process can take it. When this returns the listener is
+/// up, so there is nothing to wait for.
 ///
 /// Takes the child's stderr to read that line; everything it writes is forwarded line by line to the
 /// test's (captured) stderr, so a child's panic or startup error is shown with a failing test instead
@@ -371,7 +358,7 @@ impl Drop for PortDown {
 
 /// A loopback port nothing listens on, held for as long as the value lives: bound but never
 /// listening, so a connection is refused, and taken, so no other process can start listening there
-/// in the meantime — which a released "dead" port from [`free_port`] cannot promise.
+/// in the meantime — which a port picked free and released cannot promise.
 pub struct DeadPort {
     _socket: tokio::net::TcpSocket,
     port: u16,
@@ -393,15 +380,85 @@ impl DeadPort {
     }
 }
 
-/// Block until `port` accepts a TCP connection, or panic after ~5s.
-pub fn wait_for_port(port: u16) {
-    for _ in 0..500 {
-        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            return;
+/// The gateway's two listeners, as config lines: each on a port the kernel picks, so no other process
+/// can take it between being chosen and being bound. Each at its own loopback address, because Pingora
+/// keys a server's listeners by their address string — two `127.0.0.1:0` collide (one listener comes
+/// up, and shutdown closes its descriptor twice) — and the address is also how [`spawn_gateway`] tells
+/// the client listener from the metrics one.
+pub const GATEWAY_LISTENERS: &str = "listen = \"127.0.0.1:0\"\nmetrics_listen = \"127.0.0.2:0\"\n";
+
+/// Where a gateway started by [`spawn_gateway`] listens.
+pub struct GatewayPorts {
+    /// Client traffic, on `127.0.0.1`.
+    pub proxy: u16,
+    /// `/metrics`, `/livez`, `/readyz`.
+    pub metrics: std::net::SocketAddr,
+}
+
+/// Spawn the gateway (`cmd`: its binary, `run -c <config>`, environment; the config's listeners must be
+/// [`GATEWAY_LISTENERS`]) and return it once both listeners are up, with the ports the kernel gave
+/// them. Read from the gateway's own sockets in `/proc` (the `LISTEN` sockets among its descriptors),
+/// so nothing about the binary changes and nothing races for a port.
+pub fn spawn_gateway(cmd: &mut Command) -> (ChildGuard, GatewayPorts) {
+    let mut child = cmd.spawn_guarded();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let bound = listening_on(child.id());
+        let at = |ip: [u8; 4]| bound.iter().find(|a| a.ip().octets() == ip).copied();
+        if let (Some(proxy), Some(metrics)) = (at([127, 0, 0, 1]), at([127, 0, 0, 2])) {
+            let ports = GatewayPorts {
+                proxy: proxy.port(),
+                metrics: std::net::SocketAddr::V4(metrics),
+            };
+            return (child, ports);
         }
-        thread::sleep(Duration::from_millis(10));
+        if let Ok(Some(status)) = child.try_wait() {
+            panic!("the gateway exited ({status}) before both listeners were up: {bound:?}");
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the gateway's listeners did not come up within 60s: {bound:?}"
+        );
+        thread::sleep(Duration::from_millis(20));
     }
-    panic!("port {port} never came up");
+}
+
+/// The IPv4 addresses `pid` itself holds sockets in `LISTEN` on: `/proc/<pid>/net/tcp` lists every
+/// socket in the network namespace, so it is filtered to the inodes among `pid`'s descriptors.
+fn listening_on(pid: u32) -> Vec<std::net::SocketAddrV4> {
+    let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+        return Vec::new();
+    };
+    let inodes: std::collections::HashSet<String> = fds
+        .flatten()
+        .filter_map(|fd| std::fs::read_link(fd.path()).ok())
+        .filter_map(|target| {
+            let target = target.to_string_lossy().into_owned();
+            target
+                .strip_prefix("socket:[")
+                .and_then(|rest| rest.strip_suffix(']'))
+                .map(str::to_owned)
+        })
+        .collect();
+    let Ok(table) = std::fs::read_to_string(format!("/proc/{pid}/net/tcp")) else {
+        return Vec::new();
+    };
+    // Columns: sl, local_address (hex addr:port, the address as the kernel's in-memory word), ...,
+    // st (`0A` is LISTEN), ..., inode (10th).
+    table
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let cols: Vec<&str> = line.split_whitespace().collect();
+            if cols.len() < 10 || cols[3] != "0A" || !inodes.contains(cols[9]) {
+                return None;
+            }
+            let (addr, port) = cols[1].split_once(':')?;
+            let addr = u32::from_str_radix(addr, 16).ok()?;
+            let port = u16::from_str_radix(port, 16).ok()?;
+            Some(std::net::SocketAddrV4::new(addr.to_ne_bytes().into(), port))
+        })
+        .collect()
 }
 
 /// One JetStream server for this test process. Held until exit so many gateway boots can share it.
@@ -410,42 +467,58 @@ pub fn wait_for_port(port: u16) {
 /// port 402s every managed request, which is why [`wait_for_allowance_ready`] exists alongside this.
 struct SharedNats {
     port: u16,
-    child: ChildGuard,
+    _child: ChildGuard,
+    _dir: tempfile::TempDir,
 }
 
 impl SharedNats {
+    /// `-p -1` has the server pick its own port, and `--ports_file_dir` has it write the port it got
+    /// to a file once it is listening — so no port is chosen and released for it.
     fn spawn() -> Self {
-        let port = free_port();
-        let store_dir = std::env::temp_dir().join(format!("beyond-ai-agent-nats-{port}"));
-        let _ = std::fs::create_dir_all(&store_dir);
+        let dir = tempfile::tempdir().unwrap();
+        let ports = dir.path().join("ports");
+        std::fs::create_dir_all(&ports).unwrap();
         let mut child = Command::new("nats-server")
-            .args([
-                "-js",
-                "-a",
-                "127.0.0.1",
-                "-p",
-                &port.to_string(),
-                "-sd",
-                store_dir.to_str().unwrap(),
-            ])
+            .args(["-js", "-a", "127.0.0.1", "-p", "-1"])
+            .arg("-sd")
+            .arg(dir.path().join("store"))
+            .arg("--ports_file_dir")
+            .arg(&ports)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             // Fails naming `nats-server`: it must be on PATH (run via mise).
             .spawn_guarded();
         let deadline = Instant::now() + Duration::from_secs(20);
-        while Instant::now() < deadline {
-            if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-                return Self { port, child };
+        loop {
+            if let Some(port) = nats_port_from(&ports) {
+                return Self {
+                    port,
+                    _child: child,
+                    _dir: dir,
+                };
             }
-            thread::sleep(Duration::from_millis(50));
+            if let Ok(Some(status)) = child.try_wait() {
+                panic!("the shared nats-server exited ({status}) before listening");
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the shared nats-server did not report a port within 20s"
+            );
+            thread::sleep(Duration::from_millis(20));
         }
-        let _ = child.kill();
-        let _ = child.wait();
-        panic!("shared nats-server did not come up on port {port}");
     }
 }
 
-pub fn unused_nats_port() -> u16 {
+/// The client port in the `<name>_<pid>.ports` file nats-server writes into `dir`
+/// (`{"nats":["nats://127.0.0.1:4222"], ...}`), once it is there and complete.
+fn nats_port_from(dir: &std::path::Path) -> Option<u16> {
+    let file = std::fs::read_dir(dir).ok()?.flatten().next()?.path();
+    let ports: Value = serde_json::from_slice(&std::fs::read(file).ok()?).ok()?;
+    ports["nats"][0].as_str()?.rsplit(':').next()?.parse().ok()
+}
+
+/// The shared JetStream server's client port.
+pub fn shared_nats_port() -> u16 {
     static SERVER: OnceLock<SharedNats> = OnceLock::new();
     SERVER.get_or_init(SharedNats::spawn).port
 }
@@ -454,25 +527,24 @@ pub fn unused_nats_port() -> u16 {
 ///
 /// Listen-port readiness is not enough: managed traffic 402s until the first scan (including an
 /// empty one).
-pub fn wait_for_allowance_ready(metrics_port: u16) {
-    wait_for_port(metrics_port);
+pub fn wait_for_allowance_ready(metrics: std::net::SocketAddr) {
     for _ in 0..200 {
-        if scrape_gauge(&fetch_metrics(metrics_port), "ai_allowance_ready") >= 1.0 {
+        if scrape_gauge(&fetch_metrics(metrics), "ai_allowance_ready") >= 1.0 {
             return;
         }
         thread::sleep(Duration::from_millis(50));
     }
-    panic!("ai_allowance_ready never reached 1 on metrics port {metrics_port}");
+    panic!("ai_allowance_ready never reached 1 on {metrics}");
 }
 
-fn fetch_metrics(port: u16) -> String {
-    let Ok(mut stream) = TcpStream::connect(("127.0.0.1", port)) else {
+fn fetch_metrics(metrics: std::net::SocketAddr) -> String {
+    let Ok(mut stream) = TcpStream::connect(metrics) else {
         return String::new();
     };
     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
     let _ = write!(
         stream,
-        "GET /metrics HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+        "GET /metrics HTTP/1.1\r\nHost: {metrics}\r\nConnection: close\r\n\r\n"
     );
     let mut buf = Vec::new();
     let _ = stream.read_to_end(&mut buf);

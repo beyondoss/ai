@@ -24,9 +24,9 @@ use std::process::{Command, Output, Stdio};
 use std::thread;
 
 use common::{
-    ChildGuard, DEV_PUBKEY_B64, DEV_TOKEN, SpawnGuarded, free_port, gateway_bin, spawn_listening,
-    unused_nats_port, wait_for_allowance_ready, wait_for_port, ws_connect, ws_connect_uds,
-    ws_next_frame, ws_read_until_response, ws_send,
+    ChildGuard, DEV_PUBKEY_B64, DEV_TOKEN, GATEWAY_LISTENERS, SpawnGuarded, gateway_bin,
+    shared_nats_port, spawn_gateway, spawn_listening, wait_for_allowance_ready, ws_connect,
+    ws_connect_uds, ws_next_frame, ws_read_until_response, ws_send,
 };
 use serde_json::{Value, json};
 
@@ -86,16 +86,13 @@ fn boot_gateway(dir: &Path, pool: &str, key: &str) -> (u16, ChildGuard) {
 /// one real provider at once — needed to exercise a cross-provider `set_model` switch (Anthropic →
 /// OpenAI) through one gateway, where each dialect's request routes to its own pool.
 fn boot_gateway_pools(dir: &Path, pools: &[(&str, &str)]) -> (u16, ChildGuard) {
-    let gw_port = free_port();
-    let metrics_port = free_port();
-    let nats_port = unused_nats_port();
+    let nats_port = shared_nats_port();
     let pool_keys: String = pools
         .iter()
         .map(|(pool, key)| format!("{pool} = \"{key}\"\n"))
         .collect();
     let config = format!(
-        "listen = \"127.0.0.1:{gw_port}\"\n\
-         metrics_listen = \"127.0.0.1:{metrics_port}\"\n\
+        "{GATEWAY_LISTENERS}\
          nats_url = \"nats://127.0.0.1:{nats_port}\"\n\
          config_bucket = \"ai-gateway\"\n\
          upstream_tls = true\n\
@@ -105,17 +102,17 @@ fn boot_gateway_pools(dir: &Path, pools: &[(&str, &str)]) -> (u16, ChildGuard) {
     );
     let config_path = dir.join("gateway.toml");
     std::fs::write(&config_path, config).unwrap();
-    let gateway = Command::new(gateway_bin())
-        .arg("run")
-        .arg("-c")
-        .arg(&config_path)
-        .env("AI_LOG", "warn")
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .spawn_guarded();
-    wait_for_port(gw_port);
-    wait_for_allowance_ready(metrics_port);
-    (gw_port, gateway)
+    let (gateway, ports) = spawn_gateway(
+        Command::new(gateway_bin())
+            .arg("run")
+            .arg("-c")
+            .arg(&config_path)
+            .env("AI_LOG", "warn")
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit()),
+    );
+    wait_for_allowance_ready(ports.metrics);
+    (ports.proxy, gateway)
 }
 
 /// Read stdout frames until the `response` for `command` arrives; return all frames seen.
