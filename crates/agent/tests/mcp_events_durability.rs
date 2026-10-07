@@ -392,9 +392,12 @@ fn a_steered_batch_summarized_away_by_a_mid_run_compaction_is_not_injected_again
     let mut stdin = child.stdin.take().unwrap();
     let mut frames = Frames::new(child.stdout.take().unwrap(), None);
     wait_active(&mut stdin, &mut frames, 1);
+    // Each turn stalls this long: the window in which the second event must be polled, coalesced
+    // and steered in before the turn carrying the first ends — wide, so full-suite load on the
+    // host cannot close it (2.5 s did, once).
     send(
         &mut stdin,
-        json!({ "type": "prompt", "id": "long", "message": beyond_ai_test_support::stall_prompt(2500) }),
+        json!({ "type": "prompt", "id": "long", "message": beyond_ai_test_support::stall_prompt(6000) }),
     );
     frames.wait(Duration::from_secs(10), "the run's ack", |f| {
         f["type"] == "ack" && f["id"] == "long"
@@ -419,7 +422,10 @@ fn a_steered_batch_summarized_away_by_a_mid_run_compaction_is_not_injected_again
         &fixture,
         json!({ "event_id": "compacted-2", "data": { "summary": "second, kept" } }),
     );
-    let done = frames.response("long");
+    // Several stalled turns and a compaction: more than `response`'s 30 s under load.
+    let done = frames.wait(Duration::from_secs(90), "the run's response", |f| {
+        f["type"] == "response" && f["id"] == "long"
+    });
     assert_eq!(done["success"], true, "{done:#}");
     assert!(
         frames
