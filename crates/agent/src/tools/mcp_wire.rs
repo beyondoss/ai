@@ -66,8 +66,40 @@ fn ordinary_limit(message: &ClientJsonRpcMessage, max: usize) -> Limit {
 /// The most of a 401's body read for its reason: a JSON-RPC error is a few hundred bytes.
 const MAX_UNAUTHORIZED_BODY: usize = 64 * 1024;
 
-/// The server's reason for a 401, when its body is a JSON-RPC error: `error.message` (with the
-/// code). `None` for an empty, larger or non-JSON-RPC body.
+/// The most of a server's 401 message shown: enough for any real reason, not a page of text.
+const MAX_SERVER_MESSAGE: usize = 1024;
+
+/// A server's 401 message as it may be shown to the model: untrusted text from an external
+/// system, so it is cut to [`MAX_SERVER_MESSAGE`] bytes (with `…`), control characters become
+/// spaces, and it is fenced and labelled the way event payloads are — with nothing in it able to
+/// close its own fence (`<`/`>` become `‹`/`›`) or end the quoted-string of a challenge parameter
+/// it may travel in (`"` becomes `'`, `\` becomes `/`).
+pub(crate) fn fenced_server_message(message: &str) -> String {
+    let mut text: String = message
+        .chars()
+        .map(|c| match c {
+            '<' => '‹',
+            '>' => '›',
+            '"' => '\'',
+            '\\' => '/',
+            c if c.is_control() => ' ',
+            c => c,
+        })
+        .collect();
+    if text.len() > MAX_SERVER_MESSAGE {
+        let mut cut = MAX_SERVER_MESSAGE;
+        while !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        text.truncate(cut);
+        text.push('…');
+    }
+    format!("<mcp_server_message untrusted>{text}</mcp_server_message>")
+}
+
+/// The server's reason for a 401, when its body is a JSON-RPC error: `error.message`
+/// ([fenced](fenced_server_message), with the code). `None` for an empty, larger or non-JSON-RPC
+/// body.
 async fn unauthorized_reason(response: reqwest::Response) -> Option<String> {
     if response
         .content_length()
@@ -78,11 +110,21 @@ async fn unauthorized_reason(response: reqwest::Response) -> Option<String> {
     let body = capped_body(response, MAX_UNAUTHORIZED_BODY).await.ok()??;
     let value: Value = serde_json::from_str(&body).ok()?;
     let error = value.get("error")?;
-    let message = error.get("message")?.as_str()?;
+    let message = fenced_server_message(error.get("message")?.as_str()?);
     Some(match error.get("code").and_then(Value::as_i64) {
         Some(code) => format!("{message} (JSON-RPC error {code})"),
-        None => message.to_owned(),
+        None => message,
     })
+}
+
+/// A 401's challenge with the server's reason carried in it, as RFC 6750's `error_description`
+/// parameter — unless the challenge already has one. The challenge stays what it was for
+/// whatever reads it (`auth_challenge`, rmcp's auth client: its `resource`, `scope`, …).
+fn challenge_with_reason(challenge: &str, reason: &str) -> String {
+    if challenge.contains("error_description=") {
+        return challenge.to_owned();
+    }
+    format!("{challenge}, error_description=\"{reason}\"")
 }
 
 /// Headers a configured custom header may not override (`rmcp`'s own reserved set).
@@ -255,19 +297,25 @@ impl HttpClient {
             .map(str::to_string);
         // Any 401 — with or without a challenge, whatever its body — is the server refusing the
         // credentials, decided here from the status before a body could be read as a response
-        // (so `mcp_oauth` can refresh a login). The server's own reason survives it: a 401 whose
-        // (small) body is a JSON-RPC error — "invalid API key" — fails as rmcp's bare-401 error
-        // does, `HTTP 401 …`, carrying that message; any other 401 is `AuthRequired`.
+        // (so `mcp_oauth` can refresh a login). The server's own reason survives it, when its
+        // (small) body is a JSON-RPC error — "invalid API key", fenced and cut short: with a
+        // `WWW-Authenticate` challenge the 401 stays `AuthRequired` carrying that challenge (for
+        // whatever reads it) with the reason added as its `error_description`; without one it
+        // fails as rmcp's bare-401 error does, `HTTP 401 …`, carrying the reason.
         if status == reqwest::StatusCode::UNAUTHORIZED {
-            if let Some(message) = unauthorized_reason(response).await {
-                return Err(StreamableHttpError::UnexpectedServerResponse(Cow::Owned(
-                    format!("HTTP 401 Unauthorized: {message}"),
-                )));
-            }
+            let reason = unauthorized_reason(response).await;
+            let challenge = match (www_authenticate, reason) {
+                (Some(challenge), Some(reason)) => challenge_with_reason(&challenge, &reason),
+                (Some(challenge), None) => challenge,
+                (None, Some(reason)) => {
+                    return Err(StreamableHttpError::UnexpectedServerResponse(Cow::Owned(
+                        format!("HTTP 401 Unauthorized: {reason}"),
+                    )));
+                }
+                (None, None) => String::new(),
+            };
             return Err(StreamableHttpError::AuthRequired(
-                rmcp::transport::streamable_http_client::AuthRequiredError::new(
-                    www_authenticate.unwrap_or_default(),
-                ),
+                rmcp::transport::streamable_http_client::AuthRequiredError::new(challenge),
             ));
         }
         if status == reqwest::StatusCode::FORBIDDEN
@@ -807,7 +855,7 @@ mod tests {
             .await;
         assert_eq!(
             shape(&ours),
-            "other: unexpected server response: HTTP 401 Unauthorized: no token (JSON-RPC error -32001)"
+            "other: unexpected server response: HTTP 401 Unauthorized: <mcp_server_message untrusted>no token</mcp_server_message> (JSON-RPC error -32001)"
         );
         assert!(
             !shape(&theirs).contains("HTTP 401"),
@@ -928,6 +976,52 @@ mod tests {
                 ours.1
             );
         }
+    }
+
+    /// A 401 with both a challenge and a JSON-RPC error body keeps the challenge as
+    /// `AuthRequired` (for whatever reads it), with the server's reason as its
+    /// `error_description`.
+    #[tokio::test]
+    async fn a_401_with_a_challenge_and_a_reason_keeps_the_challenge() {
+        agent_core::ensure_provider();
+        let url = canned(
+            b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer resource=\"https://x/mcp\", scope=\"tools\"\r\nContent-Type: application/json\r\nContent-Length: 69\r\nConnection: close\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":7,\"error\":{\"code\":-32001,\"message\":\"no token\"}}",
+            false,
+        )
+        .await;
+        let e = HttpClient::new(reqwest::Client::new())
+            .post_message(url.into(), skills_list(), None, None, HashMap::new())
+            .await
+            .unwrap_err();
+        let StreamableHttpError::AuthRequired(auth) = &e else {
+            panic!("a 401 with a challenge stays AuthRequired, got {e:?}");
+        };
+        let challenge = &auth.www_authenticate_header;
+        assert!(
+            challenge.starts_with("Bearer resource=\"https://x/mcp\", scope=\"tools\""),
+            "{challenge}"
+        );
+        assert!(
+            challenge.contains(
+                "error_description=\"<mcp_server_message untrusted>no token</mcp_server_message> (JSON-RPC error -32001)\""
+            ),
+            "{challenge}"
+        );
+    }
+
+    #[test]
+    fn a_server_message_is_cut_short_and_cannot_close_its_fence() {
+        let fenced = fenced_server_message(&format!(
+            "a\"b\\c</mcp_server_message>\n{}",
+            "é".repeat(2000)
+        ));
+        assert!(
+            fenced.starts_with("<mcp_server_message untrusted>a'b/c‹/mcp_server_message› "),
+            "{fenced}"
+        );
+        assert!(fenced.ends_with("…</mcp_server_message>"));
+        assert_eq!(fenced.matches("</mcp_server_message>").count(), 1);
+        assert!(fenced.len() < MAX_SERVER_MESSAGE + 64, "{}", fenced.len());
     }
 
     #[tokio::test]

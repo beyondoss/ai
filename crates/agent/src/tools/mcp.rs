@@ -1216,9 +1216,25 @@ impl McpServerHandle {
     }
 }
 
-fn tool_call_err(server: &str, remote: &str, e: impl std::fmt::Display) -> ToolError {
+fn tool_call_err(server: &str, remote: &str, e: &ServiceError) -> ToolError {
+    // The causes too, each once: a 401's challenge (and the server's reason in it) is in the
+    // transport error's source, not its own text ("Auth required").
+    let mut text = e.to_string();
+    // rmcp's `TransportSend` shows its transport error but does not chain it as a source.
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = match e {
+        ServiceError::TransportSend(transport) => std::error::Error::source(transport),
+        _ => std::error::Error::source(e),
+    };
+    while let Some(c) = cause {
+        let more = c.to_string();
+        if !text.contains(&more) {
+            text.push_str(": ");
+            text.push_str(&more);
+        }
+        cause = c.source();
+    }
     ToolError::Execution(format!(
-        "mcp server `{server}` tool `{remote}` call failed: {e}"
+        "mcp server `{server}` tool `{remote}` call failed: {text}"
     ))
 }
 
@@ -1240,7 +1256,7 @@ async fn drive_tool_call(
         let host_arc = calling_host(&client.service().host);
         match call_tool_tracked(&client, params.clone(), host_arc)
             .await
-            .map_err(|e| tool_call_err(server_name, remote_name, e))?
+            .map_err(|e| tool_call_err(server_name, remote_name, &e))?
         {
             CallToolResponse::Complete(result) => return Ok(result),
             CallToolResponse::InputRequired(required) => {
@@ -1686,7 +1702,7 @@ async fn await_task(
                         client = recover(conn, client, loss, losses).await;
                         continue;
                     }
-                    None => return Err(tool_call_err(server_name, remote_name, e).into()),
+                    None => return Err(tool_call_err(server_name, remote_name, &e).into()),
                 },
             }
         }
@@ -1726,7 +1742,7 @@ async fn await_task(
                     client = recover(conn, client, loss, losses).await;
                     continue;
                 }
-                None => return Err(tool_call_err(server_name, remote_name, e).into()),
+                None => return Err(tool_call_err(server_name, remote_name, &e).into()),
             },
         };
         let detailed = info.task;
