@@ -215,7 +215,9 @@ pub(crate) fn rescue(line: &[u8]) -> Option<Vec<u8>> {
 /// server response cannot take the host's memory with it.
 pub const DEFAULT_MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 
-fn max_message_bytes() -> usize {
+/// The per-message cap in force — the one cap every MCP transport applies: stdio lines here, every
+/// streamable-HTTP body and SSE event (`mcp_wire::HttpClient`), and the MCP Events direct-HTTP wire.
+pub(crate) fn max_message_bytes() -> usize {
     std::env::var("BEYOND_AI_AGENT_MCP_MAX_MESSAGE_BYTES")
         .ok()
         .and_then(|v| v.parse().ok())

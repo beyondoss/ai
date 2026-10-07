@@ -535,7 +535,18 @@ async fn rpc(
             "name": "echo",
             "description": "Echoes back its `text` argument.",
             "inputSchema": { "type": "object", "properties": { "text": { "type": "string" } } }
+        }, {
+            "name": "blob",
+            "description": "Returns a text result of `bytes` bytes.",
+            "inputSchema": { "type": "object", "properties": { "bytes": { "type": "integer" } } }
         }] })),
+        "tools/call" if params["name"] == "blob" => {
+            let n = params
+                .pointer("/arguments/bytes")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as usize;
+            Ok(json!({ "content": [{ "type": "text", "text": "x".repeat(n) }], "isError": false }))
+        }
         "tools/call" => {
             let text = params
                 .pointer("/arguments/text")
@@ -555,6 +566,12 @@ async fn rpc(
             let delay = env_u64("MCP_FIXTURE_LIST_DELAY_MS", 0);
             if delay > 0 {
                 tokio::time::sleep(Duration::from_millis(delay)).await;
+            }
+            // `MCP_FIXTURE_LIST_PAD_BYTES`: a discovery answer far larger than any client should
+            // read whole.
+            let pad = env_u64("MCP_FIXTURE_LIST_PAD_BYTES", 0) as usize;
+            if pad > 0 {
+                return Ok(json!({ "events": event_types(), "pad": "x".repeat(pad) }));
             }
             Ok(json!({ "events": event_types() }))
         }
@@ -1395,6 +1412,18 @@ async fn handle_http(state: Shared, mut stream: TcpStream) {
     // `MCP_FIXTURE_NESTED_DURING=poll` over HTTP: the first `events/poll` is answered as an SSE
     // stream that raises the nested request first, and carries the result only after the client
     // has answered it (or the wait has timed out).
+    // `MCP_FIXTURE_POLL_SSE_PAD_BYTES`: `events/poll` answered as an SSE stream whose one event is
+    // padded far past any sane message size.
+    let poll_pad = env_u64("MCP_FIXTURE_POLL_SSE_PAD_BYTES", 0) as usize;
+    if method == "events/poll" && poll_pad > 0 {
+        let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
+        let _ = stream.write_all(head.as_bytes()).await;
+        let body = json!({"jsonrpc": "2.0", "id": id, "result": { "events": [], "cursor": "0", "pad": "x".repeat(poll_pad) }});
+        let _ = stream
+            .write_all(format!("data: {body}\n\n").as_bytes())
+            .await;
+        return;
+    }
     if method == "events/poll" && raise_nested("poll") {
         let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
         let _ = stream.write_all(head.as_bytes()).await;

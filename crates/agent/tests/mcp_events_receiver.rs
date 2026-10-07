@@ -133,10 +133,11 @@ async fn a_delivery_body_that_never_finishes_is_timed_out() {
     );
     let mut ws = ws_connect(port, Some(EVENTS_SESSION)).await;
     ws_wait_active(&mut ws).await;
-    let url = state(&fixture)["hooks"][0]["url"]
-        .as_str()
-        .unwrap()
-        .to_owned();
+    let url = eventually(Duration::from_secs(10), "the hook", || {
+        state(&fixture)["hooks"][0]["url"]
+            .as_str()
+            .map(str::to_owned)
+    });
     let path = url.split_once(&format!("127.0.0.1:{port}")).unwrap().1;
     let started = Instant::now();
     let status = raw_request(

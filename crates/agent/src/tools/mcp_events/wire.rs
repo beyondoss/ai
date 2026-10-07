@@ -18,12 +18,14 @@ use tokio::sync::mpsc;
 
 use super::env_ms;
 
-/// Most bytes one SSE event (one JSON-RPC message on a push stream) may be. The draft keeps
-/// delivery bodies at or under 256 KiB; anything far past that is a broken or hostile server.
-pub(super) const MAX_SSE_EVENT_BYTES: usize = 1024 * 1024;
-/// Most bytes a unary `events/*` response body may be.
-pub(super) const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
-/// Most bytes a server's webhook JWKS document may be.
+/// Most bytes one message on the direct-HTTP events wire — a unary response body, or one SSE event
+/// (a JSON-RPC message on a push stream or a unary SSE answer) — may be: the same per-message cap
+/// every MCP transport applies ([`crate::tools::mcp_stdio::max_message_bytes`],
+/// `BEYOND_AI_AGENT_MCP_MAX_MESSAGE_BYTES`).
+fn max_message_bytes() -> usize {
+    crate::tools::mcp_stdio::max_message_bytes()
+}
+/// Most bytes a server's webhook JWKS document may be (a key document, not an MCP message).
 pub(super) const MAX_JWKS_BYTES: usize = 64 * 1024;
 
 /// How many notifications one push stream may have queued before its consumer catches up. Past it
@@ -471,7 +473,7 @@ impl Conn {
                     let sse = is_sse(&resp);
                     let status = resp.status();
                     if !sse {
-                        let bytes = read_capped(resp, MAX_RESPONSE_BYTES)
+                        let bytes = read_capped(resp, max_message_bytes())
                             .await
                             .map_err(|e| RpcError::local(format!("{method}: {e}")))?;
                         let msg: Value = serde_json::from_slice(&bytes).map_err(|_| {
@@ -572,7 +574,7 @@ impl Conn {
                 .await?;
                 if !is_sse(&resp) {
                     // A JSON answer to a stream request is an immediate error (or a result).
-                    let bytes = read_capped(resp, MAX_RESPONSE_BYTES)
+                    let bytes = read_capped(resp, max_message_bytes())
                         .await
                         .map_err(|e| RpcError::local(format!("events/stream: {e}")))?;
                     let msg: Value = serde_json::from_slice(&bytes)
@@ -705,7 +707,7 @@ fn rpc_outcome(msg: Value) -> Result<Value, RpcError> {
 
 /// Minimal `text/event-stream` reader: yields each event's `data:` payload parsed as JSON.
 ///
-/// Bounded and linear: an event larger than [`MAX_SSE_EVENT_BYTES`] ends the stream (with
+/// Bounded and linear: an event larger than the per-message cap ends the stream (with
 /// [`Self::error`] saying why) instead of growing the buffer, and the separator scan resumes where
 /// it stopped rather than rescanning the whole buffer on every chunk.
 pub(super) struct SseReader {
@@ -717,16 +719,23 @@ pub(super) struct SseReader {
     start: usize,
     /// How far into `buf` no separator can start — the next scan begins here.
     scanned: usize,
+    /// The largest event read (see [`max_message_bytes`]).
+    max: usize,
     pub(super) error: Option<String>,
 }
 
 impl SseReader {
     pub(super) fn new(resp: reqwest::Response) -> Self {
+        Self::with_max(resp, max_message_bytes())
+    }
+
+    pub(super) fn with_max(resp: reqwest::Response, max: usize) -> Self {
         Self {
             resp,
             buf: Vec::new(),
             start: 0,
             scanned: 0,
+            max,
             error: None,
         }
     }
@@ -750,8 +759,8 @@ impl SseReader {
             }
             // A separator is at most four bytes, so one could still start in the last three.
             self.scanned = self.scanned.max(self.buf.len().saturating_sub(3));
-            if self.buf.len() > MAX_SSE_EVENT_BYTES {
-                self.error = Some(format!("an SSE event exceeded {MAX_SSE_EVENT_BYTES} bytes"));
+            if self.buf.len() > self.max {
+                self.error = Some(format!("an SSE event exceeded {} bytes", self.max));
                 return None;
             }
             match self.resp.chunk().await {
@@ -1040,9 +1049,9 @@ mod tests {
 
     #[tokio::test]
     async fn an_oversized_sse_event_ends_the_stream_instead_of_buffering_it() {
-        let body = format!("data: {}", "x".repeat(MAX_SSE_EVENT_BYTES + 10));
+        let body = format!("data: {}", "x".repeat(4096 + 10));
         let resp = reqwest::Response::from(http::Response::new(body));
-        let mut reader = SseReader::new(resp);
+        let mut reader = SseReader::with_max(resp, 4096);
         assert!(reader.next().await.is_none());
         assert!(reader.error.unwrap().contains("exceeded"));
         // A normal event still parses.

@@ -7,10 +7,14 @@
 //! [`crate::tools::mcp_stdio::rescue`] / [`crate::tools::mcp_stdio::unwrap_rescued`], applied to the
 //! raw bytes before `rmcp` parses them. For stdio that is the one stdio transport
 //! ([`crate::tools::mcp_stdio`]); for streamable HTTP it is [`HttpClient`] here, which wraps the
-//! `reqwest` client `rmcp` drives and answers `skills/*` POSTs itself (with the exact URI, session,
-//! auth and standard headers the transport handed it), delegating everything else untouched. The
-//! same request path ([`HttpClient::post_bounded`]) serves `mcp_view_http`'s capped MCP App view
-//! reads.
+//! `reqwest` client `rmcp` drives and answers every POST itself (with the exact URI, session, auth
+//! and standard headers the transport handed it). The same request path
+//! ([`HttpClient::post_bounded`]) serves `mcp_view_http`'s capped MCP App view reads.
+//!
+//! It is also where every streamable-HTTP message is held to the one per-message cap
+//! ([`crate::tools::mcp_stdio::max_message_bytes`], `BEYOND_AI_AGENT_MCP_MAX_MESSAGE_BYTES`): a JSON
+//! body or SSE event over it answers its request with an error instead of being buffered whole, and
+//! the GET stream is capped through `rmcp`'s own SSE-event limit.
 //!
 //! Delete this module when the upstream fix ships.
 
@@ -26,45 +30,37 @@ use rmcp::transport::streamable_http_client::{
 };
 use serde_json::Value;
 
-/// The `reqwest` client `rmcp`'s streamable-HTTP transport drives, with `skills/*` answered here so
-/// their results can be [rescued](crate::tools::mcp_stdio::rescue) before `rmcp` parses them.
+/// The `reqwest` client `rmcp`'s streamable-HTTP transport drives, answering **every** POST itself
+/// ([`HttpClient::post_bounded`]; rmcp's own `post_message` is never called) so results are
+/// [rescued](crate::tools::mcp_stdio::rescue) and size-capped before `rmcp` parses them, and so a
+/// 401's status is always visible: rmcp turns a 401 whose body is a JSON-RPC error into an ordinary
+/// error *response*, the status lost before `mcp_oauth` could see it and refresh. Here any 401 is
+/// `AuthRequired`, for every server.
 #[derive(Clone)]
 pub(crate) struct HttpClient {
     pub(crate) client: reqwest::Client,
-    /// The server has an `agent mcp-login`: **every** POST is answered here
-    /// ([`HttpClient::post_bounded`]) rather than by rmcp's client, because rmcp turns a 401 whose
-    /// body is a JSON-RPC error into an ordinary error *response* — the status lost before
-    /// `mcp_oauth` could see it and refresh. Here any 401 is `AuthRequired`.
-    pub(crate) oauth: bool,
 }
 
 impl HttpClient {
     #[cfg(test)]
     pub(crate) fn new(client: reqwest::Client) -> Self {
-        Self {
-            client,
-            oauth: false,
-        }
+        Self { client }
     }
 }
 
-/// The largest JSON body (or SSE event) a POST answered here for an OAuth server may be: the
-/// host's per-message cap, the same as the stdio transport's.
-const OAUTH_MAX_MESSAGE_BYTES: usize = crate::tools::mcp_stdio::DEFAULT_MAX_MESSAGE_BYTES;
-
-fn is_skills_request(message: &ClientJsonRpcMessage) -> bool {
-    // The method is the one thing needed; serializing is how to read it without matching every
-    // request variant.
-    matches!(message, ClientJsonRpcMessage::Request(_))
-        && serde_json::to_value(message)
-            .ok()
-            .and_then(|v| v.get("method").and_then(Value::as_str).map(str::to_string))
-            .is_some_and(|m| m.starts_with("skills/"))
+/// The limit for an ordinary POST: the per-message cap (no larger than `max`, when the transport
+/// names one); over it, a request is answered with a JSON-RPC error (its caller sees an ordinary
+/// failed request), anything else fails as an undeliverable message does.
+fn ordinary_limit(message: &ClientJsonRpcMessage, max: usize) -> Limit {
+    let id = matches!(message, ClientJsonRpcMessage::Request(_))
+        .then(|| serde_json::to_value(message).ok())
+        .flatten()
+        .and_then(|v| v.get("id").cloned());
+    Limit {
+        max: max.min(crate::tools::mcp_stdio::max_message_bytes()),
+        over: id.map_or(OverLimit::Fail, OverLimit::Refuse),
+    }
 }
-
-/// The largest SSE event a `skills/*` response may carry when the transport names no limit: one
-/// listing page or entry of a skill at the spec's per-skill limits, with room to spare.
-const DEFAULT_MAX_SKILLS_EVENT: usize = 32 * 1024 * 1024;
 
 /// Headers a configured custom header may not override (`rmcp`'s own reserved set).
 const RESERVED_HEADERS: [&str; 3] = ["accept", "mcp-session-id", "last-event-id"];
@@ -438,27 +434,8 @@ impl StreamableHttpClient for HttpClient {
         auth_header: Option<String>,
         custom_headers: HashMap<HeaderName, HeaderValue>,
     ) -> Result<StreamableHttpPostResponse, StreamableHttpError<Self::Error>> {
-        if self.oauth || is_skills_request(&message) {
-            return self
-                .post_bounded(
-                    uri,
-                    message,
-                    session_id,
-                    auth_header,
-                    custom_headers,
-                    Limit {
-                        max: if self.oauth {
-                            OAUTH_MAX_MESSAGE_BYTES
-                        } else {
-                            DEFAULT_MAX_SKILLS_EVENT
-                        },
-                        over: OverLimit::Fail,
-                    },
-                )
-                .await;
-        }
-        self.client
-            .post_message(uri, message, session_id, auth_header, custom_headers)
+        let limit = ordinary_limit(&message, usize::MAX);
+        self.post_bounded(uri, message, session_id, auth_header, custom_headers, limit)
             .await
     }
 
@@ -471,34 +448,8 @@ impl StreamableHttpClient for HttpClient {
         custom_headers: HashMap<HeaderName, HeaderValue>,
         max_sse_event_size: usize,
     ) -> Result<StreamableHttpPostResponse, StreamableHttpError<Self::Error>> {
-        if self.oauth || is_skills_request(&message) {
-            return self
-                .post_bounded(
-                    uri,
-                    message,
-                    session_id,
-                    auth_header,
-                    custom_headers,
-                    Limit {
-                        max: if self.oauth {
-                            OAUTH_MAX_MESSAGE_BYTES.max(max_sse_event_size)
-                        } else {
-                            max_sse_event_size
-                        },
-                        over: OverLimit::Fail,
-                    },
-                )
-                .await;
-        }
-        self.client
-            .post_message_with_max_sse_event_size(
-                uri,
-                message,
-                session_id,
-                auth_header,
-                custom_headers,
-                max_sse_event_size,
-            )
+        let limit = ordinary_limit(&message, max_sse_event_size);
+        self.post_bounded(uri, message, session_id, auth_header, custom_headers, limit)
             .await
     }
 
@@ -526,7 +477,14 @@ impl StreamableHttpClient for HttpClient {
         StreamableHttpError<Self::Error>,
     > {
         self.client
-            .get_stream(uri, session_id, last_event_id, auth_header, custom_headers)
+            .get_stream_with_max_sse_event_size(
+                uri,
+                session_id,
+                last_event_id,
+                auth_header,
+                custom_headers,
+                crate::tools::mcp_stdio::max_message_bytes(),
+            )
             .await
     }
 
@@ -549,7 +507,7 @@ impl StreamableHttpClient for HttpClient {
                 last_event_id,
                 auth_header,
                 custom_headers,
-                max_sse_event_size,
+                max_sse_event_size.min(crate::tools::mcp_stdio::max_message_bytes()),
             )
             .await
     }
@@ -772,10 +730,7 @@ mod tests {
     async fn a_json_success_that_is_not_json_rpc_is_accepted_for_a_notification_but_fails_a_request()
      {
         agent_core::ensure_provider();
-        let oauth = HttpClient {
-            client: reqwest::Client::new(),
-            oauth: true,
-        };
+        let oauth = HttpClient::new(reqwest::Client::new());
         let not_json_rpc: &'static [u8] = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}";
         // A notification: accepted, as rmcp's client does.
         let notification: ClientJsonRpcMessage = serde_json::from_value(
@@ -821,14 +776,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_json_body_over_the_cap_is_refused() {
+    async fn a_json_body_over_the_cap_answers_the_request_with_an_error() {
         agent_core::ensure_provider();
         let url = canned(
             b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 64\r\nConnection: close\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"skills\":[]},\"pad\":\"xxxxxxxx\"}",
             false,
         )
         .await;
-        let e = HttpClient::new(reqwest::Client::new())
+        let answer = HttpClient::new(reqwest::Client::new())
             .post_message_with_max_sse_event_size(
                 url.into(),
                 skills_list(),
@@ -838,8 +793,36 @@ mod tests {
                 16,
             )
             .await
-            .unwrap_err();
-        assert!(format!("{e}").contains("maximum size of 16 bytes"), "{e}");
+            .unwrap();
+        let StreamableHttpPostResponse::Json(message, _) = answer else {
+            panic!("an over-cap answer to a request is that request's error");
+        };
+        let text = serde_json::to_string(&message).unwrap();
+        assert!(text.contains("over 16 bytes refused"), "{text}");
+    }
+
+    /// Every POST — not only `skills/*` — is held to the one per-message cap: a tool call's over-cap
+    /// answer comes back as that call's error, not read whole.
+    #[tokio::test]
+    async fn any_request_is_held_to_the_cap() {
+        agent_core::ensure_provider();
+        let url = canned(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 64\r\nConnection: close\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"content\":[]},\"pad\":\"xxxxxxx\"}",
+            false,
+        )
+        .await;
+        let call: ClientJsonRpcMessage = serde_json::from_value(serde_json::json!({
+            "jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": { "name": "x" },
+        }))
+        .unwrap();
+        let answer = HttpClient::new(reqwest::Client::new())
+            .post_message_with_max_sse_event_size(url.into(), call, None, None, HashMap::new(), 16)
+            .await
+            .unwrap();
+        let StreamableHttpPostResponse::Json(message, _) = answer else {
+            panic!("an over-cap answer to a tool call is that call's error");
+        };
+        assert!(serde_json::to_string(&message).unwrap().contains("refused"));
     }
 
     #[tokio::test]
