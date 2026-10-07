@@ -2375,9 +2375,12 @@ async fn connect_http(
     if let Some(token) = &bearer_token {
         transport_config = transport_config.auth_header(token.clone());
     }
-    // Wrapped so extension results survive rmcp's result decoding — see `mcp_wire`.
+    // Wrapped so extension results survive rmcp's result decoding — see `mcp_wire` — and so an MCP
+    // App view's read is refused over its cap without being read whole — see `mcp_view_http`.
     let transport = StreamableHttpClientTransport::with_client(
-        crate::tools::mcp_wire::HttpClient(client),
+        crate::tools::mcp_view_http::ViewCappedHttp::new(crate::tools::mcp_wire::HttpClient(
+            client,
+        )),
         transport_config,
     );
 

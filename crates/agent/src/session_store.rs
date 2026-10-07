@@ -4920,6 +4920,27 @@ impl TenantCodec {
         self.open(&self.transcript, &self.line_aad(id), line)
     }
 
+    /// `tenant ‖ 0x00 ‖ session_id ‖ 0x00 ‖ "sidecar:" ‖ kind` — a session sidecar's AAD: bound to its
+    /// session *and* its kind, so neither a transcript line nor another sidecar opens as this one.
+    fn sidecar_aad(&self, id: &str, kind: &str) -> Vec<u8> {
+        let mut aad = self.line_aad(id);
+        aad.push(0);
+        aad.extend_from_slice(b"sidecar:");
+        aad.extend_from_slice(kind.as_bytes());
+        aad
+    }
+
+    /// Seal one whole session sidecar file (e.g. MCP App view state) for session `id`.
+    pub fn seal_sidecar(&self, id: &str, kind: &str, bytes: &[u8]) -> std::io::Result<Vec<u8>> {
+        self.seal(&self.transcript, &self.sidecar_aad(id, kind), bytes)
+    }
+
+    /// Open a sidecar sealed by [`Self::seal_sidecar`]. Never accepts plaintext: a sealed store's
+    /// sidecar that is not sealed is not ours.
+    pub fn open_sidecar(&self, id: &str, kind: &str, bytes: &[u8]) -> std::io::Result<Vec<u8>> {
+        self.open(&self.transcript, &self.sidecar_aad(id, kind), bytes)
+    }
+
     /// Seal the whole `.listings.json` cache.
     pub(crate) fn seal_listing(&self, bytes: &[u8]) -> std::io::Result<Vec<u8>> {
         self.seal(&self.listing, self.tenant.as_bytes(), bytes)

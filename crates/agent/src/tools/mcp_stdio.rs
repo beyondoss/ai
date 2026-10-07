@@ -207,10 +207,193 @@ pub(crate) fn rescue(line: &[u8]) -> Option<Vec<u8>> {
     Some(msg.to_string().into_bytes())
 }
 
+// ---- per-message caps -------------------------------------------------------------------------------
+
+/// The most one inbound message from a stdio server may be before the host refuses it, in bytes
+/// (`BEYOND_AI_AGENT_MCP_MAX_MESSAGE_BYTES` overrides). A line past it is discarded as it streams in —
+/// never buffered whole — and the request it answered gets a JSON-RPC error instead, so one runaway
+/// server response cannot take the host's memory with it.
+pub const DEFAULT_MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+
+fn max_message_bytes() -> usize {
+    std::env::var("BEYOND_AI_AGENT_MCP_MAX_MESSAGE_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_MAX_MESSAGE_BYTES)
+}
+
+/// How much of a line is kept to find its JSON-RPC `id` (a server's serializer usually puts it
+/// first; when it does not, the line's tail is searched too).
+const ID_WINDOW: usize = 4096;
+
+/// Per-connection message caps: the global one, and a tighter one for the responses to requests the
+/// host flagged as it wrote them — today an MCP App's `resources/read` of a `ui://` view, capped at
+/// the largest view the host will show — so an oversized view is refused as it streams in rather
+/// than read whole and refused after.
+#[derive(Default)]
+pub(crate) struct MessageCaps {
+    /// Request id (its JSON text) → that response's cap.
+    tight: std::sync::Mutex<std::collections::HashMap<String, usize>>,
+    /// Outbound bytes not yet ended by a newline.
+    outbound: std::sync::Mutex<Vec<u8>>,
+}
+
+impl MessageCaps {
+    /// Note bytes written to the server; a completed request line that reads a `ui://` resource gets
+    /// the view cap. Only lines that mention `resources/read` are parsed.
+    fn wrote(&self, bytes: &[u8]) {
+        let mut pending = lock(&self.outbound);
+        pending.extend_from_slice(bytes);
+        while let Some(end) = pending.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = pending.drain(..=end).collect();
+            if !contains(&line, b"resources/read") {
+                continue;
+            }
+            let Ok(msg) = serde_json::from_slice::<Value>(&line) else {
+                continue;
+            };
+            let is_view = msg["method"] == "resources/read"
+                && msg["params"]["uri"]
+                    .as_str()
+                    .is_some_and(crate::tools::mcp_apps::is_ui_uri);
+            if is_view && let Some(id) = msg.get("id") {
+                lock(&self.tight).insert(id.to_string(), crate::tools::mcp_apps::MAX_VIEW_BYTES);
+            }
+        }
+    }
+
+    /// The cap for the response with this id (its JSON text), and forget it.
+    fn take(&self, id: Option<&str>) -> Option<usize> {
+        id.and_then(|id| lock(&self.tight).remove(id))
+    }
+
+    fn peek(&self, id: &str) -> Option<usize> {
+        lock(&self.tight).get(id).copied()
+    }
+}
+
+/// The top-level JSON-RPC `id` of a message, from a prefix (where it sits ahead of `result`/`error`)
+/// or, failing that, from a suffix (its last occurrence) — as its JSON text.
+fn find_id(head: &[u8], tail: &[u8]) -> Option<String> {
+    let parse_after = |bytes: &[u8], at: usize| -> Option<String> {
+        let rest = bytes.get(at + 5..)?;
+        let mut de = serde_json::Deserializer::from_slice(rest).into_iter::<Value>();
+        match de.next()? {
+            Ok(v @ (Value::Number(_) | Value::String(_))) => Some(v.to_string()),
+            _ => None,
+        }
+    };
+    let first = |hay: &[u8], needle: &[u8]| hay.windows(needle.len()).position(|w| w == needle);
+    if let Some(at) = first(head, b"\"id\":") {
+        let body_at = [first(head, b"\"result\""), first(head, b"\"error\"")]
+            .into_iter()
+            .flatten()
+            .min();
+        if body_at.is_none_or(|b| at < b)
+            && let Some(id) = parse_after(head, at)
+        {
+            return Some(id);
+        }
+    }
+    let at = tail.windows(5).rposition(|w| w == b"\"id\":")?;
+    parse_after(tail, at)
+}
+
+/// One inbound line, read without ever buffering more than its cap.
+#[derive(Debug, PartialEq)]
+pub(crate) enum Inbound {
+    Line(Vec<u8>),
+    /// Over its cap: discarded as it streamed in. `id` is the request it answered, when found.
+    Refused {
+        id: Option<String>,
+        cap: usize,
+    },
+    Eof,
+}
+
+/// Read one `\n`-terminated line from `reader`, holding at most `max(cap, ID_WINDOW)` bytes of it.
+/// The cap is the global one, or a tighter one once the line's `id` (found in its first
+/// [`ID_WINDOW`] bytes) names a capped request. `peak` reports the most bytes held at once.
+pub(crate) async fn read_capped<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    caps: &MessageCaps,
+    global: usize,
+    peak: &mut usize,
+) -> std::io::Result<Inbound> {
+    use tokio::io::AsyncBufReadExt;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut cap = global;
+    let mut id_checked = false;
+    let mut discarding: Option<(Vec<u8>, Vec<u8>)> = None; // (head, rolling tail)
+    loop {
+        let avail = reader.fill_buf().await?;
+        if avail.is_empty() {
+            return Ok(match discarding {
+                Some((head, tail)) => {
+                    let id = find_id(&head, &tail);
+                    caps.take(id.as_deref());
+                    Inbound::Refused { id, cap }
+                }
+                None if buf.is_empty() => Inbound::Eof,
+                None => Inbound::Line(buf),
+            });
+        }
+        let (chunk, done) = match avail.iter().position(|&b| b == b'\n') {
+            Some(i) => (&avail[..=i], true),
+            None => (avail, false),
+        };
+        let n = chunk.len();
+        match &mut discarding {
+            Some((_, tail)) => {
+                tail.extend_from_slice(chunk);
+                if tail.len() > ID_WINDOW {
+                    let cut = tail.len() - ID_WINDOW;
+                    tail.drain(..cut);
+                }
+            }
+            None => {
+                buf.extend_from_slice(chunk);
+                if !id_checked && (buf.len() >= ID_WINDOW || done) {
+                    id_checked = true;
+                    if let Some(id) = find_id(&buf[..buf.len().min(ID_WINDOW)], &[])
+                        && let Some(tight) = caps.peek(&id)
+                    {
+                        cap = cap.min(tight);
+                    }
+                }
+                if buf.len() > cap.max(ID_WINDOW) || (done && buf.len() > cap) {
+                    let head = buf[..buf.len().min(ID_WINDOW)].to_vec();
+                    let tail = buf[buf.len().saturating_sub(ID_WINDOW)..].to_vec();
+                    buf = Vec::new();
+                    discarding = Some((head, tail));
+                }
+            }
+        }
+        *peak = (*peak).max(buf.len());
+        reader.consume(n);
+        if done {
+            return Ok(match discarding {
+                Some((head, tail)) => {
+                    let id = find_id(&head, &tail);
+                    caps.take(id.as_deref());
+                    Inbound::Refused { id, cap }
+                }
+                None => {
+                    if let Some(id) = find_id(&buf[..buf.len().min(ID_WINDOW)], &[]) {
+                        caps.take(Some(&id));
+                    }
+                    Inbound::Line(buf)
+                }
+            });
+        }
+    }
+}
+
 /// The transport's write half: writes go to the server's stdin while it is open. Dropping it (rmcp
 /// dropped the transport) retires the server.
 struct StdinGuard {
     server: std::sync::Arc<ServerProcess>,
+    caps: std::sync::Arc<MessageCaps>,
 }
 
 impl Drop for StdinGuard {
@@ -232,10 +415,14 @@ impl tokio::io::AsyncWrite for StdinGuard {
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
-        match lock(&self.server.stdin).as_mut() {
+        let written = match lock(&self.server.stdin).as_mut() {
             Some(stdin) => std::pin::Pin::new(stdin).poll_write(cx, buf),
             None => std::task::Poll::Ready(Err(closed())),
+        };
+        if let std::task::Poll::Ready(Ok(n)) = &written {
+            self.caps.wrote(&buf[..*n]);
         }
+        written
     }
 
     fn poll_flush(
@@ -271,7 +458,7 @@ pub(crate) fn stdio_transport(
     std::sync::Arc<ServerProcess>,
     (tokio::io::DuplexStream, impl tokio::io::AsyncWrite),
 )> {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
     cmd.stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit())
@@ -298,15 +485,28 @@ pub(crate) fn stdio_transport(
         live.push(std::sync::Arc::downgrade(&server));
     }
     let (rmcp_side, mut pump_side) = tokio::io::duplex(64 * 1024);
+    let caps = std::sync::Arc::new(MessageCaps::default());
+    let pump_caps = caps.clone();
     tokio::spawn(async move {
         let mut reader = tokio::io::BufReader::new(stdout);
-        let mut line = Vec::new();
+        let global = max_message_bytes();
+        let mut peak = 0;
         loop {
-            line.clear();
-            match reader.read_until(b'\n', &mut line).await {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {}
-            }
+            let line = match read_capped(&mut reader, &pump_caps, global, &mut peak).await {
+                Ok(Inbound::Line(line)) => line,
+                Ok(Inbound::Refused { id, cap }) => {
+                    tracing::warn!(?id, cap, "refused an MCP server message over its size cap");
+                    let Some(id) = id else { continue };
+                    let error = format!(
+                        "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"error\":{{\"code\":-32000,\"message\":\"MCP message over {cap} bytes refused by the host\"}}}}\n"
+                    );
+                    if pump_side.write_all(error.as_bytes()).await.is_err() {
+                        break;
+                    }
+                    continue;
+                }
+                Ok(Inbound::Eof) | Err(_) => break,
+            };
             if std::str::from_utf8(&line).is_err() {
                 tracing::debug!("skipping a non-UTF-8 line from an MCP server's stdout");
                 continue;
@@ -322,6 +522,7 @@ pub(crate) fn stdio_transport(
     });
     let guard = StdinGuard {
         server: server.clone(),
+        caps,
     };
     Ok((server, (rmcp_side, guard)))
 }
@@ -330,6 +531,125 @@ pub(crate) fn stdio_transport(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    /// A reader that hands out at most `step` bytes per read, like a pipe would.
+    struct Trickle {
+        data: Vec<u8>,
+        at: usize,
+        step: usize,
+    }
+
+    impl tokio::io::AsyncRead for Trickle {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let n = self
+                .step
+                .min(self.data.len() - self.at)
+                .min(buf.remaining());
+            let at = self.at;
+            buf.put_slice(&self.data[at..at + n]);
+            self.at += n;
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    fn reader(lines: &[String]) -> tokio::io::BufReader<Trickle> {
+        let data = lines
+            .iter()
+            .map(|l| format!("{l}\n"))
+            .collect::<String>()
+            .into_bytes();
+        tokio::io::BufReader::with_capacity(
+            8192,
+            Trickle {
+                data,
+                at: 0,
+                step: 8192,
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn an_oversized_view_response_is_refused_while_holding_no_more_than_its_cap() {
+        let caps = MessageCaps::default();
+        caps.wrote(
+            json!({"jsonrpc":"2.0","id":7,"method":"resources/read","params":{"uri":"ui://x/v"}})
+                .to_string()
+                .as_bytes(),
+        );
+        caps.wrote(b"\n");
+        let view_cap = crate::tools::mcp_apps::MAX_VIEW_BYTES;
+        // id first (as serde_json, rmcp and the Python SDK write it), then a 20 MiB view.
+        let huge = format!(
+            "{{\"id\":7,\"jsonrpc\":\"2.0\",\"result\":{{\"contents\":[{{\"text\":\"{}\"}}]}}}}",
+            "x".repeat(20 * 1024 * 1024)
+        );
+        let ok = json!({"jsonrpc":"2.0","id":8,"result":{"tools":[]}}).to_string();
+        let mut r = reader(&[huge, ok.clone()]);
+        let mut peak = 0;
+        let got = read_capped(&mut r, &caps, DEFAULT_MAX_MESSAGE_BYTES, &mut peak)
+            .await
+            .unwrap();
+        assert_eq!(
+            got,
+            Inbound::Refused {
+                id: Some("7".into()),
+                cap: view_cap
+            }
+        );
+        assert!(
+            peak <= view_cap + 8192,
+            "held {peak} bytes of a refused view"
+        );
+        // The stream stays in sync: the next message reads normally.
+        let next = read_capped(&mut r, &caps, DEFAULT_MAX_MESSAGE_BYTES, &mut peak)
+            .await
+            .unwrap();
+        assert!(
+            next == Inbound::Line(format!("{ok}\n").into_bytes()),
+            "{next:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_message_over_the_global_cap_is_refused_and_its_trailing_id_still_found() {
+        let caps = MessageCaps::default();
+        // id last (as some serializers write it): found in the tail.
+        let big = format!(
+            "{{\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"{}\"}}]}},\"jsonrpc\":\"2.0\",\"id\":\"abc\"}}",
+            "y".repeat(300_000)
+        );
+        let mut r = reader(&[big]);
+        let mut peak = 0;
+        let got = read_capped(&mut r, &caps, 100_000, &mut peak)
+            .await
+            .unwrap();
+        assert_eq!(
+            got,
+            Inbound::Refused {
+                id: Some("\"abc\"".into()),
+                cap: 100_000
+            }
+        );
+        assert!(peak <= 100_000 + 8192, "held {peak}");
+        // A plain response under the cap passes untouched, and an untracked large one is not
+        // held to the view cap.
+        let fine = format!(
+            "{{\"id\":1,\"result\":{{\"x\":\"{}\"}}}}",
+            "z".repeat(6 * 1024 * 1024)
+        );
+        let mut r = reader(std::slice::from_ref(&fine));
+        let got = read_capped(&mut r, &caps, DEFAULT_MAX_MESSAGE_BYTES, &mut peak)
+            .await
+            .unwrap();
+        assert!(
+            matches!(&got, Inbound::Line(l) if l.len() == fine.len() + 1),
+            "an untracked 6 MiB message must pass whole"
+        );
+    }
 
     #[test]
     fn rescue_keeps_a_meta_carrying_custom_result_and_leaves_typed_results_alone() {
