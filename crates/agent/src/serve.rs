@@ -2013,6 +2013,14 @@ impl Persistence {
             .unwrap_or(&[])
     }
 
+    /// Custom entries of `kind` on the active path; empty without persistence.
+    fn active_custom(&self, kind: &str) -> Vec<Value> {
+        self.store
+            .as_ref()
+            .map(|store| store.active_custom(kind))
+            .unwrap_or_default()
+    }
+
     /// Every user-turn message anywhere in the session's tree — every branch, not just the active path
     /// — as `(id, Message)` pairs (empty unless persistence is configured). What `get_fork_messages`
     /// surfaces, matching pi's own whole-tree `getUserMessagesForForking` rather than only the active
@@ -2740,15 +2748,13 @@ pub(crate) async fn serve_session(
     // enabled — matching prior behavior — and is cleared on session switch so tenants cannot inherit
     // each other's enablement the way they must not inherit each other's exec endpoint.
     let mcp_enabled = crate::tools::mcp::McpEnabledSet::new();
-    // Where this session's MCP servers send their *questions* (elicitation, sampling). In service
-    // mode the connectors below are dialed by this session alone, so the hub they consult is this
-    // session's own and a server's question reaches the session that asked it. Outside service mode
-    // the servers were connected once at startup and are shared by every session, so there is no
-    // one session to route to: those keep consulting the process-wide hub.
-    let mcp_host = match &service {
-        Some(_) => Arc::new(crate::tools::mcp_host::McpHost::new()),
-        None => crate::tools::mcp::host(),
-    };
+    // Where this session's MCP calls send their *questions* (elicitation, sampling). Always this
+    // session's own hub. In service mode the connectors below are dialed by this session alone and
+    // consult it directly; the operator's servers, connected once and shared by every session of a
+    // daemon, find it through the task-local the session's runs are scoped in
+    // (`tools::mcp::with_session_host`), so a server's question reaches the session whose call
+    // raised it rather than whichever session installed a gate last.
+    let mcp_host = Arc::new(crate::tools::mcp_host::McpHost::new());
     // This session's own MCP connectors, named and credentialed by its grant, dialed now — not at
     // process startup, which is where the *operator's* configured servers would have come from.
     // Fail-soft per connector (a dead server costs its own tools, not the session), and the
@@ -2763,6 +2769,9 @@ pub(crate) async fn serve_session(
         cfg.mcp_catalog = catalog;
         timing.mark("connect session MCP connectors");
     }
+    // This session's view of the shared catalog: its non-tool MCP requests are registered under
+    // its own host (see `McpCatalog::for_session`).
+    cfg.mcp_catalog = cfg.mcp_catalog.for_session(mcp_host.clone());
     // MCP Events (draft extension): only when a server is connected at all, and never in service
     // mode — a grant connector has no `events` configuration, and the `mcp_events_*` commands are
     // refused there outright (`service::refused_command`). The hub interposes on `input_rx` so an
@@ -3049,6 +3058,12 @@ pub(crate) async fn serve_session(
         persistence.session_id(),
     );
     mcp_host.elicitation.install(elicit_gate);
+    let (sampling_gate, pending_samplings) = ServeSamplingGate::new(
+        out_conn.clone(),
+        cfg.approval_timeout,
+        persistence.session_id(),
+    );
+    mcp_host.sampling.install(sampling_gate);
 
     // `structured_output` is installed per-`prompt` (see that arm's `output_schema` handling), not at
     // startup: one session can answer one request in prose and the next as typed JSON. The `OutputSlot`
@@ -3269,6 +3284,23 @@ pub(crate) async fn serve_session(
         mpsc::unbounded_channel::<Arc<Vec<agent_core::Message>>>();
     let checkpoint: Arc<dyn agent_core::CheckpointHook> =
         Arc::new(ChannelCheckpoint(checkpoint_tx));
+    // SEP-2663 journal writes, `(kind, data)` (see `crate::mcp_resume`): task records from the
+    // run's event sink and from the background resumer, results from the resumer. Drained by the
+    // idle loop, the busy loop and at run end; `data.sessionId` must match the session persisted to.
+    let (mcp_task_tx, mut mcp_task_rx) = mpsc::unbounded_channel::<(String, Value)>();
+    macro_rules! journal_mcp {
+        ($kind:expr, $data:expr) => {{
+            let data: Value = $data;
+            if data["sessionId"].as_str() == Some(persistence.session_id()) {
+                match persistence.append_custom($kind, data) {
+                    Err(e) if e.kind() != std::io::ErrorKind::Unsupported => {
+                        tracing::warn!(error = %e, "MCP task journal entry failed to persist");
+                    }
+                    _ => {}
+                }
+            }
+        }};
+    }
     // Resolved *here*, against `current_model` (the actual starting model, after the anti-bleed
     // session-restore check above may have overridden `cfg.model`) rather than earlier against
     // `cfg.model` directly — a credential/routing resolved for the wrong (pre-restore) model would
@@ -3367,6 +3399,41 @@ pub(crate) async fn serve_session(
             }
         })
     };
+
+    // MCP tasks a previous process left in flight resume now, in the background, not on the next
+    // prompt (see `crate::mcp_resume`). Restarted for a session switched to later.
+    macro_rules! start_mcp_resumer {
+        () => {{
+            let journal = persistence.active_custom(crate::mcp_resume::TASK_ENTRY_KIND);
+            let results = crate::mcp_resume::results(
+                &persistence.active_custom(crate::mcp_resume::RESULT_ENTRY_KIND),
+            );
+            let pending = crate::mcp_resume::pending(
+                &session.messages,
+                &journal,
+                &results,
+                persistence.session_id(),
+            );
+            if pending.is_empty() {
+                crate::mcp_resume::Resumer::idle(persistence.session_id())
+            } else {
+                let out = out_tx.clone();
+                crate::mcp_resume::Resumer::start(
+                    persistence.session_id(),
+                    pending,
+                    cfg.mcp_catalog.clone(),
+                    mcp_host.clone(),
+                    Arc::new(move |ev| {
+                        if let Some(frame) = event_frame(ev) {
+                            let _ = out.send(frame);
+                        }
+                    }),
+                    mcp_task_tx.clone(),
+                )
+            }
+        }};
+    }
+    let mut mcp_resumer = start_mcp_resumer!();
 
     // Sends a frame through the writer; if the writer has shut down (stdout closed), stop the control
     // loop — there is no way to deliver any further response, so continuing would only swallow output.
@@ -3984,6 +4051,13 @@ pub(crate) async fn serve_session(
         // very first snapshot, from the history `Persistence::open` restored off disk, so a client
         // attaching to a resumed session is caught up before it has issued a single command.
         sync_history!();
+        // A command just switched sessions (`switch_session`, `new_session`, `fork`, `clone`): the
+        // old session's resumer stops (it must not emit into this session's clients, and never
+        // cancels its tasks, which stay journaled) and the new session's pending tasks resume now,
+        // not on its first prompt.
+        if mcp_resumer.session_id() != persistence.session_id() {
+            mcp_resumer = start_mcp_resumer!();
+        }
         // Checked here because every write path — a run's persist, a mid-run checkpoint, a title, a
         // label, a compaction rewrite — comes back through this loop before the next command is read.
         // Another owner has created a newer epoch on this session's storage, so nothing this process
@@ -4032,6 +4106,11 @@ pub(crate) async fn serve_session(
                     Some(l) => l,
                     None => break,
                 },
+                // A resumed MCP task's progress record or result, landing while idle.
+                Some((kind, data)) = mcp_task_rx.recv() => {
+                    journal_mcp!(kind, data);
+                    continue;
+                }
             }
         };
         let line = line.trim();
@@ -4168,6 +4247,15 @@ pub(crate) async fn serve_session(
                 // Optional image attachments: `images: [{media_type, data}]` (base64). Builds a
                 // multimodal user turn; absent or empty → a plain text turn.
                 let images = parse_images(cmd.get("images"));
+                // MCP tasks a previous process left in flight are waited on and answered before this
+                // turn's model call (see `crate::mcp_resume`), by the first attempt only.
+                if mcp_resumer.session_id() != persistence.session_id() {
+                    mcp_resumer = start_mcp_resumer!();
+                }
+                let mut mcp_resume_first = true;
+                let mcp_journaled = crate::mcp_resume::results(
+                    &persistence.active_custom(crate::mcp_resume::RESULT_ENTRY_KIND),
+                );
                 if images.is_empty() {
                     session.user(message);
                 } else {
@@ -4307,6 +4395,8 @@ pub(crate) async fn serve_session(
                     // `cancel.cancel()` is called).
                     let mut pending_abort_acks: Vec<Option<String>> = Vec::new();
                     let tx = out_tx.clone();
+                    let mcp_task_journal = mcp_task_tx.clone();
+                    let mcp_journal_session = persistence.session_id().to_owned();
                     let tokens_before_sink = tokens_before.clone();
                     let refused_sink = refused.clone();
                     let is_compacting_sink = is_compacting.clone();
@@ -4347,98 +4437,123 @@ pub(crate) async fn serve_session(
                     }
                     let life_obs = life.clone();
                     let attempt_result = {
-                        let run = agent.run_events_steered(
-                            &mut session,
-                            move |ev| {
-                                // Set on `CompactionStart`, cleared on literally anything else — see
-                                // `is_compacting`'s own declaration above for why that's exact, not a
-                                // conservative approximation.
-                                is_compacting_sink.store(
-                                    matches!(ev, AgentEvent::CompactionStart { .. }),
-                                    Ordering::Relaxed,
-                                );
-                                if let AgentEvent::Compacted { tokens_before, .. } = ev {
-                                    tokens_before_sink.store(tokens_before, Ordering::Relaxed);
-                                    // The context just dropped — re-arm the pressure nudge for the next
-                                    // fill cycle.
-                                    pressure_armed_sink.store(true, Ordering::Relaxed);
-                                    // Actively nudge the model to read back its `/session` working memory
-                                    // now that the raw transcript is a lossy summary. Rides the next
-                                    // post-compaction request as a mid-run steer. Once per compaction (the
-                                    // event fires once); skipped when no session mount is active.
-                                    if session_memory_active {
-                                        steer_on_compact.push_steer(
-                                            agent_core::SteeringMessage::new(
-                                                crate::memory::COMPACTION_REMINDER.to_string(),
-                                                Vec::new(),
-                                            ),
-                                        );
-                                    }
+                        let mut sink = move |ev: AgentEvent| {
+                            // Set on `CompactionStart`, cleared on literally anything else — see
+                            // `is_compacting`'s own declaration above for why that's exact, not a
+                            // conservative approximation.
+                            is_compacting_sink.store(
+                                matches!(ev, AgentEvent::CompactionStart { .. }),
+                                Ordering::Relaxed,
+                            );
+                            if let AgentEvent::Compacted { tokens_before, .. } = ev {
+                                tokens_before_sink.store(tokens_before, Ordering::Relaxed);
+                                // The context just dropped — re-arm the pressure nudge for the next
+                                // fill cycle.
+                                pressure_armed_sink.store(true, Ordering::Relaxed);
+                                // Actively nudge the model to read back its `/session` working memory
+                                // now that the raw transcript is a lossy summary. Rides the next
+                                // post-compaction request as a mid-run steer. Once per compaction (the
+                                // event fires once); skipped when no session mount is active.
+                                if session_memory_active {
+                                    steer_on_compact.push_steer(agent_core::SteeringMessage::new(
+                                        crate::memory::COMPACTION_REMINDER.to_string(),
+                                        Vec::new(),
+                                    ));
                                 }
-                                if let AgentEvent::TurnEnd { stop_reason, step } = &ev {
-                                    refused_sink.store(
-                                        *stop_reason == StopReason::Refusal,
-                                        Ordering::Relaxed,
-                                    );
-                                    live_stats_sink.set_steps(*step);
-                                }
-                                if let AgentEvent::Stream(StreamEvent::Usage(usage)) = &ev {
-                                    live_stats_sink.record_usage(usage);
-                                    // Pre-compaction pressure: the first time this fill cycle's live prompt
-                                    // crosses the pressure point, warn the model to checkpoint to
-                                    // `/session` while it still has full detail — before the cut, not after
-                                    // (that's `COMPACTION_REMINDER`'s job). `swap` only runs when actually
-                                    // over the point, so below it the flag stays armed; disarmed on fire,
-                                    // re-armed on `Compacted`. Skipped without a session mount (nowhere to
-                                    // checkpoint).
-                                    if session_memory_active
-                                        && crate::memory::live_prompt_tokens(usage) > pressure_point
-                                        && pressure_armed_sink.swap(false, Ordering::Relaxed)
-                                    {
-                                        steer_on_compact.push_steer(
-                                            agent_core::SteeringMessage::new(
-                                                crate::memory::PRESSURE_NUDGE.to_string(),
-                                                Vec::new(),
-                                            ),
-                                        );
-                                    }
-                                }
-                                // B-L1: mirrors the same events into `pending_tool_ids`, so `get_state`
-                                // can answer "which calls are still running" mid-turn — see that
-                                // field's own doc comment.
-                                if let AgentEvent::ToolStart { id, .. } = &ev {
-                                    live_stats_sink.tool_started(id.clone());
-                                }
-                                if let AgentEvent::ToolEnd { id, .. } = &ev {
-                                    live_stats_sink.tool_ended(id);
-                                }
-                                // Same mirroring, for the `todo` list — see `LiveStats::todos`. The tool
-                                // validates before it emits, so a rejected call never lands here and the
-                                // mirror only ever holds a list the model actually committed.
-                                if let AgentEvent::ToolProgress {
-                                    name,
-                                    details: Some(d),
-                                    ..
-                                } = &ev
-                                    && name == crate::tools::todo::NAME
-                                    && let Some(todos) = d.get("todos")
+                            }
+                            if let AgentEvent::TurnEnd { stop_reason, step } = &ev {
+                                refused_sink
+                                    .store(*stop_reason == StopReason::Refusal, Ordering::Relaxed);
+                                live_stats_sink.set_steps(*step);
+                            }
+                            if let AgentEvent::Stream(StreamEvent::Usage(usage)) = &ev {
+                                live_stats_sink.record_usage(usage);
+                                // Pre-compaction pressure: the first time this fill cycle's live prompt
+                                // crosses the pressure point, warn the model to checkpoint to
+                                // `/session` while it still has full detail — before the cut, not after
+                                // (that's `COMPACTION_REMINDER`'s job). `swap` only runs when actually
+                                // over the point, so below it the flag stays armed; disarmed on fire,
+                                // re-armed on `Compacted`. Skipped without a session mount (nowhere to
+                                // checkpoint).
+                                if session_memory_active
+                                    && crate::memory::live_prompt_tokens(usage) > pressure_point
+                                    && pressure_armed_sink.swap(false, Ordering::Relaxed)
                                 {
-                                    live_stats_sink.todos_updated(todos.clone());
+                                    steer_on_compact.push_steer(agent_core::SteeringMessage::new(
+                                        crate::memory::PRESSURE_NUDGE.to_string(),
+                                        Vec::new(),
+                                    ));
                                 }
-                                // Best-effort: a sync sink can't break the control loop. If the writer is
-                                // gone the send fails here and the terminal response send below detects it
-                                // via `emit!` and stops the loop. An unserializable event is skipped rather
-                                // than emitted as a malformed frame (see `event_frame`).
-                                if let Some(life) = &life_obs {
-                                    life.observe(&ev);
-                                }
-                                if let Some(frame) = event_frame(ev) {
-                                    let _ = tx.send(frame);
-                                }
-                            },
-                            cancel.clone(),
-                            steering.clone(),
-                        );
+                            }
+                            // B-L1: mirrors the same events into `pending_tool_ids`, so `get_state`
+                            // can answer "which calls are still running" mid-turn — see that
+                            // field's own doc comment.
+                            if let AgentEvent::ToolStart { id, .. } = &ev {
+                                live_stats_sink.tool_started(id.clone());
+                            }
+                            if let AgentEvent::ToolEnd { id, .. } = &ev {
+                                live_stats_sink.tool_ended(id);
+                            }
+                            // Same mirroring, for the `todo` list — see `LiveStats::todos`. The tool
+                            // validates before it emits, so a rejected call never lands here and the
+                            // mirror only ever holds a list the model actually committed.
+                            if let AgentEvent::ToolProgress {
+                                name,
+                                details: Some(d),
+                                ..
+                            } = &ev
+                                && name == crate::tools::todo::NAME
+                                && let Some(todos) = d.get("todos")
+                            {
+                                live_stats_sink.todos_updated(todos.clone());
+                            }
+                            // Best-effort: a sync sink can't break the control loop. If the writer is
+                            // gone the send fails here and the terminal response send below detects it
+                            // via `emit!` and stops the loop. An unserializable event is skipped rather
+                            // than emitted as a malformed frame (see `event_frame`).
+                            if let AgentEvent::ToolProgress {
+                                id,
+                                details: Some(d),
+                                ..
+                            } = &ev
+                                && let Some(record) = d.get(crate::tools::mcp::MCP_TASK_DETAILS_KEY)
+                            {
+                                let _ = mcp_task_journal.send((
+                                    crate::mcp_resume::TASK_ENTRY_KIND.to_owned(),
+                                    crate::mcp_resume::task_entry(record, id, &mcp_journal_session),
+                                ));
+                            }
+                            if let Some(life) = &life_obs {
+                                life.observe(&ev);
+                            }
+                            if let Some(frame) = event_frame(ev) {
+                                let _ = tx.send(frame);
+                            }
+                        };
+                        let resume_first = std::mem::take(&mut mcp_resume_first);
+                        let resumer = &mcp_resumer;
+                        let journaled = &mcp_journaled;
+                        let run_cancel = cancel.clone();
+                        let run = crate::tools::mcp::with_session_host(mcp_host.clone(), async {
+                            if resume_first {
+                                crate::mcp_resume::resume_into_turn(
+                                    &mut session,
+                                    resumer,
+                                    journaled,
+                                    &mut sink,
+                                    &run_cancel,
+                                )
+                                .await;
+                            }
+                            agent
+                                .run_events_steered(
+                                    &mut session,
+                                    &mut sink,
+                                    run_cancel.clone(),
+                                    steering.clone(),
+                                )
+                                .await
+                        });
                         tokio::pin!(run);
                         // No timer when unconfigured or `--lifecycle-heartbeat-secs 0`. Tool-edge
                         // samples still fire from `observe` above.
@@ -4490,6 +4605,11 @@ pub(crate) async fn serve_session(
                                     if let Err(e) = r {
                                         tracing::warn!(error = %e, "mid-run checkpoint failed to persist");
                                     }
+                                }
+                                // After the checkpoint arm (`biased`), so the assistant's `tool_use` is on
+                                // disk before the task record that answers it.
+                                Some((kind, data)) = mcp_task_rx.recv() => {
+                                    journal_mcp!(kind, data);
                                 }
                                 maybe_line = input_rx.recv(), if stdin_open => match maybe_line {
                                     Some(l) => {
@@ -4781,6 +4901,9 @@ pub(crate) async fn serve_session(
                                             "elicit" => {
                                                 let _ = out_tx.send(handle_elicit(cid, &c, Some(&pending_elicitations)));
                                             }
+                                            "sample" => {
+                                                let _ = out_tx.send(handle_sample(cid, &c, &pending_samplings));
+                                            }
                                             "get_tree" => {
                                                 // Same `since` handling as the idle-loop arm below — see
                                                 // `nodes_since`'s own doc comment (Task #48, pi-parity gap).
@@ -4920,6 +5043,12 @@ pub(crate) async fn serve_session(
                     // turn's own final state, and this must run *before* any later command gets a chance
                     // to swap `persistence` out from under it.
                     while checkpoint_rx.try_recv().is_ok() {}
+                    // MCP journal writes still queued belong to *this* session: persist them now,
+                    // before a deferred command can swap `persistence` (they would be dropped by the
+                    // session-id check, but this session would lose them).
+                    while let Ok((kind, data)) = mcp_task_rx.try_recv() {
+                        journal_mcp!(kind, data);
+                    }
 
                     // Whether this attempt is about to be retried. Decided *here*, before the persist
                     // below, and reused verbatim as the retry arm's own guard — the two must not be
@@ -5618,6 +5747,9 @@ pub(crate) async fn serve_session(
             }
             "elicit" => {
                 emit!(handle_elicit(id, &cmd, Some(&pending_elicitations)));
+            }
+            "sample" => {
+                emit!(handle_sample(id, &cmd, &pending_samplings));
             }
             "get_state" => {
                 let mut data = session_stats(&session, &current_model);
@@ -7782,6 +7914,10 @@ pub(crate) async fn serve_session(
     if let Some(p) = lock_ignoring_poison(&pending_login).take() {
         p.cancel.cancel();
     }
+    // The same hazard: a resumed MCP task still polling holds an `out_tx` clone for its progress.
+    // Dropping the resumer aborts its tasks (never cancelling the MCP tasks themselves, which stay
+    // journaled for the next start), so the writer can end.
+    drop(mcp_resumer);
     drop(out_tx);
     let _ = writer.await;
     Ok(shutdown_cause)
@@ -9724,6 +9860,204 @@ fn handle_elicit(
         None,
     )
 }
+
+/// MCP sampling answered by the attached host (see [`serve_sampling::ServeSamplingGate`]).
+mod serve_sampling {
+    #![expect(deprecated)] // Sampling: SEP-2577-deprecated but still on the wire.
+    use super::*;
+
+    /// Outstanding `sampling_request`s: request id → where the host's `sample` answer goes.
+    pub(super) type PendingSamplings = Arc<
+        std::sync::Mutex<
+            HashMap<
+                String,
+                tokio::sync::oneshot::Sender<Result<rmcp::model::CreateMessageResult, String>>,
+            >,
+        >,
+    >;
+
+    /// Removes a request's slot however its wait ends, including the gate's future being dropped
+    /// (an aborted call), so an abandoned request never lingers in `pending`.
+    struct PendingSlot {
+        pending: PendingSamplings,
+        id: String,
+    }
+
+    impl Drop for PendingSlot {
+        fn drop(&mut self) {
+            lock_ignoring_poison(&self.pending).remove(&self.id);
+        }
+    }
+
+    /// `serve`'s MCP sampling gate: the same ask-the-host shape as [`ServeElicitationGate`]. A
+    /// server's `sampling/createMessage` (nested, MRTR, or an in-task `inputRequests` entry, which
+    /// the spec says must be treated exactly like the standalone request) becomes a
+    /// `sampling_request` frame naming the asking `server`, and the host answers with a `sample`
+    /// command carrying the `CreateMessageResult`, or declines. Every attached view then sees a
+    /// `sampling_resolved` frame, so a second client stops offering an answer. The host decides
+    /// what runs the completion; the agent never spends model tokens on a server's behalf unasked.
+    /// No attached client, a decline, or the timeout refuses the request.
+    pub(super) struct ServeSamplingGate {
+        out: std::sync::Weak<std::sync::Mutex<OutFanout>>,
+        pending: PendingSamplings,
+        timeout: Option<std::time::Duration>,
+        seq: AtomicU64,
+        session_id: String,
+    }
+
+    impl ServeSamplingGate {
+        pub(super) fn new(
+            out: SharedOutConn,
+            timeout: Option<std::time::Duration>,
+            session_id: impl Into<String>,
+        ) -> (Arc<Self>, PendingSamplings) {
+            let pending: PendingSamplings = Arc::new(std::sync::Mutex::new(HashMap::new()));
+            let gate = Arc::new(Self {
+                out: Arc::downgrade(&out),
+                pending: pending.clone(),
+                timeout,
+                seq: AtomicU64::new(0),
+                session_id: session_id.into(),
+            });
+            (gate, pending)
+        }
+
+        fn broadcast(&self, frame: Value) {
+            if let Some(out) = self.out.upgrade() {
+                lock_ignoring_poison(&out).broadcast(frame.into());
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::tools::mcp_host::SamplingGate for ServeSamplingGate {
+        async fn create_message(
+            &self,
+            server: &str,
+            params: rmcp::model::CreateMessageRequestParams,
+        ) -> Result<rmcp::model::CreateMessageResult, rmcp::ErrorData> {
+            let refuse =
+                |why: &str| rmcp::ErrorData::new(rmcp::model::ErrorCode(-1), why.to_owned(), None);
+            let attached = self
+                .out
+                .upgrade()
+                .is_some_and(|out| !lock_ignoring_poison(&out).is_empty());
+            if !attached {
+                return Err(refuse("no client attached to answer sampling"));
+            }
+            let request_id = format!(
+                "sample:{}:{}",
+                self.session_id,
+                self.seq.fetch_add(1, Ordering::Relaxed)
+            );
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            lock_ignoring_poison(&self.pending).insert(request_id.clone(), tx);
+            let _slot = PendingSlot {
+                pending: self.pending.clone(),
+                id: request_id.clone(),
+            };
+            self.broadcast(json!({
+                "type": "sampling_request",
+                "request_id": request_id,
+                "server": server,
+                "params": params,
+            }));
+            let wait = self.timeout.or(Some(std::time::Duration::from_secs(120)));
+            let outcome = tokio::select! {
+                biased;
+                answer = rx => answer.unwrap_or_else(|_| Err("cancelled".to_owned())),
+                _ = sleep_opt(wait) => Err("timed out".to_owned()),
+            };
+            let mut resolved = json!({ "type": "sampling_resolved", "request_id": request_id });
+            match &outcome {
+                Ok(_) => resolved["action"] = json!("accept"),
+                Err(why) => {
+                    resolved["action"] = json!("decline");
+                    resolved["reason"] = json!(why);
+                }
+            }
+            self.broadcast(resolved);
+            outcome.map_err(|why| refuse(&format!("sampling request refused: {why}")))
+        }
+    }
+
+    /// `{type:"sample", request_id, result}` answers a `sampling_request` with a
+    /// `CreateMessageResult`; `{type:"sample", request_id, action:"decline"}` refuses it.
+    pub(super) fn handle_sample(
+        id: Option<String>,
+        cmd: &Value,
+        pending: &PendingSamplings,
+    ) -> OutFrame {
+        let Some(request_id) = cmd.get("request_id").and_then(Value::as_str) else {
+            return response(id, "sample", false, None, Some("missing `request_id`"));
+        };
+        let answer = match (cmd.get("result"), cmd.get("action").and_then(Value::as_str)) {
+            (Some(result), _) => match serde_json::from_value(result.clone()) {
+                Ok(result) => Ok(result),
+                Err(e) => {
+                    let why = format!("invalid `result` (CreateMessageResult): {e}");
+                    return response(id, "sample", false, None, Some(&why));
+                }
+            },
+            (None, Some("decline")) => Err("declined by the host".to_owned()),
+            _ => {
+                let why = "`sample` needs a `result` or `action: \"decline\"`";
+                return response(id, "sample", false, None, Some(why));
+            }
+        };
+        let accepted = lock_ignoring_poison(pending)
+            .remove(request_id)
+            .and_then(|tx| tx.send(answer).ok())
+            .is_some();
+        response(
+            id,
+            "sample",
+            true,
+            Some(json!({ "accepted": accepted })),
+            None,
+        )
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::tools::mcp_host::SamplingGate;
+
+        /// F7: a sampling request whose call is abandoned (the gate's future dropped mid-wait)
+        /// must not leave its slot behind in `pending`.
+        #[tokio::test]
+        async fn an_abandoned_sampling_request_leaves_no_pending_slot() {
+            let out: SharedOutConn = Arc::new(std::sync::Mutex::new(OutFanout::default()));
+            let (tx, _rx) = mpsc::unbounded_channel();
+            lock_ignoring_poison(&out).add(OutSink::Unbounded(tx));
+            let (gate, pending) = ServeSamplingGate::new(out.clone(), None, "session-under-test");
+            let params: rmcp::model::CreateMessageRequestParams = serde_json::from_value(json!({
+                "messages": [{ "role": "user", "content": { "type": "text", "text": "hi" } }],
+                "maxTokens": 8,
+            }))
+            .unwrap();
+            let mut ask = Box::pin(gate.create_message("srv", params));
+            // Poll until the request is outstanding, then abandon it.
+            for _ in 0..10 {
+                if !lock_ignoring_poison(&pending).is_empty() {
+                    break;
+                }
+                let _ = futures::poll!(ask.as_mut());
+            }
+            assert_eq!(
+                lock_ignoring_poison(&pending).len(),
+                1,
+                "the request is outstanding"
+            );
+            drop(ask);
+            assert!(
+                lock_ignoring_poison(&pending).is_empty(),
+                "an abandoned request must free its slot"
+            );
+        }
+    }
+}
+use serve_sampling::{ServeSamplingGate, handle_sample};
 
 /// Parse an inbound `approve` command's `decision`/`scope` fields.
 fn parse_approval_decision(cmd: &Value) -> Result<ApprovalDecision, String> {

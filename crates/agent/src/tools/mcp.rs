@@ -52,9 +52,10 @@
 //! out of scope.
 //!
 //! **Tasks (SEP-2663).** Client advertises `io.modelcontextprotocol/tasks`. When `tools/call` returns
-//! `resultType: "task"`, we poll `tasks/get` (honoring `pollIntervalMs`), fulfill in-task
-//! `inputRequests` via `tasks/update`, surface `statusMessage` as [`ToolProgress`], and best-effort
-//! `tasks/cancel` if the tool future is dropped mid-poll.
+//! `resultType: "task"`, we poll `tasks/get` (honoring the latest `pollIntervalMs`, bounded only by
+//! the task's `ttlMs`), fulfill in-task `inputRequests` via `tasks/update` (each key once), surface
+//! `statusMessage` as [`ToolProgress`], and best-effort `tasks/cancel` if the tool future is dropped
+//! mid-poll or the TTL elapses.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -63,17 +64,19 @@ use std::time::{Duration, Instant};
 use agent_core::{ImageSource, Tool, ToolError, ToolOutput, ToolProgress};
 use async_trait::async_trait;
 use http::{HeaderName, HeaderValue};
+use rmcp::ServiceError;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, CallToolResult, CancelTaskParams, ClientCapabilities,
-    ClientInfo, ContentBlock, CreateMessageRequestParams, CreateMessageResult, CreateTaskResult,
-    DEFAULT_MRTR_MAX_ROUNDS, ElicitRequestParams, ElicitResult, GetPromptRequestParams,
-    GetTaskParams, Implementation, InputRequest, InputRequests, InputResponses, ListRootsResult,
-    ProgressNotificationParam, ProgressToken, ProtocolVersion, ReadResourceRequestParams,
-    ResourceContents, TaskPayload, TaskStatus, UpdateTaskParams,
+    CallToolRequest, CallToolRequestParams, CallToolResponse, CallToolResult, CancelTaskParams,
+    CancelTaskRequest, ClientCapabilities, ClientInfo, ClientRequest, ContentBlock,
+    CreateMessageRequestParams, CreateMessageResult, DEFAULT_MRTR_MAX_ROUNDS, ElicitRequestParams,
+    ElicitResult, GetPromptRequestParams, GetTaskParams, Implementation, InputRequest,
+    InputRequests, InputResponses, ListRootsResult, ProgressNotificationParam, ProgressToken,
+    ProtocolVersion, ReadResourceRequestParams, RequestId, ResourceContents, ServerResult,
+    TaskPayload, TaskStatus, UpdateTaskParams, UpdateTaskRequest,
 };
 use rmcp::service::{
-    ClientLifecycleMode, ClientServiceExt, NotificationContext, Peer, RequestContext,
-    RunningService,
+    ClientLifecycleMode, ClientServiceExt, InboundStreamOrigin, NotificationContext, Peer,
+    PeerRequestOptions, RequestContext, RunningService,
 };
 use rmcp::transport::ConfigureCommandExt;
 use rmcp::transport::streamable_http_client::{
@@ -214,6 +217,17 @@ struct McpHandler {
     /// Where this connection's `notifications/events/*` go (MCP Events draft — see
     /// [`crate::tools::mcp_events`]). Empty, and so free, unless a push stream is open.
     events: crate::tools::mcp_events::NotificationRouter,
+    /// The calls in flight on this connection, each with the host of the session that made it.
+    /// See [`Self::route`].
+    calls: Arc<std::sync::Mutex<Vec<ActiveCall>>>,
+}
+
+/// One request in flight on a connection, and the session (host) it belongs to.
+struct ActiveCall {
+    key: u64,
+    /// The JSON-RPC id of the outbound request, once sent.
+    request: Option<RequestId>,
+    host: Arc<McpHost>,
 }
 
 impl McpHandler {
@@ -224,20 +238,83 @@ impl McpHandler {
             sinks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             active: Arc::new(std::sync::Mutex::new(Vec::new())),
             events: crate::tools::mcp_events::NotificationRouter::default(),
+            calls: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
-    /// Where a server→client elicitation goes: **this connection's** host, never a process-wide
-    /// one. Split out of the `ClientHandler` method so the routing is testable without standing up
-    /// an rmcp `RequestContext`.
-    async fn elicit(&self, params: ElicitRequestParams) -> ElicitResult {
-        self.host
+    /// Which session a nested server→client request (one the server sends while a call is in
+    /// flight) belongs to. Never a guess:
+    ///
+    /// - Over Streamable HTTP the request arrives on the SSE stream of the POST that raised it
+    ///   (`InboundStreamOrigin::OutboundRequest`), so it belongs to that call's session.
+    /// - Otherwise (stdio has no such correlation) it is attributable only if every call in flight
+    ///   on this connection belongs to one session.
+    /// - With no call in flight it goes to this connection's own host.
+    /// - With calls from more than one session in flight it is refused: delivered to a possibly
+    ///   wrong session, one user would answer another's server, or spend tokens for it.
+    fn route(&self, origin: Option<&InboundStreamOrigin>) -> Result<Arc<McpHost>, String> {
+        let calls = self
+            .calls
+            .lock()
+            .map_err(|_| "MCP call registry poisoned".to_owned())?;
+        if let Some(InboundStreamOrigin::OutboundRequest(id)) = origin
+            && let Some(call) = calls.iter().find(|c| c.request.as_ref() == Some(id))
+        {
+            return Ok(call.host.clone());
+        }
+        let mut hosts: Vec<&Arc<McpHost>> = Vec::new();
+        for call in calls.iter() {
+            if !hosts.iter().any(|h| Arc::ptr_eq(h, &call.host)) {
+                hosts.push(&call.host);
+            }
+        }
+        match hosts.as_slice() {
+            [] => Ok(self.host.clone()),
+            [only] => Ok(Arc::clone(only)),
+            _ => Err(format!(
+                "refused: calls from more than one session are in flight on MCP server `{}` and \
+                 this request carries nothing that says which one it belongs to",
+                self.server_name
+            )),
+        }
+    }
+
+    /// Register a call in flight for `host` until the returned guard drops; bind its request id
+    /// once sent (see [`ActiveCallGuard::bind`]).
+    fn track_call(&self, host: Arc<McpHost>) -> ActiveCallGuard {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let key = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Ok(mut calls) = self.calls.lock() {
+            calls.push(ActiveCall {
+                key,
+                request: None,
+                host,
+            });
+        }
+        ActiveCallGuard {
+            calls: self.calls.clone(),
+            key,
+        }
+    }
+
+    /// Where a server→client elicitation goes (see [`Self::route`]). Split out of the
+    /// `ClientHandler` method so the routing is testable without standing up an rmcp
+    /// `RequestContext`.
+    async fn elicit(
+        &self,
+        params: ElicitRequestParams,
+        origin: Option<&InboundStreamOrigin>,
+    ) -> Result<ElicitResult, McpError> {
+        let host = self
+            .route(origin)
+            .map_err(|why| McpError::invalid_request(format!("elicitation {why}"), None))?;
+        Ok(host
             .elicitation
             .elicit(ElicitationAsk {
                 server: self.server_name.clone(),
                 params,
             })
-            .await
+            .await)
     }
 
     fn push_active(&self, progress: ToolProgress) -> ActiveProgressGuard {
@@ -248,6 +325,50 @@ impl McpHandler {
             active: self.active.clone(),
         }
     }
+}
+
+/// Removes one call from its connection's registry when it ends.
+struct ActiveCallGuard {
+    calls: Arc<std::sync::Mutex<Vec<ActiveCall>>>,
+    key: u64,
+}
+
+impl ActiveCallGuard {
+    /// Record the call's outbound request id, so a nested request on its stream routes to it.
+    fn bind(&self, request: RequestId) {
+        if let Ok(mut calls) = self.calls.lock()
+            && let Some(call) = calls.iter_mut().find(|c| c.key == self.key)
+        {
+            call.request = Some(request);
+        }
+    }
+}
+
+impl Drop for ActiveCallGuard {
+    fn drop(&mut self) {
+        if let Ok(mut calls) = self.calls.lock() {
+            calls.retain(|c| c.key != self.key);
+        }
+    }
+}
+
+tokio::task_local! {
+    /// The MCP host of the session whose turn is running. `serve` scopes every run (and every
+    /// resumed task) in it, so a call answers its server's questions through the session that made
+    /// it, even on a connection every session shares.
+    static SESSION_HOST: Arc<McpHost>;
+}
+
+/// Run `fut` with `host` as the session host for every MCP call made inside it.
+pub async fn with_session_host<F: std::future::Future>(host: Arc<McpHost>, fut: F) -> F::Output {
+    SESSION_HOST.scope(host, fut).await
+}
+
+/// The host that answers a call's questions: the calling session's, else the connection's own.
+fn calling_host(connection_host: &Arc<McpHost>) -> Arc<McpHost> {
+    SESSION_HOST
+        .try_with(Arc::clone)
+        .unwrap_or_else(|_| connection_host.clone())
 }
 
 /// Pops the active progress sink pushed for one `call_tool` when the call ends.
@@ -295,17 +416,22 @@ impl ClientHandler for McpHandler {
     async fn create_elicitation(
         &self,
         request: ElicitRequestParams,
-        _context: RequestContext<RoleClient>,
+        context: RequestContext<RoleClient>,
     ) -> Result<ElicitResult, McpError> {
-        Ok(self.elicit(request).await)
+        self.elicit(request, context.extensions.get::<InboundStreamOrigin>())
+            .await
     }
 
     async fn create_message(
         &self,
         params: CreateMessageRequestParams,
-        _context: RequestContext<RoleClient>,
+        context: RequestContext<RoleClient>,
     ) -> Result<CreateMessageResult, McpError> {
-        self.host.sampling.create_message(params).await
+        self.route(context.extensions.get::<InboundStreamOrigin>())
+            .map_err(|why| McpError::invalid_request(format!("sampling {why}"), None))?
+            .sampling
+            .create_message(&self.server_name, params)
+            .await
     }
 
     async fn on_custom_notification(
@@ -690,6 +816,31 @@ impl McpConnection {
         Ok(client)
     }
 
+    /// Forget `stale` if it is still the cached client, so the next [`Self::client`] redials. A
+    /// client someone else already replaced is left alone: two calls noticing the same dead
+    /// connection must produce one redial, not drop each other's fresh client.
+    async fn invalidate(&self, stale: &Arc<McpClient>) {
+        let mut guard = self.client.lock().await;
+        if let Some(live) = guard.as_ref()
+            && Arc::ptr_eq(&live.client, stale)
+        {
+            let proc = live.proc.clone();
+            *guard = None;
+            if let Some(proc) = &proc {
+                crate::tools::mcp_stdio::retire(proc);
+            }
+        }
+    }
+
+    /// The cached client, if there is one, without dialing.
+    async fn live_client(&self) -> Option<Arc<McpClient>> {
+        self.client
+            .lock()
+            .await
+            .as_ref()
+            .map(|live| live.client.clone())
+    }
+
     /// Drop the process if it has been idle long enough. Returns whether it reaped.
     ///
     /// Never reaps while a call is in flight: an in-flight call holds an `Arc` clone of the client, so
@@ -791,9 +942,13 @@ impl McpTool {
             ))
         })?;
 
+        // The questions this call raises go to the session that made it (see [`calling_host`]).
+        let host = calling_host(&client.service().host);
         let _active = progress.map(|p| client.service().push_active(p.clone()));
         let result = drive_tool_call(
-            &client,
+            &self.conn,
+            client.clone(),
+            &host,
             &self.server_name,
             &self.remote_name,
             params,
@@ -817,22 +972,24 @@ fn tool_call_err(server: &str, remote: &str, e: impl std::fmt::Display) -> ToolE
 /// advertised we must use `call_tool_once` and poll ourselves. In-task elicitation/sampling/roots
 /// reuse the same host hubs as nested and MRTR input (rmcp's fulfill helpers are private).
 async fn drive_tool_call(
-    client: &McpClient,
+    conn: &Arc<McpConnection>,
+    client: Arc<McpClient>,
+    host: &McpHost,
     server_name: &str,
     remote_name: &str,
     mut params: CallToolRequestParams,
     progress: Option<&ToolProgress>,
 ) -> Result<CallToolResult, ToolError> {
     for _round in 0..DEFAULT_MRTR_MAX_ROUNDS {
-        match client
-            .call_tool_once(params.clone())
+        let host_arc = calling_host(&client.service().host);
+        match call_tool_tracked(&client, params.clone(), host_arc)
             .await
             .map_err(|e| tool_call_err(server_name, remote_name, e))?
         {
             CallToolResponse::Complete(result) => return Ok(result),
             CallToolResponse::InputRequired(required) => {
                 let responses = fulfill_input_requests(
-                    &client.service().host,
+                    host,
                     server_name,
                     required.input_requests.unwrap_or_default(),
                 )
@@ -841,7 +998,22 @@ async fn drive_tool_call(
                 params.request_state = required.request_state;
             }
             CallToolResponse::Task(create) => {
-                return await_task(client, server_name, remote_name, create, progress).await;
+                let task = &create.task;
+                let record = McpTaskRecord {
+                    server: server_name.to_owned(),
+                    tool: remote_name.to_owned(),
+                    task_id: task.task_id.clone(),
+                    created_at_ms: unix_ms(),
+                    ttl_ms: task.ttl_ms,
+                    answered: Vec::new(),
+                };
+                let seed = TaskSeed {
+                    poll_interval_ms: task.poll_interval_ms,
+                    status_message: task.status_message.clone(),
+                    cancel_on_drop: true,
+                    fresh: true,
+                };
+                return await_task(conn, client, host, record, seed, progress).await;
             }
             other => {
                 return Err(ToolError::Execution(format!(
@@ -855,8 +1027,76 @@ async fn drive_tool_call(
     )))
 }
 
-/// Fulfill SEP-2322 / in-task `inputRequests` through the hubs of the host that owns this
-/// connection — the session's own in service mode, the process-wide one otherwise.
+/// One `tools/call`, registered as in flight (with its request id) for exactly as long as the
+/// request is outstanding, so a nested request the server sends meanwhile can be attributed to the
+/// calling session (see [`McpHandler::route`]). Once the response (a result, an MRTR round, or a
+/// task handle) is back, nothing nested can belong to it any more.
+async fn call_tool_tracked(
+    client: &McpClient,
+    params: CallToolRequestParams,
+    host: Arc<McpHost>,
+) -> Result<CallToolResponse, ServiceError> {
+    let call = client.service().track_call(host);
+    let handle = client
+        .peer()
+        .send_request_with_option(
+            ClientRequest::CallToolRequest(CallToolRequest::new(params)),
+            PeerRequestOptions::no_options(),
+        )
+        .await?;
+    call.bind(handle.id.clone());
+    match handle.await_response().await? {
+        ServerResult::CallToolResult(result) => Ok(CallToolResponse::Complete(result)),
+        ServerResult::InputRequiredResult(result) => Ok(CallToolResponse::InputRequired(result)),
+        ServerResult::CreateTaskResult(result) => Ok(CallToolResponse::Task(result)),
+        _ => Err(ServiceError::UnexpectedResponse),
+    }
+}
+
+/// The `tool_progress` `details` key carrying a task's current [`McpTaskRecord`].
+pub const MCP_TASK_DETAILS_KEY: &str = "mcpTask";
+
+/// The session custom-entry kind `serve` journals an [`McpTaskRecord`] under.
+pub const MCP_TASK_ENTRY_KIND: &str = "mcp_task";
+
+/// A durable handle to one in-flight SEP-2663 task: enough to poll it again from a fresh process.
+///
+/// The spec asks clients to persist task ids so polling survives a crash or restart. The tool emits
+/// this record in a `tool_progress` `details` entry ([`MCP_TASK_DETAILS_KEY`]) when the task is
+/// created, and again whenever its durable state changes (an `inputRequests` key answered, the
+/// `ttlMs` moved). `serve` journals each emission with the session (see `crate::mcp_resume`); the
+/// latest one for a task wins.
+///
+/// The `taskId` may be a bearer token for the server's stored state, so the journal is as private
+/// as the session file that holds it, and the HTML export leaves it out.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct McpTaskRecord {
+    pub server: String,
+    /// The server's own tool name (not the registered `mcp__…` name).
+    pub tool: String,
+    pub task_id: String,
+    /// Local wall clock when the task was created, so the `ttlMs` backstop still counts from
+    /// creation after a restart.
+    pub created_at_ms: u64,
+    /// The task's latest `ttlMs`, so a resumed task keeps its backstop even if the server can no
+    /// longer be reached to say it again.
+    #[serde(default)]
+    pub ttl_ms: Option<u64>,
+    /// `inputRequests` keys already answered, so a resume never asks the user twice.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub answered: Vec<String>,
+}
+
+pub fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+/// Fulfill SEP-2322 / in-task `inputRequests` through the hubs of the host that owns this call
+/// (see [`calling_host`]).
 async fn fulfill_input_requests(
     host: &McpHost,
     server_name: &str,
@@ -880,7 +1120,7 @@ async fn fulfill_input_requests(
             InputRequest::CreateMessage(req) => {
                 let result = host
                     .sampling
-                    .create_message(req.params)
+                    .create_message(server_name, req.params)
                     .await
                     .map_err(|e| ToolError::Execution(format!("MCP sampling failed: {e}")))?;
                 serde_json::to_value(result)
@@ -899,77 +1139,288 @@ async fn fulfill_input_requests(
     Ok(responses)
 }
 
+/// Send `tasks/update` and take any successful result as the acknowledgement.
+///
+/// The spec's ack is an empty result, and every MCP result may carry `_meta`. rmcp's
+/// `Peer::update_task` decodes the reply through its untagged `ServerResult`, where
+/// `{"_meta":{…},"resultType":"complete"}` matches `CallToolResult` first (its `content` defaults
+/// to empty) and the ack is rejected as an unexpected response: found against the SEP's reference
+/// server (mcpkit), whose acks carry `serverInfo` in `_meta`. A JSON-RPC error still comes back as
+/// an error; only the shape of a success is not second-guessed.
+async fn update_task_acked(
+    peer: &Peer<RoleClient>,
+    params: UpdateTaskParams,
+) -> Result<(), ServiceError> {
+    peer.send_request(ClientRequest::UpdateTaskRequest(UpdateTaskRequest::new(
+        params,
+    )))
+    .await
+    .map(drop)
+}
+
+/// `tasks/cancel`, with the same any-success-is-the-ack reading as [`update_task_acked`].
+async fn cancel_task_acked(
+    peer: &Peer<RoleClient>,
+    params: CancelTaskParams,
+) -> Result<(), ServiceError> {
+    peer.send_request(ClientRequest::CancelTaskRequest(CancelTaskRequest::new(
+        params,
+    )))
+    .await
+    .map(drop)
+}
+
 /// Best-effort `tasks/cancel` when the tool future is aborted mid-poll.
+///
+/// Holds the connection, not a peer: a call aborted mid-backoff would otherwise cancel through the
+/// client that just died. At drop it uses whatever client the connection has *now* (one redialed
+/// since the loss), redialing for it if there is none: a server that keeps its tasks across its own
+/// restart still gets the cancel.
+///
+/// Disarmed (`armed: false`) for a resume after a restart: the user aborting the prompt that waited
+/// on it did not ask to cancel the task, which the next prompt will wait on again.
 struct TaskCancelOnDrop {
-    peer: Peer<RoleClient>,
+    conn: Arc<McpConnection>,
     task_id: String,
-    finished: bool,
+    armed: bool,
 }
 
 impl TaskCancelOnDrop {
     fn finish(&mut self) {
-        self.finished = true;
+        self.armed = false;
     }
 }
 
 impl Drop for TaskCancelOnDrop {
     fn drop(&mut self) {
-        if self.finished {
+        if !self.armed {
             return;
         }
-        let peer = self.peer.clone();
+        let conn = self.conn.clone();
         let task_id = self.task_id.clone();
         tokio::spawn(async move {
-            let _ = peer.cancel_task(CancelTaskParams::new(task_id)).await;
+            let client = match conn.live_client().await {
+                Some(client) => Some(client),
+                None => conn.client().await.ok(),
+            };
+            if let Some(client) = client {
+                let _ = cancel_task_acked(client.peer(), CancelTaskParams::new(task_id)).await;
+            }
         });
     }
 }
 
+/// How polling starts: from a fresh `CreateTaskResult`, or (resume) from a journaled record.
+struct TaskSeed {
+    poll_interval_ms: Option<u64>,
+    status_message: Option<String>,
+    /// Whether dropping the poll cancels the task (see [`TaskCancelOnDrop`]).
+    cancel_on_drop: bool,
+    /// A task just created (journal its record) rather than one resumed from the journal, whose
+    /// record is already there: a restart must not append another per pending task.
+    fresh: bool,
+}
+
+/// Consecutive connection losses one task survives; the next one fails the call.
+const MAX_TASK_RECONNECTS: u32 = 8;
+
+/// The longest single wait between polls, whatever `pollIntervalMs` says, so a TTL or an abort is
+/// noticed without sleeping through it.
+const MAX_POLL_SLEEP: Duration = Duration::from_secs(60);
+
+/// What a failed request says about the connection.
+enum Loss {
+    /// The request could not be delivered, but the client is alive (an HTTP POST that failed):
+    /// back off and send again on the same client.
+    Retry,
+    /// The client is gone (transport closed, e.g. a stdio server that exited): redial.
+    Redial,
+}
+
+/// A failed request that means the connection is in trouble, not that the server answered. The
+/// task lives on the server, so the right response is to recover and poll the same `taskId`.
+fn connection_loss(e: &ServiceError) -> Option<Loss> {
+    match e {
+        ServiceError::TransportSend(_) => Some(Loss::Retry),
+        ServiceError::TransportClosed => Some(Loss::Redial),
+        _ => None,
+    }
+}
+
+/// Back off, then (for [`Loss::Redial`]) drop the dead client and dial again. A failed dial keeps
+/// the stale client: the next request on it fails as a loss too, which counts toward
+/// [`MAX_TASK_RECONNECTS`].
+async fn recover(
+    conn: &McpConnection,
+    client: Arc<McpClient>,
+    loss: Loss,
+    losses: u32,
+) -> Arc<McpClient> {
+    let backoff = Duration::from_millis(200u64 << losses.saturating_sub(1).min(5));
+    tokio::time::sleep(backoff.min(Duration::from_secs(5))).await;
+    if let Loss::Retry = loss {
+        return client;
+    }
+    conn.invalidate(&client).await;
+    match conn.client().await {
+        Ok(fresh) => fresh,
+        Err(e) => {
+            tracing::debug!(server = %conn.config.name, error = %e, "mcp task redial failed");
+            client
+        }
+    }
+}
+
+/// Emit the task's current durable record, for `serve` to journal (see [`McpTaskRecord`]).
+fn journal(progress: Option<&ToolProgress>, record: &McpTaskRecord, snapshot: &str) {
+    if let Some(sink) = progress {
+        sink.emit(
+            snapshot.to_owned(),
+            Some(json!({ "taskId": record.task_id, MCP_TASK_DETAILS_KEY: record })),
+        );
+    }
+}
+
 /// Poll `tasks/get` until terminal; fulfill in-task input via `tasks/update`.
+///
+/// No poll-count cap: the spec says to keep polling until a terminal status or `tasks/cancel`, and a
+/// cap measured in polls is a wall-clock limit that silently depends on the server's
+/// `pollIntervalMs`. The only backstop is the task's own `ttlMs` (latest value, counted from
+/// creation), which the spec lets a client treat as the point the task is no longer usable; a
+/// `null` TTL polls until the turn is aborted. A single wait is capped by the TTL's remainder and
+/// [`MAX_POLL_SLEEP`].
+///
+/// An `inputRequests` key is answered once. `tasks/update` is acknowledged eventually-consistently,
+/// so the next poll can still list a key we already answered; re-asking would show the user the
+/// same elicitation twice and send a duplicate response. Answered keys are journaled with the
+/// record, so a resume after a restart does not ask again either.
+///
+/// A lost connection is not the task's failure: the task lives on the server. A request that could
+/// not be delivered is re-sent on the same client after a backoff; a dead client is dropped and the
+/// server redialed. Either way the same `taskId` is polled again, and a pending `tasks/update` is
+/// re-sent rather than re-asked. The call survives [`MAX_TASK_RECONNECTS`] consecutive losses and
+/// fails on the next. A stdio server that died took its tasks with it: the redialed process
+/// answers `-32602`, and that ends the call.
 async fn await_task(
-    client: &McpClient,
-    server_name: &str,
-    remote_name: &str,
-    create: CreateTaskResult,
+    conn: &Arc<McpConnection>,
+    mut client: Arc<McpClient>,
+    host: &McpHost,
+    mut record: McpTaskRecord,
+    seed: TaskSeed,
     progress: Option<&ToolProgress>,
 ) -> Result<CallToolResult, ToolError> {
-    let peer = client.peer().clone();
-    let task_id = create.task.task_id.clone();
+    let task_id = record.task_id.clone();
+    let server_name = record.server.clone();
+    let remote_name = record.tool.clone();
+    let (server_name, remote_name) = (server_name.as_str(), remote_name.as_str());
     let mut cancel = TaskCancelOnDrop {
-        peer: peer.clone(),
+        conn: conn.clone(),
         task_id: task_id.clone(),
-        finished: false,
+        armed: seed.cancel_on_drop,
     };
-    let mut poll_ms = create.task.poll_interval_ms.unwrap_or(1_000).max(10);
-    let mut last_status_message: Option<String> = None;
+    let created = Instant::now()
+        .checked_sub(Duration::from_millis(
+            unix_ms().saturating_sub(record.created_at_ms),
+        ))
+        .unwrap_or_else(Instant::now);
+    let mut poll_ms = seed.poll_interval_ms.unwrap_or(1_000).max(10);
+    let mut last_status_message = seed.status_message;
+    let mut answered: HashSet<String> = record.answered.iter().cloned().collect();
+    let mut pending_update: Option<(Vec<String>, InputResponses)> = None;
+    let mut losses: u32 = 0;
+    let lost = |losses: u32, e: &ServiceError| {
+        ToolError::Execution(format!(
+            "mcp task `{task_id}` on `{server_name}`/`{remote_name}`: connection lost {losses} times in a row, giving up: {e}"
+        ))
+    };
 
-    if let Some(message) = create.task.status_message.as_ref()
-        && let Some(sink) = progress
-    {
-        sink.emit(
-            message.clone(),
-            Some(json!({
-                "taskId": task_id,
-                "status": "working",
-                "statusMessage": message,
-            })),
+    if seed.fresh {
+        journal(
+            progress,
+            &record,
+            last_status_message.as_deref().unwrap_or("task created"),
         );
-        last_status_message = Some(message.clone());
     }
 
-    // Cap polls so a stuck server cannot hang the agent forever (~poll_ms * MAX, typically minutes).
-    const MAX_POLLS: usize = 10_000;
-    for _ in 0..MAX_POLLS {
-        tokio::time::sleep(Duration::from_millis(poll_ms)).await;
+    loop {
+        if let Some((keys, responses)) = pending_update.take() {
+            match update_task_acked(
+                client.peer(),
+                UpdateTaskParams::new(task_id.clone(), responses.clone()),
+            )
+            .await
+            {
+                Ok(()) => {
+                    answered.extend(keys);
+                    losses = 0;
+                    record.answered = answered.iter().cloned().collect();
+                    record.answered.sort();
+                    journal(progress, &record, "input delivered");
+                }
+                Err(e) => match connection_loss(&e) {
+                    Some(loss) => {
+                        losses += 1;
+                        if losses > MAX_TASK_RECONNECTS {
+                            return Err(lost(losses, &e));
+                        }
+                        pending_update = Some((keys, responses));
+                        client = recover(conn, client, loss, losses).await;
+                        continue;
+                    }
+                    None => return Err(tool_call_err(server_name, remote_name, e)),
+                },
+            }
+        }
 
-        let info = peer
+        let mut wait = Duration::from_millis(poll_ms).min(MAX_POLL_SLEEP);
+        if let Some(ttl) = record.ttl_ms {
+            let ttl = Duration::from_millis(ttl);
+            let elapsed = created.elapsed();
+            if elapsed >= ttl {
+                // Not `finish()`ed: the drop guard sends a best-effort `tasks/cancel` (unless this
+                // is a resume, which never cancels).
+                return Err(ToolError::Execution(format!(
+                    "mcp task `{task_id}` on `{server_name}`/`{remote_name}` did not finish within its ttlMs ({} ms)",
+                    ttl.as_millis()
+                )));
+            }
+            wait = wait.min(ttl - elapsed);
+        }
+        tokio::time::sleep(wait).await;
+
+        let info = match client
+            .peer()
             .get_task(GetTaskParams::new(task_id.clone()))
             .await
-            .map_err(|e| tool_call_err(server_name, remote_name, e))?;
+        {
+            Ok(info) => {
+                losses = 0;
+                info
+            }
+            Err(e) => match connection_loss(&e) {
+                Some(loss) => {
+                    losses += 1;
+                    if losses > MAX_TASK_RECONNECTS {
+                        return Err(lost(losses, &e));
+                    }
+                    client = recover(conn, client, loss, losses).await;
+                    continue;
+                }
+                None => return Err(tool_call_err(server_name, remote_name, e)),
+            },
+        };
         let detailed = info.task;
 
         if let Some(interval) = detailed.task.poll_interval_ms {
             poll_ms = interval.max(10);
+        }
+        if detailed.task.ttl_ms != record.ttl_ms {
+            record.ttl_ms = detailed.task.ttl_ms;
+            journal(
+                progress,
+                &record,
+                last_status_message.as_deref().unwrap_or("ttl changed"),
+            );
         }
 
         if let Some(message) = detailed.task.status_message.as_ref()
@@ -998,13 +1449,14 @@ async fn await_task(
 
         match detailed.payload {
             TaskPayload::Working => {}
-            TaskPayload::InputRequired { input_requests } => {
-                let responses =
-                    fulfill_input_requests(&client.service().host, server_name, input_requests)
-                        .await?;
-                peer.update_task(UpdateTaskParams::new(task_id.clone(), responses))
-                    .await
-                    .map_err(|e| tool_call_err(server_name, remote_name, e))?;
+            TaskPayload::InputRequired { mut input_requests } => {
+                input_requests.retain(|key, _| !answered.contains(key));
+                if input_requests.is_empty() {
+                    continue;
+                }
+                let keys: Vec<String> = input_requests.keys().cloned().collect();
+                let responses = fulfill_input_requests(host, server_name, input_requests).await?;
+                pending_update = Some((keys, responses));
             }
             TaskPayload::Completed { result } => {
                 cancel.finish();
@@ -1019,7 +1471,8 @@ async fn await_task(
             TaskPayload::Failed { error } => {
                 cancel.finish();
                 return Err(ToolError::Execution(format!(
-                    "mcp task `{task_id}` on `{server_name}`/`{remote_name}` failed: {error:?}"
+                    "mcp task `{task_id}` on `{server_name}`/`{remote_name}` failed: {}",
+                    Value::Object(error)
                 )));
             }
             TaskPayload::Cancelled => {
@@ -1035,14 +1488,55 @@ async fn await_task(
             }
         }
     }
+}
 
-    let _ = peer
-        .cancel_task(CancelTaskParams::new(task_id.clone()))
-        .await;
-    cancel.finish();
-    Err(ToolError::Execution(format!(
-        "mcp task `{task_id}` on `{server_name}`/`{remote_name}` did not complete within {MAX_POLLS} polls"
-    )))
+impl McpCatalog {
+    /// Resume polling a journaled task after a restart (see [`McpTaskRecord`]) through this
+    /// catalog's live (or redialed) connection to `record.server`, to its terminal result. Never
+    /// cancels the task when dropped. A server that no longer knows the task answers `-32602`,
+    /// and that is the call's answer. `host` answers any in-task input; `progress` receives the
+    /// task's status and record updates.
+    pub async fn resume_task(
+        &self,
+        record: McpTaskRecord,
+        host: &McpHost,
+        progress: Option<&ToolProgress>,
+    ) -> Result<ToolOutput, ToolError> {
+        let server = record.server.clone();
+        let tool = record.tool.clone();
+        // A TTL that ran out while the process was down needs no server (nor its configuration)
+        // to say so.
+        if let Some(ttl) = record.ttl_ms
+            && unix_ms().saturating_sub(record.created_at_ms) >= ttl
+        {
+            return Err(ToolError::Execution(format!(
+                "mcp task `{}` on `{server}`/`{tool}` did not finish within its ttlMs ({ttl} ms)",
+                record.task_id
+            )));
+        }
+        let entry = self
+            .snapshot()
+            .into_iter()
+            .find(|s| s.name == server)
+            .ok_or_else(|| {
+                ToolError::Execution(format!("mcp server `{server}` is not configured any more"))
+            })?;
+        let conn = entry.conn.upgrade().ok_or_else(|| {
+            ToolError::Execution(format!("mcp server `{server}` is no longer connected"))
+        })?;
+        let seed = TaskSeed {
+            // Unknown until the first poll answers; ask promptly, then follow the server.
+            poll_interval_ms: Some(10),
+            status_message: None,
+            cancel_on_drop: false,
+            fresh: false,
+        };
+        let client = conn.client().await.map_err(|e| {
+            ToolError::Execution(format!("mcp server `{server}` is not reachable: {e}"))
+        })?;
+        let result = await_task(&conn, client, host, record, seed, progress).await?;
+        tool_output_from_result(&server, &tool, result)
+    }
 }
 
 fn tool_output_from_result(
@@ -1652,6 +2146,9 @@ impl Tool for McpResourceTool {
                 self.server_name
             ))
         })?;
+        let _call = client
+            .service()
+            .track_call(calling_host(&client.service().host));
         let result = client
             .read_resource(ReadResourceRequestParams::new(self.uri.clone()))
             .await
@@ -1710,6 +2207,9 @@ impl Tool for McpPromptTool {
         if let Some(arguments) = arguments {
             params = params.with_arguments(arguments);
         }
+        let _call = client
+            .service()
+            .track_call(calling_host(&client.service().host));
         let result = client.get_prompt(params).await.map_err(|e| {
             ToolError::Execution(format!(
                 "mcp server `{}` prompts/get `{}` failed: {e}",
@@ -1839,13 +2339,33 @@ pub struct McpPromptInfo {
 #[derive(Clone, Default)]
 pub struct McpCatalog {
     servers: Arc<std::sync::Mutex<Vec<McpServerCatalog>>>,
+    /// The session this view of the catalog belongs to (see [`Self::for_session`]): the host its
+    /// non-tool requests (`events/*`, `completion/complete`) are registered under, so a nested
+    /// request raised during one is attributed to that session or refused, never guessed.
+    session_host: Option<Arc<McpHost>>,
 }
 
 impl McpCatalog {
     pub fn new(servers: Vec<McpServerCatalog>) -> Self {
         Self {
             servers: Arc::new(std::sync::Mutex::new(servers)),
+            session_host: None,
         }
+    }
+
+    /// This catalog (the same servers, shared) as session `host` uses it.
+    pub fn for_session(&self, host: Arc<McpHost>) -> Self {
+        Self {
+            servers: self.servers.clone(),
+            session_host: Some(host),
+        }
+    }
+
+    /// The host a request made through this catalog belongs to.
+    fn request_host(&self, client: &McpClient) -> Arc<McpHost> {
+        self.session_host
+            .clone()
+            .unwrap_or_else(|| calling_host(&client.service().host))
     }
 
     pub fn snapshot(&self) -> Vec<McpServerCatalog> {
@@ -1911,7 +2431,8 @@ impl McpCatalog {
             return Ok(EventsPeer::Rmcp {
                 peer: client.peer().clone(),
                 router: client.service().events.clone(),
-                _live: ClientHold(client),
+                host: self.request_host(&client),
+                live: ClientHold(client),
             });
         };
         let mut headers: Vec<(HeaderName, HeaderValue)> = Vec::new();
@@ -1964,6 +2485,7 @@ impl McpCatalog {
             .upgrade()
             .ok_or_else(|| format!("mcp server `{server}` is no longer connected"))?;
         let client = conn.client().await?;
+        let _call = client.service().track_call(self.request_host(&client));
         client
             .complete(params)
             .await
@@ -1972,7 +2494,7 @@ impl McpCatalog {
 }
 
 /// Keeps a client (and so its process) alive; deliberately opaque outside this module.
-pub(crate) struct ClientHold(#[expect(dead_code, reason = "held for its Drop")] Arc<McpClient>);
+pub(crate) struct ClientHold(Arc<McpClient>);
 
 /// One server's connection, as the MCP Events client needs it. See [`McpCatalog::events_peer`].
 pub(crate) enum EventsPeer {
@@ -1981,7 +2503,9 @@ pub(crate) enum EventsPeer {
     Rmcp {
         peer: Peer<RoleClient>,
         router: crate::tools::mcp_events::NotificationRouter,
-        _live: ClientHold,
+        /// The session the requests belong to (see [`EventsPeer::track_request`]).
+        host: Arc<McpHost>,
+        live: ClientHold,
     },
     /// Streamable HTTP: where and how to POST `events/*` directly. `router` still carries
     /// `notifications/events/list_changed`, which arrives on rmcp's own connection.
@@ -1991,6 +2515,31 @@ pub(crate) enum EventsPeer {
         headers: Vec<(HeaderName, HeaderValue)>,
         protocol_version: String,
     },
+}
+
+impl EventsPeer {
+    /// Register one `events/*` request as in flight for its session, for as long as the returned
+    /// guard lives, so a nested request the server raises during it is attributed or refused like
+    /// one raised during a `tools/call` (see `McpHandler::route`). `None` over direct HTTP, where
+    /// rmcp never sees the exchange (and so never delivers a nested request from it).
+    pub(crate) fn track_request(&self) -> Option<EventsCall> {
+        match self {
+            Self::Rmcp { host, live, .. } => {
+                Some(EventsCall(live.0.service().track_call(host.clone())))
+            }
+            Self::Http { .. } => None,
+        }
+    }
+}
+
+/// An `events/*` request registered as in flight (see [`EventsPeer::track_request`]).
+pub(crate) struct EventsCall(ActiveCallGuard);
+
+impl EventsCall {
+    /// Record the request's id once sent, so a nested request on its stream routes to it.
+    pub(crate) fn bind(&self, request: RequestId) {
+        self.0.bind(request);
+    }
 }
 
 async fn tools_from_client(
@@ -2309,11 +2858,70 @@ mod tests {
             url: "https://example.com/ask".into(),
             elicitation_id: "e1".into(),
         };
-        assert_eq!(answered_by(&a.elicit(params.clone()).await), "session-a");
-        assert_eq!(answered_by(&b.elicit(params.clone()).await), "session-b");
+        assert_eq!(
+            answered_by(&a.elicit(params.clone(), None).await.unwrap()),
+            "session-a"
+        );
+        assert_eq!(
+            answered_by(&b.elicit(params.clone(), None).await.unwrap()),
+            "session-b"
+        );
         // And a connection built the process-wide way still reaches the process-wide hub.
         let shared = McpHandler::new("linear", host());
-        assert_eq!(answered_by(&shared.elicit(params).await), "process");
+        assert_eq!(
+            answered_by(&shared.elicit(params, None).await.unwrap()),
+            "process"
+        );
+    }
+
+    /// N1: on a connection shared by sessions, a nested request goes to the session whose call is
+    /// in flight when that is unambiguous (one session, or the HTTP stream names the call), and is
+    /// refused, reaching nobody, when calls from two sessions are in flight and nothing says which.
+    #[tokio::test]
+    async fn a_nested_request_is_routed_only_when_attributable() {
+        let session_a = Arc::new(McpHost::new());
+        let session_b = Arc::new(McpHost::new());
+        session_a
+            .elicitation
+            .install(Arc::new(MarkerGate("session-a")));
+        session_b
+            .elicitation
+            .install(Arc::new(MarkerGate("session-b")));
+        let shared = McpHandler::new("linear", host());
+        let params = ElicitRequestParams::UrlElicitationParams {
+            meta: None,
+            message: "which session?".into(),
+            url: "https://example.com/ask".into(),
+            elicitation_id: "e1".into(),
+        };
+        let call_a = shared.track_call(session_a.clone());
+        call_a.bind(RequestId::Number(7));
+        let second_a = shared.track_call(session_a.clone());
+        assert_eq!(
+            answered_by(&shared.elicit(params.clone(), None).await.unwrap()),
+            "session-a",
+            "every call in flight is A's"
+        );
+        let call_b = shared.track_call(session_b.clone());
+        call_b.bind(RequestId::Number(8));
+        let refused = shared.elicit(params.clone(), None).await.unwrap_err();
+        assert!(
+            refused.message.contains("more than one session"),
+            "{refused:?}"
+        );
+        let origin = InboundStreamOrigin::OutboundRequest(RequestId::Number(7));
+        assert_eq!(
+            answered_by(&shared.elicit(params.clone(), Some(&origin)).await.unwrap()),
+            "session-a",
+            "the HTTP stream names A's call"
+        );
+        drop((call_a, second_a));
+        assert_eq!(
+            answered_by(&shared.elicit(params, None).await.unwrap()),
+            "session-b",
+            "only B's call is left"
+        );
+        drop(call_b);
     }
 
     #[test]
