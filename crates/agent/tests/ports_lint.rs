@@ -29,11 +29,26 @@
 //!   - `SocketAddr::new`, `SocketAddrV4::new`, or `SocketAddrV6::new` (the second argument);
 //!   - `set_port`;
 //!   - an address tuple whose first element is an IP (`("127.0.0.1", 0)`, `([127, 0, 0, 1], 0)`,
-//!     `(Ipv4Addr::LOCALHOST, 0)`, `(ip, 0)`).
+//!     `(Ipv4Addr::LOCALHOST, 0)`, `(ip, 0)`);
+//! - a zero formatted in as an address's port: `format!("127.0.0.1:{}", 0)`,
+//!   `format!("{}:{}", host, 0)`, `format!("{host}:{port}", port = 0)`, or `{port}` capturing a
+//!   `let port = 0`;
+//! - a zero in a port field: `Config { port: 0, .. }`, `listen_port: 0`.
 //!
 //! Comments are skipped, and string literals are only checked for addresses. Whitespace is
-//! ignored, so layout cannot hide a case. A port computed at run time (`n - n`) is beyond any text
-//! rule. That would be deliberate evasion, not the accidental pattern this rule exists to stop.
+//! ignored, so layout cannot hide a case.
+//!
+//! **What a text rule cannot see.** A zero that only becomes a port later, through a value the rule
+//! cannot follow, passes:
+//!
+//! - an environment default: `env::var("PORT").ok().and_then(|v| v.parse().ok()).unwrap_or(0)`,
+//!   later passed to a bind;
+//! - a string default: `unwrap_or_else(|| "0".into())`, later formatted into an address;
+//! - a port computed at run time: `n - n`.
+//!
+//! Catching these needs the value's flow, which is exactly the analysis this rule gave up. The first
+//! two are plausible by accident, so review still matters where a port comes from configuration; the
+//! last would be deliberate evasion.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::collections::HashSet;
@@ -168,7 +183,47 @@ fn literal_has_port_zero(text: &[char]) -> bool {
         if after.is_some_and(|c| c.is_ascii_alphanumeric() || c == '.' || c == '/' || c == ':') {
             return false;
         }
-        let before = &t[..at];
+        names_a_host(&t[..at])
+    })
+}
+
+/// The placeholders of a format string that stand for an address's port (`"127.0.0.1:{}"`,
+/// `"{host}:{port}"`), each as the argument it takes: `Ok(i)` the `i`th positional argument, or
+/// `Err(name)` a named one (or a captured variable).
+fn port_placeholders(t: &str) -> Vec<Result<usize, String>> {
+    let mut out = Vec::new();
+    let mut positional = 0;
+    let mut i = 0;
+    while let Some(open) = t[i..].find('{').map(|o| o + i) {
+        if t[open + 1..].starts_with('{') {
+            i = open + 2;
+            continue;
+        }
+        let Some(close) = t[open..].find('}').map(|c| c + open) else {
+            break;
+        };
+        let inner = &t[open + 1..close];
+        let arg = inner.split(':').next().unwrap_or("");
+        let which = if arg.is_empty() {
+            positional += 1;
+            Ok(positional - 1)
+        } else if let Ok(n) = arg.parse::<usize>() {
+            Ok(n)
+        } else {
+            Err(arg.to_string())
+        };
+        if open > 0 && t[..open].ends_with(':') && names_a_host(&t[..open - 1]) {
+            out.push(which);
+        }
+        i = close + 1;
+    }
+    out
+}
+
+/// Whether `before` (the text up to an address's `:`) ends with a host: a dotted quad, `]`,
+/// `localhost`, a `{placeholder}`, or nothing at all.
+fn names_a_host(before: &str) -> bool {
+    {
         if before.is_empty() || before.ends_with(']') || before.ends_with('}') {
             return true;
         }
@@ -189,7 +244,7 @@ fn literal_has_port_zero(text: &[char]) -> bool {
             && parts
                 .iter()
                 .all(|p| !p.is_empty() && p.parse::<u8>().is_ok())
-    })
+    }
 }
 
 /// The code with whitespace removed (a single space kept between two identifier characters), each
@@ -373,7 +428,31 @@ fn port_zero_sites(source: &str, global_zero: &HashSet<String>) -> Vec<usize> {
         let called = callee(&n, open);
         let zero_at = |k: usize| els.get(k).is_some_and(|e| is_zero(e));
         let site = n.get(close.saturating_sub(1)).map_or(0, |&(_, at, _)| at);
-        let hit = if called.ends_with("SocketAddrV6::new") {
+        let macro_call = open > 0 && n[open - 1].0 == '!' && !n[open - 1].2;
+        let hit = if macro_call {
+            // `format!("127.0.0.1:{}", 0)`: an address format string whose port placeholder takes
+            // a zero, positional, named (`port = 0`) or captured (`{port}` with `let port = 0`).
+            let lit = els
+                .first()
+                .map_or("", |f| f.trim_start_matches('r').trim_matches('#'));
+            let args = els.get(1..).unwrap_or_default();
+            let positional: Vec<&String> = args.iter().filter(|e| !e.contains('=')).collect();
+            lit.starts_with('"')
+                && port_placeholders(lit.trim_matches('"'))
+                    .iter()
+                    .any(|which| match which {
+                        Ok(i) => positional.get(*i).is_some_and(|e| is_zero(e)),
+                        // A captured variable counts only when it is named as a port: a
+                        // `{seed}:{attempt}` key whose counter starts at 0 is not an address.
+                        Err(name) => {
+                            ((name == "port" || name.ends_with("_port")) && is_zero(name))
+                                || args.iter().any(|e| {
+                                    e.split_once('=')
+                                        .is_some_and(|(k, v)| k == name && is_zero(v))
+                                })
+                        }
+                    })
+        } else if called.ends_with("SocketAddrV6::new") {
             zero_at(1)
         } else if called.ends_with("set_port") {
             els.len() == 1 && zero_at(0)
@@ -387,6 +466,33 @@ fn port_zero_sites(source: &str, global_zero: &HashSet<String>) -> Vec<usize> {
         };
         if hit {
             sites.push(site);
+        }
+    }
+    // A port field set to zero: `Config { port: 0, .. }`, `listen_port: 0`.
+    for (at, _) in text.match_indices(':') {
+        let name: String = text[..at]
+            .chars()
+            .rev()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        let opens_field = text[..at - name.len()].ends_with(['{', ',']);
+        let value = &text[at + 1..];
+        let zero = ZERO_SPELLINGS.iter().any(|z| {
+            value
+                .strip_prefix(z)
+                .is_some_and(|r| r.starts_with([',', '}']))
+        });
+        if (name == "port" || name.ends_with("_port"))
+            && opens_field
+            && zero
+            && !n[at].2
+            && !text[at + 1..].starts_with(':')
+            && !text[..at].ends_with(':')
+        {
+            sites.push(n[at].1);
         }
     }
     sites
@@ -576,6 +682,16 @@ fn the_rule_catches_every_spelling_of_port_zero() {
         // A held listener is still a zero port written outside `ports.rs`.
         "let listener = TcpListener::bind(\"127.0.0.1:0\").await.unwrap();\ntokio::spawn(serve(listener));",
         "CallbackServer::bind(\"127.0.0.1\", 0).unwrap();",
+        // A zero formatted in as the port.
+        "let a = format!(\"127.0.0.1:{}\", 0);",
+        "let a = format!(\"{host}:{}\", 0u16);",
+        "let a = format!(\"{host}:{port}\", port = 0);",
+        "let a = format!(\"{}:{}\", host, 0);",
+        "let port = 0;\nlet a = format!(\"127.0.0.1:{port}\");",
+        "TcpListener::bind(format!(\"localhost:{}\", ANY)).unwrap();\nconst ANY: u16 = 0;",
+        // A zero in a port field.
+        "let cfg = Config { host: \"127.0.0.1\".into(), port: 0 };",
+        "let cfg = ListenConfig {\n    listen_port: 0,\n    ..Default::default()\n};",
         // Layout cannot hide it.
         "TcpListener::bind((\n    \"127.0.0.1\",\n    0,\n))",
     ] {
@@ -602,6 +718,17 @@ fn the_rule_catches_every_spelling_of_port_zero() {
         "TcpListener::bind((\"127.0.0.1\", held.port())).unwrap();",
         "let x = vec![(1, 0)];",
         "let c = '\"'; let l = TcpListener::bind(addr).unwrap();",
+        // A format string that is not an address, or a port that is not zero.
+        "let t = format!(\"{} of {}\", 12, 0);",
+        "let mut attempt = 0;\nlet key = format!(\"{seed_base}:{attempt}\");",
+        "let a = format!(\"127.0.0.1:{}\", port);",
+        "let line = format!(\"line {}:{}\", 0, col);",
+        "let a = format!(\"{host}:{port}\", host = 0, port = p);",
+        // Fields that are not ports, and port fields that are not zero or are types.
+        "let p = Point { x: 0, y: 0 };",
+        "let cfg = Config { port: held.port() };",
+        "struct Config { port: u16 }",
+        "fn f(port: u16) {}",
         // Annotated, on the line or above it.
         "TcpListener::bind(\"127.0.0.1:0\").unwrap(); // port-0: held by the server for its life",
         "// port-0: the child binds it and reports the port it got.\n\"127.0.0.1:0\",",
