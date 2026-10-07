@@ -153,7 +153,19 @@ fn fence_safe(c: char) -> Option<char> {
     // A lookalike of a fence character, by its compatibility form or its confusable skeleton.
     use unicode_normalization::UnicodeNormalization as _;
     let one = c.to_string();
-    let mut forms = one.nfkc().chain(unicode_security::skeleton(&one));
+    // A letter is never folded to `/`: the skeleton maps Katakana ノ and Coptic Ⳇ to `/`, and a
+    // server's message in Japanese must read as written. Letters shaped like `<`, `>` or `"`
+    // (Canadian syllabics ᐸ/ᐳ) still are, and without a `<` the fence cannot be closed.
+    let letter = matches!(
+        get_general_category(c),
+        G::UppercaseLetter
+            | G::LowercaseLetter
+            | G::TitlecaseLetter
+            | G::ModifierLetter
+            | G::OtherLetter
+    );
+    let skeleton = unicode_security::skeleton(&one).filter(move |&k| !(letter && k == '/'));
+    let mut forms = one.nfkc().chain(skeleton);
     // The angle-bracket family's own canonical forms count as `<`/`>`: the vertical presentation
     // forms and the CJK brackets normalize to `〈`/`〉`, not to `<`/`>`.
     let lookalike = forms.find_map(|k| match k {
@@ -1187,6 +1199,15 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn letters_whose_skeleton_is_a_slash_are_left_as_written() {
+        // Katakana ノ and Coptic Ⳇ fold to `/` under UTS #39; letters are not fence characters.
+        assert_eq!(
+            fenced_server_message("ノートが見つかりません Ⳇ"),
+            "<mcp_server_message untrusted>ノートが見つかりません Ⳇ</mcp_server_message>"
+        );
     }
 
     #[test]
