@@ -169,6 +169,9 @@ pub struct OAuthFixture {
     /// Answer a rejected request's 401 with an `application/json` JSON-RPC error body and no
     /// `WWW-Authenticate` challenge (what rmcp's own client reads as an ordinary error response).
     pub reject_with_json_body: Arc<AtomicBool>,
+    /// Answer every `tools/call` 401, whatever token it carries — a login the server keeps
+    /// refusing (a refresh gets a new token, and that is refused too).
+    pub reject_calls: Arc<AtomicBool>,
     /// Speak sessions: `initialize` issues an `Mcp-Session-Id`, every later POST must carry a live
     /// one (`400` without, `404` for an expired one), `GET` opens the standalone SSE stream, and
     /// `DELETE` ends the session.
@@ -198,6 +201,12 @@ impl OAuthFixture {
         self.issued.lock().unwrap().clear();
     }
 
+    /// Accept `token` as if issued: for a server configured with a static `Authorization` header
+    /// rather than a login.
+    pub fn issue(&self, token: &str) {
+        self.issued.lock().unwrap().insert(token.to_owned());
+    }
+
     /// Start one. `expires_in_secs` is the lifetime the fixture reports for each token it issues.
     /// `rmcp`'s `AuthorizationManager::get_access_token` refreshes proactively whenever fewer than 30
     /// seconds remain, so anything below 30 is refreshed on the very next read without any waiting;
@@ -215,6 +224,7 @@ impl OAuthFixture {
             refresh_reply: Arc::default(),
             hold_rejections_until: Arc::default(),
             reject_with_json_body: Arc::default(),
+            reject_calls: Arc::default(),
             sessions: Arc::default(),
             expire_sessions_after_calls: Arc::default(),
             sse_responses: Arc::default(),
@@ -448,7 +458,8 @@ impl Shared {
         let request: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
         let method = request.get("method").and_then(Value::as_str).unwrap_or("");
         let id = request.get("id").cloned().unwrap_or(Value::Null);
-        if !self.authorized(req) {
+        let refused = method == "tools/call" && f.reject_calls.load(Ordering::SeqCst);
+        if refused || !self.authorized(req) {
             if method == "tools/call" {
                 f.rejected_calls.fetch_add(1, Ordering::SeqCst);
                 let want = f.hold_rejections_until.load(Ordering::SeqCst);
