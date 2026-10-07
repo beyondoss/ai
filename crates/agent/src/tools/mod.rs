@@ -12,6 +12,7 @@ pub mod bash;
 pub mod code_mode;
 pub mod edit;
 pub mod exec;
+pub(crate) mod fence_tables;
 pub mod find;
 pub mod fs;
 pub mod grep;

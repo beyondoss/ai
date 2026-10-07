@@ -506,8 +506,11 @@ fn params_members(head: &[u8], at: usize) -> (serde_json::Map<String, Value>, Op
             return (kept, None);
         };
         let value = &head[j..v_end];
-        // Scalars, and the small `_meta` (routing); a whole nested payload is skipped.
-        let keep = !matches!(value.first(), Some(b'{' | b'[')) || k == "_meta";
+        // Scalars, and the small `_meta` (routing); a whole nested payload is skipped — and so is
+        // any `$`-key: those are the host's (`$oversized`, `$dropped_id`, …), and a server's own
+        // must not ride into the host's genuine stand-in.
+        let keep =
+            (!matches!(value.first(), Some(b'{' | b'[')) || k == "_meta") && !k.starts_with('$');
         if keep && let Ok(v) = serde_json::from_slice::<Value>(value) {
             kept.insert(k, v);
         }
@@ -854,6 +857,21 @@ pub(crate) fn stdio_transport(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    /// A server's own `$`-keys in an over-cap event's head do not ride into the host's stand-in:
+    /// only the host's `$oversized`/`$host` (and, unseen method, `$ambiguous`) are there.
+    #[test]
+    fn a_servers_dollar_keys_are_not_copied_into_the_stand_in() {
+        let stand_in = oversized_stand_in(
+            br#"{"jsonrpc":"2.0","method":"notifications/events/event","params":{"$dropped_id":7,"$ambiguous":false,"$host":1,"cursor":"3","data":{"blob":"xxxx"#,
+        )
+        .unwrap();
+        let params = stand_in["params"].as_object().unwrap();
+        assert_eq!(params["cursor"], "3");
+        assert!(params.get("$dropped_id").is_none(), "{params:?}");
+        assert!(params.get("$ambiguous").is_none(), "{params:?}");
+        assert_eq!(params["$host"], host_mark());
+    }
 
     /// A reader that hands out at most `step` bytes per read, like a pipe would.
     struct Trickle {
