@@ -4353,9 +4353,10 @@ transport makes goes through `OAuthHttp`, which attaches the server's _current_ 
 carries no `auth_header` of its own); direct `events/*` POSTs (`mcp_events::wire`'s `Conn::send`)
 likewise read the current token per request, not the one their headers were built with. **One rule
 on both paths:** any **401** from a server with a login — with or without a `WWW-Authenticate`
-challenge, whatever its body (for such a server every POST is answered by
-`mcp_wire::HttpClient::post_bounded`, which decides from the status; rmcp's own client reads a 401
-carrying a JSON-RPC error body as an ordinary error response) — makes `ServerAuth::after_rejection` force a refresh through the same `AuthorizationManager`
+challenge, whatever its body (every POST, for every server, is answered by
+`mcp_wire::HttpClient::post_bounded`, which decides from the status — the one deliberate divergence
+from rmcp's own client, which reads a 401 carrying a JSON-RPC error body as an ordinary error
+response; pinned in `an_ordinary_request_is_answered_as_rmcps_own_client_would`) — makes `ServerAuth::after_rejection` force a refresh through the same `AuthorizationManager`
 and `McpAuthStore` `mcp-login` uses (so the new token is persisted), and the request is retried
 **once**; a second 401 is returned as the server's answer. That covers `tools/call`, `resources/*`,
 `prompts/*`, `skills/*`, MCP App view reads, the handshake, the standalone stream and `events/*`. A 403

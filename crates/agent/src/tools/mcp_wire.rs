@@ -677,7 +677,8 @@ mod tests {
     /// Every POST now goes through [`HttpClient::post_bounded`] instead of `rmcp`'s own
     /// `reqwest` client — so for an ordinary request (a tool call) the two must agree on every
     /// response shape `rmcp` acts on: auth required, insufficient scope, an expired session,
-    /// accepted, a JSON answer (with its `Mcp-Session-Id`), and an SSE stream.
+    /// accepted, a JSON answer (with its `Mcp-Session-Id`), and an SSE stream. One divergence is
+    /// deliberate, and pinned last: a 401 with no challenge is still `AuthRequired` here.
     #[tokio::test]
     async fn an_ordinary_request_is_answered_as_rmcps_own_client_would() {
         use futures::StreamExt as _;
@@ -713,7 +714,7 @@ mod tests {
             (b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nMcp-Session-Id: s-9\r\nConnection: close\r\n\r\ndata: {\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"content\":[]}}\n\n", None),
         ];
         for (raw, session) in cases {
-            let ours = HttpClient(reqwest::Client::new())
+            let ours = HttpClient::new(reqwest::Client::new())
                 .post_message(
                     canned(raw, false).await.into(),
                     call(),
@@ -749,6 +750,35 @@ mod tests {
                 );
             }
         }
+        // The deliberate divergence: a 401 with no `WWW-Authenticate` whose body is a JSON-RPC
+        // error. rmcp hands that back as an ordinary error *response*, losing the status; here any
+        // 401 is `AuthRequired`, so `mcp_oauth` can refresh (and any server's caller sees why).
+        let raw: &[u8] = b"HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: 69\r\nConnection: close\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":7,\"error\":{\"code\":-32001,\"message\":\"no token\"}}";
+        let ours = HttpClient::new(reqwest::Client::new())
+            .post_message(
+                canned(raw, false).await.into(),
+                call(),
+                None,
+                None,
+                HashMap::new(),
+            )
+            .await;
+        let theirs = reqwest::Client::new()
+            .post_message(
+                canned(raw, false).await.into(),
+                call(),
+                None,
+                None,
+                HashMap::new(),
+            )
+            .await;
+        assert_eq!(shape(&ours), "auth-required");
+        assert_ne!(
+            shape(&theirs),
+            "auth-required",
+            "rmcp's own client: {}",
+            shape(&theirs)
+        );
     }
 
     /// …and they send the same request: the bearer token, the session id, `Accept`, the protocol
@@ -826,7 +856,7 @@ mod tests {
             ])
         };
         let (url, ours) = capture().await;
-        HttpClient(reqwest::Client::new())
+        HttpClient::new(reqwest::Client::new())
             .post_message(
                 url.into(),
                 message(),
