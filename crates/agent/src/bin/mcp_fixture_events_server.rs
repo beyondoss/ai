@@ -1496,7 +1496,7 @@ async fn handle_http(state: Shared, mut stream: TcpStream) {
                         break false;
                     };
                     let terminal = frame["method"] == "notifications/events/terminated";
-                    let line = format!("data: {frame}\n\n");
+                    let line = format!("data: {}\n\n", frame_text(&frame));
                     if stream.write_all(line.as_bytes()).await.is_err()
                         || stream.flush().await.is_err()
                     {
@@ -1550,8 +1550,35 @@ async fn handle_http(state: Shared, mut stream: TcpStream) {
     .await;
 }
 
+/// A frame's wire text. `MCP_FIXTURE_KEY_ORDER=params_first` writes an event notification the
+/// other way round from the usual key order — `params` before `method`, and the payload (`data`)
+/// first inside `params` — as JSON allows: a client reading a bounded head of an over-cap one then
+/// sees neither its method, its routing nor its cursor.
+fn frame_text(v: &Value) -> String {
+    let params_first = std::env::var("MCP_FIXTURE_KEY_ORDER").is_ok_and(|o| o == "params_first");
+    let (Some(method), Some(Value::Object(params))) = (v["method"].as_str(), v.get("params"))
+    else {
+        return v.to_string();
+    };
+    if !params_first || method != "notifications/events/event" {
+        return v.to_string();
+    }
+    let mut members: Vec<String> = Vec::new();
+    if let Some(data) = params.get("data") {
+        members.push(format!("\"data\":{data}"));
+    }
+    for (k, val) in params.iter().filter(|(k, _)| *k != "data") {
+        members.push(format!("{}:{val}", Value::String(k.clone())));
+    }
+    format!(
+        "{{\"params\":{{{}}},\"jsonrpc\":\"2.0\",\"method\":{}}}",
+        members.join(","),
+        Value::String(method.to_owned())
+    )
+}
+
 async fn write_line(out: &Stdout, v: &Value) -> bool {
-    let mut line = serde_json::to_vec(v).unwrap();
+    let mut line = frame_text(v).into_bytes();
     line.push(b'\n');
     let mut out = out.lock().await;
     out.write_all(&line).await.is_ok() && out.flush().await.is_ok()

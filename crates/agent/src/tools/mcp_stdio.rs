@@ -360,12 +360,21 @@ pub(crate) fn scan_head(head: &[u8]) -> Head {
 }
 
 /// A small stand-in for an over-cap **MCP Events notification** (`notifications/events/*`), built
-/// from the bounded head of the message — the oversized one itself is never held. The stand-in is
-/// the same notification with `params` cut down to the members that appear, whole, before the
-/// head runs out (the event's `_meta` routing, `cursor`, `eventId`, `name`, … — whatever precedes the
-/// payload) plus `"$oversized": true`, so the events client can skip that event, keep its cursor and
-/// tell the model it was dropped, rather than reconnecting into the same giant event forever.
-/// `None` for anything else (it is dropped as before).
+/// from the bounded head of the message — the oversized one itself is never held. The head is read
+/// **in any key order** (JSON fixes none): the top-level members are walked as far as the window
+/// reaches, wherever `method`, `id`, `result`/`error` and `params` fall, and inside `params` every
+/// member that appears whole is kept if it is a scalar (`cursor`, `eventId`, `name`, …) or the small
+/// `_meta` (routing) — a nested payload is skipped. The stand-in is the notification with those
+/// `params` plus `"$oversized": true`, so the events client skips that event, keeps what position it
+/// can and tells the model it was dropped, rather than reconnecting into the same giant event.
+///
+/// When the head does not reach the `method` (a payload-first `params` fills the window), the
+/// message is still taken for an event — `notifications/events/event` — unless the head proves
+/// otherwise: a response (`result`/`error`) or a request (an `id`; notifications have none). An
+/// over-cap message that is something else is far likelier to be an event than not on a connection
+/// carrying events; the price of guessing wrong is one spurious gap notice, where guessing the
+/// other way loses an event silently (stdio) or loops on it (HTTP). `None` for anything else (it
+/// is dropped as before).
 pub(crate) fn oversized_stand_in(head: &[u8]) -> Option<Value> {
     let ws = |mut i: usize| {
         while head.get(i).is_some_and(u8::is_ascii_whitespace) {
@@ -379,67 +388,105 @@ pub(crate) fn oversized_stand_in(head: &[u8]) -> Option<Value> {
     }
     i += 1;
     let mut method: Option<String> = None;
+    let mut params = serde_json::Map::new();
     loop {
         i = ws(i);
         if head.get(i) != Some(&b'"') {
-            return None;
+            break;
         }
-        let key_end = string_end(head, i)?;
+        let Some(key_end) = string_end(head, i) else {
+            break;
+        };
         let key = &head[i + 1..key_end - 1];
         i = ws(key_end);
         if head.get(i) != Some(&b':') {
-            return None;
+            break;
         }
         i = ws(i + 1);
-        if key == b"params" {
-            let method = method.filter(|m| m.starts_with("notifications/events/"))?;
-            let mut params = serde_json::Map::new();
-            if head.get(i) == Some(&b'{') {
-                let mut j = i + 1;
-                loop {
-                    j = ws(j);
-                    if head.get(j) != Some(&b'"') {
-                        break;
-                    }
-                    let Some(k_end) = string_end(head, j) else {
-                        break;
-                    };
-                    let Ok(k) = serde_json::from_slice::<String>(&head[j..k_end]) else {
-                        break;
-                    };
-                    j = ws(k_end);
-                    if head.get(j) != Some(&b':') {
-                        break;
-                    }
-                    j = ws(j + 1);
-                    let Some(v_end) = value_end(head, j) else {
-                        break;
-                    };
-                    let value = &head[j..v_end];
-                    // Scalars, and the small `_meta` (routing); a whole nested payload is skipped.
-                    let keep = !matches!(value.first(), Some(b'{' | b'[')) || k == "_meta";
-                    if keep && let Ok(v) = serde_json::from_slice::<Value>(value) {
-                        params.insert(k, v);
-                    }
-                    j = ws(v_end);
-                    if head.get(j) != Some(&b',') {
-                        break;
-                    }
-                    j += 1;
+        match key {
+            // A response, or a request: not an event, whatever else the head shows.
+            b"result" | b"error" | b"id" => return None,
+            b"params" => {
+                let (members, end) = params_members(head, i);
+                params = members;
+                match end {
+                    Some(end) => i = end,
+                    None => break,
                 }
             }
-            params.insert("$oversized".into(), Value::Bool(true));
-            return Some(json!({ "jsonrpc": "2.0", "method": method, "params": params }));
+            _ => {
+                let Some(end) = value_end(head, i) else {
+                    break;
+                };
+                if key == b"method" {
+                    method = Some(serde_json::from_slice::<String>(&head[i..end]).ok()?);
+                }
+                i = end;
+            }
         }
-        let end = value_end(head, i)?;
-        if key == b"method" {
-            method = serde_json::from_slice::<String>(&head[i..end]).ok();
-        }
-        i = ws(end);
+        i = ws(i);
         if head.get(i) != Some(&b',') {
-            return None;
+            break;
         }
         i += 1;
+    }
+    let method = match method {
+        Some(m) if m.starts_with("notifications/events/") => m,
+        Some(_) => return None,
+        None => "notifications/events/event".to_owned(),
+    };
+    params.insert("$oversized".into(), Value::Bool(true));
+    Some(json!({ "jsonrpc": "2.0", "method": method, "params": params }))
+}
+
+/// The members of the `params` object starting at `head[at]` that appear whole within `head` and
+/// are worth keeping in a stand-in — scalars, and `_meta` — in any order; and where the object
+/// ends, if it ends within `head`.
+fn params_members(head: &[u8], at: usize) -> (serde_json::Map<String, Value>, Option<usize>) {
+    let ws = |mut i: usize| {
+        while head.get(i).is_some_and(u8::is_ascii_whitespace) {
+            i += 1;
+        }
+        i
+    };
+    let mut kept = serde_json::Map::new();
+    if head.get(at) != Some(&b'{') {
+        return (kept, value_end(head, at));
+    }
+    let mut j = at + 1;
+    loop {
+        j = ws(j);
+        match head.get(j) {
+            Some(b'}') => return (kept, Some(j + 1)),
+            Some(b'"') => {}
+            _ => return (kept, None),
+        }
+        let Some(k_end) = string_end(head, j) else {
+            return (kept, None);
+        };
+        let Ok(k) = serde_json::from_slice::<String>(&head[j..k_end]) else {
+            return (kept, None);
+        };
+        j = ws(k_end);
+        if head.get(j) != Some(&b':') {
+            return (kept, None);
+        }
+        j = ws(j + 1);
+        let Some(v_end) = value_end(head, j) else {
+            return (kept, None);
+        };
+        let value = &head[j..v_end];
+        // Scalars, and the small `_meta` (routing); a whole nested payload is skipped.
+        let keep = !matches!(value.first(), Some(b'{' | b'[')) || k == "_meta";
+        if keep && let Ok(v) = serde_json::from_slice::<Value>(value) {
+            kept.insert(k, v);
+        }
+        j = ws(v_end);
+        match head.get(j) {
+            Some(b',') => j += 1,
+            Some(b'}') => return (kept, Some(j + 1)),
+            _ => return (kept, None),
+        }
     }
 }
 
@@ -1184,8 +1231,51 @@ mod tests {
         for other in [
             &br#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"progress":1"#[..],
             br#"{"jsonrpc":"2.0","id":3,"result":{"x":"yyyy"#,
-            br#"{"jsonrpc":"2.0","params":{"cursor":"1"},"method":"notifications/events/event"}"#,
             b"not json",
+        ] {
+            assert_eq!(
+                oversized_stand_in(other),
+                None,
+                "{}",
+                String::from_utf8_lossy(other)
+            );
+        }
+    }
+
+    /// JSON fixes no key order: the head is read wherever `method`, `id` and `params` fall.
+    #[test]
+    fn an_oversized_events_notification_is_recognized_in_any_key_order() {
+        // `params` (whole) before `method`.
+        let stand_in = oversized_stand_in(
+            br#"{"params":{"cursor":"7","eventId":"e1"},"jsonrpc":"2.0","method":"notifications/events/event","x":"yyyy"#,
+        )
+        .unwrap();
+        assert_eq!(stand_in["method"], "notifications/events/event");
+        assert_eq!(stand_in["params"]["cursor"], "7");
+        assert_eq!(stand_in["params"]["eventId"], "e1");
+        // `params` first and the payload in it: the method is past the window, the routing and
+        // cursor ahead of the payload are kept, and it is taken for an event.
+        let stand_in = oversized_stand_in(
+            br#"{"params":{"_meta":{"io.modelcontextprotocol/subscriptionId":"s1"},"cursor":"9","data":{"blob":"xxxx"#,
+        )
+        .unwrap();
+        assert_eq!(stand_in["method"], "notifications/events/event");
+        assert_eq!(stand_in["params"]["cursor"], "9");
+        assert_eq!(
+            stand_in["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"],
+            "s1"
+        );
+        // Payload first: nothing identifying is visible, and it is still skipped as an event.
+        let stand_in = oversized_stand_in(br#"{"params":{"data":{"blob":"xxxx"#).unwrap();
+        assert_eq!(stand_in["params"]["$oversized"], true);
+        assert!(stand_in["params"].get("cursor").is_none());
+        // What the head proves is not an event is not stood in for, in any order: a request (an
+        // id, which notifications never carry), a response, another method.
+        for other in [
+            &br#"{"params":{"data":"x"},"id":4,"method":"#[..],
+            br#"{"id":4,"params":{"data":{"blob":"xxxx"#,
+            br#"{"params":{"progress":1},"method":"notifications/progress","jsonrpc":"#,
+            br#"{"error":{"code":1,"message":"xxxx"#,
         ] {
             assert_eq!(
                 oversized_stand_in(other),

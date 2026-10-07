@@ -88,7 +88,16 @@ impl NotificationRouter {
             self.generation.fetch_add(1, Ordering::Relaxed);
             return;
         }
+        let params = notification.params.unwrap_or(Value::Null);
         let Some(id) = subscription_id else {
+            // The stand-in for an over-cap event whose routing lay past the bounded head
+            // (`mcp_stdio::oversized_stand_in`): it belongs to one of this connection's streams,
+            // which is unknowable — so each is told an event may have been dropped, rather than
+            // none. Anything else without a subscription id is dropped, as before.
+            if params.get("$oversized") == Some(&Value::Bool(true)) {
+                self.to_every_stream(method, &params);
+                return;
+            }
             tracing::debug!(
                 method,
                 "events notification without a subscriptionId; dropped"
@@ -103,12 +112,30 @@ impl NotificationRouter {
         };
         let msg = StreamMsg {
             method: method.to_owned(),
-            params: notification.params.unwrap_or(Value::Null),
+            params,
         };
         if slot.tx.try_send(msg).is_err() {
             slot.overflowed.store(true, Ordering::Release);
             inner.streams.remove(&id);
         }
+    }
+
+    /// Deliver one message to every open stream, with the same overflow rule as [`Self::route`].
+    fn to_every_stream(&self, method: &str, params: &Value) {
+        let Ok(mut inner) = self.inner.lock() else {
+            return;
+        };
+        inner.streams.retain(|_, slot| {
+            let msg = StreamMsg {
+                method: method.to_owned(),
+                params: params.clone(),
+            };
+            let sent = slot.tx.try_send(msg).is_ok();
+            if !sent {
+                slot.overflowed.store(true, Ordering::Release);
+            }
+            sent
+        });
     }
 
     fn register(&self, id: RequestId, tx: mpsc::Sender<StreamMsg>, overflowed: Arc<AtomicBool>) {
