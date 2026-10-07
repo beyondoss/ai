@@ -432,6 +432,7 @@ dependencies = [
  "libc",
  "listenfd",
  "mimalloc",
+ "nix",
  "percent-encoding",
  "prometheus",
  "pulldown-cmark",

@@ -111,8 +111,15 @@ pub(crate) fn retire(server: &std::sync::Arc<ServerProcess>) {
 /// to reap. Bounded by a server's grace plus a margin for the sweep — so exiting takes a little
 /// longer whenever a stdio server ran (it is given the chance to exit cleanly), and up to that
 /// bound when one ignores its stdin closing.
+///
+/// Every streamable-HTTP MCP session still open is ended too (`mcp_http_exit`): its `DELETE`s go out
+/// first, in parallel and bounded by [`CLOSE_DEADLINE`](crate::tools::mcp_http_exit::CLOSE_DEADLINE),
+/// overlapping the stdio grace.
 pub fn sweep_before_exit() {
+    let http_closed =
+        crate::tools::mcp_http_exit::begin_close_all(crate::tools::mcp_http_exit::CLOSE_DEADLINE);
     retire_all();
+    http_closed();
     #[cfg(unix)]
     crate::tools::exec::wait_for_pending_group_kills(
         SHUTDOWN_GRACE + std::time::Duration::from_secs(2),

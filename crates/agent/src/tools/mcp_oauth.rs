@@ -483,11 +483,42 @@ fn is_unauthorized(e: &StreamableHttpError<reqwest::Error>) -> bool {
 pub(crate) struct OAuthHttp<C> {
     inner: C,
     auth: Option<Arc<ServerAuth>>,
+    /// Where the session this connection opens is recorded, so the exit can end it
+    /// (`mcp_http_exit`). This layer sees every response's session id and every `DELETE`.
+    exit: Option<Arc<crate::tools::mcp_http_exit::HttpSession>>,
 }
 
 impl<C> OAuthHttp<C> {
     pub(crate) fn new(inner: C, auth: Option<Arc<ServerAuth>>) -> Self {
-        Self { inner, auth }
+        Self {
+            inner,
+            auth,
+            exit: None,
+        }
+    }
+
+    /// Record the session this connection opens in `exit`, for the process exit to end.
+    pub(crate) fn ending_session_on_exit(
+        mut self,
+        exit: Arc<crate::tools::mcp_http_exit::HttpSession>,
+    ) -> Self {
+        self.exit = Some(exit);
+        self
+    }
+
+    fn saw(
+        &self,
+        response: &StreamableHttpPostResponse,
+        headers: &HashMap<HeaderName, HeaderValue>,
+    ) {
+        let session = match response {
+            StreamableHttpPostResponse::Json(_, Some(id))
+            | StreamableHttpPostResponse::Sse(_, Some(id)) => id,
+            _ => return,
+        };
+        if let Some(exit) = &self.exit {
+            exit.opened(session, headers);
+        }
     }
 }
 
@@ -565,16 +596,19 @@ where
         auth_header: Option<String>,
         custom_headers: HashMap<HeaderName, HeaderValue>,
     ) -> Result<StreamableHttpPostResponse, StreamableHttpError<Self::Error>> {
-        self.authed(auth_header, |token| {
-            self.inner.post_message(
-                uri.clone(),
-                message.clone(),
-                session_id.clone(),
-                token,
-                custom_headers.clone(),
-            )
-        })
-        .await
+        let response = self
+            .authed(auth_header, |token| {
+                self.inner.post_message(
+                    uri.clone(),
+                    message.clone(),
+                    session_id.clone(),
+                    token,
+                    custom_headers.clone(),
+                )
+            })
+            .await?;
+        self.saw(&response, &custom_headers);
+        Ok(response)
     }
 
     async fn post_message_with_max_sse_event_size(
@@ -586,17 +620,20 @@ where
         custom_headers: HashMap<HeaderName, HeaderValue>,
         max_sse_event_size: usize,
     ) -> Result<StreamableHttpPostResponse, StreamableHttpError<Self::Error>> {
-        self.authed(auth_header, |token| {
-            self.inner.post_message_with_max_sse_event_size(
-                uri.clone(),
-                message.clone(),
-                session_id.clone(),
-                token,
-                custom_headers.clone(),
-                max_sse_event_size,
-            )
-        })
-        .await
+        let response = self
+            .authed(auth_header, |token| {
+                self.inner.post_message_with_max_sse_event_size(
+                    uri.clone(),
+                    message.clone(),
+                    session_id.clone(),
+                    token,
+                    custom_headers.clone(),
+                    max_sse_event_size,
+                )
+            })
+            .await?;
+        self.saw(&response, &custom_headers);
+        Ok(response)
     }
 
     async fn delete_session(
@@ -606,6 +643,10 @@ where
         auth_header: Option<String>,
         custom_headers: HashMap<HeaderName, HeaderValue>,
     ) -> Result<(), StreamableHttpError<Self::Error>> {
+        // rmcp is ending the session itself: the exit has nothing left to end.
+        if let Some(exit) = &self.exit {
+            exit.closed(&session_id);
+        }
         self.authed(auth_header, |token| {
             self.inner.delete_session(
                 uri.clone(),

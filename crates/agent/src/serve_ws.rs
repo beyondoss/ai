@@ -590,9 +590,9 @@ where
 /// a replica that died mid-start) is left for an out-of-band sweep; see ARCHITECTURE.md.
 ///
 /// `remove_dir` *is* the emptiness check, and an atomic one: `000001.jsonl` is created with `O_EXCL`
-/// before anything else and never deleted, so a directory holding nothing but `lock` has never been
+/// before anything else and never deleted, so a directory holding nothing but its lock files has never been
 /// a session — and if a racing replica got one written in between, `ENOTEMPTY` leaves everything
-/// alone. The `lock` file is unlinked first because `remove_dir` would otherwise always fail; the
+/// alone. The lock files are unlinked first because `remove_dir` would otherwise always fail; the
 /// window that opens between that unlink and this task's own release is harmless, since the lock is
 /// liveness-only (correctness is the epoch fence) and this replica is already done with the session.
 async fn release_session_lock(lock: Option<SessionLock>, path: Option<std::path::PathBuf>) {
@@ -601,16 +601,15 @@ async fn release_session_lock(lock: Option<SessionLock>, path: Option<std::path:
     };
     // Off the runtime thread: three network-filesystem calls and a descriptor close.
     let _ = tokio::task::spawn_blocking(move || {
-        let only_lock = std::fs::read_dir(&path).is_ok_and(|entries| {
-            entries
-                .flatten()
-                .all(|e| e.file_name() == std::ffi::OsStr::new("lock"))
-        });
-        if only_lock {
-            let _ = std::fs::remove_file(path.join("lock"));
+        // The lock files are `file_lock`'s to name and unlink. Released (descriptors closed) before
+        // they are unlinked: an NFS client silly-renames a file it still holds open to `.nfs*`, and
+        // that leftover would keep the directory from ever being removed.
+        if crate::file_lock::dir_holds_only_lock_files(&path) {
+            lock.release_and_remove_files();
             let _ = std::fs::remove_dir(&path);
+        } else {
+            drop(lock);
         }
-        drop(lock);
     })
     .await;
 }
@@ -3651,8 +3650,9 @@ mod tests {
             "the segment must survive"
         );
         assert!(
-            path.join("lock").is_file(),
-            "so must the lock file it is locked through"
+            !crate::file_lock::dir_holds_only_lock_files(&path)
+                && std::fs::read_dir(&path).unwrap().count() > 1,
+            "so must the lock files it is locked through"
         );
         // The lock itself is released, so the next owner can take it.
         assert!(acquire_session_lock(&path).unwrap().is_some());

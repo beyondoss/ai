@@ -1053,7 +1053,13 @@ mod tests {
         // `ensure_temp_file` now sweeps stale siblings (older than `STALE_TEMP_FILE_AGE`) before
         // creating a new one. A fresh sibling — e.g. one from a command that just finished, whose
         // `full_output_path` a caller may still legitimately be about to read — must survive.
-        let prefix = "test-stale-sweep";
+        // Unique per run: the files live in the shared system temp dir, and a fixed name let two
+        // concurrent runs of this suite (another checkout, a stress loop) sweep each other's files.
+        let prefix = &format!(
+            "test-stale-sweep-{}-{}",
+            std::process::id(),
+            crate::tools::temp_suffix()
+        );
         let dir = std::env::temp_dir();
         let stale_path = dir.join(format!("{prefix}-aaaaaaaaaaaaaaaa.log"));
         let fresh_path = dir.join(format!("{prefix}-bbbbbbbbbbbbbbbb.log"));
