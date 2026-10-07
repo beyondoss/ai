@@ -318,6 +318,9 @@ struct SessionHandle {
     /// `true` exactly while the session's [`serve_session`] loop is running a `prompt`. The reaper reads
     /// it so a detached-but-mid-run background session is never reaped out from under an in-flight turn.
     running: Arc<AtomicBool>,
+    /// `true` while the session holds a live MCP Events subscription (and `--mcp-events-reapable`
+    /// is off): a background trigger, so the idle reaper leaves the session alone.
+    keep_alive: Arc<AtomicBool>,
     /// Why this session ended, shared with its [`ExitGuard`]. Written by whoever stops it, read once
     /// as the task exits — so the reason is recorded by the code that knows it, rather than guessed
     /// at the point of exit where every ending looks alike.
@@ -385,6 +388,7 @@ type SessionBody = Box<
             Option<Arc<ServiceSession>>,
             mpsc::Receiver<String>,
             SharedOutConn,
+            Arc<AtomicBool>,
             Arc<AtomicBool>,
         ) -> BoxFuture<'static, ()>
         + Send
@@ -457,6 +461,9 @@ fn session_cfg(base: &ServeConfig, id: &str, service: Option<Arc<ServiceSession>
     c.listen_uds = None;
     c.listen_uds_mode = None;
     c.session_id = Some(id.to_string());
+    // Configured MCP Events subscriptions belong to exactly one daemon session, so one event is
+    // one model run — not one per connected session.
+    c.mcp_events_owner = id == base.mcp_events_session;
     // An addressed session selects itself; `--continue`'s "most recent for this cwd" would only be
     // able to disagree with the id the client actually routed on.
     c.continue_session = false;
@@ -476,25 +483,27 @@ fn session_cfg(base: &ServeConfig, id: &str, service: Option<Arc<ServiceSession>
 /// `serve_session`, not shared. The process runtime itself is `current_thread` by default (see
 /// `main.rs::build_runtime`).
 fn serve_session_body(base: ServeConfig) -> SessionBody {
-    Box::new(move |id, service, input_rx, out_conn, running| {
-        let cfg = session_cfg(&base, id, service);
-        let id = id.to_owned();
-        // Kept past the move into `serve_session` so a session that fails to *start* can still be
-        // reported: without this the only trace of "your sandbox is unreachable" was a line on the
-        // replica's stderr, and the client saw a socket that accepted its commands and answered
-        // nothing.
-        let out_err = out_conn.clone();
-        Box::pin(async move {
-            if let Err(e) = serve_session(cfg, input_rx, out_conn, running).await {
-                eprintln!("serve: session {id} ended: {e}");
-                lock_ignoring_poison(&out_err).broadcast(OutFrame::Value(json!({
-                    "type": "error",
-                    "session_id": id,
-                    "error": e.to_string(),
-                })));
-            }
-        })
-    })
+    Box::new(
+        move |id, service, input_rx, out_conn, running, keep_alive| {
+            let cfg = session_cfg(&base, id, service);
+            let id = id.to_owned();
+            // Kept past the move into `serve_session` so a session that fails to *start* can still be
+            // reported: without this the only trace of "your sandbox is unreachable" was a line on the
+            // replica's stderr, and the client saw a socket that accepted its commands and answered
+            // nothing.
+            let out_err = out_conn.clone();
+            Box::pin(async move {
+                if let Err(e) = serve_session(cfg, input_rx, out_conn, running, keep_alive).await {
+                    eprintln!("serve: session {id} ended: {e}");
+                    lock_ignoring_poison(&out_err).broadcast(OutFrame::Value(json!({
+                        "type": "error",
+                        "session_id": id,
+                        "error": e.to_string(),
+                    })));
+                }
+            })
+        },
+    )
 }
 
 /// Take the advisory lock on a session directory, off the runtime: both the `create_dir_all` and the
@@ -898,6 +907,7 @@ impl Supervisor {
         // Shared with the session loop: `true` only while it's running a `prompt`. The reaper reads
         // this handle-side clone to never reclaim a mid-run background session.
         let running = Arc::new(AtomicBool::new(false));
+        let keep_alive = Arc::new(AtomicBool::new(false));
         let exited = CancellationToken::new();
         table.sessions.insert(
             id.to_owned(),
@@ -910,6 +920,7 @@ impl Supervisor {
                 attached: 1,
                 last_detached_at: None,
                 running: running.clone(),
+                keep_alive: keep_alive.clone(),
                 end_reason: Arc::clone(&end_reason),
             },
         );
@@ -939,7 +950,14 @@ impl Supervisor {
         let lock_path = service.map(|svc| svc.session_path());
         let (started_tx, started_rx) = oneshot::channel();
         let started = lock_path.is_some().then_some(started_rx);
-        let body = (self.body)(id, service.cloned(), input_rx, out_conn.clone(), running);
+        let body = (self.body)(
+            id,
+            service.cloned(),
+            input_rx,
+            out_conn.clone(),
+            running,
+            keep_alive,
+        );
         let session_id = id.to_owned();
         // For the failure paths below: whoever attached to the `Starting` slot while the lock was
         // being taken is told why nothing started.
@@ -1402,7 +1420,9 @@ impl Supervisor {
 ///
 /// Otherwise the session is alive, and the ordinary conditions apply: **detached** (`attached == 0`) for
 /// at least `timeout`, and not mid-`prompt` — a detached background run is exactly what this design
-/// exists to keep alive, so `running` is never reaped out from under an in-flight turn.
+/// exists to keep alive, so `running` is never reaped out from under an in-flight turn. Nor is a
+/// session with a live MCP Events subscription (`keep_alive`): its triggers fire with no client
+/// attached, which is the point of them.
 fn is_reapable(h: &SessionHandle, timeout: Duration) -> bool {
     match h.phase.input() {
         None => false,
@@ -1411,6 +1431,7 @@ fn is_reapable(h: &SessionHandle, timeout: Duration) -> bool {
             h.attached == 0
                 && h.last_detached_at.is_some_and(|d| d.elapsed() >= timeout)
                 && !h.running.load(Ordering::Relaxed)
+                && !h.keep_alive.load(Ordering::Acquire)
         }
     }
 }
@@ -1597,6 +1618,9 @@ pub async fn serve_ws(
     // on stderr (the protocol never uses stderr): `h2c` against an h1-only gateway fails *every*
     // request, so an operator who flipped this on must see the mode they're running.
     cfg.shared_http = build_shared_h2_client(&cfg)?;
+    if let Some(callback) = &cfg.mcp_events_callback_url {
+        crate::tools::mcp_events::enable_receiver_document(callback);
+    }
     match cfg.upstream_http2 {
         UpstreamHttp2::Off => {
             eprintln!("serve: upstream-http2=off — each session opens its own connection pool")
@@ -1696,6 +1720,11 @@ pub async fn serve_ws(
     };
     // Read before `cfg` is moved into the session body factory inside this initializer.
     let cfg_drain_grace = cfg.drain_grace;
+    // The daemon session that owns configured MCP Events subscriptions, started below so its
+    // triggers run with no client attached. Only when something is configured, never in service
+    // mode.
+    let events_session = (!cfg.service_mode && !cfg.mcp_catalog.event_subscriptions().is_empty())
+        .then(|| cfg.mcp_events_session.clone());
     let supervisor = Arc::new(Supervisor {
         table: Arc::default(),
         // Service mode lists per tenant, from the shards, never from one process-wide directory.
@@ -1707,6 +1736,21 @@ pub async fn serve_ws(
         body: serve_session_body(cfg),
     });
     let mut shutdown = crate::serve::ShutdownSignal::new()?;
+
+    if let Some(id) = events_session {
+        // Pinned and at once unpinned: the session starts exactly as if a client had connected and
+        // left. It stays because its subscriptions keep it alive, not because anything holds it.
+        match supervisor.pin(Some(id.clone()), None).await {
+            Ok(p) => {
+                supervisor.unpin(&p.id, p.incarnation);
+                eprintln!("serve: MCP Events session `{id}` owns the configured subscriptions");
+            }
+            Err(e) => eprintln!(
+                "serve: could not start the MCP Events session `{id}`: {}",
+                HttpError::from(e)
+            ),
+        }
+    }
 
     // The idle reaper (on unless `--session-idle-timeout 0` turned it off). A background ticker that
     // stops dead and detached-idle-not-mid-run sessions — the same `Stopping` transition (drop the
@@ -1856,6 +1900,31 @@ where
             drain_http_body(&mut stream, &head, &leftover).await;
         }
         let _ = handle_health(supervisor, &mut stream, &head).await;
+        return Ok(());
+    }
+
+    // MCP Events receiver document (draft endpoint-verification path (d)): a public, static
+    // statement of which paths accept deliveries, so a server can verify without a challenge.
+    if supervisor.service.is_none()
+        && head.path == crate::tools::mcp_events::RECEIVER_DOCUMENT_PATH
+        && let Some(doc) = crate::tools::mcp_events::receiver_document()
+    {
+        drain_http_body(&mut stream, &head, &leftover).await;
+        let _ = write_http_ok(&mut stream, 200, "OK", None, doc).await;
+        return Ok(());
+    }
+
+    // MCP Events webhook deliveries (draft extension). Ahead of the grant check: the caller is an
+    // MCP server, not a tenant, and it authenticates with the subscription's HMAC signature, which
+    // `mcp_events::receive_webhook` verifies over the raw body. Not routed at all in service mode,
+    // which has no MCP Events (and so no subscription a delivery could belong to).
+    if supervisor.service.is_none()
+        && let Some(token) = head
+            .path
+            .strip_prefix(crate::tools::mcp_events::WEBHOOK_PATH_PREFIX)
+    {
+        let token = token.to_owned();
+        handle_mcp_event_webhook(&mut stream, &head, leftover, &token).await;
         return Ok(());
     }
 
@@ -2164,6 +2233,88 @@ where
         WebSocketStream::from_partially_read(stream, leftover, Role::Server, Some(config)).await;
     supervisor.attach(pinned, service, ws).await;
     Ok(())
+}
+
+/// POST `/_beyond/mcp-events/<token>`: one MCP Events webhook delivery. Everything past reading the
+/// body is `mcp_events::receive_webhook`'s.
+/// How long a webhook delivery's body may take to arrive, all of it.
+fn webhook_body_timeout() -> std::time::Duration {
+    std::time::Duration::from_millis(
+        std::env::var("BEYOND_AI_AGENT_MCP_EVENTS_BODY_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10_000),
+    )
+}
+
+async fn handle_mcp_event_webhook<S>(
+    stream: &mut S,
+    head: &HttpHead,
+    leftover: Vec<u8>,
+    token: &str,
+) where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    use crate::tools::mcp_events::{MAX_WEBHOOK_BODY, WebhookReply};
+    let reply_now = |reply: WebhookReply| reply;
+    // Cheap answers first, before a byte of the body is read: an unknown token is `410` (the
+    // draft's "do not retry"), a non-POST `405`, a body past the cap `413` (the draft lets a
+    // receiver refuse oversized deliveries, and the server must not retry them).
+    let early = if head.method != "POST" {
+        Some(WebhookReply::error(405, "Method Not Allowed", "POST only"))
+    } else if !crate::tools::mcp_events::route_exists(token) {
+        Some(WebhookReply::error(410, "Gone", "no such subscription"))
+    } else {
+        match head.content_length {
+            None => Some(WebhookReply::error(
+                411,
+                "Length Required",
+                "Content-Length required",
+            )),
+            Some(len) if len > MAX_WEBHOOK_BODY => Some(WebhookReply::error(
+                413,
+                "Payload Too Large",
+                "delivery body too large",
+            )),
+            Some(_) => None,
+        }
+    };
+    if let Some(reply) = early {
+        // Drain a body small enough to be worth it (closing on unread bytes can turn the answer
+        // into a reset); a large or absent-length one is not read at all.
+        if head.content_length.is_some_and(|l| l <= MAX_WEBHOOK_BODY) {
+            drain_http_body(stream, head, &leftover).await;
+        }
+        let reply = reply_now(reply);
+        let _ = write_http_ok(stream, reply.status, reply.reason, None, &reply.body).await;
+        return;
+    }
+    let len = head.content_length.unwrap_or(0);
+    // Grown as bytes arrive — never sized from the untrusted `Content-Length` — and under one
+    // deadline for the whole body, so a sender that trickles (or stops) cannot hold the connection.
+    let read = async {
+        let mut body = leftover[..leftover.len().min(len)].to_vec();
+        let mut tmp = [0u8; 8192];
+        while body.len() < len {
+            let want = (len - body.len()).min(tmp.len());
+            match stream.read(&mut tmp[..want]).await {
+                Ok(0) | Err(_) => return None,
+                Ok(n) => body.extend_from_slice(&tmp[..n]),
+            }
+        }
+        Some(body)
+    };
+    let body = match tokio::time::timeout(webhook_body_timeout(), read).await {
+        Ok(Some(body)) => body,
+        Ok(None) => return,
+        Err(_) => {
+            let reply = WebhookReply::error(408, "Request Timeout", "body not received in time");
+            let _ = write_http_ok(stream, reply.status, reply.reason, None, &reply.body).await;
+            return;
+        }
+    };
+    let reply = crate::tools::mcp_events::receive_webhook(token, &head.headers, &body).await;
+    let _ = write_http_ok(stream, reply.status, reply.reason, None, &reply.body).await;
 }
 
 /// POST `/_beyond/agent`: inject one command into the session and return its `ack` or `response`.
@@ -2689,6 +2840,7 @@ mod tests {
             attached,
             last_detached_at: detached_ago.and_then(|d| Instant::now().checked_sub(d)),
             running: Arc::new(AtomicBool::new(false)),
+            keep_alive: Arc::new(AtomicBool::new(false)),
             end_reason: Arc::new(Mutex::new(crate::metrics::SessionEnd::Client)),
         };
         (h, input_rx)
@@ -2852,22 +3004,24 @@ mod tests {
             table: Arc::default(),
             session_dir: None,
             service: None,
-            body: Box::new(move |_id, _service, mut input_rx, _out, _running| {
-                let probe = probe.clone();
-                Box::pin(async move {
-                    let now = probe.running_now.fetch_add(1, Ordering::SeqCst) + 1;
-                    probe.peak.fetch_max(now, Ordering::SeqCst);
-                    let nth = probe.started.fetch_add(1, Ordering::SeqCst);
-                    if first_ends_itself && nth == 0 {
-                        drop(input_rx);
-                    } else {
-                        while input_rx.recv().await.is_some() {}
-                    }
-                    probe.exiting.fetch_add(1, Ordering::SeqCst);
-                    probe.release.cancelled().await;
-                    probe.running_now.fetch_sub(1, Ordering::SeqCst);
-                })
-            }),
+            body: Box::new(
+                move |_id, _service, mut input_rx, _out, _running, _keep_alive| {
+                    let probe = probe.clone();
+                    Box::pin(async move {
+                        let now = probe.running_now.fetch_add(1, Ordering::SeqCst) + 1;
+                        probe.peak.fetch_max(now, Ordering::SeqCst);
+                        let nth = probe.started.fetch_add(1, Ordering::SeqCst);
+                        if first_ends_itself && nth == 0 {
+                            drop(input_rx);
+                        } else {
+                            while input_rx.recv().await.is_some() {}
+                        }
+                        probe.exiting.fetch_add(1, Ordering::SeqCst);
+                        probe.release.cancelled().await;
+                        probe.running_now.fetch_sub(1, Ordering::SeqCst);
+                    })
+                },
+            ),
         })
     }
 

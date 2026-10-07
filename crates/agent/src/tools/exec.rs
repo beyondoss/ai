@@ -363,24 +363,29 @@ impl Drop for GroupKillGuard {
             // (SIGTERM/SIGINT/SIGHUP) can reach `std::process::exit` moments after this guard drops,
             // and `process::exit` tears down every thread immediately with no chance for this one to
             // finish — see `wait_for_pending_group_kills`, which such a caller must call first.
-            let (tx, rx) = std::sync::mpsc::channel();
-            std::thread::spawn(move || {
-                kill_process_group(pid);
-                let _ = tx.send(());
-            });
-            if let Ok(mut pending) = PENDING_GROUP_KILLS.lock() {
-                // Opportunistically reclaim entries whose kill thread has already finished (`Ok`) or
-                // whose sender was dropped (`Disconnected`), so this registry — otherwise drained in
-                // full only just before `process::exit` — can't grow for the whole lifetime of a
-                // long-lived `serve` daemon that cancels one bash after another. A still-running kill
-                // thread's receiver (`Err(Empty)`) is kept, so `wait_for_pending_group_kills` can still
-                // block on it.
-                pending.retain(|rx| {
-                    matches!(rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty))
-                });
-                pending.push(rx);
-            }
+            spawn_tracked_cleanup(move || kill_process_group(pid));
         }
+    }
+}
+
+/// Run `cleanup` on its own OS thread, registered so [`wait_for_pending_group_kills`] waits for it
+/// before `std::process::exit` tears it down. The one way a `Drop` here hands off process cleanup.
+#[cfg(unix)]
+pub(crate) fn spawn_tracked_cleanup(cleanup: impl FnOnce() + Send + 'static) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        cleanup();
+        let _ = tx.send(());
+    });
+    if let Ok(mut pending) = PENDING_GROUP_KILLS.lock() {
+        // Opportunistically reclaim entries whose kill thread has already finished (`Ok`) or
+        // whose sender was dropped (`Disconnected`), so this registry — otherwise drained in
+        // full only just before `process::exit` — can't grow for the whole lifetime of a
+        // long-lived `serve` daemon that cancels one bash after another. A still-running kill
+        // thread's receiver (`Err(Empty)`) is kept, so `wait_for_pending_group_kills` can still
+        // block on it.
+        pending.retain(|rx| matches!(rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)));
+        pending.push(rx);
     }
 }
 
@@ -597,8 +602,25 @@ impl Capture {
 /// needs it: the process that was killed is not necessarily the process holding the memory.
 #[cfg(unix)]
 pub(crate) fn kill_process_group(pgid: u32) {
+    kill_group(pgid, true);
+}
+
+/// [`kill_process_group`] without its kill-by-pid fallback: only processes that are *in* group
+/// `pgid` are signalled. For a caller whose group leader has already been reaped — its pid is free
+/// to be reused by an unrelated process, which a fallback `kill -KILL <pid>` would then hit.
+#[cfg(unix)]
+pub(crate) fn kill_group_members(pgid: u32) {
+    kill_group(pgid, false);
+}
+
+#[cfg(unix)]
+fn kill_group(pgid: u32, pid_fallback: bool) {
     let group_result = std::process::Command::new("kill")
         .arg("-KILL")
+        // `--` first, so the exit status means what the code below assumes. Without it procps-ng
+        // `kill` still signals a live group, but exits 1 doing so (and 0 for a group that is already
+        // gone) — inverted, so the kill-by-pid fallback below ran after every successful group kill.
+        .arg("--")
         .arg(format!("-{pgid}"))
         // `kill` prints "No such process" on a group that already exited, which is the *expected*
         // case here — and since an MCP connection sweeps its group on every drop, inheriting that
@@ -610,7 +632,7 @@ pub(crate) fn kill_process_group(pgid: u32) {
     // exited on its own between the timeout firing and this running) isn't worth logging on its own —
     // the group kill covers the overwhelmingly common case, so try the direct fallback next regardless
     // of *why* it didn't succeed; a no-op fallback against an already-gone process is harmless.
-    if !matches!(&group_result, Ok(status) if status.success()) {
+    if pid_fallback && !matches!(&group_result, Ok(status) if status.success()) {
         match std::process::Command::new("kill")
             .arg("-KILL")
             .arg(pgid.to_string())

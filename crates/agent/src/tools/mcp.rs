@@ -75,10 +75,10 @@ use rmcp::service::{
     ClientLifecycleMode, ClientServiceExt, NotificationContext, Peer, RequestContext,
     RunningService,
 };
+use rmcp::transport::ConfigureCommandExt;
 use rmcp::transport::streamable_http_client::{
     StreamableHttpClientTransport, StreamableHttpClientTransportConfig,
 };
-use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
 use rmcp::{ClientHandler, ErrorData as McpError, RoleClient};
 use serde_json::{Map, Value, json};
 
@@ -211,6 +211,9 @@ struct McpHandler {
     sinks: Arc<std::sync::Mutex<HashMap<ProgressToken, ToolProgress>>>,
     /// In-flight tool-call progress sinks (LIFO). See [`Self::push_active`].
     active: Arc<std::sync::Mutex<Vec<ToolProgress>>>,
+    /// Where this connection's `notifications/events/*` go (MCP Events draft — see
+    /// [`crate::tools::mcp_events`]). Empty, and so free, unless a push stream is open.
+    events: crate::tools::mcp_events::NotificationRouter,
 }
 
 impl McpHandler {
@@ -220,6 +223,7 @@ impl McpHandler {
             host,
             sinks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             active: Arc::new(std::sync::Mutex::new(Vec::new())),
+            events: crate::tools::mcp_events::NotificationRouter::default(),
         }
     }
 
@@ -302,6 +306,23 @@ impl ClientHandler for McpHandler {
         _context: RequestContext<RoleClient>,
     ) -> Result<CreateMessageResult, McpError> {
         self.host.sampling.create_message(params).await
+    }
+
+    async fn on_custom_notification(
+        &self,
+        notification: rmcp::model::CustomNotification,
+        context: NotificationContext<RoleClient>,
+    ) {
+        // rmcp moves `_meta` off the notification before dispatch. In 3.2.0 it swaps the whole
+        // extension map out first, so the metadata lands in `context.extensions` and
+        // `context.meta` is left empty; read both, so a fixed rmcp keeps working.
+        let subscription_id = context.meta.subscription_id().or_else(|| {
+            context
+                .extensions
+                .get::<rmcp::model::NotificationMetaObject>()
+                .and_then(rmcp::model::NotificationMetaObject::subscription_id)
+        });
+        self.events.route(notification, subscription_id);
     }
 }
 
@@ -445,8 +466,8 @@ struct McpTool {
 /// dead weight until someone actually calls it. So the process is reaped after
 /// [`IDLE_REAP_AFTER`] without a call, and re-spawned on the next one.
 ///
-/// Dropping the client is what kills the child: rmcp's `ChildWithCleanup` reaps the process in its
-/// `Drop`. There is no separate shutdown to call, and no zombie left behind.
+/// Dropping the client is what ends the child: rmcp drops the stdio transport, and
+/// `mcp_stdio::retire` closes its stdin, gives it its grace, then kills and reaps what is left.
 /// A connected server: the client, and the process group to sweep when it goes away.
 ///
 /// The group is kept beside the client rather than on the connection because it belongs to *this*
@@ -455,8 +476,11 @@ struct McpTool {
 struct Live {
     client: Arc<McpClient>,
     /// `None` for HTTP transports: there is no process of ours to reap.
-    pgid: Option<u32>,
+    proc: ServerProc,
 }
+
+/// A stdio server's process, to retire when its connection goes away; `None` for HTTP.
+type ServerProc = Option<Arc<crate::tools::mcp_stdio::ServerProcess>>;
 
 struct McpConnection {
     config: McpServerConfig,
@@ -622,7 +646,7 @@ impl McpConnection {
         config: McpServerConfig,
         dial: Dial,
         client: McpClient,
-        pgid: Option<u32>,
+        proc: ServerProc,
         idle_after: Duration,
     ) -> Self {
         Self {
@@ -630,7 +654,7 @@ impl McpConnection {
             dial,
             client: tokio::sync::Mutex::new(Some(Live {
                 client: Arc::new(client),
-                pgid,
+                proc,
             })),
             last_used: std::sync::atomic::AtomicU64::new(now_secs()),
             idle_after,
@@ -657,11 +681,11 @@ impl McpConnection {
         if let Some(live) = guard.as_ref() {
             return Ok(live.client.clone());
         }
-        let (client, pgid) = connect_one_client(&self.config, &self.dial).await?;
+        let (client, proc) = connect_one_client(&self.config, &self.dial).await?;
         let client = Arc::new(client);
         *guard = Some(Live {
             client: client.clone(),
-            pgid,
+            proc,
         });
         Ok(client)
     }
@@ -684,14 +708,18 @@ impl McpConnection {
         let mut guard = self.client.lock().await;
         match guard.as_ref() {
             Some(live) if Arc::strong_count(&live.client) == 1 => {
-                let pgid = live.pgid;
-                // Drops the client, which closes the server's stdin and kills it...
+                let proc = live.proc.clone();
+                let pgid = proc.as_ref().and_then(|p| p.pgid());
+                // Drops the client; then the server's stdin closes, it gets
+                // `mcp_stdio::SHUTDOWN_GRACE` to exit, and its group is swept — taking anything it
+                // forked away from itself, which a kill aimed at the server alone leaves running.
                 *guard = None;
-                // ...and this takes anything it forked away from itself, which a kill aimed at the
-                // server alone leaves running.
-                sweep_process_group(pgid);
+                if let Some(proc) = &proc {
+                    crate::tools::mcp_stdio::retire(proc);
+                }
                 tracing::debug!(
                     server = %self.config.name,
+                    pgid,
                     idle_secs = idle,
                     "reaped an idle MCP server process"
                 );
@@ -1129,6 +1157,7 @@ pub async fn connect_granted(
         jobs.push((
             McpServerConfig {
                 name: connector.name.clone(),
+                events: Vec::new(),
                 transport: McpTransport::Http {
                     url: connector.url.clone(),
                     headers: BTreeMap::new(),
@@ -1191,7 +1220,7 @@ async fn connect_many(
 async fn connect_one_client(
     config: &McpServerConfig,
     dial: &Dial,
-) -> Result<(McpClient, Option<u32>), String> {
+) -> Result<(McpClient, ServerProc), String> {
     match &config.transport {
         McpTransport::Stdio { command, args, .. } => {
             connect_stdio(config, dial, command, args).await
@@ -1317,8 +1346,8 @@ async fn connect_one(
         );
         return Ok(tools_from_manifest(config, dial, manifest, idle_reap_after));
     }
-    let (client, pgid) = connect_one_client(config, dial).await?;
-    tools_from_client(config, dial, client, pgid, idle_reap_after, manifest_dir).await
+    let (client, proc) = connect_one_client(config, dial).await?;
+    tools_from_client(config, dial, client, proc, idle_reap_after, manifest_dir).await
 }
 
 /// Spawns `command` as its own process-group leader (`process_group(0)`), the same way
@@ -1333,7 +1362,7 @@ async fn connect_one(
 /// second browser beside the first. (`@playwright/mcp` happens not to do this; "happens not to" is not
 /// a property to build a memory budget on.)
 ///
-/// The group is what makes [`sweep_process_group`] able to catch them, and it is why the pid is read
+/// The group is what makes the transport's final sweep (`mcp_stdio::stdio_transport`) able to catch them, and it is why the pid is read
 /// here and carried on the connection.
 ///
 /// Dropping the client is still the primary shutdown, not the kill: the MCP stdio contract is that a
@@ -1343,7 +1372,7 @@ async fn connect_one(
 /// and a well-behaved browser server closes its browser on the way out. The group sweep is the
 /// backstop for everything that doesn't.
 ///
-/// `stderr` is left at `TokioChildProcess`'s own default (`Stdio::inherit()`), not captured — a
+/// `stderr` is inherited (`Stdio::inherit()`, set in `mcp_events::stdio_transport`), not captured — a
 /// deliberate choice, not an oversight: a server that fails to start or crashes typically explains why
 /// on its own stderr, and inheriting it means that reaches the operator's own console (this process's
 /// stderr) immediately, the same way a connect failure's `tracing::warn!` does.
@@ -1352,9 +1381,9 @@ async fn connect_stdio(
     dial: &Dial,
     command: &str,
     args: &[String],
-) -> Result<(McpClient, Option<u32>), String> {
+) -> Result<(McpClient, ServerProc), String> {
     let env = config.resolved_env();
-    let child = TokioChildProcess::new(tokio::process::Command::new(command).configure(|cmd| {
+    let cmd = tokio::process::Command::new(command).configure(|cmd| {
         cmd.args(args);
         for (k, v) in &env {
             cmd.env(k, v);
@@ -1369,49 +1398,43 @@ async fn connect_stdio(
         // while the next call starts a second browser. A group leader here is what makes
         // [`kill_process_group`] able to catch them.
         cmd.process_group(0);
-    }))
-    .map_err(|e| format!("failed to spawn `{command}`: {e}"))?;
-    // Read before the transport is consumed; this is also the group id, since the child leads it.
-    let pgid = child.id();
+    });
+    // Spawned here rather than by rmcp's `TokioChildProcess` — for every stdio server — so its
+    // stdout passes through `mcp_stdio::stdio_transport`, which keeps rmcp 3.x from silently dropping
+    // custom results (see `mcp_stdio::rescue`). When the transport or the connection goes away,
+    // `mcp_stdio::retire` closes the server's stdin, gives it `mcp_stdio::SHUTDOWN_GRACE` to exit,
+    // and then kills what is left of its group.
+    let (proc, transport) = crate::tools::mcp_stdio::stdio_transport(cmd)
+        .map_err(|e| format!("failed to spawn `{command}`: {e}"))?;
 
     let client = McpHandler::new(&config.name, dial.host.clone())
-        .serve_with_lifecycle(child, client_lifecycle())
+        .serve_with_lifecycle(transport, client_lifecycle())
         .await
         .map_err(|e| format!("MCP handshake over stdio failed: {e}"))?;
-    Ok((client, pgid))
+    Ok((client, Some(proc)))
 }
 
 /// The other way a server goes away: the last tool holding the connection is dropped (a `serve`
-/// registry rebuild, a finished `run`, process exit). rmcp kills the server itself on drop; this adds
-/// the sweep, so that path reclaims as much as a reap does.
+/// registry rebuild, a finished `run`). [`mcp_stdio::retire`](crate::tools::mcp_stdio::retire)
+/// closes the server's stdin at once, gives it its grace and sweeps its group, on a tracked OS
+/// thread. A connection never dropped before the process exits is retired by
+/// `mcp_stdio::retire_all`, which every exit path of `run` and `serve` calls before waiting for the
+/// sweeps.
+///
+/// What this does *not* cover is the agent being hard-killed: a server in its own group no longer
+/// receives the terminal's signals, and nothing then sweeps it. No worse than before — an orphaned
+/// browser already outlived a killed agent — and fixing it properly needs a supervisor.
 impl Drop for McpConnection {
     fn drop(&mut self) {
         // `get_mut` rather than a lock: we hold `&mut self`, so no one else can be holding it.
         if let Some(live) = self.client.get_mut().take() {
-            let pgid = live.pgid;
+            let proc = live.proc.clone();
             drop(live);
-            sweep_process_group(pgid);
+            if let Some(proc) = &proc {
+                crate::tools::mcp_stdio::retire(proc);
+            }
         }
     }
-}
-
-/// Sweep a reaped server's process group, in the background.
-///
-/// Deliberately *after* the client is dropped rather than instead of it: dropping closes the server's
-/// stdin, which is the MCP shutdown signal, and a well-behaved server closes its browser on seeing it.
-/// This is the backstop for the rest — and it reuses `exec`'s implementation rather than adding a
-/// second one, including its `ps`-enumeration pass, because group-signal delivery alone turned out not
-/// to be reliable there either.
-///
-/// What this does *not* cover is the agent being hard-killed: a server in its own group no longer
-/// receives the terminal's signals, and nothing then sweeps it. That is no worse than before — an
-/// orphaned browser already outlived a killed agent — and fixing it properly needs a supervisor rather
-/// than a signal.
-fn sweep_process_group(pgid: Option<u32>) {
-    let Some(pgid) = pgid else { return };
-    // On its own thread: `kill_process_group` blocks (it shells out and sleeps between passes), and
-    // this is called from both an async reap and a `Drop`, neither of which may block.
-    std::thread::spawn(move || crate::tools::exec::kill_process_group(pgid));
 }
 
 /// Dial an HTTP server. Two shapes, decided by `dial.http`:
@@ -1840,6 +1863,91 @@ impl McpCatalog {
             .collect()
     }
 
+    /// Every configured server's declared MCP Events subscriptions (`mcp_servers[].events`), for
+    /// the servers still connected. Read off the connection's own config, so it is exactly what was
+    /// dialed — nothing is re-read from disk.
+    pub fn event_subscriptions(&self) -> Vec<(String, Vec<crate::settings::McpEventSubscription>)> {
+        self.snapshot()
+            .into_iter()
+            .filter_map(|s| {
+                let conn = s.conn.upgrade()?;
+                (!conn.config.events.is_empty()).then(|| (s.name, conn.config.events.clone()))
+            })
+            .collect()
+    }
+
+    /// Whether any server is connected at all — the cheap gate `serve` uses before wiring events.
+    pub fn is_empty(&self) -> bool {
+        self.snapshot().is_empty()
+    }
+
+    /// How to reach `server` for MCP Events requests, redialing a reaped process first.
+    ///
+    /// - **stdio**, and a pre-`2026-07-28` (session-bound) HTTP server: rmcp's own connection. The handle keeps the process alive (the reaper never
+    ///   reaps a client somebody holds), so an open push stream pins its server while it is open.
+    /// - **streamable HTTP**: the URL, credential headers and negotiated protocol version, for
+    ///   direct stateless requests — rmcp's typed result union would drop a custom result that
+    ///   carries `_meta` (see `mcp_events::rescue_line`), and over HTTP there is no byte stream of
+    ///   ours to repair it on.
+    pub(crate) async fn events_peer(&self, server: &str) -> Result<EventsPeer, String> {
+        let entry = self
+            .snapshot()
+            .into_iter()
+            .find(|s| s.name == server)
+            .ok_or_else(|| format!("unknown MCP server `{server}`"))?;
+        let conn = entry
+            .conn
+            .upgrade()
+            .ok_or_else(|| format!("mcp server `{server}` is no longer connected"))?;
+        let client = conn.client().await?;
+        // Direct requests only for a stateless (`2026-07-28`) server. An older streamable-HTTP
+        // server may bind requests to the `Mcp-Session-Id` rmcp negotiated — only rmcp's own
+        // connection carries it — and it does not attach `_meta` to results, so rmcp's own path
+        // decodes them intact.
+        let stateless = client
+            .peer_info()
+            .is_some_and(|i| i.protocol_version >= ProtocolVersion::V_2026_07_28);
+        let (McpTransport::Http { url, .. }, true) = (&conn.config.transport, stateless) else {
+            return Ok(EventsPeer::Rmcp {
+                peer: client.peer().clone(),
+                router: client.service().events.clone(),
+                _live: ClientHold(client),
+            });
+        };
+        let mut headers: Vec<(HeaderName, HeaderValue)> = Vec::new();
+        match &conn.dial.http {
+            Some(http) => headers.extend(
+                http.headers
+                    .iter()
+                    .map(|h| (h.name.clone(), h.value.clone())),
+            ),
+            None => {
+                for (k, v) in conn.config.resolved_headers() {
+                    if let (Ok(k), Ok(v)) = (
+                        HeaderName::from_bytes(k.as_bytes()),
+                        HeaderValue::from_str(&v),
+                    ) {
+                        headers.push((k, v));
+                    }
+                }
+                if let Some(token) = oauth_bearer_token(&conn.config.name, url).await
+                    && let Ok(v) = HeaderValue::from_str(&format!("Bearer {token}"))
+                {
+                    headers.push((http::header::AUTHORIZATION, v));
+                }
+            }
+        }
+        Ok(EventsPeer::Http {
+            url: url.clone(),
+            router: client.service().events.clone(),
+            headers,
+            protocol_version: client
+                .peer_info()
+                .map(|i| i.protocol_version.to_string())
+                .unwrap_or_else(|| ProtocolVersion::V_2026_07_28.to_string()),
+        })
+    }
+
     /// `completion/complete` against a live (or reconnected) server.
     pub async fn complete(
         &self,
@@ -1863,12 +1971,34 @@ impl McpCatalog {
     }
 }
 
+/// Keeps a client (and so its process) alive; deliberately opaque outside this module.
+pub(crate) struct ClientHold(#[expect(dead_code, reason = "held for its Drop")] Arc<McpClient>);
+
+/// One server's connection, as the MCP Events client needs it. See [`McpCatalog::events_peer`].
+pub(crate) enum EventsPeer {
+    /// stdio: the raw peer for `events/*` requests, the router its `notifications/events/*` arrive
+    /// on, and a hold on the client so the idle reaper leaves it alone while this is alive.
+    Rmcp {
+        peer: Peer<RoleClient>,
+        router: crate::tools::mcp_events::NotificationRouter,
+        _live: ClientHold,
+    },
+    /// Streamable HTTP: where and how to POST `events/*` directly. `router` still carries
+    /// `notifications/events/list_changed`, which arrives on rmcp's own connection.
+    Http {
+        url: String,
+        router: crate::tools::mcp_events::NotificationRouter,
+        headers: Vec<(HeaderName, HeaderValue)>,
+        protocol_version: String,
+    },
+}
+
 async fn tools_from_client(
     config: &McpServerConfig,
     dial: &Dial,
     client: McpClient,
-    // The server's process group, so a reap can take its children too; `None` for HTTP.
-    pgid: Option<u32>,
+    // The server's process, so a reap can take its group too; `None` for HTTP.
+    proc: ServerProc,
     idle_reap_after: Duration,
     manifest_dir: Option<&crate::tools::mcp_manifest::ManifestDir>,
 ) -> Result<(Vec<Arc<dyn Tool>>, McpServerCatalog), String> {
@@ -1899,7 +2029,7 @@ async fn tools_from_client(
         config.clone(),
         dial.clone(),
         client,
-        pgid,
+        proc,
         idle_reap_after,
     ));
     register_for_reaping(&conn, idle_reap_after);

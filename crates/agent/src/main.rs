@@ -791,6 +791,24 @@ enum Command {
         /// do); a production replica never should.
         #[usage(long, env = "AI_AGENT_MCP_ALLOW_PRIVATE")]
         mcp_allow_private: bool,
+        /// MCP Events (draft extension): the externally reachable base URL that routes to this
+        /// daemon's `--listen`/`--listen-uds` listener, e.g. `https://agent.example.com`. Webhook
+        /// callbacks are `<this>/_beyond/mcp-events/<token>`, so a server can deliver events to a
+        /// session. Servers require `https`; terminate TLS in front of the listener. Unset, webhook
+        /// delivery is off and subscriptions use push or poll.
+        #[usage(long, env = "AI_AGENT_MCP_EVENTS_CALLBACK_URL")]
+        mcp_events_callback_url: Option<String>,
+        /// MCP Events: let the idle reaper (`--session-idle-timeout`) stop a detached session even
+        /// while it holds live event subscriptions. By default such a session is exempt — its
+        /// subscriptions are background triggers, and reaping it would silently end them.
+        #[usage(long, env = "AI_AGENT_MCP_EVENTS_REAPABLE")]
+        mcp_events_reapable: bool,
+        /// MCP Events: the daemon session that owns the subscriptions configured in
+        /// `mcp_servers[].events`. It is started at boot, every configured event is delivered to
+        /// it (and only it), and a client attaches to it by this id. Other sessions subscribe only
+        /// at runtime (`mcp_events_subscribe`). Over stdio the one session owns them.
+        #[usage(long, env = "AI_AGENT_MCP_EVENTS_SESSION")]
+        mcp_events_session: Option<String>,
         /// Address this exact session: reattach to it if it already exists, or create it under exactly
         /// this id if it doesn't. Gives a caller a known, predictable name to route on rather than
         /// parsing an id back out of `get_state`/the startup `{"kind":"session", id, …}` banner.
@@ -1630,7 +1648,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // can run first, before any worker exists. The flavour depends on whether this process is a
     // fleet replica — see [`build_runtime`] — which has to be decided from the raw arguments,
     // because the runtime must exist before anything can parse them properly.
+    // The ordinary way out (`run` finishing, every subcommand that returns) and a panic unwinding
+    // out of `run` both pass through this guard's `Drop`: the same cleanup as `exit_process`.
+    let _sweep = tools::mcp_stdio::ExitSweep;
     build_runtime(is_service_mode())?.block_on(run())
+}
+
+/// What every way out of the process does first: retire every stdio MCP server still running
+/// (close its stdin, give it its grace, sweep its process group) and wait for those sweeps and for
+/// any `bash` group kill still in flight — see `mcp_stdio::sweep_before_exit`.
+fn finish_process_cleanup() {
+    tools::mcp_stdio::sweep_before_exit();
+}
+
+/// `std::process::exit` after [`finish_process_cleanup`]. Every exit of `run` and `serve` that
+/// happens after their tools exist goes through here.
+fn exit_process(code: i32) -> ! {
+    finish_process_cleanup();
+    std::process::exit(code)
 }
 
 /// Is this process a `serve --service` replica?
@@ -1940,6 +1975,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             metrics_listen,
             drain_grace,
             mcp_allow_private,
+            mcp_events_callback_url,
+            mcp_events_reapable,
+            mcp_events_session,
             session_id,
             r#continue: continue_session,
             no_session_persistence,
@@ -2053,6 +2091,19 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 && listen.is_none()
                 && listen_uds.is_none()
                 && std::env::var_os("LISTEN_FDS").is_some();
+            // Webhook callbacks arrive on the daemon's HTTP listener; over stdio nothing would
+            // receive them, and a server would fail its verification challenge on every subscribe.
+            if mcp_events_callback_url.is_some()
+                && listen.is_none()
+                && listen_uds.is_none()
+                && !systemd_activated
+            {
+                return Err(
+                    "--mcp-events-callback-url requires --listen, --listen-uds, or systemd socket \
+                     activation: webhook deliveries arrive on serve's HTTP listener"
+                        .into(),
+                );
+            }
             if service {
                 if grant_verifier.is_none() {
                     return Err(
@@ -2405,6 +2456,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 service: None,
                 max_live_sessions,
                 mcp_http,
+                mcp_events_callback_url,
+                mcp_events_reapable,
+                mcp_events_session: mcp_events_session
+                    .clone()
+                    .unwrap_or_else(|| tools::mcp_events::DEFAULT_EVENTS_SESSION.to_owned()),
+                // Over stdio the one session owns the configured subscriptions; the daemon picks
+                // its events session per session (`serve_ws::session_cfg`).
+                mcp_events_owner: true,
                 metrics: metrics.clone(),
                 // The process `main` built: it owns the signal handler. `serve_ws::session_cfg`
                 // flips this for each session it spawns.
@@ -2449,7 +2508,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .unwrap_or_else(|e| {
                     eprintln!("{e}");
-                    std::process::exit(2);
+                    exit_process(2);
                 }),
                 lifecycle_heartbeat: std::time::Duration::from_secs(lifecycle_heartbeat_secs),
                 tools,
@@ -2470,7 +2529,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 // `ToolPolicy::validate_deny_path_patterns` uses for a malformed `--deny-path` glob.
                 approve: beyond_ai_agent::approval::GatedSet::parse(&approve).unwrap_or_else(|e| {
                     eprintln!("{e}");
-                    std::process::exit(2);
+                    exit_process(2);
                 }),
                 approval_timeout: (approval_timeout > 0)
                     .then(|| std::time::Duration::from_secs(approval_timeout)),
@@ -2545,9 +2604,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             // way out, and that `process::exit` would otherwise terminate mid-`kill`, orphaning exactly
             // the backgrounded grandchildren the guard exists to reap. Bounded, so a wedged `kill`/`ps`
             // shell-out can't hold the daemon's own shutdown open.
-            #[cfg(unix)]
-            tools::exec::wait_for_pending_group_kills(std::time::Duration::from_secs(2));
-            std::process::exit(shutdown_cause.map(serve::Signal::exit_code).unwrap_or(0));
+            //
+            // Stdio MCP servers are in the same position — see `exit_process`.
+            exit_process(shutdown_cause.map(serve::Signal::exit_code).unwrap_or(0));
         }
         Command::Tools => {
             let mut reg = tools::default_registry();
@@ -3419,9 +3478,7 @@ fn unwrap_turn_result(
             // won't wait for on its own, so an in-flight timed-out/backgrounded grandchild would be
             // silently orphaned without this. Bounded, not indefinite: a hung `kill`/`ps` shell-out
             // must not hang the whole process's own shutdown.
-            #[cfg(unix)]
-            tools::exec::wait_for_pending_group_kills(std::time::Duration::from_secs(2));
-            std::process::exit(code);
+            exit_process(code);
         }
         Err(e) => Err(e.into()),
     }
@@ -4396,7 +4453,7 @@ async fn run_task(
             Some(
                 beyond_ai_agent::memory::open(dsn.as_deref(), &cwd).unwrap_or_else(|e| {
                     eprintln!("{e}");
-                    std::process::exit(2);
+                    exit_process(2);
                 }),
             )
         };
@@ -4458,7 +4515,7 @@ async fn run_task(
     if let Some(arg) = &output_schema {
         let schema = tools::structured_output::load_schema(arg).unwrap_or_else(|e| {
             eprintln!("{e}");
-            std::process::exit(2);
+            exit_process(2);
         });
         let tool = tools::structured_output::StructuredOutput::new(
             schema,
@@ -4467,7 +4524,7 @@ async fn run_task(
         )
         .unwrap_or_else(|e| {
             eprintln!("{e}");
-            std::process::exit(2);
+            exit_process(2);
         });
         registry.register(Arc::new(tool));
     }
@@ -4884,9 +4941,7 @@ async fn run_task(
     persist_run_tail(&store, &session)?;
     if broken_pipe.load(Ordering::Relaxed) {
         emit_cli_lifecycle(life.as_ref(), &session, CliTerminal::Aborted, None).await;
-        #[cfg(unix)]
-        tools::exec::wait_for_pending_group_kills(std::time::Duration::from_secs(2));
-        std::process::exit(0);
+        exit_process(0);
     }
     if let Err(e) = &turn_result {
         emit_cli_lifecycle(
@@ -4923,9 +4978,7 @@ async fn run_task(
         persist_run_tail(&store, &session)?;
         if broken_pipe.load(Ordering::Relaxed) {
             emit_cli_lifecycle(life.as_ref(), &session, CliTerminal::Aborted, None).await;
-            #[cfg(unix)]
-            tools::exec::wait_for_pending_group_kills(std::time::Duration::from_secs(2));
-            std::process::exit(0);
+            exit_process(0);
         }
         if let Err(e) = &turn_result {
             emit_cli_lifecycle(
@@ -5039,7 +5092,7 @@ async fn run_task(
                     "[no structured output: the model ended the run without calling `{}`]",
                     tools::structured_output::NAME
                 );
-                std::process::exit(1);
+                exit_process(1);
             }
         }
     } else {
@@ -5073,7 +5126,7 @@ async fn run_task(
     // checked too, defensively, even though it's currently unreachable here).
     if let Some(message) = text_mode_failure_message(json, stop_reason) {
         eprintln!("{message}");
-        std::process::exit(1);
+        exit_process(1);
     }
     Ok(())
 }
