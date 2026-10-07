@@ -17,7 +17,6 @@ mod common;
 use std::io::Write;
 use std::path::Path;
 use std::process::Command;
-use std::time::{Duration, Instant};
 
 use common::mcp_fixture::spawn_http_mcp_fixture;
 use common::{
@@ -501,41 +500,44 @@ fn mcp_a_server_that_fails_to_spawn_is_skipped_fail_soft_while_others_still_work
 
 #[test]
 fn mcp_multiple_servers_connect_concurrently_not_sequentially() {
-    // Regression guard for `tools::mcp::connect_all`'s `futures::future::join_all` fan-out: three
-    // servers, each artificially delayed at startup by the same amount — if `connect_all` connected
-    // them one at a time, total startup time would scale with the *sum* of the delays; connected
-    // concurrently, it tracks the *slowest one*, plus incidental process-spawn/tokio-runtime overhead.
-    const DELAY_MS: u64 = 400;
-    const SERVER_COUNT: u64 = 3;
+    // Regression guard for `tools::mcp::connect_all`'s `futures::future::join_all` fan-out, proved
+    // by structure rather than by wall clock: each server answers nothing until all three have
+    // started (a startup barrier). Connected concurrently, all three are starting at once and pass
+    // it; connected one at a time, the first waits for two that are never started, gives up and
+    // exits unserved, so its tools are missing. Host load can slow this down, but not flip it.
+    const SERVER_COUNT: usize = 3;
 
     let home = tempfile::tempdir().unwrap();
     let cwd = tempfile::tempdir().unwrap();
-    let delayed = |name: &str| {
+    let barrier = tempfile::tempdir().unwrap();
+    let gated = |name: &str| {
         stdio_server_config(
             name,
-            json!({ "MCP_FIXTURE_STARTUP_DELAY_MS": DELAY_MS.to_string() }),
+            json!({
+                "MCP_FIXTURE_STARTUP_BARRIER":
+                    format!("{}:{SERVER_COUNT}", barrier.path().display()),
+            }),
         )
     };
     write_global_settings(
         home.path(),
-        json!([delayed("one"), delayed("two"), delayed("three")]),
+        json!([gated("one"), gated("two"), gated("three")]),
     );
 
-    let start = Instant::now();
-    let (ok, _stdout, stderr, _bodies) = run_against(
+    let (ok, _stdout, stderr, bodies) = run_against(
         home.path(),
         cwd.path(),
         "just say hi",
         vec![turn_text("hi")],
     );
-    let elapsed = start.elapsed();
     assert!(ok, "run failed: {stderr}");
-    assert!(
-        elapsed < Duration::from_millis(DELAY_MS * SERVER_COUNT - 100),
-        "three {DELAY_MS}ms-delayed servers took {elapsed:?} — should track the slowest one \
-         (~{DELAY_MS}ms) plus overhead, not their sum (~{}ms), if they connected concurrently",
-        DELAY_MS * SERVER_COUNT
-    );
+    for name in ["one", "two", "three"] {
+        assert!(
+            bodies[0].contains(&format!("mcp__{name}__")),
+            "server `{name}` never got past the startup barrier: the servers were not connected \
+             concurrently. stderr: {stderr}"
+        );
+    }
 }
 
 #[test]

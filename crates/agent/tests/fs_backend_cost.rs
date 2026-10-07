@@ -79,7 +79,7 @@ impl FsBackend for Counting {
         self.tick();
         self.inner.read_bytes(path, offset, max).await
     }
-    async fn write_bytes(&self, path: &Path, bytes: &[u8]) -> Result<(), FsError> {
+    async fn write_bytes(&self, path: &Path, bytes: Vec<u8>) -> Result<(), FsError> {
         self.tick();
         self.inner.write_bytes(path, bytes).await
     }

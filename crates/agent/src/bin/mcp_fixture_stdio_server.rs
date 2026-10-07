@@ -22,7 +22,8 @@
 //! `tasks/update`, and `server/discover` (advertising `2026-07-28` + `2025-11-25` + tasks extension).
 //! Legacy `initialize` still works for Auto fallback.
 //!
-//! Env: `MCP_FIXTURE_STARTUP_DELAY_MS`, `MCP_FIXTURE_ORPHAN_PIDFILE` (unchanged).
+//! Env: `MCP_FIXTURE_STARTUP_BARRIER` (`<dir>:<n>`: serve nothing until `n` fixtures have started; see
+//! `main`), `MCP_FIXTURE_STARTUP_BARRIER_SECS`, `MCP_FIXTURE_ORPHAN_PIDFILE` (unchanged).
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -90,11 +91,29 @@ fn capabilities() -> Value {
 
 #[tokio::main]
 async fn main() {
-    if let Some(delay_ms) = std::env::var("MCP_FIXTURE_STARTUP_DELAY_MS")
+    // A startup barrier: announce this process in `<dir>`, then serve nothing until `<n>` processes
+    // have announced themselves there. Only a client that has all `n` servers starting at once gets
+    // past it; one that waits for each to answer before starting the next never does, and this
+    // process exits unserved after `MCP_FIXTURE_STARTUP_BARRIER_SECS` (default 30).
+    if let Some((dir, n)) = std::env::var("MCP_FIXTURE_STARTUP_BARRIER")
         .ok()
-        .and_then(|v| v.parse::<u64>().ok())
+        .and_then(|v| {
+            let (dir, n) = v.rsplit_once(':')?;
+            Some((std::path::PathBuf::from(dir), n.parse::<usize>().ok()?))
+        })
     {
-        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+        let secs = std::env::var("MCP_FIXTURE_STARTUP_BARRIER_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30);
+        let _ = std::fs::write(dir.join(std::process::id().to_string()), b"");
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        while std::fs::read_dir(&dir).map(|d| d.count()).unwrap_or(0) < n {
+            if Instant::now() > deadline {
+                std::process::exit(3);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
     if let Ok(pidfile) = std::env::var("MCP_FIXTURE_ORPHAN_PIDFILE") {
         let script = format!("sleep 600 & echo $! > {pidfile}");

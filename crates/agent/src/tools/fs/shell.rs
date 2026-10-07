@@ -192,6 +192,45 @@ impl ShellFs {
     pub fn capabilities(&self) -> Capabilities {
         self.caps
     }
+
+    /// [`FsBackend::write_bytes`] over borrowed bytes, which `write_if_unchanged` also writes
+    /// through.
+    async fn write_slice(&self, path: &Path, bytes: &[u8]) -> Result<(), FsError> {
+        let target = path.to_string_lossy().into_owned();
+        // Chosen here rather than by the script's `$$` because the chunked path spans several shells,
+        // and unpredictable for the reason `LocalFs`'s is: a preplanted name cannot redirect the write.
+        let tmp = format!("{target}.tmp.{}", crate::tools::temp_suffix());
+        let outcome = if self.caps.stdin {
+            let args = sh_script(
+                WRITE_STDIN_SCRIPT,
+                &[target, tmp.clone(), bytes.len().to_string()],
+            );
+            self.runner
+                .run_with_stdin("sh", &args, None, self.timeout, bytes)
+                .await
+                .map_err(|e| FsError::Backend(format!("sh: {e}")))
+        } else {
+            self.write_chunks(&target, &tmp, bytes).await
+        };
+        match outcome {
+            Ok(result) if result.code == Some(0) => Ok(()),
+            failed => {
+                // The compensating action. The scripts remove the temp on every failure *they* see;
+                // this covers the ones they cannot — a transport error or a timeout between chunks.
+                let _ = self
+                    .exec("rm", &["-f".to_string(), "--".to_string(), tmp])
+                    .await;
+                Err(match failed {
+                    Ok(result) => FsError::Backend(format!(
+                        "write {}: {}",
+                        path.display(),
+                        first_line_or(&result.stderr, "command failed")
+                    )),
+                    Err(e) => e,
+                })
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -316,41 +355,8 @@ impl FsBackend for ShellFs {
     ///
     /// Either way the temp's size is checked against `bytes.len()` before the `mv`, so a transport
     /// that silently dropped or cut short the content fails the write instead of committing it.
-    async fn write_bytes(&self, path: &Path, bytes: &[u8]) -> Result<(), FsError> {
-        let target = path.to_string_lossy().into_owned();
-        // Chosen here rather than by the script's `$$` because the chunked path spans several shells,
-        // and unpredictable for the reason `LocalFs`'s is: a preplanted name cannot redirect the write.
-        let tmp = format!("{target}.tmp.{}", crate::tools::temp_suffix());
-        let outcome = if self.caps.stdin {
-            let args = sh_script(
-                WRITE_STDIN_SCRIPT,
-                &[target, tmp.clone(), bytes.len().to_string()],
-            );
-            self.runner
-                .run_with_stdin("sh", &args, None, self.timeout, bytes)
-                .await
-                .map_err(|e| FsError::Backend(format!("sh: {e}")))
-        } else {
-            self.write_chunks(&target, &tmp, bytes).await
-        };
-        match outcome {
-            Ok(result) if result.code == Some(0) => Ok(()),
-            failed => {
-                // The compensating action. The scripts remove the temp on every failure *they* see;
-                // this covers the ones they cannot — a transport error or a timeout between chunks.
-                let _ = self
-                    .exec("rm", &["-f".to_string(), "--".to_string(), tmp])
-                    .await;
-                Err(match failed {
-                    Ok(result) => FsError::Backend(format!(
-                        "write {}: {}",
-                        path.display(),
-                        first_line_or(&result.stderr, "command failed")
-                    )),
-                    Err(e) => e,
-                })
-            }
-        }
+    async fn write_bytes(&self, path: &Path, bytes: Vec<u8>) -> Result<(), FsError> {
+        self.write_slice(path, &bytes).await
     }
 
     async fn write_if_unchanged(
@@ -368,7 +374,7 @@ impl FsBackend for ShellFs {
         if !mtimes_match(current, expected) {
             return Ok(false);
         }
-        self.write_bytes(path, bytes).await?;
+        self.write_slice(path, bytes).await?;
         Ok(true)
     }
 

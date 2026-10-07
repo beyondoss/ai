@@ -246,6 +246,9 @@ beyond-ai-test-support = { path = "../test-support" }
 # (via its `AllocProfiler` global allocator) alongside timing — so the search bench proves both the
 # speed and the allocation cost of our in-process engine vs shelling out to `rg` (pi's approach).
 divan = "0.1"
+# A thread's own CPU clock (`clock_gettime(CLOCK_THREAD_CPUTIME_ID)`) without `unsafe`, for
+# `tests/tool_reactor_stall.rs`'s load-proof probe. Already in the tree through `tempfile`.
+rustix = { version = "1", features = ["time"] }
 tempfile = "3"
 tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "handshake"] }
 

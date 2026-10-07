@@ -40,6 +40,12 @@ const DEFAULT_LIMIT: usize = 500;
 /// it; only a pathological directory does.
 const HARD_CAP: usize = 10_000;
 
+/// The most entries a listing sorts and renders on the async executor. Past it, that CPU (a
+/// collation key allocated per entry, then the sort) moves to a blocking worker: about a millisecond
+/// here in a debug build, against several for a directory at `HARD_CAP`. Below it, the hand-off would
+/// cost more than it saves.
+const RENDER_INLINE_MAX: usize = 512;
+
 /// A cheap Unicode-aware sort key: lowercase, then NFD-decompose and drop combining marks, so an
 /// accented Latin letter collates next to its unaccented form (e.g. "café" sorts next to "cafe", ahead
 /// of "cafz") instead of by raw codepoint (where "é" is U+00E9 — after "z" — so a plain codepoint
@@ -151,9 +157,9 @@ impl Tool for Ls {
             .map(|e| (e.name, e.kind == FileKind::Dir))
             .collect();
 
-        // Sorting and rendering are pure CPU over an already-bounded list, so they stay here rather
-        // than on a blocking worker; the syscall-heavy part is inside the backend, which does its own
-        // `spawn_blocking`.
+        // Sorting and rendering are pure CPU over an already-bounded list; the syscall-heavy part is
+        // inside the backend, which does its own `spawn_blocking`. Where they run is decided below.
+        let entry_count = entries.len();
         let render = move || -> Result<ToolOutput, ToolError> {
             // Directories first, then case-insensitive alphabetical by bare name, collated in a way that
             // groups an accented letter with its unaccented form (`collation_key`) rather than a raw
@@ -249,7 +255,16 @@ impl Tool for Ls {
             }
             Ok(out.into())
         };
-        render()
+        // A small listing renders right here. A big one (up to `HARD_CAP` entries, each collated
+        // with an allocation, then sorted) is milliseconds of CPU: done here it would hold the
+        // executor every other session on this runtime shares, so it goes to a blocking worker.
+        if entry_count <= RENDER_INLINE_MAX {
+            render()
+        } else {
+            tokio::task::spawn_blocking(render)
+                .await
+                .map_err(|e| ToolError::Execution(format!("ls render failed: {e}")))?
+        }
     }
 }
 
