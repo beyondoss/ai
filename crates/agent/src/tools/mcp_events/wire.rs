@@ -310,6 +310,8 @@ impl Conn {
         json!({ "jsonrpc": "2.0", "id": format!("beyond-events-{id}"), "method": method, "params": params })
     }
 
+    /// One direct POST. `method` is empty for an answer (a JSON-RPC response has no method, so it
+    /// carries no `Mcp-Method`).
     fn http_request(
         http: &reqwest::Client,
         url: &str,
@@ -322,8 +324,10 @@ impl Conn {
             .post(url)
             .header("Content-Type", "application/json")
             .header("Accept", "application/json, text/event-stream")
-            .header("MCP-Protocol-Version", protocol_version)
-            .header("Mcp-Method", method);
+            .header("MCP-Protocol-Version", protocol_version);
+        if !method.is_empty() {
+            req = req.header("Mcp-Method", method);
+        }
         for (k, v) in headers {
             req = req.header(k, v);
         }
@@ -487,7 +491,15 @@ impl Conn {
                             return rpc_outcome(msg);
                         }
                         if is_server_request(&msg) {
-                            refuse_server_request(http, url, headers, protocol_version, &msg).await;
+                            refuse_server_request(
+                                http,
+                                url,
+                                headers,
+                                auth.as_deref(),
+                                protocol_version,
+                                &msg,
+                            )
+                            .await;
                         }
                     }
                     Err(RpcError::local(format!(
@@ -588,6 +600,7 @@ impl Conn {
                     http.clone(),
                     url.clone(),
                     headers.clone(),
+                    auth.clone(),
                     protocol_version.clone(),
                 );
                 let reader = tokio::spawn(async move {
@@ -596,8 +609,16 @@ impl Conn {
                         // Answered inline — one at a time, each bounded — so a server that floods
                         // requests onto the stream cannot make the reader spawn without limit.
                         if is_server_request(&msg) {
-                            let (http, url, headers, version) = &refuse_with;
-                            refuse_server_request(http, url, headers, version, &msg).await;
+                            let (http, url, headers, auth, version) = &refuse_with;
+                            refuse_server_request(
+                                http,
+                                url,
+                                headers,
+                                auth.as_deref(),
+                                version,
+                                &msg,
+                            )
+                            .await;
                             continue;
                         }
                         if msg.get("id") == Some(&want) {
@@ -664,6 +685,7 @@ async fn refuse_server_request(
     http: &reqwest::Client,
     url: &str,
     headers: &[(http::HeaderName, http::HeaderValue)],
+    auth: Option<&crate::tools::mcp_oauth::ServerAuth>,
     protocol_version: &str,
     msg: &Value,
 ) {
@@ -676,19 +698,12 @@ async fn refuse_server_request(
             "message": format!("`{method}` is not served during an events request over direct HTTP"),
         },
     });
-    // The same `Accept` as every events POST: a streamable-HTTP server (the official Python SDK
-    // among them) answers a POST without it `406` — and then still waits for the answer.
-    let mut req = http
-        .post(url)
-        .header("Content-Type", "application/json")
-        .header("Accept", "application/json, text/event-stream")
-        .header("MCP-Protocol-Version", protocol_version);
-    for (k, v) in headers {
-        req = req.header(k, v);
-    }
-    if let Ok(Err(e)) =
-        tokio::time::timeout(Duration::from_secs(5), req.body(body.to_string()).send()).await
-    {
+    // Sent as every events POST is (`Conn::send`): the same `Accept` — a streamable-HTTP server
+    // (the official Python SDK among them) answers a POST without it `406`, and then still waits
+    // for the answer — and, with an OAuth login, the server's current token, refreshed and resent
+    // once on a 401, so a refresh since the stream opened cannot leave the server waiting either.
+    let send = Conn::send(http, url, headers, auth, protocol_version, "", &body);
+    if let Ok(Err(e)) = tokio::time::timeout(Duration::from_secs(5), send).await {
         tracing::debug!(error = %e, method, "could not refuse a server request");
     }
 }
@@ -1292,5 +1307,39 @@ mod tests {
         .unwrap();
         assert_eq!(resp.status(), 200);
         assert_eq!(*seen.lock().unwrap(), ["bearer fresh"]);
+    }
+
+    #[tokio::test]
+    async fn a_refused_server_request_is_answered_with_the_current_token_and_refreshed_on_401() {
+        // The refusal is sent the way every events POST is: the current shared token, not the
+        // one the stream's headers were built with, and a 401 refreshes and resends once — a
+        // refusal the server rejects leaves it waiting on an answer that never comes.
+        agent_core::ensure_provider();
+        let request = json!({ "jsonrpc": "2.0", "id": 3, "method": "elicitation/create" });
+        let (url, seen) = bearer_server().await;
+        let auth = crate::tools::mcp_oauth::ServerAuth::fake("fresh", || Ok("unused".into()));
+        refuse_server_request(
+            &reqwest::Client::new(),
+            &url,
+            &bearer("stale"),
+            Some(&auth),
+            "2026-07-28",
+            &request,
+        )
+        .await;
+        assert_eq!(*seen.lock().unwrap(), ["bearer fresh"]);
+
+        let (url, seen) = bearer_server().await;
+        let auth = crate::tools::mcp_oauth::ServerAuth::fake("stale", || Ok("fresh".into()));
+        refuse_server_request(
+            &reqwest::Client::new(),
+            &url,
+            &bearer("stale"),
+            Some(&auth),
+            "2026-07-28",
+            &request,
+        )
+        .await;
+        assert_eq!(*seen.lock().unwrap(), ["bearer stale", "bearer fresh"]);
     }
 }

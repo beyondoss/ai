@@ -4677,7 +4677,8 @@ mcp_events_subscribe (any session) ──► owned by that session
   with an error rather than left unanswered (`tests/mcp_events_nested.rs`). That answer is POSTed
   with the same `Accept` (`application/json, text/event-stream`) as every events request — a
   streamable-HTTP server refuses an answer without it `406` and keeps waiting (the fixture enforces
-  it) — and on an `events/stream` it is answered inline, one at a time, so a server flooding
+  it) — and through the same `Conn::send`, so with an OAuth login it carries the server's current
+  token and a 401 refreshes and resends once (no `Mcp-Method`: an answer has no method) — and on an `events/stream` it is answered inline, one at a time, so a server flooding
   requests onto the stream cannot make the client spawn without limit
   (`a_flood_of_server_requests_on_an_events_stream_is_answered_one_at_a_time`).
 - **`run` and service mode.** One-shot `run` does not subscribe: it ends when the model stops, and an
