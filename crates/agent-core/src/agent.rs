@@ -722,7 +722,7 @@ impl Agent {
         // called: a crash here must not lose it, exactly the exposure `CheckpointHook`'s own doc
         // comment used to call out (the very first turn of a run was the one point a crash lost the
         // user's own submitted prompt entirely).
-        self.checkpoint_guarded(session).await;
+        let _ = self.checkpoint_guarded(session).await;
         // Set once we've already compacted to recover from a context-overflow *error* this turn, so a
         // second overflow gives up instead of looping. Reset after each turn that lands cleanly — which
         // is sound for this flag precisely because both arms that read it (`Err(e) if
@@ -1123,7 +1123,7 @@ impl Agent {
             // immediately instead, leaving the queue untouched (the same persistent `Steering` handle a
             // later `prompt` call reads from — see `serve.rs`).
             if turn.stop_reason == StopReason::Refusal {
-                self.checkpoint_guarded(session).await;
+                let _ = self.checkpoint_guarded(session).await;
                 sink(AgentEvent::AgentEnd {
                     steps: session.steps,
                 });
@@ -1222,7 +1222,7 @@ impl Agent {
                 // the tool-calling half of a turn ever reached a checkpoint; a plain conversational reply
                 // (the model's *most* common shape) never did, silently relying on a caller's own
                 // post-run persist to ever see it recorded.
-                self.checkpoint_guarded(session).await;
+                let _ = self.checkpoint_guarded(session).await;
                 // A pending graceful-stop request wins over draining follow-up/steer messages, exactly
                 // as it wins over continuing tool-call turns below — the queue is left untouched (same
                 // rationale as the refusal case above) so nothing queued for "next time" is lost. A
@@ -1278,7 +1278,7 @@ impl Agent {
                 // `Steered` event, as on the tool-results path below: a host that records delivery
                 // on that event (by its tags) must find the messages already in the persisted
                 // transcript.
-                self.checkpoint_guarded(session).await;
+                let _ = self.checkpoint_guarded(session).await;
                 sink(AgentEvent::Steered {
                     messages: count,
                     tags,
@@ -1302,7 +1302,31 @@ impl Agent {
             // checkpoints its own tool-less case separately) — a call requesting tools never falls
             // through to that other checkpoint, so this is the one and only checkpoint a `tool_use` turn
             // pays for here.
-            self.checkpoint_guarded(session).await;
+            //
+            // And so it fails closed: if the `tool_use` cannot be made durable, no tool runs. Each call
+            // is answered in memory with an error result saying so (the transcript must not end on an
+            // orphaned `tool_use`), and the run ends with `Error::Checkpoint`.
+            if let Err(e) = self.checkpoint_guarded(session).await {
+                let not_run = format!(
+                    "not run: this call could not be recorded durably before it would have run ({e})"
+                );
+                let blocks = calls
+                    .iter()
+                    .map(|(id, ..)| ContentBlock::ToolResult {
+                        tool_use_id: id.clone(),
+                        content: not_run.clone().into(),
+                        is_error: true,
+                        images: Vec::new(),
+                    })
+                    .collect();
+                session.push(Message::tool_results(blocks));
+                steering.clear_run_scoped();
+                let err = Error::Checkpoint(e);
+                sink(AgentEvent::Error {
+                    message: err.to_string(),
+                });
+                return Err(err);
+            }
 
             // Run the tools and feed results back as a single user turn. A tool's own failure becomes
             // an error `tool_result`, not an aborted run — the model can react to it next turn.
@@ -1842,7 +1866,7 @@ impl Agent {
             // A tool round-trip just landed: assistant `tool_use` and its matching `tool_result`s are
             // both committed now, so this is a valid, resumable checkpoint (see `CheckpointHook`) — the
             // one mid-run point a crash between here and the run's eventual end would otherwise lose.
-            self.checkpoint_guarded(session).await;
+            let _ = self.checkpoint_guarded(session).await;
             // Reported before any way out of the loop below: the steered messages are in the
             // checkpointed transcript now, whether or not the run goes on.
             if steered_count > 0 {
@@ -2461,7 +2485,7 @@ impl Agent {
         // very next turn immediately re-triggers the identical (already-paid-for) compaction again, and
         // if this was overflow-recovery, the resumed session lands right back in the same
         // context-overflow condition it just paid to escape.
-        self.checkpoint_guarded(session).await;
+        let _ = self.checkpoint_guarded(session).await;
         sink(AgentEvent::Compacted {
             messages_before: before,
             messages_after: session.messages.len(),
@@ -2486,12 +2510,20 @@ impl Agent {
     /// whole session task — down with it. A checkpoint is an optimization (it bounds what a crash
     /// loses); failing to take one must degrade to "this checkpoint didn't persist", never to "the run
     /// died". Logged at `error` because a host whose persistence is panicking genuinely wants to know.
-    async fn checkpoint_guarded(&self, session: &Session) {
-        if let Err(msg) = catch_tool_panic(self.checkpoint.checkpoint(session)).await {
-            tracing::error!(
-                error = %msg,
-                "checkpoint hook panicked; continuing without persisting this checkpoint"
-            );
+    ///
+    /// Returns whether the checkpoint is durable. Only the one before a tool dispatch acts on a
+    /// failure (it fails closed — see [`CheckpointHook`]); the others log it and carry on.
+    async fn checkpoint_guarded(&self, session: &Session) -> std::result::Result<(), String> {
+        match catch_tool_panic(self.checkpoint.checkpoint(session)).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "checkpoint failed to persist");
+                Err(e)
+            }
+            Err(msg) => {
+                tracing::error!(error = %msg, "checkpoint hook panicked");
+                Err(format!("the checkpoint hook panicked: {msg}"))
+            }
         }
     }
 
@@ -4603,7 +4635,7 @@ mod tests {
         }
         #[async_trait]
         impl CheckpointHook for PanickingCheckpoint {
-            async fn checkpoint(&self, _session: &Session) {
+            async fn checkpoint(&self, _session: &Session) -> std::result::Result<(), String> {
                 self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 panic!("disk is full");
             }
@@ -9927,12 +9959,124 @@ mod tests {
 
     #[async_trait]
     impl CheckpointHook for RecordingCheckpoint {
-        async fn checkpoint(&self, session: &Session) {
+        async fn checkpoint(&self, session: &Session) -> std::result::Result<(), String> {
             self.lens
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .push(session.messages.len());
+            Ok(())
         }
+    }
+
+    /// A tool that records whether it ever ran.
+    struct RanTool(Arc<std::sync::atomic::AtomicBool>);
+    #[async_trait]
+    impl Tool for RanTool {
+        fn name(&self) -> &str {
+            "effect"
+        }
+        fn description(&self) -> &str {
+            "has an effect"
+        }
+        fn input_schema(&self) -> Value {
+            json!({ "type": "object" })
+        }
+        async fn run(
+            &self,
+            _input: Value,
+        ) -> std::result::Result<crate::tool::ToolOutput, crate::error::ToolError> {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok("done".into())
+        }
+    }
+
+    /// A checkpoint whose write fails from the `nth` call on (1-based).
+    struct FailingCheckpoint {
+        calls: std::sync::atomic::AtomicUsize,
+        from: usize,
+    }
+
+    #[async_trait]
+    impl CheckpointHook for FailingCheckpoint {
+        async fn checkpoint(&self, _session: &Session) -> std::result::Result<(), String> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            if n >= self.from {
+                Err("disk full".into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    /// A failed write at the checkpoint before a dispatch fails closed: the tool never runs, the run
+    /// ends with `Error::Checkpoint`, and the call is answered (in memory) as not run — no orphaned
+    /// `tool_use`. Only that checkpoint fails closed: one failing *before* the model call (the user's
+    /// prompt) is logged and the run goes on.
+    #[tokio::test]
+    async fn a_failed_pre_dispatch_checkpoint_means_the_tool_never_runs() {
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(RanTool(ran.clone())));
+        let mock = Arc::new(MockTransport::new(vec![
+            turn::tool_call("tu_1", "effect", "{}"),
+            turn::text("done"),
+        ]));
+        // Every checkpoint fails, the first (the user's prompt) included.
+        let agent = Agent::new(mock, "claude-opus-4-8")
+            .with_tools(tools)
+            .with_max_steps(8)
+            .with_checkpoint_hook(Arc::new(FailingCheckpoint {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                from: 1,
+            }));
+        let mut session = Session::new();
+        session.user("go");
+        let mut events = Vec::new();
+        let result = agent.run_events(&mut session, |e| events.push(e)).await;
+        assert!(
+            matches!(&result, Err(Error::Checkpoint(e)) if e == "disk full"),
+            "{result:?}"
+        );
+        assert!(
+            !ran.load(std::sync::atomic::Ordering::SeqCst),
+            "a tool ran although its tool_use was never durable"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ToolStart { .. })),
+            "no tool_start for a call that was not run"
+        );
+        let last = session.messages.last().unwrap();
+        assert!(
+            matches!(&last.content[0], ContentBlock::ToolResult { tool_use_id, is_error: true, .. } if tool_use_id == "tu_1"),
+            "the call is answered as not run: {last:?}"
+        );
+    }
+
+    /// A failure at a checkpoint with no tool waiting on it (after the results landed) does not end
+    /// the run: the host's own end-of-run persist covers it.
+    #[tokio::test]
+    async fn a_failed_checkpoint_with_no_tool_waiting_is_best_effort() {
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(RanTool(ran.clone())));
+        let mock = Arc::new(MockTransport::new(vec![
+            turn::tool_call("tu_1", "effect", "{}"),
+            turn::text("done"),
+        ]));
+        // Checkpoints 1 (prompt) and 2 (pre-dispatch) land; 3 (results) and later fail.
+        let agent = Agent::new(mock, "claude-opus-4-8")
+            .with_tools(tools)
+            .with_max_steps(8)
+            .with_checkpoint_hook(Arc::new(FailingCheckpoint {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                from: 3,
+            }));
+        let mut session = Session::new();
+        session.user("go");
+        agent.run(&mut session, |_| {}).await.unwrap();
+        assert!(ran.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[tokio::test]
@@ -10163,11 +10307,12 @@ mod tests {
         }
         #[async_trait]
         impl CheckpointHook for SnapshotOnFirstCheckpoint {
-            async fn checkpoint(&self, session: &Session) {
+            async fn checkpoint(&self, session: &Session) -> std::result::Result<(), String> {
                 let mut guard = self.snapshot.lock().unwrap_or_else(|e| e.into_inner());
                 if guard.is_none() {
                     *guard = Some((self.mock.calls(), session.messages.as_ref().clone()));
                 }
+                Ok(())
             }
         }
 

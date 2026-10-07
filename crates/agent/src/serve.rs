@@ -1131,7 +1131,7 @@ async fn persist_messages_blocking(
     messages: Arc<Vec<agent_core::Message>>,
 ) -> (Persistence, std::io::Result<()>) {
     match tokio::task::spawn_blocking(move || {
-        let r = persistence.persist_messages(&messages);
+        let r = simulated_checkpoint_write().and_then(|()| persistence.persist_messages(&messages));
         (persistence, r)
     })
     .await
@@ -1183,7 +1183,7 @@ struct ChannelCheckpoint(mpsc::UnboundedSender<Checkpoint>);
 /// acknowledgement the loop sends once it is on disk.
 type Checkpoint = (
     Arc<Vec<agent_core::Message>>,
-    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Sender<Result<(), String>>,
 );
 
 #[async_trait::async_trait]
@@ -1193,34 +1193,68 @@ impl agent_core::CheckpointHook for ChannelCheckpoint {
     /// before the tool runs" true: returning as soon as the snapshot was queued let the tool start (and
     /// do whatever it does) while the write was still pending, and a crash in that window lost the
     /// record that the model ever asked for it. Every path that drives the agent drains this channel
-    /// while it waits (the prompt loop, a manual `compact`). A snapshot dropped undrained — the loop
-    /// sweeps leftovers when a run ends — resolves the wait without a write, never hangs it.
-    async fn checkpoint(&self, session: &Session) {
+    /// while it waits (the prompt loop, a manual `compact`).
+    ///
+    /// `Err` when the snapshot is **not** on disk — the write failed, the loop is gone, or the snapshot
+    /// was swept undrained when a run ended. Before a tool dispatch the agent then fails closed and the
+    /// tool never runs (see `agent_core::CheckpointHook`); a write that failed leaves the same hole as
+    /// one that never happened.
+    async fn checkpoint(&self, session: &Session) -> Result<(), String> {
         let (ack, persisted) = tokio::sync::oneshot::channel();
-        // Best-effort: if the receiving end is gone there's nothing to recover, and the run itself
-        // must not fail just because incremental persistence couldn't.
         if self.0.send((session.messages.clone(), ack)).is_err() {
-            return;
+            return Err("the session loop is gone".into());
         }
-        let _ = persisted.await;
+        persisted
+            .await
+            .unwrap_or_else(|_| Err("the checkpoint was dropped unwritten".into()))
     }
 }
 
-/// A slow disk under a checkpoint write, simulated: sleeps `BEYOND_AI_AGENT_TEST_SLOW_CHECKPOINT_MS`
-/// milliseconds before each mid-run checkpoint is written, so a test can hold the window between "the
-/// agent asked for a checkpoint" and "it is on disk" open on demand. `#[cfg]`-gated like
-/// [`simulated_slow_open`]: a release binary has no latency-injection path at all.
+/// Perform a checkpoint write, then — only then — acknowledge it with the write's result. The one
+/// place that ordering lives (both checkpoint arms go through it), so the agent can never be told a
+/// checkpoint is durable before the write finished. In the session loop as it stands the order is
+/// also forced by the loop itself — the run is not polled while an arm awaits its write — but that
+/// is an accident of structure a future change could undo; this is the contract.
+async fn write_then_ack<T>(
+    write: impl std::future::Future<Output = (T, std::io::Result<()>)>,
+    ack: tokio::sync::oneshot::Sender<Result<(), String>>,
+) -> (T, std::io::Result<()>) {
+    let (state, result) = write.await;
+    let _ = ack.send(result.as_ref().map(|_| ()).map_err(|e| e.to_string()));
+    (state, result)
+}
+
+/// A slow or failing disk under a checkpoint write, simulated, **inside** the write itself: sleeps
+/// `BEYOND_AI_AGENT_TEST_SLOW_CHECKPOINT_MS` milliseconds, then fails the write when
+/// `BEYOND_AI_AGENT_TEST_FAIL_CHECKPOINT` says so — `all` fails every checkpoint write, a number `n`
+/// only the `n`th (1-based, per process). Inside the write, not before it, so an
+/// acknowledgement sent ahead of the write would precede the slow part — which is the mistake the
+/// slow-disk test is there to catch. `#[cfg]`-gated like [`simulated_slow_open`], names and all: a
+/// release binary has no fault-injection path and carries none of these variable names.
 #[cfg(debug_assertions)]
-async fn simulated_slow_checkpoint() {
+fn simulated_checkpoint_write() -> std::io::Result<()> {
     if let Ok(ms) = std::env::var("BEYOND_AI_AGENT_TEST_SLOW_CHECKPOINT_MS")
         && let Ok(ms) = ms.parse::<u64>()
     {
-        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+        std::thread::sleep(std::time::Duration::from_millis(ms));
     }
+    static WRITES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = WRITES.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    let fail = match std::env::var("BEYOND_AI_AGENT_TEST_FAIL_CHECKPOINT").as_deref() {
+        Ok("all") => true,
+        Ok(which) => which.parse::<usize>().is_ok_and(|which| which == n),
+        Err(_) => false,
+    };
+    if fail {
+        return Err(std::io::Error::other("simulated checkpoint write failure"));
+    }
+    Ok(())
 }
 
 #[cfg(not(debug_assertions))]
-async fn simulated_slow_checkpoint() {}
+fn simulated_checkpoint_write() -> std::io::Result<()> {
+    Ok(())
+}
 
 /// Mint a brand-new `SessionMeta`, using `session_id` in place of a freshly generated one when given
 /// (`ServeConfig::session_id`, already validated by `main.rs` before this is ever called).
@@ -4180,10 +4214,12 @@ pub(crate) async fn serve_session(
                     tokio::select! {
                         biased;
                         Some((messages, ack)) = checkpoint_rx.recv() => {
-                            simulated_slow_checkpoint().await;
-                            let (p, r) = persist_messages_blocking(persistence, messages).await;
+                            let (p, r) = write_then_ack(
+                                persist_messages_blocking(persistence, messages),
+                                ack,
+                            )
+                            .await;
                             persistence = p;
-                            let _ = ack.send(());
                             if let Err(e) = r {
                                 tracing::warn!(error = %e, "compaction checkpoint failed to persist");
                             }
@@ -4929,12 +4965,15 @@ pub(crate) async fn serve_session(
                                 // turn — see that drain's own comment for why "harmless, the final persist
                                 // is a superset" isn't quite true on its own.
                                 Some((messages, ack)) = checkpoint_rx.recv() => {
-                                    simulated_slow_checkpoint().await;
-                                    let (p, r) = persist_messages_blocking(persistence, messages).await;
+                                    // The agent is waiting on the acknowledgement before it dispatches
+                                    // the next tool, and acts on a failure — the tool does not run (see
+                                    // `ChannelCheckpoint`). Sent only once the write is done.
+                                    let (p, r) = write_then_ack(
+                                        persist_messages_blocking(persistence, messages),
+                                        ack,
+                                    )
+                                    .await;
                                     persistence = p;
-                                    // The agent is waiting on this before it dispatches the next tool
-                                    // (see `ChannelCheckpoint`).
-                                    let _ = ack.send(());
                                     // Note this deliberately does *not* republish the fanout's catch-up
                                     // history, even though a perfectly good snapshot is right here. The
                                     // catch-up's contract is base-plus-frames: `history` is the transcript
@@ -12967,6 +13006,40 @@ mod tests {
         assert!(persistence.restore_session(None, &other_id).unwrap());
         assert!(persistence.list_trash(None).unwrap().is_empty());
         assert!(!persistence.restore_session(None, "never-existed").unwrap());
+    }
+
+    /// A checkpoint is acknowledged only once its write is done, and with the write's result: the
+    /// agent must never be told a `tool_use` is durable while the write is still under way.
+    #[tokio::test]
+    async fn a_checkpoint_is_acknowledged_only_once_its_write_is_done() {
+        let (ack, mut acked) = tokio::sync::oneshot::channel();
+        let (finish, finished) = tokio::sync::oneshot::channel::<()>();
+        let write = tokio::spawn(write_then_ack(
+            async move {
+                let _ = finished.await;
+                ((), Ok(()))
+            },
+            ack,
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            matches!(
+                acked.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
+            "acknowledged before the write finished"
+        );
+        finish.send(()).unwrap();
+        let ((), written) = write.await.unwrap();
+        assert!(written.is_ok());
+        assert_eq!(acked.await.unwrap(), Ok(()));
+
+        // A write that fails is acknowledged as a failure.
+        let (ack, acked) = tokio::sync::oneshot::channel();
+        let (_, result) =
+            write_then_ack(async { ((), Err(std::io::Error::other("disk full"))) }, ack).await;
+        assert!(result.is_err());
+        assert_eq!(acked.await.unwrap(), Err("disk full".to_string()));
     }
 
     #[test]

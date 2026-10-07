@@ -34,6 +34,12 @@ pub enum Error {
     /// The loop hit its step ceiling without the model ending its turn.
     #[error("reached max steps ({0}) without completion")]
     MaxSteps(u32),
+    /// The checkpoint before a tool dispatch failed: the assistant's `tool_use` could not be made
+    /// durable, so **no tool ran** — the run ends here rather than let a call take effect that the
+    /// session has no record of (see [`crate::CheckpointHook`]). Every call of that turn is answered,
+    /// in memory, with an error result saying it was not run, so the transcript stays well-formed.
+    #[error("the tool call could not be recorded durably, so it was not run: {0}")]
+    Checkpoint(String),
     // Note: a streamed tool call whose arguments never parse as JSON is *not* an `Error`. The loop
     // keeps the tool_use block and feeds back a malformed-arguments error `tool_result` the model can
     // correct, never aborting the run — so there is no fatal `MalformedToolInput` variant by design.

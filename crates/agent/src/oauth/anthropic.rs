@@ -54,10 +54,6 @@ impl std::fmt::Debug for AnthropicCredential {
 /// Bind address for the local callback listener — overridable for a remote/container setup where
 /// the browser and this process aren't on the same host loopback. Only affects the *bind* address;
 /// the `redirect_uri` sent to Anthropic is always `localhost` (see [`REDIRECT_URI`]).
-fn callback_host() -> String {
-    std::env::var("AI_AGENT_OAUTH_CALLBACK_HOST").unwrap_or_else(|_| "127.0.0.1".to_string())
-}
-
 /// Log in via PKCE + a local callback listener, racing a manual paste-the-code/URL fallback.
 /// Anthropic has no bind-failure fallback (unlike OpenAI Codex's browser flow) — a port-in-use error
 /// propagates as a hard failure, matching pi's own behavior.
@@ -74,7 +70,7 @@ pub async fn login(
     let authorize_url = build_authorize_url(&pkce.challenge, &state);
     callbacks.show_auth_url(&authorize_url, None).await;
 
-    let server = CallbackServer::bind(&callback_host(), CALLBACK_PORT)?;
+    let server = CallbackServer::bind(&super::callback_server::callback_host()?, CALLBACK_PORT)?;
     let server_cancel = cancel.child_token();
     let code = tokio::select! {
         server_code = server.wait_for_callback(CALLBACK_PATH, state.clone(), server_cancel.clone()) => {

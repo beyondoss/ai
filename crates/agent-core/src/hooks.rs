@@ -232,9 +232,17 @@ impl AgentHooks for NoHooks {}
 /// host can perform its own blocking I/O — appending to a session file — off of whatever executor it
 /// runs on (e.g. via `tokio::task::spawn_blocking`) without this crate depending on a specific one.
 /// Defaults to a no-op; implement only if incremental persistence matters to you.
+///
+/// **`Err` means the snapshot is not durable.** At the checkpoint before a tool dispatch that ends
+/// the run with [`crate::Error::Checkpoint`] and the tools are never run: a call that takes effect
+/// with no record of it in the session is exactly what that checkpoint exists to prevent, and a write
+/// that failed leaves the same hole as one that never happened. Every other checkpoint stays
+/// best-effort — a failure there is logged, and the host's own end-of-run persist covers it.
 #[async_trait]
 pub trait CheckpointHook: Send + Sync {
-    async fn checkpoint(&self, _session: &crate::session::Session) {}
+    async fn checkpoint(&self, _session: &crate::session::Session) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// The default: checkpoints are no-ops. A caller happy with "only ever persisted once the run

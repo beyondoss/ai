@@ -961,14 +961,11 @@ fn serve_reports_success_when_a_failed_checkpoint_is_superseded_by_a_successful_
     // LOW pi-parity gap (fixed): `persist_error` used to be set the moment any mid-run checkpoint
     // failed and never cleared, so a checkpoint hiccup early in a run made the terminal `prompt`
     // response report failure even when the run's actual final state was later persisted just fine.
-    // Root-only environments can't exercise this (permission bits don't restrict root), so skip there.
-    if std::env::var("USER").as_deref() == Ok("root") {
-        return;
-    }
-
-    use std::os::unix::fs::PermissionsExt;
-    use std::time::Duration;
-
+    //
+    // The failure here is the checkpoint *after* the first round-trip's results (the third checkpoint
+    // write: the prompt, the pre-dispatch one, then this) — one with no tool waiting on it, so it is
+    // best-effort. A failed checkpoint *before* a dispatch is different: it fails closed (see
+    // `a_failed_checkpoint_before_a_tool_means_the_tool_never_runs`).
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
 
@@ -980,34 +977,18 @@ fn serve_reports_success_when_a_failed_checkpoint_is_superseded_by_a_successful_
     let turn2 = turn_tool_use(
         "toolu_2",
         "bash",
-        &json!({ "command": "sleep 1" }).to_string(),
+        &json!({ "command": "printf second-round-marker" }).to_string(),
     );
     let (base, _bodies) = spawn_model_server(vec![turn1, turn2, turn_text("done")]);
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
 
-    let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
+    let mut child = serve_cmd(bin, &base, &session_file)
+        .env("BEYOND_AI_AGENT_TEST_FAIL_CHECKPOINT", "3")
+        .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = common::child_frames(&mut child);
-
-    // Consume the ready frame — by now `Persistence::open` has already created the file with normal
-    // permissions, so this doesn't race the file's own creation.
-    let mut ready = String::new();
-    stdout.read_line(&mut ready).unwrap();
-
-    // Make the session file read-only *before* sending the prompt, so the first round-trip's
-    // mid-run checkpoint (fired right after `toolu_1` completes) fails to append to it.
-    std::fs::set_permissions(&session_file, std::fs::Permissions::from_mode(0o444)).unwrap();
-
     writeln!(stdin, "{}", json!({ "type": "prompt", "message": "go" })).unwrap();
     stdin.flush().unwrap();
-
-    // The first round-trip (a fast `printf`) completes and its checkpoint attempt fails well within
-    // this window; the second turn's `sleep 1` is still running when permissions are restored.
-    std::thread::sleep(Duration::from_millis(500));
-    std::fs::set_permissions(&session_file, std::fs::Permissions::from_mode(0o644)).unwrap();
-
-    // The run ends once `sleep 1` finishes and the model's concluding "done" turn is emitted; the
-    // unconditional final persist right after that must now succeed against the writable-again file.
     let frames = read_until_response(&mut stdout, "prompt");
     drop(stdin);
     child.wait().unwrap();
@@ -1022,13 +1003,75 @@ fn serve_reports_success_when_a_failed_checkpoint_is_superseded_by_a_successful_
         response.get("error").is_none() || response["error"].is_null(),
         "got: {response:#?}"
     );
-
+    // Both tools ran: a best-effort checkpoint failing stops nothing.
+    let tool_starts = frames
+        .iter()
+        .filter(|f| f["type"] == "event" && f["event"]["kind"] == "tool_start")
+        .count();
+    assert_eq!(tool_starts, 2, "{frames:#?}");
     // And the final persist genuinely did land on disk, not just "no error was reported."
     let on_disk = std::fs::read_to_string(&session_file).unwrap();
     assert!(
-        on_disk.contains("first-round-marker"),
+        on_disk.contains("first-round-marker") && on_disk.contains("second-round-marker"),
         "the final persist must have actually written the transcript: {on_disk}"
     );
+}
+
+/// The checkpoint before a tool dispatch fails to write: the tool must never run — a call taking
+/// effect with no record of it is the hole that checkpoint exists to close, and a failed write leaves
+/// it as wide open as a slow one. The run ends with the checkpoint error, reported on the `prompt`
+/// response as any other persistence failure is.
+#[test]
+fn a_failed_checkpoint_before_a_tool_means_the_tool_never_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+    let marker = dir.path().join("the-tool-ran");
+    let (base, _bodies) = spawn_model_server(vec![
+        turn_tool_use(
+            "toolu_1",
+            "bash",
+            &json!({ "command": format!("touch {}", marker.display()) }).to_string(),
+        ),
+        turn_text("done"),
+    ]);
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    // Write 1 is the prompt's checkpoint (it lands); write 2 is the one before `toolu_1` runs.
+    let mut child = serve_cmd(bin, &base, &session_file)
+        .env("BEYOND_AI_AGENT_TEST_FAIL_CHECKPOINT", "2")
+        .spawn_guarded();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = common::child_frames(&mut child);
+    writeln!(stdin, "{}", json!({ "type": "prompt", "message": "go" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "prompt");
+
+    // Asked after the run: the transcript holds the call, answered as not run.
+    writeln!(stdin, "{}", json!({ "type": "get_messages" })).unwrap();
+    stdin.flush().unwrap();
+    let messages = read_until_response(&mut stdout, "get_messages");
+    drop(stdin);
+    child.wait().unwrap();
+
+    assert!(
+        !marker.exists(),
+        "the tool ran although its tool_use was never durable"
+    );
+    assert!(
+        !frames
+            .iter()
+            .any(|f| f["type"] == "event" && f["event"]["kind"] == "tool_start"),
+        "no tool_start for a call that did not run: {frames:#?}"
+    );
+    let response = frames.last().unwrap();
+    assert_eq!(response["success"], false, "{response:#?}");
+    let error = response["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("could not be recorded durably")
+            && error.contains("simulated checkpoint write failure"),
+        "the client is told why: {response:#?}"
+    );
+    let dump = messages.last().unwrap()["data"]["messages"].to_string();
+    assert!(dump.contains("not run"), "{dump}");
 }
 
 #[test]

@@ -58,10 +58,6 @@ impl std::fmt::Debug for OpenaiCodexCredential {
     }
 }
 
-fn callback_host() -> String {
-    std::env::var("AI_AGENT_OAUTH_CALLBACK_HOST").unwrap_or_else(|_| "127.0.0.1".to_string())
-}
-
 /// Log in, letting the user pick browser vs. device-code via `callbacks.select`.
 pub async fn login(
     callbacks: &dyn LoginCallbacks,
@@ -105,7 +101,10 @@ async fn login_via_browser(
     callbacks.show_auth_url(&authorize_url, None).await;
 
     let manual_prompt = manual_paste_prompt();
-    let code = match CallbackServer::bind(&callback_host(), BROWSER_CALLBACK_PORT) {
+    // Validated before the bind: a bind failure below falls back to paste-only, and a host that
+    // isn't loopback must be an error, not a reason to fall back quietly.
+    let host = super::callback_server::callback_host()?;
+    let code = match CallbackServer::bind(&host, BROWSER_CALLBACK_PORT) {
         Ok(server) => {
             let server_cancel = cancel.child_token();
             tokio::select! {

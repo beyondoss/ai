@@ -567,6 +567,14 @@ async fn expect_100_continue_never_stalls() {
 /// binding port 0 is never handed a port a reuseport socket holds, and one binding it explicitly
 /// without reuseport is refused. (A server restarted on its old port could find it taken; closing the
 /// listener without the holder would release it.)
+///
+/// **Linux semantics.** That holding relies on Linux's `SO_REUSEPORT`: a socket may share a port only
+/// if it too set the option (and runs as the same user), and the kernel's port-0 search skips ports a
+/// reuseport group holds. The gateway suites run on Linux CI, which is where this is relied on. On
+/// the BSDs and macOS the option means something different (it lets any later socket with the option
+/// share the port, and the last one bound may take the traffic), so the hold would be weaker there —
+/// and there is no portable non-reuseport alternative: an ordinary socket bound to the port cannot
+/// coexist with the listener that has to be bound to it while the server is up.
 struct RestartableNats {
     child: Option<Child>,
     /// The forwarder's port: what the gateway and the test dial.
