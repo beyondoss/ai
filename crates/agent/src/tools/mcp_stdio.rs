@@ -222,8 +222,9 @@ fn max_message_bytes() -> usize {
         .unwrap_or(DEFAULT_MAX_MESSAGE_BYTES)
 }
 
-/// How much of a line is kept to find its JSON-RPC `id` (a server's serializer usually puts it
-/// first; when it does not, the line's tail is searched too).
+/// How much of a line's start is scanned for its top-level JSON-RPC members ([`scan_head`]). A
+/// server's serializer puts `id` ahead of the `result` it answers with (serde_json, rmcp and the
+/// Python and TypeScript SDKs all do); one that does not gets no synthesized answer.
 const ID_WINDOW: usize = 4096;
 
 /// Per-connection message caps: the global one, and a tighter one for the responses to requests the
@@ -272,48 +273,157 @@ impl MessageCaps {
     }
 }
 
-/// The top-level JSON-RPC `id` of a message, from a prefix (where it sits ahead of `result`/`error`)
-/// or, failing that, from a suffix (its last occurrence) — as its JSON text.
-fn find_id(head: &[u8], tail: &[u8]) -> Option<String> {
-    let parse_after = |bytes: &[u8], at: usize| -> Option<String> {
-        let rest = bytes.get(at + 5..)?;
-        let mut de = serde_json::Deserializer::from_slice(rest).into_iter::<Value>();
-        match de.next()? {
-            Ok(v @ (Value::Number(_) | Value::String(_))) => Some(v.to_string()),
-            _ => None,
-        }
-    };
-    let first = |hay: &[u8], needle: &[u8]| hay.windows(needle.len()).position(|w| w == needle);
-    if let Some(at) = first(head, b"\"id\":") {
-        let body_at = [first(head, b"\"result\""), first(head, b"\"error\"")]
-            .into_iter()
-            .flatten()
-            .min();
-        if body_at.is_none_or(|b| at < b)
-            && let Some(id) = parse_after(head, at)
-        {
-            return Some(id);
+/// What a message's first bytes say about its **top-level** object — read by walking that object's
+/// members in order (strings, escapes and nested values skipped whole), never by searching for a
+/// key's text, which a nested `"id":` inside `params` or `result` would match.
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct Head {
+    /// The top-level `id`, as its JSON text, if reached.
+    id: Option<String>,
+    /// A top-level `result` or `error` member was reached: the message is a response.
+    response: bool,
+    /// The top-level `method`, if reached: the message is a request or a notification.
+    method: Option<String>,
+}
+
+impl Head {
+    /// The id of the host request this message answers — only when the prefix proves it: a
+    /// top-level `id` seen before a top-level `result`/`error`, and no `method`. Anything less (an
+    /// id past the window, after the body, or on a server→client request, whose id is the
+    /// *server's* and can equal one of the host's) is not answered on its behalf.
+    fn reply_to(&self) -> Option<&str> {
+        if self.response && self.method.is_none() {
+            self.id.as_deref()
+        } else {
+            None
         }
     }
-    let at = tail.windows(5).rposition(|w| w == b"\"id\":")?;
-    parse_after(tail, at)
+}
+
+/// Scan `head` — a bounded prefix of one message — for its top-level `id`, `method` and whether it
+/// is a response. Stops at the first `result`/`error` member (its value is the bulk of the message)
+/// or wherever the prefix runs out or stops being a JSON object.
+pub(crate) fn scan_head(head: &[u8]) -> Head {
+    let mut out = Head::default();
+    let ws = |mut i: usize| {
+        while head.get(i).is_some_and(u8::is_ascii_whitespace) {
+            i += 1;
+        }
+        i
+    };
+    let mut i = ws(0);
+    if head.get(i) != Some(&b'{') {
+        return out;
+    }
+    i += 1;
+    loop {
+        i = ws(i);
+        if head.get(i) != Some(&b'"') {
+            return out;
+        }
+        let Some(key_end) = string_end(head, i) else {
+            return out;
+        };
+        let key = &head[i + 1..key_end - 1];
+        i = ws(key_end);
+        if head.get(i) != Some(&b':') {
+            return out;
+        }
+        i = ws(i + 1);
+        if key == b"result" || key == b"error" {
+            out.response = true;
+            return out;
+        }
+        let Some(end) = value_end(head, i) else {
+            return out;
+        };
+        let value = || serde_json::from_slice::<Value>(&head[i..end]).ok();
+        match key {
+            b"id" => match value() {
+                Some(v @ (Value::Number(_) | Value::String(_))) => out.id = Some(v.to_string()),
+                _ => return out,
+            },
+            b"method" => match value() {
+                Some(Value::String(m)) => out.method = Some(m),
+                _ => return out,
+            },
+            _ => {}
+        }
+        i = ws(end);
+        if head.get(i) != Some(&b',') {
+            return out;
+        }
+        i += 1;
+    }
+}
+
+/// The index just past the JSON string opening at `buf[at]`, if it closes within `buf`.
+fn string_end(buf: &[u8], at: usize) -> Option<usize> {
+    let mut j = at + 1;
+    while let Some(&b) = buf.get(j) {
+        match b {
+            b'\\' => j += 2,
+            b'"' => return Some(j + 1),
+            _ => j += 1,
+        }
+    }
+    None
+}
+
+/// The index just past the JSON value starting at `buf[at]`, if it ends within `buf` (a scalar
+/// running to the very end may continue past it, so it does not count).
+fn value_end(buf: &[u8], at: usize) -> Option<usize> {
+    match buf.get(at)? {
+        b'"' => string_end(buf, at),
+        b'{' | b'[' => {
+            let mut depth = 0usize;
+            let mut j = at;
+            while let Some(&b) = buf.get(j) {
+                match b {
+                    b'"' => {
+                        j = string_end(buf, j)?;
+                        continue;
+                    }
+                    b'{' | b'[' => depth += 1,
+                    b'}' | b']' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Some(j + 1);
+                        }
+                    }
+                    _ => {}
+                }
+                j += 1;
+            }
+            None
+        }
+        _ => {
+            let len = buf[at..]
+                .iter()
+                .position(|b| matches!(b, b',' | b'}' | b']') || b.is_ascii_whitespace())?;
+            Some(at + len)
+        }
+    }
 }
 
 /// One inbound line, read without ever buffering more than its cap.
 #[derive(Debug, PartialEq)]
 pub(crate) enum Inbound {
     Line(Vec<u8>),
-    /// Over its cap: discarded as it streamed in. `id` is the request it answered, when found.
+    /// Over its cap: discarded as it streamed in. `reply_to` is the host request it provably
+    /// answered ([`Head::reply_to`]) — the only case the host answers in its place; `method` is
+    /// set when it was a server→client request or notification, which is dropped.
     Refused {
-        id: Option<String>,
+        reply_to: Option<String>,
+        method: Option<String>,
         cap: usize,
     },
     Eof,
 }
 
 /// Read one `\n`-terminated line from `reader`, holding at most `max(cap, ID_WINDOW)` bytes of it.
-/// The cap is the global one, or a tighter one once the line's `id` (found in its first
-/// [`ID_WINDOW`] bytes) names a capped request. `peak` reports the most bytes held at once.
+/// The cap is the global one, or a tighter one once the line's first [`ID_WINDOW`] bytes prove it
+/// answers a capped request ([`Head::reply_to`]). `peak` reports the most bytes held at once.
 pub(crate) async fn read_capped<R: tokio::io::AsyncBufRead + Unpin>(
     reader: &mut R,
     caps: &MessageCaps,
@@ -323,17 +433,23 @@ pub(crate) async fn read_capped<R: tokio::io::AsyncBufRead + Unpin>(
     use tokio::io::AsyncBufReadExt;
     let mut buf: Vec<u8> = Vec::new();
     let mut cap = global;
-    let mut id_checked = false;
-    let mut discarding: Option<(Vec<u8>, Vec<u8>)> = None; // (head, rolling tail)
+    // What the line's first bytes say, scanned once they are in (or the line ended sooner).
+    let mut head: Option<Head> = None;
+    // Set once the line is over its cap. The rest is discarded unread.
+    let mut discarding: Option<Head> = None;
+    let refused = |head: Head, cap: usize| {
+        caps.take(head.reply_to());
+        Inbound::Refused {
+            reply_to: head.reply_to().map(str::to_owned),
+            method: head.method,
+            cap,
+        }
+    };
     loop {
         let avail = reader.fill_buf().await?;
         if avail.is_empty() {
             return Ok(match discarding {
-                Some((head, tail)) => {
-                    let id = find_id(&head, &tail);
-                    caps.take(id.as_deref());
-                    Inbound::Refused { id, cap }
-                }
+                Some(head) => refused(head, cap),
                 None if buf.is_empty() => Inbound::Eof,
                 None => Inbound::Line(buf),
             });
@@ -343,45 +459,28 @@ pub(crate) async fn read_capped<R: tokio::io::AsyncBufRead + Unpin>(
             None => (avail, false),
         };
         let n = chunk.len();
-        match &mut discarding {
-            Some((_, tail)) => {
-                tail.extend_from_slice(chunk);
-                if tail.len() > ID_WINDOW {
-                    let cut = tail.len() - ID_WINDOW;
-                    tail.drain(..cut);
+        if discarding.is_none() {
+            buf.extend_from_slice(chunk);
+            if head.is_none() && (buf.len() >= ID_WINDOW || done) {
+                let scanned = scan_head(&buf[..buf.len().min(ID_WINDOW)]);
+                if let Some(tight) = scanned.reply_to().and_then(|id| caps.peek(id)) {
+                    cap = cap.min(tight);
                 }
+                head = Some(scanned);
             }
-            None => {
-                buf.extend_from_slice(chunk);
-                if !id_checked && (buf.len() >= ID_WINDOW || done) {
-                    id_checked = true;
-                    if let Some(id) = find_id(&buf[..buf.len().min(ID_WINDOW)], &[])
-                        && let Some(tight) = caps.peek(&id)
-                    {
-                        cap = cap.min(tight);
-                    }
-                }
-                if buf.len() > cap.max(ID_WINDOW) || (done && buf.len() > cap) {
-                    let head = buf[..buf.len().min(ID_WINDOW)].to_vec();
-                    let tail = buf[buf.len().saturating_sub(ID_WINDOW)..].to_vec();
-                    buf = Vec::new();
-                    discarding = Some((head, tail));
-                }
+            // Over the window means scanned above, so `head` is always `Some` here.
+            if buf.len() > cap.max(ID_WINDOW) || (done && buf.len() > cap) {
+                discarding = Some(head.take().unwrap_or_default());
+                buf = Vec::new();
             }
         }
         *peak = (*peak).max(buf.len());
         reader.consume(n);
         if done {
             return Ok(match discarding {
-                Some((head, tail)) => {
-                    let id = find_id(&head, &tail);
-                    caps.take(id.as_deref());
-                    Inbound::Refused { id, cap }
-                }
+                Some(head) => refused(head, cap),
                 None => {
-                    if let Some(id) = find_id(&buf[..buf.len().min(ID_WINDOW)], &[]) {
-                        caps.take(Some(&id));
-                    }
+                    caps.take(head.as_ref().and_then(Head::reply_to));
                     Inbound::Line(buf)
                 }
             });
@@ -494,9 +593,22 @@ pub(crate) fn stdio_transport(
         loop {
             let line = match read_capped(&mut reader, &pump_caps, global, &mut peak).await {
                 Ok(Inbound::Line(line)) => line,
-                Ok(Inbound::Refused { id, cap }) => {
-                    tracing::warn!(?id, cap, "refused an MCP server message over its size cap");
-                    let Some(id) = id else { continue };
+                Ok(Inbound::Refused {
+                    reply_to,
+                    method,
+                    cap,
+                }) => {
+                    // Answer in the server's place only for a response that provably answers a host
+                    // request. A server→client request or notification is dropped (its id is the
+                    // server's, and an error under it could fail an unrelated host request), as is a
+                    // message whose id the prefix does not prove — its request times out instead.
+                    tracing::warn!(
+                        reply_to = reply_to.as_deref(),
+                        method = method.as_deref(),
+                        cap,
+                        "refused an MCP server message over its size cap"
+                    );
+                    let Some(id) = reply_to else { continue };
                     let error = format!(
                         "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"error\":{{\"code\":-32000,\"message\":\"MCP message over {cap} bytes refused by the host\"}}}}\n"
                     );
@@ -596,7 +708,8 @@ mod tests {
         assert_eq!(
             got,
             Inbound::Refused {
-                id: Some("7".into()),
+                reply_to: Some("7".into()),
+                method: None,
                 cap: view_cap
             }
         );
@@ -615,9 +728,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_message_over_the_global_cap_is_refused_and_its_trailing_id_still_found() {
+    async fn a_message_over_the_global_cap_is_refused_but_an_id_past_its_body_is_not_trusted() {
         let caps = MessageCaps::default();
-        // id last (as some serializers write it): found in the tail.
+        // id last: past the body, so the prefix cannot prove which request this answers (a tail
+        // search could land on an `"id":` inside the body). Refused, and answered by no one.
         let big = format!(
             "{{\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"{}\"}}]}},\"jsonrpc\":\"2.0\",\"id\":\"abc\"}}",
             "y".repeat(300_000)
@@ -630,11 +744,28 @@ mod tests {
         assert_eq!(
             got,
             Inbound::Refused {
-                id: Some("\"abc\"".into()),
+                reply_to: None,
+                method: None,
                 cap: 100_000
             }
         );
         assert!(peak <= 100_000 + 8192, "held {peak}");
+        // A string id ahead of the body is proof.
+        let big = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":\"abc\",\"result\":{{\"x\":\"{}\"}}}}",
+            "y".repeat(300_000)
+        );
+        let got = read_capped(&mut reader(&[big]), &caps, 100_000, &mut peak)
+            .await
+            .unwrap();
+        assert_eq!(
+            got,
+            Inbound::Refused {
+                reply_to: Some("\"abc\"".into()),
+                method: None,
+                cap: 100_000
+            }
+        );
         // A plain response under the cap passes untouched, and an untracked large one is not
         // held to the view cap.
         let fine = format!(
@@ -649,6 +780,104 @@ mod tests {
             matches!(&got, Inbound::Line(l) if l.len() == fine.len() + 1),
             "an untracked 6 MiB message must pass whole"
         );
+    }
+
+    #[tokio::test]
+    async fn an_oversized_message_with_only_a_nested_id_is_answered_by_no_one() {
+        // No top-level id: the `"id":5` inside `params` is not the message's. Answering it would
+        // fail whatever host request has id 5.
+        let caps = MessageCaps::default();
+        let big = format!(
+            "{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{{\"id\":5,\"blob\":\"{}\"}}}}",
+            "n".repeat(300_000)
+        );
+        let mut peak = 0;
+        let got = read_capped(&mut reader(&[big]), &caps, 100_000, &mut peak)
+            .await
+            .unwrap();
+        assert_eq!(
+            got,
+            Inbound::Refused {
+                reply_to: None,
+                method: Some("notifications/progress".into()),
+                cap: 100_000
+            }
+        );
+        // Nor when the nested id comes before the top-level members, in a response with no id.
+        let big = format!(
+            "{{\"jsonrpc\":\"2.0\",\"meta\":{{\"id\":5}},\"result\":{{\"x\":\"{}\"}}}}",
+            "n".repeat(300_000)
+        );
+        let got = read_capped(&mut reader(&[big]), &caps, 100_000, &mut peak)
+            .await
+            .unwrap();
+        assert!(
+            matches!(&got, Inbound::Refused { reply_to: None, .. }),
+            "{got:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_oversized_server_to_client_request_is_dropped_not_answered() {
+        // Its id is the server's own numbering, which can equal one of the host's in-flight
+        // request ids: an error under it would fail that unrelated request.
+        let caps = MessageCaps::default();
+        let big = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"sampling/createMessage\",\"params\":{{\"x\":\"{}\"}}}}",
+            "r".repeat(300_000)
+        );
+        let mut peak = 0;
+        let got = read_capped(&mut reader(&[big]), &caps, 100_000, &mut peak)
+            .await
+            .unwrap();
+        assert_eq!(
+            got,
+            Inbound::Refused {
+                reply_to: None,
+                method: Some("sampling/createMessage".into()),
+                cap: 100_000
+            }
+        );
+        // And it never steals a tight cap registered for the host's own request with that id.
+        caps.wrote(
+            json!({"jsonrpc":"2.0","id":3,"method":"resources/read","params":{"uri":"ui://x/v"}})
+                .to_string()
+                .as_bytes(),
+        );
+        caps.wrote(b"\n");
+        let request = json!({"jsonrpc":"2.0","id":3,"method":"ping"}).to_string();
+        let got = read_capped(
+            &mut reader(std::slice::from_ref(&request)),
+            &caps,
+            100_000,
+            &mut peak,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(got, Inbound::Line(_)), "{got:?}");
+        assert_eq!(caps.peek("3"), Some(crate::tools::mcp_apps::MAX_VIEW_BYTES));
+    }
+
+    #[test]
+    fn the_head_scan_reads_only_top_level_members() {
+        let head = |s: &str| scan_head(s.as_bytes());
+        assert_eq!(
+            head(r#"{"jsonrpc":"2.0","id":7,"result":{"#).reply_to(),
+            Some("7")
+        );
+        // Strings with escaped quotes and braces, and nested arrays, are skipped whole.
+        assert_eq!(
+            head(r#" { "x" : "a\"}{\\" , "y":[1,{"id":9},"]"], "id" : "q\"1" , "error":"#)
+                .reply_to(),
+            Some(r#""q\"1""#)
+        );
+        // A truncated prefix proves nothing past where it stops.
+        assert_eq!(head(r#"{"jsonrpc":"2.0","id":12"#).reply_to(), None);
+        assert_eq!(head(r#"{"params":{"id":1,"#).reply_to(), None);
+        // An id that is not a number or a string is not an id.
+        assert_eq!(head(r#"{"id":{"n":1},"result":"#).reply_to(), None);
+        // Not an object at all.
+        assert_eq!(head(r#"["id",1]"#), Head::default());
     }
 
     #[test]

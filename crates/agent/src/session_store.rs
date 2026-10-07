@@ -2692,8 +2692,8 @@ fn move_sibling_memory(session_jsonl: &Path, dst_dir: &Path) {
     {
         let _ = fs::rename(&src_mem, dst_dir.join(name));
     }
-    // The MCP Events state (cursors, undelivered events) travels with its session too.
-    for ext in MCP_EVENTS_SIDECARS {
+    // The session's sidecar files (MCP Events state, MCP App view state) travel with it too.
+    for ext in SESSION_SIDECARS {
         let events = session_jsonl.with_extension(ext);
         if let Some(name) = events.file_name()
             && events.is_file()
@@ -2703,8 +2703,21 @@ fn move_sibling_memory(session_jsonl: &Path, dst_dir: &Path) {
     }
 }
 
-/// The extensions of a session's MCP Events state files (`tools::mcp_events::state_path_for`): the
-/// snapshot (cursors, keys) and the append-only log of undelivered events.
+/// The extensions of every per-session sidecar file kept beside a single-file session's `.jsonl`:
+/// the MCP Events state (`tools::mcp_events::state_path_for` — the snapshot of cursors and keys, and
+/// the append-only log of undelivered events) and the MCP App view state (`tools::mcp_apps::Sidecar`
+/// — the attached view context, and the view replay store holding each kept view's HTML and full
+/// tool result). Each trashes, restores and is removed with its session: left behind, it would keep
+/// a deleted session's content on disk. (A segmented session keeps its MCP App sidecars inside its
+/// own directory, which moves whole.)
+const SESSION_SIDECARS: [&str; 4] = [
+    "mcp-events.json",
+    "mcp-events.log",
+    "mcp-app-context.json",
+    "mcp-app-views.json",
+];
+
+/// The MCP Events subset — the only sidecars a segmented session keeps *beside* its directory.
 const MCP_EVENTS_SIDECARS: [&str; 2] = ["mcp-events.json", "mcp-events.log"];
 
 /// Best-effort removal of a session's sibling working-memory dir, for the hard-delete fallback path where
@@ -2714,7 +2727,7 @@ fn remove_sibling_memory(session_jsonl: &Path) {
     if src_mem.is_dir() {
         let _ = fs::remove_dir_all(&src_mem);
     }
-    for ext in MCP_EVENTS_SIDECARS {
+    for ext in SESSION_SIDECARS {
         let _ = fs::remove_file(session_jsonl.with_extension(ext));
     }
 }
@@ -4578,6 +4591,37 @@ fn create_private(path: &Path) -> std::io::Result<File> {
         opts.mode(0o600);
     }
     opts.open(path)
+}
+
+/// Replace `path` with `bytes` the way a transcript rewrite does: a `0600` temp file beside it
+/// ([`create_private`]), `fsync`ed, renamed over `path`, then the directory `fsync`ed — so a reader
+/// (or a crash) sees the old content or the new, never a torn file, and never a group/world-readable
+/// one. For a session's sidecar files, which can carry as much as the transcript does.
+pub(crate) fn write_private_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    let mut f = create_private(&tmp)?;
+    let write = (|| -> std::io::Result<()> {
+        f.write_all(bytes)?;
+        f.flush()?;
+        f.sync_all()?;
+        fs::rename(&tmp, path)?;
+        fsync_dir(path)
+    })();
+    if write.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    write
+}
+
+/// Remove `path` durably (the directory `fsync`ed after); absent already is success.
+pub(crate) fn remove_durably(path: &Path) -> std::io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => fsync_dir(path),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 fn fsync_dir(path: &Path) -> std::io::Result<()> {
@@ -8647,6 +8691,49 @@ mod tests {
             "the prod DB port is 5433\n",
             "the restored working memory must have its contents intact"
         );
+    }
+
+    #[test]
+    fn delete_restore_and_hard_delete_carry_the_mcp_app_sidecars_with_the_session() {
+        use crate::tools::mcp_apps::Sidecar;
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let store = repo.create(SessionMeta::new("/w", "m")).unwrap();
+        let id = store.meta().id.clone();
+        let sidecars: Vec<PathBuf> = [Sidecar::CONTEXT, Sidecar::VIEWS]
+            .into_iter()
+            .map(|kind| {
+                let s = Sidecar::new(store.path(), kind, None);
+                s.write(Some(b"<html>secret view</html>")).unwrap();
+                s.path().to_path_buf()
+            })
+            .collect();
+        let trashed = |f: &PathBuf| dir.path().join(".trash").join(f.file_name().unwrap());
+
+        repo.delete(&id).unwrap();
+        for f in &sidecars {
+            assert!(!f.exists(), "{} must leave with its session", f.display());
+            assert!(trashed(f).exists(), "and land in .trash/ beside it");
+        }
+
+        assert!(repo.restore_session(&id).unwrap());
+        for f in &sidecars {
+            assert_eq!(fs::read(f).unwrap(), b"<html>secret view</html>");
+            assert!(!trashed(f).exists(), "a restore brings it back out");
+        }
+
+        // No `.trash/` to move into (a file is in the way): the hard delete removes them too.
+        fs::remove_dir_all(dir.path().join(".trash")).unwrap();
+        fs::write(dir.path().join(".trash"), "").unwrap();
+        repo.delete(&id).unwrap();
+        assert!(!store.path().exists());
+        for f in &sidecars {
+            assert!(
+                !f.exists(),
+                "{} must not outlive a hard delete",
+                f.display()
+            );
+        }
     }
 
     #[test]

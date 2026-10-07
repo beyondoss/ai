@@ -11746,6 +11746,60 @@ async fn write_frame(out: &mut tokio::io::Stdout, line: &[u8]) -> std::io::Resul
 mod tests {
     use super::*;
 
+    /// A views sidecar of `n` views, oldest first, each opening `html_bytes` of HTML.
+    fn views_sidecar(n: usize, html_bytes: usize) -> Vec<u8> {
+        let html = "h".repeat(html_bytes);
+        let views: Vec<Value> = (0..n)
+            .map(|i| {
+                json!({
+                    "app_id": format!("app-{i:02}"),
+                    "server": "s",
+                    "open": { "type": "mcp_app_open", "app_id": format!("app-{i:02}"), "html": html },
+                    "result": { "type": "mcp_app_result", "app_id": format!("app-{i:02}") },
+                })
+            })
+            .collect();
+        serde_json::to_vec(&views).unwrap()
+    }
+
+    fn kept_ids(fanout: &OutFanout) -> Vec<String> {
+        fanout
+            .app_view_servers()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect()
+    }
+
+    #[test]
+    fn a_restored_views_sidecar_is_re_bounded_to_the_view_count() {
+        // A sidecar written by an older binary, or edited on disk, may hold more than the store
+        // keeps: the restore re-imposes the bound, newest views kept.
+        let mut fanout = OutFanout::default();
+        fanout.restore_app_views(&views_sidecar(APP_VIEWS_MAX + 4, 16));
+        let want: Vec<String> = (4..APP_VIEWS_MAX + 4)
+            .map(|i| format!("app-{i:02}"))
+            .collect();
+        assert_eq!(kept_ids(&fanout), want);
+        // And what it would write back is the bounded store, not the oversized input.
+        let snapshot: Vec<Value> =
+            serde_json::from_slice(&fanout.app_views_snapshot().unwrap()).unwrap();
+        assert_eq!(snapshot.len(), APP_VIEWS_MAX);
+    }
+
+    #[test]
+    fn a_restored_views_sidecar_is_re_bounded_to_the_byte_budget() {
+        // Four 3 MiB views are 12 MiB: over the 8 MiB budget, so only the newest two survive.
+        let mut fanout = OutFanout::default();
+        fanout.restore_app_views(&views_sidecar(4, 3 * 1024 * 1024));
+        assert_eq!(kept_ids(&fanout), ["app-02", "app-03"]);
+        let snapshot = fanout.app_views_snapshot().unwrap();
+        assert!(
+            snapshot.len() <= APP_VIEWS_MAX_BYTES,
+            "{} bytes kept",
+            snapshot.len()
+        );
+    }
+
     #[test]
     fn pending_login_guard_resets_the_slot_even_when_the_task_panics() {
         // Regression: the detached `login` task's `JoinHandle` is discarded (see the `"login"`

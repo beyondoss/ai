@@ -75,6 +75,11 @@ pub const SPEC_REVISION: &str = "2026-01-26";
 pub(crate) const MAX_CONTEXT_VIEWS: usize = 8;
 /// The most one view's model context may weigh, serialized.
 pub(crate) const MAX_CONTEXT_BYTES: usize = 16 * 1024;
+/// The most attached view-context text the context sidecar keeps, newest first. Without a bound it
+/// would grow by one block per turn that delivered context until compaction, and be rewritten whole
+/// each time it moved. Past it the oldest blocks are not re-attached after a restart — the same fate
+/// as a block whose message was summarized away — and the newer blocks carry each view's later state.
+pub(crate) const MAX_SAVED_CONTEXT_BYTES: usize = 1024 * 1024;
 /// The largest view HTML this host will pass on (text or base64 blob). Single-file bundled views
 /// are commonly a few hundred KiB; this is an order of magnitude above that, and under the
 /// per-session replay budget, so no single view can crowd every other one out of it.
@@ -968,22 +973,23 @@ impl Sidecar {
         }
     }
 
-    /// Replace the sidecar with `bytes`, atomically (sealed first in service mode). `None` removes it.
+    /// Replace the sidecar with `bytes` (sealed first in service mode); `None` removes it. Written
+    /// the way a transcript rewrite is (`session_store::write_private_atomic`): a `0600` temp file,
+    /// `fsync`ed, renamed over the old one, the directory `fsync`ed — it holds view HTML, full tool
+    /// results and the context the model was given, so it is never group/world-readable and never
+    /// torn. It sits in the transcript's own directory, so that directory's permissions are the
+    /// transcript's.
     pub fn write(&self, bytes: Option<&[u8]>) -> std::io::Result<()> {
         let Some(bytes) = bytes else {
-            return match std::fs::remove_file(&self.path) {
-                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
-                _ => Ok(()),
-            };
+            return crate::session_store::remove_durably(&self.path);
         };
-        let body = match &self.seal {
-            None => bytes.to_vec(),
-            Some((codec, id)) => codec.seal_sidecar(id, self.kind, bytes)?,
-        };
-        let mut tmp = self.path.clone().into_os_string();
-        tmp.push(".tmp");
-        std::fs::write(&tmp, body)?;
-        std::fs::rename(&tmp, &self.path)
+        match &self.seal {
+            None => crate::session_store::write_private_atomic(&self.path, bytes),
+            Some((codec, id)) => crate::session_store::write_private_atomic(
+                &self.path,
+                &codec.seal_sidecar(id, self.kind, bytes)?,
+            ),
+        }
     }
 }
 
@@ -1001,20 +1007,30 @@ fn fingerprint(message: &agent_core::Message) -> String {
 /// The session's attached view-context blocks as the context sidecar records them (stable,
 /// comparable JSON). Each names the message it rides by content fingerprint (not a tree id, which
 /// compaction reissues), so it finds the same turn after a restart, a switch, a fork or a clone.
+///
+/// Only blocks whose message is still in the session are recorded, and only the newest
+/// [`MAX_SAVED_CONTEXT_BYTES`] of them.
 pub fn context_records(session: &agent_core::Session) -> String {
-    let records: Vec<Value> = session
+    let mut budget = MAX_SAVED_CONTEXT_BYTES;
+    let mut records: Vec<Value> = session
         .request_blocks
         .iter()
+        .rev()
         .filter(|b| session.messages.get(b.index) == Some(&b.anchor))
         .filter_map(|b| match &b.block {
-            agent_core::ContentBlock::Text { text, .. } => Some(json!({
+            agent_core::ContentBlock::Text { text, .. } => Some((b, text)),
+            _ => None,
+        })
+        .map_while(|(b, text)| {
+            budget = budget.checked_sub(text.len())?;
+            Some(json!({
                 "fp": fingerprint(&b.anchor),
                 "index": b.index,
                 "text": text.as_ref(),
-            })),
-            _ => None,
+            }))
         })
         .collect();
+    records.reverse();
     Value::Array(records).to_string()
 }
 
@@ -1472,6 +1488,78 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .starts_with("</mcp_app_context>")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_sidecar_is_written_owner_only_and_never_through_a_planted_temp_file() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let session = dir.path().join("2026_s.jsonl");
+        std::fs::write(&session, "").unwrap();
+        let sidecar = Sidecar::new(&session, Sidecar::VIEWS, None);
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+
+        sidecar.write(Some(b"[1]")).unwrap();
+        assert_eq!(
+            mode(sidecar.path()),
+            0o600,
+            "view HTML and tool results must not be group/world-readable"
+        );
+
+        // A stale temp file planted as a symlink must be replaced, not written through.
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, "keep").unwrap();
+        let mut tmp = sidecar.path().as_os_str().to_owned();
+        tmp.push(".tmp");
+        std::os::unix::fs::symlink(&victim, &tmp).unwrap();
+        sidecar.write(Some(b"[2]")).unwrap();
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
+        assert_eq!(sidecar.read().unwrap(), b"[2]");
+        assert_eq!(mode(sidecar.path()), 0o600);
+        assert!(!std::path::Path::new(&tmp).exists());
+
+        sidecar.write(None).unwrap();
+        assert!(!sidecar.path().exists());
+        sidecar.write(None).unwrap();
+    }
+
+    #[test]
+    fn the_context_records_keep_only_the_newest_blocks_within_their_budget() {
+        let mut session = agent_core::Session::new();
+        let block = "c".repeat(100 * 1024);
+        for turn in 0..40 {
+            session.user(format!("turn {turn}"));
+            assert!(session.attach_request_block(format!("{turn:02}{block}")));
+            session.push(agent_core::Message::assistant(vec![
+                agent_core::ContentBlock::text(format!("reply {turn}")),
+            ]));
+        }
+        let records = context_records(&session);
+        assert!(
+            records.len() <= MAX_SAVED_CONTEXT_BYTES + 64 * 1024,
+            "the sidecar must stay bounded: {} bytes",
+            records.len()
+        );
+        let parsed: Vec<Value> = serde_json::from_str(&records).unwrap();
+        let kept: Vec<&str> = parsed
+            .iter()
+            .map(|r| &r["text"].as_str().unwrap()[..2])
+            .collect();
+        assert_eq!(kept.last(), Some(&"39"), "the newest block is kept");
+        assert!(
+            kept.windows(2).all(|w| w[0] < w[1]),
+            "oldest first: {kept:?}"
+        );
+        assert!(kept.len() < 40 && !kept.is_empty(), "{kept:?}");
+
+        // What is kept re-attaches in full to a fresh copy of the same transcript.
+        let mut copy = agent_core::Session::new();
+        copy.messages = session.messages.clone();
+        assert_eq!(
+            attach_context_records(records.as_bytes(), &mut copy),
+            kept.len()
         );
     }
 }
