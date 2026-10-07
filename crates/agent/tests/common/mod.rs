@@ -251,9 +251,13 @@ pub fn spawn_listening_logged(cmd: &mut Command, log: Option<std::fs::File>) -> 
 ///
 /// It is passed as the child's stdin (inetd's convention, `LISTEN_FDS_FIRST_FD=0`): std's `dup2` onto
 /// a standard stream is the one way to give a child a descriptor without `unsafe`, which the workspace
-/// forbids, and `serve` never reads stdin once it serves a listener. Drop it once the daemon is up
-/// unless it will be restarted: while the test holds the socket, a daemon that died leaves it
-/// listening, and a client would wait on it instead of being refused.
+/// forbids, and `serve` never reads stdin once it serves a listener. `serve` adopts passed sockets
+/// only when `LISTEN_PID` names its own pid, as systemd's protocol says — and a pid is not known
+/// before the spawn — so the child is started the way `systemd-socket-activate` starts one: through a
+/// shell that exports its own pid as `LISTEN_PID` and `exec`s `serve` in place, keeping that pid.
+/// Nothing in the binary is test-only. Drop it once the daemon is up unless it will be restarted:
+/// while the test holds the socket, a daemon that died leaves it listening, and a client would wait
+/// on it instead of being refused.
 pub struct HeldPort {
     listener: TcpListener,
     port: u16,
@@ -270,14 +274,34 @@ impl HeldPort {
         self.port
     }
 
-    /// Make this socket `cmd`'s listener. Call it after anything else that sets stdin, and pass no
-    /// `--listen`/`--listen-uds` (either turns socket activation off).
-    pub fn hand_to(&self, cmd: &mut Command) {
+    /// Spawn `cmd` (program, arguments, environment and directory; its stdio is not used) with this
+    /// socket as its socket-activated listener: stdin is the socket, stdout is discarded, stderr goes
+    /// to `stderr`. Pass no `--listen`/`--listen-uds` (either turns socket activation off).
+    pub fn spawn(&self, cmd: &Command, stderr: impl Into<Stdio>) -> ChildGuard {
+        let mut activated = Command::new("sh");
+        activated
+            .arg("-c")
+            .arg(r#"LISTEN_PID=$$; export LISTEN_PID; exec "$0" "$@""#)
+            .arg(cmd.get_program())
+            .args(cmd.get_args());
+        for (key, value) in cmd.get_envs() {
+            match value {
+                Some(value) => activated.env(key, value),
+                None => activated.env_remove(key),
+            };
+        }
+        if let Some(dir) = cmd.get_current_dir() {
+            activated.current_dir(dir);
+        }
         let fd = std::os::fd::OwnedFd::from(self.listener.try_clone().unwrap());
-        cmd.stdin(Stdio::from(fd))
+        activated
             .env("LISTEN_FDS", "1")
             .env("LISTEN_FDS_FIRST_FD", "0")
-            .env_remove("LISTEN_PID");
+            .stdin(Stdio::from(fd))
+            .stdout(Stdio::null())
+            .stderr(stderr);
+        // `activated`, and with it this copy of the socket, drops on return.
+        ChildGuard::spawn(&mut activated)
     }
 
     /// Between a daemon's death and its restart: until the guard drops, every connection is accepted
@@ -460,11 +484,17 @@ pub fn read_until_response(reader: &mut impl BufRead, command: &str) -> Vec<Valu
     frames
 }
 
+/// How long a test waits for a `serve` child's next frame — on stdout ([`serve_frames`]), over a
+/// WebSocket ([`ws_next_frame`]), or through [`skills_env::Serve`] — before failing. Long enough for
+/// any honest wait on a loaded CI runner; far short of the runner's own kill, which says nothing
+/// about where the test stopped. A stall, not slowness, is what it catches: a scripted reply taken by
+/// the wrong request, a run waiting on a question nobody will answer.
+pub const FRAME_DEADLINE: Duration = Duration::from_secs(60);
+
 /// A `serve` child's stdout, read line by line on its own thread, that fails rather than hangs: a
-/// read that sees no new line within `deadline` panics, naming the deadline. Hand it to
-/// [`read_until_response`]/[`read_until_event`] like any `BufRead`. Without one, a run that stalls —
-/// a scripted reply consumed by the wrong request, say — leaves the test blocked in `read_line` until
-/// the runner's own timeout kills it, with nothing said about where it stopped.
+/// read that sees no new line within its deadline panics, naming the deadline. Hand it to
+/// [`read_until_response`]/[`read_until_event`] like any `BufRead`, or take whole frames with
+/// [`Frames::next_frame`].
 pub struct Frames {
     lines: std::sync::mpsc::Receiver<String>,
     current: Vec<u8>,
@@ -472,7 +502,13 @@ pub struct Frames {
     deadline: Duration,
 }
 
-/// [`Frames`] over `out`.
+/// [`Frames`] over a `serve` child's stdout, with [`FRAME_DEADLINE`]. Every stdio frame reader in the
+/// `serve_*` suites is one of these.
+pub fn serve_frames(out: impl Read + Send + 'static) -> Frames {
+    frames_with_deadline(out, FRAME_DEADLINE)
+}
+
+/// [`Frames`] over `out`, with its own per-line deadline.
 pub fn frames_with_deadline(out: impl Read + Send + 'static, deadline: Duration) -> Frames {
     let (tx, lines) = std::sync::mpsc::channel();
     thread::spawn(move || {
@@ -491,6 +527,43 @@ pub fn frames_with_deadline(out: impl Read + Send + 'static, deadline: Duration)
         current: Vec::new(),
         pos: 0,
         deadline,
+    }
+}
+
+/// Why [`Frames::next_frame`] returned no frame.
+#[derive(Debug, PartialEq, Eq)]
+pub enum NoFrame {
+    /// Nothing arrived within the time allowed.
+    TimedOut,
+    /// The stream ended.
+    Closed,
+}
+
+impl Frames {
+    /// The next line that parses as JSON, waiting at most `limit` in all.
+    pub fn next_frame(&mut self, limit: Duration) -> Result<Value, NoFrame> {
+        let deadline = Instant::now() + limit;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let line = if self.pos < self.current.len() {
+                let rest = String::from_utf8_lossy(&self.current[self.pos..]).into_owned();
+                self.pos = self.current.len();
+                rest
+            } else {
+                match self.lines.recv_timeout(left) {
+                    Ok(line) => line,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        return Err(NoFrame::TimedOut);
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        return Err(NoFrame::Closed);
+                    }
+                }
+            };
+            if let Ok(v) = serde_json::from_str::<Value>(line.trim()) {
+                return Ok(v);
+            }
+        }
     }
 }
 
@@ -812,9 +885,24 @@ pub async fn ws_next_frame<T>(ws: &mut tokio_tungstenite::WebSocketStream<T>) ->
 where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
+    ws_next_frame_within(ws, FRAME_DEADLINE).await
+}
+
+/// [`ws_next_frame`], panicking if no message arrives within `deadline` of the last one.
+pub async fn ws_next_frame_within<T>(
+    ws: &mut tokio_tungstenite::WebSocketStream<T>,
+    deadline: Duration,
+) -> Option<Value>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     use futures::StreamExt as _;
     use tokio_tungstenite::tungstenite::Message;
-    while let Some(msg) = ws.next().await {
+    loop {
+        let Ok(next) = tokio::time::timeout(deadline, ws.next()).await else {
+            panic!("no WebSocket frame from serve for {deadline:?}: the run is stalled");
+        };
+        let Some(msg) = next else { break };
         match msg.expect("websocket recv") {
             Message::Text(t) => {
                 if let Ok(v) = serde_json::from_str::<Value>(t.as_str()) {

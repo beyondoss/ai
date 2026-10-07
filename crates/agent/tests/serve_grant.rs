@@ -8,7 +8,7 @@
 
 mod common;
 
-use std::io::{BufReader, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -42,7 +42,7 @@ fn serve(dir: &Path) -> Command {
 fn assert_serves(cmd: &mut Command) {
     let mut child = cmd.spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
     writeln!(stdin, "{}", json!({ "type": "get_state", "id": "g1" })).unwrap();
     let frames = read_until_response(&mut stdout, "get_state");
     assert_eq!(frames.last().unwrap()["success"], true, "{frames:#?}");

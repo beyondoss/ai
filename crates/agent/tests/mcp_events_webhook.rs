@@ -18,7 +18,7 @@ use common::mcp_events_fixture::{
     control, emit, eventually, model_requests_with, spawn_http_fixture, state, write_settings,
 };
 use common::{
-    BIN, ChildGuard, DeadPort, HeldPort, SpawnGuarded, TestWs, serve_dir_cmd, spawn_listening,
+    BIN, ChildGuard, DeadPort, HeldPort, TestWs, serve_dir_cmd, spawn_listening,
     spawn_model_server_routed, turn_text, ws_connect, ws_next_frame, ws_send,
 };
 use serde_json::{Value, json};
@@ -46,12 +46,8 @@ fn start_daemon(mcp_servers: Value) -> Daemon {
     ])
     .env("HOME", home.path())
     .env("BEYOND_AI_AGENT_MCP_EVENTS_COALESCE_MS", "300")
-    .env("BEYOND_AI_AGENT_MCP_IDLE_SECS", "0")
-    .stdin(Stdio::null())
-    .stdout(Stdio::null())
-    .stderr(Stdio::from(std::fs::File::create(&stderr).unwrap()));
-    held.hand_to(&mut cmd);
-    let child = cmd.spawn_guarded();
+    .env("BEYOND_AI_AGENT_MCP_IDLE_SECS", "0");
+    let child = held.spawn(&cmd, std::fs::File::create(&stderr).unwrap());
     Daemon {
         child,
         port,

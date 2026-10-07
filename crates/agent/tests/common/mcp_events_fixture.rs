@@ -295,14 +295,9 @@ pub fn spawn_daemon_on(
     .args(extra)
     .env("HOME", home)
     .env("BEYOND_AI_AGENT_MCP_EVENTS_COALESCE_MS", "300")
-    .env("BEYOND_AI_AGENT_MCP_IDLE_SECS", "0")
-    .stdin(Stdio::null())
-    .stdout(Stdio::null())
-    .stderr(Stdio::from(
-        std::fs::File::create(home.join(format!("serve-{port}.stderr"))).unwrap(),
-    ));
-    held.hand_to(&mut cmd);
-    cmd.spawn_guarded()
+    .env("BEYOND_AI_AGENT_MCP_IDLE_SECS", "0");
+    let stderr = std::fs::File::create(home.join(format!("serve-{port}.stderr"))).unwrap();
+    held.spawn(&cmd, stderr)
 }
 
 /// The next WebSocket frame matching `pred`, or a panic naming `what` after `timeout`.

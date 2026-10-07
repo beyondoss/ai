@@ -9,22 +9,23 @@
 
 mod common;
 
-use std::io::{BufReader, Write};
+use std::io::Write;
 
 use common::{SpawnGuarded, read_until_response, serve_dir_cmd, spawn_model_server, turn_text};
 use serde_json::{Value, json};
 
 /// Three sessions, each whose first user message is its own marker, listed newest-first.
-fn three_sessions() -> (tempfile::TempDir, common::ChildGuard) {
+fn three_sessions() -> (tempfile::TempDir, common::ChildGuard, common::Frames) {
     let dir = tempfile::tempdir().unwrap();
     let dir_str = dir.path().to_string_lossy().into_owned();
     let (base, _bodies) =
         spawn_model_server(vec![turn_text("ok"), turn_text("ok"), turn_text("ok")]);
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_dir_cmd(bin, &base, &dir_str).spawn_guarded();
+    // One reader for the child's life: it owns stdout, so it is handed back with the child.
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
     {
         let mut stdin = child.stdin.take().unwrap();
-        let mut stdout = BufReader::new(child.stdout.take().unwrap());
         for (i, marker) in ["alpha-one", "beta-two", "gamma-three"].iter().enumerate() {
             if i > 0 {
                 writeln!(stdin, "{}", json!({ "type": "new_session" })).unwrap();
@@ -36,16 +37,14 @@ fn three_sessions() -> (tempfile::TempDir, common::ChildGuard) {
             read_until_response(&mut stdout, "prompt");
         }
         child.stdin = Some(stdin);
-        child.stdout = Some(stdout.into_inner());
     }
-    (dir, child)
+    (dir, child, stdout)
 }
 
 #[test]
 fn a_listing_is_one_page_and_reports_the_total() {
-    let (_dir, mut child) = three_sessions();
+    let (_dir, mut child, mut stdout) = three_sessions();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
     fn page<W: Write, R: std::io::BufRead>(stdin: &mut W, stdout: &mut R, cmd: Value) -> Value {
         writeln!(stdin, "{cmd}").unwrap();
@@ -95,9 +94,8 @@ fn a_listing_is_one_page_and_reports_the_total() {
 
 #[test]
 fn a_listing_entry_carries_metadata_and_not_the_transcript() {
-    let (_dir, mut child) = three_sessions();
+    let (_dir, mut child, mut stdout) = three_sessions();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
     writeln!(stdin, "{}", json!({ "type": "list_sessions" })).unwrap();
     stdin.flush().unwrap();

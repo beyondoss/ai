@@ -194,32 +194,21 @@ pub type Bodies = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
 
 /// How long any one wait on `serve` may take before a test fails — so a regression fails fast with
 /// what was seen, instead of hanging the suite.
-pub const DEADLINE: Duration = Duration::from_secs(60);
+pub const DEADLINE: Duration = super::FRAME_DEADLINE;
 
 /// A running `serve` over stdin/stdout. Its stdout is read on a thread of its own, so every wait has
 /// a deadline.
 pub struct Serve {
     pub child: ChildGuard,
     pub stdin: ChildStdin,
-    frames: mpsc::Receiver<Value>,
+    frames: super::Frames,
 }
 
 impl Serve {
     pub fn spawn(cmd: &mut Command) -> Self {
         let mut child = cmd.spawn_guarded();
         let stdin = child.stdin.take().unwrap();
-        let stdout = BufReader::new(child.stdout.take().unwrap());
-        let (tx, frames) = mpsc::channel();
-        std::thread::spawn(move || {
-            for line in stdout.lines() {
-                let Ok(line) = line else { break };
-                if let Ok(v) = serde_json::from_str::<Value>(line.trim())
-                    && tx.send(v).is_err()
-                {
-                    break;
-                }
-            }
-        });
+        let frames = super::serve_frames(child.stdout.take().unwrap());
         Self {
             child,
             stdin,
@@ -255,7 +244,7 @@ impl Serve {
         let mut frames = Vec::new();
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
-            match self.frames.recv_timeout(left) {
+            match self.frames.next_frame(left) {
                 Ok(v) => {
                     let done = stop(&v);
                     frames.push(v);
@@ -263,10 +252,10 @@ impl Serve {
                         return frames;
                     }
                 }
-                Err(mpsc::RecvTimeoutError::Timeout) => {
+                Err(super::NoFrame::TimedOut) => {
                     panic!("serve did not answer within {limit:?}; saw: {frames:#?}")
                 }
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                Err(super::NoFrame::Closed) => {
                     panic!("serve's stdout closed; saw: {frames:#?}")
                 }
             }

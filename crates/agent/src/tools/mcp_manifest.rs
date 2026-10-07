@@ -26,9 +26,8 @@
 //! longer exists; it cannot make a call silently do the wrong thing.
 
 use std::collections::BTreeMap;
-use std::io::ErrorKind;
-use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime};
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -177,13 +176,39 @@ pub fn load(dir: &ManifestDir, config: &McpServerConfig) -> Option<ServerManifes
         })
 }
 
+/// How long a write waits for another writer before giving up on caching this answer.
+const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(5);
+
+/// The manifest's write lock, waited for up to [`LOCK_TIMEOUT`]: the repo's session lock
+/// ([`crate::session_store::acquire_session_lock`]) on `<manifest>.lock` — a kernel file lock, which
+/// the kernel releases when its holder exits, however it exits. So there is no staleness to judge and
+/// no lockfile to break: a crashed writer's leftover file is simply unlocked, and two waiters cannot
+/// both take it. (A create-new lockfile with an age-based break could: both judge it stale, both
+/// remove and recreate it, both "hold" it.) Blocking — call it off the async runtime.
+fn lock_store(dir: &ManifestDir) -> Option<crate::session_store::SessionLock> {
+    let path = dir.file();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok()?;
+    }
+    let deadline = Instant::now() + LOCK_TIMEOUT;
+    loop {
+        match crate::session_store::acquire_session_lock(&path) {
+            Ok(Some(lock)) => return Some(lock),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(LOCK_RETRY_INTERVAL),
+            Ok(None) | Err(_) => return None,
+        }
+    }
+}
+
 /// Read the store, apply `change`, and write it back if `change` says it changed anything — under
-/// the cross-process [`FileLock`], since several connections (and agents) update one file: a skills
-/// refresh on one server racing a connect on another must not drop either's entry. Best-effort like
-/// everything here: a lock that cannot be had skips the write, which costs a server spawn at the next
-/// boot, never a wrong answer.
+/// [`lock_store`], since several connections (and agents) update one file: a skills refresh on one
+/// server racing a connect on another must not drop either's entry. Best-effort like everything here:
+/// a lock that cannot be had skips the write, which costs a server spawn at the next boot, never a
+/// wrong answer. Blocking (it may wait for the lock), so the public writers below run it on the
+/// blocking pool: they are called from connection tasks on the async runtime.
 fn update_store(dir: &ManifestDir, change: impl FnOnce(&mut Store) -> bool) {
-    let Ok(_lock) = FileLock::acquire(&dir.file()) else {
+    let Some(_lock) = lock_store(dir) else {
         return;
     };
     let mut all = read_store(dir);
@@ -192,10 +217,20 @@ fn update_store(dir: &ManifestDir, change: impl FnOnce(&mut Store) -> bool) {
     }
 }
 
+/// [`update_store`] on the blocking pool, so waiting for another writer never holds an async worker.
+async fn update_store_off_runtime(
+    dir: &ManifestDir,
+    change: impl FnOnce(&mut Store) -> bool + Send + 'static,
+) {
+    let dir = dir.clone();
+    let _ = tokio::task::spawn_blocking(move || update_store(&dir, change)).await;
+}
+
 /// Drop `config`'s cached manifest, if any — for a server whose answer must not be cached here (a
 /// skills listing marked `cacheScope: "private"`). Best-effort, like [`store`].
-pub fn forget(dir: &ManifestDir, config: &McpServerConfig) {
-    update_store(dir, |all| all.remove(&config.name).is_some());
+pub async fn forget(dir: &ManifestDir, config: &McpServerConfig) {
+    let name = config.name.clone();
+    update_store_off_runtime(dir, move |all| all.remove(&name).is_some()).await;
 }
 
 /// Replace only the skills listing in `config`'s cached manifest — for a listing re-fetched after
@@ -204,7 +239,7 @@ pub fn forget(dir: &ManifestDir, config: &McpServerConfig) {
 /// (`cacheScope: "private"`) forgets the server instead, as at connect. Without a manifest already
 /// recorded for this exact invocation there is nothing to amend: the next live connect writes a
 /// whole one. Best-effort, like [`store`].
-pub fn store_skills(
+pub async fn store_skills(
     dir: &ManifestDir,
     config: &McpServerConfig,
     skills: Vec<crate::tools::mcp_skills::SkillEntry>,
@@ -212,23 +247,25 @@ pub fn store_skills(
     private: bool,
 ) {
     if private {
-        forget(dir, config);
+        forget(dir, config).await;
         return;
     }
     let key = invocation_key(config);
-    update_store(dir, |all| {
-        let Some(manifest) = all.get_mut(&config.name).filter(|m| m.key == key) else {
+    let name = config.name.clone();
+    update_store_off_runtime(dir, move |all| {
+        let Some(manifest) = all.get_mut(&name).filter(|m| m.key == key) else {
             return false;
         };
         manifest.skills = Some(skills);
         manifest.skill_diagnostics = skill_diagnostics;
         true
-    });
+    })
+    .await;
 }
 
 /// Record what `config`'s server advertises. Best-effort: a cache that cannot be written costs a
 /// server spawn on the next boot, which is the behavior without it.
-pub fn store(
+pub async fn store(
     dir: &ManifestDir,
     config: &McpServerConfig,
     tools: Vec<CachedTool>,
@@ -245,10 +282,12 @@ pub fn store(
         skills,
         skill_diagnostics,
     };
-    update_store(dir, |all| {
-        all.insert(config.name.clone(), manifest);
+    let name = config.name.clone();
+    update_store_off_runtime(dir, move |all| {
+        all.insert(name, manifest);
         true
-    });
+    })
+    .await;
 }
 
 fn write_store(dir: &ManifestDir, all: &Store) {
@@ -261,71 +300,12 @@ fn write_store(dir: &ManifestDir, all: &Store) {
     }
     // Write-then-rename: a crash mid-write must not leave a truncated manifest that reads as a
     // *different* tool set. A miss is fine; a plausible-looking wrong answer is not. The temporary
-    // name is this writer's own, so a writer that lost the lock to a stale-lock break still cannot
-    // rename another's half-written file into place.
+    // name is this writer's own, so no two writes ever share one.
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let tmp = path.with_extension(format!("json.{}.{seq}.tmp", std::process::id()));
     if std::fs::write(&tmp, &bytes).is_ok() && std::fs::rename(&tmp, &path).is_err() {
         let _ = std::fs::remove_file(&tmp);
-    }
-}
-
-const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
-const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(5);
-const STALE_LOCK_AGE: Duration = Duration::from_secs(10);
-
-/// A cross-process advisory lock via atomic lockfile creation — `mcp_auth_store.rs::FileLock`'s
-/// pattern (itself `trust_store.rs`'s and `settings.rs`'s), duplicated rather than shared like each of
-/// those. Held for one read-modify-write of the manifest; a lockfile older than [`STALE_LOCK_AGE`] is
-/// a crashed holder's and is broken.
-struct FileLock {
-    path: PathBuf,
-}
-
-impl FileLock {
-    fn acquire(store_path: &Path) -> std::io::Result<Self> {
-        let mut os = store_path.as_os_str().to_owned();
-        os.push(".lock");
-        let lock_path = PathBuf::from(os);
-        if let Some(parent) = lock_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let deadline = Instant::now() + LOCK_TIMEOUT;
-        loop {
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&lock_path)
-            {
-                Ok(_) => return Ok(Self { path: lock_path }),
-                Err(e) if e.kind() == ErrorKind::AlreadyExists => {
-                    let stale = std::fs::metadata(&lock_path)
-                        .and_then(|m| m.modified())
-                        .ok()
-                        .and_then(|t| SystemTime::now().duration_since(t).ok())
-                        .is_some_and(|age| age > STALE_LOCK_AGE);
-                    if stale {
-                        let _ = std::fs::remove_file(&lock_path);
-                        continue;
-                    }
-                    if Instant::now() >= deadline {
-                        return Err(std::io::Error::new(
-                            ErrorKind::TimedOut,
-                            format!("timed out waiting for {}", lock_path.display()),
-                        ));
-                    }
-                    std::thread::sleep(LOCK_RETRY_INTERVAL);
-                }
-                Err(e) => return Err(e),
-            }
-        }
-    }
-}
-
-impl Drop for FileLock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
     }
 }
 
@@ -368,7 +348,7 @@ mod tests {
             });
         };
         race(&|i| {
-            store(
+            block_on(store(
                 &manifest,
                 &configs[i],
                 vec![],
@@ -376,19 +356,19 @@ mod tests {
                 vec![],
                 Some(vec![]),
                 vec![],
-            );
+            ));
         });
         for (i, c) in configs.iter().enumerate() {
             assert!(load(&manifest, c).is_some(), "s{i}'s connect was lost");
         }
         race(&|i| {
-            store_skills(
+            block_on(store_skills(
                 &manifest,
                 &configs[i],
                 vec![],
                 vec![format!("refreshed-{i}")],
                 false,
-            );
+            ));
         });
         for (i, c) in configs.iter().enumerate() {
             let m = load(&manifest, c).unwrap_or_else(|| panic!("s{i}'s entry was lost"));
@@ -401,11 +381,110 @@ mod tests {
         let leftovers: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-            .filter(|n| n != FILE)
+            .filter(|n| n != FILE && *n != format!("{FILE}.lock"))
             .collect();
         assert!(
             leftovers.is_empty(),
-            "no lock or temporary file is left: {leftovers:?}"
+            "no temporary file is left: {leftovers:?}"
+        );
+    }
+
+    /// Run one async writer to completion on a runtime of its own (each test thread is a separate
+    /// agent process, as far as the manifest is concerned).
+    fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(f)
+    }
+
+    /// A lock left behind by a writer that died — its file still there, long past any age a
+    /// "stale" judgement would use — never lets two waiters hold the lock at once: many writers
+    /// racing for it take turns. (An age-based break let every waiter that judged it stale remove and
+    /// recreate it, and each then believed it held the lock.)
+    #[test]
+    fn a_dead_writers_leftover_lock_admits_exactly_one_holder_at_a_time() {
+        const WAITERS: usize = 16;
+        for _ in 0..20 {
+            let dir = tempfile::tempdir().unwrap();
+            let manifest = ManifestDir::at(dir.path());
+            let lock = dir.path().join(format!("{FILE}.lock"));
+            let file = std::fs::File::create(&lock).unwrap();
+            let long_ago = std::time::SystemTime::now() - Duration::from_secs(3600);
+            file.set_modified(long_ago).unwrap();
+            drop(file);
+            let holders = std::sync::atomic::AtomicUsize::new(0);
+            let most = std::sync::atomic::AtomicUsize::new(0);
+            let barrier = std::sync::Barrier::new(WAITERS);
+            std::thread::scope(|scope| {
+                for _ in 0..WAITERS {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        let held = lock_store(&manifest).expect("the lock is taken in turn");
+                        let now = holders.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                        most.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+                        std::thread::sleep(Duration::from_millis(2));
+                        holders.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                        drop(held);
+                    });
+                }
+            });
+            assert_eq!(
+                most.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "two writers held the manifest lock at once"
+            );
+        }
+    }
+
+    /// Waiting for another writer happens off the async runtime: on a single-threaded runtime, a
+    /// write that has to wait still lets every other task run.
+    #[test]
+    fn a_write_waiting_for_the_lock_does_not_block_the_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = ManifestDir::at(dir.path());
+        let config = stdio("s", "npx", &["server"]);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        // Another writer holds the lock for 400 ms.
+        let held = lock_store(&manifest).unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(400));
+            drop(held);
+        });
+        let ticks = rt.block_on(async {
+            let ticks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counter = ticks.clone();
+            let ticker = tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            });
+            store(
+                &manifest,
+                &config,
+                vec![],
+                vec![],
+                vec![],
+                Some(vec![]),
+                vec![],
+            )
+            .await;
+            ticker.abort();
+            ticks.load(std::sync::atomic::Ordering::Relaxed)
+        });
+        release.join().unwrap();
+        assert!(
+            load(&manifest, &config).is_some(),
+            "the write landed once the lock was free"
+        );
+        assert!(
+            ticks >= 10,
+            "the runtime's only thread was blocked while the write waited ({ticks} ticks in ~400 ms)"
         );
     }
 

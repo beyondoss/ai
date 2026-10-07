@@ -6,7 +6,7 @@
 
 mod common;
 
-use std::io::{BufReader, Write};
+use std::io::Write;
 use std::process::Command;
 
 use common::{SpawnGuarded, read_until_response, serve_cmd};
@@ -42,7 +42,7 @@ fn auth_status_with_nothing_stored_reports_every_provider_logged_out() {
 
     let mut child = serve_cmd_with_real_home(bin, &session_file, home.path()).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     writeln!(stdin, "{}", json!({ "id": "1", "type": "auth_status" })).unwrap();
     stdin.flush().unwrap();
@@ -73,7 +73,7 @@ fn auth_status_for_a_single_provider_reports_logged_in_when_a_non_expired_creden
 
     let mut child = serve_cmd_with_real_home(bin, &session_file, home.path()).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     writeln!(
         stdin,
@@ -101,7 +101,7 @@ fn auth_status_for_an_unknown_provider_is_a_clean_error_not_a_crash() {
 
     let mut child = serve_cmd_with_real_home(bin, &session_file, home.path()).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     writeln!(
         stdin,
@@ -137,7 +137,7 @@ fn logout_removes_a_stored_credential_and_is_idempotent() {
 
     let mut child = serve_cmd_with_real_home(bin, &session_file, home.path()).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     writeln!(
         stdin,
@@ -179,7 +179,7 @@ fn login_acks_then_a_second_concurrent_login_is_rejected_then_abort_login_cancel
 
     let mut child = serve_cmd_with_real_home(bin, &session_file, home.path()).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     writeln!(
         stdin,

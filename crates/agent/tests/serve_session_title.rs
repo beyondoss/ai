@@ -9,8 +9,7 @@
 
 mod common;
 
-use std::io::{BufReader, Write};
-use std::time::Duration;
+use std::io::Write;
 
 use common::{
     SpawnGuarded, read_until_response, serve_dir_cmd, spawn_model_server,
@@ -42,7 +41,7 @@ fn a_session_names_itself_from_its_opening_exchange() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_dir_cmd(bin, &base, &dir_str).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     writeln!(
         stdin,
@@ -76,7 +75,7 @@ fn an_unusable_title_is_attempted_once_and_costs_the_session_nothing() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_dir_cmd(bin, &base, &dir_str).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     for msg in ["first", "second"] {
         writeln!(stdin, "{}", json!({ "type": "prompt", "message": msg })).unwrap();
@@ -136,8 +135,7 @@ fn a_title_call_does_not_consume_the_conversation_script() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_dir_cmd(bin, &base, &dir_str).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout =
-        common::frames_with_deadline(child.stdout.take().unwrap(), Duration::from_secs(20));
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
     let mut texts = Vec::new();
     for message in ["one", "two", "three"] {
         writeln!(stdin, "{}", json!({ "type": "prompt", "message": message })).unwrap();

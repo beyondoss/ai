@@ -42,7 +42,7 @@ fn serve_export_html_writes_a_self_contained_transcript() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     writeln!(
         stdin,
@@ -97,7 +97,7 @@ fn serve_export_html_includes_model_change_and_label_events() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     writeln!(
         stdin,
@@ -178,7 +178,7 @@ fn serve_export_html_includes_abandoned_branches_not_just_the_active_path() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     writeln!(stdin, "{}", json!({ "type": "prompt", "message": "first" })).unwrap();
     stdin.flush().unwrap();
@@ -260,7 +260,7 @@ fn serve_defaults_to_home_claude_sessions_when_no_session_flag_given() {
     cmd.current_dir(project.path()).env("HOME", home.path());
     let mut child = cmd.spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     writeln!(stdin, "{}", json!({ "type": "prompt", "message": "hi" })).unwrap();
     stdin.flush().unwrap();
@@ -314,7 +314,7 @@ fn serve_resumes_newest_session_matching_cwd_not_globally_newest() {
         cmd.current_dir(project_a.path());
         let mut child = cmd.spawn_guarded();
         let mut stdin = child.stdin.take().unwrap();
-        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let mut stdout = common::serve_frames(child.stdout.take().unwrap());
         writeln!(
             stdin,
             "{}",
@@ -335,7 +335,7 @@ fn serve_resumes_newest_session_matching_cwd_not_globally_newest() {
         cmd.current_dir(project_b.path());
         let mut child = cmd.spawn_guarded();
         let mut stdin = child.stdin.take().unwrap();
-        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let mut stdout = common::serve_frames(child.stdout.take().unwrap());
         writeln!(
             stdin,
             "{}",
@@ -356,7 +356,7 @@ fn serve_resumes_newest_session_matching_cwd_not_globally_newest() {
         cmd.current_dir(project_a.path()).arg("--continue");
         let mut child = cmd.spawn_guarded();
         let mut stdin = child.stdin.take().unwrap();
-        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let mut stdout = common::serve_frames(child.stdout.take().unwrap());
         writeln!(stdin, "{}", json!({ "type": "get_messages" })).unwrap();
         stdin.flush().unwrap();
         let frames = read_until_response(&mut stdout, "get_messages");
@@ -394,7 +394,7 @@ fn serve_reattaches_through_a_symlinked_cwd_to_the_session_recorded_under_its_re
         cmd.current_dir(&real);
         let mut child = cmd.spawn_guarded();
         let mut stdin = child.stdin.take().unwrap();
-        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let mut stdout = common::serve_frames(child.stdout.take().unwrap());
         writeln!(
             stdin,
             "{}",
@@ -414,7 +414,7 @@ fn serve_reattaches_through_a_symlinked_cwd_to_the_session_recorded_under_its_re
         cmd.current_dir(&link).arg("--continue");
         let mut child = cmd.spawn_guarded();
         let mut stdin = child.stdin.take().unwrap();
-        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let mut stdout = common::serve_frames(child.stdout.take().unwrap());
         writeln!(stdin, "{}", json!({ "type": "get_messages" })).unwrap();
         stdin.flush().unwrap();
         let frames = read_until_response(&mut stdout, "get_messages");
@@ -445,7 +445,7 @@ fn serve_list_sessions_streams_progress_frames_correlated_to_the_request_id() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_dir_cmd(bin, &base, &session_dir).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
     // Drain the `ready` banner.
     let mut ready = String::new();
     stdout.read_line(&mut ready).unwrap();
@@ -543,7 +543,7 @@ fn serve_exits_gracefully_on_sigterm_mid_run() {
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let pid = child.id();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     writeln!(
         stdin,
@@ -647,7 +647,7 @@ fn serve_exits_gracefully_on_sighup_mid_run() {
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let pid = child.id();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     writeln!(
         stdin,
@@ -727,7 +727,7 @@ fn serve_exits_with_130_on_sigint_mid_run() {
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let pid = child.id();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     writeln!(
         stdin,
@@ -799,7 +799,7 @@ fn serve_streams_events_and_reattaches() {
     // --- First session: prompt, observe streamed events, read transcript ---
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     writeln!(
         stdin,
@@ -851,7 +851,7 @@ fn serve_streams_events_and_reattaches() {
     // --- Reattach: a fresh process over the same session file sees the prior transcript ---
     let mut child2 = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin2 = child2.stdin.take().unwrap();
-    let mut stdout2 = BufReader::new(child2.stdout.take().unwrap());
+    let mut stdout2 = common::serve_frames(child2.stdout.take().unwrap());
     writeln!(stdin2, "{}", json!({ "type": "get_messages" })).unwrap();
     stdin2.flush().unwrap();
     let frames3 = read_until_response(&mut stdout2, "get_messages");
@@ -897,7 +897,7 @@ fn serve_survives_a_hard_crash_mid_run_with_both_round_trips_tool_use_already_du
 
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
     writeln!(stdin, "{}", json!({ "type": "prompt", "message": "go" })).unwrap();
     stdin.flush().unwrap();
 
@@ -915,7 +915,7 @@ fn serve_survives_a_hard_crash_mid_run_with_both_round_trips_tool_use_already_du
     let (base2, _bodies2) = spawn_model_server(vec![]);
     let mut child2 = serve_cmd(bin, &base2, &session_file).spawn_guarded();
     let mut stdin2 = child2.stdin.take().unwrap();
-    let mut stdout2 = BufReader::new(child2.stdout.take().unwrap());
+    let mut stdout2 = common::serve_frames(child2.stdout.take().unwrap());
     writeln!(stdin2, "{}", json!({ "type": "get_messages" })).unwrap();
     stdin2.flush().unwrap();
     let frames = read_until_response(&mut stdout2, "get_messages");
@@ -970,7 +970,7 @@ fn serve_reports_success_when_a_failed_checkpoint_is_superseded_by_a_successful_
 
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     // Consume the ready frame — by now `Persistence::open` has already created the file with normal
     // permissions, so this doesn't race the file's own creation.
@@ -1045,7 +1045,7 @@ fn serve_stdout_stays_valid_json_even_when_a_load_warning_fires() {
         .stderr(Stdio::piped())
         .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
     let mut stderr = BufReader::new(child.stderr.take().unwrap());
 
     // Deliberately NOT `read_until_response` — it silently skips a line that fails to parse as JSON,
@@ -1118,7 +1118,7 @@ fn new_session_reports_failure_and_leaves_the_old_session_active_when_persist_fa
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     writeln!(stdin, "{}", json!({ "type": "prompt", "message": "hello" })).unwrap();
     stdin.flush().unwrap();
@@ -1180,7 +1180,7 @@ fn serve_unknown_command_type_reports_a_clear_failure_frame() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     writeln!(stdin, "{}", json!({ "type": "foobar", "id": "test" })).unwrap();
     stdin.flush().unwrap();
@@ -1216,7 +1216,7 @@ fn serve_jsonl_framing_preserves_u2028_and_u2029_inside_a_payload() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     let title = "a\u{2028}b\u{2029}c";
     writeln!(
@@ -1261,7 +1261,7 @@ fn serve_jsonl_framing_handles_crlf_delimited_commands() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     let cmd_a = json!({ "id": "a", "type": "set_session_name", "title": "first" }).to_string();
     let cmd_b = json!({ "id": "b", "type": "set_session_name", "title": "second" }).to_string();
@@ -1302,7 +1302,7 @@ fn serve_jsonl_framing_handles_a_final_command_with_no_trailing_newline() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     // No trailing `\n` at all — `write!`, not `writeln!` — then drop `stdin` to close the pipe.
     write!(
@@ -1337,7 +1337,7 @@ fn serve_name_flag_sets_the_initial_session_title() {
         .args(["--name", "my-serve-session"])
         .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     writeln!(stdin, "{}", json!({ "type": "get_state" })).unwrap();
     stdin.flush().unwrap();
@@ -1366,7 +1366,7 @@ fn serve_session_id_flag_applies_to_a_brand_new_session_file() {
         .args(["--session-id", "my-chosen-serve-id"])
         .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     writeln!(stdin, "{}", json!({ "type": "get_state" })).unwrap();
     stdin.flush().unwrap();
@@ -1405,7 +1405,7 @@ fn serve_session_id_flag_applies_to_the_default_repo_mode_when_no_session_exists
         .args(["--session-id", "my-chosen-repo-id"]);
     let mut child = cmd.spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     writeln!(stdin, "{}", json!({ "type": "get_state" })).unwrap();
     stdin.flush().unwrap();
@@ -1437,7 +1437,7 @@ fn serve_session_id_flag_addresses_its_own_session_not_whatever_matched_the_cwd(
         cmd.current_dir(project.path());
         let mut child = cmd.spawn_guarded();
         let mut stdin = child.stdin.take().unwrap();
-        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let mut stdout = common::serve_frames(child.stdout.take().unwrap());
         writeln!(stdin, "{}", json!({ "type": "get_state" })).unwrap();
         stdin.flush().unwrap();
         let state = read_until_response(&mut stdout, "get_state");
@@ -1458,7 +1458,7 @@ fn serve_session_id_flag_addresses_its_own_session_not_whatever_matched_the_cwd(
         .args(["--session-id", "mine-alone"]);
     let mut child = cmd.spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     writeln!(stdin, "{}", json!({ "type": "get_state" })).unwrap();
     stdin.flush().unwrap();

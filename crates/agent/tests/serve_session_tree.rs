@@ -3,7 +3,7 @@
 
 mod common;
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, Write};
 use std::process::{Command, Stdio};
 
 use common::{
@@ -24,7 +24,7 @@ fn serve_get_messages_since_returns_only_what_was_appended_after_a_known_id() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     writeln!(stdin, "{}", json!({ "type": "prompt", "message": "first" })).unwrap();
     stdin.flush().unwrap();
@@ -100,7 +100,7 @@ fn serve_set_label_and_get_label_round_trip_over_the_wire() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     writeln!(stdin, "{}", json!({ "type": "prompt", "message": "hi" })).unwrap();
     stdin.flush().unwrap();
@@ -218,7 +218,7 @@ fn serve_append_custom_reaches_the_tree_but_not_the_active_messages() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     writeln!(stdin, "{}", json!({ "type": "prompt", "message": "hi" })).unwrap();
     stdin.flush().unwrap();
@@ -298,7 +298,7 @@ fn serve_repo_lists_switches_and_forks_sessions() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_dir_cmd(bin, &base, &session_dir).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     // Read the `ready` banner to learn the first session's id.
     let mut ready = String::new();
@@ -451,7 +451,7 @@ fn serve_clone_forks_the_current_session_at_its_current_tip() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_dir_cmd(bin, &base, &session_dir).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     let mut ready = String::new();
     stdout.read_line(&mut ready).unwrap();
@@ -495,7 +495,7 @@ fn serve_new_session_parent_session_overrides_the_default_lineage() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_dir_cmd(bin, &base, &session_dir).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     let mut ready = String::new();
     stdout.read_line(&mut ready).unwrap();
@@ -547,7 +547,7 @@ fn serve_delete_session_soft_deletes_another_session_but_refuses_the_active_one(
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_dir_cmd(bin, &base, &session_dir).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     let mut ready = String::new();
     stdout.read_line(&mut ready).unwrap();
@@ -643,7 +643,7 @@ fn serve_fork_by_target_id_reaches_an_off_active_path_branch() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_dir_cmd(bin, &base, &session_dir).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     for msg in ["a", "b", "c"] {
         writeln!(stdin, "{}", json!({ "type": "prompt", "message": msg })).unwrap();
@@ -777,7 +777,7 @@ fn serve_fork_includes_the_forked_from_messages_text() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_dir_cmd(bin, &base, &session_dir).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     for msg in ["a", "b"] {
         writeln!(stdin, "{}", json!({ "type": "prompt", "message": msg })).unwrap();
@@ -845,7 +845,7 @@ fn serve_fork_and_preview_fork_default_before_to_true() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_dir_cmd(bin, &base, &session_dir).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     for msg in ["a", "b"] {
         writeln!(stdin, "{}", json!({ "type": "prompt", "message": msg })).unwrap();
@@ -920,7 +920,7 @@ fn serve_list_all_sessions_spans_every_project_under_the_shared_root() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child_a = serve_dir_cmd(bin, &base_a, &dir_a).spawn_guarded();
     let mut stdin_a = child_a.stdin.take().unwrap();
-    let mut stdout_a = BufReader::new(child_a.stdout.take().unwrap());
+    let mut stdout_a = common::serve_frames(child_a.stdout.take().unwrap());
     writeln!(stdin_a, "{}", json!({ "type": "prompt", "message": "hi" })).unwrap();
     stdin_a.flush().unwrap();
     read_until_response(&mut stdout_a, "prompt");
@@ -928,7 +928,7 @@ fn serve_list_all_sessions_spans_every_project_under_the_shared_root() {
     let (base_b, _bodies_b) = spawn_model_server(vec![turn_text("answer from b")]);
     let mut child_b = serve_dir_cmd(bin, &base_b, &dir_b).spawn_guarded();
     let mut stdin_b = child_b.stdin.take().unwrap();
-    let mut stdout_b = BufReader::new(child_b.stdout.take().unwrap());
+    let mut stdout_b = common::serve_frames(child_b.stdout.take().unwrap());
     writeln!(stdin_b, "{}", json!({ "type": "prompt", "message": "hi" })).unwrap();
     stdin_b.flush().unwrap();
     read_until_response(&mut stdout_b, "prompt");
@@ -983,7 +983,7 @@ fn serve_list_sessions_filters_by_cwd_under_one_shared_session_dir() {
         .current_dir(cwd_a.path())
         .spawn_guarded();
     let mut stdin_a = child_a.stdin.take().unwrap();
-    let mut stdout_a = BufReader::new(child_a.stdout.take().unwrap());
+    let mut stdout_a = common::serve_frames(child_a.stdout.take().unwrap());
     writeln!(stdin_a, "{}", json!({ "type": "prompt", "message": "hi" })).unwrap();
     stdin_a.flush().unwrap();
     read_until_response(&mut stdout_a, "prompt");
@@ -993,7 +993,7 @@ fn serve_list_sessions_filters_by_cwd_under_one_shared_session_dir() {
         .current_dir(cwd_b.path())
         .spawn_guarded();
     let mut stdin_b = child_b.stdin.take().unwrap();
-    let mut stdout_b = BufReader::new(child_b.stdout.take().unwrap());
+    let mut stdout_b = common::serve_frames(child_b.stdout.take().unwrap());
     writeln!(stdin_b, "{}", json!({ "type": "prompt", "message": "hi" })).unwrap();
     stdin_b.flush().unwrap();
     read_until_response(&mut stdout_b, "prompt");
@@ -1037,7 +1037,7 @@ fn serve_list_all_sessions_errors_outside_repo_mode() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     writeln!(stdin, "{}", json!({ "type": "list_all_sessions" })).unwrap();
     stdin.flush().unwrap();
@@ -1060,7 +1060,7 @@ fn serve_get_tree_reports_every_node_not_just_leaves() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_dir_cmd(bin, &base, &session_dir).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     writeln!(stdin, "{}", json!({ "type": "prompt", "message": "hi" })).unwrap();
     stdin.flush().unwrap();
@@ -1114,7 +1114,7 @@ fn serve_get_tree_since_returns_only_what_was_appended_after_a_known_id() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     writeln!(stdin, "{}", json!({ "type": "prompt", "message": "first" })).unwrap();
     stdin.flush().unwrap();
@@ -1228,7 +1228,7 @@ fn serve_get_tree_leaf_id_is_null_without_persistence_configured() {
         .stderr(Stdio::null())
         .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     writeln!(stdin, "{}", json!({ "type": "get_tree" })).unwrap();
     stdin.flush().unwrap();
@@ -1258,7 +1258,7 @@ fn serve_switch_branch_summarizes_abandoned_activity_and_navigates() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     writeln!(stdin, "{}", json!({ "type": "prompt", "message": "first" })).unwrap();
     stdin.flush().unwrap();
@@ -1402,7 +1402,7 @@ fn serve_branch_summary_reserve_tokens_flag_independently_bounds_the_summarizati
         ])
         .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     writeln!(stdin, "{}", json!({ "type": "prompt", "message": "first" })).unwrap();
     stdin.flush().unwrap();
@@ -1470,7 +1470,7 @@ fn serve_switch_branch_abort_cancels_summarization_and_leaves_session_unchanged(
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     writeln!(stdin, "{}", json!({ "type": "prompt", "message": "first" })).unwrap();
     stdin.flush().unwrap();
@@ -1564,7 +1564,7 @@ fn serve_switch_branch_restores_the_model_active_on_that_branch() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     writeln!(stdin, "{}", json!({ "type": "prompt", "message": "first" })).unwrap();
     stdin.flush().unwrap();
@@ -1640,7 +1640,7 @@ fn serve_new_session_in_single_file_mode_does_not_leak_the_discarded_sessions_mo
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     // Before any message exists in the (soon to be discarded) original session: `set_model` anchors its
     // `ModelChange` at the tree's own root, not at some message id.
@@ -1721,7 +1721,7 @@ fn serve_switch_branch_before_restores_the_model_at_the_resolved_parent_not_the_
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     writeln!(stdin, "{}", json!({ "type": "prompt", "message": "first" })).unwrap();
     stdin.flush().unwrap();
@@ -1789,7 +1789,7 @@ fn serve_switch_branch_resets_thinking_level_instead_of_bleeding_a_sibling_branc
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     writeln!(stdin, "{}", json!({ "type": "prompt", "message": "first" })).unwrap();
     stdin.flush().unwrap();
@@ -1858,7 +1858,7 @@ fn serve_get_messages_ids_enable_forking_from_any_point() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     writeln!(stdin, "{}", json!({ "type": "prompt", "message": "first" })).unwrap();
     stdin.flush().unwrap();
@@ -1943,7 +1943,7 @@ fn serve_switch_branch_rejects_unknown_target() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     writeln!(stdin, "{}", json!({ "type": "prompt", "message": "hi" })).unwrap();
     stdin.flush().unwrap();
@@ -1985,7 +1985,7 @@ fn serve_switch_branch_before_the_first_message_resets_to_root() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     writeln!(stdin, "{}", json!({ "type": "prompt", "message": "first" })).unwrap();
     stdin.flush().unwrap();
@@ -2075,7 +2075,7 @@ fn serve_list_sessions_query_filters_to_matching_sessions_only() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_dir_cmd(bin, &base, &session_dir_str).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     writeln!(
         stdin,
@@ -2168,7 +2168,7 @@ fn serve_list_all_sessions_query_filters_across_every_project() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child_a = serve_dir_cmd(bin, &base_a, &dir_a).spawn_guarded();
     let mut stdin_a = child_a.stdin.take().unwrap();
-    let mut stdout_a = BufReader::new(child_a.stdout.take().unwrap());
+    let mut stdout_a = common::serve_frames(child_a.stdout.take().unwrap());
     writeln!(
         stdin_a,
         "{}",
@@ -2181,7 +2181,7 @@ fn serve_list_all_sessions_query_filters_across_every_project() {
     let (base_b, _bodies_b) = spawn_model_server(vec![turn_text("ok")]);
     let mut child_b = serve_dir_cmd(bin, &base_b, &dir_b).spawn_guarded();
     let mut stdin_b = child_b.stdin.take().unwrap();
-    let mut stdout_b = BufReader::new(child_b.stdout.take().unwrap());
+    let mut stdout_b = common::serve_frames(child_b.stdout.take().unwrap());
     writeln!(
         stdin_b,
         "{}",
@@ -2235,7 +2235,7 @@ fn serve_get_fork_messages_lists_user_turn_candidates_for_the_active_path() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     writeln!(
         stdin,
@@ -2318,7 +2318,7 @@ fn serve_get_fork_messages_spans_every_branch_not_just_the_active_path() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     writeln!(stdin, "{}", json!({ "type": "prompt", "message": "first" })).unwrap();
     stdin.flush().unwrap();
@@ -2422,7 +2422,7 @@ fn serve_get_fork_messages_is_empty_without_persistence_configured() {
         .stderr(Stdio::null())
         .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     writeln!(stdin, "{}", json!({ "type": "prompt", "message": "hi" })).unwrap();
     stdin.flush().unwrap();
@@ -2452,7 +2452,7 @@ fn serve_switch_session_resolves_a_unique_id_prefix() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_dir_cmd(bin, &base, &session_dir).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     let mut ready = String::new();
     stdout.read_line(&mut ready).unwrap();
@@ -2499,7 +2499,7 @@ fn serve_switch_session_rejects_an_ambiguous_prefix_naming_every_candidate() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_dir_cmd(bin, &base, &session_dir).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     writeln!(stdin, "{}", json!({ "type": "prompt", "message": "hi" })).unwrap();
     stdin.flush().unwrap();
@@ -2552,7 +2552,7 @@ fn serve_switch_session_response_carries_reasoning_effort_like_its_three_sibling
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_dir_cmd(bin, &base, &session_dir).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
 
     writeln!(stdin, "{}", json!({ "type": "prompt", "message": "hi" })).unwrap();
     stdin.flush().unwrap();
@@ -2637,7 +2637,7 @@ fn serve_append_custom_refuses_the_kinds_the_agent_writes_itself() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = common::serve_frames(child.stdout.take().unwrap());
     writeln!(stdin, "{}", json!({ "type": "prompt", "message": "hi" })).unwrap();
     stdin.flush().unwrap();
     read_until_response(&mut stdout, "prompt");
