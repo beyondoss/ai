@@ -583,7 +583,8 @@ async fn memory_keeps_the_runtime_responsive() {
 
 /// A local HTTP server answering every request with `body` as HTML.
 async fn html_server(body: String) -> String {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = beyond_ai_test_support::ports::listener();
+    listener.set_nonblocking(true).unwrap();
     let addr = listener.local_addr().unwrap();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -591,7 +592,7 @@ async fn html_server(body: String) -> String {
             .build()
             .unwrap();
         rt.block_on(async move {
-            let listener = tokio::net::TcpListener::from_std(listener.into_std().unwrap()).unwrap();
+            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
             while let Ok((mut stream, _)) = listener.accept().await {
                 let body = body.clone();
                 tokio::spawn(async move {

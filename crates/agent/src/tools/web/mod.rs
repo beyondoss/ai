@@ -522,7 +522,7 @@ mod tests {
             panic!("injected build panic")
         }
         for build in [errs as fn(_, _) -> _, panics] {
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let listener = beyond_ai_test_support::ports::listener();
             listener.set_nonblocking(true).unwrap();
             let url = format!(
                 "http://127.0.0.1:{}/",
