@@ -21,6 +21,8 @@
 //! *model* knowledge (context window, thinking shape), which belongs in `agent_core::models` instead.
 
 pub mod catalog;
+pub mod pricing;
+pub mod rates;
 
 pub use catalog::{
     Candidate, ListPrice, MAX_CANDIDATES, ModelCard, ModelRoute, endpoint_of_path, for_model,

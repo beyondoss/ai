@@ -13,8 +13,9 @@
 //! A row carries routing facts — provider, the id that provider spells it with, and the path to
 //! send it to — plus one published list price ([`ListPrice`]). Model *capability* facts (context
 //! window, thinking shape) stay in `agent_core::models`; a test keeps a [`Candidate`] from growing
-//! them. The price is the public standard card, not the invoice: `ai.usage` still emits token
-//! counts, and a downstream consumer applies (or replaces) this card.
+//! them. The price is the public standard card: the customer card's standard tier in
+//! [`crate::rates`], whose other dimensions (long context, fast mode, 1-hour writes, tool fees) and
+//! per-candidate costs [`crate::pricing::price`] applies. See `crates/providers/ARCHITECTURE.md`.
 //!
 //! # Wire format belongs to the row, not the provider
 //!
@@ -271,7 +272,9 @@ const fn card_unpublished_output(
 /// Decimal strings, not `f64`: `0.075` is not binary-exact, and these bytes are copied into
 /// `GET /v1/models`. At most six digits after the point (one micro-dollar). The four rates are the
 /// standard card only — not batch, not fast mode, not a long-context override, and not the 1-hour
-/// Claude cache write (2× input). `cache_write` here is the 5-minute / default write rate.
+/// Claude cache write (2× input). `cache_write` here is the 5-minute / default write rate. The rest
+/// of the card, and what each candidate costs us, is [`crate::rates`]; `customer_standard_is_the_list_price`
+/// holds the two together.
 ///
 /// The rate is the **primary candidate's** vendor standard published rate, checked 2026-10-01 and
 /// recorded with its source URL in `verify/catalog_truth.toml` (a test holds this table to it).
@@ -1068,7 +1071,7 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         wire: WireFormat::Anthropic,
         candidates: &claude("claude-sonnet-5-5", "anthropic/claude-sonnet-5.5"),
         responses: &[],
-        price: price("2", "10", "0.2", "2.5"),
+        price: price("2", "10", "0.1", "2.5"),
         card: card(
             "Claude Sonnet 5.5",
             "anthropic",

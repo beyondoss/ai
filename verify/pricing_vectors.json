@@ -1,0 +1,1711 @@
+{
+  "about": "Golden vectors for the pricing contract (crates/providers/ARCHITECTURE.md, 'Pricing contract'). Each row is an ai.usage row; expect is what price(row) must return. An implementation must reproduce every one exactly. Absent row fields take their defaults: usage_wire anthropic, counts 0, strings null, booleans false, server_tools {}.",
+  "rate_version": "2026-10-10.37b37a282ad2066c",
+  "vectors": [
+    {
+      "name": "anthropic_basic",
+      "why": "Opus 4.8 direct: input and output at the card.",
+      "row": {
+        "price_model": "claude-opus-4-8",
+        "provider": "anthropic",
+        "input_tokens": 1200,
+        "output_tokens": 345,
+        "usage_wire": "anthropic",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "status": "priced",
+        "basis": "tokens",
+        "cost_micros": 14625,
+        "price_micros": 14625,
+        "cost_class": "standard",
+        "price_class": "standard",
+        "cost_long": false,
+        "price_long": false
+      }
+    },
+    {
+      "name": "anthropic_reasoning_inside_output",
+      "why": "Thinking tokens are inside output_tokens; reasoning_tokens is a breakout and is never priced on its own.",
+      "row": {
+        "price_model": "claude-sonnet-5-5",
+        "provider": "anthropic",
+        "input_tokens": 50,
+        "output_tokens": 4000,
+        "reasoning_tokens": 3500,
+        "usage_wire": "anthropic",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "status": "priced",
+        "basis": "tokens",
+        "cost_micros": 40100,
+        "price_micros": 40100,
+        "cost_class": "standard",
+        "price_class": "standard",
+        "cost_long": false,
+        "price_long": false
+      }
+    },
+    {
+      "name": "anthropic_cache_read_5m_1h",
+      "why": "Anthropic wire: input excludes cache reads and writes. 1h writes are a subset of cache_write_tokens, billed at 2x input; the rest at 1.25x.",
+      "row": {
+        "price_model": "claude-opus-4-8",
+        "provider": "anthropic",
+        "input_tokens": 100,
+        "cache_read_tokens": 50000,
+        "cache_write_tokens": 12000,
+        "cache_write_1h_tokens": 4000,
+        "output_tokens": 800,
+        "usage_wire": "anthropic",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "status": "priced",
+        "basis": "tokens",
+        "cost_micros": 135500,
+        "price_micros": 135500,
+        "cost_class": "standard",
+        "price_class": "standard",
+        "cost_long": false,
+        "price_long": false
+      }
+    },
+    {
+      "name": "anthropic_gateway_cache_writes",
+      "why": "Writes from breakpoints the gateway added are already in input_tokens: the customer pays them at input, the vendor charges them as 5-minute writes.",
+      "row": {
+        "price_model": "claude-sonnet-5",
+        "provider": "anthropic",
+        "input_tokens": 20000,
+        "gateway_cache_write_tokens": 15000,
+        "output_tokens": 500,
+        "usage_wire": "anthropic",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "status": "priced",
+        "basis": "tokens",
+        "cost_micros": 52500,
+        "price_micros": 45000,
+        "cost_class": "standard",
+        "price_class": "standard",
+        "cost_long": false,
+        "price_long": false
+      }
+    },
+    {
+      "name": "anthropic_everything_together",
+      "why": "Fast mode (2x every rate, caches included) x US-only inference (1.1x every token category) with cache reads, 5m and 1h writes and web search ($10/1k; the geo premium multiplies token categories only, so the fee is not multiplied).",
+      "row": {
+        "price_model": "claude-opus-5-5",
+        "provider": "anthropic",
+        "input_tokens": 3000,
+        "cache_read_tokens": 90000,
+        "cache_write_tokens": 20000,
+        "cache_write_1h_tokens": 5000,
+        "output_tokens": 2500,
+        "speed": "fast",
+        "service_tier": "standard",
+        "inference_geo": "us",
+        "server_tools": {
+          "web_search": 3,
+          "web_fetch": 2
+        },
+        "usage_wire": "anthropic",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "status": "priced",
+        "basis": "tokens",
+        "cost_micros": 459000,
+        "price_micros": 459000,
+        "cost_class": "fast",
+        "price_class": "fast",
+        "cost_long": false,
+        "price_long": false
+      }
+    },
+    {
+      "name": "anthropic_geo_us",
+      "why": "inference_geo us: 1.1x on all token categories (Claude 4.6 and later).",
+      "row": {
+        "price_model": "claude-sonnet-4-6",
+        "provider": "anthropic",
+        "input_tokens": 10000,
+        "cache_read_tokens": 1000,
+        "output_tokens": 1000,
+        "inference_geo": "us",
+        "usage_wire": "anthropic",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "status": "priced",
+        "basis": "tokens",
+        "cost_micros": 49830,
+        "price_micros": 49830,
+        "cost_class": "standard",
+        "price_class": "standard",
+        "cost_long": false,
+        "price_long": false
+      }
+    },
+    {
+      "name": "anthropic_geo_global",
+      "why": "inference_geo global is the standard price.",
+      "row": {
+        "price_model": "claude-sonnet-4-6",
+        "provider": "anthropic",
+        "input_tokens": 10000,
+        "output_tokens": 1000,
+        "inference_geo": "global",
+        "usage_wire": "anthropic",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "status": "priced",
+        "basis": "tokens",
+        "cost_micros": 45000,
+        "price_micros": 45000,
+        "cost_class": "standard",
+        "price_class": "standard",
+        "cost_long": false,
+        "price_long": false
+      }
+    },
+    {
+      "name": "anthropic_geo_unsupported",
+      "why": "Sonnet 4.5 rejects inference_geo (400); a row claiming it is refused.",
+      "row": {
+        "price_model": "claude-sonnet-4-5",
+        "provider": "anthropic",
+        "input_tokens": 10,
+        "output_tokens": 10,
+        "inference_geo": "us",
+        "usage_wire": "anthropic",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "unpriced": "unknown_geo"
+      }
+    },
+    {
+      "name": "anthropic_priority_tier_refused",
+      "why": "Anthropic's own service_tier priority is Priority Tier (committed capacity, contract-priced), not fast mode: refused.",
+      "row": {
+        "price_model": "claude-opus-4-8",
+        "provider": "anthropic",
+        "input_tokens": 10,
+        "output_tokens": 10,
+        "service_tier": "priority",
+        "usage_wire": "anthropic",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "unpriced": "unknown_class"
+      }
+    },
+    {
+      "name": "anthropic_fast_unsupported",
+      "why": "Fast mode is not sold on Opus 4.7: refused, not billed at standard.",
+      "row": {
+        "price_model": "claude-opus-4-7",
+        "provider": "anthropic",
+        "input_tokens": 10,
+        "output_tokens": 10,
+        "speed": "fast",
+        "usage_wire": "anthropic",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "unpriced": "no_rate"
+      }
+    },
+    {
+      "name": "anthropic_web_fetch_free",
+      "why": "Web fetch has no charge beyond tokens: a published $0 fee, priced.",
+      "row": {
+        "price_model": "claude-haiku-4-5",
+        "provider": "anthropic",
+        "input_tokens": 4000,
+        "output_tokens": 200,
+        "server_tools": {
+          "web_fetch": 5
+        },
+        "usage_wire": "anthropic",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "status": "priced",
+        "basis": "tokens",
+        "cost_micros": 5000,
+        "price_micros": 5000,
+        "cost_class": "standard",
+        "price_class": "standard",
+        "cost_long": false,
+        "price_long": false
+      }
+    },
+    {
+      "name": "anthropic_code_execution_unpriced",
+      "why": "Code execution bills container-hours beyond a monthly free allowance: no per-row fee, refused.",
+      "row": {
+        "price_model": "claude-opus-4-8",
+        "provider": "anthropic",
+        "input_tokens": 10,
+        "output_tokens": 10,
+        "server_tools": {
+          "code_execution": 1
+        },
+        "usage_wire": "anthropic",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "unpriced": "no_tool_fee"
+      }
+    },
+    {
+      "name": "anthropic_1h_exceeds_writes",
+      "why": "1h writes are a subset of the writes; more 1h than writes is an inconsistent row.",
+      "row": {
+        "price_model": "claude-opus-4-8",
+        "provider": "anthropic",
+        "input_tokens": 10,
+        "cache_write_tokens": 5,
+        "cache_write_1h_tokens": 6,
+        "output_tokens": 1,
+        "usage_wire": "anthropic",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "unpriced": "inconsistent_tokens"
+      }
+    },
+    {
+      "name": "anthropic_gateway_writes_exceed_input",
+      "why": "The gateway's writes are inside the uncached input; more of them than that is inconsistent.",
+      "row": {
+        "price_model": "claude-opus-4-8",
+        "provider": "anthropic",
+        "input_tokens": 10,
+        "gateway_cache_write_tokens": 11,
+        "output_tokens": 1,
+        "usage_wire": "anthropic",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "unpriced": "inconsistent_tokens"
+      }
+    },
+    {
+      "name": "anthropic_estimated",
+      "why": "A cut-short stream's estimate is priced like any row and flagged estimated.",
+      "row": {
+        "price_model": "claude-opus-4-8",
+        "provider": "anthropic",
+        "input_tokens": 900,
+        "output_tokens": 120,
+        "usage_estimated": true,
+        "usage_wire": "anthropic",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "status": "estimated",
+        "basis": "tokens",
+        "cost_micros": 7500,
+        "price_micros": 7500,
+        "cost_class": "standard",
+        "price_class": "standard",
+        "cost_long": false,
+        "price_long": false
+      }
+    },
+    {
+      "name": "cache_hit_is_free",
+      "why": "A response-cache hit makes no vendor call: cost 0 and price 0 (owner rule). The stored token facts stay on the row for audit.",
+      "row": {
+        "price_model": "claude-opus-4-8",
+        "provider": "anthropic",
+        "input_tokens": 5000,
+        "output_tokens": 5000,
+        "cache_hit": true,
+        "usage_wire": "anthropic",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "status": "priced",
+        "basis": "cache_hit",
+        "cost_micros": 0,
+        "price_micros": 0,
+        "cost_class": "standard",
+        "price_class": "standard",
+        "cost_long": false,
+        "price_long": false
+      }
+    },
+    {
+      "name": "cache_hit_unknown_model_still_free",
+      "why": "A cache hit is free whatever it names: nothing was bought.",
+      "row": {
+        "price_model": "no-such-model",
+        "provider": "anthropic",
+        "input_tokens": 5,
+        "output_tokens": 5,
+        "cache_hit": true,
+        "usage_wire": "anthropic",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "status": "priced",
+        "basis": "cache_hit",
+        "cost_micros": 0,
+        "price_micros": 0,
+        "cost_class": "standard",
+        "price_class": "standard",
+        "cost_long": false,
+        "price_long": false
+      }
+    },
+    {
+      "name": "bedrock_us_profile",
+      "why": "Bedrock's us. geo inference profile is billed at the Regional SKUs: +10% on every category, 1h writes included. The customer pays the Anthropic card.",
+      "row": {
+        "price_model": "claude-haiku-4-5",
+        "provider": "bedrock",
+        "input_tokens": 2000,
+        "cache_read_tokens": 10000,
+        "cache_write_tokens": 3000,
+        "cache_write_1h_tokens": 1000,
+        "output_tokens": 700,
+        "usage_wire": "anthropic",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "status": "priced",
+        "basis": "tokens",
+        "cost_micros": 12100,
+        "price_micros": 11000,
+        "cost_class": "standard",
+        "price_class": "standard",
+        "cost_long": false,
+        "price_long": false
+      }
+    },
+    {
+      "name": "bedrock_us_variant_stated",
+      "why": "upstream_variant us on Bedrock names what the candidate already is.",
+      "row": {
+        "price_model": "claude-opus-4-8",
+        "provider": "bedrock",
+        "upstream_variant": "us",
+        "input_tokens": 2000,
+        "output_tokens": 700,
+        "usage_wire": "anthropic",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "status": "priced",
+        "basis": "tokens",
+        "cost_micros": 30250,
+        "price_micros": 27500,
+        "cost_class": "standard",
+        "price_class": "standard",
+        "cost_long": false,
+        "price_long": false
+      }
+    },
+    {
+      "name": "bedrock_global_variant_refused",
+      "why": "A global Bedrock profile is not a catalog candidate: refused.",
+      "row": {
+        "price_model": "claude-opus-4-8",
+        "provider": "bedrock",
+        "upstream_variant": "global",
+        "input_tokens": 2000,
+        "output_tokens": 700,
+        "usage_wire": "anthropic",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "unpriced": "unknown_variant"
+      }
+    },
+    {
+      "name": "bedrock_fast_refused",
+      "why": "Bedrock sells no fast mode; a fast row served there is refused on the cost side.",
+      "row": {
+        "price_model": "claude-opus-4-8",
+        "provider": "bedrock",
+        "speed": "fast",
+        "input_tokens": 10,
+        "output_tokens": 10,
+        "usage_wire": "anthropic",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "unpriced": "no_rate"
+      }
+    },
+    {
+      "name": "openai_wire_cached",
+      "why": "OpenAI wire: input_tokens includes the cached tokens. 10000 input with 4000 cached is 6000 uncached plus 4000 at the cached rate, never 10000 + 4000.",
+      "row": {
+        "price_model": "gpt-5.5",
+        "provider": "openai",
+        "input_tokens": 10000,
+        "cache_read_tokens": 4000,
+        "output_tokens": 1500,
+        "usage_wire": "openai",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "status": "priced",
+        "basis": "tokens",
+        "cost_micros": 77000,
+        "price_micros": 77000,
+        "cost_class": "standard",
+        "price_class": "standard",
+        "cost_long": false,
+        "price_long": false
+      }
+    },
+    {
+      "name": "openai_cache_exceeds_input",
+      "why": "On the OpenAI wire cache reads are part of input; more cached than input is inconsistent.",
+      "row": {
+        "price_model": "gpt-5.5",
+        "provider": "openai",
+        "input_tokens": 100,
+        "cache_read_tokens": 101,
+        "output_tokens": 1,
+        "usage_wire": "openai",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "unpriced": "inconsistent_tokens"
+      }
+    },
+    {
+      "name": "openai_cache_writes_gpt_5_6",
+      "why": "GPT-5.6 and later bill cache writes at 1.25x input, a third input rate inside input_tokens (not an extra fee).",
+      "row": {
+        "price_model": "gpt-5.6-terra",
+        "provider": "openai",
+        "input_tokens": 50000,
+        "cache_read_tokens": 20000,
+        "cache_write_tokens": 25000,
+        "output_tokens": 3000,
+        "usage_wire": "openai",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "status": "priced",
+        "basis": "tokens",
+        "cost_micros": 112500,
+        "price_micros": 112500,
+        "cost_class": "standard",
+        "price_class": "standard",
+        "cost_long": false,
+        "price_long": false
+      }
+    },
+    {
+      "name": "openai_long_context_at_threshold",
+      "why": "Long context starts at MORE than 272K input tokens: exactly 272000 is short.",
+      "row": {
+        "price_model": "gpt-5.5",
+        "provider": "openai",
+        "input_tokens": 272000,
+        "cache_read_tokens": 100000,
+        "output_tokens": 1000,
+        "usage_wire": "openai",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "status": "priced",
+        "basis": "tokens",
+        "cost_micros": 940000,
+        "price_micros": 940000,
+        "cost_class": "standard",
+        "price_class": "standard",
+        "cost_long": false,
+        "price_long": false
+      }
+    },
+    {
+      "name": "openai_long_context_over_threshold",
+      "why": "272001 input tokens (cached included) bills the whole request at the long rates: 2x input and cache, 1.5x output.",
+      "row": {
+        "price_model": "gpt-5.5",
+        "provider": "openai",
+        "input_tokens": 272001,
+        "cache_read_tokens": 100000,
+        "output_tokens": 1000,
+        "usage_wire": "openai",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "status": "priced",
+        "basis": "tokens",
+        "cost_micros": 1865010,
+        "price_micros": 1865010,
+        "cost_class": "standard",
+        "price_class": "standard",
+        "cost_long": true,
+        "price_long": true
+      }
+    },
+    {
+      "name": "openai_priority",
+      "why": "service_tier priority (OpenAI's Fast mode) uses the published Fast table: 2.5x on gpt-5.5.",
+      "row": {
+        "price_model": "gpt-5.5",
+        "provider": "openai",
+        "input_tokens": 8000,
+        "cache_read_tokens": 2000,
+        "output_tokens": 900,
+        "service_tier": "priority",
+        "usage_wire": "openai",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "status": "priced",
+        "basis": "tokens",
+        "cost_micros": 145000,
+        "price_micros": 145000,
+        "cost_class": "fast",
+        "price_class": "fast",
+        "cost_long": false,
+        "price_long": false
+      }
+    },
+    {
+      "name": "openai_fast_echo",
+      "why": "OpenAI may echo service_tier fast: the same class as priority.",
+      "row": {
+        "price_model": "gpt-6-sol",
+        "provider": "openai",
+        "input_tokens": 8000,
+        "output_tokens": 900,
+        "service_tier": "fast",
+        "usage_wire": "openai",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "status": "priced",
+        "basis": "tokens",
+        "cost_micros": 50000,
+        "price_micros": 50000,
+        "cost_class": "fast",
+        "price_class": "fast",
+        "cost_long": false,
+        "price_long": false
+      }
+    },
+    {
+      "name": "openai_priority_long_unpublished",
+      "why": "Fast mode above 272K is unpublished for gpt-5.5: refused, not guessed.",
+      "row": {
+        "price_model": "gpt-5.5",
+        "provider": "openai",
+        "input_tokens": 300000,
+        "output_tokens": 10,
+        "service_tier": "priority",
+        "usage_wire": "openai",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "unpriced": "no_rate"
+      }
+    },
+    {
+      "name": "openai_fast_long",
+      "why": "GPT-5.6 and GPT-6 publish Fast long-context rates (2x the long rates).",
+      "row": {
+        "price_model": "gpt-6-sol",
+        "provider": "openai",
+        "input_tokens": 300000,
+        "cache_read_tokens": 200000,
+        "output_tokens": 2000,
+        "service_tier": "priority",
+        "usage_wire": "openai",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "status": "priced",
+        "basis": "tokens",
+        "cost_micros": 1020000,
+        "price_micros": 1020000,
+        "cost_class": "fast",
+        "price_class": "fast",
+        "cost_long": true,
+        "price_long": true
+      }
+    },
+    {
+      "name": "openai_ultrafast_long",
+      "why": "Ultrafast (6x) on GPT-6 Astra above 272K.",
+      "row": {
+        "price_model": "gpt-6-astra",
+        "provider": "openai",
+        "input_tokens": 280000,
+        "cache_read_tokens": 10000,
+        "cache_write_tokens": 5000,
+        "output_tokens": 1000,
+        "service_tier": "ultrafast",
+        "usage_wire": "openai",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "status": "priced",
+        "basis": "tokens",
+        "cost_micros": 33120000,
+        "price_micros": 33120000,
+        "cost_class": "ultrafast",
+        "price_class": "ultrafast",
+        "cost_long": true,
+        "price_long": true
+      }
+    },
+    {
+      "name": "openai_flex",
+      "why": "service_tier flex bills the Flex (Batch) rates.",
+      "row": {
+        "price_model": "gpt-6.1-sol",
+        "provider": "openai",
+        "input_tokens": 40000,
+        "cache_read_tokens": 30000,
+        "output_tokens": 4000,
+        "service_tier": "flex",
+        "usage_wire": "openai",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "status": "priced",
+        "basis": "tokens",
+        "cost_micros": 31500,
+        "price_micros": 31500,
+        "cost_class": "flex",
+        "price_class": "flex",
+        "cost_long": false,
+        "price_long": false
+      }
+    },
+    {
+      "name": "openai_scale_refused",
+      "why": "service_tier scale is not priced: refused.",
+      "row": {
+        "price_model": "gpt-5.5",
+        "provider": "openai",
+        "input_tokens": 10,
+        "output_tokens": 10,
+        "service_tier": "scale",
+        "usage_wire": "openai",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "unpriced": "unknown_class"
+      }
+    },
+    {
+      "name": "openai_tools",
+      "why": "Web search $10/1k calls and file search $2.50/1k calls on a reasoning model.",
+      "row": {
+        "price_model": "gpt-5.4",
+        "provider": "openai",
+        "input_tokens": 12000,
+        "output_tokens": 600,
+        "server_tools": {
+          "web_search": 2,
+          "file_search": 4,
+          "web_search_preview": 1
+        },
+        "usage_wire": "openai",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "status": "priced",
+        "basis": "tokens",
+        "cost_micros": 79000,
+        "price_micros": 79000,
+        "cost_class": "standard",
+        "price_class": "standard",
+        "cost_long": false,
+        "price_long": false
+      }
+    },
+    {
+      "name": "openai_search_preview_non_reasoning",
+      "why": "web_search_preview on a non-reasoning model is $25/1k calls.",
+      "row": {
+        "price_model": "gpt-4o",
+        "provider": "openai",
+        "input_tokens": 500,
+        "output_tokens": 200,
+        "server_tools": {
+          "web_search_preview": 2
+        },
+        "usage_wire": "openai",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "status": "priced",
+        "basis": "tokens",
+        "cost_micros": 53250,
+        "price_micros": 53250,
+        "cost_class": "standard",
+        "price_class": "standard",
+        "cost_long": false,
+        "price_long": false
+      }
+    },
+    {
+      "name": "openai_search_fixed_block_refused",
+      "why": "gpt-4o-mini bills web search content as a fixed 8,000-token block the usage may not show: refused until measured.",
+      "row": {
+        "price_model": "gpt-4o-mini",
+        "provider": "openai",
+        "input_tokens": 500,
+        "output_tokens": 200,
+        "server_tools": {
+          "web_search": 1
+        },
+        "usage_wire": "openai",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "unpriced": "no_tool_fee"
+      }
+    },
+    {
+      "name": "openai_container_refused",
+      "why": "Container sessions bill per minute by memory size, neither reported: refused.",
+      "row": {
+        "price_model": "gpt-5.5",
+        "provider": "openai",
+        "input_tokens": 500,
+        "output_tokens": 200,
+        "server_tools": {
+          "container_session": 1
+        },
+        "usage_wire": "openai",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "unpriced": "no_tool_fee"
+      }
+    },
+    {
+      "name": "openai_image_generation_refused",
+      "why": "The image_generation tool bills image tokens the response does not report: refused.",
+      "row": {
+        "price_model": "gpt-5.5",
+        "provider": "openai",
+        "input_tokens": 500,
+        "output_tokens": 200,
+        "server_tools": {
+          "image_generation": 1
+        },
+        "usage_wire": "openai",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "unpriced": "no_tool_fee"
+      }
+    },
+    {
+      "name": "openai_embeddings",
+      "why": "Embeddings: input only.",
+      "row": {
+        "price_model": "text-embedding-3-large",
+        "provider": "openai",
+        "input_tokens": 123456,
+        "usage_wire": "openai",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "status": "priced",
+        "basis": "tokens",
+        "cost_micros": 16049,
+        "price_micros": 16049,
+        "cost_class": "standard",
+        "price_class": "standard",
+        "cost_long": false,
+        "price_long": false
+      }
+    },
+    {
+      "name": "openai_responses_arm",
+      "why": "A Responses request on a GPT row is served by OpenAI's responses arm: same provider, same card.",
+      "row": {
+        "price_model": "o3",
+        "provider": "openai",
+        "input_tokens": 3000,
+        "cache_read_tokens": 1000,
+        "output_tokens": 7000,
+        "reasoning_tokens": 6000,
+        "usage_wire": "openai",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "status": "priced",
+        "basis": "tokens",
+        "cost_micros": 60500,
+        "price_micros": 60500,
+        "cost_class": "standard",
+        "price_class": "standard",
+        "cost_long": false,
+        "price_long": false
+      }
+    },
+    {
+      "name": "rounding_half_up",
+      "why": "10 tokens at $0.05/M is exactly 0.5 micro-dollars: rounds up to 1.",
+      "row": {
+        "price_model": "gpt-5-nano",
+        "provider": "openai",
+        "input_tokens": 10,
+        "usage_wire": "openai",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "status": "priced",
+        "basis": "tokens",
+        "cost_micros": 1,
+        "price_micros": 1,
+        "cost_class": "standard",
+        "price_class": "standard",
+        "cost_long": false,
+        "price_long": false
+      }
+    },
+    {
+      "name": "rounding_below_half",
+      "why": "9 tokens at $0.05/M is 0.45 micro-dollars: rounds to 0 (a priced zero, not unpriced).",
+      "row": {
+        "price_model": "gpt-5-nano",
+        "provider": "openai",
+        "input_tokens": 9,
+        "usage_wire": "openai",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "status": "priced",
+        "basis": "tokens",
+        "cost_micros": 0,
+        "price_micros": 0,
+        "cost_class": "standard",
+        "price_class": "standard",
+        "cost_long": false,
+        "price_long": false
+      }
+    },
+    {
+      "name": "rounding_once_per_side",
+      "why": "Rounding is once per side on the exact sum: 9 input (0.45 µ$) + 1 output (0.40 µ$) = 0.85 µ$ rounds to 1, though each part alone rounds to 0.",
+      "row": {
+        "price_model": "gpt-5-nano",
+        "provider": "openai",
+        "input_tokens": 9,
+        "output_tokens": 1,
+        "usage_wire": "openai",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "status": "priced",
+        "basis": "tokens",
+        "cost_micros": 1,
+        "price_micros": 1,
+        "cost_class": "standard",
+        "price_class": "standard",
+        "cost_long": false,
+        "price_long": false
+      }
+    },
+    {
+      "name": "xai_long_at_threshold",
+      "why": "xAI's long tier applies when the prompt (cached included) REACHES 200k: exactly 200000 is long, every token at 2x.",
+      "row": {
+        "price_model": "grok-4.3",
+        "provider": "xai",
+        "input_tokens": 200000,
+        "cache_read_tokens": 150000,
+        "output_tokens": 1000,
+        "usage_wire": "openai",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "status": "priced",
+        "basis": "tokens",
+        "cost_micros": 190000,
+        "price_micros": 190000,
+        "cost_class": "standard",
+        "price_class": "standard",
+        "cost_long": true,
+        "price_long": true
+      }
+    },
+    {
+      "name": "xai_long_below_threshold",
+      "why": "199999 prompt tokens: standard.",
+      "row": {
+        "price_model": "grok-4.3",
+        "provider": "xai",
+        "input_tokens": 199999,
+        "cache_read_tokens": 150000,
+        "output_tokens": 1000,
+        "usage_wire": "openai",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "status": "priced",
+        "basis": "tokens",
+        "cost_micros": 94999,
+        "price_micros": 94999,
+        "cost_class": "standard",
+        "price_class": "standard",
+        "cost_long": false,
+        "price_long": false
+      }
+    },
+    {
+      "name": "xai_priority_and_tools",
+      "why": "Priority is 2x every token type (caching applied first); web search $5/1k, X search $5/1k posts and $10/1k profiles, code execution and attachment search $5/1k.",
+      "row": {
+        "price_model": "grok-4.7",
+        "provider": "xai",
+        "input_tokens": 30000,
+        "cache_read_tokens": 20000,
+        "output_tokens": 2000,
+        "service_tier": "priority",
+        "server_tools": {
+          "web_search": 4,
+          "x_search_post": 25,
+          "x_search_profile": 2,
+          "code_execution": 1,
+          "attachment_search": 1
+        },
+        "usage_wire": "openai",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "status": "priced",
+        "basis": "tokens",
+        "cost_micros": 259000,
+        "price_micros": 259000,
+        "cost_class": "fast",
+        "price_class": "fast",
+        "cost_long": false,
+        "price_long": false
+      }
+    },
+    {
+      "name": "xai_priority_long_unpublished",
+      "why": "Priority above 200k is unpublished: refused.",
+      "row": {
+        "price_model": "grok-4.7",
+        "provider": "xai",
+        "input_tokens": 250000,
+        "output_tokens": 10,
+        "service_tier": "priority",
+        "usage_wire": "openai",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "unpriced": "no_rate"
+      }
+    },
+    {
+      "name": "deepseek_peak",
+      "why": "Monday 02:00 UTC is peak (01:00-04:00 and 06:00-10:00 UTC, Mon-Fri): the card rate.",
+      "row": {
+        "price_model": "deepseek-v4-pro",
+        "provider": "deepseek",
+        "input_tokens": 100000,
+        "cache_read_tokens": 60000,
+        "output_tokens": 5000,
+        "unix_secs": 1791770400,
+        "usage_wire": "openai"
+      },
+      "expect": {
+        "status": "priced",
+        "basis": "tokens",
+        "cost_micros": 75240,
+        "price_micros": 75240,
+        "cost_class": "standard",
+        "price_class": "standard",
+        "cost_long": false,
+        "price_long": false
+      }
+    },
+    {
+      "name": "deepseek_off_peak",
+      "why": "Monday 11:00 UTC is off-peak: half of every rate, for the customer too (the card follows its vendor's rules).",
+      "row": {
+        "price_model": "deepseek-v4-pro",
+        "provider": "deepseek",
+        "input_tokens": 100000,
+        "cache_read_tokens": 60000,
+        "output_tokens": 5000,
+        "unix_secs": 1791802800,
+        "usage_wire": "openai"
+      },
+      "expect": {
+        "status": "priced",
+        "basis": "tokens",
+        "cost_micros": 37620,
+        "price_micros": 37620,
+        "cost_class": "off_peak",
+        "price_class": "off_peak",
+        "cost_long": false,
+        "price_long": false
+      }
+    },
+    {
+      "name": "deepseek_weekend",
+      "why": "Saturday is off-peak all day.",
+      "row": {
+        "price_model": "deepseek-flash",
+        "provider": "deepseek",
+        "input_tokens": 100000,
+        "output_tokens": 5000,
+        "unix_secs": 1792202400,
+        "usage_wire": "openai"
+      },
+      "expect": {
+        "status": "priced",
+        "basis": "tokens",
+        "cost_micros": 18000,
+        "price_micros": 18000,
+        "cost_class": "off_peak",
+        "price_class": "off_peak",
+        "cost_long": false,
+        "price_long": false
+      }
+    },
+    {
+      "name": "deepseek_window_start",
+      "why": "01:00:00 is the first peak minute.",
+      "row": {
+        "price_model": "deepseek-flash",
+        "provider": "deepseek",
+        "input_tokens": 100000,
+        "output_tokens": 5000,
+        "unix_secs": 1791853200,
+        "usage_wire": "openai"
+      },
+      "expect": {
+        "status": "priced",
+        "basis": "tokens",
+        "cost_micros": 36000,
+        "price_micros": 36000,
+        "cost_class": "standard",
+        "price_class": "standard",
+        "cost_long": false,
+        "price_long": false
+      }
+    },
+    {
+      "name": "deepseek_window_end",
+      "why": "04:00:00 is off-peak again (windows are half-open).",
+      "row": {
+        "price_model": "deepseek-flash",
+        "provider": "deepseek",
+        "input_tokens": 100000,
+        "output_tokens": 5000,
+        "unix_secs": 1791864000,
+        "usage_wire": "openai"
+      },
+      "expect": {
+        "status": "priced",
+        "basis": "tokens",
+        "cost_micros": 18000,
+        "price_micros": 18000,
+        "cost_class": "off_peak",
+        "price_class": "off_peak",
+        "cost_long": false,
+        "price_long": false
+      }
+    },
+    {
+      "name": "deepseek_window_last_minute",
+      "why": "03:59:59 is still peak.",
+      "row": {
+        "price_model": "deepseek-flash",
+        "provider": "deepseek",
+        "input_tokens": 100000,
+        "output_tokens": 5000,
+        "unix_secs": 1791863999,
+        "usage_wire": "openai"
+      },
+      "expect": {
+        "status": "priced",
+        "basis": "tokens",
+        "cost_micros": 36000,
+        "price_micros": 36000,
+        "cost_class": "standard",
+        "price_class": "standard",
+        "cost_long": false,
+        "price_long": false
+      }
+    },
+    {
+      "name": "deepseek_calendar_unknown",
+      "why": "A weekday peak minute in 2027 is refused until the 2027 Chinese public holidays are recorded.",
+      "row": {
+        "price_model": "deepseek-flash",
+        "provider": "deepseek",
+        "input_tokens": 100,
+        "output_tokens": 5,
+        "unix_secs": 1799114400,
+        "usage_wire": "openai"
+      },
+      "expect": {
+        "unpriced": "unknown_calendar"
+      }
+    },
+    {
+      "name": "deepseek_calendar_unknown_off_peak",
+      "why": "Outside the peak windows no calendar is needed: priced off-peak.",
+      "row": {
+        "price_model": "deepseek-flash",
+        "provider": "deepseek",
+        "input_tokens": 100,
+        "output_tokens": 5,
+        "unix_secs": 1799150400,
+        "usage_wire": "openai"
+      },
+      "expect": {
+        "status": "priced",
+        "basis": "tokens",
+        "cost_micros": 18,
+        "price_micros": 18,
+        "cost_class": "off_peak",
+        "price_class": "off_peak",
+        "cost_long": false,
+        "price_long": false
+      }
+    },
+    {
+      "name": "deepseek_via_together_off_peak",
+      "why": "Served by Together off-peak: the customer pays DeepSeek's off-peak half, we pay Together's flat rate (and its own cached rate).",
+      "row": {
+        "price_model": "deepseek-v4-pro",
+        "provider": "together",
+        "input_tokens": 100000,
+        "cache_read_tokens": 60000,
+        "output_tokens": 5000,
+        "unix_secs": 1791802800,
+        "usage_wire": "openai"
+      },
+      "expect": {
+        "status": "priced",
+        "basis": "tokens",
+        "cost_micros": 80400,
+        "price_micros": 37620,
+        "cost_class": "standard",
+        "price_class": "off_peak",
+        "cost_long": false,
+        "price_long": false
+      }
+    },
+    {
+      "name": "groq_flex_is_standard",
+      "why": "Groq flex is priced as on-demand.",
+      "row": {
+        "price_model": "openai/gpt-oss-120b",
+        "provider": "groq",
+        "input_tokens": 10000,
+        "cache_read_tokens": 4000,
+        "output_tokens": 2000,
+        "service_tier": "flex",
+        "usage_wire": "openai",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "status": "priced",
+        "basis": "tokens",
+        "cost_micros": 2400,
+        "price_micros": 2400,
+        "cost_class": "flex",
+        "price_class": "flex",
+        "cost_long": false,
+        "price_long": false
+      }
+    },
+    {
+      "name": "groq_on_demand",
+      "why": "Groq echoes on_demand for its standard tier.",
+      "row": {
+        "price_model": "openai/gpt-oss-20b",
+        "provider": "groq",
+        "input_tokens": 10000,
+        "cache_read_tokens": 4000,
+        "output_tokens": 2000,
+        "service_tier": "on_demand",
+        "usage_wire": "openai",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "status": "priced",
+        "basis": "tokens",
+        "cost_micros": 1200,
+        "price_micros": 1200,
+        "cost_class": "standard",
+        "price_class": "standard",
+        "cost_long": false,
+        "price_long": false
+      }
+    },
+    {
+      "name": "fireworks_failover",
+      "why": "Failover to Fireworks: the customer pays the row's card (Groq's), we pay Fireworks' own card.",
+      "row": {
+        "price_model": "openai/gpt-oss-120b",
+        "provider": "fireworks",
+        "input_tokens": 10000,
+        "cache_read_tokens": 4000,
+        "output_tokens": 2000,
+        "usage_wire": "openai",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "status": "priced",
+        "basis": "tokens",
+        "cost_micros": 2160,
+        "price_micros": 2400,
+        "cost_class": "standard",
+        "price_class": "standard",
+        "cost_long": false,
+        "price_long": false
+      }
+    },
+    {
+      "name": "fireworks_priority_customer_has_none",
+      "why": "Fireworks served Priority but the row's customer card sells no fast class: refused.",
+      "row": {
+        "price_model": "openai/gpt-oss-120b",
+        "provider": "fireworks",
+        "input_tokens": 10,
+        "output_tokens": 10,
+        "service_tier": "priority",
+        "usage_wire": "openai",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "unpriced": "no_rate"
+      }
+    },
+    {
+      "name": "together_list_card",
+      "why": "A Together-primary row whose customer card is the catalog list price.",
+      "row": {
+        "price_model": "moonshotai/kimi-k3",
+        "provider": "together",
+        "input_tokens": 10000,
+        "cache_read_tokens": 3000,
+        "output_tokens": 2000,
+        "usage_wire": "openai",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "status": "priced",
+        "basis": "tokens",
+        "cost_micros": 51900,
+        "price_micros": 51900,
+        "cost_class": "standard",
+        "price_class": "standard",
+        "cost_long": false,
+        "price_long": false
+      }
+    },
+    {
+      "name": "together_conflict_bound",
+      "why": "Together publishes two prices for Qwen3.7 Max; the cost uses the dearer (a bound).",
+      "row": {
+        "price_model": "qwen/qwen3.7-max",
+        "provider": "together",
+        "input_tokens": 10000,
+        "output_tokens": 2000,
+        "usage_wire": "openai",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "status": "priced",
+        "basis": "tokens",
+        "cost_micros": 40000,
+        "price_micros": 40000,
+        "cost_class": "standard",
+        "price_class": "standard",
+        "cost_long": false,
+        "price_long": false
+      }
+    },
+    {
+      "name": "openrouter_reported_cost",
+      "why": "OpenRouter's usage.cost is the cost, plus the 5.5% credit fee. The price is the Anthropic card on OpenRouter's OpenAI-wire counts: input includes cache reads AND cache writes.",
+      "row": {
+        "price_model": "claude-opus-4-8",
+        "provider": "openrouter",
+        "input_tokens": 60000,
+        "cache_read_tokens": 40000,
+        "cache_write_tokens": 15000,
+        "output_tokens": 1200,
+        "openrouter_cost": "0.0612345",
+        "openrouter_host": "Google",
+        "usage_wire": "openai",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "status": "priced",
+        "basis": "reported",
+        "cost_micros": 64602,
+        "price_micros": 168750,
+        "cost_class": "standard",
+        "price_class": "standard",
+        "cost_long": false,
+        "price_long": false
+      }
+    },
+    {
+      "name": "openrouter_reported_cost_exponent",
+      "why": "usage.cost may arrive in exponent form.",
+      "row": {
+        "price_model": "openai/gpt-oss-20b",
+        "provider": "openrouter",
+        "input_tokens": 1000,
+        "output_tokens": 100,
+        "openrouter_cost": "1.5e-05",
+        "usage_wire": "openai",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "status": "priced",
+        "basis": "reported",
+        "cost_micros": 16,
+        "price_micros": 105,
+        "cost_class": "standard",
+        "price_class": "standard",
+        "cost_long": false,
+        "price_long": false
+      }
+    },
+    {
+      "name": "openrouter_reported_cost_tiny",
+      "why": "Sub-micro-dollar costs round half-up per side: 4.7e-7 USD x 1.055 = 0.49585 µ$ rounds to 0.",
+      "row": {
+        "price_model": "openai/gpt-oss-20b",
+        "provider": "openrouter",
+        "input_tokens": 5,
+        "output_tokens": 0,
+        "openrouter_cost": "0.00000047",
+        "usage_wire": "openai",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "status": "priced",
+        "basis": "reported",
+        "cost_micros": 0,
+        "price_micros": 0,
+        "cost_class": "standard",
+        "price_class": "standard",
+        "cost_long": false,
+        "price_long": false
+      }
+    },
+    {
+      "name": "openrouter_reported_cost_negative",
+      "why": "A negative reported cost is refused.",
+      "row": {
+        "price_model": "openai/gpt-oss-20b",
+        "provider": "openrouter",
+        "input_tokens": 5,
+        "output_tokens": 0,
+        "openrouter_cost": "-0.001",
+        "usage_wire": "openai",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "unpriced": "bad_reported_cost"
+      }
+    },
+    {
+      "name": "openrouter_reported_cost_garbage",
+      "why": "A non-numeric reported cost is refused.",
+      "row": {
+        "price_model": "openai/gpt-oss-20b",
+        "provider": "openrouter",
+        "input_tokens": 5,
+        "output_tokens": 0,
+        "openrouter_cost": "abc",
+        "usage_wire": "openai",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "unpriced": "bad_reported_cost"
+      }
+    },
+    {
+      "name": "openrouter_no_cost_host",
+      "why": "No reported cost (a stream cut before its usage chunk): the dearest endpoint of the named host. Amazon Bedrock's include its eu-west-1 regional endpoint at +10%, so the bound is that one, plus the credit fee. Estimated.",
+      "row": {
+        "price_model": "claude-opus-4-8",
+        "provider": "openrouter",
+        "input_tokens": 60000,
+        "cache_read_tokens": 40000,
+        "cache_write_tokens": 15000,
+        "output_tokens": 1200,
+        "openrouter_host": "Amazon Bedrock",
+        "usage_estimated": true,
+        "usage_wire": "openai",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "status": "estimated",
+        "basis": "dearest_endpoint",
+        "cost_micros": 195834,
+        "price_micros": 168750,
+        "cost_class": "standard",
+        "price_class": "standard",
+        "cost_long": false,
+        "price_long": false
+      }
+    },
+    {
+      "name": "openrouter_no_cost_no_host",
+      "why": "No reported cost and no host: the dearest standard endpoint of the model.",
+      "row": {
+        "price_model": "moonshotai/kimi-k3",
+        "provider": "openrouter",
+        "input_tokens": 10000,
+        "cache_read_tokens": 3000,
+        "output_tokens": 2000,
+        "usage_wire": "openai",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "status": "estimated",
+        "basis": "dearest_endpoint",
+        "cost_micros": 82132,
+        "price_micros": 51900,
+        "cost_class": "standard",
+        "price_class": "standard",
+        "cost_long": false,
+        "price_long": false
+      }
+    },
+    {
+      "name": "openrouter_no_cost_long",
+      "why": "Endpoint long-context overrides apply to the fallback (min_prompt_tokens, strictly greater).",
+      "row": {
+        "price_model": "gpt-5.5",
+        "provider": "openrouter",
+        "input_tokens": 272001,
+        "output_tokens": 100,
+        "openrouter_host": "OpenAI",
+        "usage_wire": "openai",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "status": "estimated",
+        "basis": "dearest_endpoint",
+        "cost_micros": 2874358,
+        "price_micros": 2724510,
+        "cost_class": "standard",
+        "price_class": "standard",
+        "cost_long": true,
+        "price_long": true
+      }
+    },
+    {
+      "name": "openrouter_no_cost_fast",
+      "why": "A fast-served OpenRouter row (service_tier priority plus usage.speed fast) falls back to the model's fast endpoints only.",
+      "row": {
+        "price_model": "claude-opus-5",
+        "provider": "openrouter",
+        "input_tokens": 5000,
+        "output_tokens": 500,
+        "service_tier": "priority",
+        "speed": "fast",
+        "usage_wire": "openai",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "status": "estimated",
+        "basis": "dearest_endpoint",
+        "cost_micros": 79125,
+        "price_micros": 75000,
+        "cost_class": "fast",
+        "price_class": "fast",
+        "cost_long": false,
+        "price_long": false
+      }
+    },
+    {
+      "name": "openrouter_unknown_host",
+      "why": "A host the endpoint list does not have is refused.",
+      "row": {
+        "price_model": "claude-opus-4-8",
+        "provider": "openrouter",
+        "input_tokens": 10,
+        "output_tokens": 10,
+        "openrouter_host": "Nowhere",
+        "usage_wire": "openai",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "unpriced": "unknown_host"
+      }
+    },
+    {
+      "name": "openrouter_pro_row",
+      "why": "An OpenRouter-only row (gpt-6-sol-pro): the customer pays OpenAI's gpt-6-sol card (OpenAI bills pro mode at the model's standard rates); the cost is OpenRouter's report plus fee.",
+      "row": {
+        "price_model": "gpt-6-sol-pro",
+        "provider": "openrouter",
+        "input_tokens": 20000,
+        "cache_read_tokens": 5000,
+        "output_tokens": 8000,
+        "openrouter_cost": "0.0912",
+        "usage_wire": "openai",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "status": "priced",
+        "basis": "reported",
+        "cost_micros": 96216,
+        "price_micros": 111000,
+        "cost_class": "standard",
+        "price_class": "standard",
+        "cost_long": false,
+        "price_long": false
+      }
+    },
+    {
+      "name": "openrouter_web_plugin_refused",
+      "why": "OpenRouter's web plugin is priced by engine and result count the row does not carry: refused on the price side.",
+      "row": {
+        "price_model": "z-ai/glm-5.1",
+        "provider": "openrouter",
+        "input_tokens": 1000,
+        "output_tokens": 100,
+        "openrouter_cost": "0.01",
+        "server_tools": {
+          "openrouter_web": 1
+        },
+        "usage_wire": "openai",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "unpriced": "no_tool_fee"
+      }
+    },
+    {
+      "name": "unpriced_no_price_model",
+      "why": "A model the catalog does not carry has no price_model: refused, never zero.",
+      "row": {
+        "provider": "openrouter",
+        "input_tokens": 10,
+        "output_tokens": 10,
+        "usage_wire": "openai",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "unpriced": "no_price_model"
+      }
+    },
+    {
+      "name": "unpriced_unknown_model",
+      "why": "A price_model that is not a catalog row.",
+      "row": {
+        "price_model": "gpt-99",
+        "provider": "openai",
+        "input_tokens": 10,
+        "output_tokens": 10,
+        "usage_wire": "openai",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "unpriced": "unknown_model"
+      }
+    },
+    {
+      "name": "unpriced_no_provider",
+      "why": "No provider was called (every breaker open) but tokens were reported: refused.",
+      "row": {
+        "price_model": "gpt-5.5",
+        "input_tokens": 10,
+        "output_tokens": 10,
+        "usage_wire": "openai",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "unpriced": "unknown_provider"
+      }
+    },
+    {
+      "name": "unpriced_not_a_candidate",
+      "why": "A provider that is not a candidate of the row.",
+      "row": {
+        "price_model": "claude-opus-4-8",
+        "provider": "openai",
+        "input_tokens": 10,
+        "output_tokens": 10,
+        "usage_wire": "openai",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "unpriced": "not_a_candidate"
+      }
+    },
+    {
+      "name": "unpriced_unknown_geo",
+      "why": "inference_geo eu is not priced.",
+      "row": {
+        "price_model": "claude-opus-4-8",
+        "provider": "anthropic",
+        "input_tokens": 10,
+        "output_tokens": 10,
+        "inference_geo": "eu",
+        "usage_wire": "anthropic",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "unpriced": "unknown_geo"
+      }
+    },
+    {
+      "name": "unpriced_class_conflict",
+      "why": "Flex and fast at once is not a class.",
+      "row": {
+        "price_model": "gpt-5.5",
+        "provider": "openai",
+        "input_tokens": 10,
+        "output_tokens": 10,
+        "service_tier": "flex",
+        "speed": "fast",
+        "usage_wire": "openai",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "unpriced": "unknown_class"
+      }
+    },
+    {
+      "name": "unpriced_overflow",
+      "why": "A nonsense token count overflows 128 bits: refused, not wrapped.",
+      "row": {
+        "price_model": "claude-opus-4-8",
+        "provider": "anthropic",
+        "input_tokens": 18446744073709551615,
+        "output_tokens": 18446744073709551615,
+        "usage_wire": "anthropic",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "unpriced": "overflow"
+      }
+    }
+  ]
+}
