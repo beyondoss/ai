@@ -321,8 +321,9 @@ const RECONCILED: &str = r"test(/^([^:]*\+)?BIL-5(\+[^:]*)?::/)";
 /// (`tests/catalog_live.rs`), tenancy sessions under control-plane changes
 /// (`tests/tenancy_live.rs`), whole sessions where the provider or model changes between turns
 /// (`tests/session_live.rs`), stock SDKs under faults injected in front of real providers
-/// (`tests/fault_live.rs`), and long coding sessions and large tool sets
-/// (`tests/long_live.rs`). Every test in them is named `CLAIMS::client::...`.
+/// (`tests/fault_live.rs`), long coding sessions and large tool sets (`tests/long_live.rs`), and
+/// pricing reconciled against what vendors bill (`tests/pricing_live.rs`). Every test in them is
+/// named `CLAIMS::client::...`.
 const LIVE_BINARIES: &[&str] = &[
     "beyond-ai-verify::live",
     "beyond-ai-verify::reconcile_live",
@@ -332,6 +333,7 @@ const LIVE_BINARIES: &[&str] = &[
     "beyond-ai-verify::session_live",
     "beyond-ai-verify::fault_live",
     "beyond-ai-verify::long_live",
+    "beyond-ai-verify::pricing_live",
 ];
 
 /// One live cell's result, parsed from its name `CLAIMS::client::route::probe`.

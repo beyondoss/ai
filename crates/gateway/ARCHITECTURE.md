@@ -2111,6 +2111,20 @@ settle one:
 - Groq: no per-request lookup exists. Price the row as relayed and accept the gap, or bound it by
   the request's `max_tokens`.
 
+The gap, measured 2026-10-10 (`crates/verify/tests/pricing_live.rs`, the cancel-gap cases, which
+append to `target/verify-cancel-gap.jsonl`):
+
+| Host                                | Full completion             | Row after a cut at 1-2 s                                 | Billed                                                                     |
+| ----------------------------------- | --------------------------- | -------------------------------------------------------- | -------------------------------------------------------------------------- |
+| Bedrock, Claude Haiku 4.5           | 603 output tokens, 3,343 µ$ | 1 output token, 32 µ$ (0.2%)                             | The full 603 if Bedrock keeps generating, as OpenRouter documents          |
+| OpenRouter, gpt-oss-20b (Darkbloom) | —                           | 84 output tokens estimated, 28 µ$ (the dearest endpoint) | 77 tokens, 8 µ$, `cancelled=false` (the generation API): the host finished |
+| Groq                                | not measured                | —                                                        | No Groq pool key in the verify environment                                 |
+
+So on Bedrock a cut stream's row can understate the bill by the whole remaining completion, up to
+`max_tokens`. The row is `estimated` with `upstream_may_continue`, and only invocation logging can
+settle it. On OpenRouter the dearest-endpoint bound overstated the bill here, and the generation
+API settles it exactly.
+
 **The price (authoritative)**
 
 `logging` calls `providers::pricing::price` with the row's own facts, as the row logs them
