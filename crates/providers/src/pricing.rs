@@ -846,7 +846,9 @@ fn served_class(r: &UsageRow<'_>) -> Result<Class, Unpriced> {
 
 fn geo_us(r: &UsageRow<'_>) -> Result<bool, Unpriced> {
     match r.inference_geo {
-        None | Some("global") => Ok(false),
+        // Anthropic reports `not_available` on models without data residency (the 4.5 family): no
+        // premium, as global.
+        None | Some("global" | "not_available") => Ok(false),
         Some("us") => Ok(true),
         Some(_) => Err(Unpriced::UnknownGeo),
     }

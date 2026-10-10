@@ -172,6 +172,30 @@
       }
     },
     {
+      "name": "anthropic_geo_not_available",
+      "why": "Anthropic reports inference_geo not_available on models without data residency (measured live on Haiku 4.5): no premium.",
+      "row": {
+        "price_model": "claude-haiku-4-5",
+        "provider": "anthropic",
+        "input_tokens": 10296,
+        "output_tokens": 96,
+        "inference_geo": "not_available",
+        "server_tools": "web_search=1",
+        "usage_wire": "anthropic",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "status": "priced",
+        "basis": "tokens",
+        "cost_micros": 20776,
+        "price_micros": 20776,
+        "cost_class": "standard",
+        "price_class": "standard",
+        "cost_long": false,
+        "price_long": false
+      }
+    },
+    {
       "name": "anthropic_geo_unsupported",
       "why": "Sonnet 4.5 rejects inference_geo (400); a row claiming it is refused.",
       "row": {
