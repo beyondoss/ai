@@ -191,71 +191,93 @@ impl OffPeak {
     }
 }
 
-/// A server-side tool a vendor runs and bills per call (or per item), beside the tokens.
+/// A server-side tool kind, as the row's `server_tools` field names it
+/// (`crates/gateway/ARCHITECTURE.md`, "Server-side tools"). A card prices a kind per call (or per
+/// item); a kind it does not list is refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Tool {
-    /// Web search: Anthropic `server_tool_use.web_search_requests`, an OpenAI `web_search_call`
-    /// search action, xAI `web_search_calls`, OpenRouter native search.
+    /// Web search: Anthropic `web_search_requests`, an OpenAI or xAI `web_search_call` search
+    /// action, xAI `web_search_calls`, OpenRouter `web_search_requests`.
     WebSearch,
-    /// OpenAI's `web_search_preview` tool (priced apart on non-reasoning models).
-    WebSearchPreview,
-    /// Anthropic web fetch (`server_tool_use.web_fetch_requests`): tokens only, a $0 fee.
+    /// OpenAI `web_search_call` items with action `open_page` / `find_in_page`: no per-call fee.
+    WebSearchPage,
+    /// Anthropic `web_fetch_requests`: no per-call fee.
     WebFetch,
-    /// One X post returned by xAI's `x_search` (`x_posts_fetched`).
-    XSearchPost,
-    /// One X profile returned by xAI's `x_search` (`x_users_fetched`).
-    XSearchProfile,
-    /// Code execution: xAI `code_interpreter_calls` (per call); Anthropic
-    /// `server_tool_use.code_execution_requests` (billed per container-hour beyond a monthly free
-    /// allowance, so no card prices it per row).
+    /// Code execution calls: Anthropic `code_execution_requests` (billed per container-hour
+    /// beyond a monthly free allowance, so no card prices it per row), OpenAI
+    /// `code_interpreter_call` (a container session, billed per minute by memory size: never
+    /// priced), xAI `code_interpreter_calls` ($5 / 1K).
     CodeExecution,
-    /// xAI attachment search.
-    AttachmentSearch,
-    /// File / collections search: OpenAI `file_search_call`, xAI `file_search_calls`.
+    /// OpenAI `file_search_call`, xAI `file_search_calls`.
     FileSearch,
-    /// An OpenAI hosted container session (Code Interpreter, hosted Shell). Billed per minute of
-    /// session at a memory-size rate, neither of which the response reports: never priced.
-    ContainerSession,
-    /// An image-generation tool call (OpenAI `image_generation_call`, xAI
-    /// `image_generation_calls`). Billed at image-token rates the response does not report:
-    /// never priced.
+    /// OpenAI `image_generation_call`, xAI `image_generation_calls`: billed at image rates the
+    /// response does not report. Never priced.
     ImageGeneration,
-    /// One request of OpenRouter's web plugin (`plugins: [{id: "web"}]`, `:online`). Its price
-    /// depends on the search engine and result count, which the row does not carry: never
-    /// priced from tokens (OpenRouter's reported cost carries it).
-    OpenRouterWeb,
+    /// OpenAI `computer_call`: tokens only.
+    ComputerUse,
+    /// OpenAI `mcp_call`, xAI `mcp_calls`: tokens only.
+    Mcp,
+    /// OpenAI hosted `shell_call` / `local_shell_call`: a container session. Never priced.
+    Shell,
+    /// OpenAI `tool_search_call`: tokens only.
+    ToolSearch,
+    /// xAI `x_search_calls`: the call is free, the items it returns are billed
+    /// ([`Self::XPosts`], [`Self::XUsers`]).
+    XSearch,
+    /// xAI `x_posts_fetched`.
+    XPosts,
+    /// xAI `x_users_fetched`.
+    XUsers,
+    /// xAI `document_search_calls`: no published fee under that name. Never priced.
+    DocumentSearch,
+    /// xAI `num_sources_used` (legacy Live Search). Never priced.
+    Sources,
+    /// OpenRouter `tool_calls_executed`: its server tools of every kind, web search included.
+    /// Never added to the others: the pricer refuses a row whose `tool_calls` exceed its
+    /// `web_search` (an OpenRouter tool it cannot price ran).
+    ToolCalls,
 }
 
 impl Tool {
-    pub const ALL: [Tool; 11] = [
+    pub const ALL: [Tool; 16] = [
         Tool::WebSearch,
-        Tool::WebSearchPreview,
+        Tool::WebSearchPage,
         Tool::WebFetch,
-        Tool::XSearchPost,
-        Tool::XSearchProfile,
         Tool::CodeExecution,
-        Tool::AttachmentSearch,
         Tool::FileSearch,
-        Tool::ContainerSession,
         Tool::ImageGeneration,
-        Tool::OpenRouterWeb,
+        Tool::ComputerUse,
+        Tool::Mcp,
+        Tool::Shell,
+        Tool::ToolSearch,
+        Tool::XSearch,
+        Tool::XPosts,
+        Tool::XUsers,
+        Tool::DocumentSearch,
+        Tool::Sources,
+        Tool::ToolCalls,
     ];
     pub const COUNT: usize = Self::ALL.len();
 
-    /// The stable snake_case name the vectors (and the row's per-kind counts) use.
+    /// The kind's name in the row's `server_tools` field.
     pub const fn as_str(self) -> &'static str {
         match self {
             Tool::WebSearch => "web_search",
-            Tool::WebSearchPreview => "web_search_preview",
+            Tool::WebSearchPage => "web_search_page",
             Tool::WebFetch => "web_fetch",
-            Tool::XSearchPost => "x_search_post",
-            Tool::XSearchProfile => "x_search_profile",
             Tool::CodeExecution => "code_execution",
-            Tool::AttachmentSearch => "attachment_search",
             Tool::FileSearch => "file_search",
-            Tool::ContainerSession => "container_session",
             Tool::ImageGeneration => "image_generation",
-            Tool::OpenRouterWeb => "openrouter_web",
+            Tool::ComputerUse => "computer_use",
+            Tool::Mcp => "mcp",
+            Tool::Shell => "shell",
+            Tool::ToolSearch => "tool_search",
+            Tool::XSearch => "x_search",
+            Tool::XPosts => "x_posts",
+            Tool::XUsers => "x_users",
+            Tool::DocumentSearch => "document_search",
+            Tool::Sources => "sources",
+            Tool::ToolCalls => "tool_calls",
         }
     }
 
@@ -286,11 +308,24 @@ impl ToolCounts {
         self.0[t.index()] = n;
         self
     }
+
+    /// Read the row's `server_tools` text (`web_search=2,x_posts=14`). An unknown kind or a bad
+    /// count is [`Unpriced::UnknownTool`]: a tool the pricer has never heard of may have a fee.
+    pub fn parse(s: &str) -> Result<ToolCounts, Unpriced> {
+        let mut out = ToolCounts::new();
+        for pair in s.split(',').filter(|p| !p.is_empty()) {
+            let (k, n) = pair.split_once('=').ok_or(Unpriced::UnknownTool)?;
+            let t = Tool::parse(k).ok_or(Unpriced::UnknownTool)?;
+            out.set(t, n.parse().map_err(|_| Unpriced::UnknownTool)?);
+        }
+        Ok(out)
+    }
+
     fn used(&self) -> impl Iterator<Item = (Tool, u64)> + '_ {
         Tool::ALL
             .into_iter()
             .map(|t| (t, self.get(t)))
-            .filter(|&(_, n)| n > 0)
+            .filter(|&(t, n)| n > 0 && t != Tool::ToolCalls)
     }
 }
 
@@ -355,23 +390,26 @@ impl Card {
     }
 }
 
-/// One `ai.usage` row, as the pricer reads it. Field names are the row's.
+/// One `ai.usage` row, as the pricer reads it. Field names and meanings are the row's
+/// (`crates/gateway/ARCHITECTURE.md`, "The `ai.usage` row").
 ///
 /// `reasoning_tokens` is deliberately absent: reasoning is already inside `output_tokens` on every
 /// wire the gateway meters (xAI's beside-count convention is folded in by the extractor), so it is
-/// never priced on its own.
+/// never priced on its own. The `requested_*` fields are absent too: the pricer prices what was
+/// served.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UsageRow<'a> {
-    /// The catalog row to price at; `None` (a model the catalog does not carry) is unpriced.
+    /// The catalog row to price at; `None` is unpriced.
     pub price_model: Option<&'a str>,
     /// The provider that served (`anthropic`, `bedrock`, `openrouter`, …); `None` when no
     /// provider was called.
     pub provider: Option<&'a str>,
-    /// A routing variant of the serving candidate that changes what we pay. Only `us` on Bedrock
-    /// (whose catalog candidates are all `us.` geo profiles already) is accepted; anything else is
-    /// [`Unpriced::UnknownVariant`]. OpenRouter's regional endpoints need no variant: the reported
-    /// cost carries the premium, and without it the dearest endpoint is used.
-    pub upstream_variant: Option<&'a str>,
+    /// Which of the provider's prices applies to the endpoint: `regional` or `global` (Bedrock
+    /// profiles; OpenRouter's in-region hosts). Every Bedrock candidate in the catalog is a `us.`
+    /// profile (`regional`), and its card is the Regional SKUs; `global` there is refused. On
+    /// OpenRouter `regional` is accepted: the reported cost carries the surcharge, and the
+    /// fallback's dearest endpoint already includes the regional ones.
+    pub price_variant: Option<&'a str>,
     /// Which convention `input_tokens` follows (see [`price`]).
     pub usage_wire: WireFormat,
     pub input_tokens: u64,
@@ -383,22 +421,29 @@ pub struct UsageRow<'a> {
     /// Cache writes from breakpoints the gateway added: already inside `input_tokens` (on both
     /// wires) and not in `cache_write_tokens`.
     pub gateway_cache_write_tokens: u64,
+    /// The row's `server_tools`, parsed ([`ToolCounts::parse`]).
     pub server_tools: ToolCounts,
     /// The service tier the provider says it served at.
     pub service_tier: Option<&'a str>,
-    /// The speed the provider says it served at (Anthropic `usage.speed`: `standard` | `fast`).
+    /// The speed the provider says it served at (`standard` | `fast`).
     pub speed: Option<&'a str>,
-    /// Where the provider says inference ran (Anthropic `usage.inference_geo`: `us` | `global`).
+    /// Where the provider says inference ran (`us` | `global`).
     pub inference_geo: Option<&'a str>,
-    /// OpenRouter's reported `usage.cost`, as the raw JSON number text (USD).
-    pub openrouter_cost: Option<&'a str>,
-    /// The host OpenRouter served from (its provider name: `Anthropic`, `Amazon Bedrock`, …).
-    pub openrouter_host: Option<&'a str>,
-    /// The token counts are the gateway's estimate of a cut-short stream.
+    /// The vendor's own reported cost, a decimal USD string: OpenRouter `usage.cost`, xAI
+    /// `cost_in_usd_ticks` ÷ 10^10.
+    pub upstream_cost_usd: Option<&'a str>,
+    /// OpenRouter's metered server-tool and plugin cost (`cost_details.server_tool_cost`).
+    pub upstream_tool_cost_usd: Option<&'a str>,
+    /// The host OpenRouter routed to (its provider name: `Anthropic`, `Amazon Bedrock`, …).
+    pub served_by: Option<&'a str>,
+    /// Some count on the row is the gateway's estimate.
     pub usage_estimated: bool,
+    /// The stream ended early on a provider that keeps generating and billing: the row's tokens
+    /// are a lower bound until reconciled.
+    pub upstream_may_continue: bool,
     /// Served from the gateway's response cache: no vendor call was made.
     pub cache_hit: bool,
-    /// When the request started, Unix seconds UTC (DeepSeek's off-peak hours).
+    /// When the request started, Unix seconds UTC (the row's timestamp less `latency_ms`).
     pub unix_secs: u64,
 }
 
@@ -407,7 +452,7 @@ impl Default for UsageRow<'_> {
         Self {
             price_model: None,
             provider: None,
-            upstream_variant: None,
+            price_variant: None,
             usage_wire: WireFormat::Anthropic,
             input_tokens: 0,
             output_tokens: 0,
@@ -419,9 +464,11 @@ impl Default for UsageRow<'_> {
             service_tier: None,
             speed: None,
             inference_geo: None,
-            openrouter_cost: None,
-            openrouter_host: None,
+            upstream_cost_usd: None,
+            upstream_tool_cost_usd: None,
+            served_by: None,
             usage_estimated: false,
+            upstream_may_continue: false,
             cache_hit: false,
             unix_secs: 0,
         }
@@ -524,7 +571,7 @@ pub enum Unpriced {
     NotACandidate,
     /// The candidate's rates could not be verified from a primary source.
     Unverified,
-    /// `upstream_variant` names a variant the tables do not price.
+    /// `price_variant` names a variant the tables do not price for the serving provider.
     UnknownVariant,
     /// `service_tier` / `speed` name a class the tables do not price, or name two at once.
     UnknownClass,
@@ -533,12 +580,15 @@ pub enum Unpriced {
     /// The card sells no rate for the class and tier the row needs (fast mode on a model without
     /// it, 1-hour writes where none are sold, fast mode above 272K where unpublished).
     NoRate,
-    /// A server tool was used that the card has no per-call fee for.
+    /// A server tool was used that the card has no per-call fee for, or OpenRouter reports a
+    /// metered tool or plugin cost (which no customer card prices).
     NoToolFee,
+    /// `server_tools` names a kind the pricer does not know, or a count that is not a number.
+    UnknownTool,
     /// Cache counts exceed the input they are part of (`openai` wire), the 1-hour writes exceed
     /// the writes, or the gateway's writes exceed the uncached input.
     InconsistentTokens,
-    /// `openrouter_cost` is not a non-negative decimal number.
+    /// `upstream_cost_usd` or `upstream_tool_cost_usd` is not a non-negative decimal number.
     BadReportedCost,
     /// The OpenRouter host is not one the tables list for this model and class.
     UnknownHost,
@@ -562,6 +612,7 @@ impl Unpriced {
             Unpriced::UnknownGeo => "unknown_geo",
             Unpriced::NoRate => "no_rate",
             Unpriced::NoToolFee => "no_tool_fee",
+            Unpriced::UnknownTool => "unknown_tool",
             Unpriced::InconsistentTokens => "inconsistent_tokens",
             Unpriced::BadReportedCost => "bad_reported_cost",
             Unpriced::UnknownHost => "unknown_host",
@@ -604,9 +655,11 @@ impl Mults {
     fn factor(self) -> u128 {
         self.0.iter().map(|&m| u128::from(m)).product()
     }
+    /// The combined multiplier in Bps, for the log. Exact for every pair the tables produce (one
+    /// of the two is always `ONE`).
     fn bps(self) -> u64 {
         let one = u128::from(ONE).pow(SLOTS - 1);
-        u64::try_from((self.factor() + one / 2) / one).unwrap_or(u64::MAX)
+        u64::try_from(self.factor() / one).unwrap_or(u64::MAX)
     }
 }
 
@@ -672,8 +725,10 @@ pub fn parse_usd_atto(s: &str) -> Result<u128, Unpriced> {
             .ok_or(Unpriced::Overflow)?;
         n.checked_mul(p).ok_or(Unpriced::Overflow)
     } else {
+        // At most 36 significant digits, so n < 10^36: below 10^-36 of a unit it rounds to 0
+        // (and 10^k past 38 would not fit in 128 bits).
         let k = shift.unsigned_abs();
-        if k > 38 {
+        if k > 36 {
             return Ok(0);
         }
         let p = 10u128.pow(k);
@@ -898,9 +953,23 @@ pub fn price(r: &UsageRow<'_>) -> Result<Priced, Unpriced> {
         .iter()
         .find(|c| c.provider == provider)
         .ok_or(Unpriced::NotACandidate)?;
-    match (provider, r.upstream_variant) {
-        (_, None) | (ProviderId::Bedrock, Some("us")) => {}
+    match (provider, r.price_variant) {
+        (_, None)
+        | (ProviderId::Bedrock, Some("regional"))
+        | (ProviderId::OpenRouter, Some("regional" | "global")) => {}
         _ => return Err(Unpriced::UnknownVariant),
+    }
+    // OpenRouter's `tool_calls` counts its server tools of every kind, web search among them. More
+    // of them than web searches means a tool ran whose fee no card holds.
+    if r.server_tools.get(Tool::ToolCalls) > r.server_tools.get(Tool::WebSearch) {
+        return Err(Unpriced::NoToolFee);
+    }
+    // A metered OpenRouter tool or plugin (its web plugin, a sandbox) has a cost no customer card
+    // prices: refuse rather than charge the tokens alone.
+    if let Some(raw) = r.upstream_tool_cost_usd
+        && parse_usd_atto(raw)? > 0
+    {
+        return Err(Unpriced::NoToolFee);
     }
     let t = Tokens::of(r)?;
     let class = served_class(r)?;
@@ -924,14 +993,35 @@ pub fn price(r: &UsageRow<'_>) -> Result<Priced, Unpriced> {
         GatewayWrites::AsInput,
     )?;
 
-    let mut status = if r.usage_estimated {
+    let mut status = if r.usage_estimated || r.upstream_may_continue {
         Status::Estimated
     } else {
         Status::Priced
     };
-    let (cost_side, basis) = match &cand.card {
-        CostCard::Unverified(_) => return Err(Unpriced::Unverified),
-        CostCard::Customer => {
+    let (cost_side, basis) = match (&cand.card, r.upstream_cost_usd) {
+        (CostCard::Unverified(_), _) => return Err(Unpriced::Unverified),
+        // The vendor's own figure is the cost of goods wherever it reports one (OpenRouter, xAI).
+        // It already carries the host's price, the tier, any regional premium and tool fees. On
+        // OpenRouter it does not carry the fee on the credits that paid for it.
+        (_, Some(raw)) => {
+            let atto = parse_usd_atto(raw)?;
+            let fee = if provider == ProviderId::OpenRouter {
+                rates::OPENROUTER_CREDIT_FEE
+            } else {
+                ONE
+            };
+            let m = Mults::new(fee, ONE);
+            let num = atto.checked_mul(m.factor()).ok_or(Unpriced::Overflow)?;
+            let s = Side {
+                micros: round_half_up(num)?,
+                class,
+                long: false,
+                multiplier: m.bps(),
+                parts: Parts::default(),
+            };
+            (s, CostBasis::Reported)
+        }
+        (CostCard::Customer, None) => {
             let (s, _) = side(
                 &row.customer,
                 &t,
@@ -943,33 +1033,16 @@ pub fn price(r: &UsageRow<'_>) -> Result<Priced, Unpriced> {
             )?;
             (s, CostBasis::Tokens)
         }
-        CostCard::Own(card) => {
+        (CostCard::Own(card), None) => {
             let (s, _) = side(card, &t, r, class, geo, ONE, GatewayWrites::AsWrites)?;
             (s, CostBasis::Tokens)
         }
-        CostCard::OpenRouter(endpoints) => {
-            if let Some(raw) = r.openrouter_cost {
-                // The reported cost already carries the host's price, the tier, any regional
-                // premium and plugin fees. What it does not carry is the fee on the credits that
-                // paid for it.
-                let atto = parse_usd_atto(raw)?;
-                let m = Mults::new(rates::OPENROUTER_CREDIT_FEE, ONE);
-                let num = atto.checked_mul(m.factor()).ok_or(Unpriced::Overflow)?;
-                let s = Side {
-                    micros: round_half_up(num)?,
-                    class,
-                    long: false,
-                    multiplier: m.bps(),
-                    parts: Parts::default(),
-                };
-                (s, CostBasis::Reported)
-            } else {
-                status = Status::Estimated;
-                (
-                    dearest_endpoint(endpoints, r, &t, class, geo)?,
-                    CostBasis::DearestEndpoint,
-                )
-            }
+        (CostCard::OpenRouter(endpoints), None) => {
+            status = Status::Estimated;
+            (
+                dearest_endpoint(endpoints, r, &t, class, geo)?,
+                CostBasis::DearestEndpoint,
+            )
         }
     };
     Ok(Priced {
@@ -999,11 +1072,10 @@ fn dearest_endpoint(
         return Err(Unpriced::UnknownGeo);
     }
     let mut best: Option<(Side, u128)> = None;
-    for e in endpoints.iter().filter(|e| {
-        e.class == class
-            && r.openrouter_host
-                .is_none_or(|h| e.host.eq_ignore_ascii_case(h))
-    }) {
+    for e in endpoints
+        .iter()
+        .filter(|e| e.class == class && r.served_by.is_none_or(|h| e.host.eq_ignore_ascii_case(h)))
+    {
         let got = side(
             &e.card,
             t,
@@ -1082,6 +1154,186 @@ mod tests {
         assert_eq!(op.contains(at(20_743, 61)), Some(true));
         assert_eq!(op.contains(at(20_819, 61)), None);
         assert_eq!(op.contains(at(20_819, 300)), Some(true));
+        // The covered span is inclusive at both ends.
+        let every_day = OffPeak {
+            weekdays_only: false,
+            holidays: &[],
+            covered_from: 20_738,
+            covered_until: 20_740,
+            ..op
+        };
+        assert_eq!(every_day.contains(at(20_737, 61)), None);
+        assert_eq!(every_day.contains(at(20_738, 61)), Some(false));
+        assert_eq!(every_day.contains(at(20_740, 61)), Some(false));
+        assert_eq!(every_day.contains(at(20_741, 61)), None);
+    }
+
+    #[test]
+    fn times_rounds_half_up_per_rate() {
+        let r = TokenRates {
+            input: 3,
+            output: 1_000_000,
+            cache_read: 1,
+            cache_write_5m: 7,
+            cache_write_1h: Some(5),
+        };
+        let x = r.times(15_000);
+        assert_eq!(
+            (
+                x.input,
+                x.output,
+                x.cache_read,
+                x.cache_write_5m,
+                x.cache_write_1h
+            ),
+            (5, 1_500_000, 2, 11, Some(8))
+        );
+        assert_eq!(r.times(ONE), r);
+        assert_eq!(r.times(25_000).output, 2_500_000);
+    }
+
+    #[test]
+    fn reported_cost_digit_limits() {
+        // Leading zeros are not significant digits.
+        assert_eq!(
+            parse_usd_atto("0000000000000000000000000000000000000001"),
+            Ok(1_000_000_000_000_000_000)
+        );
+        // 36 significant digits are accepted, 37 refused.
+        let d36 = format!("0.{}", "1".repeat(36));
+        assert!(parse_usd_atto(&d36).is_ok());
+        let d37 = format!("0.{}", "1".repeat(37));
+        assert_eq!(parse_usd_atto(&d37), Err(Unpriced::BadReportedCost));
+        // A value 10^-39 attodollars below a unit rounds to zero rather than overflowing.
+        assert_eq!(parse_usd_atto("0.00000000000000001e-40"), Ok(0));
+        // 36 nines × 10^-36 attodollars rounds up to one attodollar.
+        let nines = format!("0.{}e-18", "9".repeat(36));
+        assert_eq!(parse_usd_atto(&nines), Ok(1));
+        assert_eq!(parse_usd_atto("123"), Ok(123_000_000_000_000_000_000));
+    }
+
+    #[test]
+    fn server_tools_parse_the_row_text() {
+        let t = ToolCounts::parse("web_search=2,x_posts=14").unwrap();
+        assert_eq!((t.get(Tool::WebSearch), t.get(Tool::XPosts)), (2, 14));
+        assert_eq!(ToolCounts::parse(""), Ok(ToolCounts::new()));
+        for bad in ["web_search", "web_search=", "teleport=1", "web_search=-1"] {
+            assert_eq!(ToolCounts::parse(bad), Err(Unpriced::UnknownTool), "{bad}");
+        }
+        for t in Tool::ALL {
+            assert_eq!(Tool::parse(t.as_str()), Some(t));
+        }
+    }
+
+    #[test]
+    fn unpriced_displays_its_code() {
+        assert_eq!(Unpriced::NoToolFee.to_string(), "no_tool_fee");
+    }
+
+    fn row(model: &'static str, provider: &'static str) -> UsageRow<'static> {
+        UsageRow {
+            price_model: Some(model),
+            provider: Some(provider),
+            input_tokens: 1_000,
+            output_tokens: 100,
+            ..UsageRow::default()
+        }
+    }
+
+    #[test]
+    fn sides_report_their_multiplier() {
+        let plain = price(&row("claude-opus-4-8", "anthropic")).unwrap();
+        assert_eq!(plain.cost.multiplier, 10_000);
+        let geo = price(&UsageRow {
+            inference_geo: Some("us"),
+            ..row("claude-opus-4-8", "anthropic")
+        })
+        .unwrap();
+        assert_eq!(
+            (geo.cost.multiplier, geo.price.multiplier),
+            (11_000, 11_000)
+        );
+        let or = price(&UsageRow {
+            usage_wire: WireFormat::OpenAi,
+            upstream_cost_usd: Some("0.01"),
+            ..row("claude-opus-4-8", "openrouter")
+        })
+        .unwrap();
+        assert_eq!((or.cost.multiplier, or.price.multiplier), (10_550, 10_000));
+    }
+
+    #[test]
+    fn gateway_writes_may_be_all_of_the_input() {
+        let p = price(&UsageRow {
+            gateway_cache_write_tokens: 1_000,
+            ..row("claude-opus-4-8", "anthropic")
+        })
+        .unwrap();
+        // Customer: 1000 input at $5 + 100 output at $25; vendor: 1000 writes at $6.25.
+        assert_eq!((p.price.micros, p.cost.micros), (7_500, 8_750));
+        assert_eq!(p.cost.parts.cache_write_5m, 6_250);
+        assert_eq!(p.price.parts.input, 5_000);
+    }
+
+    /// A long request is billed at the long rates even inside an off-peak window: off-peak
+    /// rates are a short-context tier.
+    #[test]
+    fn long_context_wins_over_off_peak() {
+        let rates = |r| TokenRates {
+            input: r,
+            output: r,
+            cache_read: r,
+            cache_write_5m: r,
+            cache_write_1h: None,
+        };
+        let card = Card {
+            long: Some(rates(3)),
+            long_context: Some(LongContext {
+                threshold: 10,
+                inclusive: false,
+            }),
+            off_peak: Some(OffPeak {
+                peak: &[],
+                weekdays_only: false,
+                holidays: &[],
+                covered_from: 0,
+                covered_until: 0,
+                rates: rates(1),
+            }),
+            ..Card::new(rates(2))
+        };
+        let r = UsageRow {
+            input_tokens: 1_000_000,
+            ..UsageRow::default()
+        };
+        let t = Tokens::of(&r).unwrap();
+        let (s, _) = side(
+            &card,
+            &t,
+            &r,
+            Class::Standard,
+            false,
+            ONE,
+            GatewayWrites::AsInput,
+        )
+        .unwrap();
+        assert_eq!((s.class, s.long, s.micros), (Class::Standard, true, 3));
+        let short = UsageRow {
+            input_tokens: 10,
+            ..UsageRow::default()
+        };
+        let t = Tokens::of(&short).unwrap();
+        let (s, _) = side(
+            &card,
+            &t,
+            &short,
+            Class::Standard,
+            false,
+            ONE,
+            GatewayWrites::AsInput,
+        )
+        .unwrap();
+        assert_eq!((s.class, s.long), (Class::OffPeak, false));
     }
 
     /// The pricer runs once per `ai.usage` row, after the response. Measured, not assumed: run

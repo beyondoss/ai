@@ -1,6 +1,6 @@
 {
   "about": "Golden vectors for the pricing contract (crates/providers/ARCHITECTURE.md, 'Pricing contract'). Each row is an ai.usage row; expect is what price(row) must return. An implementation must reproduce every one exactly. Absent row fields take their defaults: usage_wire anthropic, counts 0, strings null, booleans false, server_tools {}.",
-  "rate_version": "2026-10-10.37b37a282ad2066c",
+  "rate_version": "2026-10-10.a06079be9e5b5e77",
   "vectors": [
     {
       "name": "anthropic_basic",
@@ -109,10 +109,7 @@
         "speed": "fast",
         "service_tier": "standard",
         "inference_geo": "us",
-        "server_tools": {
-          "web_search": 3,
-          "web_fetch": 2
-        },
+        "server_tools": "web_search=3,web_fetch=2",
         "usage_wire": "anthropic",
         "unix_secs": 1791806400
       },
@@ -230,9 +227,7 @@
         "provider": "anthropic",
         "input_tokens": 4000,
         "output_tokens": 200,
-        "server_tools": {
-          "web_fetch": 5
-        },
+        "server_tools": "web_fetch=5",
         "usage_wire": "anthropic",
         "unix_secs": 1791806400
       },
@@ -255,9 +250,7 @@
         "provider": "anthropic",
         "input_tokens": 10,
         "output_tokens": 10,
-        "server_tools": {
-          "code_execution": 1
-        },
+        "server_tools": "code_execution=1",
         "usage_wire": "anthropic",
         "unix_secs": 1791806400
       },
@@ -394,11 +387,11 @@
     },
     {
       "name": "bedrock_us_variant_stated",
-      "why": "upstream_variant us on Bedrock names what the candidate already is.",
+      "why": "price_variant regional on Bedrock names what the candidate already is (a us. profile).",
       "row": {
         "price_model": "claude-opus-4-8",
         "provider": "bedrock",
-        "upstream_variant": "us",
+        "price_variant": "regional",
         "input_tokens": 2000,
         "output_tokens": 700,
         "usage_wire": "anthropic",
@@ -421,7 +414,7 @@
       "row": {
         "price_model": "claude-opus-4-8",
         "provider": "bedrock",
-        "upstream_variant": "global",
+        "price_variant": "global",
         "input_tokens": 2000,
         "output_tokens": 700,
         "usage_wire": "anthropic",
@@ -710,25 +703,21 @@
     },
     {
       "name": "openai_tools",
-      "why": "Web search $10/1k calls and file search $2.50/1k calls on a reasoning model.",
+      "why": "Web search $10/1k search actions and file search $2.50/1k calls on a reasoning model; open_page / find_in_page actions, computer use, MCP and tool search are tokens only.",
       "row": {
         "price_model": "gpt-5.4",
         "provider": "openai",
         "input_tokens": 12000,
         "output_tokens": 600,
-        "server_tools": {
-          "web_search": 2,
-          "file_search": 4,
-          "web_search_preview": 1
-        },
+        "server_tools": "web_search=2,web_search_page=3,file_search=4,computer_use=1,mcp=2,tool_search=1",
         "usage_wire": "openai",
         "unix_secs": 1791806400
       },
       "expect": {
         "status": "priced",
         "basis": "tokens",
-        "cost_micros": 79000,
-        "price_micros": 79000,
+        "cost_micros": 69000,
+        "price_micros": 69000,
         "cost_class": "standard",
         "price_class": "standard",
         "cost_long": false,
@@ -736,41 +725,30 @@
       }
     },
     {
-      "name": "openai_search_preview_non_reasoning",
-      "why": "web_search_preview on a non-reasoning model is $25/1k calls.",
+      "name": "openai_search_non_reasoning_refused",
+      "why": "On a non-reasoning model a web_search_call costs $10/1k (web_search) or $25/1k (web_search_preview), which the row cannot tell apart: refused.",
       "row": {
         "price_model": "gpt-4o",
         "provider": "openai",
         "input_tokens": 500,
         "output_tokens": 200,
-        "server_tools": {
-          "web_search_preview": 2
-        },
+        "server_tools": "web_search=2",
         "usage_wire": "openai",
         "unix_secs": 1791806400
       },
       "expect": {
-        "status": "priced",
-        "basis": "tokens",
-        "cost_micros": 53250,
-        "price_micros": 53250,
-        "cost_class": "standard",
-        "price_class": "standard",
-        "cost_long": false,
-        "price_long": false
+        "unpriced": "no_tool_fee"
       }
     },
     {
       "name": "openai_search_fixed_block_refused",
-      "why": "gpt-4o-mini bills web search content as a fixed 8,000-token block the usage may not show: refused until measured.",
+      "why": "gpt-4o-mini bills web search content as a fixed 8,000-token block the usage may not show (and is non-reasoning): refused.",
       "row": {
         "price_model": "gpt-4o-mini",
         "provider": "openai",
         "input_tokens": 500,
         "output_tokens": 200,
-        "server_tools": {
-          "web_search": 1
-        },
+        "server_tools": "web_search=1",
         "usage_wire": "openai",
         "unix_secs": 1791806400
       },
@@ -780,15 +758,29 @@
     },
     {
       "name": "openai_container_refused",
-      "why": "Container sessions bill per minute by memory size, neither reported: refused.",
+      "why": "Code Interpreter is a container session, billed per minute by memory size, neither reported: refused.",
       "row": {
         "price_model": "gpt-5.5",
         "provider": "openai",
         "input_tokens": 500,
         "output_tokens": 200,
-        "server_tools": {
-          "container_session": 1
-        },
+        "server_tools": "code_execution=1",
+        "usage_wire": "openai",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "unpriced": "no_tool_fee"
+      }
+    },
+    {
+      "name": "openai_shell_refused",
+      "why": "Hosted shell is a container session too: refused.",
+      "row": {
+        "price_model": "gpt-5.5",
+        "provider": "openai",
+        "input_tokens": 500,
+        "output_tokens": 200,
+        "server_tools": "shell=1",
         "usage_wire": "openai",
         "unix_secs": 1791806400
       },
@@ -804,9 +796,7 @@
         "provider": "openai",
         "input_tokens": 500,
         "output_tokens": 200,
-        "server_tools": {
-          "image_generation": 1
-        },
+        "server_tools": "image_generation=1",
         "usage_wire": "openai",
         "unix_secs": 1791806400
       },
@@ -971,7 +961,7 @@
     },
     {
       "name": "xai_priority_and_tools",
-      "why": "Priority is 2x every token type (caching applied first); web search $5/1k, X search $5/1k posts and $10/1k profiles, code execution and attachment search $5/1k.",
+      "why": "Priority is 2x every token type (caching applied first); web search $5/1k, X search $5/1k posts and $10/1k profiles, code execution $5/1k; the x_search call itself and MCP calls are tokens only.",
       "row": {
         "price_model": "grok-4.7",
         "provider": "xai",
@@ -979,21 +969,15 @@
         "cache_read_tokens": 20000,
         "output_tokens": 2000,
         "service_tier": "priority",
-        "server_tools": {
-          "web_search": 4,
-          "x_search_post": 25,
-          "x_search_profile": 2,
-          "code_execution": 1,
-          "attachment_search": 1
-        },
+        "server_tools": "web_search=4,code_execution=1,mcp=1,x_search=3,x_posts=25,x_users=2",
         "usage_wire": "openai",
         "unix_secs": 1791806400
       },
       "expect": {
         "status": "priced",
         "basis": "tokens",
-        "cost_micros": 259000,
-        "price_micros": 259000,
+        "cost_micros": 254000,
+        "price_micros": 254000,
         "cost_class": "fast",
         "price_class": "fast",
         "cost_long": false,
@@ -1352,8 +1336,8 @@
         "cache_read_tokens": 40000,
         "cache_write_tokens": 15000,
         "output_tokens": 1200,
-        "openrouter_cost": "0.0612345",
-        "openrouter_host": "Google",
+        "upstream_cost_usd": "0.0612345",
+        "served_by": "Google",
         "usage_wire": "openai",
         "unix_secs": 1791806400
       },
@@ -1376,7 +1360,7 @@
         "provider": "openrouter",
         "input_tokens": 1000,
         "output_tokens": 100,
-        "openrouter_cost": "1.5e-05",
+        "upstream_cost_usd": "1.5e-05",
         "usage_wire": "openai",
         "unix_secs": 1791806400
       },
@@ -1399,7 +1383,7 @@
         "provider": "openrouter",
         "input_tokens": 5,
         "output_tokens": 0,
-        "openrouter_cost": "0.00000047",
+        "upstream_cost_usd": "0.00000047",
         "usage_wire": "openai",
         "unix_secs": 1791806400
       },
@@ -1422,7 +1406,7 @@
         "provider": "openrouter",
         "input_tokens": 5,
         "output_tokens": 0,
-        "openrouter_cost": "-0.001",
+        "upstream_cost_usd": "-0.001",
         "usage_wire": "openai",
         "unix_secs": 1791806400
       },
@@ -1438,7 +1422,7 @@
         "provider": "openrouter",
         "input_tokens": 5,
         "output_tokens": 0,
-        "openrouter_cost": "abc",
+        "upstream_cost_usd": "abc",
         "usage_wire": "openai",
         "unix_secs": 1791806400
       },
@@ -1456,7 +1440,7 @@
         "cache_read_tokens": 40000,
         "cache_write_tokens": 15000,
         "output_tokens": 1200,
-        "openrouter_host": "Amazon Bedrock",
+        "served_by": "Amazon Bedrock",
         "usage_estimated": true,
         "usage_wire": "openai",
         "unix_secs": 1791806400
@@ -1503,7 +1487,7 @@
         "provider": "openrouter",
         "input_tokens": 272001,
         "output_tokens": 100,
-        "openrouter_host": "OpenAI",
+        "served_by": "OpenAI",
         "usage_wire": "openai",
         "unix_secs": 1791806400
       },
@@ -1550,7 +1534,7 @@
         "provider": "openrouter",
         "input_tokens": 10,
         "output_tokens": 10,
-        "openrouter_host": "Nowhere",
+        "served_by": "Nowhere",
         "usage_wire": "openai",
         "unix_secs": 1791806400
       },
@@ -1567,7 +1551,7 @@
         "input_tokens": 20000,
         "cache_read_tokens": 5000,
         "output_tokens": 8000,
-        "openrouter_cost": "0.0912",
+        "upstream_cost_usd": "0.0912",
         "usage_wire": "openai",
         "unix_secs": 1791806400
       },
@@ -1583,22 +1567,222 @@
       }
     },
     {
-      "name": "openrouter_web_plugin_refused",
-      "why": "OpenRouter's web plugin is priced by engine and result count the row does not carry: refused on the price side.",
+      "name": "openrouter_tool_cost_refused",
+      "why": "A metered OpenRouter tool or plugin (its web plugin) has a cost no customer card prices: refused.",
       "row": {
         "price_model": "z-ai/glm-5.1",
         "provider": "openrouter",
         "input_tokens": 1000,
         "output_tokens": 100,
-        "openrouter_cost": "0.01",
-        "server_tools": {
-          "openrouter_web": 1
-        },
+        "upstream_cost_usd": "0.01",
+        "upstream_tool_cost_usd": "0.007",
         "usage_wire": "openai",
         "unix_secs": 1791806400
       },
       "expect": {
         "unpriced": "no_tool_fee"
+      }
+    },
+    {
+      "name": "openrouter_tool_cost_zero",
+      "why": "A zero tool cost is no tool: priced.",
+      "row": {
+        "price_model": "z-ai/glm-5.1",
+        "provider": "openrouter",
+        "input_tokens": 1000,
+        "output_tokens": 100,
+        "upstream_cost_usd": "0.01",
+        "upstream_tool_cost_usd": "0",
+        "usage_wire": "openai",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "status": "priced",
+        "basis": "reported",
+        "cost_micros": 10550,
+        "price_micros": 1840,
+        "cost_class": "standard",
+        "price_class": "standard",
+        "cost_long": false,
+        "price_long": false
+      }
+    },
+    {
+      "name": "openrouter_native_search",
+      "why": "OpenRouter native web search on a Claude row: tool_calls counts it too and is not added; the customer pays Anthropic's $10/1k.",
+      "row": {
+        "price_model": "claude-sonnet-4-6",
+        "provider": "openrouter",
+        "input_tokens": 5000,
+        "output_tokens": 300,
+        "upstream_cost_usd": "0.0381",
+        "server_tools": "web_search=2,tool_calls=2",
+        "usage_wire": "openai",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "status": "priced",
+        "basis": "reported",
+        "cost_micros": 40196,
+        "price_micros": 39500,
+        "cost_class": "standard",
+        "price_class": "standard",
+        "cost_long": false,
+        "price_long": false
+      }
+    },
+    {
+      "name": "openrouter_tool_calls_exceed_search",
+      "why": "tool_calls beyond the web searches means another OpenRouter tool ran: refused.",
+      "row": {
+        "price_model": "claude-sonnet-4-6",
+        "provider": "openrouter",
+        "input_tokens": 5000,
+        "output_tokens": 300,
+        "upstream_cost_usd": "0.0381",
+        "server_tools": "web_search=1,tool_calls=2",
+        "usage_wire": "openai",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "unpriced": "no_tool_fee"
+      }
+    },
+    {
+      "name": "openrouter_regional_host",
+      "why": "OpenRouter's in-region host (price_variant regional): the reported cost carries the surcharge.",
+      "row": {
+        "price_model": "claude-opus-4-8",
+        "provider": "openrouter",
+        "price_variant": "regional",
+        "input_tokens": 1000,
+        "output_tokens": 100,
+        "upstream_cost_usd": "0.00825",
+        "usage_wire": "openai",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "status": "priced",
+        "basis": "reported",
+        "cost_micros": 8704,
+        "price_micros": 7500,
+        "cost_class": "standard",
+        "price_class": "standard",
+        "cost_long": false,
+        "price_long": false
+      }
+    },
+    {
+      "name": "openrouter_may_continue",
+      "why": "A cancelled OpenRouter stream on a host that keeps generating: the row is a lower bound until reconciled, so estimated.",
+      "row": {
+        "price_model": "claude-opus-4-8",
+        "provider": "openrouter",
+        "input_tokens": 1000,
+        "output_tokens": 100,
+        "upstream_cost_usd": "0.0075",
+        "upstream_may_continue": true,
+        "served_by": "Amazon Bedrock",
+        "usage_wire": "openai",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "status": "estimated",
+        "basis": "reported",
+        "cost_micros": 7913,
+        "price_micros": 7500,
+        "cost_class": "standard",
+        "price_class": "standard",
+        "cost_long": false,
+        "price_long": false
+      }
+    },
+    {
+      "name": "xai_reported_cost",
+      "why": "xAI reports its own cost (cost_in_usd_ticks): that is the cost of goods, with no fee; the customer pays the card.",
+      "row": {
+        "price_model": "grok-4.3",
+        "provider": "xai",
+        "input_tokens": 10000,
+        "cache_read_tokens": 2000,
+        "output_tokens": 500,
+        "upstream_cost_usd": "0.0118500000",
+        "usage_wire": "openai",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "status": "priced",
+        "basis": "reported",
+        "cost_micros": 11850,
+        "price_micros": 11650,
+        "cost_class": "standard",
+        "price_class": "standard",
+        "cost_long": false,
+        "price_long": false
+      }
+    },
+    {
+      "name": "xai_document_search_refused",
+      "why": "xAI document_search has no published fee under that name: refused.",
+      "row": {
+        "price_model": "grok-4.3",
+        "provider": "xai",
+        "input_tokens": 10,
+        "output_tokens": 10,
+        "server_tools": "document_search=1",
+        "usage_wire": "openai",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "unpriced": "no_tool_fee"
+      }
+    },
+    {
+      "name": "xai_sources_refused",
+      "why": "xAI legacy Live Search sources: refused.",
+      "row": {
+        "price_model": "grok-4.3",
+        "provider": "xai",
+        "input_tokens": 10,
+        "output_tokens": 10,
+        "server_tools": "sources=4",
+        "usage_wire": "openai",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "unpriced": "no_tool_fee"
+      }
+    },
+    {
+      "name": "unknown_tool_kind",
+      "why": "A server_tools kind the pricer has never heard of may have a fee: refused.",
+      "row": {
+        "price_model": "grok-4.3",
+        "provider": "xai",
+        "input_tokens": 10,
+        "output_tokens": 10,
+        "server_tools": "web_search=1,teleport=2",
+        "usage_wire": "openai",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "unpriced": "unknown_tool"
+      }
+    },
+    {
+      "name": "bad_tool_count",
+      "why": "A server_tools count that is not a number: refused.",
+      "row": {
+        "price_model": "grok-4.3",
+        "provider": "xai",
+        "input_tokens": 10,
+        "output_tokens": 10,
+        "server_tools": "web_search=two",
+        "usage_wire": "openai",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "unpriced": "unknown_tool"
       }
     },
     {

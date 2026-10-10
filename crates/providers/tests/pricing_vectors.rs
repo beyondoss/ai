@@ -5,7 +5,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use providers::WireFormat;
-use providers::pricing::{Priced, Tool, ToolCounts, UsageRow, price};
+use providers::pricing::{Priced, Tool, ToolCounts, Unpriced, UsageRow, price};
 use providers::rates::RATE_VERSION;
 use serde_json::Value;
 
@@ -18,22 +18,17 @@ fn vectors() -> Value {
         .expect("pricing_vectors.json parses")
 }
 
-/// A vector's row as the pricer reads it. Absent fields take the documented defaults.
-fn row(v: &Value) -> UsageRow<'_> {
+/// A vector's row as the pricer reads it. Absent fields take the documented defaults. The row's
+/// `server_tools` text is parsed as the gateway parses it, so a malformed one is an outcome.
+fn row(v: &Value) -> Result<UsageRow<'_>, Unpriced> {
     let n = |k: &str| v.get(k).and_then(Value::as_u64).unwrap_or(0);
     let s = |k: &str| v.get(k).and_then(Value::as_str);
     let b = |k: &str| v.get(k).and_then(Value::as_bool).unwrap_or(false);
-    let mut tools = ToolCounts::new();
-    if let Some(t) = v.get("server_tools").and_then(Value::as_object) {
-        for (k, c) in t {
-            let tool = Tool::parse(k).unwrap_or_else(|| panic!("unknown tool {k}"));
-            tools.set(tool, c.as_u64().expect("tool count"));
-        }
-    }
+    let tools = ToolCounts::parse(s("server_tools").unwrap_or(""))?;
     let known = [
         "price_model",
         "provider",
-        "upstream_variant",
+        "price_variant",
         "usage_wire",
         "input_tokens",
         "output_tokens",
@@ -46,19 +41,21 @@ fn row(v: &Value) -> UsageRow<'_> {
         "service_tier",
         "speed",
         "inference_geo",
-        "openrouter_cost",
-        "openrouter_host",
+        "upstream_cost_usd",
+        "upstream_tool_cost_usd",
+        "served_by",
         "usage_estimated",
+        "upstream_may_continue",
         "cache_hit",
         "unix_secs",
     ];
     for k in v.as_object().expect("row is an object").keys() {
         assert!(known.contains(&k.as_str()), "unknown row field {k}");
     }
-    UsageRow {
+    Ok(UsageRow {
         price_model: s("price_model"),
         provider: s("provider"),
-        upstream_variant: s("upstream_variant"),
+        price_variant: s("price_variant"),
         usage_wire: match s("usage_wire").unwrap_or("anthropic") {
             "openai" => WireFormat::OpenAi,
             "anthropic" => WireFormat::Anthropic,
@@ -74,12 +71,14 @@ fn row(v: &Value) -> UsageRow<'_> {
         service_tier: s("service_tier"),
         speed: s("speed"),
         inference_geo: s("inference_geo"),
-        openrouter_cost: s("openrouter_cost"),
-        openrouter_host: s("openrouter_host"),
+        upstream_cost_usd: s("upstream_cost_usd"),
+        upstream_tool_cost_usd: s("upstream_tool_cost_usd"),
+        served_by: s("served_by"),
         usage_estimated: b("usage_estimated"),
+        upstream_may_continue: b("upstream_may_continue"),
         cache_hit: b("cache_hit"),
         unix_secs: n("unix_secs"),
-    }
+    })
 }
 
 fn got(p: &Priced) -> Value {
@@ -113,8 +112,7 @@ fn golden_vectors_price_exactly() {
             v["why"].as_str().is_some_and(|w| !w.is_empty()),
             "{name}: says why"
         );
-        let r = row(&v["row"]);
-        let actual = match price(&r) {
+        let actual = match row(&v["row"]).and_then(|r| price(&r)) {
             Ok(p) => got(&p),
             Err(e) => serde_json::json!({ "unpriced": e.as_str() }),
         };
@@ -148,6 +146,7 @@ fn vectors_cover_every_outcome() {
         "unknown_host",
         "unknown_calendar",
         "overflow",
+        "unknown_tool",
     ] {
         assert!(has("unpriced", code), "no vector refuses with {code}");
     }
@@ -161,8 +160,9 @@ fn vectors_cover_every_outcome() {
     assert!(expects.iter().any(|e| e["cost_long"] == true));
     let tools: std::collections::BTreeSet<&str> = vs
         .iter()
-        .filter_map(|v| v["row"]["server_tools"].as_object())
-        .flat_map(|t| t.keys().map(String::as_str))
+        .filter_map(|v| v["row"]["server_tools"].as_str())
+        .flat_map(|t| t.split(','))
+        .filter_map(|kv| kv.split_once('=').map(|(k, _)| k))
         .collect();
     for t in Tool::ALL {
         assert!(tools.contains(t.as_str()), "no vector uses {}", t.as_str());
