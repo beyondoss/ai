@@ -49,7 +49,7 @@ Client (stock OpenAI/Anthropic SDK)
   │
   ▼  request_filter (proxy.rs)
   │  ├─ Route: first segment → provider row (authority, dialect, auth scheme)
-  │  │    `/{provider}/…` is the escape hatch (no catalog)
+  │  │    `/{provider}/…` is the escape hatch (no walk; a managed key: catalog models only, D267)
   │  │    …or `/auto` / managed `/v1` → x-beyond-model if present, else body's root `model`
   │  │      → catalog row → candidate list (default: the caller's computed session pin)
   │  │      x-beyond-order / split fix it; only filters; then the pin (same wire; no new providers)
@@ -139,7 +139,10 @@ Client (stock OpenAI/Anthropic SDK)
   │    (a client-sent stream_options is rewritten to include_usage:true, never left off)
   │  Managed /{provider}/…/responses: buffered (same body budget); root `background: true`
   │    ─────── 400, aborted before the last byte goes upstream (D202). BYO streams through.
-  │  Model-routed: a client body with two root `model` keys (any spelling) ─────── 400
+  │  Managed /{provider}/… billable call (all but the free token counts): buffered (same body
+  │    budget); root `model` missing or in no catalog row ─────── 404, aborted before the last
+  │    byte goes upstream (D267). BYO streams through.
+  │  Model-routed or managed /{provider}: two root `model` keys (any spelling) ─────── 400
   │  Model-routed: same buffer, and `model` is spliced to the serving candidate's own id
   │    (rewrite first — the injection offset precedes the value, so it cannot move)
   │  Wire-mismatched catalog walk (Chat Completions ↔ Messages ↔ Responses): map the
@@ -672,6 +675,28 @@ buffered for this (as an OpenAI Chat body is for `stream_options`; the same body
 request aborted before its last byte goes upstream, the way a duplicate `model` is, so no provider
 receives it whole. `background: false` is served; BYO keys relay it as sent (the caller's account
 can poll).
+
+**A managed key runs catalog models only, on every route (D267).** `/{provider}/…` does not walk
+the catalog, but a managed billable call on it (every allowlisted endpoint except the free
+`/messages/count_tokens` and `/responses/input_tokens`) must name a model its billing row can
+price: the root `model` must resolve through the lookup `price_model` makes on the requested model
+(`proxy::price_row`: a catalog name or any candidate's provider-specific spelling, as spelled or
+without a dated snapshot suffix). So `/anthropic/v1/messages` with `claude-opus-4-8`, or
+`/openai/v1/chat/completions` with `gpt-4o-mini-2024-07-18`, is served; `my-finetune` is not. A
+miss is the catalog walk's own 404 (`invalid_request_error`, `model "…" is not in the catalog; …
+GET /v1/models lists them`, or `missing model: …` when the body names none), with
+`x-beyond-request-id`, counted as `ai_rejections_total{reason="unknown_model"}`. Without it a
+managed key could run any model a pool key reaches, and its row would carry no `price_model`:
+usage nothing downstream can price. The body is buffered for the check (as an OpenAI Chat body is
+for `stream_options` and a Responses body for `background`, so the new cost is the Messages and
+embeddings bodies; the same body budget) and the request aborted before its last byte goes
+upstream, so no provider receives it whole. The refusal sits in `request_body_filter` rather than
+`request_filter` because a body past the 64 KiB replay buffer cannot be read up front and then
+forwarded on a provider route (only a catalog walk has the `FullBody` re-run); the request head
+has left by then, but a provider acts on nothing before the body's last byte. A body with two root
+`model` keys is a 400 there too: the provider serves the last, the row would name the first. A
+refused request bills nothing: the gateway's own refusal is not a client giving up after delivery
+(`gave_up_waiting`), so no prompt estimate is written. BYO keys run any slug.
 
 **Which paths name an endpoint.** `route::implied_endpoint` is an exact table:
 `/v1/chat/completions`, `/v1/messages`, `/v1/responses`, `/v1/embeddings` (under `/auto` the `/v1`
@@ -1606,7 +1631,10 @@ A third field, `price_model`, names the catalog row the row prices at. A model-r
 knows it (`routed_model`); a provider-routed one resolves `model`, then `requested_model`, through
 `providers::catalog::for_model`, each as spelled and then without a dated snapshot suffix
 (`-YYYY-MM-DD`, `-YYYYMMDD`), since the catalog lists aliases and vendor slugs, never snapshots.
-Absent when neither names a row: an unpriced model.
+Absent when neither names a row: an unpriced model. A managed request cannot get there (D267): a
+catalog walk routes on a row, and a managed `/{provider}` billable call whose requested model
+resolves to no row (the same lookup, `proxy::price_row`) is refused before the provider has its
+body. A BYO request may name any model, and writes no row.
 
 ### Usage Extraction (`usage.rs`)
 
@@ -1843,7 +1871,8 @@ when the request ends. This section is the contract a pricer is built against. F
 stable: a field is only ever added, never renamed, retyped or given a new meaning (D268).
 
 One row per managed request that reached `logging` with a billable outcome (not BYO, not a free
-sub-resource such as a token count, not an abandoned `FullBody` attempt). It is a `tracing` event on
+sub-resource such as a token count, not an abandoned `FullBody` attempt, and not the gateway's own
+refusal before any response head, such as a catalog miss on `/{provider}`, D267). It is a `tracing` event on
 target `ai.usage`, written as one JSON line whose fields are under `fields`. A field that has no
 value is **absent**, never `null`. Types below are JSON types. Token counts are integers.
 
@@ -1863,7 +1892,7 @@ the numbers, not their log text.
 | `model`           | string  | The model id the provider echoed (the pinned snapshot it billed). Falls back to `requested_model` when the response named none.                      |
 | `requested_model` | string  | What the client asked for: the catalog name on a catalog walk, the body's `model` on `/{provider}`.                                                  |
 | `routed_model`    | string  | The catalog row a catalog walk routed on. Absent on `/{provider}`.                                                                                   |
-| `price_model`     | string  | The catalog row whose card prices this row. Absent when unpriced.                                                                                    |
+| `price_model`     | string  | The catalog row whose card prices this row. Absent when unpriced, which a managed request cannot be (D267).                                          |
 | `upstream_model`  | string  | The exact model id the gateway sent upstream: the serving candidate's spelling (`us.anthropic.claude-opus-4-8`), or the body's `model` when relayed. |
 | `upstream_host`   | string  | The host the request went to (`api.anthropic.com`, `bedrock-runtime.us-east-1.amazonaws.com`, `openrouter.ai`).                                      |
 | `upstream_path`   | string  | The upstream path, query removed (`/v1/messages`, `/api/v1/chat/completions`). It says which wire served.                                            |
@@ -2962,7 +2991,9 @@ prefix requires no SDK modification.
 
 The managed `/v1` catalog walk is the other half of that: a stock SDK that can only set a host and
 put `model` in the JSON body does not have to learn `x-beyond-model` or `/auto`. `/{provider}/…`
-remains the escape hatch when the catalog should not apply.
+remains the escape hatch when the catalog walk should not apply: a fixed provider, its own path and
+wire, no translation. On a managed key the model must still be a catalog one (D267); a BYO key may
+send any.
 
 ### Why the response cache is a tap, and why the key is the client body
 
@@ -2993,8 +3024,13 @@ to serve.
 - Catalog model on managed `/v1` and `/auto` (unknown or missing → 404 naming the miss). Candidate
   spellings are aliases. Chat Completions ↔ Messages ↔ Responses is translated when the inbound
   path names a different one of those three; any other inbound-path vs row mismatch is a 400.
-  `/{provider}/…` is not allowlisted and never translates. A managed `GET /v1/models` lists the
-  keyed catalog; a BYO one relays to its provider.
+  `/{provider}/…` never translates. A managed `GET /v1/models` lists the keyed catalog; a BYO one
+  relays to its provider.
+- Catalog model on a managed `/{provider}/…` billable call (D267): the body's root `model` must
+  resolve the way `price_model` resolves a requested model (a catalog name or a candidate's
+  provider spelling, with or without a dated snapshot suffix), so no managed row is unpriced.
+  Unknown or missing → the same 404, before the provider has the body; two root `model` keys → 400.
+  The free token counts are not checked. BYO keys are not checked.
 - Request body size ≤ `MAX_REQUEST_BODY` (declared `Content-Length` + streaming running total)
 - One root `model` key on a catalog walk. The walk routes on one and rewrites one, while most JSON
   parsers take the _last_, so `{"model":"cheap",…,"model":"gpt-5.5-pro"}` would route as the cheap
@@ -3016,8 +3052,9 @@ to serve.
 **What passes through unchecked:**
 
 - Request body content and schema — no validation at the gateway layer
-- Model name on `/{provider}/…` — extracted for billing facts, never validated against an allowlist.
-  That path is the escape hatch.
+- Model name on BYO `/{provider}/…` — not read (BYO writes no billing row) and never validated.
+  That path, with the caller's own key, is the escape hatch for an id the catalog does not carry. A
+  managed key's model is checked (above).
 - **The request body's `model` on a catalog walk when `x-beyond-model` is set.** It is an input the
   gateway _overwrites_ with the serving candidate's id, so it determines nothing — the header does.
   A body that names a different model is counted on `ai_model_header_body_mismatch_total` (a client
@@ -3126,8 +3163,9 @@ is kept once for all of them:
 - Body schema validation belongs to the provider — duplicate validation adds latency without a
   security benefit at the gateway layer
 - A per-provider model allowlist coupled to release cadence is what the catalog already is, for the
-  drop-in `/v1` and `/auto` paths. `/{provider}/…` stays unlisted so an operator can still send an
-  id the catalog does not carry
+  drop-in `/v1` and `/auto` paths. On a managed key `/{provider}/…` reads the same catalog, since
+  a managed row must be priceable (D267); with a BYO key it stays unlisted, so a caller can still
+  send an id the catalog does not carry
 - BYO token validation requires a provider round-trip — the provider does it anyway
 
 ---

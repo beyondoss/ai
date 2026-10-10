@@ -313,3 +313,230 @@ async fn background_responses_are_refused_on_managed_keys_only() {
     }
     assert!(failures.is_empty(), "{}\n{}", failures.join("\n"), gw.log());
 }
+
+/// A billable OpenAI answer, so a served request writes a priced row.
+const CHAT_OK: &str = r#"{"id":"c1","object":"chat.completion","model":"gpt-4o-mini","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":1,"total_tokens":4}}"#;
+
+fn chat_body(model: &str) -> String {
+    format!(r#"{{"model":"{model}","messages":[{{"role":"user","content":"hi"}}]}}"#)
+}
+
+/// A managed key on `/{provider}/…` runs only what its billing row can price: a billable call whose
+/// root `model` resolves to no catalog row (the lookup `price_model` makes on the requested model:
+/// a catalog name or any candidate's provider-specific spelling, either with a dated snapshot
+/// suffix) is the catalog walk's 404, naming the model and pointing at `/v1/models`, and no
+/// provider receives the body (the mock counts only requests that arrived whole). Small and large
+/// bodies, `model` before and after the prompt, every billable endpoint. A missing `model` is
+/// refused too, and a duplicate one is a 400 (the provider serves the last, the row names the
+/// first). The free token counts write no billing row and stay open, and a BYO key runs any slug.
+/// claim: SEC-1, BIL-2
+/// defect: D267
+#[tokio::test]
+async fn managed_provider_routes_run_catalog_models_only() {
+    let (pubkey, sk) = test_keypair(66);
+    let mock = ScriptedUpstream::reply(200, "application/json", CHAT_OK.to_owned()).await;
+    let gw = Gateway::builder(unused_nats_port(), &mock.authority(), &b64(&pubkey))
+        .providers(&["openai", "anthropic"])
+        .start()
+        .await;
+    let key = managed_key(&sk);
+    let bearer = || ("authorization", format!("Bearer {key}"));
+    let x_api_key = || ("x-api-key", key.clone());
+    let pad = "x".repeat(80 * 1024);
+    let large = |model: &str| {
+        format!(r#"{{"messages":[{{"role":"user","content":"{pad}"}}],"model":"{model}"}}"#)
+    };
+    let mut failures = Vec::new();
+
+    // Priced: a catalog name, a candidate's own spelling, and a dated snapshot of either; then the
+    // free token counts, whatever their model.
+    let served: Vec<(&str, bool, String)> = vec![
+        (
+            "/openai/v1/chat/completions",
+            true,
+            chat_body("gpt-4o-mini"),
+        ),
+        (
+            "/openai/v1/chat/completions",
+            true,
+            chat_body("gpt-4o-mini-2024-07-18"),
+        ),
+        (
+            "/openai/v1/responses",
+            true,
+            r#"{"model":"gpt-4.1","input":"hi"}"#.to_owned(),
+        ),
+        (
+            "/openai/v1/embeddings",
+            true,
+            r#"{"model":"text-embedding-3-small","input":"hi"}"#.to_owned(),
+        ),
+        (
+            "/anthropic/v1/messages",
+            false,
+            chat_body("claude-opus-4-8"),
+        ),
+        (
+            "/anthropic/v1/messages",
+            false,
+            chat_body("claude-sonnet-4-5-20250929"),
+        ),
+        ("/anthropic/v1/messages", false, large("claude-haiku-4-5")),
+        (
+            "/anthropic/v1/messages/count_tokens",
+            false,
+            chat_body("not-a-catalog-model"),
+        ),
+        (
+            "/openai/v1/responses/input_tokens",
+            true,
+            r#"{"model":"not-a-catalog-model","input":"hi"}"#.to_owned(),
+        ),
+    ];
+    let served_billable = 7;
+    for (path, bearer_auth, body) in &served {
+        let before = mock.hits();
+        let auth = if *bearer_auth { bearer() } else { x_api_key() };
+        let (status, text, _) = send(&gw, reqwest::Method::POST, path, auth, Some(body)).await;
+        if status != 200 || mock.hits() != before + 1 {
+            failures.push(format!(
+                "served {path} ({} bytes): {status}: {text}",
+                body.len()
+            ));
+        }
+    }
+
+    // Unpriced: refused before the provider has the body.
+    let refused: Vec<(&str, bool, String, u16, &str)> = vec![
+        (
+            "/openai/v1/chat/completions",
+            true,
+            chat_body("my-finetune"),
+            404,
+            "\"my-finetune\"",
+        ),
+        (
+            "/openai/v1/chat/completions",
+            true,
+            large("ft:gpt-4o:acme"),
+            404,
+            "\"ft:gpt-4o:acme\"",
+        ),
+        (
+            "/openai/v1/responses",
+            true,
+            r#"{"model":"o9-secret","input":"hi"}"#.to_owned(),
+            404,
+            "\"o9-secret\"",
+        ),
+        (
+            "/openai/v1/responses/compact",
+            true,
+            r#"{"model":"o9-secret","input":"hi"}"#.to_owned(),
+            404,
+            "\"o9-secret\"",
+        ),
+        (
+            "/openai/v1/embeddings",
+            true,
+            r#"{"model":"text-embedding-ada-002","input":"hi"}"#.to_owned(),
+            404,
+            "\"text-embedding-ada-002\"",
+        ),
+        (
+            "/anthropic/v1/messages",
+            false,
+            chat_body("claude-2.1"),
+            404,
+            "\"claude-2.1\"",
+        ),
+        (
+            "/anthropic/v1/messages",
+            false,
+            large("claude-2.1"),
+            404,
+            "\"claude-2.1\"",
+        ),
+        (
+            "/openai/v1/chat/completions",
+            true,
+            r#"{"messages":[{"role":"user","content":"hi"}]}"#.to_owned(),
+            404,
+            "missing model",
+        ),
+        (
+            "/openai/v1/chat/completions",
+            true,
+            r#"{"model":"gpt-4o-mini","messages":[],"model":"my-finetune"}"#.to_owned(),
+            400,
+            "",
+        ),
+    ];
+    let mut refused_ids = Vec::new();
+    for (path, bearer_auth, body, want, named) in &refused {
+        let before = mock.hits();
+        let auth = if *bearer_auth { bearer() } else { x_api_key() };
+        let (status, text, rid) = send(&gw, reqwest::Method::POST, path, auth, Some(body)).await;
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+        let msg = v["error"]["message"].as_str().unwrap_or("");
+        let named_ok = *want != 404
+            || (msg.contains(named)
+                && msg.contains("/v1/models")
+                && v["error"]["type"] == "invalid_request_error");
+        if status != *want || !named_ok || rid.is_none() || mock.hits() != before {
+            failures.push(format!(
+                "refused {path} ({} bytes): {status}, {} upstream hits: {text}",
+                body.len(),
+                mock.hits() - before
+            ));
+        }
+        refused_ids.extend(rid);
+    }
+
+    // A BYO key is the caller's own: any slug, relayed as sent.
+    for (path, auth) in [
+        (
+            "/openai/v1/chat/completions",
+            ("authorization", "Bearer sk-caller-own-key".to_owned()),
+        ),
+        (
+            "/anthropic/v1/messages",
+            ("x-api-key", "sk-ant-caller-own-key".to_owned()),
+        ),
+    ] {
+        let before = mock.hits();
+        let body = chat_body("my-finetune");
+        let (status, text, _) = send(&gw, reqwest::Method::POST, path, auth, Some(&body)).await;
+        if status != 200 || mock.hits() != before + 1 {
+            failures.push(format!("BYO {path}: {status}: {text}"));
+        }
+    }
+
+    // A refusal writes no billing row, and every served managed row is priced.
+    let rows = wait_usage_rows(&gw, served_billable, 5).await;
+    for row in &rows {
+        let refused_row = refused_ids
+            .iter()
+            .any(|r| Some(r.as_str()) == row["request_id"].as_str());
+        let tokens =
+            row["input_tokens"].as_u64().unwrap_or(0) + row["output_tokens"].as_u64().unwrap_or(0);
+        if refused_row {
+            failures.push(format!(
+                "a refused request wrote a billing row (tokens {tokens}): {row}"
+            ));
+        }
+        if !refused_row && row["price_model"].as_str().is_none() {
+            failures.push(format!("a served managed row is unpriced: {row}"));
+        }
+    }
+    let metrics = gw.metrics().await;
+    if !metrics.contains(r#"ai_rejections_total{reason="unknown_model"} 8"#) {
+        failures.push("the eight catalog misses are counted as unknown_model".to_owned());
+    }
+    assert!(
+        failures.is_empty(),
+        "{}\n{}",
+        failures.join("\n"),
+        log_tail(&gw.log())
+    );
+}

@@ -82,7 +82,7 @@ async fn every_served_request_writes_one_row_with_a_unique_request_id() {
                 send(
                     format!("{url}/fireworks/inference/v1/chat/completions"),
                     bearer(&key),
-                    r#"{"model":"accounts/fireworks/models/x","stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+                    r#"{"model":"accounts/fireworks/models/gpt-oss-120b","stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
                     &[],
                 )
                 .await

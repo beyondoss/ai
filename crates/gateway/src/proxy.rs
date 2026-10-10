@@ -435,10 +435,15 @@ pub struct RequestCtx {
     /// request body" — scoped to the managed OpenAI chat/completions path (see `is_streamable_path`)
     /// and bounded by `MAX_REQUEST_BODY`. BYO and every other request still stream straight through.
     inject_eligible: bool,
-    /// Managed `/{provider}/…/responses`: buffer the body (as `inject_eligible` does) so a
-    /// `background: true` request is refused before any byte of it goes upstream (D202). A catalog
-    /// walk reads its body in `request_filter` and refuses there.
-    background_check: bool,
+    /// Managed `/{provider}/…` billable call (every allowlisted endpoint but the free token
+    /// counts): buffer the body (as `inject_eligible` does) so a request whose root `model` names
+    /// no catalog row ([`price_row`]) is refused before any byte of it goes upstream, with the
+    /// catalog walk's 404. A managed key runs priced models only (D267). BYO keys never set it.
+    ///
+    /// The same buffer refuses a `/responses` body's `background: true` (D202): that endpoint is
+    /// billable, so it is always checked here (a catalog walk reads its body in `request_filter`
+    /// and refuses there).
+    catalog_check: bool,
     /// Accumulated request body — populated only when `inject_eligible`; otherwise stays empty and
     /// the body is never buffered.
     req_buf: Vec<u8>,
@@ -934,12 +939,27 @@ fn h2_body_unsent(e: &pingora_core::Error) -> bool {
 ///
 /// The request deadline passing ([`is_deadline`]) is the gateway giving up too, as a read timeout
 /// is: a provider still working on a delivered request bills its prompt.
+///
+/// Not the gateway's own refusal of a body it withheld (a downstream-tagged status from
+/// `request_body_filter`: a catalog miss, a duplicate `model`, `background`, a foreign id, the
+/// body budget). The client read in full, but the provider never had the body's last byte, so
+/// nothing was waited on and nothing is billed (D267).
 fn gave_up_waiting(e: &pingora_core::Error) -> bool {
     match e.esource() {
-        pingora_core::ErrorSource::Downstream => true,
+        pingora_core::ErrorSource::Downstream => !gateway_refusal(e),
         pingora_core::ErrorSource::Upstream => e.etype() == &pingora_core::ErrorType::ReadTimedout,
         _ => is_deadline(e),
     }
+}
+
+/// Whether `e` is the gateway's own answer to the client (a `CustomCode` or `HTTPStatus` tagged
+/// downstream: a catalog miss, a duplicate `model`, `background`, a foreign id, an oversized body),
+/// not the client going away. Before any response head, such a request never reached a provider
+/// whole, so it bills nothing and writes no `ai.usage` row (rejections write none, D267).
+fn gateway_refusal(e: &pingora_core::Error) -> bool {
+    use pingora_core::ErrorType::{CustomCode, HTTPStatus};
+    e.esource() == &pingora_core::ErrorSource::Downstream
+        && matches!(e.etype(), CustomCode(..) | HTTPStatus(_))
 }
 
 /// Whether the upstream refused this request's HTTP/2 stream with a GOAWAY, one shape of
@@ -1279,17 +1299,15 @@ impl RequestCtx {
     ///   translating between Chat Completions, Messages and Responses when the wires differ, and
     ///   the same-wire edits a walk makes (the output-limit cap, `max_tokens` respelled for native
     ///   OpenAI, dropped nulls and unreplayable reasoning).
-    /// - `background_check`: a managed `/{provider}/…/responses` body is held whole so a
-    ///   `background: true` is refused before any byte goes upstream (D202).
+    /// - `catalog_check`: a managed `/{provider}/…` billable body is held whole so a model outside
+    ///   the catalog (D267), or a `/responses` body's `background: true` (D202), is refused before
+    ///   any byte goes upstream.
     /// - `signed`: a managed Responses relay to a provider's store swaps each tenant-signed id for
     ///   the provider's (`signed_id`, D230).
     ///
     /// Several can apply to the same request, in which case every edit is made to the one buffer.
     fn rewrites_body(&self) -> bool {
-        self.inject_eligible
-            || self.background_check
-            || self.auto.is_some()
-            || self.signed.is_some()
+        self.inject_eligible || self.catalog_check || self.auto.is_some() || self.signed.is_some()
     }
 
     /// Whether the bytes sent to the client are watched for the stream's terminal event
@@ -1818,13 +1836,7 @@ impl AiProxy {
         request_id: &str,
         name: Option<&str>,
     ) -> Result<bool> {
-        let msg = match name.map(str::trim).filter(|s| !s.is_empty()) {
-            None => {
-                "missing model: set the JSON body's model (or x-beyond-model) to a catalog name"
-                    .to_string()
-            }
-            Some(n) => format!("model \"{}\" is not in the catalog", clip_catalog_name(n)),
-        };
+        let msg = catalog_miss_message(name, true);
         Self::reject_message_boxed(session, request_id, 404, "invalid_request_error", msg).await
     }
 
@@ -2489,11 +2501,18 @@ fn sanitize_model(model: String) -> Cow<'static, str> {
 /// provider-routed row's `model` matches nothing. Runs once per billing row, on strings that are
 /// already in hand.
 fn price_model(billed: &str, requested: &str) -> Option<&'static str> {
-    [billed, requested].into_iter().find_map(|m| {
-        route::model_route(m)
-            .or_else(|| strip_snapshot_date(m).and_then(route::model_route))
-            .map(|r| r.model)
-    })
+    [billed, requested]
+        .into_iter()
+        .find_map(|m| price_row(m).map(|r| r.model))
+}
+
+/// The catalog row one model id prices at: as spelled (a catalog name, or any candidate's
+/// provider-specific spelling of it), then with a dated snapshot suffix removed. The one lookup
+/// both [`price_model`] and the managed `/{provider}` refusal ([`RequestCtx::catalog_check`])
+/// make on the requested model, so a managed `/{provider}` request is refused exactly when its
+/// requested model would leave its billing row without a `price_model`.
+fn price_row(m: &str) -> Option<&'static route::ModelRoute> {
+    route::model_route(m).or_else(|| strip_snapshot_date(m).and_then(route::model_route))
 }
 
 /// `m` without a trailing `-YYYY-MM-DD` (OpenAI) or `-YYYYMMDD` (Anthropic) snapshot date.
@@ -3199,6 +3218,30 @@ const TRANSLATE_TOO_LARGE: &str = "request body is too large to translate onto t
 
 fn gateway_error(status: u16, msg: &'static str) -> Box<pingora_core::Error> {
     pingora_core::Error::new(pingora_core::ErrorType::CustomCode(msg, status))
+}
+
+/// The [`gateway_error`] tag for a managed `/{provider}` body whose model names no catalog row
+/// (D267). Never shown as is: `fail_to_proxy` answers it with [`catalog_miss_message`] for the
+/// model the request carried, the catalog walk's own 404.
+const CATALOG_MISS: &str = "model is not in the catalog";
+
+/// The catalog-miss message, for the catalog walk (`reject_catalog_miss`) and for a managed
+/// `/{provider}` body (D267) alike: the model by name (clipped), or that none was sent, and where
+/// the models a managed key can use are listed.
+/// `header`: whether the route reads `x-beyond-model` (a catalog walk does, `/{provider}` does not).
+fn catalog_miss_message(name: Option<&str>, header: bool) -> String {
+    match name.map(str::trim).filter(|s| !s.is_empty()) {
+        None => format!(
+            "missing model: set the JSON body's model{} to a catalog name; GET /v1/models lists \
+             them",
+            if header { " (or x-beyond-model)" } else { "" }
+        ),
+        Some(n) => format!(
+            "model \"{}\" is not in the catalog; a managed key runs catalog models only (GET \
+             /v1/models lists them)",
+            clip_catalog_name(n)
+        ),
+    }
 }
 
 /// The 504 for a request that outlived `request_max_secs` before its response head.
@@ -4927,18 +4970,22 @@ impl ProxyHttp for AiProxy {
         // passthrough), OpenAI dialect only, streaming-capable paths only — so everything else still
         // streams through untouched. Checked on the forwarded path (suffix), so it's prefix-agnostic.
         let inject_eligible = managed && dialect == Dialect::OpenAi && forward_streamable;
-        // A managed `/{provider}/…/responses` body is buffered too, so `background: true` (a
-        // generation the provider runs after the request ends, which no usage tap can meter) is
-        // refused before a byte of it goes upstream (D202). A catalog walk checked its body above.
-        let background_check = managed
+        // Every billable managed `/{provider}/…` body is buffered too, so a model outside the
+        // catalog is refused before a byte of it goes upstream: a managed key runs only what its
+        // billing row can price (D267). So is a `/responses` body's `background: true` (a
+        // generation the provider runs after the request ends, which no usage tap can meter,
+        // D202). The free token counts are left to stream: nothing there bills. A catalog walk
+        // checked its body above.
+        let catalog_check = managed
             && provider_route
-            && forward_path.as_deref().is_some_and(|p| {
-                route::forward_is_responses(p.split_once('?').map_or(p, |(p, _)| p))
-            });
+            && forward_path
+                .as_deref()
+                .and_then(route::forward_endpoint)
+                .is_some_and(|e| e.sub.is_none_or(route::SubResource::billed));
         // That buffer counts against the body budget. A declared large body reserves up front,
         // before the tenant slot and the breaker permit, so a refusal holds neither; a chunked one
         // reserves as it grows (`request_body_filter`).
-        if (inject_eligible || background_check)
+        if (inject_eligible || catalog_check)
             && model_route.is_none()
             && let Some(n) = declared_len.filter(|&n| past_replay_buffer(n))
             && !ctx.held.reserve_body(n)
@@ -5027,7 +5074,7 @@ impl ProxyHttp for AiProxy {
                     // was never incremented. The stored `hit.streaming` is emitted on `ai.usage`.
                     streaming: false,
                     inject_eligible: false,
-                    background_check: false,
+                    catalog_check: false,
                     req_buf: Vec::new(),
                     resp_tail: UsageTail::default(),
                     resp_head: Vec::new(),
@@ -5177,7 +5224,7 @@ impl ProxyHttp for AiProxy {
             resp_model_scanner: peek::ModelScanner::for_response(),
             streaming: false,
             inject_eligible,
-            background_check,
+            catalog_check,
             // Pre-sized below, once the context says whether this request rewrites its body.
             req_buf: Vec::new(),
             // Grown lazily by the response tap (`response_body_filter`), not pre-reserved: a
@@ -5988,7 +6035,9 @@ impl ProxyHttp for AiProxy {
                 // below edits one, but the provider's parser picks its own (usually the last). Refused
                 // rather than guessed, before a body byte goes upstream. Checked on the client's
                 // body, ahead of translation, which re-serializes and would hide it.
-                if rc.auto.is_some() && scan.duplicate_model {
+                // A managed `/{provider}` body is relayed as sent, so the provider serves whichever
+                // copy its parser keeps while the billing row names the first: refused the same way.
+                if (rc.auto.is_some() || rc.catalog_check) && scan.duplicate_model {
                     self.state
                         .metrics
                         .rejection(Rejection::DuplicateModel)
@@ -5999,8 +6048,25 @@ impl ProxyHttp for AiProxy {
                     )
                     .into_down());
                 }
+                // Managed `/{provider}/…` billable call naming no catalog row (D267): its billing
+                // row would carry no `price_model`. The client's id is kept for the error and the
+                // row, then the request ends before a byte of the body goes upstream.
+                if rc.catalog_check && scan.model.as_deref().and_then(price_row).is_none() {
+                    if rc.model.is_empty()
+                        && let Some(m) = scan.model.take()
+                    {
+                        rc.model = sanitize_model(m).into_owned();
+                    }
+                    self.state.metrics.rejection(Rejection::UnknownModel).inc();
+                    return Err(gateway_error(404, CATALOG_MISS).into_down());
+                }
                 // Managed `/{provider}/…/responses` asking for `background: true` (D202).
-                if rc.background_check && requests_background(&buf) {
+                if rc.catalog_check
+                    && rc.forward_path.as_deref().is_some_and(|p| {
+                        route::forward_is_responses(p.split_once('?').map_or(p, |(p, _)| p))
+                    })
+                    && requests_background(&buf)
+                {
                     self.state
                         .metrics
                         .rejection(Rejection::ManagedEndpoint)
@@ -6844,6 +6910,11 @@ impl ProxyHttp for AiProxy {
             }
             (false, status) => status,
         };
+        // A managed `/{provider}` model outside the catalog (D267) names the model, as the catalog
+        // walk's 404 does. The one error message built per request, on a refusal path.
+        let miss = (msg == CATALOG_MISS)
+            .then(|| catalog_miss_message(ctx.rc.as_ref().map(|rc| rc.model.as_str()), false));
+        let msg = miss.as_deref().unwrap_or(msg);
         // Pingora closes the client connection after a proxy error; say so (`connection: close`),
         // as its own error responses do, so a pooled client does not send its next request into a
         // socket about to close.
@@ -7266,7 +7337,12 @@ impl ProxyHttp for AiProxy {
         // the Prometheus metrics above, which is the right tool for non-billing observability.
         // An abandoned `FullBody` attempt is not the request the client got: the attempt that
         // serves writes the one row (and the one capture).
-        if rc.managed && !rc.relay_abandoned && !free {
+        // The gateway's own refusal before any response head (a catalog miss on `/{provider}`, a
+        // duplicate `model`, `background`): no provider had the request, so no row, as for every
+        // other rejection.
+        let refused =
+            cache_hit.is_none() && rc.upstream_status.is_none() && e.is_some_and(gateway_refusal);
+        if rc.managed && !rc.relay_abandoned && !free && !refused {
             // What the client asked for that changes the price (read before the borrows below).
             let requested = requested_knobs(session, rc);
             // Emit BOTH models. `model` is the one the *provider* resolved + billed (echoed in its
@@ -7635,7 +7711,7 @@ mod tests {
             body_bytes_fed: 0,
             upstream_status: None,
             inject_eligible,
-            background_check: false,
+            catalog_check: false,
             req_buf: Vec::new(),
             start: Instant::now(),
             deadline: crate::deadline::NONE,
@@ -8613,6 +8689,23 @@ mod tests {
     }
 
     #[test]
+    fn the_gateways_own_refusal_is_not_giving_up_on_a_delivered_request() {
+        use pingora_core::{Error, ErrorType as T};
+        // A body the gateway withheld and refused: the provider never had it, nothing to bill.
+        assert!(!gave_up_waiting(
+            &gateway_error(404, CATALOG_MISS).into_down()
+        ));
+        assert!(!gave_up_waiting(
+            &Error::new(T::HTTPStatus(400)).into_down()
+        ));
+        // The client going away, and the gateway's read timeout, still are.
+        assert!(gave_up_waiting(
+            &Error::new(T::ConnectionClosed).into_down()
+        ));
+        assert!(gave_up_waiting(&Error::new(T::ReadTimedout).into_up()));
+    }
+
+    #[test]
     fn price_model_resolves_echoed_snapshots_and_vendor_slugs() {
         assert_eq!(price_model("gpt-5-2025-08-07", "gpt-5"), Some("gpt-5"));
         assert_eq!(price_model("gpt-5-2025-08-07", "x"), Some("gpt-5"));
@@ -8627,6 +8720,20 @@ mod tests {
         // The echo names nothing priced, the request does.
         assert_eq!(price_model("unknown", "gpt-5"), Some("gpt-5"));
         assert_eq!(price_model("my-finetune-2025-08-07", "nope"), None);
+        // The managed `/{provider}` refusal (D267) asks exactly this of the requested model: any
+        // candidate's provider spelling counts, as does a dated snapshot; nothing else does.
+        let row = |m| price_row(m).map(|r| r.model);
+        assert_eq!(
+            row("accounts/fireworks/models/gpt-oss-120b"),
+            price_model("", "accounts/fireworks/models/gpt-oss-120b")
+        );
+        assert!(row("accounts/fireworks/models/gpt-oss-120b").is_some());
+        assert_eq!(row("claude-sonnet-4-5-20250929"), Some("claude-sonnet-4-5"));
+        assert_eq!(row("gpt-4o-mini-2024-07-18"), Some("gpt-4o-mini"));
+        for unpriced in ["my-finetune", "ft:gpt-4o:acme", "claude-2.1", "", "unknown"] {
+            assert_eq!(row(unpriced), None, "{unpriced}");
+            assert_eq!(price_model("", unpriced), None, "{unpriced}");
+        }
         // Not a date: left alone.
         assert_eq!(strip_snapshot_date("gpt-4o-mini"), None);
         assert_eq!(strip_snapshot_date("model-12-34"), None);

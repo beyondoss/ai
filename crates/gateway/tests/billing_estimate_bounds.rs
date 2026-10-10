@@ -163,13 +163,13 @@ async fn a_stream_accepted_then_silent_before_its_first_byte_is_billed_an_estima
             .start()
             .await;
         let key = billing_vkey(&sk, u64::from(seed));
-        let headers = if provider == "openai" {
-            bearer(&key)
+        let (headers, model) = if provider == "openai" {
+            (bearer(&key), "gpt-4o-mini")
         } else {
-            anthropic_headers(&key)
+            (anthropic_headers(&key), "claude-haiku-4-5")
         };
         let body = format!(
-            r#"{{"model":"m","max_tokens":80,"stream":true,"messages":[{{"role":"user","content":"{FAULT_PROMPT}"}}]}}"#
+            r#"{{"model":"{model}","max_tokens":80,"stream":true,"messages":[{{"role":"user","content":"{FAULT_PROMPT}"}}]}}"#
         );
         let mut req = test_client()
             .post(format!("{}{path}", gw.url()))
@@ -287,7 +287,7 @@ async fn post_non_stream(gw: &Gateway, key: &str) {
         .header("authorization", format!("Bearer {key}"))
         .header("content-type", "application/json")
         .body(format!(
-            r#"{{"model":"m","max_tokens":80,"messages":[{{"role":"user","content":"{FAULT_PROMPT}"}}]}}"#
+            r#"{{"model":"gpt-4o-mini","max_tokens":80,"messages":[{{"role":"user","content":"{FAULT_PROMPT}"}}]}}"#
         ))
         .send()
         .await

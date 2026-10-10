@@ -642,7 +642,8 @@ async fn agreeing_header_and_body_count_no_mismatch() {
 }
 
 /// Provider-routed traffic keeps the old meaning: the body is untouched, so the body's `model` *is*
-/// what was requested, and no `routed_model` appears at all.
+/// what was requested, and no `routed_model` appears at all. A dated snapshot is no catalog name
+/// (a walk would 404 it) but prices at its row, so a managed key may send it here (D267).
 #[tokio::test]
 async fn provider_routed_requested_model_still_comes_from_the_body() {
     let nats_port = unused_nats_port();
@@ -657,7 +658,7 @@ async fn provider_routed_requested_model_still_comes_from_the_body() {
         .post(format!("{}/openai/v1/chat/completions", gw.url()))
         .header("authorization", format!("Bearer {}", vkey(&sk)))
         .header("content-type", "application/json")
-        .body(r#"{"model":"some-other-model","messages":[{"role":"user","content":"hi"}]}"#)
+        .body(r#"{"model":"gpt-4o-mini-2024-07-18","messages":[{"role":"user","content":"hi"}]}"#)
         .send()
         .await
         .unwrap();
@@ -667,7 +668,7 @@ async fn provider_routed_requested_model_still_comes_from_the_body() {
         .wait_for_log_line(&["ai.usage", r#""provider":"openai""#])
         .await;
     assert!(
-        line.contains(r#""requested_model":"some-other-model""#),
+        line.contains(r#""requested_model":"gpt-4o-mini-2024-07-18""#),
         "a provider-routed body is untouched, so it is what was requested: {line}"
     );
     assert!(
@@ -1270,7 +1271,9 @@ async fn byo_v1_forwards_an_unknown_model() {
     );
 }
 
-/// `/{provider}/…` is the escape hatch: the catalog is not consulted.
+/// `/{provider}/…` is the escape hatch: no catalog walk. The body is relayed as sent, never re-spelled
+/// for a candidate: a managed key's model need only price at a catalog row (D267; a dated snapshot,
+/// which a walk would 404, does), and a BYO key's may be anything.
 #[tokio::test]
 async fn explicit_provider_path_ignores_the_catalog() {
     let nats_port = unused_nats_port();
@@ -1285,7 +1288,7 @@ async fn explicit_provider_path_ignores_the_catalog() {
         .post(format!("{}/openai/v1/chat/completions", gw.url()))
         .header("authorization", format!("Bearer {}", vkey(&sk)))
         .header("content-type", "application/json")
-        .body(r#"{"model":"no-such-model","messages":[{"role":"user","content":"hi"}]}"#)
+        .body(r#"{"model":"gpt-4o-mini-2024-07-18","messages":[{"role":"user","content":"hi"}]}"#)
         .send()
         .await
         .unwrap();
@@ -1296,8 +1299,23 @@ async fn explicit_provider_path_ignores_the_catalog() {
     assert_eq!(cap.path, "/v1/chat/completions");
     let got = String::from_utf8(cap.body).unwrap();
     assert!(
+        got.contains(r#""model":"gpt-4o-mini-2024-07-18""#),
+        "/openai/… must not walk the catalog or re-spell the model: {got}"
+    );
+
+    let resp = test_client()
+        .post(format!("{}/openai/v1/chat/completions", gw.url()))
+        .header("authorization", "Bearer sk-caller-own-key")
+        .header("content-type", "application/json")
+        .body(r#"{"model":"no-such-model","messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let got = String::from_utf8(mock.captured().unwrap().body).unwrap();
+    assert!(
         got.contains(r#""model":"no-such-model""#),
-        "/openai/… must not apply the catalog allowlist: {got}"
+        "a BYO /openai/… request must not apply the catalog allowlist: {got}"
     );
 }
 
