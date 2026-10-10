@@ -56,7 +56,7 @@ async fn anthropic_relay_records_speed_geo_tools_container_and_ids() {
     let status = post(
         format!("{}/anthropic/v1/messages", gw.url()),
         ("x-api-key", billing_vkey(&sk, 150)),
-        r#"{"model":"claude-opus-4-8","max_tokens":64,"speed":"fast","inference_geo":"us","container":"container_011abc","messages":[{"role":"user","content":"hi"}]}"#,
+        r#"{"model":"claude-opus-4-8","max_tokens":64,"speed":"fast","inference_geo":"us","messages":[{"role":"user","content":"hi"}]}"#,
         &[("anthropic-version", "2023-06-01")],
     )
     .await;
@@ -77,7 +77,9 @@ async fn anthropic_relay_records_speed_geo_tools_container_and_ids() {
         "old field kept: {row}"
     );
     assert_eq!(row["container_id"], "container_011abc", "{row}");
-    assert_eq!(row["requested_container"], "container_011abc", "{row}");
+    // A managed request may not ask for a container (code execution bills container-hours the
+    // row cannot see), so the response's is the only one.
+    assert!(row.get("requested_container").is_none(), "{row}");
     assert_eq!(row["upstream_generation_id"], "msg_01fast", "{row}");
     assert_eq!(row["upstream_request_id"], "req_011upstream", "{row}");
     assert_eq!(row["upstream_model"], "claude-opus-4-8", "{row}");
@@ -226,7 +228,7 @@ async fn openrouter_records_cost_host_generation_id_and_routing() {
     let status = post(
         format!("{}/openrouter/api/v1/chat/completions", gw.url()),
         bearer(&sk, 154),
-        r#"{"model":"anthropic/claude-opus-4.8","provider":{"order":["amazon-bedrock"]},"plugins":[{"id":"web"}],"messages":[{"role":"user","content":"hi"}]}"#,
+        r#"{"model":"anthropic/claude-opus-4.8","provider":{"order":["amazon-bedrock"]},"plugins":[{"id":"response-healing"}],"messages":[{"role":"user","content":"hi"}]}"#,
         &[],
     )
     .await;
@@ -248,7 +250,10 @@ async fn openrouter_records_cost_host_generation_id_and_routing() {
         row["requested_provider_routing"], r#"{"order":["amazon-bedrock"]}"#,
         "{row}"
     );
-    assert_eq!(row["requested_plugins"], r#"[{"id":"web"}]"#, "{row}");
+    assert_eq!(
+        row["requested_plugins"], r#"[{"id":"response-healing"}]"#,
+        "{row}"
+    );
     assert_eq!(row["server_tools"], "web_search=1,tool_calls=1", "{row}");
     assert_eq!(row["model"], "anthropic/claude-opus-4.8", "{row}");
 }
@@ -452,4 +457,30 @@ async fn a_cancelled_openrouter_stream_flags_that_the_upstream_may_continue() {
     assert_eq!(row["usage_estimate_excludes"], "cache,reasoning", "{row}");
     assert_eq!(row["upstream_may_continue"], true, "{row}");
     assert_eq!(row["upstream_generation_id"], "chatcmpl-mock", "{row}");
+}
+
+/// `web_search_call` items look the same whichever web search tool ran; the request's
+/// `web_search_preview` tool (priced apart) is what tells them apart.
+/// claim: BIL-23
+/// defect: D268
+#[tokio::test]
+async fn web_search_preview_calls_are_counted_apart() {
+    let body = r#"{"id":"resp_p","object":"response","model":"gpt-5-2025-08-07","output":[{"id":"ws_1","type":"web_search_call","status":"completed","action":{"type":"search","query":"q"}}],"usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15}}"#;
+    let (pubkey, sk) = test_keypair(162);
+    let mock = MockUpstream::start(Mode::Raw(200, "application/json", body)).await;
+    let gw = Gateway::builder(unused_nats_port(), &mock.authority(), &b64(&pubkey))
+        .providers(&["openai"])
+        .start()
+        .await;
+    let status = post(
+        format!("{}/openai/v1/responses", gw.url()),
+        bearer(&sk, 162),
+        r#"{"model":"gpt-5","input":"hi","tools":[{"type":"web_search_preview"}]}"#,
+        &[],
+    )
+    .await;
+    assert_eq!(status, 200);
+    let row = usage_row_of(&gw).await;
+    assert_eq!(row["server_tools"], "web_search_preview=1", "{row}");
+    assert_eq!(row["server_tool_calls"].as_u64(), Some(0), "{row}");
 }

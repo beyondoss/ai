@@ -10,6 +10,8 @@ use arrayvec::ArrayString;
 use serde::Deserialize;
 use tracing_subscriber::filter::{FilterFn, filter_fn};
 
+#[cfg(test)]
+mod charset_tests;
 mod tools;
 mod vendor;
 #[cfg(test)]

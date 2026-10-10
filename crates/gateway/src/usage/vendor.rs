@@ -24,6 +24,9 @@ pub struct ServerTools {
     /// `web_search_call` items (action `search`, or no action seen), xAI `web_search_calls`,
     /// OpenRouter `server_tool_use(_details).web_search_requests`.
     pub web_search: u32,
+    /// OpenAI `web_search_call` items (search actions) when the request offered the
+    /// `web_search_preview` tool, priced apart from `web_search` (the items look the same).
+    pub web_search_preview: u32,
     /// OpenAI `web_search_call` items whose action is `open_page` / `find_in_page` (no fee).
     pub web_search_page: u32,
     /// Anthropic `server_tool_use.web_fetch_requests` (no per-call fee; tokens only).
@@ -59,9 +62,10 @@ pub struct ServerTools {
 
 impl ServerTools {
     /// `(row key, count)` for every kind, in the row's fixed order.
-    pub fn entries(&self) -> [(&'static str, u32); 16] {
+    pub fn entries(&self) -> [(&'static str, u32); 17] {
         [
             ("web_search", self.web_search),
+            ("web_search_preview", self.web_search_preview),
             ("web_search_page", self.web_search_page),
             ("web_fetch", self.web_fetch),
             ("code_execution", self.code_execution),
@@ -109,6 +113,7 @@ impl ServerTools {
         }
         m!(
             web_search,
+            web_search_preview,
             web_search_page,
             web_fetch,
             code_execution,

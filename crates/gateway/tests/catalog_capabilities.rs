@@ -401,13 +401,18 @@ async fn an_openrouter_candidate_is_asked_not_to_compress_the_prompt() {
     let sent: Value = serde_json::from_slice(&openrouter.captured().unwrap().body).unwrap();
     assert_eq!(sent["plugins"][0]["enabled"], false);
 
-    // The client's own plugins are its choice.
+    // The client's own free plugins are its choice, sent as they are. A billed one (web search)
+    // is refused on a managed key: no row could price it (D268).
     let own = json!({"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}],
-                     "plugins": [{"id": "web"}]});
+                     "plugins": [{"id": "response-healing"}]});
     let resp = post(&gw, &key, "/v1/chat/completions", &only("openrouter"), &own).await;
     assert_eq!(resp.status().as_u16(), 200);
     let sent: Value = serde_json::from_slice(&openrouter.captured().unwrap().body).unwrap();
-    assert_eq!(sent["plugins"], json!([{"id": "web"}]));
+    assert_eq!(sent["plugins"], json!([{"id": "response-healing"}]));
+    let web = json!({"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}],
+                     "plugins": [{"id": "web"}]});
+    let resp = post(&gw, &key, "/v1/chat/completions", &only("openrouter"), &web).await;
+    assert_eq!(resp.status().as_u16(), 400);
 
     // OpenAI's body carries no OpenRouter field.
     let resp = post(&gw, &key, "/v1/chat/completions", &only("openai"), &body).await;

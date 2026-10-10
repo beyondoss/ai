@@ -73,7 +73,7 @@ use crate::route::{self, Dialect, Provider};
 use crate::signed_id;
 use crate::state::{GatewayState, RequestId};
 use crate::terminal::TerminalTracker;
-use crate::{control, peek, pin, remedy, translate, usage};
+use crate::{control, peek, pin, remedy, translate, unpriced, usage};
 use arrayvec::{ArrayString, ArrayVec};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -552,6 +552,9 @@ struct BillingTaps {
     /// The vendor's request id header (`request-id`, `x-request-id`, `x-amzn-requestid`): what its
     /// support and logs key on.
     request_id: Option<usage::IdStr>,
+    /// The request offers OpenAI's `web_search_preview` tool: its `web_search_call` items are
+    /// counted as `web_search_preview`, priced apart (see `unpriced::Inspection`).
+    web_search_preview: bool,
 }
 
 /// What a request asked for that changes its price, as the client sent it (the served values come
@@ -678,7 +681,7 @@ fn merge_taps(rc: &mut RequestCtx, usage: &mut usage::Usage) {
         .as_ref()
         .and_then(|k| k.get(1))
         .and_then(usage::host_from);
-    let (hdr_id, tools) = (t.generation_id, t.tools.take());
+    let (hdr_id, tools, preview) = (t.generation_id, t.tools.take(), t.web_search_preview);
     if let Some(id) = hdr_id.or(head_id) {
         usage.upstream.generation_id = Some(id);
     }
@@ -687,7 +690,12 @@ fn merge_taps(rc: &mut RequestCtx, usage: &mut usage::Usage) {
     }
     if let Some(mut t) = tools {
         t.finish();
-        usage.server_tools.merge_max(&t.tools);
+        let mut counted = t.tools;
+        if preview {
+            counted.web_search_preview = counted.web_search;
+            counted.web_search = 0;
+        }
+        usage.server_tools.merge_max(&counted);
         if usage.upstream.container_id.is_none() {
             usage.upstream.container_id = t.container_id;
         }
@@ -5919,7 +5927,7 @@ impl ProxyHttp for AiProxy {
 
     async fn request_body_filter(
         &self,
-        _session: &mut Session,
+        session: &mut Session,
         body: &mut Option<Bytes>,
         end_of_stream: bool,
         ctx: &mut Self::CTX,
@@ -6047,6 +6055,31 @@ impl ProxyHttp for AiProxy {
                         "duplicate root model key",
                     )
                     .into_down());
+                }
+                // A feature billed outside the usage a row can meter (a container, the image
+                // generation tool, an OpenRouter plugin, Anthropic Priority Tier): refused before a
+                // byte of the body goes upstream, so nothing runs unpriced (D268). Read on the
+                // client's body, ahead of any rewrite and of the catalog check (an `:online` model is named
+                // for what it is). Every body buffered here is managed.
+                if rc.managed {
+                    let model = rc
+                        .auto
+                        .as_ref()
+                        .map(|a| a.route.model)
+                        .or(scan.model.as_deref())
+                        .unwrap_or(rc.model.as_str());
+                    let messages = session.req_header().uri.path().ends_with("/messages");
+                    let found = unpriced::inspect(&buf, model, messages);
+                    if let Some(why) = found.refused {
+                        self.state
+                            .metrics
+                            .rejection(Rejection::UnpricedFeature)
+                            .inc();
+                        return Err(gateway_error(400, why).into_down());
+                    }
+                    if found.web_search_preview {
+                        rc.taps.get_or_insert_with(Box::default).web_search_preview = true;
+                    }
                 }
                 // Managed `/{provider}/…` billable call naming no catalog row (D267): its billing
                 // row would carry no `price_model`. The client's id is kept for the error and the
@@ -7601,6 +7634,10 @@ impl ProxyHttp for AiProxy {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "proxy_row_tests.rs"]
+mod row_tests;
 
 #[cfg(test)]
 mod tests {

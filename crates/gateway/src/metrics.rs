@@ -93,12 +93,16 @@ pub enum Rejection {
     /// A request outlived `request_max_secs` and was ended: a 504 before its response head, a cut
     /// stream after.
     RequestDeadline,
+    /// A managed request asked for something a provider bills outside the usage the gateway can
+    /// meter (a container, the image generation tool, an OpenRouter plugin, Anthropic Priority
+    /// Tier: `unpriced::feature`). 400 before any upstream, so nothing runs unpriced.
+    UnpricedFeature,
 }
 
 impl Rejection {
     /// Every variant, in `as_index` order. The array in `Metrics` is built from this, so adding a
     /// variant without adding it here fails the exhaustive `match` in `as_index`.
-    pub(crate) const ALL: [Rejection; 24] = [
+    pub(crate) const ALL: [Rejection; 25] = [
         Rejection::Auth,
         Rejection::DenySpend,
         Rejection::DenyFraud,
@@ -123,6 +127,7 @@ impl Rejection {
         Rejection::IdSigningUnset,
         Rejection::TranslateTooLarge,
         Rejection::RequestDeadline,
+        Rejection::UnpricedFeature,
     ];
 
     /// The `reason=` label value. `RateLimit` keeps the original `"rate_limit"` string so existing
@@ -153,6 +158,7 @@ impl Rejection {
             Rejection::IdSigningUnset => "id_signing_unset",
             Rejection::TranslateTooLarge => "translate_too_large",
             Rejection::RequestDeadline => "request_deadline",
+            Rejection::UnpricedFeature => "unpriced_feature",
         }
     }
 
@@ -182,6 +188,7 @@ impl Rejection {
             Rejection::IdSigningUnset => 21,
             Rejection::TranslateTooLarge => 22,
             Rejection::RequestDeadline => 23,
+            Rejection::UnpricedFeature => 24,
         }
     }
 }

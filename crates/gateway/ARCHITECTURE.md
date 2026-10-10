@@ -1980,24 +1980,25 @@ in-region routing guide.
 | `server_tool_calls` | integer | Kept for existing consumers: billable web searches, equal to `server_tools`' `web_search` (`0` when none).                    |
 | `container_id`      | string  | The code-execution container the turn used (Anthropic `container.id`, OpenAI `code_interpreter_call.container_id`).           |
 
-| Kind               | Counted from                                                                                                                                                                                                                                                    |
-| ------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `web_search`       | Anthropic `usage.server_tool_use.web_search_requests`; OpenAI/xAI Responses `web_search_call` items with action `search` (or no action seen); xAI `server_side_tool_usage_details.web_search_calls`; OpenRouter `server_tool_use(_details).web_search_requests` |
-| `web_search_page`  | OpenAI `web_search_call` items with action `open_page` / `find_in_page` (no per-call fee)                                                                                                                                                                       |
-| `web_fetch`        | Anthropic `server_tool_use.web_fetch_requests` (no per-call fee)                                                                                                                                                                                                |
-| `code_execution`   | Anthropic `server_tool_use.code_execution_requests`; OpenAI `code_interpreter_call` items; xAI `code_interpreter_calls`. Calls, not container sessions                                                                                                          |
-| `file_search`      | OpenAI `file_search_call` items; xAI `file_search_calls`                                                                                                                                                                                                        |
-| `image_generation` | OpenAI `image_generation_call` items; xAI `image_generation_calls`                                                                                                                                                                                              |
-| `computer_use`     | OpenAI `computer_call` items (billed as tokens)                                                                                                                                                                                                                 |
-| `mcp`              | OpenAI `mcp_call` items; xAI `mcp_calls` (token-billed)                                                                                                                                                                                                         |
-| `shell`            | OpenAI `shell_call` / `local_shell_call` items                                                                                                                                                                                                                  |
-| `tool_search`      | OpenAI `tool_search_call` items                                                                                                                                                                                                                                 |
-| `x_search`         | xAI `x_search_calls`                                                                                                                                                                                                                                            |
-| `x_posts`          | xAI `x_posts_fetched` (X search bills per post)                                                                                                                                                                                                                 |
-| `x_users`          | xAI `x_users_fetched` (X search bills per profile)                                                                                                                                                                                                              |
-| `document_search`  | xAI `document_search_calls`                                                                                                                                                                                                                                     |
-| `sources`          | xAI `num_sources_used`                                                                                                                                                                                                                                          |
-| `tool_calls`       | OpenRouter `server_tool_use(_details).tool_calls_executed`: its server tools of every kind (do not add to the others; use `upstream_tool_cost_usd`)                                                                                                             |
+| Kind                 | Counted from                                                                                                                                                                                                                                                    |
+| -------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `web_search`         | Anthropic `usage.server_tool_use.web_search_requests`; OpenAI/xAI Responses `web_search_call` items with action `search` (or no action seen); xAI `server_side_tool_usage_details.web_search_calls`; OpenRouter `server_tool_use(_details).web_search_requests` |
+| `web_search_preview` | OpenAI `web_search_call` items (search actions) when the request offered the `web_search_preview` tool, priced apart from `web_search`; the items look the same, so the request decides                                                                         |
+| `web_search_page`    | OpenAI `web_search_call` items with action `open_page` / `find_in_page` (no per-call fee)                                                                                                                                                                       |
+| `web_fetch`          | Anthropic `server_tool_use.web_fetch_requests` (no per-call fee)                                                                                                                                                                                                |
+| `code_execution`     | Anthropic `server_tool_use.code_execution_requests`; OpenAI `code_interpreter_call` items; xAI `code_interpreter_calls`. Calls, not container sessions                                                                                                          |
+| `file_search`        | OpenAI `file_search_call` items; xAI `file_search_calls`                                                                                                                                                                                                        |
+| `image_generation`   | OpenAI `image_generation_call` items; xAI `image_generation_calls`                                                                                                                                                                                              |
+| `computer_use`       | OpenAI `computer_call` items (billed as tokens)                                                                                                                                                                                                                 |
+| `mcp`                | OpenAI `mcp_call` items; xAI `mcp_calls` (token-billed)                                                                                                                                                                                                         |
+| `shell`              | OpenAI `shell_call` / `local_shell_call` items                                                                                                                                                                                                                  |
+| `tool_search`        | OpenAI `tool_search_call` items                                                                                                                                                                                                                                 |
+| `x_search`           | xAI `x_search_calls`                                                                                                                                                                                                                                            |
+| `x_posts`            | xAI `x_posts_fetched` (X search bills per post)                                                                                                                                                                                                                 |
+| `x_users`            | xAI `x_users_fetched` (X search bills per profile)                                                                                                                                                                                                              |
+| `document_search`    | xAI `document_search_calls`                                                                                                                                                                                                                                     |
+| `sources`            | xAI `num_sources_used`                                                                                                                                                                                                                                          |
+| `tool_calls`         | OpenRouter `server_tool_use(_details).tool_calls_executed`: its server tools of every kind (do not add to the others; use `upstream_tool_cost_usd`)                                                                                                             |
 
 OpenAI's Responses `usage` has no tool counts, so the gateway counts the hosted-tool items itself.
 They come first in the output and a long answer pushes them out of the retained tail, so a managed
@@ -2023,8 +2024,27 @@ Price modifiers the row does not need to record, because they never reach a prov
 key: `anthropic-beta` tokens outside the allowlist (`context-1m-*` long context, `code-execution-*`,
 `mcp-client-*`, `files-api-*`) are dropped; the fast-mode beta is forwarded to direct Anthropic only
 (D266) and its effect is reported as `speed`; batch, background and file endpoints are refused.
-OpenRouter's model variant suffixes (`:online`, `:nitro`, `:floor`, `:free`) are part of
-`requested_model` and `model`, and their price is in `upstream_cost_usd`.
+OpenRouter's model variant suffixes (`:nitro`, `:floor`, `:free`) are part of `requested_model` and
+`model`; they admit endpoints of another class, which `service_tier` reports.
+
+**Refused on a managed key, because no row could price them** (`unpriced::inspect`, D268). Each
+is a 400 (`ai_rejections_total{reason="unpriced_feature"}`) before the provider has the body, and
+writes no row; a BYO key is not checked. Read structurally from the client's body: root members,
+and each `tools` element's own `type`, so a prompt that names a tool cannot trip it.
+
+| Asked for                                                                                                                                               | Why the row cannot price it                                   |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------- |
+| OpenAI `code_interpreter` or hosted `shell` tool                                                                                                        | containers bill per session minute by memory, unreported      |
+| `image_generation` tool (OpenAI, xAI)                                                                                                                   | image tokens are outside `usage`                              |
+| a `web_search*` tool on gpt-4o-mini or gpt-4.1-mini                                                                                                     | each call bills a fixed 8,000-token content block, unmeasured |
+| Anthropic `code_execution_*` tool, or a root `container`                                                                                                | container-hours, unreported                                   |
+| Anthropic `advisor_*` tool                                                                                                                              | the advisor's tokens are outside top-level `usage`            |
+| Groq `browser_search` tool                                                                                                                              | no published fee                                              |
+| OpenRouter `plugins` other than `context-compression` and `response-healing`, a `:online` model, `web_search_options`, the `openrouter:web_search` tool | the search engine and result count are unreported             |
+| Messages `service_tier: "priority"`                                                                                                                     | Anthropic Priority Tier is priced by contract                 |
+
+So on a managed row `requested_container` is always absent and `requested_plugins` names only free
+plugins; both are kept for the day either is priced.
 
 **The upstream's own ids and price**
 
@@ -3037,6 +3057,10 @@ to serve.
   provider spelling, with or without a dated snapshot suffix), so no managed row is unpriced.
   Unknown or missing → the same 404, before the provider has the body; two root `model` keys → 400.
   The free token counts are not checked. BYO keys are not checked.
+- Priced features only on a managed billable call, catalog walk or `/{provider}` (D268): a tool,
+  plugin or tier a provider bills outside the usage a row can meter (a container, the image
+  generation tool, an OpenRouter plugin or `:online` model, Anthropic Priority Tier; the list is in
+  "The `ai.usage` row") → 400 before the provider has the body. BYO keys are not checked.
 - Request body size ≤ `MAX_REQUEST_BODY` (declared `Content-Length` + streaming running total)
 - One root `model` key on a catalog walk. The walk routes on one and rewrites one, while most JSON
   parsers take the _last_, so `{"model":"cheap",…,"model":"gpt-5.5-pro"}` would route as the cheap
@@ -3370,7 +3394,7 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
 | Metric                                | Type      | Labels               | What It Measures                                                                                                                                                                                                           |
 | ------------------------------------- | --------- | -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `ai_requests_total`                   | Counter   | —                    | Every client request received, rejected ones included (a `FullBody` re-run is not counted again)                                                                                                                           |
-| `ai_rejections_total`                 | Counter   | `reason`             | Rejected requests by cause (auth, deny_spend, quota, allowance_unavailable, deny_fraud, rate_limit, tenant_concurrency, managed_endpoint, duplicate_model, modality, request_deadline, etc.)                               |
+| `ai_rejections_total`                 | Counter   | `reason`             | Rejected requests by cause (auth, deny_spend, quota, allowance_unavailable, deny_fraud, rate_limit, tenant_concurrency, managed_endpoint, duplicate_model, modality, request_deadline, unpriced_feature, etc.)             |
 | `ai_upstream_responses_total`         | Counter   | `provider`, `status` | Upstream responses by provider and status class                                                                                                                                                                            |
 | `ai_tokens_total`                     | Counter   | `kind`               | input / output / cache_read / cache_write token counts                                                                                                                                                                     |
 | `ai_ttft_seconds`                     | Histogram | `provider`           | Time to first token (50ms–30s buckets)                                                                                                                                                                                     |
