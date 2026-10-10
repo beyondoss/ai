@@ -386,8 +386,13 @@ impl Report {
                 s.push_str(
                     "`RATE_VERSION` is bumped (`rates-sync rate-version`). A golden vector in \
                      `verify/pricing_vectors.json` that priced a moved rate fails CI until it is \
-                     recomputed. A human merges this PR.\n",
+                     recomputed. ",
                 );
+                s.push_str(if self.class == Class::Routine {
+                    "This PR merges itself once `Check` is green.\n"
+                } else {
+                    "A human merges this PR.\n"
+                });
             }
         }
         if !sources_changed.is_empty() {
