@@ -302,61 +302,21 @@ jobs:
       # The authority on "no test seam ships": the release binaries themselves, scanned for the
       # seam prefix (a grep over what was just built; seconds).
       - run: mise check:release-seams
-  # Mutation testing on what this PR changed: every line the diff touches in the gateway and the
-  # catalog is mutated, and a mutant the tests don't catch fails the job. Cost scales with the diff
-  # (each mutant is a rebuild plus a test run), so the mutants are split across 8 runners: a typical
-  # PR finishes in minutes, a sweeping one (~1,100 mutants) in about two hours, and nothing is
-  # skipped. The full mutation run over the whole files is weekly (deep.yml).
-  mutants-diff:
-    name: mutants (changed lines, ${{ matrix.shard }}/8)
-    runs-on: ubuntu-latest
-    timeout-minutes: 240
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: [0, 1, 2, 3, 4, 5, 6, 7]
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-      - uses: jdx/mise-action@v4
-      - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: nextest,cargo-mutants
-      - name: mutate the lines this PR changed
-        # No debug info: mutants only need pass/fail, and each mutant rebuilds the test binaries.
-        env:
-          CARGO_PROFILE_DEV_DEBUG: 0
-          CARGO_PROFILE_TEST_DEBUG: 0
-        run: |
-          git diff "origin/${{ github.base_ref }}...HEAD" -- crates/gateway/src crates/providers/src > "$RUNNER_TEMP/pr.diff"
-          if [ ! -s "$RUNNER_TEMP/pr.diff" ]; then echo "no gateway or catalog source changes"; exit 0; fi
-          # Exit 3 means only timeouts: the mutant made the suite hang or overrun, i.e. the tests did
-          # not pass with it, so it is caught. Missed mutants (2) and a failed baseline (4) still fail.
-          rc=0
-          cargo mutants --in-diff "$RUNNER_TEMP/pr.diff" -p beyond-ai -p beyond-ai-providers \
-            --shard ${{ matrix.shard }}/8 --test-tool nextest --jobs 2 --timeout-multiplier 2 \
-            --no-shuffle </dev/null || rc=$?
-          if [ "$rc" = 3 ]; then echo "timeouts only (counted as caught):"; cat mutants.out/timeout.txt; exit 0; fi
-          exit "$rc"
-      - name: missed mutants
-        if: failure()
-        run: cat mutants.out/missed.txt 2>/dev/null || true
+  # Mutation testing is not a PR check: a missed mutant is a test gap, not a bug, and the per-PR
+  # run added about an hour to every gateway change. The full mutation sweep is weekly (deep.yml).
   # Single required status check. Branch protection can require just `Check`; it stays green only if
   # every parallel job above did. Cheap (no build), and keeps the required-check name stable.
   Check:
     name: Check
     runs-on: ubuntu-latest
-    needs: [fmt, clippy, test, gateway-stress, build, mutants-diff]
+    needs: [fmt, clippy, test, gateway-stress, build]
     if: always()
     steps:
       - name: Gate on all checks
         run: |
-          echo "fmt=${{ needs.fmt.result }} clippy=${{ needs.clippy.result }} test=${{ needs.test.result }} gateway-stress=${{ needs.gateway-stress.result }} build=${{ needs.build.result }} mutants-diff=${{ needs.mutants-diff.result }}"
+          echo "fmt=${{ needs.fmt.result }} clippy=${{ needs.clippy.result }} test=${{ needs.test.result }} gateway-stress=${{ needs.gateway-stress.result }} build=${{ needs.build.result }}"
           [ "${{ needs.fmt.result }}" = "success" ] \
             && [ "${{ needs.clippy.result }}" = "success" ] \
             && [ "${{ needs.test.result }}" = "success" ] \
             && [ "${{ needs.gateway-stress.result }}" = "success" ] \
-            && [ "${{ needs.build.result }}" = "success" ] \
-            && [ "${{ needs.mutants-diff.result }}" = "success" ]
+            && [ "${{ needs.build.result }}" = "success" ]
