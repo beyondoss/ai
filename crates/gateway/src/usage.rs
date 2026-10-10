@@ -55,8 +55,8 @@ pub struct Usage {
     /// subset of `cache_write_tokens`, priced at 2× input where the 5-minute ones are 1.25×.
     pub cache_write_1h_tokens: u64,
     /// Cache writes caused by breakpoints the gateway added (the client sent no `cache_control`).
-    /// Already folded into `input_tokens` and absent from `cache_write_tokens`: the gateway chose to
-    /// cache, so they bill at the input rate. Kept so the row reconciles against the provider's
+    /// Already folded into `input_tokens` and absent from `cache_write_tokens`. The pricer bills them
+    /// as the 5-minute writes the vendor charges (pass-through). Kept so the row reconciles against the provider's
     /// usage, which reports them as cache writes. See [`Usage::bill_gateway_cache_writes`].
     pub gateway_cache_write_tokens: u64,
     /// Server-side tool calls the provider ran and prices per call (Anthropic
@@ -93,11 +93,11 @@ impl Usage {
         }
     }
 
-    /// Bill this request's cache writes as input: the gateway added the breakpoints that caused
+    /// Record this request's cache writes as the gateway's own: it added the breakpoints that caused
     /// them (`translate::request_with_tools`), so they are its optimization, not the client's
     /// request. `wire` is the convention `input_tokens` follows: Anthropic's excludes cache writes,
     /// so they are added; OpenAI's (OpenRouter's) already includes them. Either way the row's
-    /// whole prompt is unchanged and a pricer charges the writes at the input rate.
+    /// whole prompt is unchanged, and the pricer bills the writes as the 5-minute writes they are.
     pub fn bill_gateway_cache_writes(&mut self, wire: Dialect) {
         let writes = self.cache_write_tokens;
         if writes == 0 {

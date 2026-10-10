@@ -7565,7 +7565,7 @@ impl ProxyHttp for AiProxy {
                 // subset of `cache_write_tokens`, not additional to them.
                 cache_write_1h_tokens = usage.cache_write_1h_tokens,
                 // Cache writes from breakpoints the gateway added, already in `input_tokens` and
-                // not in `cache_write_tokens` (the gateway chose to cache, so they bill as input).
+                // not in `cache_write_tokens` (the pricer bills them as the 5-minute writes the vendor charges).
                 // For reconciling against the provider's usage, which calls them cache writes.
                 gateway_cache_write_tokens = usage.gateway_cache_write_tokens,
                 server_tool_calls = usage.server_tool_calls,

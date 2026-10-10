@@ -3526,7 +3526,7 @@ impl Usage {
     }
 
     /// When `on`, cache writes become uncached input: the gateway added the breakpoints that caused
-    /// them, and bills them at the input rate (see [`request_with_tools`]). The whole prompt is
+    /// them, and records them as `gateway_cache_write_tokens` (see [`request_with_tools`]). The whole prompt is
     /// unchanged; only the cache-write share moves.
     fn writes_as_input(mut self, on: bool) -> Self {
         if on {

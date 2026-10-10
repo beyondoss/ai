@@ -1964,10 +1964,11 @@ note = "Neither candidate enforces the schema: the card drops structured_outputs
 # - `note`: what the source said where it needed reading (a conflict between two vendor pages,
 #   a promotion, a scope).
 #
-# `[[pricing]]`: one per catalog row. `customer` names the card the customer pays (`list`: the
-# catalog's ListPrice alone, no other dimension); `cost` maps each candidate provider to its card:
-# `customer` (the same card), a `[[card]]` name, `openrouter:{slug}` (an `[[openrouter]]` entry),
-# or `unverified: {reason}` (the pricer refuses every row that provider serves).
+# `[[pricing]]`: one per catalog row. `list_card` names the primary vendor's published card
+# (`list`: the catalog's ListPrice alone, no other dimension); `cost` maps each candidate provider
+# to the card it bills from: `list` (the list card: the row's own vendor), a `[[card]]` name,
+# `openrouter:{slug}` (an `[[openrouter]]` entry), or `unverified: {reason}` (the pricer refuses
+# every row that provider serves). Pricing is pass-through: a row's price is its cost.
 #
 # `[[openrouter]]`: one model's endpoints as `GET /api/v1/models/{slug}/endpoints` lists them
 # (prices per token there, per million here). Each endpoint is a host plus a region or tier
@@ -2949,422 +2950,422 @@ standard = { input = "0.02", output = "0", cache_read = "0.02", cache_write = "0
 
 [[pricing]]
 model = "claude-fable-5"
-customer = "anthropic:claude-fable-5"
-cost = { anthropic = "customer", openrouter = "openrouter:anthropic/claude-fable-5" }
+list_card = "anthropic:claude-fable-5"
+cost = { anthropic = "list", openrouter = "openrouter:anthropic/claude-fable-5" }
 
 [[pricing]]
 model = "claude-fable-5-1"
-customer = "anthropic:claude-fable-5-1"
-cost = { anthropic = "customer", openrouter = "openrouter:anthropic/claude-fable-5.1" }
+list_card = "anthropic:claude-fable-5-1"
+cost = { anthropic = "list", openrouter = "openrouter:anthropic/claude-fable-5.1" }
 
 [[pricing]]
 model = "claude-haiku-4-5"
-customer = "anthropic:claude-haiku-4-5"
-cost = { anthropic = "customer", bedrock = "bedrock:claude-haiku-4-5", openrouter = "openrouter:anthropic/claude-haiku-4.5" }
+list_card = "anthropic:claude-haiku-4-5"
+cost = { anthropic = "list", bedrock = "bedrock:claude-haiku-4-5", openrouter = "openrouter:anthropic/claude-haiku-4.5" }
 
 [[pricing]]
 model = "claude-opus-4-5"
-customer = "anthropic:claude-opus-4-5"
-cost = { anthropic = "customer", openrouter = "openrouter:anthropic/claude-opus-4.5" }
+list_card = "anthropic:claude-opus-4-5"
+cost = { anthropic = "list", openrouter = "openrouter:anthropic/claude-opus-4.5" }
 
 [[pricing]]
 model = "claude-opus-4-6"
-customer = "anthropic:claude-opus-4-6"
-cost = { anthropic = "customer", openrouter = "openrouter:anthropic/claude-opus-4.6" }
+list_card = "anthropic:claude-opus-4-6"
+cost = { anthropic = "list", openrouter = "openrouter:anthropic/claude-opus-4.6" }
 
 [[pricing]]
 model = "claude-opus-4-7"
-customer = "anthropic:claude-opus-4-7"
-cost = { anthropic = "customer", openrouter = "openrouter:anthropic/claude-opus-4.7" }
+list_card = "anthropic:claude-opus-4-7"
+cost = { anthropic = "list", openrouter = "openrouter:anthropic/claude-opus-4.7" }
 
 [[pricing]]
 model = "claude-opus-4-8"
-customer = "anthropic:claude-opus-4-8"
-cost = { anthropic = "customer", bedrock = "bedrock:claude-opus-4-8", openrouter = "openrouter:anthropic/claude-opus-4.8" }
+list_card = "anthropic:claude-opus-4-8"
+cost = { anthropic = "list", bedrock = "bedrock:claude-opus-4-8", openrouter = "openrouter:anthropic/claude-opus-4.8" }
 
 [[pricing]]
 model = "claude-opus-5"
-customer = "anthropic:claude-opus-5"
-cost = { anthropic = "customer", openrouter = "openrouter:anthropic/claude-opus-5" }
+list_card = "anthropic:claude-opus-5"
+cost = { anthropic = "list", openrouter = "openrouter:anthropic/claude-opus-5" }
 
 [[pricing]]
 model = "claude-opus-5-5"
-customer = "anthropic:claude-opus-5-5"
-cost = { anthropic = "customer", openrouter = "openrouter:anthropic/claude-opus-5.5" }
+list_card = "anthropic:claude-opus-5-5"
+cost = { anthropic = "list", openrouter = "openrouter:anthropic/claude-opus-5.5" }
 
 [[pricing]]
 model = "claude-sonnet-4-5"
-customer = "anthropic:claude-sonnet-4-5"
-cost = { anthropic = "customer", openrouter = "openrouter:anthropic/claude-sonnet-4.5" }
+list_card = "anthropic:claude-sonnet-4-5"
+cost = { anthropic = "list", openrouter = "openrouter:anthropic/claude-sonnet-4.5" }
 
 [[pricing]]
 model = "claude-sonnet-4-6"
-customer = "anthropic:claude-sonnet-4-6"
-cost = { anthropic = "customer", openrouter = "openrouter:anthropic/claude-sonnet-4.6" }
+list_card = "anthropic:claude-sonnet-4-6"
+cost = { anthropic = "list", openrouter = "openrouter:anthropic/claude-sonnet-4.6" }
 
 [[pricing]]
 model = "claude-sonnet-5"
-customer = "anthropic:claude-sonnet-5"
-cost = { anthropic = "customer", openrouter = "openrouter:anthropic/claude-sonnet-5" }
+list_card = "anthropic:claude-sonnet-5"
+cost = { anthropic = "list", openrouter = "openrouter:anthropic/claude-sonnet-5" }
 
 [[pricing]]
 model = "claude-sonnet-5-5"
-customer = "anthropic:claude-sonnet-5-5"
-cost = { anthropic = "customer", openrouter = "openrouter:anthropic/claude-sonnet-5.5" }
+list_card = "anthropic:claude-sonnet-5-5"
+cost = { anthropic = "list", openrouter = "openrouter:anthropic/claude-sonnet-5.5" }
 
 [[pricing]]
 model = "deepseek-flash"
-customer = "deepseek:deepseek-flash"
-cost = { deepseek = "customer", together = "together:deepseek-ai/DeepSeek-V4.1-Flash", openrouter = "openrouter:deepseek/deepseek-v4.1-flash" }
+list_card = "deepseek:deepseek-flash"
+cost = { deepseek = "list", together = "together:deepseek-ai/DeepSeek-V4.1-Flash", openrouter = "openrouter:deepseek/deepseek-v4.1-flash" }
 
 [[pricing]]
 model = "deepseek-v4-pro"
-customer = "deepseek:deepseek-v4-pro"
-cost = { deepseek = "customer", together = "together:deepseek-ai/DeepSeek-V4-Pro-0813", openrouter = "openrouter:deepseek/deepseek-v4-pro-0813" }
+list_card = "deepseek:deepseek-v4-pro"
+cost = { deepseek = "list", together = "together:deepseek-ai/DeepSeek-V4-Pro-0813", openrouter = "openrouter:deepseek/deepseek-v4-pro-0813" }
 
 [[pricing]]
 model = "google/gemma-4-31b-it"
-customer = "list"
+list_card = "list"
 cost = { openrouter = "openrouter:google/gemma-4-31b-it" }
 
 [[pricing]]
 model = "gpt-4.1"
-customer = "openai:gpt-4.1"
-cost = { openai = "customer", openrouter = "openrouter:openai/gpt-4.1" }
+list_card = "openai:gpt-4.1"
+cost = { openai = "list", openrouter = "openrouter:openai/gpt-4.1" }
 
 [[pricing]]
 model = "gpt-4.1-mini"
-customer = "openai:gpt-4.1-mini"
-cost = { openai = "customer", openrouter = "openrouter:openai/gpt-4.1-mini" }
+list_card = "openai:gpt-4.1-mini"
+cost = { openai = "list", openrouter = "openrouter:openai/gpt-4.1-mini" }
 
 [[pricing]]
 model = "gpt-4o"
-customer = "openai:gpt-4o"
-cost = { openai = "customer", openrouter = "openrouter:openai/gpt-4o" }
+list_card = "openai:gpt-4o"
+cost = { openai = "list", openrouter = "openrouter:openai/gpt-4o" }
 
 [[pricing]]
 model = "gpt-4o-mini"
-customer = "openai:gpt-4o-mini"
-cost = { openai = "customer", openrouter = "openrouter:openai/gpt-4o-mini" }
+list_card = "openai:gpt-4o-mini"
+cost = { openai = "list", openrouter = "openrouter:openai/gpt-4o-mini" }
 
 [[pricing]]
 model = "gpt-5"
-customer = "openai:gpt-5"
-cost = { openai = "customer", openrouter = "openrouter:openai/gpt-5" }
+list_card = "openai:gpt-5"
+cost = { openai = "list", openrouter = "openrouter:openai/gpt-5" }
 
 [[pricing]]
 model = "gpt-5-mini"
-customer = "openai:gpt-5-mini"
-cost = { openai = "customer", openrouter = "openrouter:openai/gpt-5-mini" }
+list_card = "openai:gpt-5-mini"
+cost = { openai = "list", openrouter = "openrouter:openai/gpt-5-mini" }
 
 [[pricing]]
 model = "gpt-5-nano"
-customer = "openai:gpt-5-nano"
-cost = { openai = "customer", openrouter = "openrouter:openai/gpt-5-nano" }
+list_card = "openai:gpt-5-nano"
+cost = { openai = "list", openrouter = "openrouter:openai/gpt-5-nano" }
 
 [[pricing]]
 model = "gpt-5-pro"
-customer = "openai:gpt-5-pro"
-cost = { openai = "customer", openrouter = "openrouter:openai/gpt-5-pro" }
+list_card = "openai:gpt-5-pro"
+cost = { openai = "list", openrouter = "openrouter:openai/gpt-5-pro" }
 
 [[pricing]]
 model = "gpt-5.1"
-customer = "openai:gpt-5.1"
-cost = { openai = "customer", openrouter = "openrouter:openai/gpt-5.1" }
+list_card = "openai:gpt-5.1"
+cost = { openai = "list", openrouter = "openrouter:openai/gpt-5.1" }
 
 [[pricing]]
 model = "gpt-5.2"
-customer = "openai:gpt-5.2"
-cost = { openai = "customer", openrouter = "openrouter:openai/gpt-5.2" }
+list_card = "openai:gpt-5.2"
+cost = { openai = "list", openrouter = "openrouter:openai/gpt-5.2" }
 
 [[pricing]]
 model = "gpt-5.2-pro"
-customer = "openai:gpt-5.2-pro"
-cost = { openai = "customer", openrouter = "openrouter:openai/gpt-5.2-pro" }
+list_card = "openai:gpt-5.2-pro"
+cost = { openai = "list", openrouter = "openrouter:openai/gpt-5.2-pro" }
 
 [[pricing]]
 model = "gpt-5.3-codex"
-customer = "openai:gpt-5.3-codex"
-cost = { openai = "customer", openrouter = "openrouter:openai/gpt-5.3-codex" }
+list_card = "openai:gpt-5.3-codex"
+cost = { openai = "list", openrouter = "openrouter:openai/gpt-5.3-codex" }
 
 [[pricing]]
 model = "gpt-5.4"
-customer = "openai:gpt-5.4"
-cost = { openai = "customer", openrouter = "openrouter:openai/gpt-5.4" }
+list_card = "openai:gpt-5.4"
+cost = { openai = "list", openrouter = "openrouter:openai/gpt-5.4" }
 
 [[pricing]]
 model = "gpt-5.4-mini"
-customer = "openai:gpt-5.4-mini"
-cost = { openai = "customer", openrouter = "openrouter:openai/gpt-5.4-mini" }
+list_card = "openai:gpt-5.4-mini"
+cost = { openai = "list", openrouter = "openrouter:openai/gpt-5.4-mini" }
 
 [[pricing]]
 model = "gpt-5.4-nano"
-customer = "openai:gpt-5.4-nano"
-cost = { openai = "customer", openrouter = "openrouter:openai/gpt-5.4-nano" }
+list_card = "openai:gpt-5.4-nano"
+cost = { openai = "list", openrouter = "openrouter:openai/gpt-5.4-nano" }
 
 [[pricing]]
 model = "gpt-5.4-pro"
-customer = "openai:gpt-5.4-pro"
-cost = { openai = "customer", openrouter = "openrouter:openai/gpt-5.4-pro" }
+list_card = "openai:gpt-5.4-pro"
+cost = { openai = "list", openrouter = "openrouter:openai/gpt-5.4-pro" }
 
 [[pricing]]
 model = "gpt-5.5"
-customer = "openai:gpt-5.5"
-cost = { openai = "customer", openrouter = "openrouter:openai/gpt-5.5" }
+list_card = "openai:gpt-5.5"
+cost = { openai = "list", openrouter = "openrouter:openai/gpt-5.5" }
 
 [[pricing]]
 model = "gpt-5.5-pro"
-customer = "openai:gpt-5.5-pro"
-cost = { openai = "customer", openrouter = "openrouter:openai/gpt-5.5-pro" }
+list_card = "openai:gpt-5.5-pro"
+cost = { openai = "list", openrouter = "openrouter:openai/gpt-5.5-pro" }
 
 [[pricing]]
 model = "gpt-5.6-luna"
-customer = "openai:gpt-5.6-luna"
-cost = { openai = "customer", openrouter = "openrouter:openai/gpt-5.6-luna" }
+list_card = "openai:gpt-5.6-luna"
+cost = { openai = "list", openrouter = "openrouter:openai/gpt-5.6-luna" }
 
 [[pricing]]
 model = "gpt-5.6-luna-pro"
-customer = "openai:gpt-5.6-luna"
+list_card = "openai:gpt-5.6-luna"
 cost = { openrouter = "openrouter:openai/gpt-5.6-luna-pro" }
 
 [[pricing]]
 model = "gpt-5.6-sol"
-customer = "openai:gpt-5.6-sol"
-cost = { openai = "customer", openrouter = "openrouter:openai/gpt-5.6-sol" }
+list_card = "openai:gpt-5.6-sol"
+cost = { openai = "list", openrouter = "openrouter:openai/gpt-5.6-sol" }
 
 [[pricing]]
 model = "gpt-5.6-sol-pro"
-customer = "openai:gpt-5.6-sol"
+list_card = "openai:gpt-5.6-sol"
 cost = { openrouter = "openrouter:openai/gpt-5.6-sol-pro" }
 
 [[pricing]]
 model = "gpt-5.6-terra"
-customer = "openai:gpt-5.6-terra"
-cost = { openai = "customer", openrouter = "openrouter:openai/gpt-5.6-terra" }
+list_card = "openai:gpt-5.6-terra"
+cost = { openai = "list", openrouter = "openrouter:openai/gpt-5.6-terra" }
 
 [[pricing]]
 model = "gpt-5.6-terra-pro"
-customer = "openai:gpt-5.6-terra"
+list_card = "openai:gpt-5.6-terra"
 cost = { openrouter = "openrouter:openai/gpt-5.6-terra-pro" }
 
 [[pricing]]
 model = "gpt-6-astra"
-customer = "openai:gpt-6-astra"
-cost = { openai = "customer", openrouter = "openrouter:openai/gpt-6-astra" }
+list_card = "openai:gpt-6-astra"
+cost = { openai = "list", openrouter = "openrouter:openai/gpt-6-astra" }
 
 [[pricing]]
 model = "gpt-6-astra-pro"
-customer = "openai:gpt-6-astra"
+list_card = "openai:gpt-6-astra"
 cost = { openrouter = "openrouter:openai/gpt-6-astra-pro" }
 
 [[pricing]]
 model = "gpt-6-luna"
-customer = "openai:gpt-6-luna"
-cost = { openai = "customer", openrouter = "openrouter:openai/gpt-6-luna" }
+list_card = "openai:gpt-6-luna"
+cost = { openai = "list", openrouter = "openrouter:openai/gpt-6-luna" }
 
 [[pricing]]
 model = "gpt-6-luna-pro"
-customer = "openai:gpt-6-luna"
+list_card = "openai:gpt-6-luna"
 cost = { openrouter = "openrouter:openai/gpt-6-luna-pro" }
 
 [[pricing]]
 model = "gpt-6-sol"
-customer = "openai:gpt-6-sol"
-cost = { openai = "customer", openrouter = "openrouter:openai/gpt-6-sol" }
+list_card = "openai:gpt-6-sol"
+cost = { openai = "list", openrouter = "openrouter:openai/gpt-6-sol" }
 
 [[pricing]]
 model = "gpt-6-sol-pro"
-customer = "openai:gpt-6-sol"
+list_card = "openai:gpt-6-sol"
 cost = { openrouter = "openrouter:openai/gpt-6-sol-pro" }
 
 [[pricing]]
 model = "gpt-6.1-sol"
-customer = "openai:gpt-6.1-sol"
-cost = { openai = "customer", openrouter = "openrouter:openai/gpt-6.1-sol" }
+list_card = "openai:gpt-6.1-sol"
+cost = { openai = "list", openrouter = "openrouter:openai/gpt-6.1-sol" }
 
 [[pricing]]
 model = "gpt-6.1-sol-pro"
-customer = "openai:gpt-6.1-sol"
+list_card = "openai:gpt-6.1-sol"
 cost = { openrouter = "openrouter:openai/gpt-6.1-sol-pro" }
 
 [[pricing]]
 model = "grok-4.20"
-customer = "xai:grok-4.20"
-cost = { xai = "customer", openrouter = "openrouter:x-ai/grok-4.20" }
+list_card = "xai:grok-4.20"
+cost = { xai = "list", openrouter = "openrouter:x-ai/grok-4.20" }
 
 [[pricing]]
 model = "grok-4.20-multi-agent"
-customer = "xai:grok-4.20-multi-agent"
-cost = { xai = "customer", openrouter = "openrouter:x-ai/grok-4.20-multi-agent" }
+list_card = "xai:grok-4.20-multi-agent"
+cost = { xai = "list", openrouter = "openrouter:x-ai/grok-4.20-multi-agent" }
 
 [[pricing]]
 model = "grok-4.3"
-customer = "xai:grok-4.3"
-cost = { xai = "customer", openrouter = "openrouter:x-ai/grok-4.3" }
+list_card = "xai:grok-4.3"
+cost = { xai = "list", openrouter = "openrouter:x-ai/grok-4.3" }
 
 [[pricing]]
 model = "grok-4.5"
-customer = "xai:grok-4.5"
-cost = { xai = "customer", openrouter = "openrouter:x-ai/grok-4.5" }
+list_card = "xai:grok-4.5"
+cost = { xai = "list", openrouter = "openrouter:x-ai/grok-4.5" }
 
 [[pricing]]
 model = "grok-4.6"
-customer = "xai:grok-4.6"
-cost = { xai = "customer", openrouter = "openrouter:x-ai/grok-4.6" }
+list_card = "xai:grok-4.6"
+cost = { xai = "list", openrouter = "openrouter:x-ai/grok-4.6" }
 
 [[pricing]]
 model = "grok-4.7"
-customer = "xai:grok-4.7"
-cost = { xai = "customer", openrouter = "openrouter:x-ai/grok-4.7" }
+list_card = "xai:grok-4.7"
+cost = { xai = "list", openrouter = "openrouter:x-ai/grok-4.7" }
 
 [[pricing]]
 model = "grok-build-0.1"
-customer = "xai:grok-build-0.1"
-cost = { xai = "customer", openrouter = "openrouter:x-ai/grok-build-0.1" }
+list_card = "xai:grok-build-0.1"
+cost = { xai = "list", openrouter = "openrouter:x-ai/grok-build-0.1" }
 
 [[pricing]]
 model = "llama-3.1-8b-instant"
-customer = "list"
+list_card = "list"
 cost = { openrouter = "openrouter:meta-llama/llama-3.1-8b-instruct" }
 
 [[pricing]]
 model = "llama-3.3-70b-versatile"
-customer = "list"
+list_card = "list"
 cost = { together = "together:meta-llama/Llama-3.3-70B-Instruct-Turbo", openrouter = "openrouter:meta-llama/llama-3.3-70b-instruct" }
 
 [[pricing]]
 model = "meta-llama/llama-4-maverick"
-customer = "list"
+list_card = "list"
 cost = { openrouter = "openrouter:meta-llama/llama-4-maverick" }
 
 [[pricing]]
 model = "meta-llama/llama-4-scout"
-customer = "list"
+list_card = "list"
 cost = { openrouter = "openrouter:meta-llama/llama-4-scout" }
 
 [[pricing]]
 model = "meta/muse-glimmer-30b"
-customer = "list"
+list_card = "list"
 cost = { together = "together:meta-models/Muse-Glimmer-30B", openrouter = "openrouter:meta/muse-glimmer-30b" }
 
 [[pricing]]
 model = "minimax/minimax-m3"
-customer = "list"
+list_card = "list"
 cost = { together = "together:MiniMaxAI/MiniMax-M3", fireworks = "fireworks:accounts/fireworks/models/minimax-m3", openrouter = "openrouter:minimax/minimax-m3" }
 
 [[pricing]]
 model = "moonshotai/kimi-k2.6"
-customer = "list"
+list_card = "list"
 cost = { openrouter = "openrouter:moonshotai/kimi-k2.6" }
 
 [[pricing]]
 model = "moonshotai/kimi-k2.7-code"
-customer = "list"
+list_card = "list"
 cost = { openrouter = "openrouter:moonshotai/kimi-k2.7-code" }
 
 [[pricing]]
 model = "moonshotai/kimi-k3"
-customer = "list"
+list_card = "list"
 cost = { together = "together:moonshotai/Kimi-K3", fireworks = "fireworks:accounts/fireworks/models/kimi-k3", openrouter = "openrouter:moonshotai/kimi-k3" }
 
 [[pricing]]
 model = "o3"
-customer = "openai:o3"
-cost = { openai = "customer", openrouter = "openrouter:openai/o3" }
+list_card = "openai:o3"
+cost = { openai = "list", openrouter = "openrouter:openai/o3" }
 
 [[pricing]]
 model = "o3-pro"
-customer = "openai:o3-pro"
+list_card = "openai:o3-pro"
 cost = { openrouter = "openrouter:openai/o3-pro" }
 
 [[pricing]]
 model = "openai/gpt-oss-120b"
-customer = "groq:openai/gpt-oss-120b"
-cost = { groq = "customer", together = "together:openai/gpt-oss-120b", fireworks = "fireworks:accounts/fireworks/models/gpt-oss-120b" }
+list_card = "groq:openai/gpt-oss-120b"
+cost = { groq = "list", together = "together:openai/gpt-oss-120b", fireworks = "fireworks:accounts/fireworks/models/gpt-oss-120b" }
 
 [[pricing]]
 model = "openai/gpt-oss-20b"
-customer = "groq:openai/gpt-oss-20b"
-cost = { groq = "customer", openrouter = "openrouter:openai/gpt-oss-20b" }
+list_card = "groq:openai/gpt-oss-20b"
+cost = { groq = "list", openrouter = "openrouter:openai/gpt-oss-20b" }
 
 [[pricing]]
 model = "openai/gpt-oss-safeguard-20b"
-customer = "groq:openai/gpt-oss-safeguard-20b"
-cost = { groq = "customer", openrouter = "openrouter:openai/gpt-oss-safeguard-20b" }
+list_card = "groq:openai/gpt-oss-safeguard-20b"
+cost = { groq = "list", openrouter = "openrouter:openai/gpt-oss-safeguard-20b" }
 
 [[pricing]]
 model = "qwen/qwen-2.5-7b-instruct"
-customer = "list"
+list_card = "list"
 cost = { openrouter = "openrouter:qwen/qwen-2.5-7b-instruct" }
 
 [[pricing]]
 model = "qwen/qwen3.5-9b"
-customer = "list"
+list_card = "list"
 cost = { together = "together:Qwen/Qwen3.5-9B", openrouter = "openrouter:qwen/qwen3.5-9b" }
 
 [[pricing]]
 model = "qwen/qwen3.6-plus"
-customer = "list"
+list_card = "list"
 cost = { together = "together:Qwen/Qwen3.6-Plus", openrouter = "openrouter:qwen/qwen3.6-plus" }
 
 [[pricing]]
 model = "qwen/qwen3.7-max"
-customer = "list"
+list_card = "list"
 cost = { together = "together:Qwen/Qwen3.7-Max", openrouter = "openrouter:qwen/qwen3.7-max" }
 
 [[pricing]]
 model = "qwen/qwen3.7-plus"
-customer = "list"
+list_card = "list"
 cost = { together = "together:Qwen/Qwen3.7-Plus", openrouter = "openrouter:qwen/qwen3.7-plus" }
 
 [[pricing]]
 model = "qwen/qwen3.8-2.4t-a95b"
-customer = "list"
+list_card = "list"
 cost = { together = "together:Qwen/Qwen3.8-2.4T-A95B", openrouter = "openrouter:qwen/qwen3.8-2.4t-a95b" }
 
 [[pricing]]
 model = "qwen/qwen3.8-27b"
-customer = "groq:qwen/qwen3.8-27b"
-cost = { groq = "customer", openrouter = "openrouter:qwen/qwen3.8-27b" }
+list_card = "groq:qwen/qwen3.8-27b"
+cost = { groq = "list", openrouter = "openrouter:qwen/qwen3.8-27b" }
 
 [[pricing]]
 model = "qwen/qwen3.8-flash"
-customer = "list"
+list_card = "list"
 cost = { together = "together:Qwen/Qwen3.8-Flash", openrouter = "openrouter:qwen/qwen3.8-flash" }
 
 [[pricing]]
 model = "text-embedding-3-large"
-customer = "openai:text-embedding-3-large"
-cost = { openai = "customer", openrouter = "openrouter:openai/text-embedding-3-large" }
+list_card = "openai:text-embedding-3-large"
+cost = { openai = "list", openrouter = "openrouter:openai/text-embedding-3-large" }
 
 [[pricing]]
 model = "text-embedding-3-small"
-customer = "openai:text-embedding-3-small"
-cost = { openai = "customer", openrouter = "openrouter:openai/text-embedding-3-small" }
+list_card = "openai:text-embedding-3-small"
+cost = { openai = "list", openrouter = "openrouter:openai/text-embedding-3-small" }
 
 [[pricing]]
 model = "thinkingmachines/inkling"
-customer = "list"
+list_card = "list"
 cost = { together = "together:thinkingmachines/Inkling", openrouter = "openrouter:thinkingmachines/inkling" }
 
 [[pricing]]
 model = "z-ai/glm-5.1"
-customer = "list"
+list_card = "list"
 cost = { openrouter = "openrouter:z-ai/glm-5.1" }
 
 [[pricing]]
 model = "z-ai/glm-5.2"
-customer = "list"
+list_card = "list"
 cost = { together = "together:zai-org/GLM-5.2", openrouter = "openrouter:z-ai/glm-5.2" }
 
 [[pricing]]
 model = "z-ai/glm-5.3"
-customer = "list"
+list_card = "list"
 cost = { together = "together:zai-org/GLM-5.3", openrouter = "openrouter:z-ai/glm-5.3" }
 
 [[pricing]]
 model = "z-ai/glm-5.3-flash"
-customer = "list"
+list_card = "list"
 cost = { together = "together:zai-org/GLM-5.3-Flash", openrouter = "openrouter:z-ai/glm-5.3-flash" }
 
 [[openrouter]]

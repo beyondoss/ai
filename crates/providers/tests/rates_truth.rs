@@ -279,14 +279,14 @@ fn rates_match_truth() {
         let p = p.as_table().unwrap();
         let model = s(p, "model");
         assert_eq!(model, r.model, "[[pricing]] in catalog order");
-        let cust = s(p, "customer");
+        let cust = s(p, "list_card");
         if cust == "list" {
-            // The catalog's ListPrice alone: `customer_standard_is_the_list_price` holds the
+            // The catalog's ListPrice alone: `list_card_standard_is_the_list_price` holds the
             // rates, and nothing else may be on the card.
             assert_eq!(
-                canon_card(&Card::new(r.customer.standard)),
-                canon_card(&r.customer),
-                "{model}: a `list` customer card carries only the standard tier"
+                canon_card(&Card::new(r.list.standard)),
+                canon_card(&r.list),
+                "{model}: a `list` card carries only the standard tier"
             );
         } else {
             let c = cards
@@ -294,9 +294,9 @@ fn rates_match_truth() {
                 .unwrap_or_else(|| panic!("{model}: no [[card]] {cust}"));
             used_cards.insert(cust);
             assert_eq!(
-                canon_card(&r.customer),
+                canon_card(&r.list),
                 toml_card(c),
-                "{model}: customer card {cust}"
+                "{model}: list card {cust}"
             );
         }
         let cost = p["cost"].as_table().unwrap();
@@ -312,7 +312,7 @@ fn rates_match_truth() {
                 .and_then(toml::Value::as_str)
                 .unwrap_or_else(|| panic!("{model}: no cost for {name}"));
             match &cc.card {
-                CostCard::Customer => assert_eq!(want, "customer", "{model} {name}"),
+                CostCard::List => assert_eq!(want, "list", "{model} {name}"),
                 CostCard::Own(card) => {
                     let c = cards
                         .get(want)
@@ -391,12 +391,12 @@ fn every_catalog_row_and_candidate_is_priced() {
     }
 }
 
-/// The customer pays the catalog's published list price: `GET /v1/models` and the invoice agree.
+/// The list card's standard tier is the catalog's published list price (`GET /v1/models`).
 #[test]
-fn customer_standard_is_the_list_price() {
+fn list_card_standard_is_the_list_price() {
     for (rr, route) in ROW_RATES.iter().zip(MODEL_ROUTES) {
         let p = route.price;
-        let s = rr.customer.standard;
+        let s = rr.list.standard;
         assert_eq!(
             (s.input, s.output, s.cache_read, s.cache_write_5m),
             (
@@ -424,7 +424,7 @@ fn cards_are_well_formed() {
         assert!(c.standard.input > 0, "{what}: zero input rate");
     };
     for rr in ROW_RATES {
-        check(rr.model, &rr.customer);
+        check(rr.model, &rr.list);
         for cc in rr.cost {
             match &cc.card {
                 CostCard::Own(c) => check(rr.model, c),
@@ -442,7 +442,7 @@ fn cards_are_well_formed() {
                         assert_eq!(e.class, want, "{}: {}", rr.model, e.tag);
                     }
                 }
-                CostCard::Customer | CostCard::Unverified(_) => {}
+                CostCard::List | CostCard::Unverified(_) => {}
             }
         }
     }
