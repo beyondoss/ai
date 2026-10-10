@@ -525,6 +525,204 @@ pub struct RequestCtx {
     /// for this tenant, and the ids the client sent were verified and are stripped back in
     /// `request_body_filter`. Boxed: `None` on every other request.
     signed: Option<Box<signed_id::Relay>>,
+    /// Billing facts tapped beside the usage block ([`BillingTaps`]): managed only, created at the
+    /// first fact. Boxed for [`ModelRouting`]'s reason; `None` on every BYO request.
+    taps: Option<Box<BillingTaps>>,
+}
+
+/// Billing facts a managed request taps beside its usage block, for the `ai.usage` row.
+#[derive(Default)]
+struct BillingTaps {
+    /// The request's price knobs ([`peek::REQUEST_KNOB_KEYS`]), fed as the body streams only when
+    /// no copy of it will be left for `logging` (`tally_eager`); otherwise `logging` scans the copy
+    /// (see [`requested_knobs`]).
+    knobs: Option<(peek::ModelScanner, peek::Kept)>,
+    /// What `resp_model_scanner` keeps beside the model: the response's id and serving host
+    /// ([`peek::RESPONSE_EXTRA_KEYS`]).
+    resp_kept: Option<peek::Kept>,
+    /// Hosted-tool items of a Responses answer (see [`usage::ToolTally`]).
+    tools: Option<usage::ToolTally>,
+    /// OpenRouter's `X-Generation-Id` response header: the id its generation API takes.
+    generation_id: Option<usage::IdStr>,
+    /// The vendor's request id header (`request-id`, `x-request-id`, `x-amzn-requestid`): what its
+    /// support and logs key on.
+    request_id: Option<usage::IdStr>,
+}
+
+/// What a request asked for that changes its price, as the client sent it (the served values come
+/// from the response). String knobs are kept when they are short tokens; object and array knobs
+/// (`provider`, `plugins`, an object `container`) as raw JSON, at most [`peek::RAW_CAPTURE`] bytes.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct RequestedKnobs {
+    pub service_tier: Option<usage::ServiceTier>,
+    pub speed: Option<usage::ServiceTier>,
+    pub inference_geo: Option<usage::ServiceTier>,
+    pub provider_routing: Option<String>,
+    pub plugins: Option<String>,
+    pub container: Option<String>,
+}
+
+impl RequestedKnobs {
+    fn from_scan(mut s: peek::Kept) -> Self {
+        let tier = |v: Option<String>| v.as_deref().and_then(usage::tier_from);
+        // A raw value is JSON the scanner copied byte for byte; a string knob arrives unquoted.
+        let raw = |v: Option<String>| v.filter(|v| !v.is_empty());
+        RequestedKnobs {
+            service_tier: tier(s.take(0)),
+            speed: tier(s.take(1)),
+            inference_geo: tier(s.take(2)),
+            provider_routing: raw(s.take(3)),
+            plugins: raw(s.take(4)),
+            container: raw(s.take(5)),
+        }
+    }
+}
+
+/// The request's price knobs: from the scan fed as the body streamed (`tally_eager`), else from
+/// the body `logging` still holds — the `FullBody` parent's copy or pingora's retry buffer, the
+/// copies [`input_estimate`] reads. That is the client's body, before any rewrite.
+fn requested_knobs(session: &Session, rc: &mut RequestCtx) -> RequestedKnobs {
+    if let Some((_, k)) = rc.taps.as_mut().and_then(|t| t.knobs.take()) {
+        return RequestedKnobs::from_scan(k);
+    }
+    let mut kept = peek::Kept::request_knobs();
+    if let Some(body) = full_body_ctx(session)
+        .map(|fb| fb.body)
+        .or_else(|| session.as_ref().get_retry_buffer())
+    {
+        peek::ModelScanner::new().feed_keeping(&body, &mut kept);
+    }
+    RequestedKnobs::from_scan(kept)
+}
+
+/// Which price a provider applies to the endpoint that served, where one provider has several:
+/// Bedrock's `global.` inference profiles are its base price, and its geographic profiles (`us.`,
+/// `eu.`, `jp.`, `au.`, `apac.`) and single-region model ids carry a 10% premium on Claude 4.5
+/// and later; OpenRouter's in-region hosts (`us.openrouter.ai`, `eu.openrouter.ai`) pass on the
+/// provider's regional surcharge. `None` where the provider has one price.
+fn price_variant(provider: &str, upstream_model: &str, host: &str) -> Option<&'static str> {
+    match provider {
+        "bedrock" => Some(if upstream_model.starts_with("global.") {
+            "global"
+        } else {
+            "regional"
+        }),
+        "openrouter" => {
+            (host != "openrouter.ai" && host.ends_with(".openrouter.ai")).then_some("regional")
+        }
+        _ => None,
+    }
+}
+
+/// Providers documented to keep generating, and billing, after the client disconnects
+/// mid-stream: a cancelled row's tokens are what was relayed, not what was billed.
+const MAY_CONTINUE_PROVIDERS: [&str; 3] = ["openrouter", "bedrock", "groq"];
+
+/// Whether this row's provider may have generated (and billed) past the point the row counts:
+/// a stream the client cancelled, or one cut short, on a provider in [`MAY_CONTINUE_PROVIDERS`].
+fn upstream_may_continue(provider: Option<&str>, outcome: &str, streaming: bool) -> bool {
+    streaming
+        && matches!(outcome, "client_cancelled" | "cut_short")
+        && provider.is_some_and(|p| MAY_CONTINUE_PROVIDERS.contains(&p))
+}
+
+/// The upstream response header carrying the vendor's request id, in the order they are tried.
+const REQUEST_ID_HEADERS: [&str; 3] = ["request-id", "x-request-id", "x-amzn-requestid"];
+
+/// At a managed response head: read the vendor's ids from its headers, and start counting
+/// hosted-tool items when a Responses endpoint answered. A few map lookups per response; a fresh
+/// tally per head, so an earlier attempt's never leaks into the one that serves.
+fn tap_response_head(rc: &mut RequestCtx, resp: &ResponseHeader) {
+    let header_id = |name: &str| {
+        resp.headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .and_then(usage::id_from)
+    };
+    let generation_id = header_id("x-generation-id");
+    let request_id = REQUEST_ID_HEADERS.iter().find_map(|h| header_id(h));
+    let responses = match rc.auto.as_ref() {
+        Some(a) => catalog_serving_endpoint(a) == Some(route::Endpoint::Responses),
+        None => {
+            rc.dialect == Dialect::OpenAi
+                && rc.forward_path.as_deref().is_some_and(|p| {
+                    let p = p.split_once('?').map_or(p, |(path, _)| path);
+                    p.ends_with("/responses") || p.ends_with("/responses/compact")
+                })
+        }
+    };
+    // Always made on a managed response: `resp_model_scanner` keeps the response's id in it.
+    let taps = rc.taps.get_or_insert_with(Box::default);
+    taps.generation_id = generation_id;
+    taps.request_id = request_id;
+    taps.tools = responses.then(|| usage::ToolTally::new(rc.streaming));
+}
+
+/// Fold what the taps saw into the row's usage: the header generation id over the body's (the
+/// response scanner's, from the head, over the usage block's), the serving host the head named,
+/// and the Responses tool items.
+fn merge_taps(rc: &mut RequestCtx, usage: &mut usage::Usage) {
+    let Some(t) = rc.taps.as_mut() else { return };
+    let head_id = t
+        .resp_kept
+        .as_ref()
+        .and_then(|k| k.get(0))
+        .and_then(usage::id_from);
+    let head_host = t
+        .resp_kept
+        .as_ref()
+        .and_then(|k| k.get(1))
+        .and_then(usage::host_from);
+    let (hdr_id, tools) = (t.generation_id, t.tools.take());
+    if let Some(id) = hdr_id.or(head_id) {
+        usage.upstream.generation_id = Some(id);
+    }
+    if head_host.is_some() {
+        usage.upstream.served_by = head_host;
+    }
+    if let Some(mut t) = tools {
+        t.finish();
+        usage.server_tools.merge_max(&t.tools);
+        if usage.upstream.container_id.is_none() {
+            usage.upstream.container_id = t.container_id;
+        }
+        usage.server_tool_calls = usage
+            .server_tool_calls
+            .max(u64::from(usage.server_tools.web_search));
+    }
+}
+
+/// Which of a row's counts an estimate replaced (see `logging`), and what the estimate cannot see.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct EstimatedParts {
+    input: bool,
+    output: bool,
+}
+
+impl EstimatedParts {
+    /// The row's `usage_estimated_parts`: `input`, `output`, `input,output`, or absent.
+    fn parts(self) -> Option<&'static str> {
+        match (self.input, self.output) {
+            (true, true) => Some("input,output"),
+            (true, false) => Some("input"),
+            (false, true) => Some("output"),
+            (false, false) => None,
+        }
+    }
+
+    /// The row's `usage_estimate_excludes`: `cache` when the input is estimated (the pre-token
+    /// count is the whole prompt as plain input: some of it may have been cache reads, cheaper, or
+    /// cache writes, dearer), `reasoning` when the output is estimated and the provider reported no
+    /// reasoning count (hidden reasoning is billed as output and invisible in the stream).
+    fn excludes(self, u: &usage::Usage) -> Option<&'static str> {
+        let reasoning = self.output && u.reasoning_tokens.is_none();
+        match (self.input, reasoning) {
+            (true, true) => Some("cache,reasoning"),
+            (true, false) => Some("cache"),
+            (false, true) => Some("reasoning"),
+            (false, false) => None,
+        }
+    }
 }
 
 /// Scrubs a managed error body (status >= 400) as it streams past: the pool key the attempt sent
@@ -1169,6 +1367,9 @@ impl RequestCtx {
         self.body_bytes_fed = 0;
         self.model_scanner = peek::ModelScanner::new();
         self.input_tally = usage::InputTally::default();
+        if let Some(k) = self.taps.as_mut().and_then(|t| t.knobs.as_mut()) {
+            *k = (peek::ModelScanner::new(), peek::Kept::request_knobs());
+        }
     }
 }
 
@@ -4786,7 +4987,7 @@ impl ProxyHttp for AiProxy {
                             arms: walk_arms,
                             session_field,
                             attempt_start: start,
-                            cache: Some(cache::Pending::Hit(hit)),
+                            cache: Some(cache::Pending::Hit(Box::new(hit))),
                             translate: None,
                             health: None,
                             addrs: 0,
@@ -4802,6 +5003,7 @@ impl ProxyHttp for AiProxy {
                     redact: None,
                     terminal: TerminalTracker::default(),
                     signed: None,
+                    taps: None,
                 });
                 ctx.held.admit();
                 return Ok(true);
@@ -4962,6 +5164,7 @@ impl ProxyHttp for AiProxy {
             redact: None,
             terminal: TerminalTracker::default(),
             signed,
+            taps: None,
         });
         // A body buffered for a rewrite (`RequestCtx::rewrites_body`) is pre-sized from the
         // declared Content-Length, so accumulation is a single allocation instead of a geometric
@@ -5669,6 +5872,18 @@ impl ProxyHttp for AiProxy {
             // everywhere else the estimate is made there, and only when a row needs one.
             if rc.tally_eager {
                 rc.input_tally.feed(chunk);
+                // The price knobs, for the same reason: no copy of this body is left for
+                // `logging` to read (see `requested_knobs`).
+                if rc.managed {
+                    let (scan, kept) = rc
+                        .taps
+                        .get_or_insert_with(Box::default)
+                        .knobs
+                        .get_or_insert_with(|| {
+                            (peek::ModelScanner::new(), peek::Kept::request_knobs())
+                        });
+                    scan.feed_keeping(chunk, kept);
+                }
             }
 
             if rc.rewrites_body() {
@@ -5976,6 +6191,9 @@ impl ProxyHttp for AiProxy {
             if rc.streaming {
                 held.open_stream();
             }
+            if rc.managed {
+                tap_response_head(rc, upstream_response);
+            }
             self.state.fault_point("response_filter");
 
             // `x-beyond-*` is the gateway's namespace. A provider (or anything between us and it)
@@ -6171,7 +6389,16 @@ impl ProxyHttp for AiProxy {
             // pure waste — and *unbounded* waste on any response with no root-level `model`, since
             // the scanner never reaches its `done` short-circuit and walks every byte.
             if rc.managed {
-                rc.resp_model_scanner.feed(chunk);
+                match rc.taps.as_mut() {
+                    Some(t) => {
+                        let kept = t.resp_kept.get_or_insert_with(peek::Kept::response);
+                        rc.resp_model_scanner.feed_keeping(chunk, kept);
+                        if let Some(tools) = t.tools.as_mut() {
+                            tools.feed(chunk);
+                        }
+                    }
+                    None => rc.resp_model_scanner.feed(chunk),
+                }
             }
 
             // Anthropic SSE only: the head that keeps `message_start` (see `keep_usage_head`).
@@ -6765,6 +6992,8 @@ impl ProxyHttp for AiProxy {
         // responses are the whole body; long ones are rotated into order here, once. Skipped on a
         // cache hit — there is no tail; tokens come from the stored entry.
         let mut usage_estimated = false;
+        // Which counts an estimate replaced (see `EstimatedParts`).
+        let mut estimated = EstimatedParts::default();
         // A free sub-resource (a token count) is not a billable call: it carries no usage block,
         // writes no billing row, and is not a usage-shape regression. On every route: a catalog
         // walk records it, a `/{provider}` route names it in the forwarded path.
@@ -6882,8 +7111,12 @@ impl ProxyHttp for AiProxy {
                 let mut u = parsed.unwrap_or_default();
                 if u.input_tokens == 0 {
                     u.input_tokens = input_estimate(session, rc);
+                    estimated.input = true;
                 }
-                u.output_tokens = u.output_tokens.max(output);
+                if output > u.output_tokens {
+                    u.output_tokens = output;
+                    estimated.output = true;
+                }
                 Some(u)
             } else {
                 parsed
@@ -6920,6 +7153,9 @@ impl ProxyHttp for AiProxy {
             );
         }
         let mut usage = parsed.unwrap_or_default();
+        if cache_hit.is_none() {
+            merge_taps(rc, &mut usage);
+        }
         // Writes caused by breakpoints the gateway added bill as input (see
         // `Usage::bill_gateway_cache_writes`). A cache hit replays the fill's already-billed usage.
         if cache_hit.is_none()
@@ -6964,6 +7200,8 @@ impl ProxyHttp for AiProxy {
         // An abandoned `FullBody` attempt is not the request the client got: the attempt that
         // serves writes the one row (and the one capture).
         if rc.managed && !rc.relay_abandoned && !free {
+            // What the client asked for that changes the price (read before the borrows below).
+            let requested = requested_knobs(session, rc);
             // Emit BOTH models. `model` is the one the *provider* resolved + billed (echoed in its
             // response) — the key for pricing AND for reconciling against the provider's invoice,
             // which itemizes by the pinned snapshot. `requested_model` is the alias the client sent —
@@ -7032,6 +7270,42 @@ impl ProxyHttp for AiProxy {
                 .as_ref()
                 .map(|h| h.streaming)
                 .unwrap_or(rc.streaming);
+            // The endpoint that served: absent on a cache hit and when no provider was called.
+            let called = cache_hit.is_none() && usage_provider.is_some();
+            let upstream_model = called
+                .then(|| {
+                    rc.auto
+                        .as_ref()
+                        .and_then(|a| a.candidate_at(a.candidate))
+                        .map_or(rc.model.as_str(), |c| c.upstream_model)
+                })
+                .filter(|m| !m.is_empty())
+                .map(|m| sanitize_model(m.to_owned()));
+            let upstream_host = called.then_some(rc.provider.host.as_str());
+            let upstream_path = called.then(|| {
+                let p = rc
+                    .forward_path
+                    .as_deref()
+                    .unwrap_or_else(|| session.req_header().uri.path());
+                p.split_once('?').map_or(p, |(path, _)| path)
+            });
+            let price_variant = match (usage_provider, upstream_model.as_deref(), upstream_host) {
+                (Some(p), Some(m), Some(h)) if called => price_variant(p, m, h),
+                _ => None,
+            };
+            let upstream_request_id = rc
+                .taps
+                .as_ref()
+                .and_then(|t| t.request_id)
+                .filter(|_| called);
+            let server_tools = usage.server_tools.to_row();
+            let upstream_may_continue =
+                upstream_may_continue(usage_provider, outcome, usage_stream);
+            let estimate_excludes = estimated.excludes(&usage);
+            let upstream_cost_usd = usage.upstream.cost_e10.map(usage::e10_to_usd);
+            let upstream_inference_cost_usd =
+                usage.upstream.inference_cost_e10.map(usage::e10_to_usd);
+            let upstream_tool_cost_usd = usage.upstream.tool_cost_e10.map(usage::e10_to_usd);
             info!(
                 target: "ai.usage",
                 request_id = %rc.request_id,
@@ -7075,6 +7349,36 @@ impl ProxyHttp for AiProxy {
                 gateway_cache_write_tokens = usage.gateway_cache_write_tokens,
                 server_tool_calls = usage.server_tool_calls,
                 service_tier = usage.service_tier.as_deref(),
+                // --- The row contract's additions (ARCHITECTURE.md, "The `ai.usage` row"). ---
+                // What the client asked for that changes the price, beside what was served.
+                requested_service_tier = requested.service_tier.as_deref(),
+                speed = usage.speed.as_deref(),
+                requested_speed = requested.speed.as_deref(),
+                inference_geo = usage.inference_geo.as_deref(),
+                requested_inference_geo = requested.inference_geo.as_deref(),
+                requested_provider_routing = requested.provider_routing.as_deref(),
+                requested_plugins = requested.plugins.as_deref(),
+                requested_container = requested.container.as_deref(),
+                // Every server-side tool by kind, `kind=count,…` (nonzero only).
+                server_tools = server_tools.as_deref(),
+                container_id = usage.upstream.container_id.as_deref(),
+                // The concrete endpoint that served, and which of its prices applies.
+                upstream_model = upstream_model.as_deref(),
+                upstream_host,
+                upstream_path,
+                price_variant,
+                served_by = usage.upstream.served_by.as_deref(),
+                // The vendor's own ids and price, for reconciling the row against it.
+                upstream_generation_id = usage.upstream.generation_id.as_deref(),
+                upstream_request_id = upstream_request_id.as_deref(),
+                upstream_cost_usd = upstream_cost_usd.as_deref(),
+                upstream_inference_cost_usd = upstream_inference_cost_usd.as_deref(),
+                upstream_tool_cost_usd = upstream_tool_cost_usd.as_deref(),
+                upstream_byok = usage.upstream.byok,
+                upstream_may_continue,
+                // Which counts are the gateway's estimate, and what the estimate cannot see.
+                usage_estimated_parts = estimated.parts(),
+                usage_estimate_excludes = estimate_excludes,
                 // `Some(0)` (reported, none used) vs `None` (not reported at all — an unreasoning
                 // model, or a provider that doesn't surface it) matters and is unrecoverable once this
                 // line ships, so it's logged as `?` (Debug) rather than collapsed to a bare `0`.
@@ -7142,7 +7446,7 @@ impl ProxyHttp for AiProxy {
                         status: rc.upstream_status.unwrap_or(200),
                         content_type: content_type.unwrap_or_else(|| "application/json".into()),
                         body: Bytes::copy_from_slice(body),
-                        usage,
+                        usage: usage.for_cache(),
                         billed_model: billed_model.to_owned().into_boxed_str(),
                         requested_model: requested_model.to_owned().into_boxed_str(),
                         routed_model,
@@ -7285,6 +7589,7 @@ mod tests {
             redact: None,
             terminal: TerminalTracker::default(),
             signed: None,
+            taps: None,
         }
     }
 
@@ -7506,8 +7811,9 @@ mod tests {
         assert!(
             // 432: + the boxed `signed` (8 bytes, `None` off the managed Responses relay).
             // 440: + `deadline` (8 bytes; every request has one, and the per-chunk check reads it).
-            size <= 440,
-            "RequestCtx grew to {size} bytes (ceiling 440). It is touched once per response chunk \
+            // 448: + the boxed `taps` (8 bytes, `None` on BYO): the billing facts beside usage.
+            size <= 448,
+            "RequestCtx grew to {size} bytes (ceiling 448). It is touched once per response chunk \
              on a stream — if the new state is only needed on one route, box it the way \
              `ModelRouting` is rather than paying for it on every request.",
         );

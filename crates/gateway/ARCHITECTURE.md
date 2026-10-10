@@ -204,8 +204,11 @@ Client (stock OpenAI/Anthropic SDK)
        estimate the missing side from the request tally + relayed events → usage_estimated
      Emit ai.usage fact: tenant, vpc, key_id, model, requested_model, routed_model, price_model,
        token counts + usage_wire + reasoning / 1h-cache-write / server-tool / service-tier
-       breakouts, upstream_status + outcome, + x-beyond-metadata tags (managed only) → blocking
-       stdout, lossless. `provider` is absent when no provider was called
+       breakouts, requested vs served tier / speed / geo, server tools by kind, the serving
+       endpoint and its price variant, the vendor's ids and own cost, estimate parts,
+       upstream_status + outcome, + x-beyond-metadata tags (managed only) → blocking stdout,
+       lossless. `provider` is absent when no provider was called. Field contract: "The
+       `ai.usage` row"
      Cache hit: same row with `cache_hit` and the stored tokens; no parse, no upstream latency
      Capturing: emit ai.payload (both bodies, truncation + completeness flags), correlated by
        request_id → bounded queue, DROPPED on overflow so a stalled sink can't backpressure
@@ -1654,15 +1657,16 @@ in `upstream_peer` → connected in `upstream_request_filter`) is what tells the
 
 **Priced variants and per-call fees** ride on the row next to the token counts:
 
-| Row field                    | Source                                                                                                                                   |
-| ---------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
-| `cache_write_1h_tokens`      | Anthropic `usage.cache_creation.ephemeral_1h_input_tokens` — a subset of `cache_write_tokens` (2×)                                       |
-| `gateway_cache_write_tokens` | Cache writes caused by breakpoints the gateway added: already in `input_tokens`, not in `cache_write_tokens` (billed at input)           |
-| `server_tool_calls`          | Anthropic `usage.server_tool_use.web_search_requests` (cumulative, on `message_delta` when streamed)                                     |
-| `service_tier`               | `service_tier` as echoed: Chat Completions root, Responses `response`, Anthropic `usage`; absent if not echoed or not `[a-z0-9_-]{1,16}` |
+| Row field                    | Source                                                                                                                                        |
+| ---------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `cache_write_1h_tokens`      | Anthropic `usage.cache_creation.ephemeral_1h_input_tokens` — a subset of `cache_write_tokens` (2×)                                            |
+| `gateway_cache_write_tokens` | Cache writes caused by breakpoints the gateway added: already in `input_tokens`, not in `cache_write_tokens` (billed at input)                |
+| `server_tool_calls`          | Billable web searches (Anthropic `usage.server_tool_use.web_search_requests`, cumulative on `message_delta`); every kind is in `server_tools` |
+| `service_tier`               | `service_tier` as echoed: Chat Completions root, Responses `response`, Anthropic `usage`; absent if not echoed or not `[a-z0-9_-]{1,16}`      |
 
-OpenAI reports no hosted-tool call count in `usage`, so `server_tool_calls` is 0 there. A
-malformed `service_tier` never fails the usage parse: it reads as absent.
+OpenAI reports no hosted-tool call count in `usage`; the gateway counts its hosted-tool items
+instead (see "The `ai.usage` row"). A malformed `service_tier` never fails the usage parse: it reads
+as absent.
 
 A final event can itself be bigger than the tail: a Responses `response.completed` echoes the
 request's instructions and tools ahead of `usage`, so a Codex-sized prompt puts it past 64 KiB and
@@ -1790,6 +1794,264 @@ A stream or non-stream body that ends **cleanly** without usage still counts on
 `ai_usage_parse_errors_total` (the wire-shape-change alarm) even though it is now billed an
 estimate. An estimated response is never
 stored in the response cache.
+
+### The `ai.usage` row (the billing contract)
+
+Billing is computed downstream from these rows, later, and a fact the row does not carry is lost
+when the request ends. This section is the contract a pricer is built against. Field names are
+stable: a field is only ever added, never renamed, retyped or given a new meaning (D268).
+
+One row per managed request that reached `logging` with a billable outcome (not BYO, not a free
+sub-resource such as a token count, not an abandoned `FullBody` attempt). It is a `tracing` event on
+target `ai.usage`, written as one JSON line whose fields are under `fields`. A field that has no
+value is **absent**, never `null`. Types below are JSON types. Token counts are integers.
+
+The pricer reads the same facts as typed values at emission (`usage::Usage`,
+`proxy::RequestedKnobs`, and the locals `logging` names), so a pricer called in the gateway gets
+the numbers, not their log text.
+
+**Identity and route**
+
+| Field             | Type    | Meaning                                                                                                                                              |
+| ----------------- | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `request_id`      | string  | Gateway request id (`x-beyond-request-id`). Unique per request.                                                                                      |
+| `tenant_id`       | integer | Tenant the managed key belongs to.                                                                                                                   |
+| `vpc_id`          | integer | VPC from the key. Attribution only.                                                                                                                  |
+| `key_id`          | integer | `bai_v2` credential id. Absent for v1 keys.                                                                                                          |
+| `provider`        | string  | Gateway provider id that served (`anthropic`, `openai`, `openrouter`, `bedrock`, `xai`, …). Absent when no provider was called (`no_candidate`).     |
+| `model`           | string  | The model id the provider echoed (the pinned snapshot it billed). Falls back to `requested_model` when the response named none.                      |
+| `requested_model` | string  | What the client asked for: the catalog name on a catalog walk, the body's `model` on `/{provider}`.                                                  |
+| `routed_model`    | string  | The catalog row a catalog walk routed on. Absent on `/{provider}`.                                                                                   |
+| `price_model`     | string  | The catalog row whose card prices this row. Absent when unpriced.                                                                                    |
+| `upstream_model`  | string  | The exact model id the gateway sent upstream: the serving candidate's spelling (`us.anthropic.claude-opus-4-8`), or the body's `model` when relayed. |
+| `upstream_host`   | string  | The host the request went to (`api.anthropic.com`, `bedrock-runtime.us-east-1.amazonaws.com`, `openrouter.ai`).                                      |
+| `upstream_path`   | string  | The upstream path, query removed (`/v1/messages`, `/api/v1/chat/completions`). It says which wire served.                                            |
+| `price_variant`   | string  | Which of the provider's prices applies to that endpoint, where it has several (see below). Absent where the provider has one price.                  |
+| `served_by`       | string  | The host OpenRouter routed to (its response's root `provider`, e.g. `Amazon Bedrock`), when the response says.                                       |
+| `stream`          | bool    | Whether the response was an SSE stream.                                                                                                              |
+| `cache_hit`       | bool    | Served from the gateway's response cache: no upstream call (see Cache hits).                                                                         |
+| `upstream_status` | integer | The provider's HTTP status. Absent when no head arrived, and on a cache hit.                                                                         |
+| `outcome`         | string  | `ok`, `upstream_error`, `client_cancelled`, `no_candidate`, `cut_short` (see "A zero-token row says why").                                           |
+| `latency_ms`      | integer | Request start to the row.                                                                                                                            |
+| `metadata`        | string  | The caller's `x-beyond-metadata` JSON object. Absent when none.                                                                                      |
+
+`upstream_model`, `upstream_host`, `upstream_path` and `price_variant` are absent on a cache hit
+and when no provider was called.
+
+**Tokens**
+
+| Field                        | Type    | Meaning                                                                                                                                                              |
+| ---------------------------- | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `input_tokens`               | integer | Prompt tokens, in the convention `usage_wire` names. `0` when none was reported or estimated.                                                                        |
+| `output_tokens`              | integer | Output tokens, reasoning included (xAI's reported-beside reasoning is added in, see "Reasoning tokens outside `completion_tokens`").                                 |
+| `cache_read_tokens`          | integer | Prompt tokens read from the provider's cache.                                                                                                                        |
+| `cache_write_tokens`         | integer | Prompt tokens written to the provider's cache, at the client's request (all TTLs).                                                                                   |
+| `cache_write_1h_tokens`      | integer | The 1-hour-TTL share of `cache_write_tokens` (Anthropic). A subset, not additional.                                                                                  |
+| `gateway_cache_write_tokens` | integer | Cache writes caused by breakpoints the gateway added. Already counted in `input_tokens`, not in `cache_write_tokens`; billed at the input rate. Reconciliation only. |
+| `reasoning_tokens`           | Debug   | `Some(n)` when the provider reported a reasoning count (a subset of `output_tokens`), `None` when it did not. Logged as Debug text so `Some(0)` stays distinct.      |
+| `usage_wire`                 | string  | `openai` or `anthropic`: which convention `input_tokens` follows.                                                                                                    |
+
+The whole prompt is `input_tokens` on `openai` (it includes `cache_read_tokens` and, on OpenRouter,
+`cache_write_tokens`), and `input_tokens + cache_read_tokens + cache_write_tokens` on `anthropic`.
+So the prompt tokens billed at the plain input rate are:
+
+- `openai`: `input_tokens - cache_read_tokens - cache_write_tokens`
+- `anthropic`: `input_tokens`
+
+**Tier, speed and geography (requested and served)**
+
+| Field                     | Type   | Meaning                                                                                                           |
+| ------------------------- | ------ | ----------------------------------------------------------------------------------------------------------------- |
+| `service_tier`            | string | The tier the provider says it served: Chat root, Responses `response`, Anthropic `usage`. Absent when not echoed. |
+| `requested_service_tier`  | string | The request body's root `service_tier`, as sent.                                                                  |
+| `speed`                   | string | The speed the provider says it served (Anthropic and OpenRouter Messages `usage.speed`: `fast` or `standard`).    |
+| `requested_speed`         | string | The request body's root `speed`.                                                                                  |
+| `inference_geo`           | string | Where the provider says inference ran (Anthropic `usage.inference_geo`: `global` or `us`).                        |
+| `requested_inference_geo` | string | The request body's root `inference_geo`.                                                                          |
+
+Every string here is `[a-z0-9_-]{1,16}` or absent: a value outside that is dropped, never logged.
+The `requested_*` fields are the client's body before any gateway rewrite. A pricer **prices the
+served value**, and uses the requested one only to tell "not reported" apart:
+
+- `speed` absent means standard. Anthropic omits `usage.speed` unless fast mode was requested,
+  and on a stream reports it on `message_start` only (measured live 2026-10-10). The row reads it
+  from the retained head, so a fast stream's row says `fast`. Anthropic rejects `speed` without
+  the fast-mode beta (400), and fails rather than downgrading when fast capacity runs out (429 /
+  529), so a 2xx whose request asked for `fast` reports `usage.speed`.
+- `service_tier` absent means the default tier. OpenAI and xAI always echo it; OpenAI echoes a
+  requested `fast` as `priority`, xAI maps `fast` to `priority` and serves an unsupported `flex` at
+  `default`. OpenRouter echoes the tier that served (its fast tier as `priority`; base `default`,
+  or `standard` on Messages) and falls back to standard endpoints when priority ones fail.
+- `inference_geo` absent means `global`.
+
+**Endpoint price variants**
+
+| `price_variant` | When                                                                                            | Multiplier                                                 |
+| --------------- | ----------------------------------------------------------------------------------------------- | ---------------------------------------------------------- |
+| `global`        | Bedrock, a `global.` inference profile                                                          | 1× (Bedrock's base)                                        |
+| `regional`      | Bedrock, a geographic profile (`us.`, `eu.`, `jp.`, `au.`, `apac.`) or a single-region model id | 1.1× on Claude Sonnet / Haiku / Opus 4.5 and later         |
+| `regional`      | OpenRouter's in-region hosts (`us.openrouter.ai`, `eu.openrouter.ai`)                           | The provider's regional surcharge; use `upstream_cost_usd` |
+
+Sources: Anthropic's pricing page ("Regional and multi-region endpoints include a 10% premium over
+global endpoints", Claude 4.5 and later), the Bedrock Messages endpoint docs, OpenRouter's
+in-region routing guide.
+
+**Server-side tools**
+
+| Field               | Type    | Meaning                                                                                                                       |
+| ------------------- | ------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| `server_tools`      | string  | Every server-side tool count, `kind=count` joined with `,`, nonzero kinds only, in the order below. Absent when all are zero. |
+| `server_tool_calls` | integer | Kept for existing consumers: billable web searches, equal to `server_tools`' `web_search` (`0` when none).                    |
+| `container_id`      | string  | The code-execution container the turn used (Anthropic `container.id`, OpenAI `code_interpreter_call.container_id`).           |
+
+| Kind               | Counted from                                                                                                                                                                                                                                                    |
+| ------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `web_search`       | Anthropic `usage.server_tool_use.web_search_requests`; OpenAI/xAI Responses `web_search_call` items with action `search` (or no action seen); xAI `server_side_tool_usage_details.web_search_calls`; OpenRouter `server_tool_use(_details).web_search_requests` |
+| `web_search_page`  | OpenAI `web_search_call` items with action `open_page` / `find_in_page` (no per-call fee)                                                                                                                                                                       |
+| `web_fetch`        | Anthropic `server_tool_use.web_fetch_requests` (no per-call fee)                                                                                                                                                                                                |
+| `code_execution`   | Anthropic `server_tool_use.code_execution_requests`; OpenAI `code_interpreter_call` items; xAI `code_interpreter_calls`. Calls, not container sessions                                                                                                          |
+| `file_search`      | OpenAI `file_search_call` items; xAI `file_search_calls`                                                                                                                                                                                                        |
+| `image_generation` | OpenAI `image_generation_call` items; xAI `image_generation_calls`                                                                                                                                                                                              |
+| `computer_use`     | OpenAI `computer_call` items (billed as tokens)                                                                                                                                                                                                                 |
+| `mcp`              | OpenAI `mcp_call` items; xAI `mcp_calls` (token-billed)                                                                                                                                                                                                         |
+| `shell`            | OpenAI `shell_call` / `local_shell_call` items                                                                                                                                                                                                                  |
+| `tool_search`      | OpenAI `tool_search_call` items                                                                                                                                                                                                                                 |
+| `x_search`         | xAI `x_search_calls`                                                                                                                                                                                                                                            |
+| `x_posts`          | xAI `x_posts_fetched` (X search bills per post)                                                                                                                                                                                                                 |
+| `x_users`          | xAI `x_users_fetched` (X search bills per profile)                                                                                                                                                                                                              |
+| `document_search`  | xAI `document_search_calls`                                                                                                                                                                                                                                     |
+| `sources`          | xAI `num_sources_used`                                                                                                                                                                                                                                          |
+| `tool_calls`       | OpenRouter `server_tool_use(_details).tool_calls_executed`: its server tools of every kind (do not add to the others; use `upstream_tool_cost_usd`)                                                                                                             |
+
+OpenAI's Responses `usage` has no tool counts, so the gateway counts the hosted-tool items itself.
+They come first in the output and a long answer pushes them out of the retained tail, so a managed
+Responses response is fed to `usage::ToolTally` chunk by chunk: one SIMD search per chunk for
+`_call"` (only an unescaped quote can match, so generated text cannot), each hit checked as the
+value of a `"type"` member and, on a stream, inside a `response.output_item.done` event (so the
+item's `.added` event and its copy in `response.completed` are not counted again). Bounded memory
+(a 518-byte carry), and nothing on any other route.
+
+**What the request asked for that changes the price**
+
+| Field                        | Type   | Meaning                                                                                          |
+| ---------------------------- | ------ | ------------------------------------------------------------------------------------------------ |
+| `requested_provider_routing` | string | OpenRouter's root `provider` routing object (`order`, `only`, `sort`, `max_price`, …), raw JSON. |
+| `requested_plugins`          | string | OpenRouter's root `plugins` array (web search, file parsing), raw JSON.                          |
+| `requested_container`        | string | Anthropic's root `container`: an id to reuse (the string) or an object (raw JSON).               |
+
+Raw JSON is cut at 512 bytes, at a character boundary (then it is not valid JSON). These are read
+from the client's body by the same structural scanner as `model` (`peek::Kept`), over the body copy
+`logging` already holds, or as the body streams when no copy will be left.
+
+Price modifiers the row does not need to record, because they never reach a provider on a managed
+key: `anthropic-beta` tokens outside the allowlist (`context-1m-*` long context, `code-execution-*`,
+`mcp-client-*`, `files-api-*`) are dropped; the fast-mode beta is forwarded to direct Anthropic only
+(D266) and its effect is reported as `speed`; batch, background and file endpoints are refused.
+OpenRouter's model variant suffixes (`:online`, `:nitro`, `:floor`, `:free`) are part of
+`requested_model` and `model`, and their price is in `upstream_cost_usd`.
+
+**The upstream's own ids and price**
+
+| Field                         | Type   | Meaning                                                                                                                                                                   |
+| ----------------------------- | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `upstream_generation_id`      | string | The vendor's id for this generation: OpenRouter's `X-Generation-Id` header (else its body `id`), Anthropic `msg_…`, OpenAI `chatcmpl-…` / `resp_…`, xAI's id.             |
+| `upstream_request_id`         | string | The vendor's request id header (`request-id`, `x-request-id`, `x-amzn-requestid`), what its support and logs key on.                                                      |
+| `upstream_cost_usd`           | string | The vendor's own reported cost, a decimal USD string: OpenRouter `usage.cost` (credits; sent on every response, no opt-in needed), xAI `usage.cost_in_usd_ticks` ÷ 10^10. |
+| `upstream_inference_cost_usd` | string | OpenRouter `usage.cost_details.upstream_inference_cost` (what the upstream charged on BYOK). Absent when `null`.                                                          |
+| `upstream_tool_cost_usd`      | string | OpenRouter `usage.cost_details.server_tool_cost` (its metered server tools and plugins).                                                                                  |
+| `upstream_byok`               | bool   | OpenRouter `usage.is_byok`.                                                                                                                                               |
+| `upstream_may_continue`       | bool   | The stream ended early (`client_cancelled` or `cut_short`) on a provider that keeps generating, and billing, after a disconnect (see below).                              |
+
+Ids are `[A-Za-z0-9_.:-]{1,128}` and hosts `[A-Za-z0-9 ._()/-]{1,64}`; anything else is dropped.
+The body id is read by the response model scanner from the head (every wire writes `id` before
+`model`), and from the usage event as a fallback. Costs are kept internally in units of 10^-10 USD
+(`usage::Upstream::cost_e10`), the finest any vendor reports, and logged as exact decimals.
+
+The gateway does not ask OpenRouter for anything extra: usage accounting is always on
+(`usage: {include: true}` is deprecated and ignored), and its router metadata
+(`X-OpenRouter-Metadata`) would change what the client receives. `served_by` is its undocumented
+root `provider`, when present; the generation API is authoritative for the host.
+
+**Estimates**
+
+| Field                     | Type   | Meaning                                                                                                                                                                                                    |
+| ------------------------- | ------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `usage_estimated`         | bool   | Some count on the row is the gateway's estimate, not the provider's report (see "Streams cut short").                                                                                                      |
+| `usage_estimated_parts`   | string | `input`, `output` or `input,output`: which counts were estimated. Absent when none.                                                                                                                        |
+| `usage_estimate_excludes` | string | What the estimate cannot see: `cache` (estimated input is the whole prompt as plain input), `reasoning` (estimated output, and the provider reported no reasoning count). Absent when nothing is excluded. |
+
+Error bounds, measured (see "Streams cut short"):
+
+- Estimated input is a pre-token count, never above the provider's count: about 0.8× on English
+  prose and code for the GPT and grok tokenizers, 0.65× for Claude's, far less on non-Latin
+  scripts. It cannot see cache hits or writes, so all of it is plain input (`cache` excluded):
+  against a mostly cached agent turn the input rate over-prices it, and against a cache write the
+  rate under-prices it. Anthropic's input is estimated only when `message_start` never arrived;
+  its exact counts are otherwise kept.
+- Estimated output: 0.94–1.05× on OpenAI Chat Completions, 0.86–1.05× on Responses, 0.84–0.85× on
+  Claude Haiku 4.5, 0.75–0.84× on Claude via OpenRouter, 0.57–0.60× on Claude Sonnet 5. Hidden
+  reasoning (an OpenAI reasoning model, Claude with thinking display omitted) is not in it at all
+  (`reasoning` excluded): up to `max_tokens` more output was billed.
+- An estimate never sees the long-context tier: a pricer should not apply a tier from an estimated
+  `input_tokens` without reconciling.
+
+**Cancelled streams on providers that keep generating**
+
+OpenRouter documents that for upstreams without cancellation support (among them AWS Bedrock,
+Google, Groq, Mistral and several open-model hosts) "the model will continue processing and you
+will be billed for the complete response" (https://openrouter.ai/docs/api/reference/streaming).
+Neither Bedrock nor Groq documents its own behavior. So `upstream_may_continue` is `true` on a
+streamed `client_cancelled` or `cut_short` row whose `provider` is `openrouter`, `bedrock` or
+`groq`. The row's tokens are what was relayed; the bill may be up to the full completion. How to
+settle one:
+
+- OpenRouter: `GET /api/v1/generation?id=<upstream_generation_id>` returns `total_cost`, native
+  token counts and `cancelled`.
+- Bedrock (`bedrock-runtime`): model invocation logging (CloudWatch Logs / S3, off by default) records
+  `requestId` and input/output token counts per request; `upstream_request_id` is the key. Not
+  available on `bedrock-mantle`.
+- Groq: no per-request lookup exists. Price the row as relayed and accept the gap, or bound it by
+  the request's `max_tokens`.
+
+**Computing a row's cost**
+
+Rates come from the pricer's per-candidate table, keyed by `provider` and `upstream_model` (or
+`price_model` for the card), never from the client's `requested_model`.
+
+1. Plain input = the plain-input prompt tokens above (by `usage_wire`).
+2. Token cost = plain input × input rate + `cache_read_tokens` × cache-read rate +
+   (`cache_write_tokens` − `cache_write_1h_tokens`) × 5-minute write rate (1.25× input on
+   Anthropic) + `cache_write_1h_tokens` × 1-hour write rate (2× input) + `output_tokens` × output
+   rate. `gateway_cache_write_tokens` is already in plain input; do not add it.
+3. Long-context tier, from the whole prompt (plain input + cache reads + cache writes): OpenAI
+   gpt-5.4 and later above 272K input bill 2× input and 1.5× output for the whole request; xAI at
+   200K and above bills 2× on every token. Anthropic has none (`context-1m-*` is never forwarded).
+4. Served modifiers, multiplied in (they stack with the cache multipliers):
+   - `speed = fast` (Anthropic, Opus 5.5 / 5 / 4.8): 2× every token category (Opus 5.5 $8/$40
+     against $4/$20).
+   - `service_tier`: OpenAI `priority` 2.5× (gpt-5.5 $12.50/$75 against $5/$30), `flex` at the
+     flex rate card; xAI `priority` 2× (measured: `cost_in_usd_ticks` exactly doubles); Anthropic
+     `priority` is a committed-capacity contract, not a per-token rate.
+   - `inference_geo = us`: 1.1× every token category (Claude 4.6 and later).
+   - `price_variant`: per the table above.
+5. Tool fees from `server_tools`: web search Anthropic $10 / 1K, OpenAI $10 / 1K ($25 / 1K for the
+   non-reasoning preview), xAI $5 / 1K; file search $2.50 / 1K (OpenAI, xAI); xAI code execution
+   $5 / 1K calls, X search $5 / 1K posts and $10 / 1K profiles. Containers bill by time, per
+   container across requests, so a pricer dedupes `container_id`: Anthropic $0.05 per
+   container-hour (5-minute minimum) after 1,550 free hours a month, free when the request carries
+   `web_search_20260209` or `web_fetch_20260209` or later; OpenAI per container per 20-minute
+   session by size ($0.03 for 1 GB). Web fetch, computer use and MCP add no fee beyond their tokens.
+6. Where the vendor reported its own cost (`upstream_cost_usd`: OpenRouter, xAI), that is the cost
+   of goods for the row. OpenRouter's figure excludes its 5.5% credit-purchase fee.
+7. An estimated row is priced from its counts, read with the bounds above; a row with
+   `upstream_may_continue` is reconciled before it is final.
+
+**Cache hits**
+
+A `cache_hit` row replays the fill's usage (the tokens, tier, speed, geography and tool counts the
+client is billed for) but no upstream facts: no `upstream_*`, `served_by`, `container_id`,
+`price_variant` or `upstream_status`. It made no upstream call and cost nothing upstream. Whether to
+charge the tenant for it is a product decision.
 
 ### Deny-Set (`deny.rs`)
 

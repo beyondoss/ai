@@ -10,6 +10,15 @@ use arrayvec::ArrayString;
 use serde::Deserialize;
 use tracing_subscriber::filter::{FilterFn, filter_fn};
 
+mod tools;
+mod vendor;
+#[cfg(test)]
+mod vendor_tests;
+
+pub use tools::ToolTally;
+use vendor::vendor_fields;
+pub use vendor::{HostStr, IdStr, ServerTools, Upstream, e10_to_usd, host_from, id_byte, id_from};
+
 /// The `tracing` target billing rows are written on.
 pub const USAGE_TARGET: &str = "ai.usage";
 
@@ -49,7 +58,9 @@ pub struct Usage {
     /// usage, which reports them as cache writes. See [`Usage::bill_gateway_cache_writes`].
     pub gateway_cache_write_tokens: u64,
     /// Server-side tool calls the provider ran and prices per call (Anthropic
-    /// `server_tool_use.web_search_requests`). OpenAI reports no such count in `usage`.
+    /// `server_tool_use.web_search_requests`). OpenAI reports no such count in `usage`. Kept for
+    /// the rows' existing consumers: [`Self::server_tools`] has every kind, this one included as
+    /// `web_search`.
     pub server_tool_calls: u64,
     /// The service tier the provider says it served at; `None` when it did not say.
     pub service_tier: Option<ServiceTier>,
@@ -57,9 +68,29 @@ pub struct Usage {
     /// cache-written) tokens, Anthropic's excludes both cache reads and writes. Set by the extractor
     /// that read it; `None` when nothing was read (an estimate), where the request's wire answers.
     pub wire: Option<Dialect>,
+    /// The speed the provider says it served at (Anthropic and OpenRouter Messages `usage.speed`:
+    /// `fast` | `standard`); `None` when not reported.
+    pub speed: Option<ServiceTier>,
+    /// Where the provider says inference ran (Anthropic `usage.inference_geo`: `global` | `us`);
+    /// `None` when not reported.
+    pub inference_geo: Option<ServiceTier>,
+    /// Server-side tool use by kind (see [`ServerTools`]).
+    pub server_tools: ServerTools,
+    /// What the upstream reported about the call itself: its ids and its own price. Not replayed
+    /// by a cache hit, which made no upstream call (see [`Self::for_cache`]).
+    pub upstream: Upstream,
 }
 
 impl Usage {
+    /// The usage a cache entry stores: everything the client is billed for, without the facts of
+    /// the upstream call that filled it, which a hit does not repeat.
+    pub fn for_cache(self) -> Self {
+        Usage {
+            upstream: Upstream::default(),
+            ..self
+        }
+    }
+
     /// Bill this request's cache writes as input: the gateway added the breakpoints that caused
     /// them (`translate::request_with_tools`), so they are its optimization, not the client's
     /// request. `wire` is the convention `input_tokens` follows: Anthropic's excludes cache writes,
@@ -77,6 +108,15 @@ impl Usage {
         self.cache_write_1h_tokens = 0;
         self.gateway_cache_write_tokens = writes;
     }
+}
+
+/// A tier-like token (`service_tier`, `speed`, `inference_geo`) from untrusted text: `None` unless
+/// it is `[a-z0-9_-]{1,16}`, the rule [`de_service_tier`] applies to a response's.
+pub fn tier_from(v: &str) -> Option<ServiceTier> {
+    let ok = !v.is_empty()
+        && v.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-');
+    ok.then(|| ServiceTier::from(v).ok()).flatten()
 }
 
 /// Deserialize a `service_tier` string into a [`ServiceTier`], leniently: anything else — `null`,
@@ -142,6 +182,7 @@ fn de_service_tier<'de, D: serde::Deserializer<'de>>(
 // `#[serde(default)]` so a missing or partial `usage` block reads as zeros, matching the prior
 // pointer-with-`unwrap_or(0)` behavior.
 
+vendor_fields! {
 /// OpenAI `usage` block (chat/completions). `prompt`/`completion` map to in/out; cached input rides
 /// in `prompt_tokens_details.cached_tokens`; reasoning in `completion_tokens_details.reasoning_tokens`.
 /// OpenAI itself has no cache-write concept, but OpenRouter serves Claude on this wire and reports
@@ -189,6 +230,7 @@ struct OpenAiUsage {
     #[serde(default)]
     output_tokens_details: OpenAiResponsesOutputDetails,
 }
+}
 
 #[derive(Deserialize, Default)]
 struct OpenAiPromptDetails {
@@ -223,7 +265,17 @@ impl OpenAiUsage {
 }
 
 impl From<OpenAiUsage> for Usage {
-    fn from(u: OpenAiUsage) -> Self {
+    fn from(mut u: OpenAiUsage) -> Self {
+        let vendor = u.vendor();
+        let mut usage = Usage::from_chat(u);
+        vendor.apply(&mut usage);
+        usage
+    }
+}
+
+impl Usage {
+    /// The token counts of a Chat Completions `usage` (or of a non-stream Responses one).
+    fn from_chat(u: OpenAiUsage) -> Self {
         if u.is_responses_shaped() {
             return Usage::from(OpenAiResponsesUsage {
                 input_tokens: u.input_tokens.unwrap_or(0),
@@ -231,6 +283,7 @@ impl From<OpenAiUsage> for Usage {
                 total_tokens: u.total_tokens,
                 input_tokens_details: u.input_tokens_details,
                 output_tokens_details: u.output_tokens_details,
+                ..OpenAiResponsesUsage::default()
             });
         }
         // OpenAI counts reasoning inside `completion_tokens`; xAI reports it beside it
@@ -270,6 +323,7 @@ impl From<OpenAiUsage> for Usage {
     }
 }
 
+vendor_fields! {
 /// The Responses API's `usage` block — named `input_tokens`/`output_tokens` (Anthropic-style) rather
 /// than `prompt_tokens`/`completion_tokens`. Streamed, it is nested under
 /// `response.completed.response.usage` (see `openai_stream`), an envelope Anthropic's wire never
@@ -288,6 +342,7 @@ struct OpenAiResponsesUsage {
     #[serde(default)]
     output_tokens_details: OpenAiResponsesOutputDetails,
 }
+}
 
 #[derive(Deserialize, Default)]
 struct OpenAiResponsesInputDetails {
@@ -305,7 +360,16 @@ struct OpenAiResponsesOutputDetails {
 }
 
 impl From<OpenAiResponsesUsage> for Usage {
-    fn from(u: OpenAiResponsesUsage) -> Self {
+    fn from(mut u: OpenAiResponsesUsage) -> Self {
+        let vendor = u.vendor();
+        let mut usage = Usage::from_responses(u);
+        vendor.apply(&mut usage);
+        usage
+    }
+}
+
+impl Usage {
+    fn from_responses(u: OpenAiResponsesUsage) -> Self {
         // OpenAI and xAI (measured against xAI's `cost_in_usd_ticks`) count reasoning inside
         // `output_tokens`. xAI's API reference shows it beside (`total_tokens = input + output +
         // reasoning`), as its Chat Completions does; the arithmetic decides, as for Chat.
@@ -333,6 +397,7 @@ impl From<OpenAiResponsesUsage> for Usage {
     }
 }
 
+vendor_fields! {
 /// Anthropic `usage` block (`/v1/messages` body + streaming events). Thinking/reasoning tokens ride
 /// in `output_tokens_details.thinking_tokens` on the final usage update — verified against the live
 /// API (some SDKs' own `Usage` type omits the field entirely).
@@ -350,8 +415,6 @@ struct AnthropicUsage {
     output_tokens_details: AnthropicOutputDetails,
     #[serde(default)]
     cache_creation: AnthropicCacheCreation,
-    #[serde(default)]
-    server_tool_use: AnthropicServerToolUse,
     #[serde(default, deserialize_with = "de_service_tier")]
     service_tier: Option<ServiceTier>,
     /// OpenAI's characteristic field names — **never billed from**, only checked by
@@ -361,6 +424,7 @@ struct AnthropicUsage {
     prompt_tokens: Option<u64>,
     #[serde(default)]
     completion_tokens: Option<u64>,
+}
 }
 
 #[derive(Deserialize, Default)]
@@ -376,13 +440,6 @@ struct AnthropicCacheCreation {
     ephemeral_1h_input_tokens: u64,
 }
 
-/// Server tools Anthropic ran during the turn. Web search is billed per request; web fetch is not.
-#[derive(Deserialize, Default)]
-struct AnthropicServerToolUse {
-    #[serde(default)]
-    web_search_requests: u64,
-}
-
 impl AnthropicUsage {
     fn looks_openai_shaped(&self) -> bool {
         self.prompt_tokens.is_some() && self.completion_tokens.is_some()
@@ -390,19 +447,22 @@ impl AnthropicUsage {
 }
 
 impl From<AnthropicUsage> for Usage {
-    fn from(u: AnthropicUsage) -> Self {
-        Usage {
+    fn from(mut u: AnthropicUsage) -> Self {
+        let vendor = u.vendor();
+        let mut usage = Usage {
             input_tokens: u.input_tokens,
             output_tokens: u.output_tokens,
             cache_read_tokens: u.cache_read_input_tokens,
             cache_write_tokens: u.cache_creation_input_tokens,
             reasoning_tokens: u.output_tokens_details.thinking_tokens,
             cache_write_1h_tokens: u.cache_creation.ephemeral_1h_input_tokens,
-            server_tool_calls: u.server_tool_use.web_search_requests,
             service_tier: u.service_tier,
             wire: Some(Dialect::Anthropic),
-            gateway_cache_write_tokens: 0,
-        }
+            ..Usage::default()
+        };
+        vendor.apply(&mut usage);
+        usage.server_tool_calls = u64::from(usage.server_tools.web_search);
+        usage
     }
 }
 
@@ -443,19 +503,31 @@ pub fn openai_body(body: &[u8]) -> Option<Usage> {
         // A root sibling of `usage` on Chat Completions and Responses bodies alike.
         #[serde(default, deserialize_with = "de_service_tier")]
         service_tier: Option<ServiceTier>,
+        #[serde(default, deserialize_with = "vendor::de_id")]
+        id: Option<IdStr>,
+        #[serde(default, deserialize_with = "vendor::de_host")]
+        provider: Option<HostStr>,
     }
-    let (usage, service_tier) = match serde_json::from_slice::<Body>(body) {
-        Ok(b) => (b.usage?, b.service_tier),
+    let (usage, service_tier, id, provider) = match serde_json::from_slice::<Body>(body) {
+        Ok(b) => (b.usage?, b.service_tier, b.id, b.provider),
         // Front-truncated tail of an oversized body — see `recover_trailing_usage`.
-        Err(_) => (recover_trailing_usage::<OpenAiUsage>(body)?, None),
+        Err(_) => (
+            recover_trailing_usage::<OpenAiUsage>(body)?,
+            None,
+            None,
+            None,
+        ),
     };
     if usage.looks_anthropic_shaped() {
         return None;
     }
-    Some(Usage {
+    let mut u = Usage {
         service_tier,
         ..Usage::from(usage)
-    })
+    };
+    u.upstream.generation_id = id;
+    u.upstream.served_by = provider;
+    Some(u)
 }
 
 /// Anthropic non-streaming: top-level `usage.{input,output,cache_*}`. `None` on a dialect mismatch —
@@ -464,15 +536,38 @@ pub fn anthropic_body(body: &[u8]) -> Option<Usage> {
     #[derive(Deserialize)]
     struct Body {
         usage: Option<AnthropicUsage>,
+        #[serde(default, deserialize_with = "vendor::de_id")]
+        id: Option<IdStr>,
+        #[serde(default)]
+        container: Option<Container>,
+        #[serde(default, deserialize_with = "vendor::de_host")]
+        provider: Option<HostStr>,
     }
-    let u = match serde_json::from_slice::<Body>(body) {
-        Ok(b) => b.usage?,
-        Err(_) => recover_trailing_usage::<AnthropicUsage>(body)?,
+    let (u, id, container, provider) = match serde_json::from_slice::<Body>(body) {
+        Ok(b) => (b.usage?, b.id, b.container, b.provider),
+        Err(_) => (
+            recover_trailing_usage::<AnthropicUsage>(body)?,
+            None,
+            None,
+            None,
+        ),
     };
     if u.looks_openai_shaped() {
         return None;
     }
-    Some(Usage::from(u))
+    let mut u = Usage::from(u);
+    u.upstream.generation_id = id;
+    u.upstream.container_id = container.and_then(|c| c.id);
+    u.upstream.served_by = provider;
+    Some(u)
+}
+
+/// Anthropic's root `container` (`{id, expires_at, skills}`), non-null when a container tool ran.
+/// Streamed, it rides on `message_delta.delta.container`.
+#[derive(Deserialize, Default)]
+struct Container {
+    #[serde(default, deserialize_with = "vendor::de_id")]
+    id: Option<IdStr>,
 }
 
 /// Strip the SSE `data:` framing from one line, yielding the raw JSON payload, or `None` if the line
@@ -649,6 +744,8 @@ fn openai_chunk_usage(payload: &[u8]) -> Option<Option<Usage>> {
         usage: Option<OpenAiResponsesUsage>,
         #[serde(default, deserialize_with = "de_service_tier")]
         service_tier: Option<ServiceTier>,
+        #[serde(default, deserialize_with = "vendor::de_id")]
+        id: Option<IdStr>,
     }
     #[derive(Deserialize)]
     struct Chunk {
@@ -657,18 +754,31 @@ fn openai_chunk_usage(payload: &[u8]) -> Option<Option<Usage>> {
         // On every Chat Completions chunk, the usage chunk included.
         #[serde(default, deserialize_with = "de_service_tier")]
         service_tier: Option<ServiceTier>,
+        #[serde(default, deserialize_with = "vendor::de_id")]
+        id: Option<IdStr>,
+        #[serde(default, deserialize_with = "vendor::de_host")]
+        provider: Option<HostStr>,
     }
     let chunk = serde_json::from_slice::<Chunk>(payload).ok()?;
     Some(if let Some(u) = chunk.usage {
-        (!u.looks_anthropic_shaped()).then(|| Usage {
-            service_tier: chunk.service_tier,
-            ..Usage::from(u)
+        (!u.looks_anthropic_shaped()).then(|| {
+            let mut u = Usage {
+                service_tier: chunk.service_tier,
+                ..Usage::from(u)
+            };
+            u.upstream.generation_id = chunk.id;
+            u.upstream.served_by = chunk.provider;
+            u
         })
     } else {
         chunk.response.and_then(|r| {
-            r.usage.map(|u| Usage {
-                service_tier: r.service_tier,
-                ..Usage::from(u)
+            r.usage.map(|u| {
+                let mut u = Usage {
+                    service_tier: r.service_tier,
+                    ..Usage::from(u)
+                };
+                u.upstream.generation_id = r.id;
+                u
             })
         })
     })
@@ -788,17 +898,30 @@ fn anthropic_apply(usage: &mut Usage, saw_any: &mut bool, payload: &[u8]) -> boo
     #[derive(Deserialize)]
     struct Message {
         usage: Option<AnthropicUsage>,
+        #[serde(default, deserialize_with = "vendor::de_id")]
+        id: Option<IdStr>,
+    }
+    #[derive(Deserialize)]
+    struct Delta {
+        #[serde(default)]
+        container: Option<Container>,
     }
     #[derive(Deserialize)]
     struct Chunk {
         // `message_start` nests usage under `message`; `message_delta` carries it top-level.
         message: Option<Message>,
         usage: Option<AnthropicUsage>,
+        // `message_delta.delta.container`: the code-execution container, once one ran.
+        delta: Option<Delta>,
     }
     let Ok(chunk) = serde_json::from_slice::<Chunk>(payload) else {
         return false;
     };
-    if let Some(u) = chunk.message.and_then(|m| m.usage)
+    if let Some(c) = chunk.delta.and_then(|d| d.container).and_then(|c| c.id) {
+        usage.upstream.container_id = Some(c);
+    }
+    if let Some(mut m) = chunk.message
+        && let Some(mut u) = m.usage.take()
         && !u.looks_openai_shaped()
     {
         usage.input_tokens = u.input_tokens;
@@ -806,9 +929,13 @@ fn anthropic_apply(usage: &mut Usage, saw_any: &mut bool, payload: &[u8]) -> boo
         usage.cache_write_tokens = u.cache_creation_input_tokens;
         usage.cache_write_1h_tokens = u.cache_creation.ephemeral_1h_input_tokens;
         usage.service_tier = u.service_tier;
+        if m.id.is_some() {
+            usage.upstream.generation_id = m.id;
+        }
+        u.vendor().apply(usage);
         *saw_any = true;
     }
-    if let Some(u) = chunk.usage
+    if let Some(mut u) = chunk.usage
         && !u.looks_openai_shaped()
     {
         // message_delta carries the running output token count — and, cumulatively, input
@@ -830,10 +957,13 @@ fn anthropic_apply(usage: &mut Usage, saw_any: &mut bool, payload: &[u8]) -> boo
         if u.cache_creation.ephemeral_1h_input_tokens > 0 {
             usage.cache_write_1h_tokens = u.cache_creation.ephemeral_1h_input_tokens;
         }
-        // Cumulative, and only ever on the delta: the searches run mid-turn.
-        if u.server_tool_use.web_search_requests > 0 {
-            usage.server_tool_calls = u.server_tool_use.web_search_requests;
+        // Cumulative, and only ever on the delta: the searches run mid-turn. Present wins, as
+        // for the token counts; `speed` / `inference_geo` / cost likewise.
+        if u.service_tier.is_some() {
+            usage.service_tier = u.service_tier;
         }
+        u.vendor().apply(usage);
+        usage.server_tool_calls = u64::from(usage.server_tools.web_search);
         if let Some(rt) = u.output_tokens_details.thinking_tokens {
             usage.reasoning_tokens = Some(rt);
         }
@@ -1989,6 +2119,11 @@ mod tests {
             cache_write_tokens: 100,
             reasoning_tokens: None,
             wire: Some(Dialect::Anthropic),
+            // `message_start.message.id`, from the head like the input counts.
+            upstream: Upstream {
+                generation_id: id_from("msg_1"),
+                ..Upstream::default()
+            },
             ..Usage::default()
         };
 

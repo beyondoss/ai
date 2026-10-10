@@ -423,6 +423,14 @@ pub enum Mode {
     /// Reply with exactly this status, content type, and body — for fixtures that belong to one
     /// test file (a provider's real stream shape, an error body with no `error` key).
     Raw(u16, &'static str, &'static str),
+    /// [`Raw`](Mode::Raw) plus these response headers: a vendor's id headers (OpenRouter's
+    /// `x-generation-id`, Anthropic's `request-id`).
+    RawHeaders(
+        u16,
+        &'static str,
+        &'static str,
+        &'static [(&'static str, &'static str)],
+    ),
     /// [`Raw`](Mode::Raw) for a request whose body contains the marker (the first field), the
     /// [`Json`](Mode::Json) 200 otherwise: one upstream that refuses some requests and serves the
     /// rest, as OpenRouter does a request too costly for the balance left.
@@ -713,7 +721,9 @@ fn canned_body(mode: Mode) -> (&'static str, Bytes) {
                 br#"{"type":"error","error":{"type":"api_error","message":"mock"}}"#,
             ),
         ),
-        Mode::Raw(_, content_type, body) => (content_type, Bytes::from_static(body.as_bytes())),
+        Mode::Raw(_, content_type, body) | Mode::RawHeaders(_, content_type, body, _) => {
+            (content_type, Bytes::from_static(body.as_bytes()))
+        }
     }
 }
 
@@ -840,11 +850,12 @@ async fn mock_handle(
         Mode::Status(s)
         | Mode::AnthropicStatus(s)
         | Mode::Raw(s, _, _)
+        | Mode::RawHeaders(s, _, _, _)
         | Mode::StatusThenStall(s) => s,
         Mode::ThrottleKey(_) if throttled => 429,
         _ => 200,
     };
-    let (ct, payload) = if status == 429 && !matches!(mode, Mode::Raw(..)) {
+    let (ct, payload) = if status == 429 && !matches!(mode, Mode::Raw(..) | Mode::RawHeaders(..)) {
         (
             "application/json",
             Bytes::from_static(br#"{"error":{"message":"mock"}}"#),
@@ -858,6 +869,11 @@ async fn mock_handle(
         .header("x-mock-proto", proto_label(version));
     if status == 429 {
         builder = builder.header("retry-after", "7");
+    }
+    if let Mode::RawHeaders(_, _, _, headers) = mode {
+        for (k, v) in headers {
+            builder = builder.header(*k, *v);
+        }
     }
     let body = if matches!(mode, Mode::StatusThenStall(_)) {
         Either::Right(StallingBody(None))
