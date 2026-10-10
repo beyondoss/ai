@@ -26,12 +26,12 @@
 //! | `openai::flex`                | Flex                              | < $0.01 |
 //! | `openai::web_search`          | Responses web search ($10 / 1K)   | ~$0.02  |
 //! | `openrouter::generation`      | `usage.cost` + generation API     | < $0.01 |
-//! | `openrouter::cancelled`       | a cancelled stream, reconciled    | < $0.01 |
+//! | `openrouter::cancelled`       | a drained cancel = generation API | < $0.01 |
 //! | `bedrock::us_profile`         | the `us.` profile's Regional SKUs | < $0.01 |
 //! | `xai::web_search`             | xAI tokens + tool fee vs ticks    | ~$0.03  |
 //! | `openai::long_context`        | > 272K input: 2× in, 1.5× out     | ~$0.06  |
 //! | `xai::long_context`           | ≥ 200K prompt: 2× (vs xAI ticks)  | ~$0.42  |
-//! | `bedrock::cancel_gap`         | cancelled-stream estimate gap     | < $0.01 |
+//! | `bedrock::cancel_gap`         | a drained cancel = the full run   | < $0.01 |
 //! | `groq::cancel_gap`            | the same on Groq (needs a key)    | < $0.01 |
 //!
 //! Cached input and every catalog row's basic rates are reconciled elsewhere. BIL-5
@@ -239,7 +239,17 @@ fn main() {
             // A case that reads a provider's usage report claims BIL-5 too, which runs it in
             // verify:live's isolated phase; the others are live traffic a window must not see.
             let reconciled = admin.is_some();
-            let claims = if reconciled { "BIL-24+BIL-5" } else { "BIL-24" };
+            // A cancelled stream on a host that keeps generating is drained: BIL-26 too.
+            let claims = if reconciled {
+                "BIL-24+BIL-5"
+            } else if matches!(
+                case.name,
+                "bedrock::cancel_gap" | "groq::cancel_gap" | "openrouter::cancelled"
+            ) {
+                "BIL-24+BIL-26"
+            } else {
+                "BIL-24"
+            };
             trials.push(Trial::test(
                 format!("{claims}::raw::{}", case.name),
                 move || {
@@ -391,7 +401,8 @@ impl Ctx {
                 reply.status, reply.body
             )
         })?;
-        let deadline = Instant::now() + Duration::from_secs(15);
+        // A drained cancel writes its row when the vendor finishes, seconds after the client left.
+        let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             let rows: Vec<Value> = recon::usage_rows(&self.gw.log)
                 .into_iter()
@@ -1168,10 +1179,12 @@ fn openrouter_cancelled(ctx: &Ctx) -> Result<(), Failed> {
     if row["outcome"] != "client_cancelled" {
         return Err(format!("not a cancel: {row}").into());
     }
-    if row["price_status"] != "estimated" {
-        return Err(format!("a cancelled OpenRouter row must be estimated: {row}").into());
+    // Drained to its end (`crate::drain` in the gateway): the row carries OpenRouter's own
+    // `usage.cost`, priced, where it used to be estimated at the dearest endpoint.
+    if row["usage_settled"] != "drained" || row["price_status"] != "priced" {
+        return Err(format!("a cancelled OpenRouter row must be drained and priced: {row}").into());
     }
-    let estimate = row["cost_micros"]
+    let cost = row["cost_micros"]
         .as_u64()
         .ok_or_else(|| format!("no cost: {row}"))?;
     let id = row["upstream_generation_id"]
@@ -1179,14 +1192,16 @@ fn openrouter_cancelled(ctx: &Ctx) -> Result<(), Failed> {
         .ok_or_else(|| format!("no generation id: {row}"))?;
     let g = generation(ctx, id)?;
     let reconciled = with_fee(&g["total_cost"].to_string())?;
-    // The reconciled amount is the bill: the row's estimate is what the gateway could see.
     eprintln!(
-        "BIL-24 openrouter::cancelled: row estimated {estimate} µ$ ({} output tokens relayed); \
-         the generation API bills {reconciled} µ$ (cancelled={}, {} completion tokens, host {})",
+        "BIL-24 openrouter::cancelled: drained row {cost} µ$ ({} output tokens); the generation \
+         API bills {reconciled} µ$ (cancelled={}, {} completion tokens, host {})",
         row["output_tokens"], g["cancelled"], g["native_tokens_completion"], g["provider_name"]
     );
-    if !g["cancelled"].is_boolean() {
-        return Err(format!("the generation API did not say whether it was cancelled: {g}").into());
+    if cost != reconciled {
+        return Err(format!(
+            "the drained row's {cost} µ$ is not the generation's total_cost × 1.055 = {reconciled} µ$ ({row})"
+        )
+        .into());
     }
     Ok(())
 }
@@ -1507,11 +1522,12 @@ fn xai_long_context(ctx: &Ctx) -> Result<(), Failed> {
 // Cancelled-stream estimate gap (Bedrock, Groq)
 // ---------------------------------------------------------------------------------------------
 
-/// How far a cancelled stream's row falls short of what a host that keeps generating bills. The
-/// same deterministic prompt is run once to completion (the full bill) and once cut after a
-/// second (the row the gateway writes). The gap is recorded in
-/// `target/verify-cancel-gap.jsonl` and printed; the case passes when the cut row is flagged
-/// (`estimated`, `upstream_may_continue`), since its tokens are a lower bound by design.
+/// What a cancelled stream's row says on a host that keeps generating, against what that host
+/// bills. The same deterministic prompt is run once to completion (the full bill) and once cut
+/// after a second (the row the gateway writes). The gateway drains the cut stream to its end
+/// (`crate::drain` in the gateway), so the case passes when the cut row equals the full run: the
+/// same output tokens, `usage_settled=drained`, priced, not estimated. The comparison is recorded
+/// in `target/verify-cancel-gap.jsonl` and printed.
 fn cancel_gap(ctx: &Ctx, path: &str, model: &str, headers: &[&str]) -> Result<(), Failed> {
     let prompt = "Count from 1 to 300, one number per line, nothing else.";
     let body = |stream: bool| {
@@ -1542,7 +1558,8 @@ fn cancel_gap(ctx: &Ctx, path: &str, model: &str, headers: &[&str]) -> Result<()
         "cut_row_output_tokens": relayed, "gap_tokens": gap,
         "row_share": if billed > 0 { relayed as f64 / billed as f64 } else { 0.0 },
         "cut_cost_micros": row["cost_micros"], "full_cost_micros": full_row["cost_micros"],
-        "outcome": row["outcome"], "at": recon::now_secs(),
+        "outcome": row["outcome"], "usage_settled": row["usage_settled"],
+        "price_status": row["price_status"], "at": recon::now_secs(),
     });
     eprintln!("BIL-24 {}: {line}", ctx.case.name);
     if let Ok(mut f) = std::fs::OpenOptions::new()
@@ -1556,9 +1573,19 @@ fn cancel_gap(ctx: &Ctx, path: &str, model: &str, headers: &[&str]) -> Result<()
     if row["outcome"] != "client_cancelled" {
         return Err(format!("the cut did not cancel: {row}").into());
     }
-    if row["price_status"] != "estimated" || row["upstream_may_continue"] != true {
+    if row["usage_settled"] != "drained"
+        || row["usage_estimated"] != false
+        || row["upstream_may_continue"] != false
+        || row["price_status"] != "priced"
+    {
         return Err(format!(
-            "a cancelled stream on a host that keeps generating must be flagged: {row}"
+            "a cancelled stream on a host that keeps generating must be drained to its usage: {row}"
+        )
+        .into());
+    }
+    if relayed != billed {
+        return Err(format!(
+            "the drained row has {relayed} output tokens, the full run {billed}: {row}"
         )
         .into());
     }

@@ -67,8 +67,9 @@
 use crate::cache;
 use crate::capture::CaptureBufs;
 use crate::circuit_breaker::Permit;
+use crate::drain::{self, Drain};
 use crate::key;
-use crate::metrics::{KeyCooled, Rejection};
+use crate::metrics::{DrainEnd, KeyCooled, Rejection};
 use crate::route::{self, Dialect, Provider};
 use crate::signed_id;
 use crate::state::{GatewayState, RequestId};
@@ -84,12 +85,12 @@ use pingora_core::protocols::http::HttpTask;
 use pingora_core::protocols::http::subrequest::server::SubrequestHandle;
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_proxy::subrequest::{BodyMode, Ctx as SubrequestCtx};
-use pingora_proxy::{FailToProxy, ProxyHttp, Session};
+use pingora_proxy::{FailToProxy, ProxyHttp, ProxyWarnLogContext, Session};
 use std::borrow::Cow;
 use std::fmt::Write as _;
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
@@ -263,8 +264,8 @@ pub struct Ctx {
     held: Held,
 }
 
-/// The releasable state of one request. Kept beside, not inside, [`RequestCtx`]: none of it is
-/// touched per response chunk, and `RequestCtx`'s size is (see its size test).
+/// The releasable state of one request. Kept beside, not inside, [`RequestCtx`]: none of it but the
+/// one-byte `drain` is touched per response chunk, and `RequestCtx`'s size is (see its size test).
 struct Held {
     state: &'static GatewayState,
     /// Set at the top of `request_filter`, so an error answered before admission (a body read
@@ -280,6 +281,15 @@ struct Held {
     body_bytes: usize,
     /// A `FullBody` re-run: its parent reserved the budget for both copies of the body.
     body_exempt: bool,
+    /// The client hung up on an armed stream ([`Drain::Armed`]): set by
+    /// `suppress_proxy_warn_log`, which pingora calls with a shared `&Ctx`, hence atomic. Read by
+    /// `response_body_filter` only while a drain is armed. While set, the request is counted on
+    /// `ai_usage_drains_in_flight`, until `close_drain` clears it. See [`crate::drain`].
+    client_left: AtomicBool,
+    /// Drain-on-cancel ([`crate::drain`]): armed at a managed 2xx stream's head from a provider
+    /// that keeps generating after a disconnect, `Off` everywhere else. The one field here read
+    /// per response chunk, a one-byte compare (kept off `RequestCtx`, whose size is tested).
+    drain: Drain,
 }
 
 impl Held {
@@ -306,6 +316,31 @@ impl Held {
     fn release_stream(&mut self) {
         if std::mem::take(&mut self.active_stream) {
             self.state.metrics.active_streams.dec();
+        }
+    }
+
+    /// The client left an armed stream (pingora ignored its downstream error): the drain starts,
+    /// counted once. Takes `&self`: pingora reports it through a hook that holds a shared `&Ctx`.
+    fn client_left(&self) {
+        if !self.client_left.swap(true, Ordering::Relaxed) {
+            self.state.metrics.usage_drains_in_flight.inc();
+        }
+    }
+
+    /// The first chunk after the client left: stop relaying, and give back the tenant's
+    /// concurrency slot, which bounds what a client has open, not what the gateway finishes
+    /// reading for it.
+    fn open_drain(&mut self) {
+        self.drain = Drain::Draining;
+        self.release_tenant();
+    }
+
+    /// End the drain this request started, if any, counting how it ended.
+    fn close_drain(&mut self, end: DrainEnd) {
+        self.drain = Drain::Off;
+        if self.client_left.swap(false, Ordering::Relaxed) {
+            self.state.metrics.usage_drains_in_flight.dec();
+            self.state.metrics.drain_ended(end);
         }
     }
 
@@ -367,6 +402,8 @@ impl Drop for Ctx {
         self.held.release_stream();
         self.held.release_tenant();
         self.held.release_body();
+        // `logging` closes a drain with how it ended; only a panic past it lands here.
+        self.held.close_drain(DrainEnd::Error);
         if let Some(rc) = self.rc.as_mut()
             && let Some(permit) = rc.breaker_pending.take()
             && let Some(b) = rc.provider.breaker.as_ref()
@@ -627,11 +664,71 @@ fn price_variant(provider: &str, upstream_model: &str, host: &str) -> Option<&'s
 const MAY_CONTINUE_PROVIDERS: [&str; 3] = ["openrouter", "bedrock", "groq"];
 
 /// Whether this row's provider may have generated (and billed) past the point the row counts:
-/// a stream the client cancelled, or one cut short, on a provider in [`MAY_CONTINUE_PROVIDERS`].
-fn upstream_may_continue(provider: Option<&str>, outcome: &str, streaming: bool) -> bool {
+/// a stream the client cancelled, or one cut short, on a provider in [`MAY_CONTINUE_PROVIDERS`],
+/// unless the gateway read that stream to its end after the client left (`drained`): then the row
+/// counts everything the provider generated.
+fn upstream_may_continue(
+    provider: Option<&str>,
+    outcome: &str,
+    streaming: bool,
+    drained: bool,
+) -> bool {
     streaming
+        && !drained
         && matches!(outcome, "client_cancelled" | "cut_short")
         && provider.is_some_and(|p| MAY_CONTINUE_PROVIDERS.contains(&p))
+}
+
+/// One response chunk of an armed stream ([`Drain::Armed`] or later): `true` when it is drained
+/// (its bytes already fed the usage taps, and are not sent), `false` while the client still reads.
+/// The first chunk after the client left starts the drain; the stream's end settles it.
+fn drain_chunk(rc: &mut RequestCtx, held: &mut Held, end_of_stream: bool) -> bool {
+    match held.drain {
+        Drain::Off => return false,
+        Drain::Armed => {
+            if !held.client_left.load(Ordering::Relaxed) {
+                return false;
+            }
+            held.open_drain();
+            // The client got part of this answer: the rest is never stored as a cache fill.
+            if let Some(a) = rc.auto.as_mut()
+                && matches!(a.cache, Some(cache::Pending::Fill { .. }))
+            {
+                a.cache = None;
+            }
+        }
+        Drain::Draining | Drain::Settled => {}
+    }
+    if end_of_stream {
+        held.drain = Drain::Settled;
+    }
+    true
+}
+
+/// How a drain ended, at `logging`: `None` when none started (the client never left an armed
+/// stream). A drain whose upstream ended is settled even if the request then errored, which can
+/// only be the dead client's last write (the end of a chunked body); the deadline or an upstream
+/// failure first leaves the estimate.
+fn drain_end(drain: Drain, client_left: bool, e: Option<&pingora_core::Error>) -> Option<DrainEnd> {
+    if !client_left {
+        return None;
+    }
+    Some(match (drain, e) {
+        (Drain::Settled, _) => DrainEnd::Settled,
+        (_, Some(e)) if is_deadline(e) => DrainEnd::Deadline,
+        (_, Some(e)) if e.esource() != &pingora_core::ErrorSource::Downstream => DrainEnd::Error,
+        _ => DrainEnd::Settled,
+    })
+}
+
+/// Whether a response head starts a stream to drain if the client hangs up ([`crate::drain`]): a
+/// managed 2xx stream from a provider in [`MAY_CONTINUE_PROVIDERS`]. BYO writes no billing row,
+/// and a provider that stops generating when the client leaves bills only what it relayed.
+fn drains_on_cancel(rc: &RequestCtx, status: u16) -> bool {
+    rc.managed
+        && rc.streaming
+        && (200..300).contains(&status)
+        && MAY_CONTINUE_PROVIDERS.contains(&rc.provider.name.as_str())
 }
 
 /// The upstream response header carrying the vendor's request id, in the order they are tried.
@@ -1035,14 +1132,23 @@ fn closed_after_terminal(rc: &RequestCtx, e: &pingora_core::Error) -> bool {
 
 /// What became of a request, on its billing row: a consumer must be able to tell a zero-token row
 /// for an upstream error or a cancel from a real zero-token generation.
-fn outcome(rc: &RequestCtx, e: Option<&pingora_core::Error>, cache_hit: bool) -> &'static str {
+///
+/// `client_left`: the client hung up on a drained stream ([`crate::drain`]) before its terminal
+/// event. The request may then end with no error (the drain settled) or an upstream one (it did
+/// not), and is a cancel either way.
+fn outcome(
+    rc: &RequestCtx,
+    e: Option<&pingora_core::Error>,
+    cache_hit: bool,
+    client_left: bool,
+) -> &'static str {
     if cache_hit {
         return "ok";
     }
     if rc.upstream_status.is_some_and(|s| s >= 400) {
         return "upstream_error";
     }
-    if e.is_some_and(|e| e.esource() == &pingora_core::ErrorSource::Downstream) {
+    if client_left || e.is_some_and(|e| e.esource() == &pingora_core::ErrorSource::Downstream) {
         return "client_cancelled";
     }
     if rc.upstream_phase == UpstreamPhase::None {
@@ -3848,8 +3954,28 @@ impl ProxyHttp for AiProxy {
                 tenant: None,
                 body_bytes: 0,
                 body_exempt: false,
+                client_left: AtomicBool::new(false),
+                drain: Drain::Off,
             },
         }
+    }
+
+    /// Pingora calls this with `DownstreamCache` exactly when it ignores a downstream error to keep
+    /// reading the upstream: on this gateway, only for a stream [`drain::arm`]ed it. That is the
+    /// client leaving a drainable stream; `response_body_filter` takes it from there. Its warn
+    /// line is replaced by `ai_usage_drains_in_flight` / `ai_usage_drains_total`.
+    fn suppress_proxy_warn_log(
+        &self,
+        _session: &Session,
+        ctx: &Self::CTX,
+        _error: &pingora_core::Error,
+        context: ProxyWarnLogContext,
+    ) -> bool {
+        if matches!(context, ProxyWarnLogContext::DownstreamCache) {
+            ctx.held.client_left();
+            return true;
+        }
+        false
     }
 
     /// The request line pingora prints on its own error lines. Its default prints the path
@@ -6297,7 +6423,7 @@ impl ProxyHttp for AiProxy {
 
     async fn response_filter(
         &self,
-        _session: &mut Session,
+        session: &mut Session,
         upstream_response: &mut ResponseHeader,
         ctx: &mut Self::CTX,
     ) -> Result<()> {
@@ -6359,6 +6485,19 @@ impl ProxyHttp for AiProxy {
             }
             if rc.managed {
                 tap_response_head(rc, upstream_response);
+            }
+            // Drain-on-cancel, decided per head (a walk's next attempt may be another provider).
+            // A drain already under way is left as it is.
+            if matches!(held.drain, Drain::Off | Drain::Armed) {
+                held.drain = if drains_on_cancel(rc, status) && full_body_ctx(session).is_none() {
+                    if drain::arm(&mut session.cache) {
+                        Drain::Armed
+                    } else {
+                        Drain::Off
+                    }
+                } else {
+                    Drain::Off
+                };
             }
             self.state.fault_point("response_filter");
 
@@ -6517,7 +6656,8 @@ impl ProxyHttp for AiProxy {
         // Usage taps read the *upstream* dialect. Cache fill (#68) and capture read the bytes
         // the client sees — post-translate on a wire-mismatched catalog walk, the relayed
         // chunk otherwise. SSE is converted event-by-event; the full stream is never buffered.
-        let Some(rc) = ctx.as_mut() else {
+        let Ctx { rc, held } = ctx;
+        let Some(rc) = rc.as_mut() else {
             return Ok(None);
         };
         self.state.fault_point("response_body_filter");
@@ -6577,6 +6717,13 @@ impl ProxyHttp for AiProxy {
                     .resp_bytes
                     .saturating_add(u32::try_from(chunk.len()).unwrap_or(u32::MAX));
             }
+        }
+
+        // Drain-on-cancel: once the client has left an armed stream, a chunk feeds the usage taps
+        // above and nothing else, and the client is sent nothing more (see `crate::drain`).
+        if held.drain != Drain::Off && drain_chunk(rc, held, end_of_stream) {
+            *body = None;
+            return Ok(None);
         }
 
         // --- signed ids (`signed_id`): after the usage taps, before anything the client sees ---
@@ -7084,6 +7231,16 @@ impl ProxyHttp for AiProxy {
         // A client that closed after its stream's terminal event reached it has the whole answer:
         // the request completed, whatever the provider's end of stream was still doing.
         let e = e.filter(|e| !closed_after_terminal(rc, e));
+        // Drain-on-cancel (`crate::drain`): the client left an armed stream before its terminal
+        // event, and whether the gateway then read the upstream to its end (`drained`: the usage
+        // tail holds the vendor's final usage).
+        let left = held.client_left.load(Ordering::Relaxed);
+        let client_left = left && !rc.terminal.ended();
+        let drain_end = drain_end(held.drain, left, e);
+        if let Some(end) = drain_end {
+            held.close_drain(end);
+        }
+        let drained = client_left && drain_end == Some(DrainEnd::Settled);
 
         // An upstream error (DNS/connect timeout, read timeout, abort) lands here with `Some(e)` but
         // no `ai.usage` row (no parseable body) — and the earlier `warn!` in `upstream_peer` only
@@ -7441,7 +7598,7 @@ impl ProxyHttp for AiProxy {
                     (rc.upstream_phase != UpstreamPhase::None).then_some(rc.provider.name.as_str())
                 }
             };
-            let outcome = outcome(rc, e, cache_hit.is_some());
+            let outcome = outcome(rc, e, cache_hit.is_some(), client_left);
             let usage_stream = cache_hit
                 .as_ref()
                 .map(|h| h.streaming)
@@ -7476,7 +7633,7 @@ impl ProxyHttp for AiProxy {
                 .filter(|_| called);
             let server_tools = usage.server_tools.to_row();
             let upstream_may_continue =
-                upstream_may_continue(usage_provider, outcome, usage_stream);
+                upstream_may_continue(usage_provider, outcome, usage_stream, drained);
             let estimate_excludes = estimated.excludes(&usage);
             let upstream_cost_usd = usage.upstream.cost_e10.map(usage::e10_to_usd);
             let upstream_inference_cost_usd =
@@ -7552,6 +7709,10 @@ impl ProxyHttp for AiProxy {
                 // True when the stream was cut short before its usage block and the token counts
                 // below are the gateway's estimate, not the provider's report. Estimates err low.
                 usage_estimated,
+                // `drained`: the client cancelled and the counts are still the provider's own,
+                // read from the stream the gateway finished after it left (`crate::drain`).
+                // Absent otherwise.
+                usage_settled = (drained && !usage_estimated).then_some("drained"),
                 input_tokens = usage.input_tokens,
                 output_tokens = usage.output_tokens,
                 cache_read_tokens = usage.cache_read_tokens,
@@ -7654,7 +7815,7 @@ impl ProxyHttp for AiProxy {
                     // died at token 400" is frequently the answer, so a partial is kept, not dropped.
                     request_truncated = cap.req_truncated(),
                     response_truncated = cap.resp_truncated(),
-                    complete = e.is_none(),
+                    complete = e.is_none() && !client_left,
                     "payload"
                 );
             }
@@ -9569,21 +9730,28 @@ mod mutation_gaps {
     #[test]
     fn every_ending_has_its_own_outcome() {
         let mut rc = tests::test_ctx(false);
-        assert_eq!(outcome(&rc, None, false), "no_candidate");
-        assert_eq!(outcome(&rc, None, true), "ok", "a cache hit made no call");
+        assert_eq!(outcome(&rc, None, false, false), "no_candidate");
+        assert_eq!(
+            outcome(&rc, None, true, false),
+            "ok",
+            "a cache hit made no call"
+        );
         rc.upstream_phase = UpstreamPhase::Attempted;
         let up = Error::new_up(T::ConnectRefused);
-        assert_eq!(outcome(&rc, Some(&up), false), "upstream_error");
+        assert_eq!(outcome(&rc, Some(&up), false, false), "upstream_error");
         let down = Error::new_down(T::ReadError);
-        assert_eq!(outcome(&rc, Some(&down), false), "client_cancelled");
+        assert_eq!(outcome(&rc, Some(&down), false, false), "client_cancelled");
         rc.upstream_phase = UpstreamPhase::Connected;
         rc.upstream_status = Some(200);
-        assert_eq!(outcome(&rc, None, false), "ok");
-        assert_eq!(outcome(&rc, Some(&up), false), "cut_short");
-        assert_eq!(outcome(&rc, Some(&down), false), "client_cancelled");
+        assert_eq!(outcome(&rc, None, false, false), "ok");
+        assert_eq!(outcome(&rc, Some(&up), false, false), "cut_short");
+        assert_eq!(outcome(&rc, Some(&down), false, false), "client_cancelled");
+        // A drained stream (the client left first) is a cancel however the request then ended.
+        assert_eq!(outcome(&rc, None, false, true), "client_cancelled");
+        assert_eq!(outcome(&rc, Some(&up), false, true), "client_cancelled");
         rc.upstream_status = Some(400);
-        assert_eq!(outcome(&rc, None, false), "upstream_error");
-        assert_eq!(outcome(&rc, Some(&down), false), "upstream_error");
+        assert_eq!(outcome(&rc, None, false, false), "upstream_error");
+        assert_eq!(outcome(&rc, Some(&down), false, false), "upstream_error");
     }
 
     /// Only a 401 is a pool key failing (D84): a 402 or 403 is about the request or the account,
