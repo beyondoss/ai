@@ -2117,8 +2117,12 @@ settle one:
 (`server_tools` is read back from its logged text), so a repricer working from the row gets the
 same inputs. The pricing contract (the model, every dimension, rounding, the rate table and the
 golden vectors) is `crates/providers/ARCHITECTURE.md`, "Pricing contract". The rate table is
-generated from snapshots of every vendor's primary pricing source: maintaining it is
-`mise run rates:sync`, a review of the diff, and a new `rate_version`.
+generated from snapshots of every vendor's primary pricing source. A daily workflow
+(`rates-drift.yml`) re-fetches them and, when a rate moved, opens a `rates/sync-*` PR with the new
+table and `rate_version`, labeled `rates-routine` (rate values only, each within 2×) or
+`rates-review`; a routine PR merges itself once CI is green, a review PR waits for a human; a source it can no longer read opens a `rates-broken` issue
+instead. By hand it is `mise run rates:sync` and a review of the diff (providers ARCHITECTURE,
+"Rate data and versions").
 
 | Field             | Type    | Meaning                                                                                                                                                        |
 | ----------------- | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |

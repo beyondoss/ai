@@ -18,10 +18,10 @@
 //! # Maintenance
 //!
 //! Run `mise run rates:sync`: it re-fetches every source, regenerates the table, and prints what
-//! moved. Then `rate_version_names_this_table` prints the new [`RATE_VERSION`]. A vendor that
-//! changes a page's layout fails the sync loudly (its parser never guesses); a vendor that
-//! rewords a prose rule fails its quote check. The weekly `rates-drift` workflow runs the same
-//! fetch and fails when any price moved.
+//! moved, and sets the new [`RATE_VERSION`] (`rates-sync rate-version`, from [`table_hash`]). A
+//! vendor that changes a page's layout fails the sync loudly (its parser never guesses); a vendor
+//! that rewords a prose rule fails its quote check. The daily `rates-drift` workflow runs the same
+//! fetch and opens a PR with what moved, or an issue when a source no longer reads.
 
 use crate::ProviderId;
 use crate::pricing::{Card, Class, TokenRates, usd};
@@ -82,6 +82,18 @@ pub struct OrEndpoint {
     pub class: Class,
     /// Its prices. A time-of-day schedule is folded to its dearest window.
     pub card: Card,
+}
+
+/// The hash half of [`RATE_VERSION`]: FNV-1a 64 over the compiled table's `Debug` text and the
+/// OpenRouter fee. `rates-sync rate-version` writes it; `rate_version_names_this_table` checks it.
+pub fn table_hash() -> String {
+    let text = format!("{ROW_RATES:?}{OPENROUTER_CREDIT_FEE}");
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in text.bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{h:016x}")
 }
 
 /// The rates for a catalog row, by exact name.

@@ -2,6 +2,9 @@ name: CI
 on:
   pull_request:
     branches: [main]
+  # The rates-drift workflow's PRs are made with GITHUB_TOKEN, which starts no pull_request run;
+  # it dispatches this on the PR's branch instead. No job reads the pull_request payload.
+  workflow_dispatch:
 # A newer push to the same PR cancels the superseded run — no pile-ups (which is how a single wedged
 # runner blocked everything), faster feedback, fewer wasted runner-minutes.
 concurrency:

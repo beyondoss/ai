@@ -240,14 +240,34 @@ per million fails.
 Maintenance is one command:
 
 - `mise run rates:sync` re-fetches every source, rewrites the changed snapshots, regenerates the
-  table, and prints the diff. Review it, then bump `RATE_VERSION` to the value
-  `rate_version_names_this_table` prints, and update `verify/pricing_vectors.json` if a vector's
-  rates moved.
+  table, prints the diff, and sets `RATE_VERSION` (`rates-sync rate-version`: `{today}.{hash}` of
+  the table a fresh build links, also written to `verify/pricing_vectors.json`'s `rate_version`;
+  unchanged when the hash already matches). Review the diff, and recompute any golden vector
+  whose rates moved (`golden_vectors_price_exactly` names it).
 - `mise run rates:generate` regenerates from the committed snapshots, offline.
   `rates_generated_from_sources` (`crates/rates-sync/tests/regenerate.rs`, per PR) does the same
   and diffs it with the committed file, so the table can only be what the snapshots and rules say.
-- `.github/workflows/rates-drift.yml` (weekly, never per PR) re-fetches into a scratch copy and
-  fails, listing the diff, when any price moved, a parser met a new layout, or a quote vanished.
+- `.github/workflows/rates-drift.yml` (daily and on dispatch, never per PR) re-fetches into a
+  scratch copy and classifies the result (`rates-sync classify`, `crates/rates-sync/src/classify.rs`;
+  `mise run rates:classify` runs it locally, writing nothing):
+
+  | Class   | When                                                                                                                                                                        | The workflow                                                                                   |
+  | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+  | none    | the generated table is unchanged (a snapshot may have changed outside any priced cell)                                                                                      | nothing                                                                                        |
+  | routine | only rate values (per-token rates, per-call fees) moved, each by at most 2× either way and none to or from zero; no card, endpoint, row, tier, or tool fee added or removed | regenerates, runs `rate-version`, opens a `rates/sync-YYYY-MM-DD` PR labeled `rates-routine`   |
+  | review  | the new snapshots generate a table, but a routine rule fails; any non-rate value (a host, a threshold, a premium, a schedule, the credit fee) changing is one               | the same, labeled `rates-review`, the failed rules listed first                                |
+  | broken  | a fetch, a reader (a layout change), a quote, a cross-check, or a stale `[[override]]`/`[[conflict]]` fails                                                                 | regenerates nothing; updates the open `rates-broken` issue for that kind (or opens one); fails |
+
+  Every reader, cross-check, quote and override check runs inside generation, so a table that
+  generates has passed them all. The PR body tables every changed rate (old, new, source URL). If
+  an open `rates/sync-*` PR exists, the workflow force-pushes a fresh commit to it (only when its
+  tip is the bot's own commit; a human's commit gets a comment instead), and does nothing when it
+  already carries the same snapshots and table. A `rates-routine` PR gets auto-merge (squash) and
+  merges itself once `Check` is green; a `rates-review` PR waits for a human. Everything runs
+  on `GITHUB_TOKEN`, whose pushes start no `pull_request` run, so after each push the workflow
+  dispatches `ci.yml` on the branch (`workflow_dispatch` is the one event such a token can start),
+  and the PR's head commit gets `Check`. A rates PR whose moved rate a golden vector prices fails
+  CI until that vector is recomputed.
 - `mise run rates:audit` prints LiteLLM's and models.dev's disagreements (leads to check against
   the primary source, never corrections), and checks the cards against the vendors' own invoices:
   every (day, model, token kind) line of OpenAI's and Anthropic's admin cost reports must equal
