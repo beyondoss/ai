@@ -223,6 +223,30 @@ impl KeyCooled {
     }
 }
 
+/// How a drain ended — the closed label set of `ai_usage_drains_total` (see `crate::drain`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DrainEnd {
+    /// The upstream stream ran to its end: the row carries the vendor's own final usage.
+    Settled,
+    /// The request's deadline (`request_max_secs`) ended it first: the row is estimated, as before.
+    Deadline,
+    /// The upstream failed, or went silent past its read timeout, first: estimated, as before.
+    Error,
+}
+
+impl DrainEnd {
+    pub const ALL: [DrainEnd; 3] = [DrainEnd::Settled, DrainEnd::Deadline, DrainEnd::Error];
+
+    /// The `result=` label value.
+    pub fn label(self) -> &'static str {
+        match self {
+            DrainEnd::Settled => "settled",
+            DrainEnd::Deadline => "deadline",
+            DrainEnd::Error => "error",
+        }
+    }
+}
+
 pub struct Metrics {
     pub requests_total: IntCounter,
     /// Labeled by reason ("auth", "deny_spend", "deny_fraud") so we can see *why* we rejected.
@@ -357,6 +381,13 @@ pub struct Metrics {
     /// before the response head — and whose `ai.usage` row carries estimated tokens
     /// (`usage_estimated=true`) instead of reported ones.
     pub usage_estimated_total: IntCounter,
+    /// Cancelled managed streams the gateway is still reading from the upstream after the client
+    /// left, so the row gets the vendor's final usage (see `crate::drain`).
+    pub usage_drains_in_flight: IntGauge,
+    /// Drains by how they ended ([`DrainEnd`]). Bump it with [`Self::drain_ended`].
+    pub usage_drains_total: IntCounterVec,
+    /// The `usage_drains_total` children, resolved once at boot, indexed as [`DrainEnd::ALL`].
+    drain_ends: [IntCounter; 3],
     /// `ai.usage` rows the pricer could not price (`price_status=unpriced`; the reason is
     /// `price_reason` on the row). Each is a request we served and cannot bill until a human
     /// prices it: alert on any.
@@ -540,6 +571,18 @@ impl Metrics {
             "ai_usage_estimated_total",
             "Managed requests billed estimated tokens: a stream or body cut short, or a cancel before the response head",
         ))?;
+        let usage_drains_in_flight = IntGauge::with_opts(Opts::new(
+            "ai_usage_drains_in_flight",
+            "Cancelled managed streams still being read from the upstream for their final usage",
+        ))?;
+        let usage_drains_total = IntCounterVec::new(
+            Opts::new(
+                "ai_usage_drains_total",
+                "Cancelled managed streams read on after the client left, by result: settled (the vendor's final usage), deadline or error (estimated)",
+            ),
+            &["result"],
+        )?;
+        let drain_ends = DrainEnd::ALL.map(|r| usage_drains_total.with_label_values(&[r.label()]));
         let usage_unpriced_total = IntCounter::with_opts(Opts::new(
             "ai_usage_unpriced_total",
             "ai.usage rows the pricer refused (price_status=unpriced; reason on the row)",
@@ -595,6 +638,8 @@ impl Metrics {
         r.register(Box::new(control_header_errors_total.clone()))?;
         r.register(Box::new(usage_parse_errors_total.clone()))?;
         r.register(Box::new(usage_estimated_total.clone()))?;
+        r.register(Box::new(usage_drains_in_flight.clone()))?;
+        r.register(Box::new(usage_drains_total.clone()))?;
         r.register(Box::new(usage_unpriced_total.clone()))?;
         r.register(Box::new(usage_write_errors_total.clone()))?;
         r.register(Box::new(log_dropped_total.clone()))?;
@@ -637,6 +682,9 @@ impl Metrics {
             control_header_errors_total,
             usage_parse_errors_total,
             usage_estimated_total,
+            usage_drains_in_flight,
+            usage_drains_total,
+            drain_ends,
             usage_unpriced_total,
             usage_write_errors_total,
             log_dropped_total,
@@ -662,6 +710,17 @@ impl Metrics {
             KeyCooled::KeyNamed403 => 2,
         };
         self.key_cooled[i].inc();
+    }
+
+    /// Count a drain that ended with `end` on `ai_usage_drains_total`.
+    #[inline]
+    pub fn drain_ended(&self, end: DrainEnd) {
+        let i = match end {
+            DrainEnd::Settled => 0,
+            DrainEnd::Deadline => 1,
+            DrainEnd::Error => 2,
+        };
+        self.drain_ends[i].inc();
     }
 
     /// Add a metered response's token counts, skipping the ones that are zero.

@@ -422,10 +422,11 @@ async fn xai_records_tier_cost_and_tools() {
     assert_eq!(row["upstream_generation_id"], "xai-1", "{row}");
 }
 
-/// A stream the client cancels on OpenRouter: the row is an estimate, says which parts were
-/// estimated and what the estimate cannot see, and flags that the upstream may have kept
+/// A stream the client cancels on OpenRouter whose drain cannot settle (the upstream goes silent
+/// until the read timeout, so its usage never arrives): the row is an estimate, says which parts
+/// were estimated and what the estimate cannot see, and flags that the upstream may have kept
 /// generating (and billing) past the cut — reconcile with the generation id.
-/// claim: BIL-23
+/// claim: BIL-23, BIL-26
 /// defect: D268
 #[tokio::test]
 async fn a_cancelled_openrouter_stream_flags_that_the_upstream_may_continue() {
@@ -433,6 +434,7 @@ async fn a_cancelled_openrouter_stream_flags_that_the_upstream_may_continue() {
     let mock = MockUpstream::start(Mode::StallSse).await;
     let gw = Gateway::builder(unused_nats_port(), &mock.authority(), &b64(&pubkey))
         .providers(&["openrouter"])
+        .config_line("read_timeout_secs = 2")
         .start()
         .await;
     let mut resp = test_client()
@@ -456,7 +458,9 @@ async fn a_cancelled_openrouter_stream_flags_that_the_upstream_may_continue() {
     assert_eq!(row["usage_estimated_parts"], "input,output", "{row}");
     assert_eq!(row["usage_estimate_excludes"], "cache,reasoning", "{row}");
     assert_eq!(row["upstream_may_continue"], true, "{row}");
+    assert!(row.get("usage_settled").is_none(), "{row}");
     assert_eq!(row["upstream_generation_id"], "chatcmpl-mock", "{row}");
+    wait_for_metric(&gw, "ai_usage_drains_total", "result=\"error\"", 1.0).await;
 }
 
 /// `web_search_call` items look the same whichever web search tool ran; the request's

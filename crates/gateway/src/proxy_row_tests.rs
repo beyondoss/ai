@@ -34,27 +34,30 @@ fn price_variant_names_bedrock_profiles_and_openrouter_regions() {
 #[test]
 fn only_a_streamed_cancel_on_a_continuing_provider_may_continue() {
     for p in MAY_CONTINUE_PROVIDERS {
+        let may = |outcome, streaming| upstream_may_continue(Some(p), outcome, streaming, false);
+        assert!(may("client_cancelled", true), "{p}");
+        assert!(may("cut_short", true), "{p}");
+        assert!(!may("client_cancelled", false), "{p}");
+        assert!(!may("ok", true), "{p}");
+        assert!(!may("upstream_error", true), "{p}");
+        // A drained stream was read to its end: nothing past the row's counts.
         assert!(
-            upstream_may_continue(Some(p), "client_cancelled", true),
-            "{p}"
-        );
-        assert!(upstream_may_continue(Some(p), "cut_short", true), "{p}");
-        assert!(
-            !upstream_may_continue(Some(p), "client_cancelled", false),
-            "{p}"
-        );
-        assert!(!upstream_may_continue(Some(p), "ok", true), "{p}");
-        assert!(
-            !upstream_may_continue(Some(p), "upstream_error", true),
+            !upstream_may_continue(Some(p), "client_cancelled", true, true),
             "{p}"
         );
     }
     assert!(!upstream_may_continue(
         Some("anthropic"),
         "client_cancelled",
-        true
+        true,
+        false
     ));
-    assert!(!upstream_may_continue(None, "client_cancelled", true));
+    assert!(!upstream_may_continue(
+        None,
+        "client_cancelled",
+        true,
+        false
+    ));
 }
 
 #[test]

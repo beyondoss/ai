@@ -1378,7 +1378,10 @@ failover itself by `model_route_fails_over_to_a_real_provider`.
 Opus 4.1 and Sonnet 4 (retired at Anthropic 2026-08-05 and 2026-06-15) and GPT-5.1-Codex / -Max /
 -Mini and GPT-5.2-Codex (shut down by OpenAI 2026-07-23, still in its `/v1/models` listing) were
 OpenRouter-only rows served from Bedrock or Azure; they were removed (D181), and a request for one
-is a catalog miss (404). The gateway never remaps a requested model to the vendor's successor.
+is a catalog miss (404). The gateway never remaps a requested model to the vendor's successor,
+except a name in `providers::catalog::ALIASES`: a row catalog-drift removed because every
+candidate retired while a newer row in its line exists, which `for_model` resolves to that row
+(served, logged and billed under the successor's name).
 So did gpt-4, gpt-4-turbo, gpt-4.1-nano, o1, o1-pro, o3-mini and o4-mini, by owner decision
 ahead of OpenAI's 2026-10-23 shutdown (D243): recorded `retired` with that date, a request for one
 is a 404 like any unknown model. MiniMax M2.7 went too (D182): its one candidate, OpenRouter, sends every forced tool call and
@@ -1403,6 +1406,17 @@ Grok; text generation only, aliases not snapshots) that is neither a row nor rec
 `[[not_carried]]` with a reason, so a release shows up as a red cell. Together and OpenRouter list
 hundreds of models, so their gaps (recent models in the namespaces the catalog carries) are a
 report, `VERIFY_CATALOG_GAPS=1`, not a failure.
+
+**Keeping the catalog current is automatic where a rule decides.** The daily catalog-drift
+workflow (`.github/workflows/catalog-drift.yml`; by hand, `gh workflow run catalog-drift.yml`)
+runs `rates-sync catalog-drift`, plain Rust over the vendors' listings, deprecation pages and the
+rate snapshots. A newer version of a carried line on the same hosts and in the same feature class
+becomes a generated row; a candidate retiring within 14 days leaves its row (a whole row becomes
+an alias of its successor). Each is one `catalog/<slug>` PR, opened only after that row passes
+CAT-1, BIL-13 and CAT-7 live through a gateway built from the PR (`VERIFY_CATALOG_ROW`), and it
+merges itself once CI is green. Anything a rule cannot settle (a new family or host, a feature
+or pricing-tier difference, a retiring primary, a failed live test) is listed in the open
+`catalog-drift` issue. The rules are `crates/providers/ARCHITECTURE.md`, "Catalog maintenance".
 
 **What that failover does and does not cover.** On the two Bedrock-backed rows, Bedrock is the
 independent second source: a different account, a different network path, and AWS's own serving of
@@ -1702,7 +1716,7 @@ an estimate with nothing parsed takes the request's wire.
 | ------------------ | ------------------------------------------------------------------------------------ |
 | `ok`               | A complete response, or a cache hit                                                  |
 | `upstream_error`   | The provider answered 4xx/5xx, or failed before any response head (connect, timeout) |
-| `client_cancelled` | The client went away before the stream's terminal event reached it                   |
+| `client_cancelled` | The client went away before the stream's terminal event reached it (drained or not)  |
 | `no_candidate`     | No provider was called — every candidate's breaker was open                          |
 | `cut_short`        | A response started and then died upstream                                            |
 
@@ -1777,6 +1791,35 @@ event (`"error":{`, an `overloaded_error` before any output): not work we were b
 that **finished** cleanly without readable usage (a provider shape change, a final event past
 recovery) is a billed turn too. Its row carries an estimate and `usage_estimated=true`;
 `ai_usage_estimated_total` counts them.
+
+**Drained, not estimated, where the provider keeps generating** (`drain.rs`). Bedrock, Groq and
+OpenRouter keep generating, and billing, after the client disconnects (see "Cancelled streams on
+providers that keep generating"), so on them the estimate counted what was relayed while the vendor
+billed the whole completion: 1 output token against 603 on Bedrock. A managed 2xx stream from one
+of them is armed at its head. When its client hangs up, the gateway keeps reading the upstream to its
+natural end, sends the client nothing more, and feeds every chunk to the same usage taps (the 64 KiB
+tail, Anthropic's head), so the row carries the vendor's own final usage (and OpenRouter's
+`usage.cost`): `usage_settled=drained`, `usage_estimated=false`, `upstream_may_continue=false`,
+`outcome=client_cancelled`, priced as any finished stream. Nothing is buffered beyond those taps;
+the drain runs in the request's own task, as the relay did, and holds no worker beyond it. It is
+bounded by the request's deadline (`request_max_secs`, "a total deadline per request") and the
+upstream read timeout: a drain that hits either first writes the estimate exactly as before, flagged
+(`usage_estimated`, `upstream_may_continue`). The tenant's concurrency slot is given back when the
+drain starts: it bounds what a client has open. A drained answer is never stored in the response
+cache, and a capture of it says `complete=false`. `ai_usage_drains_in_flight` and
+`ai_usage_drains_total{result=settled|deadline|error}` count them.
+
+The mechanism is pingora's own: its proxy loop ignores a downstream read error, and keeps reading
+the upstream, while the response could still be written to a cache whose storage supports streaming
+partial writes. Arming puts the session's pingora cache (not `cache.rs`) in its `Bypass` phase on a
+storage that claims that support and stores nothing, so pingora continues the upstream and caches
+nothing: in `Bypass` no body is written and nothing is looked up or served. Pingora reports the hang-up
+through `suppress_proxy_warn_log(DownstreamCache)`. A cache miss on a real storage would also
+continue, but would serve the client from that storage, holding the body; a vendored pingora patch
+would be a fork to carry. Not drained: a hang-up pingora sees first as a write error (the loop polls
+the client every turn, so the read side almost always sees it first), a `FullBody` attempt (its
+client is the parent's pipe), BYO (no row), and every other provider, which stops generating when
+the client leaves and bills what it relayed.
 
 - **Input:** Anthropic's `message_start` is the first event and carries exact input and cache
   counts, so those are kept. Otherwise the prompt text's **pre-tokens** (`InputTally`, 12 bytes of
@@ -2050,15 +2093,15 @@ plugins; both are kept for the day either is priced.
 
 **The upstream's own ids and price**
 
-| Field                         | Type   | Meaning                                                                                                                                                                   |
-| ----------------------------- | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `upstream_generation_id`      | string | The vendor's id for this generation: OpenRouter's `X-Generation-Id` header (else its body `id`), Anthropic `msg_…`, OpenAI `chatcmpl-…` / `resp_…`, xAI's id.             |
-| `upstream_request_id`         | string | The vendor's request id header (`request-id`, `x-request-id`, `x-amzn-requestid`), what its support and logs key on.                                                      |
-| `upstream_cost_usd`           | string | The vendor's own reported cost, a decimal USD string: OpenRouter `usage.cost` (credits; sent on every response, no opt-in needed), xAI `usage.cost_in_usd_ticks` ÷ 10^10. |
-| `upstream_inference_cost_usd` | string | OpenRouter `usage.cost_details.upstream_inference_cost` (what the upstream charged on BYOK). Absent when `null`.                                                          |
-| `upstream_tool_cost_usd`      | string | OpenRouter `usage.cost_details.server_tool_cost` (its metered server tools and plugins).                                                                                  |
-| `upstream_byok`               | bool   | OpenRouter `usage.is_byok`.                                                                                                                                               |
-| `upstream_may_continue`       | bool   | The stream ended early (`client_cancelled` or `cut_short`) on a provider that keeps generating, and billing, after a disconnect (see below).                              |
+| Field                         | Type   | Meaning                                                                                                                                                                      |
+| ----------------------------- | ------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `upstream_generation_id`      | string | The vendor's id for this generation: OpenRouter's `X-Generation-Id` header (else its body `id`), Anthropic `msg_…`, OpenAI `chatcmpl-…` / `resp_…`, xAI's id.                |
+| `upstream_request_id`         | string | The vendor's request id header (`request-id`, `x-request-id`, `x-amzn-requestid`), what its support and logs key on.                                                         |
+| `upstream_cost_usd`           | string | The vendor's own reported cost, a decimal USD string: OpenRouter `usage.cost` (credits; sent on every response, no opt-in needed), xAI `usage.cost_in_usd_ticks` ÷ 10^10.    |
+| `upstream_inference_cost_usd` | string | OpenRouter `usage.cost_details.upstream_inference_cost` (what the upstream charged on BYOK). Absent when `null`.                                                             |
+| `upstream_tool_cost_usd`      | string | OpenRouter `usage.cost_details.server_tool_cost` (its metered server tools and plugins).                                                                                     |
+| `upstream_byok`               | bool   | OpenRouter `usage.is_byok`.                                                                                                                                                  |
+| `upstream_may_continue`       | bool   | The stream ended early (`client_cancelled` or `cut_short`) on a provider that keeps generating, and billing, after a disconnect, and was not drained to its end (see below). |
 
 Ids are `[A-Za-z0-9_.:-]{1,128}` and hosts `[A-Za-z0-9 ._()/-]{1,64}`; anything else is dropped.
 The body id is read by the response model scanner from the head (every wire writes `id` before
@@ -2072,11 +2115,12 @@ root `provider`, when present; the generation API is authoritative for the host.
 
 **Estimates**
 
-| Field                     | Type   | Meaning                                                                                                                                                                                                    |
-| ------------------------- | ------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `usage_estimated`         | bool   | Some count on the row is the gateway's estimate, not the provider's report (see "Streams cut short").                                                                                                      |
-| `usage_estimated_parts`   | string | `input`, `output` or `input,output`: which counts were estimated. Absent when none.                                                                                                                        |
-| `usage_estimate_excludes` | string | What the estimate cannot see: `cache` (estimated input is the whole prompt as plain input), `reasoning` (estimated output, and the provider reported no reasoning count). Absent when nothing is excluded. |
+| Field                     | Type   | Meaning                                                                                                                                                                                                                        |
+| ------------------------- | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `usage_estimated`         | bool   | Some count on the row is the gateway's estimate, not the provider's report (see "Streams cut short").                                                                                                                          |
+| `usage_estimated_parts`   | string | `input`, `output` or `input,output`: which counts were estimated. Absent when none.                                                                                                                                            |
+| `usage_estimate_excludes` | string | What the estimate cannot see: `cache` (estimated input is the whole prompt as plain input), `reasoning` (estimated output, and the provider reported no reasoning count). Absent when nothing is excluded.                     |
+| `usage_settled`           | string | `drained`: the client cancelled the stream and the gateway read the upstream to its end after it left, so the counts are the provider's own final usage, not an estimate (see "Streams cut short"). Absent on every other row. |
 
 Error bounds, measured (see "Streams cut short"):
 
@@ -2098,10 +2142,14 @@ Error bounds, measured (see "Streams cut short"):
 OpenRouter documents that for upstreams without cancellation support (among them AWS Bedrock,
 Google, Groq, Mistral and several open-model hosts) "the model will continue processing and you
 will be billed for the complete response" (https://openrouter.ai/docs/api/reference/streaming).
-Neither Bedrock nor Groq documents its own behavior. So `upstream_may_continue` is `true` on a
-streamed `client_cancelled` or `cut_short` row whose `provider` is `openrouter`, `bedrock` or
-`groq`. The row's tokens are what was relayed; the bill may be up to the full completion. How to
-settle one:
+Neither Bedrock nor Groq documents its own behavior. So a managed stream on `openrouter`,
+`bedrock` or `groq` that the client cancels is **drained** (see "Streams cut short"): the gateway
+reads it to its end and the row carries the vendor's final usage, `usage_settled=drained`, with
+`usage_estimated` and `upstream_may_continue` false. `upstream_may_continue` stays `true` on a
+streamed `client_cancelled` or `cut_short` row from one of them that was not drained to its end
+(the request deadline or an upstream failure came first, a stream cut upstream, a hang-up seen as a
+write error): its tokens are what was relayed, and the bill may be up to the full completion. How
+to settle one:
 
 - OpenRouter: `GET /api/v1/generation?id=<upstream_generation_id>` returns `total_cost`, native
   token counts and `cancelled`.
@@ -2111,19 +2159,21 @@ settle one:
 - Groq: no per-request lookup exists. Price the row as relayed and accept the gap, or bound it by
   the request's `max_tokens`.
 
-The gap, measured 2026-10-10 (`crates/verify/tests/pricing_live.rs`, the cancel-gap cases, which
-append to `target/verify-cancel-gap.jsonl`):
+The gap, measured 2026-10-10 (`crates/verify/tests/pricing_live.rs`, `bedrock::cancel_gap` and
+`openrouter::cancelled`; the cancel-gap cases append to `target/verify-cancel-gap.jsonl`), before
+and after the drain:
 
-| Host                                | Full completion             | Row after a cut at 1-2 s                                 | Billed                                                                     |
-| ----------------------------------- | --------------------------- | -------------------------------------------------------- | -------------------------------------------------------------------------- |
-| Bedrock, Claude Haiku 4.5           | 603 output tokens, 3,343 µ$ | 1 output token, 32 µ$ (0.2%)                             | The full 603 if Bedrock keeps generating, as OpenRouter documents          |
-| OpenRouter, gpt-oss-20b (Darkbloom) | —                           | 84 output tokens estimated, 28 µ$ (the dearest endpoint) | 77 tokens, 8 µ$, `cancelled=false` (the generation API): the host finished |
-| Groq                                | not measured                | —                                                        | No Groq pool key in the verify environment                                 |
+| Host                      | Full completion             | Row after a cut at 1-2 s, estimated (before)             | Row after the same cut, drained (now)                        | Billed                                                                   |
+| ------------------------- | --------------------------- | -------------------------------------------------------- | ------------------------------------------------------------ | ------------------------------------------------------------------------ |
+| Bedrock, Claude Haiku 4.5 | 603 output tokens, 3,343 µ$ | 1 output token, 32 µ$ (0.2%)                             | 603 output tokens, 3,343 µ$, `priced` (exact)                | The full completion: Bedrock kept generating                             |
+| OpenRouter, gpt-oss-20b   | —                           | 84 output tokens estimated, 28 µ$ (the dearest endpoint) | 1,707 output tokens, 182 µ$ from `usage.cost` (host AkashML) | 182 µ$, `cancelled=false` (the generation API): equal to the drained row |
+| Groq                      | not measured                | —                                                        | not measured                                                 | No Groq pool key in the verify environment                               |
 
-So on Bedrock a cut stream's row can understate the bill by the whole remaining completion, up to
-`max_tokens`. The row is `estimated` with `upstream_may_continue`, and only invocation logging can
-settle it. On OpenRouter the dearest-endpoint bound overstated the bill here, and the generation
-API settles it exactly.
+Before the drain, a cut Bedrock stream's row understated the bill by the whole remaining
+completion, up to `max_tokens`, and only invocation logging could settle it; on OpenRouter the
+dearest-endpoint bound could overstate it. A drained row equals the full run on Bedrock and the
+generation API's `total_cost` (× 1.055) on OpenRouter. The settling routes above remain for a row
+still flagged `upstream_may_continue`.
 
 **The price (authoritative)**
 
@@ -2135,8 +2185,10 @@ generated from snapshots of every vendor's primary pricing source. A daily workf
 (`rates-drift.yml`) re-fetches them and, when a rate moved, opens a `rates/sync-*` PR with the new
 table and `rate_version`, labeled `rates-routine` (rate values only, each within 2×) or
 `rates-review`; a routine PR merges itself once CI is green, a review PR waits for a human; a source it can no longer read opens a `rates-broken` issue
-instead. By hand it is `mise run rates:sync` and a review of the diff (providers ARCHITECTURE,
-"Rate data and versions").
+instead. Each run also rebases a `rates/sync-*` PR that fell behind main (or regenerates it on
+main), since main merges only up-to-date branches. By hand it is `mise run rates:sync` and a
+review of the diff, or `gh workflow run rates-drift.yml` (providers ARCHITECTURE, "Rate data
+and versions").
 
 | Field             | Type    | Meaning                                                                                                                                                        |
 | ----------------- | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -3457,6 +3509,8 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
 | `ai_model_header_body_mismatch_total` | Counter   | —                    | Catalog-walk requests whose `x-beyond-model` and body `model` disagreed (header wins; client bug)                                                                                                                          |
 | `ai_failover_unreplayable_total`      | Counter   | —                    | 5xx/429 retries declined on `/{provider}` or a still-uploading body: not provably replayable (catalog walks re-run instead)                                                                                                |
 | `ai_usage_estimated_total`            | Counter   | —                    | Managed requests billed estimated tokens: a stream or body cut short, or a cancel before the response head                                                                                                                 |
+| `ai_usage_drains_in_flight`           | Gauge     | —                    | Cancelled managed streams still being read from the upstream, after the client left, for their final usage ("Streams cut short")                                                                                           |
+| `ai_usage_drains_total`               | Counter   | `result`             | Drains by how they ended: `settled` (the row has the vendor's final usage), `deadline` or `error` (the row is estimated, as before)                                                                                        |
 | `ai_usage_unpriced_total`             | Counter   | —                    | `ai.usage` rows the pricer refused (`price_status=unpriced`, reason on the row): served and not yet billable                                                                                                               |
 | `ai_usage_write_errors_total`         | Counter   | —                    | `ai.usage` billing rows whose stdout write failed (the row is lost; also reported on stderr)                                                                                                                               |
 | `ai_log_dropped_total`                | Counter   | —                    | Diagnostic log lines dropped: the log sink queue was full (a stalled stdout) or the write failed (D263)                                                                                                                    |
@@ -3465,36 +3519,37 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
 
 ## Modules
 
-| Module            | Role                                                                                                                                                  | Tested         |
-| ----------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- | -------------- |
-| `proxy`           | `ProxyHttp` impl — request/response pipeline (request_filter through logging)                                                                         | e2e ✓          |
-| `key`             | `bai_v1` parse + Ed25519 verify + mint; keyring with multi-kid rotation support                                                                       | unit ✓         |
-| `route`           | Data-driven provider table (name / authority / auth) + dialect default + model-route re-exports                                                       | unit ✓         |
-| `peek`            | `ModelScanner` — streaming structural scan for the root-level `model`; O(1) memory                                                                    | unit ✓         |
-| `usage`           | Token extraction (OpenAI / Anthropic, body + SSE)                                                                                                     | unit ✓         |
-| `terminal`        | Whether the bytes sent to a client end with the stream's terminal event (`[DONE]`, `message_stop`, `response.completed`)                              | unit ✓ + e2e ✓ |
-| `deny`            | Sparse deny-set, default-allow, reason → HTTP status                                                                                                  | unit ✓         |
-| `allowance`       | Sparse remaining-ok / exhausted set; fail-closed until seeded (503); 402 when exhausted                                                               | unit ✓ + e2e ✓ |
-| `capture`         | Sparse capture-set (default-off) + head-bounded `CaptureBufs` and 1-in-N sampling                                                                     | unit ✓ + e2e ✓ |
-| `remedy`          | Provider-account remedies in a managed error: the neutral rewrite (D174, D196) and the structured out-of-credit verdict that cools a key (D180, D200) | unit ✓ + e2e ✓ |
-| `capture_sink`    | Bounded (lines and bytes), lossy writer for `ai.payload` and diagnostics — drops on a full queue so a stalled log sink can't backpressure             | unit ✓, e2e ✓  |
-| `control`         | `x-beyond-*` header parse/validate; metadata canonicalized and re-serialized; catalog walk permute (`order` / `only` / `split`)                       | unit ✓ + e2e ✓ |
-| `translate`       | Chat Completions ↔ Messages ↔ Responses mapping for a catalog endpoint mismatch; SSE event-by-event                                                   | unit ✓ + e2e ✓ |
-| `pin`             | Computed session pin: the order of a managed default walk; a pure function of the caller and the row                                                  | unit ✓ + e2e ✓ |
-| `cache`           | Per-pod exact-match response store (TTL + max entries + max bytes/entry); tap, never a buffer; miss does not consult Redis                            | unit ✓ + e2e ✓ |
-| `concurrency`     | Per-tenant in-flight cap (`tenant_max_in_flight`): sharded, sparse, exact counters; the overspend bound                                               | unit ✓ + e2e ✓ |
-| `deadline`        | Request deadline clock (`request_max_secs`): a coarse clock a ticker thread advances each second; a per-chunk check is one atomic load                | unit ✓ + e2e ✓ |
-| `ratelimit`       | Two-tier guardrail: per-credential (count-min sketch, fixed memory, no GC) + global BYO (one atomic)                                                  | unit ✓         |
-| `circuit_breaker` | Per-provider lock-free breaker (packed `AtomicU64`, windowed policy) — trips on 5xx/connect, not 429                                                  | unit ✓ + e2e ✓ |
-| `state`           | Keyring + provider registry + watched deny-/allowance-/capture-sets (ArcSwap) + TTL DNS cache (all addresses, serve-stale)                            | unit ✓         |
-| `store_watch`     | Generic `WatchedSet` driver — gap-free seeding + delta watch, instantiated per set                                                                    | e2e ✓          |
-| `config`          | Figment config; build keyring; pool keys / authorities by provider name                                                                               | unit ✓         |
-| `secret`          | Redacting, zeroize-on-drop `Secret<T>` newtype for pool keys and NATS creds                                                                           | unit ✓         |
-| `signed_id`       | Tenant-bound Responses ids: provider ids HMAC-signed for the tenant out, verified and stripped in; no state                                           | unit ✓ + e2e ✓ |
-| `admin`           | `ServeHttp` on the metrics listener: `/livez`, `/readyz`, `/metrics`                                                                                  | e2e ✓          |
-| `metrics`         | Prometheus counter/histogram/gauge registration and update helpers                                                                                    | compile ✓      |
-| `doctor`          | Boot-time diagnostics (`beyond-ai doctor`)                                                                                                            | compile ✓      |
-| `main`            | CLI (`run` / `doctor`), rustls init, config load, Pingora server + proxy/watchers/admin bootstrap                                                     | compile ✓      |
+| Module            | Role                                                                                                                                                               | Tested         |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------- |
+| `proxy`           | `ProxyHttp` impl — request/response pipeline (request_filter through logging)                                                                                      | e2e ✓          |
+| `key`             | `bai_v1` parse + Ed25519 verify + mint; keyring with multi-kid rotation support                                                                                    | unit ✓         |
+| `route`           | Data-driven provider table (name / authority / auth) + dialect default + model-route re-exports                                                                    | unit ✓         |
+| `peek`            | `ModelScanner` — streaming structural scan for the root-level `model`; O(1) memory                                                                                 | unit ✓         |
+| `usage`           | Token extraction (OpenAI / Anthropic, body + SSE)                                                                                                                  | unit ✓         |
+| `terminal`        | Whether the bytes sent to a client end with the stream's terminal event (`[DONE]`, `message_stop`, `response.completed`)                                           | unit ✓ + e2e ✓ |
+| `deny`            | Sparse deny-set, default-allow, reason → HTTP status                                                                                                               | unit ✓         |
+| `allowance`       | Sparse remaining-ok / exhausted set; fail-closed until seeded (503); 402 when exhausted                                                                            | unit ✓ + e2e ✓ |
+| `capture`         | Sparse capture-set (default-off) + head-bounded `CaptureBufs` and 1-in-N sampling                                                                                  | unit ✓ + e2e ✓ |
+| `remedy`          | Provider-account remedies in a managed error: the neutral rewrite (D174, D196) and the structured out-of-credit verdict that cools a key (D180, D200)              | unit ✓ + e2e ✓ |
+| `capture_sink`    | Bounded (lines and bytes), lossy writer for `ai.payload` and diagnostics — drops on a full queue so a stalled log sink can't backpressure                          | unit ✓, e2e ✓  |
+| `control`         | `x-beyond-*` header parse/validate; metadata canonicalized and re-serialized; catalog walk permute (`order` / `only` / `split`)                                    | unit ✓ + e2e ✓ |
+| `translate`       | Chat Completions ↔ Messages ↔ Responses mapping for a catalog endpoint mismatch; SSE event-by-event                                                                | unit ✓ + e2e ✓ |
+| `pin`             | Computed session pin: the order of a managed default walk; a pure function of the caller and the row                                                               | unit ✓ + e2e ✓ |
+| `cache`           | Per-pod exact-match response store (TTL + max entries + max bytes/entry); tap, never a buffer; miss does not consult Redis                                         | unit ✓ + e2e ✓ |
+| `concurrency`     | Per-tenant in-flight cap (`tenant_max_in_flight`): sharded, sparse, exact counters; the overspend bound                                                            | unit ✓ + e2e ✓ |
+| `deadline`        | Request deadline clock (`request_max_secs`): a coarse clock a ticker thread advances each second; a per-chunk check is one atomic load                             | unit ✓ + e2e ✓ |
+| `drain`           | Drain-on-cancel: arms pingora's keep-reading-after-a-downstream-error path (cache `Bypass` on a no-op storage) so a cancelled stream settles to the vendor's usage | unit ✓ + e2e ✓ |
+| `ratelimit`       | Two-tier guardrail: per-credential (count-min sketch, fixed memory, no GC) + global BYO (one atomic)                                                               | unit ✓         |
+| `circuit_breaker` | Per-provider lock-free breaker (packed `AtomicU64`, windowed policy) — trips on 5xx/connect, not 429                                                               | unit ✓ + e2e ✓ |
+| `state`           | Keyring + provider registry + watched deny-/allowance-/capture-sets (ArcSwap) + TTL DNS cache (all addresses, serve-stale)                                         | unit ✓         |
+| `store_watch`     | Generic `WatchedSet` driver — gap-free seeding + delta watch, instantiated per set                                                                                 | e2e ✓          |
+| `config`          | Figment config; build keyring; pool keys / authorities by provider name                                                                                            | unit ✓         |
+| `secret`          | Redacting, zeroize-on-drop `Secret<T>` newtype for pool keys and NATS creds                                                                                        | unit ✓         |
+| `signed_id`       | Tenant-bound Responses ids: provider ids HMAC-signed for the tenant out, verified and stripped in; no state                                                        | unit ✓ + e2e ✓ |
+| `admin`           | `ServeHttp` on the metrics listener: `/livez`, `/readyz`, `/metrics`                                                                                               | e2e ✓          |
+| `metrics`         | Prometheus counter/histogram/gauge registration and update helpers                                                                                                 | compile ✓      |
+| `doctor`          | Boot-time diagnostics (`beyond-ai doctor`)                                                                                                                         | compile ✓      |
+| `main`            | CLI (`run` / `doctor`), rustls init, config load, Pingora server + proxy/watchers/admin bootstrap                                                                  | compile ✓      |
 
 ---
 
