@@ -26,6 +26,7 @@ pub mod control;
 pub mod deadline;
 pub mod deny;
 pub mod doctor;
+pub mod drain;
 pub mod error;
 pub mod key;
 pub mod metrics;

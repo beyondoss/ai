@@ -1516,6 +1516,19 @@ touches = [
 ]
 defects = []
 
+[[claim]]
+id = "BIL-26"
+priority = "P1"
+group = "Billing integrity"
+text = "A managed stream the client cancels on a provider that keeps generating after a disconnect (Bedrock, Groq, OpenRouter) is read to its end within the request's deadline, and its row carries the vendor's exact final usage (usage_settled=drained, priced, not estimated); a drain cut by the deadline is estimated and flagged as before, and no other stream is drained"
+layer = "both"
+touches = [
+  "crates/gateway/src/drain.rs",
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/metrics.rs",
+]
+defects = []
+
 # --- Reliability -------------------------------------------------------------------------------
 [[claim]]
 id = "REL-1"

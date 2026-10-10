@@ -31,6 +31,9 @@ store = { package = "beyond-slipstream", version = "0.8.0" }
 providers = { package = "beyond-ai-providers", path = "../providers" }
 
 pingora = { version = "0.9", default-features = false, features = ["rustls"] }
+# `drain`: the no-op storage that keeps pingora reading a cancelled stream's upstream (already in
+# the build graph through `pingora-proxy`).
+pingora-cache = { version = "0.9", default-features = false }
 pingora-core = "0.9"
 pingora-limits = "0.9"
 pingora-proxy = "0.9"

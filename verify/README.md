@@ -200,8 +200,9 @@ It runs one case per dimension:
 - an xAI web search;
 - the long-context tiers on each vendor's cheapest long-context row (OpenAI gpt-6-luna past 272K,
   against its usage report; xAI grok-build-0.1 at 200K, against its own billed cost);
-- the cancelled-stream estimate gap on Bedrock (and Groq, with a key): the same deterministic
-  prompt run to completion and cut after a second, recorded in `target/verify-cancel-gap.jsonl`.
+- a cancelled stream on Bedrock (and Groq, with a key), drained by the gateway: the same
+  deterministic prompt run to completion and cut after a second must write the same row
+  (`usage_settled=drained`, priced), recorded in `target/verify-cancel-gap.jsonl` (BIL-26).
 
 The file's header lists each case's budget, about $0.65 in all. The Anthropic admin API allows 90
 requests a window, shared by the whole organization. The cases read it six minutes after their request, then every three, through one per-process gate, and wait out
@@ -217,8 +218,9 @@ its `retry-after`.
   BIL-5 too and runs in the isolated phase). The logged cost must then be the rate table's price
   of those facts.
 - **A disagreement is a finding to fix in the rate table**, never a tolerance to widen.
-- **The cancelled-stream case** prints the row's estimate beside the generation API's bill, which
-  is what a downstream reconciliation of `upstream_may_continue` rows settles to.
+- **The cancelled-stream cases** hold a drained row to the vendor's own bill: on OpenRouter the
+  row's `cost_micros` must equal the generation API's `total_cost` × 1.055, on Bedrock the cut row
+  must equal the full run.
 - **Long-context boundaries** (exactly at and one past each threshold) are pinned by the golden
   vectors (`verify/pricing_vectors.json`). The live cases prove one request on each side's tier.
 
