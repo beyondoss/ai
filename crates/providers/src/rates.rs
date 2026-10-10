@@ -23,7 +23,7 @@ use crate::pricing::{Bps, Card, Class, LongContext, OffPeak, TokenRates, Tool, u
 /// The exact rate table compiled into this build: the date its rates were checked, and a hash of
 /// the table (`rate_version_names_this_table` recomputes it, and fails with the new value when
 /// any rate changes). Logged on every priced `ai.usage` row.
-pub const RATE_VERSION: &str = "2026-10-10.37b37a282ad2066c";
+pub const RATE_VERSION: &str = "2026-10-10.a06079be9e5b5e77";
 
 /// OpenRouter's fee on the credits that pay for every request: 5.5% of each card purchase on the
 /// Standard plan ("OpenRouter's fee is charged when you buy credits, 5.5% on Standard and 8% on
@@ -111,24 +111,28 @@ const fn tr(
 // --- per-call fee lists ---
 const ANTHROPIC_TOOLS: &[(Tool, u64)] = &[(Tool::WebFetch, 0), (Tool::WebSearch, 10000)];
 const OPENAI_NON_REASONING_TOOLS: &[(Tool, u64)] = &[
+    (Tool::ComputerUse, 0),
     (Tool::FileSearch, 2500),
-    (Tool::WebSearch, 10000),
-    (Tool::WebSearchPreview, 25000),
+    (Tool::Mcp, 0),
+    (Tool::ToolSearch, 0),
+    (Tool::WebSearchPage, 0),
 ];
-const OPENAI_FIXED_SEARCH_BLOCK_TOOLS: &[(Tool, u64)] =
-    &[(Tool::FileSearch, 2500), (Tool::WebSearchPreview, 25000)];
 const OPENAI_TOOLS: &[(Tool, u64)] = &[
+    (Tool::ComputerUse, 0),
     (Tool::FileSearch, 2500),
+    (Tool::Mcp, 0),
+    (Tool::ToolSearch, 0),
     (Tool::WebSearch, 10000),
-    (Tool::WebSearchPreview, 10000),
+    (Tool::WebSearchPage, 0),
 ];
 const XAI_TOOLS: &[(Tool, u64)] = &[
-    (Tool::AttachmentSearch, 5000),
     (Tool::CodeExecution, 5000),
     (Tool::FileSearch, 2500),
+    (Tool::Mcp, 0),
     (Tool::WebSearch, 5000),
-    (Tool::XSearchPost, 5000),
-    (Tool::XSearchProfile, 10000),
+    (Tool::XPosts, 5000),
+    (Tool::XSearch, 0),
+    (Tool::XUsers, 10000),
 ];
 const OR_SEARCH_10: &[(Tool, u64)] = &[(Tool::WebSearch, 10000)];
 const OR_SEARCH_5: &[(Tool, u64)] = &[(Tool::WebSearch, 5000)];
@@ -364,7 +368,7 @@ const OPENAI_GPT_4_1: Card = Card {
 /// `openai:gpt-4.1-mini`.
 const OPENAI_GPT_4_1_MINI: Card = Card {
     fast: Some(tr("0.7", "2.8", "0.175", "0.7", None)),
-    tools: OPENAI_FIXED_SEARCH_BLOCK_TOOLS,
+    tools: OPENAI_NON_REASONING_TOOLS,
     ..Card::new(tr("0.4", "1.6", "0.1", "0.4", None))
 };
 
@@ -378,7 +382,7 @@ const OPENAI_GPT_4O: Card = Card {
 /// `openai:gpt-4o-mini`.
 const OPENAI_GPT_4O_MINI: Card = Card {
     fast: Some(tr("0.25", "1", "0.125", "0.25", None)),
-    tools: OPENAI_FIXED_SEARCH_BLOCK_TOOLS,
+    tools: OPENAI_NON_REASONING_TOOLS,
     ..Card::new(tr("0.15", "0.6", "0.075", "0.15", None))
 };
 

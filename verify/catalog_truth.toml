@@ -2453,7 +2453,7 @@ source = [
 date = "2026-10-10"
 standard = { input = "2", output = "8", cache_read = "0.5", cache_write = "2" }
 fast = { input = "3.5", output = "14", cache_read = "0.875", cache_write = "3.5" }
-tools = { file_search = "0.0025", web_search_preview = "0.025", web_search = "0.01" }
+tools = { file_search = "0.0025", web_search_page = "0", computer_use = "0", mcp = "0", tool_search = "0" }
 
 [[card]]
 name = "openai:gpt-4.1-mini"
@@ -2465,7 +2465,7 @@ source = [
 date = "2026-10-10"
 standard = { input = "0.4", output = "1.6", cache_read = "0.1", cache_write = "0.4" }
 fast = { input = "0.7", output = "2.8", cache_read = "0.175", cache_write = "0.7" }
-tools = { file_search = "0.0025", web_search_preview = "0.025" }
+tools = { file_search = "0.0025", web_search_page = "0", computer_use = "0", mcp = "0", tool_search = "0" }
 
 [[card]]
 name = "openai:gpt-4o"
@@ -2477,7 +2477,7 @@ source = [
 date = "2026-10-10"
 standard = { input = "2.5", output = "10", cache_read = "1.25", cache_write = "2.5" }
 fast = { input = "4.25", output = "17", cache_read = "2.125", cache_write = "4.25" }
-tools = { file_search = "0.0025", web_search_preview = "0.025", web_search = "0.01" }
+tools = { file_search = "0.0025", web_search_page = "0", computer_use = "0", mcp = "0", tool_search = "0" }
 
 [[card]]
 name = "openai:gpt-4o-mini"
@@ -2489,7 +2489,7 @@ source = [
 date = "2026-10-10"
 standard = { input = "0.15", output = "0.6", cache_read = "0.075", cache_write = "0.15" }
 fast = { input = "0.25", output = "1", cache_read = "0.125", cache_write = "0.25" }
-tools = { file_search = "0.0025", web_search_preview = "0.025" }
+tools = { file_search = "0.0025", web_search_page = "0", computer_use = "0", mcp = "0", tool_search = "0" }
 
 [[card]]
 name = "openai:gpt-5"
@@ -2502,7 +2502,7 @@ date = "2026-10-10"
 standard = { input = "1.25", output = "10", cache_read = "0.125", cache_write = "1.25" }
 fast = { input = "2.5", output = "20", cache_read = "0.25", cache_write = "2.5" }
 flex = { input = "0.625", output = "5", cache_read = "0.0625", cache_write = "0.625" }
-tools = { file_search = "0.0025", web_search_preview = "0.01", web_search = "0.01" }
+tools = { file_search = "0.0025", web_search_page = "0", computer_use = "0", mcp = "0", tool_search = "0", web_search = "0.01" }
 
 [[card]]
 name = "openai:gpt-5-mini"
@@ -2515,7 +2515,7 @@ date = "2026-10-10"
 standard = { input = "0.25", output = "2", cache_read = "0.025", cache_write = "0.25" }
 fast = { input = "0.45", output = "3.6", cache_read = "0.045", cache_write = "0.45" }
 flex = { input = "0.125", output = "1", cache_read = "0.0125", cache_write = "0.125" }
-tools = { file_search = "0.0025", web_search_preview = "0.01", web_search = "0.01" }
+tools = { file_search = "0.0025", web_search_page = "0", computer_use = "0", mcp = "0", tool_search = "0", web_search = "0.01" }
 
 [[card]]
 name = "openai:gpt-5-nano"
@@ -2527,7 +2527,7 @@ source = [
 date = "2026-10-10"
 standard = { input = "0.05", output = "0.4", cache_read = "0.005", cache_write = "0.05" }
 flex = { input = "0.025", output = "0.2", cache_read = "0.0025", cache_write = "0.025" }
-tools = { file_search = "0.0025", web_search_preview = "0.01", web_search = "0.01" }
+tools = { file_search = "0.0025", web_search_page = "0", computer_use = "0", mcp = "0", tool_search = "0", web_search = "0.01" }
 
 [[card]]
 name = "openai:gpt-5-pro"
@@ -2538,7 +2538,7 @@ source = [
 ]
 date = "2026-10-10"
 standard = { input = "15", output = "120", cache_read = "15", cache_write = "15" }
-tools = { file_search = "0.0025", web_search_preview = "0.01", web_search = "0.01" }
+tools = { file_search = "0.0025", web_search_page = "0", computer_use = "0", mcp = "0", tool_search = "0", web_search = "0.01" }
 
 [[card]]
 name = "openai:gpt-5.1"
@@ -2551,7 +2551,7 @@ date = "2026-10-10"
 standard = { input = "1.25", output = "10", cache_read = "0.125", cache_write = "1.25" }
 fast = { input = "2.5", output = "20", cache_read = "0.25", cache_write = "2.5" }
 flex = { input = "0.625", output = "5", cache_read = "0.0625", cache_write = "0.625" }
-tools = { file_search = "0.0025", web_search_preview = "0.01", web_search = "0.01" }
+tools = { file_search = "0.0025", web_search_page = "0", computer_use = "0", mcp = "0", tool_search = "0", web_search = "0.01" }
 
 [[card]]
 name = "openai:gpt-5.2"
@@ -2564,7 +2564,7 @@ date = "2026-10-10"
 standard = { input = "1.75", output = "14", cache_read = "0.175", cache_write = "1.75" }
 fast = { input = "3.5", output = "28", cache_read = "0.35", cache_write = "3.5" }
 flex = { input = "0.875", output = "7", cache_read = "0.0875", cache_write = "0.875" }
-tools = { file_search = "0.0025", web_search_preview = "0.01", web_search = "0.01" }
+tools = { file_search = "0.0025", web_search_page = "0", computer_use = "0", mcp = "0", tool_search = "0", web_search = "0.01" }
 
 [[card]]
 name = "openai:gpt-5.2-pro"
@@ -2575,7 +2575,7 @@ source = [
 ]
 date = "2026-10-10"
 standard = { input = "21", output = "168", cache_read = "21", cache_write = "21" }
-tools = { file_search = "0.0025", web_search_preview = "0.01", web_search = "0.01" }
+tools = { file_search = "0.0025", web_search_page = "0", computer_use = "0", mcp = "0", tool_search = "0", web_search = "0.01" }
 
 [[card]]
 name = "openai:gpt-5.3-codex"
@@ -2587,7 +2587,7 @@ source = [
 date = "2026-10-10"
 standard = { input = "1.75", output = "14", cache_read = "0.175", cache_write = "1.75" }
 fast = { input = "3.5", output = "28", cache_read = "0.35", cache_write = "3.5" }
-tools = { file_search = "0.0025", web_search_preview = "0.01", web_search = "0.01" }
+tools = { file_search = "0.0025", web_search_page = "0", computer_use = "0", mcp = "0", tool_search = "0", web_search = "0.01" }
 
 [[card]]
 name = "openai:gpt-5.4"
@@ -2603,7 +2603,7 @@ fast = { input = "5", output = "30", cache_read = "0.5", cache_write = "5" }
 flex = { input = "1.25", output = "7.5", cache_read = "0.13", cache_write = "1.25" }
 flex_long = { input = "2.5", output = "11.25", cache_read = "0.25", cache_write = "2.5" }
 long_context = { threshold = 272000, inclusive = false }
-tools = { file_search = "0.0025", web_search_preview = "0.01", web_search = "0.01" }
+tools = { file_search = "0.0025", web_search_page = "0", computer_use = "0", mcp = "0", tool_search = "0", web_search = "0.01" }
 
 [[card]]
 name = "openai:gpt-5.4-mini"
@@ -2616,7 +2616,7 @@ date = "2026-10-10"
 standard = { input = "0.75", output = "4.5", cache_read = "0.075", cache_write = "0.75" }
 fast = { input = "1.5", output = "9", cache_read = "0.15", cache_write = "1.5" }
 flex = { input = "0.375", output = "2.25", cache_read = "0.0375", cache_write = "0.375" }
-tools = { file_search = "0.0025", web_search_preview = "0.01", web_search = "0.01" }
+tools = { file_search = "0.0025", web_search_page = "0", computer_use = "0", mcp = "0", tool_search = "0", web_search = "0.01" }
 
 [[card]]
 name = "openai:gpt-5.4-nano"
@@ -2628,7 +2628,7 @@ source = [
 date = "2026-10-10"
 standard = { input = "0.2", output = "1.25", cache_read = "0.02", cache_write = "0.2" }
 flex = { input = "0.1", output = "0.625", cache_read = "0.01", cache_write = "0.1" }
-tools = { file_search = "0.0025", web_search_preview = "0.01", web_search = "0.01" }
+tools = { file_search = "0.0025", web_search_page = "0", computer_use = "0", mcp = "0", tool_search = "0", web_search = "0.01" }
 
 [[card]]
 name = "openai:gpt-5.4-pro"
@@ -2643,7 +2643,7 @@ long = { input = "60", output = "270", cache_read = "60", cache_write = "60" }
 flex = { input = "15", output = "90", cache_read = "15", cache_write = "15" }
 flex_long = { input = "30", output = "135", cache_read = "30", cache_write = "30" }
 long_context = { threshold = 272000, inclusive = false }
-tools = { file_search = "0.0025", web_search_preview = "0.01", web_search = "0.01" }
+tools = { file_search = "0.0025", web_search_page = "0", computer_use = "0", mcp = "0", tool_search = "0", web_search = "0.01" }
 
 [[card]]
 name = "openai:gpt-5.5"
@@ -2659,7 +2659,7 @@ fast = { input = "12.5", output = "75", cache_read = "1.25", cache_write = "12.5
 flex = { input = "2.5", output = "15", cache_read = "0.25", cache_write = "2.5" }
 flex_long = { input = "5", output = "22.5", cache_read = "0.5", cache_write = "5" }
 long_context = { threshold = 272000, inclusive = false }
-tools = { file_search = "0.0025", web_search_preview = "0.01", web_search = "0.01" }
+tools = { file_search = "0.0025", web_search_page = "0", computer_use = "0", mcp = "0", tool_search = "0", web_search = "0.01" }
 
 [[card]]
 name = "openai:gpt-5.5-pro"
@@ -2673,7 +2673,7 @@ standard = { input = "30", output = "180", cache_read = "30", cache_write = "30"
 long = { input = "60", output = "270", cache_read = "60", cache_write = "60" }
 flex = { input = "15", output = "90", cache_read = "15", cache_write = "15" }
 long_context = { threshold = 272000, inclusive = false }
-tools = { file_search = "0.0025", web_search_preview = "0.01", web_search = "0.01" }
+tools = { file_search = "0.0025", web_search_page = "0", computer_use = "0", mcp = "0", tool_search = "0", web_search = "0.01" }
 
 [[card]]
 name = "openai:gpt-5.6-luna"
@@ -2690,7 +2690,7 @@ fast_long = { input = "0.8", output = "3.6", cache_read = "0.08", cache_write = 
 flex = { input = "0.1", output = "0.6", cache_read = "0.01", cache_write = "0.125" }
 flex_long = { input = "0.2", output = "0.9", cache_read = "0.02", cache_write = "0.25" }
 long_context = { threshold = 272000, inclusive = false }
-tools = { file_search = "0.0025", web_search_preview = "0.01", web_search = "0.01" }
+tools = { file_search = "0.0025", web_search_page = "0", computer_use = "0", mcp = "0", tool_search = "0", web_search = "0.01" }
 
 [[card]]
 name = "openai:gpt-5.6-sol"
@@ -2707,7 +2707,7 @@ fast_long = { input = "16", output = "60", cache_read = "1.6", cache_write = "20
 flex = { input = "2", output = "10", cache_read = "0.2", cache_write = "2.5" }
 flex_long = { input = "4", output = "15", cache_read = "0.4", cache_write = "5" }
 long_context = { threshold = 272000, inclusive = false }
-tools = { file_search = "0.0025", web_search_preview = "0.01", web_search = "0.01" }
+tools = { file_search = "0.0025", web_search_page = "0", computer_use = "0", mcp = "0", tool_search = "0", web_search = "0.01" }
 
 [[card]]
 name = "openai:gpt-5.6-terra"
@@ -2724,7 +2724,7 @@ fast_long = { input = "8", output = "36", cache_read = "0.8", cache_write = "10"
 flex = { input = "1", output = "6", cache_read = "0.1", cache_write = "1.25" }
 flex_long = { input = "2", output = "9", cache_read = "0.2", cache_write = "2.5" }
 long_context = { threshold = 272000, inclusive = false }
-tools = { file_search = "0.0025", web_search_preview = "0.01", web_search = "0.01" }
+tools = { file_search = "0.0025", web_search_page = "0", computer_use = "0", mcp = "0", tool_search = "0", web_search = "0.01" }
 
 [[card]]
 name = "openai:gpt-6-astra"
@@ -2743,7 +2743,7 @@ ultrafast_long = { input = "120", output = "450", cache_read = "12", cache_write
 flex = { input = "5", output = "25", cache_read = "0.5", cache_write = "6.25" }
 flex_long = { input = "10", output = "37.5", cache_read = "1", cache_write = "12.5" }
 long_context = { threshold = 272000, inclusive = false }
-tools = { file_search = "0.0025", web_search_preview = "0.01", web_search = "0.01" }
+tools = { file_search = "0.0025", web_search_page = "0", computer_use = "0", mcp = "0", tool_search = "0", web_search = "0.01" }
 
 [[card]]
 name = "openai:gpt-6-luna"
@@ -2760,7 +2760,7 @@ fast_long = { input = "0.4", output = "1.5", cache_read = "0.04", cache_write = 
 flex = { input = "0.05", output = "0.25", cache_read = "0.005", cache_write = "0.0625" }
 flex_long = { input = "0.1", output = "0.375", cache_read = "0.01", cache_write = "0.125" }
 long_context = { threshold = 272000, inclusive = false }
-tools = { file_search = "0.0025", web_search_preview = "0.01", web_search = "0.01" }
+tools = { file_search = "0.0025", web_search_page = "0", computer_use = "0", mcp = "0", tool_search = "0", web_search = "0.01" }
 
 [[card]]
 name = "openai:gpt-6-sol"
@@ -2777,7 +2777,7 @@ fast_long = { input = "8", output = "30", cache_read = "0.8", cache_write = "10"
 flex = { input = "1", output = "5", cache_read = "0.1", cache_write = "1.25" }
 flex_long = { input = "2", output = "7.5", cache_read = "0.2", cache_write = "2.5" }
 long_context = { threshold = 272000, inclusive = false }
-tools = { file_search = "0.0025", web_search_preview = "0.01", web_search = "0.01" }
+tools = { file_search = "0.0025", web_search_page = "0", computer_use = "0", mcp = "0", tool_search = "0", web_search = "0.01" }
 
 [[card]]
 name = "openai:gpt-6.1-sol"
@@ -2796,7 +2796,7 @@ ultrafast_long = { input = "24", output = "90", cache_read = "1.2", cache_write 
 flex = { input = "1", output = "5", cache_read = "0.05", cache_write = "1.25" }
 flex_long = { input = "2", output = "7.5", cache_read = "0.1", cache_write = "2.5" }
 long_context = { threshold = 272000, inclusive = false }
-tools = { file_search = "0.0025", web_search_preview = "0.01", web_search = "0.01" }
+tools = { file_search = "0.0025", web_search_page = "0", computer_use = "0", mcp = "0", tool_search = "0", web_search = "0.01" }
 
 [[card]]
 name = "xai:grok-4.20"
@@ -2811,7 +2811,7 @@ standard = { input = "1.25", output = "2.5", cache_read = "0.2", cache_write = "
 long = { input = "2.5", output = "5", cache_read = "0.4", cache_write = "2.5" }
 fast = { input = "2.5", output = "5", cache_read = "0.4", cache_write = "2.5" }
 long_context = { threshold = 200000, inclusive = true }
-tools = { web_search = "0.005", x_search_post = "0.005", x_search_profile = "0.01", code_execution = "0.005", attachment_search = "0.005", file_search = "0.0025" }
+tools = { web_search = "0.005", x_search = "0", x_posts = "0.005", x_users = "0.01", code_execution = "0.005", file_search = "0.0025", mcp = "0" }
 
 [[card]]
 name = "xai:grok-4.20-multi-agent"
@@ -2826,7 +2826,7 @@ standard = { input = "1.25", output = "2.5", cache_read = "0.2", cache_write = "
 long = { input = "2.5", output = "5", cache_read = "0.4", cache_write = "2.5" }
 fast = { input = "2.5", output = "5", cache_read = "0.4", cache_write = "2.5" }
 long_context = { threshold = 200000, inclusive = true }
-tools = { web_search = "0.005", x_search_post = "0.005", x_search_profile = "0.01", code_execution = "0.005", attachment_search = "0.005", file_search = "0.0025" }
+tools = { web_search = "0.005", x_search = "0", x_posts = "0.005", x_users = "0.01", code_execution = "0.005", file_search = "0.0025", mcp = "0" }
 
 [[card]]
 name = "xai:grok-4.3"
@@ -2841,7 +2841,7 @@ standard = { input = "1.25", output = "2.5", cache_read = "0.2", cache_write = "
 long = { input = "2.5", output = "5", cache_read = "0.4", cache_write = "2.5" }
 fast = { input = "2.5", output = "5", cache_read = "0.4", cache_write = "2.5" }
 long_context = { threshold = 200000, inclusive = true }
-tools = { web_search = "0.005", x_search_post = "0.005", x_search_profile = "0.01", code_execution = "0.005", attachment_search = "0.005", file_search = "0.0025" }
+tools = { web_search = "0.005", x_search = "0", x_posts = "0.005", x_users = "0.01", code_execution = "0.005", file_search = "0.0025", mcp = "0" }
 
 [[card]]
 name = "xai:grok-4.5"
@@ -2856,7 +2856,7 @@ standard = { input = "2", output = "6", cache_read = "0.3", cache_write = "2" }
 long = { input = "4", output = "12", cache_read = "0.6", cache_write = "4" }
 fast = { input = "4", output = "12", cache_read = "0.6", cache_write = "4" }
 long_context = { threshold = 200000, inclusive = true }
-tools = { web_search = "0.005", x_search_post = "0.005", x_search_profile = "0.01", code_execution = "0.005", attachment_search = "0.005", file_search = "0.0025" }
+tools = { web_search = "0.005", x_search = "0", x_posts = "0.005", x_users = "0.01", code_execution = "0.005", file_search = "0.0025", mcp = "0" }
 
 [[card]]
 name = "xai:grok-4.6"
@@ -2871,7 +2871,7 @@ standard = { input = "2", output = "6", cache_read = "0.5", cache_write = "2" }
 long = { input = "4", output = "12", cache_read = "1", cache_write = "4" }
 fast = { input = "4", output = "12", cache_read = "1", cache_write = "4" }
 long_context = { threshold = 200000, inclusive = true }
-tools = { web_search = "0.005", x_search_post = "0.005", x_search_profile = "0.01", code_execution = "0.005", attachment_search = "0.005", file_search = "0.0025" }
+tools = { web_search = "0.005", x_search = "0", x_posts = "0.005", x_users = "0.01", code_execution = "0.005", file_search = "0.0025", mcp = "0" }
 
 [[card]]
 name = "xai:grok-4.7"
@@ -2886,7 +2886,7 @@ standard = { input = "2", output = "6", cache_read = "0.5", cache_write = "2" }
 long = { input = "4", output = "12", cache_read = "1", cache_write = "4" }
 fast = { input = "4", output = "12", cache_read = "1", cache_write = "4" }
 long_context = { threshold = 200000, inclusive = true }
-tools = { web_search = "0.005", x_search_post = "0.005", x_search_profile = "0.01", code_execution = "0.005", attachment_search = "0.005", file_search = "0.0025" }
+tools = { web_search = "0.005", x_search = "0", x_posts = "0.005", x_users = "0.01", code_execution = "0.005", file_search = "0.0025", mcp = "0" }
 
 [[card]]
 name = "xai:grok-build-0.1"
@@ -2901,7 +2901,7 @@ standard = { input = "1", output = "2", cache_read = "0.2", cache_write = "1" }
 long = { input = "2", output = "4", cache_read = "0.4", cache_write = "2" }
 fast = { input = "2", output = "4", cache_read = "0.4", cache_write = "2" }
 long_context = { threshold = 200000, inclusive = true }
-tools = { web_search = "0.005", x_search_post = "0.005", x_search_profile = "0.01", code_execution = "0.005", attachment_search = "0.005", file_search = "0.0025" }
+tools = { web_search = "0.005", x_search = "0", x_posts = "0.005", x_users = "0.01", code_execution = "0.005", file_search = "0.0025", mcp = "0" }
 
 [[card]]
 name = "openai:o3"
@@ -2914,7 +2914,7 @@ date = "2026-10-10"
 standard = { input = "2", output = "8", cache_read = "0.5", cache_write = "2" }
 fast = { input = "3.5", output = "14", cache_read = "0.875", cache_write = "3.5" }
 flex = { input = "1", output = "4", cache_read = "0.25", cache_write = "1" }
-tools = { file_search = "0.0025", web_search_preview = "0.01", web_search = "0.01" }
+tools = { file_search = "0.0025", web_search_page = "0", computer_use = "0", mcp = "0", tool_search = "0", web_search = "0.01" }
 
 [[card]]
 name = "openai:o3-pro"
@@ -2925,7 +2925,7 @@ source = [
 ]
 date = "2026-10-10"
 standard = { input = "20", output = "80", cache_read = "20", cache_write = "20" }
-tools = { file_search = "0.0025", web_search_preview = "0.01", web_search = "0.01" }
+tools = { file_search = "0.0025", web_search_page = "0", computer_use = "0", mcp = "0", tool_search = "0", web_search = "0.01" }
 
 [[card]]
 name = "openai:text-embedding-3-large"
