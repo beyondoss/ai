@@ -791,7 +791,11 @@ fn anthropic_fast(ctx: &Ctx) -> Result<(), Failed> {
 }
 
 fn anthropic_cache_1h(ctx: &Ctx) -> Result<(), Failed> {
-    let model = "claude-sonnet-5-5";
+    // A model no other reconciled cell uses on this key: BIL-5 reconciles claude-sonnet-5-5 and
+    // pi's long session claude-sonnet-5 in the same isolated phase, and the unfiltered report
+    // would add their tokens to this one's (measured 2026-10-10: BIL-5 failed by exactly this
+    // case's request).
+    let model = "claude-opus-4-7";
     // A ~3k-token prefix, unique to this run so the first request writes rather than reads.
     let nonce = format!("{}-{}", std::process::id(), recon::now_secs());
     let prefix = format!(

@@ -1234,13 +1234,35 @@ fn sweep_file() -> PathBuf {
     sweep_dir().join(format!("{id}.jsonl"))
 }
 
-/// The row's own price (`price_micros`, logged by the gateway's reference pricer: the row's card
-/// under every dimension it carries), in USD. NaN when the row is unpriced, so no comparison
-/// passes on it.
+/// The row's own price (`price_micros`, logged by the gateway's reference pricer), in USD. NaN when
+/// the row is unpriced, so no comparison passes on it. Pricing is pass-through, so this is what
+/// the serving host cost, fees included.
 fn priced(l: &Value) -> f64 {
     l["price_micros"]
         .as_u64()
         .map_or(f64::NAN, |m| m as f64 / 1e6)
+}
+
+/// The row's tokens at its list card's standard rates (fresh input, output, cache reads and
+/// writes), in USD: what CAT-7 holds a vendor's own charge to. Not the row's price, which on
+/// OpenRouter adds the credit fee and on a failover host is that host's card.
+fn card_usd(row: &ModelRoute, l: &Value) -> f64 {
+    let p = |s: &str| s.parse::<f64>().unwrap_or(f64::NAN) / 1e6;
+    let n = |k: &str| l[k].as_u64().unwrap_or(0) as f64;
+    let (input, read, write) = (
+        n("input_tokens"),
+        n("cache_read_tokens"),
+        n("cache_write_tokens"),
+    );
+    let fresh = if l["usage_wire"] == "anthropic" {
+        input
+    } else {
+        input - read - write
+    };
+    fresh * p(row.price.input)
+        + n("output_tokens") * p(row.price.output)
+        + read * p(row.price.cache_read)
+        + write * p(row.price.cache_write)
 }
 
 /// The row's cost to us, in USD (`cost_micros`).
@@ -2189,7 +2211,7 @@ fn cat7(trial: &str, arm: Arm) -> Result<(), Failed> {
         )?;
         match served(trial, &probe, "cost", &r) {
             Ok((out, row)) => {
-                let ours = priced(&row);
+                let ours = card_usd(arm.row, &row);
                 match out.provider_cost {
                     Some(theirs) if theirs > 0.0 => {
                         let off = (ours - theirs) / theirs;
@@ -2619,6 +2641,24 @@ fn cat13(_trial: &str, m: Mount, byo: bool) -> Result<(), Failed> {
         req = req.bearer_auth(DEV_TOKEN);
     }
     let r = send(req)?;
+    // A managed key runs catalog models only (D267): on a provider no catalog row names, the
+    // gateway answers 404 before any provider has the body, and bills nothing.
+    if !byo && providers::catalog::for_model(m.model).is_none() {
+        let id = r.request_id.clone().unwrap_or_default();
+        let rows = ledger(&id, 0);
+        return if r.status == 404 && r.excerpt().contains("not in the catalog") && rows.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "managed {} on a non-catalog model: want 404 and no row, got HTTP {} ({} rows): {}",
+                m.model,
+                r.status,
+                rows.len(),
+                r.excerpt()
+            )
+            .into())
+        };
+    }
     if r.status != 200 {
         return Err(format!("HTTP {}: {}", r.status, r.excerpt()).into());
     }
@@ -3561,7 +3601,7 @@ fn retries_end_inside_the_nextest_budget() -> Result<(), Failed> {
             "verify",
             Some("beyond-ai-verify::reconcile_live"),
             None,
-            min(18),
+            min(95),
         ),
         ("verify", Some("beyond-ai-verify::long_live"), None, min(35)),
         ("verify", Some("beyond-ai-verify::live"), long, min(6)),

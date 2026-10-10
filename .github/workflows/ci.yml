@@ -278,7 +278,7 @@ jobs:
           for i in $(seq "$STRESS_RUNS"); do
             echo "=== run $i/$STRESS_RUNS ===" >> "$LOG"
             start=$SECONDS
-            cargo nextest run --profile ci -p beyond-ai -E "$STRESS_FILTER" >> "$LOG" 2>&1 </dev/null
+            cargo nextest run --color never --profile ci -p beyond-ai -E "$STRESS_FILTER" >> "$LOG" 2>&1 </dev/null
             rc=$?
             echo "run $i/$STRESS_RUNS: exit $rc in $((SECONDS - start))s"
             [ "$rc" -ne 0 ] && status=$rc
