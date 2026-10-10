@@ -199,6 +199,9 @@ pub enum Tool {
     /// Web search: Anthropic `web_search_requests`, an OpenAI or xAI `web_search_call` search
     /// action, xAI `web_search_calls`, OpenRouter `web_search_requests`.
     WebSearch,
+    /// An OpenAI `web_search_call` made with the `web_search_preview` tool (the row counts it apart
+    /// when the request offered that tool): $10 / 1K on reasoning models, $25 / 1K on the others.
+    WebSearchPreview,
     /// OpenAI `web_search_call` items with action `open_page` / `find_in_page`: no per-call fee.
     WebSearchPage,
     /// Anthropic `web_fetch_requests`: no per-call fee.
@@ -239,8 +242,9 @@ pub enum Tool {
 }
 
 impl Tool {
-    pub const ALL: [Tool; 16] = [
+    pub const ALL: [Tool; 17] = [
         Tool::WebSearch,
+        Tool::WebSearchPreview,
         Tool::WebSearchPage,
         Tool::WebFetch,
         Tool::CodeExecution,
@@ -263,6 +267,7 @@ impl Tool {
     pub const fn as_str(self) -> &'static str {
         match self {
             Tool::WebSearch => "web_search",
+            Tool::WebSearchPreview => "web_search_preview",
             Tool::WebSearchPage => "web_search_page",
             Tool::WebFetch => "web_fetch",
             Tool::CodeExecution => "code_execution",
@@ -544,6 +549,28 @@ pub struct Side {
     /// fee), in [`Bps`].
     pub multiplier: u64,
     pub parts: Parts,
+}
+
+/// The side's breakdown as one `key=value` list, written straight into the log line with no heap
+/// allocation: `class=fast,long=false,mult=11000,input=24000,cache_read=36000,cache_write_5m=0,
+/// cache_write_1h=0,output=100000,tools=30000` (micro-dollars; `mult` in basis points).
+impl std::fmt::Display for Side {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let p = &self.parts;
+        write!(
+            f,
+            "class={},long={},mult={},input={},cache_read={},cache_write_5m={},cache_write_1h={},output={},tools={}",
+            self.class.as_str(),
+            self.long,
+            self.multiplier,
+            p.input,
+            p.cache_read,
+            p.cache_write_5m,
+            p.cache_write_1h,
+            p.output,
+            p.tools
+        )
+    }
 }
 
 /// A priced row.
@@ -1223,6 +1250,21 @@ mod tests {
         for t in Tool::ALL {
             assert_eq!(Tool::parse(t.as_str()), Some(t));
         }
+    }
+
+    #[test]
+    fn a_side_displays_its_breakdown() {
+        let p = price(&UsageRow {
+            inference_geo: Some("us"),
+            server_tools: ToolCounts::new().with(Tool::WebSearch, 1),
+            ..row("claude-opus-4-8", "anthropic")
+        })
+        .unwrap();
+        assert_eq!(
+            p.price.to_string(),
+            "class=standard,long=false,mult=11000,input=5500,cache_read=0,cache_write_5m=0,\
+             cache_write_1h=0,output=2750,tools=10000"
+        );
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! Token-usage extraction — the "passive tap" the gateway emits as billing *facts*.
 //!
-//! We never compute price here (pricing is a closed downstream consumer); we only extract raw
-//! token counts. Two shapes per provider: the non-streaming JSON body, and the terminal event of
+//! No price is computed here: this extracts the raw counts, and `proxy`'s `logging` prices the row
+//! from them with `providers::pricing`. Two shapes per provider: the non-streaming JSON body, and the terminal event of
 //! an SSE stream. For streaming we scan the relayed bytes for the usage event but never block the
 //! relay on it (see `proxy`).
 

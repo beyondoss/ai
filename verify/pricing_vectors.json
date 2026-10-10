@@ -1,6 +1,6 @@
 {
   "about": "Golden vectors for the pricing contract (crates/providers/ARCHITECTURE.md, 'Pricing contract'). Each row is an ai.usage row; expect is what price(row) must return. An implementation must reproduce every one exactly. Absent row fields take their defaults: usage_wire anthropic, counts 0, strings null, booleans false, server_tools {}.",
-  "rate_version": "2026-10-10.a06079be9e5b5e77",
+  "rate_version": "2026-10-10.70d68df553023807",
   "vectors": [
     {
       "name": "anthropic_basic",
@@ -725,8 +725,8 @@
       }
     },
     {
-      "name": "openai_search_non_reasoning_refused",
-      "why": "On a non-reasoning model a web_search_call costs $10/1k (web_search) or $25/1k (web_search_preview), which the row cannot tell apart: refused.",
+      "name": "openai_search_non_reasoning",
+      "why": "On a non-reasoning model the web_search tool is $10/1k calls; the row counts web_search_preview calls apart.",
       "row": {
         "price_model": "gpt-4o",
         "provider": "openai",
@@ -737,12 +737,65 @@
         "unix_secs": 1791806400
       },
       "expect": {
-        "unpriced": "no_tool_fee"
+        "status": "priced",
+        "basis": "tokens",
+        "cost_micros": 23250,
+        "price_micros": 23250,
+        "cost_class": "standard",
+        "price_class": "standard",
+        "cost_long": false,
+        "price_long": false
+      }
+    },
+    {
+      "name": "openai_search_preview_non_reasoning",
+      "why": "web_search_preview on a non-reasoning model is $25/1k calls.",
+      "row": {
+        "price_model": "gpt-4.1",
+        "provider": "openai",
+        "input_tokens": 500,
+        "output_tokens": 200,
+        "server_tools": "web_search_preview=2",
+        "usage_wire": "openai",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "status": "priced",
+        "basis": "tokens",
+        "cost_micros": 52600,
+        "price_micros": 52600,
+        "cost_class": "standard",
+        "price_class": "standard",
+        "cost_long": false,
+        "price_long": false
+      }
+    },
+    {
+      "name": "openai_search_preview_reasoning",
+      "why": "web_search_preview on a reasoning model is $10/1k, like web_search.",
+      "row": {
+        "price_model": "gpt-5.5",
+        "provider": "openai",
+        "input_tokens": 500,
+        "output_tokens": 200,
+        "server_tools": "web_search=1,web_search_preview=1",
+        "usage_wire": "openai",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "status": "priced",
+        "basis": "tokens",
+        "cost_micros": 28500,
+        "price_micros": 28500,
+        "cost_class": "standard",
+        "price_class": "standard",
+        "cost_long": false,
+        "price_long": false
       }
     },
     {
       "name": "openai_search_fixed_block_refused",
-      "why": "gpt-4o-mini bills web search content as a fixed 8,000-token block the usage may not show (and is non-reasoning): refused.",
+      "why": "gpt-4o-mini bills web search content as a fixed 8,000-token block the usage may not show: refused (the gateway also refuses the request, D268).",
       "row": {
         "price_model": "gpt-4o-mini",
         "provider": "openai",

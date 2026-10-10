@@ -7362,9 +7362,9 @@ impl ProxyHttp for AiProxy {
             held.release_stream();
         }
 
-        // Emit the usage *fact* on a dedicated target — **managed only**. The event is an
-        // identity-keyed billing record (logfwd/OTLP ships `ai.usage` → ClickHouse → a closed
-        // pricing consumer); BYO carries no Beyond identity, so a BYO event would be a billing row
+        // Emit the priced usage row on a dedicated target — **managed only**. The event is an
+        // identity-keyed billing record (logfwd/OTLP ships `ai.usage` → ClickHouse → beyond, which
+        // batches it for invoicing); BYO carries no Beyond identity, so a BYO event would be a billing row
         // with `tenant_id=0` — unbillable, unattributable, and a footgun for any consumer that sums
         // without filtering it out. Aggregate gateway throughput (incl. BYO) is already covered by
         // the Prometheus metrics above, which is the right tool for non-billing observability.
@@ -7482,6 +7482,51 @@ impl ProxyHttp for AiProxy {
             let upstream_inference_cost_usd =
                 usage.upstream.inference_cost_e10.map(usage::e10_to_usd);
             let upstream_tool_cost_usd = usage.upstream.tool_cost_e10.map(usage::e10_to_usd);
+            // The request's start, whole seconds UTC: what time-of-day tiers (DeepSeek's off-peak)
+            // are decided on. Logged, so a repricer reads the same second.
+            let start_unix_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs())
+                .saturating_sub(elapsed.as_secs());
+            // Price the row from the very facts it logs (the contract is `providers::pricing`;
+            // `crates/providers/ARCHITECTURE.md`, "Pricing contract"). `server_tools` is read
+            // back from its logged text so a repricer working from the row gets the same counts.
+            // Pure and allocation-free: a few hundred nanoseconds, after the response.
+            let priced =
+                providers::pricing::ToolCounts::parse(server_tools.as_deref().unwrap_or(""))
+                    .and_then(|server_tools| {
+                        providers::pricing::price(&providers::pricing::UsageRow {
+                            price_model,
+                            provider: usage_provider,
+                            price_variant,
+                            usage_wire: usage.wire.unwrap_or(rc.dialect),
+                            input_tokens: usage.input_tokens,
+                            output_tokens: usage.output_tokens,
+                            cache_read_tokens: usage.cache_read_tokens,
+                            cache_write_tokens: usage.cache_write_tokens,
+                            cache_write_1h_tokens: usage.cache_write_1h_tokens,
+                            gateway_cache_write_tokens: usage.gateway_cache_write_tokens,
+                            server_tools,
+                            service_tier: usage.service_tier.as_deref(),
+                            speed: usage.speed.as_deref(),
+                            inference_geo: usage.inference_geo.as_deref(),
+                            upstream_cost_usd: upstream_cost_usd.as_deref(),
+                            upstream_tool_cost_usd: upstream_tool_cost_usd.as_deref(),
+                            served_by: usage.upstream.served_by.as_deref(),
+                            usage_estimated,
+                            upstream_may_continue,
+                            cache_hit: cache_hit.is_some(),
+                            unix_secs: start_unix_secs,
+                        })
+                    });
+            let (price_status, price_reason) = match &priced {
+                Ok(p) => (p.status.as_str(), None),
+                Err(reason) => {
+                    self.state.metrics.usage_unpriced_total.inc();
+                    ("unpriced", Some(reason.as_str()))
+                }
+            };
+            let priced = priced.ok();
             info!(
                 target: "ai.usage",
                 request_id = %rc.request_id,
@@ -7552,6 +7597,18 @@ impl ProxyHttp for AiProxy {
                 upstream_tool_cost_usd = upstream_tool_cost_usd.as_deref(),
                 upstream_byok = usage.upstream.byok,
                 upstream_may_continue,
+                // --- The price: authoritative (crates/providers/ARCHITECTURE.md, "Pricing
+                // contract"). The facts above are kept for audit and repricing. An unpriced row
+                // carries `price_status=unpriced` and its reason, never a zero.
+                rate_version = providers::rates::RATE_VERSION,
+                price_status,
+                price_reason,
+                cost_micros = priced.map(|p| p.cost.micros),
+                price_micros = priced.map(|p| p.price.micros),
+                cost_basis = priced.map(|p| p.basis.as_str()),
+                cost_detail = priced.map(|p| tracing::field::display(p.cost)),
+                price_detail = priced.map(|p| tracing::field::display(p.price)),
+                start_unix_secs,
                 // Which counts are the gateway's estimate, and what the estimate cannot see.
                 usage_estimated_parts = estimated.parts(),
                 usage_estimate_excludes = estimate_excludes,
