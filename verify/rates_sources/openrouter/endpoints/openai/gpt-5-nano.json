@@ -1,0 +1,63 @@
+{
+  "data": {
+    "endpoints": [
+      {
+        "context_length": 400000,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.0000004",
+          "discount": 0,
+          "input_cache_read": "0.00000001",
+          "prompt": "0.00000005",
+          "web_search": "0.01"
+        },
+        "provider_name": "Azure",
+        "quantization": "unknown",
+        "tag": "azure"
+      },
+      {
+        "context_length": 400000,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.00000044",
+          "discount": 0,
+          "input_cache_read": "0.000000011",
+          "prompt": "0.000000055",
+          "web_search": "0.01"
+        },
+        "provider_name": "Azure",
+        "quantization": "unknown",
+        "tag": "azure/swedencentral"
+      },
+      {
+        "context_length": 400000,
+        "max_prompt_tokens": 272000,
+        "pricing": {
+          "completion": "0.0000004",
+          "discount": 0,
+          "input_cache_read": "0.000000005",
+          "prompt": "0.00000005",
+          "web_search": "0.01"
+        },
+        "provider_name": "OpenAI",
+        "quantization": "unknown",
+        "tag": "openai"
+      },
+      {
+        "context_length": 400000,
+        "max_prompt_tokens": 272000,
+        "pricing": {
+          "completion": "0.0000002",
+          "discount": 0,
+          "input_cache_read": "0.0000000025",
+          "prompt": "0.000000025",
+          "web_search": "0.01"
+        },
+        "provider_name": "OpenAI",
+        "quantization": "unknown",
+        "tag": "openai/flex"
+      }
+    ],
+    "id": "openai/gpt-5-nano"
+  }
+}

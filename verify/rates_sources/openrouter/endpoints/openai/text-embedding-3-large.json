@@ -1,0 +1,31 @@
+{
+  "data": {
+    "endpoints": [
+      {
+        "context_length": 8192,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0",
+          "discount": 0,
+          "prompt": "0.00000013"
+        },
+        "provider_name": "Azure",
+        "quantization": "unknown",
+        "tag": "azure"
+      },
+      {
+        "context_length": 8192,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0",
+          "discount": 0,
+          "prompt": "0.00000013"
+        },
+        "provider_name": "OpenAI",
+        "quantization": "unknown",
+        "tag": "openai"
+      }
+    ],
+    "id": "openai/text-embedding-3-large"
+  }
+}

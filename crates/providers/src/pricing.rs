@@ -5,8 +5,8 @@
 //! implementation (a repricer, an invoice audit) must reproduce it exactly:
 //! `verify/pricing_vectors.json` holds golden rows and their expected results, and
 //! `crates/providers/ARCHITECTURE.md` ("Pricing contract") states every rule in prose. The rate
-//! data lives in [`crate::rates`]; every rate there carries its primary source in
-//! `verify/catalog_truth.toml`, and a test holds the two to each other.
+//! data lives in [`crate::rates`], generated from snapshots of each rate's primary source
+//! (`verify/rates_sources/`) by `mise run rates:sync`.
 //!
 //! Pure: no I/O, no allocation, no floating point.
 //!

@@ -7,7 +7,7 @@ lookups over them:
   (authority, auth header, wire).
 - **The catalog** (`catalog.rs`): canonical model name → the ordered candidates that serve it, plus
   the list price and card `GET /v1/models` publishes.
-- **The pricing contract** (`pricing.rs`, `rates.rs`): what one `ai.usage` row costs us and what
+- **The pricing contract** (`pricing.rs`, `rates.rs`, generated `rates/generated.rs`): what one `ai.usage` row costs us and what
   we charge for it.
 
 The first two are documented in their module docs. This file is the contract for the third.
@@ -18,8 +18,8 @@ The first two are documented in their module docs. This file is the contract for
 
 This repo owns the billing contract. `providers::pricing::price` is the reference implementation.
 `verify/pricing_vectors.json` holds the golden vectors any other implementation (beyond's billing,
-a repricer, an invoice audit) must reproduce exactly. `verify/catalog_truth.toml` holds every
-rate's primary source. If this section and the code disagree, the vectors settle it. The code and
+a repricer, an invoice audit) must reproduce exactly. The rates are generated from snapshots of
+their primary sources (`verify/rates_sources/`; see "Rate data and versions"). If this section and the code disagree, the vectors settle it. The code and
 vectors are fixed first, then this text.
 
 ### The model
@@ -205,12 +205,61 @@ never a wrapped number.
 
 ### Rate data and versions
 
-`rates.rs` holds every card. `verify/catalog_truth.toml` (`[[card]]`, `[[pricing]]`,
-`[[openrouter]]`, `[openrouter_fee]`) holds the same rates with their source URLs and the date
-checked. `crates/providers/tests/rates_truth.rs` holds the two to each other entry for entry, so a
-rate changes in both or the build fails. The same test checks three more things: every catalog row
-and candidate provider is priced, every list card's standard tier is the `ListPrice`, and
-`RATE_VERSION` (`{date}.{hash of the table}`) changes whenever any rate does.
+The table is generated, never typed. `rates/generated.rs` (every card, every OpenRouter endpoint
+list, `ROW_RATES` and `OPENROUTER_CREDIT_FEE`) is written by `crates/rates-sync` from two inputs:
+
+1. **Snapshots of the primary sources**, `verify/rates_sources/`. `manifest.toml` records each
+   file's URL, the date its content was fetched, and the sha256 of the raw response and of the
+   snapshot. A snapshot is the response normalized: churn that is not a price is dropped
+   (OpenRouter's uptime and latency, xAI's build fingerprints, an HTML page's navigation), and
+   order that carries no meaning is sorted.
+2. **The hand-entered rules**, `verify/catalog_truth.toml`: which source row each card is, the
+   facts a vendor states only in prose, per-call tool fees, recorded source conflicts and
+   overrides, and which card each row's candidates bill from (`[[pricing]]`). Every prose fact and
+   fee carries its URL and a verbatim quote, and generation fails unless the quote is in that
+   URL's snapshot.
+
+| Vendor     | Source the numbers come from (chosen)                                              | Cross-checked against (generation fails on disagreement)                                     | Hand-entered, with a checked quote                                                                                     |
+| ---------- | ---------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| Anthropic  | `pricing.md`: model table (input, 5m and 1h writes, hits, output), fast mode table | Bedrock's Global SKUs (must equal the list); the organization's billed costs (`rates:audit`) | fast mode's cache rates ride the model's own multipliers; `inference_geo` 1.1× (4.6+); web search $10/1K, web fetch $0 |
+| Bedrock    | AWS Price List offer `AmazonBedrockFoundationModels` (us-east-1): Regional SKUs    | Global SKUs = Anthropic's list; Regional = Global × 1.1 (Anthropic's pricing page)           | the 10% regional premium                                                                                               |
+| OpenAI     | `pricing.md`: Standard, Flex, Fast, Ultrafast tables; specialized table            | the organization's billed costs per line item (`rates:audit`)                                | long context `> 272K`; tool fees                                                                                       |
+| xAI        | `GET /v1/language-models` (1e-10 USD ticks per token; long tier and threshold)     | `pricing.md` text table, row for row                                                         | `>=` (reaches) at the threshold; Priority 2×; tool fees                                                                |
+| DeepSeek   | the pricing page's HTML table (peak and off-peak, both read)                       | none published                                                                               | peak windows; the holiday calendar (gov.cn, quoted)                                                                    |
+| Groq       | `models.md` price column; `prompt-caching.md` supported-model table                | none published                                                                               | cached input 50%; Flex priced as on-demand                                                                             |
+| Fireworks  | `serverless/pricing.md` table (Standard and Priority)                              | none published                                                                               | the Priority column is the `fast` class                                                                                |
+| Together   | `GET /v1/models` `pricing`                                                         | the docs' chat-models table (`serverless/models.md`)                                         | `[[conflict]]` per disagreement; the Kimi K3 promotion `[[override]]`                                                  |
+| OpenRouter | `GET /api/v1/models/{slug}/endpoints` (×10^6; overrides folded)                    | the slug is in `GET /api/v1/models`                                                          | the 5.5% credit fee (its pricing page's FAQ, quoted)                                                                   |
+
+Every reader is strict: it finds its table by exact header and label and parses a cell only when a
+card asks for its row, so an unrelated row never breaks generation, while a renamed column, a
+missing or duplicated row, or a malformed cell on a priced row always does. It never guesses. An
+unpublished cache read or write is the input rate, by rule. A rate finer than six decimal places
+per million fails.
+
+Maintenance is one command:
+
+- `mise run rates:sync` re-fetches every source, rewrites the changed snapshots, regenerates the
+  table, and prints the diff. Review it, then bump `RATE_VERSION` to the value
+  `rate_version_names_this_table` prints, and update `verify/pricing_vectors.json` if a vector's
+  rates moved.
+- `mise run rates:generate` regenerates from the committed snapshots, offline.
+  `rates_generated_from_sources` (`crates/rates-sync/tests/regenerate.rs`, per PR) does the same
+  and diffs it with the committed file, so the table can only be what the snapshots and rules say.
+- `.github/workflows/rates-drift.yml` (weekly, never per PR) re-fetches into a scratch copy and
+  fails, listing the diff, when any price moved, a parser met a new layout, or a quote vanished.
+- `mise run rates:audit` prints LiteLLM's and models.dev's disagreements (leads to check against
+  the primary source, never corrections), and checks the cards against the vendors' own invoices:
+  every (day, model, token kind) line of OpenAI's and Anthropic's admin cost reports must equal
+  tokens × rate, except that a line from before a vendor's announced price change is checked at
+  the old rate (`[[superseded]]`). The reports are the organization's spend, so they are read live
+  and never committed.
+
+`crates/providers/tests/rates_truth.rs` checks the compiled table against the catalog: every row
+and candidate provider is priced, every list card's standard tier is the `ListPrice`, every card is
+well formed, and `RATE_VERSION` (`{date}.{hash of the table}`) changes whenever any rate does. The
+catalog's `ListPrice` (and its `[[row]]` in the truth file) is the one hand copy of a list rate
+left, and that test fails the moment it differs from the generated list card.
 
 Every priced row should log `RATE_VERSION`. Repricing a historical row means running its token
 facts through a table version of your choice: the facts are kept, and the version says which table
@@ -277,7 +326,7 @@ So no fee is held there.
 
 Every billable dimension found in each provider's primary pricing pages and docs, read on
 2026-10-10. Each row says how the pricer handles it and how the row learns it applied. "Held"
-means the rate is in `rates.rs` and the truth file. Where the row cannot observe a dimension, the
+means the rate is in the generated table. Where the row cannot observe a dimension, the
 **Prevent/bound** column says how it is kept from costing money unseen.
 
 #### Anthropic (direct): https://platform.claude.com/docs/en/about-claude/pricing.md
@@ -285,7 +334,7 @@ means the rate is in `rates.rs` and the truth file. Where the row cannot observe
 | Dimension           | Rate                                                                                                    | Observed via                                                       | Row field                                    | Pricer / prevent                                                                                  |
 | ------------------- | ------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------ | -------------------------------------------- | ------------------------------------------------------------------------------------------------- |
 | Input / output      | per model (= `ListPrice`)                                                                               | `usage`                                                            | `input_tokens`, `output_tokens`              | Held                                                                                              |
-| Cache read          | 0.1× input; 0.025× Fable 5.1; 0.05× Opus 5.5 and Sonnet 5.5                                             | `usage.cache_read_input_tokens`                                    | `cache_read_tokens`                          | Held (Sonnet 5.5 fixed to $0.10 in this change)                                                   |
+| Cache read          | 0.1× input; 0.025× Fable 5.1; 0.05× Opus 5.5 and Sonnet 5.5                                             | `usage.cache_read_input_tokens`                                    | `cache_read_tokens`                          | Held. Sonnet 5.5: $0.10 since 2026-10-07; invoices before then bill $0.20                         |
 | 5-minute write      | 1.25× input                                                                                             | `usage.cache_creation.ephemeral_5m_input_tokens`                   | `cache_write_tokens − cache_write_1h_tokens` | Held                                                                                              |
 | 1-hour write        | 2× input                                                                                                | `usage.cache_creation.ephemeral_1h_input_tokens`                   | `cache_write_1h_tokens`                      | Held                                                                                              |
 | Fast mode           | 2× every rate, caches included; Opus 4.8, Opus 5, Opus 5.5 only (fast-mode.md)                          | `usage.speed`                                                      | `speed`                                      | Held; refused on other models. Today unreachable: the gateway's beta filter drops `fast-mode-*`   |
@@ -359,11 +408,11 @@ means the rate is in `rates.rs` and the truth file. Where the row cannot observe
 
 #### Together: https://www.together.ai/pricing, https://docs.together.ai/docs/serverless/models
 
-| Dimension               | Rate                                                     | Observed via | Row field | Pricer / prevent                                                  |
-| ----------------------- | -------------------------------------------------------- | ------------ | --------- | ----------------------------------------------------------------- |
-| Input / cached / output | per model; no cached price = no discount; no write price | `usage`      | tokens    | Held. Where Together's two pages disagree, the dearer is recorded |
-| Long context, tiers     | none published                                           | —            | —         | —                                                                 |
-| Images                  | input tokens (1,601 per 560px tile)                      | `usage`      | tokens    | Nothing extra                                                     |
+| Dimension               | Rate                                                     | Observed via | Row field | Pricer / prevent                                                                         |
+| ----------------------- | -------------------------------------------------------- | ------------ | --------- | ---------------------------------------------------------------------------------------- |
+| Input / cached / output | per model; no cached price = no discount; no write price | `usage`      | tokens    | Held, from `/v1/models`; a disagreement with the docs table is a recorded `[[conflict]]` |
+| Long context, tiers     | none published                                           | —            | —         | —                                                                                        |
+| Images                  | input tokens (1,601 per 560px tile)                      | `usage`      | tokens    | Nothing extra                                                                            |
 
 #### Fireworks: https://docs.fireworks.ai/serverless/pricing
 
@@ -411,8 +460,9 @@ OpenRouter's Alibaba endpoint carries the tier on the cost side.
   The caching page says "exceed". At most one request in 200K tokens straddles this.
 - **OpenRouter `usage.cost` and plugin fees**: "the total amount charged" is read as including
   them. Unverified until the live reconciliation compares it with the generation API.
-- **Together Kimi K3** is recorded at list ($3 / $15). A promotion ($2.70 / $13.50) ends
-  2026-10-11.
+- **Together Kimi K3** is held at list ($3 / $15 / cached $0.30) by an `[[override]]`: Together's
+  API and pricing page show a promotion ($2.70 / $13.50 / $0.27) that ends 2026-10-11. The first
+  sync after it ends fails until the override is removed.
 - **Together retires Llama 3.3 70B Turbo on 2026-10-22.** Its row needs a decision before then.
 - **DeepSeek's holiday calendar** must be extended before 2027-01-01, or weekday peak rows refuse.
 - **The seven OpenAI `*-pro` ids for GPT-5.6 and GPT-6 are not OpenAI models.** OpenAI makes "pro" a

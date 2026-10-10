@@ -1,0 +1,1239 @@
+{
+  "data": [
+    {
+      "context_length": 1000000,
+      "id": "anthropic/claude-fable-5",
+      "name": "Anthropic: Claude Fable 5",
+      "pricing": {
+        "completion": "0.00005",
+        "input_cache_read": "0.000001",
+        "input_cache_write": "0.0000125",
+        "input_cache_write_1h": "0.00002",
+        "prompt": "0.00001",
+        "web_search": "0.01"
+      }
+    },
+    {
+      "context_length": 1000000,
+      "id": "anthropic/claude-fable-5.1",
+      "name": "Anthropic: Claude Fable 5.1",
+      "pricing": {
+        "completion": "0.00005",
+        "input_cache_read": "0.00000025",
+        "input_cache_write": "0.0000125",
+        "input_cache_write_1h": "0.00002",
+        "prompt": "0.00001",
+        "web_search": "0.01"
+      }
+    },
+    {
+      "context_length": 200000,
+      "id": "anthropic/claude-haiku-4.5",
+      "name": "Anthropic: Claude Haiku 4.5",
+      "pricing": {
+        "completion": "0.000005",
+        "input_cache_read": "0.0000001",
+        "input_cache_write": "0.00000125",
+        "input_cache_write_1h": "0.000002",
+        "prompt": "0.000001",
+        "web_search": "0.01"
+      }
+    },
+    {
+      "context_length": 200000,
+      "id": "anthropic/claude-opus-4.5",
+      "name": "Anthropic: Claude Opus 4.5",
+      "pricing": {
+        "completion": "0.000025",
+        "input_cache_read": "0.0000005",
+        "input_cache_write": "0.00000625",
+        "input_cache_write_1h": "0.00001",
+        "prompt": "0.000005",
+        "web_search": "0.01"
+      }
+    },
+    {
+      "context_length": 1000000,
+      "id": "anthropic/claude-opus-4.6",
+      "name": "Anthropic: Claude Opus 4.6",
+      "pricing": {
+        "completion": "0.000025",
+        "input_cache_read": "0.0000005",
+        "input_cache_write": "0.00000625",
+        "input_cache_write_1h": "0.00001",
+        "prompt": "0.000005",
+        "web_search": "0.01"
+      }
+    },
+    {
+      "context_length": 1000000,
+      "id": "anthropic/claude-opus-4.7",
+      "name": "Anthropic: Claude Opus 4.7",
+      "pricing": {
+        "completion": "0.000025",
+        "input_cache_read": "0.0000005",
+        "input_cache_write": "0.00000625",
+        "input_cache_write_1h": "0.00001",
+        "prompt": "0.000005",
+        "web_search": "0.01"
+      }
+    },
+    {
+      "context_length": 1000000,
+      "id": "anthropic/claude-opus-4.8",
+      "name": "Anthropic: Claude Opus 4.8",
+      "pricing": {
+        "completion": "0.000025",
+        "input_cache_read": "0.0000005",
+        "input_cache_write": "0.00000625",
+        "input_cache_write_1h": "0.00001",
+        "prompt": "0.000005",
+        "web_search": "0.01"
+      }
+    },
+    {
+      "context_length": 1000000,
+      "id": "anthropic/claude-opus-5",
+      "name": "Anthropic: Claude Opus 5",
+      "pricing": {
+        "completion": "0.000025",
+        "input_cache_read": "0.0000005",
+        "input_cache_write": "0.00000625",
+        "input_cache_write_1h": "0.00001",
+        "prompt": "0.000005",
+        "web_search": "0.01"
+      }
+    },
+    {
+      "context_length": 1000000,
+      "id": "anthropic/claude-opus-5.5",
+      "name": "Anthropic: Claude Opus 5.5",
+      "pricing": {
+        "completion": "0.00002",
+        "input_cache_read": "0.0000002",
+        "input_cache_write": "0.000005",
+        "input_cache_write_1h": "0.000008",
+        "prompt": "0.000004",
+        "web_search": "0.01"
+      }
+    },
+    {
+      "context_length": 1000000,
+      "id": "anthropic/claude-sonnet-4.5",
+      "name": "Anthropic: Claude Sonnet 4.5",
+      "pricing": {
+        "completion": "0.000015",
+        "input_cache_read": "0.0000003",
+        "input_cache_write": "0.00000375",
+        "input_cache_write_1h": "0.000006",
+        "overrides": [
+          {
+            "completion": "0.0000225",
+            "input_cache_read": "0.0000006",
+            "input_cache_write": "0.0000075",
+            "input_cache_write_1h": "0.000012",
+            "min_prompt_tokens": 200000,
+            "prompt": "0.000006"
+          }
+        ],
+        "prompt": "0.000003",
+        "web_search": "0.01"
+      }
+    },
+    {
+      "context_length": 1000000,
+      "id": "anthropic/claude-sonnet-4.6",
+      "name": "Anthropic: Claude Sonnet 4.6",
+      "pricing": {
+        "completion": "0.000015",
+        "input_cache_read": "0.0000003",
+        "input_cache_write": "0.00000375",
+        "input_cache_write_1h": "0.000006",
+        "prompt": "0.000003",
+        "web_search": "0.01"
+      }
+    },
+    {
+      "context_length": 1000000,
+      "id": "anthropic/claude-sonnet-5",
+      "name": "Anthropic: Claude Sonnet 5",
+      "pricing": {
+        "completion": "0.00001",
+        "input_cache_read": "0.0000002",
+        "input_cache_write": "0.0000025",
+        "input_cache_write_1h": "0.000004",
+        "prompt": "0.000002",
+        "web_search": "0.01"
+      }
+    },
+    {
+      "context_length": 1000000,
+      "id": "anthropic/claude-sonnet-5.5",
+      "name": "Anthropic: Claude Sonnet 5.5",
+      "pricing": {
+        "completion": "0.00001",
+        "input_cache_read": "0.0000001",
+        "input_cache_write": "0.0000025",
+        "input_cache_write_1h": "0.000004",
+        "prompt": "0.000002",
+        "web_search": "0.01"
+      }
+    },
+    {
+      "context_length": 1048576,
+      "id": "deepseek/deepseek-v4-pro-0813",
+      "name": "DeepSeek: DeepSeek V4 Pro 0813",
+      "pricing": {
+        "completion": "0.00000198",
+        "input_cache_read": "0.000000022",
+        "overrides": [
+          {
+            "completion": "0.00000198",
+            "input_cache_read": "0.000000022",
+            "prompt": "0.00000066",
+            "utc_days": [
+              "saturday",
+              "sunday"
+            ]
+          },
+          {
+            "completion": "0.00000198",
+            "input_cache_read": "0.000000022",
+            "prompt": "0.00000066",
+            "utc_days": [
+              "monday",
+              "tuesday",
+              "wednesday",
+              "thursday",
+              "friday"
+            ],
+            "utc_end": 100,
+            "utc_start": 0
+          },
+          {
+            "completion": "0.00000396",
+            "input_cache_read": "0.000000044",
+            "prompt": "0.00000132",
+            "utc_days": [
+              "monday",
+              "tuesday",
+              "wednesday",
+              "thursday",
+              "friday"
+            ],
+            "utc_end": 400,
+            "utc_start": 100
+          },
+          {
+            "completion": "0.00000198",
+            "input_cache_read": "0.000000022",
+            "prompt": "0.00000066",
+            "utc_days": [
+              "monday",
+              "tuesday",
+              "wednesday",
+              "thursday",
+              "friday"
+            ],
+            "utc_end": 600,
+            "utc_start": 400
+          },
+          {
+            "completion": "0.00000396",
+            "input_cache_read": "0.000000044",
+            "prompt": "0.00000132",
+            "utc_days": [
+              "monday",
+              "tuesday",
+              "wednesday",
+              "thursday",
+              "friday"
+            ],
+            "utc_end": 1000,
+            "utc_start": 600
+          },
+          {
+            "completion": "0.00000198",
+            "input_cache_read": "0.000000022",
+            "prompt": "0.00000066",
+            "utc_days": [
+              "monday",
+              "tuesday",
+              "wednesday",
+              "thursday",
+              "friday"
+            ],
+            "utc_end": 0,
+            "utc_start": 1000
+          }
+        ],
+        "prompt": "0.00000066"
+      }
+    },
+    {
+      "context_length": 1048576,
+      "id": "deepseek/deepseek-v4.1-flash",
+      "name": "DeepSeek: DeepSeek V4.1 Flash",
+      "pricing": {
+        "completion": "0.0000012",
+        "input_cache_read": "0.000000006",
+        "prompt": "0.0000003"
+      }
+    },
+    {
+      "context_length": 262144,
+      "id": "google/gemma-4-31b-it",
+      "name": "Google: Gemma 4 31B",
+      "pricing": {
+        "completion": "0.00000034",
+        "input_cache_read": "0.00000005",
+        "prompt": "0.00000009"
+      }
+    },
+    {
+      "context_length": 131072,
+      "id": "meta-llama/llama-3.1-8b-instruct",
+      "name": "Meta: Llama 3.1 8B Instruct",
+      "pricing": {
+        "completion": "0.00000008",
+        "input_cache_read": "0.000000025",
+        "prompt": "0.00000005"
+      }
+    },
+    {
+      "context_length": 131072,
+      "id": "meta-llama/llama-3.3-70b-instruct",
+      "name": "Meta: Llama 3.3 70B Instruct",
+      "pricing": {
+        "completion": "0.0000005",
+        "input_cache_read": "0.00000011",
+        "prompt": "0.00000022"
+      }
+    },
+    {
+      "context_length": 1048576,
+      "id": "meta-llama/llama-4-maverick",
+      "name": "Meta: Llama 4 Maverick",
+      "pricing": {
+        "completion": "0.0000006525",
+        "input_cache_read": "0.00000005",
+        "prompt": "0.0000001875"
+      }
+    },
+    {
+      "context_length": 1310720,
+      "id": "meta-llama/llama-4-scout",
+      "name": "Meta: Llama 4 Scout",
+      "pricing": {
+        "completion": "0.0000003",
+        "prompt": "0.0000001"
+      }
+    },
+    {
+      "context_length": 131072,
+      "id": "meta/muse-glimmer-30b",
+      "name": "Meta: Muse Glimmer 30B",
+      "pricing": {
+        "completion": "0.0000012",
+        "input_cache_read": "0.00000004",
+        "prompt": "0.0000003"
+      }
+    },
+    {
+      "context_length": 1048576,
+      "id": "minimax/minimax-m3",
+      "name": "MiniMax: MiniMax M3",
+      "pricing": {
+        "completion": "0.0000012",
+        "input_cache_read": "0.00000006",
+        "prompt": "0.0000003"
+      }
+    },
+    {
+      "context_length": 262144,
+      "id": "moonshotai/kimi-k2.6",
+      "name": "MoonshotAI: Kimi K2.6",
+      "pricing": {
+        "completion": "0.00000245",
+        "input_cache_read": "0.0000001077",
+        "prompt": "0.0000004344"
+      }
+    },
+    {
+      "context_length": 262144,
+      "id": "moonshotai/kimi-k2.7-code",
+      "name": "MoonshotAI: Kimi K2.7 Code",
+      "pricing": {
+        "completion": "0.00000335",
+        "input_cache_read": "0.00000018",
+        "prompt": "0.0000006712"
+      }
+    },
+    {
+      "context_length": 1048576,
+      "id": "moonshotai/kimi-k3",
+      "name": "MoonshotAI: Kimi K3",
+      "pricing": {
+        "completion": "0.000015",
+        "input_cache_read": "0.00000055",
+        "prompt": "0.0000008"
+      }
+    },
+    {
+      "context_length": 1047576,
+      "id": "openai/gpt-4.1",
+      "name": "OpenAI: GPT-4.1",
+      "pricing": {
+        "completion": "0.000008",
+        "input_cache_read": "0.0000005",
+        "prompt": "0.000002",
+        "web_search": "0.01"
+      }
+    },
+    {
+      "context_length": 1047576,
+      "id": "openai/gpt-4.1-mini",
+      "name": "OpenAI: GPT-4.1 Mini",
+      "pricing": {
+        "completion": "0.0000016",
+        "input_cache_read": "0.0000001",
+        "prompt": "0.0000004",
+        "web_search": "0.01"
+      }
+    },
+    {
+      "context_length": 128000,
+      "id": "openai/gpt-4o",
+      "name": "OpenAI: GPT-4o",
+      "pricing": {
+        "completion": "0.00001",
+        "input_cache_read": "0.00000125",
+        "prompt": "0.0000025"
+      }
+    },
+    {
+      "context_length": 128000,
+      "id": "openai/gpt-4o-mini",
+      "name": "OpenAI: GPT-4o-mini",
+      "pricing": {
+        "completion": "0.0000006",
+        "input_cache_read": "0.000000075",
+        "prompt": "0.00000015"
+      }
+    },
+    {
+      "context_length": 400000,
+      "id": "openai/gpt-5",
+      "name": "OpenAI: GPT-5",
+      "pricing": {
+        "completion": "0.00001",
+        "input_cache_read": "0.000000125",
+        "prompt": "0.00000125",
+        "web_search": "0.01"
+      }
+    },
+    {
+      "context_length": 400000,
+      "id": "openai/gpt-5-mini",
+      "name": "OpenAI: GPT-5 Mini",
+      "pricing": {
+        "completion": "0.000002",
+        "input_cache_read": "0.000000025",
+        "prompt": "0.00000025",
+        "web_search": "0.01"
+      }
+    },
+    {
+      "context_length": 400000,
+      "id": "openai/gpt-5-nano",
+      "name": "OpenAI: GPT-5 Nano",
+      "pricing": {
+        "completion": "0.0000004",
+        "input_cache_read": "0.000000005",
+        "prompt": "0.00000005",
+        "web_search": "0.01"
+      }
+    },
+    {
+      "context_length": 400000,
+      "id": "openai/gpt-5-pro",
+      "name": "OpenAI: GPT-5 Pro",
+      "pricing": {
+        "completion": "0.00012",
+        "prompt": "0.000015",
+        "web_search": "0.01"
+      }
+    },
+    {
+      "context_length": 400000,
+      "id": "openai/gpt-5.1",
+      "name": "OpenAI: GPT-5.1",
+      "pricing": {
+        "completion": "0.00001",
+        "input_cache_read": "0.000000125",
+        "prompt": "0.00000125",
+        "web_search": "0.01"
+      }
+    },
+    {
+      "context_length": 400000,
+      "id": "openai/gpt-5.2",
+      "name": "OpenAI: GPT-5.2",
+      "pricing": {
+        "completion": "0.000014",
+        "input_cache_read": "0.000000175",
+        "prompt": "0.00000175",
+        "web_search": "0.01"
+      }
+    },
+    {
+      "context_length": 400000,
+      "id": "openai/gpt-5.2-pro",
+      "name": "OpenAI: GPT-5.2 Pro",
+      "pricing": {
+        "completion": "0.000168",
+        "prompt": "0.000021",
+        "web_search": "0.01"
+      }
+    },
+    {
+      "context_length": 400000,
+      "id": "openai/gpt-5.3-codex",
+      "name": "OpenAI: GPT-5.3-Codex",
+      "pricing": {
+        "completion": "0.000014",
+        "input_cache_read": "0.000000175",
+        "prompt": "0.00000175",
+        "web_search": "0.01"
+      }
+    },
+    {
+      "context_length": 1050000,
+      "id": "openai/gpt-5.4",
+      "name": "OpenAI: GPT-5.4",
+      "pricing": {
+        "completion": "0.000015",
+        "input_cache_read": "0.00000025",
+        "overrides": [
+          {
+            "completion": "0.0000225",
+            "input_cache_read": "0.0000005",
+            "min_prompt_tokens": 272000,
+            "prompt": "0.000005"
+          }
+        ],
+        "prompt": "0.0000025",
+        "web_search": "0.01"
+      }
+    },
+    {
+      "context_length": 400000,
+      "id": "openai/gpt-5.4-mini",
+      "name": "OpenAI: GPT-5.4 Mini",
+      "pricing": {
+        "completion": "0.0000045",
+        "input_cache_read": "0.000000075",
+        "prompt": "0.00000075",
+        "web_search": "0.01"
+      }
+    },
+    {
+      "context_length": 400000,
+      "id": "openai/gpt-5.4-nano",
+      "name": "OpenAI: GPT-5.4 Nano",
+      "pricing": {
+        "completion": "0.00000125",
+        "input_cache_read": "0.00000002",
+        "prompt": "0.0000002",
+        "web_search": "0.01"
+      }
+    },
+    {
+      "context_length": 1050000,
+      "id": "openai/gpt-5.4-pro",
+      "name": "OpenAI: GPT-5.4 Pro",
+      "pricing": {
+        "completion": "0.00018",
+        "overrides": [
+          {
+            "completion": "0.00027",
+            "min_prompt_tokens": 272000,
+            "prompt": "0.00006"
+          }
+        ],
+        "prompt": "0.00003",
+        "web_search": "0.01"
+      }
+    },
+    {
+      "context_length": 1050000,
+      "id": "openai/gpt-5.5",
+      "name": "OpenAI: GPT-5.5",
+      "pricing": {
+        "completion": "0.00003",
+        "input_cache_read": "0.0000005",
+        "overrides": [
+          {
+            "completion": "0.000045",
+            "input_cache_read": "0.000001",
+            "min_prompt_tokens": 272000,
+            "prompt": "0.00001"
+          }
+        ],
+        "prompt": "0.000005",
+        "web_search": "0.01"
+      }
+    },
+    {
+      "context_length": 1050000,
+      "id": "openai/gpt-5.5-pro",
+      "name": "OpenAI: GPT-5.5 Pro",
+      "pricing": {
+        "completion": "0.00018",
+        "overrides": [
+          {
+            "completion": "0.00027",
+            "min_prompt_tokens": 272000,
+            "prompt": "0.00006"
+          }
+        ],
+        "prompt": "0.00003",
+        "web_search": "0.01"
+      }
+    },
+    {
+      "context_length": 1050000,
+      "id": "openai/gpt-5.6-luna",
+      "name": "OpenAI: GPT-5.6 Luna",
+      "pricing": {
+        "completion": "0.0000012",
+        "input_cache_read": "0.00000002",
+        "input_cache_write": "0.00000025",
+        "overrides": [
+          {
+            "completion": "0.0000018",
+            "input_cache_read": "0.00000004",
+            "input_cache_write": "0.0000005",
+            "min_prompt_tokens": 272000,
+            "prompt": "0.0000004"
+          }
+        ],
+        "prompt": "0.0000002",
+        "web_search": "0.01"
+      }
+    },
+    {
+      "context_length": 1050000,
+      "id": "openai/gpt-5.6-luna-pro",
+      "name": "OpenAI: GPT-5.6 Luna Pro",
+      "pricing": {
+        "completion": "0.0000012",
+        "input_cache_read": "0.00000002",
+        "input_cache_write": "0.00000025",
+        "overrides": [
+          {
+            "completion": "0.0000018",
+            "input_cache_read": "0.00000004",
+            "input_cache_write": "0.0000005",
+            "min_prompt_tokens": 272000,
+            "prompt": "0.0000004"
+          }
+        ],
+        "prompt": "0.0000002",
+        "web_search": "0.01"
+      }
+    },
+    {
+      "context_length": 1050000,
+      "id": "openai/gpt-5.6-sol",
+      "name": "OpenAI: GPT-5.6 Sol",
+      "pricing": {
+        "completion": "0.00001",
+        "input_cache_read": "0.0000002",
+        "input_cache_write": "0.0000025",
+        "overrides": [
+          {
+            "completion": "0.000015",
+            "input_cache_read": "0.0000004",
+            "input_cache_write": "0.000005",
+            "min_prompt_tokens": 272000,
+            "prompt": "0.000004"
+          }
+        ],
+        "prompt": "0.000002",
+        "web_search": "0.01"
+      }
+    },
+    {
+      "context_length": 1050000,
+      "id": "openai/gpt-5.6-sol-pro",
+      "name": "OpenAI: GPT-5.6 Sol Pro",
+      "pricing": {
+        "completion": "0.00001",
+        "input_cache_read": "0.0000002",
+        "input_cache_write": "0.0000025",
+        "overrides": [
+          {
+            "completion": "0.000015",
+            "input_cache_read": "0.0000004",
+            "input_cache_write": "0.000005",
+            "min_prompt_tokens": 272000,
+            "prompt": "0.000004"
+          }
+        ],
+        "prompt": "0.000002",
+        "web_search": "0.01"
+      }
+    },
+    {
+      "context_length": 1050000,
+      "id": "openai/gpt-5.6-terra",
+      "name": "OpenAI: GPT-5.6 Terra",
+      "pricing": {
+        "completion": "0.000012",
+        "input_cache_read": "0.0000002",
+        "input_cache_write": "0.0000025",
+        "overrides": [
+          {
+            "completion": "0.000018",
+            "input_cache_read": "0.0000004",
+            "input_cache_write": "0.000005",
+            "min_prompt_tokens": 272000,
+            "prompt": "0.000004"
+          }
+        ],
+        "prompt": "0.000002",
+        "web_search": "0.01"
+      }
+    },
+    {
+      "context_length": 1050000,
+      "id": "openai/gpt-5.6-terra-pro",
+      "name": "OpenAI: GPT-5.6 Terra Pro",
+      "pricing": {
+        "completion": "0.000012",
+        "input_cache_read": "0.0000002",
+        "input_cache_write": "0.0000025",
+        "overrides": [
+          {
+            "completion": "0.000018",
+            "input_cache_read": "0.0000004",
+            "input_cache_write": "0.000005",
+            "min_prompt_tokens": 272000,
+            "prompt": "0.000004"
+          }
+        ],
+        "prompt": "0.000002",
+        "web_search": "0.01"
+      }
+    },
+    {
+      "context_length": 1050000,
+      "id": "openai/gpt-6-astra",
+      "name": "OpenAI: GPT-6 Astra",
+      "pricing": {
+        "completion": "0.00005",
+        "input_cache_read": "0.000001",
+        "input_cache_write": "0.0000125",
+        "overrides": [
+          {
+            "completion": "0.000075",
+            "input_cache_read": "0.000002",
+            "input_cache_write": "0.000025",
+            "min_prompt_tokens": 272000,
+            "prompt": "0.00002"
+          }
+        ],
+        "prompt": "0.00001",
+        "web_search": "0.01"
+      }
+    },
+    {
+      "context_length": 1050000,
+      "id": "openai/gpt-6-astra-pro",
+      "name": "OpenAI: GPT-6 Astra Pro",
+      "pricing": {
+        "completion": "0.00005",
+        "input_cache_read": "0.000001",
+        "input_cache_write": "0.0000125",
+        "overrides": [
+          {
+            "completion": "0.000075",
+            "input_cache_read": "0.000002",
+            "input_cache_write": "0.000025",
+            "min_prompt_tokens": 272000,
+            "prompt": "0.00002"
+          }
+        ],
+        "prompt": "0.00001",
+        "web_search": "0.01"
+      }
+    },
+    {
+      "context_length": 1050000,
+      "id": "openai/gpt-6-luna",
+      "name": "OpenAI: GPT-6 Luna",
+      "pricing": {
+        "completion": "0.0000005",
+        "input_cache_read": "0.00000001",
+        "input_cache_write": "0.000000125",
+        "overrides": [
+          {
+            "completion": "0.00000075",
+            "input_cache_read": "0.00000002",
+            "input_cache_write": "0.00000025",
+            "min_prompt_tokens": 272000,
+            "prompt": "0.0000002"
+          }
+        ],
+        "prompt": "0.0000001",
+        "web_search": "0.01"
+      }
+    },
+    {
+      "context_length": 1050000,
+      "id": "openai/gpt-6-luna-pro",
+      "name": "OpenAI: GPT-6 Luna Pro",
+      "pricing": {
+        "completion": "0.0000005",
+        "input_cache_read": "0.00000001",
+        "input_cache_write": "0.000000125",
+        "overrides": [
+          {
+            "completion": "0.00000075",
+            "input_cache_read": "0.00000002",
+            "input_cache_write": "0.00000025",
+            "min_prompt_tokens": 272000,
+            "prompt": "0.0000002"
+          }
+        ],
+        "prompt": "0.0000001",
+        "web_search": "0.01"
+      }
+    },
+    {
+      "context_length": 1050000,
+      "id": "openai/gpt-6-sol",
+      "name": "OpenAI: GPT-6 Sol",
+      "pricing": {
+        "completion": "0.00001",
+        "input_cache_read": "0.0000002",
+        "input_cache_write": "0.0000025",
+        "overrides": [
+          {
+            "completion": "0.000015",
+            "input_cache_read": "0.0000004",
+            "input_cache_write": "0.000005",
+            "min_prompt_tokens": 272000,
+            "prompt": "0.000004"
+          }
+        ],
+        "prompt": "0.000002",
+        "web_search": "0.01"
+      }
+    },
+    {
+      "context_length": 1050000,
+      "id": "openai/gpt-6-sol-pro",
+      "name": "OpenAI: GPT-6 Sol Pro",
+      "pricing": {
+        "completion": "0.00001",
+        "input_cache_read": "0.0000002",
+        "input_cache_write": "0.0000025",
+        "overrides": [
+          {
+            "completion": "0.000015",
+            "input_cache_read": "0.0000004",
+            "input_cache_write": "0.000005",
+            "min_prompt_tokens": 272000,
+            "prompt": "0.000004"
+          }
+        ],
+        "prompt": "0.000002",
+        "web_search": "0.01"
+      }
+    },
+    {
+      "context_length": 1050000,
+      "id": "openai/gpt-6.1-sol",
+      "name": "OpenAI: GPT-6.1 Sol",
+      "pricing": {
+        "completion": "0.00001",
+        "input_cache_read": "0.0000001",
+        "input_cache_write": "0.0000025",
+        "overrides": [
+          {
+            "completion": "0.000015",
+            "input_cache_read": "0.0000002",
+            "input_cache_write": "0.000005",
+            "min_prompt_tokens": 272000,
+            "prompt": "0.000004"
+          }
+        ],
+        "prompt": "0.000002",
+        "web_search": "0.01"
+      }
+    },
+    {
+      "context_length": 1050000,
+      "id": "openai/gpt-6.1-sol-pro",
+      "name": "OpenAI: GPT-6.1 Sol Pro",
+      "pricing": {
+        "completion": "0.00001",
+        "input_cache_read": "0.0000001",
+        "input_cache_write": "0.0000025",
+        "overrides": [
+          {
+            "completion": "0.000015",
+            "input_cache_read": "0.0000002",
+            "input_cache_write": "0.000005",
+            "min_prompt_tokens": 272000,
+            "prompt": "0.000004"
+          }
+        ],
+        "prompt": "0.000002",
+        "web_search": "0.01"
+      }
+    },
+    {
+      "context_length": 131072,
+      "id": "openai/gpt-oss-20b",
+      "name": "OpenAI: gpt-oss-20b",
+      "pricing": {
+        "completion": "0.00000009",
+        "input_cache_read": "0.000000009",
+        "prompt": "0.000000018"
+      }
+    },
+    {
+      "context_length": 131072,
+      "id": "openai/gpt-oss-safeguard-20b",
+      "name": "OpenAI: gpt-oss-safeguard-20b",
+      "pricing": {
+        "completion": "0.0000003",
+        "input_cache_read": "0.0000000375",
+        "prompt": "0.000000075"
+      }
+    },
+    {
+      "context_length": 200000,
+      "id": "openai/o3",
+      "name": "OpenAI: o3",
+      "pricing": {
+        "completion": "0.000008",
+        "input_cache_read": "0.0000005",
+        "prompt": "0.000002",
+        "web_search": "0.01"
+      }
+    },
+    {
+      "context_length": 200000,
+      "id": "openai/o3-pro",
+      "name": "OpenAI: o3 Pro",
+      "pricing": {
+        "completion": "0.00008",
+        "prompt": "0.00002",
+        "web_search": "0.01"
+      }
+    },
+    {
+      "context_length": 8192,
+      "id": "openai/text-embedding-3-large",
+      "name": "OpenAI: Text Embedding 3 Large",
+      "pricing": {
+        "completion": "0",
+        "prompt": "0.00000013"
+      }
+    },
+    {
+      "context_length": 8192,
+      "id": "openai/text-embedding-3-small",
+      "name": "OpenAI: Text Embedding 3 Small",
+      "pricing": {
+        "completion": "0",
+        "prompt": "0.00000002"
+      }
+    },
+    {
+      "context_length": 32768,
+      "id": "qwen/qwen-2.5-7b-instruct",
+      "name": "Qwen: Qwen2.5 7B Instruct",
+      "pricing": {
+        "completion": "0.0000002",
+        "prompt": "0.0000001"
+      }
+    },
+    {
+      "context_length": 262144,
+      "id": "qwen/qwen3.5-9b",
+      "name": "Qwen: Qwen3.5-9B",
+      "pricing": {
+        "completion": "0.00000015",
+        "prompt": "0.0000001"
+      }
+    },
+    {
+      "context_length": 1000000,
+      "id": "qwen/qwen3.6-plus",
+      "name": "Qwen: Qwen3.6 Plus",
+      "pricing": {
+        "completion": "0.00000195",
+        "input_cache_write": "0.00000040625",
+        "overrides": [
+          {
+            "completion": "0.0000039",
+            "input_cache_write": "0.000001625",
+            "min_prompt_tokens": 256000,
+            "prompt": "0.0000013"
+          }
+        ],
+        "prompt": "0.000000325"
+      }
+    },
+    {
+      "context_length": 1000000,
+      "id": "qwen/qwen3.7-max",
+      "name": "Qwen: Qwen3.7 Max",
+      "pricing": {
+        "completion": "0.000004425",
+        "input_cache_read": "0.000000295",
+        "input_cache_write": "0.00000184375",
+        "prompt": "0.000001475"
+      }
+    },
+    {
+      "context_length": 1000000,
+      "id": "qwen/qwen3.7-plus",
+      "name": "Qwen: Qwen3.7 Plus",
+      "pricing": {
+        "completion": "0.00000128",
+        "input_cache_read": "0.000000064",
+        "input_cache_write": "0.0000004",
+        "overrides": [
+          {
+            "completion": "0.00000384",
+            "input_cache_read": "0.000000192",
+            "input_cache_write": "0.0000012",
+            "min_prompt_tokens": 256000,
+            "prompt": "0.00000096"
+          }
+        ],
+        "prompt": "0.00000032"
+      }
+    },
+    {
+      "context_length": 1048576,
+      "id": "qwen/qwen3.8-2.4t-a95b",
+      "name": "Qwen: Qwen3.8 2.4T A95B",
+      "pricing": {
+        "completion": "0.000006",
+        "input_cache_read": "0.00000025",
+        "prompt": "0.000002"
+      }
+    },
+    {
+      "context_length": 1000000,
+      "id": "qwen/qwen3.8-27b",
+      "name": "Qwen: Qwen3.8 27B",
+      "pricing": {
+        "completion": "0.00000255",
+        "input_cache_read": "0.000000085",
+        "input_cache_write": "0.00000053125",
+        "prompt": "0.000000425"
+      }
+    },
+    {
+      "context_length": 1000000,
+      "id": "qwen/qwen3.8-flash",
+      "name": "Qwen: Qwen3.8 Flash",
+      "pricing": {
+        "completion": "0.00000047",
+        "input_cache_read": "0.000000016",
+        "prompt": "0.00000015"
+      }
+    },
+    {
+      "context_length": 524288,
+      "id": "thinkingmachines/inkling",
+      "name": "Thinking Machines: Inkling",
+      "pricing": {
+        "completion": "0.00000405",
+        "input_cache_read": "0.00000017",
+        "prompt": "0.000001"
+      }
+    },
+    {
+      "context_length": 2000000,
+      "id": "x-ai/grok-4.20",
+      "name": "SpaceXAI: Grok 4.20",
+      "pricing": {
+        "completion": "0.0000025",
+        "input_cache_read": "0.0000002",
+        "overrides": [
+          {
+            "completion": "0.000005",
+            "input_cache_read": "0.0000004",
+            "min_prompt_tokens": 200000,
+            "prompt": "0.0000025"
+          }
+        ],
+        "prompt": "0.00000125",
+        "web_search": "0.005"
+      }
+    },
+    {
+      "context_length": 2000000,
+      "id": "x-ai/grok-4.20-multi-agent",
+      "name": "SpaceXAI: Grok 4.20 Multi-Agent",
+      "pricing": {
+        "completion": "0.0000025",
+        "input_cache_read": "0.0000002",
+        "overrides": [
+          {
+            "completion": "0.000005",
+            "input_cache_read": "0.0000004",
+            "min_prompt_tokens": 200000,
+            "prompt": "0.0000025"
+          }
+        ],
+        "prompt": "0.00000125",
+        "web_search": "0.005"
+      }
+    },
+    {
+      "context_length": 1000000,
+      "id": "x-ai/grok-4.3",
+      "name": "SpaceXAI: Grok 4.3",
+      "pricing": {
+        "completion": "0.0000025",
+        "input_cache_read": "0.0000002",
+        "overrides": [
+          {
+            "completion": "0.000005",
+            "input_cache_read": "0.0000004",
+            "min_prompt_tokens": 200000,
+            "prompt": "0.0000025"
+          }
+        ],
+        "prompt": "0.00000125",
+        "web_search": "0.005"
+      }
+    },
+    {
+      "context_length": 500000,
+      "id": "x-ai/grok-4.5",
+      "name": "SpaceXAI: Grok 4.5",
+      "pricing": {
+        "completion": "0.000006",
+        "input_cache_read": "0.0000003",
+        "overrides": [
+          {
+            "completion": "0.000012",
+            "input_cache_read": "0.0000006",
+            "min_prompt_tokens": 200000,
+            "prompt": "0.000004"
+          }
+        ],
+        "prompt": "0.000002",
+        "web_search": "0.005"
+      }
+    },
+    {
+      "context_length": 500000,
+      "id": "x-ai/grok-4.6",
+      "name": "SpaceXAI: Grok 4.6",
+      "pricing": {
+        "completion": "0.000006",
+        "input_cache_read": "0.0000005",
+        "overrides": [
+          {
+            "completion": "0.000012",
+            "input_cache_read": "0.000001",
+            "min_prompt_tokens": 200000,
+            "prompt": "0.000004"
+          }
+        ],
+        "prompt": "0.000002",
+        "web_search": "0.005"
+      }
+    },
+    {
+      "context_length": 500000,
+      "id": "x-ai/grok-4.7",
+      "name": "SpaceXAI: Grok 4.7",
+      "pricing": {
+        "completion": "0.000006",
+        "input_cache_read": "0.0000005",
+        "overrides": [
+          {
+            "completion": "0.000012",
+            "input_cache_read": "0.000001",
+            "min_prompt_tokens": 200000,
+            "prompt": "0.000004"
+          }
+        ],
+        "prompt": "0.000002",
+        "web_search": "0.005"
+      }
+    },
+    {
+      "context_length": 256000,
+      "id": "x-ai/grok-build-0.1",
+      "name": "SpaceXAI: Grok Build 0.1",
+      "pricing": {
+        "completion": "0.000002",
+        "input_cache_read": "0.0000002",
+        "overrides": [
+          {
+            "completion": "0.000004",
+            "input_cache_read": "0.0000004",
+            "min_prompt_tokens": 200000,
+            "prompt": "0.000002"
+          }
+        ],
+        "prompt": "0.000001",
+        "web_search": "0.005"
+      }
+    },
+    {
+      "context_length": 204800,
+      "id": "z-ai/glm-5.1",
+      "name": "Z.ai: GLM 5.1",
+      "pricing": {
+        "completion": "0.000003036",
+        "input_cache_read": "0.0000001794",
+        "prompt": "0.000000966"
+      }
+    },
+    {
+      "context_length": 1048576,
+      "id": "z-ai/glm-5.2",
+      "name": "Z.ai: GLM 5.2",
+      "pricing": {
+        "completion": "0.000007",
+        "input_cache_read": "0.000000059",
+        "prompt": "0.00000006"
+      }
+    },
+    {
+      "context_length": 1048576,
+      "id": "z-ai/glm-5.3",
+      "name": "Z.ai: GLM 5.3",
+      "pricing": {
+        "completion": "0.0000048",
+        "input_cache_read": "0.000000038",
+        "prompt": "0.000000039"
+      }
+    },
+    {
+      "context_length": 1048576,
+      "id": "z-ai/glm-5.3-flash",
+      "name": "Z.ai: GLM 5.3 Flash",
+      "pricing": {
+        "completion": "0.0000005",
+        "input_cache_read": "0.00000003",
+        "prompt": "0.00000015"
+      }
+    }
+  ]
+}

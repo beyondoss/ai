@@ -1,0 +1,32 @@
+name: Rates drift
+# The rate table (crates/providers/src/rates/generated.rs) is generated from snapshots of every
+# vendor's primary pricing source (verify/rates_sources/). Weekly, this re-fetches every source and
+# fails, listing the diff, when any vendor price moved, a layout changed under a parser, or a cited
+# prose quote disappeared. Never per PR: per-PR CI regenerates from the committed snapshots only
+# (rates_generated_from_sources), offline. The fix is `mise run rates:sync`, then review and bump
+# RATE_VERSION.
+#
+# Every source but two is public. TOGETHER_API_KEY and XAI_API_KEY (repository secrets) let the
+# job re-fetch Together's and xAI's models APIs; without them those two keep their committed
+# snapshots and the job warns. Their prices are still covered by the public cross-check sources
+# (Together's docs table, xAI's pricing page), which disagreeing with the snapshot fails the run.
+on:
+  schedule:
+    - cron: "0 8 * * 1"
+  workflow_dispatch:
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+jobs:
+  drift:
+    name: vendor price drift
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+      - uses: Swatinem/rust-cache@v2
+      - env:
+          TOGETHER_API_KEY: ${{ secrets.TOGETHER_API_KEY }}
+          XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
+        run: cargo run -q -p beyond-ai-rates-sync -- drift </dev/null

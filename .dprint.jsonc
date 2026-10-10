@@ -3,7 +3,16 @@
   "markdown": {},
   "toml": {},
   "json": {},
-  "excludes": ["**/node_modules/**", "**/dist/**", "**/tmp/**", "**/target/**"],
+  "excludes": [
+    "**/node_modules/**",
+    "**/dist/**",
+    "**/tmp/**",
+    "**/target/**",
+    // Vendor responses, byte for byte as snapshotted (their sha256 is in the manifest), and the
+    // table generated from them: formatting either would break `rates_generated_from_sources`.
+    "verify/rates_sources/**",
+    "crates/providers/src/rates/generated.rs",
+  ],
   "exec": {
     "commands": [
       {

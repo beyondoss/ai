@@ -1,0 +1,162 @@
+{
+  "data": {
+    "endpoints": [
+      {
+        "context_length": 262144,
+        "max_prompt_tokens": 229376,
+        "pricing": {
+          "completion": "0.000004",
+          "discount": 0,
+          "input_cache_read": "0.00000019",
+          "prompt": "0.00000095"
+        },
+        "provider_name": "Alibaba",
+        "quantization": "fp8",
+        "tag": "alibaba/fp8"
+      },
+      {
+        "context_length": 262144,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.000004",
+          "discount": 0,
+          "input_cache_read": "0.00000019",
+          "prompt": "0.00000095"
+        },
+        "provider_name": "Cloudflare",
+        "quantization": "unknown",
+        "tag": "cloudflare"
+      },
+      {
+        "context_length": 262144,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.0000035",
+          "discount": 0,
+          "input_cache_read": "0.00000015",
+          "prompt": "0.00000071"
+        },
+        "provider_name": "CoreWeave",
+        "quantization": "int4",
+        "tag": "coreweave/int4"
+      },
+      {
+        "context_length": 262144,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.000004",
+          "discount": 0,
+          "input_cache_read": "0.00000019",
+          "prompt": "0.00000095"
+        },
+        "provider_name": "GMICloud",
+        "quantization": "fp8",
+        "tag": "gmicloud/fp8"
+      },
+      {
+        "context_length": 262144,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.00000335",
+          "discount": 0,
+          "input_cache_read": "0.00000018",
+          "prompt": "0.0000006712"
+        },
+        "provider_name": "Inceptron",
+        "quantization": "int4",
+        "tag": "inceptron/int4"
+      },
+      {
+        "context_length": 262144,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.000008",
+          "discount": 0,
+          "input_cache_read": "0.00000038",
+          "prompt": "0.0000019"
+        },
+        "provider_name": "Moonshot AI",
+        "quantization": "int4",
+        "tag": "moonshotai/highspeed"
+      },
+      {
+        "context_length": 262144,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.000004",
+          "discount": 0,
+          "input_cache_read": "0.00000019",
+          "prompt": "0.00000095"
+        },
+        "provider_name": "Moonshot AI",
+        "quantization": "int4",
+        "tag": "moonshotai/int4"
+      },
+      {
+        "context_length": 262144,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.000004",
+          "discount": 0,
+          "prompt": "0.00000095"
+        },
+        "provider_name": "Nebius",
+        "quantization": "fp4",
+        "tag": "nebius/fp4"
+      },
+      {
+        "context_length": 262144,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.00000384",
+          "discount": 0.04,
+          "input_cache_read": "0.0000001824",
+          "prompt": "0.000000912"
+        },
+        "provider_name": "Novita",
+        "quantization": "int4",
+        "tag": "novita/int4"
+      },
+      {
+        "context_length": 262144,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.0000038",
+          "discount": 0,
+          "input_cache_read": "0.00000017993",
+          "prompt": "0.00000085916"
+        },
+        "provider_name": "SiliconFlow",
+        "quantization": "fp8",
+        "tag": "siliconflow/fp8"
+      },
+      {
+        "context_length": 256000,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.000003",
+          "discount": 0.25,
+          "input_cache_read": "0.0000001425",
+          "prompt": "0.0000007125"
+        },
+        "provider_name": "StreamLake",
+        "quantization": "unknown",
+        "tag": "streamlake"
+      },
+      {
+        "context_length": 256000,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.0000035",
+          "discount": 0,
+          "input_cache_read": "0.00000016",
+          "prompt": "0.00000075"
+        },
+        "provider_name": "Venice",
+        "quantization": "int4",
+        "tag": "venice/int4"
+      }
+    ],
+    "id": "moonshotai/kimi-k2.7-code"
+  }
+}

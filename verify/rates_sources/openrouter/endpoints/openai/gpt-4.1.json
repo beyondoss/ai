@@ -1,0 +1,49 @@
+{
+  "data": {
+    "endpoints": [
+      {
+        "context_length": 1047576,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.000008",
+          "discount": 0,
+          "input_cache_read": "0.0000005",
+          "prompt": "0.000002",
+          "web_search": "0.01"
+        },
+        "provider_name": "Azure",
+        "quantization": "unknown",
+        "tag": "azure"
+      },
+      {
+        "context_length": 1047576,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.0000088",
+          "discount": 0,
+          "input_cache_read": "0.00000055",
+          "prompt": "0.0000022",
+          "web_search": "0.01"
+        },
+        "provider_name": "Azure",
+        "quantization": "unknown",
+        "tag": "azure/swedencentral"
+      },
+      {
+        "context_length": 1047576,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.000008",
+          "discount": 0,
+          "input_cache_read": "0.0000005",
+          "prompt": "0.000002",
+          "web_search": "0.01"
+        },
+        "provider_name": "OpenAI",
+        "quantization": "unknown",
+        "tag": "openai"
+      }
+    ],
+    "id": "openai/gpt-4.1"
+  }
+}

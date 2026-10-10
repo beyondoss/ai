@@ -1,0 +1,43 @@
+{
+  "data": {
+    "endpoints": [
+      {
+        "context_length": 327680,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.0000003",
+          "discount": 0,
+          "prompt": "0.0000001"
+        },
+        "provider_name": "DeepInfra",
+        "quantization": "fp8",
+        "tag": "deepinfra/fp8"
+      },
+      {
+        "context_length": 1310720,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.0000007",
+          "discount": 0,
+          "prompt": "0.00000025"
+        },
+        "provider_name": "Google",
+        "quantization": "unknown",
+        "tag": "google-vertex/us-east5"
+      },
+      {
+        "context_length": 131072,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.00000059",
+          "discount": 0,
+          "prompt": "0.00000018"
+        },
+        "provider_name": "Novita",
+        "quantization": "bf16",
+        "tag": "novita/bf16"
+      }
+    ],
+    "id": "meta-llama/llama-4-scout"
+  }
+}

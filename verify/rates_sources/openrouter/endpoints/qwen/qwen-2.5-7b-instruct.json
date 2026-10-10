@@ -1,0 +1,19 @@
+{
+  "data": {
+    "endpoints": [
+      {
+        "context_length": 32768,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.0000002",
+          "discount": 0,
+          "prompt": "0.0000001"
+        },
+        "provider_name": "Phala",
+        "quantization": "unknown",
+        "tag": "phala"
+      }
+    ],
+    "id": "qwen/qwen-2.5-7b-instruct"
+  }
+}

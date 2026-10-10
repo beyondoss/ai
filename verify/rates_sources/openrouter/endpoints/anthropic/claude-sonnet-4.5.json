@@ -1,0 +1,179 @@
+{
+  "data": {
+    "endpoints": [
+      {
+        "context_length": 1000000,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.000015",
+          "discount": 0,
+          "input_cache_read": "0.0000003",
+          "input_cache_write": "0.00000375",
+          "input_cache_write_1h": "0.000006",
+          "overrides": [
+            {
+              "completion": "0.0000225",
+              "input_cache_read": "0.0000006",
+              "input_cache_write": "0.0000075",
+              "input_cache_write_1h": "0.000012",
+              "min_prompt_tokens": 200000,
+              "prompt": "0.000006"
+            }
+          ],
+          "prompt": "0.000003",
+          "web_search": "0.01"
+        },
+        "provider_name": "Amazon Bedrock",
+        "quantization": "unknown",
+        "tag": "amazon-bedrock"
+      },
+      {
+        "context_length": 1000000,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.0000165",
+          "discount": 0,
+          "input_cache_read": "0.00000033",
+          "input_cache_write": "0.000004125",
+          "input_cache_write_1h": "0.0000066",
+          "overrides": [
+            {
+              "completion": "0.00002475",
+              "input_cache_read": "0.00000066",
+              "input_cache_write": "0.00000825",
+              "input_cache_write_1h": "0.0000132",
+              "min_prompt_tokens": 200000,
+              "prompt": "0.0000066"
+            }
+          ],
+          "prompt": "0.0000033",
+          "web_search": "0.01"
+        },
+        "provider_name": "Amazon Bedrock",
+        "quantization": "unknown",
+        "tag": "amazon-bedrock/eu-west-1"
+      },
+      {
+        "context_length": 1000000,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.000015",
+          "discount": 0,
+          "input_cache_read": "0.0000003",
+          "input_cache_write": "0.00000375",
+          "input_cache_write_1h": "0.000006",
+          "overrides": [
+            {
+              "completion": "0.0000225",
+              "input_cache_read": "0.0000006",
+              "input_cache_write": "0.0000075",
+              "input_cache_write_1h": "0.000012",
+              "min_prompt_tokens": 200000,
+              "prompt": "0.000006"
+            }
+          ],
+          "prompt": "0.000003",
+          "web_search": "0.01"
+        },
+        "provider_name": "Anthropic",
+        "quantization": "unknown",
+        "tag": "anthropic"
+      },
+      {
+        "context_length": 200000,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.000015",
+          "discount": 0,
+          "input_cache_read": "0.0000003",
+          "input_cache_write": "0.00000375",
+          "input_cache_write_1h": "0.000006",
+          "prompt": "0.000003",
+          "web_search": "0.01"
+        },
+        "provider_name": "Azure",
+        "quantization": "unknown",
+        "tag": "azure/global"
+      },
+      {
+        "context_length": 1000000,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.000015",
+          "discount": 0,
+          "input_cache_read": "0.0000003",
+          "input_cache_write": "0.00000375",
+          "input_cache_write_1h": "0.000006",
+          "overrides": [
+            {
+              "completion": "0.0000225",
+              "input_cache_read": "0.0000006",
+              "input_cache_write": "0.0000075",
+              "input_cache_write_1h": "0.000012",
+              "min_prompt_tokens": 200000,
+              "prompt": "0.000006"
+            }
+          ],
+          "prompt": "0.000003",
+          "web_search": "0.01"
+        },
+        "provider_name": "Claude Platform on AWS",
+        "quantization": "unknown",
+        "tag": "claude-on-aws"
+      },
+      {
+        "context_length": 1000000,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.000015",
+          "discount": 0,
+          "input_cache_read": "0.0000003",
+          "input_cache_write": "0.00000375",
+          "input_cache_write_1h": "0.000006",
+          "overrides": [
+            {
+              "completion": "0.0000225",
+              "input_cache_read": "0.0000006",
+              "input_cache_write": "0.0000075",
+              "input_cache_write_1h": "0.000012",
+              "min_prompt_tokens": 200000,
+              "prompt": "0.000006"
+            }
+          ],
+          "prompt": "0.000003",
+          "web_search": "0.01"
+        },
+        "provider_name": "Google",
+        "quantization": "unknown",
+        "tag": "google-vertex/global"
+      },
+      {
+        "context_length": 1000000,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.0000165",
+          "discount": 0,
+          "input_cache_read": "0.00000033",
+          "input_cache_write": "0.000004125",
+          "input_cache_write_1h": "0.0000066",
+          "overrides": [
+            {
+              "completion": "0.00002475",
+              "input_cache_read": "0.00000066",
+              "input_cache_write": "0.00000825",
+              "input_cache_write_1h": "0.0000132",
+              "min_prompt_tokens": 200000,
+              "prompt": "0.0000066"
+            }
+          ],
+          "prompt": "0.0000033",
+          "web_search": "0.01"
+        },
+        "provider_name": "Google",
+        "quantization": "unknown",
+        "tag": "google-vertex/us-east5"
+      }
+    ],
+    "id": "anthropic/claude-sonnet-4.5"
+  }
+}
