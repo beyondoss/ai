@@ -29,29 +29,28 @@ One row in, two amounts out, both in integer micro-dollars (1e-6 USD):
 - **cost**: what we owe the vendor that served the row.
 - **price**: what we charge the customer.
 
-The **price** is the row's _customer card_: the published card of the catalog row's primary
-vendor. Its standard tier is exactly the catalog's `ListPrice`, which a test enforces, so
-`GET /v1/models` and the invoice cannot disagree. The card is applied under that vendor's own
-rules (long-context tier, fast mode, data residency, off-peak hours, server-tool fees). The
-customer pays the same price whichever candidate served the request.
+**Pricing is pass-through** (owner decision, 2026-10-10). The customer pays exactly what we pay
+for each request, fees included, so `price == cost` on every row. Both come from the card of the
+host that **actually served** the request, under that host's own rules (long-context tier, fast
+mode, data residency, off-peak hours, server-tool fees):
 
-The **cost** is the serving candidate's card, applied the same way:
+| Serving candidate                                               | Card                                                                                                            |
+| --------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| The row's own vendor (Anthropic, OpenAI, xAI, DeepSeek, Groq)   | The row's list card (`CostCard::List`)                                                                          |
+| Another host (Bedrock, Together, Fireworks, a non-primary Groq) | That host's own published card (`CostCard::Own`); Bedrock's `us.` profile is list + 10%                         |
+| OpenRouter                                                      | `usage.cost` as reported × 1.055 (the credit fee); with no reported cost, the dearest matching endpoint × 1.055 |
+| A candidate whose rates no primary source gives (none today)    | Refused (`CostCard::Unverified`)                                                                                |
 
-| Candidate                                                          | Cost card                                                                                                       |
-| ------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------- |
-| The primary vendor itself (Anthropic, OpenAI, xAI, DeepSeek, Groq) | The customer card (`CostCard::Customer`)                                                                        |
-| Another host (Bedrock, Together, Fireworks, a non-primary Groq)    | That host's own published card (`CostCard::Own`)                                                                |
-| OpenRouter                                                         | `usage.cost` as reported × 1.055 (the credit fee); with no reported cost, the dearest matching endpoint × 1.055 |
-| A candidate whose rates no primary source gives (none today)       | Refused (`CostCard::Unverified`)                                                                                |
+The **list card** (`RowRates::list`) is the catalog row's primary vendor's published card. Its
+standard tier is exactly the catalog's `ListPrice`, which a test enforces, so `GET /v1/models`
+publishes what the primary vendor charges. A failover host prices at its own rates, which can be
+above or below the list. An estimated row (a stream cut short, a cancelled stream on a host that
+may keep generating) is priced from the same estimate as its cost. `pass_through.rs` asserts
+`price == cost` across every vector, and across every card under a sweep of usage shapes.
 
 Anything the tables cannot price exactly is an `Unpriced` error with a stable reason code. It is
 never a zero. A zero is only ever a priced zero: a cache hit, or a row whose exact cost rounds
 below half a micro-dollar.
-
-**The customer card is kept as the list price.** That was the brief's default, and there is no
-reason to change it: the list card is what a client sees and estimates with. The consequence is
-that a failover candidate can cost more than the customer pays. Those cases are listed under
-"Where cost exceeds price" as product decisions, not pricer bugs.
 
 ### Input: the row
 
@@ -132,10 +131,8 @@ On the Anthropic wire it includes neither. Subtracting on the wrong wire double-
 token or bills it free. A row whose subtraction would go negative is `inconsistent_tokens`, as is
 one with more 1-hour writes than writes, or more gateway writes than uncached input.
 
-The gateway's own cache writes (`gateway_cache_write_tokens`) are billed to the customer at the
-**input** rate: the gateway chose to cache, the client did not. They are costed at the vendor's
-**5-minute write** rate, which is what the vendor charges. The 0.25× input difference is the
-gateway's by design.
+The gateway's own cache writes (`gateway_cache_write_tokens`) sit inside the uncached input. The
+vendor bills them as **5-minute writes**, and pass-through bills them the same.
 
 ### Choosing the rates
 
@@ -157,14 +154,14 @@ gateway's by design.
    writes) is compared with its threshold: `>=` where the vendor says "reaches" (xAI, 200,000),
    `>` where it says "more than" (OpenAI, 272,000; OpenRouter's `min_prompt_tokens`). Above it,
    **every** token in the request is billed at the long rates. Each side decides on its own card,
-   so a customer card can be long while a host's flat card is not.
+   so a list card can be long while a host's flat card is not.
 
 3. **Off-peak** (DeepSeek), for a standard-class, short request. Peak is 01:00–04:00 and
    06:00–10:00 UTC, Monday to Friday, with windows half-open. Everything else is off-peak, at half
    the rates: weekends, and Chinese public holidays in full. The holiday list covers a span of days
    (2026-10-10 to 2026-12-31 today, which holds no statutory holiday). A weekday peak minute
    outside the span is `unknown_calendar` until the next year's holidays are recorded. The
-   customer gets the off-peak price too: the customer card follows its vendor's rules.
+   off-peak price applies only when DeepSeek itself served; a host with a flat rate bills its flat rate.
 
 4. **The rate set** for (class, tier) must exist on the card, or the row is `no_rate`. Examples:
    fast mode on Opus 4.7; fast mode above 272K on gpt-5.5, which OpenAI does not publish; 1-hour
@@ -183,7 +180,7 @@ Where the vendor reports its own cost (`upstream_cost_usd`), that is the cost, p
 its decimal text (exponent forms included, rounded half-up below one attodollar). It already
 carries the host's price, the tier, any regional premium and tool fees. OpenRouter's is then
 × 1.055: the 5.5% is its fee on the credits that paid for it (Standard plan; Business is 8%). xAI's
-is taken as reported. The price side is still the customer card.
+is taken as reported. The price is the same figure (pass-through).
 
 On OpenRouter with none (a stream cut before its final usage chunk), the cost is the dearest endpoint that could
 have served the row, × 1.055. "Could have served" means listed for the served class and, if the row
@@ -212,7 +209,7 @@ never a wrapped number.
 `[[openrouter]]`, `[openrouter_fee]`) holds the same rates with their source URLs and the date
 checked. `crates/providers/tests/rates_truth.rs` holds the two to each other entry for entry, so a
 rate changes in both or the build fails. The same test checks three more things: every catalog row
-and candidate provider is priced, every customer card's standard tier is the `ListPrice`, and
+and candidate provider is priced, every list card's standard tier is the `ListPrice`, and
 `RATE_VERSION` (`{date}.{hash of the table}`) changes whenever any rate does.
 
 Every priced row should log `RATE_VERSION`. Repricing a historical row means running its token
@@ -245,32 +242,35 @@ micro-dollar.
 ### Server tools
 
 The row's `server_tools` kinds, and each card's fee per call (or per item). "—" means no fee, so
-the row is refused. `tool_calls` (OpenRouter, every kind together) is never priced on its own: a
-row whose `tool_calls` exceed its `web_search` is refused, as is an OpenRouter row with a nonzero
-`upstream_tool_cost_usd` (its web plugin, a sandbox), which no customer card prices.
+the row is refused. `tool_calls` (OpenRouter, every kind together) is never priced on its own.
+With a reported cost, OpenRouter's tools and plugins (`upstream_tool_cost_usd`) are inside it and
+pass through. Without one, a row whose `tool_calls` exceed its `web_search` is refused: a tool ran
+whose fee no endpoint lists.
 
-| Kind               | Anthropic                 | OpenAI                                                                        | xAI                           | OpenRouter endpoint              |
-| ------------------ | ------------------------- | ----------------------------------------------------------------------------- | ----------------------------- | -------------------------------- |
-| `web_search`       | $0.01                     | $0.01 reasoning models; refused on gpt-4o, gpt-4o-mini, gpt-4.1, gpt-4.1-mini | $0.005                        | the endpoint's ($0.01 or $0.005) |
-| `web_search_page`  | —                         | $0                                                                            | —                             | —                                |
-| `web_fetch`        | $0                        | —                                                                             | —                             | —                                |
-| `code_execution`   | refused (container-hours) | refused (container session, per minute by size)                               | $0.005                        | —                                |
-| `file_search`      | —                         | $0.0025                                                                       | $0.0025                       | —                                |
-| `computer_use`     | —                         | $0                                                                            | —                             | —                                |
-| `mcp`              | —                         | $0                                                                            | $0                            | —                                |
-| `tool_search`      | —                         | $0                                                                            | —                             | —                                |
-| `shell`            | —                         | refused (container session)                                                   | —                             | —                                |
-| `image_generation` | —                         | refused (image tokens unreported)                                             | refused                       | —                                |
-| `x_search`         | —                         | —                                                                             | $0 (items billed)             | —                                |
-| `x_posts`          | —                         | —                                                                             | $0.005 / post                 | —                                |
-| `x_users`          | —                         | —                                                                             | $0.01 / profile               | —                                |
-| `document_search`  | —                         | —                                                                             | refused (no fee by that name) | —                                |
-| `sources`          | —                         | —                                                                             | refused (legacy Live Search)  | —                                |
+| Kind                 | Anthropic                 | OpenAI                                                                | xAI                           | OpenRouter endpoint              |
+| -------------------- | ------------------------- | --------------------------------------------------------------------- | ----------------------------- | -------------------------------- |
+| `web_search`         | $0.01                     | $0.01; refused on gpt-4o-mini and gpt-4.1-mini (fixed 8K-token block) | $0.005                        | the endpoint's ($0.01 or $0.005) |
+| `web_search_preview` | —                         | $0.01 reasoning models, $0.025 non-reasoning                          | —                             | —                                |
+| `web_search_page`    | —                         | $0                                                                    | —                             | —                                |
+| `web_fetch`          | $0                        | —                                                                     | —                             | —                                |
+| `code_execution`     | refused (container-hours) | refused (container session, per minute by size)                       | $0.005                        | —                                |
+| `file_search`        | —                         | $0.0025                                                               | $0.0025                       | —                                |
+| `computer_use`       | —                         | $0                                                                    | —                             | —                                |
+| `mcp`                | —                         | $0                                                                    | $0                            | —                                |
+| `tool_search`        | —                         | $0                                                                    | —                             | —                                |
+| `shell`              | —                         | refused (container session)                                           | —                             | —                                |
+| `image_generation`   | —                         | refused (image tokens unreported)                                     | refused                       | —                                |
+| `x_search`           | —                         | —                                                                     | $0 (items billed)             | —                                |
+| `x_posts`            | —                         | —                                                                     | $0.005 / post                 | —                                |
+| `x_users`            | —                         | —                                                                     | $0.01 / profile               | —                                |
+| `document_search`    | —                         | —                                                                     | refused (no fee by that name) | —                                |
+| `sources`            | —                         | —                                                                     | refused (legacy Live Search)  | —                                |
 
 OpenAI's $0 kinds follow its pricing page: fee-bearing tools are the Tools table, and "tokens used
-for built-in tools are billed at the chosen model's per-token rates". On a non-reasoning model a
-`web_search_call` is $10 / 1K (`web_search`) or $25 / 1K (`web_search_preview`), which the row
-cannot tell apart. gpt-4o-mini and gpt-4.1-mini also add a fixed 8,000-token content block per call.
+for built-in tools are billed at the chosen model's per-token rates". A `web_search_call` made with
+`web_search_preview` is counted apart on the row, so each tool gets its own fee. gpt-4o-mini and
+gpt-4.1-mini add a fixed 8,000-token content block per `web_search` call, which the usage may not
+show, so no `web_search` fee is held there (and the gateway refuses the request, D268).
 So no fee is held there.
 
 ### Provider × dimension matrix
@@ -315,25 +315,25 @@ means the rate is in `rates.rs` and the truth file. Where the row cannot observe
 
 #### OpenAI: https://developers.openai.com/api/docs/pricing.md
 
-| Dimension                 | Rate                                                                                | Observed via                                                     | Row field                                 | Pricer / prevent                                                                                         |
-| ------------------------- | ----------------------------------------------------------------------------------- | ---------------------------------------------------------------- | ----------------------------------------- | -------------------------------------------------------------------------------------------------------- |
-| Input / cached / output   | per model; "-" cached = no discount                                                 | `usage`                                                          | tokens                                    | Held                                                                                                     |
-| Cache writes              | 1.25× input on GPT-5.6 and later, a third input rate inside `input_tokens`          | `input_tokens_details.cache_write_tokens`                        | `cache_write_tokens`                      | Held                                                                                                     |
-| Long context              | > 272K input: 2× input and cache, 1.5× output, whole request (gpt-5.4, 5.5, 5.6, 6) | derived from tokens                                              | tokens                                    | Held                                                                                                     |
-| Fast mode (Priority)      | the Fast table, per model (2×; 2.5× gpt-5.5; 1.67–1.8× older)                       | `service_tier: priority` (or `fast`); a downgrade says `default` | `service_tier`                            | Held. Fast above 272K held for 5.6/6; unpublished for 5.4/5.5, so refused                                |
-| Ultrafast                 | 6× (gpt-6-astra, gpt-6.1-sol)                                                       | `service_tier: ultrafast`                                        | `service_tier`                            | Held                                                                                                     |
-| Flex                      | the Flex table (= Batch rates)                                                      | `service_tier: flex`                                             | `service_tier`                            | Held                                                                                                     |
-| Scale tier                | contract                                                                            | `service_tier: scale`                                            | `service_tier`                            | Refused                                                                                                  |
-| Regional processing       | +10% (models from 2026-03-05)                                                       | the host (`us.api.openai.com`); no response field                | —                                         | Never applies: the pool key goes to `api.openai.com`                                                     |
-| Web search                | $10 / 1k search actions + content tokens at model rates                             | `web_search_call` output items (search actions)                  | `server_tools.web_search`                 | Held; refused on gpt-4o-mini / gpt-4.1-mini, and on every non-reasoning model (see Server tools)         |
-| Web search preview        | $10 / 1k reasoning models; $25 / 1k non-reasoning                                   | `web_search_call` (the same item as web search)                  | `server_tools` `web_search`               | Held on reasoning models (both $10); refused on non-reasoning models, where the two cannot be told apart |
-| File search               | $2.50 / 1k calls; storage $0.10 / GB-day                                            | `file_search_call`                                               | `server_tools.file_search`                | Calls held; storage cannot accrue (managed vector stores are refused)                                    |
-| Containers                | $0.03–$1.92 per 20-minute session by memory, billed per minute, 5-minute minimum    | `code_interpreter_call` / `shell_call` (no minutes, no size)     | `server_tools` `code_execution` / `shell` | Refused. Gateway: strip or refuse the tool on managed traffic                                            |
-| Image generation tool     | image-token rates, not in `usage`                                                   | `image_generation_call` (no usage)                               | `server_tools.image_generation`           | Refused. Gateway: strip or refuse the tool on managed traffic                                            |
-| Image input               | input tokens (per-model multipliers already in the count)                           | `usage.input_tokens`                                             | `input_tokens`                            | Nothing extra                                                                                            |
-| Reasoning                 | inside output                                                                       | `output_tokens_details.reasoning_tokens`                         | `output_tokens`                           | Never priced on its own                                                                                  |
-| Pro mode (GPT-5.6, GPT-6) | the model's standard rates                                                          | —                                                                | —                                         | The seven `*-pro` rows (OpenRouter-only) are priced at the base model's card                             |
-| Promotion                 | gpt-5.6-sol's current $4 / $20 is promotional "at least through November 21, 2026"  | —                                                                | —                                         | Re-check that day                                                                                        |
+| Dimension                 | Rate                                                                                | Observed via                                                                             | Row field                                 | Pricer / prevent                                                                        |
+| ------------------------- | ----------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- | ----------------------------------------- | --------------------------------------------------------------------------------------- |
+| Input / cached / output   | per model; "-" cached = no discount                                                 | `usage`                                                                                  | tokens                                    | Held                                                                                    |
+| Cache writes              | 1.25× input on GPT-5.6 and later, a third input rate inside `input_tokens`          | `input_tokens_details.cache_write_tokens`                                                | `cache_write_tokens`                      | Held                                                                                    |
+| Long context              | > 272K input: 2× input and cache, 1.5× output, whole request (gpt-5.4, 5.5, 5.6, 6) | derived from tokens                                                                      | tokens                                    | Held                                                                                    |
+| Fast mode (Priority)      | the Fast table, per model (2×; 2.5× gpt-5.5; 1.67–1.8× older)                       | `service_tier: priority` (or `fast`); a downgrade says `default`                         | `service_tier`                            | Held. Fast above 272K held for 5.6/6; unpublished for 5.4/5.5, so refused               |
+| Ultrafast                 | 6× (gpt-6-astra, gpt-6.1-sol)                                                       | `service_tier: ultrafast`                                                                | `service_tier`                            | Held                                                                                    |
+| Flex                      | the Flex table (= Batch rates)                                                      | `service_tier: flex`                                                                     | `service_tier`                            | Held                                                                                    |
+| Scale tier                | contract                                                                            | `service_tier: scale`                                                                    | `service_tier`                            | Refused                                                                                 |
+| Regional processing       | +10% (models from 2026-03-05)                                                       | the host (`us.api.openai.com`); no response field                                        | —                                         | Never applies: the pool key goes to `api.openai.com`                                    |
+| Web search                | $10 / 1k search actions + content tokens at model rates                             | `web_search_call` output items (search actions)                                          | `server_tools.web_search`                 | Held; refused on gpt-4o-mini / gpt-4.1-mini (the gateway refuses the request too, D268) |
+| Web search preview        | $10 / 1k reasoning models; $25 / 1k non-reasoning                                   | `web_search_call` from a request offering `web_search_preview` (the row counts it apart) | `server_tools` `web_search_preview`       | Held                                                                                    |
+| File search               | $2.50 / 1k calls; storage $0.10 / GB-day                                            | `file_search_call`                                                                       | `server_tools.file_search`                | Calls held; storage cannot accrue (managed vector stores are refused)                   |
+| Containers                | $0.03–$1.92 per 20-minute session by memory, billed per minute, 5-minute minimum    | `code_interpreter_call` / `shell_call` (no minutes, no size)                             | `server_tools` `code_execution` / `shell` | Refused. Gateway: strip or refuse the tool on managed traffic                           |
+| Image generation tool     | image-token rates, not in `usage`                                                   | `image_generation_call` (no usage)                                                       | `server_tools.image_generation`           | Refused. Gateway: strip or refuse the tool on managed traffic                           |
+| Image input               | input tokens (per-model multipliers already in the count)                           | `usage.input_tokens`                                                                     | `input_tokens`                            | Nothing extra                                                                           |
+| Reasoning                 | inside output                                                                       | `output_tokens_details.reasoning_tokens`                                                 | `output_tokens`                           | Never priced on its own                                                                 |
+| Pro mode (GPT-5.6, GPT-6) | the model's standard rates                                                          | —                                                                                        | —                                         | The seven `*-pro` rows (OpenRouter-only) are priced at the base model's card            |
+| Promotion                 | gpt-5.6-sol's current $4 / $20 is promotional "at least through November 21, 2026"  | —                                                                                        | —                                         | Re-check that day                                                                       |
 
 #### xAI: https://docs.x.ai/developers/pricing.md
 
@@ -367,10 +367,10 @@ means the rate is in `rates.rs` and the truth file. Where the row cannot observe
 
 #### Fireworks: https://docs.fireworks.ai/serverless/pricing
 
-| Dimension | Rate                        | Observed via             | Row field      | Pricer / prevent                                                                   |
-| --------- | --------------------------- | ------------------------ | -------------- | ---------------------------------------------------------------------------------- |
-| Tokens    | per model, cached per model | `usage`                  | tokens         | Held                                                                               |
-| Priority  | per model (1.2–1.5×)        | `service_tier: priority` | `service_tier` | Held on the cost side; the customer card must sell fast too, or the row is refused |
+| Dimension | Rate                        | Observed via             | Row field      | Pricer / prevent                              |
+| --------- | --------------------------- | ------------------------ | -------------- | --------------------------------------------- |
+| Tokens    | per model, cached per model | `usage`                  | tokens         | Held                                          |
+| Priority  | per model (1.2–1.5×)        | `service_tier: priority` | `service_tier` | Held: priced at Fireworks' own priority rates |
 
 #### Groq: https://console.groq.com/docs/models
 
@@ -400,22 +400,10 @@ means the rate is in `rates.rs` and the truth file. Where the row cannot observe
 #### Hosts the catalog reaches only through OpenRouter
 
 Google (Vertex), Azure, Alibaba, Moonshot, Z.ai, and the open-model hosts are priced as
-OpenRouter endpoints. Their makers' own cards, where a row's customer price follows one, match the
+OpenRouter endpoints. Their makers' own cards, where a row's list card follows one, match the
 catalog: Moonshot Kimi K2.6/K2.7 Code, Z.ai GLM 5.1–5.3, Alibaba Qwen. Alibaba tiers qwen3.6-plus
-and qwen3.7-plus at 256K. Those rows' customer card is Together's flat rate (the primary), and
+and qwen3.7-plus at 256K. Those rows' list card is Together's flat rate (the primary), and
 OpenRouter's Alibaba endpoint carries the tier on the cost side.
-
-### Where cost exceeds price (product decisions, not pricer bugs)
-
-- **Every OpenRouter-served row**: the price is the card, and the cost is the host's price + 5.5%.
-- **Bedrock `us.` failover**: +10% over the Anthropic card.
-- **DeepSeek served by Together off-peak**: the customer pays half, and Together charges its flat
-  peak-equivalent rate (and $0.13 cached against DeepSeek's $0.044).
-- **Qwen3.8 2.4T cached on Together**: recorded at the dearer $0.50 (docs) against the card's $0.25
-  (pricing page).
-- **Open-model OpenRouter fallbacks** can cost several times the card (minimax-m3, glm-5.x,
-  kimi-k3).
-- **Gateway-added cache writes**: 0.25× input per write, by design.
 
 ### Known gaps
 

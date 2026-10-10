@@ -5,7 +5,7 @@ Ed25519 virtual key or BYO provider token, swaps in a pool key for managed traff
 request and response to the upstream provider (byte-for-byte when the inbound path and the catalog
 row share an endpoint, including same-endpoint Responses; translated Chat Completions ↔ Messages ↔
 Responses when they don't), and
-emits a token-usage billing fact (`ai.usage`) on completion. Usage taps the upstream body; the
+emits a priced billing row (`ai.usage`) on completion. Usage taps the upstream body; the
 client sees the inbound dialect.
 
 **Self-contained:** no `path` deps into the `beyond` repo. Depends only on crates.io + the
@@ -1726,12 +1726,12 @@ in `upstream_peer` → connected in `upstream_request_filter`) is what tells the
 
 **Priced variants and per-call fees** ride on the row next to the token counts:
 
-| Row field                    | Source                                                                                                                                        |
-| ---------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| `cache_write_1h_tokens`      | Anthropic `usage.cache_creation.ephemeral_1h_input_tokens` — a subset of `cache_write_tokens` (2×)                                            |
-| `gateway_cache_write_tokens` | Cache writes caused by breakpoints the gateway added: already in `input_tokens`, not in `cache_write_tokens` (billed at input)                |
-| `server_tool_calls`          | Billable web searches (Anthropic `usage.server_tool_use.web_search_requests`, cumulative on `message_delta`); every kind is in `server_tools` |
-| `service_tier`               | `service_tier` as echoed: Chat Completions root, Responses `response`, Anthropic `usage`; absent if not echoed or not `[a-z0-9_-]{1,16}`      |
+| Row field                    | Source                                                                                                                                                        |
+| ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `cache_write_1h_tokens`      | Anthropic `usage.cache_creation.ephemeral_1h_input_tokens` — a subset of `cache_write_tokens` (2×)                                                            |
+| `gateway_cache_write_tokens` | Cache writes caused by breakpoints the gateway added: already in `input_tokens`, not in `cache_write_tokens` (priced as the 5-minute writes the vendor bills) |
+| `server_tool_calls`          | Billable web searches (Anthropic `usage.server_tool_use.web_search_requests`, cumulative on `message_delta`); every kind is in `server_tools`                 |
+| `service_tier`               | `service_tier` as echoed: Chat Completions root, Responses `response`, Anthropic `usage`; absent if not echoed or not `[a-z0-9_-]{1,16}`                      |
 
 OpenAI reports no hosted-tool call count in `usage`; the gateway counts its hosted-tool items
 instead (see "The `ai.usage` row"). A malformed `service_tier` never fails the usage parse: it reads
@@ -1866,9 +1866,11 @@ stored in the response cache.
 
 ### The `ai.usage` row (the billing contract)
 
-Billing is computed downstream from these rows, later, and a fact the row does not carry is lost
-when the request ends. This section is the contract a pricer is built against. Field names are
-stable: a field is only ever added, never renamed, retyped or given a new meaning (D268).
+The gateway prices every row when it writes it: its price fields are authoritative, and beyond
+only collects, batches and invoices them. The token facts stay on the row beside the price, for
+audit and repricing, because a fact the row does not carry is lost when the request ends. This
+section is the row's contract. Field names are stable: a field is only ever added, never
+renamed, retyped or given a new meaning (D268).
 
 One row per managed request that reached `logging` with a billable outcome (not BYO, not a free
 sub-resource such as a token count, not an abandoned `FullBody` attempt, and not the gateway's own
@@ -1910,16 +1912,16 @@ and when no provider was called.
 
 **Tokens**
 
-| Field                        | Type    | Meaning                                                                                                                                                              |
-| ---------------------------- | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `input_tokens`               | integer | Prompt tokens, in the convention `usage_wire` names. `0` when none was reported or estimated.                                                                        |
-| `output_tokens`              | integer | Output tokens, reasoning included (xAI's reported-beside reasoning is added in, see "Reasoning tokens outside `completion_tokens`").                                 |
-| `cache_read_tokens`          | integer | Prompt tokens read from the provider's cache.                                                                                                                        |
-| `cache_write_tokens`         | integer | Prompt tokens written to the provider's cache, at the client's request (all TTLs).                                                                                   |
-| `cache_write_1h_tokens`      | integer | The 1-hour-TTL share of `cache_write_tokens` (Anthropic). A subset, not additional.                                                                                  |
-| `gateway_cache_write_tokens` | integer | Cache writes caused by breakpoints the gateway added. Already counted in `input_tokens`, not in `cache_write_tokens`; billed at the input rate. Reconciliation only. |
-| `reasoning_tokens`           | Debug   | `Some(n)` when the provider reported a reasoning count (a subset of `output_tokens`), `None` when it did not. Logged as Debug text so `Some(0)` stays distinct.      |
-| `usage_wire`                 | string  | `openai` or `anthropic`: which convention `input_tokens` follows.                                                                                                    |
+| Field                        | Type    | Meaning                                                                                                                                                                                               |
+| ---------------------------- | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `input_tokens`               | integer | Prompt tokens, in the convention `usage_wire` names. `0` when none was reported or estimated.                                                                                                         |
+| `output_tokens`              | integer | Output tokens, reasoning included (xAI's reported-beside reasoning is added in, see "Reasoning tokens outside `completion_tokens`").                                                                  |
+| `cache_read_tokens`          | integer | Prompt tokens read from the provider's cache.                                                                                                                                                         |
+| `cache_write_tokens`         | integer | Prompt tokens written to the provider's cache, at the client's request (all TTLs).                                                                                                                    |
+| `cache_write_1h_tokens`      | integer | The 1-hour-TTL share of `cache_write_tokens` (Anthropic). A subset, not additional.                                                                                                                   |
+| `gateway_cache_write_tokens` | integer | Cache writes caused by breakpoints the gateway added. Already counted in `input_tokens`, not in `cache_write_tokens`; the vendor bills them as 5-minute writes, and so does the price (pass-through). |
+| `reasoning_tokens`           | Debug   | `Some(n)` when the provider reported a reasoning count (a subset of `output_tokens`), `None` when it did not. Logged as Debug text so `Some(0)` stays distinct.                                       |
+| `usage_wire`                 | string  | `openai` or `anthropic`: which convention `input_tokens` follows.                                                                                                                                     |
 
 The whole prompt is `input_tokens` on `openai` (it includes `cache_read_tokens` and, on OpenRouter,
 `cache_write_tokens`), and `input_tokens + cache_read_tokens + cache_write_tokens` on `anthropic`.
@@ -2109,45 +2111,51 @@ settle one:
 - Groq: no per-request lookup exists. Price the row as relayed and accept the gap, or bound it by
   the request's `max_tokens`.
 
-**Computing a row's cost**
+**The price (authoritative)**
 
-Rates come from the pricer's per-candidate table, keyed by `provider` and `upstream_model` (or
-`price_model` for the card), never from the client's `requested_model`.
+`logging` calls `providers::pricing::price` with the row's own facts, as the row logs them
+(`server_tools` is read back from its logged text), so a repricer working from the row gets the
+same inputs. The pricing contract (the model, every dimension, rounding, the rate table and the
+golden vectors) is `crates/providers/ARCHITECTURE.md`, "Pricing contract".
 
-1. Plain input = the plain-input prompt tokens above (by `usage_wire`).
-2. Token cost = plain input × input rate + `cache_read_tokens` × cache-read rate +
-   (`cache_write_tokens` − `cache_write_1h_tokens`) × 5-minute write rate (1.25× input on
-   Anthropic) + `cache_write_1h_tokens` × 1-hour write rate (2× input) + `output_tokens` × output
-   rate. `gateway_cache_write_tokens` is already in plain input; do not add it.
-3. Long-context tier, from the whole prompt (plain input + cache reads + cache writes): OpenAI
-   gpt-5.4 and later above 272K input bill 2× input and 1.5× output for the whole request; xAI at
-   200K and above bills 2× on every token. Anthropic has none (`context-1m-*` is never forwarded).
-4. Served modifiers, multiplied in (they stack with the cache multipliers):
-   - `speed = fast` (Anthropic, Opus 5.5 / 5 / 4.8): 2× every token category (Opus 5.5 $8/$40
-     against $4/$20).
-   - `service_tier`: OpenAI `priority` 2.5× (gpt-5.5 $12.50/$75 against $5/$30), `flex` at the
-     flex rate card; xAI `priority` 2× (measured: `cost_in_usd_ticks` exactly doubles); Anthropic
-     `priority` is a committed-capacity contract, not a per-token rate.
-   - `inference_geo = us`: 1.1× every token category (Claude 4.6 and later).
-   - `price_variant`: per the table above.
-5. Tool fees from `server_tools`: web search Anthropic $10 / 1K, OpenAI $10 / 1K ($25 / 1K for the
-   non-reasoning preview), xAI $5 / 1K; file search $2.50 / 1K (OpenAI, xAI); xAI code execution
-   $5 / 1K calls, X search $5 / 1K posts and $10 / 1K profiles. Containers bill by time, per
-   container across requests, so a pricer dedupes `container_id`: Anthropic $0.05 per
-   container-hour (5-minute minimum) after 1,550 free hours a month, free when the request carries
-   `web_search_20260209` or `web_fetch_20260209` or later; OpenAI per container per 20-minute
-   session by size ($0.03 for 1 GB). Web fetch, computer use and MCP add no fee beyond their tokens.
-6. Where the vendor reported its own cost (`upstream_cost_usd`: OpenRouter, xAI), that is the cost
-   of goods for the row. OpenRouter's figure excludes its 5.5% credit-purchase fee.
-7. An estimated row is priced from its counts, read with the bounds above; a row with
-   `upstream_may_continue` is reconciled before it is final.
+| Field             | Type    | Meaning                                                                                                                                                        |
+| ----------------- | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `price_status`    | string  | `priced`, `estimated` (estimated counts, `upstream_may_continue`, or an OpenRouter row with no reported cost, priced at its dearest endpoint), or `unpriced`   |
+| `price_reason`    | string  | Why a row is `unpriced` (`no_rate`, `no_tool_fee`, `unknown_class`, …). Absent otherwise.                                                                      |
+| `price_micros`    | integer | What the customer is charged, micro-dollars: pass-through, always equal to `cost_micros`. Absent when unpriced: **never 0 for unpriced**                       |
+| `cost_micros`     | integer | What we owe the vendor, micro-dollars. Absent when unpriced.                                                                                                   |
+| `cost_basis`      | string  | `tokens` (the candidate's card), `reported` (`upstream_cost_usd`, × 1.055 on OpenRouter), `dearest_endpoint`, `cache_hit`                                      |
+| `price_detail`    | string  | The price's breakdown: `class=…,long=…,mult=…,input=…,cache_read=…,cache_write_5m=…,cache_write_1h=…,output=…,tools=…` (micro-dollars; `mult` in basis points) |
+| `cost_detail`     | string  | The cost's, the same shape (all parts 0 on a reported cost)                                                                                                    |
+| `rate_version`    | string  | The rate table compiled into this build (`{date}.{hash}`): which rates produced the two amounts                                                                |
+| `start_unix_secs` | integer | The request's start, whole seconds UTC: the time a time-of-day tier (DeepSeek's off-peak) was decided on                                                       |
+
+**Pricing is pass-through** (owner decision, 2026-10-10). The customer pays exactly what we pay
+for the request, on the card of the host that actually served it, fees included. That covers
+OpenRouter's 5.5% credit fee, Bedrock's `us.` profile at list + 10%, and each open-model host at
+its own rates. So `price_micros == cost_micros` on every row, an estimated row included, and
+`price_detail` equals `cost_detail`. Both are logged so a later pricing policy can diverge
+without a schema change.
+
+Each amount is rounded once, half-up, to the micro-dollar, from an exact integer sum. An unpriced
+row also increments `ai_usage_unpriced_total`, and every one is a request served that cannot be
+billed until a human prices it. Pricing costs about 165 ns per row, off the relay path, with no
+allocation.
+
+**Repricing stays possible.** The row keeps every fact the price was computed from (tokens by
+bucket, served tier, speed and geography, tools by kind, the serving endpoint and its variant,
+the vendor's own cost, the estimate flags, the start second), and `rate_version` names the table
+that priced it. A corrected rate, a vendor's retroactive invoice change, or a product decision is
+applied by running the same facts through `providers::pricing` at another table version. The
+golden vectors (`verify/pricing_vectors.json`) are what any such implementation must reproduce.
 
 **Cache hits**
 
 A `cache_hit` row replays the fill's usage (the tokens, tier, speed, geography and tool counts the
 client is billed for) but no upstream facts: no `upstream_*`, `served_by`, `container_id`,
-`price_variant` or `upstream_status`. It made no upstream call and cost nothing upstream. Whether to
-charge the tenant for it is a product decision.
+`price_variant` or `upstream_status`. It made no upstream call, so it cost nothing, and the
+customer is charged what it cost: `cost_micros` and `price_micros` are both 0, `cost_basis` is
+`cache_hit` (owner decision, 2026-10-10; a rule, not a setting).
 
 ### Deny-Set (`deny.rs`)
 
@@ -2984,28 +2992,34 @@ fails over exactly as a small body does (D81: pinning the walk to that one candi
 body paid a revoked key's 401 and a second upload); and the last attempt the parent allows records
 no retry, so its answer is relayed rather than lost.
 
-### Why the catalog has a list price and the request does not
+### Why the gateway prices the row
 
-`GET /v1/models` carries a standard list price on every catalog row (`providers::catalog::ListPrice`):
-USD per million tokens for input, output, cache read, and cache write. That is the card a client
-estimates with, and the card a downstream consumer uses when it has nothing better. A public card
-that omits a cache rate is stored as the input rate — no discount, no write premium. Omission is
-not zero; a missing rate is how cache tokens used to bill free.
+The gateway computes and logs each row's price, and beyond only collects the rows, batches them
+and sends them to Stripe. There were three reasons to move pricing out of a downstream consumer:
 
-The rate is the **primary candidate's** vendor standard published rate: not batch or flex, and not
-OpenRouter's cheapest host (OpenRouter's card is used only when OpenRouter is the primary). A
-vendor that tiers its rate is listed at the standard tier, which one card cannot fully express:
-DeepSeek's peak rate (off-peak is half, so off-peak traffic is over-listed 2x), xAI's < 200k-prompt
-tier (≥ 200k is 2x on every token), and OpenAI's ≤ 272K-input tier (above it, 2x input and 1.5x
-output). Each direct-vendor row's rates are recorded with their source URL in
-`verify/catalog_truth.toml`, and `catalog_matches_vendor_truth` fails when a row drifts from it or a
-direct-vendor row has no entry.
+- **Only the gateway sees every fact.** Fast mode, data residency, the long-context tier, 1-hour
+  writes, per-kind tool calls, the serving candidate and the vendor's reported cost are all
+  request-time facts. A downstream pricer can only reprice what the row carried, and each
+  dimension it missed was a silent underbill (the 1-hour write at the 5-minute rate, fast mode at
+  standard, OpenRouter's fee ignored).
+- **One implementation, held to its sources.** `providers::pricing` is the reference pricer.
+  Every rate in `providers::rates` carries its primary source and check date in
+  `verify/catalog_truth.toml`, and the golden vectors pin the arithmetic. A second pricer in
+  another repo would drift from all three.
+- **Refusing is safer at the source.** A dimension the tables cannot price (a tool fee the vendor
+  does not publish, fast mode where it is not sold) becomes `price_status=unpriced` on the row,
+  counted and alertable, instead of a zero that bills silently downstream.
 
-The gateway still does not multiply those rates into `ai.usage`. It emits token facts: counts and
-model identifiers. Provider pricing changes frequently, varies by contract tier, and is sometimes
-retroactively corrected on invoices. Batch, fast mode, the 1-hour Claude cache write (2× input),
-and long-context overrides are not this card. A downstream consumer can reprice historical facts;
-the gateway's facts cannot be regenerated once the request is gone.
+`GET /v1/models` still publishes the list price (`providers::catalog::ListPrice`): the primary
+vendor's standard card, which `list_card_standard_is_the_list_price` holds to the rate table. It
+is what a request costs when the primary serves it. Under pass-through, a request a failover host
+serves is invoiced at that host's rates instead. A public card that omits a cache rate is stored
+as the input rate (no discount, no write premium), never zero.
+
+Vendor pricing still changes, is sometimes corrected on invoices, and sometimes depends on a
+contract. That is why the row keeps its facts and its `rate_version` (see "The price
+(authoritative)"): a later table reprices history exactly, and the live reconciliation suite
+compares the logged cost against what each vendor actually billed.
 
 ### Why routing uses the first path segment, not a header
 
@@ -3423,6 +3437,7 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
 | `ai_model_header_body_mismatch_total` | Counter   | —                    | Catalog-walk requests whose `x-beyond-model` and body `model` disagreed (header wins; client bug)                                                                                                                          |
 | `ai_failover_unreplayable_total`      | Counter   | —                    | 5xx/429 retries declined on `/{provider}` or a still-uploading body: not provably replayable (catalog walks re-run instead)                                                                                                |
 | `ai_usage_estimated_total`            | Counter   | —                    | Managed requests billed estimated tokens: a stream or body cut short, or a cancel before the response head                                                                                                                 |
+| `ai_usage_unpriced_total`             | Counter   | —                    | `ai.usage` rows the pricer refused (`price_status=unpriced`, reason on the row): served and not yet billable                                                                                                               |
 | `ai_usage_write_errors_total`         | Counter   | —                    | `ai.usage` billing rows whose stdout write failed (the row is lost; also reported on stderr)                                                                                                                               |
 | `ai_log_dropped_total`                | Counter   | —                    | Diagnostic log lines dropped: the log sink queue was full (a stalled stdout) or the write failed (D263)                                                                                                                    |
 

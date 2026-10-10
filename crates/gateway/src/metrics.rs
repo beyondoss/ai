@@ -357,6 +357,10 @@ pub struct Metrics {
     /// before the response head — and whose `ai.usage` row carries estimated tokens
     /// (`usage_estimated=true`) instead of reported ones.
     pub usage_estimated_total: IntCounter,
+    /// `ai.usage` rows the pricer could not price (`price_status=unpriced`; the reason is
+    /// `price_reason` on the row). Each is a request we served and cannot bill until a human
+    /// prices it: alert on any.
+    pub usage_unpriced_total: IntCounter,
     /// `ai.usage` billing rows whose stdout write failed (a closed or broken pipe). The row is lost
     /// to the log pipeline, so this counter, and the line on stderr, are the only record of it.
     pub usage_write_errors_total: IntCounter,
@@ -536,6 +540,10 @@ impl Metrics {
             "ai_usage_estimated_total",
             "Managed requests billed estimated tokens: a stream or body cut short, or a cancel before the response head",
         ))?;
+        let usage_unpriced_total = IntCounter::with_opts(Opts::new(
+            "ai_usage_unpriced_total",
+            "ai.usage rows the pricer refused (price_status=unpriced; reason on the row)",
+        ))?;
         let usage_write_errors_total = IntCounter::with_opts(Opts::new(
             "ai_usage_write_errors_total",
             "ai.usage billing rows whose stdout write failed (the row is lost)",
@@ -587,6 +595,7 @@ impl Metrics {
         r.register(Box::new(control_header_errors_total.clone()))?;
         r.register(Box::new(usage_parse_errors_total.clone()))?;
         r.register(Box::new(usage_estimated_total.clone()))?;
+        r.register(Box::new(usage_unpriced_total.clone()))?;
         r.register(Box::new(usage_write_errors_total.clone()))?;
         r.register(Box::new(log_dropped_total.clone()))?;
         r.register(Box::new(cache_hits_total.clone()))?;
@@ -628,6 +637,7 @@ impl Metrics {
             control_header_errors_total,
             usage_parse_errors_total,
             usage_estimated_total,
+            usage_unpriced_total,
             usage_write_errors_total,
             log_dropped_total,
             cache_hits_total,

@@ -1,6 +1,6 @@
 {
   "about": "Golden vectors for the pricing contract (crates/providers/ARCHITECTURE.md, 'Pricing contract'). Each row is an ai.usage row; expect is what price(row) must return. An implementation must reproduce every one exactly. Absent row fields take their defaults: usage_wire anthropic, counts 0, strings null, booleans false, server_tools {}.",
-  "rate_version": "2026-10-10.a06079be9e5b5e77",
+  "rate_version": "2026-10-10.ad3fdef71820a687",
   "vectors": [
     {
       "name": "anthropic_basic",
@@ -74,7 +74,7 @@
     },
     {
       "name": "anthropic_gateway_cache_writes",
-      "why": "Writes from breakpoints the gateway added are already in input_tokens: the customer pays them at input, the vendor charges them as 5-minute writes.",
+      "why": "Writes from breakpoints the gateway added are already in input_tokens; the vendor bills them as 5-minute writes, and pass-through bills them the same.",
       "row": {
         "price_model": "claude-sonnet-5",
         "provider": "anthropic",
@@ -88,7 +88,7 @@
         "status": "priced",
         "basis": "tokens",
         "cost_micros": 52500,
-        "price_micros": 45000,
+        "price_micros": 52500,
         "cost_class": "standard",
         "price_class": "standard",
         "cost_long": false,
@@ -362,7 +362,7 @@
     },
     {
       "name": "bedrock_us_profile",
-      "why": "Bedrock's us. geo inference profile is billed at the Regional SKUs: +10% on every category, 1h writes included. The customer pays the Anthropic card.",
+      "why": "Bedrock's us. geo inference profile is billed at the Regional SKUs: +10% on every category, 1h writes included; pass-through, the customer pays the same.",
       "row": {
         "price_model": "claude-haiku-4-5",
         "provider": "bedrock",
@@ -378,7 +378,7 @@
         "status": "priced",
         "basis": "tokens",
         "cost_micros": 12100,
-        "price_micros": 11000,
+        "price_micros": 12100,
         "cost_class": "standard",
         "price_class": "standard",
         "cost_long": false,
@@ -401,7 +401,7 @@
         "status": "priced",
         "basis": "tokens",
         "cost_micros": 30250,
-        "price_micros": 27500,
+        "price_micros": 30250,
         "cost_class": "standard",
         "price_class": "standard",
         "cost_long": false,
@@ -725,8 +725,8 @@
       }
     },
     {
-      "name": "openai_search_non_reasoning_refused",
-      "why": "On a non-reasoning model a web_search_call costs $10/1k (web_search) or $25/1k (web_search_preview), which the row cannot tell apart: refused.",
+      "name": "openai_search_non_reasoning",
+      "why": "On a non-reasoning model the web_search tool is $10/1k calls; the row counts web_search_preview calls apart.",
       "row": {
         "price_model": "gpt-4o",
         "provider": "openai",
@@ -737,12 +737,65 @@
         "unix_secs": 1791806400
       },
       "expect": {
-        "unpriced": "no_tool_fee"
+        "status": "priced",
+        "basis": "tokens",
+        "cost_micros": 23250,
+        "price_micros": 23250,
+        "cost_class": "standard",
+        "price_class": "standard",
+        "cost_long": false,
+        "price_long": false
+      }
+    },
+    {
+      "name": "openai_search_preview_non_reasoning",
+      "why": "web_search_preview on a non-reasoning model is $25/1k calls.",
+      "row": {
+        "price_model": "gpt-4.1",
+        "provider": "openai",
+        "input_tokens": 500,
+        "output_tokens": 200,
+        "server_tools": "web_search_preview=2",
+        "usage_wire": "openai",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "status": "priced",
+        "basis": "tokens",
+        "cost_micros": 52600,
+        "price_micros": 52600,
+        "cost_class": "standard",
+        "price_class": "standard",
+        "cost_long": false,
+        "price_long": false
+      }
+    },
+    {
+      "name": "openai_search_preview_reasoning",
+      "why": "web_search_preview on a reasoning model is $10/1k, like web_search.",
+      "row": {
+        "price_model": "gpt-5.5",
+        "provider": "openai",
+        "input_tokens": 500,
+        "output_tokens": 200,
+        "server_tools": "web_search=1,web_search_preview=1",
+        "usage_wire": "openai",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "status": "priced",
+        "basis": "tokens",
+        "cost_micros": 28500,
+        "price_micros": 28500,
+        "cost_class": "standard",
+        "price_class": "standard",
+        "cost_long": false,
+        "price_long": false
       }
     },
     {
       "name": "openai_search_fixed_block_refused",
-      "why": "gpt-4o-mini bills web search content as a fixed 8,000-token block the usage may not show (and is non-reasoning): refused.",
+      "why": "gpt-4o-mini bills web search content as a fixed 8,000-token block the usage may not show: refused (the gateway also refuses the request, D268).",
       "row": {
         "price_model": "gpt-4o-mini",
         "provider": "openai",
@@ -1173,7 +1226,7 @@
     },
     {
       "name": "deepseek_via_together_off_peak",
-      "why": "Served by Together off-peak: the customer pays DeepSeek's off-peak half, we pay Together's flat rate (and its own cached rate).",
+      "why": "Served by Together off-peak: Together's flat rate (and its own cached rate) applies, not DeepSeek's off-peak half; pass-through, the customer pays Together's rate.",
       "row": {
         "price_model": "deepseek-v4-pro",
         "provider": "together",
@@ -1187,9 +1240,9 @@
         "status": "priced",
         "basis": "tokens",
         "cost_micros": 80400,
-        "price_micros": 37620,
+        "price_micros": 80400,
         "cost_class": "standard",
-        "price_class": "off_peak",
+        "price_class": "standard",
         "cost_long": false,
         "price_long": false
       }
@@ -1244,7 +1297,7 @@
     },
     {
       "name": "fireworks_failover",
-      "why": "Failover to Fireworks: the customer pays the row's card (Groq's), we pay Fireworks' own card.",
+      "why": "Failover to Fireworks: Fireworks' own card, for cost and price alike.",
       "row": {
         "price_model": "openai/gpt-oss-120b",
         "provider": "fireworks",
@@ -1258,7 +1311,7 @@
         "status": "priced",
         "basis": "tokens",
         "cost_micros": 2160,
-        "price_micros": 2400,
+        "price_micros": 2160,
         "cost_class": "standard",
         "price_class": "standard",
         "cost_long": false,
@@ -1266,8 +1319,8 @@
       }
     },
     {
-      "name": "fireworks_priority_customer_has_none",
-      "why": "Fireworks served Priority but the row's customer card sells no fast class: refused.",
+      "name": "fireworks_priority",
+      "why": "Fireworks served its Priority tier: its own priority rates, passed through.",
       "row": {
         "price_model": "openai/gpt-oss-120b",
         "provider": "fireworks",
@@ -1278,7 +1331,14 @@
         "unix_secs": 1791806400
       },
       "expect": {
-        "unpriced": "no_rate"
+        "status": "priced",
+        "basis": "tokens",
+        "cost_micros": 9,
+        "price_micros": 9,
+        "cost_class": "fast",
+        "price_class": "fast",
+        "cost_long": false,
+        "price_long": false
       }
     },
     {
@@ -1328,7 +1388,7 @@
     },
     {
       "name": "openrouter_reported_cost",
-      "why": "OpenRouter's usage.cost is the cost, plus the 5.5% credit fee. The price is the Anthropic card on OpenRouter's OpenAI-wire counts: input includes cache reads AND cache writes.",
+      "why": "OpenRouter's usage.cost plus the 5.5% credit fee is the cost, and the price (pass-through). The counts are OpenAI-wire: input includes cache reads AND cache writes.",
       "row": {
         "price_model": "claude-opus-4-8",
         "provider": "openrouter",
@@ -1345,7 +1405,7 @@
         "status": "priced",
         "basis": "reported",
         "cost_micros": 64602,
-        "price_micros": 168750,
+        "price_micros": 64602,
         "cost_class": "standard",
         "price_class": "standard",
         "cost_long": false,
@@ -1368,7 +1428,7 @@
         "status": "priced",
         "basis": "reported",
         "cost_micros": 16,
-        "price_micros": 105,
+        "price_micros": 16,
         "cost_class": "standard",
         "price_class": "standard",
         "cost_long": false,
@@ -1449,7 +1509,7 @@
         "status": "estimated",
         "basis": "dearest_endpoint",
         "cost_micros": 195834,
-        "price_micros": 168750,
+        "price_micros": 195834,
         "cost_class": "standard",
         "price_class": "standard",
         "cost_long": false,
@@ -1472,7 +1532,7 @@
         "status": "estimated",
         "basis": "dearest_endpoint",
         "cost_micros": 82132,
-        "price_micros": 51900,
+        "price_micros": 82132,
         "cost_class": "standard",
         "price_class": "standard",
         "cost_long": false,
@@ -1495,7 +1555,7 @@
         "status": "estimated",
         "basis": "dearest_endpoint",
         "cost_micros": 2874358,
-        "price_micros": 2724510,
+        "price_micros": 2874358,
         "cost_class": "standard",
         "price_class": "standard",
         "cost_long": true,
@@ -1519,7 +1579,7 @@
         "status": "estimated",
         "basis": "dearest_endpoint",
         "cost_micros": 79125,
-        "price_micros": 75000,
+        "price_micros": 79125,
         "cost_class": "fast",
         "price_class": "fast",
         "cost_long": false,
@@ -1544,7 +1604,7 @@
     },
     {
       "name": "openrouter_pro_row",
-      "why": "An OpenRouter-only row (gpt-6-sol-pro): the customer pays OpenAI's gpt-6-sol card (OpenAI bills pro mode at the model's standard rates); the cost is OpenRouter's report plus fee.",
+      "why": "An OpenRouter-only row (gpt-6-sol-pro): OpenRouter's report plus fee, for cost and price alike.",
       "row": {
         "price_model": "gpt-6-sol-pro",
         "provider": "openrouter",
@@ -1559,7 +1619,7 @@
         "status": "priced",
         "basis": "reported",
         "cost_micros": 96216,
-        "price_micros": 111000,
+        "price_micros": 96216,
         "cost_class": "standard",
         "price_class": "standard",
         "cost_long": false,
@@ -1567,8 +1627,8 @@
       }
     },
     {
-      "name": "openrouter_tool_cost_refused",
-      "why": "A metered OpenRouter tool or plugin (its web plugin) has a cost no customer card prices: refused.",
+      "name": "openrouter_tool_cost_passed_through",
+      "why": "A metered OpenRouter tool or plugin cost is inside the reported usage.cost: passed through with the fee.",
       "row": {
         "price_model": "z-ai/glm-5.1",
         "provider": "openrouter",
@@ -1580,7 +1640,14 @@
         "unix_secs": 1791806400
       },
       "expect": {
-        "unpriced": "no_tool_fee"
+        "status": "priced",
+        "basis": "reported",
+        "cost_micros": 10550,
+        "price_micros": 10550,
+        "cost_class": "standard",
+        "price_class": "standard",
+        "cost_long": false,
+        "price_long": false
       }
     },
     {
@@ -1600,7 +1667,7 @@
         "status": "priced",
         "basis": "reported",
         "cost_micros": 10550,
-        "price_micros": 1840,
+        "price_micros": 10550,
         "cost_class": "standard",
         "price_class": "standard",
         "cost_long": false,
@@ -1609,7 +1676,7 @@
     },
     {
       "name": "openrouter_native_search",
-      "why": "OpenRouter native web search on a Claude row: tool_calls counts it too and is not added; the customer pays Anthropic's $10/1k.",
+      "why": "OpenRouter native web search on a Claude row: tool_calls counts it too and is not added; the reported cost carries the search.",
       "row": {
         "price_model": "claude-sonnet-4-6",
         "provider": "openrouter",
@@ -1624,7 +1691,7 @@
         "status": "priced",
         "basis": "reported",
         "cost_micros": 40196,
-        "price_micros": 39500,
+        "price_micros": 40196,
         "cost_class": "standard",
         "price_class": "standard",
         "cost_long": false,
@@ -1632,8 +1699,8 @@
       }
     },
     {
-      "name": "openrouter_tool_calls_exceed_search",
-      "why": "tool_calls beyond the web searches means another OpenRouter tool ran: refused.",
+      "name": "openrouter_tool_calls_with_reported_cost",
+      "why": "tool_calls beyond the web searches: another OpenRouter tool ran, and the reported cost carries it.",
       "row": {
         "price_model": "claude-sonnet-4-6",
         "provider": "openrouter",
@@ -1645,7 +1712,14 @@
         "unix_secs": 1791806400
       },
       "expect": {
-        "unpriced": "no_tool_fee"
+        "status": "priced",
+        "basis": "reported",
+        "cost_micros": 40196,
+        "price_micros": 40196,
+        "cost_class": "standard",
+        "price_class": "standard",
+        "cost_long": false,
+        "price_long": false
       }
     },
     {
@@ -1665,7 +1739,7 @@
         "status": "priced",
         "basis": "reported",
         "cost_micros": 8704,
-        "price_micros": 7500,
+        "price_micros": 8704,
         "cost_class": "standard",
         "price_class": "standard",
         "cost_long": false,
@@ -1690,7 +1764,7 @@
         "status": "estimated",
         "basis": "reported",
         "cost_micros": 7913,
-        "price_micros": 7500,
+        "price_micros": 7913,
         "cost_class": "standard",
         "price_class": "standard",
         "cost_long": false,
@@ -1698,8 +1772,24 @@
       }
     },
     {
+      "name": "openrouter_tool_calls_no_cost_refused",
+      "why": "tool_calls beyond the web searches and no reported cost: no endpoint lists that tool's fee, so refused.",
+      "row": {
+        "price_model": "claude-sonnet-4-6",
+        "provider": "openrouter",
+        "input_tokens": 5000,
+        "output_tokens": 300,
+        "server_tools": "web_search=1,tool_calls=2",
+        "usage_wire": "openai",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "unpriced": "no_tool_fee"
+      }
+    },
+    {
       "name": "xai_reported_cost",
-      "why": "xAI reports its own cost (cost_in_usd_ticks): that is the cost of goods, with no fee; the customer pays the card.",
+      "why": "xAI reports its own cost (cost_in_usd_ticks): that is the cost and the price, with no fee.",
       "row": {
         "price_model": "grok-4.3",
         "provider": "xai",
@@ -1714,7 +1804,7 @@
         "status": "priced",
         "basis": "reported",
         "cost_micros": 11850,
-        "price_micros": 11650,
+        "price_micros": 11850,
         "cost_class": "standard",
         "price_class": "standard",
         "cost_long": false,

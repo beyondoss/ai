@@ -1,11 +1,13 @@
-//! The rate tables behind [`crate::pricing`]: per catalog row, what the customer pays (the
-//! primary vendor's card) and what each candidate costs us.
+//! The rate tables behind [`crate::pricing`]: per catalog row, its list card (the primary
+//! vendor's published card) and what each candidate costs us. Pricing is pass-through: the
+//! customer pays what the serving candidate costs us, so the list card prices a row only when its
+//! own vendor served it.
 //!
 //! Every rate here is a vendor's published figure, read from a primary source on the date in
 //! `verify/catalog_truth.toml` (`[[card]]`, `[[pricing]]`, `[[openrouter]]`), and
-//! `rates_match_truth` holds this file to that one, entry for entry. A customer card's standard
-//! tier is the catalog's [`crate::ListPrice`] for the row (`customer_standard_is_the_list_price`),
-//! so `GET /v1/models` and the invoice can never disagree.
+//! `rates_match_truth` holds this file to that one, entry for entry. A list card's standard
+//! tier is the catalog's [`crate::ListPrice`] for the row (`list_card_standard_is_the_list_price`),
+//! so `GET /v1/models` publishes exactly what the primary vendor charges.
 //!
 //! Changing any rate changes [`RATE_VERSION`], which every priced row logs: a row can always be
 //! traced to the exact table that priced it, and repriced against another.
@@ -23,7 +25,7 @@ use crate::pricing::{Bps, Card, Class, LongContext, OffPeak, TokenRates, Tool, u
 /// The exact rate table compiled into this build: the date its rates were checked, and a hash of
 /// the table (`rate_version_names_this_table` recomputes it, and fails with the new value when
 /// any rate changes). Logged on every priced `ai.usage` row.
-pub const RATE_VERSION: &str = "2026-10-10.a06079be9e5b5e77";
+pub const RATE_VERSION: &str = "2026-10-10.ad3fdef71820a687";
 
 /// OpenRouter's fee on the credits that pay for every request: 5.5% of each card purchase on the
 /// Standard plan ("OpenRouter's fee is charged when you buy credits, 5.5% on Standard and 8% on
@@ -38,9 +40,9 @@ pub const OPENROUTER_CREDIT_FEE: Bps = 10_550;
 pub struct RowRates {
     /// The catalog row's name.
     pub model: &'static str,
-    /// What the customer pays: the primary vendor's card. Its standard tier is the row's
-    /// [`crate::ListPrice`].
-    pub customer: Card,
+    /// The primary vendor's published card. Its standard tier is the row's
+    /// [`crate::ListPrice`]; it prices the rows that vendor serves ([`CostCard::List`]).
+    pub list: Card,
     /// What each candidate costs us, one per provider in the row's `candidates` and `responses`.
     pub cost: &'static [CandidateCost],
 }
@@ -54,8 +56,8 @@ pub struct CandidateCost {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CostCard {
-    /// The customer card: the candidate is the vendor whose card the customer pays.
-    Customer,
+    /// The list card: the candidate is the row's own vendor.
+    List,
     /// The candidate's own published card.
     Own(&'static Card),
     /// OpenRouter: its reported `usage.cost` plus [`OPENROUTER_CREDIT_FEE`], or, with none
@@ -115,7 +117,17 @@ const OPENAI_NON_REASONING_TOOLS: &[(Tool, u64)] = &[
     (Tool::FileSearch, 2500),
     (Tool::Mcp, 0),
     (Tool::ToolSearch, 0),
+    (Tool::WebSearch, 10000),
     (Tool::WebSearchPage, 0),
+    (Tool::WebSearchPreview, 25000),
+];
+const OPENAI_FIXED_SEARCH_BLOCK_TOOLS: &[(Tool, u64)] = &[
+    (Tool::ComputerUse, 0),
+    (Tool::FileSearch, 2500),
+    (Tool::Mcp, 0),
+    (Tool::ToolSearch, 0),
+    (Tool::WebSearchPage, 0),
+    (Tool::WebSearchPreview, 25000),
 ];
 const OPENAI_TOOLS: &[(Tool, u64)] = &[
     (Tool::ComputerUse, 0),
@@ -124,6 +136,7 @@ const OPENAI_TOOLS: &[(Tool, u64)] = &[
     (Tool::ToolSearch, 0),
     (Tool::WebSearch, 10000),
     (Tool::WebSearchPage, 0),
+    (Tool::WebSearchPreview, 10000),
 ];
 const XAI_TOOLS: &[(Tool, u64)] = &[
     (Tool::CodeExecution, 5000),
@@ -368,7 +381,7 @@ const OPENAI_GPT_4_1: Card = Card {
 /// `openai:gpt-4.1-mini`.
 const OPENAI_GPT_4_1_MINI: Card = Card {
     fast: Some(tr("0.7", "2.8", "0.175", "0.7", None)),
-    tools: OPENAI_NON_REASONING_TOOLS,
+    tools: OPENAI_FIXED_SEARCH_BLOCK_TOOLS,
     ..Card::new(tr("0.4", "1.6", "0.1", "0.4", None))
 };
 
@@ -382,7 +395,7 @@ const OPENAI_GPT_4O: Card = Card {
 /// `openai:gpt-4o-mini`.
 const OPENAI_GPT_4O_MINI: Card = Card {
     fast: Some(tr("0.25", "1", "0.125", "0.25", None)),
-    tools: OPENAI_NON_REASONING_TOOLS,
+    tools: OPENAI_FIXED_SEARCH_BLOCK_TOOLS,
     ..Card::new(tr("0.15", "0.6", "0.075", "0.15", None))
 };
 
@@ -6434,11 +6447,11 @@ static OR_Z_AI_GLM_5_3_FLASH: &[OrEndpoint] = &[
 pub static ROW_RATES: &[RowRates] = &[
     RowRates {
         model: "claude-fable-5",
-        customer: ANTHROPIC_CLAUDE_FABLE_5,
+        list: ANTHROPIC_CLAUDE_FABLE_5,
         cost: &[
             CandidateCost {
                 provider: ProviderId::Anthropic,
-                card: CostCard::Customer,
+                card: CostCard::List,
             },
             CandidateCost {
                 provider: ProviderId::OpenRouter,
@@ -6448,11 +6461,11 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "claude-fable-5-1",
-        customer: ANTHROPIC_CLAUDE_FABLE_5_1,
+        list: ANTHROPIC_CLAUDE_FABLE_5_1,
         cost: &[
             CandidateCost {
                 provider: ProviderId::Anthropic,
-                card: CostCard::Customer,
+                card: CostCard::List,
             },
             CandidateCost {
                 provider: ProviderId::OpenRouter,
@@ -6462,11 +6475,11 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "claude-haiku-4-5",
-        customer: ANTHROPIC_CLAUDE_HAIKU_4_5,
+        list: ANTHROPIC_CLAUDE_HAIKU_4_5,
         cost: &[
             CandidateCost {
                 provider: ProviderId::Anthropic,
-                card: CostCard::Customer,
+                card: CostCard::List,
             },
             CandidateCost {
                 provider: ProviderId::Bedrock,
@@ -6480,11 +6493,11 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "claude-opus-4-5",
-        customer: ANTHROPIC_CLAUDE_OPUS_4_5,
+        list: ANTHROPIC_CLAUDE_OPUS_4_5,
         cost: &[
             CandidateCost {
                 provider: ProviderId::Anthropic,
-                card: CostCard::Customer,
+                card: CostCard::List,
             },
             CandidateCost {
                 provider: ProviderId::OpenRouter,
@@ -6494,11 +6507,11 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "claude-opus-4-6",
-        customer: ANTHROPIC_CLAUDE_OPUS_4_6,
+        list: ANTHROPIC_CLAUDE_OPUS_4_6,
         cost: &[
             CandidateCost {
                 provider: ProviderId::Anthropic,
-                card: CostCard::Customer,
+                card: CostCard::List,
             },
             CandidateCost {
                 provider: ProviderId::OpenRouter,
@@ -6508,11 +6521,11 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "claude-opus-4-7",
-        customer: ANTHROPIC_CLAUDE_OPUS_4_7,
+        list: ANTHROPIC_CLAUDE_OPUS_4_7,
         cost: &[
             CandidateCost {
                 provider: ProviderId::Anthropic,
-                card: CostCard::Customer,
+                card: CostCard::List,
             },
             CandidateCost {
                 provider: ProviderId::OpenRouter,
@@ -6522,11 +6535,11 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "claude-opus-4-8",
-        customer: ANTHROPIC_CLAUDE_OPUS_4_8,
+        list: ANTHROPIC_CLAUDE_OPUS_4_8,
         cost: &[
             CandidateCost {
                 provider: ProviderId::Anthropic,
-                card: CostCard::Customer,
+                card: CostCard::List,
             },
             CandidateCost {
                 provider: ProviderId::Bedrock,
@@ -6540,11 +6553,11 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "claude-opus-5",
-        customer: ANTHROPIC_CLAUDE_OPUS_5,
+        list: ANTHROPIC_CLAUDE_OPUS_5,
         cost: &[
             CandidateCost {
                 provider: ProviderId::Anthropic,
-                card: CostCard::Customer,
+                card: CostCard::List,
             },
             CandidateCost {
                 provider: ProviderId::OpenRouter,
@@ -6554,11 +6567,11 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "claude-opus-5-5",
-        customer: ANTHROPIC_CLAUDE_OPUS_5_5,
+        list: ANTHROPIC_CLAUDE_OPUS_5_5,
         cost: &[
             CandidateCost {
                 provider: ProviderId::Anthropic,
-                card: CostCard::Customer,
+                card: CostCard::List,
             },
             CandidateCost {
                 provider: ProviderId::OpenRouter,
@@ -6568,11 +6581,11 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "claude-sonnet-4-5",
-        customer: ANTHROPIC_CLAUDE_SONNET_4_5,
+        list: ANTHROPIC_CLAUDE_SONNET_4_5,
         cost: &[
             CandidateCost {
                 provider: ProviderId::Anthropic,
-                card: CostCard::Customer,
+                card: CostCard::List,
             },
             CandidateCost {
                 provider: ProviderId::OpenRouter,
@@ -6582,11 +6595,11 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "claude-sonnet-4-6",
-        customer: ANTHROPIC_CLAUDE_SONNET_4_6,
+        list: ANTHROPIC_CLAUDE_SONNET_4_6,
         cost: &[
             CandidateCost {
                 provider: ProviderId::Anthropic,
-                card: CostCard::Customer,
+                card: CostCard::List,
             },
             CandidateCost {
                 provider: ProviderId::OpenRouter,
@@ -6596,11 +6609,11 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "claude-sonnet-5",
-        customer: ANTHROPIC_CLAUDE_SONNET_5,
+        list: ANTHROPIC_CLAUDE_SONNET_5,
         cost: &[
             CandidateCost {
                 provider: ProviderId::Anthropic,
-                card: CostCard::Customer,
+                card: CostCard::List,
             },
             CandidateCost {
                 provider: ProviderId::OpenRouter,
@@ -6610,11 +6623,11 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "claude-sonnet-5-5",
-        customer: ANTHROPIC_CLAUDE_SONNET_5_5,
+        list: ANTHROPIC_CLAUDE_SONNET_5_5,
         cost: &[
             CandidateCost {
                 provider: ProviderId::Anthropic,
-                card: CostCard::Customer,
+                card: CostCard::List,
             },
             CandidateCost {
                 provider: ProviderId::OpenRouter,
@@ -6624,11 +6637,11 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "deepseek-flash",
-        customer: DEEPSEEK_DEEPSEEK_FLASH,
+        list: DEEPSEEK_DEEPSEEK_FLASH,
         cost: &[
             CandidateCost {
                 provider: ProviderId::DeepSeek,
-                card: CostCard::Customer,
+                card: CostCard::List,
             },
             CandidateCost {
                 provider: ProviderId::Together,
@@ -6642,11 +6655,11 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "deepseek-v4-pro",
-        customer: DEEPSEEK_DEEPSEEK_V4_PRO,
+        list: DEEPSEEK_DEEPSEEK_V4_PRO,
         cost: &[
             CandidateCost {
                 provider: ProviderId::DeepSeek,
-                card: CostCard::Customer,
+                card: CostCard::List,
             },
             CandidateCost {
                 provider: ProviderId::Together,
@@ -6660,7 +6673,7 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "google/gemma-4-31b-it",
-        customer: Card::new(tr("0.09", "0.34", "0.05", "0.09", None)),
+        list: Card::new(tr("0.09", "0.34", "0.05", "0.09", None)),
         cost: &[CandidateCost {
             provider: ProviderId::OpenRouter,
             card: CostCard::OpenRouter(OR_GOOGLE_GEMMA_4_31B_IT),
@@ -6668,11 +6681,11 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "gpt-4.1",
-        customer: OPENAI_GPT_4_1,
+        list: OPENAI_GPT_4_1,
         cost: &[
             CandidateCost {
                 provider: ProviderId::OpenAi,
-                card: CostCard::Customer,
+                card: CostCard::List,
             },
             CandidateCost {
                 provider: ProviderId::OpenRouter,
@@ -6682,11 +6695,11 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "gpt-4.1-mini",
-        customer: OPENAI_GPT_4_1_MINI,
+        list: OPENAI_GPT_4_1_MINI,
         cost: &[
             CandidateCost {
                 provider: ProviderId::OpenAi,
-                card: CostCard::Customer,
+                card: CostCard::List,
             },
             CandidateCost {
                 provider: ProviderId::OpenRouter,
@@ -6696,11 +6709,11 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "gpt-4o",
-        customer: OPENAI_GPT_4O,
+        list: OPENAI_GPT_4O,
         cost: &[
             CandidateCost {
                 provider: ProviderId::OpenAi,
-                card: CostCard::Customer,
+                card: CostCard::List,
             },
             CandidateCost {
                 provider: ProviderId::OpenRouter,
@@ -6710,11 +6723,11 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "gpt-4o-mini",
-        customer: OPENAI_GPT_4O_MINI,
+        list: OPENAI_GPT_4O_MINI,
         cost: &[
             CandidateCost {
                 provider: ProviderId::OpenAi,
-                card: CostCard::Customer,
+                card: CostCard::List,
             },
             CandidateCost {
                 provider: ProviderId::OpenRouter,
@@ -6724,11 +6737,11 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "gpt-5",
-        customer: OPENAI_GPT_5,
+        list: OPENAI_GPT_5,
         cost: &[
             CandidateCost {
                 provider: ProviderId::OpenAi,
-                card: CostCard::Customer,
+                card: CostCard::List,
             },
             CandidateCost {
                 provider: ProviderId::OpenRouter,
@@ -6738,11 +6751,11 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "gpt-5-mini",
-        customer: OPENAI_GPT_5_MINI,
+        list: OPENAI_GPT_5_MINI,
         cost: &[
             CandidateCost {
                 provider: ProviderId::OpenAi,
-                card: CostCard::Customer,
+                card: CostCard::List,
             },
             CandidateCost {
                 provider: ProviderId::OpenRouter,
@@ -6752,11 +6765,11 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "gpt-5-nano",
-        customer: OPENAI_GPT_5_NANO,
+        list: OPENAI_GPT_5_NANO,
         cost: &[
             CandidateCost {
                 provider: ProviderId::OpenAi,
-                card: CostCard::Customer,
+                card: CostCard::List,
             },
             CandidateCost {
                 provider: ProviderId::OpenRouter,
@@ -6766,11 +6779,11 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "gpt-5-pro",
-        customer: OPENAI_GPT_5_PRO,
+        list: OPENAI_GPT_5_PRO,
         cost: &[
             CandidateCost {
                 provider: ProviderId::OpenAi,
-                card: CostCard::Customer,
+                card: CostCard::List,
             },
             CandidateCost {
                 provider: ProviderId::OpenRouter,
@@ -6780,11 +6793,11 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "gpt-5.1",
-        customer: OPENAI_GPT_5_1,
+        list: OPENAI_GPT_5_1,
         cost: &[
             CandidateCost {
                 provider: ProviderId::OpenAi,
-                card: CostCard::Customer,
+                card: CostCard::List,
             },
             CandidateCost {
                 provider: ProviderId::OpenRouter,
@@ -6794,11 +6807,11 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "gpt-5.2",
-        customer: OPENAI_GPT_5_2,
+        list: OPENAI_GPT_5_2,
         cost: &[
             CandidateCost {
                 provider: ProviderId::OpenAi,
-                card: CostCard::Customer,
+                card: CostCard::List,
             },
             CandidateCost {
                 provider: ProviderId::OpenRouter,
@@ -6808,11 +6821,11 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "gpt-5.2-pro",
-        customer: OPENAI_GPT_5_2_PRO,
+        list: OPENAI_GPT_5_2_PRO,
         cost: &[
             CandidateCost {
                 provider: ProviderId::OpenAi,
-                card: CostCard::Customer,
+                card: CostCard::List,
             },
             CandidateCost {
                 provider: ProviderId::OpenRouter,
@@ -6822,11 +6835,11 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "gpt-5.3-codex",
-        customer: OPENAI_GPT_5_3_CODEX,
+        list: OPENAI_GPT_5_3_CODEX,
         cost: &[
             CandidateCost {
                 provider: ProviderId::OpenAi,
-                card: CostCard::Customer,
+                card: CostCard::List,
             },
             CandidateCost {
                 provider: ProviderId::OpenRouter,
@@ -6836,11 +6849,11 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "gpt-5.4",
-        customer: OPENAI_GPT_5_4,
+        list: OPENAI_GPT_5_4,
         cost: &[
             CandidateCost {
                 provider: ProviderId::OpenAi,
-                card: CostCard::Customer,
+                card: CostCard::List,
             },
             CandidateCost {
                 provider: ProviderId::OpenRouter,
@@ -6850,11 +6863,11 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "gpt-5.4-mini",
-        customer: OPENAI_GPT_5_4_MINI,
+        list: OPENAI_GPT_5_4_MINI,
         cost: &[
             CandidateCost {
                 provider: ProviderId::OpenAi,
-                card: CostCard::Customer,
+                card: CostCard::List,
             },
             CandidateCost {
                 provider: ProviderId::OpenRouter,
@@ -6864,11 +6877,11 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "gpt-5.4-nano",
-        customer: OPENAI_GPT_5_4_NANO,
+        list: OPENAI_GPT_5_4_NANO,
         cost: &[
             CandidateCost {
                 provider: ProviderId::OpenAi,
-                card: CostCard::Customer,
+                card: CostCard::List,
             },
             CandidateCost {
                 provider: ProviderId::OpenRouter,
@@ -6878,11 +6891,11 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "gpt-5.4-pro",
-        customer: OPENAI_GPT_5_4_PRO,
+        list: OPENAI_GPT_5_4_PRO,
         cost: &[
             CandidateCost {
                 provider: ProviderId::OpenAi,
-                card: CostCard::Customer,
+                card: CostCard::List,
             },
             CandidateCost {
                 provider: ProviderId::OpenRouter,
@@ -6892,11 +6905,11 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "gpt-5.5",
-        customer: OPENAI_GPT_5_5,
+        list: OPENAI_GPT_5_5,
         cost: &[
             CandidateCost {
                 provider: ProviderId::OpenAi,
-                card: CostCard::Customer,
+                card: CostCard::List,
             },
             CandidateCost {
                 provider: ProviderId::OpenRouter,
@@ -6906,11 +6919,11 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "gpt-5.5-pro",
-        customer: OPENAI_GPT_5_5_PRO,
+        list: OPENAI_GPT_5_5_PRO,
         cost: &[
             CandidateCost {
                 provider: ProviderId::OpenAi,
-                card: CostCard::Customer,
+                card: CostCard::List,
             },
             CandidateCost {
                 provider: ProviderId::OpenRouter,
@@ -6920,11 +6933,11 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "gpt-5.6-luna",
-        customer: OPENAI_GPT_5_6_LUNA,
+        list: OPENAI_GPT_5_6_LUNA,
         cost: &[
             CandidateCost {
                 provider: ProviderId::OpenAi,
-                card: CostCard::Customer,
+                card: CostCard::List,
             },
             CandidateCost {
                 provider: ProviderId::OpenRouter,
@@ -6934,7 +6947,7 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "gpt-5.6-luna-pro",
-        customer: OPENAI_GPT_5_6_LUNA,
+        list: OPENAI_GPT_5_6_LUNA,
         cost: &[CandidateCost {
             provider: ProviderId::OpenRouter,
             card: CostCard::OpenRouter(OR_OPENAI_GPT_5_6_LUNA_PRO),
@@ -6942,11 +6955,11 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "gpt-5.6-sol",
-        customer: OPENAI_GPT_5_6_SOL,
+        list: OPENAI_GPT_5_6_SOL,
         cost: &[
             CandidateCost {
                 provider: ProviderId::OpenAi,
-                card: CostCard::Customer,
+                card: CostCard::List,
             },
             CandidateCost {
                 provider: ProviderId::OpenRouter,
@@ -6956,7 +6969,7 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "gpt-5.6-sol-pro",
-        customer: OPENAI_GPT_5_6_SOL,
+        list: OPENAI_GPT_5_6_SOL,
         cost: &[CandidateCost {
             provider: ProviderId::OpenRouter,
             card: CostCard::OpenRouter(OR_OPENAI_GPT_5_6_SOL_PRO),
@@ -6964,11 +6977,11 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "gpt-5.6-terra",
-        customer: OPENAI_GPT_5_6_TERRA,
+        list: OPENAI_GPT_5_6_TERRA,
         cost: &[
             CandidateCost {
                 provider: ProviderId::OpenAi,
-                card: CostCard::Customer,
+                card: CostCard::List,
             },
             CandidateCost {
                 provider: ProviderId::OpenRouter,
@@ -6978,7 +6991,7 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "gpt-5.6-terra-pro",
-        customer: OPENAI_GPT_5_6_TERRA,
+        list: OPENAI_GPT_5_6_TERRA,
         cost: &[CandidateCost {
             provider: ProviderId::OpenRouter,
             card: CostCard::OpenRouter(OR_OPENAI_GPT_5_6_TERRA_PRO),
@@ -6986,11 +6999,11 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "gpt-6-astra",
-        customer: OPENAI_GPT_6_ASTRA,
+        list: OPENAI_GPT_6_ASTRA,
         cost: &[
             CandidateCost {
                 provider: ProviderId::OpenAi,
-                card: CostCard::Customer,
+                card: CostCard::List,
             },
             CandidateCost {
                 provider: ProviderId::OpenRouter,
@@ -7000,7 +7013,7 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "gpt-6-astra-pro",
-        customer: OPENAI_GPT_6_ASTRA,
+        list: OPENAI_GPT_6_ASTRA,
         cost: &[CandidateCost {
             provider: ProviderId::OpenRouter,
             card: CostCard::OpenRouter(OR_OPENAI_GPT_6_ASTRA_PRO),
@@ -7008,11 +7021,11 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "gpt-6-luna",
-        customer: OPENAI_GPT_6_LUNA,
+        list: OPENAI_GPT_6_LUNA,
         cost: &[
             CandidateCost {
                 provider: ProviderId::OpenAi,
-                card: CostCard::Customer,
+                card: CostCard::List,
             },
             CandidateCost {
                 provider: ProviderId::OpenRouter,
@@ -7022,7 +7035,7 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "gpt-6-luna-pro",
-        customer: OPENAI_GPT_6_LUNA,
+        list: OPENAI_GPT_6_LUNA,
         cost: &[CandidateCost {
             provider: ProviderId::OpenRouter,
             card: CostCard::OpenRouter(OR_OPENAI_GPT_6_LUNA_PRO),
@@ -7030,11 +7043,11 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "gpt-6-sol",
-        customer: OPENAI_GPT_6_SOL,
+        list: OPENAI_GPT_6_SOL,
         cost: &[
             CandidateCost {
                 provider: ProviderId::OpenAi,
-                card: CostCard::Customer,
+                card: CostCard::List,
             },
             CandidateCost {
                 provider: ProviderId::OpenRouter,
@@ -7044,7 +7057,7 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "gpt-6-sol-pro",
-        customer: OPENAI_GPT_6_SOL,
+        list: OPENAI_GPT_6_SOL,
         cost: &[CandidateCost {
             provider: ProviderId::OpenRouter,
             card: CostCard::OpenRouter(OR_OPENAI_GPT_6_SOL_PRO),
@@ -7052,11 +7065,11 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "gpt-6.1-sol",
-        customer: OPENAI_GPT_6_1_SOL,
+        list: OPENAI_GPT_6_1_SOL,
         cost: &[
             CandidateCost {
                 provider: ProviderId::OpenAi,
-                card: CostCard::Customer,
+                card: CostCard::List,
             },
             CandidateCost {
                 provider: ProviderId::OpenRouter,
@@ -7066,7 +7079,7 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "gpt-6.1-sol-pro",
-        customer: OPENAI_GPT_6_1_SOL,
+        list: OPENAI_GPT_6_1_SOL,
         cost: &[CandidateCost {
             provider: ProviderId::OpenRouter,
             card: CostCard::OpenRouter(OR_OPENAI_GPT_6_1_SOL_PRO),
@@ -7074,11 +7087,11 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "grok-4.20",
-        customer: XAI_GROK_4_20,
+        list: XAI_GROK_4_20,
         cost: &[
             CandidateCost {
                 provider: ProviderId::XAi,
-                card: CostCard::Customer,
+                card: CostCard::List,
             },
             CandidateCost {
                 provider: ProviderId::OpenRouter,
@@ -7088,11 +7101,11 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "grok-4.20-multi-agent",
-        customer: XAI_GROK_4_20_MULTI_AGENT,
+        list: XAI_GROK_4_20_MULTI_AGENT,
         cost: &[
             CandidateCost {
                 provider: ProviderId::XAi,
-                card: CostCard::Customer,
+                card: CostCard::List,
             },
             CandidateCost {
                 provider: ProviderId::OpenRouter,
@@ -7102,11 +7115,11 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "grok-4.3",
-        customer: XAI_GROK_4_3,
+        list: XAI_GROK_4_3,
         cost: &[
             CandidateCost {
                 provider: ProviderId::XAi,
-                card: CostCard::Customer,
+                card: CostCard::List,
             },
             CandidateCost {
                 provider: ProviderId::OpenRouter,
@@ -7116,11 +7129,11 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "grok-4.5",
-        customer: XAI_GROK_4_5,
+        list: XAI_GROK_4_5,
         cost: &[
             CandidateCost {
                 provider: ProviderId::XAi,
-                card: CostCard::Customer,
+                card: CostCard::List,
             },
             CandidateCost {
                 provider: ProviderId::OpenRouter,
@@ -7130,11 +7143,11 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "grok-4.6",
-        customer: XAI_GROK_4_6,
+        list: XAI_GROK_4_6,
         cost: &[
             CandidateCost {
                 provider: ProviderId::XAi,
-                card: CostCard::Customer,
+                card: CostCard::List,
             },
             CandidateCost {
                 provider: ProviderId::OpenRouter,
@@ -7144,11 +7157,11 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "grok-4.7",
-        customer: XAI_GROK_4_7,
+        list: XAI_GROK_4_7,
         cost: &[
             CandidateCost {
                 provider: ProviderId::XAi,
-                card: CostCard::Customer,
+                card: CostCard::List,
             },
             CandidateCost {
                 provider: ProviderId::OpenRouter,
@@ -7158,11 +7171,11 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "grok-build-0.1",
-        customer: XAI_GROK_BUILD_0_1,
+        list: XAI_GROK_BUILD_0_1,
         cost: &[
             CandidateCost {
                 provider: ProviderId::XAi,
-                card: CostCard::Customer,
+                card: CostCard::List,
             },
             CandidateCost {
                 provider: ProviderId::OpenRouter,
@@ -7172,7 +7185,7 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "llama-3.1-8b-instant",
-        customer: Card::new(tr("0.05", "0.08", "0.025", "0.05", None)),
+        list: Card::new(tr("0.05", "0.08", "0.025", "0.05", None)),
         cost: &[CandidateCost {
             provider: ProviderId::OpenRouter,
             card: CostCard::OpenRouter(OR_META_LLAMA_LLAMA_3_1_8B_INSTRUCT),
@@ -7180,7 +7193,7 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "llama-3.3-70b-versatile",
-        customer: Card::new(tr("1.04", "1.04", "1.04", "1.04", None)),
+        list: Card::new(tr("1.04", "1.04", "1.04", "1.04", None)),
         cost: &[
             CandidateCost {
                 provider: ProviderId::Together,
@@ -7194,7 +7207,7 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "meta-llama/llama-4-maverick",
-        customer: Card::new(tr("0.1875", "0.6525", "0.1875", "0.1875", None)),
+        list: Card::new(tr("0.1875", "0.6525", "0.1875", "0.1875", None)),
         cost: &[CandidateCost {
             provider: ProviderId::OpenRouter,
             card: CostCard::OpenRouter(OR_META_LLAMA_LLAMA_4_MAVERICK),
@@ -7202,7 +7215,7 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "meta-llama/llama-4-scout",
-        customer: Card::new(tr("0.1", "0.3", "0.1", "0.1", None)),
+        list: Card::new(tr("0.1", "0.3", "0.1", "0.1", None)),
         cost: &[CandidateCost {
             provider: ProviderId::OpenRouter,
             card: CostCard::OpenRouter(OR_META_LLAMA_LLAMA_4_SCOUT),
@@ -7210,7 +7223,7 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "meta/muse-glimmer-30b",
-        customer: Card::new(tr("0.35", "1.5", "0.04", "0.35", None)),
+        list: Card::new(tr("0.35", "1.5", "0.04", "0.35", None)),
         cost: &[
             CandidateCost {
                 provider: ProviderId::Together,
@@ -7224,7 +7237,7 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "minimax/minimax-m3",
-        customer: Card::new(tr("0.3", "1.2", "0.06", "0.3", None)),
+        list: Card::new(tr("0.3", "1.2", "0.06", "0.3", None)),
         cost: &[
             CandidateCost {
                 provider: ProviderId::Together,
@@ -7242,7 +7255,7 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "moonshotai/kimi-k2.6",
-        customer: Card::new(tr("0.95", "4", "0.16", "0.95", None)),
+        list: Card::new(tr("0.95", "4", "0.16", "0.95", None)),
         cost: &[CandidateCost {
             provider: ProviderId::OpenRouter,
             card: CostCard::OpenRouter(OR_MOONSHOTAI_KIMI_K2_6),
@@ -7250,7 +7263,7 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "moonshotai/kimi-k2.7-code",
-        customer: Card::new(tr("0.95", "4", "0.19", "0.95", None)),
+        list: Card::new(tr("0.95", "4", "0.19", "0.95", None)),
         cost: &[CandidateCost {
             provider: ProviderId::OpenRouter,
             card: CostCard::OpenRouter(OR_MOONSHOTAI_KIMI_K2_7_CODE),
@@ -7258,7 +7271,7 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "moonshotai/kimi-k3",
-        customer: Card::new(tr("3", "15", "0.3", "3", None)),
+        list: Card::new(tr("3", "15", "0.3", "3", None)),
         cost: &[
             CandidateCost {
                 provider: ProviderId::Together,
@@ -7276,11 +7289,11 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "o3",
-        customer: OPENAI_O3,
+        list: OPENAI_O3,
         cost: &[
             CandidateCost {
                 provider: ProviderId::OpenAi,
-                card: CostCard::Customer,
+                card: CostCard::List,
             },
             CandidateCost {
                 provider: ProviderId::OpenRouter,
@@ -7290,7 +7303,7 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "o3-pro",
-        customer: OPENAI_O3_PRO,
+        list: OPENAI_O3_PRO,
         cost: &[CandidateCost {
             provider: ProviderId::OpenRouter,
             card: CostCard::OpenRouter(OR_OPENAI_O3_PRO),
@@ -7298,11 +7311,11 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "openai/gpt-oss-120b",
-        customer: GROQ_OPENAI_GPT_OSS_120B,
+        list: GROQ_OPENAI_GPT_OSS_120B,
         cost: &[
             CandidateCost {
                 provider: ProviderId::Groq,
-                card: CostCard::Customer,
+                card: CostCard::List,
             },
             CandidateCost {
                 provider: ProviderId::Together,
@@ -7316,11 +7329,11 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "openai/gpt-oss-20b",
-        customer: GROQ_OPENAI_GPT_OSS_20B,
+        list: GROQ_OPENAI_GPT_OSS_20B,
         cost: &[
             CandidateCost {
                 provider: ProviderId::Groq,
-                card: CostCard::Customer,
+                card: CostCard::List,
             },
             CandidateCost {
                 provider: ProviderId::OpenRouter,
@@ -7330,11 +7343,11 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "openai/gpt-oss-safeguard-20b",
-        customer: GROQ_OPENAI_GPT_OSS_SAFEGUARD_20B,
+        list: GROQ_OPENAI_GPT_OSS_SAFEGUARD_20B,
         cost: &[
             CandidateCost {
                 provider: ProviderId::Groq,
-                card: CostCard::Customer,
+                card: CostCard::List,
             },
             CandidateCost {
                 provider: ProviderId::OpenRouter,
@@ -7344,7 +7357,7 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "qwen/qwen-2.5-7b-instruct",
-        customer: Card::new(tr("0.1", "0.2", "0.1", "0.1", None)),
+        list: Card::new(tr("0.1", "0.2", "0.1", "0.1", None)),
         cost: &[CandidateCost {
             provider: ProviderId::OpenRouter,
             card: CostCard::OpenRouter(OR_QWEN_QWEN_2_5_7B_INSTRUCT),
@@ -7352,7 +7365,7 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "qwen/qwen3.5-9b",
-        customer: Card::new(tr("0.17", "0.25", "0.17", "0.17", None)),
+        list: Card::new(tr("0.17", "0.25", "0.17", "0.17", None)),
         cost: &[
             CandidateCost {
                 provider: ProviderId::Together,
@@ -7366,7 +7379,7 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "qwen/qwen3.6-plus",
-        customer: Card::new(tr("0.5", "3", "0.5", "0.5", None)),
+        list: Card::new(tr("0.5", "3", "0.5", "0.5", None)),
         cost: &[
             CandidateCost {
                 provider: ProviderId::Together,
@@ -7380,7 +7393,7 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "qwen/qwen3.7-max",
-        customer: Card::new(tr("2.5", "7.5", "0.5", "2.5", None)),
+        list: Card::new(tr("2.5", "7.5", "0.5", "2.5", None)),
         cost: &[
             CandidateCost {
                 provider: ProviderId::Together,
@@ -7394,7 +7407,7 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "qwen/qwen3.7-plus",
-        customer: Card::new(tr("0.32", "1.28", "0.32", "0.32", None)),
+        list: Card::new(tr("0.32", "1.28", "0.32", "0.32", None)),
         cost: &[
             CandidateCost {
                 provider: ProviderId::Together,
@@ -7408,7 +7421,7 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "qwen/qwen3.8-2.4t-a95b",
-        customer: Card::new(tr("2", "6", "0.25", "2", None)),
+        list: Card::new(tr("2", "6", "0.25", "2", None)),
         cost: &[
             CandidateCost {
                 provider: ProviderId::Together,
@@ -7422,11 +7435,11 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "qwen/qwen3.8-27b",
-        customer: GROQ_QWEN_QWEN3_8_27B,
+        list: GROQ_QWEN_QWEN3_8_27B,
         cost: &[
             CandidateCost {
                 provider: ProviderId::Groq,
-                card: CostCard::Customer,
+                card: CostCard::List,
             },
             CandidateCost {
                 provider: ProviderId::OpenRouter,
@@ -7436,7 +7449,7 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "qwen/qwen3.8-flash",
-        customer: Card::new(tr("0.15", "0.47", "0.15", "0.15", None)),
+        list: Card::new(tr("0.15", "0.47", "0.15", "0.15", None)),
         cost: &[
             CandidateCost {
                 provider: ProviderId::Together,
@@ -7450,11 +7463,11 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "text-embedding-3-large",
-        customer: OPENAI_TEXT_EMBEDDING_3_LARGE,
+        list: OPENAI_TEXT_EMBEDDING_3_LARGE,
         cost: &[
             CandidateCost {
                 provider: ProviderId::OpenAi,
-                card: CostCard::Customer,
+                card: CostCard::List,
             },
             CandidateCost {
                 provider: ProviderId::OpenRouter,
@@ -7464,11 +7477,11 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "text-embedding-3-small",
-        customer: OPENAI_TEXT_EMBEDDING_3_SMALL,
+        list: OPENAI_TEXT_EMBEDDING_3_SMALL,
         cost: &[
             CandidateCost {
                 provider: ProviderId::OpenAi,
-                card: CostCard::Customer,
+                card: CostCard::List,
             },
             CandidateCost {
                 provider: ProviderId::OpenRouter,
@@ -7478,7 +7491,7 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "thinkingmachines/inkling",
-        customer: Card::new(tr("1", "4.05", "0.17", "1", None)),
+        list: Card::new(tr("1", "4.05", "0.17", "1", None)),
         cost: &[
             CandidateCost {
                 provider: ProviderId::Together,
@@ -7492,7 +7505,7 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "z-ai/glm-5.1",
-        customer: Card::new(tr("1.4", "4.4", "0.26", "1.4", None)),
+        list: Card::new(tr("1.4", "4.4", "0.26", "1.4", None)),
         cost: &[CandidateCost {
             provider: ProviderId::OpenRouter,
             card: CostCard::OpenRouter(OR_Z_AI_GLM_5_1),
@@ -7500,7 +7513,7 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "z-ai/glm-5.2",
-        customer: Card::new(tr("1.4", "4.4", "0.26", "1.4", None)),
+        list: Card::new(tr("1.4", "4.4", "0.26", "1.4", None)),
         cost: &[
             CandidateCost {
                 provider: ProviderId::Together,
@@ -7514,7 +7527,7 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "z-ai/glm-5.3",
-        customer: Card::new(tr("1.4", "4.4", "0.26", "1.4", None)),
+        list: Card::new(tr("1.4", "4.4", "0.26", "1.4", None)),
         cost: &[
             CandidateCost {
                 provider: ProviderId::Together,
@@ -7528,7 +7541,7 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "z-ai/glm-5.3-flash",
-        customer: Card::new(tr("0.15", "0.5", "0.03", "0.15", None)),
+        list: Card::new(tr("0.15", "0.5", "0.03", "0.15", None)),
         cost: &[
             CandidateCost {
                 provider: ProviderId::Together,

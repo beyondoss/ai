@@ -199,6 +199,9 @@ pub enum Tool {
     /// Web search: Anthropic `web_search_requests`, an OpenAI or xAI `web_search_call` search
     /// action, xAI `web_search_calls`, OpenRouter `web_search_requests`.
     WebSearch,
+    /// An OpenAI `web_search_call` made with the `web_search_preview` tool (the row counts it apart
+    /// when the request offered that tool): $10 / 1K on reasoning models, $25 / 1K on the others.
+    WebSearchPreview,
     /// OpenAI `web_search_call` items with action `open_page` / `find_in_page`: no per-call fee.
     WebSearchPage,
     /// Anthropic `web_fetch_requests`: no per-call fee.
@@ -239,8 +242,9 @@ pub enum Tool {
 }
 
 impl Tool {
-    pub const ALL: [Tool; 16] = [
+    pub const ALL: [Tool; 17] = [
         Tool::WebSearch,
+        Tool::WebSearchPreview,
         Tool::WebSearchPage,
         Tool::WebFetch,
         Tool::CodeExecution,
@@ -263,6 +267,7 @@ impl Tool {
     pub const fn as_str(self) -> &'static str {
         match self {
             Tool::WebSearch => "web_search",
+            Tool::WebSearchPreview => "web_search_preview",
             Tool::WebSearchPage => "web_search_page",
             Tool::WebFetch => "web_fetch",
             Tool::CodeExecution => "code_execution",
@@ -546,6 +551,28 @@ pub struct Side {
     pub parts: Parts,
 }
 
+/// The side's breakdown as one `key=value` list, written straight into the log line with no heap
+/// allocation: `class=fast,long=false,mult=11000,input=24000,cache_read=36000,cache_write_5m=0,
+/// cache_write_1h=0,output=100000,tools=30000` (micro-dollars; `mult` in basis points).
+impl std::fmt::Display for Side {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let p = &self.parts;
+        write!(
+            f,
+            "class={},long={},mult={},input={},cache_read={},cache_write_5m={},cache_write_1h={},output={},tools={}",
+            self.class.as_str(),
+            self.long,
+            self.multiplier,
+            p.input,
+            p.cache_read,
+            p.cache_write_5m,
+            p.cache_write_1h,
+            p.output,
+            p.tools
+        )
+    }
+}
+
 /// A priced row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Priced {
@@ -825,15 +852,6 @@ fn geo_us(r: &UsageRow<'_>) -> Result<bool, Unpriced> {
     }
 }
 
-/// Which rate a side bills the gateway's own cache writes at.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum GatewayWrites {
-    /// The customer: the input rate (the gateway chose to cache, not the client).
-    AsInput,
-    /// The vendor: the 5-minute write rate it actually charges.
-    AsWrites,
-}
-
 /// Price one side on one card. Returns the side and its exact numerator (for comparing sides).
 fn side(
     card: &Card,
@@ -842,7 +860,6 @@ fn side(
     class: Class,
     geo_us: bool,
     fee: Bps,
-    gw: GatewayWrites,
 ) -> Result<(Side, u128), Unpriced> {
     let long = card.long_context.is_some_and(|lc| {
         if lc.inclusive {
@@ -868,10 +885,9 @@ fn side(
     let m = Mults::new(geo, fee);
     let f = m.factor();
 
-    let (input_tokens, gw_as_write) = match gw {
-        GatewayWrites::AsInput => (t.fresh, 0),
-        GatewayWrites::AsWrites => (t.fresh - t.gateway_writes, t.gateway_writes),
-    };
+    // The gateway's own cache writes are inside the uncached input; the vendor bills them as
+    // 5-minute writes, and pass-through bills them the same.
+    let (input_tokens, gw_as_write) = (t.fresh - t.gateway_writes, t.gateway_writes);
     let write_1h_rate = if t.write_1h > 0 {
         rates.cache_write_1h.ok_or(Unpriced::NoRate)?
     } else {
@@ -959,18 +975,6 @@ pub fn price(r: &UsageRow<'_>) -> Result<Priced, Unpriced> {
         | (ProviderId::OpenRouter, Some("regional" | "global")) => {}
         _ => return Err(Unpriced::UnknownVariant),
     }
-    // OpenRouter's `tool_calls` counts its server tools of every kind, web search among them. More
-    // of them than web searches means a tool ran whose fee no card holds.
-    if r.server_tools.get(Tool::ToolCalls) > r.server_tools.get(Tool::WebSearch) {
-        return Err(Unpriced::NoToolFee);
-    }
-    // A metered OpenRouter tool or plugin (its web plugin, a sandbox) has a cost no customer card
-    // prices: refuse rather than charge the tokens alone.
-    if let Some(raw) = r.upstream_tool_cost_usd
-        && parse_usd_atto(raw)? > 0
-    {
-        return Err(Unpriced::NoToolFee);
-    }
     let t = Tokens::of(r)?;
     let class = served_class(r)?;
     // Anthropic's own `service_tier: "priority"` is Priority Tier, committed capacity no longer
@@ -982,16 +986,6 @@ pub fn price(r: &UsageRow<'_>) -> Result<Priced, Unpriced> {
         return Err(Unpriced::UnknownClass);
     }
     let geo = geo_us(r)?;
-
-    let (price_side, _) = side(
-        &row.customer,
-        &t,
-        r,
-        class,
-        geo,
-        ONE,
-        GatewayWrites::AsInput,
-    )?;
 
     let mut status = if r.usage_estimated || r.upstream_may_continue {
         Status::Estimated
@@ -1021,23 +1015,21 @@ pub fn price(r: &UsageRow<'_>) -> Result<Priced, Unpriced> {
             };
             (s, CostBasis::Reported)
         }
-        (CostCard::Customer, None) => {
-            let (s, _) = side(
-                &row.customer,
-                &t,
-                r,
-                class,
-                geo,
-                ONE,
-                GatewayWrites::AsWrites,
-            )?;
+        (CostCard::List, None) => {
+            let (s, _) = side(&row.list, &t, r, class, geo, ONE)?;
             (s, CostBasis::Tokens)
         }
         (CostCard::Own(card), None) => {
-            let (s, _) = side(card, &t, r, class, geo, ONE, GatewayWrites::AsWrites)?;
+            let (s, _) = side(card, &t, r, class, geo, ONE)?;
             (s, CostBasis::Tokens)
         }
         (CostCard::OpenRouter(endpoints), None) => {
+            // OpenRouter's `tool_calls` counts its server tools of every kind, web search among
+            // them. More of them than web searches means a tool ran whose fee no endpoint lists;
+            // with no reported cost to carry it, refuse.
+            if r.server_tools.get(Tool::ToolCalls) > r.server_tools.get(Tool::WebSearch) {
+                return Err(Unpriced::NoToolFee);
+            }
             status = Status::Estimated;
             (
                 dearest_endpoint(endpoints, r, &t, class, geo)?,
@@ -1049,7 +1041,9 @@ pub fn price(r: &UsageRow<'_>) -> Result<Priced, Unpriced> {
         status,
         basis,
         cost: cost_side,
-        price: price_side,
+        // Pass-through (owner decision, 2026-10-10): the customer pays exactly what we pay for
+        // this request, on the card of the host that served it, fees included.
+        price: cost_side,
     })
 }
 
@@ -1083,7 +1077,6 @@ fn dearest_endpoint(
             Class::Standard,
             false,
             rates::OPENROUTER_CREDIT_FEE,
-            GatewayWrites::AsWrites,
         )?;
         if best.as_ref().is_none_or(|b| got.1 > b.1) {
             best = Some(got);
@@ -1226,6 +1219,21 @@ mod tests {
     }
 
     #[test]
+    fn a_side_displays_its_breakdown() {
+        let p = price(&UsageRow {
+            inference_geo: Some("us"),
+            server_tools: ToolCounts::new().with(Tool::WebSearch, 1),
+            ..row("claude-opus-4-8", "anthropic")
+        })
+        .unwrap();
+        assert_eq!(
+            p.price.to_string(),
+            "class=standard,long=false,mult=11000,input=5500,cache_read=0,cache_write_5m=0,\
+             cache_write_1h=0,output=2750,tools=10000"
+        );
+    }
+
+    #[test]
     fn unpriced_displays_its_code() {
         assert_eq!(Unpriced::NoToolFee.to_string(), "no_tool_fee");
     }
@@ -1259,7 +1267,7 @@ mod tests {
             ..row("claude-opus-4-8", "openrouter")
         })
         .unwrap();
-        assert_eq!((or.cost.multiplier, or.price.multiplier), (10_550, 10_000));
+        assert_eq!((or.cost.multiplier, or.price.multiplier), (10_550, 10_550));
     }
 
     #[test]
@@ -1269,10 +1277,10 @@ mod tests {
             ..row("claude-opus-4-8", "anthropic")
         })
         .unwrap();
-        // Customer: 1000 input at $5 + 100 output at $25; vendor: 1000 writes at $6.25.
-        assert_eq!((p.price.micros, p.cost.micros), (7_500, 8_750));
+        // 1000 gateway writes at $6.25 (what the vendor bills) + 100 output at $25, passed through.
+        assert_eq!((p.price.micros, p.cost.micros), (8_750, 8_750));
         assert_eq!(p.cost.parts.cache_write_5m, 6_250);
-        assert_eq!(p.price.parts.input, 5_000);
+        assert_eq!(p.price.parts.input, 0);
     }
 
     /// A long request is billed at the long rates even inside an off-peak window: off-peak
@@ -1307,32 +1315,14 @@ mod tests {
             ..UsageRow::default()
         };
         let t = Tokens::of(&r).unwrap();
-        let (s, _) = side(
-            &card,
-            &t,
-            &r,
-            Class::Standard,
-            false,
-            ONE,
-            GatewayWrites::AsInput,
-        )
-        .unwrap();
+        let (s, _) = side(&card, &t, &r, Class::Standard, false, ONE).unwrap();
         assert_eq!((s.class, s.long, s.micros), (Class::Standard, true, 3));
         let short = UsageRow {
             input_tokens: 10,
             ..UsageRow::default()
         };
         let t = Tokens::of(&short).unwrap();
-        let (s, _) = side(
-            &card,
-            &t,
-            &short,
-            Class::Standard,
-            false,
-            ONE,
-            GatewayWrites::AsInput,
-        )
-        .unwrap();
+        let (s, _) = side(&card, &t, &short, Class::Standard, false, ONE).unwrap();
         assert_eq!((s.class, s.long), (Class::OffPeak, false));
     }
 
