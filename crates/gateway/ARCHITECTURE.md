@@ -1954,6 +1954,12 @@ served value**, and uses the requested one only to tell "not reported" apart:
   or `standard` on Messages) and falls back to standard endpoints when priority ones fail.
 - `inference_geo` absent means `global`.
 
+A Chat Completions or Responses client's `service_tier: "priority"` on a Claude row is served as
+Anthropic fast mode when the attempt reaches direct Anthropic on a fast-mode model (D266). That row
+reads `requested_service_tier=priority`, `speed=fast` and Anthropic's own `service_tier`
+(`standard`): the multiplier to apply is fast mode's, from `speed`. Elsewhere the same request is
+served at standard speed and the row says so.
+
 **Endpoint price variants**
 
 | `price_variant` | When                                                                                            | Multiplier                                                 |

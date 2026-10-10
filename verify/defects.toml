@@ -2693,7 +2693,7 @@ evidence = "proxy.rs logging (the ai.usage info! call) and usage.rs Usage before
 claims = ["BIL-23"]
 state = "fixed"
 test = "anthropic_relay_records_speed_geo_tools_container_and_ids"
-fix = "PENDING"
+fix = "47a6242"
 note = "Fixed: the row gains requested_service_tier, speed, requested_speed, inference_geo, requested_inference_geo, requested_provider_routing, requested_plugins, requested_container, server_tools (kind=count list), container_id, upstream_model, upstream_host, upstream_path, price_variant, served_by, upstream_generation_id, upstream_request_id, upstream_cost_usd, upstream_inference_cost_usd, upstream_tool_cost_usd, upstream_byok, upstream_may_continue, usage_estimated_parts and usage_estimate_excludes; every existing field keeps its meaning (server_tool_calls stays). ARCHITECTURE.md 'The ai.usage row' is the contract. Hosted-tool items of an OpenAI Responses answer are counted per chunk (usage::ToolTally), since they precede the retained tail. Request knobs are read by the model scanner (peek::Kept) from the body copy logging already holds. RequestCtx grew 8 bytes (440 -> 448) for the boxed taps. Also tested: every test in billing_row_contract.rs, usage::vendor_tests, usage::tools::tests, peek::kept_tests."
 
 [[defect]]
