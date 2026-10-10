@@ -61,7 +61,8 @@ pub enum Pending {
         content_type: Option<Box<str>>,
     },
     /// Hit: the cached response has already been written; `logging` emits stored tokens.
-    Hit(CachedResponse),
+    /// Boxed: a hit carries the whole stored `Usage`, far larger than a fill.
+    Hit(Box<CachedResponse>),
 }
 
 /// Head-bounded copy of a response, taken as a tap — bytes are never withheld from the client.

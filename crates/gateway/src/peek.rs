@@ -35,7 +35,38 @@ enum Cap {
     No,
     Key,
     ModelValue,
+    /// The string value of the key [`Kept::last_key_extra`] names.
+    Extra,
 }
+
+/// The key-level members a response scanner also keeps when they come before `model`: the
+/// provider's id for this generation (every wire puts `id` first: Anthropic `message.id`, Chat
+/// Completions' root `id`, Responses `response.id`, OpenRouter's `gen-…`) and OpenRouter's
+/// serving host (`provider`, which it writes between `id` and `model`).
+pub const RESPONSE_EXTRA_KEYS: &[&[u8]] = &[b"id", b"provider"];
+
+/// The root request knobs a billing row records as *requested* (the served value comes from the
+/// response): OpenAI/OpenRouter/xAI `service_tier`, Anthropic/OpenRouter `speed`, Anthropic
+/// `inference_geo`.
+///
+/// Also the knobs whose value is an object or array, kept as raw JSON (at most [`RAW_CAPTURE`]
+/// bytes): OpenRouter's `provider` routing preferences and `plugins` (web search, file parsing),
+/// and Anthropic's `container` (a code-execution container to reuse; an id string or an object).
+pub const REQUEST_KNOB_KEYS: &[&[u8]] = &[
+    b"service_tier",
+    b"speed",
+    b"inference_geo",
+    b"provider",
+    b"plugins",
+    b"container",
+];
+
+/// Most bytes of an object or array knob value kept. Past it the value is cut (and then not valid
+/// JSON), at a UTF-8 boundary.
+pub const RAW_CAPTURE: usize = 512;
+
+/// How many extra keys a scan can keep.
+const MAX_EXTRAS: usize = 6;
 
 #[derive(Default)]
 pub struct ModelScanner {
@@ -61,6 +92,83 @@ pub struct ModelScanner {
     /// What (if anything) we're accumulating into `cur` for the current string.
     cap: Cap,
     cur: Vec<u8>,
+}
+
+/// What a scan keeps beside `model` ([`ModelScanner::feed_keeping`]): the values of a fixed set of
+/// key-level members. Held outside the scanner, by the one caller that wants them, so the scanner
+/// inline on every request stays the size it was (`RequestCtx`'s per-chunk size budget).
+pub struct Kept {
+    keys: &'static [&'static [u8]],
+    /// Walk past `model` until every key is found (the request-knob scan, whose keys may follow
+    /// `model`). A response scan stops at `model`: what precedes it is all it keeps.
+    past_model: bool,
+    /// The first value seen for each key, by index.
+    values: [Option<String>; MAX_EXTRAS],
+    /// The most recent key-level key was `keys[i]`.
+    last_key_extra: Option<u8>,
+    /// An object or array value of `keys[i]` is being captured raw.
+    raw: Option<u8>,
+    /// The depth outside that value: the capture ends when the depth returns to it.
+    raw_depth: u32,
+    raw_buf: Vec<u8>,
+}
+
+impl Kept {
+    fn with(keys: &'static [&'static [u8]], past_model: bool) -> Self {
+        Kept {
+            keys,
+            past_model,
+            values: Default::default(),
+            last_key_extra: None,
+            raw: None,
+            raw_depth: 0,
+            raw_buf: Vec::new(),
+        }
+    }
+
+    /// [`RESPONSE_EXTRA_KEYS`], for a [`ModelScanner::for_response`] scan.
+    pub fn response() -> Self {
+        Self::with(RESPONSE_EXTRA_KEYS, false)
+    }
+
+    /// [`REQUEST_KNOB_KEYS`], over a whole request body: fed to a [`ModelScanner::new`] scan,
+    /// which then walks the whole body (see `proxy::requested_knobs`).
+    pub fn request_knobs() -> Self {
+        Self::with(REQUEST_KNOB_KEYS, true)
+    }
+
+    /// The value captured for `keys[i]`, if one was seen.
+    pub fn get(&self, i: usize) -> Option<&str> {
+        self.values.get(i).and_then(|v| v.as_deref())
+    }
+
+    /// Take the value captured for `keys[i]`.
+    pub fn take(&mut self, i: usize) -> Option<String> {
+        self.values.get_mut(i).and_then(Option::take)
+    }
+
+    /// Keep `v` as the value of the key [`Self::last_key_extra`] names, or of the raw capture,
+    /// unless one was kept already.
+    fn keep(&mut self, k: u8, v: String) {
+        if let Some(slot) = self.values.get_mut(usize::from(k))
+            && slot.is_none()
+        {
+            *slot = Some(v);
+        }
+    }
+
+    fn all_found(&self) -> bool {
+        self.values
+            .iter()
+            .take(self.keys.len())
+            .all(Option::is_some)
+    }
+}
+
+/// Append to a raw capture, up to [`RAW_CAPTURE`] bytes.
+fn push_raw(buf: &mut Vec<u8>, bytes: &[u8]) {
+    let room = RAW_CAPTURE.saturating_sub(buf.len());
+    buf.extend_from_slice(bytes.get(..room.min(bytes.len())).unwrap_or_default());
 }
 
 impl ModelScanner {
@@ -120,8 +228,19 @@ impl ModelScanner {
         (self.depth == 1 && self.root_is_object) || (self.depth == 2 && self.in_message)
     }
 
-    #[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+    /// Feed the next bytes of the body.
     pub fn feed(&mut self, bytes: &[u8]) {
+        self.feed_inner(bytes, None);
+    }
+
+    /// Feed the next bytes, keeping the values of `kept`'s keys too. Every chunk of one body goes
+    /// to the same `kept`.
+    pub fn feed_keeping(&mut self, bytes: &[u8], kept: &mut Kept) {
+        self.feed_inner(bytes, Some(kept));
+    }
+
+    #[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+    fn feed_inner(&mut self, bytes: &[u8], mut kept: Option<&mut Kept>) {
         // Proof for the allow: every index is `i`/`j` with `i < n` (the loop condition, or a `memchr`
         // offset inside `bytes[i..]`), or a key span bounded by the closing quote just found; counters
         // (`i`, `j`, `depth`, `model_keys`) count bytes of a body that fits in memory, so they cannot
@@ -131,6 +250,8 @@ impl ModelScanner {
         }
         let mut i = 0;
         let n = bytes.len();
+        // Where the raw capture in progress starts in this chunk.
+        let mut raw_from = kept.as_ref().and_then(|k| k.raw).map(|_| 0);
         while i < n {
             if self.in_string {
                 // Fast path: the content of a string we don't accumulate (a big base64 image, a long
@@ -139,7 +260,8 @@ impl ModelScanner {
                 if self.cap == Cap::No && !self.escaped {
                     match memchr::memchr2(b'"', b'\\', &bytes[i..]) {
                         Some(rel) => i += rel,
-                        None => return, // rest of this chunk is skippable string content
+                        // The rest of this chunk is skippable string content.
+                        None => break,
                     }
                 }
                 let b = bytes[i];
@@ -156,6 +278,13 @@ impl ModelScanner {
                     match self.cap {
                         Cap::Key => {
                             self.last_key_is_model = self.cur == b"model";
+                            if let Some(k) = kept.as_deref_mut() {
+                                k.last_key_extra = k
+                                    .keys
+                                    .iter()
+                                    .position(|key| *key == self.cur.as_slice())
+                                    .and_then(|i| u8::try_from(i).ok());
+                            }
                             // Only a *root* `message` opens the nested scan — a `message` key inside
                             // the message object itself must not re-arm it.
                             if self.accept_message_nesting && self.depth == 1 {
@@ -167,12 +296,37 @@ impl ModelScanner {
                             // A valid JSON string value is UTF-8; if a malformed/adversarial body
                             // smuggles non-UTF-8 bytes here we record "unknown" rather than emitting
                             // a `U+FFFD`-corrupted model into the billing log. Either way we're done.
-                            self.model = Some(
-                                String::from_utf8(std::mem::take(&mut self.cur))
-                                    .unwrap_or_else(|_| "unknown".to_string()),
-                            );
-                            self.done = true;
-                            return;
+                            let v = String::from_utf8(std::mem::take(&mut self.cur))
+                                .unwrap_or_else(|_| "unknown".to_string());
+                            match kept.as_deref() {
+                                // A knob scan keeps walking; the first `model` is the one kept.
+                                Some(k) if k.past_model => {
+                                    self.model.get_or_insert(v);
+                                    if k.all_found() {
+                                        self.done = true;
+                                        return;
+                                    }
+                                }
+                                _ => {
+                                    self.model = Some(v);
+                                    self.done = true;
+                                    return;
+                                }
+                            }
+                        }
+                        Cap::Extra => {
+                            if let Some(k) = kept.as_deref_mut()
+                                && let Some(idx) = k.last_key_extra
+                            {
+                                // Not UTF-8: dropped, never written to a row as a corrupted value.
+                                if let Ok(v) = String::from_utf8(std::mem::take(&mut self.cur)) {
+                                    k.keep(idx, v);
+                                }
+                                if k.past_model && k.all_found() {
+                                    self.done = true;
+                                    return;
+                                }
+                            }
                         }
                         Cap::No => {}
                     }
@@ -186,6 +340,7 @@ impl ModelScanner {
 
             let b = bytes[i];
             i += 1;
+            let extra = kept.as_ref().and_then(|k| k.last_key_extra);
             match b {
                 b'"' => {
                     self.in_string = true;
@@ -197,12 +352,29 @@ impl ModelScanner {
                             Cap::Key
                         } else if self.last_key_is_model {
                             Cap::ModelValue
+                        } else if extra.is_some() {
+                            Cap::Extra
                         } else {
                             Cap::No
                         }
                     } else {
                         Cap::No
                     };
+                }
+                b'{' | b'['
+                    if extra.is_some()
+                        && !self.expect_key
+                        && self.at_key_level()
+                        && kept.as_ref().is_some_and(|k| k.raw.is_none()) =>
+                {
+                    // An object or array value of a kept key: captured raw until its depth closes.
+                    if let Some(k) = kept.as_deref_mut() {
+                        k.raw = extra;
+                        k.raw_depth = self.depth;
+                        k.raw_buf.clear();
+                    }
+                    raw_from = Some(i - 1);
+                    self.depth += 1;
                 }
                 b'{' => {
                     if self.depth == 0 {
@@ -228,6 +400,20 @@ impl ModelScanner {
                         self.last_key_is_message = false;
                     }
                     self.depth = self.depth.saturating_sub(1);
+                    if let Some(k) = kept.as_deref_mut()
+                        && let Some(idx) = k.raw
+                        && self.depth == k.raw_depth
+                    {
+                        push_raw(&mut k.raw_buf, &bytes[raw_from.unwrap_or(0)..i]);
+                        raw_from = None;
+                        k.raw = None;
+                        let v = utf8_prefix(std::mem::take(&mut k.raw_buf));
+                        k.keep(idx, v);
+                        if k.past_model && k.all_found() {
+                            self.done = true;
+                            return;
+                        }
+                    }
                 }
                 // Unguarded by depth: a `:` or `,` inside a nested value is always followed by
                 // the key-level `,` or `}` that closes it before the next key-level string, and
@@ -236,12 +422,35 @@ impl ModelScanner {
                 b',' => {
                     self.expect_key = true;
                     self.last_key_is_model = false;
+                    if let Some(k) = kept.as_deref_mut() {
+                        k.last_key_extra = None;
+                    }
                     if self.depth == 1 {
                         self.last_key_is_message = false;
                     }
                 }
                 _ => {}
             }
+        }
+        if let Some(k) = kept
+            && k.raw.is_some()
+            && let Some(from) = raw_from
+        {
+            push_raw(&mut k.raw_buf, &bytes[from..n]);
+        }
+    }
+}
+
+/// The whole UTF-8 characters at the front of `buf`: a capture cut inside a character keeps the
+/// ones before it, never a corrupted value.
+fn utf8_prefix(buf: Vec<u8>) -> String {
+    match String::from_utf8(buf) {
+        Ok(v) => v,
+        Err(e) => {
+            let up_to = e.utf8_error().valid_up_to();
+            let mut b = e.into_bytes();
+            b.truncate(up_to);
+            String::from_utf8(b).unwrap_or_default()
         }
     }
 }
@@ -1181,6 +1390,11 @@ pub fn structure(b: &[u8]) -> Structure {
     }
     s
 }
+
+#[cfg(test)]
+#[path = "peek_kept_tests.rs"]
+#[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+mod kept_tests;
 
 #[cfg(test)]
 #[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]

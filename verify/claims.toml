@@ -858,7 +858,7 @@ touches = [
   "crates/gateway/src/control.rs",
   "crates/gateway/src/secret.rs",
 ]
-defects = ["D04"]
+defects = ["D04", "D266"]
 
 [[claim]]
 id = "SEC-7"
@@ -1475,6 +1475,21 @@ touches = [
 ]
 defects = ["D70"]
 
+[[claim]]
+id = "BIL-23"
+priority = "P1"
+group = "Billing integrity"
+text = "Every fact a pricer needs is on the ai.usage row: requested and served tier, speed and geography, server tools by kind, the serving endpoint, the vendor's ids and own cost, and which counts are estimates"
+layer = "hermetic"
+touches = [
+  "crates/gateway/src/usage.rs",
+  "crates/gateway/src/usage/tools.rs",
+  "crates/gateway/src/usage/vendor.rs",
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/peek.rs",
+]
+defects = ["D268"]
+
 # --- Reliability -------------------------------------------------------------------------------
 [[claim]]
 id = "REL-1"
@@ -1968,6 +1983,7 @@ defects = [
   "D171",
   "D181",
   "D182",
+  "D266",
 ]
 
 [[claim]]

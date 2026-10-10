@@ -247,7 +247,7 @@ async fn fireworks_path_prefix_strips_and_swaps_pool_key() {
                     &u,
                     "/fireworks/inference/v1/chat/completions",
                     &k,
-                    body_for("accounts/fireworks/models/llama-v3p1-70b-instruct"),
+                    body_for("accounts/fireworks/models/gpt-oss-120b"),
                 )
                 .await
             }

@@ -73,7 +73,7 @@ use crate::route::{self, Dialect, Provider};
 use crate::signed_id;
 use crate::state::{GatewayState, RequestId};
 use crate::terminal::TerminalTracker;
-use crate::{control, peek, pin, remedy, translate, usage};
+use crate::{control, peek, pin, remedy, translate, unpriced, usage};
 use arrayvec::{ArrayString, ArrayVec};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -435,10 +435,15 @@ pub struct RequestCtx {
     /// request body" — scoped to the managed OpenAI chat/completions path (see `is_streamable_path`)
     /// and bounded by `MAX_REQUEST_BODY`. BYO and every other request still stream straight through.
     inject_eligible: bool,
-    /// Managed `/{provider}/…/responses`: buffer the body (as `inject_eligible` does) so a
-    /// `background: true` request is refused before any byte of it goes upstream (D202). A catalog
-    /// walk reads its body in `request_filter` and refuses there.
-    background_check: bool,
+    /// Managed `/{provider}/…` billable call (every allowlisted endpoint but the free token
+    /// counts): buffer the body (as `inject_eligible` does) so a request whose root `model` names
+    /// no catalog row ([`price_row`]) is refused before any byte of it goes upstream, with the
+    /// catalog walk's 404. A managed key runs priced models only (D267). BYO keys never set it.
+    ///
+    /// The same buffer refuses a `/responses` body's `background: true` (D202): that endpoint is
+    /// billable, so it is always checked here (a catalog walk reads its body in `request_filter`
+    /// and refuses there).
+    catalog_check: bool,
     /// Accumulated request body — populated only when `inject_eligible`; otherwise stays empty and
     /// the body is never buffered.
     req_buf: Vec<u8>,
@@ -525,6 +530,212 @@ pub struct RequestCtx {
     /// for this tenant, and the ids the client sent were verified and are stripped back in
     /// `request_body_filter`. Boxed: `None` on every other request.
     signed: Option<Box<signed_id::Relay>>,
+    /// Billing facts tapped beside the usage block ([`BillingTaps`]): managed only, created at the
+    /// first fact. Boxed for [`ModelRouting`]'s reason; `None` on every BYO request.
+    taps: Option<Box<BillingTaps>>,
+}
+
+/// Billing facts a managed request taps beside its usage block, for the `ai.usage` row.
+#[derive(Default)]
+struct BillingTaps {
+    /// The request's price knobs ([`peek::REQUEST_KNOB_KEYS`]), fed as the body streams only when
+    /// no copy of it will be left for `logging` (`tally_eager`); otherwise `logging` scans the copy
+    /// (see [`requested_knobs`]).
+    knobs: Option<(peek::ModelScanner, peek::Kept)>,
+    /// What `resp_model_scanner` keeps beside the model: the response's id and serving host
+    /// ([`peek::RESPONSE_EXTRA_KEYS`]).
+    resp_kept: Option<peek::Kept>,
+    /// Hosted-tool items of a Responses answer (see [`usage::ToolTally`]).
+    tools: Option<usage::ToolTally>,
+    /// OpenRouter's `X-Generation-Id` response header: the id its generation API takes.
+    generation_id: Option<usage::IdStr>,
+    /// The vendor's request id header (`request-id`, `x-request-id`, `x-amzn-requestid`): what its
+    /// support and logs key on.
+    request_id: Option<usage::IdStr>,
+    /// The request offers OpenAI's `web_search_preview` tool: its `web_search_call` items are
+    /// counted as `web_search_preview`, priced apart (see `unpriced::Inspection`).
+    web_search_preview: bool,
+}
+
+/// What a request asked for that changes its price, as the client sent it (the served values come
+/// from the response). String knobs are kept when they are short tokens; object and array knobs
+/// (`provider`, `plugins`, an object `container`) as raw JSON, at most [`peek::RAW_CAPTURE`] bytes.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct RequestedKnobs {
+    pub service_tier: Option<usage::ServiceTier>,
+    pub speed: Option<usage::ServiceTier>,
+    pub inference_geo: Option<usage::ServiceTier>,
+    pub provider_routing: Option<String>,
+    pub plugins: Option<String>,
+    pub container: Option<String>,
+}
+
+impl RequestedKnobs {
+    fn from_scan(mut s: peek::Kept) -> Self {
+        let tier = |v: Option<String>| v.as_deref().and_then(usage::tier_from);
+        // A raw value is JSON the scanner copied byte for byte; a string knob arrives unquoted.
+        let raw = |v: Option<String>| v.filter(|v| !v.is_empty());
+        RequestedKnobs {
+            service_tier: tier(s.take(0)),
+            speed: tier(s.take(1)),
+            inference_geo: tier(s.take(2)),
+            provider_routing: raw(s.take(3)),
+            plugins: raw(s.take(4)),
+            container: raw(s.take(5)),
+        }
+    }
+}
+
+/// The request's price knobs: from the scan fed as the body streamed (`tally_eager`), else from
+/// the body `logging` still holds — the `FullBody` parent's copy or pingora's retry buffer, the
+/// copies [`input_estimate`] reads. That is the client's body, before any rewrite.
+fn requested_knobs(session: &Session, rc: &mut RequestCtx) -> RequestedKnobs {
+    if let Some((_, k)) = rc.taps.as_mut().and_then(|t| t.knobs.take()) {
+        return RequestedKnobs::from_scan(k);
+    }
+    let mut kept = peek::Kept::request_knobs();
+    if let Some(body) = full_body_ctx(session)
+        .map(|fb| fb.body)
+        .or_else(|| session.as_ref().get_retry_buffer())
+    {
+        peek::ModelScanner::new().feed_keeping(&body, &mut kept);
+    }
+    RequestedKnobs::from_scan(kept)
+}
+
+/// Which price a provider applies to the endpoint that served, where one provider has several:
+/// Bedrock's `global.` inference profiles are its base price, and its geographic profiles (`us.`,
+/// `eu.`, `jp.`, `au.`, `apac.`) and single-region model ids carry a 10% premium on Claude 4.5
+/// and later; OpenRouter's in-region hosts (`us.openrouter.ai`, `eu.openrouter.ai`) pass on the
+/// provider's regional surcharge. `None` where the provider has one price.
+fn price_variant(provider: &str, upstream_model: &str, host: &str) -> Option<&'static str> {
+    match provider {
+        "bedrock" => Some(if upstream_model.starts_with("global.") {
+            "global"
+        } else {
+            "regional"
+        }),
+        "openrouter" => {
+            (host != "openrouter.ai" && host.ends_with(".openrouter.ai")).then_some("regional")
+        }
+        _ => None,
+    }
+}
+
+/// Providers documented to keep generating, and billing, after the client disconnects
+/// mid-stream: a cancelled row's tokens are what was relayed, not what was billed.
+const MAY_CONTINUE_PROVIDERS: [&str; 3] = ["openrouter", "bedrock", "groq"];
+
+/// Whether this row's provider may have generated (and billed) past the point the row counts:
+/// a stream the client cancelled, or one cut short, on a provider in [`MAY_CONTINUE_PROVIDERS`].
+fn upstream_may_continue(provider: Option<&str>, outcome: &str, streaming: bool) -> bool {
+    streaming
+        && matches!(outcome, "client_cancelled" | "cut_short")
+        && provider.is_some_and(|p| MAY_CONTINUE_PROVIDERS.contains(&p))
+}
+
+/// The upstream response header carrying the vendor's request id, in the order they are tried.
+const REQUEST_ID_HEADERS: [&str; 3] = ["request-id", "x-request-id", "x-amzn-requestid"];
+
+/// At a managed response head: read the vendor's ids from its headers, and start counting
+/// hosted-tool items when a Responses endpoint answered. A few map lookups per response; a fresh
+/// tally per head, so an earlier attempt's never leaks into the one that serves.
+fn tap_response_head(rc: &mut RequestCtx, resp: &ResponseHeader) {
+    let header_id = |name: &str| {
+        resp.headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .and_then(usage::id_from)
+    };
+    let generation_id = header_id("x-generation-id");
+    let request_id = REQUEST_ID_HEADERS.iter().find_map(|h| header_id(h));
+    let responses = match rc.auto.as_ref() {
+        Some(a) => catalog_serving_endpoint(a) == Some(route::Endpoint::Responses),
+        None => {
+            rc.dialect == Dialect::OpenAi
+                && rc.forward_path.as_deref().is_some_and(|p| {
+                    let p = p.split_once('?').map_or(p, |(path, _)| path);
+                    p.ends_with("/responses") || p.ends_with("/responses/compact")
+                })
+        }
+    };
+    // Always made on a managed response: `resp_model_scanner` keeps the response's id in it.
+    let taps = rc.taps.get_or_insert_with(Box::default);
+    taps.generation_id = generation_id;
+    taps.request_id = request_id;
+    taps.tools = responses.then(|| usage::ToolTally::new(rc.streaming));
+}
+
+/// Fold what the taps saw into the row's usage: the header generation id over the body's (the
+/// response scanner's, from the head, over the usage block's), the serving host the head named,
+/// and the Responses tool items.
+fn merge_taps(rc: &mut RequestCtx, usage: &mut usage::Usage) {
+    let Some(t) = rc.taps.as_mut() else { return };
+    let head_id = t
+        .resp_kept
+        .as_ref()
+        .and_then(|k| k.get(0))
+        .and_then(usage::id_from);
+    let head_host = t
+        .resp_kept
+        .as_ref()
+        .and_then(|k| k.get(1))
+        .and_then(usage::host_from);
+    let (hdr_id, tools, preview) = (t.generation_id, t.tools.take(), t.web_search_preview);
+    if let Some(id) = hdr_id.or(head_id) {
+        usage.upstream.generation_id = Some(id);
+    }
+    if head_host.is_some() {
+        usage.upstream.served_by = head_host;
+    }
+    if let Some(mut t) = tools {
+        t.finish();
+        let mut counted = t.tools;
+        if preview {
+            counted.web_search_preview = counted.web_search;
+            counted.web_search = 0;
+        }
+        usage.server_tools.merge_max(&counted);
+        if usage.upstream.container_id.is_none() {
+            usage.upstream.container_id = t.container_id;
+        }
+        usage.server_tool_calls = usage
+            .server_tool_calls
+            .max(u64::from(usage.server_tools.web_search));
+    }
+}
+
+/// Which of a row's counts an estimate replaced (see `logging`), and what the estimate cannot see.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct EstimatedParts {
+    input: bool,
+    output: bool,
+}
+
+impl EstimatedParts {
+    /// The row's `usage_estimated_parts`: `input`, `output`, `input,output`, or absent.
+    fn parts(self) -> Option<&'static str> {
+        match (self.input, self.output) {
+            (true, true) => Some("input,output"),
+            (true, false) => Some("input"),
+            (false, true) => Some("output"),
+            (false, false) => None,
+        }
+    }
+
+    /// The row's `usage_estimate_excludes`: `cache` when the input is estimated (the pre-token
+    /// count is the whole prompt as plain input: some of it may have been cache reads, cheaper, or
+    /// cache writes, dearer), `reasoning` when the output is estimated and the provider reported no
+    /// reasoning count (hidden reasoning is billed as output and invisible in the stream).
+    fn excludes(self, u: &usage::Usage) -> Option<&'static str> {
+        let reasoning = self.output && u.reasoning_tokens.is_none();
+        match (self.input, reasoning) {
+            (true, true) => Some("cache,reasoning"),
+            (true, false) => Some("cache"),
+            (false, true) => Some("reasoning"),
+            (false, false) => None,
+        }
+    }
 }
 
 /// Scrubs a managed error body (status >= 400) as it streams past: the pool key the attempt sent
@@ -736,12 +947,27 @@ fn h2_body_unsent(e: &pingora_core::Error) -> bool {
 ///
 /// The request deadline passing ([`is_deadline`]) is the gateway giving up too, as a read timeout
 /// is: a provider still working on a delivered request bills its prompt.
+///
+/// Not the gateway's own refusal of a body it withheld (a downstream-tagged status from
+/// `request_body_filter`: a catalog miss, a duplicate `model`, `background`, a foreign id, the
+/// body budget). The client read in full, but the provider never had the body's last byte, so
+/// nothing was waited on and nothing is billed (D267).
 fn gave_up_waiting(e: &pingora_core::Error) -> bool {
     match e.esource() {
-        pingora_core::ErrorSource::Downstream => true,
+        pingora_core::ErrorSource::Downstream => !gateway_refusal(e),
         pingora_core::ErrorSource::Upstream => e.etype() == &pingora_core::ErrorType::ReadTimedout,
         _ => is_deadline(e),
     }
+}
+
+/// Whether `e` is the gateway's own answer to the client (a `CustomCode` or `HTTPStatus` tagged
+/// downstream: a catalog miss, a duplicate `model`, `background`, a foreign id, an oversized body),
+/// not the client going away. Before any response head, such a request never reached a provider
+/// whole, so it bills nothing and writes no `ai.usage` row (rejections write none, D267).
+fn gateway_refusal(e: &pingora_core::Error) -> bool {
+    use pingora_core::ErrorType::{CustomCode, HTTPStatus};
+    e.esource() == &pingora_core::ErrorSource::Downstream
+        && matches!(e.etype(), CustomCode(..) | HTTPStatus(_))
 }
 
 /// Whether the upstream refused this request's HTTP/2 stream with a GOAWAY, one shape of
@@ -905,6 +1131,9 @@ struct ModelRouting {
     /// Seconds until the soonest skipped open breaker admits a request, for the `Retry-After` on
     /// the 503 when every candidate was skipped. `None` while no breaker skipped one.
     open_retry_after: Option<u16>,
+    /// The client asked for priority processing (`route::SpeedAsk::Priority`): an attempt
+    /// translated onto a candidate that serves fast mode asks it for fast mode (D266).
+    priority: bool,
 }
 
 /// A 2xx's held-back health verdict, waiting on the body to say whether it is an answer.
@@ -1078,17 +1307,15 @@ impl RequestCtx {
     ///   translating between Chat Completions, Messages and Responses when the wires differ, and
     ///   the same-wire edits a walk makes (the output-limit cap, `max_tokens` respelled for native
     ///   OpenAI, dropped nulls and unreplayable reasoning).
-    /// - `background_check`: a managed `/{provider}/…/responses` body is held whole so a
-    ///   `background: true` is refused before any byte goes upstream (D202).
+    /// - `catalog_check`: a managed `/{provider}/…` billable body is held whole so a model outside
+    ///   the catalog (D267), or a `/responses` body's `background: true` (D202), is refused before
+    ///   any byte goes upstream.
     /// - `signed`: a managed Responses relay to a provider's store swaps each tenant-signed id for
     ///   the provider's (`signed_id`, D230).
     ///
     /// Several can apply to the same request, in which case every edit is made to the one buffer.
     fn rewrites_body(&self) -> bool {
-        self.inject_eligible
-            || self.background_check
-            || self.auto.is_some()
-            || self.signed.is_some()
+        self.inject_eligible || self.catalog_check || self.auto.is_some() || self.signed.is_some()
     }
 
     /// Whether the bytes sent to the client are watched for the stream's terminal event
@@ -1169,6 +1396,9 @@ impl RequestCtx {
         self.body_bytes_fed = 0;
         self.model_scanner = peek::ModelScanner::new();
         self.input_tally = usage::InputTally::default();
+        if let Some(k) = self.taps.as_mut().and_then(|t| t.knobs.as_mut()) {
+            *k = (peek::ModelScanner::new(), peek::Kept::request_knobs());
+        }
     }
 }
 
@@ -1614,13 +1844,7 @@ impl AiProxy {
         request_id: &str,
         name: Option<&str>,
     ) -> Result<bool> {
-        let msg = match name.map(str::trim).filter(|s| !s.is_empty()) {
-            None => {
-                "missing model: set the JSON body's model (or x-beyond-model) to a catalog name"
-                    .to_string()
-            }
-            Some(n) => format!("model \"{}\" is not in the catalog", clip_catalog_name(n)),
-        };
+        let msg = catalog_miss_message(name, true);
         Self::reject_message_boxed(session, request_id, 404, "invalid_request_error", msg).await
     }
 
@@ -2012,7 +2236,8 @@ const MANAGED_FORWARD_HEADERS: [&str; 8] = [
 /// long-context pricing, `mcp-client-*` / `code-execution-*` / `files-api-*` reach servers, sandboxes
 /// and storage on Beyond's account, and `oauth-*` is meaningless beside a pool API key. The gateway's
 /// own [`translate::THINKING_BINDING_BETA`] is listed too, so a Messages client on a binding model
-/// may send it itself.
+/// may send it itself. Fast mode's beta is not here: it doubles the per-token price, and is kept
+/// only on a request to direct Anthropic (see [`retain_managed_client_headers`]).
 const MANAGED_ANTHROPIC_BETAS: [&str; 8] = [
     "claude-code-20250219",
     "prompt-caching-2024-07-31",
@@ -2025,20 +2250,27 @@ const MANAGED_ANTHROPIC_BETAS: [&str; 8] = [
 ];
 
 /// Drop every client header a managed request may not forward ([`MANAGED_FORWARD_HEADERS`]), and
-/// every `anthropic-beta` token not in [`MANAGED_ANTHROPIC_BETAS`]. The header sweep allocates
-/// nothing (D92: it collected the names into a `Vec` on nearly every managed request); only an
-/// `anthropic-beta` value with a token to drop is rebuilt.
-fn retain_managed_client_headers(req: &mut pingora::http::RequestHeader) -> Result<()> {
+/// every `anthropic-beta` token not in [`MANAGED_ANTHROPIC_BETAS`], less
+/// [`translate::FAST_MODE_BETA`] when `anthropic` (the attempt goes to direct Anthropic, the only
+/// provider with fast mode). Fast mode is a product Beyond sells at its price: the row records the
+/// speed asked and the speed served (`usage.speed`), so it is billed as served (D266). The header
+/// sweep allocates nothing (D92: it collected the names into a `Vec` on nearly every managed
+/// request); only an `anthropic-beta` value with a token to drop is rebuilt.
+fn retain_managed_client_headers(
+    req: &mut pingora::http::RequestHeader,
+    anthropic: bool,
+) -> Result<()> {
+    let allowed = |t: &str| {
+        MANAGED_ANTHROPIC_BETAS.contains(&t) || (anthropic && t == translate::FAST_MODE_BETA)
+    };
     remove_headers_where(req, |name| !MANAGED_FORWARD_HEADERS.contains(&name));
     let betas = req.headers.get_all("anthropic-beta");
     let mut values = betas.iter();
     let clean = match (values.next(), values.next()) {
         (None, _) => true,
-        (Some(v), None) => v.to_str().is_ok_and(|v| {
-            v.split(',')
-                .map(str::trim)
-                .all(|t| MANAGED_ANTHROPIC_BETAS.contains(&t))
-        }),
+        (Some(v), None) => v
+            .to_str()
+            .is_ok_and(|v| v.split(',').map(str::trim).all(allowed)),
         _ => false,
     };
     if !clean {
@@ -2047,7 +2279,7 @@ fn retain_managed_client_headers(req: &mut pingora::http::RequestHeader) -> Resu
             .filter_map(|v| v.to_str().ok())
             .flat_map(|v| v.split(','))
             .map(str::trim)
-            .filter(|t| MANAGED_ANTHROPIC_BETAS.contains(t))
+            .filter(|t| allowed(t))
             .collect::<Vec<_>>()
             .join(",");
         req.remove_header("anthropic-beta");
@@ -2277,11 +2509,18 @@ fn sanitize_model(model: String) -> Cow<'static, str> {
 /// provider-routed row's `model` matches nothing. Runs once per billing row, on strings that are
 /// already in hand.
 fn price_model(billed: &str, requested: &str) -> Option<&'static str> {
-    [billed, requested].into_iter().find_map(|m| {
-        route::model_route(m)
-            .or_else(|| strip_snapshot_date(m).and_then(route::model_route))
-            .map(|r| r.model)
-    })
+    [billed, requested]
+        .into_iter()
+        .find_map(|m| price_row(m).map(|r| r.model))
+}
+
+/// The catalog row one model id prices at: as spelled (a catalog name, or any candidate's
+/// provider-specific spelling of it), then with a dated snapshot suffix removed. The one lookup
+/// both [`price_model`] and the managed `/{provider}` refusal ([`RequestCtx::catalog_check`])
+/// make on the requested model, so a managed `/{provider}` request is refused exactly when its
+/// requested model would leave its billing row without a `price_model`.
+fn price_row(m: &str) -> Option<&'static route::ModelRoute> {
+    route::model_route(m).or_else(|| strip_snapshot_date(m).and_then(route::model_route))
 }
 
 /// `m` without a trailing `-YYYY-MM-DD` (OpenAI) or `-YYYYMMDD` (Anthropic) snapshot date.
@@ -2989,6 +3228,30 @@ fn gateway_error(status: u16, msg: &'static str) -> Box<pingora_core::Error> {
     pingora_core::Error::new(pingora_core::ErrorType::CustomCode(msg, status))
 }
 
+/// The [`gateway_error`] tag for a managed `/{provider}` body whose model names no catalog row
+/// (D267). Never shown as is: `fail_to_proxy` answers it with [`catalog_miss_message`] for the
+/// model the request carried, the catalog walk's own 404.
+const CATALOG_MISS: &str = "model is not in the catalog";
+
+/// The catalog-miss message, for the catalog walk (`reject_catalog_miss`) and for a managed
+/// `/{provider}` body (D267) alike: the model by name (clipped), or that none was sent, and where
+/// the models a managed key can use are listed.
+/// `header`: whether the route reads `x-beyond-model` (a catalog walk does, `/{provider}` does not).
+fn catalog_miss_message(name: Option<&str>, header: bool) -> String {
+    match name.map(str::trim).filter(|s| !s.is_empty()) {
+        None => format!(
+            "missing model: set the JSON body's model{} to a catalog name; GET /v1/models lists \
+             them",
+            if header { " (or x-beyond-model)" } else { "" }
+        ),
+        Some(n) => format!(
+            "model \"{}\" is not in the catalog; a managed key runs catalog models only (GET \
+             /v1/models lists them)",
+            clip_catalog_name(n)
+        ),
+    }
+}
+
 /// The 504 for a request that outlived `request_max_secs` before its response head.
 const REQUEST_DEADLINE: &str = "request exceeded the gateway's maximum duration";
 
@@ -3251,6 +3514,32 @@ fn apply_serving_candidate(rc: &mut RequestCtx) {
 fn catalog_serving_endpoint(auto: &ModelRouting) -> Option<route::Endpoint> {
     auto.candidate_at(auto.candidate)
         .map(|c| route::Endpoint::of_upstream_path(c.path))
+}
+
+/// Whether this attempt, translated onto candidate `c`, asks it for Anthropic fast mode: the client
+/// asked for priority processing and `c` serves fast mode (D266). One decision for the attempt's
+/// `anthropic-beta` header and its translated body, so the two never disagree.
+fn translated_fast(auto: &ModelRouting, c: &route::Candidate) -> bool {
+    auto.priority && providers::catalog::serves_fast_mode(c)
+}
+
+/// Add `beta` to the request's `anthropic-beta` value, unless it is already there.
+fn merge_anthropic_beta(req: &mut pingora::http::RequestHeader, beta: &'static str) -> Result<()> {
+    let existing = req
+        .headers
+        .get("anthropic-beta")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+    match existing {
+        Some(v) if v.split(',').any(|b| b.trim() == beta) => {}
+        Some(v) => {
+            let merged = format!("{v},{beta}");
+            req.insert_header("anthropic-beta", merged)?;
+        }
+        None => req.insert_header("anthropic-beta", beta)?,
+    }
+    Ok(())
 }
 
 fn catalog_translating(auto: &ModelRouting) -> bool {
@@ -4270,6 +4559,8 @@ impl ProxyHttp for AiProxy {
         // Model routing is **managed-only**, and the first candidate is chosen here.
         let mut walk = control::Walk::identity(0);
         let mut walk_arms: &'static [route::Candidate] = &[];
+        // The client asked for priority processing (`route::SpeedAsk::Priority`, D266).
+        let mut priority = false;
         let inbound_responses =
             model_route.is_some() && route::is_responses_path(session.req_header().uri.path());
         let session_field = match &full_body {
@@ -4438,6 +4729,32 @@ impl ProxyHttp for AiProxy {
                     (None, Some(b)) => route::unserved(arms, b),
                     (None, None) => 0,
                 };
+                // Anthropic fast mode (D266). A Messages client's `speed: "fast"` is served fast or
+                // refused, as Anthropic itself does: only a candidate that serves fast mode may
+                // take it, and a walk with none is a 400 here rather than an answer at standard
+                // speed (or Bedrock's own refusal) under a fast request. A Chat Completions or
+                // Responses client's `service_tier: "priority"` is a best effort and moves nothing:
+                // it is mapped to fast mode on whichever attempt reaches a candidate that serves it.
+                if sub.is_none() {
+                    let scanned = match &full_body {
+                        Some(fb) => Some(&fb.body[..]),
+                        None => body_complete.as_deref(),
+                    };
+                    let client = route::implied_endpoint(session.req_header().uri.path());
+                    match scanned.map(|b| route::speed_ask(client, b)) {
+                        Some(route::SpeedAsk::Fast) => {
+                            let slow = route::fast_unserved(arms);
+                            if walk.mask() & !slow == 0 {
+                                return self
+                                    .reject_refused_input(session, &request_id, row, "fast mode")
+                                    .await;
+                            }
+                            dispatchable &= !slow;
+                        }
+                        Some(route::SpeedAsk::Priority) => priority = true,
+                        _ => {}
+                    }
+                }
                 let walked = walk.mask();
                 if dispatchable & walked & !unserved != 0 {
                     dispatchable &= !unserved;
@@ -4661,18 +4978,22 @@ impl ProxyHttp for AiProxy {
         // passthrough), OpenAI dialect only, streaming-capable paths only — so everything else still
         // streams through untouched. Checked on the forwarded path (suffix), so it's prefix-agnostic.
         let inject_eligible = managed && dialect == Dialect::OpenAi && forward_streamable;
-        // A managed `/{provider}/…/responses` body is buffered too, so `background: true` (a
-        // generation the provider runs after the request ends, which no usage tap can meter) is
-        // refused before a byte of it goes upstream (D202). A catalog walk checked its body above.
-        let background_check = managed
+        // Every billable managed `/{provider}/…` body is buffered too, so a model outside the
+        // catalog is refused before a byte of it goes upstream: a managed key runs only what its
+        // billing row can price (D267). So is a `/responses` body's `background: true` (a
+        // generation the provider runs after the request ends, which no usage tap can meter,
+        // D202). The free token counts are left to stream: nothing there bills. A catalog walk
+        // checked its body above.
+        let catalog_check = managed
             && provider_route
-            && forward_path.as_deref().is_some_and(|p| {
-                route::forward_is_responses(p.split_once('?').map_or(p, |(p, _)| p))
-            });
+            && forward_path
+                .as_deref()
+                .and_then(route::forward_endpoint)
+                .is_some_and(|e| e.sub.is_none_or(route::SubResource::billed));
         // That buffer counts against the body budget. A declared large body reserves up front,
         // before the tenant slot and the breaker permit, so a refusal holds neither; a chunked one
         // reserves as it grows (`request_body_filter`).
-        if (inject_eligible || background_check)
+        if (inject_eligible || catalog_check)
             && model_route.is_none()
             && let Some(n) = declared_len.filter(|&n| past_replay_buffer(n))
             && !ctx.held.reserve_body(n)
@@ -4761,7 +5082,7 @@ impl ProxyHttp for AiProxy {
                     // was never incremented. The stored `hit.streaming` is emitted on `ai.usage`.
                     streaming: false,
                     inject_eligible: false,
-                    background_check: false,
+                    catalog_check: false,
                     req_buf: Vec::new(),
                     resp_tail: UsageTail::default(),
                     resp_head: Vec::new(),
@@ -4786,12 +5107,13 @@ impl ProxyHttp for AiProxy {
                             arms: walk_arms,
                             session_field,
                             attempt_start: start,
-                            cache: Some(cache::Pending::Hit(hit)),
+                            cache: Some(cache::Pending::Hit(Box::new(hit))),
                             translate: None,
                             health: None,
                             addrs: 0,
                             attempted: false,
                             open_retry_after: None,
+                            priority,
                         })
                     }),
                     request_id,
@@ -4802,6 +5124,7 @@ impl ProxyHttp for AiProxy {
                     redact: None,
                     terminal: TerminalTracker::default(),
                     signed: None,
+                    taps: None,
                 });
                 ctx.held.admit();
                 return Ok(true);
@@ -4909,7 +5232,7 @@ impl ProxyHttp for AiProxy {
             resp_model_scanner: peek::ModelScanner::for_response(),
             streaming: false,
             inject_eligible,
-            background_check,
+            catalog_check,
             // Pre-sized below, once the context says whether this request rewrites its body.
             req_buf: Vec::new(),
             // Grown lazily by the response tap (`response_body_filter`), not pre-reserved: a
@@ -4952,6 +5275,7 @@ impl ProxyHttp for AiProxy {
                     addrs: 0,
                     attempted: false,
                     open_retry_after: None,
+                    priority,
                 })
             }),
             request_id,
@@ -4962,6 +5286,7 @@ impl ProxyHttp for AiProxy {
             redact: None,
             terminal: TerminalTracker::default(),
             signed,
+            taps: None,
         });
         // A body buffered for a rewrite (`RequestCtx::rewrites_body`) is pre-sized from the
         // declared Content-Length, so accumulation is a single allocation instead of a geometric
@@ -5457,7 +5782,7 @@ impl ProxyHttp for AiProxy {
             //
             // The allowlist would drop these too; they are removed by name so this invariant does
             // not hang on the list's contents.
-            retain_managed_client_headers(upstream_request)?;
+            retain_managed_client_headers(upstream_request, rc.provider.name == "anthropic")?;
             upstream_request.remove_header("authorization");
             for header in STATIC_KEY_HEADERS {
                 upstream_request.remove_header(header);
@@ -5535,21 +5860,15 @@ impl ProxyHttp for AiProxy {
             && let Some(c) = a.candidate_at(a.candidate)
             && c.provider == providers::ProviderId::Anthropic
             && route::Endpoint::of_upstream_path(c.path) == route::Endpoint::Messages
-            && let Some(beta) = translate::messages_beta(c.upstream_model)
         {
-            let existing = upstream_request
-                .headers
-                .get("anthropic-beta")
-                .and_then(|v| v.to_str().ok())
-                .map(str::trim)
-                .filter(|v| !v.is_empty());
-            match existing {
-                Some(v) if v.split(',').any(|b| b.trim() == beta) => {}
-                Some(v) => {
-                    let merged = format!("{v},{beta}");
-                    upstream_request.insert_header("anthropic-beta", merged)?;
-                }
-                None => upstream_request.insert_header("anthropic-beta", beta)?,
+            if let Some(beta) = translate::messages_beta(c.upstream_model) {
+                merge_anthropic_beta(upstream_request, beta)?;
+            }
+            // A Chat Completions or Responses client's `service_tier: "priority"`, translated to
+            // fast mode on a candidate that serves it (D266). The same decision makes
+            // `translate::request_with_tools` add `speed: "fast"` to this attempt's body.
+            if translated_fast(a, c) {
+                merge_anthropic_beta(upstream_request, translate::FAST_MODE_BETA)?;
             }
         }
 
@@ -5608,7 +5927,7 @@ impl ProxyHttp for AiProxy {
 
     async fn request_body_filter(
         &self,
-        _session: &mut Session,
+        session: &mut Session,
         body: &mut Option<Bytes>,
         end_of_stream: bool,
         ctx: &mut Self::CTX,
@@ -5669,6 +5988,18 @@ impl ProxyHttp for AiProxy {
             // everywhere else the estimate is made there, and only when a row needs one.
             if rc.tally_eager {
                 rc.input_tally.feed(chunk);
+                // The price knobs, for the same reason: no copy of this body is left for
+                // `logging` to read (see `requested_knobs`).
+                if rc.managed {
+                    let (scan, kept) = rc
+                        .taps
+                        .get_or_insert_with(Box::default)
+                        .knobs
+                        .get_or_insert_with(|| {
+                            (peek::ModelScanner::new(), peek::Kept::request_knobs())
+                        });
+                    scan.feed_keeping(chunk, kept);
+                }
             }
 
             if rc.rewrites_body() {
@@ -5712,7 +6043,9 @@ impl ProxyHttp for AiProxy {
                 // below edits one, but the provider's parser picks its own (usually the last). Refused
                 // rather than guessed, before a body byte goes upstream. Checked on the client's
                 // body, ahead of translation, which re-serializes and would hide it.
-                if rc.auto.is_some() && scan.duplicate_model {
+                // A managed `/{provider}` body is relayed as sent, so the provider serves whichever
+                // copy its parser keeps while the billing row names the first: refused the same way.
+                if (rc.auto.is_some() || rc.catalog_check) && scan.duplicate_model {
                     self.state
                         .metrics
                         .rejection(Rejection::DuplicateModel)
@@ -5723,8 +6056,50 @@ impl ProxyHttp for AiProxy {
                     )
                     .into_down());
                 }
+                // A feature billed outside the usage a row can meter (a container, the image
+                // generation tool, an OpenRouter plugin, Anthropic Priority Tier): refused before a
+                // byte of the body goes upstream, so nothing runs unpriced (D268). Read on the
+                // client's body, ahead of any rewrite and of the catalog check (an `:online` model is named
+                // for what it is). Every body buffered here is managed.
+                if rc.managed {
+                    let model = rc
+                        .auto
+                        .as_ref()
+                        .map(|a| a.route.model)
+                        .or(scan.model.as_deref())
+                        .unwrap_or(rc.model.as_str());
+                    let messages = session.req_header().uri.path().ends_with("/messages");
+                    let found = unpriced::inspect(&buf, model, messages);
+                    if let Some(why) = found.refused {
+                        self.state
+                            .metrics
+                            .rejection(Rejection::UnpricedFeature)
+                            .inc();
+                        return Err(gateway_error(400, why).into_down());
+                    }
+                    if found.web_search_preview {
+                        rc.taps.get_or_insert_with(Box::default).web_search_preview = true;
+                    }
+                }
+                // Managed `/{provider}/…` billable call naming no catalog row (D267): its billing
+                // row would carry no `price_model`. The client's id is kept for the error and the
+                // row, then the request ends before a byte of the body goes upstream.
+                if rc.catalog_check && scan.model.as_deref().and_then(price_row).is_none() {
+                    if rc.model.is_empty()
+                        && let Some(m) = scan.model.take()
+                    {
+                        rc.model = sanitize_model(m).into_owned();
+                    }
+                    self.state.metrics.rejection(Rejection::UnknownModel).inc();
+                    return Err(gateway_error(404, CATALOG_MISS).into_down());
+                }
                 // Managed `/{provider}/…/responses` asking for `background: true` (D202).
-                if rc.background_check && requests_background(&buf) {
+                if rc.catalog_check
+                    && rc.forward_path.as_deref().is_some_and(|p| {
+                        route::forward_is_responses(p.split_once('?').map_or(p, |(p, _)| p))
+                    })
+                    && requests_background(&buf)
+                {
                     self.state
                         .metrics
                         .rejection(Rejection::ManagedEndpoint)
@@ -5754,6 +6129,7 @@ impl ProxyHttp for AiProxy {
                     let openai_host =
                         candidate.is_some_and(|c| c.provider == providers::ProviderId::OpenAi);
                     let stream_only = candidate.is_some_and(providers::catalog::stream_only);
+                    let fast = candidate.is_some_and(|c| translated_fast(a, c));
                     let reads_developer =
                         candidate.is_none_or(providers::catalog::reads_developer_role);
                     let tool_thinking = candidate
@@ -5772,8 +6148,13 @@ impl ProxyHttp for AiProxy {
                             // The tool names this attempt's response maps calls back through, and
                             // whether its cache breakpoints are the gateway's (per attempt: a
                             // failover candidate on another wire re-decides both).
-                            (buf, t.tools, t.gateway_cache) =
-                                translate::request_with_tools(t.client, to, &buf, upstream_model);
+                            (buf, t.tools, t.gateway_cache) = translate::request_with_tools(
+                                t.client,
+                                to,
+                                &buf,
+                                upstream_model,
+                                fast,
+                            );
                             changed = true;
                         } else if to == route::Endpoint::Responses {
                             let len = buf.len();
@@ -5976,6 +6357,9 @@ impl ProxyHttp for AiProxy {
             if rc.streaming {
                 held.open_stream();
             }
+            if rc.managed {
+                tap_response_head(rc, upstream_response);
+            }
             self.state.fault_point("response_filter");
 
             // `x-beyond-*` is the gateway's namespace. A provider (or anything between us and it)
@@ -6171,7 +6555,16 @@ impl ProxyHttp for AiProxy {
             // pure waste — and *unbounded* waste on any response with no root-level `model`, since
             // the scanner never reaches its `done` short-circuit and walks every byte.
             if rc.managed {
-                rc.resp_model_scanner.feed(chunk);
+                match rc.taps.as_mut() {
+                    Some(t) => {
+                        let kept = t.resp_kept.get_or_insert_with(peek::Kept::response);
+                        rc.resp_model_scanner.feed_keeping(chunk, kept);
+                        if let Some(tools) = t.tools.as_mut() {
+                            tools.feed(chunk);
+                        }
+                    }
+                    None => rc.resp_model_scanner.feed(chunk),
+                }
             }
 
             // Anthropic SSE only: the head that keeps `message_start` (see `keep_usage_head`).
@@ -6550,6 +6943,11 @@ impl ProxyHttp for AiProxy {
             }
             (false, status) => status,
         };
+        // A managed `/{provider}` model outside the catalog (D267) names the model, as the catalog
+        // walk's 404 does. The one error message built per request, on a refusal path.
+        let miss = (msg == CATALOG_MISS)
+            .then(|| catalog_miss_message(ctx.rc.as_ref().map(|rc| rc.model.as_str()), false));
+        let msg = miss.as_deref().unwrap_or(msg);
         // Pingora closes the client connection after a proxy error; say so (`connection: close`),
         // as its own error responses do, so a pooled client does not send its next request into a
         // socket about to close.
@@ -6765,6 +7163,8 @@ impl ProxyHttp for AiProxy {
         // responses are the whole body; long ones are rotated into order here, once. Skipped on a
         // cache hit — there is no tail; tokens come from the stored entry.
         let mut usage_estimated = false;
+        // Which counts an estimate replaced (see `EstimatedParts`).
+        let mut estimated = EstimatedParts::default();
         // A free sub-resource (a token count) is not a billable call: it carries no usage block,
         // writes no billing row, and is not a usage-shape regression. On every route: a catalog
         // walk records it, a `/{provider}` route names it in the forwarded path.
@@ -6882,8 +7282,12 @@ impl ProxyHttp for AiProxy {
                 let mut u = parsed.unwrap_or_default();
                 if u.input_tokens == 0 {
                     u.input_tokens = input_estimate(session, rc);
+                    estimated.input = true;
                 }
-                u.output_tokens = u.output_tokens.max(output);
+                if output > u.output_tokens {
+                    u.output_tokens = output;
+                    estimated.output = true;
+                }
                 Some(u)
             } else {
                 parsed
@@ -6920,6 +7324,9 @@ impl ProxyHttp for AiProxy {
             );
         }
         let mut usage = parsed.unwrap_or_default();
+        if cache_hit.is_none() {
+            merge_taps(rc, &mut usage);
+        }
         // Writes caused by breakpoints the gateway added bill as input (see
         // `Usage::bill_gateway_cache_writes`). A cache hit replays the fill's already-billed usage.
         if cache_hit.is_none()
@@ -6963,7 +7370,14 @@ impl ProxyHttp for AiProxy {
         // the Prometheus metrics above, which is the right tool for non-billing observability.
         // An abandoned `FullBody` attempt is not the request the client got: the attempt that
         // serves writes the one row (and the one capture).
-        if rc.managed && !rc.relay_abandoned && !free {
+        // The gateway's own refusal before any response head (a catalog miss on `/{provider}`, a
+        // duplicate `model`, `background`): no provider had the request, so no row, as for every
+        // other rejection.
+        let refused =
+            cache_hit.is_none() && rc.upstream_status.is_none() && e.is_some_and(gateway_refusal);
+        if rc.managed && !rc.relay_abandoned && !free && !refused {
+            // What the client asked for that changes the price (read before the borrows below).
+            let requested = requested_knobs(session, rc);
             // Emit BOTH models. `model` is the one the *provider* resolved + billed (echoed in its
             // response) — the key for pricing AND for reconciling against the provider's invoice,
             // which itemizes by the pinned snapshot. `requested_model` is the alias the client sent —
@@ -7032,6 +7446,42 @@ impl ProxyHttp for AiProxy {
                 .as_ref()
                 .map(|h| h.streaming)
                 .unwrap_or(rc.streaming);
+            // The endpoint that served: absent on a cache hit and when no provider was called.
+            let called = cache_hit.is_none() && usage_provider.is_some();
+            let upstream_model = called
+                .then(|| {
+                    rc.auto
+                        .as_ref()
+                        .and_then(|a| a.candidate_at(a.candidate))
+                        .map_or(rc.model.as_str(), |c| c.upstream_model)
+                })
+                .filter(|m| !m.is_empty())
+                .map(|m| sanitize_model(m.to_owned()));
+            let upstream_host = called.then_some(rc.provider.host.as_str());
+            let upstream_path = called.then(|| {
+                let p = rc
+                    .forward_path
+                    .as_deref()
+                    .unwrap_or_else(|| session.req_header().uri.path());
+                p.split_once('?').map_or(p, |(path, _)| path)
+            });
+            let price_variant = match (usage_provider, upstream_model.as_deref(), upstream_host) {
+                (Some(p), Some(m), Some(h)) if called => price_variant(p, m, h),
+                _ => None,
+            };
+            let upstream_request_id = rc
+                .taps
+                .as_ref()
+                .and_then(|t| t.request_id)
+                .filter(|_| called);
+            let server_tools = usage.server_tools.to_row();
+            let upstream_may_continue =
+                upstream_may_continue(usage_provider, outcome, usage_stream);
+            let estimate_excludes = estimated.excludes(&usage);
+            let upstream_cost_usd = usage.upstream.cost_e10.map(usage::e10_to_usd);
+            let upstream_inference_cost_usd =
+                usage.upstream.inference_cost_e10.map(usage::e10_to_usd);
+            let upstream_tool_cost_usd = usage.upstream.tool_cost_e10.map(usage::e10_to_usd);
             info!(
                 target: "ai.usage",
                 request_id = %rc.request_id,
@@ -7075,6 +7525,36 @@ impl ProxyHttp for AiProxy {
                 gateway_cache_write_tokens = usage.gateway_cache_write_tokens,
                 server_tool_calls = usage.server_tool_calls,
                 service_tier = usage.service_tier.as_deref(),
+                // --- The row contract's additions (ARCHITECTURE.md, "The `ai.usage` row"). ---
+                // What the client asked for that changes the price, beside what was served.
+                requested_service_tier = requested.service_tier.as_deref(),
+                speed = usage.speed.as_deref(),
+                requested_speed = requested.speed.as_deref(),
+                inference_geo = usage.inference_geo.as_deref(),
+                requested_inference_geo = requested.inference_geo.as_deref(),
+                requested_provider_routing = requested.provider_routing.as_deref(),
+                requested_plugins = requested.plugins.as_deref(),
+                requested_container = requested.container.as_deref(),
+                // Every server-side tool by kind, `kind=count,…` (nonzero only).
+                server_tools = server_tools.as_deref(),
+                container_id = usage.upstream.container_id.as_deref(),
+                // The concrete endpoint that served, and which of its prices applies.
+                upstream_model = upstream_model.as_deref(),
+                upstream_host,
+                upstream_path,
+                price_variant,
+                served_by = usage.upstream.served_by.as_deref(),
+                // The vendor's own ids and price, for reconciling the row against it.
+                upstream_generation_id = usage.upstream.generation_id.as_deref(),
+                upstream_request_id = upstream_request_id.as_deref(),
+                upstream_cost_usd = upstream_cost_usd.as_deref(),
+                upstream_inference_cost_usd = upstream_inference_cost_usd.as_deref(),
+                upstream_tool_cost_usd = upstream_tool_cost_usd.as_deref(),
+                upstream_byok = usage.upstream.byok,
+                upstream_may_continue,
+                // Which counts are the gateway's estimate, and what the estimate cannot see.
+                usage_estimated_parts = estimated.parts(),
+                usage_estimate_excludes = estimate_excludes,
                 // `Some(0)` (reported, none used) vs `None` (not reported at all — an unreasoning
                 // model, or a provider that doesn't surface it) matters and is unrecoverable once this
                 // line ships, so it's logged as `?` (Debug) rather than collapsed to a bare `0`.
@@ -7142,7 +7622,7 @@ impl ProxyHttp for AiProxy {
                         status: rc.upstream_status.unwrap_or(200),
                         content_type: content_type.unwrap_or_else(|| "application/json".into()),
                         body: Bytes::copy_from_slice(body),
-                        usage,
+                        usage: usage.for_cache(),
                         billed_model: billed_model.to_owned().into_boxed_str(),
                         requested_model: requested_model.to_owned().into_boxed_str(),
                         routed_model,
@@ -7154,6 +7634,10 @@ impl ProxyHttp for AiProxy {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "proxy_row_tests.rs"]
+mod row_tests;
 
 #[cfg(test)]
 mod tests {
@@ -7264,7 +7748,7 @@ mod tests {
             body_bytes_fed: 0,
             upstream_status: None,
             inject_eligible,
-            background_check: false,
+            catalog_check: false,
             req_buf: Vec::new(),
             start: Instant::now(),
             deadline: crate::deadline::NONE,
@@ -7285,6 +7769,7 @@ mod tests {
             redact: None,
             terminal: TerminalTracker::default(),
             signed: None,
+            taps: None,
         }
     }
 
@@ -7506,8 +7991,9 @@ mod tests {
         assert!(
             // 432: + the boxed `signed` (8 bytes, `None` off the managed Responses relay).
             // 440: + `deadline` (8 bytes; every request has one, and the per-chunk check reads it).
-            size <= 440,
-            "RequestCtx grew to {size} bytes (ceiling 440). It is touched once per response chunk \
+            // 448: + the boxed `taps` (8 bytes, `None` on BYO): the billing facts beside usage.
+            size <= 448,
+            "RequestCtx grew to {size} bytes (ceiling 448). It is touched once per response chunk \
              on a stream — if the new state is only needed on one route, box it the way \
              `ModelRouting` is rather than paying for it on every request.",
         );
@@ -7869,7 +8355,7 @@ mod tests {
                 ),
             ],
         );
-        retain_managed_client_headers(&mut req).unwrap();
+        retain_managed_client_headers(&mut req, true).unwrap();
         let mut names: Vec<&str> = req.headers.keys().map(|k| k.as_str()).collect();
         names.sort_unstable();
         assert_eq!(
@@ -7892,14 +8378,14 @@ mod tests {
             "/v1/messages",
             &[("anthropic-beta", "mcp-client-2025-04-04")],
         );
-        retain_managed_client_headers(&mut req).unwrap();
+        retain_managed_client_headers(&mut req, true).unwrap();
         assert!(req.headers.get("anthropic-beta").is_none());
         let mut req = req_with_headers("/v1/messages", &[]);
         req.append_header("anthropic-beta", "prompt-caching-2024-07-31")
             .unwrap();
         req.append_header("anthropic-beta", "code-execution-2025-05-22")
             .unwrap();
-        retain_managed_client_headers(&mut req).unwrap();
+        retain_managed_client_headers(&mut req, true).unwrap();
         assert_eq!(
             req.headers
                 .get_all("anthropic-beta")
@@ -8240,6 +8726,23 @@ mod tests {
     }
 
     #[test]
+    fn the_gateways_own_refusal_is_not_giving_up_on_a_delivered_request() {
+        use pingora_core::{Error, ErrorType as T};
+        // A body the gateway withheld and refused: the provider never had it, nothing to bill.
+        assert!(!gave_up_waiting(
+            &gateway_error(404, CATALOG_MISS).into_down()
+        ));
+        assert!(!gave_up_waiting(
+            &Error::new(T::HTTPStatus(400)).into_down()
+        ));
+        // The client going away, and the gateway's read timeout, still are.
+        assert!(gave_up_waiting(
+            &Error::new(T::ConnectionClosed).into_down()
+        ));
+        assert!(gave_up_waiting(&Error::new(T::ReadTimedout).into_up()));
+    }
+
+    #[test]
     fn price_model_resolves_echoed_snapshots_and_vendor_slugs() {
         assert_eq!(price_model("gpt-5-2025-08-07", "gpt-5"), Some("gpt-5"));
         assert_eq!(price_model("gpt-5-2025-08-07", "x"), Some("gpt-5"));
@@ -8254,6 +8757,20 @@ mod tests {
         // The echo names nothing priced, the request does.
         assert_eq!(price_model("unknown", "gpt-5"), Some("gpt-5"));
         assert_eq!(price_model("my-finetune-2025-08-07", "nope"), None);
+        // The managed `/{provider}` refusal (D267) asks exactly this of the requested model: any
+        // candidate's provider spelling counts, as does a dated snapshot; nothing else does.
+        let row = |m| price_row(m).map(|r| r.model);
+        assert_eq!(
+            row("accounts/fireworks/models/gpt-oss-120b"),
+            price_model("", "accounts/fireworks/models/gpt-oss-120b")
+        );
+        assert!(row("accounts/fireworks/models/gpt-oss-120b").is_some());
+        assert_eq!(row("claude-sonnet-4-5-20250929"), Some("claude-sonnet-4-5"));
+        assert_eq!(row("gpt-4o-mini-2024-07-18"), Some("gpt-4o-mini"));
+        for unpriced in ["my-finetune", "ft:gpt-4o:acme", "claude-2.1", "", "unknown"] {
+            assert_eq!(row(unpriced), None, "{unpriced}");
+            assert_eq!(price_model("", unpriced), None, "{unpriced}");
+        }
         // Not a date: left alone.
         assert_eq!(strip_snapshot_date("gpt-4o-mini"), None);
         assert_eq!(strip_snapshot_date("model-12-34"), None);
@@ -9392,7 +9909,27 @@ mod mutation_gaps {
         let value = "prompt-caching-2024-07-31,  interleaved-thinking-2025-05-14";
         let mut req = pingora::http::RequestHeader::build("POST", b"/v1/messages", None).unwrap();
         req.insert_header("anthropic-beta", value).unwrap();
-        retain_managed_client_headers(&mut req).unwrap();
+        retain_managed_client_headers(&mut req, true).unwrap();
         assert_eq!(req.headers.get("anthropic-beta").unwrap(), value);
+    }
+
+    /// Fast mode's beta rides on a managed request to direct Anthropic, the only provider with fast
+    /// mode, and is dropped on the way to any other (D266).
+    /// claim: SEC-6
+    /// defect: D266
+    #[test]
+    fn the_fast_mode_beta_reaches_direct_anthropic_only() {
+        let value = "prompt-caching-2024-07-31,fast-mode-2026-02-01";
+        let header = |anthropic| {
+            let mut req =
+                pingora::http::RequestHeader::build("POST", b"/v1/messages", None).unwrap();
+            req.insert_header("anthropic-beta", value).unwrap();
+            retain_managed_client_headers(&mut req, anthropic).unwrap();
+            req.headers
+                .get("anthropic-beta")
+                .map(|v| v.to_str().unwrap().to_owned())
+        };
+        assert_eq!(header(true).as_deref(), Some(value));
+        assert_eq!(header(false).as_deref(), Some("prompt-caching-2024-07-31"));
     }
 }

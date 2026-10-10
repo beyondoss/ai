@@ -388,7 +388,8 @@ pub fn catalog_wire_action(path: &str, row: Endpoint) -> WireAction {
 /// when a header named the row. A headerless walk reads it anyway (to find `model`); this makes a
 /// header-won one do the same where the body decides something: the row's card refuses image input
 /// or tools ([`refused_input`]), or a candidate cannot serve a capability the card advertises
-/// ([`unserved`]). Embeddings rows never: their bodies carry neither.
+/// ([`unserved`]), or a candidate serves fast mode, which the body may ask for ([`speed_ask`]).
+/// Embeddings rows never: their bodies carry neither.
 pub fn walk_reads_body(row: &ModelRoute) -> bool {
     Endpoint::of_row(row) != Endpoint::Embeddings
         && (row.card.input & providers::catalog::IN_IMAGE == 0
@@ -397,6 +398,10 @@ pub fn walk_reads_body(row: &ModelRoute) -> bool {
                 .candidates
                 .iter()
                 .any(|c| !providers::catalog::serves_structured_outputs(c))
+            || row
+                .candidates
+                .iter()
+                .any(providers::catalog::serves_fast_mode)
             || (row.card.input & providers::catalog::IN_FILE != 0
                 && row
                     .candidates
@@ -545,6 +550,65 @@ pub fn unserved(arms: &[Candidate], body: &[u8]) -> u8 {
         out |= no_file;
     }
     out
+}
+
+/// How a request asks for Anthropic fast mode, in its client's own API (D266).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpeedAsk {
+    /// Nothing asked, or the default speed.
+    Standard,
+    /// A Messages client's `speed: "fast"`. Anthropic's contract is fast or an error ("when a
+    /// request with `speed: \"fast\"` succeeds, `usage.speed` is `\"fast\"`"), so only a candidate
+    /// that serves fast mode may take it ([`fast_unserved`]); a walk with none is a 400.
+    Fast,
+    /// A Chat Completions or Responses client's `service_tier: "priority"`: OpenAI's priority
+    /// processing, which OpenAI brands as its fast mode and serves at the default tier when it
+    /// cannot (reporting the tier that served). A best effort, so it changes no walk: a candidate
+    /// that serves fast mode is asked for it (`speed: "fast"` plus the beta), every other one
+    /// serves at standard speed, as before.
+    Priority,
+}
+
+/// What `body`, from a client on `client`, asks of the serving speed (see [`SpeedAsk`]): the root
+/// `speed` of a Messages body, the root `service_tier` of a Chat Completions or Responses body,
+/// the last of each as a provider's parser keeps it. Answered by `memmem` alone for a body that
+/// never names the key, and otherwise by one walk of the root members, parsing only that value.
+pub fn speed_ask(client: Option<Endpoint>, body: &[u8]) -> SpeedAsk {
+    let (key, quoted, value, ask): (&str, &[u8], &str, SpeedAsk) = match client {
+        Some(Endpoint::Messages) => ("speed", b"\"speed\"", "fast", SpeedAsk::Fast),
+        Some(Endpoint::ChatCompletions | Endpoint::Responses) => (
+            "service_tier",
+            b"\"service_tier\"",
+            "priority",
+            SpeedAsk::Priority,
+        ),
+        _ => return SpeedAsk::Standard,
+    };
+    if memchr::memmem::find(body, quoted).is_none() {
+        return SpeedAsk::Standard;
+    }
+    let Some(member) = crate::peek::root_members(body)
+        .and_then(|m| m.into_iter().rev().find(|m| m.key_is(body, key)))
+    else {
+        return SpeedAsk::Standard;
+    };
+    // Parsed rather than compared as bytes, so an escaped spelling reads as what it says.
+    match serde_json::from_slice::<std::borrow::Cow<'_, str>>(&body[member.value.0..member.value.1])
+    {
+        Ok(v) if v == value => ask,
+        _ => SpeedAsk::Standard,
+    }
+}
+
+/// Catalog indices (bit per index) of `arms` that cannot serve Anthropic fast mode
+/// (`providers::catalog::serves_fast_mode`). A request that asks [`SpeedAsk::Fast`] is never sent
+/// to one of them, and is a 400 when the walk holds no other.
+pub fn fast_unserved(arms: &[Candidate]) -> u8 {
+    arms.iter()
+        .take(MAX_CANDIDATES)
+        .enumerate()
+        .filter(|(_, c)| !providers::catalog::serves_fast_mode(c))
+        .fold(0u8, |m, (i, _)| m | (1 << i))
 }
 
 /// A file content part anywhere in the conversation: Chat Completions `file`, Messages
@@ -1488,6 +1552,82 @@ mod tests {
         ] {
             assert_eq!(walk_reads_body(&row), want, "{what}");
         }
+    }
+
+    /// A row with a fast-mode candidate reads the body on a header-won walk, which may ask for
+    /// fast mode; one with none does not on that account (D266).
+    /// claim: CAT-6
+    /// defect: D266
+    #[test]
+    fn a_fast_mode_row_reads_the_body() {
+        assert!(walk_reads_body(&catalog_row("claude-opus-5-5")));
+        assert!(walk_reads_body(&catalog_row("claude-opus-5")));
+        assert!(!walk_reads_body(&catalog_row("claude-sonnet-5-5")));
+    }
+
+    /// Each client asks for fast mode in its own API's words: Messages `speed: "fast"`, Chat
+    /// Completions and Responses `service_tier: "priority"`, the last root member of each, escaped
+    /// or not. A nested one, another value, or the other API's field asks nothing (D266).
+    /// claim: CAT-6
+    /// defect: D266
+    #[test]
+    fn speed_ask_reads_each_apis_own_field() {
+        use SpeedAsk::{Fast, Priority, Standard};
+        let m = Some(Endpoint::Messages);
+        let chat = Some(Endpoint::ChatCompletions);
+        let resp = Some(Endpoint::Responses);
+        for (client, body, want) in [
+            (m, r#"{"model":"x","speed":"fast"}"#, Fast),
+            (m, r#"{"speed" : "fast","model":"x"}"#, Fast),
+            (m, r#"{"speed":"fast","speed":"standard"}"#, Standard),
+            (m, r#"{"speed":"standard"}"#, Standard),
+            (m, r#"{"metadata":{"speed":"fast"}}"#, Standard),
+            (
+                m,
+                r#"{"messages":[{"role":"user","content":"\"speed\":\"fast\""}]}"#,
+                Standard,
+            ),
+            (m, r#"{"service_tier":"priority"}"#, Standard),
+            (chat, r#"{"service_tier":"priority"}"#, Priority),
+            (
+                resp,
+                r#"{"input":"hi","service_tier":"priority"}"#,
+                Priority,
+            ),
+            (chat, r#"{"service_tier":"default"}"#, Standard),
+            (chat, r#"{"speed":"fast"}"#, Standard),
+            (Some(Endpoint::Embeddings), r#"{"speed":"fast"}"#, Standard),
+            (None, r#"{"speed":"fast"}"#, Standard),
+            (m, "not json \"speed\"", Standard),
+        ] {
+            assert_eq!(
+                speed_ask(client, body.as_bytes()),
+                want,
+                "{client:?} {body}"
+            );
+        }
+    }
+
+    /// Only direct Anthropic serves fast mode: on Opus 4.8 the Bedrock and OpenRouter candidates
+    /// are left out of a fast request's walk, and on Sonnet 5.5 every candidate is (D266).
+    /// claim: CAT-6
+    /// defect: D266
+    #[test]
+    fn only_direct_anthropic_serves_fast_mode() {
+        let opus = catalog_row("claude-opus-4-8");
+        let want = opus
+            .candidates
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.provider != providers::ProviderId::Anthropic)
+            .fold(0u8, |m, (i, _)| m | 1 << i);
+        assert_eq!(opus.candidates.len(), 3);
+        assert_eq!(fast_unserved(opus.candidates), want);
+        let sonnet = catalog_row("claude-sonnet-5-5");
+        assert_eq!(
+            fast_unserved(sonnet.candidates),
+            (1u8 << sonnet.candidates.len()) - 1
+        );
     }
 
     /// Only a Messages client on a Chat Completions row with a Responses arm counts tools.

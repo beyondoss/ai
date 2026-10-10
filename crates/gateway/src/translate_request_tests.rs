@@ -1993,6 +1993,7 @@ fn request_reports_gateway_added_breakpoints() {
             Endpoint::Messages,
             &serde_json::to_vec(&body).unwrap(),
             "claude-opus-4-8",
+            false,
         )
         .2
     };
@@ -2010,7 +2011,8 @@ fn request_reports_gateway_added_breakpoints() {
             Endpoint::Messages,
             Endpoint::Messages,
             b"{}",
-            "claude-opus-4-8"
+            "claude-opus-4-8",
+            false
         )
         .2
     );
@@ -2918,4 +2920,70 @@ fn a_plain_text_document_becomes_a_text_part() {
         "gpt-5",
     );
     assert_eq!(v["messages"][0]["content"], "the notes", "{v}");
+}
+
+/// `request_with_tools` with the caller's fast-mode decision, decoded.
+fn fast_req(from: Endpoint, to: Endpoint, body: &Value, model: &str, fast: bool) -> Value {
+    let (out, _, _) = request_with_tools(from, to, &serde_json::to_vec(body).unwrap(), model, fast);
+    serde_json::from_slice(&out).unwrap()
+}
+
+/// OpenAI's `service_tier: "priority"` becomes Anthropic fast mode where the caller decided the
+/// attempt asks for it (a direct Anthropic candidate with fast mode), from a Chat Completions and
+/// a Responses client alike; otherwise it goes, as every `service_tier` onto Messages does (D266).
+/// claim: CAT-6
+/// defect: D266
+#[test]
+fn priority_onto_messages_is_fast_mode_only_when_the_attempt_asks_for_it() {
+    let chat_body = chat(json!({"service_tier": "priority"}));
+    let responses_body = json!({"model": "m", "input": "hi", "service_tier": "priority"});
+    for (from, body) in [
+        (Endpoint::ChatCompletions, &chat_body),
+        (Endpoint::Responses, &responses_body),
+    ] {
+        let v = fast_req(from, Endpoint::Messages, body, "claude-opus-5-5", true);
+        assert_eq!(v["speed"], "fast", "{from:?}: {v}");
+        assert!(v.get("service_tier").is_none(), "{from:?}: {v}");
+        let v = fast_req(from, Endpoint::Messages, body, "claude-opus-5-5", false);
+        assert!(v.get("speed").is_none(), "{from:?}: {v}");
+        assert!(v.get("service_tier").is_none(), "{from:?}: {v}");
+    }
+    // Never onto another wire: the decision is about a Messages body.
+    let v = fast_req(
+        Endpoint::ChatCompletions,
+        Endpoint::Responses,
+        &chat_body,
+        "gpt-5",
+        true,
+    );
+    assert!(v.get("speed").is_none(), "{v}");
+    assert_eq!(v["service_tier"], "priority", "{v}");
+}
+
+/// A Messages client's `speed: "fast"` is not served by an OpenAI-wire candidate: a walk that read
+/// the body never sends it there. One that did not forwards it for the provider to refuse, rather
+/// than serve the answer at standard speed; it is never respelled as `service_tier`, a best effort
+/// that may be served at the default tier. Anthropic's own `service_tier` values (`auto`,
+/// `standard_only`) mean nothing on that wire and are dropped, as is `speed: "standard"` (D266).
+/// claim: CAT-6
+/// defect: D266
+#[test]
+fn fast_mode_onto_an_openai_wire_is_forwarded_for_the_provider_to_refuse() {
+    for to in [Endpoint::ChatCompletions, Endpoint::Responses] {
+        let v = req(
+            Endpoint::Messages,
+            to,
+            &anth(json!({"speed": "fast", "service_tier": "auto"})),
+            "gpt-5",
+        );
+        assert_eq!(v["speed"], "fast", "{to:?}: {v}");
+        assert!(v.get("service_tier").is_none(), "{to:?}: {v}");
+        let v = req(
+            Endpoint::Messages,
+            to,
+            &anth(json!({"speed": "standard"})),
+            "gpt-5",
+        );
+        assert!(v.get("speed").is_none(), "{to:?}: {v}");
+    }
 }
