@@ -1103,6 +1103,9 @@ struct ModelRouting {
     /// Seconds until the soonest skipped open breaker admits a request, for the `Retry-After` on
     /// the 503 when every candidate was skipped. `None` while no breaker skipped one.
     open_retry_after: Option<u16>,
+    /// The client asked for priority processing (`route::SpeedAsk::Priority`): an attempt
+    /// translated onto a candidate that serves fast mode asks it for fast mode (D266).
+    priority: bool,
 }
 
 /// A 2xx's held-back health verdict, waiting on the body to say whether it is an answer.
@@ -2213,7 +2216,8 @@ const MANAGED_FORWARD_HEADERS: [&str; 8] = [
 /// long-context pricing, `mcp-client-*` / `code-execution-*` / `files-api-*` reach servers, sandboxes
 /// and storage on Beyond's account, and `oauth-*` is meaningless beside a pool API key. The gateway's
 /// own [`translate::THINKING_BINDING_BETA`] is listed too, so a Messages client on a binding model
-/// may send it itself.
+/// may send it itself. Fast mode's beta is not here: it doubles the per-token price, and is kept
+/// only on a request to direct Anthropic (see [`retain_managed_client_headers`]).
 const MANAGED_ANTHROPIC_BETAS: [&str; 8] = [
     "claude-code-20250219",
     "prompt-caching-2024-07-31",
@@ -2226,20 +2230,27 @@ const MANAGED_ANTHROPIC_BETAS: [&str; 8] = [
 ];
 
 /// Drop every client header a managed request may not forward ([`MANAGED_FORWARD_HEADERS`]), and
-/// every `anthropic-beta` token not in [`MANAGED_ANTHROPIC_BETAS`]. The header sweep allocates
-/// nothing (D92: it collected the names into a `Vec` on nearly every managed request); only an
-/// `anthropic-beta` value with a token to drop is rebuilt.
-fn retain_managed_client_headers(req: &mut pingora::http::RequestHeader) -> Result<()> {
+/// every `anthropic-beta` token not in [`MANAGED_ANTHROPIC_BETAS`], less
+/// [`translate::FAST_MODE_BETA`] when `anthropic` (the attempt goes to direct Anthropic, the only
+/// provider with fast mode). Fast mode is a product Beyond sells at its price: the row records the
+/// speed asked and the speed served (`usage.speed`), so it is billed as served (D266). The header
+/// sweep allocates nothing (D92: it collected the names into a `Vec` on nearly every managed
+/// request); only an `anthropic-beta` value with a token to drop is rebuilt.
+fn retain_managed_client_headers(
+    req: &mut pingora::http::RequestHeader,
+    anthropic: bool,
+) -> Result<()> {
+    let allowed = |t: &str| {
+        MANAGED_ANTHROPIC_BETAS.contains(&t) || (anthropic && t == translate::FAST_MODE_BETA)
+    };
     remove_headers_where(req, |name| !MANAGED_FORWARD_HEADERS.contains(&name));
     let betas = req.headers.get_all("anthropic-beta");
     let mut values = betas.iter();
     let clean = match (values.next(), values.next()) {
         (None, _) => true,
-        (Some(v), None) => v.to_str().is_ok_and(|v| {
-            v.split(',')
-                .map(str::trim)
-                .all(|t| MANAGED_ANTHROPIC_BETAS.contains(&t))
-        }),
+        (Some(v), None) => v
+            .to_str()
+            .is_ok_and(|v| v.split(',').map(str::trim).all(allowed)),
         _ => false,
     };
     if !clean {
@@ -2248,7 +2259,7 @@ fn retain_managed_client_headers(req: &mut pingora::http::RequestHeader) -> Resu
             .filter_map(|v| v.to_str().ok())
             .flat_map(|v| v.split(','))
             .map(str::trim)
-            .filter(|t| MANAGED_ANTHROPIC_BETAS.contains(t))
+            .filter(|t| allowed(t))
             .collect::<Vec<_>>()
             .join(",");
         req.remove_header("anthropic-beta");
@@ -3454,6 +3465,32 @@ fn catalog_serving_endpoint(auto: &ModelRouting) -> Option<route::Endpoint> {
         .map(|c| route::Endpoint::of_upstream_path(c.path))
 }
 
+/// Whether this attempt, translated onto candidate `c`, asks it for Anthropic fast mode: the client
+/// asked for priority processing and `c` serves fast mode (D266). One decision for the attempt's
+/// `anthropic-beta` header and its translated body, so the two never disagree.
+fn translated_fast(auto: &ModelRouting, c: &route::Candidate) -> bool {
+    auto.priority && providers::catalog::serves_fast_mode(c)
+}
+
+/// Add `beta` to the request's `anthropic-beta` value, unless it is already there.
+fn merge_anthropic_beta(req: &mut pingora::http::RequestHeader, beta: &'static str) -> Result<()> {
+    let existing = req
+        .headers
+        .get("anthropic-beta")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+    match existing {
+        Some(v) if v.split(',').any(|b| b.trim() == beta) => {}
+        Some(v) => {
+            let merged = format!("{v},{beta}");
+            req.insert_header("anthropic-beta", merged)?;
+        }
+        None => req.insert_header("anthropic-beta", beta)?,
+    }
+    Ok(())
+}
+
 fn catalog_translating(auto: &ModelRouting) -> bool {
     let Some(t) = auto.translate.as_ref() else {
         return false;
@@ -4471,6 +4508,8 @@ impl ProxyHttp for AiProxy {
         // Model routing is **managed-only**, and the first candidate is chosen here.
         let mut walk = control::Walk::identity(0);
         let mut walk_arms: &'static [route::Candidate] = &[];
+        // The client asked for priority processing (`route::SpeedAsk::Priority`, D266).
+        let mut priority = false;
         let inbound_responses =
             model_route.is_some() && route::is_responses_path(session.req_header().uri.path());
         let session_field = match &full_body {
@@ -4639,6 +4678,32 @@ impl ProxyHttp for AiProxy {
                     (None, Some(b)) => route::unserved(arms, b),
                     (None, None) => 0,
                 };
+                // Anthropic fast mode (D266). A Messages client's `speed: "fast"` is served fast or
+                // refused, as Anthropic itself does: only a candidate that serves fast mode may
+                // take it, and a walk with none is a 400 here rather than an answer at standard
+                // speed (or Bedrock's own refusal) under a fast request. A Chat Completions or
+                // Responses client's `service_tier: "priority"` is a best effort and moves nothing:
+                // it is mapped to fast mode on whichever attempt reaches a candidate that serves it.
+                if sub.is_none() {
+                    let scanned = match &full_body {
+                        Some(fb) => Some(&fb.body[..]),
+                        None => body_complete.as_deref(),
+                    };
+                    let client = route::implied_endpoint(session.req_header().uri.path());
+                    match scanned.map(|b| route::speed_ask(client, b)) {
+                        Some(route::SpeedAsk::Fast) => {
+                            let slow = route::fast_unserved(arms);
+                            if walk.mask() & !slow == 0 {
+                                return self
+                                    .reject_refused_input(session, &request_id, row, "fast mode")
+                                    .await;
+                            }
+                            dispatchable &= !slow;
+                        }
+                        Some(route::SpeedAsk::Priority) => priority = true,
+                        _ => {}
+                    }
+                }
                 let walked = walk.mask();
                 if dispatchable & walked & !unserved != 0 {
                     dispatchable &= !unserved;
@@ -4993,6 +5058,7 @@ impl ProxyHttp for AiProxy {
                             addrs: 0,
                             attempted: false,
                             open_retry_after: None,
+                            priority,
                         })
                     }),
                     request_id,
@@ -5154,6 +5220,7 @@ impl ProxyHttp for AiProxy {
                     addrs: 0,
                     attempted: false,
                     open_retry_after: None,
+                    priority,
                 })
             }),
             request_id,
@@ -5660,7 +5727,7 @@ impl ProxyHttp for AiProxy {
             //
             // The allowlist would drop these too; they are removed by name so this invariant does
             // not hang on the list's contents.
-            retain_managed_client_headers(upstream_request)?;
+            retain_managed_client_headers(upstream_request, rc.provider.name == "anthropic")?;
             upstream_request.remove_header("authorization");
             for header in STATIC_KEY_HEADERS {
                 upstream_request.remove_header(header);
@@ -5738,21 +5805,15 @@ impl ProxyHttp for AiProxy {
             && let Some(c) = a.candidate_at(a.candidate)
             && c.provider == providers::ProviderId::Anthropic
             && route::Endpoint::of_upstream_path(c.path) == route::Endpoint::Messages
-            && let Some(beta) = translate::messages_beta(c.upstream_model)
         {
-            let existing = upstream_request
-                .headers
-                .get("anthropic-beta")
-                .and_then(|v| v.to_str().ok())
-                .map(str::trim)
-                .filter(|v| !v.is_empty());
-            match existing {
-                Some(v) if v.split(',').any(|b| b.trim() == beta) => {}
-                Some(v) => {
-                    let merged = format!("{v},{beta}");
-                    upstream_request.insert_header("anthropic-beta", merged)?;
-                }
-                None => upstream_request.insert_header("anthropic-beta", beta)?,
+            if let Some(beta) = translate::messages_beta(c.upstream_model) {
+                merge_anthropic_beta(upstream_request, beta)?;
+            }
+            // A Chat Completions or Responses client's `service_tier: "priority"`, translated to
+            // fast mode on a candidate that serves it (D266). The same decision makes
+            // `translate::request_with_tools` add `speed: "fast"` to this attempt's body.
+            if translated_fast(a, c) {
+                merge_anthropic_beta(upstream_request, translate::FAST_MODE_BETA)?;
             }
         }
 
@@ -5969,6 +6030,7 @@ impl ProxyHttp for AiProxy {
                     let openai_host =
                         candidate.is_some_and(|c| c.provider == providers::ProviderId::OpenAi);
                     let stream_only = candidate.is_some_and(providers::catalog::stream_only);
+                    let fast = candidate.is_some_and(|c| translated_fast(a, c));
                     let reads_developer =
                         candidate.is_none_or(providers::catalog::reads_developer_role);
                     let tool_thinking = candidate
@@ -5987,8 +6049,13 @@ impl ProxyHttp for AiProxy {
                             // The tool names this attempt's response maps calls back through, and
                             // whether its cache breakpoints are the gateway's (per attempt: a
                             // failover candidate on another wire re-decides both).
-                            (buf, t.tools, t.gateway_cache) =
-                                translate::request_with_tools(t.client, to, &buf, upstream_model);
+                            (buf, t.tools, t.gateway_cache) = translate::request_with_tools(
+                                t.client,
+                                to,
+                                &buf,
+                                upstream_model,
+                                fast,
+                            );
                             changed = true;
                         } else if to == route::Endpoint::Responses {
                             let len = buf.len();
@@ -8175,7 +8242,7 @@ mod tests {
                 ),
             ],
         );
-        retain_managed_client_headers(&mut req).unwrap();
+        retain_managed_client_headers(&mut req, true).unwrap();
         let mut names: Vec<&str> = req.headers.keys().map(|k| k.as_str()).collect();
         names.sort_unstable();
         assert_eq!(
@@ -8198,14 +8265,14 @@ mod tests {
             "/v1/messages",
             &[("anthropic-beta", "mcp-client-2025-04-04")],
         );
-        retain_managed_client_headers(&mut req).unwrap();
+        retain_managed_client_headers(&mut req, true).unwrap();
         assert!(req.headers.get("anthropic-beta").is_none());
         let mut req = req_with_headers("/v1/messages", &[]);
         req.append_header("anthropic-beta", "prompt-caching-2024-07-31")
             .unwrap();
         req.append_header("anthropic-beta", "code-execution-2025-05-22")
             .unwrap();
-        retain_managed_client_headers(&mut req).unwrap();
+        retain_managed_client_headers(&mut req, true).unwrap();
         assert_eq!(
             req.headers
                 .get_all("anthropic-beta")
@@ -9698,7 +9765,27 @@ mod mutation_gaps {
         let value = "prompt-caching-2024-07-31,  interleaved-thinking-2025-05-14";
         let mut req = pingora::http::RequestHeader::build("POST", b"/v1/messages", None).unwrap();
         req.insert_header("anthropic-beta", value).unwrap();
-        retain_managed_client_headers(&mut req).unwrap();
+        retain_managed_client_headers(&mut req, true).unwrap();
         assert_eq!(req.headers.get("anthropic-beta").unwrap(), value);
+    }
+
+    /// Fast mode's beta rides on a managed request to direct Anthropic, the only provider with fast
+    /// mode, and is dropped on the way to any other (D266).
+    /// claim: SEC-6
+    /// defect: D266
+    #[test]
+    fn the_fast_mode_beta_reaches_direct_anthropic_only() {
+        let value = "prompt-caching-2024-07-31,fast-mode-2026-02-01";
+        let header = |anthropic| {
+            let mut req =
+                pingora::http::RequestHeader::build("POST", b"/v1/messages", None).unwrap();
+            req.insert_header("anthropic-beta", value).unwrap();
+            retain_managed_client_headers(&mut req, anthropic).unwrap();
+            req.headers
+                .get("anthropic-beta")
+                .map(|v| v.to_str().unwrap().to_owned())
+        };
+        assert_eq!(header(true).as_deref(), Some(value));
+        assert_eq!(header(false).as_deref(), Some("prompt-caching-2024-07-31"));
     }
 }

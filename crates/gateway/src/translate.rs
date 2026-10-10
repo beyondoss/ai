@@ -68,6 +68,12 @@
 //!   them as input, as they are billed (see [`request_with_tools`]).
 //! - **Added onto Responses:** `store: false` unless the client asked to store; Chat Completions
 //!   stores nothing by default, Responses stores everything.
+//! - **Speed (D266):** a Chat Completions or Responses client's `service_tier: "priority"` becomes
+//!   Anthropic fast mode (`speed: "fast"`, beta from `proxy`) on an attempt the caller says serves
+//!   it ([`request_with_tools`]'s `fast`), and is dropped onto any other Messages candidate. A
+//!   Messages client's `speed: "fast"` is forwarded onto Chat Completions and Responses for the
+//!   provider to refuse (a walk that read the body never sends it there); Anthropic's own
+//!   `service_tier` values are dropped off Messages.
 //! - **Required mapping:** system/messages/`input`, `max_tokens`/`max_output_tokens`, stop,
 //!   stream, tools, `tool_choice`, text + tool_use/tool_result, usage. Anthropic requires
 //!   `max_tokens`; a missing OpenAI value becomes 4096.
@@ -197,7 +203,7 @@ impl TranslateState {
 /// headers have already gone upstream. The candidate `model` id is spliced by the caller
 /// **after** this returns.
 pub fn request(from: Endpoint, to: Endpoint, body: &[u8], upstream_model: &str) -> Vec<u8> {
-    request_with_tools(from, to, body, upstream_model).0
+    request_with_tools(from, to, body, upstream_model, false).0
 }
 
 /// [`request`], plus what the response translation must follow: the [`ToolNames`] the upstream's
@@ -205,11 +211,17 @@ pub fn request(from: Endpoint, to: Endpoint, body: &[u8], upstream_model: &str) 
 /// the gateway added default cache breakpoints (see `auto_cache_breakpoints`). When it did, the
 /// client never asked for caching: the writes those breakpoints cause are the gateway's
 /// optimization, billed and shown to the client as input.
+///
+/// `fast` is the caller's decision that this attempt asks for Anthropic fast mode: a Chat
+/// Completions or Responses client's `service_tier: "priority"` bound for a candidate that serves
+/// it (`providers::catalog::serves_fast_mode`). The Messages body then carries `speed: "fast"`, and
+/// `proxy` sends [`FAST_MODE_BETA`] on the same attempt's headers from the same decision (D266).
 pub fn request_with_tools(
     from: Endpoint,
     to: Endpoint,
     body: &[u8],
     upstream_model: &str,
+    fast: bool,
 ) -> (Vec<u8>, ToolNames, bool) {
     if from == to {
         return (body.to_vec(), ToolNames::default(), false);
@@ -225,7 +237,13 @@ pub fn request_with_tools(
     } else {
         ToolNames::default()
     };
-    let (out, gateway_cache) = map_request(from, to, &v, Upstream::of(upstream_model));
+    let (mut out, gateway_cache) = map_request(from, to, &v, Upstream::of(upstream_model));
+    if fast
+        && to == Endpoint::Messages
+        && let Some(obj) = out.as_object_mut()
+    {
+        obj.insert("speed".into(), json!("fast"));
+    }
     (encode(&out), names, gateway_cache)
 }
 
@@ -1352,6 +1370,12 @@ fn place_system(
 /// The `anthropic-beta` value that lets a translated request set
 /// `thinking.block_binding.prefix_mismatch_behavior`.
 pub const THINKING_BINDING_BETA: &str = "thinking-binding-controls-2026-08-01";
+
+/// The `anthropic-beta` value Anthropic fast mode needs beside `speed: "fast"`
+/// (platform.claude.com/docs/en/build-with-claude/fast-mode). A managed client may send it to
+/// direct Anthropic itself; `proxy` adds it to a translated attempt that [`request_with_tools`]
+/// asks for fast mode (D266).
+pub const FAST_MODE_BETA: &str = "fast-mode-2026-02-01";
 
 /// The `anthropic-beta` value a request translated onto Messages needs for `upstream_model`, if
 /// any. `proxy` sends it on that attempt's request headers, which leave before the body is
@@ -2837,6 +2861,13 @@ fn anthropic_req_to_openai(v: &Value, up: Upstream) -> Value {
     copy_if(&mut out, v, "stream");
     // Remote MCP servers have no Chat Completions equivalent and change what the model can do.
     copy_if(&mut out, v, "mcp_servers");
+    // Anthropic fast mode is served by direct Anthropic only, and a walk that read the body never
+    // sends `speed: "fast"` anywhere else (`route::speed_ask`, D266). One that did not read it may
+    // still fail over here: the field goes on for the provider to refuse rather than be served at
+    // standard speed under a fast request. `standard` is the default and means nothing here.
+    if v.get("speed").and_then(Value::as_str) == Some("fast") {
+        out.insert("speed".into(), json!("fast"));
+    }
     if let Some(stop) = v.get("stop_sequences") {
         out.insert("stop".into(), stop.clone());
     }
@@ -4077,6 +4108,11 @@ fn openai_req_to_responses(v: &Value, openai: OpenAiModel) -> Value {
     let mut out = Map::new();
     copy_if(&mut out, v, "model");
     copy_if(&mut out, v, "stream");
+    // A Messages client's fast mode, carried by `anthropic_req_to_openai` for the provider to
+    // refuse (D266).
+    if v.get("speed").and_then(Value::as_str) == Some("fast") {
+        out.insert("speed".into(), json!("fast"));
+    }
     // The Responses API rejects a limit under 16 ("integer_below_min_value"); Chat Completions
     // and Messages accept 1. Raising a tiny limit to the floor answers the request instead of
     // forwarding a guaranteed 400.

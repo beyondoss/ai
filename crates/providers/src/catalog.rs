@@ -367,6 +367,26 @@ pub fn serves_structured_outputs(c: &Candidate) -> bool {
             .any(|&(p, m)| p == c.provider && m == c.upstream_model)
 }
 
+/// Anthropic models that run in fast mode (`speed: "fast"` with the `fast-mode-2026-02-01` beta,
+/// a research preview at twice the per-token price): Claude Opus 5.5, Opus 5 and Opus 4.8, on the
+/// Claude API only, "not available on Amazon Bedrock, Claude Platform on AWS, Google Cloud, or
+/// Microsoft Foundry" (platform.claude.com/docs/en/build-with-claude/fast-mode, read 2026-10-10).
+/// Opus 4.7 answers `speed: "fast"` with an error; Opus 4.6 runs it at standard speed.
+const FAST_MODE_MODELS: [&str; 3] = ["claude-opus-5-5", "claude-opus-5", "claude-opus-4-8"];
+
+/// Whether a candidate serves Anthropic fast mode: direct Anthropic Messages for a model in
+/// [`FAST_MODE_MODELS`]. Nothing else does. OpenRouter forwards a fast request to Anthropic but
+/// falls back to its standard-speed endpoints when the fast one fails (openrouter.ai/docs/guides/
+/// features/service-tiers), where Anthropic's own contract is fast or an error; Bedrock and every
+/// other host have no fast mode. The gateway sends a Messages client's `speed: "fast"` only here,
+/// and maps a Chat Completions or Responses client's `service_tier: "priority"` to fast mode only
+/// here.
+pub fn serves_fast_mode(c: &Candidate) -> bool {
+    c.provider == ProviderId::Anthropic
+        && endpoint_of_path(c.path) == "messages"
+        && FAST_MODE_MODELS.contains(&c.upstream_model)
+}
+
 /// Candidates that refuse file (PDF) input on a row whose card advertises it. OpenRouter routes
 /// `x-ai/grok-build-0.1` to no file-capable endpoint: 404 "No endpoints found that support file
 /// input" (measured 2026-10-01; its `x-ai/grok-4.20`, `grok-4.3`, `grok-4.5` and `grok-4.6` read
@@ -2370,6 +2390,32 @@ pub fn models_list_json(keep: impl Fn(&ModelRoute) -> bool) -> String {
 mod tests {
     use super::*;
     use crate::{by_id, gateway_providers};
+
+    /// Every fast-mode model is a row whose Anthropic candidate serves fast mode, and no other
+    /// candidate in the table does: a renamed or retired model would otherwise leave fast mode
+    /// refused on a row that has it, or offered where nobody serves it.
+    #[test]
+    fn fast_mode_is_served_by_direct_anthropic_on_its_three_rows_only() {
+        let mut served: Vec<&str> = MODEL_ROUTES
+            .iter()
+            .flat_map(|r| r.candidates.iter().chain(r.responses))
+            .filter(|c| serves_fast_mode(c))
+            .map(|c| {
+                assert_eq!(c.provider, ProviderId::Anthropic, "{c:?}");
+                c.upstream_model
+            })
+            .collect();
+        served.sort_unstable();
+        let mut want = FAST_MODE_MODELS.to_vec();
+        want.sort_unstable();
+        assert_eq!(served, want);
+        for m in FAST_MODE_MODELS {
+            assert!(
+                for_model(m).is_some_and(|r| r.model == m),
+                "{m} has no row of its own"
+            );
+        }
+    }
 
     /// Product floor: managed `/v1` should list a full current generation, not a handful of
     /// flagships. Count is the guard; new rows still have to pass the uniqueness / wire tests below.

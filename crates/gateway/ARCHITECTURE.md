@@ -438,8 +438,9 @@ served after identity and before the body peek, so an empty GET is not a missing
 
 **The card holds the request.** A header-won catalog walk normally relays a small body without
 reading it first; on a row where the body decides something (`route::walk_reads_body`: a card
-without image input or tools, or a candidate that cannot honor an advertised capability) it reads
-the whole body before choosing, as a headerless walk always does. Then:
+without image input or tools, a candidate that cannot honor an advertised capability, or a
+candidate with fast mode) it reads the whole body before choosing, as a headerless walk always
+does. Then:
 
 - An image part (Chat `image_url`, Messages `image`, Responses `input_image`) on a row whose card
   lists no image input is a 400 naming the row (`ai_rejections_total{reason="modality"}`), before
@@ -464,8 +465,44 @@ the whole body before choosing, as a headerless walk always does. Then:
   candidate that reads none out of the walk the same way (`providers::catalog::serves_file_input`):
   OpenRouter's `x-ai/grok-build-0.1` answers a PDF with 404 "No endpoints found that support file
   input" (its other grok ids read the same PDF). Both checks are one mask, `route::unserved`.
+- A Messages body asking for Anthropic fast mode (root `speed: "fast"`) is served only by a
+  candidate that has it (`providers::catalog::serves_fast_mode`: direct Anthropic for Claude Opus
+  5.5, Opus 5 and Opus 4.8), and a walk with none is a 400 ("... does not accept fast mode", the
+  `modality` reason) before any upstream (D266; see **Fast mode** below). Unlike the two masks
+  above this one is hard: even `x-beyond-only: bedrock` is refused rather than sent.
 
 A large body reaches the same checks in `relay_full_body`, which holds it whole.
+
+**Fast mode** (D266). Anthropic's fast mode is `speed: "fast"` plus the `fast-mode-2026-02-01`
+beta, on Claude Opus 5.5, Opus 5 and Opus 4.8, on the Claude API only (not Bedrock, Vertex or
+Foundry), at twice the per-token price; the response's `usage.speed` says which speed served
+([platform.claude.com/docs/en/build-with-claude/fast-mode](https://platform.claude.com/docs/en/build-with-claude/fast-mode)).
+Anthropic's contract is fast or an error: an unsupported model is an error (Opus 4.7) or served at
+standard speed and reported so (Opus 4.6), and a shortfall of fast capacity is a 429 or 529, never
+a silent downgrade. OpenAI's `service_tier: "priority"` is OpenAI's own fast mode and a best effort:
+served at the default tier when priority capacity is short, and reported. The gateway keeps each
+API's meaning:
+
+| Client asks                                       | Direct Anthropic, fast model                  | Any other candidate                                                     |
+| ------------------------------------------------- | --------------------------------------------- | ----------------------------------------------------------------------- |
+| Messages `speed: "fast"`                          | relayed, client's beta kept                   | never sent (left out; none left is a 400)                               |
+| Chat / Responses `service_tier: "priority"`       | `speed: "fast"` + the beta, no `service_tier` | served at standard speed (as before); OpenRouter Chat relays it as sent |
+| Messages `service_tier` (`auto`, `standard_only`) | relayed                                       | dropped off Messages                                                    |
+
+A Messages client's fast request is not sent to OpenRouter, though OpenRouter forwards `speed:
+"fast"` to Anthropic: its priority routing falls back to standard-speed endpoints when the fast one
+fails ([openrouter.ai/docs/guides/features/service-tiers](https://openrouter.ai/docs/guides/features/service-tiers)),
+which breaks the contract the client coded against, and no fast failover is better than a
+downgrade. Nor is it respelled `service_tier: "priority"` onto an OpenAI-wire candidate, for the
+same reason. A row without fast mode refuses it at the gateway even where Anthropic would serve
+standard speed (Opus 4.6): one list (`FAST_MODE_MODELS` in `providers::catalog`), one answer.
+Priority, being a best effort, changes no walk: whichever attempt reaches a direct Anthropic
+candidate with fast mode asks it for fast mode, and every other serves at standard speed. One
+decision (`proxy::translated_fast`) drives both the attempt's beta header and its translated body,
+since headers leave before the body is translated; a row with a fast candidate therefore reads its
+body on a header-won walk too. The beta survives the managed header allowlist only on a request to
+direct Anthropic (below). Requested and served speed are both on the `ai.usage` row, so a fast
+request is billed at the speed that served it.
 
 **Every admission check reads the body by span, never into a `serde_json::Value`** (D215). A body
 can be 100 MiB, and a `Value` costs 10-250 bytes of heap per byte of JSON (a `BTreeMap` node per
@@ -843,7 +880,11 @@ upstream, so the gateway cannot answer 400 itself; the field is passed through a
 forwarded in any shape, on any wire pair (Chat Completions ↔ Responses included); inline `data:`
 URIs are not URLs and pass. Hints that change nothing about the response's shape (`seed`, penalties,
 `logit_bias`, `top_k`, a message's `name`) are dropped, and so are `prompt_cache_key`,
-`service_tier` and `verbosity` everywhere but OpenAI's own Chat Completions (which takes all three).
+`service_tier` and `verbosity` everywhere but OpenAI's own Chat Completions (which takes all three),
+except that `service_tier: "priority"` onto a direct Anthropic candidate with fast mode becomes
+`speed: "fast"` (D266, **Fast mode** above). A Messages client's `speed: "fast"` onto Chat
+Completions or Responses (only a header-won walk that did not read the body can get there) is
+forwarded for the provider to refuse.
 Equivalents are mapped instead: legacy `functions` / `function_call` become the `tools` loop (a
 legacy call gets an id from its message position, reused by its `function` result); a
 Responses `custom` tool and its calls map to Chat Completions' `custom`, in requests and in
@@ -3012,11 +3053,15 @@ its own (pool key, `Host`, `accept-encoding`, OpenRouter attribution, a translat
 nothing about price or server-side execution: `claude-code-20250219`, `prompt-caching-2024-07-31`,
 `interleaved-thinking-2025-05-14`, `fine-grained-tool-streaming-2025-05-14`,
 `context-management-2025-06-27`, `token-efficient-tools-2025-02-19`, `output-128k-2025-02-19`, and
-the gateway's own `thinking-binding-controls-2026-08-01`. Everything else is dropped: `context-1m-*`
-turns on premium long-context pricing, `mcp-client-*`, `code-execution-*` and `files-api-*` reach
-servers, sandboxes and storage on Beyond's account, and `oauth-*` means nothing beside a pool API
-key. The gateway's own beta for a translated walk is merged in after the filter, so it is never
-dropped. Adding a token is a one-line change to `MANAGED_ANTHROPIC_BETAS` in `proxy.rs`.
+the gateway's own `thinking-binding-controls-2026-08-01`. One more, `fast-mode-2026-02-01`, is
+kept only on a request to direct Anthropic, the one provider with fast mode: it doubles the
+per-token price, and fast mode is a product Beyond sells and bills at the speed served (D266, see
+**Fast mode** under model routing). Everything else is dropped: `context-1m-*` turns on premium
+long-context pricing, `mcp-client-*`, `code-execution-*` and `files-api-*` reach servers, sandboxes
+and storage on Beyond's account, and `oauth-*` means nothing beside a pool API key. The gateway's
+own beta for a translated walk (block binding, or fast mode for a priority request) is merged in
+after the filter, so it is never dropped. Adding a token is a one-line change to
+`MANAGED_ANTHROPIC_BETAS` in `proxy.rs`.
 
 Dropped, among others: `openai-organization` and `openai-project` (they switch the org or project the
 pool key bills to, and an SDK user with `OPENAI_ORG_ID` set got a 401), `cookie`,
