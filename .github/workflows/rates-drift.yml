@@ -132,6 +132,13 @@ jobs:
           # A GITHUB_TOKEN push starts no pull_request run; a dispatch does, and its `Check` lands
           # on the branch's head commit, which is the PR's.
           gh workflow run ci.yml --ref "$branch"
+          # Routine drift (rate values only, each within 2x, every check passed) merges itself once
+          # `Check` is green, by the owner's decision; review drift waits for a human.
+          if [ "$CLASS" = routine ]; then
+            gh pr merge "$pr" --auto --squash --delete-branch
+          else
+            gh pr merge "$pr" --disable-auto || true
+          fi
           echo "PR: $pr (CI dispatched on $branch)"
       - name: File the rates-broken issue
         if: steps.classify.outputs.class == 'broken'

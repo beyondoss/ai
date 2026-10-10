@@ -262,7 +262,8 @@ Maintenance is one command:
   generates has passed them all. The PR body tables every changed rate (old, new, source URL). If
   an open `rates/sync-*` PR exists, the workflow force-pushes a fresh commit to it (only when its
   tip is the bot's own commit; a human's commit gets a comment instead), and does nothing when it
-  already carries the same snapshots and table. A human merges every rates PR. Everything runs
+  already carries the same snapshots and table. A `rates-routine` PR gets auto-merge (squash) and
+  merges itself once `Check` is green; a `rates-review` PR waits for a human. Everything runs
   on `GITHUB_TOKEN`, whose pushes start no `pull_request` run, so after each push the workflow
   dispatches `ci.yml` on the branch (`workflow_dispatch` is the one event such a token can start),
   and the PR's head commit gets `Check`. A rates PR whose moved rate a golden vector prices fails

@@ -2120,7 +2120,7 @@ golden vectors) is `crates/providers/ARCHITECTURE.md`, "Pricing contract". The r
 generated from snapshots of every vendor's primary pricing source. A daily workflow
 (`rates-drift.yml`) re-fetches them and, when a rate moved, opens a `rates/sync-*` PR with the new
 table and `rate_version`, labeled `rates-routine` (rate values only, each within 2×) or
-`rates-review`, which a human merges; a source it can no longer read opens a `rates-broken` issue
+`rates-review`; a routine PR merges itself once CI is green, a review PR waits for a human; a source it can no longer read opens a `rates-broken` issue
 instead. By hand it is `mise run rates:sync` and a review of the diff (providers ARCHITECTURE,
 "Rate data and versions").
 
