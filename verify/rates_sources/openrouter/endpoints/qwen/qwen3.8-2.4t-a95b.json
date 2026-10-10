@@ -1,0 +1,99 @@
+{
+  "data": {
+    "endpoints": [
+      {
+        "context_length": 1000000,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.000006",
+          "discount": 0,
+          "input_cache_read": "0.00000025",
+          "input_cache_write": "0.0000025",
+          "prompt": "0.000002"
+        },
+        "provider_name": "Alibaba",
+        "quantization": "unknown",
+        "tag": "alibaba"
+      },
+      {
+        "context_length": 262144,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.000006",
+          "discount": 0,
+          "input_cache_read": "0.0000002",
+          "prompt": "0.000002"
+        },
+        "provider_name": "DeepInfra",
+        "quantization": "fp4",
+        "tag": "deepinfra/fp4"
+      },
+      {
+        "context_length": 1000000,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.000006",
+          "discount": 0,
+          "input_cache_read": "0.00000025",
+          "prompt": "0.000002"
+        },
+        "provider_name": "Modal",
+        "quantization": "unknown",
+        "tag": "modal"
+      },
+      {
+        "context_length": 1000000,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.000006",
+          "discount": 0,
+          "input_cache_read": "0.00000025",
+          "prompt": "0.000002"
+        },
+        "provider_name": "Novita",
+        "quantization": "unknown",
+        "tag": "novita"
+      },
+      {
+        "context_length": 1048576,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.000006",
+          "discount": 0,
+          "input_cache_read": "0.00000025",
+          "prompt": "0.000002"
+        },
+        "provider_name": "SiliconFlow",
+        "quantization": "fp8",
+        "tag": "siliconflow/fp8"
+      },
+      {
+        "context_length": 1010000,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.000006",
+          "discount": 0,
+          "input_cache_read": "0.00000025",
+          "prompt": "0.000002"
+        },
+        "provider_name": "Together",
+        "quantization": "unknown",
+        "tag": "together"
+      },
+      {
+        "context_length": 262144,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.000006",
+          "discount": 0.2,
+          "input_cache_read": "0.00000025",
+          "prompt": "0.000002"
+        },
+        "provider_name": "Venice",
+        "quantization": "unknown",
+        "tag": "venice"
+      }
+    ],
+    "id": "qwen/qwen3.8-2.4t-a95b"
+  }
+}

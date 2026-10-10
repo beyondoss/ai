@@ -1,0 +1,80 @@
+{
+  "data": {
+    "endpoints": [
+      {
+        "context_length": 262144,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.00000013",
+          "discount": 0,
+          "input_cache_read": "0.00000004",
+          "prompt": "0.00000008"
+        },
+        "provider_name": "Darkbloom",
+        "quantization": "fp4",
+        "tag": "darkbloom/fp4"
+      },
+      {
+        "context_length": 262144,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.00000015",
+          "discount": 0,
+          "prompt": "0.0000001"
+        },
+        "provider_name": "DeepInfra",
+        "quantization": "bf16",
+        "tag": "deepinfra/bf16"
+      },
+      {
+        "context_length": 262144,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.00000025",
+          "discount": 0,
+          "prompt": "0.0000001"
+        },
+        "provider_name": "Parasail",
+        "quantization": "bf16",
+        "tag": "parasail/bf16"
+      },
+      {
+        "context_length": 262144,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.00000015",
+          "discount": 0,
+          "prompt": "0.0000001"
+        },
+        "provider_name": "SiliconFlow",
+        "quantization": "fp8",
+        "tag": "siliconflow/fp8"
+      },
+      {
+        "context_length": 262144,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.00000025",
+          "discount": 0,
+          "prompt": "0.00000017"
+        },
+        "provider_name": "Together",
+        "quantization": "unknown",
+        "tag": "together"
+      },
+      {
+        "context_length": 256000,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.00000015",
+          "discount": 0,
+          "prompt": "0.0000001"
+        },
+        "provider_name": "Venice",
+        "quantization": "fp8",
+        "tag": "venice/fp8"
+      }
+    ],
+    "id": "qwen/qwen3.5-9b"
+  }
+}

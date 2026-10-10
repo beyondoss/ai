@@ -514,6 +514,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "beyond-ai-rates-sync"
+version = "0.1.0"
+dependencies = [
+ "beyond-ai-providers",
+ "reqwest",
+ "serde_json",
+ "sha2",
+ "toml",
+]
+
+[[package]]
 name = "beyond-ai-test-support"
 version = "0.1.0"
 dependencies = [

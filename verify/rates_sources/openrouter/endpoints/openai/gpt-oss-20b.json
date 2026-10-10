@@ -1,0 +1,144 @@
+{
+  "data": {
+    "endpoints": [
+      {
+        "context_length": 131072,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.0000001",
+          "discount": 0,
+          "prompt": "0.00000002"
+        },
+        "provider_name": "AkashML",
+        "quantization": "fp4",
+        "tag": "akashml/fp4"
+      },
+      {
+        "context_length": 131072,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.00000015",
+          "discount": 0,
+          "prompt": "0.00000007"
+        },
+        "provider_name": "Amazon Bedrock",
+        "quantization": "unknown",
+        "tag": "amazon-bedrock"
+      },
+      {
+        "context_length": 131072,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.00000015",
+          "discount": 0,
+          "prompt": "0.00000007"
+        },
+        "provider_name": "Amazon Bedrock",
+        "quantization": "unknown",
+        "tag": "amazon-bedrock/eu-west-1"
+      },
+      {
+        "context_length": 131072,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.00000013",
+          "discount": 0,
+          "input_cache_read": "0.00000003",
+          "prompt": "0.00000003"
+        },
+        "provider_name": "CoreWeave",
+        "quantization": "fp4",
+        "tag": "coreweave/fp4"
+      },
+      {
+        "context_length": 131072,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.00000009",
+          "discount": 0,
+          "input_cache_read": "0.000000009",
+          "prompt": "0.000000018"
+        },
+        "provider_name": "Darkbloom",
+        "quantization": "fp8",
+        "tag": "darkbloom/fp8"
+      },
+      {
+        "context_length": 131072,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.00000014",
+          "discount": 0,
+          "prompt": "0.00000003"
+        },
+        "provider_name": "DeepInfra",
+        "quantization": "bf16",
+        "tag": "deepinfra/bf16"
+      },
+      {
+        "context_length": 131072,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.00000014",
+          "discount": 0,
+          "input_cache_read": "0.000000029",
+          "prompt": "0.000000029"
+        },
+        "provider_name": "DekaLLM",
+        "quantization": "bf16",
+        "tag": "dekallm/bf16"
+      },
+      {
+        "context_length": 131072,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.00000025",
+          "discount": 0,
+          "prompt": "0.00000007"
+        },
+        "provider_name": "Google",
+        "quantization": "unknown",
+        "tag": "google-vertex/us-central1"
+      },
+      {
+        "context_length": 131072,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.0000003",
+          "discount": 0,
+          "input_cache_read": "0.0000000375",
+          "prompt": "0.000000075"
+        },
+        "provider_name": "Groq",
+        "quantization": "unknown",
+        "tag": "groq"
+      },
+      {
+        "context_length": 131072,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.00000015",
+          "discount": 0,
+          "input_cache_read": "0.00000002",
+          "prompt": "0.00000003"
+        },
+        "provider_name": "Parasail",
+        "quantization": "fp4",
+        "tag": "parasail/fp4"
+      },
+      {
+        "context_length": 131072,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.00000018",
+          "discount": 0,
+          "prompt": "0.00000004"
+        },
+        "provider_name": "SiliconFlow",
+        "quantization": "fp8",
+        "tag": "siliconflow/fp8"
+      }
+    ],
+    "id": "openai/gpt-oss-20b"
+  }
+}

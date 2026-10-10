@@ -1,0 +1,28 @@
+{
+  "data": {
+    "endpoints": [
+      {
+        "context_length": 1000000,
+        "max_prompt_tokens": 983616,
+        "pricing": {
+          "completion": "0.00000195",
+          "discount": 0,
+          "input_cache_write": "0.00000040625",
+          "overrides": [
+            {
+              "completion": "0.0000039",
+              "input_cache_write": "0.000001625",
+              "min_prompt_tokens": 256000,
+              "prompt": "0.0000013"
+            }
+          ],
+          "prompt": "0.000000325"
+        },
+        "provider_name": "Alibaba",
+        "quantization": "unknown",
+        "tag": "alibaba"
+      }
+    ],
+    "id": "qwen/qwen3.6-plus"
+  }
+}

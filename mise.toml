@@ -74,6 +74,31 @@ if [ -f .env ]; then set -a; . ./.env; set +a; fi
 cargo test -p beyond-ai-agent --test smoke -- --ignored --nocapture
 """
 
+[tasks."rates:sync"]
+description = "Re-fetch every primary pricing source into verify/rates_sources/ and regenerate the rate table (crates/providers/src/rates/generated.rs), printing what moved. Auto-loads .env: TOGETHER_API_KEY and XAI_API_KEY are required, every other source is public. See crates/providers/ARCHITECTURE.md."
+run = """
+if [ -f .env ]; then set -a; . ./.env; set +a; fi
+cargo run -q -p beyond-ai-rates-sync -- sync
+"""
+
+[tasks."rates:generate"]
+description = "Regenerate the rate table from the committed snapshots and verify/catalog_truth.toml. Offline and byte-reproducible."
+run = "cargo run -q -p beyond-ai-rates-sync -- generate"
+
+[tasks."rates:drift"]
+description = "Re-fetch every pricing source into a scratch copy and fail, listing the diff, if any vendor price moved. What the weekly rates-drift workflow runs. Auto-loads .env."
+run = """
+if [ -f .env ]; then set -a; . ./.env; set +a; fi
+cargo run -q -p beyond-ai-rates-sync -- drift
+"""
+
+[tasks."rates:audit"]
+description = "Second opinions on the rate table: LiteLLM and models.dev disagreements (leads, never corrections), and the vendors' own invoices (OpenAI/Anthropic admin cost APIs) checked line by line against the cards. Auto-loads .env; the invoice check needs OPENAI_ADMIN_KEY / ANTHROPIC_ADMIN_KEY."
+run = """
+if [ -f .env ]; then set -a; . ./.env; set +a; fi
+cargo run -q -p beyond-ai-rates-sync -- audit
+"""
+
 [tasks."bench:unit"]
 description = "divan micro-benchmarks of the IO-free hot paths (key/peek/usage/route/deny/allowance/cache/translate/rank): timing + native allocation counts."
 run = "cargo bench --bench unit"

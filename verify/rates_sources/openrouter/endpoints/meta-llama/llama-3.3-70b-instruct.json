@@ -1,0 +1,143 @@
+{
+  "data": {
+    "endpoints": [
+      {
+        "context_length": 131072,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.00000052",
+          "discount": 0,
+          "input_cache_read": "0.0000001",
+          "prompt": "0.0000002"
+        },
+        "provider_name": "AkashML",
+        "quantization": "fp8",
+        "tag": "akashml/fp8"
+      },
+      {
+        "context_length": 24000,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.000002253",
+          "discount": 0,
+          "prompt": "0.000000293"
+        },
+        "provider_name": "Cloudflare",
+        "quantization": "fp8",
+        "tag": "cloudflare/fp8"
+      },
+      {
+        "context_length": 128000,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.00000071",
+          "discount": 0,
+          "input_cache_read": "0.00000071",
+          "prompt": "0.00000071"
+        },
+        "provider_name": "CoreWeave",
+        "quantization": "fp16",
+        "tag": "coreweave/fp16"
+      },
+      {
+        "context_length": 131072,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.00000032",
+          "discount": 0,
+          "prompt": "0.0000001"
+        },
+        "provider_name": "DeepInfra",
+        "quantization": "fp8",
+        "tag": "deepinfra/turbo"
+      },
+      {
+        "context_length": 128000,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.00000072",
+          "discount": 0,
+          "prompt": "0.00000072"
+        },
+        "provider_name": "Google",
+        "quantization": "unknown",
+        "tag": "google-vertex"
+      },
+      {
+        "context_length": 128000,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.00000072",
+          "discount": 0,
+          "prompt": "0.00000072"
+        },
+        "provider_name": "Google",
+        "quantization": "unknown",
+        "tag": "google-vertex/us-central1"
+      },
+      {
+        "context_length": 131072,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.00000079",
+          "discount": 0,
+          "input_cache_read": "0.000000295",
+          "prompt": "0.00000059"
+        },
+        "provider_name": "Groq",
+        "quantization": "unknown",
+        "tag": "groq"
+      },
+      {
+        "context_length": 12288,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.0000004",
+          "discount": 0,
+          "prompt": "0.000000135"
+        },
+        "provider_name": "Novita",
+        "quantization": "bf16",
+        "tag": "novita/bf16"
+      },
+      {
+        "context_length": 131072,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.0000005",
+          "discount": 0,
+          "input_cache_read": "0.00000011",
+          "prompt": "0.00000022"
+        },
+        "provider_name": "Parasail",
+        "quantization": "fp8",
+        "tag": "parasail/fp8"
+      },
+      {
+        "context_length": 131072,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.0000009",
+          "discount": 0.25,
+          "prompt": "0.00000045"
+        },
+        "provider_name": "SambaNova",
+        "quantization": "unknown",
+        "tag": "sambanova-turbo"
+      },
+      {
+        "context_length": 131072,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.00000104",
+          "discount": 0,
+          "prompt": "0.00000104"
+        },
+        "provider_name": "Together",
+        "quantization": "unknown",
+        "tag": "together"
+      }
+    ],
+    "id": "meta-llama/llama-3.3-70b-instruct"
+  }
+}

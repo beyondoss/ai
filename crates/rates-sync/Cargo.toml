@@ -1,0 +1,29 @@
+[package]
+name = "beyond-ai-rates-sync"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+rust-version.workspace = true
+description = "Fetches every vendor's primary pricing source, snapshots it under verify/rates_sources/, and generates the providers crate's rate table from the snapshots (`mise run rates:sync`)"
+
+[lib]
+name = "rates_sync"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rates-sync"
+path = "src/main.rs"
+
+[dependencies]
+# The catalog the table prices (row order, candidate providers, a `list` row's ListPrice). The
+# generator links the providers crate as it is: generation reads the catalog, never the table.
+beyond-ai-providers = { path = "../providers" }
+# Blocking HTTP for `fetch`, with the workspace's TLS pins (rustls, no OpenSSL), as crates/verify.
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
+serde_json.workspace = true
+sha2 = "0.10"
+toml = "0.8"
+
+[lints]
+workspace = true

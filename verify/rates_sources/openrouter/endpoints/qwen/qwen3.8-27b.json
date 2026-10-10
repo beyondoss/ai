@@ -1,0 +1,253 @@
+{
+  "data": {
+    "endpoints": [
+      {
+        "context_length": 262144,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.00000198",
+          "discount": 0,
+          "input_cache_read": "0.00000005",
+          "prompt": "0.000000225"
+        },
+        "provider_name": "AkashML",
+        "quantization": "fp8",
+        "tag": "akashml/fp8"
+      },
+      {
+        "context_length": 1000000,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.00000255",
+          "discount": 0,
+          "input_cache_read": "0.000000085",
+          "input_cache_write": "0.00000053125",
+          "prompt": "0.000000425"
+        },
+        "provider_name": "Alibaba",
+        "quantization": "unknown",
+        "tag": "alibaba"
+      },
+      {
+        "context_length": 65536,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.00000149",
+          "discount": 0,
+          "input_cache_read": "0.00000099",
+          "prompt": "0.00000099"
+        },
+        "provider_name": "Cerebras",
+        "quantization": "fp16",
+        "tag": "cerebras/fp16"
+      },
+      {
+        "context_length": 262144,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.0000022",
+          "discount": 0,
+          "input_cache_read": "0.000000024",
+          "prompt": "0.00000024"
+        },
+        "provider_name": "Chutes",
+        "quantization": "fp8",
+        "tag": "chutes/fp8"
+      },
+      {
+        "context_length": 262144,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.0000032",
+          "discount": 0,
+          "input_cache_read": "0.00000005",
+          "prompt": "0.00000045"
+        },
+        "provider_name": "Cloudflare",
+        "quantization": "unknown",
+        "tag": "cloudflare"
+      },
+      {
+        "context_length": 262144,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.000003",
+          "discount": 0,
+          "input_cache_read": "0.00000015",
+          "prompt": "0.0000004"
+        },
+        "provider_name": "CoreWeave",
+        "quantization": "fp8",
+        "tag": "coreweave/fp8"
+      },
+      {
+        "context_length": 262144,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.0000022",
+          "discount": 0,
+          "input_cache_read": "0.000000025",
+          "prompt": "0.00000005"
+        },
+        "provider_name": "Darkbloom",
+        "quantization": "fp4",
+        "tag": "darkbloom/fp4"
+      },
+      {
+        "context_length": 262144,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.000001875",
+          "discount": 0.25,
+          "input_cache_read": "0.0000000375",
+          "prompt": "0.00000015"
+        },
+        "provider_name": "DeepInfra",
+        "quantization": "bf16",
+        "tag": "deepinfra/bf16"
+      },
+      {
+        "context_length": 262144,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.000003",
+          "discount": 0,
+          "input_cache_read": "0.00000002",
+          "prompt": "0.000000049"
+        },
+        "provider_name": "DekaLLM",
+        "quantization": "unknown",
+        "tag": "dekallm"
+      },
+      {
+        "context_length": 262144,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.00000235",
+          "discount": 0,
+          "input_cache_read": "0.000000085",
+          "prompt": "0.0000000893"
+        },
+        "provider_name": "Ionstream",
+        "quantization": "fp8",
+        "tag": "ionstream/fp8"
+      },
+      {
+        "context_length": 262144,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.0000025",
+          "discount": 0,
+          "prompt": "0.0000002"
+        },
+        "provider_name": "Mancer 2",
+        "quantization": "fp8",
+        "tag": "mancer/fp8"
+      },
+      {
+        "context_length": 262144,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.0000047",
+          "discount": 0,
+          "input_cache_read": "0.000000135",
+          "prompt": "0.0000007"
+        },
+        "provider_name": "ModelRun",
+        "quantization": "fp4",
+        "tag": "modelrun/fp4"
+      },
+      {
+        "context_length": 262144,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.00000135",
+          "discount": 0,
+          "input_cache_read": "0.000000018",
+          "prompt": "0.00000004"
+        },
+        "provider_name": "Near AI",
+        "quantization": "fp8",
+        "tag": "near-ai/fp8"
+      },
+      {
+        "context_length": 1000000,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.000003",
+          "discount": 0,
+          "input_cache_read": "0.000000085",
+          "prompt": "0.00000042"
+        },
+        "provider_name": "Novita",
+        "quantization": "unknown",
+        "tag": "novita"
+      },
+      {
+        "context_length": 262144,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.0000022",
+          "discount": 0,
+          "input_cache_read": "0.00000005",
+          "prompt": "0.00000024"
+        },
+        "provider_name": "Parasail",
+        "quantization": "fp8",
+        "tag": "parasail/fp8"
+      },
+      {
+        "context_length": 1000000,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.000001875",
+          "discount": 0.25,
+          "input_cache_read": "0.0000000375",
+          "prompt": "0.00000015"
+        },
+        "provider_name": "Phala",
+        "quantization": "unknown",
+        "tag": "phala"
+      },
+      {
+        "context_length": 262144,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.0000014",
+          "discount": 0.3,
+          "input_cache_read": "0.000000035",
+          "prompt": "0.00000014"
+        },
+        "provider_name": "Reka",
+        "quantization": "fp8",
+        "tag": "reka/fp8"
+      },
+      {
+        "context_length": 262144,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.0000032",
+          "discount": 0,
+          "prompt": "0.00000045"
+        },
+        "provider_name": "Venice",
+        "quantization": "fp8",
+        "tag": "venice/fp8"
+      },
+      {
+        "context_length": 262144,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.0000023",
+          "discount": 0,
+          "input_cache_read": "0.0000000198",
+          "prompt": "0.00000004"
+        },
+        "provider_name": "Wafer",
+        "quantization": "unknown",
+        "tag": "wafer"
+      }
+    ],
+    "id": "qwen/qwen3.8-27b"
+  }
+}

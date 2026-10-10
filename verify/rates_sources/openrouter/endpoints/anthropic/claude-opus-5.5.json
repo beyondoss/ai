@@ -1,0 +1,183 @@
+{
+  "data": {
+    "endpoints": [
+      {
+        "context_length": 1000000,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.00002",
+          "discount": 0,
+          "input_cache_read": "0.0000002",
+          "input_cache_write": "0.000005",
+          "input_cache_write_1h": "0.000008",
+          "prompt": "0.000004",
+          "web_search": "0.01"
+        },
+        "provider_name": "Amazon Bedrock",
+        "quantization": "unknown",
+        "tag": "amazon-bedrock"
+      },
+      {
+        "context_length": 1000000,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.000022",
+          "discount": 0,
+          "input_cache_read": "0.00000022",
+          "input_cache_write": "0.0000055",
+          "input_cache_write_1h": "0.0000088",
+          "prompt": "0.0000044",
+          "web_search": "0.01"
+        },
+        "provider_name": "Amazon Bedrock",
+        "quantization": "unknown",
+        "tag": "amazon-bedrock/eu-west-1"
+      },
+      {
+        "context_length": 1000000,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.000022",
+          "discount": 0,
+          "input_cache_read": "0.00000022",
+          "input_cache_write": "0.0000055",
+          "input_cache_write_1h": "0.0000088",
+          "prompt": "0.0000044",
+          "web_search": "0.01"
+        },
+        "provider_name": "Amazon Bedrock",
+        "quantization": "unknown",
+        "tag": "amazon-bedrock/us-east-1"
+      },
+      {
+        "context_length": 1000000,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.00002",
+          "discount": 0,
+          "input_cache_read": "0.0000002",
+          "input_cache_write": "0.000005",
+          "input_cache_write_1h": "0.000008",
+          "prompt": "0.000004",
+          "web_search": "0.01"
+        },
+        "provider_name": "Anthropic",
+        "quantization": "unknown",
+        "tag": "anthropic"
+      },
+      {
+        "context_length": 1000000,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.00004",
+          "discount": 0,
+          "input_cache_read": "0.0000004",
+          "input_cache_write": "0.00001",
+          "input_cache_write_1h": "0.000016",
+          "prompt": "0.000008",
+          "web_search": "0.01"
+        },
+        "provider_name": "Anthropic",
+        "quantization": "unknown",
+        "tag": "anthropic/fast"
+      },
+      {
+        "context_length": 1000000,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.00002",
+          "discount": 0,
+          "input_cache_read": "0.0000002",
+          "input_cache_write": "0.000005",
+          "input_cache_write_1h": "0.000008",
+          "prompt": "0.000004",
+          "web_search": "0.01"
+        },
+        "provider_name": "Azure",
+        "quantization": "unknown",
+        "tag": "azure/global"
+      },
+      {
+        "context_length": 1000000,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.000022",
+          "discount": 0,
+          "input_cache_read": "0.00000022",
+          "input_cache_write": "0.0000055",
+          "input_cache_write_1h": "0.0000088",
+          "prompt": "0.0000044",
+          "web_search": "0.01"
+        },
+        "provider_name": "Azure",
+        "quantization": "unknown",
+        "tag": "azure/us"
+      },
+      {
+        "context_length": 1000000,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.00002",
+          "discount": 0,
+          "input_cache_read": "0.0000002",
+          "input_cache_write": "0.000005",
+          "input_cache_write_1h": "0.000008",
+          "prompt": "0.000004",
+          "web_search": "0.01"
+        },
+        "provider_name": "Claude Platform on AWS",
+        "quantization": "unknown",
+        "tag": "claude-on-aws"
+      },
+      {
+        "context_length": 1000000,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.000022",
+          "discount": 0,
+          "input_cache_read": "0.00000022",
+          "input_cache_write": "0.0000055",
+          "input_cache_write_1h": "0.0000088",
+          "prompt": "0.0000044",
+          "web_search": "0.01"
+        },
+        "provider_name": "Google",
+        "quantization": "unknown",
+        "tag": "google-vertex/europe"
+      },
+      {
+        "context_length": 1000000,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.00002",
+          "discount": 0,
+          "input_cache_read": "0.0000002",
+          "input_cache_write": "0.000005",
+          "input_cache_write_1h": "0.000008",
+          "prompt": "0.000004",
+          "web_search": "0.01"
+        },
+        "provider_name": "Google",
+        "quantization": "unknown",
+        "tag": "google-vertex/global"
+      },
+      {
+        "context_length": 1000000,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.000022",
+          "discount": 0,
+          "input_cache_read": "0.00000022",
+          "input_cache_write": "0.0000055",
+          "input_cache_write_1h": "0.0000088",
+          "prompt": "0.0000044",
+          "web_search": "0.01"
+        },
+        "provider_name": "Google",
+        "quantization": "unknown",
+        "tag": "google-vertex/us"
+      }
+    ],
+    "id": "anthropic/claude-opus-5.5"
+  }
+}

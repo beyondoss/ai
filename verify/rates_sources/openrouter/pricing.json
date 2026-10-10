@@ -1,0 +1,272 @@
+[
+  {
+    "@context": "https://schema.org",
+    "@id": "https://openrouter.ai/#organization",
+    "@type": "Organization",
+    "address": {
+      "@type": "PostalAddress",
+      "addressCountry": "US",
+      "addressLocality": "New York",
+      "addressRegion": "NY",
+      "postalCode": "10016",
+      "streetAddress": "169 Madison Avenue"
+    },
+    "contactPoint": {
+      "@type": "ContactPoint",
+      "contactType": "customer support",
+      "email": "support@openrouter.ai",
+      "url": "https://openrouter.ai/support"
+    },
+    "description": "The unified interface for every model. Find the best models & prices for your prompts",
+    "logo": "https://openrouter.ai/brand/v2/openrouter-glyph-light.svg",
+    "name": "OpenRouter",
+    "sameAs": [
+      "https://x.com/openrouter",
+      "https://github.com/OpenRouterTeam",
+      "https://www.linkedin.com/company/104068329"
+    ],
+    "url": "https://openrouter.ai"
+  },
+  {
+    "@context": "https://schema.org",
+    "@id": "https://openrouter.ai/#website",
+    "@type": "WebSite",
+    "name": "OpenRouter",
+    "potentialAction": {
+      "@type": "SearchAction",
+      "query-input": "required name=search_term_string",
+      "target": {
+        "@type": "EntryPoint",
+        "urlTemplate": "https://openrouter.ai/models?q={search_term_string}"
+      }
+    },
+    "publisher": {
+      "@id": "https://openrouter.ai/#organization"
+    },
+    "url": "https://openrouter.ai"
+  },
+  {
+    "@context": "https://schema.org",
+    "@type": "BreadcrumbList",
+    "itemListElement": [
+      {
+        "@type": "ListItem",
+        "item": "https://openrouter.ai/",
+        "name": "Home",
+        "position": 1
+      },
+      {
+        "@type": "ListItem",
+        "item": "https://openrouter.ai/pricing",
+        "name": "Pricing",
+        "position": 2
+      }
+    ]
+  },
+  {
+    "@context": "https://schema.org",
+    "@type": "FAQPage",
+    "mainEntity": [
+      {
+        "@type": "Question",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "Input and output tokens are billed per model at posted rates."
+        },
+        "name": "How are tokens billed?"
+      },
+      {
+        "@type": "Question",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "No. Inference is billed at the provider's list price on every plan. OpenRouter's fee is charged when you buy credits, 5.5% on Standard and 8% on Business, never on individual requests."
+        },
+        "name": "Do you mark up provider pricing?"
+      },
+      {
+        "@type": "Question",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "Standard and Business: you buy credits, manually or with auto top-up, and each request deducts its cost from your balance. The only billing difference between the two is the fee on credit purchases, 5.5% on Standard and 8% on Business. Enterprise: pricing is set by contract and based on volume, prepaid credits and annual commitments, with invoicing. BYOK: the provider bills you for inference directly. Standard and Business include $25,000 of list-price inference per month through BYOK with no OpenRouter fee; Enterprise allowances are custom. Above the allowance, OpenRouter charges 5% of what the same request would cost at list price on OpenRouter, deducted from your credits."
+        },
+        "name": "How is billing structured for Standard, Business, Enterprise and BYOK?"
+      },
+      {
+        "@type": "Question",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "No. An attempt that errors is not charged for its model tokens, so with fallback you pay only for the run that answers. Under Zero Completion Insurance the same holds for a response that returns nothing and no finish reason; auxiliary services that already ran, such as web search or file parsing, may still be billed. Routing through openrouter/auto adds no fee; you pay the rate of whichever model serves the request."
+        },
+        "name": "Are failed or fallback attempts billed?"
+      },
+      {
+        "@type": "Question",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "We offer discounted OpenRouter fees in our enterprise plan. We do not discount inference."
+        },
+        "name": "Do you offer volume discounts or annual plans?"
+      },
+      {
+        "@type": "Question",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "No. Pricing is per token whether or not you stream."
+        },
+        "name": "Are streaming responses billed differently?"
+      },
+      {
+        "@type": "Question",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "Standard and Business: credit and debit cards, AliPay, and crypto (USDC). Enterprise: invoicing and purchase orders through sales."
+        },
+        "name": "What payment methods do you accept?"
+      },
+      {
+        "@type": "Question",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "Prices are exclusive of applicable taxes. Where required, VAT/GST may be added on invoices."
+        },
+        "name": "Are taxes (VAT/GST) included in prices?"
+      },
+      {
+        "@type": "Question",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "No. Standard and Business have no minimums and no lock-in. You pay only for what you use."
+        },
+        "name": "Is there a minimum spend or lock-in on Standard?"
+      },
+      {
+        "@type": "Question",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "The 8% Business platform fee applies to credit purchases. It is charged when you buy credits, not on individual API requests, and model token prices are the same as on every other plan."
+        },
+        "name": "What does the Business plan fee apply to?"
+      },
+      {
+        "@type": "Question",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "No. Upgrade from the settings of the account or organization you want on Business. There is no contract, no minimum spend, and no sales conversation. You can downgrade 30 days after the upgrade, from the same place."
+        },
+        "name": "Do I need to talk to sales to upgrade to Business?"
+      },
+      {
+        "@type": "Question",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "OpenRouter sets no plan-based rate limit on paid models. A limit you hit there normally comes from the provider, and fallback routing retries other providers automatically; only very high burst traffic is rejected by OpenRouter's own DDoS protection with a 429. Free models are capped at 20 requests per minute and 50 per day, rising to 1,000 per day once your account has bought at least $10 of credits. Failed attempts count toward that daily cap, and a negative balance blocks free models until you add credits. Details are in the rate limits documentation."
+        },
+        "name": "Do you enforce rate limits?"
+      },
+      {
+        "@type": "Question",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "Yes. Workspaces give each environment its own keys, limits and activity: 5 workspaces on Free and Standard, 1,000 on Business. Within a workspace, each API key can carry its own credit cap."
+        },
+        "name": "Can I separate environments (dev/staging/production)?"
+      },
+      {
+        "@type": "Question",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "No plan-based ones. On Standard, Business and Enterprise, limits on paid models come from the provider, not from your plan; only OpenRouter's DDoS protection can reject very high burst traffic. Free models carry the caps in the answer above."
+        },
+        "name": "Do you enforce platform rate limits?"
+      },
+      {
+        "@type": "Question",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "Yes. In-region routing is included on Business and Enterprise plans. Send requests to eu.openrouter.ai to keep inference with providers in the EU, or to us.openrouter.ai to keep it in the US. Upgrade to Business from your settings; for Enterprise, contact sales."
+        },
+        "name": "Can I make sure to send API requests in specific regions?"
+      },
+      {
+        "@type": "Question",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "Routing improves reliability; latency varies by model, provider and region. For consistent latency, pin a specific model and provider."
+        },
+        "name": "Does routing affect latency?"
+      },
+      {
+        "@type": "Question",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "If a model is deprecated, you will receive a 404 when you request it, with an error message like \"no endpoints for this model found.\" If the pricing changes, we will continue to route to the model and it will serve your requests. But, you will be charged at the new rate and your credits will deduct accordingly. This will be reflected in your billing."
+        },
+        "name": "What happens if a model is deprecated or pricing changes?"
+      },
+      {
+        "@type": "Question",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "Yes. Choose an explicit model ID/version to avoid unexpected changes. You can also switch models without changing your integration."
+        },
+        "name": "Can I pin specific model versions?"
+      },
+      {
+        "@type": "Question",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "No. We do not train on your data. Provider-side retention can be disabled for the account or per request, and Zero Data Retention routing is available on every plan."
+        },
+        "name": "Do you train on customer data?"
+      },
+      {
+        "@type": "Question",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "SSO (SAML) and SCIM are available on Enterprise plans; contact sales to enable them. Business and Enterprise plans also include Workload Identity Federation, which lets your services call OpenRouter with tokens from your own identity provider instead of long-lived API keys."
+        },
+        "name": "Do you support SSO?"
+      },
+      {
+        "@type": "Question",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "Our API is OpenAI‑compatible. Update the base URL and model names; see Quickstart."
+        },
+        "name": "How do I migrate from OpenAI/Anthropic?"
+      },
+      {
+        "@type": "Question",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "If the underlying model supports tools/function calling, you can use it through the same API. See the API reference for examples."
+        },
+        "name": "Do you support function calling/tools?"
+      },
+      {
+        "@type": "Question",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "Routing/fallback can automatically try alternative models, and an attempt that errors is not charged for its model tokens under Zero Completion Insurance."
+        },
+        "name": "What happens if a provider is down or a model errors?"
+      },
+      {
+        "@type": "Question",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "Visit the status page for real‑time uptime and incident history."
+        },
+        "name": "Where can I check uptime and incidents?"
+      },
+      {
+        "@type": "Question",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "Enterprise accounts get a support SLA with committed response times, a dedicated Slack channel with the OpenRouter team, a customer success manager who owns the account, and a forward-deployed engineer for integration, routing and rollout work. Standard and Business use email support, and every plan can use the community Discord."
+        },
+        "name": "What does the Enterprise dedicated support team include?"
+      }
+    ]
+  }
+]

@@ -108,7 +108,7 @@ jobs:
             filter: package(beyond-ai-agent) and kind(test) and binary(~serve)
             extra: ""
           - name: core-providers
-            filter: package(beyond-ai-agent-core) or package(beyond-ai-providers)
+            filter: package(beyond-ai-agent-core) or package(beyond-ai-providers) or package(beyond-ai-rates-sync)
             extra: ""
           # The remote-exec path against a **real, isolated target**, not a mock. Every other test of
           # it runs commands on the same machine, which proves the wiring and nothing about a

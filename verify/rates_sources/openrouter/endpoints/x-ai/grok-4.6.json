@@ -1,0 +1,141 @@
+{
+  "data": {
+    "endpoints": [
+      {
+        "context_length": 500000,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.0000066",
+          "discount": 0,
+          "input_cache_read": "0.00000055",
+          "input_cache_write": "0",
+          "overrides": [
+            {
+              "completion": "0.0000132",
+              "input_cache_read": "0.0000011",
+              "input_cache_write": "0",
+              "min_prompt_tokens": 200000,
+              "prompt": "0.0000044"
+            }
+          ],
+          "prompt": "0.0000022",
+          "web_search": "0.01"
+        },
+        "provider_name": "Amazon Bedrock",
+        "quantization": "unknown",
+        "tag": "amazon-bedrock/us-west-2"
+      },
+      {
+        "context_length": 500000,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.000006",
+          "discount": 0,
+          "input_cache_read": "0.0000005",
+          "overrides": [
+            {
+              "completion": "0.000012",
+              "input_cache_read": "0.000001",
+              "min_prompt_tokens": 200000,
+              "prompt": "0.000004"
+            }
+          ],
+          "prompt": "0.000002",
+          "web_search": "0.005"
+        },
+        "provider_name": "xAI",
+        "quantization": "unknown",
+        "tag": "xai"
+      },
+      {
+        "context_length": 500000,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.000012",
+          "discount": 0,
+          "input_cache_read": "0.000001",
+          "overrides": [
+            {
+              "completion": "0.000024",
+              "input_cache_read": "0.000002",
+              "min_prompt_tokens": 200000,
+              "prompt": "0.000008"
+            }
+          ],
+          "prompt": "0.000004",
+          "web_search": "0.005"
+        },
+        "provider_name": "xAI",
+        "quantization": "unknown",
+        "tag": "xai/priority"
+      },
+      {
+        "context_length": 500000,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.000006",
+          "discount": 0,
+          "input_cache_read": "0.0000005",
+          "overrides": [
+            {
+              "completion": "0.000012",
+              "input_cache_read": "0.000001",
+              "min_prompt_tokens": 200000,
+              "prompt": "0.000004"
+            }
+          ],
+          "prompt": "0.000002",
+          "web_search": "0.005"
+        },
+        "provider_name": "xAI",
+        "quantization": "unknown",
+        "tag": "xai/zdr"
+      },
+      {
+        "context_length": 500000,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.000012",
+          "discount": 0,
+          "input_cache_read": "0.000001",
+          "overrides": [
+            {
+              "completion": "0.000024",
+              "input_cache_read": "0.000002",
+              "min_prompt_tokens": 200000,
+              "prompt": "0.000008"
+            }
+          ],
+          "prompt": "0.000004",
+          "web_search": "0.005"
+        },
+        "provider_name": "xAI",
+        "quantization": "unknown",
+        "tag": "xai/zdr/priority"
+      },
+      {
+        "context_length": 500000,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.0000066",
+          "discount": 0,
+          "input_cache_read": "0.00000055",
+          "overrides": [
+            {
+              "completion": "0.0000132",
+              "input_cache_read": "0.0000011",
+              "min_prompt_tokens": 200000,
+              "prompt": "0.0000044"
+            }
+          ],
+          "prompt": "0.0000022",
+          "web_search": "0.005"
+        },
+        "provider_name": "xAI",
+        "quantization": "unknown",
+        "tag": "xai/zdr/us"
+      }
+    ],
+    "id": "x-ai/grok-4.6"
+  }
+}

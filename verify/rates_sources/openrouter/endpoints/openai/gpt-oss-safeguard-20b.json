@@ -1,0 +1,20 @@
+{
+  "data": {
+    "endpoints": [
+      {
+        "context_length": 131072,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.0000003",
+          "discount": 0,
+          "input_cache_read": "0.0000000375",
+          "prompt": "0.000000075"
+        },
+        "provider_name": "Groq",
+        "quantization": "unknown",
+        "tag": "groq"
+      }
+    ],
+    "id": "openai/gpt-oss-safeguard-20b"
+  }
+}

@@ -2116,7 +2116,9 @@ settle one:
 `logging` calls `providers::pricing::price` with the row's own facts, as the row logs them
 (`server_tools` is read back from its logged text), so a repricer working from the row gets the
 same inputs. The pricing contract (the model, every dimension, rounding, the rate table and the
-golden vectors) is `crates/providers/ARCHITECTURE.md`, "Pricing contract".
+golden vectors) is `crates/providers/ARCHITECTURE.md`, "Pricing contract". The rate table is
+generated from snapshots of every vendor's primary pricing source: maintaining it is
+`mise run rates:sync`, a review of the diff, and a new `rate_version`.
 
 | Field             | Type    | Meaning                                                                                                                                                        |
 | ----------------- | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |

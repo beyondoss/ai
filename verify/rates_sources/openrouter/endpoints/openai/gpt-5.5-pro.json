@@ -1,0 +1,47 @@
+{
+  "data": {
+    "endpoints": [
+      {
+        "context_length": 1050000,
+        "max_prompt_tokens": 922000,
+        "pricing": {
+          "completion": "0.00018",
+          "discount": 0,
+          "overrides": [
+            {
+              "completion": "0.00027",
+              "min_prompt_tokens": 272000,
+              "prompt": "0.00006"
+            }
+          ],
+          "prompt": "0.00003",
+          "web_search": "0.01"
+        },
+        "provider_name": "OpenAI",
+        "quantization": "unknown",
+        "tag": "openai"
+      },
+      {
+        "context_length": 1050000,
+        "max_prompt_tokens": 922000,
+        "pricing": {
+          "completion": "0.00009",
+          "discount": 0,
+          "overrides": [
+            {
+              "completion": "0.000135",
+              "min_prompt_tokens": 272000,
+              "prompt": "0.00003"
+            }
+          ],
+          "prompt": "0.000015",
+          "web_search": "0.01"
+        },
+        "provider_name": "OpenAI",
+        "quantization": "unknown",
+        "tag": "openai/flex"
+      }
+    ],
+    "id": "openai/gpt-5.5-pro"
+  }
+}

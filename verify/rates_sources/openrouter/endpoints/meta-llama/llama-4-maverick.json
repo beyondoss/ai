@@ -1,0 +1,57 @@
+{
+  "data": {
+    "endpoints": [
+      {
+        "context_length": 128000,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.0000006525",
+          "discount": 0,
+          "input_cache_read": "0.00000005",
+          "prompt": "0.0000001875"
+        },
+        "provider_name": "DigitalOcean",
+        "quantization": "unknown",
+        "tag": "digitalocean"
+      },
+      {
+        "context_length": 524288,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.00000115",
+          "discount": 0,
+          "prompt": "0.00000035"
+        },
+        "provider_name": "Google",
+        "quantization": "unknown",
+        "tag": "google-vertex/us-east5"
+      },
+      {
+        "context_length": 1048576,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.00000085",
+          "discount": 0,
+          "prompt": "0.00000027"
+        },
+        "provider_name": "Novita",
+        "quantization": "fp8",
+        "tag": "novita/fp8"
+      },
+      {
+        "context_length": 524288,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.000001",
+          "discount": 0,
+          "input_cache_read": "0.00000017",
+          "prompt": "0.00000035"
+        },
+        "provider_name": "Parasail",
+        "quantization": "fp8",
+        "tag": "parasail/fp8"
+      }
+    ],
+    "id": "meta-llama/llama-4-maverick"
+  }
+}
