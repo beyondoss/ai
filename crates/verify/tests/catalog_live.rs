@@ -1231,24 +1231,20 @@ fn sweep_file() -> PathBuf {
     sweep_dir().join(format!("{id}.jsonl"))
 }
 
-/// Ledger row priced at the row's card: fresh input, output, cache reads and writes.
-fn priced(row: &ModelRoute, l: &Value) -> f64 {
-    let p = |s: &str| s.parse::<f64>().unwrap_or(f64::NAN) / 1e6;
-    let n = |k: &str| l[k].as_u64().unwrap_or(0) as f64;
-    let (input, read, write) = (
-        n("input_tokens"),
-        n("cache_read_tokens"),
-        n("cache_write_tokens"),
-    );
-    let fresh = if l["usage_wire"] == "anthropic" {
-        input
-    } else {
-        input - read - write
-    };
-    fresh * p(row.price.input)
-        + n("output_tokens") * p(row.price.output)
-        + read * p(row.price.cache_read)
-        + write * p(row.price.cache_write)
+/// The row's own price (`price_micros`, logged by the gateway's reference pricer: the row's card
+/// under every dimension it carries), in USD. NaN when the row is unpriced, so no comparison
+/// passes on it.
+fn priced(l: &Value) -> f64 {
+    l["price_micros"]
+        .as_u64()
+        .map_or(f64::NAN, |m| m as f64 / 1e6)
+}
+
+/// The row's cost to us, in USD (`cost_micros`).
+fn cost_of(l: &Value) -> f64 {
+    l["cost_micros"]
+        .as_u64()
+        .map_or(f64::NAN, |m| m as f64 / 1e6)
 }
 
 fn record(trial: &str, arm: &Arm, probe: &str, l: &Value, out: &Out) {
@@ -1256,7 +1252,8 @@ fn record(trial: &str, arm: &Arm, probe: &str, l: &Value, out: &Out) {
         "trial": trial, "row": arm.row.model, "provider": arm.provider(), "route": arm.route(),
         "probe": probe, "input": l["input_tokens"], "output": l["output_tokens"],
         "cache_read": l["cache_read_tokens"], "cache_write": l["cache_write_tokens"],
-        "reasoning": out.reasoning, "usd": priced(arm.row, l), "provider_usd": out.provider_cost,
+        "reasoning": out.reasoning, "usd": priced(l), "cost_usd": cost_of(l), "price_status": l["price_status"],
+        "provider_usd": out.provider_cost,
         "at": SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
     });
     if let Ok(mut f) = std::fs::OpenOptions::new()
@@ -1328,6 +1325,21 @@ fn served(trial: &str, arm: &Arm, probe: &str, r: &Reply) -> Result<(Out, Value)
         return Err(format!(
             "{probe}: BIL-13 price_model {} does not resolve to the row {} ({row})",
             row["price_model"], arm.row.model
+        ));
+    }
+    // BIL-24: every served row is priced by the reference pricer, at the table this build carries,
+    // on this candidate's own card.
+    if row["price_status"] != "priced" || row["price_micros"].as_u64().is_none() {
+        return Err(format!(
+            "{probe}: BIL-24 row is not priced: {} {} ({row})",
+            row["price_status"], row["price_reason"]
+        ));
+    }
+    if row["cost_micros"].as_u64().is_none()
+        || row["rate_version"] != providers::rates::RATE_VERSION
+    {
+        return Err(format!(
+            "{probe}: BIL-24 row has no cost, or another rate table ({row})"
         ));
     }
     Ok((out, row.clone()))
@@ -2174,7 +2186,7 @@ fn cat7(trial: &str, arm: Arm) -> Result<(), Failed> {
         )?;
         match served(trial, &probe, "cost", &r) {
             Ok((out, row)) => {
-                let ours = priced(arm.row, &row);
+                let ours = priced(&row);
                 match out.provider_cost {
                     Some(theirs) if theirs > 0.0 => {
                         let off = (ours - theirs) / theirs;

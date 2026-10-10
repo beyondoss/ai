@@ -51,11 +51,17 @@ fail-fast = false
 retries = 0
 slow-timeout = { period = "60s", terminate-after = 3 }
 
-# Billing reconciliation waits up to 15 minutes for the providers' usage reports to catch up with
+# Billing reconciliation waits up to 90 minutes for the providers' usage reports to catch up with
 # its batch (see verify/README.md), so it gets its own cap.
 [[profile.verify.overrides]]
 filter = "binary_id(beyond-ai-verify::reconcile_live)"
-slow-timeout = { period = "60s", terminate-after = 18 }
+slow-timeout = { period = "60s", terminate-after = 95 }
+
+# A pricing case that reads a provider's usage report (or OpenRouter's generation API) waits for
+# it the same way (crates/verify/tests/pricing_live.rs).
+[[profile.verify.overrides]]
+filter = "binary_id(beyond-ai-verify::pricing_live)"
+slow-timeout = { period = "60s", terminate-after = 95 }
 
 # A long coding session runs 3-10 minutes, then (where reconciled) waits up to 15 more for the
 # provider's usage report (crates/verify/tests/long_live.rs).
@@ -82,7 +88,11 @@ inherits = "verify"
 
 [[profile.verify-isolated.overrides]]
 filter = "binary_id(beyond-ai-verify::reconcile_live)"
-slow-timeout = { period = "60s", terminate-after = 18 }
+slow-timeout = { period = "60s", terminate-after = 95 }
+
+[[profile.verify-isolated.overrides]]
+filter = "binary_id(beyond-ai-verify::pricing_live)"
+slow-timeout = { period = "60s", terminate-after = 95 }
 
 [[profile.verify-isolated.overrides]]
 filter = "binary_id(beyond-ai-verify::long_live)"

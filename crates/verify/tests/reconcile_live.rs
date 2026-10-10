@@ -10,8 +10,8 @@
 //! uncached input, cache reads, cache writes and output tokens (and, where the provider reports it,
 //! the request count).
 //!
-//! Usage reports lag the traffic by minutes, so a trial takes up to ~15 minutes. The admin keys
-//! touch only read-only endpoints (key listings and usage reports).
+//! Usage reports lag the traffic (by 45-60 minutes on 2026-10-10), so a trial takes up to 90 minutes.
+//! The admin keys touch only read-only endpoints (key listings and usage reports).
 //!
 //! Trials are listed only with `VERIFY_LIVE=1` *and* both of the provider's keys set (admin and
 //! pool): a missing key means the trial is not listed, never that it fails.
@@ -35,11 +35,13 @@ use serde_json::{Value, json};
 /// The dev signing key (seed `[7; 32]`, kid 1) and the tenant-1 token minted from it; the same
 /// constants `mise run ai:mint-dev-key` prints (and `live.rs` uses).
 const DEV_PUBKEY_B64: &str = "6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw=";
-const DEV_TOKEN: &str = "bai_v1.1.AQAAAAAAAAABAAAAAAAAAA.WrWcPbklu91PS-4WuR6GnBNF3h4nROpH0EQQlfJf06f7_lEnlQOCSBimhH2JMwXFJgw40BniTB7-yIdFnpldDw";
+pub(crate) const DEV_TOKEN: &str = "bai_v1.1.AQAAAAAAAAABAAAAAAAAAA.WrWcPbklu91PS-4WuR6GnBNF3h4nROpH0EQQlfJf06f7_lEnlQOCSBimhH2JMwXFJgw40BniTB7-yIdFnpldDw";
 
-/// How long to wait for the provider's report to settle on the batch, and how often to ask.
-const SETTLE_BUDGET: Duration = Duration::from_secs(15 * 60);
-const POLL_EVERY: Duration = Duration::from_secs(30);
+/// How long to wait for the provider's report to settle on the batch, and how often to ask. Anthropic
+/// documents "typically within 5 minutes"; on 2026-10-10 its report lagged 45-60 minutes.
+const SETTLE_BUDGET: Duration = Duration::from_secs(90 * 60);
+/// Anthropic's admin API allows 90 requests a window, shared by the organization.
+const POLL_EVERY: Duration = Duration::from_secs(180);
 
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum Provider {
@@ -118,12 +120,12 @@ const ANTHROPIC: Recon = Recon {
     ],
 };
 
-fn repo_root() -> PathBuf {
+pub(crate) fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
 /// `.env` at the repo root, then the process environment (which wins).
-fn env_keys() -> BTreeMap<String, String> {
+pub(crate) fn env_keys() -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     if let Ok(s) = std::fs::read_to_string(repo_root().join(".env")) {
         for line in s.lines() {
@@ -141,7 +143,7 @@ fn env_keys() -> BTreeMap<String, String> {
     out
 }
 
-fn gateway_bin() -> PathBuf {
+pub(crate) fn gateway_bin() -> PathBuf {
     std::env::var_os("VERIFY_GATEWAY_BIN")
         .map(PathBuf::from)
         .unwrap_or_else(|| repo_root().join("target/debug/beyond-ai"))
@@ -174,6 +176,9 @@ pub(crate) struct Totals {
     pub(crate) fresh: u64,
     pub(crate) cache_read: u64,
     pub(crate) cache_write: u64,
+    /// The 1-hour share of `cache_write` (Anthropic). Priced, not compared: the batch writes at
+    /// the default TTL.
+    pub(crate) cache_write_1h: u64,
     pub(crate) output: u64,
     /// Request count, where the side reports one (Anthropic's usage report doesn't).
     pub(crate) requests: Option<u64>,
@@ -307,6 +312,8 @@ fn reconcile(recon: Recon, pool: &str, admin: &str) -> Result<(), Failed> {
             Ok(t) => {
                 eprintln!("BIL-5 {}: provider reports {t}", recon.name);
                 if t.agrees(&ledger) && last == Some(t) {
+                    // The tokens agree; now the money (BIL-24).
+                    cost_agrees(recon, &t, &rows, &ids)?;
                     let _ = std::fs::remove_dir_all(&dir);
                     return Ok(());
                 }
@@ -334,6 +341,69 @@ fn reconcile(recon: Recon, pool: &str, admin: &str) -> Result<(), Failed> {
         dir.display(),
     )
     .into())
+}
+
+/// BIL-24 on the batch: the provider's own token totals, priced by the reference pricer at this
+/// build's rate table, are what the rows' `cost_micros` sum to. Each row rounds half-up once, so
+/// the two may differ by at most half a micro-dollar a row; anything more is a rate-table or
+/// pricing finding, never a tolerance to widen.
+fn cost_agrees(
+    recon: Recon,
+    reported: &Totals,
+    rows: &[Value],
+    ids: &[String],
+) -> Result<(), Failed> {
+    use providers::pricing::{UsageRow, price};
+    let mut ledger: u64 = 0;
+    for id in ids {
+        let row = rows
+            .iter()
+            .find(|r| r["request_id"] == id.as_str())
+            .ok_or_else(|| format!("{id}: no row"))?;
+        if row["price_status"] != "priced" {
+            return Err(format!("BIL-24 {id}: row not priced: {row}").into());
+        }
+        ledger += row["cost_micros"]
+            .as_u64()
+            .ok_or_else(|| format!("BIL-24 {id}: no cost_micros: {row}"))?;
+    }
+    let anthropic = recon.provider == Provider::Anthropic;
+    let vendor = price(&UsageRow {
+        price_model: Some(recon.model),
+        provider: Some(recon.name),
+        usage_wire: if anthropic {
+            providers::WireFormat::Anthropic
+        } else {
+            providers::WireFormat::OpenAi
+        },
+        input_tokens: if anthropic {
+            reported.fresh
+        } else {
+            reported.fresh + reported.cache_read + reported.cache_write
+        },
+        output_tokens: reported.output,
+        cache_read_tokens: reported.cache_read,
+        cache_write_tokens: reported.cache_write,
+        cache_write_1h_tokens: reported.cache_write_1h,
+        unix_secs: now_secs(),
+        ..UsageRow::default()
+    })
+    .map_err(|e| format!("BIL-24: the provider's totals are unpriced: {e}"))?;
+    let slack = ids.len() as u64;
+    eprintln!(
+        "BIL-24 {}: rows cost {ledger} µ$; the provider's totals at the rate table {} µ$ (allowed          difference {slack} µ$, rounding)",
+        recon.name, vendor.cost.micros
+    );
+    if ledger.abs_diff(vendor.cost.micros) > slack {
+        return Err(format!(
+            "BIL-24 {}: rows' cost_micros sum to {ledger}, the provider's own totals ({reported})              price at {} on {}",
+            recon.name,
+            vendor.cost.micros,
+            providers::rates::RATE_VERSION
+        )
+        .into());
+    }
+    Ok(())
 }
 
 /// Sum the batch's rows, normalized: an `anthropic`-wire row's input excludes the cache, an
@@ -418,11 +488,11 @@ const QUESTIONS: &[&str] = &[
 ];
 
 /// A gateway and its nats-server, killed on drop.
-struct Gateway {
+pub(crate) struct Gateway {
     _nats: Guard,
     _gw: Guard,
-    port: u16,
-    log: PathBuf,
+    pub(crate) port: u16,
+    pub(crate) log: PathBuf,
 }
 
 /// Kills its process on drop, so a failing trial never leaks a gateway or nats-server.
@@ -436,7 +506,7 @@ impl Drop for Guard {
 }
 
 impl Gateway {
-    fn boot(dir: &Path, provider: &str, pool: &str) -> Result<Gateway, Failed> {
+    pub(crate) fn boot(dir: &Path, provider: &str, pool: &str) -> Result<Gateway, Failed> {
         let (nats_child, nats_port) = common::spawn_nats(&dir.join("nats"))?;
         let nats = Guard(nats_child);
         let listeners = common::GATEWAY_LISTENERS;
@@ -588,7 +658,7 @@ fn tail(path: &Path) -> String {
     s[start..].to_owned()
 }
 
-fn usage_rows(log: &Path) -> Vec<Value> {
+pub(crate) fn usage_rows(log: &Path) -> Vec<Value> {
     let Ok(f) = std::fs::File::open(log) else {
         return Vec::new();
     };
@@ -603,7 +673,7 @@ fn usage_rows(log: &Path) -> Vec<Value> {
 
 /// Run curl with `stdin` on its standard input; the last line of its output is the HTTP status
 /// (`-w "\n%{http_code}"`).
-fn run_curl(mut cmd: Command, stdin: &str) -> Result<(u16, String), Failed> {
+pub(crate) fn run_curl(mut cmd: Command, stdin: &str) -> Result<(u16, String), Failed> {
     let mut child = cmd
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -628,7 +698,7 @@ fn run_curl(mut cmd: Command, stdin: &str) -> Result<(u16, String), Failed> {
 
 /// GET a provider admin endpoint. The admin key goes to curl on stdin (a `-K -` config), never on
 /// its command line.
-fn admin_get(provider: Provider, admin: &str, url: &str) -> Result<Value, Failed> {
+pub(crate) fn admin_get(provider: Provider, admin: &str, url: &str) -> Result<Value, Failed> {
     let config = match provider {
         Provider::OpenAi => format!("header = \"authorization: Bearer {admin}\"\n"),
         Provider::Anthropic => {
@@ -758,7 +828,7 @@ fn pool_key_id_once(provider: Provider, pool: &str, admin: &str) -> Result<Strin
 /// the catalog row's upstream id followed by a date, and nothing else. Any other suffix is another
 /// model: `claude-sonnet-5` must not take `claude-sonnet-5-5`'s tokens (both reconcile in the
 /// same isolated phase), nor `gpt-4.1` take `gpt-4.1-mini`'s.
-fn model_matches(reported: &str, model: &str) -> bool {
+pub(crate) fn model_matches(reported: &str, model: &str) -> bool {
     let date = |d: &str| {
         let b = d.as_bytes();
         let digits = |r: std::ops::Range<usize>| b[r].iter().all(u8::is_ascii_digit);
@@ -863,6 +933,7 @@ pub(crate) fn anthropic_usage(
                 t.cache_read += n(&r["cache_read_input_tokens"]);
                 t.cache_write += n(&r["cache_creation"]["ephemeral_5m_input_tokens"])
                     + n(&r["cache_creation"]["ephemeral_1h_input_tokens"]);
+                t.cache_write_1h += n(&r["cache_creation"]["ephemeral_1h_input_tokens"]);
                 t.output += n(&r["output_tokens"]);
             }
         }
@@ -875,7 +946,7 @@ pub(crate) fn anthropic_usage(
 }
 
 /// Unix seconds as `YYYY-MM-DDTHH:MM:SSZ` (civil-from-days, proleptic Gregorian).
-fn rfc3339(secs: u64) -> String {
+pub(crate) fn rfc3339(secs: u64) -> String {
     let (days, rem) = ((secs / 86_400) as i64, secs % 86_400);
     let z = days + 719_468;
     let era = z.div_euclid(146_097);

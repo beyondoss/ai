@@ -1495,7 +1495,20 @@ id = "BIL-24"
 priority = "P0"
 group = "Billing integrity"
 text = "Every ai.usage row carries its price, computed by the reference pricer from the row's own facts: cost_micros and price_micros exactly as the golden vectors require, the rate_version that produced them, and price_status; a row that cannot be priced says unpriced and why, never zero"
-layer = "hermetic"
+layer = "both"
+touches = [
+  "crates/providers/src/pricing.rs",
+  "crates/providers/src/rates.rs",
+  "crates/gateway/src/proxy.rs",
+]
+defects = []
+
+[[claim]]
+id = "BIL-25"
+priority = "P1"
+group = "Billing integrity"
+text = "The rows' summed cost_micros for a key reconcile with the vendor's own invoice for that key's workspace or project, per day, within a cent or 0.1%"
+layer = "live"
 touches = [
   "crates/providers/src/pricing.rs",
   "crates/providers/src/rates.rs",
