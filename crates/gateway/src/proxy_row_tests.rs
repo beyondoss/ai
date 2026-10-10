@@ -92,3 +92,29 @@ fn only_the_gateways_own_downstream_answer_is_a_refusal() {
         400
     ))));
 }
+
+/// The fast-mode beta is added once: a header already carrying it (alone or among others, with
+/// or without spaces) is left as it is, and any other value gains it.
+#[test]
+fn merge_anthropic_beta_adds_a_beta_once() {
+    let beta = translate::FAST_MODE_BETA;
+    let header = |v: Option<&str>| {
+        let mut req = pingora::http::RequestHeader::build("POST", b"/v1/messages", None).unwrap();
+        if let Some(v) = v {
+            req.insert_header("anthropic-beta", v.to_owned()).unwrap();
+        }
+        merge_anthropic_beta(&mut req, beta).unwrap();
+        req.headers
+            .get("anthropic-beta")
+            .map(|v| v.to_str().unwrap().to_owned())
+    };
+    assert_eq!(header(None).as_deref(), Some(beta));
+    assert_eq!(header(Some("")).as_deref(), Some(beta));
+    assert_eq!(header(Some(beta)).as_deref(), Some(beta));
+    let both = format!("prompt-caching-2024-07-31, {beta}");
+    assert_eq!(header(Some(&both)), Some(both.clone()));
+    assert_eq!(
+        header(Some("prompt-caching-2024-07-31")),
+        Some(format!("prompt-caching-2024-07-31,{beta}"))
+    );
+}

@@ -484,3 +484,57 @@ async fn web_search_preview_calls_are_counted_apart() {
     assert_eq!(row["server_tools"], "web_search_preview=1", "{row}");
     assert_eq!(row["server_tool_calls"].as_u64(), Some(0), "{row}");
 }
+
+const RESPONSES_TOOL_SSE: &str = "event: response.created\ndata: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp_walk\",\"object\":\"response\",\"model\":\"gpt-5-2025-08-07\",\"output\":[]}}\n\n\
+event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"fs_1\",\"type\":\"file_search_call\",\"status\":\"completed\"}}\n\n\
+event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_walk\",\"output\":[{\"id\":\"fs_1\",\"type\":\"file_search_call\"}],\"usage\":{\"input_tokens\":10,\"output_tokens\":4,\"total_tokens\":14}}}\n\n";
+
+/// A catalog walk onto a Responses candidate counts its tool items too (the walk names the
+/// serving endpoint, not a forwarded path).
+/// claim: BIL-23
+/// defect: D268
+#[tokio::test]
+async fn a_responses_walk_counts_tool_items() {
+    let (pubkey, sk) = test_keypair(163);
+    let mock = MockUpstream::start(Mode::Raw(200, "text/event-stream", RESPONSES_TOOL_SSE)).await;
+    let gw = Gateway::builder(unused_nats_port(), &mock.authority(), &b64(&pubkey))
+        .providers(&["openai"])
+        .start()
+        .await;
+    let status = post(
+        format!("{}/v1/responses", gw.url()),
+        bearer(&sk, 163),
+        r#"{"model":"gpt-5","stream":true,"input":"hi","tools":[{"type":"file_search","vector_store_ids":["vs_1"]}]}"#,
+        &[],
+    )
+    .await;
+    assert_eq!(status, 200);
+    let row = usage_row_of(&gw).await;
+    assert_eq!(row["routed_model"], "gpt-5", "{row}");
+    assert_eq!(row["server_tools"], "file_search=1", "{row}");
+}
+
+/// A Chat Completions walk (not Responses) is not tallied: its stream has no output items, and the
+/// row's tools come from its usage block alone.
+/// claim: BIL-23
+/// defect: D268
+#[tokio::test]
+async fn a_chat_walk_counts_no_responses_items() {
+    let (pubkey, sk) = test_keypair(164);
+    // A chat body that happens to carry a Responses-looking done event in its text is never read
+    // as one: only a Responses endpoint is tallied.
+    let mock = MockUpstream::start(Mode::Raw(200, "text/event-stream", RESPONSES_TOOL_SSE)).await;
+    let gw = Gateway::builder(unused_nats_port(), &mock.authority(), &b64(&pubkey))
+        .providers(&["openai"])
+        .start()
+        .await;
+    let _ = post(
+        format!("{}/v1/chat/completions", gw.url()),
+        bearer(&sk, 164),
+        r#"{"model":"gpt-5","stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+        &[],
+    )
+    .await;
+    let row = usage_row_of(&gw).await;
+    assert!(row.get("server_tools").is_none(), "{row}");
+}
