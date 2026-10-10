@@ -689,6 +689,19 @@ pub fn or_search_name(micros: u64) -> String {
     }
 }
 
+/// One card from its `[[card]]` spec, as [`build`] reads it: `catalog-drift` prices a row this way
+/// before the row exists.
+pub fn card(store: &Store, spec: &Spec, c: &CardSpec) -> Result<Card> {
+    Ctx { store, spec }.card(c)
+}
+
+/// One OpenRouter slug's endpoint cards, as [`build`] reads them (the slug must be in the store's
+/// `openrouter.models` and have its `openrouter.endpoints/{slug}` snapshot).
+pub fn openrouter(store: &Store, spec: &Spec, slug: &str) -> Result<Vec<Endpoint>> {
+    let eps = Ctx { store, spec }.openrouter(slug)?;
+    Ok(eps.into_iter().map(|(e, _)| e).collect())
+}
+
 /// Build the table from the snapshots and the spec.
 pub fn build(store: &Store, spec: &Spec) -> Result<Table> {
     let cx = Ctx { store, spec };

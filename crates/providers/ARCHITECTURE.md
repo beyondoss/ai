@@ -10,7 +10,8 @@ lookups over them:
 - **The pricing contract** (`pricing.rs`, `rates.rs`, generated `rates/generated.rs`): what one `ai.usage` row costs us and what
   we charge for it.
 
-The first two are documented in their module docs. This file is the contract for the third.
+The first two are documented in their module docs. This file is the contract for the third, and
+describes how the catalog keeps current ("Catalog maintenance").
 
 ---
 
@@ -267,7 +268,12 @@ Maintenance is one command:
   on `GITHUB_TOKEN`, whose pushes start no `pull_request` run, so after each push the workflow
   dispatches `ci.yml` on the branch (`workflow_dispatch` is the one event such a token can start),
   and the PR's head commit gets `Check`. A rates PR whose moved rate a golden vector prices fails
-  CI until that vector is recomputed.
+  CI until that vector is recomputed. Main requires an up-to-date branch, so every run, whatever
+  moved, also rebases an open `rates/sync-*` PR that fell behind main (only when all its commits
+  are the bot's), or regenerates the table on main from the PR's own snapshots when the rebase
+  conflicts, force-pushes it with lease and dispatches CI again
+  (`.github/scripts/refresh-bot-prs.sh`); "already carries this change" holds only on top of
+  today's main. Run it by hand with `gh workflow run rates-drift.yml`.
 - `mise run rates:audit` prints LiteLLM's and models.dev's disagreements (leads to check against
   the primary source, never corrections), and checks the cards against the vendors' own invoices:
   every (day, model, token kind) line of OpenAI's and Anthropic's admin cost reports must equal
@@ -487,3 +493,104 @@ OpenRouter's Alibaba endpoint carries the tier on the cost side.
 - **DeepSeek's holiday calendar** must be extended before 2027-01-01, or weekday peak rows refuse.
 - **The seven OpenAI `*-pro` ids for GPT-5.6 and GPT-6 are not OpenAI models.** OpenAI makes "pro" a
   `reasoning.mode`. The rows exist only on OpenRouter, priced at the base model's card.
+
+---
+
+## Catalog maintenance
+
+New models and retirements reach the catalog by rule, with no model in the loop.
+`rates-sync catalog-drift` (`crates/rates-sync/src/catalog_drift.rs`) is a pure function of its
+inputs, saved under one directory (`--save DIR`; `--inputs DIR` replays them byte for byte):
+
+| Input                                                                                    | Read for                                                                             |
+| ---------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------ |
+| the rate snapshots, re-fetched into a scratch copy of `verify/rates_sources/`            | each new card's rates; xAI's and Together's listings                                 |
+| OpenRouter `GET /api/v1/models?output_modalities=all`, unfiltered                        | new models in every family; `expiration_date`; the feature-class compare             |
+| `GET /api/v1/models/{slug}/endpoints` for each slug a new model would be priced from     | that candidate's rates                                                               |
+| Anthropic and OpenAI `GET /v1/models`, Bedrock's inference profiles (each needs its key) | which ids each host lists; `created`; Anthropic `retires_at`, OpenAI `shutdown_date` |
+| Anthropic, OpenAI and Together deprecation pages (markdown)                              | scheduled retirements                                                                |
+
+**Lineage** (`crates/rates-sync/src/lineage.rs`). An id's version is its first number run
+(`4.5`, Anthropic's `4-5`); the rest, lowercased and without snapshot tokens (`-20251001`,
+`-0813`, Bedrock's `-v1:0`), is its line: `claude-haiku-4-5`, `anthropic/claude-haiku-4.5` and
+`us.anthropic.claude-haiku-4-5-20251001-v1:0` are version `[4, 5]` of three spellings of one line.
+An id whose number is glued to letters (`gpt-4o`, `gpt-oss-120b`) has no lineage, so nothing
+succeeds it mechanically.
+
+**Detection.** For each host with a listing, a listed id that no candidate spells and
+`[[not_carried]]` / `[[retired]]` / `[[not_serverless]]` does not record is:
+
+- a **new version** when it is in the line of a candidate at that host and its version is above
+  every version in that line and in its row's own line (no row has it yet). The predecessor is the
+  highest version row in that line.
+- **ambiguous lineage** (needs-human) when its version is not the highest but it was released after
+  every carried model in the line (xAI's `grok-4.20` sorts above a later `grok-4.8`).
+- a **new family** (needs-human; OpenRouter only, which lists every vendor with release times) when
+  it is in a carried brand (vendor prefix and name stem: `anthropic/claude`, `qwen/qwen`) but no
+  carried line, and was released after every model of that brand the catalog carries. Older
+  long-tail models are never reported.
+
+A candidate **retires** on the earliest of: its host listing's own date (OpenRouter
+`expiration_date`, Anthropic `retires_at`, OpenAI `shutdown_date`); a deprecation page row naming
+its id (an Anthropic alias also by its dated snapshot, which it pins; an OpenAI alias moves between
+snapshots, so only its own id counts); or today, when the host's listing no longer has it. Only
+dates within 14 days count (the window `no_catalog_row_outlives_its_retirement` warns in). More
+than two candidates vanishing from one host at once is a broken listing, reported, not acted on.
+
+**Classification.** A new version is a **successor** when every one of these holds, and
+**needs-human** (listing each that fails) otherwise:
+
+1. each predecessor candidate's host lists exactly one id for the new version in that candidate's
+   line (an undated predecessor keeps the undated spelling); a host that lists none is left out,
+   except the primary;
+2. no host the predecessor lacks (Anthropic, OpenAI, xAI, Together) lists it;
+3. OpenRouter lists the predecessor and the new model with the same input modalities, tool,
+   structured-output and reasoning parameters, context window and max output;
+4. every kept candidate's card builds from the snapshots ("no rate" otherwise) with the same pricing
+   tiers as the predecessor's (long context and its threshold, fast, flex, off-peak, US-only
+   premium, tool fees);
+5. the list price is a host card's: the list card is the primary's, or the predecessor's inline
+   list price equals its primary's card (not the maker's own rate);
+6. the primary vendor's listing (else OpenRouter's) gives a release time;
+7. the predecessor has no hand-kept per-candidate rule (`STREAM_ONLY`, `TOOL_THINKING`, the
+   `REFUSES_*` lists, `FAST_MODE_MODELS`), no measured `input_limit` / `output_limit`, no
+   `follows`, and no `[[schema_unenforced]]`, `[[conflict]]`, `[[override]]`, `[[superseded]]` or
+   `[[promo]]` entry.
+
+A successor's edit: a `ModelRoute` in sorted position with the predecessor's wire, candidate order
+and paths, each host's listed id, the predecessor's card limits and capability bits, the vendor
+scheme's display name (`Claude Haiku 4.5` → `Claude Haiku 5.5`), the release time, and the list
+card's standard rates; `[[card]]`s re-spelled from the predecessor's; a `[[pricing]]` in catalog
+order; a `[[row]]` (price, `created`, capability bits) where the predecessor has one; and the
+snapshots its cards and OpenRouter slug read.
+
+Retirements of a row's candidates are a **retirement** when some, not all, retire, the primary is
+not one of them, and none has a hand-kept rule or a truth-file measurement: they leave
+`candidates` / `responses` and `[[pricing]]`, an unused `[[card]]` goes, and a `[[retired]]` entry
+records each. When every candidate retires and a newer row in the row's line exists, the row is
+removed and `(name, successor)` joins `ALIASES`, so a request for the old name is served and billed
+as the successor. Anything else (a retiring primary, a whole row with no successor) is needs-human.
+
+`rates-sync catalog-apply --inputs DIR SLUG` replays a saved run and writes one finding's edit into
+`catalog.rs`, `verify/catalog_truth.toml` and the snapshots (from the saved responses, never
+re-fetched); `rates-sync generate` and `rate-version` then rebuild against the edited catalog.
+`crates/rates-sync/tests/catalog_drift.rs` holds each rule to a fixture, and a generated row to
+its expected bytes.
+
+**The workflow** (`.github/workflows/catalog-drift.yml`, daily at 09:00 UTC). Run it by hand with
+`gh workflow run catalog-drift.yml` (or "Run workflow" on the Actions tab), and locally, writing
+nothing, with `mise run catalog:drift` (`-- --save DIR` keeps the inputs). For each successor or
+retirement, `.github/scripts/catalog-drift-prs.sh` builds the edit on a fresh copy of main as one
+bot commit on `catalog/<slug>`, and stops if that branch already holds exactly it on top of main
+(or holds a human's commit). Otherwise it live tests the edited row through a gateway built from
+that commit, `VERIFY_CATALOG_ROW=<row>` cells CAT-1, BIL-13 and CAT-7 of
+`crates/verify/tests/catalog_live.rs` (a real request served, one priced `ai.usage` row, and the
+logged tokens at the card matching the vendor's report), and puts the result in the PR body. A pass
+force-pushes the branch with lease, opens or updates the PR (label `catalog-auto`), dispatches
+`ci.yml` on it, and enables squash auto-merge. A failure, or a candidate whose key
+(`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `XAI_API_KEY`, `TOGETHER_API_KEY`,
+`AWS_BEARER_TOKEN_BEDROCK`) is not set or that no live cell reaches (Groq, DeepSeek, Fireworks),
+makes the finding needs-human. Every needs-human finding is a row of the one open `catalog-drift`
+issue (vendor, list price, source, reasons), rewritten each run and closed when empty. Each run
+then rebases any `catalog/*` PR left behind main (`.github/scripts/refresh-bot-prs.sh`), as
+rates-drift does for `rates/sync-*`.

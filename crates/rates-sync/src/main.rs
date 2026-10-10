@@ -11,14 +11,21 @@
 //! rates-sync rate-version  set RATE_VERSION (and the golden vectors' rate_version) to name the
 //!                      table this binary was compiled with
 //! rates-sync audit     LiteLLM and models.dev as second opinions, plus the vendors' invoices
+//! rates-sync catalog-drift [--save DIR | --inputs DIR]
+//!                      fetch every listing, deprecation page and rate source into DIR (default a
+//!                      scratch directory), or replay a saved DIR, and print the catalog's new
+//!                      models and retirements as JSON (crates/rates-sync/src/catalog_drift.rs)
+//! rates-sync catalog-apply --inputs DIR SLUG
+//!                      write one successor or retirement finding of DIR into catalog.rs, the truth
+//!                      file and the snapshots (then run `generate` and `rate-version`)
 //! ```
 
 use rates_sync::classify::{self, Class, Report};
 use rates_sync::{
-    GENERATED, Result, SOURCES, audit, build, diff, emit, fetch, invoice, repo_root, snapshot,
-    sources,
+    GENERATED, Result, SOURCES, TRUTH, audit, build, catalog_drift, catalog_edit, diff, emit,
+    fetch, invoice, repo_root, snapshot, sources,
 };
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
@@ -35,7 +42,18 @@ fn main() -> ExitCode {
             }
         };
     }
+    let flag = |name: &str| {
+        args.iter()
+            .position(|a| a == name)
+            .and_then(|i| args.get(i + 1))
+            .map(PathBuf::from)
+    };
     let r = match cmd {
+        "catalog-drift" => drift_catalog(&root, flag("--save"), flag("--inputs")),
+        "catalog-apply" => match (flag("--inputs"), args.last()) {
+            (Some(dir), Some(slug)) if args.len() == 4 => apply_catalog(&root, &dir, slug),
+            _ => Err("usage: rates-sync catalog-apply --inputs DIR SLUG".into()),
+        },
         "sync" => sync(&root),
         "rate-version" => rate_version(&root),
         "generate" => write_generated(&root),
@@ -47,7 +65,7 @@ fn main() -> ExitCode {
             Ok(())
         }
         _ => Err(
-            "usage: rates-sync sync | generate | check | drift | classify [--apply] | rate-version | audit"
+            "usage: rates-sync sync | generate | check | drift | classify [--apply] | rate-version | audit | catalog-drift [--save DIR | --inputs DIR] | catalog-apply --inputs DIR SLUG"
                 .into(),
         ),
     };
@@ -322,5 +340,249 @@ fn run_audit(root: &Path) -> Result<()> {
     if bad > 0 {
         return Err(format!("{bad} invoice lines disagree with the table"));
     }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
+// catalog-drift
+// ---------------------------------------------------------------------------------------------
+
+const CATALOG: &str = "crates/providers/src/catalog.rs";
+
+/// Fetch everything `catalog_drift::detect` reads into `dir`: the rate sources (a re-fetched copy
+/// of the committed store), OpenRouter's whole model list, the vendors' own listings (where the
+/// key is set), the deprecation pages, and the endpoint lists of the slugs new models would be
+/// priced from. A source that can't be fetched keeps its committed snapshot, or is left out.
+fn fetch_inputs(root: &Path, dir: &Path) -> Result<()> {
+    let spec = rates_sync::read_spec(root)?;
+    let slugs = spec.openrouter_slugs();
+    let defs = sources::all(&slugs);
+    let _ = std::fs::remove_dir_all(dir);
+    let store = catalog_drift::sources_dir(dir);
+    copy_dir(&root.join(SOURCES), &store)?;
+    let today = fetch::today();
+    match fetch::fetch_all(&store, &defs, &slugs, &today, true) {
+        Ok((_, skipped)) => {
+            for s in skipped {
+                println!("::warning::not re-fetched (its key is not set): {s}");
+            }
+        }
+        Err(e) => println!("::warning::some rate sources kept their committed snapshot: {e}"),
+    }
+    let c = fetch::client()?;
+    let save = |rel: &str, bytes: &[u8]| -> Result<()> {
+        let p = dir.join(rel);
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+        }
+        std::fs::write(&p, bytes).map_err(|e| format!("{}: {e}", p.display()))
+    };
+    save("today", format!("{today}\n").as_bytes())?;
+    save(
+        "openrouter-models.json",
+        &fetch::get(&c, sources::OPENROUTER_MODELS, &[])?,
+    )?;
+    let key = |var: &str| std::env::var(var).ok().filter(|k| !k.is_empty());
+    let keyed = [
+        (
+            "anthropic-models.json",
+            catalog_drift::ANTHROPIC_MODELS,
+            "ANTHROPIC_API_KEY",
+            key("ANTHROPIC_API_KEY").map(|k| {
+                vec![
+                    ("x-api-key", k),
+                    ("anthropic-version", "2023-06-01".to_owned()),
+                ]
+            }),
+        ),
+        (
+            "openai-models.json",
+            catalog_drift::OPENAI_MODELS,
+            "OPENAI_API_KEY",
+            key("OPENAI_API_KEY").map(|k| vec![("authorization", format!("Bearer {k}"))]),
+        ),
+        (
+            "bedrock-profiles.json",
+            catalog_drift::BEDROCK_PROFILES,
+            "AWS_BEARER_TOKEN_BEDROCK",
+            key("AWS_BEARER_TOKEN_BEDROCK").map(|k| vec![("authorization", format!("Bearer {k}"))]),
+        ),
+    ];
+    for (file, url, var, headers) in keyed {
+        match headers {
+            None => println!("::warning::{var} is not set: {url} not read"),
+            Some(h) => match fetch::get(&c, url, &h) {
+                Ok(b) => save(file, &b)?,
+                Err(e) => println!("::warning::{url}: {e}"),
+            },
+        }
+    }
+    for (p, url) in catalog_drift::DEPRECATION_PAGES {
+        match fetch::get(&c, url, &[]) {
+            Ok(b) => save(&format!("deprecations/{p}.md"), &b)?,
+            Err(e) => println!("::warning::{url}: {e}"),
+        }
+    }
+    let truth = read_truth(root)?;
+    let inputs = catalog_drift::Inputs::load(dir, &defs)?;
+    let cat = catalog_drift::Catalog {
+        rows: providers::catalog::MODEL_ROUTES,
+        spec: &spec,
+        truth: &truth,
+    };
+    for slug in catalog_drift::wanted_endpoints(&inputs, &cat)? {
+        let url = format!("https://openrouter.ai/api/v1/models/{slug}/endpoints");
+        match fetch::get(&c, &url, &[]) {
+            Ok(b) => save(&format!("endpoints/{slug}.json"), &b)?,
+            Err(e) => println!("::warning::{url}: {e}"),
+        }
+    }
+    Ok(())
+}
+
+fn read_truth(root: &Path) -> Result<toml::Table> {
+    let text = std::fs::read_to_string(root.join(TRUTH)).map_err(|e| format!("{TRUTH}: {e}"))?;
+    text.parse().map_err(|e| format!("{TRUTH}: {e}"))
+}
+
+fn detect_saved(
+    root: &Path,
+    dir: &Path,
+) -> Result<(catalog_drift::Inputs, Vec<catalog_drift::Finding>)> {
+    let spec = rates_sync::read_spec(root)?;
+    let truth = read_truth(root)?;
+    let inputs = catalog_drift::Inputs::load(dir, &sources::all(&spec.openrouter_slugs()))?;
+    let cat = catalog_drift::Catalog {
+        rows: providers::catalog::MODEL_ROUTES,
+        spec: &spec,
+        truth: &truth,
+    };
+    let findings = catalog_drift::detect(&inputs, &cat)?;
+    Ok((inputs, findings))
+}
+
+/// Fetch (or replay) the inputs and print every finding, and the needs-human issue body, as JSON.
+fn drift_catalog(root: &Path, save: Option<PathBuf>, inputs: Option<PathBuf>) -> Result<()> {
+    let dir = match (inputs, save) {
+        (Some(d), _) => d,
+        (None, save) => {
+            let d = save.unwrap_or_else(|| {
+                std::env::temp_dir().join(format!("catalog-drift-{}", std::process::id()))
+            });
+            fetch_inputs(root, &d)?;
+            eprintln!("catalog-drift: inputs saved in {}", d.display());
+            d
+        }
+    };
+    let (_, findings) = detect_saved(root, &dir)?;
+    for f in &findings {
+        eprintln!("catalog-drift: {} {}", f.class.as_str(), f.slug);
+    }
+    let out = serde_json::json!({
+        "findings": findings.iter().map(catalog_drift::Finding::to_json).collect::<Vec<_>>(),
+        "issue": catalog_drift::issue_markdown(&findings),
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&out).map_err(|e| e.to_string())?
+    );
+    Ok(())
+}
+
+/// Apply one successor or retirement finding of a saved run to the tree: the catalog row, the
+/// truth file, and the snapshots its cards and OpenRouter slugs read (taken from the run, never
+/// re-fetched). `generate` and `rate-version`, run after, rebuild against the edited catalog.
+fn apply_catalog(root: &Path, dir: &Path, slug: &str) -> Result<()> {
+    let (inputs, findings) = detect_saved(root, dir)?;
+    let f = findings
+        .iter()
+        .find(|f| f.slug == slug)
+        .ok_or_else(|| format!("no finding {slug} in {}", dir.display()))?;
+    let edit = f
+        .edit
+        .as_ref()
+        .ok_or_else(|| format!("{slug} is {}: no rule edits it", f.class.as_str()))?;
+    let rewrite = |rel: &str, g: &dyn Fn(&str) -> Result<String>| -> Result<()> {
+        let p = root.join(rel);
+        let old = std::fs::read_to_string(&p).map_err(|e| format!("{rel}: {e}"))?;
+        std::fs::write(&p, g(&old)?).map_err(|e| format!("{rel}: {e}"))
+    };
+    rewrite(CATALOG, &|t| catalog_edit::apply_catalog(t, edit))?;
+    rewrite(TRUTH, &|t| catalog_edit::apply_truth(t, edit))?;
+
+    // The snapshots: OpenRouter's model list for the new slug set, a new slug's endpoints, and
+    // (a successor) the vendor pages its cards read, as this run fetched them.
+    let spec = rates_sync::read_spec(root)?;
+    let slugs = spec.openrouter_slugs();
+    let defs = sources::all(&slugs);
+    let committed = root.join(SOURCES);
+    let mut entries = snapshot::read_manifest(&committed)?;
+    let refresh: Vec<String> = match edit {
+        catalog_edit::Edit::Add(a) => a.refresh.clone(),
+        catalog_edit::Edit::Retire(_) => vec!["openrouter.models".into()],
+    };
+    for d in &defs {
+        let from_raw = if d.id == "openrouter.models" {
+            Some(inputs.openrouter.as_str())
+        } else {
+            d.id.strip_prefix("openrouter.endpoints/")
+                .filter(|_| !entries.contains_key(&d.id))
+                .and_then(|s| inputs.endpoints.get(s))
+                .map(String::as_str)
+        };
+        let (raw_sha, text, fetched) = match from_raw {
+            Some(raw) => (
+                snapshot::sha256_hex(raw.as_bytes()),
+                sources::normalize(d, raw.as_bytes(), &slugs)?,
+                inputs.today.clone(),
+            ),
+            None if refresh.contains(&d.id) => {
+                let e = inputs
+                    .store
+                    .entries
+                    .get(&d.id)
+                    .ok_or_else(|| format!("{}: not in the run's snapshots", d.id))?;
+                (
+                    e.raw_sha256.clone(),
+                    inputs.store.get(&d.id)?.to_owned(),
+                    e.fetched.clone(),
+                )
+            }
+            None => continue,
+        };
+        let sha = snapshot::sha256_hex(text.as_bytes());
+        if entries.get(&d.id).is_some_and(|e| e.sha256 == sha) {
+            continue;
+        }
+        let path = committed.join(&d.file);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        std::fs::write(&path, &text).map_err(|e| format!("{}: {e}", path.display()))?;
+        entries.insert(
+            d.id.clone(),
+            snapshot::Entry {
+                id: d.id.clone(),
+                url: d.url.clone(),
+                file: d.file.clone(),
+                fetched,
+                raw_sha256: raw_sha,
+                sha256: sha,
+            },
+        );
+    }
+    // A slug no row prices any more leaves the store.
+    let gone: Vec<String> = entries
+        .keys()
+        .filter(|id| !defs.iter().any(|d| &d.id == *id))
+        .cloned()
+        .collect();
+    for id in gone {
+        if let Some(e) = entries.remove(&id) {
+            let _ = std::fs::remove_file(committed.join(&e.file));
+        }
+    }
+    snapshot::write_manifest(&committed, &entries)?;
+    println!("{}", f.model);
     Ok(())
 }

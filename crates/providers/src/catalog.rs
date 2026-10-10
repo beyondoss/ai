@@ -60,6 +60,12 @@
 //! cells `CAT-16::raw::*` (`crates/verify/tests/catalog_live.rs`) check every candidate against its
 //! vendor's own listing and deprecation notices, and every first-party release in a carried family
 //! against the table, so neither a retirement nor a new model goes unnoticed.
+//!
+//! The daily catalog-drift workflow acts on both by rule (`rates-sync catalog-drift`): a newer
+//! version of a row's line on the same hosts and in the same feature class becomes a generated row,
+//! a retiring candidate leaves its row, and a row whose every candidate retires joins [`ALIASES`].
+//! Each is a PR opened after the row passes live; the rest is an issue for a human. See
+//! `crates/providers/ARCHITECTURE.md`, "Catalog maintenance".
 
 use crate::{ProviderId, WireFormat};
 
@@ -210,14 +216,14 @@ pub const REASONING: u8 = 1 << 1;
 pub const STRUCTURED_OUTPUTS: u8 = 1 << 2;
 
 /// The `/v1/models` names of the `IN_*` bits and the capability bits, in output order.
-const INPUT_NAMES: [(u8, &str); 5] = [
+pub const INPUT_NAMES: [(u8, &str); 5] = [
     (IN_TEXT, "text"),
     (IN_IMAGE, "image"),
     (IN_FILE, "file"),
     (IN_AUDIO, "audio"),
     (IN_VIDEO, "video"),
 ];
-const FEATURE_NAMES: [(u8, &str); 3] = [
+pub const FEATURE_NAMES: [(u8, &str); 3] = [
     (TOOLS, "tools"),
     (REASONING, "reasoning"),
     (STRUCTURED_OUTPUTS, "structured_outputs"),
@@ -2276,6 +2282,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
     },
 ];
 
+/// Retired catalog names that resolve to their successor row, as `(old, successor)`, sorted.
+///
+/// A name lands here only when every candidate of its row retired and a newer row in the same
+/// line exists: `rates-sync catalog-drift` removes the row and adds the pair (its
+/// `verify/catalog_truth.toml` `[[retired]]` entry names the row). A request for the old name is
+/// then served and billed as the successor row, under the successor's name. Every other retired
+/// name stays a 404. `aliases_name_live_successors` holds each pair to that.
+pub const ALIASES: &[(&str, &str)] = &[];
+
 /// The catalog row for a model name, or `None` if we do not serve it.
 ///
 /// [`MODEL_ROUTES`] is sorted (asserted), so the common path is a binary search over `&'static str`
@@ -2286,7 +2301,8 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
 /// A miss then tries each row's candidate `upstream_model` ids (OpenRouter's
 /// `anthropic/claude-opus-4.8`, Bedrock's inference-profile id, …). Those are not extra products —
 /// they are the spellings we already rewrite *to* — so accepting them as aliases is how a caller
-/// who copied a vendor slug still hits the row.
+/// who copied a vendor slug still hits the row. Last, a retired name in [`ALIASES`] resolves to
+/// its successor row.
 pub fn for_model(name: &str) -> Option<&'static ModelRoute> {
     match MODEL_ROUTES.binary_search_by(|r| r.model.cmp(name)) {
         Ok(i) => MODEL_ROUTES.get(i),
@@ -2299,6 +2315,10 @@ pub fn for_model(name: &str) -> Option<&'static ModelRoute> {
                         .iter()
                         .any(|c| c.upstream_model.eq_ignore_ascii_case(name))
                 })
+            })
+            .or_else(|| {
+                let (_, to) = ALIASES.iter().find(|(a, _)| a.eq_ignore_ascii_case(name))?;
+                MODEL_ROUTES.iter().find(|r| r.model == *to)
             }),
     }
 }
@@ -2721,6 +2741,39 @@ mod tests {
                 None,
                 "{unknown:?} must not resolve — a near-miss is not a match",
             );
+        }
+    }
+
+    /// An alias is a retired row's name (no row, no candidate spells it, `[[retired]]` names it)
+    /// resolving to a row in its own line, and the list is sorted and unique.
+    #[test]
+    fn aliases_name_live_successors() {
+        let t = truth();
+        for w in ALIASES.windows(2) {
+            assert!(w[0].0 < w[1].0, "ALIASES must be sorted and unique: {w:?}");
+        }
+        for (old, to) in ALIASES {
+            assert!(
+                MODEL_ROUTES.iter().all(|r| r.model != *old
+                    && r.candidates
+                        .iter()
+                        .chain(r.responses)
+                        .all(|c| !c.upstream_model.eq_ignore_ascii_case(old))),
+                "{old}: an alias is no row's name or candidate"
+            );
+            assert_eq!(for_model(old).map(|r| r.model), Some(*to), "{old}");
+            assert!(
+                truth_array(&t, "retired")
+                    .iter()
+                    .any(|e| e.get("model").and_then(toml::Value::as_str) == Some(*old)),
+                "{old}: no [[retired]] entry names the row"
+            );
+            let family = |m: &str| {
+                m.split(|c: char| c.is_ascii_digit())
+                    .next()
+                    .map(str::to_owned)
+            };
+            assert_eq!(family(old), family(to), "{old} → {to}: not the same line");
         }
     }
 
@@ -3856,7 +3909,8 @@ mod tests {
     /// `CATALOG_RETIREMENT_STRICT=1`, set by the weekly `deep.yml` job, the warning is a failure,
     /// so the row is removed before the vendor's 404 reaches a customer under our name, while the
     /// calendar never fails an unrelated PR. A client's request for a retired row is a 404, never a
-    /// remap to the vendor's successor. The seven OpenAI rows due 2026-10-23 left early by owner
+    /// remap to the vendor's successor, except a row catalog-drift retired whole into [`ALIASES`]
+    /// (`aliases_name_live_successors`). The seven OpenAI rows due 2026-10-23 left early by owner
     /// decision (D243), recorded `retired` with that date: no row, candidate or Responses arm names
     /// them, here or as OpenRouter's `openai/` slug. That took gpt-4's card with it, so the D111
     /// (max output leaves room for a prompt in its 8,192 window) and D113 (the card lists the tools

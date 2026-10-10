@@ -1,0 +1,137 @@
+name: Catalog drift
+# Keeps the managed model catalog (crates/providers/src/catalog.rs) current: daily, and on demand
+# (`gh workflow run catalog-drift.yml`, or "Run workflow" on the Actions tab), it fetches every
+# vendor listing, deprecation page and rate source and runs `rates-sync catalog-drift`
+# (crates/rates-sync/src/catalog_drift.rs), which finds new models in the families the catalog
+# carries and retirements of its candidates, and classifies each one by rule. Plain Rust, no model
+# in the loop: the same inputs always give the same findings.
+#
+# - successor (a newer version of a row's line, on the same hosts, in the same feature class, with
+#   a rate for every candidate) and retirement (a candidate retiring within 14 days or gone from
+#   its host's listing leaves its row; a row whose every candidate retires becomes an alias of its
+#   successor row): one PR per finding on `catalog/<slug>`, updated in place, never duplicated.
+#   Before it is opened the edited row is live tested through a gateway built from the PR's commit
+#   (catalog_live.rs CAT-1, BIL-13 and CAT-7 for that row); the result goes in the PR body. A pass
+#   gets squash auto-merge; a failure, or a provider key that is not set, makes it needs-human.
+# - needs-human (a new family, a new host, a feature difference, ambiguous lineage, no rate, a
+#   retiring primary, a failed live test, ...): the one open `catalog-drift` issue lists each
+#   finding with its vendor, prices, source and reason, and is rewritten each run.
+#
+# Every run also rebases any `catalog/*` PR that fell behind main (main requires up-to-date
+# branches, so a stale PR never merges) when only the bot has committed to it.
+#
+# Everything is done with GITHUB_TOKEN, whose pushes start no workflow except a dispatch: after a
+# push the job dispatches CI (ci.yml) on the branch. The live keys are repository secrets; a
+# missing one only demotes the findings that need it.
+on:
+  schedule:
+    - cron: "0 9 * * *"
+  workflow_dispatch:
+permissions: {}
+concurrency:
+  group: catalog-drift
+  cancel-in-progress: false
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+jobs:
+  drift:
+    name: catalog drift
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    # contents: push `catalog/*`; pull-requests: open/edit the PRs; issues: the catalog-drift issue
+    # and labels; actions: dispatch CI on a PR's branch.
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      actions: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: jdx/mise-action@v4
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+      - name: Detect and classify
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          AWS_BEARER_TOKEN_BEDROCK: ${{ secrets.AWS_BEARER_TOKEN_BEDROCK }}
+          TOGETHER_API_KEY: ${{ secrets.TOGETHER_API_KEY }}
+          XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
+        run: |
+          set -euo pipefail
+          cargo run -q -p beyond-ai-rates-sync -- catalog-drift --save "$RUNNER_TEMP/inputs" \
+            >"$RUNNER_TEMP/findings.json" </dev/null
+          {
+            echo "### Catalog drift"
+            echo
+            jq -r '.findings[] | "- `\(.class)` \(.slug): \(.title)"' "$RUNNER_TEMP/findings.json"
+          } >>"$GITHUB_STEP_SUMMARY"
+      - name: Live test and open the PRs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
+          TOGETHER_API_KEY: ${{ secrets.TOGETHER_API_KEY }}
+          AWS_BEARER_TOKEN_BEDROCK: ${{ secrets.AWS_BEARER_TOKEN_BEDROCK }}
+        run: .github/scripts/catalog-drift-prs.sh "$RUNNER_TEMP/findings.json" "$RUNNER_TEMP/inputs"
+      - name: Update the catalog-drift issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          demoted="$RUNNER_TEMP/demoted.json"
+          [ -f "$demoted" ] || echo '[]' >"$demoted"
+          # Needs-human findings, and the ones the live step demoted, as one table.
+          jq -r --slurpfile d "$demoted" '
+            def cell: tostring | gsub("\\|"; "\\|") | gsub("\n"; " ");
+            def price: if . == null then "unknown"
+              else "$\(.input) in / $\(.output) out" + (if .cache_read == "" then "" else " / $\(.cache_read) cache read / $\(.cache_write) cache write" end) end;
+            [.findings[] | . as $f
+              | ($d[0] | map(select(.slug == $f.slug)) | map(.reason)) as $extra
+              | select(.class == "needs-human" or ($extra | length) > 0)
+              | .reasons += $extra]
+            | if length == 0 then "Nothing needs a human."
+              else (["| Finding | Vendor | List price (USD/MTok) | Source | Why it needs a human |",
+                     "| ------- | ------ | --------------------- | ------ | -------------------- |"]
+                    + map("| `\(.slug)`: \(.title | cell) | \(.vendor | cell) | \(.prices | price | cell) | \(.sources | join(" ") | cell) | \(.reasons | join("; ") | cell) |"))
+                   | join("\n") end' "$RUNNER_TEMP/findings.json" >"$RUNNER_TEMP/table.md"
+          {
+            echo "Catalog drift that no rule settles (\`rates-sync catalog-drift\`, \`.github/workflows/catalog-drift.yml\`). Settle each by hand: add or edit the row, or record the model in \`verify/catalog_truth.toml\` (\`[[not_carried]]\`, \`[[retired]]\`), and the next run drops it. Rewritten by every run."
+            echo
+            head -c 60000 "$RUNNER_TEMP/table.md"
+            echo
+            echo
+            echo "Last run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          } >"$RUNNER_TEMP/issue.md"
+          gh label create catalog-drift --force --color fbca04 \
+            --description "Catalog drift (new models, retirements) a human must settle"
+          export TITLE="Catalog drift: findings that need a human"
+          # shellcheck disable=SC2016 # $ENV.TITLE is jq's, not the shell's.
+          number=$(gh issue list --state open --label catalog-drift --limit 100 --json number,title \
+            --jq 'map(select(.title == $ENV.TITLE)) | .[0].number // empty')
+          if grep -qx 'Nothing needs a human.' "$RUNNER_TEMP/table.md"; then
+            if [ -n "$number" ]; then
+              gh issue edit "$number" --body-file "$RUNNER_TEMP/issue.md"
+              gh issue close "$number" --comment "Nothing needs a human as of this run."
+            fi
+          elif [ -n "$number" ]; then
+            gh issue edit "$number" --body-file "$RUNNER_TEMP/issue.md"
+          else
+            gh issue create --title "$TITLE" --label catalog-drift --body-file "$RUNNER_TEMP/issue.md"
+          fi
+      - name: Rebase catalog PRs that fell behind main
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git reset -q --hard
+          git clean -fdq -- verify/rates_sources
+          .github/scripts/refresh-bot-prs.sh catalog/

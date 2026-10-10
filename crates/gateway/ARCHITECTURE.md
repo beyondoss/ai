@@ -1378,7 +1378,10 @@ failover itself by `model_route_fails_over_to_a_real_provider`.
 Opus 4.1 and Sonnet 4 (retired at Anthropic 2026-08-05 and 2026-06-15) and GPT-5.1-Codex / -Max /
 -Mini and GPT-5.2-Codex (shut down by OpenAI 2026-07-23, still in its `/v1/models` listing) were
 OpenRouter-only rows served from Bedrock or Azure; they were removed (D181), and a request for one
-is a catalog miss (404). The gateway never remaps a requested model to the vendor's successor.
+is a catalog miss (404). The gateway never remaps a requested model to the vendor's successor,
+except a name in `providers::catalog::ALIASES`: a row catalog-drift removed because every
+candidate retired while a newer row in its line exists, which `for_model` resolves to that row
+(served, logged and billed under the successor's name).
 So did gpt-4, gpt-4-turbo, gpt-4.1-nano, o1, o1-pro, o3-mini and o4-mini, by owner decision
 ahead of OpenAI's 2026-10-23 shutdown (D243): recorded `retired` with that date, a request for one
 is a 404 like any unknown model. MiniMax M2.7 went too (D182): its one candidate, OpenRouter, sends every forced tool call and
@@ -1403,6 +1406,17 @@ Grok; text generation only, aliases not snapshots) that is neither a row nor rec
 `[[not_carried]]` with a reason, so a release shows up as a red cell. Together and OpenRouter list
 hundreds of models, so their gaps (recent models in the namespaces the catalog carries) are a
 report, `VERIFY_CATALOG_GAPS=1`, not a failure.
+
+**Keeping the catalog current is automatic where a rule decides.** The daily catalog-drift
+workflow (`.github/workflows/catalog-drift.yml`; by hand, `gh workflow run catalog-drift.yml`)
+runs `rates-sync catalog-drift`, plain Rust over the vendors' listings, deprecation pages and the
+rate snapshots. A newer version of a carried line on the same hosts and in the same feature class
+becomes a generated row; a candidate retiring within 14 days leaves its row (a whole row becomes
+an alias of its successor). Each is one `catalog/<slug>` PR, opened only after that row passes
+CAT-1, BIL-13 and CAT-7 live through a gateway built from the PR (`VERIFY_CATALOG_ROW`), and it
+merges itself once CI is green. Anything a rule cannot settle (a new family or host, a feature
+or pricing-tier difference, a retiring primary, a failed live test) is listed in the open
+`catalog-drift` issue. The rules are `crates/providers/ARCHITECTURE.md`, "Catalog maintenance".
 
 **What that failover does and does not cover.** On the two Bedrock-backed rows, Bedrock is the
 independent second source: a different account, a different network path, and AWS's own serving of
@@ -2135,8 +2149,10 @@ generated from snapshots of every vendor's primary pricing source. A daily workf
 (`rates-drift.yml`) re-fetches them and, when a rate moved, opens a `rates/sync-*` PR with the new
 table and `rate_version`, labeled `rates-routine` (rate values only, each within 2×) or
 `rates-review`; a routine PR merges itself once CI is green, a review PR waits for a human; a source it can no longer read opens a `rates-broken` issue
-instead. By hand it is `mise run rates:sync` and a review of the diff (providers ARCHITECTURE,
-"Rate data and versions").
+instead. Each run also rebases a `rates/sync-*` PR that fell behind main (or regenerates it on
+main), since main merges only up-to-date branches. By hand it is `mise run rates:sync` and a
+review of the diff, or `gh workflow run rates-drift.yml` (providers ARCHITECTURE, "Rate data
+and versions").
 
 | Field             | Type    | Meaning                                                                                                                                                        |
 | ----------------- | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
