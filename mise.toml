@@ -100,6 +100,13 @@ if [ -f .env ]; then set -a; . ./.env; set +a; fi
 cargo run -q -p beyond-ai-rates-sync -- classify
 """
 
+[tasks."catalog:drift"]
+description = "New models and retirements against the catalog (crates/rates-sync/src/catalog_drift.rs): fetch every listing, deprecation page and rate source, and print each finding (successor, retirement or needs-human) as JSON. Writes nothing to the tree. `-- --save DIR` keeps the inputs; `-- --inputs DIR` replays them offline. What the daily catalog-drift workflow runs. Auto-loads .env."
+run = """
+if [ -f .env ]; then set -a; . ./.env; set +a; fi
+cargo run -q -p beyond-ai-rates-sync -- catalog-drift "$@"
+"""
+
 [tasks."rates:audit"]
 description = "Second opinions on the rate table: LiteLLM and models.dev disagreements (leads, never corrections), and the vendors' own invoices (OpenAI/Anthropic admin cost APIs) checked line by line against the cards. Auto-loads .env; the invoice check needs OPENAI_ADMIN_KEY / ANTHROPIC_ADMIN_KEY."
 run = """

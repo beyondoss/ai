@@ -11,6 +11,10 @@ name: Rates drift
 #   stale override or conflict): nothing is regenerated; the open `rates-broken` issue for that
 #   failure kind is updated, or one is opened, and the job fails.
 #
+# Every run, an open `rates/sync-*` PR that fell behind main is rebased (or regenerated on main from
+# its snapshots) and re-dispatched, even when nothing moved: main requires up-to-date branches
+# (.github/scripts/refresh-bot-prs.sh).
+#
 # Never per PR: per-PR CI regenerates from the committed snapshots only
 # (rates_generated_from_sources), offline.
 #
@@ -49,6 +53,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
+          # Full history: the open PR's branch is compared with main, and rebased onto it.
+          fetch-depth: 0
           persist-credentials: false
       - uses: jdx/mise-action@v4
       - uses: Swatinem/rust-cache@v2
@@ -111,9 +117,13 @@ jobs:
               --body-file "$RUNNER_TEMP/body.md" --label "$label")
           else
             read -r pr branch <<<"$open"
-            git fetch -q --depth=1 --no-tags "$remote" "+refs/heads/$branch:refs/remotes/origin/$branch"
-            if git diff --quiet "origin/$branch" -- "${paths[@]}"; then
-              echo "PR #$pr already carries exactly this change: nothing to do."
+            git fetch -q --no-tags "$remote" "+refs/heads/$branch:refs/remotes/origin/$branch"
+            # Same snapshots and table, on top of today's main: nothing to do. Behind main, it is
+            # rebuilt on main below even when the data is the same: main requires an up-to-date
+            # branch, so a stale PR never merges.
+            if git diff --quiet "origin/$branch" -- "${paths[@]}" &&
+              git merge-base --is-ancestor HEAD "origin/$branch"; then
+              echo "PR #$pr already carries exactly this change on top of main: nothing to do."
               exit 0
             fi
             # The bot's branch is one bot commit on main. A commit by anyone else on top (or an
@@ -140,6 +150,17 @@ jobs:
             gh pr merge "$pr" --disable-auto || true
           fi
           echo "PR: $pr (CI dispatched on $branch)"
+      - name: Rebase rates PRs that fell behind main
+        # Every run, whatever the drift: a `rates/sync-*` PR behind main (and only the bot's
+        # commits) is rebased onto it, or regenerated on main from its own snapshots when the
+        # rebase conflicts, force-pushed with lease, and CI is dispatched on it again.
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git reset -q --hard
+          git clean -fdq -- verify/rates_sources
+          .github/scripts/refresh-bot-prs.sh rates/sync-
       - name: File the rates-broken issue
         if: steps.classify.outputs.class == 'broken'
         env:
@@ -155,6 +176,7 @@ jobs:
             echo
             echo "Last failing run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
           } >"$RUNNER_TEMP/issue.md"
+          # shellcheck disable=SC2016 # $ENV.TITLE is jq's, not the shell's.
           number=$(gh issue list --state open --label rates-broken --limit 100 --json number,title \
             --jq 'map(select(.title == $ENV.TITLE)) | .[0].number // empty')
           if [ -n "$number" ]; then

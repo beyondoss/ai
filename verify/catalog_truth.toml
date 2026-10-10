@@ -44,7 +44,9 @@
 # it, or a dated snapshot of it), a catalog row (`model`: the row and all its candidates), or both,
 # and carries exactly one date:
 # - `retired`: the vendor no longer serves it. No row may be named `model`, and no candidate may
-#   name the (provider, id). A client's request for it is a 404, never a remap to a successor.
+#   name the (provider, id). A client's request for it is a 404, never a remap to a successor,
+#   unless catalog-drift removed the row because every candidate retired and a newer row in its
+#   line exists: then `ALIASES` (crates/providers/src/catalog.rs) maps the name to that row.
 #   A row removed early by owner decision records the vendor's announced shutdown here too, so
 #   the date can still be ahead (the seven OpenAI rows due 2026-10-23, removed 2026-10-01: D243).
 # - `retires`: the vendor has announced the date. The row or candidate stays until then;

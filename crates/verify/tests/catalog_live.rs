@@ -46,6 +46,9 @@
 //! Cost: every billed call appends a record to `target/catalog-live/<sweep>.jsonl`
 //! (`VERIFY_CATALOG_SWEEP`, default `sweep`), priced from the ledger's tokens at the card;
 //! `VERIFY_CATALOG_SUMMARY=1` totals it. Listed only with `VERIFY_LIVE=1`.
+//!
+//! `VERIFY_CATALOG_ROW=<model>` lists one row's cells only (no CAT-13, no new-models): the
+//! catalog-drift workflow runs CAT-1, BIL-13 and CAT-7 that way on a row before it opens its PR.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -3309,7 +3312,15 @@ fn plan() -> (Vec<Planned>, Vec<String>) {
     let mut skipped = Vec::new();
     let cap = call_cap();
     let name = |claims: &str, route: &str, probe: &str| format!("{claims}::raw::{route}::{probe}");
-    for row in MODEL_ROUTES {
+    // `VERIFY_CATALOG_ROW=<model>`: that row's cells only, and no CAT-13 or new-models cell (the
+    // catalog-drift workflow's live gate on the row it adds or edits).
+    let only = std::env::var("VERIFY_CATALOG_ROW")
+        .ok()
+        .filter(|m| !m.is_empty());
+    for row in MODEL_ROUTES
+        .iter()
+        .filter(|r| only.as_deref().is_none_or(|m| r.model == m))
+    {
         for c in row.candidates.iter().chain(row.responses) {
             let p = by_id(c.provider).name;
             if !SCOPE.iter().any(|(s, _)| *s == p) {
@@ -3484,6 +3495,9 @@ fn plan() -> (Vec<Planned>, Vec<String>) {
             }),
             _ => skipped.push(format!("CAT-8 {}: no in-scope metadata source", row.model)),
         }
+    }
+    if only.is_some() {
+        return (out, skipped);
     }
     for m in MOUNTS {
         if key_of(m.key).is_none() {

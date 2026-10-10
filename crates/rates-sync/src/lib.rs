@@ -12,6 +12,8 @@
 pub mod audit;
 pub mod build;
 pub mod canon;
+pub mod catalog_drift;
+pub mod catalog_edit;
 pub mod classify;
 pub mod dec;
 pub mod diff;
@@ -19,6 +21,7 @@ pub mod emit;
 pub mod fetch;
 pub mod invoice;
 pub mod json;
+pub mod lineage;
 pub mod md;
 pub mod snapshot;
 pub mod sources;
