@@ -176,8 +176,69 @@ and `OPENAI_API_KEY`, or `ANTHROPIC_ADMIN_KEY` and `ANTHROPIC_API_KEY`. A missin
 trial isn't listed, never that it fails. The admin keys are used only on read-only endpoints (key
 listings and usage reports).
 
-Usage reports lag traffic by minutes. A trial polls every 30 seconds until the provider's totals
-match and hold, so it can take up to ~15 minutes.
+Usage reports lag traffic: Anthropic documents "typically within 5 minutes", but on 2026-10-10 its
+report lagged 45-60 minutes. A trial polls every three minutes (the admin API allows 90 requests a
+window, shared by the organization) until the provider's totals match and hold, for up to 90
+minutes.
+
+Once the tokens agree, the trial checks the money (BIL-24). It prices the provider's own totals
+with the reference pricer (`providers::pricing`, this build's `RATE_VERSION`) and compares them
+with the sum of the rows' `cost_micros`. They may differ by at most one micro-dollar per row,
+because each row rounds half-up once.
+
+## Pricing reconciliation (BIL-24, BIL-25)
+
+`crates/verify/tests/pricing_live.rs` holds the gateway's logged `cost_micros` to what vendors
+actually bill. Pricing is pass-through, so every case also checks `price_micros == cost_micros`.
+It runs one case per dimension:
+
+- Anthropic `inference_geo: us`, fast mode, a 1-hour cache write then read, web search and web
+  fetch;
+- OpenAI priority (Fast mode), flex and Responses web search;
+- an OpenRouter call and an OpenRouter cancelled stream;
+- a Bedrock `us.` profile (list × 1.1);
+- an xAI web search;
+- the long-context tiers on each vendor's cheapest long-context row (OpenAI gpt-6-luna past 272K,
+  against its usage report; xAI grok-build-0.1 at 200K, against its own billed cost);
+- the cancelled-stream estimate gap on Bedrock (and Groq, with a key): the same deterministic
+  prompt run to completion and cut after a second, recorded in `target/verify-cancel-gap.jsonl`.
+
+The file's header lists each case's budget, about $0.65 in all. The Anthropic admin API allows 90
+requests a window, shared by the whole organization. The cases read it six minutes after their request, then every three, through one per-process gate, and wait out
+its `retry-after`.
+
+- **Dollars, where the vendor reports them, must match exactly.** On OpenRouter the row's
+  `upstream_cost_usd` must equal `usage.cost` and the generation API's `total_cost`, and
+  `cost_micros` must equal that × 1.055. On xAI the rate table's price of the row's tokens and
+  tools must equal xAI's `cost_in_usd_ticks` to the micro-dollar.
+- **Usage, where the vendor reports only usage, must match exactly.** First the response's usage
+  block, then the admin usage report for the pool key, model and minutes, filtered by
+  `inference_geos[]` / `speeds[]` where the dimension is one (a case with the admin key claims
+  BIL-5 too and runs in the isolated phase). The logged cost must then be the rate table's price
+  of those facts.
+- **A disagreement is a finding to fix in the rate table**, never a tolerance to widen.
+- **The cancelled-stream case** prints the row's estimate beside the generation API's bill, which
+  is what a downstream reconciliation of `upstream_may_continue` rows settles to.
+- **Long-context boundaries** (exactly at and one past each threshold) are pinned by the golden
+  vectors (`verify/pricing_vectors.json`). The live cases prove one request on each side's tier.
+
+**BIL-25 (invoice level)** is listed when `VERIFY_INVOICE_ROWS` names a JSONL file of rows (keep
+one with `VERIFY_ROWS_OUT`). For every whole UTC day in it, the trial compares the rows' summed
+`cost_micros` with Anthropic's daily cost report for the key's workspace, or OpenAI's costs for the
+key's project, within one cent or 0.1%. It prints a per-day diff table. Both reports are daily and
+group by workspace or project, not key, so they reconcile only a key whose workspace or project
+carries nothing else.
+
+Other vendors are covered differently:
+
+- OpenRouter is reconciled per generation instead.
+- Bedrock, Together, Fireworks, Groq and DeepSeek expose no per-key cost API this suite can read.
+  Their costs are held by the rate table and its sources (`verify/catalog_truth.toml`).
+
+```sh
+VERIFY_LIVE=1 cargo nextest run -p beyond-ai-verify --test pricing_live --profile verify
+VERIFY_INVOICE_ROWS=$PWD/target/rows.jsonl VERIFY_LIVE=1 cargo test -p beyond-ai-verify --test pricing_live -- BIL-25
+```
 
 ## Live cells
 

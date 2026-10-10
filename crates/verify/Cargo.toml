@@ -68,5 +68,9 @@ harness = false
 name = "long_live"
 harness = false
 
+[[test]]
+name = "pricing_live"
+harness = false
+
 [lints]
 workspace = true
