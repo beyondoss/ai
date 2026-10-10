@@ -92,28 +92,17 @@ fn cards_are_well_formed() {
     }
 }
 
-/// FNV-1a 64 over the table's `Debug` text and the OpenRouter fee.
-fn table_hash() -> String {
-    let text = format!("{ROW_RATES:?}{}", rates::OPENROUTER_CREDIT_FEE);
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in text.bytes() {
-        h ^= u64::from(b);
-        h = h.wrapping_mul(0x0100_0000_01b3);
-    }
-    format!("{h:016x}")
-}
-
 /// `RATE_VERSION` names exactly this table: any rate change must bump it, so a logged row always
 /// identifies the rates that priced it.
 #[test]
 fn rate_version_names_this_table() {
-    let hash = table_hash();
+    let hash = rates::table_hash();
     let (date, recorded) = RATE_VERSION
         .split_once('.')
         .expect("RATE_VERSION is {date}.{hash}");
     assert_eq!(date.len(), 10, "RATE_VERSION date");
     assert_eq!(
         recorded, hash,
-        "the rate table changed: set RATE_VERSION to \"{{check date}}.{hash}\""
+        "the rate table changed: run `cargo run -p beyond-ai-rates-sync -- rate-version` (sets RATE_VERSION to \"{{today}}.{hash}\")"
     );
 }

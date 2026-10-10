@@ -12,6 +12,7 @@
 pub mod audit;
 pub mod build;
 pub mod canon;
+pub mod classify;
 pub mod dec;
 pub mod diff;
 pub mod emit;

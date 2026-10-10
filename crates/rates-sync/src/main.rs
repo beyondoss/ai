@@ -5,11 +5,18 @@
 //! rates-sync generate  regenerate the table from the committed snapshots (offline)
 //! rates-sync check     fail if the committed table is not what the snapshots generate (offline)
 //! rates-sync drift     re-fetch into a scratch copy; fail, listing the diff, if any price moved
+//! rates-sync classify  re-fetch into a scratch copy and print, as JSON, whether the change is
+//!                      none (exit 0), routine (2), review (3) or broken (4); `--apply` writes a
+//!                      routine or review change into the snapshots and the table
+//! rates-sync rate-version  set RATE_VERSION (and the golden vectors' rate_version) to name the
+//!                      table this binary was compiled with
 //! rates-sync audit     LiteLLM and models.dev as second opinions, plus the vendors' invoices
 //! ```
 
+use rates_sync::classify::{self, Class, Report};
 use rates_sync::{
-    GENERATED, Result, SOURCES, audit, build, diff, fetch, invoice, repo_root, snapshot, sources,
+    GENERATED, Result, SOURCES, audit, build, diff, emit, fetch, invoice, repo_root, snapshot,
+    sources,
 };
 use std::path::Path;
 use std::process::ExitCode;
@@ -18,8 +25,19 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cmd = args.first().map_or("", String::as_str);
     let root = repo_root();
+    if cmd == "classify" {
+        let apply = args.get(1).is_some_and(|a| a == "--apply");
+        return match run_classify(&root, apply) {
+            Ok(class) => ExitCode::from(class.exit_code()),
+            Err(e) => {
+                eprintln!("rates-sync classify: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     let r = match cmd {
         "sync" => sync(&root),
+        "rate-version" => rate_version(&root),
         "generate" => write_generated(&root),
         "check" => check(&root),
         "drift" => drift(&root),
@@ -28,7 +46,10 @@ fn main() -> ExitCode {
             print!("{}", rates_sync::canon::dump());
             Ok(())
         }
-        _ => Err("usage: rates-sync sync | generate | check | drift | audit".into()),
+        _ => Err(
+            "usage: rates-sync sync | generate | check | drift | classify [--apply] | rate-version | audit"
+                .into(),
+        ),
     };
     match r {
         Ok(()) => ExitCode::SUCCESS,
@@ -55,8 +76,8 @@ fn write_generated(root: &Path) -> Result<()> {
         println!("{GENERATED}: regenerated\n{d}");
     }
     println!(
-        "Rates changed: run `cargo test -p beyond-ai-providers --test rates_truth` for the new RATE_VERSION,\n\
-         and update verify/pricing_vectors.json for any vector whose rates moved."
+        "Rates changed: run `cargo run -p beyond-ai-rates-sync -- rate-version` for the new RATE_VERSION\n\
+         (`mise run rates:sync` does), and update verify/pricing_vectors.json for any vector whose rates moved."
     );
     Ok(())
 }
@@ -95,10 +116,7 @@ fn drift(root: &Path) -> Result<()> {
     let spec = rates_sync::read_spec(root)?;
     let slugs = spec.openrouter_slugs();
     let defs = sources::all(&slugs);
-    let committed = root.join(SOURCES);
-    let scratch = std::env::temp_dir().join(format!("rates-drift-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&scratch);
-    copy_dir(&committed, &scratch)?;
+    let scratch = scratch_copy(&root.join(SOURCES))?;
     let fetched = fetch::fetch_all(&scratch, &defs, &slugs, &fetch::today(), true);
     let report = (|| -> Result<Option<String>> {
         let (changed, skipped) = fetched?;
@@ -126,6 +144,100 @@ fn drift(root: &Path) -> Result<()> {
             "vendor prices changed; run `mise run rates:sync`, review, and bump RATE_VERSION:\n{d}"
         )),
     }
+}
+
+/// A fresh copy of the committed store to re-fetch into.
+fn scratch_copy(committed: &Path) -> Result<std::path::PathBuf> {
+    let scratch = std::env::temp_dir().join(format!("rates-drift-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&scratch);
+    copy_dir(committed, &scratch)?;
+    Ok(scratch)
+}
+
+/// Re-fetch into a scratch copy and classify what moved (`classify.rs`), printing the report as
+/// JSON on stdout. With `apply`, a routine or review change replaces the committed snapshots and
+/// regenerates the table; a broken one writes nothing.
+fn run_classify(root: &Path, apply: bool) -> Result<Class> {
+    let spec = rates_sync::read_spec(root)?;
+    let slugs = spec.openrouter_slugs();
+    let defs = sources::all(&slugs);
+    let committed = root.join(SOURCES);
+    let old = build::build(&snapshot::load(&committed, &defs)?, &spec)
+        .map_err(|e| format!("the committed snapshots do not generate the table: {e}"))?;
+    let scratch = scratch_copy(&committed)?;
+    let r = (|| -> Result<Class> {
+        let (report, changed, skipped) =
+            match fetch::fetch_all(&scratch, &defs, &slugs, &fetch::today(), true) {
+                Err(e) => (Report::broken("fetch", e), Vec::new(), Vec::new()),
+                Ok((changed, skipped)) => {
+                    let new = snapshot::load(&scratch, &defs)
+                        .and_then(|store| build::build(&store, &spec))
+                        .and_then(|t| emit::render(&t).map(|text| (t, text)));
+                    let entries = snapshot::read_manifest(&scratch)?;
+                    let report = classify::classify(
+                        &old,
+                        new.as_ref().map(|(t, _)| t).map_err(String::as_str),
+                        &entries,
+                    );
+                    if apply
+                        && matches!(report.class, Class::Routine | Class::Review)
+                        && let Ok((_, text)) = &new
+                    {
+                        std::fs::remove_dir_all(&committed)
+                            .map_err(|e| format!("{}: {e}", committed.display()))?;
+                        copy_dir(&scratch, &committed)?;
+                        let path = root.join(GENERATED);
+                        std::fs::write(&path, text)
+                            .map_err(|e| format!("{}: {e}", path.display()))?;
+                    }
+                    (report, changed, skipped)
+                }
+            };
+        eprintln!(
+            "rates-sync classify: {}\n{}",
+            report.class.as_str(),
+            report.markdown(&changed, &skipped)
+        );
+        println!("{}", report.to_json(&changed, &skipped));
+        Ok(report.class)
+    })();
+    let _ = std::fs::remove_dir_all(&scratch);
+    r
+}
+
+/// Point `RATE_VERSION` (and the golden vectors' `rate_version`) at the table this binary was
+/// compiled with: `{today}.{hash}`, or unchanged when the hash already matches. Deterministic for
+/// a table and a day. Run it in a fresh `cargo run` after regenerating, so the linked providers
+/// crate is the new table.
+fn rate_version(root: &Path) -> Result<()> {
+    let hash = providers::rates::table_hash();
+    let cur = providers::rates::RATE_VERSION;
+    let v = match cur.split_once('.') {
+        Some((_, h)) if h == hash => cur.to_owned(),
+        _ => format!("{}.{hash}", fetch::today()),
+    };
+    let rewrite = |rel: &str, from: &str, to: &str| -> Result<()> {
+        let path = root.join(rel);
+        let text = std::fs::read_to_string(&path).map_err(|e| format!("{rel}: {e}"))?;
+        if text.matches(from).count() != 1 {
+            return Err(format!("{rel}: expected exactly one {from:?}"));
+        }
+        std::fs::write(&path, text.replacen(from, to, 1)).map_err(|e| format!("{rel}: {e}"))
+    };
+    let decl = |v: &str| format!("pub const RATE_VERSION: &str = \"{v}\";");
+    rewrite("crates/providers/src/rates.rs", &decl(cur), &decl(&v))?;
+    let vectors = "verify/pricing_vectors.json";
+    let doc: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(root.join(vectors)).map_err(|e| format!("{vectors}: {e}"))?,
+    )
+    .map_err(|e| format!("{vectors}: {e}"))?;
+    let had = doc["rate_version"]
+        .as_str()
+        .ok_or_else(|| format!("{vectors}: no rate_version"))?;
+    let field = |v: &str| format!("\"rate_version\": \"{v}\"");
+    rewrite(vectors, &field(had), &field(&v))?;
+    println!("{v}");
+    Ok(())
 }
 
 fn copy_dir(from: &Path, to: &Path) -> Result<()> {

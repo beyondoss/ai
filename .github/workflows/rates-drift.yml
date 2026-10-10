@@ -1,19 +1,36 @@
 name: Rates drift
 # The rate table (crates/providers/src/rates/generated.rs) is generated from snapshots of every
-# vendor's primary pricing source (verify/rates_sources/). Weekly, this re-fetches every source and
-# fails, listing the diff, when any vendor price moved, a layout changed under a parser, or a cited
-# prose quote disappeared. Never per PR: per-PR CI regenerates from the committed snapshots only
-# (rates_generated_from_sources), offline. The fix is `mise run rates:sync`, then review and bump
-# RATE_VERSION.
+# vendor's primary pricing source (verify/rates_sources/). Daily, this re-fetches every source and
+# classifies what moved (`rates-sync classify`, crates/rates-sync/src/classify.rs):
+#
+# - routine (only rate values moved, each within 2x, none to or from zero, nothing added or
+#   removed) and review (it all parsed, but a routine rule failed): the snapshots and the table are
+#   regenerated, RATE_VERSION is bumped (`rates-sync rate-version`), and a `rates/sync-*` PR labeled
+#   `rates-routine` or `rates-review` is opened, or the open one is updated. A human merges it.
+# - broken (a fetch, a reader meeting a new layout, a missing quote, a cross-check disagreement, a
+#   stale override or conflict): nothing is regenerated; the open `rates-broken` issue for that
+#   failure kind is updated, or one is opened, and the job fails.
+#
+# Never per PR: per-PR CI regenerates from the committed snapshots only
+# (rates_generated_from_sources), offline.
+#
+# Everything is done with GITHUB_TOKEN. Its pushes and PRs start no workflow, except a
+# workflow_dispatch: after a push, the job dispatches CI (ci.yml) on the PR's branch, so the PR's
+# head commit gets the `Check` status. Opening a PR needs the repository setting "Allow GitHub
+# Actions to create and approve pull requests".
 #
 # Every source but two is public. TOGETHER_API_KEY and XAI_API_KEY (repository secrets) let the
 # job re-fetch Together's and xAI's models APIs; without them those two keep their committed
 # snapshots and the job warns. Their prices are still covered by the public cross-check sources
-# (Together's docs table, xAI's pricing page), which disagreeing with the snapshot fails the run.
+# (Together's docs table, xAI's pricing page), which disagreeing with the snapshot breaks the run.
 on:
   schedule:
-    - cron: "0 8 * * 1"
+    - cron: "0 8 * * *"
   workflow_dispatch:
+permissions: {}
+concurrency:
+  group: rates-drift
+  cancel-in-progress: false
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
@@ -21,12 +38,122 @@ jobs:
   drift:
     name: vendor price drift
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
+    # contents: push the branch; pull-requests: open/edit the PR; issues: the rates-broken issue and
+    # labels; actions: dispatch CI on the PR's branch.
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      actions: write
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: jdx/mise-action@v4
       - uses: Swatinem/rust-cache@v2
-      - env:
+      - name: Classify drift
+        id: classify
+        env:
           TOGETHER_API_KEY: ${{ secrets.TOGETHER_API_KEY }}
           XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
-        run: cargo run -q -p beyond-ai-rates-sync -- drift </dev/null
+        run: |
+          set +e
+          cargo run -q -p beyond-ai-rates-sync -- classify --apply >"$RUNNER_TEMP/classify.json" </dev/null
+          code=$?
+          set -e
+          case $code in
+            0 | 2 | 3 | 4) ;;
+            *)
+              echo "::error::rates-sync classify failed (exit $code)"
+              exit 1
+              ;;
+          esac
+          echo "class=$(jq -r .class "$RUNNER_TEMP/classify.json")" >>"$GITHUB_OUTPUT"
+          jq -r .markdown "$RUNNER_TEMP/classify.json" >"$RUNNER_TEMP/body.md"
+          cat "$RUNNER_TEMP/body.md" >>"$GITHUB_STEP_SUMMARY"
+      - name: Bump RATE_VERSION
+        if: steps.classify.outputs.class == 'routine' || steps.classify.outputs.class == 'review'
+        # A fresh build links the regenerated table, so the hash it writes names that table.
+        run: cargo run -q -p beyond-ai-rates-sync -- rate-version </dev/null
+      - name: Open or update the rates PR
+        if: steps.classify.outputs.class == 'routine' || steps.classify.outputs.class == 'review'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CLASS: ${{ steps.classify.outputs.class }}
+        run: |
+          set -euo pipefail
+          label="rates-$CLASS"
+          if [ "$CLASS" = routine ]; then other=rates-review; else other=rates-routine; fi
+          gh label create rates-routine --force --color 0e8a16 \
+            --description "Automatic rate sync: only rate values moved, each within 2x"
+          gh label create rates-review --force --color fbca04 \
+            --description "Automatic rate sync: a change a human must review before merging"
+          today=$(date -u +%F)
+          title="providers: sync vendor rates ($today, $CLASS)"
+          bot="41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git config user.email "$bot"
+          remote="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          paths=(crates/providers/src/rates/generated.rs verify/rates_sources)
+          commit() {
+            git switch -q -c "$1"
+            git add -A -- "${paths[@]}" crates/providers/src/rates.rs verify/pricing_vectors.json
+            git commit -q -m "$title" -m "Generated by the rates-drift workflow (rates-sync classify: $CLASS)."
+          }
+          open=$(gh pr list --state open --limit 200 --json number,headRefName \
+            --jq '[.[] | select(.headRefName | startswith("rates/sync-"))] | sort_by(.number) | .[0] // empty | "\(.number) \(.headRefName)"')
+          if [ -z "$open" ]; then
+            branch="rates/sync-$today"
+            commit "$branch"
+            git push -q --force "$remote" "HEAD:refs/heads/$branch"
+            pr=$(gh pr create --base main --head "$branch" --title "$title" \
+              --body-file "$RUNNER_TEMP/body.md" --label "$label")
+          else
+            read -r pr branch <<<"$open"
+            git fetch -q --depth=1 --no-tags "$remote" "+refs/heads/$branch:refs/remotes/origin/$branch"
+            if git diff --quiet "origin/$branch" -- "${paths[@]}"; then
+              echo "PR #$pr already carries exactly this change: nothing to do."
+              exit 0
+            fi
+            # The bot's branch is one bot commit on main. A commit by anyone else on top (or an
+            # amend) is a human's work: never force-push over it; say what moved instead.
+            if git log -1 --format='%ae%n%ce' "origin/$branch" | grep -qvxF "$bot"; then
+              { echo "Rates moved again, but this branch has commits from a human, so the workflow did not push. Latest drift:"; echo; cat "$RUNNER_TEMP/body.md"; } >"$RUNNER_TEMP/comment.md"
+              gh pr comment "$pr" --body-file "$RUNNER_TEMP/comment.md"
+              exit 0
+            fi
+            commit "$branch"
+            git push -q --force-with-lease="refs/heads/$branch:$(git rev-parse "origin/$branch")" \
+              "$remote" "HEAD:refs/heads/$branch"
+            gh pr edit "$pr" --title "$title" --body-file "$RUNNER_TEMP/body.md" --add-label "$label"
+            gh pr edit "$pr" --remove-label "$other" || true
+          fi
+          # A GITHUB_TOKEN push starts no pull_request run; a dispatch does, and its `Check` lands
+          # on the branch's head commit, which is the PR's.
+          gh workflow run ci.yml --ref "$branch"
+          echo "PR: $pr (CI dispatched on $branch)"
+      - name: File the rates-broken issue
+        if: steps.classify.outputs.class == 'broken'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          kind=$(jq -r .kind "$RUNNER_TEMP/classify.json")
+          export TITLE="Rate sync broken: $kind"
+          gh label create rates-broken --force --color d73a4a \
+            --description "The daily rate sync cannot regenerate the rate table"
+          {
+            head -c 60000 "$RUNNER_TEMP/body.md"
+            echo
+            echo "Last failing run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          } >"$RUNNER_TEMP/issue.md"
+          number=$(gh issue list --state open --label rates-broken --limit 100 --json number,title \
+            --jq 'map(select(.title == $ENV.TITLE)) | .[0].number // empty')
+          if [ -n "$number" ]; then
+            gh issue edit "$number" --body-file "$RUNNER_TEMP/issue.md"
+          else
+            gh issue create --title "$TITLE" --label rates-broken --body-file "$RUNNER_TEMP/issue.md"
+          fi
+          echo "::error::the rate sync is broken ($kind); nothing was regenerated"
+          exit 1
