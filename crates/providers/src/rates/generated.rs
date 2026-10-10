@@ -1897,7 +1897,7 @@ static OR_DEEPSEEK_DEEPSEEK_V4_1_FLASH: &[OrEndpoint] = &[
         host: "InferenceNet",
         tag: "inference-net/fp8",
         class: Class::Standard,
-        card: Card::new(tr("0.07", "0.6", "0.01", "0.07", None)),
+        card: Card::new(tr("0.077", "0.66", "0.01", "0.077", None)),
     },
     OrEndpoint {
         host: "Ionstream",
@@ -1987,7 +1987,7 @@ static OR_DEEPSEEK_DEEPSEEK_V4_1_FLASH: &[OrEndpoint] = &[
         host: "Wafer",
         tag: "wafer",
         class: Class::Standard,
-        card: Card::new(tr("0.05", "1.6", "0.049", "0.05", None)),
+        card: Card::new(tr("0.05", "0.65", "0.049", "0.05", None)),
     },
 ];
 
@@ -2615,7 +2615,7 @@ static OR_MOONSHOTAI_KIMI_K3: &[OrEndpoint] = &[
         host: "Morph",
         tag: "morph/fp8",
         class: Class::Standard,
-        card: Card::new(tr("0.3", "14.9", "0.29", "0.3", None)),
+        card: Card::new(tr("0.289", "14.9", "0.29", "0.289", None)),
     },
     OrEndpoint {
         host: "Parasail",
@@ -2657,7 +2657,7 @@ static OR_MOONSHOTAI_KIMI_K3: &[OrEndpoint] = &[
         host: "Wafer",
         tag: "wafer",
         class: Class::Standard,
-        card: Card::new(tr("0.31", "14.89", "0.3", "0.31", None)),
+        card: Card::new(tr("0.29", "14.89", "0.28", "0.29", None)),
     },
     OrEndpoint {
         host: "Wafer",
@@ -6238,7 +6238,7 @@ static OR_Z_AI_GLM_5_3_FLASH: &[OrEndpoint] = &[
         host: "Inceptron",
         tag: "inceptron/fp8",
         class: Class::Standard,
-        card: Card::new(tr("0.12", "0.55", "0.099", "0.12", None)),
+        card: Card::new(tr("0.09", "0.55", "0.099", "0.09", None)),
     },
     OrEndpoint {
         host: "InferenceNet",
@@ -6346,7 +6346,7 @@ static OR_Z_AI_GLM_5_3_FLASH: &[OrEndpoint] = &[
         host: "Wafer",
         tag: "wafer",
         class: Class::Standard,
-        card: Card::new(tr("0.07", "0.5", "0.03", "0.07", None)),
+        card: Card::new(tr("0.03", "0.5", "0.012", "0.03", None)),
     },
     OrEndpoint {
         host: "Z.AI",

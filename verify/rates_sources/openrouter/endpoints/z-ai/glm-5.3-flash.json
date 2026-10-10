@@ -177,7 +177,7 @@
           "completion": "0.00000055",
           "discount": 0,
           "input_cache_read": "0.000000099",
-          "prompt": "0.00000012"
+          "prompt": "0.00000009"
         },
         "provider_name": "Inceptron",
         "quantization": "fp8",
@@ -410,8 +410,8 @@
         "pricing": {
           "completion": "0.0000005",
           "discount": 0,
-          "input_cache_read": "0.00000003",
-          "prompt": "0.00000007"
+          "input_cache_read": "0.000000012",
+          "prompt": "0.00000003"
         },
         "provider_name": "Wafer",
         "quantization": "unknown",
