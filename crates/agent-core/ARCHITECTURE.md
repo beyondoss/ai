@@ -318,6 +318,27 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
   clamps below a configured thinking budget, and never raises
   `max_tokens` above what was asked.
 
+- **Masking old tool output before summarizing** — when the prompt crosses the trigger,
+  `Agent::mask_tool_output` first plans `compaction::mask_tool_results`: every tool result older than
+  the last `mask_keep_turns` turns (assistant messages, default 10) becomes a one-line placeholder
+  naming the call (`[tool output elided to save context: read(path=src/lib.rs), 48213 chars. Run the
+  tool again if you need it.]`, images dropped). Kept: results of files being edited (the provenance's
+  modified files plus this transcript's own `write`/`edit` targets), errors within `2 × mask_keep_turns`
+  turns, results under 1,000 chars, and results already masked. The pass is applied only when it frees
+  at least `mask_min_free_tokens` (default 25K, capped at a quarter of the trigger so a small model can
+  reach it — our `clear_at_least`); if it then leaves the prompt under the trigger, no summary runs
+  (`AgentEvent::ToolOutputMasked`, no `CompactionStart`), otherwise the summary runs in the same turn
+  over the masked transcript. **Batched, never incremental**: it only runs past the trigger and a
+  too-small pass is not applied, so history is rewritten at most once per fill cycle and every turn in
+  between reads a byte-identical prefix from the cache (masking a little every turn invalidates the
+  cache each turn and costs 2–3× more). No recall tool: in the evidence one was rarely called and
+  bought nothing; the placeholder says to re-run the call. Only `ToolResult` blocks change, in place,
+  so count, roles and every `tool_use_id` pairing hold by construction (`find_cut`'s invariant and
+  role alternation), and request blocks riding a masked message move to its new content. The live-size
+  snapshot drops by the estimate freed. `Session::edited` lists the rewritten indices for persistence
+  (`crates/agent`'s `SessionStore::record_edits`), cleared by `apply_summary`, whose rewrite carries the
+  content. Off with `mask_tool_output: false`.
+
 - **The deterministic-carry channel** — `apply_summary` is deliberately destructive: it _replaces_
   `session.messages` with `[summary, …kept_suffix]`, and `SessionStore::open` reloads that
   post-compaction list, so anything living only inside a folded-away message is gone for good. A

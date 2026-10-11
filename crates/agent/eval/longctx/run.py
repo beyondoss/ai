@@ -118,6 +118,7 @@ class Live:
         self.turns = 0
         self.requests: list[dict] = []
         self.compactions: list[dict] = []
+        self.maskings: list[dict] = []
         self.compaction_failed = 0
         self.errors: list[str] = []
         self.suspect: list[str] = []
@@ -157,6 +158,9 @@ class Live:
                                          summary_chars=len(ev.get("summary", "")), usd=round(usd, 5),
                                          i=u.get("input_tokens", 0), cr=u.get("cache_read_tokens", 0),
                                          cw=u.get("cache_write_tokens", 0), o=u.get("output_tokens", 0)))
+        elif k == "tool_output_masked":
+            self.maskings.append(dict(after_turn=self.turns, masked=ev.get("masked"),
+                                      tokens_before=ev.get("tokens_before"), tokens_freed=ev.get("tokens_freed")))
         elif k == "compaction_failed":
             self.compaction_failed += 1
         elif k == "error":
@@ -318,6 +322,7 @@ def run_one(binary: Path, task: str, model: str, arm: str, attempt: int, cap_usd
         usd=round(live.usd, 4), compaction_usd=round(live.compaction_usd, 4),
         turns=live.turns, tools=live.tools, requests=len(live.requests),
         compactions=len(live.compactions), compaction_failed=live.compaction_failed,
+        maskings=len(live.maskings), masking_log=live.maskings, agent_args=extra,
         peak_prompt=max((r["prompt"] for r in live.requests), default=0),
         first_prompt=live.requests[0]["prompt"] if live.requests else 0,
         cache_read_share=round(sum(r["cr"] for r in live.requests) / prompt_total, 4) if prompt_total else 0,
@@ -403,6 +408,7 @@ def main(argv: list[str]) -> None:
             tot = spent
         print(f"{r['task']:15} {r['model']:18} {r['arm']:8} a{r['attempt']} pass={int(r['passed'])} "
               f"fixed={r['fixed']}/{r['broken']} ${r['usd']:.2f} turns={r['turns']} comp={r['compactions']} "
+              f"mask={r.get('maskings', 0)} "
               f"peak={r['peak_prompt'] // 1000}K killed={r['killed']}  [total ${tot:.2f}]", flush=True)
         return r
 

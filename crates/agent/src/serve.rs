@@ -562,16 +562,12 @@ pub struct ServeConfig {
     /// An explicit opt-out for the cases that genuinely want pure in-memory operation (e.g. a
     /// short-lived test harness).
     pub no_session_persistence: bool,
-    /// The model's context window in tokens — the budget the loop compacts against to stay below.
-    /// `None` defers to the model's own capability-table window (`Agent::new`'s default), so switching
-    /// to a model with a different real window (via `set_model`) gets that model's true budget instead
-    /// of a stale operator-supplied number. `Some` pins a fixed budget that survives model switches.
-    pub context_window: Option<u32>,
-    /// `--compact-at`: compact once the prompt passes this many tokens, even when the window allows
-    /// more. `None` defers to the model's own (provisional) `ModelCaps::compact_at`, re-read on every
-    /// model switch; `Some(0)` turns the cap off (the window alone sets the trigger); `Some(n)` pins
-    /// it across switches. See [`compaction_config`].
-    pub compact_at: Option<u32>,
+    /// The operator's compaction flags: `--context-window`, `--compact-at`, the reserve and keep-recent
+    /// budgets, and the tool-masking knobs. Each `None` defers to the current model's own value (its
+    /// window, its provisional `ModelCaps::compact_at`), re-read on every `set_model`, so a switch gets
+    /// the new model's real budget instead of a stale operator number; a `Some` pins it across
+    /// switches. Resolved by [`compaction_config`].
+    pub compaction: CompactionFlags,
     /// The per-turn output token ceiling (`Agent::with_max_tokens`). `None` defers to `Agent::new`'s
     /// own model-aware default (the model's own capability-table `max_output`, floored at
     /// `DEFAULT_MAX_TOKENS`) — matches `context_window`'s own "unset means model-derived" convention.
@@ -603,12 +599,6 @@ pub struct ServeConfig {
     /// behavior, or extra caution on a checkout that happens to live under an already-trusted parent).
     /// Wins over `trust_project` if both are somehow set.
     pub force_untrusted: bool,
-    /// Compaction headroom (tokens) reserved below the context window. `None` keeps
-    /// `CompactionConfig::default()`'s value.
-    pub compaction_reserve_tokens: Option<u32>,
-    /// Roughly how many tokens of recent conversation compaction keeps verbatim. `None` keeps
-    /// `CompactionConfig::default()`'s value.
-    pub compaction_keep_recent_tokens: Option<u32>,
     /// Token budget reserved below the context window when summarizing an abandoned tree branch —
     /// independent of `compaction_reserve_tokens`. `None` keeps `Agent`'s prior hard-tied behavior
     /// (falls back to whatever `compaction.reserve_tokens` resolves to — see
@@ -1534,8 +1524,10 @@ impl Persistence {
     }
 
     /// Persist the session after a turn: non-destructively rewrite the transcript (see
-    /// `SessionStore::rewrite_compacted`) if compaction fired this round, otherwise append just the
-    /// new messages. `tokens_before` is `Some` (carrying `AgentEvent::Compacted`'s own value) exactly
+    /// `SessionStore::rewrite_compacted`) if compaction fired this round, otherwise write any messages
+    /// a masking pass rewrote in place (`SessionStore::record_edits`) and append just the new messages.
+    /// Mid-run checkpoints only append, so a masking pass reaches disk here, at the end of the turn; a
+    /// crash before then reloads the unmasked transcript, which is valid, just larger. `tokens_before` is `Some` (carrying `AgentEvent::Compacted`'s own value) exactly
     /// when a compaction fired.
     fn persist(&mut self, session: &Session, tokens_before: Option<u32>) -> std::io::Result<()> {
         let Some(store) = &mut self.store else {
@@ -1553,7 +1545,10 @@ impl Persistence {
                     provenance: session.compaction.clone(),
                 },
             ),
-            None => store.append_new(&session.messages),
+            // A masking pass rewrote old messages in place (`Session::edited`); append can't see that.
+            None => store
+                .record_edits(&session.messages, &session.edited)
+                .and_then(|()| store.append_new(&session.messages)),
         };
         if let Err(e) = &r {
             eprintln!("serve: failed to persist session: {e}");
@@ -9868,40 +9863,55 @@ fn parse_images(images: Option<&Value>) -> Vec<agent_core::ImageSource> {
 /// place `build_agent`, the pressure nudge and `context_usage` resolve it, so all three agree on where
 /// compaction fires. `enabled` is left at its default; `build_agent` applies the live flag.
 pub(crate) fn compaction_config(cfg: &ServeConfig, model: &str) -> agent_core::CompactionConfig {
-    resolve_compaction(
-        model,
-        cfg.context_window,
-        cfg.compact_at,
-        cfg.compaction_reserve_tokens,
-        cfg.compaction_keep_recent_tokens,
-    )
+    resolve_compaction(model, &cfg.compaction)
+}
+
+/// The operator's compaction flags, as `run` and `serve` both take them. `None`/`false` leaves the
+/// model's own value or the struct default.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CompactionFlags {
+    /// `--context-window`.
+    pub context_window: Option<u32>,
+    /// `--compact-at`: `None` takes the model's cap, `Some(0)` removes it, `Some(n)` sets it.
+    pub compact_at: Option<u32>,
+    /// `--compaction-reserve-tokens`.
+    pub reserve_tokens: Option<u32>,
+    /// `--compaction-keep-recent-tokens`.
+    pub keep_recent_tokens: Option<u32>,
+    /// `--no-tool-masking`: summarize without masking old tool output first.
+    pub no_tool_masking: bool,
+    /// `--tool-masking-keep-turns`: turns whose tool output is never masked.
+    pub tool_masking_keep_turns: Option<usize>,
+    /// `--tool-masking-min-tokens`: the least a masking pass must free to be applied.
+    pub tool_masking_min_tokens: Option<u32>,
 }
 
 /// [`compaction_config`] from the raw flag values, shared with `run`. `context_window` and the two
 /// budgets override the model's own when given (reserve and keep-recent are the struct's absolute
-/// defaults otherwise, as before). `compact_at`: `None` takes the model's cap, `Some(0)` removes it,
-/// `Some(n)` sets it. A cap also bounds `keep_recent_tokens` to half of itself unless that was set
-/// explicitly: a compaction must keep less than the line that fires it, or every turn re-fires.
-pub fn resolve_compaction(
-    model: &str,
-    context_window: Option<u32>,
-    compact_at: Option<u32>,
-    reserve_tokens: Option<u32>,
-    keep_recent_tokens: Option<u32>,
-) -> agent_core::CompactionConfig {
+/// defaults otherwise, as before). A `compact_at` cap also bounds `keep_recent_tokens` to half of
+/// itself unless that was set explicitly: a compaction must keep less than the line that fires it, or
+/// every turn re-fires.
+pub fn resolve_compaction(model: &str, flags: &CompactionFlags) -> agent_core::CompactionConfig {
     let caps = agent_core::capabilities(model);
     let d = agent_core::CompactionConfig::default();
-    let compact_at = compact_at.map_or(caps.compact_at, |n| (n > 0).then_some(n));
+    let compact_at = flags
+        .compact_at
+        .map_or(caps.compact_at, |n| (n > 0).then_some(n));
     agent_core::CompactionConfig {
-        context_window: context_window.unwrap_or(caps.context_window),
+        context_window: flags.context_window.unwrap_or(caps.context_window),
         input_limit: caps.input_limit,
         compact_at,
-        reserve_tokens: reserve_tokens.unwrap_or(d.reserve_tokens),
-        keep_recent_tokens: keep_recent_tokens.unwrap_or_else(|| {
+        reserve_tokens: flags.reserve_tokens.unwrap_or(d.reserve_tokens),
+        keep_recent_tokens: flags.keep_recent_tokens.unwrap_or_else(|| {
             compact_at.map_or(d.keep_recent_tokens, |cap| {
                 d.keep_recent_tokens.min(cap / 2)
             })
         }),
+        mask_tool_output: !flags.no_tool_masking,
+        mask_keep_turns: flags.tool_masking_keep_turns.unwrap_or(d.mask_keep_turns),
+        mask_min_free_tokens: flags
+            .tool_masking_min_tokens
+            .unwrap_or(d.mask_min_free_tokens),
         ..d
     }
 }
@@ -12213,7 +12223,7 @@ mod tests {
 
     /// `model`'s compaction policy with no operator overrides.
     fn test_compaction(model: &str) -> agent_core::CompactionConfig {
-        resolve_compaction(model, None, None, None, None)
+        resolve_compaction(model, &CompactionFlags::default())
     }
 
     #[test]
@@ -12232,12 +12242,30 @@ mod tests {
             1_000_000 - 16_384
         );
         // `--compact-at n` sets it, `--compact-at 0` removes the model's cap.
-        let pinned = resolve_compaction("claude-opus-5-5", None, Some(150_000), None, None);
+        let pinned = resolve_compaction(
+            "claude-opus-5-5",
+            &CompactionFlags {
+                compact_at: Some(150_000),
+                ..Default::default()
+            },
+        );
         assert_eq!(at(pinned)["compact_at"], 150_000);
-        let off = resolve_compaction("claude-opus-5-5", None, Some(0), None, None);
+        let off = resolve_compaction(
+            "claude-opus-5-5",
+            &CompactionFlags {
+                compact_at: Some(0),
+                ..Default::default()
+            },
+        );
         assert_eq!(at(off)["compact_at"], 1_000_000 - 16_384);
         // `--context-window` still bounds both figures; the lower of the two lines wins.
-        let small = resolve_compaction("claude-opus-5-5", Some(100_000), None, None, None);
+        let small = resolve_compaction(
+            "claude-opus-5-5",
+            &CompactionFlags {
+                context_window: Some(100_000),
+                ..Default::default()
+            },
+        );
         assert_eq!(at(small)["context_window"], 100_000);
         assert_eq!(at(small)["compact_at"], 100_000 - 16_384);
     }
@@ -12245,7 +12273,13 @@ mod tests {
     #[test]
     fn a_small_compact_at_keeps_less_than_it_fires_at() {
         // keep_recent must stay under the trigger, or every compaction lands back over it.
-        let c = resolve_compaction("claude-opus-5-5", None, Some(30_000), None, None);
+        let c = resolve_compaction(
+            "claude-opus-5-5",
+            &CompactionFlags {
+                compact_at: Some(30_000),
+                ..Default::default()
+            },
+        );
         assert_eq!(c.keep_recent_tokens, 15_000);
         // The model defaults are all far above 2 × keep_recent: untouched.
         assert_eq!(
@@ -12253,7 +12287,14 @@ mod tests {
             20_000
         );
         // An explicit keep-recent is the operator's call.
-        let c = resolve_compaction("claude-opus-5-5", None, Some(30_000), None, Some(25_000));
+        let c = resolve_compaction(
+            "claude-opus-5-5",
+            &CompactionFlags {
+                compact_at: Some(30_000),
+                keep_recent_tokens: Some(25_000),
+                ..Default::default()
+            },
+        );
         assert_eq!(c.keep_recent_tokens, 25_000);
     }
 

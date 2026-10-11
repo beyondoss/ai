@@ -379,6 +379,18 @@ enum Command {
         /// the lower of the two lines fires. `serve`'s identical flag.
         #[usage(long, env = "AI_AGENT_COMPACT_AT")]
         compact_at: Option<u32>,
+        /// Summarize without first masking old tool output. By default an automatic compaction first
+        /// replaces tool results older than `--tool-masking-keep-turns` turns with one-line
+        /// placeholders, and summarizes only if that frees too little. `serve`'s identical flag.
+        #[usage(long, env = "AI_AGENT_NO_TOOL_MASKING")]
+        no_tool_masking: bool,
+        /// Turns (model responses) whose tool output masking never touches. Default 10.
+        #[usage(long, env = "AI_AGENT_TOOL_MASKING_KEEP_TURNS")]
+        tool_masking_keep_turns: Option<usize>,
+        /// The least a masking pass must free, in tokens, to be applied (each pass invalidates the
+        /// prompt cache from its first edit). Default 25,000, or a quarter of the trigger if lower.
+        #[usage(long, env = "AI_AGENT_TOOL_MASKING_MIN_TOKENS")]
+        tool_masking_min_tokens: Option<u32>,
         /// Compaction headroom (tokens) reserved below the context window before it fires. Defaults to
         /// `CompactionConfig::default()`'s 16,384. `serve`'s identical flag.
         #[usage(long, env = "AI_AGENT_COMPACTION_RESERVE_TOKENS")]
@@ -934,6 +946,18 @@ enum Command {
         /// the lower of the two lines fires. `run`'s identical flag.
         #[usage(long, env = "AI_AGENT_COMPACT_AT")]
         compact_at: Option<u32>,
+        /// Summarize without first masking old tool output. By default an automatic compaction first
+        /// replaces tool results older than `--tool-masking-keep-turns` turns with one-line
+        /// placeholders, and summarizes only if that frees too little. `run`'s identical flag.
+        #[usage(long, env = "AI_AGENT_NO_TOOL_MASKING")]
+        no_tool_masking: bool,
+        /// Turns (model responses) whose tool output masking never touches. Default 10.
+        #[usage(long, env = "AI_AGENT_TOOL_MASKING_KEEP_TURNS")]
+        tool_masking_keep_turns: Option<usize>,
+        /// The least a masking pass must free, in tokens, to be applied (each pass invalidates the
+        /// prompt cache from its first edit). Default 25,000, or a quarter of the trigger if lower.
+        #[usage(long, env = "AI_AGENT_TOOL_MASKING_MIN_TOKENS")]
+        tool_masking_min_tokens: Option<u32>,
         /// Per-turn output token ceiling. Defaults to the model's own capability-table `max_output`
         /// (see `agent_core::models::capabilities`), floored at a sane minimum — only pass this to
         /// override that, e.g. capping generation length or lifting it past the model-derived default.
@@ -1929,6 +1953,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             force_untrusted,
             context_window,
             compact_at,
+            no_tool_masking,
+            tool_masking_keep_turns,
+            tool_masking_min_tokens,
             compaction_reserve_tokens,
             compaction_keep_recent_tokens,
             branch_summary_reserve_tokens,
@@ -2004,6 +2031,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 force_untrusted,
                 context_window,
                 compact_at,
+                no_tool_masking,
+                tool_masking_keep_turns,
+                tool_masking_min_tokens,
                 compaction_reserve_tokens,
                 compaction_keep_recent_tokens,
                 branch_summary_reserve_tokens,
@@ -2097,6 +2127,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             no_context_files,
             context_window,
             compact_at,
+            no_tool_masking,
+            tool_masking_keep_turns,
+            tool_masking_min_tokens,
             cache_ttl,
             cache_long,
             thinking,
@@ -2592,16 +2625,21 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 session_id,
                 continue_session,
                 no_session_persistence,
-                context_window,
-                compact_at,
+                compaction: serve::CompactionFlags {
+                    context_window,
+                    compact_at,
+                    reserve_tokens: compaction_reserve_tokens,
+                    keep_recent_tokens: compaction_keep_recent_tokens,
+                    no_tool_masking,
+                    tool_masking_keep_turns,
+                    tool_masking_min_tokens,
+                },
                 cache_long: CacheTtl::resolve(cache_ttl, cache_long, CacheTtl::OneHour),
                 thinking,
                 reasoning_effort,
                 temperature,
                 trust_project,
                 force_untrusted,
-                compaction_reserve_tokens,
-                compaction_keep_recent_tokens,
                 branch_summary_reserve_tokens,
                 no_compaction,
                 retry_max_retries,
@@ -4057,7 +4095,8 @@ impl RunStore {
 }
 
 /// Persist `session`: a compaction since the last write is written as one
-/// ([`SessionStore::rewrite_compacted`]); otherwise whatever is new is appended. Called at every
+/// ([`SessionStore::rewrite_compacted`]); otherwise messages a masking pass rewrote in place are
+/// written as edits ([`SessionStore::record_edits`]) and whatever is new is appended. Called at every
 /// checkpoint and after each whole turn (a checkpoint never fires for the turn's own final assistant
 /// message; see `agent_core::Agent::run_turn`'s doc comment on where checkpoints land). A no-op when
 /// `run` isn't persisting at all, or when nothing is new.
@@ -4089,6 +4128,8 @@ fn persist_run(run: &RunStore, session: &Session) -> std::io::Result<()> {
         run.compactions.store(compactions, Relaxed);
         return Ok(());
     }
+    // A masking pass rewrote old messages in place (`Session::edited`), which an append can't see.
+    store.record_edits(&session.messages, &session.edited)?;
     store.append_new(&session.messages)
 }
 
@@ -4138,6 +4179,9 @@ async fn run_task(
     force_untrusted: bool,
     context_window: Option<u32>,
     compact_at: Option<u32>,
+    no_tool_masking: bool,
+    tool_masking_keep_turns: Option<usize>,
+    tool_masking_min_tokens: Option<u32>,
     compaction_reserve_tokens: Option<u32>,
     compaction_keep_recent_tokens: Option<u32>,
     branch_summary_reserve_tokens: Option<u32>,
@@ -5116,10 +5160,15 @@ async fn run_task(
     // then the `--context-window`/`--compact-at`/reserve/keep-recent overrides.
     let mut compaction = beyond_ai_agent::serve::resolve_compaction(
         &model,
-        context_window,
-        compact_at,
-        compaction_reserve_tokens,
-        compaction_keep_recent_tokens,
+        &beyond_ai_agent::serve::CompactionFlags {
+            context_window,
+            compact_at,
+            reserve_tokens: compaction_reserve_tokens,
+            keep_recent_tokens: compaction_keep_recent_tokens,
+            no_tool_masking,
+            tool_masking_keep_turns,
+            tool_masking_min_tokens,
+        },
     );
     if no_compaction {
         compaction.enabled = false;
