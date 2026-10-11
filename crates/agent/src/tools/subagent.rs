@@ -1119,6 +1119,30 @@ impl Subagent {
                 &owned_context_files
             }
         };
+        // Lean by default: a child lists only the skills its definition names, and carries the memory
+        // guidance (it has the tool) without the parent's indexes unless asked. Both re-ship uncached
+        // on every spawn otherwise.
+        let listed_skills: Vec<crate::skills::Skill> = match &def.skills {
+            None => Vec::new(),
+            Some(names) if names.iter().any(|n| n == "all") => self.ctx.skills.to_vec(),
+            Some(names) => self
+                .ctx
+                .skills
+                .iter()
+                .filter(|s| names.contains(&s.name))
+                .cloned()
+                .collect(),
+        };
+        let unindexed: Vec<(crate::memory::MountKind, String)>;
+        let memory_sections = if def.memory_index {
+            memory_sections
+        } else {
+            unindexed = memory_sections
+                .iter()
+                .map(|(kind, _)| (*kind, String::new()))
+                .collect();
+            &unindexed
+        };
         let mut prompt = crate::resources::build_system_prompt_with_context(
             &crate::resources::PromptOptions {
                 base: None,
@@ -1128,7 +1152,7 @@ impl Subagent {
                 // Follows the parent's `--no-context-files`, which the `context_files` slice above
                 // already reflects; kept honest here so the two can't disagree.
                 include_context_files: self.ctx.include_context_files,
-                skills: &self.ctx.skills,
+                skills: &listed_skills,
                 context_window: agent_core::capabilities(
                     def.model.as_deref().unwrap_or(&self.ctx.parent_model),
                 )

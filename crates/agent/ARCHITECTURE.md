@@ -2507,7 +2507,13 @@ child's progress stream into the parent's own observers for free.
 (user, ungated), and `<cwd>/.claude/agents`, `.agents/agents` ancestors (project, trust-gated exactly
 like skills, because a definition body is injected verbatim as a child's system prompt). Frontmatter:
 `name`, `description` (required); `tools` (comma-separated allow-list), `model`, `isolation`
-(`none`|`worktree`) (optional); the body is the child's system prompt. Discovered like skills/prompts,
+(`none`|`worktree`), `skills` (names, or `all`), `memory-index` (`true`) (optional); the body is the
+child's system prompt. **A child's prompt is lean by default**: no skills listing unless `skills:`
+names some (Claude Code's subagent key; `read skill:<name>` still loads any skill), and the `memory`
+guidance without the parent's `MEMORY.md` indexes unless `memory-index: true` (the child keeps the tool
+and the shared `/session`, and can `view` an index). Both re-ship uncached on every spawn: on this repo
+with a 23-skill Claude Code HOME, a child's first request went from 8,655 to 5,492 Claude tokens
+(17,345 before the skills and memory budgets). Discovered like skills/prompts,
 reusing `skills::parse_frontmatter`/`xml_escape`/`Collision`. When at least one definition exists, the
 tool is registered and an `<available_agents>` block is added to the system prompt; otherwise neither
 appears.

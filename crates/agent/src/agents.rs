@@ -13,6 +13,10 @@
 //! tools       optional   comma-separated allow-list, applied via `tools::apply_filter`
 //! model       optional   overrides the parent's model for this child
 //! isolation   optional   `none` (default) | `worktree`
+//! skills      optional   skills the child's prompt lists: comma-separated names, or `all`;
+//!                        absent lists none (the child can still `read skill:<name>`)
+//! memory-index optional  `true` puts the parent's `MEMORY.md` indexes in the child's prompt;
+//!                        absent leaves them out (the child keeps the `memory` tool and guidance)
 //! <body>      the child's system prompt
 //! ```
 //!
@@ -86,6 +90,16 @@ pub struct AgentDef {
     pub model: Option<String>,
     /// Frontmatter `isolation:`. See [`Isolation`].
     pub isolation: Isolation,
+    /// Frontmatter `skills:` — which discovered skills the child's system prompt lists: names
+    /// (comma-separated), or `all`. `None` lists none. A child is spawned for one focused task, and the
+    /// parent's whole listing (~1.5K tokens on a 23-skill HOME) re-sent uncached on every spawn is cost
+    /// it rarely uses; `read skill:<name>` still loads any skill by name. Same key as Claude Code's
+    /// subagent `skills:` field.
+    pub skills: Option<Vec<String>>,
+    /// Frontmatter `memory-index: true` — put the parent's `MEMORY.md` indexes in the child's prompt.
+    /// Off by default for the same reason as [`Self::skills`]: the child keeps the `memory` tool and
+    /// its guidance (it shares the parent's `/session`), and can `view` an index when it needs one.
+    pub memory_index: bool,
     /// The body past the frontmatter fence — the child's system prompt.
     pub system: String,
     /// Absolute path to the definition's own `.md` file.
@@ -385,6 +399,16 @@ fn parse_agent_text(path: &Path, text: &str, diagnostics: &mut Vec<String>) -> O
         .get("model")
         .map(|m| m.trim().to_string())
         .filter(|m| !m.is_empty());
+    let skills = fm.get("skills").map(|raw| {
+        raw.split(',')
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_string)
+            .collect()
+    });
+    let memory_index = fm
+        .get("memory-index")
+        .is_some_and(|v| v.trim().eq_ignore_ascii_case("true"));
 
     for issue in validate_agent_name(&name) {
         tracing::warn!(agent = %name, path = %path.display(), "{issue}");
@@ -396,6 +420,8 @@ fn parse_agent_text(path: &Path, text: &str, diagnostics: &mut Vec<String>) -> O
         tools,
         model,
         isolation,
+        skills,
+        memory_index,
         system: body.trim().to_string(),
         path: path.to_path_buf(),
         // Always overwritten per root group by `discover_with_diagnostics`.
@@ -528,6 +554,29 @@ mod tests {
         assert_eq!(def.model.as_deref(), Some("claude-sonnet-5"));
         assert_eq!(def.isolation, Isolation::Worktree);
         assert_eq!(def.system, "You are a worker.");
+    }
+
+    #[test]
+    fn parse_agent_reads_the_skills_and_memory_index_opt_ins() {
+        let def = parse_agent_text(
+            Path::new("/x/a.md"),
+            "---\nname: a\ndescription: d\nskills: pdf, lint\nmemory-index: true\n---\nbody",
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            def.skills,
+            Some(vec!["pdf".to_string(), "lint".to_string()])
+        );
+        assert!(def.memory_index);
+        let def = parse_agent_text(
+            Path::new("/x/b.md"),
+            "---\ndescription: d\n---\n",
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(def.skills, None);
+        assert!(!def.memory_index);
     }
 
     #[test]
