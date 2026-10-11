@@ -1290,7 +1290,10 @@ fn run_first_body(extra: &[&str]) -> String {
 fn run_defaults_to_the_5_minute_cache_ttl_and_takes_an_explicit_1h() {
     let body = run_first_body(&[]);
     assert!(body.contains(r#""cache_control""#), "{body}");
-    assert!(!body.contains(r#""ttl""#), "`run` must default to 5 minutes: {body}");
+    assert!(
+        !body.contains(r#""ttl""#),
+        "`run` must default to 5 minutes: {body}"
+    );
     let body = run_first_body(&["--cache-ttl", "1h"]);
     assert!(body.contains(r#""ttl":"1h""#), "{body}");
 }
