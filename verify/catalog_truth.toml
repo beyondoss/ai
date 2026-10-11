@@ -1640,6 +1640,27 @@ source = "https://developers.openai.com/api/docs/deprecations"
 retired = "2026-07-23"
 note = "Its only snapshot, gpt-4o-mini-search-preview-2025-03-11, shut down 2026-07-23 (replacement gpt-5.6-terra); the alias is still listed. Never a row."
 
+[[retired]]
+provider = "together"
+id = "meta-llama/Llama-3.3-70B-Instruct-Turbo"
+source = "https://docs.together.ai/docs/deprecations"
+retires = "2026-10-22"
+note = "Together's deprecation page retires it 2026-10-22 (replacement meta-models/Muse-Glimmer-30B), and its serverless models table no longer lists it (CAT-16 live, 2026-10-10). The llama-3.3-70b-versatile row keeps its OpenRouter candidate until then; the Together candidate goes before the date."
+
+[[retired]]
+provider = "openrouter"
+id = "qwen/qwen3.5-9b"
+source = "https://openrouter.ai/api/v1/models/qwen/qwen3.5-9b/endpoints"
+retires = "2026-10-21"
+note = "OpenRouter's listing schedules the model's removal for 2026-10-21 (CAT-16 live, 2026-10-10). The qwen/qwen3.5-9b row keeps its Together primary; this candidate goes before the date."
+
+[[not_carried]]
+provider = "anthropic"
+id = "claude-haiku-5-5"
+source = "https://platform.claude.com/docs/en/about-claude/models/overview.md"
+date = "2026-10-10"
+reason = "New on Anthropic's model list (CAT-16 live, 2026-10-10). Not yet a row: it is the one Claude model with a long-context price tier (above 100K prompt tokens, https://platform.claude.com/docs/en/about-claude/pricing.md), so its card needs that tier and a live-verified Bedrock/OpenRouter candidate set first. Add it as a row with both."
+
 [[not_carried]]
 provider = "openai"
 id = "chat-latest"
