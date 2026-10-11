@@ -560,9 +560,14 @@ The harness layers several capabilities over the bare tools + loop:
   system-prompt guidance, and (for the host) the on-disk location. Storage is behind the `MemoryBackend`
   trait so it isn't welded to local disk; `redis://`/`postgres://` DSNs are recognized by `memory::open`
   but return a clear "not yet supported" (the seam exists without the impl). Each root's `MEMORY.md` index
-  is read at session start (bounded to ~200 lines/25 KB) and injected into the system prompt as its own
-  guidance subsection (`resources::PromptOptions::memory_sections`, rendered by `memory::render_sections`)
-  — Claude Code's auto-memory model. Two host-side steers bracket a compaction so the model prepares for
+  is read at session start (bounded to ~200 lines/25 KB, what `view` also returns) and injected into the
+  system prompt as its own guidance subsection (`resources::PromptOptions::memory_sections`, rendered by
+  `memory::render_sections`) — Claude Code's auto-memory model. The injected copy is cut at a line
+  boundary to `PROMPT_INDEX_MAX_BYTES` (4 KB; it is re-sent with every request) with a visible
+  `[index truncated at 4 KB for the prompt: N more lines — read the full index with`memory``view
+  <root>/MEMORY.md`]` note; an empty index adds nothing past the guidance. The guidance says what
+  belongs in each store and how to curate it; the commands and their semantics live once, in the
+  tool's schema, and the tool description is a two-line summary of the roots. Two host-side steers bracket a compaction so the model prepares for
   it rather than only reacting: a **pre-compaction pressure nudge** (`memory::PRESSURE_NUDGE`) fires once
   per fill cycle when the live prompt first crosses `memory::compaction_pressure_point` (80% of the
   `input_budget - reserve_tokens` cut `should_compact` fires at; the input budget is the window, or a
