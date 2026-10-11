@@ -611,6 +611,12 @@ pub fn capabilities(model: &str) -> ModelCaps {
 /// entry point and threads the `&str` down through every layer, rather than each layer re-lowercasing
 /// the same value into a fresh `String` (findings T2-F2, T2-F3).
 fn capabilities_lc(m: &str) -> ModelCaps {
+    // Bedrock spells a Claude id `[region.]anthropic.<claude id>[-v1[:0]]`. Without this the id
+    // matches no family and gets `ModelCaps::unknown()` — a 4096-token output ceiling and no
+    // long-cache TTL on a model that has both.
+    if let Some(native) = bedrock_claude_id(m) {
+        return capabilities_lc(native);
+    }
     let mut caps = capabilities_impl_lc(m);
     caps.compact_at = provisional_compact_at(m);
     // `is_fireworks_anthropic_wire_model` re-lowercases internally, so guard it behind the
@@ -622,6 +628,27 @@ fn capabilities_lc(m: &str) -> ModelCaps {
         caps.supports_cache_control_on_tools = false;
     }
     caps
+}
+
+/// The native Claude id inside a Bedrock model id: `us.anthropic.claude-haiku-4-5-20251001-v1:0` →
+/// `claude-haiku-4-5-20251001`. `None` for anything that isn't Bedrock-spelled.
+fn bedrock_claude_id(m: &str) -> Option<&str> {
+    let (_, id) = m.split_once("anthropic.")?;
+    if !id.starts_with("claude-") {
+        return None;
+    }
+    // The model-version suffix: `-v1`, `-v1:0`, `-v2:0`.
+    let id = match id.rsplit_once("-v") {
+        Some((head, version))
+            if version
+                .split(':')
+                .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())) =>
+        {
+            head
+        }
+        _ => id,
+    };
+    Some(id)
 }
 
 fn capabilities_impl_lc(m: &str) -> ModelCaps {
@@ -3997,6 +4024,28 @@ mod tests {
         assert_eq!(c.max_tokens_field, MaxTokensField::MaxTokens);
         assert!(!c.supports_long_cache);
         assert_eq!(c.thinking, ThinkingShape::None);
+    }
+
+    #[test]
+    fn a_bedrock_spelled_claude_id_gets_the_native_ids_capabilities() {
+        for (bedrock, native) in [
+            (
+                "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+                "claude-haiku-4-5-20251001",
+            ),
+            ("global.anthropic.claude-opus-4-8", "claude-opus-4-8"),
+            ("anthropic.claude-opus-4-6-v1", "claude-opus-4-6"),
+            (
+                "eu.anthropic.claude-sonnet-4-5-20250929-v1:0",
+                "claude-sonnet-4-5-20250929",
+            ),
+        ] {
+            assert_eq!(capabilities(bedrock), capabilities(native), "{bedrock}");
+            assert!(capabilities(bedrock).supports_long_cache, "{bedrock}");
+        }
+        // Not Bedrock-spelled: untouched.
+        assert_eq!(bedrock_claude_id("anthropic/claude-opus-4.6"), None);
+        assert_eq!(bedrock_claude_id("anthropic.titan-text"), None);
     }
 
     #[test]

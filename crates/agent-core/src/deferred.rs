@@ -149,7 +149,7 @@ pub(crate) fn native(req: &ModelRequest, dialect: Dialect) -> bool {
     match dialect {
         Dialect::Anthropic => {
             matches!(req.host, None | Some(Host::Anthropic | Host::Bedrock))
-                && claude_supports_tool_search(&req.model)
+                && claude_4_5_or_later(&req.model)
         }
         Dialect::OpenAiResponses => {
             matches!(req.host, None | Some(Host::OpenAi))
@@ -162,10 +162,12 @@ pub(crate) fn native(req: &ModelRequest, dialect: Dialect) -> bool {
     }
 }
 
-/// Claude Opus/Sonnet/Haiku 4.5 and later, and every Fable/Mythos — the models Anthropic's tool
-/// search page lists. Accepts the Bedrock (`us.anthropic.claude-…`) and Vertex (`…@date`) spellings,
-/// whose Messages endpoints honour `defer_loading` and `tool_reference` too.
-fn claude_supports_tool_search(model: &str) -> bool {
+/// Claude Opus/Sonnet/Haiku 4.5 and later, and every Fable/Mythos. Two features key on exactly this
+/// set: Anthropic's tool search page lists these models, and Bedrock's 1-hour prompt-cache TTL is
+/// documented for them only (`client::long_cache_reaches`). Accepts the Bedrock
+/// (`us.anthropic.claude-…`) and Vertex (`…@date`) spellings, whose Messages endpoints honour
+/// `defer_loading` and `tool_reference` too.
+pub(crate) fn claude_4_5_or_later(model: &str) -> bool {
     let model = model.rsplit_once("anthropic.").map_or(model, |(_, m)| m);
     let Some(rest) = model.strip_prefix("claude-") else {
         return false;

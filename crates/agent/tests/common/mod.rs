@@ -694,6 +694,8 @@ fn isolate_provider_env(cmd: &mut Command) {
         // depend on it.
         "AI_AGENT_GRANT_KEY",
         "AI_AGENT_SEAL_KEY",
+        // Picks the prompt-cache TTL, which tests assert on the wire.
+        "AI_AGENT_CACHE_TTL",
     ] {
         cmd.env_remove(key);
     }

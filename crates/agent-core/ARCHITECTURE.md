@@ -1058,7 +1058,9 @@ input-token price: an O(n²) token cost over an n-step run, on the very history 
 already keeps O(1) _in memory_ via `Arc`/COW (the wire cost was the half left unoptimized).
 `anthropic::build_body` marks `cache_control` (ephemeral; `ttl: "1h"` only when `cache_long` _and_
 `capabilities(model).supports_long_cache` — an unsupported model silently falls back to the 5-minute
-TTL instead of 400-ing) at three points (Anthropic caches the request prefix up to each mark; cache
+TTL instead of 400-ing; `GatewayClient::stream` has already cleared `cache_long` on a route not
+documented to take the long TTL, see `client::long_cache_reaches` and the agent crate's "Prompt-cache
+TTL by mode") at three points (Anthropic caches the request prefix up to each mark; cache
 reads cost ~10% of input tokens):
 
 - an **anchor** on the last tool definition — the JSON schemas are byte-identical every turn and sit

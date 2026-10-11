@@ -202,9 +202,10 @@ pub struct ModelRequest {
     /// `prompt_cache_key` so sessions under one key share a cached prefix and two keys (two tenants
     /// behind one gateway org) never do. `0` when unset.
     pub cache_scope: u64,
-    /// Use the 1-hour prompt-cache TTL instead of the default 5 minutes. Worth it for a long-running
-    /// agent that may pause more than 5 minutes between turns (a slow tool, a thinking user), at a
-    /// higher cache-write price.
+    /// Use the 1-hour prompt-cache TTL instead of the default 5 minutes (OpenAI: 24h retention). Worth
+    /// it for a long-running agent that may pause more than 5 minutes between turns (a slow tool, a
+    /// thinking user), at a higher cache-write price. `GatewayClient::stream` clears it on a route not
+    /// documented to take the long TTL (`client::long_cache_reaches`).
     pub cache_long: bool,
     /// Skip prompt-cache breakpoint stamping entirely (Anthropic's `cache_control`; equivalently
     /// OpenAI's `prompt_cache_key`/`prompt_cache_retention`). A cache write costs ~1.25x the input-token

@@ -48,6 +48,41 @@ const DEFAULT_GATEWAY: &str = "http://ai.internal";
 /// the wire-level `ReasoningEffort` (`None` for `Off`) converts via `ThinkingLevel::reasoning_effort`
 /// once every other candidate source (CLI flag, model suffix, stored setting) has had its turn — see
 /// `run_task`'s/`Command::Serve`'s own resolution chains.
+/// `--cache-ttl`: how long the provider keeps a prompt-cache entry alive between requests. The wire
+/// still carries one bool (`ModelRequest::cache_long`); this only decides it, per mode — `serve`
+/// defaults to [`CacheTtl::OneHour`], `run` to [`CacheTtl::FiveMinutes`]. See "Prompt-cache TTL by
+/// mode" in `crates/agent/ARCHITECTURE.md` for the break-even behind the defaults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CacheTtl {
+    FiveMinutes,
+    OneHour,
+}
+
+impl std::str::FromStr for CacheTtl {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "5m" => Ok(Self::FiveMinutes),
+            "1h" => Ok(Self::OneHour),
+            other => Err(format!("invalid cache TTL {other:?}; expected 5m or 1h")),
+        }
+    }
+}
+
+impl CacheTtl {
+    /// Whether to ask for the 1-hour TTL: `--cache-ttl` if given, else `--cache-long`, else the
+    /// mode's default.
+    fn resolve(flag: Option<Self>, cache_long: bool, mode_default: Self) -> bool {
+        let ttl = flag.unwrap_or(if cache_long {
+            Self::OneHour
+        } else {
+            mode_default
+        });
+        ttl == Self::OneHour
+    }
+}
+
 fn parse_reasoning_effort(s: &str) -> Result<agent_core::ThinkingLevel, String> {
     agent_core::ThinkingLevel::parse(s).ok_or_else(|| {
         format!("invalid reasoning effort {s:?}; expected one of off/minimal/low/medium/high/xhigh")
@@ -258,9 +293,13 @@ enum Command {
         /// capability-table `max_output` (see `agent_core::models::capabilities`) when omitted.
         #[usage(long, env = "AI_AGENT_MAX_TOKENS")]
         max_tokens: Option<u32>,
-        /// Use the 1-hour prompt-cache TTL (vs 5 minutes); helps when turns are spaced out. `serve`'s
-        /// identical flag; `run`'s one-shot single-turn case rarely benefits, but a multi-message
-        /// invocation (several `tasks` sent as sequential turns) can.
+        /// Prompt-cache TTL: `5m` or `1h`. Defaults to `5m` for `run`: its requests are spaced by tool
+        /// calls, not by a person reading, so the cache rarely idles past five minutes and the 1-hour
+        /// write premium buys nothing. Pass `1h` when a tool can run longer than five minutes. See
+        /// "Prompt-cache TTL by mode" in `crates/agent/ARCHITECTURE.md`.
+        #[usage(long, env = "AI_AGENT_CACHE_TTL")]
+        cache_ttl: Option<CacheTtl>,
+        /// Shorthand for `--cache-ttl 1h`; `--cache-ttl` wins when both are given.
         #[usage(long)]
         cache_long: bool,
         /// Enable extended thinking with this token budget (must be below the per-turn max tokens). A
@@ -900,7 +939,13 @@ enum Command {
         /// override that, e.g. capping generation length or lifting it past the model-derived default.
         #[usage(long, env = "AI_AGENT_MAX_TOKENS")]
         max_tokens: Option<u32>,
-        /// Use the 1-hour prompt-cache TTL (vs 5 minutes); helps when turns are spaced out.
+        /// Prompt-cache TTL: `5m` or `1h`. Defaults to `1h` for `serve`: a person reads and types
+        /// between prompts, and every pause past five minutes would otherwise re-write the whole
+        /// transcript at the cache-write price. Pass `5m` for a `serve` driven by automation. See
+        /// "Prompt-cache TTL by mode" in `crates/agent/ARCHITECTURE.md`.
+        #[usage(long, env = "AI_AGENT_CACHE_TTL")]
+        cache_ttl: Option<CacheTtl>,
+        /// Shorthand for `--cache-ttl 1h`; `--cache-ttl` wins when both are given.
         #[usage(long)]
         cache_long: bool,
         /// Enable extended thinking with this token budget (must be below the per-turn max tokens). A
@@ -1871,6 +1916,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             key,
             max_steps,
             max_tokens,
+            cache_ttl,
             cache_long,
             thinking,
             reasoning_effort,
@@ -1946,7 +1992,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 key,
                 max_steps,
                 max_tokens,
-                cache_long,
+                CacheTtl::resolve(cache_ttl, cache_long, CacheTtl::FiveMinutes),
                 thinking,
                 reasoning_effort,
                 steering_mode,
@@ -2051,6 +2097,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             no_context_files,
             context_window,
             compact_at,
+            cache_ttl,
             cache_long,
             thinking,
             reasoning_effort,
@@ -2547,7 +2594,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 no_session_persistence,
                 context_window,
                 compact_at,
-                cache_long,
+                cache_long: CacheTtl::resolve(cache_ttl, cache_long, CacheTtl::OneHour),
                 thinking,
                 reasoning_effort,
                 temperature,
@@ -5486,6 +5533,62 @@ mod tests {
     use super::*;
     use agent_core::Error;
     use agent_core::mock::{MockTransport, turn};
+
+    /// The TTL a real command line resolves to, through the same `CacheTtl::resolve` call and mode
+    /// default `main` uses for that subcommand.
+    fn resolved_cache_long(args: &[&str]) -> bool {
+        match parse_cli(args).expect("parses").command {
+            Command::Run {
+                cache_ttl,
+                cache_long,
+                ..
+            } => CacheTtl::resolve(cache_ttl, cache_long, CacheTtl::FiveMinutes),
+            Command::Serve {
+                cache_ttl,
+                cache_long,
+                ..
+            } => CacheTtl::resolve(cache_ttl, cache_long, CacheTtl::OneHour),
+            _ => unreachable!("only run and serve carry a cache TTL"),
+        }
+    }
+
+    #[test]
+    fn cache_ttl_defaults_to_5m_for_run_and_1h_for_serve() {
+        assert!(!resolved_cache_long(&["a", "run", "hi"]));
+        assert!(resolved_cache_long(&["a", "serve"]));
+    }
+
+    #[test]
+    fn an_explicit_cache_ttl_overrides_the_mode_default() {
+        assert!(resolved_cache_long(&[
+            "a",
+            "run",
+            "--cache-ttl",
+            "1h",
+            "hi"
+        ]));
+        assert!(!resolved_cache_long(&["a", "serve", "--cache-ttl", "5m"]));
+        // `--cache-long` still means 1h, and an explicit `--cache-ttl` beats it.
+        assert!(resolved_cache_long(&["a", "run", "--cache-long", "hi"]));
+        assert!(!resolved_cache_long(&[
+            "a",
+            "run",
+            "--cache-long",
+            "--cache-ttl",
+            "5m",
+            "hi"
+        ]));
+    }
+
+    #[test]
+    fn cache_ttl_rejects_anything_but_5m_or_1h() {
+        assert!(parse_cli(&["a", "serve", "--cache-ttl", "24h"]).is_none());
+    }
+
+    fn parse_cli(args: &[&str]) -> Option<Cli> {
+        let os: Vec<&OsStr> = args.iter().map(OsStr::new).collect();
+        Cli::try_parse_from(&os).ok()
+    }
 
     #[test]
     fn a_broken_pipe_trips_cancel_and_the_flag_instead_of_exiting_on_the_spot() {

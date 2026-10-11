@@ -579,7 +579,8 @@ pub struct ServeConfig {
     /// `cfg`-sourced override, so it survives a model switch rather than resetting to that new model's
     /// own default.
     pub max_tokens: Option<u32>,
-    /// Use the 1-hour prompt-cache TTL (vs the default 5 minutes) — useful when turns are spaced out.
+    /// Ask for the 1-hour prompt-cache TTL instead of 5 minutes. `main` sets it from `--cache-ttl`,
+    /// which defaults to `1h` for `serve` (see "Prompt-cache TTL by mode" in ARCHITECTURE.md).
     pub cache_long: bool,
     /// Extended-thinking token budget, when enabled (`None` leaves thinking off). Must be below the
     /// per-turn `max_tokens`.
