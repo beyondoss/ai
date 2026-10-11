@@ -48,6 +48,11 @@ TASKS: dict[str, tuple[str, ...]] = {
     "parsers": ("parso", "pyparsing", "sqlparse"),  # 4666
     "utils": ("boltons", "toolz", "marshmallow"),  # 4287
     "text": ("mistune", "more-itertools", "tabulate"),  # 3988
+    # Single small repos: cheap-model gate tasks whose context mostly stays under 100K.
+    "toolz": ("toolz",),  # 681
+    "sqlparse": ("sqlparse",),  # 840
+    "tabulate": ("tabulate",),  # 425
+    "marshmallow": ("marshmallow",),  # 1101
 }
 
 # Test-only tooling in the shared venv. Never the packages under test: an installed copy would be

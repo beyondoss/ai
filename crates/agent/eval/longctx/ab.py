@@ -88,8 +88,7 @@ def cmd_run(a) -> None:
                 "--attempts", str(a.attempts), "--jobs", str(a.jobs), "--cap-usd", str(a.cap_usd),
                 "--budget-usd", str(a.budget_usd), "--runs-dir", str(tasks.work_dir() / "ab" / label),
                 "--label", label]
-        for e in extra:
-            argv += ["--agent-arg", e]
+        argv += [f"--agent-arg={e}" for e in extra]  # `=`: a value starting with `--` is otherwise a flag
         run.main(argv)
     cmd_report(a)
 

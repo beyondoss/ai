@@ -11,6 +11,7 @@ never repeated, so an interrupted sweep resumes where it stopped.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
@@ -27,6 +28,8 @@ import mcp_tasks
 import prefix_tasks
 import tasks
 from repos import BY_NAME, TASKS
+
+_LOCKS: list = []  # run locks held for the process lifetime (see run_one)
 
 RESERVE = 16_384  # CompactionConfig::default().reserve_tokens; the arms leave it alone.
 
@@ -51,10 +54,42 @@ PRICES: dict[str, dict] = {
     "claude-opus-5-5": dict(base=(4, 20, 0.2, 5, 8)),
     "claude-sonnet-5-5": dict(base=(2, 10, 0.1, 2.5, 4)),
     "gpt-6.1-sol": dict(base=(2, 10, 0.1, 0, 0), long=(4, 15, 0.2, 0, 0), long_over=272_000),
+    "claude-haiku-5-5": dict(base=(0.1, 0.5, 0.01, 0.125, 0.2), long=(0.5, 2.5, 0.05, 0.625, 1), long_over=100_000),
+    "gpt-6-luna": dict(base=(0.1, 0.5, 0.01, 0, 0), long=(0.2, 0.75, 0.02, 0, 0), long_over=272_000),
 }
 
 # Rough $/run for `--estimate`, by arm; replace with measured means once a pilot exists.
-PRIOR_USD = {"claude-opus-5-5": 4.0, "claude-sonnet-5-5": 2.0, "gpt-6.1-sol": 2.0}
+PRIOR_USD = {"claude-opus-5-5": 4.0, "claude-sonnet-5-5": 2.0, "gpt-6.1-sol": 2.0, "claude-haiku-5-5": 0.1,
+             "gpt-6-luna": 0.1}
+
+
+class Ledger:
+    """Spend across invocations, with a hard cap. A run reserves its own kill-switch cap (its worst
+    case) before it starts and only starts if spent + reserved + cap fits under the hard cap."""
+
+    def __init__(self, path: Path | None, hard_cap: float):
+        self.path, self.cap, self.reserved = path, hard_cap, 0.0
+        self.lock = threading.Lock()
+
+    def spent(self) -> float:
+        if self.path and self.path.exists():
+            return sum(json.loads(l)["usd"] for l in self.path.read_text().splitlines() if l.strip())
+        return 0.0
+
+    def reserve(self, worst: float) -> bool:
+        with self.lock:
+            if self.spent() + self.reserved + worst > self.cap:
+                return False
+            self.reserved += worst
+            return True
+
+    def settle(self, worst: float, usd: float, what: str) -> float:
+        with self.lock:
+            self.reserved -= worst
+            if self.path:
+                with open(self.path, "a") as f:
+                    f.write(json.dumps({"run": what, "usd": round(usd, 5)}) + "\n")
+            return self.spent()
 
 _SUSPECT = re.compile(r"\bpip3? (install|download)\b|site-packages|dist-packages|\bcurl\b|\bwget\b|git clone|codeload|pypi\.org")
 _DROP = {"text_delta", "thinking_delta", "input_json_delta", "signature_delta"}
@@ -180,6 +215,18 @@ class Live:
         self.tok["cache_write"] += u.get("cache_write_tokens", 0)
 
 
+def events_usd(model: str, events: Path) -> float:
+    """What a run's event log says it spent, whether or not it finished."""
+    live = Live(model)
+    if events.exists():
+        for line in events.read_text().splitlines():
+            try:
+                live.feed(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+    return live.usd
+
+
 def grade_repo(repo, tree: Path, meta: dict) -> dict:
     pristine = tasks.work_dir() / "pristine" / repo.name
     for rel in (*repo.tests, *repo.restore):
@@ -216,6 +263,15 @@ def run_one(binary: Path, task: str, model: str, arm: str, attempt: int, cap_usd
     res_path = d / "result.json"
     if res_path.exists():
         return json.loads(res_path.read_text())
+    # One process per run: a second sweep over the same item would delete this run's tree from
+    # under its agent. The lock lives beside the run dir, which is about to be reset.
+    d.parent.mkdir(parents=True, exist_ok=True)
+    lock = open(d.parent / f"a{attempt}.lock", "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise RuntimeError(f"{d}: already running in another process") from None
+    _LOCKS.append(lock)  # held until this process exits
     if d.exists():
         shutil.rmtree(d)
     d.mkdir(parents=True)
@@ -249,6 +305,9 @@ def run_one(binary: Path, task: str, model: str, arm: str, attempt: int, cap_usd
         env["PYTHONPATH"] = ":".join(str(tree / r.name / r.pythonpath) for r in repos)
         prompt = prompt_text(repos)
     env["HOME"] = str(home)  # no user CLAUDE.md, skills, settings or memory leak into the run
+    # The run's own temp dir: a full shared /tmp must not fail the agent's test runs (ENOSPC).
+    (d / "tmp").mkdir(exist_ok=True)
+    env["TMPDIR"] = str(d / "tmp")
     env["AI_DIRECT"] = "1"
     for k in [k for k in env if k.startswith("AI_AGENT_") or k == "AI_GATEWAY_URL"]:
         del env[k]
@@ -374,6 +433,9 @@ def main(argv: list[str]) -> None:
     ap.add_argument("--max-steps", type=int, default=250)
     ap.add_argument("--wall-min", type=int, default=75)
     ap.add_argument("--estimate", action="store_true")
+    ap.add_argument("--ledger", default="", help="append-only spend ledger shared across invocations")
+    ap.add_argument("--hard-cap-usd", type=float, default=float("inf"),
+                    help="with --ledger: never start a run whose worst case (--cap-usd) could pass this total")
     ap.add_argument("--runs-dir", default="", help="where results go (default $LONGCTX_WORK/runs)")
     ap.add_argument("--label", default="", help="recorded on each result (e.g. the binary's commit)")
     ap.add_argument("--agent-arg", dest="extra", action="append", default=[],
@@ -385,6 +447,12 @@ def main(argv: list[str]) -> None:
         print(f"{len(todo)} runs, prior estimate ${est:.0f}")
         return
     binary = Path(a.bin).resolve()
+    # Grading's junit files go under the work dir too, not the shared /tmp.
+    tmp = tasks.work_dir() / "tmp"
+    tmp.mkdir(parents=True, exist_ok=True)
+    os.environ["TMPDIR"] = str(tmp)
+    import tempfile as _tf
+    _tf.tempdir = str(tmp)
     for n in {n for t, *_ in todo if t in TASKS for n in TASKS[t]}:
         tasks.build(BY_NAME[n])
     runs_dir = Path(a.runs_dir) if a.runs_dir else tasks.work_dir() / "runs"
@@ -392,16 +460,28 @@ def main(argv: list[str]) -> None:
         mcp_tasks.prewarm(tasks.work_dir() / "mcp-cache")
     spent = 0.0
     lock = threading.Lock()
+    ledger = Ledger(Path(a.ledger) if a.ledger else None, a.hard_cap_usd)
 
     def go(item):
         nonlocal spent
         with lock:
             if spent > a.budget_usd:
                 return None
+        d = runs_dir / item[0] / item[1] / item[2] / f"a{item[3]}"
+        done = (d / "result.json").exists()
+        if not done and not ledger.reserve(a.cap_usd):
+            print(f"SKIP {item}: worst case ${a.cap_usd:.2f} would not fit under the ${ledger.cap:.2f} cap "
+                  f"(spent ${ledger.spent():.2f})", flush=True)
+            return None
         try:
             r = run_one(binary, *item, a.cap_usd, a.max_steps, a.wall_min * 60, a.extra, runs_dir, a.label)
         except Exception as e:  # one broken run must not stop the sweep; it has no result, so reruns retry it
             print(f"ERROR {item}: {e}", flush=True)
+            r = None
+        finally:
+            if not done:
+                ledger.settle(a.cap_usd, events_usd(item[1], d / "events.jsonl"), f"{a.label}:{'/'.join(map(str, item))}")
+        if r is None:
             return None
         with lock:
             spent += r["usd"]
@@ -409,7 +489,8 @@ def main(argv: list[str]) -> None:
         print(f"{r['task']:15} {r['model']:18} {r['arm']:8} a{r['attempt']} pass={int(r['passed'])} "
               f"fixed={r['fixed']}/{r['broken']} ${r['usd']:.2f} turns={r['turns']} comp={r['compactions']} "
               f"mask={r.get('maskings', 0)} "
-              f"peak={r['peak_prompt'] // 1000}K killed={r['killed']}  [total ${tot:.2f}]", flush=True)
+              f"peak={r['peak_prompt'] // 1000}K killed={r['killed']}  [run total ${tot:.2f}, ledger ${ledger.spent():.2f}]",
+              flush=True)
         return r
 
     with ThreadPoolExecutor(a.jobs) as ex:
