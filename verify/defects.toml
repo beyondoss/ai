@@ -2723,3 +2723,31 @@ state = "fixed"
 test = "a_forced_tool_on_qwen3_8_max_prime_goes_as_an_instruction"
 fix = "29375f4"
 note = "Fixed the way the gateway serves Claude models that refuse forced tool use: providers::catalog::ToolThinking::ForcedAsInstruction marks the OpenRouter candidate, and translate::fit_tools_to_thinking sends a forced request as tool_choice auto with a closing {\"role\": \"system\", \"content\": \"Respond by calling the `NAME` tool.\"} (\"... one of the provided tools.\" for required), reasoning as the client asked. A call is very likely, not guaranteed: with auto and that closing system message the model called the tool 4 of 4 times (direct, 2026-10-11, a prompt that did not need it). Applied after translation, so a Messages tool_choice any or tool is covered. Also held by a_forced_tool_goes_as_an_instruction_where_thinking_cannot_go_off and qwen_candidates_whose_thinking_breaks_tools. Live 2026-10-11: VERIFY_CATALOG_ROW=qwen/qwen3.8-max-prime 13/13, CAT-6's forced named tool served with no auto retry."
+
+[[defect]]
+id = "D270"
+severity = "med"
+area = "Catalog"
+title = "Muse Spark answers every tool_choice but auto with a 400"
+impact = "Meta's Muse Spark (both Contributor rows, OpenRouter's only host Meta) refuses tool_choice required, a named function and none: 400 \"only `\\\"auto\\\"` is supported for `tool_choice`. `\\\"none\\\"`, `\\\"required\\\"`, and named function choices are not currently supported\". A stock SDK or LangChain call that forces a tool, or turns tools off with none, fails on the row's only candidate."
+confidence = "high"
+evidence = "Direct to OpenRouter 2026-10-11, meta/muse-spark-1.3-contributor: required, named and none each that 400; auto calls the tool. CAT-6 on both rows noted 'forced tool_choice rejected, retrying with auto'."
+claims = ["T1"]
+state = "fixed"
+test = "muse_spark_gets_only_the_tool_choice_it_accepts"
+fix = "FIX"
+note = "providers::catalog::ToolThinking::AutoOnly marks both OpenRouter candidates; translate::fit_tools_to_thinking sends a forced request as tool_choice auto with a closing system message naming the tool (as D269 does for Qwen3.8 Max Prime: 4 of 4 calls measured on Muse Spark 1.3), and a none request with its root tools and tool_choice cut out by span, so no tool can be called (measured: a conversation holding a tool call and its result is answered without tools). Also held by an_auto_only_candidate_gets_none_as_no_tools_and_forced_as_an_instruction and qwen_candidates_whose_thinking_breaks_tools. Not changed: a small max_tokens can end in finish_reason length with no text, because the model reasons hidden first (\"Say OK\" took 88 reasoning tokens); that is the caller's budget, as on OpenAI's reasoning models, and the card says reasoning."
+
+[[defect]]
+id = "D271"
+severity = "high"
+area = "Billing"
+title = "Every Muse Spark answer was unpriced: Meta reports service_tier auto"
+impact = "Meta, through OpenRouter, puts service_tier \"auto\" on every Muse Spark answer. The pricer knew none, default, standard and on_demand as the standard class and refused anything else, so every served request on both Contributor rows logged price_status unpriced (unknown_class), and CAT-1, 4, 5, 6, 6+BIL-9 and 7 failed live on both rows."
+confidence = "high"
+evidence = "Live 2026-10-11, VERIFY_CATALOG_ROW=meta/muse-spark-1.3-contributor (and 1.2) on main bb52a35: 7/13, every failing cell 'BIL-24 row is not priced: unpriced unknown_class' with service_tier auto, served_by Meta. Direct: OpenRouter answered service_tier \"auto\" with usage.cost $0.0000212 for 14 in / 99 out, exactly Meta's standard Contributor rate."
+claims = ["BIL-24"]
+state = "fixed"
+test = "service_tier_auto_is_the_standard_class"
+fix = "FIX"
+note = "Fixed in the contract: a reported service_tier auto is the request default echoed back unresolved, so it is the standard class (providers::pricing::served_class and verify/pricing_reference.py alike; crates/providers/ARCHITECTURE.md's class table). Anthropic and Bedrock still refuse anything but standard. Golden vectors from the reference pricer: openrouter_service_tier_auto_reported, openrouter_service_tier_auto_dearest_endpoint, anthropic_service_tier_auto_refused. Live 2026-10-11: VERIFY_CATALOG_ROW 13/13 on both Muse rows."

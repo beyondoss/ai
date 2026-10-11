@@ -200,3 +200,59 @@ async fn the_models_list_labels_rows_that_train_on_inputs() {
     );
     assert!(seen.lock().unwrap().is_empty());
 }
+
+/// Meta's Muse Spark accepts only `tool_choice: "auto"`: a forced choice goes as `auto` with a
+/// closing system message naming the tool, `none` goes with no tools at all, and `auto` as sent.
+/// claim: T1
+/// defect: D270
+#[tokio::test]
+async fn muse_spark_gets_only_the_tool_choice_it_accepts() {
+    let seen = Seen::default();
+    let (_up, gw, key) = gateway(&seen, 74).await;
+    let tools = json!([{"type": "function", "function": {"name": "get_weather",
+        "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}}]);
+    let post = |choice: Value| {
+        test_client()
+            .post(format!("{}/v1/chat/completions", gw.url()))
+            .header("authorization", format!("Bearer {key}"))
+            .header("content-type", "application/json")
+            .body(
+                json!({"model": "meta/muse-spark-1.3-contributor", "tools": tools,
+                    "tool_choice": choice,
+                    "messages": [{"role": "user", "content": "Weather in Paris?"}]})
+                .to_string(),
+            )
+            .send()
+    };
+    for (choice, must) in [
+        (
+            json!({"type": "function", "function": {"name": "get_weather"}}),
+            "Respond by calling the `get_weather` tool.",
+        ),
+        (
+            json!("required"),
+            "Respond by calling one of the provided tools.",
+        ),
+    ] {
+        assert_eq!(post(choice).await.unwrap().status().as_u16(), 200);
+        let (_, sent) = seen.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(sent["tool_choice"], "auto", "{sent}");
+        assert_eq!(
+            sent["messages"][1],
+            json!({"role": "system", "content": must}),
+            "{sent}"
+        );
+    }
+    assert_eq!(post(json!("none")).await.unwrap().status().as_u16(), 200);
+    let (_, sent) = seen.lock().unwrap().last().cloned().unwrap();
+    assert!(
+        sent.get("tools").is_none() && sent.get("tool_choice").is_none(),
+        "{sent}"
+    );
+    assert_eq!(sent["messages"].as_array().unwrap().len(), 1, "{sent}");
+    assert_eq!(post(json!("auto")).await.unwrap().status().as_u16(), 200);
+    let (_, sent) = seen.lock().unwrap().last().cloned().unwrap();
+    assert_eq!(sent["tool_choice"], "auto");
+    assert_eq!(sent["tools"], tools);
+    assert_eq!(sent["messages"].as_array().unwrap().len(), 1, "{sent}");
+}
