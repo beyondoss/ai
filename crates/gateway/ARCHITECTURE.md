@@ -1027,6 +1027,22 @@ input, which now matches the bill. A client that sent `cache_control` itself ask
 and is billed and shown true cache writes, exactly as calling Anthropic directly; whether its wire
 can display them is a limitation it shares with direct use. Cache reads are unaffected either way.
 
+**A client's 1-hour TTL survives the OpenRouter failover.** A Messages client's `cache_control`
+carries its `ttl` onto every candidate:
+
+- **Anthropic and Bedrock:** relayed as bytes.
+- **OpenRouter Chat Completions:** `copy_cache_control` copies it.
+
+OpenRouter honours the TTL and bills 1-hour writes at 2× input. Probed on Haiku 4.5: 19,007 written
+tokens cost $0.038. But its usage reports writes only as `prompt_tokens_details.cache_write_tokens`,
+with no TTL split. So when every breakpoint on the Chat Completions body asks for `1h`
+(`translate::chat_cache_is_1h`, reported per attempt into `TranslateState::cache_1h`), the row
+records all the writes as `cache_write_1h_tokens` (`Usage::attribute_cache_writes_1h`).
+
+A mixed request leaves the split unknown and reads as 5-minute writes. The price itself was already
+right, because OpenRouter's `usage.cost` is pass-through. The token columns now agree with it. The
+gateway does not log the request-side TTL; `cache_write_1h_tokens` is its record.
+
 **What the client gets back.** Responses are translated in `translate::response_json_status`
 (non-stream, withheld until end of stream) and `translate::SseBridge` (event by event). Every stream
 pairing meets in Chat Completions chunks held as values, so Messages → Responses parses each event
@@ -1772,12 +1788,12 @@ in `upstream_peer` → connected in `upstream_request_filter`) is what tells the
 
 **Priced variants and per-call fees** ride on the row next to the token counts:
 
-| Row field                    | Source                                                                                                                                                        |
-| ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `cache_write_1h_tokens`      | Anthropic `usage.cache_creation.ephemeral_1h_input_tokens` — a subset of `cache_write_tokens` (2×)                                                            |
-| `gateway_cache_write_tokens` | Cache writes caused by breakpoints the gateway added: already in `input_tokens`, not in `cache_write_tokens` (priced as the 5-minute writes the vendor bills) |
-| `server_tool_calls`          | Billable web searches (Anthropic `usage.server_tool_use.web_search_requests`, cumulative on `message_delta`); every kind is in `server_tools`                 |
-| `service_tier`               | `service_tier` as echoed: Chat Completions root, Responses `response`, Anthropic `usage`; absent if not echoed or not `[a-z0-9_-]{1,16}`                      |
+| Row field                    | Source                                                                                                                                                                |
+| ---------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `cache_write_1h_tokens`      | Anthropic `usage.cache_creation.ephemeral_1h_input_tokens`, or every write when the Chat Completions body asked for `1h` only — a subset of `cache_write_tokens` (2×) |
+| `gateway_cache_write_tokens` | Cache writes caused by breakpoints the gateway added: already in `input_tokens`, not in `cache_write_tokens` (priced as the 5-minute writes the vendor bills)         |
+| `server_tool_calls`          | Billable web searches (Anthropic `usage.server_tool_use.web_search_requests`, cumulative on `message_delta`); every kind is in `server_tools`                         |
+| `service_tier`               | `service_tier` as echoed: Chat Completions root, Responses `response`, Anthropic `usage`; absent if not echoed or not `[a-z0-9_-]{1,16}`                              |
 
 OpenAI reports no hosted-tool call count in `usage`; the gateway counts its hosted-tool items
 instead (see "The `ai.usage` row"). A malformed `service_tier` never fails the usage parse: it reads

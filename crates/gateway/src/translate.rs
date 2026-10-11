@@ -164,6 +164,11 @@ pub struct TranslateState {
     /// This attempt's request carries cache breakpoints the gateway added (see
     /// [`request_with_tools`]). Its cache writes are the gateway's cost, billed and shown as input.
     pub gateway_cache: bool,
+    /// Every cache breakpoint this attempt's Chat Completions request carries asks for the 1-hour
+    /// TTL (see [`chat_cache_is_1h`]). OpenRouter honours it and bills those writes at the 1-hour
+    /// rate, but its usage has no TTL split, so the row attributes the writes from this. Set per
+    /// attempt.
+    pub cache_1h: bool,
     /// This attempt asked a stream-only candidate for a stream the client did not ask for
     /// ([`force_stream`]); a streamed answer is assembled into one body
     /// ([`SseBridge::assembling`]). Set per attempt.
@@ -178,6 +183,7 @@ impl TranslateState {
             json_buf: Vec::new(),
             tools: ToolNames::default(),
             gateway_cache: false,
+            cache_1h: false,
             assemble: false,
         }
     }
@@ -206,11 +212,37 @@ pub fn request(from: Endpoint, to: Endpoint, body: &[u8], upstream_model: &str) 
     request_with_tools(from, to, body, upstream_model, false).0
 }
 
+/// Whether a Chat Completions body marks at least one cache breakpoint and every one asks for the
+/// 1-hour TTL. OpenRouter takes `cache_control` (with its `ttl`) on system and message content parts
+/// and on tools, and bills 1-hour writes at 2x input (probed: 19,007 tokens on Haiku 4.5 cost
+/// $0.038), but reports them only as `prompt_tokens_details.cache_write_tokens`. A mixed request
+/// leaves the split unknown, so it reads as 5-minute writes, the cheaper side.
+pub fn chat_cache_is_1h(chat: &Value) -> bool {
+    let parts = chat
+        .get("messages")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|m| m.get("content").and_then(Value::as_array))
+        .flatten();
+    let tools = chat
+        .get("tools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten();
+    let mut marks = parts
+        .chain(tools)
+        .filter_map(|p| p.get("cache_control"))
+        .peekable();
+    marks.peek().is_some() && marks.all(|cc| cc.get("ttl").and_then(Value::as_str) == Some("1h"))
+}
+
 /// [`request`], plus what the response translation must follow: the [`ToolNames`] the upstream's
 /// tool calls map back through (empty unless a Responses body's tools were reshaped), and whether
 /// the gateway added default cache breakpoints (see `auto_cache_breakpoints`). When it did, the
 /// client never asked for caching: the writes those breakpoints cause are the gateway's
-/// optimization, billed and shown to the client as input.
+/// optimization, billed and shown to the client as input. The last value is [`chat_cache_is_1h`]
+/// of the Chat Completions body sent (`false` onto any other wire).
 ///
 /// `fast` is the caller's decision that this attempt asks for Anthropic fast mode: a Chat
 /// Completions or Responses client's `service_tier: "priority"` bound for a candidate that serves
@@ -222,15 +254,15 @@ pub fn request_with_tools(
     body: &[u8],
     upstream_model: &str,
     fast: bool,
-) -> (Vec<u8>, ToolNames, bool) {
+) -> (Vec<u8>, ToolNames, bool, bool) {
     if from == to {
-        return (body.to_vec(), ToolNames::default(), false);
+        return (body.to_vec(), ToolNames::default(), false, false);
     }
     let Some(v) = parse_body(from, body) else {
-        return (body.to_vec(), ToolNames::default(), false);
+        return (body.to_vec(), ToolNames::default(), false, false);
     };
     if !v.is_object() {
-        return (body.to_vec(), ToolNames::default(), false);
+        return (body.to_vec(), ToolNames::default(), false, false);
     }
     let names = if from == Endpoint::Responses {
         ToolNames::of_responses(&v, to == Endpoint::Messages)
@@ -244,7 +276,8 @@ pub fn request_with_tools(
     {
         obj.insert("speed".into(), json!("fast"));
     }
-    (encode(&out), names, gateway_cache)
+    let cache_1h = to == Endpoint::ChatCompletions && chat_cache_is_1h(&out);
+    (encode(&out), names, gateway_cache, cache_1h)
 }
 
 /// How a Responses client's tools were reshaped on the way to a Chat Completions or Messages

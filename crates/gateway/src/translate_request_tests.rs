@@ -2953,9 +2953,45 @@ fn a_plain_text_document_becomes_a_text_part() {
     assert_eq!(v["messages"][0]["content"], "the notes", "{v}");
 }
 
+/// Onto Chat Completions, `request_with_tools` says whether every breakpoint the body carries asks
+/// for the 1-hour TTL — the split OpenRouter's usage does not report.
+#[test]
+fn request_reports_an_all_1h_chat_body() {
+    let one_hour = |system_cc: Value, tool_cc: Option<Value>, to: Endpoint| {
+        let mut tool = json!({"name": "t", "description": "d", "input_schema": {"type": "object"}});
+        if let Some(cc) = tool_cc {
+            tool["cache_control"] = cc;
+        }
+        let body = json!({
+            "model": "m", "max_tokens": 5,
+            "system": [{"type": "text", "text": "be terse", "cache_control": system_cc}],
+            "tools": [tool],
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+        request_with_tools(
+            Endpoint::Messages,
+            to,
+            &serde_json::to_vec(&body).unwrap(),
+            "anthropic/claude-opus-4.8",
+            false,
+        )
+        .3
+    };
+    let long = json!({"type": "ephemeral", "ttl": "1h"});
+    let short = json!({"type": "ephemeral"});
+    let chat = Endpoint::ChatCompletions;
+    assert!(one_hour(long.clone(), None, chat));
+    assert!(one_hour(long.clone(), Some(long.clone()), chat));
+    // Mixed or 5-minute: the split is unknown or 5-minute, never claimed as 1-hour.
+    assert!(!one_hour(long.clone(), Some(short.clone()), chat));
+    assert!(!one_hour(short, None, chat));
+    // Only Chat Completions lacks the split.
+    assert!(!one_hour(long, None, Endpoint::Responses));
+}
+
 /// `request_with_tools` with the caller's fast-mode decision, decoded.
 fn fast_req(from: Endpoint, to: Endpoint, body: &Value, model: &str, fast: bool) -> Value {
-    let (out, _, _) = request_with_tools(from, to, &serde_json::to_vec(body).unwrap(), model, fast);
+    let (out, ..) = request_with_tools(from, to, &serde_json::to_vec(body).unwrap(), model, fast);
     serde_json::from_slice(&out).unwrap()
 }
 

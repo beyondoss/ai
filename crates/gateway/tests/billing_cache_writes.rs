@@ -186,3 +186,51 @@ async fn client_cache_control_bills_true_cache_writes() {
         "{u}"
     );
 }
+
+/// An OpenRouter Chat Completions reply (its real usage shape): 19,007 written, billed at the 1-hour
+/// rate in `cost` (probed live on Haiku 4.5: $0.038 = 19,007 × $1/M × 2), with no TTL split.
+const OPENROUTER_1H_WRITE: &str = r#"{"id":"gen-1","object":"chat.completion","model":"anthropic/claude-opus-4.8","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":19015,"completion_tokens":5,"total_tokens":19020,"cost":0.038047,"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":19007}}}"#;
+
+/// A Messages client asking for the 1-hour TTL, failed over to OpenRouter's Chat Completions: the
+/// gateway carries `cache_control` (with its `ttl`) onto the chat body, OpenRouter bills 1-hour
+/// writes but reports no TTL split, so the row attributes them from the request. A 5-minute
+/// request's writes stay 5-minute.
+#[tokio::test]
+async fn a_1h_request_failed_over_to_openrouter_records_1h_writes() {
+    for (ttl, want_1h) in [(r#","ttl":"1h""#, 19_007), ("", 0)] {
+        let up =
+            ScriptedUpstream::reply(200, "application/json", OPENROUTER_1H_WRITE.to_owned()).await;
+        let (pubkey, sk) = test_keypair(77);
+        let gw = Gateway::builder(
+            unused_nats_port(),
+            &GatewayBuilder::dead_authority(),
+            &b64(&pubkey),
+        )
+        .providers(&["anthropic", "openrouter"])
+        .provider_authority("openrouter", &up.authority())
+        .start()
+        .await;
+        let body = format!(
+            r#"{{"model":"claude-opus-4-8","max_tokens":5,"system":[{{"type":"text","text":"You are terse.","cache_control":{{"type":"ephemeral"{ttl}}}}}],"messages":[{{"role":"user","content":"hi"}}]}}"#
+        );
+        let resp = test_client()
+            .post(format!("{}/v1/messages", gw.url()))
+            .header("authorization", format!("Bearer {}", billing_vkey(&sk, 77)))
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status().as_u16();
+        let text = resp.text().await.unwrap();
+        assert_eq!(status, 200, "{text}\n{}", gw.log());
+        let sent = String::from_utf8(up.bodies()[0].clone()).unwrap();
+        assert_eq!(sent.contains(r#""ttl":"1h""#), want_1h > 0, "{sent}");
+        wait_usage_rows(&gw, 1, 5).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let rows = usage_rows_of(&gw);
+        let row = &rows[0];
+        assert_eq!(n(row, "/cache_write_tokens"), Some(19_007), "{row}");
+        assert_eq!(n(row, "/cache_write_1h_tokens"), Some(want_1h), "{row}");
+    }
+}

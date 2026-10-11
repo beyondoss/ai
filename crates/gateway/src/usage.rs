@@ -93,6 +93,13 @@ impl Usage {
         }
     }
 
+    /// Record every cache write as a 1-hour write: the request asked for the 1-hour TTL on every
+    /// breakpoint, and the wire (Chat Completions) reports writes with no TTL split. See
+    /// `translate::chat_cache_is_1h`.
+    pub fn attribute_cache_writes_1h(&mut self) {
+        self.cache_write_1h_tokens = self.cache_write_tokens;
+    }
+
     /// Record this request's cache writes as the gateway's own: it added the breakpoints that caused
     /// them (`translate::request_with_tools`), so they are its optimization, not the client's
     /// request. `wire` is the convention `input_tokens` follows: Anthropic's excludes cache writes,
