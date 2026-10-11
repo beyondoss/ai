@@ -1,6 +1,6 @@
 {
   "about": "Golden vectors for the pricing contract (crates/providers/ARCHITECTURE.md, 'Pricing contract'). Each row is an ai.usage row; expect is what price(row) must return. An implementation must reproduce every one exactly. Absent row fields take their defaults: usage_wire anthropic, counts 0, strings null, booleans false, server_tools {}.",
-  "rate_version": "2026-10-11.f1aa042f51ab136d",
+  "rate_version": "2026-10-11.7d98051597c3a842",
   "vectors": [
     {
       "name": "anthropic_basic",
@@ -1590,7 +1590,7 @@
     },
     {
       "name": "together_list_card",
-      "why": "A Together-primary row whose customer card is the catalog list price.",
+      "why": "Kimi K3 served by its Together primary: Together's own card, which follows its live promotion ($2.70 / $13.50, cached $0.27, until 2026-10-11): the customer pays what Together bills (pass-through), whatever the row's list price (Moonshot's $3 / $15).",
       "row": {
         "price_model": "moonshotai/kimi-k3",
         "provider": "together",
@@ -1603,8 +1603,8 @@
       "expect": {
         "status": "priced",
         "basis": "tokens",
-        "cost_micros": 51900,
-        "price_micros": 51900,
+        "cost_micros": 46710,
+        "price_micros": 46710,
         "cost_class": "standard",
         "price_class": "standard",
         "cost_long": false,

@@ -282,9 +282,70 @@ fn a_moved_long_threshold_is_broken() {
     broken(&r, "crosscheck", "[[prose]] anthropic.long_context says");
 }
 
+/// Pricing is pass-through, so the card follows a vendor's promotion and its end alike: Together's
+/// Kimi K3 promotion ($2.70 / $13.50 / cached $0.27) ending at list ($3 / $15 / $0.30) is a routine
+/// change within 2x. The cached-rate [[conflict]] it caused settles (both sources say $0.30) and
+/// `--apply` removes it, rather than the run breaking.
 #[test]
-fn a_stale_override_is_broken() {
-    // Together's models API re-fetched after the promotion's end date.
-    let r = run(|_, e| e.get_mut("together.models").unwrap().fetched = "2099-01-01".into());
-    broken(&r, "stale", "[[override]]");
+fn a_promotion_ending_is_routine() {
+    let r = run(|t, _| {
+        replace(
+            t,
+            "together.models",
+            "\"cached_input\": 0.27,",
+            "\"cached_input\": 0.3,",
+        );
+        replace(t, "together.models", "\"input\": 2.7,", "\"input\": 3,");
+        replace(t, "together.models", "\"output\": 13.5,", "\"output\": 15,");
+        let d = t.get_mut("together.docs").unwrap();
+        *d = d
+            .replace(
+                r"| moonshotai/Kimi-K3 | 1048576 | \$2.70 | \$0.30 | \$13.50 |",
+                r"| moonshotai/Kimi-K3 | 1048576 | \$3.00 | \$0.30 | \$15.00 |",
+            )
+            .replace(
+                r"| moonshotai/Kimi-K3 | 1048576 | \$2.70 | \$13.50 |",
+                r"| moonshotai/Kimi-K3 | 1048576 | \$3.00 | \$15.00 |",
+            );
+    });
+    assert_eq!(r.class, Class::Routine, "{r:?}");
+    assert_eq!(
+        r.settled,
+        [(
+            "together:moonshotai/Kimi-K3".to_owned(),
+            "cache_read".to_owned()
+        )]
+    );
+    assert!(
+        r.changes
+            .iter()
+            .any(|c| c.item.contains("Kimi-K3") && c.new.as_deref() == Some("$3/MTok")),
+        "{r:?}"
+    );
+    let md = r.markdown(&[], &[]);
+    assert!(md.contains("Settled `[[conflict]]`"), "{md}");
+    // And the entry comes out of the truth file cleanly.
+    let truth = std::fs::read_to_string(repo_root().join(rates_sync::TRUTH)).unwrap();
+    let out = rates_sync::catalog_edit::remove_conflict(
+        &truth,
+        "together:moonshotai/Kimi-K3",
+        "cache_read",
+    )
+    .unwrap();
+    assert!(!out.contains("card = \"together:moonshotai/Kimi-K3\"\nfield = \"cache_read\""));
+}
+
+/// A recorded [[conflict]] whose sources still disagree, on values it did not record, is stale:
+/// a human decides which to follow again.
+#[test]
+fn a_stale_conflict_is_broken() {
+    let r = run(|t, _| {
+        replace(
+            t,
+            "together.models",
+            "\"cached_input\": 0.27,",
+            "\"cached_input\": 0.26,",
+        );
+    });
+    broken(&r, "stale", "[[conflict]]");
 }

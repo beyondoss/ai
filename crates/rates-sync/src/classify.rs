@@ -5,10 +5,17 @@
 //!   zero, and nothing was added or removed. The workflow opens a `rates-routine` PR.
 //! - **review**: everything parsed, but a routine rule failed. A `rates-review` PR, reasons first.
 //! - **broken**: a fetch, a reader (a layout change), a quote, a cross-check, or a stale
-//!   `[[override]]`/`[[conflict]]` failed. Nothing is regenerated; the workflow files an issue.
+//!   `[[conflict]]` (its sources still disagree, on other values) failed. Nothing is
+//!   regenerated; the workflow files an issue.
 //!
-//! Every strict reader, cross-check, quote and override check runs inside [`crate::build::build`],
-//! so a new table that builds has passed them all, and one that does not is broken.
+//! A vendor promotion is an ordinary rate change both ways (pricing is pass-through: the card is
+//! what the vendor bills today): routine when within 2x. A `[[conflict]]` the promotion caused,
+//! whose sources agree again once it ends, is **settled**, not broken: the agreed value is the
+//! table's, the report lists it, and `--apply` (like `generate`) removes the entry.
+//!
+//! Every strict reader, cross-check, quote and conflict check runs inside
+//! [`crate::build::build`], so a new table that builds has passed them all, and one that does not
+//! is broken.
 
 use crate::build::{Card, Table, Tr};
 use crate::dec::Rate;
@@ -68,6 +75,8 @@ pub struct Report {
     /// Why a run is review, not routine.
     pub reasons: Vec<String>,
     pub changes: Vec<Change>,
+    /// `[[conflict]]`s whose sources agree again, `card field`: `--apply` removes them.
+    pub settled: Vec<(String, String)>,
 }
 
 impl Report {
@@ -78,6 +87,7 @@ impl Report {
             error: Some(error),
             reasons: Vec::new(),
             changes: Vec::new(),
+            settled: Vec::new(),
         }
     }
 }
@@ -85,8 +95,7 @@ impl Report {
 /// Which failure a generation error is. Every check reports its own fixed phrase (`build.rs`);
 /// the fixture tests pin each one, so a reworded message fails them rather than misfiling.
 pub fn broken_kind(err: &str) -> &'static str {
-    let stale = (err.contains("[[override]]") || err.contains("[[conflict]]"))
-        && (err.contains("is stale") || err.contains("remove it"));
+    let stale = err.contains("[[conflict]]") && err.contains("is stale");
     if stale {
         "stale"
     } else if err.contains("the quote is no longer on") || err.contains("so its quote cannot") {
@@ -323,7 +332,8 @@ pub fn classify(
             });
         }
     }
-    let class = if reasons.is_empty() && changes.is_empty() {
+    let settled = new.settled_conflicts.clone();
+    let class = if reasons.is_empty() && changes.is_empty() && settled.is_empty() {
         Class::None
     } else if reasons.is_empty() {
         Class::Routine
@@ -336,6 +346,7 @@ pub fn classify(
         error: None,
         reasons,
         changes,
+        settled,
     }
 }
 
@@ -385,10 +396,20 @@ impl Report {
                     }
                     s.push('\n');
                 }
+                if !self.settled.is_empty() {
+                    s.push_str(
+                        "Settled `[[conflict]]` entries (their sources agree again, so the agreed \
+                         value is the table's; removed from `verify/catalog_truth.toml`):\n\n",
+                    );
+                    for (card, field) in &self.settled {
+                        let _ = writeln!(s, "- `{card}` `{field}`");
+                    }
+                    s.push('\n');
+                }
                 s.push_str(
-                    "`RATE_VERSION` is bumped (`rates-sync rate-version`). A golden vector in \
-                     `verify/pricing_vectors.json` that priced a moved rate fails CI until it is \
-                     recomputed. ",
+                    "`RATE_VERSION` is bumped (`rates-sync rate-version`), and every golden vector \
+                     in `verify/pricing_vectors.json` that priced a moved rate is recomputed by the \
+                     independent reference pricer (`verify/pricing_reference.py`). ",
                 );
                 s.push_str(if self.class == Class::Routine {
                     "This PR merges itself once `Check` is green.\n"
@@ -435,6 +456,7 @@ impl Report {
                 "new": c.new,
                 "url": c.url,
             })).collect::<Vec<_>>(),
+            "settled": self.settled.iter().map(|(c, f)| json!({"card": c, "field": f})).collect::<Vec<_>>(),
             "sources_changed": sources_changed,
             "skipped": skipped,
             "markdown": self.markdown(sources_changed, skipped),

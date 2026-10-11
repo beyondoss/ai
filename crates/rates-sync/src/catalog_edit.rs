@@ -346,6 +346,20 @@ fn add_alias(text: &str, old: &str, new: &str) -> Result<String> {
     Ok(format!("{}{body}{}", &text[..start], &text[end..]))
 }
 
+/// The truth file without the `[[conflict]]` for `(card, field)` (a settled one: its sources agree
+/// again).
+pub fn remove_conflict(text: &str, card: &str, field: &str) -> Result<String> {
+    let start = one_at(
+        text,
+        &format!("[[conflict]]\ncard = \"{card}\"\nfield = \"{field}\"\n"),
+        &format!("[[conflict]] {card} {field}"),
+    )?;
+    let end = text[start..]
+        .find("\n\n")
+        .map_or(text.len(), |i| start + i + 2);
+    Ok(format!("{}{}", &text[..start], &text[end..]))
+}
+
 /// The byte range of the truth file's block `[[{kind}]]` whose `{key} = "{value}"` line follows
 /// its header, through the blank line after it.
 fn block_range(text: &str, kind: &str, key: &str, value: &str) -> Result<(usize, usize)> {

@@ -1,6 +1,6 @@
 //! The hand-entered half of the rate table, read from `verify/catalog_truth.toml`: which source
 //! row each card is, the dimensions that live only in a vendor's prose (each with the URL and the
-//! verbatim quote that states it), per-call tool fees, recorded source conflicts and overrides,
+//! verbatim quote that states it), per-call tool fees, recorded source conflicts,
 //! and which card each catalog row's candidates bill from (`[[pricing]]`).
 
 use crate::Result;
@@ -50,18 +50,6 @@ pub struct Conflict {
     pub reason: String,
 }
 
-/// The table holds a rate other than the source's (a promotion ending before the next sync).
-/// `source_says` must be what the source says, or the override is stale and generation fails.
-#[derive(Clone, Debug)]
-pub struct Override {
-    pub card: String,
-    pub source_says: BTreeMap<String, String>,
-    pub holds: BTreeMap<String, String>,
-    pub until: String,
-    pub url: String,
-    pub quote: String,
-}
-
 /// A rate the vendor billed until `until` (exclusive) and has since changed: the invoice check
 /// (`rates-sync audit`) accepts a line from before then at this rate. Never used to generate.
 #[derive(Clone, Debug)]
@@ -96,7 +84,6 @@ pub struct Spec {
     pub tools: Vec<Tools>,
     pub cards: Vec<CardSpec>,
     pub conflicts: Vec<Conflict>,
-    pub overrides: Vec<Override>,
     pub superseded: Vec<Superseded>,
     pub calendar: Calendar,
     pub pricing: Vec<Pricing>,
@@ -199,19 +186,6 @@ pub fn parse(text: &str) -> Result<Spec> {
             card,
         });
     }
-    let mut overrides = Vec::new();
-    for o in arr(&t, "override") {
-        let o = table(o, "[[override]]")?;
-        let card = s(o, "card", "[[override]]")?;
-        overrides.push(Override {
-            source_says: str_map(o, "source_says", &card)?,
-            holds: str_map(o, "holds", &card)?,
-            until: s(o, "until", &card)?,
-            url: s(o, "url", &card)?,
-            quote: s(o, "quote", &card)?,
-            card,
-        });
-    }
     let mut superseded = Vec::new();
     for x in arr(&t, "superseded") {
         let x = table(x, "[[superseded]]")?;
@@ -264,7 +238,6 @@ pub fn parse(text: &str) -> Result<Spec> {
         tools,
         cards,
         conflicts,
-        overrides,
         superseded,
         calendar,
         pricing,

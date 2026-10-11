@@ -80,6 +80,9 @@ run = """
 if [ -f .env ]; then set -a; . ./.env; set +a; fi
 cargo run -q -p beyond-ai-rates-sync -- sync
 cargo run -q -p beyond-ai-rates-sync -- rate-version
+mkdir -p target
+cargo run -q -p beyond-ai-rates-sync -- dump --json > target/rate-table.json
+python3 -I verify/pricing_reference.py target/rate-table.json verify/pricing_vectors.json --write
 """
 
 [tasks."rates:generate"]

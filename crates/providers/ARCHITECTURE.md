@@ -49,6 +49,19 @@ above or below the list. An estimated row (a stream cut short, a cancelled strea
 may keep generating) is priced from the same estimate as its cost. `pass_through.rs` asserts
 `price == cost` across every vector, and across every card under a sweep of usage shapes.
 
+**Promotions follow the source.** The customer pays what we pay, so a card is what its source
+says the vendor bills today, a promotional rate included: there is no mechanism that holds a card
+at list during a promotion. When a promotion ends, the daily rates-drift picks the new rate up as
+an ordinary change, routine when within 2× (a `[[conflict]]` the promotion caused between two
+sources settles, and `rates-sync generate` or `classify --apply` removes it from the truth file). A `[[promo]]` entry is not a card rule: it
+records a promotion that a route charges **below a card that still follows its own source**, so
+CAT-7 accepts that charge. Both today are OpenAI's GPT-5.6 Sol promotion, which OpenAI publishes
+only in prose (its Standard table, the source, lists $4 / $20, and OpenAI bills our key exactly
+that: `rates:audit`, 30 days) while OpenRouter, routed to OpenAI, charges $2 / $10. A request
+OpenRouter serves is billed from its reported cost, so the customer pays the promotional rate there
+too; `gpt-5.6-sol-pro`, OpenRouter's alone, lists OpenAI's published $4 / $20 because no source
+publishes another number for it.
+
 Anything the tables cannot price exactly is an `Unpriced` error with a stable reason code. It is
 never a zero. A zero is only ever a priced zero: a cache hit, or a row whose exact cost rounds
 below half a micro-dollar.
@@ -216,8 +229,8 @@ list, `ROW_RATES` and `OPENROUTER_CREDIT_FEE`) is written by `crates/rates-sync`
    (OpenRouter's uptime and latency, xAI's build fingerprints, an HTML page's navigation), and
    order that carries no meaning is sorted.
 2. **The hand-entered rules**, `verify/catalog_truth.toml`: which source row each card is, the
-   facts a vendor states only in prose, per-call tool fees, recorded source conflicts and
-   overrides, and which card each row's candidates bill from (`[[pricing]]`). Every prose fact and
+   facts a vendor states only in prose, per-call tool fees, recorded source conflicts, and which
+   card each row's candidates bill from (`[[pricing]]`). Every prose fact and
    fee carries its URL and a verbatim quote, and generation fails unless the quote is in that
    URL's snapshot.
 
@@ -230,7 +243,7 @@ list, `ROW_RATES` and `OPENROUTER_CREDIT_FEE`) is written by `crates/rates-sync`
 | DeepSeek   | the pricing page's HTML table (peak and off-peak, both read)                                                                                              | none published                                                                                         | peak windows; the holiday calendar (gov.cn, quoted)                                                                                                                       |
 | Groq       | `models.md` price column; `prompt-caching.md` supported-model table                                                                                       | none published                                                                                         | cached input 50%; Flex priced as on-demand                                                                                                                                |
 | Fireworks  | `serverless/pricing.md` table (Standard and Priority)                                                                                                     | none published                                                                                         | the Priority column is the `fast` class                                                                                                                                   |
-| Together   | `GET /v1/models` `pricing`                                                                                                                                | the docs' chat-models table (`serverless/models.md`)                                                   | `[[conflict]]` per disagreement; the Kimi K3 promotion `[[override]]`                                                                                                     |
+| Together   | `GET /v1/models` `pricing`                                                                                                                                | the docs' chat-models table (`serverless/models.md`)                                                   | `[[conflict]]` per disagreement (one settles when its sources agree again)                                                                                                |
 | OpenRouter | `GET /api/v1/models/{slug}/endpoints` (×10^6; overrides folded)                                                                                           | the slug is in `GET /api/v1/models`                                                                    | the 5.5% credit fee (its pricing page's FAQ, quoted)                                                                                                                      |
 
 Every reader is strict: it finds its table by exact header and label and parses a cell only when a
@@ -259,9 +272,9 @@ Maintenance is one command:
   | none    | the generated table is unchanged (a snapshot may have changed outside any priced cell)                                                                                      | nothing                                                                                        |
   | routine | only rate values (per-token rates, per-call fees) moved, each by at most 2× either way and none to or from zero; no card, endpoint, row, tier, or tool fee added or removed | regenerates, runs `rate-version`, opens a `rates/sync-YYYY-MM-DD` PR labeled `rates-routine`   |
   | review  | the new snapshots generate a table, but a routine rule fails; any non-rate value (a host, a threshold, a premium, a schedule, the credit fee) changing is one               | the same, labeled `rates-review`, the failed rules listed first                                |
-  | broken  | a fetch, a reader (a layout change), a quote, a cross-check, or a stale `[[override]]`/`[[conflict]]` fails                                                                 | regenerates nothing; updates the open `rates-broken` issue for that kind (or opens one); fails |
+  | broken  | a fetch, a reader (a layout change), a quote, a cross-check, or a stale `[[conflict]]` (sources that still disagree, on new values) fails                                   | regenerates nothing; updates the open `rates-broken` issue for that kind (or opens one); fails |
 
-  Every reader, cross-check, quote and override check runs inside generation, so a table that
+  Every reader, cross-check, quote and conflict check runs inside generation, so a table that
   generates has passed them all. The PR body tables every changed rate (old, new, source URL). If
   an open `rates/sync-*` PR exists, the workflow force-pushes a fresh commit to it (only when its
   tip is the bot's own commit; a human's commit gets a comment instead), and does nothing when it
@@ -503,9 +516,10 @@ OpenRouter's Alibaba endpoint carries the tier on the cost side.
   The caching page says "exceed". At most one request in 200K tokens straddles this.
 - **OpenRouter `usage.cost` and plugin fees**: "the total amount charged" is read as including
   them. Unverified until the live reconciliation compares it with the generation API.
-- **Together Kimi K3** is held at list ($3 / $15 / cached $0.30) by an `[[override]]`: Together's
-  API and pricing page show a promotion ($2.70 / $13.50 / $0.27) that ends 2026-10-11. The first
-  sync after it ends fails until the override is removed.
+- **Together Kimi K3** is on promotion ($2.70 / $13.50 / cached $0.27, "valid until 10/11/2026"),
+  and its card follows it. When it ends, the next rates-drift run moves the card to $3 / $15 /
+  $0.30 in a routine PR, and its cached-rate `[[conflict]]` settles. The row's list price stays
+  Moonshot's $3 / $15 (`follows = "maker"`).
 - **Bedrock's long-context threshold is not on AWS's price list.** Its `long_ctx` SKUs name no
   threshold, so Claude Haiku 5.5's Bedrock card takes Anthropic's (`> 100,000` prompt tokens). The
   SKU rates themselves are cross-checked against Anthropic's over-100K list.
@@ -573,7 +587,7 @@ than two candidates vanishing from one host at once is a broken listing, reporte
 6. the primary vendor's listing (else OpenRouter's) gives a release time;
 7. the predecessor has no hand-kept per-candidate rule (`STREAM_ONLY`, `TOOL_THINKING`, the
    `REFUSES_*` lists, `FAST_MODE_MODELS`), no measured `input_limit` / `output_limit`, no
-   `follows`, and no `[[schema_unenforced]]`, `[[conflict]]`, `[[override]]`, `[[superseded]]` or
+   `follows`, and no `[[schema_unenforced]]`, `[[conflict]]`, `[[superseded]]` or
    `[[promo]]` entry.
 
 A successor's edit: a `ModelRoute` in sorted position with the predecessor's wire, candidate order

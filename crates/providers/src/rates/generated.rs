@@ -221,7 +221,7 @@ const TOGETHER_META_MODELS_MUSE_GLIMMER_30B: Card =
 const TOGETHER_MINIMAXAI_MINIMAX_M3: Card = Card::new(tr("0.3", "1.2", "0.06", "0.3", None));
 
 /// `together:moonshotai/Kimi-K3`.
-const TOGETHER_MOONSHOTAI_KIMI_K3: Card = Card::new(tr("3", "15", "0.3", "3", None));
+const TOGETHER_MOONSHOTAI_KIMI_K3: Card = Card::new(tr("2.7", "13.5", "0.27", "2.7", None));
 
 /// `together:thinkingmachines/Inkling`.
 const TOGETHER_THINKINGMACHINES_INKLING: Card = Card::new(tr("1", "4.05", "0.17", "1", None));

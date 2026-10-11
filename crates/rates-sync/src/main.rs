@@ -85,7 +85,10 @@ fn main() -> ExitCode {
 }
 
 fn write_generated(root: &Path) -> Result<()> {
-    let text = rates_sync::generate(root, &root.join(SOURCES))?;
+    let (table, text) = rates_sync::generate_table(root, &root.join(SOURCES))?;
+    for c in rates_sync::remove_settled(root, &table.settled_conflicts)? {
+        println!("{TRUTH}: removed the settled [[conflict]] {c} (its sources agree again)");
+    }
     let path = root.join(GENERATED);
     let old = std::fs::read_to_string(&path).unwrap_or_default();
     if old == text {
@@ -213,6 +216,7 @@ fn run_classify(root: &Path, apply: bool) -> Result<Class> {
                         let path = root.join(GENERATED);
                         std::fs::write(&path, text)
                             .map_err(|e| format!("{}: {e}", path.display()))?;
+                        rates_sync::remove_settled(root, &report.settled)?;
                     }
                     (report, changed, skipped)
                 }

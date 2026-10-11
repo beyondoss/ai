@@ -29,6 +29,9 @@ regenerate_rates() {
   git checkout -q "origin/$branch" -- verify/rates_sources
   cargo run -q -p beyond-ai-rates-sync -- generate </dev/null
   cargo run -q -p beyond-ai-rates-sync -- rate-version </dev/null
+  mkdir -p target
+  cargo run -q -p beyond-ai-rates-sync -- dump --json >target/rate-table.json </dev/null
+  python3 -I verify/pricing_reference.py target/rate-table.json verify/pricing_vectors.json --write
   git add -A -- verify/rates_sources crates/providers/src/rates/generated.rs \
     crates/providers/src/rates.rs verify/pricing_vectors.json
   git commit -q -m "$(git log -1 --format=%s "origin/$branch")" \

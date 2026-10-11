@@ -26,8 +26,10 @@
 # `created` (Unix seconds) and `owned_by` are the vendor's own model listing (`GET /v1/models` at
 # api.openai.com / api.x.ai), not OpenRouter's listing date.
 #
-# `[[promo]]` records a vendor-announced promotional rate that some route charges while the card
-# keeps the standard rate (the catalog_live CAT-7 check accepts a charge at that rate until `until`).
+# `[[promo]]` records a vendor-announced promotional rate that some route charges below a card that
+# still follows its own source (the catalog_live CAT-7 check accepts a charge at that rate until
+# `until`). It never holds a card: pricing is pass-through, so a card follows a promotion its source
+# shows (crates/providers/ARCHITECTURE.md, "Promotions follow the source").
 # `cache_read` is the promotional cached-input rate; without it cached input is held to the card's.
 #
 # `catalog_matches_vendor_truth` (crates/providers/src/catalog.rs) asserts:
@@ -1959,7 +1961,7 @@ output = "10.00"
 cache_read = "0.20"
 until = "2026-11-21"
 source = "https://developers.openai.com/api/docs/pricing.md"
-note = "\"GPT-5.6 Sol's promotional pricing is available at least through November 21, 2026.\" OpenRouter, routed to OpenAI, charges it; OpenAI bills the pool key the standard $4 / $20 (organization costs report, 2026-10-01: 4,289 input tokens $0.017156, 1,394 output $0.02788). The card keeps the standard rate: it is what the primary charges, and one row has one list price."
+note = "\"GPT-5.6 Sol's promotional pricing is available at least through November 21, 2026.\" OpenRouter, routed to OpenAI, charges it; OpenAI bills the pool key the standard $4 / $20 (organization costs report, 2026-10-01: 4,289 input tokens $0.017156, 1,394 output $0.02788). Reviewed under pass-through (2026-10-11): the card follows its source, OpenAI's Standard table ($4 / $20, the promotion is prose only), which is what OpenAI bills our key (rates:audit, every gpt-5.6-sol line of the last 30 days at $4 / $20). A request OpenRouter serves bills its reported, promotional cost, so the customer pays the promotion there."
 
 [[promo]]
 model = "gpt-5.6-sol-pro"
@@ -1968,7 +1970,7 @@ output = "10.00"
 cache_read = "0.20"
 until = "2026-11-21"
 source = "https://developers.openai.com/api/docs/pricing.md"
-note = "OpenRouter lists $4 / $20 / cached $0.40 and charges half (CAT-7::raw::openrouter::gpt-5.6-sol-pro, 2026-10-01, twice: 2,433 input of which 1,510 cached, 30 output -> $0.002448 against $0.004896 at the card): the gpt-5.6-sol promotion, since OpenRouter's listing calls -pro \"the same underlying model as GPT-5.6 Sol, served with reasoning.mode set to pro\". Its gpt-5.6-sol listing shows the promotional rates, cached input included: $2 / $10 / $0.20."
+note = "OpenRouter lists $4 / $20 / cached $0.40 and charges half (CAT-7::raw::openrouter::gpt-5.6-sol-pro, 2026-10-01, twice: 2,433 input of which 1,510 cached, 30 output -> $0.002448 against $0.004896 at the card): the gpt-5.6-sol promotion, since OpenRouter's listing calls -pro \"the same underlying model as GPT-5.6 Sol, served with reasoning.mode set to pro\". Its gpt-5.6-sol listing shows the promotional rates, cached input included: $2 / $10 / $0.20. Reviewed under pass-through (2026-10-11): customers pay OpenRouter's reported cost (the promotion), and the list price stays OpenAI's published $4 / $20, the only number any source gives for -pro (OpenRouter's own -pro listing says $4 / $20 too)."
 
 [[schema_unenforced]]
 model = "z-ai/glm-5.2"
@@ -2066,9 +2068,10 @@ note = "Neither candidate enforces the schema: the card drops structured_outputs
 # `[[conflict]]`: two machine-readable sources disagree on a field; `follow` names the one the
 #   table uses and `reason` says why. `values` must still be what each source says, or it is stale
 #   and generation fails; when the sources agree again it must be removed.
-# `[[override]]`: the table holds a rate other than the source's (a promotion that ends before the
-#   next sync). `source_says` must still be what the source says, and the source's snapshot no
-#   later than `until`, or generation fails.
+#   Sources that agree again (a promotion that split them ended) settle it: the agreed value is
+#   used and `rates-sync generate` (or `classify --apply`) removes the entry.
+# There is no override: pricing is pass-through, so a card is what its source says today,
+#   promotions included, and a promotion's end is an ordinary rate change.
 # `[[superseded]]`: a rate a vendor billed until `until` (exclusive) and has since changed, with the
 #   vendor's announcement. Only `mise run rates:audit` reads it: an invoice line from before then
 #   is checked against this rate. Never used to generate.
@@ -2228,15 +2231,7 @@ card = "together:moonshotai/Kimi-K3"
 field = "cache_read"
 values = { "together.models" = "0.27", "together.docs" = "0.3" }
 follow = "together.models"
-reason = "The models API and the pricing page say $0.27 (the promotion's cached rate); the docs table pairs the promotional input and output with the list cached rate. The [[override]] below holds the list card either way."
-
-[[override]]
-card = "together:moonshotai/Kimi-K3"
-source_says = { input = "2.7", output = "13.5", cache_read = "0.27" }
-holds = { input = "3", output = "15", cache_read = "0.3" }
-until = "2026-10-11"
-url = "https://www.together.ai/pricing"
-quote = "Promotion valid until 10/11/2026"
+reason = "The models API and the pricing page say $0.27 (the promotion's cached rate, \"Promotion valid until 10/11/2026\"); the docs table pairs the promotional input and output with the list cached rate. Together bills the models API's rates, which the card follows; once the promotion ends both sources say $0.30 and this entry settles."
 
 [[superseded]]
 card = "anthropic:claude-sonnet-5-5"
