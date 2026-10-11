@@ -591,19 +591,23 @@ non-streaming upstream. The cache stores the assembled JSON (`application/json`)
 client's non-stream key, so a hit replays JSON. A streaming client on these rows is relayed as
 before.
 
-**Thinking and tools on Alibaba's Qwen backend.** Qwen3.7 Plus and Qwen3.8 Flash, at Together and
-at OpenRouter (whose only host is Alibaba), think by default and refuse a forced `tool_choice`
-(`"required"` or a named function) while thinking: 400 "The tool_choice parameter does not support
-being set to required or object in thinking mode" (D172). Thinking, Qwen3.7 Plus also writes about
-one tool call in eight as content text ("call\n{\"name\": ...}") with no `tool_calls`, at both
-hosts; never with thinking off (D171). Both candidates of each row behave the same, so skipping one
-cannot help; instead the body is adapted per attempt (`providers::catalog::tool_thinking`,
-`translate::thinking_off_for_tools`): a forced tool on either row, and any request offering tools on
-Qwen3.7 Plus whose client asked for no reasoning, goes with every root `reasoning` /
-`reasoning_effort` cut out by span and `"reasoning":{"enabled":false}` spliced first (Together's
-documented switch for hybrid models, and OpenRouter's unified one). A Qwen3.7 Plus client that did
-ask for reasoning gets it, with the risk. Applied after translation, so a Messages `tool_choice`
-`any` or a named tool is covered too.
+**Thinking and tools on Alibaba's Qwen backend.** Qwen3.7 Plus, Qwen3.8 Flash and Qwen3.8 Omni
+Flash, at Together and at OpenRouter (whose only host is Alibaba), think by default and refuse a
+forced `tool_choice` (`"required"` or a named function) while thinking: 400 "The tool_choice
+parameter does not support being set to required or object in thinking mode" (D172). Thinking,
+Qwen3.7 Plus also writes about one tool call in eight as content text ("call\n{\"name\": ...}")
+with no `tool_calls`, at both hosts; never with thinking off (D171). Every candidate of each row
+behaves the same, so skipping one cannot help; instead the body is adapted per attempt
+(`providers::catalog::tool_thinking`, `translate::fit_tools_to_thinking`): a forced tool on any of
+them, and any request offering tools on Qwen3.7 Plus whose client asked for no reasoning, goes with
+every root `reasoning` / `reasoning_effort` cut out by span and `"reasoning":{"enabled":false}`
+spliced first (Together's documented switch for hybrid models, and OpenRouter's unified one). A
+Qwen3.7 Plus client that did ask for reasoning gets it, with the risk. Qwen3.8 Max Prime refuses a
+forced tool the same way but cannot think off (400 "Reasoning is mandatory for this endpoint and
+cannot be disabled", D269), so a forced request goes as `"tool_choice":"auto"` with a closing system
+message naming the tool to call (or any of them, for `"required"`), as a Claude model that refuses
+forced tool use gets it: a call is very likely, not guaranteed. Applied after translation, so a Messages `tool_choice` `any` or a named tool is
+covered too.
 
 **`developer` off OpenAI.** A same-wire Chat Completions `developer` message is sent as `system` to
 any host but OpenAI and OpenRouter (`providers::catalog::reads_developer_role`,
@@ -1361,7 +1365,10 @@ OpenRouter's only host for them is Alibaba on that same kind of shared upstream 
 serves them first, and the failover works when OpenRouter's pool has room (live, 2026-10-01: all
 of their OpenRouter cells pass). When it is saturated, the failover attempt gets OpenRouter's 429,
 relayed with its `Retry-After` and with the account remedy rewritten (D174). Expect that
-occasionally on these failovers. It is not a gateway fault. Likewise, a candidate the host
+occasionally on these failovers. It is not a gateway fault. Qwen3.8 Max Prime and Omni Flash have
+no Together copy and no other OpenRouter host, so they are OpenRouter-only rows on that pool
+outright (owner decision, 2026-10-11): the same 429 reaches their clients whenever it is
+saturated. Likewise, a candidate the host
 reserves for Enterprise or dedicated deployments is not listed
 (Groq `llama-3.1-8b-instant` / `llama-3.3-70b-versatile` / `minimaxai/minimax-m2.7`, the
 Fireworks Llama 4 / Kimi K2.6 / GLM 5.1 / GLM 5.2 / Llama 3.3 ids, Together Kimi K2.7 Code, GPT-OSS 20B,

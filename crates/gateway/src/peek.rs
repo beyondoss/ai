@@ -1476,7 +1476,7 @@ mod tests {
     }
 
     /// The one root-member splice behind `store_false`, `force_stream` and
-    /// `thinking_off_for_tools`: every member under the key goes, one goes first, the rest of the
+    /// `fit_tools_to_thinking`: every member under the key goes, one goes first, the rest of the
     /// bytes stay as sent.
     #[test]
     fn set_root_member_replaces_every_spelling_and_keeps_the_rest() {

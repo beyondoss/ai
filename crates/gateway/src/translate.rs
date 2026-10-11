@@ -4912,13 +4912,15 @@ pub fn developer_as_system(body: &mut Vec<u8>) -> bool {
 }
 
 /// A Chat Completions body for a candidate whose thinking conflicts with tools
-/// (`providers::catalog::ToolThinking`, D171/D172): when it offers tools and the rule says so, every
-/// root `reasoning` and `reasoning_effort` member is cut out by span and
+/// (`providers::catalog::ToolThinking`, D171/D172/D269), when it offers tools and the rule says so.
+/// Thinking off: every root `reasoning` and `reasoning_effort` member is cut out by span and
 /// `"reasoning":{"enabled":false}` goes first. A forced `tool_choice` (`"required"` or a named
-/// function) turns thinking off under either rule, since the candidate refuses it while thinking;
-/// under `OffWithTools` any tool request does, unless the client asked for reasoning itself.
-/// Every other byte stays as sent. `true` when the body changed.
-pub fn thinking_off_for_tools(body: &mut Vec<u8>, rule: providers::catalog::ToolThinking) -> bool {
+/// function) turns thinking off under `OffWhenForced` and `OffWithTools`, since the candidate
+/// refuses it while thinking; under `OffWithTools` any tool request does, unless the client asked
+/// for reasoning itself. Under `ForcedAsInstruction` (the candidate cannot think off) a forced
+/// request goes as `"tool_choice":"auto"` with a closing system message naming what must be called
+/// instead. Every other byte stays as sent. `true` when the body changed.
+pub fn fit_tools_to_thinking(body: &mut Vec<u8>, rule: providers::catalog::ToolThinking) -> bool {
     use providers::catalog::ToolThinking;
     if rule == ToolThinking::Free || memchr::memmem::find(body, b"\"tools\"").is_none() {
         return false;
@@ -4934,10 +4936,21 @@ pub fn thinking_off_for_tools(body: &mut Vec<u8>, rule: providers::catalog::Tool
     if !offers_tools {
         return false;
     }
-    let forced = last("tool_choice").is_some_and(|m| {
-        let v = &body[m.value.0..m.value.1];
-        v == b"\"required\"" || v.first() == Some(&b'{')
-    });
+    let choice = last("tool_choice").map(|m| &body[m.value.0..m.value.1]);
+    let forced = choice.is_some_and(|v| v == b"\"required\"" || v.first() == Some(&b'{'));
+    if rule == ToolThinking::ForcedAsInstruction {
+        let Some(choice) = choice.filter(|_| forced) else {
+            return false;
+        };
+        let must = match serde_json::from_slice::<Value>(choice) {
+            Ok(Value::Object(o)) => match o.get("function").and_then(|f| f.get("name")) {
+                Some(Value::String(n)) => format!("Respond by calling the `{n}` tool."),
+                _ => return false,
+            },
+            _ => "Respond by calling one of the provided tools.".to_owned(),
+        };
+        return forced_as_instruction(body, &must);
+    }
     let asked_reasoning = ["reasoning", "reasoning_effort"]
         .iter()
         .any(|k| last(k).is_some_and(|m| &body[m.value.0..m.value.1] != b"null"));
@@ -4947,6 +4960,35 @@ pub fn thinking_off_for_tools(body: &mut Vec<u8>, rule: providers::catalog::Tool
     }
     peek::remove_root_members(body, "reasoning_effort");
     peek::set_root_member(body, "reasoning", br#"{"enabled":false}"#)
+}
+
+/// `"tool_choice":"auto"` first, and `{"role":"system","content":must}` closing the root
+/// `messages`. Untouched, `false`, when `messages` is not an array.
+fn forced_as_instruction(body: &mut Vec<u8>, must: &str) -> bool {
+    let close = peek::root_members(body)
+        .and_then(|m| m.into_iter().rev().find(|m| m.key_is(body, "messages")))
+        .filter(|m| body.get(m.value.0) == Some(&b'['))
+        .and_then(|m| {
+            Some((
+                m.value.1.checked_sub(1)?,
+                peek::array_elements(body, m.value.0)?,
+            ))
+        });
+    let Some((close, items)) = close else {
+        return false;
+    };
+    let mut msg = if items.is_empty() {
+        Vec::new()
+    } else {
+        b",".to_vec()
+    };
+    msg.extend_from_slice(
+        json!({"role": "system", "content": must})
+            .to_string()
+            .as_bytes(),
+    );
+    body.splice(close..close, msg);
+    peek::set_root_member(body, "tool_choice", b"\"auto\"")
 }
 
 /// A same-wire Responses body, minus the `reasoning` items this gateway minted from Claude's
@@ -8837,30 +8879,30 @@ mod tests {
     /// claim: T1
     /// defect: D171, D172
     #[test]
-    fn thinking_off_for_tools_follows_the_rule() {
+    fn fit_tools_to_thinking_follows_the_rule() {
         use providers::catalog::ToolThinking::{Free, OffWhenForced, OffWithTools};
         let forced = br#"{"model":"m","tools":[{"type":"function"}],"tool_choice":"required","reasoning_effort":"high","n":1.50}"#;
         let mut b = forced.to_vec();
-        assert!(thinking_off_for_tools(&mut b, OffWhenForced));
+        assert!(fit_tools_to_thinking(&mut b, OffWhenForced));
         assert_eq!(
             String::from_utf8(b).unwrap(),
             r#"{"reasoning":{"enabled":false},"model":"m","tools":[{"type":"function"}],"tool_choice":"required","n":1.50}"#
         );
         let named = br#"{"tools":[{}],"tool_choice":{"type":"function","function":{"name":"f"}}}"#;
         let mut b = named.to_vec();
-        assert!(thinking_off_for_tools(&mut b, OffWithTools));
+        assert!(fit_tools_to_thinking(&mut b, OffWithTools));
         assert!(b.starts_with(br#"{"reasoning":{"enabled":false},"tools""#));
 
         let auto = br#"{"tools":[{}],"tool_choice":"auto"}"#;
         let mut b = auto.to_vec();
-        assert!(!thinking_off_for_tools(&mut b, OffWhenForced));
-        assert!(thinking_off_for_tools(&mut b, OffWithTools));
+        assert!(!fit_tools_to_thinking(&mut b, OffWhenForced));
+        assert!(fit_tools_to_thinking(&mut b, OffWithTools));
         let asked = br#"{"tools":[{}],"reasoning_effort":"low"}"#;
         let mut b = asked.to_vec();
-        assert!(!thinking_off_for_tools(&mut b, OffWithTools));
+        assert!(!fit_tools_to_thinking(&mut b, OffWithTools));
         let asked_null = br#"{"tools":[{}],"reasoning_effort":null}"#;
         let mut b = asked_null.to_vec();
-        assert!(thinking_off_for_tools(&mut b, OffWithTools));
+        assert!(fit_tools_to_thinking(&mut b, OffWithTools));
 
         for (body, rule) in [
             (&br#"{"tool_choice":"required"}"#[..], OffWithTools),
@@ -8871,8 +8913,49 @@ mod tests {
             (&forced[..], Free),
         ] {
             let mut b = body.to_vec();
-            assert!(!thinking_off_for_tools(&mut b, rule));
+            assert!(!fit_tools_to_thinking(&mut b, rule));
             assert_eq!(b, body);
+        }
+    }
+
+    /// A candidate that always thinks gets a forced tool as `auto` plus a closing system message
+    /// naming the tool (or any tool, for `required`); its reasoning stays as asked. Unforced, no
+    /// tools, or no `messages` array: as sent.
+    /// claim: T1
+    /// defect: D269
+    #[test]
+    fn a_forced_tool_goes_as_an_instruction_where_thinking_cannot_go_off() {
+        use providers::catalog::ToolThinking::ForcedAsInstruction;
+        let run = |body: &str| {
+            let mut b = body.as_bytes().to_vec();
+            let changed = fit_tools_to_thinking(&mut b, ForcedAsInstruction);
+            (changed, String::from_utf8(b).unwrap())
+        };
+        assert_eq!(
+            run(
+                r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"tools":[{}],"tool_choice":{"type":"function","function":{"name":"get_weather"}},"reasoning_effort":"high"}"#
+            ),
+            (
+                true,
+                r#"{"tool_choice":"auto","model":"m","messages":[{"role":"user","content":"hi"},{"content":"Respond by calling the `get_weather` tool.","role":"system"}],"tools":[{}],"reasoning_effort":"high"}"#
+                    .to_owned()
+            )
+        );
+        let (changed, out) = run(r#"{"messages":[ ],"tools":[{}],"tool_choice":"required"}"#);
+        assert!(changed);
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["tool_choice"], "auto");
+        assert_eq!(
+            v["messages"],
+            json!([{"role": "system", "content": "Respond by calling one of the provided tools."}])
+        );
+        for body in [
+            r#"{"messages":[],"tools":[{}],"tool_choice":"auto"}"#,
+            r#"{"messages":[],"tools":[{}]}"#,
+            r#"{"messages":[],"tools":[],"tool_choice":"required"}"#,
+            r#"{"messages":"x","tools":[{}],"tool_choice":"required"}"#,
+        ] {
+            assert_eq!(run(body), (false, body.to_owned()));
         }
     }
 

@@ -1989,6 +1989,32 @@ fn capabilities_impl_lc(m: &str) -> ModelCaps {
                 supports_cache_control_on_tools: true,
             };
         }
+        // Qwen3.8 Max Prime and Omni Flash: OpenRouter-only catalog rows (Alibaba its one host),
+        // 983,616 prompt tokens (its `max_prompt_tokens`), 131,072 output, image and video in.
+        // Max Prime always reasons: `"reasoning":{"enabled":false}` is a 400 "Reasoning is
+        // mandatory for this endpoint and cannot be disabled" (measured 2026-10-11), so it has no
+        // off switch to send.
+        if m == "qwen/qwen3.8-max-prime" || m == "qwen/qwen3.8-omni-flash" {
+            return ModelCaps {
+                context_window: 983_616,
+                max_output: 131_072,
+                max_tokens_field: MaxTokensField::MaxTokens,
+                supports_long_cache: false,
+                supports_vision: true,
+                supports_temperature: true,
+                thinking: ThinkingShape::None,
+                reasoning_effort: true,
+                reasoning_disableable: m != "qwen/qwen3.8-max-prime",
+                supports_eager_tool_streaming: false,
+                supports_tool_stream: false,
+                api: ApiKind::ChatCompletions,
+                min_reasoning_effort: RE::Minimal,
+                supports_xhigh_reasoning: true,
+                adaptive_xhigh_effort_wire: "xhigh",
+                openai_reasoning_format: OpenAiReasoningFormat::OpenRouter,
+                supports_cache_control_on_tools: true,
+            };
+        }
         let q = if m.contains('/') { family_id } else { m };
         // pi-parity pass 20 Task 1: these 6 ids are OpenRouter's own `"qwen/…"` vendor-slug entries
         // (`openrouter.models.ts`), each colliding on `family_id`'s shared suffix `q` with a Together
@@ -6017,6 +6043,19 @@ mod tests {
             "was 262_144, ~1.6x over-report"
         );
         assert_eq!(coder_30b.max_output, 32_768, "was 65_536, ~2x over-report");
+    }
+
+    #[test]
+    fn qwen3_8_max_prime_always_reasons_and_omni_flash_can_stop() {
+        for id in ["qwen/qwen3.8-max-prime", "qwen/qwen3.8-omni-flash"] {
+            let c = capabilities(id);
+            assert_eq!(c.context_window, 983_616, "{id}");
+            assert_eq!(c.max_output, 131_072, "{id}");
+            assert!(c.supports_vision, "{id}");
+            assert_eq!(c.openai_reasoning_format, OpenAiReasoningFormat::OpenRouter);
+        }
+        assert!(!capabilities("qwen/qwen3.8-max-prime").reasoning_disableable);
+        assert!(capabilities("qwen/qwen3.8-omni-flash").reasoning_disableable);
     }
 
     #[test]

@@ -656,6 +656,22 @@ raw_sha256 = "cbc48a253c7d8f74e96016dda6374b3dc2345e7cb504f2de5eff2a62f56f55ea"
 sha256 = "56bbb78833d3c8a0a6747acbf84ebd33a09a9857f6832e95fdea3745465f67f6"
 
 [[source]]
+id = "openrouter.endpoints/qwen/qwen3.8-max-prime"
+url = "https://openrouter.ai/api/v1/models/qwen/qwen3.8-max-prime/endpoints"
+file = "openrouter/endpoints/qwen/qwen3.8-max-prime.json"
+fetched = "2026-10-11"
+raw_sha256 = "48c0199717a484d10c15bd9063e8e03311a457e9bb50d5b7b72a8525b41984dc"
+sha256 = "e44a41fbc8672921163de7c57c80911fc612a46e047fd3fd6a8cac39bb8ae005"
+
+[[source]]
+id = "openrouter.endpoints/qwen/qwen3.8-omni-flash"
+url = "https://openrouter.ai/api/v1/models/qwen/qwen3.8-omni-flash/endpoints"
+file = "openrouter/endpoints/qwen/qwen3.8-omni-flash.json"
+fetched = "2026-10-11"
+raw_sha256 = "789ae7de38c9d018272d21cc95125fad2f3dfdac53f23fe25178be32861aceab"
+sha256 = "8561f5708fe8609d455a581b0f5643aee33eb410f867a4caca2735f6b6555131"
+
+[[source]]
 id = "openrouter.endpoints/thinkingmachines/inkling"
 url = "https://openrouter.ai/api/v1/models/thinkingmachines/inkling/endpoints"
 file = "openrouter/endpoints/thinkingmachines/inkling.json"
@@ -756,8 +772,8 @@ id = "openrouter.models"
 url = "https://openrouter.ai/api/v1/models?output_modalities=all"
 file = "openrouter/models.json"
 fetched = "2026-10-11"
-raw_sha256 = "c516c1a75eb510b61d792e138a5357a85bfb21f54207de784ee2b2768bac1a12"
-sha256 = "1e2bf24288030e3db3fcb4f0154e0b9caa5d48daa57d7bb1c8a6e854138a3bde"
+raw_sha256 = "d0c58bfbc37a2b544c78fb52ad272941d89abaab0597f4b18c19eb94a211007a"
+sha256 = "e26cc1bb2ab69a201e2475fed37b479a591f5bb3f2f4e802d671e014a7a9fa2a"
 
 [[source]]
 id = "openrouter.pricing"
