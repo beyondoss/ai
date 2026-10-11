@@ -916,7 +916,7 @@ impl Agent {
                 step: session.steps + 1,
             });
 
-            let mut req = ModelRequest::new(
+            let mut req = self.conversation_request(
                 current_model.clone(),
                 // `Arc` pointer clone, not a deep copy of the transcript. The wire-shaped copy is
                 // `dialect::build_body` turning this history into a `serde_json::Value` (then
@@ -924,38 +924,14 @@ impl Agent {
                 // request-only blocks attached, the one place they join the history.
                 session.request_messages(),
                 self.max_tokens,
-            )
-            .with_tools(current_tool_defs.clone())
-            .with_deferred_tools(current_deferred_defs.clone())
-            .with_cache_long(self.cache_long);
-            // pi-parity (Task 1, serve pass 19): wire-layer enforcement twin of the ingestion-time
-            // `block_images` gate — see `ModelRequest::block_images`'s doc comment. Setting this here,
-            // on every turn built from `session.messages`, closes both gaps an ingestion-only gate
-            // can't: an RPC client pushing an image directly into a running session, and an image
-            // already persisted in session history before the flag was toggled on getting resent on a
-            // resumed session.
-            req.block_images = self.block_images;
-            // Task #15 (pi-parity): a per-turn callback (`with_system_fn`) is re-evaluated fresh here,
-            // every turn — the seam a long-running call (which holds `&self` for its whole span, so
-            // `set_system`'s `&mut self` is unavailable mid-run) uses to keep a time-varying prompt (a
-            // date stamp) current turn-to-turn. Takes priority over the static `system` string when
-            // both are set, mirroring pi's single function-or-string `systemPrompt` field.
-            if let Some(system_fn) = &self.system_fn {
-                req = req.with_system(system_fn());
-            } else if let Some(system) = &self.system {
-                req = req.with_system(system.clone());
-            }
+                &current_tool_defs,
+                &current_deferred_defs,
+            );
             if let Some(budget) = current_thinking {
                 req = req.with_thinking(budget);
             }
             if let Some(effort) = current_reasoning_effort {
                 req = req.with_reasoning_effort(effort);
-            }
-            if let Some(temperature) = self.temperature {
-                req = req.with_temperature(temperature);
-            }
-            if let Some(key) = &self.cache_key {
-                req = req.with_cache_key(key.clone());
             }
 
             // `emit` borrows `sink` for the turn; bind the result, then drop the borrow before handling
@@ -2413,84 +2389,110 @@ impl Agent {
         // What the summarization call(s) below cost. They run outside the conversational loop, so no
         // `Stream(Usage)` event carries them; `Compacted.usage` is the only place a caller sees them.
         let mut usage = TokenUsage::default();
-        let summary = match cut.turn_start {
-            None => {
-                // Clean boundary: unchanged, single-call path.
-                let req = self.with_reasoning(compaction::summary_request(
-                    &self.model,
-                    &prefix,
-                    self.compaction.summary_max_tokens,
-                    &file_ops,
-                    custom_instructions,
-                ));
-                let turn = self.run_utility_turn(req, cancel).await?;
-                add_usage(&mut usage, &turn.usage);
-                turn_text(&turn)
+        // The cached path first: the live conversation plus a closing instruction, read from the
+        // prompt cache (see `conversation_summary_request`). It sees the whole conversation, the kept
+        // turns and an open split turn included, so it needs no split. Skipped for an overflow (the
+        // provider already refused this conversation), when it doesn't fit, and if the model answers
+        // with a tool call or nothing, which fall through to the re-render below.
+        let cached = match self.compaction.cached_summary && reason != CompactionReason::Overflow {
+            true => {
+                match self.conversation_summary_request(session, &file_ops, custom_instructions) {
+                    Some(req) => {
+                        let turn = self.run_utility_turn(req, cancel).await?;
+                        add_usage(&mut usage, &turn.usage);
+                        let text = turn_text(&turn);
+                        let called_a_tool = turn
+                            .blocks
+                            .iter()
+                            .any(|b| matches!(b, ContentBlock::ToolUse { .. }));
+                        (!called_a_tool && !text.trim().is_empty()).then_some(text)
+                    }
+                    None => None,
+                }
             }
-            Some(turn_start) => {
-                // Split turn: summarize the closed-off history and the in-progress turn's own prefix
-                // separately, then stitch them together — rather than collapsing both under the
-                // split-turn template, which is written for a partial turn, not a whole conversation's
-                // worth of already-completed ones. The two calls run *sequentially*, not concurrently
-                // (pi originally ran them concurrently via `Promise.all`, then fixed exactly this in its
-                // own 13-commit-ahead history: "serialize split-turn compaction summaries... so
-                // single-concurrency local providers do not fail with 429 errors" — a self-hosted/local
-                // model behind a one-request-at-a-time server rejects the second of two simultaneous
-                // completions).
-                // Off the raw `reserve_tokens`, not `summary_max_tokens` (already `0.8 *
-                // reserve_tokens`) — matches pi's own `generateTurnPrefixSummary`
-                // (`Math.floor(0.5 * reserveTokens)`, `compaction.ts`), rather than compounding the two
-                // scale factors into an effective ~0.4 * reserve_tokens.
-                let turn_prefix_max_tokens = ((self.compaction.reserve_tokens as f64)
-                    * compaction::SPLIT_TURN_PREFIX_SCALE)
-                    as u32;
-                let history = async {
-                    if turn_start == 0 {
-                        // Nothing precedes the split turn — no history to summarize, no call to make.
-                        return Ok(("No prior history.".to_string(), TokenUsage::default()));
-                    }
-                    // The closed-off side is nothing but a still-current prior summary (a compaction's
-                    // summary message is always `session.messages[0]`; `find_split_cut` only ever bumps
-                    // `turn_start` to exactly 1 when the scan found no history beyond it) — no new
-                    // activity happened before this split turn began, so reuse it verbatim instead of
-                    // spending a model call to ask for what would be an unchanged restatement.
-                    if turn_start == 1
-                        && let Some(prev) =
-                            compaction::previous_summary(&session.messages[..turn_start])
-                    {
-                        return Ok((prev.to_string(), TokenUsage::default()));
-                    }
+            false => None,
+        };
+        let summary = match (cached, cut.turn_start) {
+            (Some(summary), _) => summary,
+            (None, turn_start) => match turn_start {
+                None => {
+                    // Clean boundary: unchanged, single-call path.
                     let req = self.with_reasoning(compaction::summary_request(
                         &self.model,
-                        &session.messages[..turn_start],
+                        &prefix,
                         self.compaction.summary_max_tokens,
                         &file_ops,
                         custom_instructions,
                     ));
                     let turn = self.run_utility_turn(req, cancel).await?;
-                    Ok::<_, Error>((turn_text(&turn), turn.usage))
-                };
-                // Unlike `history` above, the turn-prefix call never takes `custom_instructions` — it
-                // summarizes the SPLIT_TURN_INSTRUCTION template's "context for the retained suffix,"
-                // not the closed-off conversation `custom_instructions` is meant to steer. Matches pi's
-                // `generateTurnPrefixSummary`, whose signature doesn't accept custom instructions at all.
-                let turn_prefix = async {
-                    let req = self.with_reasoning(compaction::summary_request(
-                        &self.model,
-                        &session.messages[turn_start..first_kept],
-                        turn_prefix_max_tokens,
-                        &file_ops,
-                        None,
-                    ));
-                    let turn = self.run_utility_turn(req, cancel).await?;
-                    Ok::<_, Error>((turn_text(&turn), turn.usage))
-                };
-                let (history, history_usage) = history.await?;
-                add_usage(&mut usage, &history_usage);
-                let (turn_prefix, turn_prefix_usage) = turn_prefix.await?;
-                add_usage(&mut usage, &turn_prefix_usage);
-                compaction::merge_split_summary(&history, &turn_prefix)
-            }
+                    add_usage(&mut usage, &turn.usage);
+                    turn_text(&turn)
+                }
+                Some(turn_start) => {
+                    // Split turn: summarize the closed-off history and the in-progress turn's own prefix
+                    // separately, then stitch them together — rather than collapsing both under the
+                    // split-turn template, which is written for a partial turn, not a whole conversation's
+                    // worth of already-completed ones. The two calls run *sequentially*, not concurrently
+                    // (pi originally ran them concurrently via `Promise.all`, then fixed exactly this in its
+                    // own 13-commit-ahead history: "serialize split-turn compaction summaries... so
+                    // single-concurrency local providers do not fail with 429 errors" — a self-hosted/local
+                    // model behind a one-request-at-a-time server rejects the second of two simultaneous
+                    // completions).
+                    // Off the raw `reserve_tokens`, not `summary_max_tokens` (already `0.8 *
+                    // reserve_tokens`) — matches pi's own `generateTurnPrefixSummary`
+                    // (`Math.floor(0.5 * reserveTokens)`, `compaction.ts`), rather than compounding the two
+                    // scale factors into an effective ~0.4 * reserve_tokens.
+                    let turn_prefix_max_tokens = ((self.compaction.reserve_tokens as f64)
+                        * compaction::SPLIT_TURN_PREFIX_SCALE)
+                        as u32;
+                    let history = async {
+                        if turn_start == 0 {
+                            // Nothing precedes the split turn — no history to summarize, no call to make.
+                            return Ok(("No prior history.".to_string(), TokenUsage::default()));
+                        }
+                        // The closed-off side is nothing but a still-current prior summary (a compaction's
+                        // summary message is always `session.messages[0]`; `find_split_cut` only ever bumps
+                        // `turn_start` to exactly 1 when the scan found no history beyond it) — no new
+                        // activity happened before this split turn began, so reuse it verbatim instead of
+                        // spending a model call to ask for what would be an unchanged restatement.
+                        if turn_start == 1
+                            && let Some(prev) =
+                                compaction::previous_summary(&session.messages[..turn_start])
+                        {
+                            return Ok((prev.to_string(), TokenUsage::default()));
+                        }
+                        let req = self.with_reasoning(compaction::summary_request(
+                            &self.model,
+                            &session.messages[..turn_start],
+                            self.compaction.summary_max_tokens,
+                            &file_ops,
+                            custom_instructions,
+                        ));
+                        let turn = self.run_utility_turn(req, cancel).await?;
+                        Ok::<_, Error>((turn_text(&turn), turn.usage))
+                    };
+                    // Unlike `history` above, the turn-prefix call never takes `custom_instructions` — it
+                    // summarizes the SPLIT_TURN_INSTRUCTION template's "context for the retained suffix,"
+                    // not the closed-off conversation `custom_instructions` is meant to steer. Matches pi's
+                    // `generateTurnPrefixSummary`, whose signature doesn't accept custom instructions at all.
+                    let turn_prefix = async {
+                        let req = self.with_reasoning(compaction::summary_request(
+                            &self.model,
+                            &session.messages[turn_start..first_kept],
+                            turn_prefix_max_tokens,
+                            &file_ops,
+                            None,
+                        ));
+                        let turn = self.run_utility_turn(req, cancel).await?;
+                        Ok::<_, Error>((turn_text(&turn), turn.usage))
+                    };
+                    let (history, history_usage) = history.await?;
+                    add_usage(&mut usage, &history_usage);
+                    let (turn_prefix, turn_prefix_usage) = turn_prefix.await?;
+                    add_usage(&mut usage, &turn_prefix_usage);
+                    compaction::merge_split_summary(&history, &turn_prefix)
+                }
+            },
         };
         if summary.trim().is_empty() {
             // A genuine summarization call ran (unlike the two early no-ops above, which never call the
@@ -2535,6 +2537,118 @@ impl Agent {
             usage,
         });
         Ok(CompactOutcome::Compacted)
+    }
+
+    /// A request carrying the live conversation the way every turn sends it: tools, deferred tools,
+    /// system prompt, sampling, cache key and TTL. Everything but reasoning, which the caller applies
+    /// (the loop's can change mid-run). Shared by the turn loop and the cached summary call
+    /// ([`Self::conversation_summary_request`]), whose cache hit depends on the two agreeing byte for
+    /// byte up to the conversation's end.
+    fn conversation_request(
+        &self,
+        model: String,
+        messages: Arc<Vec<Message>>,
+        max_tokens: u32,
+        tool_defs: &Arc<[ToolDef]>,
+        deferred_tool_defs: &Arc<[ToolDef]>,
+    ) -> ModelRequest {
+        let mut req = ModelRequest::new(model, messages, max_tokens)
+            .with_tools(tool_defs.clone())
+            .with_deferred_tools(deferred_tool_defs.clone())
+            .with_cache_long(self.cache_long);
+        // pi-parity (Task 1, serve pass 19): wire-layer enforcement twin of the ingestion-time
+        // `block_images` gate — see `ModelRequest::block_images`'s doc comment. Setting this here,
+        // on every turn built from `session.messages`, closes both gaps an ingestion-only gate
+        // can't: an RPC client pushing an image directly into a running session, and an image
+        // already persisted in session history before the flag was toggled on getting resent on a
+        // resumed session.
+        req.block_images = self.block_images;
+        // Task #15 (pi-parity): a per-turn callback (`with_system_fn`) is re-evaluated fresh here,
+        // every turn — the seam a long-running call (which holds `&self` for its whole span, so
+        // `set_system`'s `&mut self` is unavailable mid-run) uses to keep a time-varying prompt (a
+        // date stamp) current turn-to-turn. Takes priority over the static `system` string when
+        // both are set, mirroring pi's single function-or-string `systemPrompt` field.
+        if let Some(system_fn) = &self.system_fn {
+            req = req.with_system(system_fn());
+        } else if let Some(system) = &self.system {
+            req = req.with_system(system.clone());
+        }
+        if let Some(temperature) = self.temperature {
+            req = req.with_temperature(temperature);
+        }
+        if let Some(key) = &self.cache_key {
+            req = req.with_cache_key(key.clone());
+        }
+        req
+    }
+
+    /// The summarization call as the live conversation plus one closing instruction
+    /// ([`compaction::conversation_summary_instruction`]) — the same model, system prompt, tools and
+    /// messages a turn would send, so the provider reads everything up to the previous turn's cache
+    /// breakpoint from its prompt cache instead of re-billing a re-rendered transcript at full price.
+    /// The summarizer also sees full tool results, not the 2,000-char excerpts of the re-render.
+    ///
+    /// The instruction replaces the trailing user message's own content, keeping only its tool results
+    /// (a new user message if the conversation ends on the model's turn), so roles still alternate,
+    /// every `tool_use` keeps its result, the cached prefix (which ends before that message) is
+    /// untouched, and nothing the user is asking right now competes with the instruction. `None` when the conversation is too close to the limit to add the instruction and
+    /// still leave `summary_max_tokens` of output: the caller falls back to the re-render, which
+    /// truncates tool results and always fits.
+    fn conversation_summary_request(
+        &self,
+        session: &Session,
+        file_ops: &compaction::CompactionProvenance,
+        custom_instructions: Option<&str>,
+    ) -> Option<ModelRequest> {
+        let cfg = &self.compaction;
+        let instruction = compaction::conversation_summary_instruction(
+            &session.messages,
+            file_ops,
+            custom_instructions,
+        );
+        // A session opened from disk has no usage snapshot yet: estimate it whole.
+        let live = if session.last_input_tokens > 0 {
+            session
+                .last_input_tokens
+                .saturating_add(compaction::trailing_tokens(session))
+        } else {
+            compaction::estimate_messages_tokens(&session.messages)
+        };
+        let prompt = live.saturating_add(compaction::estimate_tokens(&instruction));
+        if prompt > cfg.input_budget()
+            || prompt.saturating_add(cfg.summary_max_tokens) > cfg.context_window
+        {
+            return None;
+        }
+        let mut messages = (*session.request_messages()).clone();
+        match messages.last_mut() {
+            // The trailing user message can carry what the user is asking *now* (a fresh prompt, a
+            // steer, a host's request block). Shown next to the instruction, the model answers that
+            // instead: measured, a pending "reply with just OK" turned the summary into "OK". Keep
+            // only its tool results, which the previous turn's `tool_use` needs paired; the dropped
+            // text stays in the kept suffix verbatim anyway.
+            Some(m) if m.role == Role::User => {
+                m.content
+                    .retain(|b| matches!(b, ContentBlock::ToolResult { .. }));
+                m.content.push(ContentBlock::text(instruction));
+            }
+            // A call still waiting for its result can't be followed by a plain user turn.
+            Some(m)
+                if m.content
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::ToolUse { .. })) =>
+            {
+                return None;
+            }
+            _ => messages.push(Message::user(instruction)),
+        }
+        Some(self.with_reasoning(self.conversation_request(
+            self.model.clone(),
+            Arc::new(messages),
+            cfg.summary_max_tokens,
+            &self.tool_defs,
+            &self.deferred_tool_defs,
+        )))
     }
 
     /// The first step of an automatic compaction: mask old tool output
@@ -8230,6 +8344,8 @@ mod tests {
         ]));
         let agent = Agent::new(mock.clone(), "claude-opus-4-8").with_compaction(CompactionConfig {
             keep_recent_tokens: 1,
+            // The split-turn re-render path; the cached path needs no split.
+            cached_summary: false,
             ..CompactionConfig::default()
         });
         let cancel = CancellationToken::new();
@@ -8999,6 +9115,8 @@ mod tests {
             keep_recent_tokens: 1,
             summary_max_tokens: 1000,
             reserve_tokens: 1000,
+            // The split-turn re-render path; the cached path needs no split.
+            cached_summary: false,
             ..CompactionConfig::default()
         });
         let cancel = CancellationToken::new();
@@ -9061,6 +9179,8 @@ mod tests {
         )]));
         let agent = Agent::new(mock.clone(), "claude-opus-4-8").with_compaction(CompactionConfig {
             keep_recent_tokens: 1,
+            // The split-turn re-render path; the cached path needs no split.
+            cached_summary: false,
             ..CompactionConfig::default()
         });
         let cancel = CancellationToken::new();
@@ -12506,6 +12626,207 @@ mod tests {
         assert!(
             format!("{:?}", sent[2]).contains("app context"),
             "the block rides the masked message"
+        );
+    }
+
+    // ---- the cached summary call ----------------------------------------------------------------
+
+    /// A one-tool-call turn that reports `input` prompt tokens.
+    fn tool_turn_with_usage(id: &str, input: u32) -> Vec<StreamEvent> {
+        let mut t = turn::tool_call(id, "echo", r#"{"text":"hi"}"#);
+        let stop = t.pop().unwrap();
+        t.push(StreamEvent::Usage(TokenUsage {
+            input_tokens: input,
+            output_tokens: 5,
+            ..Default::default()
+        }));
+        t.push(stop);
+        t
+    }
+
+    /// Compaction at a 10K trigger with masking off, so the summary call is the only rewrite.
+    fn summary_config() -> CompactionConfig {
+        CompactionConfig {
+            mask_tool_output: false,
+            ..masking_config()
+        }
+    }
+
+    fn summary_agent(mock: &Arc<MockTransport>, cfg: CompactionConfig) -> Agent {
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(EchoTool));
+        Agent::new(mock.clone(), "claude-opus-4-8")
+            .with_tools(tools)
+            .with_system("you are the agent")
+            .with_cache_key("session-1")
+            .with_compaction(cfg)
+    }
+
+    fn last_text(m: &Message) -> &str {
+        match m.content.last() {
+            Some(ContentBlock::Text { text, .. }) => text,
+            _ => "",
+        }
+    }
+
+    #[tokio::test]
+    async fn the_summary_call_is_the_previous_turns_request_plus_one_instruction() {
+        // Turn 1 runs under the trigger and reports 11K: the next loop iteration compacts. The
+        // summary request must extend turn 1's request byte for byte (same model, system, tools,
+        // cache key, messages), so the provider serves that whole prefix from cache.
+        let mock = Arc::new(MockTransport::new(vec![
+            tool_turn_with_usage("t1", 11_000),
+            turn::text("## Goal\nthe summary"),
+            turn::text("done"),
+        ]));
+        let agent = summary_agent(&mock, summary_config());
+        let mut session = masking_session(0, 4);
+        session.last_input_tokens = 0;
+        let mut events = Vec::new();
+        agent
+            .run_events(&mut session, |ev| events.push(ev))
+            .await
+            .unwrap();
+        assert_eq!(kinds(&events), ["compaction_start", "compacted"]);
+        let reqs = mock.requests();
+        assert_eq!(reqs.len(), 3, "one summary call, no split");
+        let (turn, summary) = (&reqs[0], &reqs[1]);
+        assert_eq!(summary.model, turn.model);
+        assert_eq!(summary.system, turn.system);
+        assert_eq!(summary.tools, turn.tools);
+        assert_eq!(summary.cache_key, turn.cache_key);
+        assert!(!summary.no_cache, "the cached path must read the cache");
+        let n = turn.messages.len();
+        assert_eq!(
+            &summary.messages[..n],
+            &turn.messages[..],
+            "the cached prefix"
+        );
+        // Then the model's tool call, and its result carrying the instruction as a last block.
+        assert_eq!(summary.messages.len(), n + 2);
+        let closing = &summary.messages[n + 1];
+        assert!(matches!(
+            closing.content[0],
+            ContentBlock::ToolResult { .. }
+        ));
+        assert!(
+            last_text(closing).contains("Do not call any tools"),
+            "{closing:?}"
+        );
+        assert!(last_text(closing).contains("## Goal"));
+        // The summarizer saw full tool output, not the re-render's 2,000-char excerpt.
+        assert!(format!("{:?}", summary.messages).contains(&"x".repeat(4_000)));
+        // The provenance carry is unchanged: host-appended, not trusted to the summary.
+        assert!(last_text(&session.messages[0]).contains("<read-files>"));
+    }
+
+    #[tokio::test]
+    async fn the_summary_instruction_replaces_a_pending_user_prompt() {
+        // Compaction runs before the turn that answers a fresh prompt. Next to the instruction, that
+        // prompt wins ("reply with just OK" made the summary "OK"), so the summary call drops it; it
+        // stays in the kept suffix.
+        let mock = Arc::new(MockTransport::new(vec![
+            turn::text("## Goal\nthe summary"),
+            turn::text("OK"),
+        ]));
+        let agent = summary_agent(&mock, summary_config());
+        let mut session = masking_session(0, 12);
+        session.push(Message::assistant(vec![ContentBlock::text("read them")]));
+        session.user("Reply with just: OK");
+        agent.run_events(&mut session, |_| {}).await.unwrap();
+        let reqs = mock.requests();
+        let closing = reqs[0].messages.last().unwrap();
+        assert_eq!(closing.content.len(), 1, "{closing:?}");
+        assert!(last_text(closing).contains("Do not call any tools"));
+        assert!(!format!("{closing:?}").contains("Reply with just"));
+        // Everything before the prompt went out as the conversation had it.
+        assert_eq!(reqs[0].messages.len(), 27);
+        // The real turn still sees the prompt, after the summary.
+        assert!(format!("{:?}", reqs[1].messages).contains("Reply with just: OK"));
+    }
+
+    #[tokio::test]
+    async fn the_summary_call_falls_back_to_the_rerender_when_it_cannot_fit() {
+        // Over the trigger and so close to the window that adding the instruction and a summary's
+        // output would not fit: the re-render (its own system prompt, no tools) runs instead.
+        let mock = Arc::new(MockTransport::new(vec![
+            turn::text("## Goal\nthe summary"),
+            turn::text("done"),
+        ]));
+        let cfg = CompactionConfig {
+            context_window: 13_000,
+            ..summary_config()
+        };
+        let agent = summary_agent(&mock, cfg);
+        let mut session = masking_session(0, 12);
+        agent.run_events(&mut session, |_| {}).await.unwrap();
+        let summary = &mock.requests()[0];
+        assert_eq!(summary.system.as_deref(), Some(compaction::SUMMARY_SYSTEM));
+        assert!(summary.tools.is_empty());
+        assert_eq!(summary.messages.len(), 1);
+        assert!(summary.no_cache, "a one-off prompt: no cache write premium");
+    }
+
+    #[tokio::test]
+    async fn a_summary_answered_with_a_tool_call_is_redone_by_the_rerender() {
+        let mock = Arc::new(MockTransport::new(vec![
+            turn::tool_call("x", "echo", r#"{"text":"not now"}"#),
+            turn::text("## Goal\nthe summary"),
+            turn::text("done"),
+        ]));
+        let agent = summary_agent(&mock, summary_config());
+        let mut session = masking_session(0, 12);
+        agent.run_events(&mut session, |_| {}).await.unwrap();
+        let reqs = mock.requests();
+        assert_eq!(reqs.len(), 3);
+        assert_eq!(reqs[1].system.as_deref(), Some(compaction::SUMMARY_SYSTEM));
+        assert!(last_text(&session.messages[0]).contains("the summary"));
+        assert!(
+            !session
+                .messages
+                .iter()
+                .flat_map(|m| &m.content)
+                .any(|b| matches!(b, ContentBlock::ToolUse { id, .. } if id == "x")),
+            "the stray call never reaches the transcript"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_cached_summary_can_be_turned_off_and_is_skipped_for_an_overflow() {
+        async fn first_system(cfg: CompactionConfig, reason: CompactionReason) -> Option<Arc<str>> {
+            let mock = Arc::new(MockTransport::new(vec![turn::text("## Goal\nsummary")]));
+            let agent = summary_agent(&mock, cfg);
+            let mut session = masking_session(0, 12);
+            agent
+                .compact(
+                    &mut session,
+                    reason,
+                    &CancellationToken::new(),
+                    &mut |_| {},
+                    None,
+                )
+                .await
+                .unwrap();
+            mock.requests()[0].system.clone()
+        }
+        let rerender = Some(Arc::from(compaction::SUMMARY_SYSTEM));
+        let off = CompactionConfig {
+            cached_summary: false,
+            ..summary_config()
+        };
+        assert_eq!(
+            first_system(off, CompactionReason::Threshold).await,
+            rerender
+        );
+        assert_eq!(
+            first_system(summary_config(), CompactionReason::Overflow).await,
+            rerender
+        );
+        assert_eq!(
+            first_system(summary_config(), CompactionReason::Manual)
+                .await
+                .as_deref(),
+            Some("you are the agent")
         );
     }
 }

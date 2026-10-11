@@ -339,6 +339,27 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
   (`crates/agent`'s `SessionStore::record_edits`), cleared by `apply_summary`, whose rewrite carries the
   content. Off with `mask_tool_output: false`.
 
+- **The summary call reads the conversation from cache** — `Agent::compact` first tries
+  `conversation_summary_request`: the request a turn would send (same model, system prompt, tools,
+  deferred tools, cache key and TTL, reasoning; one helper, `conversation_request`, builds both) with
+  the trailing user message replaced by `compaction::conversation_summary_instruction` (the
+  `SUMMARY_SYSTEM` guardrails, "do not call any tools", the `SUMMARY_INSTRUCTION` format, incremental
+  rules when the conversation opens with a summary, the file tags and any custom focus). Everything up
+  to the previous turn's rolling breakpoint is a cache read, and the summarizer sees full tool results
+  instead of 2,000-char excerpts. Only the trailing message's tool results are kept beside the
+  instruction: a pending user prompt there wins over it (measured on gpt-6-luna, a pending "reply with
+  just OK" made the summary "OK"), and it is in the kept suffix anyway. One call covers a split turn,
+  since the model sees the whole turn. It falls back to the `summary_request` re-render when the
+  conversation can't take the instruction plus `summary_max_tokens` of output under the input budget
+  and window, for an overflow (the provider already refused this conversation), when the model answers
+  with a tool call or nothing, or with `cached_summary: false`. The re-render itself is now sent
+  `no_cache`: nothing re-reads that one-off prompt, so a breakpoint only bought a cache-write premium on
+  all of it. The provenance carry is unchanged: host code appends it to whichever summary comes back.
+  Measured on real models (summary call only, ~80–100K-token sessions; see the PR): cache-read share
+  0% → 98–99%; input cost about equal when tool results are long (the re-render truncates them to
+  ~10K tokens), and −84% (Haiku 5.5) / −87% (gpt-6-luna) when they are ~2K chars each and the re-render
+  is nearly the whole conversation.
+
 - **The deterministic-carry channel** — `apply_summary` is deliberately destructive: it _replaces_
   `session.messages` with `[summary, …kept_suffix]`, and `SessionStore::open` reloads that
   post-compaction list, so anything living only inside a folded-away message is gone for good. A

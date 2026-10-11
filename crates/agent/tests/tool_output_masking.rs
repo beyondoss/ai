@@ -186,3 +186,23 @@ fn serve_persists_a_masking_pass_for_the_next_process() {
     assert_eq!(bodies.lock().unwrap().len(), 1, "no summarization call");
     assert_masked_on_disk(&session_file);
 }
+
+#[test]
+fn run_summarizes_from_the_cached_conversation_unless_told_not_to() {
+    // The summary call is the live conversation plus an instruction by default; the flag forces
+    // the re-render (its own system prompt over a rendered transcript).
+    for (extra, cached) in [(&[][..], true), (&["--no-cached-summary"][..], false)] {
+        let dir = tempfile::tempdir().unwrap();
+        let session_file = seeded_session(dir.path());
+        let (base, bodies) = spawn_model_server(vec![turn_text("SUMMARY"), turn_text("done")]);
+        let mut args = vec!["--no-tool-masking"];
+        args.extend_from_slice(extra);
+        run(&base, &session_file, &args);
+        let body = bodies.lock().unwrap()[0].clone();
+        assert_eq!(body.contains("Do not call any tools"), cached, "{extra:?}");
+        // The cached call carries the conversation's tools; the re-render carries none.
+        assert_eq!(body.contains("\"tools\""), cached, "{extra:?}");
+        // Either way the pending prompt waits for the real turn.
+        assert!(!body.contains("now fix them") || !cached, "{body}");
+    }
+}
