@@ -1095,6 +1095,20 @@ pub fn apply_summary(session: &mut Session, first_kept: usize, summary: &str, to
     session.last_output_tokens = 0;
 }
 
+/// The `tokens_before` an [`apply_summary`] summary message records in its leading
+/// `"Compacted from {N} tokens"` line — `None` for any other message. Lets a persistence layer that
+/// sees only the session (not the `Compacted` event) record the compaction it is writing.
+pub fn summary_tokens_before(m: &Message) -> Option<u32> {
+    let ContentBlock::Text { text, .. } = m.content.first()? else {
+        return None;
+    };
+    let body = text.strip_prefix(SUMMARY_MARKER)?.trim_start();
+    let (n, _) = body
+        .strip_prefix("Compacted from ")?
+        .split_once(" tokens")?;
+    n.parse().ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2251,6 +2265,13 @@ mod tests {
         // Alternation: summary(user) then the kept assistant message.
         assert_eq!(s.messages[1].role, Role::Assistant);
         assert_eq!(s.last_input_tokens, 0);
+        // The recorded size reads back off the summary, and off nothing else.
+        assert_eq!(summary_tokens_before(&s.messages[0]), Some(9999));
+        assert_eq!(summary_tokens_before(&s.messages[1]), None);
+        assert_eq!(
+            summary_tokens_before(&Message::user("Compacted from 5 tokens")),
+            None
+        );
     }
 
     // ---- the `todo` deterministic-carry channel -------------------------------------------------
