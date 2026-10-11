@@ -1073,6 +1073,15 @@ context_window = 1_000_000
 note = "Alibaba Cloud Model Studio, International deployment, one tier to 1M (the Global deployment is 0.113 / 0.382). Together's /v1/models matches: 0.15 / 0.47 (its pricing page still shows the old 0.09 / 0.28) (D241)."
 
 [[row]]
+model = "qwen/qwen3.8-omni-flash"
+source = ["https://www.alibabacloud.com/help/en/model-studio/model-pricing"]
+date = "2026-10-11"
+input = "0.15"
+output = "0.47"
+cache_read = "0.016"
+note = "OpenRouter-primary (Alibaba its only host); Alibaba Cloud Model Studio, International deployment (Singapore): USD 0.15 input, 0.016 cache-hit input, 0.47 output, one price for text, image, audio and video input. No cache-write rate. Qwen3.8 Max Prime has no entry: Alibaba prices it only for China (Beijing), so its list is OpenRouter's card."
+
+[[row]]
 model = "text-embedding-3-large"
 source = ["https://developers.openai.com/api/docs/pricing.md"]
 date = "2026-10-01"
@@ -3012,6 +3021,16 @@ cost = { groq = "list", openrouter = "openrouter:qwen/qwen3.8-27b" }
 model = "qwen/qwen3.8-flash"
 list_card = "list"
 cost = { together = "together:Qwen/Qwen3.8-Flash", openrouter = "openrouter:qwen/qwen3.8-flash" }
+
+[[pricing]]
+model = "qwen/qwen3.8-max-prime"
+list_card = "list"
+cost = { openrouter = "openrouter:qwen/qwen3.8-max-prime" }
+
+[[pricing]]
+model = "qwen/qwen3.8-omni-flash"
+list_card = "list"
+cost = { openrouter = "openrouter:qwen/qwen3.8-omni-flash" }
 
 [[pricing]]
 model = "text-embedding-3-large"

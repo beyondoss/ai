@@ -1,0 +1,20 @@
+{
+  "data": {
+    "endpoints": [
+      {
+        "context_length": 1000000,
+        "max_prompt_tokens": 983616,
+        "pricing": {
+          "completion": "0.000012",
+          "discount": 0,
+          "input_cache_read": "0.0000005",
+          "prompt": "0.000004"
+        },
+        "provider_name": "Alibaba",
+        "quantization": "unknown",
+        "tag": "alibaba"
+      }
+    ],
+    "id": "qwen/qwen3.8-max-prime"
+  }
+}

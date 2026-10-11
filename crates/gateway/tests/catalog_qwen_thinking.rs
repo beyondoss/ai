@@ -1,7 +1,9 @@
 //! End-to-end: Together's (and OpenRouter's) Qwen rows get what their backend can serve.
 //!
 //! - A forced `tool_choice` on Qwen3.7 Plus or Qwen3.8 Flash goes with thinking off: thinking on,
-//!   it is a 400 on every candidate of the row (D172).
+//!   it is a 400 on every candidate of the row (D172). Qwen3.8 Omni Flash too.
+//! - A forced `tool_choice` on Qwen3.8 Max Prime, which cannot think off, goes as `auto` with a
+//!   closing system message naming the tool (D269).
 //! - Tools on Qwen3.7 Plus go with thinking off unless the client asked for reasoning: thinking,
 //!   it sometimes writes the call as text (D171).
 //! - A `developer` message reaches Together as `system`, which its Qwen backend reads and
@@ -265,4 +267,76 @@ async fn a_developer_message_reaches_together_as_system() {
     let (path, sent) = last_sent(&seen);
     assert_eq!(path, "/api/v1/chat/completions");
     assert_eq!(sent["messages"][0]["role"], "developer");
+}
+
+/// Qwen3.8 Omni Flash (OpenRouter, Alibaba) refuses a forced tool while thinking, as Qwen3.8 Flash
+/// does: it goes with thinking off. Qwen3.8 Max Prime refuses it too and cannot think off, so a
+/// forced call goes as `auto` with a closing system message naming the tool; its reasoning stays as
+/// asked. Messages `any` arrives the same way, after translation.
+/// claim: T1, E1, E2
+/// defect: D172, D269
+#[tokio::test]
+async fn a_forced_tool_on_qwen3_8_max_prime_goes_as_an_instruction() {
+    let seen = Seen::default();
+    let (_up, gw, key) = gateway(&seen, 169).await;
+    let named = json!({"type": "function", "function": {"name": "get_weather"}});
+
+    let body = chat(
+        "qwen/qwen3.8-omni-flash",
+        json!({"tool_choice": "required"}),
+    );
+    let resp = post(&gw, &key, "/v1/chat/completions", &[], &body).await;
+    assert_eq!(resp.status().as_u16(), 200);
+    let (path, sent) = last_sent(&seen);
+    assert_eq!(path, "/api/v1/chat/completions");
+    assert_eq!(sent["reasoning"], json!({"enabled": false}), "{sent}");
+    assert_eq!(sent["tool_choice"], "required", "{sent}");
+
+    for (choice, must) in [
+        (named.clone(), "Respond by calling the `get_weather` tool."),
+        (
+            json!("required"),
+            "Respond by calling one of the provided tools.",
+        ),
+    ] {
+        let body = chat(
+            "qwen/qwen3.8-max-prime",
+            json!({"tool_choice": choice, "reasoning_effort": "high"}),
+        );
+        let resp = post(&gw, &key, "/v1/chat/completions", &[], &body).await;
+        assert_eq!(resp.status().as_u16(), 200, "{body}");
+        let (path, sent) = last_sent(&seen);
+        assert_eq!(path, "/api/v1/chat/completions");
+        assert_eq!(sent["tool_choice"], "auto", "{sent}");
+        assert_eq!(sent["reasoning_effort"], "high", "{sent}");
+        assert!(sent.get("reasoning").is_none(), "{sent}");
+        let msgs = sent["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 2, "{sent}");
+        assert_eq!(msgs[0], body["messages"][0]);
+        assert_eq!(msgs[1], json!({"role": "system", "content": must}));
+    }
+
+    let body = json!({"model": "qwen/qwen3.8-max-prime", "max_tokens": 256,
+        "tools": [{"name": "get_weather", "input_schema": {"type": "object",
+            "properties": {"city": {"type": "string"}}}}],
+        "tool_choice": {"type": "any"},
+        "messages": [{"role": "user", "content": "Weather in Paris?"}]});
+    let resp = post(&gw, &key, "/v1/messages", &[], &body).await;
+    assert_eq!(resp.status().as_u16(), 200, "{body}");
+    let (_, sent) = last_sent(&seen);
+    assert_eq!(sent["tool_choice"], "auto", "{sent}");
+    let last = sent["messages"]
+        .as_array()
+        .unwrap()
+        .last()
+        .cloned()
+        .unwrap();
+    assert_eq!(last["role"], "system", "{sent}");
+
+    // `auto` is sent as it came.
+    let body = chat("qwen/qwen3.8-max-prime", json!({"tool_choice": "auto"}));
+    let resp = post(&gw, &key, "/v1/chat/completions", &[], &body).await;
+    assert_eq!(resp.status().as_u16(), 200);
+    let (_, sent) = last_sent(&seen);
+    assert_eq!(sent["messages"].as_array().unwrap().len(), 1, "{sent}");
 }
