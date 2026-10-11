@@ -70,6 +70,18 @@ const ANTHROPIC_CLAUDE_HAIKU_4_5: Card = Card {
     ..Card::new(tr("1", "5", "0.1", "1.25", Some("2")))
 };
 
+/// `anthropic:claude-haiku-5-5`.
+const ANTHROPIC_CLAUDE_HAIKU_5_5: Card = Card {
+    long: Some(tr("0.5", "2.5", "0.05", "0.625", Some("1"))),
+    long_context: Some(LongContext {
+        threshold: 100000,
+        inclusive: false,
+    }),
+    geo_us: Some(11000),
+    tools: ANTHROPIC_TOOLS,
+    ..Card::new(tr("0.1", "0.5", "0.01", "0.125", Some("0.2")))
+};
+
 /// `anthropic:claude-opus-4-5`.
 const ANTHROPIC_CLAUDE_OPUS_4_5: Card = Card {
     tools: ANTHROPIC_TOOLS,
@@ -143,6 +155,16 @@ const ANTHROPIC_CLAUDE_SONNET_5_5: Card = Card {
 
 /// `bedrock:claude-haiku-4-5`.
 const BEDROCK_CLAUDE_HAIKU_4_5: Card = Card::new(tr("1.1", "5.5", "0.11", "1.375", Some("2.2")));
+
+/// `bedrock:claude-haiku-5-5`.
+const BEDROCK_CLAUDE_HAIKU_5_5: Card = Card {
+    long: Some(tr("0.55", "2.75", "0.055", "0.6875", Some("1.1"))),
+    long_context: Some(LongContext {
+        threshold: 100000,
+        inclusive: false,
+    }),
+    ..Card::new(tr("0.11", "0.55", "0.011", "0.1375", Some("0.22")))
+};
 
 /// `bedrock:claude-opus-4-8`.
 const BEDROCK_CLAUDE_OPUS_4_8: Card = Card::new(tr("5.5", "27.5", "0.55", "6.875", Some("11")));
@@ -804,6 +826,150 @@ static OR_ANTHROPIC_CLAUDE_HAIKU_4_5: &[OrEndpoint] = &[
         card: Card {
             tools: OR_SEARCH_10,
             ..Card::new(tr("1.1", "5.5", "0.11", "1.375", Some("2.2")))
+        },
+    },
+];
+
+/// `anthropic/claude-haiku-5.5` (`GET /api/v1/models/anthropic/claude-haiku-5.5/endpoints`).
+static OR_ANTHROPIC_CLAUDE_HAIKU_5_5: &[OrEndpoint] = &[
+    OrEndpoint {
+        host: "Amazon Bedrock",
+        tag: "amazon-bedrock",
+        class: Class::Standard,
+        card: Card {
+            long: Some(tr("0.5", "2.5", "0.05", "0.625", Some("1"))),
+            long_context: Some(LongContext {
+                threshold: 100000,
+                inclusive: false,
+            }),
+            tools: OR_SEARCH_10,
+            ..Card::new(tr("0.1", "0.5", "0.01", "0.125", Some("0.2")))
+        },
+    },
+    OrEndpoint {
+        host: "Amazon Bedrock",
+        tag: "amazon-bedrock/eu-west-1",
+        class: Class::Standard,
+        card: Card {
+            long: Some(tr("0.55", "2.75", "0.055", "0.6875", Some("1.1"))),
+            long_context: Some(LongContext {
+                threshold: 100000,
+                inclusive: false,
+            }),
+            tools: OR_SEARCH_10,
+            ..Card::new(tr("0.11", "0.55", "0.011", "0.1375", Some("0.22")))
+        },
+    },
+    OrEndpoint {
+        host: "Amazon Bedrock",
+        tag: "amazon-bedrock/us-east-1",
+        class: Class::Standard,
+        card: Card {
+            long: Some(tr("0.55", "2.75", "0.055", "0.6875", Some("1.1"))),
+            long_context: Some(LongContext {
+                threshold: 100000,
+                inclusive: false,
+            }),
+            tools: OR_SEARCH_10,
+            ..Card::new(tr("0.11", "0.55", "0.011", "0.1375", Some("0.22")))
+        },
+    },
+    OrEndpoint {
+        host: "Anthropic",
+        tag: "anthropic",
+        class: Class::Standard,
+        card: Card {
+            long: Some(tr("0.5", "2.5", "0.05", "0.625", Some("1"))),
+            long_context: Some(LongContext {
+                threshold: 100000,
+                inclusive: false,
+            }),
+            tools: OR_SEARCH_10,
+            ..Card::new(tr("0.1", "0.5", "0.01", "0.125", Some("0.2")))
+        },
+    },
+    OrEndpoint {
+        host: "Azure",
+        tag: "azure/global",
+        class: Class::Standard,
+        card: Card {
+            long: Some(tr("0.5", "2.5", "0.05", "0.625", Some("1"))),
+            long_context: Some(LongContext {
+                threshold: 100000,
+                inclusive: false,
+            }),
+            tools: OR_SEARCH_10,
+            ..Card::new(tr("0.1", "0.5", "0.01", "0.125", Some("0.2")))
+        },
+    },
+    OrEndpoint {
+        host: "Azure",
+        tag: "azure/us",
+        class: Class::Standard,
+        card: Card {
+            long: Some(tr("0.55", "2.75", "0.055", "0.6875", Some("1.1"))),
+            long_context: Some(LongContext {
+                threshold: 100000,
+                inclusive: false,
+            }),
+            tools: OR_SEARCH_10,
+            ..Card::new(tr("0.11", "0.55", "0.011", "0.1375", Some("0.22")))
+        },
+    },
+    OrEndpoint {
+        host: "Claude Platform on AWS",
+        tag: "claude-on-aws",
+        class: Class::Standard,
+        card: Card {
+            long: Some(tr("0.5", "2.5", "0.05", "0.625", Some("1"))),
+            long_context: Some(LongContext {
+                threshold: 100000,
+                inclusive: false,
+            }),
+            tools: OR_SEARCH_10,
+            ..Card::new(tr("0.1", "0.5", "0.01", "0.125", Some("0.2")))
+        },
+    },
+    OrEndpoint {
+        host: "Google",
+        tag: "google-vertex/europe",
+        class: Class::Standard,
+        card: Card {
+            long: Some(tr("0.55", "2.75", "0.055", "0.6875", Some("1.1"))),
+            long_context: Some(LongContext {
+                threshold: 100000,
+                inclusive: false,
+            }),
+            tools: OR_SEARCH_10,
+            ..Card::new(tr("0.11", "0.55", "0.011", "0.1375", Some("0.22")))
+        },
+    },
+    OrEndpoint {
+        host: "Google",
+        tag: "google-vertex/global",
+        class: Class::Standard,
+        card: Card {
+            long: Some(tr("0.5", "2.5", "0.05", "0.625", Some("1"))),
+            long_context: Some(LongContext {
+                threshold: 100000,
+                inclusive: false,
+            }),
+            tools: OR_SEARCH_10,
+            ..Card::new(tr("0.1", "0.5", "0.01", "0.125", Some("0.2")))
+        },
+    },
+    OrEndpoint {
+        host: "Google",
+        tag: "google-vertex/us",
+        class: Class::Standard,
+        card: Card {
+            long: Some(tr("0.55", "2.75", "0.055", "0.6875", Some("1.1"))),
+            long_context: Some(LongContext {
+                threshold: 100000,
+                inclusive: false,
+            }),
+            tools: OR_SEARCH_10,
+            ..Card::new(tr("0.11", "0.55", "0.011", "0.1375", Some("0.22")))
         },
     },
 ];
@@ -6356,6 +6522,24 @@ pub static ROW_RATES: &[RowRates] = &[
             CandidateCost {
                 provider: ProviderId::OpenRouter,
                 card: CostCard::OpenRouter(OR_ANTHROPIC_CLAUDE_HAIKU_4_5),
+            },
+        ],
+    },
+    RowRates {
+        model: "claude-haiku-5-5",
+        list: ANTHROPIC_CLAUDE_HAIKU_5_5,
+        cost: &[
+            CandidateCost {
+                provider: ProviderId::Anthropic,
+                card: CostCard::List,
+            },
+            CandidateCost {
+                provider: ProviderId::Bedrock,
+                card: CostCard::Own(&BEDROCK_CLAUDE_HAIKU_5_5),
+            },
+            CandidateCost {
+                provider: ProviderId::OpenRouter,
+                card: CostCard::OpenRouter(OR_ANTHROPIC_CLAUDE_HAIKU_5_5),
             },
         ],
     },

@@ -91,24 +91,88 @@ fn anthropic_name(cell: &str) -> &str {
     cell.split(" ([").next().unwrap_or(cell).trim()
 }
 
+/// A model's rates as the model table prices it: one row, or a row split by prompt length.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AnthropicModel {
+    pub standard: Published,
+    /// `(n, rates)` where the table splits the model into `(for prompts up to n tokens)` and
+    /// `(for prompts over n tokens)` rows: the over-`n` rates, for a prompt strictly above `n`.
+    pub long: Option<(u64, Published)>,
+}
+
+/// A split row's prompt-length label, after the model name: ` (for prompts over 100,000 tokens)`
+/// is (over, 100000), ` (for prompts up to 100,000 tokens)` is (up to, 100000). Any other label is
+/// an error.
+fn anthropic_split(row: &str, label: &str) -> Result<(bool, u64)> {
+    let bad = || format!("Anthropic pricing: unrecognized prompt-length row {row:?}");
+    let label = label.strip_prefix(" (for prompts ").ok_or_else(bad)?;
+    let (over, n) = if let Some(n) = label.strip_prefix("up to ") {
+        (false, n)
+    } else if let Some(n) = label.strip_prefix("over ") {
+        (true, n)
+    } else {
+        return Err(bad());
+    };
+    let n = n
+        .strip_suffix(" tokens)")
+        .and_then(|n| n.replace(',', "").parse().ok())
+        .ok_or_else(bad)?;
+    Ok((over, n))
+}
+
 impl Anthropic {
-    /// The standard row: input, 5-minute write, 1-hour write, cache hit, output.
-    pub fn model(&self, name: &str) -> Result<Published> {
-        let r = one(
-            self.models
-                .rows
-                .iter()
-                .filter(|r| anthropic_name(&r[0]) == name)
-                .collect(),
-            &format!("Anthropic model pricing row {name:?}"),
-        )?;
-        Ok(Published {
-            input: mtok(&r[1])?,
-            cache_write: Some(mtok(&r[2])?),
-            cache_write_1h: Some(mtok(&r[3])?),
-            cache_read: Some(mtok(&r[4])?),
-            output: Some(mtok(&r[5])?),
-        })
+    /// The model's rates: input, 5-minute write, 1-hour write, cache hit, output. Either one row
+    /// names the model, or exactly two split it by prompt length at one threshold (`up to n` and
+    /// `over n`); anything else is an error.
+    pub fn model(&self, name: &str) -> Result<AnthropicModel> {
+        let what = format!("Anthropic model pricing row {name:?}");
+        let mut plain = Vec::new();
+        let (mut up_to, mut over) = (Vec::new(), Vec::new());
+        for r in &self.models.rows {
+            let full = anthropic_name(&r[0]);
+            if full == name {
+                plain.push(r);
+                continue;
+            }
+            // Only this model's split rows are parsed: another model's label never fails it.
+            if let Some(label) = full
+                .strip_prefix(name)
+                .filter(|rest| rest.starts_with(" (for prompts "))
+            {
+                match anthropic_split(full, label)? {
+                    (true, n) => over.push((n, r)),
+                    (false, n) => up_to.push((n, r)),
+                }
+            }
+        }
+        let rates = |r: &Vec<String>| -> Result<Published> {
+            Ok(Published {
+                input: mtok(&r[1])?,
+                cache_write: Some(mtok(&r[2])?),
+                cache_write_1h: Some(mtok(&r[3])?),
+                cache_read: Some(mtok(&r[4])?),
+                output: Some(mtok(&r[5])?),
+            })
+        };
+        match (&plain[..], &up_to[..], &over[..]) {
+            ([r], [], []) => Ok(AnthropicModel {
+                standard: rates(r)?,
+                long: None,
+            }),
+            ([], [(a, short)], [(b, long)]) if a == b => Ok(AnthropicModel {
+                standard: rates(short)?,
+                long: Some((*b, rates(long)?)),
+            }),
+            ([], [], []) => Err(format!("{what}: not found")),
+            _ => Err(format!(
+                "{what}: {} plain, {} \"up to\" and {} \"over\" rows (thresholds {:?} / {:?})",
+                plain.len(),
+                up_to.len(),
+                over.len(),
+                up_to.iter().map(|(n, _)| n).collect::<Vec<_>>(),
+                over.iter().map(|(n, _)| n).collect::<Vec<_>>(),
+            )),
+        }
     }
 
     /// The fast mode (input, output), if the model is in the fast mode table. A row may name
@@ -681,10 +745,23 @@ pub struct BedrockScope {
     pub cache_write_1h: Option<Rate>,
 }
 
+/// One model's on-demand per-token SKUs, by scope. A model AWS prices by prompt length (Claude
+/// Haiku 5.5) has a second, `long_ctx` SKU for each token kind in each scope: those are the
+/// `*_long` scopes, empty on a model without them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Bedrock {
+    /// The geo profiles (`us.`): AWS's "Standard" SKUs without "Global".
+    pub regional: BedrockScope,
+    pub global: BedrockScope,
+    pub regional_long: BedrockScope,
+    pub global_long: BedrockScope,
+}
+
 /// The on-demand per-token SKUs for one model (`attributes.model`), split into the Regional
-/// (geo-profile, `us.`) and Global scopes. Batch, reserved-throughput and latency SKUs are
-/// skipped by name; any other usage type on the model is an error.
-pub fn bedrock(json: &str, model: &str) -> Result<(BedrockScope, BedrockScope)> {
+/// (geo-profile, `us.`) and Global scopes, each with its long-context SKUs apart. Batch,
+/// reserved-throughput and latency SKUs are skipped by name; any other usage type on the model is
+/// an error, and so is a second SKU for one token kind in one scope.
+pub fn bedrock(json: &str, model: &str) -> Result<Bedrock> {
     let v: Value = serde_json::from_str(json).map_err(|e| format!("AWS offer: {e}"))?;
     let products = v
         .get("products")
@@ -694,7 +771,7 @@ pub fn bedrock(json: &str, model: &str) -> Result<(BedrockScope, BedrockScope)> 
         .pointer("/terms/OnDemand")
         .and_then(Value::as_object)
         .ok_or("AWS offer: no OnDemand terms")?;
-    let (mut regional, mut global) = (BedrockScope::default(), BedrockScope::default());
+    let mut out = Bedrock::default();
     let mut seen = 0;
     for (sku, p) in products {
         if p.pointer("/attributes/model").and_then(Value::as_str) != Some(model) {
@@ -732,10 +809,13 @@ pub fn bedrock(json: &str, model: &str) -> Result<(BedrockScope, BedrockScope)> 
         } else {
             return Err(format!("AWS {model}: unrecognized usage type {ut}"));
         };
-        let scope = if u.contains("global") {
-            &mut global
-        } else {
-            &mut regional
+        let long =
+            u.contains("long_ctx") || u.contains("longcontext") || u.contains("long_context");
+        let scope = match (u.contains("global"), long) {
+            (true, false) => &mut out.global,
+            (false, false) => &mut out.regional,
+            (true, true) => &mut out.global_long,
+            (false, true) => &mut out.regional_long,
         };
         let offers = terms
             .get(sku)
@@ -778,7 +858,7 @@ pub fn bedrock(json: &str, model: &str) -> Result<(BedrockScope, BedrockScope)> 
     if seen == 0 {
         return Err(format!("AWS offer: no on-demand token SKUs for {model:?}"));
     }
-    Ok((regional, global))
+    Ok(out)
 }
 
 // --- OpenRouter: GET /api/v1/models/{slug}/endpoints -------------------------------------------

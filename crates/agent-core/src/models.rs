@@ -617,12 +617,13 @@ fn capabilities_impl_lc(m: &str) -> ModelCaps {
             return caps;
         }
 
-        // Generation 6+ (opus-4-6/4-7/4-8, opus-5, sonnet-4-6, sonnet-5, fable-5 / fable-5-1)
-        // require the newer `adaptive` thinking shape (`Budget`'s `{type:"enabled", budget_tokens}`
-        // is rejected) and ship a 1M-token context window — a full step up from every earlier
-        // generation. Matched by the exact family+generation token so "claude-opus-4-5" can't
-        // collide with "claude-opus-4-6" and later. `claude-opus-5` is its own major (Anthropic's
-        // 2026 recommended default); `claude-fable-5` also matches `claude-fable-5-1`.
+        // Generation 6+ (opus-4-6/4-7/4-8, opus-5, sonnet-4-6, sonnet-5, haiku-5-5, fable-5 /
+        // fable-5-1) require the newer `adaptive` thinking shape (`Budget`'s `{type:"enabled",
+        // budget_tokens}` is rejected) and ship a 1M-token context window — a full step up from
+        // every earlier generation. Matched by the exact family+generation token so
+        // "claude-opus-4-5" can't collide with "claude-opus-4-6" and later. `claude-opus-5` is its
+        // own major (Anthropic's 2026 recommended default); `claude-fable-5` also matches
+        // `claude-fable-5-1`. Haiku joins at 5.5 (1M context, 128k output, adaptive only).
         const GEN6_PLUS: &[&str] = &[
             "claude-opus-4-6",
             "claude-opus-4-7",
@@ -630,6 +631,7 @@ fn capabilities_impl_lc(m: &str) -> ModelCaps {
             "claude-opus-5",
             "claude-sonnet-4-6",
             "claude-sonnet-5",
+            "claude-haiku-5-5",
             "claude-fable-5",
             "fable-5",
         ];
@@ -660,8 +662,11 @@ fn capabilities_impl_lc(m: &str) -> ModelCaps {
             // false` is set on exactly these two ids in `anthropic.models.ts` and no other gen6+ entry
             // (opus-4-6, sonnet-4-6, sonnet-5, fable-5 all default to supported). Our own DEFAULT_MODEL
             // is `claude-opus-4-8`, so this is a live, reachable 400 without the gate.
-            let supports_temperature =
-                !(m.starts_with("claude-opus-4-7") || m.starts_with("claude-opus-4-8"));
+            // claude-haiku-5-5 too: "`temperature` is deprecated for this model" (400, measured
+            // 2026-10-11; its migration guide: "Omit `temperature`, `top_p`, and `top_k`").
+            let supports_temperature = !(m.starts_with("claude-opus-4-7")
+                || m.starts_with("claude-opus-4-8")
+                || m.starts_with("claude-haiku-5-5"));
             return ModelCaps {
                 context_window: 1_000_000,
                 max_output,
@@ -3320,6 +3325,8 @@ mod tests {
             "claude-opus-4-7",
             "claude-opus-5",
             "claude-sonnet-5",
+            "claude-haiku-5-5",
+            "anthropic/claude-haiku-5.5",
             "claude-fable-5",
             "claude-fable-5-1",
         ] {
@@ -3331,6 +3338,7 @@ mod tests {
             );
             assert_eq!(c.context_window, 1_000_000, "{id} should have 1M context");
         }
+        assert_eq!(capabilities("claude-haiku-5-5").max_output, 128_000);
         // sonnet-4-6 is adaptive but caps output at 64k, not 128k.
         let c = capabilities("claude-sonnet-4-6");
         assert_eq!(c.thinking, ThinkingShape::Adaptive);
@@ -3339,11 +3347,12 @@ mod tests {
     }
 
     #[test]
-    fn only_opus_4_7_and_opus_4_8_reject_temperature() {
-        // pi: `compat.supportsTemperature: false` is set on exactly these two ids in
-        // `anthropic.models.ts`; every other current id (including the rest of gen6+, legacy Budget-
-        // shape Claude, and every OpenAI-wire model) defaults to supporting it.
-        for id in ["claude-opus-4-7", "claude-opus-4-8"] {
+    fn only_opus_4_7_opus_4_8_and_haiku_5_5_reject_temperature() {
+        // pi: `compat.supportsTemperature: false` is set on exactly the two Opus ids in
+        // `anthropic.models.ts`; Haiku 5.5 answers `temperature` with a 400 (measured 2026-10-11).
+        // Every other current id (including the rest of gen6+, legacy Budget-shape Claude, and
+        // every OpenAI-wire model) defaults to supporting it.
+        for id in ["claude-opus-4-7", "claude-opus-4-8", "claude-haiku-5-5"] {
             assert!(
                 !capabilities(id).supports_temperature,
                 "{id} should reject temperature"

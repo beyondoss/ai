@@ -286,7 +286,8 @@ const fn card_unpublished_output(
 /// recorded with its source URL in `verify/catalog_truth.toml` (a test holds this table to it).
 /// Not batch or flex, and not OpenRouter's cheapest host. Where a vendor tiers the rate, the row
 /// lists the standard tier and says so in a comment: DeepSeek's peak rate (off-peak is half),
-/// xAI's < 200k-prompt tier, OpenAI's ≤ 272K-input tier. A promotional rate is not a list rate:
+/// xAI's < 200k-prompt tier, OpenAI's ≤ 272K-input tier, Claude Haiku 5.5's ≤ 100K-prompt tier. A
+/// promotional rate is not a list rate:
 /// gpt-5.6-sol lists OpenAI's standard $4 / $20, which OpenAI bills the pool key, while OpenRouter
 /// passes on OpenAI's announced half-price promotion (`[[promo]]` in the truth file). A row whose
 /// primary is OpenRouter lists its maker's own published rate where there is one (Moonshot's Kimi,
@@ -884,13 +885,13 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
     // supply. It covers failures that are ours: egress blocked, our Anthropic key throttled,
     // api.anthropic.com unreachable from us.
     //
-    // Two rows have a live-verified independent second source: Amazon Bedrock's Messages API
+    // Three rows have a live-verified independent second source: Amazon Bedrock's Messages API
     // (`claude_bedrock()`, `/anthropic/v1/messages`, `x-api-key`). Ids are the US geo inference
     // profiles the default `bedrock-runtime.us-east-1.amazonaws.com` host serves. OpenRouter
     // stays third on those rows. Do not add a Bedrock candidate without a live-verified
     // inference-profile id — a wrong id 404s and looks like the client's fault.
     //
-    // Current lineup (Fable 5.1 / Opus 5 / Sonnet 5 / Haiku 4.5) plus the still-served 4.x
+    // Current lineup (Fable 5.1 / Opus 5.5 / Sonnet 5.5 / Haiku 5.5) plus the still-served 4.x
     // snapshots Anthropic lists as legacy. Dateless 4.6+ ids are pinned snapshots, not aliases.
     ModelRoute {
         model: "claude-fable-5",
@@ -940,6 +941,28 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
             1760486400,
             200_000,
             64_000,
+            IN_TEXT | IN_IMAGE | IN_FILE,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
+    },
+    ModelRoute {
+        model: "claude-haiku-5-5",
+        wire: WireFormat::Anthropic,
+        candidates: &claude_bedrock(
+            "claude-haiku-5-5",
+            "us.anthropic.claude-haiku-5-5",
+            "anthropic/claude-haiku-5.5",
+        ),
+        responses: &[],
+        // The tier for prompts up to 100,000 tokens; over that, every token bills at 5x (the
+        // generated card's long tier).
+        price: price("0.1", "0.5", "0.01", "0.125"),
+        card: card(
+            "Claude Haiku 5.5",
+            "anthropic",
+            1791396000,
+            1_000_000,
+            128_000,
             IN_TEXT | IN_IMAGE | IN_FILE,
             TOOLS | REASONING | STRUCTURED_OUTPUTS,
         ),
@@ -3109,11 +3132,11 @@ mod tests {
         );
     }
 
-    /// The two Claude rows whose Bedrock inference-profile ids were live-verified. Other Claude
-    /// rows from the 2026-09 lineup stay on Anthropic → OpenRouter until those ids are checked.
+    /// The three Claude rows whose Bedrock inference-profile ids were live-verified. Other Claude
+    /// rows stay on Anthropic → OpenRouter until those ids are checked.
     #[test]
     fn verified_claude_bedrock_rows_fail_over_through_bedrock() {
-        for name in ["claude-haiku-4-5", "claude-opus-4-8"] {
+        for name in ["claude-haiku-4-5", "claude-haiku-5-5", "claude-opus-4-8"] {
             assert!(for_model(name).is_some(), "{name} must be in the catalog");
             if let Some(route) = for_model(name) {
                 assert_eq!(route.wire, WireFormat::Anthropic, "{name}");
@@ -3147,8 +3170,8 @@ mod tests {
     /// Spot-check the current-generation rows: native id matches the catalog name, OpenRouter uses
     /// the vendor-slug + (for Claude) dot-spelled form published on 2026-09-12.
     ///
-    /// These flagships still use the two-candidate `claude()` / `openai_chat()` shape. Haiku 4.5
-    /// and Opus 4.8 insert Bedrock and are pinned separately.
+    /// These flagships still use the two-candidate `claude()` / `openai_chat()` shape. Haiku 4.5,
+    /// Haiku 5.5 and Opus 4.8 insert Bedrock and are pinned separately.
     #[test]
     fn current_flagships_have_native_plus_openrouter_candidates() {
         let cases = [

@@ -298,12 +298,45 @@ impl Ctx<'_> {
         Ok(card)
     }
 
+    /// The model table's long-context split, held to the prose rule: the split rows' threshold
+    /// must be the one `[[prose]] anthropic.long_context` quotes, and "over" is strictly more.
+    fn anthropic_long(
+        &self,
+        spec: &CardSpec,
+        m: &vendors::AnthropicModel,
+    ) -> Result<Option<(Tr, (u64, bool))>> {
+        let Some((n, long)) = m.long else {
+            return Ok(None);
+        };
+        let (rule, inclusive) = threshold(&self.prose_value("anthropic.long_context")?)?;
+        if (rule, inclusive) != (n, false) {
+            return Err(format!(
+                "{}: the model table splits at prompts over {n}, [[prose]] anthropic.long_context says {}{rule}",
+                spec.name,
+                if inclusive { ">=" } else { ">" }
+            ));
+        }
+        Ok(Some((Tr::from(&long, &spec.name)?, (n, false))))
+    }
+
     fn anthropic(&self, spec: &CardSpec) -> Result<Card> {
         let a = vendors::anthropic(self.store.get("anthropic.pricing")?)?;
-        let p = a.model(&spec.row)?;
-        let standard = Tr::from(&p, &spec.name)?;
+        let m = a.model(&spec.row)?;
+        let standard = Tr::from(&m.standard, &spec.name)?;
         let mut card = Card::new(standard);
+        if let Some((long, lc)) = self.anthropic_long(spec, &m)? {
+            card.long = Some(long);
+            card.long_context = Some(lc);
+        }
         if let Some((fi, fo)) = a.fast(&spec.row)? {
+            if card.long.is_some() {
+                // Fast mode "applies across the full context window": a model with both would
+                // need a fast long tier the fast mode table does not state.
+                return Err(format!(
+                    "{}: fast mode on a model priced by prompt length is not read",
+                    spec.name
+                ));
+            }
             // "Prompt caching multipliers apply on top of fast mode pricing": the model's own
             // cache-to-input ratios, applied to the fast input rate.
             self.prose_value("anthropic.fast_caching")?;
@@ -320,7 +353,7 @@ impl Ctx<'_> {
     }
 
     fn bedrock(&self, spec: &CardSpec) -> Result<Card> {
-        let (regional, global) = vendors::bedrock(self.store.get("aws.bedrock")?, &spec.row)?;
+        let b = vendors::bedrock(self.store.get("aws.bedrock")?, &spec.row)?;
         let req = |r: Option<Rate>, f: &str, scope: &str| {
             r.ok_or_else(|| format!("AWS {}: no {scope} {f} SKU", spec.row))
         };
@@ -333,27 +366,48 @@ impl Ctx<'_> {
                 cache_write_1h: Some(req(s.cache_write_1h, "1-hour cache write", scope)?),
             })
         };
-        let reg = tr(&regional, "Regional")?;
-        let glob = tr(&global, "Global")?;
-        // Cross-checks: Global is Anthropic's own list, and Regional is Global plus the premium.
-        let list = Tr::from(
-            &vendors::anthropic(self.store.get("anthropic.pricing")?)?.model(&spec.row)?,
-            &spec.row,
-        )?;
-        if glob != list {
-            return Err(format!(
-                "{}: AWS Global SKUs {glob:?} are not Anthropic's list {list:?}",
-                spec.name
-            ));
-        }
+        // Cross-checks, per tier: Global is Anthropic's own list, and Regional is Global plus the
+        // premium. AWS states no threshold for its long-context SKUs: the tier is the model's own,
+        // so it exists here exactly when Anthropic's table splits the model, at its threshold.
+        let a = vendors::anthropic(self.store.get("anthropic.pricing")?)?.model(&spec.row)?;
         let premium = self.prose_bps("bedrock.regional")?;
-        if glob.scale(premium, 10_000)? != reg {
-            return Err(format!(
-                "{}: AWS Regional SKUs {reg:?} are not Global x {premium} bps",
-                spec.name
-            ));
+        let check = |reg: Tr, glob: Tr, list: Tr, tier: &str| -> Result<()> {
+            if glob != list {
+                return Err(format!(
+                    "{}: AWS Global {tier} SKUs {glob:?} are not Anthropic's list {list:?}",
+                    spec.name
+                ));
+            }
+            if glob.scale(premium, 10_000)? != reg {
+                return Err(format!(
+                    "{}: AWS Regional {tier} SKUs {reg:?} are not Global x {premium} bps",
+                    spec.name
+                ));
+            }
+            Ok(())
+        };
+        let reg = tr(&b.regional, "Regional")?;
+        let list = Tr::from(&a.standard, &spec.row)?;
+        check(reg, tr(&b.global, "Global")?, list, "standard")?;
+        let mut card = Card::new(reg);
+        let none = vendors::BedrockScope::default();
+        match self.anthropic_long(spec, &a)? {
+            Some((list_long, lc)) => {
+                let reg_long = tr(&b.regional_long, "Regional long-context")?;
+                let glob_long = tr(&b.global_long, "Global long-context")?;
+                check(reg_long, glob_long, list_long, "long-context")?;
+                card.long = Some(reg_long);
+                card.long_context = Some(lc);
+            }
+            None if b.regional_long != none || b.global_long != none => {
+                return Err(format!(
+                    "{}: AWS lists long-context SKUs, but Anthropic's table prices the model flat",
+                    spec.name
+                ));
+            }
+            None => {}
         }
-        Ok(Card::new(reg))
+        Ok(card)
     }
 
     fn openai(&self, spec: &CardSpec) -> Result<Card> {

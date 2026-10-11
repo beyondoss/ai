@@ -1,6 +1,6 @@
 {
   "about": "Golden vectors for the pricing contract (crates/providers/ARCHITECTURE.md, 'Pricing contract'). Each row is an ai.usage row; expect is what price(row) must return. An implementation must reproduce every one exactly. Absent row fields take their defaults: usage_wire anthropic, counts 0, strings null, booleans false, server_tools {}.",
-  "rate_version": "2026-10-11.87f1874f411d7061",
+  "rate_version": "2026-10-11.0b18dd2139ec9512",
   "vectors": [
     {
       "name": "anthropic_basic",
@@ -462,6 +462,229 @@
       },
       "expect": {
         "unpriced": "no_rate"
+      }
+    },
+    {
+      "name": "anthropic_tier_100k_at_threshold",
+      "why": "Claude Haiku 5.5 bills more for prompts OVER 100,000 tokens, and the prompt counts every input token, cache reads and writes included: 60,000 uncached + 30,000 read + 6,000 5m + 4,000 1h writes is exactly 100,000, so the short rates.",
+      "row": {
+        "price_model": "claude-haiku-5-5",
+        "provider": "anthropic",
+        "input_tokens": 60000,
+        "cache_read_tokens": 30000,
+        "cache_write_tokens": 10000,
+        "cache_write_1h_tokens": 4000,
+        "output_tokens": 2000,
+        "usage_wire": "anthropic",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "status": "priced",
+        "basis": "tokens",
+        "cost_micros": 8850,
+        "price_micros": 8850,
+        "cost_class": "standard",
+        "price_class": "standard",
+        "cost_long": false,
+        "price_long": false
+      }
+    },
+    {
+      "name": "anthropic_tier_100k_over_threshold",
+      "why": "One more uncached token (100,001) bills the whole request at the long rates: input $0.50, 5m write $0.625, 1h write $1, read $0.05, output $2.50.",
+      "row": {
+        "price_model": "claude-haiku-5-5",
+        "provider": "anthropic",
+        "input_tokens": 60001,
+        "cache_read_tokens": 30000,
+        "cache_write_tokens": 10000,
+        "cache_write_1h_tokens": 4000,
+        "output_tokens": 2000,
+        "usage_wire": "anthropic",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "status": "priced",
+        "basis": "tokens",
+        "cost_micros": 44251,
+        "price_micros": 44251,
+        "cost_class": "standard",
+        "price_class": "standard",
+        "cost_long": true,
+        "price_long": true
+      }
+    },
+    {
+      "name": "anthropic_tier_100k_cache_tips_it",
+      "why": "A cache read alone can carry the prompt over: 1,000 uncached + 99,001 read is 100,001, so even the cached tokens pay the long read rate.",
+      "row": {
+        "price_model": "claude-haiku-5-5",
+        "provider": "anthropic",
+        "input_tokens": 1000,
+        "cache_read_tokens": 99001,
+        "output_tokens": 300,
+        "usage_wire": "anthropic",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "status": "priced",
+        "basis": "tokens",
+        "cost_micros": 6200,
+        "price_micros": 6200,
+        "cost_class": "standard",
+        "price_class": "standard",
+        "cost_long": true,
+        "price_long": true
+      }
+    },
+    {
+      "name": "anthropic_tier_100k_geo_us",
+      "why": "US-only inference multiplies the long rates too (1.1x every token category, 'the multiplier also applies to the higher prices'), and web search stays $10/1k, unmultiplied.",
+      "row": {
+        "price_model": "claude-haiku-5-5",
+        "provider": "anthropic",
+        "input_tokens": 80001,
+        "cache_read_tokens": 15000,
+        "cache_write_tokens": 5000,
+        "cache_write_1h_tokens": 5000,
+        "output_tokens": 1500,
+        "inference_geo": "us",
+        "server_tools": "web_search=2",
+        "usage_wire": "anthropic",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "status": "priced",
+        "basis": "tokens",
+        "cost_micros": 74451,
+        "price_micros": 74451,
+        "cost_class": "standard",
+        "price_class": "standard",
+        "cost_long": true,
+        "price_long": true
+      }
+    },
+    {
+      "name": "anthropic_tier_100k_gateway_writes",
+      "why": "The gateway's own cache writes are inside input_tokens, so they count toward the prompt like any input, and bill as 5m writes at the long rate once over 100,000.",
+      "row": {
+        "price_model": "claude-haiku-5-5",
+        "provider": "anthropic",
+        "input_tokens": 100001,
+        "gateway_cache_write_tokens": 20000,
+        "output_tokens": 100,
+        "usage_wire": "anthropic",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "status": "priced",
+        "basis": "tokens",
+        "cost_micros": 52751,
+        "price_micros": 52751,
+        "cost_class": "standard",
+        "price_class": "standard",
+        "cost_long": true,
+        "price_long": true
+      }
+    },
+    {
+      "name": "bedrock_tier_100k_at_threshold",
+      "why": "Bedrock's us. profile at exactly 100,000 prompt tokens: the Regional standard SKUs (+10%), 1h writes included.",
+      "row": {
+        "price_model": "claude-haiku-5-5",
+        "provider": "bedrock",
+        "input_tokens": 60000,
+        "cache_read_tokens": 30000,
+        "cache_write_tokens": 10000,
+        "cache_write_1h_tokens": 4000,
+        "output_tokens": 2000,
+        "usage_wire": "anthropic",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "status": "priced",
+        "basis": "tokens",
+        "cost_micros": 9735,
+        "price_micros": 9735,
+        "cost_class": "standard",
+        "price_class": "standard",
+        "cost_long": false,
+        "price_long": false
+      }
+    },
+    {
+      "name": "bedrock_tier_100k_over_threshold",
+      "why": "One past it: Bedrock's Regional long_ctx SKUs, every token (Global long = Anthropic's over-100K list, Regional = Global + 10%).",
+      "row": {
+        "price_model": "claude-haiku-5-5",
+        "provider": "bedrock",
+        "input_tokens": 60001,
+        "cache_read_tokens": 30000,
+        "cache_write_tokens": 10000,
+        "cache_write_1h_tokens": 4000,
+        "output_tokens": 2000,
+        "usage_wire": "anthropic",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "status": "priced",
+        "basis": "tokens",
+        "cost_micros": 48676,
+        "price_micros": 48676,
+        "cost_class": "standard",
+        "price_class": "standard",
+        "cost_long": true,
+        "price_long": true
+      }
+    },
+    {
+      "name": "openrouter_tier_100k_at_threshold",
+      "why": "OpenAI wire on OpenRouter, no reported cost: 100,000 input tokens (reads and writes inside) is not over min_prompt_tokens 100,000, so the dearest endpoint's base rates (a +10% regional one), plus the 5.5% credit fee. Estimated.",
+      "row": {
+        "price_model": "claude-haiku-5-5",
+        "provider": "openrouter",
+        "input_tokens": 100000,
+        "cache_read_tokens": 30000,
+        "cache_write_tokens": 10000,
+        "cache_write_1h_tokens": 4000,
+        "output_tokens": 2000,
+        "usage_wire": "openai",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "status": "estimated",
+        "basis": "dearest_endpoint",
+        "cost_micros": 10270,
+        "price_micros": 10270,
+        "cost_class": "standard",
+        "price_class": "standard",
+        "cost_long": false,
+        "price_long": false
+      }
+    },
+    {
+      "name": "openrouter_tier_100k_over_threshold",
+      "why": "100,001 on the OpenAI wire: every endpoint's long override applies; the dearest is a +10% regional host, plus the credit fee.",
+      "row": {
+        "price_model": "claude-haiku-5-5",
+        "provider": "openrouter",
+        "input_tokens": 100001,
+        "cache_read_tokens": 30000,
+        "cache_write_tokens": 10000,
+        "cache_write_1h_tokens": 4000,
+        "output_tokens": 2000,
+        "usage_wire": "openai",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "status": "estimated",
+        "basis": "dearest_endpoint",
+        "cost_micros": 51353,
+        "price_micros": 51353,
+        "cost_class": "standard",
+        "price_class": "standard",
+        "cost_long": true,
+        "price_long": true
       }
     },
     {

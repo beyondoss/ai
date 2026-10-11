@@ -145,7 +145,8 @@ impl Class {
 pub struct LongContext {
     pub threshold: u64,
     /// `true`: the tier applies at `prompt >= threshold` (xAI, "reaches"); `false`: at
-    /// `prompt > threshold` (OpenAI, "more than 272K"; OpenRouter's `min_prompt_tokens`).
+    /// `prompt > threshold` (OpenAI, "more than 272K"; Anthropic's Claude Haiku 5.5, "over 100,000
+    /// tokens", on Anthropic and Bedrock; OpenRouter's `min_prompt_tokens`).
     pub inclusive: bool,
 }
 

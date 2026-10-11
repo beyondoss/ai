@@ -35,7 +35,7 @@ pub use generated::{OPENROUTER_CREDIT_FEE, ROW_RATES};
 /// The exact rate table compiled into this build: the date its rates were checked, and a hash of
 /// the table (`rate_version_names_this_table` recomputes it, and fails with the new value when
 /// any rate changes). Logged on every priced `ai.usage` row.
-pub const RATE_VERSION: &str = "2026-10-11.87f1874f411d7061";
+pub const RATE_VERSION: &str = "2026-10-11.0b18dd2139ec9512";
 
 /// What one catalog row costs and charges.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

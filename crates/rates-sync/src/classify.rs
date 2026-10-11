@@ -95,6 +95,8 @@ pub fn broken_kind(err: &str) -> &'static str {
         || err.contains("are not Anthropic's list")
         || err.contains("are not Global x")
         || err.contains("[[prose]] xai.long_context says")
+        || err.contains("[[prose]] anthropic.long_context says")
+        || err.contains("but Anthropic's table prices the model flat")
     {
         "crosscheck"
     } else {

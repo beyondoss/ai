@@ -31,14 +31,17 @@
 //! | `xai::web_search`             | xAI tokens + tool fee vs ticks    | ~$0.03  |
 //! | `openai::long_context`        | > 272K input: 2× in, 1.5× out     | ~$0.06  |
 //! | `xai::long_context`           | ≥ 200K prompt: 2× (vs xAI ticks)  | ~$0.42  |
+//! | `anthropic::long_context`     | > 100K prompt: 5×, Haiku 5.5      | ~$0.05  |
+//! | `bedrock::long_context`       | the same on the `us.` long SKUs   | ~$0.06  |
 //! | `bedrock::cancel_gap`         | a drained cancel = the full run   | < $0.01 |
 //! | `groq::cancel_gap`            | the same on Groq (needs a key)    | < $0.01 |
 //!
 //! Cached input and every catalog row's basic rates are reconciled elsewhere. BIL-5
 //! (`reconcile_live.rs`) does it per batch, against the providers' usage reports, and now prices
 //! them. CAT-7 (`catalog_live.rs`) does it per candidate, against reported costs. The long-context tiers
-//! are exercised on each vendor's cheapest long-context row (OpenAI's against its usage report,
-//! xAI's against its own billed cost); the vectors pin both boundaries exactly (at and one past).
+//! are exercised on each vendor's cheapest long-context row (OpenAI's and Anthropic's Claude Haiku
+//! 5.5 against their usage reports, xAI's against its own billed cost, Bedrock's Haiku 5.5 against
+//! Anthropic's long list × 1.1); the vectors pin every boundary exactly (at and one past).
 //! The cancel-gap cases measure how far a cancelled stream's row (what the gateway saw) falls
 //! short of the full completion a host that keeps generating bills, and record it in
 //! `target/verify-cancel-gap.jsonl`.
@@ -208,6 +211,20 @@ const CASES: &[Case] = &[
         pool_var: "OPENAI_API_KEY",
         admin_var: Some("OPENAI_ADMIN_KEY"),
         run: openai_long_context,
+    },
+    Case {
+        name: "anthropic::long_context",
+        provider: "anthropic",
+        pool_var: "ANTHROPIC_API_KEY",
+        admin_var: Some("ANTHROPIC_ADMIN_KEY"),
+        run: anthropic_long_context,
+    },
+    Case {
+        name: "bedrock::long_context",
+        provider: "bedrock",
+        pool_var: "AWS_BEARER_TOKEN_BEDROCK",
+        admin_var: None,
+        run: bedrock_long_context,
     },
     Case {
         name: "xai::long_context",
@@ -1418,8 +1435,8 @@ fn openai_cost_day(pool: &str, admin: &str, day: u64) -> Result<u64, Failed> {
 // Long-context tiers
 // ---------------------------------------------------------------------------------------------
 
-/// A prompt of about `n` tokens on the GPT and Grok tokenizers (` a` is one token each), with a
-/// nonce first so no cache serves it.
+/// A prompt of about `n` tokens on the GPT, Grok and Claude tokenizers (` a` is one token each),
+/// with a nonce first so no cache serves it.
 fn long_prompt(n: usize) -> String {
     format!(
         "Run {}-{}. Reply with the word ok and nothing else.{}",
@@ -1484,6 +1501,81 @@ fn openai_long_context(ctx: &Ctx) -> Result<(), Failed> {
             }
             std::thread::sleep(POLL);
         }
+    }
+    Ok(())
+}
+
+/// Claude Haiku 5.5's prompt tokens on a row: every input token, cache reads and writes included,
+/// which is what its long-context threshold is measured on (Anthropic wire).
+fn claude_prompt(row: &Value) -> u64 {
+    let n = |k: &str| row[k].as_u64().unwrap_or(0);
+    n("input_tokens") + n("cache_read_tokens") + n("cache_write_tokens")
+}
+
+/// Claude Haiku 5.5's long-context tier (a prompt over 100,000 tokens bills every token at 5×) on
+/// Anthropic, held to Anthropic's usage report: about $0.05.
+fn anthropic_long_context(ctx: &Ctx) -> Result<(), Failed> {
+    let model = "claude-haiku-5-5";
+    let window = ctx.admin.as_ref().map(|_| Window::open());
+    let reply = ctx.post(
+        "/v1/messages",
+        &[],
+        &messages(model, &long_prompt(100_100), json!({})),
+        None,
+    )?;
+    ctx.ok(&reply)?;
+    let row = ctx.row(&reply)?;
+    anthropic_usage_matches(&reply, &row)?;
+    let prompt = claude_prompt(&row);
+    if prompt <= 100_000 {
+        return Err(format!("prompt of {prompt} tokens is not over 100,000: {row}").into());
+    }
+    priced(&row)?;
+    if !row["price_detail"]
+        .as_str()
+        .unwrap_or("")
+        .contains("long=true")
+    {
+        return Err(format!("{prompt} prompt tokens not priced at the long tier: {row}").into());
+    }
+    if let Some(w) = window {
+        anthropic_report_settles(ctx, model, w.close(), "", &totals_of(&[&row]), 0)?;
+    }
+    Ok(())
+}
+
+/// The same tier on Bedrock's `us.` profile: the Regional `long_ctx` SKUs, which are Anthropic's
+/// over-100K list × 1.1. Bedrock reports no cost, so the row's usage is held to the response and
+/// its cost to that identity: about $0.06.
+fn bedrock_long_context(ctx: &Ctx) -> Result<(), Failed> {
+    let reply = ctx.post(
+        "/v1/messages",
+        &["x-beyond-only: bedrock"],
+        &messages("claude-haiku-5-5", &long_prompt(100_100), json!({})),
+        None,
+    )?;
+    ctx.ok(&reply)?;
+    let row = ctx.row(&reply)?;
+    anthropic_usage_matches(&reply, &row)?;
+    eq("provider", &row["provider"], &json!("bedrock"), &row)?;
+    let prompt = claude_prompt(&row);
+    if prompt <= 100_000 {
+        return Err(format!("prompt of {prompt} tokens is not over 100,000: {row}").into());
+    }
+    let (cost, _) = priced(&row)?;
+    if !reprice(&row, true)?.cost.long {
+        return Err(format!("{prompt} prompt tokens not at the long tier: {row}").into());
+    }
+    let mut as_list = row.clone();
+    as_list["provider"] = json!("anthropic");
+    as_list["price_variant"] = Value::Null;
+    let list = reprice(&as_list, false)?;
+    if !list.cost.long || cost.abs_diff(list.cost.micros * 11 / 10) > 1 {
+        return Err(format!(
+            "Bedrock us. long-context cost {cost} is not Anthropic's long list {} × 1.1 ({row})",
+            list.cost.micros
+        )
+        .into());
     }
     Ok(())
 }
