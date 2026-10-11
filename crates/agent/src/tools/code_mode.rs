@@ -976,6 +976,76 @@ mod runtime {
             assert!(out.contains("mcp__github__list_issues"), "{out}");
         }
 
+        /// A tool from a captured real catalog (`eval/mcp_catalogs/`).
+        struct Real {
+            name: String,
+            desc: String,
+            schema: Value,
+        }
+
+        #[async_trait]
+        impl Tool for Real {
+            fn name(&self) -> &str {
+                &self.name
+            }
+            fn description(&self) -> &str {
+                &self.desc
+            }
+            fn input_schema(&self) -> Value {
+                self.schema.clone()
+            }
+            async fn run(&self, _: Value) -> Result<ToolOutput, ToolError> {
+                Ok("ok".into())
+            }
+        }
+
+        fn real(server: &str, catalog: &str) -> Vec<Arc<dyn Tool>> {
+            serde_json::from_str::<Vec<Value>>(catalog)
+                .unwrap()
+                .into_iter()
+                .map(|t| {
+                    Arc::new(Real {
+                        name: format!("mcp__{server}__{}", t["name"].as_str().unwrap()),
+                        desc: t["description"].as_str().unwrap_or_default().into(),
+                        schema: t["inputSchema"].clone(),
+                    }) as Arc<dyn Tool>
+                })
+                .collect()
+        }
+
+        /// The A/B regression on the real playwright and github catalogs: a one-word query that is
+        /// a prefix every tool name shares ("browser" on `browser_*`), a server name, or a common
+        /// verb must list those tools, not `[]`.
+        #[tokio::test]
+        async fn execute_search_finds_a_shared_name_prefix() {
+            let mut tools = real(
+                "playwright",
+                include_str!("../../eval/mcp_catalogs/playwright.json"),
+            );
+            tools.extend(real(
+                "github",
+                include_str!("../../eval/mcp_catalogs/github.json"),
+            ));
+            let tool = exec(tools);
+            for (query, want, at_least) in [
+                ("browser", "playwright.browser_click", 25),
+                ("github", "github.get_issue", 26),
+                ("list", "github.list_issues", 3),
+            ] {
+                let out = run_code(
+                    &tool,
+                    &format!(
+                        "const t = await tools.search({query:?}); return t.map((x) => x.path);"
+                    ),
+                )
+                .await
+                .unwrap();
+                let paths: Vec<String> = serde_json::from_str(&out).unwrap();
+                assert!(paths.len() >= at_least, "{query:?}: {paths:?}");
+                assert!(paths.iter().any(|p| p == want), "{query:?}: {paths:?}");
+            }
+        }
+
         /// The A/B regression: `tools.search("get file contents")` returned `[]` for
         /// `github.get_file_contents` — the query was matched as one exact phrase.
         #[tokio::test]
