@@ -51,9 +51,31 @@ pub fn read_spec(root: &Path) -> Result<spec::Spec> {
 
 /// The generated module's text, from the snapshots in `sources_dir` and the truth file.
 pub fn generate(root: &Path, sources_dir: &Path) -> Result<String> {
+    generate_table(root, sources_dir).map(|(_, text)| text)
+}
+
+/// The table and its generated module's text.
+pub fn generate_table(root: &Path, sources_dir: &Path) -> Result<(build::Table, String)> {
     let spec = read_spec(root)?;
     let defs = sources::all(&spec.openrouter_slugs());
     let store = snapshot::load(sources_dir, &defs)?;
     let table = build::build(&store, &spec)?;
-    emit::render(&table)
+    let text = emit::render(&table)?;
+    Ok((table, text))
+}
+
+/// Remove each settled `[[conflict]]` (its sources agree again) from the truth file. Returns what
+/// it removed, `card field`.
+pub fn remove_settled(root: &Path, settled: &[(String, String)]) -> Result<Vec<String>> {
+    if settled.is_empty() {
+        return Ok(Vec::new());
+    }
+    let path = root.join(TRUTH);
+    let mut truth =
+        std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    for (card, field) in settled {
+        truth = catalog_edit::remove_conflict(&truth, card, field)?;
+    }
+    std::fs::write(&path, truth).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(settled.iter().map(|(c, f)| format!("{c} {f}")).collect())
 }

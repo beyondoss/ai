@@ -23,6 +23,19 @@ fn rates_generated_from_sources() {
             "{GENERATED} is not what the snapshots generate; run `mise run rates:generate`:\n{d}"
         );
     }
+    // A committed [[conflict]] whose sources agree again is stale: remove it.
+    let spec = rates_sync::read_spec(&root).unwrap();
+    let store = rates_sync::snapshot::load(
+        &root.join(SOURCES),
+        &rates_sync::sources::all(&spec.openrouter_slugs()),
+    )
+    .unwrap();
+    let table = rates_sync::build::build(&store, &spec).unwrap();
+    assert!(
+        table.settled_conflicts.is_empty(),
+        "[[conflict]] entries whose sources agree again, to remove from verify/catalog_truth.toml: {:?}",
+        table.settled_conflicts
+    );
     // Twice is the same: nothing in generation depends on time, order of a map, or the network.
     assert_eq!(
         want,

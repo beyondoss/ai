@@ -8,7 +8,7 @@ name: Rates drift
 #   regenerated, RATE_VERSION is bumped (`rates-sync rate-version`), and a `rates/sync-*` PR labeled
 #   `rates-routine` or `rates-review` is opened, or the open one is updated. A human merges it.
 # - broken (a fetch, a reader meeting a new layout, a missing quote, a cross-check disagreement, a
-#   stale override or conflict): nothing is regenerated; the open `rates-broken` issue for that
+#   stale conflict): nothing is regenerated; the open `rates-broken` issue for that
 #   failure kind is updated, or one is opened, and the job fails.
 #
 # Every run, an open `rates/sync-*` PR that fell behind main is rebased (or regenerated on main from
@@ -78,10 +78,16 @@ jobs:
           echo "class=$(jq -r .class "$RUNNER_TEMP/classify.json")" >>"$GITHUB_OUTPUT"
           jq -r .markdown "$RUNNER_TEMP/classify.json" >"$RUNNER_TEMP/body.md"
           cat "$RUNNER_TEMP/body.md" >>"$GITHUB_STEP_SUMMARY"
-      - name: Bump RATE_VERSION
+      - name: Bump RATE_VERSION and recompute the golden vectors
         if: steps.classify.outputs.class == 'routine' || steps.classify.outputs.class == 'review'
-        # A fresh build links the regenerated table, so the hash it writes names that table.
-        run: cargo run -q -p beyond-ai-rates-sync -- rate-version </dev/null
+        # A fresh build links the regenerated table, so the hash it writes names that table. The
+        # vectors whose rates moved are recomputed by the independent reference pricer, never by
+        # the crate under test, so a routine change (a promotion starting or ending) passes CI.
+        run: |
+          cargo run -q -p beyond-ai-rates-sync -- rate-version </dev/null
+          mkdir -p target
+          cargo run -q -p beyond-ai-rates-sync -- dump --json >target/rate-table.json </dev/null
+          python3 -I verify/pricing_reference.py target/rate-table.json verify/pricing_vectors.json --write
       - name: Open or update the rates PR
         if: steps.classify.outputs.class == 'routine' || steps.classify.outputs.class == 'review'
         env:
@@ -101,7 +107,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "$bot"
           remote="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
-          paths=(crates/providers/src/rates/generated.rs verify/rates_sources)
+          paths=(crates/providers/src/rates/generated.rs verify/rates_sources verify/catalog_truth.toml)
           commit() {
             git switch -q -c "$1"
             git add -A -- "${paths[@]}" crates/providers/src/rates.rs verify/pricing_vectors.json

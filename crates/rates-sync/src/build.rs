@@ -131,6 +131,9 @@ pub struct Table {
     /// `(slug, endpoints)`, sorted by slug.
     pub openrouter: Vec<(String, Vec<Endpoint>)>,
     pub rows: Vec<Row>,
+    /// `[[conflict]]`s whose sources agree again, `(card, field)`: no longer a disagreement to
+    /// record. The agreed value is in the table.
+    pub settled_conflicts: Vec<(String, String)>,
 }
 
 /// `anthropic:claude-opus-4-8` → `ANTHROPIC_CLAUDE_OPUS_4_8`.
@@ -195,9 +198,19 @@ fn check_quote(store: &Store, url: &str, quote: &str, what: &str) -> Result<()> 
 struct Ctx<'a> {
     store: &'a Store,
     spec: &'a Spec,
+    /// `[[conflict]]`s whose sources agree again: `(card, field)`.
+    settled: std::cell::RefCell<Vec<(String, String)>>,
 }
 
-impl Ctx<'_> {
+impl<'a> Ctx<'a> {
+    fn new(store: &'a Store, spec: &'a Spec) -> Ctx<'a> {
+        Ctx {
+            store,
+            spec,
+            settled: std::cell::RefCell::new(Vec::new()),
+        }
+    }
+
     fn prose_value(&self, id: &str) -> Result<String> {
         let p = self.spec.prose(id)?;
         check_quote(self.store, &p.url, &p.quote, &format!("[[prose]] {id}"))?;
@@ -221,17 +234,18 @@ impl Ctx<'_> {
         };
         let first = says[0].1;
         if says.iter().all(|(_, r)| *r == first) {
-            if let Some(c) = self
+            // The sources agree again (a promotion that split them ended): the agreed value is
+            // the only one, so it is used, and the entry is reported settled for removal
+            // (`classify --apply` removes it; a committed one fails `rates_generated_from_sources`).
+            if self
                 .spec
                 .conflicts
                 .iter()
-                .find(|c| c.card == card && c.field == field)
+                .any(|c| c.card == card && c.field == field)
             {
-                return Err(format!(
-                    "[[conflict]] {card} {field}: the sources now agree ({}); remove it ({})",
-                    show(&first),
-                    c.reason
-                ));
+                self.settled
+                    .borrow_mut()
+                    .push((card.to_owned(), field.to_owned()));
             }
             return Ok(first);
         }
@@ -562,58 +576,17 @@ impl Ctx<'_> {
                 )?,
             ),
         };
-        let mut p = Published {
+        // The card is what the source says today, promotions included: pricing is pass-through,
+        // so a promotional rate Together bills is the rate the customer pays, and the promotion's
+        // end is an ordinary (routine) rate change the next sync picks up.
+        let p = Published {
             input,
             output: Some(output),
             cache_read: cached,
             cache_write: None,
             cache_write_1h: None,
         };
-        self.apply_override(name, &mut p, "together.models")?;
         Ok(Card::new(Tr::from(&p, name)?))
-    }
-
-    fn apply_override(&self, name: &str, p: &mut Published, source: &str) -> Result<()> {
-        let Some(o) = self.spec.overrides.iter().find(|o| o.card == name) else {
-            return Ok(());
-        };
-        check_quote(
-            self.store,
-            &o.url,
-            &o.quote,
-            &format!("[[override]] {name}"),
-        )?;
-        let fetched = &self
-            .store
-            .entries
-            .get(source)
-            .ok_or_else(|| format!("no snapshot {source}"))?
-            .fetched;
-        if fetched.as_str() > o.until.as_str() {
-            return Err(format!(
-                "[[override]] {name} ran until {}; the {source} snapshot is from {fetched}: remove it",
-                o.until
-            ));
-        }
-        for (field, want) in &o.source_says {
-            let got = field_of(p, field)?
-                .map_or("absent".to_owned(), |r| r.table_text().unwrap_or_default());
-            if &got != want {
-                return Err(format!(
-                    "[[override]] {name} is stale: {source} now says {field} = {got}, not {want}: remove it"
-                ));
-            }
-        }
-        for (field, v) in &o.holds {
-            let r = Rate::per_million(v)?;
-            match field.as_str() {
-                "input" => p.input = r,
-                "output" => p.output = Some(r),
-                "cache_read" => p.cache_read = Some(r),
-                f => return Err(format!("[[override]] {name}: unknown field {f}")),
-            }
-        }
-        Ok(())
     }
 
     fn fireworks(&self, spec: &CardSpec) -> Result<Card> {
@@ -694,15 +667,6 @@ impl Ctx<'_> {
     }
 }
 
-fn field_of(p: &Published, field: &str) -> Result<Option<Rate>> {
-    match field {
-        "input" => Ok(Some(p.input)),
-        "output" => Ok(p.output),
-        "cache_read" => Ok(p.cache_read),
-        f => Err(format!("unknown field {f}")),
-    }
-}
-
 /// `>272000` (strictly more) or `>=200000` (reaches).
 fn threshold(v: &str) -> Result<(u64, bool)> {
     let (inclusive, n) = match v.strip_prefix(">=") {
@@ -746,19 +710,19 @@ pub fn or_search_name(micros: u64) -> String {
 /// One card from its `[[card]]` spec, as [`build`] reads it: `catalog-drift` prices a row this way
 /// before the row exists.
 pub fn card(store: &Store, spec: &Spec, c: &CardSpec) -> Result<Card> {
-    Ctx { store, spec }.card(c)
+    Ctx::new(store, spec).card(c)
 }
 
 /// One OpenRouter slug's endpoint cards, as [`build`] reads them (the slug must be in the store's
 /// `openrouter.models` and have its `openrouter.endpoints/{slug}` snapshot).
 pub fn openrouter(store: &Store, spec: &Spec, slug: &str) -> Result<Vec<Endpoint>> {
-    let eps = Ctx { store, spec }.openrouter(slug)?;
+    let eps = Ctx::new(store, spec).openrouter(slug)?;
     Ok(eps.into_iter().map(|(e, _)| e).collect())
 }
 
 /// Build the table from the snapshots and the spec.
 pub fn build(store: &Store, spec: &Spec) -> Result<Table> {
-    let cx = Ctx { store, spec };
+    let cx = Ctx::new(store, spec);
     let fee = cx.prose_value("openrouter.credit_fee")?;
     let credit_fee_bps = 10_000 + bps(&fee)?;
 
@@ -802,11 +766,6 @@ pub fn build(store: &Store, spec: &Spec) -> Result<Table> {
     for x in &spec.superseded {
         if !spec.cards.iter().any(|c| c.name == x.card) {
             return Err(format!("[[superseded]] for unknown card {}", x.card));
-        }
-    }
-    for o in &spec.overrides {
-        if !spec.cards.iter().any(|x| x.name == o.card) {
-            return Err(format!("[[override]] for unknown card {}", o.card));
         }
     }
 
@@ -916,5 +875,6 @@ pub fn build(store: &Store, spec: &Spec) -> Result<Table> {
         cards,
         openrouter,
         rows,
+        settled_conflicts: cx.settled.into_inner(),
     })
 }

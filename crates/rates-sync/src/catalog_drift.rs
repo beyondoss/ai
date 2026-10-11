@@ -491,13 +491,7 @@ impl Catalog<'_> {
     /// Entries in the truth file's per-candidate measurements that name `needle`.
     fn measured(&self, needles: &[&str]) -> Vec<String> {
         let mut out = Vec::new();
-        for list in [
-            "schema_unenforced",
-            "conflict",
-            "override",
-            "superseded",
-            "promo",
-        ] {
+        for list in ["schema_unenforced", "conflict", "superseded", "promo"] {
             for e in truth_list(self.truth, list) {
                 let hit = e.as_table().is_some_and(|t| {
                     t.values()
