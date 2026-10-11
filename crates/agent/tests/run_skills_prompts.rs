@@ -311,6 +311,42 @@ fn run_binary_no_context_files_skips_project_instructions() {
 }
 
 #[test]
+fn run_binary_caps_a_long_project_instruction_file_at_32_kib_with_a_marker() {
+    // An AGENTS.md rides every request; past 32 KiB (Codex's cap) the rest is left out and the model
+    // is told so, with the file's path, rather than paying for it on every turn.
+    let dir = tempfile::tempdir().unwrap();
+    let mut body = "HEAD-MARKER-31\n".to_string();
+    body.push_str(&"Keep functions small and name them for what they do.\n".repeat(2_000));
+    body.push_str("TAIL-MARKER-97\n");
+    std::fs::write(dir.path().join("AGENTS.md"), &body).unwrap();
+    let (base, bodies) = spawn_model_server(vec![turn_text("done")]);
+    let output = run_cmd(env!("CARGO_BIN_EXE_beyond-ai-agent"))
+        .args([
+            "run",
+            "hello",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--no-session-persistence",
+        ])
+        .current_dir(dir.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+    assert!(output.status.success());
+    let req = &bodies.lock().unwrap()[0];
+    assert!(req.contains("HEAD-MARKER-31"));
+    assert!(!req.contains("TAIL-MARKER-97"), "the tail is past the cap");
+    assert!(
+        req.contains("AGENTS.md is 104 KiB; only its first 32 KiB is included here"),
+        "{req}"
+    );
+}
+
+#[test]
 fn run_binary_injects_project_instructions_by_default() {
     // The other half of the previous test: without the flag, CLAUDE.md must still be injected —
     // proving `--no-context-files` genuinely toggles behavior rather than the marker just never having
