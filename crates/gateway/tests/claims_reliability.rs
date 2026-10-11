@@ -630,6 +630,19 @@ impl RestartableNats {
         self.relays.lock().unwrap().len()
     }
 
+    /// Wait for every tracked relay to finish, leaving them tracked. A relay ends on its own once
+    /// both sides close (the client hangs up, then the server answers its EOF), but after the client
+    /// has moved on: until then it is still live, and pruning is right to keep it.
+    async fn relays_finished(&self) {
+        let mut relays = std::mem::take(&mut *self.relays.lock().unwrap());
+        for relay in &mut relays {
+            let _ = relay.await;
+        }
+        let mut tracked = self.relays.lock().unwrap();
+        relays.append(&mut tracked);
+        *tracked = relays;
+    }
+
     async fn up(&mut self) {
         let ports = self.dir.join("ports");
         let _ = std::fs::remove_dir_all(&ports);
@@ -716,9 +729,15 @@ async fn the_restartable_nats_refuses_while_down_and_keeps_its_port() {
     for _ in 0..5 {
         assert!(greeting(nats.port).await.is_some());
     }
-    // Each finished relay is pruned when the next one starts.
-    assert!(
-        nats.relays_tracked() <= 2,
+    // Every finished relay is pruned when the next one starts. Wait for those still tracked to
+    // finish (each ends after its client hung up, on its own schedule), then start one more: it is
+    // the only one left. Counting before they finished raced them: under CPU contention three were
+    // still live, rightly kept.
+    nats.relays_finished().await;
+    assert!(greeting(nats.port).await.is_some());
+    assert_eq!(
+        nats.relays_tracked(),
+        1,
         "finished relays pile up: {}",
         nats.relays_tracked()
     );
