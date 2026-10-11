@@ -6,7 +6,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use providers::catalog::{
-    Candidate, IN_FILE, IN_IMAGE, IN_TEXT, ListPrice, ModelCard, ModelRoute, REASONING,
+    Candidate, DataUse, IN_FILE, IN_IMAGE, IN_TEXT, ListPrice, ModelCard, ModelRoute, REASONING,
     STRUCTURED_OUTPUTS, TOOLS,
 };
 use providers::{ProviderId, WireFormat};
@@ -62,6 +62,7 @@ fn row(model: &'static str, c: &'static [Candidate], name: &'static str) -> Mode
             max_output_published: true,
             input: IN_TEXT | IN_IMAGE | IN_FILE,
             features: TOOLS | REASONING | STRUCTURED_OUTPUTS,
+            data_use: DataUse::Standard,
         },
     }
 }
@@ -604,5 +605,42 @@ fn a_candidate_its_host_stopped_listing_retires_today() {
         r.retired[0].contains("retired = \"2026-10-10\""),
         "{}",
         r.retired[0]
+    );
+}
+
+/// `row` as a model whose vendor trains on what it serves.
+fn training(mut r: ModelRoute) -> ModelRoute {
+    r.card.data_use = DataUse::TrainsOnInputs {
+        terms: "https://example.com/terms",
+    };
+    r
+}
+
+/// A row that trains on inputs was carried by owner decision: its successor waits for one too.
+/// claim: CAT-17
+#[test]
+fn needs_human_successor_of_a_row_that_trains_on_inputs() {
+    let mut w = with_48();
+    w.rows = vec![training(sonata47())];
+    human(
+        &run(&w),
+        "add-claude-sonata-4-8",
+        "claude-sonata-4-7 trains on inputs",
+    );
+}
+
+/// A retired name never becomes an alias of a row that trains on inputs: only its own name
+/// reaches one.
+/// claim: CAT-17
+#[test]
+fn needs_human_alias_onto_a_row_that_trains_on_inputs() {
+    let mut w = with_48();
+    w.rows.push(training(sonata48()));
+    w.anthropic[0].2 = Some("2026-10-20T00:00:00Z");
+    w.or[0].3 = Some("2026-10-20");
+    human(
+        &run(&w),
+        "retire-claude-sonata-4-7",
+        "claude-sonata-4-8 trains on inputs",
     );
 }

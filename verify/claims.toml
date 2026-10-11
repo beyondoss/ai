@@ -2156,6 +2156,18 @@ touches = [
 ]
 defects = ["D181", "D182"]
 
+[[claim]]
+id = "CAT-17"
+priority = "P0"
+group = "Catalog truth"
+text = "A row whose vendor may train on what it serves is served only to a caller who names it: no alias, fallback, order, split or only walk of another row reaches it, catalog-drift never aliases to it or generates its successor unattended, and GET /v1/models labels it with the vendor's terms"
+layer = "both"
+touches = [
+  "crates/providers/src/catalog.rs",
+  "crates/rates-sync/src/catalog_drift.rs",
+]
+defects = []
+
 # --- Translation detail ------------------------------------------------------------------------
 [[claim]]
 id = "TRN-1"

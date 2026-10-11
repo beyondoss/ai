@@ -901,6 +901,15 @@ fn successor(
         .collect();
     notes.dedup();
 
+    // A row whose vendor trains on what it serves is carried by owner decision, row by row
+    // (`catalog::DataUse`): its successor is too.
+    if pred.card.data_use.trains_on_inputs() {
+        reasons.push(format!(
+            "{} trains on inputs (DataUse::TrainsOnInputs): carrying another such row is an owner decision",
+            pred.model
+        ));
+    }
+
     // Each predecessor host's id for the new version, as that host lists it.
     let mut kept: Vec<(bool, NewCand)> = Vec::new();
     let mut ids: BTreeMap<&'static str, String> = BTreeMap::new();
@@ -1678,6 +1687,18 @@ fn retire_row(
             reasons.push(format!(
                 "every candidate of {} retires and no newer row in its line exists to alias it to",
                 row.model
+            ));
+        }
+        // An alias serves a name the caller did not mean as that row: never onto a row whose
+        // vendor trains on what it serves (`catalog::DataUse`), which only its own name reaches.
+        if let Some(to) = successor
+            && cat
+                .rows
+                .iter()
+                .any(|r| r.model == to && r.card.data_use.trains_on_inputs())
+        {
+            reasons.push(format!(
+                "{to} trains on inputs (DataUse::TrainsOnInputs): no name may alias to it"
             ));
         }
     } else if retiring(&row.candidates[0]) {
