@@ -1,0 +1,21 @@
+{
+  "data": {
+    "endpoints": [
+      {
+        "context_length": 1048576,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.0000002",
+          "discount": 0,
+          "input_cache_read": "0.000000002",
+          "prompt": "0.0000001",
+          "web_search": "0.0025"
+        },
+        "provider_name": "Meta",
+        "quantization": "unknown",
+        "tag": "meta"
+      }
+    ],
+    "id": "meta/muse-spark-1.2-contributor"
+  }
+}

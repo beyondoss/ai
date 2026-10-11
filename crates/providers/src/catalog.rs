@@ -1958,6 +1958,42 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
             TOOLS | REASONING | STRUCTURED_OUTPUTS,
         ),
     },
+    // Meta's Muse Spark Contributor tier: "heavily discounted token pricing in exchange for
+    // permission to use your prompts and completions to train future Meta models" (Meta's pricing
+    // page), so a request on these rows is training data for Meta. We hold no Meta key, and
+    // OpenRouter's only host is Meta on OpenRouter's own key (D156), so they are OpenRouter-only,
+    // at Meta's own rate, which OpenRouter's card matches. OpenRouter serves them only to an
+    // account that has confirmed 18+ age (403 otherwise).
+    ModelRoute {
+        model: "meta/muse-spark-1.2-contributor",
+        wire: WireFormat::OpenAi,
+        candidates: &openrouter_only("meta/muse-spark-1.2-contributor"),
+        responses: &[],
+        price: price("0.1", "0.2", "0.002", "0.1"), // cache_write unpublished; equals input
+        card: card_unpublished_output(
+            "Muse Spark 1.2 Contributor",
+            "meta",
+            1787336476,
+            1_048_576,
+            IN_TEXT | IN_IMAGE | IN_FILE | IN_VIDEO,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
+    },
+    ModelRoute {
+        model: "meta/muse-spark-1.3-contributor",
+        wire: WireFormat::OpenAi,
+        candidates: &openrouter_only("meta/muse-spark-1.3-contributor"),
+        responses: &[],
+        price: price("0.1", "0.2", "0.002", "0.1"), // cache_write unpublished; equals input
+        card: card_unpublished_output(
+            "Muse Spark 1.3 Contributor",
+            "meta",
+            1788381519,
+            1_048_576,
+            IN_TEXT | IN_IMAGE | IN_FILE | IN_VIDEO,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
+    },
     ModelRoute {
         model: "minimax/minimax-m3",
         wire: WireFormat::OpenAi,

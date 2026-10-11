@@ -907,6 +907,24 @@ cache_read = "0.04"
 context_window = 131_072
 
 [[row]]
+model = "meta/muse-spark-1.2-contributor"
+source = ["https://llama.developer.meta.com/docs/pricing-rate-limits"]
+date = "2026-10-11"
+input = "0.10"
+output = "0.20"
+cache_read = "0.002"
+note = "OpenRouter-primary (Meta its only host). Meta Model API, Contributor tier (muse-spark-1.3-contributor, muse-spark-1.2-contributor): \"Heavily discounted token pricing in exchange for permission to use your prompts and completions to train future Meta models.\" Cached input $0.002, input $0.10, output $0.20; web search grounding $2.50 per 1,000 queries; \"There is no long-context premium\". No cache-write rate."
+
+[[row]]
+model = "meta/muse-spark-1.3-contributor"
+source = ["https://llama.developer.meta.com/docs/pricing-rate-limits"]
+date = "2026-10-11"
+input = "0.10"
+output = "0.20"
+cache_read = "0.002"
+note = "OpenRouter-primary (Meta its only host). Meta Model API, Contributor tier (muse-spark-1.3-contributor, muse-spark-1.2-contributor): \"Heavily discounted token pricing in exchange for permission to use your prompts and completions to train future Meta models.\" Cached input $0.002, input $0.10, output $0.20; web search grounding $2.50 per 1,000 queries; \"There is no long-context premium\". No cache-write rate."
+
+[[row]]
 model = "minimax/minimax-m3"
 source = [
   "https://www.together.ai/pricing",
@@ -2931,6 +2949,16 @@ cost = { openrouter = "openrouter:meta-llama/llama-4-scout" }
 model = "meta/muse-glimmer-30b"
 list_card = "list"
 cost = { together = "together:meta-models/Muse-Glimmer-30B", openrouter = "openrouter:meta/muse-glimmer-30b" }
+
+[[pricing]]
+model = "meta/muse-spark-1.2-contributor"
+list_card = "list"
+cost = { openrouter = "openrouter:meta/muse-spark-1.2-contributor" }
+
+[[pricing]]
+model = "meta/muse-spark-1.3-contributor"
+list_card = "list"
+cost = { openrouter = "openrouter:meta/muse-spark-1.3-contributor" }
 
 [[pricing]]
 model = "minimax/minimax-m3"

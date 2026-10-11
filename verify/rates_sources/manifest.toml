@@ -264,6 +264,22 @@ raw_sha256 = "6ea65629f592bc0d7377dbd59af5122552349ff5cab8fda4e3ebe1d063df5fb5"
 sha256 = "8480e64e8df6e5cfa9d8031f5dd1f8170eb152677f8e502be4e28646a727e437"
 
 [[source]]
+id = "openrouter.endpoints/meta/muse-spark-1.2-contributor"
+url = "https://openrouter.ai/api/v1/models/meta/muse-spark-1.2-contributor/endpoints"
+file = "openrouter/endpoints/meta/muse-spark-1.2-contributor.json"
+fetched = "2026-10-11"
+raw_sha256 = "48f8a22a24768fe42f7beda53bdc128b3fc2cf5a409cd7aa4e69d15204f9e989"
+sha256 = "26a9ddc7769db5c19c63b064e8fe31376a14523bf81bafbe967579e150a9ad3f"
+
+[[source]]
+id = "openrouter.endpoints/meta/muse-spark-1.3-contributor"
+url = "https://openrouter.ai/api/v1/models/meta/muse-spark-1.3-contributor/endpoints"
+file = "openrouter/endpoints/meta/muse-spark-1.3-contributor.json"
+fetched = "2026-10-11"
+raw_sha256 = "d9e278be8c3d3f6d976dd63cb48d79f9f0780621b5eb75312e28aa07b684127f"
+sha256 = "200a9f8aff23179ee060dbc23273c0ae3ab3725644cedc6960a99d56eab58a72"
+
+[[source]]
 id = "openrouter.endpoints/minimax/minimax-m3"
 url = "https://openrouter.ai/api/v1/models/minimax/minimax-m3/endpoints"
 file = "openrouter/endpoints/minimax/minimax-m3.json"
@@ -773,7 +789,7 @@ url = "https://openrouter.ai/api/v1/models?output_modalities=all"
 file = "openrouter/models.json"
 fetched = "2026-10-11"
 raw_sha256 = "0e82fd05910147d2eba464c632413fecbeb60b8f6a615590c00e38cc01d95ab9"
-sha256 = "1d2019a10bd7525c4f84cb8eb74c3a4a4882b1dfeeac0835f4097f7dda7dd514"
+sha256 = "27489860b6c8a4bb6e34935d31623291595484b181d6939e6a34ee5e117234c4"
 
 [[source]]
 id = "openrouter.pricing"

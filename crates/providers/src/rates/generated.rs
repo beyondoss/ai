@@ -48,6 +48,7 @@ const XAI_TOOLS: &[(Tool, u64)] = &[
 ];
 const OR_SEARCH_10: &[(Tool, u64)] = &[(Tool::WebSearch, 10000)];
 const OR_SEARCH_5: &[(Tool, u64)] = &[(Tool::WebSearch, 5000)];
+const OR_SEARCH_2500U: &[(Tool, u64)] = &[(Tool::WebSearch, 2500)];
 
 // --- vendor cards ---
 /// `anthropic:claude-fable-5`.
@@ -2484,6 +2485,32 @@ static OR_META_MUSE_GLIMMER_30B: &[OrEndpoint] = &[
         tag: "together",
         class: Class::Standard,
         card: Card::new(tr("0.35", "1.5", "0.04", "0.35", None)),
+    },
+];
+
+/// `meta/muse-spark-1.2-contributor` (`GET /api/v1/models/meta/muse-spark-1.2-contributor/endpoints`).
+static OR_META_MUSE_SPARK_1_2_CONTRIBUTOR: &[OrEndpoint] = &[
+    OrEndpoint {
+        host: "Meta",
+        tag: "meta",
+        class: Class::Standard,
+        card: Card {
+            tools: OR_SEARCH_2500U,
+            ..Card::new(tr("0.1", "0.2", "0.002", "0.1", None))
+        },
+    },
+];
+
+/// `meta/muse-spark-1.3-contributor` (`GET /api/v1/models/meta/muse-spark-1.3-contributor/endpoints`).
+static OR_META_MUSE_SPARK_1_3_CONTRIBUTOR: &[OrEndpoint] = &[
+    OrEndpoint {
+        host: "Meta",
+        tag: "meta",
+        class: Class::Standard,
+        card: Card {
+            tools: OR_SEARCH_2500U,
+            ..Card::new(tr("0.1", "0.2", "0.002", "0.1", None))
+        },
     },
 ];
 
@@ -7414,6 +7441,26 @@ pub static ROW_RATES: &[RowRates] = &[
             CandidateCost {
                 provider: ProviderId::OpenRouter,
                 card: CostCard::OpenRouter(OR_META_MUSE_GLIMMER_30B),
+            },
+        ],
+    },
+    RowRates {
+        model: "meta/muse-spark-1.2-contributor",
+        list: Card::new(tr("0.1", "0.2", "0.002", "0.1", None)),
+        cost: &[
+            CandidateCost {
+                provider: ProviderId::OpenRouter,
+                card: CostCard::OpenRouter(OR_META_MUSE_SPARK_1_2_CONTRIBUTOR),
+            },
+        ],
+    },
+    RowRates {
+        model: "meta/muse-spark-1.3-contributor",
+        list: Card::new(tr("0.1", "0.2", "0.002", "0.1", None)),
+        cost: &[
+            CandidateCost {
+                provider: ProviderId::OpenRouter,
+                card: CostCard::OpenRouter(OR_META_MUSE_SPARK_1_3_CONTRIBUTOR),
             },
         ],
     },
