@@ -163,6 +163,10 @@ pub struct CompactionConfig {
     /// history and so invalidates the prompt cache from its first edit on; a pass must buy back enough
     /// context to pay for that. Our `clear_at_least`.
     pub mask_min_free_tokens: u32,
+    /// Whether the summarization call is the live conversation plus a closing instruction (its
+    /// prefix read from the prompt cache; see `Agent::conversation_summary_request`), falling back to
+    /// the [`summary_request`] re-render only when that doesn't fit. `false`: always re-render.
+    pub cached_summary: bool,
 }
 
 impl CompactionConfig {
@@ -257,6 +261,7 @@ impl Default for CompactionConfig {
             mask_tool_output: true,
             mask_keep_turns: 10,
             mask_min_free_tokens: 25_000,
+            cached_summary: true,
         }
     }
 }
@@ -1040,8 +1045,62 @@ pub fn summary_request(
         prompt.push_str(custom);
     }
 
+    // A one-off prompt nothing will send again: a cache breakpoint on it only buys a write premium
+    // (1.25×, or 2× at the 1-hour TTL) on every token of the re-render.
     ModelRequest::new(model, Arc::new(vec![Message::user(prompt)]), max_tokens)
         .with_system(SUMMARY_SYSTEM)
+        .with_no_cache(true)
+}
+
+/// The closing user instruction of the cached summarization call — the one that sends the live
+/// conversation itself rather than a re-render of it (`Agent::conversation_summary_request`). Its
+/// request keeps the conversation's own system prompt (that is what makes the prefix a cache hit), so
+/// [`SUMMARY_SYSTEM`]'s guardrails ride here instead, ahead of the same structured format
+/// ([`SUMMARY_INSTRUCTION`]). The request carries the conversation's tools too, so it also says not
+/// to call one. A conversation that opens with an earlier summary gets the incremental rules; the
+/// read/modified-file tags and `custom_instructions` are added exactly as [`summary_request`] adds
+/// them, and the host still appends the carried provenance to whatever comes back.
+pub fn conversation_summary_instruction(
+    messages: &[Message],
+    file_ops: &CompactionProvenance,
+    custom_instructions: Option<&str>,
+) -> String {
+    let mut out = String::from(
+        "<system-reminder>Stop working on the task now. Do not call any tools. This conversation is \
+         about to be compacted: reply with nothing but a structured summary of it, which will replace \
+         everything above except the most recent turns (those stay verbatim, so spend the least on \
+         them).\n\n",
+    );
+    out.push_str(SUMMARY_SYSTEM);
+    out.push_str("\n\n");
+    out.push_str(SUMMARY_INSTRUCTION);
+    if previous_summary(messages).is_some() {
+        out.push_str(
+            "\n\nThe conversation opens with an earlier checkpoint summary (the message starting \
+             \"[Earlier conversation compacted to save context]\"). Fold it in: PRESERVE all of its \
+             information, ADD the progress, decisions and context since, move items from \"In \
+             Progress\" to \"Done\" as they were completed, and keep every Key Decision.",
+        );
+    }
+    let (read, modified) = (&file_ops.read_files, &file_ops.modified_files);
+    if !read.is_empty() {
+        out.push_str(&format!(
+            "\n\n<read-files>\n{}\n</read-files>",
+            read.join("\n")
+        ));
+    }
+    if !modified.is_empty() {
+        out.push_str(&format!(
+            "\n\n<modified-files>\n{}\n</modified-files>",
+            modified.join("\n")
+        ));
+    }
+    if let Some(custom) = custom_instructions {
+        out.push_str("\n\nAdditional focus: ");
+        out.push_str(custom);
+    }
+    out.push_str("</system-reminder>");
+    out
 }
 
 /// Render `read_files`/`modified_files` as the same `<read-files>`/`<modified-files>` tags

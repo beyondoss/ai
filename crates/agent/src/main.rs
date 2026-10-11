@@ -391,6 +391,10 @@ enum Command {
         /// prompt cache from its first edit). Default 25,000, or a quarter of the trigger if lower.
         #[usage(long, env = "AI_AGENT_TOOL_MASKING_MIN_TOKENS")]
         tool_masking_min_tokens: Option<u32>,
+        /// Make the compaction summary from a re-rendered transcript every time, instead of sending
+        /// the live conversation (its prefix read from the prompt cache) plus a closing instruction.
+        #[usage(long, env = "AI_AGENT_NO_CACHED_SUMMARY")]
+        no_cached_summary: bool,
         /// Compaction headroom (tokens) reserved below the context window before it fires. Defaults to
         /// `CompactionConfig::default()`'s 16,384. `serve`'s identical flag.
         #[usage(long, env = "AI_AGENT_COMPACTION_RESERVE_TOKENS")]
@@ -958,6 +962,10 @@ enum Command {
         /// prompt cache from its first edit). Default 25,000, or a quarter of the trigger if lower.
         #[usage(long, env = "AI_AGENT_TOOL_MASKING_MIN_TOKENS")]
         tool_masking_min_tokens: Option<u32>,
+        /// Make the compaction summary from a re-rendered transcript every time, instead of sending
+        /// the live conversation (its prefix read from the prompt cache) plus a closing instruction.
+        #[usage(long, env = "AI_AGENT_NO_CACHED_SUMMARY")]
+        no_cached_summary: bool,
         /// Per-turn output token ceiling. Defaults to the model's own capability-table `max_output`
         /// (see `agent_core::models::capabilities`), floored at a sane minimum — only pass this to
         /// override that, e.g. capping generation length or lifting it past the model-derived default.
@@ -1956,6 +1964,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             no_tool_masking,
             tool_masking_keep_turns,
             tool_masking_min_tokens,
+            no_cached_summary,
             compaction_reserve_tokens,
             compaction_keep_recent_tokens,
             branch_summary_reserve_tokens,
@@ -2034,6 +2043,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 no_tool_masking,
                 tool_masking_keep_turns,
                 tool_masking_min_tokens,
+                no_cached_summary,
                 compaction_reserve_tokens,
                 compaction_keep_recent_tokens,
                 branch_summary_reserve_tokens,
@@ -2130,6 +2140,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             no_tool_masking,
             tool_masking_keep_turns,
             tool_masking_min_tokens,
+            no_cached_summary,
             cache_ttl,
             cache_long,
             thinking,
@@ -2633,6 +2644,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     no_tool_masking,
                     tool_masking_keep_turns,
                     tool_masking_min_tokens,
+                    no_cached_summary,
                 },
                 cache_long: CacheTtl::resolve(cache_ttl, cache_long, CacheTtl::OneHour),
                 thinking,
@@ -4182,6 +4194,7 @@ async fn run_task(
     no_tool_masking: bool,
     tool_masking_keep_turns: Option<usize>,
     tool_masking_min_tokens: Option<u32>,
+    no_cached_summary: bool,
     compaction_reserve_tokens: Option<u32>,
     compaction_keep_recent_tokens: Option<u32>,
     branch_summary_reserve_tokens: Option<u32>,
@@ -5168,6 +5181,7 @@ async fn run_task(
             no_tool_masking,
             tool_masking_keep_turns,
             tool_masking_min_tokens,
+            no_cached_summary,
         },
     );
     if no_compaction {
