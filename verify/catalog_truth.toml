@@ -1890,6 +1890,52 @@ source = "https://api.x.ai/v1/video-generation-models"
 date = "2026-10-01"
 reason = "Video generation (output [\"video\"]). The gateway serves Chat Completions, Responses, Messages and embeddings only."
 
+# Non-chat models OpenRouter lists in a carried brand (catalog-drift's new-family findings, issue
+# #176), recorded by owner decision 2026-10-11: every chat model there became a row; these are not
+# chat models.
+
+[[not_carried]]
+provider = "openrouter"
+id = "openai/gpt-6-luna-decisions"
+source = "https://developers.openai.com/api/docs/guides/decisions.md"
+date = "2026-10-11"
+reason = "Not a chat model: GPT-6 Luna on OpenAI's Decisions API (\"Use the dedicated `POST /v1/decisions` endpoint\"), which returns typed probabilities for named questions instead of text. OpenRouter lists output modality \"decisions\", no supported parameters. The gateway serves Chat Completions, Responses, Messages and embeddings only; gpt-6-luna is carried."
+
+[[not_carried]]
+provider = "openrouter"
+id = "meta/muse-image"
+source = "https://openrouter.ai/api/v1/models?output_modalities=all"
+date = "2026-10-11"
+reason = "Image generation and editing (output modalities [\"image\"]), billed per image token (image_output), which a per-token text card and the ledger do not carry."
+
+[[not_carried]]
+provider = "openrouter"
+id = "meta/muse-voice-transcribe-1.0"
+source = "https://openrouter.ai/api/v1/models?output_modalities=all"
+date = "2026-10-11"
+reason = "Speech-to-text (input [\"audio\"], output [\"transcription\"], $50 per million audio tokens). The gateway serves Chat Completions, Responses, Messages and embeddings only."
+
+[[not_carried]]
+provider = "openrouter"
+id = "openai/text-embedding-ada-002"
+source = "https://openrouter.ai/api/v1/models?output_modalities=all"
+date = "2026-10-11"
+reason = "Embeddings (output [\"embeddings\"]), OpenAI's legacy model: OpenAI and OpenRouter both answer it as text-embedding-ada-002-v2, a billed id no row names (see the text-embedding-3 rows in catalog.rs, which are carried)."
+
+[[not_carried]]
+provider = "openrouter"
+id = "x-ai/grok-imagine-video-1.5-lite"
+source = "https://openrouter.ai/api/v1/models?output_modalities=all"
+date = "2026-10-11"
+reason = "Video generation (output modalities [\"video\"]); not carried on xAI either (above). The gateway serves Chat Completions, Responses, Messages and embeddings only."
+
+[[not_carried]]
+provider = "openrouter"
+id = "meta-llama/llama-guard-4-12b"
+source = "https://openrouter.ai/api/v1/models/meta-llama/llama-guard-4-12b/endpoints"
+date = "2026-10-11"
+reason = "A content-safety classifier, not a chat model: Llama 4 Scout \"fine-tuned for content safety classification\" (OpenRouter's description), answering safe or unsafe with violated categories. No tools or structured outputs on its one host (DeepInfra)."
+
 [[promo]]
 model = "gpt-5.6-sol"
 input = "2.00"
