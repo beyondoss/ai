@@ -208,6 +208,14 @@ raw_sha256 = "d4b93997b85c144025c6091e8ef8977f9fbf89ea283e82679294495c87f21034"
 sha256 = "872f1fedeed6155d26db078d03601738605dd4af67f111866fb7522983d1af84"
 
 [[source]]
+id = "openrouter.endpoints/google/gemma-4-26b-a4b-it"
+url = "https://openrouter.ai/api/v1/models/google/gemma-4-26b-a4b-it/endpoints"
+file = "openrouter/endpoints/google/gemma-4-26b-a4b-it.json"
+fetched = "2026-10-11"
+raw_sha256 = "7185154f167eb54760ab146b50790f0c3874d9d89f0be970e83f7e1a9284a743"
+sha256 = "9f4102f6203be7ea68a3c4cc65865f1d7a312667ec2894873d5e975eaba95538"
+
+[[source]]
 id = "openrouter.endpoints/google/gemma-4-31b-it"
 url = "https://openrouter.ai/api/v1/models/google/gemma-4-31b-it/endpoints"
 file = "openrouter/endpoints/google/gemma-4-31b-it.json"
@@ -748,8 +756,8 @@ id = "openrouter.models"
 url = "https://openrouter.ai/api/v1/models?output_modalities=all"
 file = "openrouter/models.json"
 fetched = "2026-10-11"
-raw_sha256 = "9599617c12740f60cb2ec49d41108180f012360b30593e5756983272c6293b7c"
-sha256 = "261ceff46893c0deaf1101bf3b3d9c8e152513fd95fc3a6f7d7d8d6459a4be7f"
+raw_sha256 = "c516c1a75eb510b61d792e138a5357a85bfb21f54207de784ee2b2768bac1a12"
+sha256 = "1e2bf24288030e3db3fcb4f0154e0b9caa5d48daa57d7bb1c8a6e854138a3bde"
 
 [[source]]
 id = "openrouter.pricing"

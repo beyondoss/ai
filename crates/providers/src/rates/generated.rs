@@ -2153,6 +2153,88 @@ static OR_DEEPSEEK_DEEPSEEK_V4_1_FLASH: &[OrEndpoint] = &[
     },
 ];
 
+/// `google/gemma-4-26b-a4b-it` (`GET /api/v1/models/google/gemma-4-26b-a4b-it/endpoints`).
+static OR_GOOGLE_GEMMA_4_26B_A4B_IT: &[OrEndpoint] = &[
+    OrEndpoint {
+        host: "Cloudflare",
+        tag: "cloudflare",
+        class: Class::Standard,
+        card: Card::new(tr("0.1", "0.3", "0.05", "0.1", None)),
+    },
+    OrEndpoint {
+        host: "CoreWeave",
+        tag: "coreweave/bf16",
+        class: Class::Standard,
+        card: Card::new(tr("0.1", "0.3", "0.05", "0.1", None)),
+    },
+    OrEndpoint {
+        host: "Darkbloom",
+        tag: "darkbloom",
+        class: Class::Standard,
+        card: Card::new(tr("0.042", "0.22", "0.021", "0.042", None)),
+    },
+    OrEndpoint {
+        host: "DeepInfra",
+        tag: "deepinfra/fp8",
+        class: Class::Standard,
+        card: Card::new(tr("0.07", "0.34", "0.07", "0.07", None)),
+    },
+    OrEndpoint {
+        host: "DekaLLM",
+        tag: "dekallm/bf16",
+        class: Class::Standard,
+        card: Card::new(tr("0.06", "0.33", "0.04", "0.06", None)),
+    },
+    OrEndpoint {
+        host: "Google",
+        tag: "google-vertex/global",
+        class: Class::Standard,
+        card: Card::new(tr("0.15", "0.6", "0.15", "0.15", None)),
+    },
+    OrEndpoint {
+        host: "Io Net",
+        tag: "io-net/bf16",
+        class: Class::Standard,
+        card: Card::new(tr("0.0483", "0.21", "0.0203", "0.0483", None)),
+    },
+    OrEndpoint {
+        host: "Makora",
+        tag: "makora",
+        class: Class::Standard,
+        card: Card::new(tr("0.08", "0.32", "0.032", "0.08", None)),
+    },
+    OrEndpoint {
+        host: "NextBit",
+        tag: "nextbit/bf16",
+        class: Class::Standard,
+        card: Card::new(tr("0.0675", "0.225", "0.0375", "0.0675", None)),
+    },
+    OrEndpoint {
+        host: "Novita",
+        tag: "novita/bf16",
+        class: Class::Standard,
+        card: Card::new(tr("0.13", "0.4", "0.13", "0.13", None)),
+    },
+    OrEndpoint {
+        host: "Parasail",
+        tag: "parasail/bf16",
+        class: Class::Standard,
+        card: Card::new(tr("0.13", "0.4", "0.05", "0.13", None)),
+    },
+    OrEndpoint {
+        host: "SiliconFlow",
+        tag: "siliconflow/fp8",
+        class: Class::Standard,
+        card: Card::new(tr("0.14", "0.4", "0.05", "0.14", None)),
+    },
+    OrEndpoint {
+        host: "Venice",
+        tag: "venice/bf16",
+        class: Class::Standard,
+        card: Card::new(tr("0.13", "0.4", "0.05", "0.13", None)),
+    },
+];
+
 /// `google/gemma-4-31b-it` (`GET /api/v1/models/google/gemma-4-31b-it/endpoints`).
 static OR_GOOGLE_GEMMA_4_31B_IT: &[OrEndpoint] = &[
     OrEndpoint {
@@ -6720,6 +6802,16 @@ pub static ROW_RATES: &[RowRates] = &[
             CandidateCost {
                 provider: ProviderId::OpenRouter,
                 card: CostCard::OpenRouter(OR_DEEPSEEK_DEEPSEEK_V4_PRO_0813),
+            },
+        ],
+    },
+    RowRates {
+        model: "google/gemma-4-26b-a4b-it",
+        list: Card::new(tr("0.0675", "0.225", "0.0375", "0.0675", None)),
+        cost: &[
+            CandidateCost {
+                provider: ProviderId::OpenRouter,
+                card: CostCard::OpenRouter(OR_GOOGLE_GEMMA_4_26B_A4B_IT),
             },
         ],
     },

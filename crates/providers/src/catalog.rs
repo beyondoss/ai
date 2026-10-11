@@ -1174,7 +1174,24 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
     // Gemma 4 on OpenRouter. Together lists `google/gemma-4-31B-it` with a price but answers a
     // serverless key 400 model_not_available ("Unable to access non-serverless model"), and its
     // serverless models table omits it, so it is not a candidate. Google sells no Gemma API, so the
-    // price is OpenRouter's (the only host). Not a Gemini dialect: Chat Completions.
+    // price is OpenRouter's (the only host). Not a Gemini dialect: Chat Completions. Gemma 4 26B
+    // A4B the same way: Together lists `google/gemma-4-26B-A4B-it` at $0 (not serverless), and
+    // OpenRouter spreads it over about a dozen hosts, priced at OpenRouter's public card.
+    ModelRoute {
+        model: "google/gemma-4-26b-a4b-it",
+        wire: WireFormat::OpenAi,
+        candidates: &openrouter_only("google/gemma-4-26b-a4b-it"), // Together: not serverless
+        responses: &[],
+        price: price("0.0675", "0.225", "0.0375", "0.0675"), // cache_write unpublished; equals input
+        card: card_unpublished_output(
+            "Gemma 4 26B A4B",
+            "google",
+            1775227989,
+            262_144,
+            IN_TEXT | IN_IMAGE | IN_VIDEO,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
+    },
     ModelRoute {
         model: "google/gemma-4-31b-it",
         wire: WireFormat::OpenAi,
@@ -1834,8 +1851,8 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
     // Qwen3.8 27B, Together for Qwen / Kimi / GLM / MiniMax / Inkling / Muse. A candidate the
     // host reserves for Enterprise or dedicated deployments is not listed (Groq
     // `llama-3.1-8b-instant` and `llama-3.3-70b-versatile`; Fireworks Llama 4, Kimi K2.6, GLM 5.1,
-    // GLM 5.2 and Llama 3.3; Together Kimi K2.7 Code, GPT-OSS 20B, Gemma 4 31B and Qwen2.5 7B
-    // Turbo), nor one the host has retired (Together Llama 3.3 70B Turbo): it fails over on
+    // GLM 5.2 and Llama 3.3; Together Kimi K2.7 Code, GPT-OSS 20B, Gemma 4 31B, Gemma 4 26B A4B
+    // and Qwen2.5 7B Turbo), nor one the host has retired (Together Llama 3.3 70B Turbo): it fails over on
     // every request. Rows left with only OpenRouter are
     // `openrouter_only`, and keep their names so existing clients still resolve. Groq caches only
     // GPT-OSS; Together publishes no cache-write rate, so those rates equal input.
