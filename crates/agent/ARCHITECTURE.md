@@ -981,6 +981,18 @@ The harness layers several capabilities over the bare tools + loop:
   this MCP-heavy verifier (and RSS/`.text`) before it can be a default. The TB slice is not the
   published 30-task board (21 TB + 9 DeepSWE) and not a Runta golden-checkpoint run.
 
+  The compaction-trigger eval is [`eval/longctx`](eval/longctx) (`mise run eval:longctx`). Its tasks
+  are real Python repos at pinned tags with ~4–5K lines of function bodies cut back to
+  `raise NotImplementedError` (Commit0-style; [`eval/longctx/specs`](eval/longctx/specs) pins which),
+  two or three repos per workspace so a run's context passes 200K. The grade is each repo's own
+  test suite with the pristine tests restored. Arms set `--context-window` to trigger + 16,384, so
+  compaction fires at the arm's trigger. `$` is priced per request from the usage on the `run
+  --json` stream, plus `Compacted.usage` for the summarization calls, which no `Stream(Usage)`
+  event carries. `BASE=<sha> CAND=<sha> mise run eval:ab` reuses the same tasks as a
+  before/after no-regression gate ([`eval/longctx/ab.py`](eval/longctx/ab.py)): both commits at
+  default compaction, plus four MCP tasks run with Playwright, GitHub and filesystem servers
+  configured, on the candidate both with tool search and with `--code-mode`.
+
   ```sh
   cargo test -p beyond-ai-agent --test code_mode_density
   cargo test -p beyond-ai-agent --features code-mode --test code_mode_eval -- --nocapture
