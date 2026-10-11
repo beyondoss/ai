@@ -327,7 +327,9 @@ provider prompt caches are per provider, so a walk that moved an agent loop betw
 Bedrock re-bought the whole prefix on each move (a Claude cache write is 1.25× input against 0.1×
 for a read). The pin key is `(tenant_id, vpc_id, key_id)` plus the catalog row: one virtual key is
 one app, and an app's sessions share their system prompt and tools, so one pin per key per model is
-the grain the provider cache wants.
+the grain the provider cache wants. The row enters by its name, never its position in the catalog:
+adding a row (catalog-drift does, unattended) used to shift every later row's index and so move
+every caller of those rows onto their other host, re-buying their caches the hour it deployed.
 
 **Session pins.** The pin is **computed every turn and never remembered**: no pod keeps any pin
 state. A managed default walk (no `order` / `split`) with a verified caller, which is every one, is

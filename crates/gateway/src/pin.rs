@@ -56,11 +56,16 @@ pub fn order(walk: Walk, route: &ModelRoute, affinity: u64, dispatchable: u8) ->
     // Name search, not the row's address. `MODEL_ROUTES` is a `const` slice, so each use site can
     // hold its own copy — pointer arithmetic against `as_ptr()` does not land on the `&'static`
     // row `for_model` returned.
-    let row_i = MODEL_ROUTES
+    MODEL_ROUTES
         .binary_search_by(|r| r.model.cmp(route.model))
         .ok()?;
     let usable = |orig: u8| dispatchable & (1 << orig) != 0;
-    Some(preferred(walk, route, pin_key(affinity, row_i), usable))
+    Some(preferred(
+        walk,
+        route,
+        pin_key(affinity, route.model),
+        usable,
+    ))
 }
 
 /// `splitmix64`'s finalizer: every input bit reaches every output bit.
@@ -71,8 +76,12 @@ fn mix(mut z: u64) -> u64 {
     z ^ (z >> 31)
 }
 
-fn pin_key(affinity: u64, row_i: usize) -> u64 {
-    mix(affinity ^ (row_i as u64).wrapping_mul(0xA076_1D64_78BD_642F))
+/// The caller's pin for one row. The row enters by its name, never its position in
+/// [`MODEL_ROUTES`]: a catalog edit that adds or removes a row elsewhere (catalog-drift does, on
+/// its own) must not move every caller of every later row onto its other host, re-buying their
+/// prompt caches the hour it deploys.
+fn pin_key(affinity: u64, model: &str) -> u64 {
+    mix(affinity ^ name_hash(model).wrapping_mul(0xA076_1D64_78BD_642F))
 }
 
 /// A first-party host for its row: the vendor's own API, or a cloud reselling the model under the
@@ -86,10 +95,10 @@ fn first_party(route: &ModelRoute, orig: u8) -> bool {
         .is_some_and(|c| !providers::by_id(c.provider).model_id_match.is_empty())
 }
 
-/// FNV-1a of the provider's name: its identity in the rendezvous hash. The name, not the
-/// `ProviderId` discriminant, so two builds that order the enum differently (a rolling deploy)
-/// still agree.
-fn provider_hash(name: &str) -> u64 {
+/// FNV-1a of a name: a provider's identity in the rendezvous hash, and a row's in [`pin_key`]. The
+/// name, not the `ProviderId` discriminant or the row's index, so two builds that order the enum
+/// or the catalog differently (a rolling deploy) still agree.
+fn name_hash(name: &str) -> u64 {
     name.bytes().fold(0xCBF2_9CE4_8422_2325, |h, b| {
         (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01B3)
     })
@@ -112,7 +121,7 @@ fn preferred(walk: Walk, route: &ModelRoute, key: u64, usable: impl Fn(u8) -> bo
     for (slot, (k, &orig)) in keyed.iter_mut().zip(&walk.indices[..n]).enumerate() {
         let rest = slot >= lead;
         let hash = match route.candidates.get(usize::from(orig)) {
-            Some(c) if !rest => !mix(key ^ provider_hash(providers::by_id(c.provider).name)),
+            Some(c) if !rest => !mix(key ^ name_hash(providers::by_id(c.provider).name)),
             _ => 0,
         };
         *k = (!usable(orig), rest, hash, slot as u8, orig);
@@ -245,15 +254,31 @@ mod tests {
     #[test]
     fn pins_are_per_caller_and_per_model() {
         let row = opus();
-        let k = |t, app| pin_key(affinity(t, 7, Some(app)), 0);
+        let k = |t, app| pin_key(affinity(t, 7, Some(app)), "claude-opus-4-8");
         assert_ne!(k(42, APP), k(42, APP + 1), "another key");
         assert_ne!(k(42, APP), k(43, APP), "another tenant");
-        assert_ne!(pin_key(aff(), 0), pin_key(aff(), 1), "another model");
+        assert_ne!(
+            pin_key(aff(), "claude-opus-4-8"),
+            pin_key(aff(), "claude-opus-4-7"),
+            "another model"
+        );
         // Over many tenants sharing one key id, the lead follows each tenant's own hash.
         let leads: std::collections::BTreeSet<_> = (0..32)
             .map(|t| computed(row, affinity(t, 7, Some(APP)))[0])
             .collect();
         assert_eq!(leads.len(), 2, "{leads:?}");
+    }
+
+    /// A row's pin is keyed by its name, not its index in the catalog: adding or removing another
+    /// row (catalog-drift does, unattended) moves no caller of this one.
+    #[test]
+    fn the_pin_follows_the_row_name_not_its_catalog_position() {
+        let row = opus();
+        for t in 0..32 {
+            let a = affinity(t, 7, Some(APP));
+            let want = preferred(Walk::identity(3), row, pin_key(a, row.model), |_| true);
+            assert_eq!(order(Walk::identity(3), row, a, ALL), Some(want));
+        }
     }
 
     /// `x-beyond-only` filters first; the pin is computed over what is left, and the removed
@@ -302,7 +327,7 @@ mod tests {
             ..*opus()
         };
         for app in 0..16 {
-            let k = pin_key(affinity(42, 7, Some(app)), 0);
+            let k = pin_key(affinity(42, 7, Some(app)), "claude-opus-4-8");
             let out = preferred(Walk::identity(3), &route, k, |_| true);
             assert_eq!(out.indices[..3], [0, 1, 2]);
         }
