@@ -68,13 +68,23 @@ pub fn select_deferred_tools(
         .collect()
 }
 
-/// After `--tools` filtering, put `execute` back unless the operator excluded it or asked for no tools.
+/// The `execute` tool over `deferred`, or `None` when the catalog is empty: the JS context reaches
+/// nothing but that catalog, so an empty `execute` is ~270 schema tokens on every request for a tool
+/// that can do nothing. A registry rebuild (`set_model`, an MCP hot-plug) re-asks once servers attach.
+#[cfg(feature = "code-mode")]
+pub fn execute_tool(deferred: Vec<Arc<dyn Tool>>) -> Option<Arc<dyn Tool>> {
+    (!deferred.is_empty()).then(|| Arc::new(Execute::new(deferred)) as Arc<dyn Tool>)
+}
+
+/// After `--tools` filtering, put `execute` back unless the operator excluded it, asked for no tools,
+/// or there is no deferred catalog for it to reach ([`execute_tool`]).
 ///
 /// An allow-list of built-ins (`--tools read,bash`) would otherwise drop `execute` and leave the
 /// deferred MCP catalog unreachable — the whole point of `--code-mode`.
+#[cfg(feature = "code-mode")]
 pub fn restore_execute(
     registry: &mut agent_core::ToolRegistry,
-    execute: Arc<dyn Tool>,
+    deferred: Vec<Arc<dyn Tool>>,
     exclude: Option<&[String]>,
     no_tools: bool,
 ) {
@@ -84,7 +94,9 @@ pub fn restore_execute(
     if exclude.is_some_and(|e| e.iter().any(|n| n == NAME)) {
         return;
     }
-    if registry.get(NAME).is_none() {
+    if registry.get(NAME).is_none()
+        && let Some(execute) = execute_tool(deferred)
+    {
         registry.register(execute);
     }
 }
@@ -1172,21 +1184,28 @@ mod tests {
         assert_eq!(kept[0].name(), "mcp__a__two");
     }
 
+    #[cfg(feature = "code-mode")]
     #[test]
-    fn restore_execute_keeps_the_tool_unless_excluded() {
+    fn restore_execute_keeps_the_tool_unless_excluded_or_empty() {
+        let deferred = || -> Vec<Arc<dyn Tool>> {
+            vec![Arc::new(Fake {
+                name: "mcp__a__one",
+                desc: "one",
+                handler: |_| Ok("ok".into()),
+            })]
+        };
         let mut reg = agent_core::ToolRegistry::new();
-        let execute: Arc<dyn Tool> = Arc::new(Fake {
-            name: NAME,
-            desc: "execute",
-            handler: |_| Ok("ok".into()),
-        });
-        restore_execute(&mut reg, execute.clone(), None, false);
+        restore_execute(&mut reg, deferred(), None, false);
         assert!(reg.get(NAME).is_some());
         let mut reg = agent_core::ToolRegistry::new();
-        restore_execute(&mut reg, execute.clone(), Some(&["execute".into()]), false);
+        restore_execute(&mut reg, deferred(), Some(&["execute".into()]), false);
         assert!(reg.get(NAME).is_none());
         let mut reg = agent_core::ToolRegistry::new();
-        restore_execute(&mut reg, execute, None, true);
+        restore_execute(&mut reg, deferred(), None, true);
+        assert!(reg.get(NAME).is_none());
+        // No deferred catalog: nothing for execute to reach, so it is not advertised.
+        let mut reg = agent_core::ToolRegistry::new();
+        restore_execute(&mut reg, Vec::new(), None, false);
         assert!(reg.get(NAME).is_none());
     }
 }
