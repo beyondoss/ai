@@ -3645,12 +3645,12 @@ async fn run_turn(
 ///
 /// On `BrokenPipe`, sets `broken_pipe` and trips `cancel` rather than calling `process::exit`
 /// directly — this function is called from deep inside `run_turn_once`'s streaming callbacks, which
-/// run *before* `run_task`'s `persist_run_tail`; exiting right here used to skip that persist entirely,
+/// run *before* `run_task`'s `persist_run`; exiting right here used to skip that persist entirely,
 /// silently dropping the turn's final (possibly-partial) assistant message from the session store —
 /// exactly the loss the Ctrl-C/SIGTERM path already takes care to avoid. Tripping `cancel` instead
 /// reuses that identical, already-correct "stop the turn, then still persist" machinery
 /// (`agent_core::Agent::run_events_cancellable`'s cooperative cancellation); `run_task` checks
-/// `broken_pipe` right after its own unconditional `persist_run_tail` call and exits 0 there instead —
+/// `broken_pipe` right after its own unconditional `persist_run` call and exits 0 there instead —
 /// same eventual exit code as before, just after the write that used to be skipped. Any other write
 /// error (a full disk, a redirected-to-file target that vanished) is swallowed instead, matching this
 /// callback's own prior `let _ = ...flush()` convention — exceptionally rare for a terminal/pipe fd, and
@@ -3834,7 +3834,7 @@ async fn run_turn_once(
 /// blocking append inside the async callback is the simplest correct thing here, not a missing
 /// optimization. Persists every mid-run checkpoint incrementally, the same guarantee `serve` gives
 /// every session: without this, only the *end* of each whole turn was ever persisted (via
-/// `persist_run_tail`, after `run_turn` returns), so a crash mid-turn — after several tool
+/// `persist_run`, after `run_turn` returns), so a crash mid-turn — after several tool
 /// round-trips already ran real commands or edited real files — lost all record of them, with the
 /// session file (if any) unable to distinguish that from "nothing happened yet".
 /// `run`'s MCP task journal: the same `mcp_task` custom entries `serve` writes (see
@@ -3972,39 +3972,77 @@ async fn resume_mcp_tasks_for_run(
     (resolved, placeholders)
 }
 
-struct DirectCheckpoint(Arc<std::sync::Mutex<Option<SessionStore>>>);
+/// `run`'s checkpoint hook: [`persist_run`] against the run's shared store.
+struct DirectCheckpoint(RunStore);
 
 #[async_trait::async_trait]
 impl agent_core::CheckpointHook for DirectCheckpoint {
     /// Append what is new, and say whether it landed — matching `serve`'s own checkpoint hook. The
     /// agent acts on a failure only before a tool dispatch, where it fails closed (the tool does not
     /// run: `agent_core::CheckpointHook`); anywhere else the next successful persist, or
-    /// `persist_run_tail` after the turn ends, catches up whatever this attempt missed.
+    /// `persist_run` after the turn ends, catches up whatever this attempt missed.
     async fn checkpoint(&self, session: &Session) -> Result<(), String> {
-        let mut guard = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(store) = guard.as_mut()
-            && let Err(e) = store.append_new(&session.messages)
-        {
+        persist_run(&self.0, session).map_err(|e| {
             eprintln!("run: failed to persist checkpoint: {e}");
-            return Err(e.to_string());
-        }
-        Ok(())
+            e.to_string()
+        })
     }
 }
 
-/// Persist whatever's new in `session` since the last append — the tail-covering persist after a
-/// whole turn ends (a checkpoint never fires for the turn's own final assistant message; see
-/// `agent_core::Agent::run_turn`'s doc comment on where checkpoints land). A no-op when `run` isn't
-/// persisting at all (`store`'s inner `Option` is `None`) or when `DirectCheckpoint` already covered
-/// everything (`SessionStore::append_new`'s own `messages.len() <= self.persisted` dedup guard).
-fn persist_run_tail(
-    store: &Arc<std::sync::Mutex<Option<SessionStore>>>,
-    session: &Session,
-) -> std::io::Result<()> {
-    if let Some(store) = store.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-        store.append_new(&session.messages)?;
+/// `run`'s session store (`None` when not persisting), shared by [`DirectCheckpoint`], the
+/// end-of-turn [`persist_run`] and the run journal, plus how many compactions it holds.
+#[derive(Clone)]
+struct RunStore {
+    store: Arc<std::sync::Mutex<Option<SessionStore>>>,
+    /// `session.compaction.compactions` as of the last write: behind it means a compaction rewrote
+    /// the transcript since, and the next persist must write that rewrite.
+    compactions: Arc<std::sync::atomic::AtomicU32>,
+}
+
+impl RunStore {
+    /// `store`, holding `session` as opened (its compaction count is what is already on disk).
+    fn new(store: Option<SessionStore>, session: &Session) -> Self {
+        Self {
+            store: Arc::new(std::sync::Mutex::new(store)),
+            compactions: Arc::new(session.compaction.compactions.into()),
+        }
     }
-    Ok(())
+}
+
+/// Persist `session`: a compaction since the last write is written as one
+/// ([`SessionStore::rewrite_compacted`]); otherwise whatever is new is appended. Called at every
+/// checkpoint and after each whole turn (a checkpoint never fires for the turn's own final assistant
+/// message; see `agent_core::Agent::run_turn`'s doc comment on where checkpoints land). A no-op when
+/// `run` isn't persisting at all, or when nothing is new.
+///
+/// `append_new` alone is count-keyed and cannot see a compaction's shrink: `run` used to skip every
+/// message after a compaction until the list grew past its old length, then chain the wrong tail onto
+/// the uncompacted history, so a resumed session lost the compaction and the turns after it.
+/// `Agent::compact` checkpoints right after the rewrite, so it lands before anything else is appended.
+fn persist_run(run: &RunStore, session: &Session) -> std::io::Result<()> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut guard = run.store.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(store) = guard.as_mut() else {
+        return Ok(());
+    };
+    let compactions = session.compaction.compactions;
+    if compactions != run.compactions.load(Relaxed) {
+        let tokens_before = session
+            .messages
+            .first()
+            .and_then(agent_core::compaction::summary_tokens_before)
+            .unwrap_or(0);
+        store.rewrite_compacted(
+            &session.messages,
+            beyond_ai_agent::session_store::CompactionMeta {
+                tokens_before,
+                provenance: session.compaction.clone(),
+            },
+        )?;
+        run.compactions.store(compactions, Relaxed);
+        return Ok(());
+    }
+    store.append_new(&session.messages)
 }
 
 /// Expand an explicit `/skill:name` invocation first (its own prefix, so it can't collide with a
@@ -5012,17 +5050,18 @@ async fn run_task(
     // Shared with `DirectCheckpoint` below (built before `agent`, so the hook can be installed at
     // construction) so a long multi-step turn (many tool round-trips) is persisted incrementally —
     // the same guarantee `serve` gives every session. Without this, only the *end* of each whole
-    // turn was ever persisted (the `persist_run_tail` calls below, after `run_turn` returns), so a
+    // turn was ever persisted (the `persist_run` calls below, after `run_turn` returns), so a
     // crash mid-turn — after several tool round-trips already ran real commands/edited real files —
     // lost all record of them with no session trace at all.
-    let store = Arc::new(std::sync::Mutex::new(store));
+    let store = RunStore::new(store, &session);
     let run_journal = store
+        .store
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .is_some()
         .then(|| {
             RUN_JOURNAL.get_or_init(|| RunJournal {
-                store: store.clone(),
+                store: store.store.clone(),
                 session_id: meta.id.clone(),
             })
         });
@@ -5161,9 +5200,9 @@ async fn run_task(
     // Set by `write_stdout_or_exit` on a broken stdout pipe (a downstream consumer that closed its
     // read end early, e.g. `agent run --json "task" | head -1`) — trips `cancel` the same as a real
     // shutdown signal so the turn stops cooperatively instead of `process::exit`ing from deep inside
-    // a streaming callback, which used to skip the `persist_run_tail` calls below entirely and
+    // a streaming callback, which used to skip the `persist_run` calls below entirely and
     // silently drop the turn's final (possibly-partial) assistant message. Checked right after each
-    // `persist_run_tail`, below, so the exit still happens (with the same code 0 as before) but only
+    // `persist_run`, below, so the exit still happens (with the same code 0 as before) but only
     // once that write has actually landed.
     let broken_pipe = AtomicBool::new(false);
 
@@ -5219,7 +5258,7 @@ async fn run_task(
     // every session, not just the happy path. `DirectCheckpoint` already covers most of this
     // incrementally, but the turn's own tail (its final, possibly-partial assistant message) is
     // only ever captured here.
-    persist_run_tail(&store, &session)?;
+    persist_run(&store, &session)?;
     if broken_pipe.load(Ordering::Relaxed) {
         emit_cli_lifecycle(life.as_ref(), &session, CliTerminal::Aborted, None).await;
         exit_process(0);
@@ -5256,7 +5295,7 @@ async fn run_task(
             std::time::Duration::from_secs(lifecycle_heartbeat_secs),
         )
         .await;
-        persist_run_tail(&store, &session)?;
+        persist_run(&store, &session)?;
         if broken_pipe.load(Ordering::Relaxed) {
             emit_cli_lifecycle(life.as_ref(), &session, CliTerminal::Aborted, None).await;
             exit_process(0);
@@ -5281,7 +5320,7 @@ async fn run_task(
 
     if let Some(export) = export {
         let (branches, events) = {
-            let guard = store.lock().unwrap_or_else(|e| e.into_inner());
+            let guard = store.store.lock().unwrap_or_else(|e| e.into_inner());
             match guard.as_ref() {
                 Some(s) => (s.abandoned_branches(), s.export_events().to_vec()),
                 None => (Vec::new(), Vec::new()),
@@ -5452,7 +5491,7 @@ mod tests {
     fn a_broken_pipe_trips_cancel_and_the_flag_instead_of_exiting_on_the_spot() {
         // Regression: `write_stdout_or_exit` used to call `process::exit(0)` directly on a broken
         // pipe, which — because it's invoked from deep inside `run_turn_once`'s streaming callbacks —
-        // ran *before* `run_task`'s `persist_run_tail`, silently dropping the turn's final assistant
+        // ran *before* `run_task`'s `persist_run`, silently dropping the turn's final assistant
         // message. The fix routes a broken pipe through the same cooperative-cancellation machinery
         // Ctrl-C/SIGTERM already use, so `run_task` can persist first and exit afterward. This exercises
         // `handle_stdout_write_error` directly (the reaction, split out from the unavoidably real
@@ -5711,7 +5750,7 @@ mod tests {
     async fn direct_checkpoint_persists_incrementally_during_a_multi_tool_round_trip_run() {
         // Two tool round-trips, then a final text turn. `DirectCheckpoint` must have already written
         // both round-trips' worth of messages to disk by the time they happen — not just once, at the
-        // very end, via `persist_run_tail` (which only ever runs after `run_turn` returns `Ok`, and so
+        // very end, via `persist_run` (which only ever runs after `run_turn` returns `Ok`, and so
         // never covers a crash or hard failure partway through a long multi-step turn). Proven here by
         // reading the session file back with a *fresh* `SessionStore::open` before `run_turn` even
         // returns — a completely independent read path from anything `run_task`'s own bookkeeping
@@ -5723,7 +5762,7 @@ mod tests {
         let store =
             SessionStore::create(session_path.clone(), SessionMeta::new("/w", "claude-test"))
                 .unwrap();
-        let store = Arc::new(std::sync::Mutex::new(Some(store)));
+        let store = RunStore::new(Some(store), &Session::new());
 
         let read_args = serde_json::json!({ "path": target.to_str().unwrap() }).to_string();
         let transport = Arc::new(MockTransport::new(vec![
@@ -5759,7 +5798,7 @@ mod tests {
         assert!(
             disk_session.messages.len() >= 4,
             "checkpoints during the run must have persisted the tool round-trips that already \
-             happened, not just whatever `persist_run_tail` would add after the fact: {:?}",
+             happened, not just whatever `persist_run` would add after the fact: {:?}",
             disk_session.messages
         );
     }
