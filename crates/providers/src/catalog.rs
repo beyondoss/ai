@@ -2058,7 +2058,11 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
     ModelRoute {
         model: "qwen/qwen3.5-9b",
         wire: WireFormat::OpenAi,
-        candidates: &together("Qwen/Qwen3.5-9B", "qwen/qwen3.5-9b"),
+        candidates: &[Candidate {
+            provider: ProviderId::Together,
+            upstream_model: "Qwen/Qwen3.5-9B",
+            path: "/v1/chat/completions",
+        }],
         responses: &[],
         price: price("0.17", "0.25", "0.17", "0.17"), // no published cache rates; both equal input
         card: card(

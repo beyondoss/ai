@@ -2916,7 +2916,7 @@ cost = { openrouter = "openrouter:qwen/qwen-2.5-7b-instruct" }
 [[pricing]]
 model = "qwen/qwen3.5-9b"
 list_card = "list"
-cost = { together = "together:Qwen/Qwen3.5-9B", openrouter = "openrouter:qwen/qwen3.5-9b" }
+cost = { together = "together:Qwen/Qwen3.5-9B" }
 
 [[pricing]]
 model = "qwen/qwen3.6-plus"
