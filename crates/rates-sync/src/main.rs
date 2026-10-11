@@ -10,6 +10,8 @@
 //!                      routine or review change into the snapshots and the table
 //! rates-sync rate-version  set RATE_VERSION (and the golden vectors' rate_version) to name the
 //!                      table this binary was compiled with
+//! rates-sync dump [--json]  the compiled table, one line per card (or, with --json, as the input
+//!                      of verify/pricing_reference.py)
 //! rates-sync audit     LiteLLM and models.dev as second opinions, plus the vendors' invoices
 //! rates-sync catalog-drift [--save DIR | --inputs DIR]
 //!                      fetch every listing, deprecation page and rate source into DIR (default a
@@ -61,11 +63,15 @@ fn main() -> ExitCode {
         "drift" => drift(&root),
         "audit" => run_audit(&root),
         "dump" => {
-            print!("{}", rates_sync::canon::dump());
+            if args.get(1).is_some_and(|a| a == "--json") {
+                print!("{}", rates_sync::canon::spec_json());
+            } else {
+                print!("{}", rates_sync::canon::dump());
+            }
             Ok(())
         }
         _ => Err(
-            "usage: rates-sync sync | generate | check | drift | classify [--apply] | rate-version | audit | catalog-drift [--save DIR | --inputs DIR] | catalog-apply --inputs DIR SLUG"
+            "usage: rates-sync sync | generate | check | drift | classify [--apply] | rate-version | audit | dump [--json] | catalog-drift [--save DIR | --inputs DIR] | catalog-apply --inputs DIR SLUG"
                 .into(),
         ),
     };
