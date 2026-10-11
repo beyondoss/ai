@@ -249,6 +249,10 @@ mod runtime {
     pub struct Execute {
         tools: Arc<BTreeMap<String, Arc<dyn Tool>>>,
         catalog: Arc<Vec<CatalogEntry>>,
+        /// `tools.search`'s ranking — the same matcher as `tool_search` (see its [`Index`]).
+        ///
+        /// [`Index`]: crate::tools::tool_search::Index
+        index: Arc<crate::tools::tool_search::Index>,
         description: String,
         limits: Limits,
     }
@@ -262,6 +266,11 @@ mod runtime {
         fn with_limits(tools: Vec<Arc<dyn Tool>>, limits: Limits) -> Self {
             let mut map = BTreeMap::new();
             let mut catalog = Vec::new();
+            let index = crate::tools::tool_search::Index::new(
+                tools
+                    .iter()
+                    .map(|t| (t.name(), t.description(), t.input_schema())),
+            );
             for tool in tools {
                 let name = tool.name().to_string();
                 let path = js_path(&name);
@@ -277,6 +286,7 @@ mod runtime {
             Self {
                 tools: Arc::new(map),
                 catalog: Arc::new(catalog),
+                index: Arc::new(index),
                 description,
                 limits,
             }
@@ -294,6 +304,7 @@ mod runtime {
 
             let tools = self.tools.clone();
             let catalog = self.catalog.clone();
+            let index = self.index.clone();
             let max_calls = self.limits.max_calls;
             let max_output = self.limits.max_output;
             let memory_limit = self.limits.memory_limit;
@@ -335,6 +346,7 @@ mod runtime {
                     futures::executor::block_on(run_js(
                         tools,
                         catalog,
+                        index,
                         code,
                         calls,
                         max_calls,
@@ -421,6 +433,7 @@ mod runtime {
     async fn run_js(
         tools: Arc<BTreeMap<String, Arc<dyn Tool>>>,
         catalog: Arc<Vec<CatalogEntry>>,
+        index: Arc<crate::tools::tool_search::Index>,
         code: String,
         calls: Arc<AtomicUsize>,
         max_calls: usize,
@@ -475,6 +488,12 @@ mod runtime {
             ctx.globals()
                 .set("__catalogJson", catalog_json)
                 .map_err(js_err)?;
+            // `tools.search` ranks in Rust, with `tool_search`'s matcher: catalog indices, best first.
+            let search = Function::new(ctx.clone(), move |query: String| -> String {
+                serde_json::to_string(&index.rank(&query)).unwrap_or_else(|_| "[]".into())
+            })
+            .map_err(js_err)?;
+            ctx.globals().set("__searchTools", search).map_err(js_err)?;
             let promise: Promise<'_> = ctx.eval(script).map_err(js_err)?;
             promise
                 .into_future::<String>()
@@ -611,13 +630,10 @@ mod runtime {
       obj[e.path[e.path.length - 1]] = (input) => call(e.name, input);
     }}
     root.search = (q) => {{
-      const needle = String(q ?? "").toLowerCase();
-      return entries
-        .filter((e) =>
-          e.name.toLowerCase().includes(needle)
-          || e.path.join(".").toLowerCase().includes(needle)
-          || String(e.description || "").toLowerCase().includes(needle)
-        )
+      const query = String(q ?? "").trim();
+      const hits = query ? JSON.parse(globalThis.__searchTools(query)) : entries.map((_, i) => i);
+      return hits
+        .map((i) => entries[i])
         .map((e) => ({{
           path: e.path.join("."),
           name: e.name,
@@ -958,6 +974,52 @@ mod runtime {
                 .unwrap();
             assert!(out.contains("github.list_issues"), "{out}");
             assert!(out.contains("mcp__github__list_issues"), "{out}");
+        }
+
+        /// The A/B regression: `tools.search("get file contents")` returned `[]` for
+        /// `github.get_file_contents` — the query was matched as one exact phrase.
+        #[tokio::test]
+        async fn execute_search_matches_words_not_a_phrase() {
+            let fake = |name: &'static str, desc: &'static str| -> Arc<dyn Tool> {
+                Arc::new(Fake {
+                    name,
+                    desc,
+                    handler: |_| Ok("[]".into()),
+                })
+            };
+            let tool = exec(vec![
+                fake(
+                    "mcp__github__get_file_contents",
+                    "Get the contents of a file or directory from a GitHub repository",
+                ),
+                fake(
+                    "mcp__github__list_issues",
+                    "List issues in a GitHub repository",
+                ),
+                fake(
+                    "mcp__playwright__browser_click",
+                    "Perform click on a web page",
+                ),
+            ]);
+            for (query, want) in [
+                ("get file contents", "github.get_file_contents"),
+                ("getFileContents", "github.get_file_contents"),
+                ("list issue", "github.list_issues"),
+                ("click", "playwright.browser_click"),
+            ] {
+                let out = run_code(
+                    &tool,
+                    &format!("return tools.search({query:?}).map((t) => t.path);"),
+                )
+                .await
+                .unwrap();
+                assert_eq!(out, format!("[\"{want}\"]"), "{query:?}");
+            }
+            // An empty query still lists everything.
+            let out = run_code(&tool, r#"return tools.search("").length;"#)
+                .await
+                .unwrap();
+            assert_eq!(out, "3");
         }
 
         #[tokio::test]

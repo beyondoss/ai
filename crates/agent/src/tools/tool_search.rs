@@ -145,13 +145,12 @@ struct Entry {
     short: String,
     description: String,
     signature: String,
-    /// Lowercased description and parameter names, for keyword matching.
-    haystack: String,
 }
 
 /// The model-facing tool.
 pub struct ToolSearch {
     entries: Vec<Entry>,
+    index: Index,
     description: String,
 }
 
@@ -169,64 +168,44 @@ impl ToolSearch {
                     .strip_prefix(&format!("mcp__{server}__"))
                     .unwrap_or(&name)
                     .to_string();
-                let schema = t.input_schema();
-                let mut haystack = t.description().to_lowercase();
-                if let Some(props) = schema.get("properties").and_then(Value::as_object) {
-                    for key in props.keys() {
-                        haystack.push(' ');
-                        haystack.push_str(&key.to_lowercase());
-                    }
-                }
                 Entry {
-                    signature: signature(&schema),
+                    signature: signature(&t.input_schema()),
                     description: t.description().to_string(),
                     name,
                     server,
                     short,
-                    haystack,
                 }
             })
             .collect();
         let description = describe(&entries);
+        let index = Index::new(
+            deferred
+                .iter()
+                .map(|t| (t.name(), t.description(), t.input_schema())),
+        );
         Self {
             entries,
+            index,
             description,
         }
     }
 
     fn search(&self, query: &str, limit: usize) -> String {
-        let terms: Vec<String> = query
-            .split(|c: char| c == ',' || c.is_whitespace())
-            .map(|t| {
-                t.trim_matches(|c: char| !(c.is_alphanumeric() || c == '_' || c == '-'))
-                    .trim_start_matches("mcp__")
-                    .to_lowercase()
-            })
-            .filter(|t| !t.is_empty())
-            .collect();
-        if terms.is_empty() {
+        if Index::terms(query).is_empty() {
             return format!("Empty query. {}", self.servers_line());
         }
-        let mut scored: Vec<((usize, u32), &Entry)> = self
-            .entries
-            .iter()
-            .filter_map(|e| {
-                let s = score(e, &terms);
-                (s.0 > 0).then_some((s, e))
-            })
+        let mut scored: Vec<&Entry> = self
+            .index
+            .rank(query)
+            .into_iter()
+            .map(|i| &self.entries[i])
             .collect();
-        // Only the tools matching the most terms: "github add" means github's `add`, not every
-        // github tool and every `add`.
-        let best = scored.iter().map(|(s, _)| s.0).max().unwrap_or(0);
-        scored.retain(|(s, _)| s.0 == best);
         if scored.is_empty() {
             return format!(
                 "No deferred tool matches {query:?}. {}",
                 self.servers_line()
             );
         }
-        // Best first; ties in name order, so the same query always loads the same tools.
-        scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.name.cmp(&b.1.name)));
         let more = scored.len().saturating_sub(limit);
         scored.truncate(limit);
         let mut out = format!(
@@ -235,7 +214,7 @@ impl ToolSearch {
             if scored.len() == 1 { "" } else { "s" },
             if scored.len() == 1 { "it" } else { "them" },
         );
-        for (_, e) in &scored {
+        for e in &scored {
             out.push_str(&format!(
                 "- {}({}) — {}\n",
                 e.name,
@@ -258,39 +237,164 @@ impl ToolSearch {
     }
 }
 
-/// How well `e` matches the query terms: (terms matched, points). An exact name wins outright;
-/// otherwise a word of the tool's own name counts most, its server next, its description or a
-/// parameter name least.
-fn score(e: &Entry, terms: &[String]) -> (usize, u32) {
-    let name = e.name.to_lowercase();
-    let short = e.short.to_lowercase();
-    let qualified = format!("{}__{short}", e.server.to_lowercase());
-    let (mut matched, mut points) = (0, 0);
-    for term in terms {
-        // A bare tool name (`add`) is not exact: several servers may have one.
-        if *term == qualified || *term == name {
-            return (usize::MAX, 0);
+/// Keyword search over a tool catalog — shared by `tool_search` and Code Mode's `tools.search`.
+///
+/// Names and text are cut into normalized words: split on anything not a letter or digit and at
+/// camelCase humps (`get_file_contents`, `get-file-contents`, `getFileContents` and `get file
+/// contents` are all `get file content`), lowercased, plurals folded (`issues` → `issue`,
+/// `entities` → `entity`). A query word scores most when it is a word of the tool's own name,
+/// less as the start of one (`nav` → `navigate`) or as the server, least when it appears only in
+/// the description or a parameter name. Only the tools matching the most query words come back —
+/// "github add" is github's `add`, not every github tool and every `add` — best first, ties in name
+/// order, so the same query always returns the same tools. An exact registered name
+/// (`mcp__github__get_issue`, or `github__get_issue`) wins outright. No embeddings, no state.
+pub struct Index {
+    docs: Vec<Doc>,
+}
+
+struct Doc {
+    /// `mcp__github__get_issue` and `github__get_issue`, lowercased.
+    exact: [String; 2],
+    server: String,
+    name_words: Vec<String>,
+    text_words: std::collections::HashSet<String>,
+}
+
+/// Words too common to tell tools apart.
+const STOPWORDS: &[&str] = &[
+    "a", "an", "and", "the", "to", "of", "for", "in", "on", "by", "with", "from", "or", "is", "it",
+    "tool", "tools", "mcp",
+];
+
+impl Index {
+    /// Index `(registered name, description, input schema)` triples, in the order results refer to.
+    pub fn new<'a>(tools: impl IntoIterator<Item = (&'a str, &'a str, Value)>) -> Self {
+        let docs = tools
+            .into_iter()
+            .map(|(name, description, schema)| {
+                let server = super::mcp::server_name_from_registered(name).unwrap_or_default();
+                let short = name
+                    .strip_prefix(&format!("mcp__{server}__"))
+                    .unwrap_or(name);
+                let mut text_words: std::collections::HashSet<String> =
+                    words(description).collect();
+                if let Some(props) = schema.get("properties").and_then(Value::as_object) {
+                    text_words.extend(props.keys().flat_map(|k| words(k)));
+                }
+                Doc {
+                    exact: [
+                        name.to_lowercase(),
+                        format!("{server}__{short}").to_lowercase(),
+                    ],
+                    server: server.to_lowercase(),
+                    name_words: words(short).collect(),
+                    text_words,
+                }
+            })
+            .collect();
+        Self { docs }
+    }
+
+    /// The query's normalized words, stopwords dropped, each once.
+    fn terms(query: &str) -> Vec<String> {
+        let mut terms: Vec<String> = Vec::new();
+        for w in words(query) {
+            if !STOPWORDS.contains(&w.as_str()) && !terms.contains(&w) {
+                terms.push(w);
+            }
         }
-        let mut p = 0;
-        if *term == short {
-            p += 8;
-        } else if short.split(['_', '-']).any(|w| w == term) {
-            p += 6;
-        } else if short.contains(term.as_str()) {
-            p += 4;
+        terms
+    }
+
+    /// Indices of the matching tools, best first (see the type's doc comment).
+    pub fn rank(&self, query: &str) -> Vec<usize> {
+        let raw: Vec<String> = query
+            .split(|c: char| c == ',' || c.is_whitespace())
+            .map(|t| {
+                t.trim_matches(|c: char| !(c.is_alphanumeric() || c == '_' || c == '-'))
+                    .to_lowercase()
+            })
+            .filter(|t| !t.is_empty())
+            .collect();
+        let exact: Vec<usize> = (0..self.docs.len())
+            .filter(|&i| raw.iter().any(|r| self.docs[i].exact.contains(r)))
+            .collect();
+        if !exact.is_empty() {
+            return exact;
         }
-        if e.server.eq_ignore_ascii_case(term) {
-            p += 3;
-        }
-        if e.haystack.contains(term.as_str()) {
-            p += 1;
-        }
-        if p > 0 {
-            matched += 1;
-            points += p;
+        let terms = Self::terms(query);
+        let mut scored: Vec<(usize, u32, usize)> = self
+            .docs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, d)| {
+                let (mut matched, mut points) = (0, 0);
+                for term in &terms {
+                    let p = if d.name_words.contains(term) {
+                        6
+                    } else if term.len() >= 3
+                        && d.name_words.iter().any(|w| w.starts_with(term.as_str()))
+                    {
+                        3
+                    } else {
+                        0
+                    } + if d.server == *term { 3 } else { 0 }
+                        + u32::from(d.text_words.contains(term));
+                    if p > 0 {
+                        matched += 1;
+                        points += p;
+                    }
+                }
+                (matched > 0).then_some((matched, points, i))
+            })
+            .collect();
+        let best = scored.iter().map(|s| s.0).max().unwrap_or(0);
+        scored.retain(|s| s.0 == best);
+        scored.sort_by(|a, b| {
+            b.1.cmp(&a.1)
+                .then_with(|| self.docs[a.2].exact[0].cmp(&self.docs[b.2].exact[0]))
+        });
+        scored.into_iter().map(|s| s.2).collect()
+    }
+}
+
+/// Normalized words of `s` — see [`Index`].
+fn words(s: &str) -> impl Iterator<Item = String> + '_ {
+    s.split(|c: char| !c.is_alphanumeric())
+        .flat_map(split_camel)
+        .map(|w| stem(&w.to_lowercase()))
+        .filter(|w| !w.is_empty())
+}
+
+/// `getFileContents` → `get`, `File`, `Contents`; `HTTPServer` → `HTTP`, `Server`.
+fn split_camel(s: &str) -> Vec<&str> {
+    let chars: Vec<(usize, char)> = s.char_indices().collect();
+    let mut out = Vec::new();
+    let mut start = 0;
+    for k in 1..chars.len() {
+        let (i, c) = chars[k];
+        let prev = chars[k - 1].1;
+        let next_lower = chars.get(k + 1).is_some_and(|(_, n)| n.is_lowercase());
+        if c.is_uppercase()
+            && (prev.is_lowercase() || prev.is_ascii_digit() || (prev.is_uppercase() && next_lower))
+        {
+            out.push(&s[start..i]);
+            start = i;
         }
     }
-    (matched, points)
+    out.push(&s[start..]);
+    out
+}
+
+/// Fold an English plural to its singular, crudely but identically on both sides of a match.
+fn stem(w: &str) -> String {
+    if w.len() > 4 && w.ends_with("ies") {
+        format!("{}y", &w[..w.len() - 3])
+    } else if w.len() > 3 && w.ends_with('s') && !w.ends_with("ss") {
+        w[..w.len() - 1].to_string()
+    } else {
+        w.to_string()
+    }
 }
 
 /// `owner, repo, page?` — required parameters bare, optional ones marked.
@@ -544,6 +648,111 @@ mod tests {
         reg.retain(|n| !n.starts_with("mcp__") || n.ends_with("skill__read"));
         refresh(&mut reg);
         assert!(reg.get(NAME).is_none());
+    }
+
+    /// The real catalogs the measurements use (`eval/mcp_catalogs/`), registered as the agent would.
+    fn real_index() -> (Index, Vec<String>) {
+        let mut tools: Vec<(String, String, Value)> = Vec::new();
+        for (server, json) in [
+            (
+                "github",
+                include_str!("../../eval/mcp_catalogs/github.json"),
+            ),
+            (
+                "playwright",
+                include_str!("../../eval/mcp_catalogs/playwright.json"),
+            ),
+            (
+                "filesystem",
+                include_str!("../../eval/mcp_catalogs/filesystem.json"),
+            ),
+            (
+                "memory",
+                include_str!("../../eval/mcp_catalogs/memory.json"),
+            ),
+            (
+                "everything",
+                include_str!("../../eval/mcp_catalogs/everything.json"),
+            ),
+            (
+                "notion",
+                include_str!("../../eval/mcp_catalogs/notion.json"),
+            ),
+        ] {
+            for t in serde_json::from_str::<Vec<Value>>(json).unwrap() {
+                tools.push((
+                    format!("mcp__{server}__{}", t["name"].as_str().unwrap()),
+                    t["description"].as_str().unwrap_or_default().to_string(),
+                    t["inputSchema"].clone(),
+                ));
+            }
+        }
+        let names = tools.iter().map(|t| t.0.clone()).collect();
+        let index = Index::new(
+            tools
+                .iter()
+                .map(|(n, d, s)| (n.as_str(), d.as_str(), s.clone())),
+        );
+        (index, names)
+    }
+
+    #[test]
+    fn search_matches_how_real_tool_names_are_spelled() {
+        let (index, names) = real_index();
+        let top = |q: &str| {
+            index
+                .rank(q)
+                .first()
+                .map(|&i| names[i].clone())
+                .unwrap_or_else(|| panic!("no match for {q:?}"))
+        };
+        for (query, want) in [
+            // snake_case, from spaced words, from camelCase, from kebab-case
+            ("get file contents", "mcp__github__get_file_contents"),
+            ("getFileContents", "mcp__github__get_file_contents"),
+            ("get-file-contents", "mcp__github__get_file_contents"),
+            ("click", "mcp__playwright__browser_click"),
+            ("list issues", "mcp__github__list_issues"),
+            // singular for a plural name, and the reverse
+            ("list issue", "mcp__github__list_issues"),
+            ("create entity", "mcp__memory__create_entities"),
+            ("get pull requests", "mcp__github__get_pull_request"),
+            // kebab-case names, stopwords in the name or the query
+            ("tiny image", "mcp__everything__get-tiny-image"),
+            ("retrieve a page", "mcp__notion__API-retrieve-a-page"),
+            (
+                "directory with sizes",
+                "mcp__filesystem__list_directory_with_sizes",
+            ),
+            // words only the description has
+            (
+                "accessibility snapshot",
+                "mcp__playwright__browser_snapshot",
+            ),
+            (
+                "knowledge graph observations",
+                "mcp__memory__add_observations",
+            ),
+            // a prefix of a name word
+            ("navig", "mcp__playwright__browser_navigate"),
+            // an exact registered name
+            ("mcp__github__search_code", "mcp__github__search_code"),
+        ] {
+            assert_eq!(top(query), want, "{query:?}");
+        }
+        // Only the tools matching the most query words: not every `get_*` and every `*_file*`.
+        assert!(index.rank("get file contents").len() <= 3);
+        assert!(index.rank("zzz qqq").is_empty());
+        // A word only descriptions have finds every tool whose description has it.
+        let hits: Vec<&str> = index
+            .rank("accessibility")
+            .iter()
+            .map(|&i| names[i].as_str())
+            .collect();
+        assert!(
+            hits.contains(&"mcp__playwright__browser_snapshot"),
+            "{hits:?}"
+        );
     }
 
     #[test]
