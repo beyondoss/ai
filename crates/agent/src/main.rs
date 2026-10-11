@@ -334,6 +334,12 @@ enum Command {
         /// flag.
         #[usage(long, env = "AI_AGENT_CONTEXT_WINDOW")]
         context_window: Option<u32>,
+        /// Compact once the prompt passes this many tokens, even when the window allows more. Defaults
+        /// to the model's own provisional cap (`list-models` shows it; most models have none, so the
+        /// trigger stays `window − reserve`). `0` removes the cap. `--context-window` still bounds it:
+        /// the lower of the two lines fires. `serve`'s identical flag.
+        #[usage(long, env = "AI_AGENT_COMPACT_AT")]
+        compact_at: Option<u32>,
         /// Compaction headroom (tokens) reserved below the context window before it fires. Defaults to
         /// `CompactionConfig::default()`'s 16,384. `serve`'s identical flag.
         #[usage(long, env = "AI_AGENT_COMPACTION_RESERVE_TOKENS")]
@@ -883,6 +889,12 @@ enum Command {
         /// pass this to pin a fixed budget that survives a `set_model` switch to a different model.
         #[usage(long, env = "AI_AGENT_CONTEXT_WINDOW")]
         context_window: Option<u32>,
+        /// Compact once the prompt passes this many tokens, even when the window allows more. Defaults
+        /// to the model's own provisional cap (`list-models` shows it; most models have none, so the
+        /// trigger stays `window − reserve`). `0` removes the cap. `--context-window` still bounds it:
+        /// the lower of the two lines fires. `run`'s identical flag.
+        #[usage(long, env = "AI_AGENT_COMPACT_AT")]
+        compact_at: Option<u32>,
         /// Per-turn output token ceiling. Defaults to the model's own capability-table `max_output`
         /// (see `agent_core::models::capabilities`), floored at a sane minimum — only pass this to
         /// override that, e.g. capping generation length or lifting it past the model-derived default.
@@ -1870,6 +1882,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             trust_project,
             force_untrusted,
             context_window,
+            compact_at,
             compaction_reserve_tokens,
             compaction_keep_recent_tokens,
             branch_summary_reserve_tokens,
@@ -1944,6 +1957,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 trust_project,
                 force_untrusted,
                 context_window,
+                compact_at,
                 compaction_reserve_tokens,
                 compaction_keep_recent_tokens,
                 branch_summary_reserve_tokens,
@@ -2036,6 +2050,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             append_system_prompt,
             no_context_files,
             context_window,
+            compact_at,
             cache_long,
             thinking,
             reasoning_effort,
@@ -2531,6 +2546,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 continue_session,
                 no_session_persistence,
                 context_window,
+                compact_at,
                 cache_long,
                 thinking,
                 reasoning_effort,
@@ -2705,17 +2721,20 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 None => serve::available_models().to_vec(),
             };
             println!(
-                "{:<22} {:>10} {:>9} {:<8} {:<6}",
-                "model", "context", "max-out", "thinking", "vision"
+                "{:<22} {:>10} {:>10} {:>9} {:<8} {:<6}",
+                "model", "context", "compact-at", "max-out", "thinking", "vision"
             );
             for model in models {
                 let caps = agent_core::capabilities(model);
                 let thinking = caps.reasoning_effort
                     || caps.thinking != agent_core::models::ThinkingShape::None;
+                // Where compaction fires with no overrides: the provisional cap, else window − reserve.
+                let trigger = agent_core::CompactionConfig::for_model(&caps).trigger_tokens();
                 println!(
-                    "{:<22} {:>10} {:>9} {:<8} {:<6}",
+                    "{:<22} {:>10} {:>10} {:>9} {:<8} {:<6}",
                     model,
                     format_token_count(caps.context_window),
+                    format_token_count(trigger),
                     format_token_count(caps.max_output),
                     if thinking { "yes" } else { "no" },
                     if caps.supports_vision { "yes" } else { "no" },
@@ -4033,6 +4052,7 @@ async fn run_task(
     trust_project: bool,
     force_untrusted: bool,
     context_window: Option<u32>,
+    compact_at: Option<u32>,
     compaction_reserve_tokens: Option<u32>,
     compaction_keep_recent_tokens: Option<u32>,
     branch_summary_reserve_tokens: Option<u32>,
@@ -5006,29 +5026,22 @@ async fn run_task(
                 session_id: meta.id.clone(),
             })
         });
-    // Matches `serve`'s own `build_agent`: defaults to the model's own capability-table context
-    // window when `--context-window` isn't given, then applies the reserve/keep-recent overrides.
-    let caps = agent_core::capabilities(&model);
-    let mut compaction = agent_core::CompactionConfig {
-        context_window: context_window.unwrap_or(caps.context_window),
-        input_limit: caps.input_limit,
-        ..agent_core::CompactionConfig::default()
-    };
-    if let Some(reserve) = compaction_reserve_tokens {
-        compaction.reserve_tokens = reserve;
-    }
-    if let Some(keep_recent) = compaction_keep_recent_tokens {
-        compaction.keep_recent_tokens = keep_recent;
-    }
+    // `serve`'s own resolution (`build_agent`): the model's window, input limit and compaction cap,
+    // then the `--context-window`/`--compact-at`/reserve/keep-recent overrides.
+    let mut compaction = beyond_ai_agent::serve::resolve_compaction(
+        &model,
+        context_window,
+        compact_at,
+        compaction_reserve_tokens,
+        compaction_keep_recent_tokens,
+    );
     if no_compaction {
         compaction.enabled = false;
     }
     // The live-prompt size at which to warn the model that a compaction is approaching (see
-    // `run_turn_once`), derived from the same resolved window/reserve the agent will compact against.
-    let pressure_point = beyond_ai_agent::memory::compaction_pressure_point(
-        compaction.input_budget(),
-        compaction.reserve_tokens,
-    );
+    // `run_turn_once`), derived from the same trigger the agent will compact at.
+    let pressure_point =
+        beyond_ai_agent::memory::compaction_pressure_point(compaction.trigger_tokens());
     // Captured before each is moved into the builder chain below — `Agent` exposes no getter for
     // either back, and `run --export`'s own call to `export_html_full` further down needs the exact
     // system prompt/tool set this run actually used, not a recomputed (and possibly out-of-sync) guess.

@@ -7478,6 +7478,7 @@ mod tests {
             .with_compaction(CompactionConfig {
                 context_window: 100,
                 input_limit: None,
+                compact_at: None,
                 reserve_tokens: 10,
                 keep_recent_tokens: 1,
                 summary_max_tokens: 256,
@@ -7629,6 +7630,7 @@ mod tests {
             .with_compaction(CompactionConfig {
                 context_window: 100,
                 input_limit: None,
+                compact_at: None,
                 reserve_tokens: 10,
                 keep_recent_tokens: 1,
                 summary_max_tokens: 256,
@@ -7725,6 +7727,7 @@ mod tests {
             .with_compaction(CompactionConfig {
                 context_window: 100,
                 input_limit: None,
+                compact_at: None,
                 reserve_tokens: 10,
                 keep_recent_tokens: 1,
                 summary_max_tokens: 256,
@@ -7837,6 +7840,7 @@ mod tests {
             .with_compaction(CompactionConfig {
                 context_window: 100,
                 input_limit: None,
+                compact_at: None,
                 reserve_tokens: 10,
                 keep_recent_tokens: 1,
                 summary_max_tokens: 256,
@@ -7917,6 +7921,7 @@ mod tests {
         let agent = Agent::new(mock.clone(), "claude-opus-4-8").with_compaction(CompactionConfig {
             context_window: 100,
             input_limit: None,
+            compact_at: None,
             reserve_tokens: 10,
             keep_recent_tokens: 1,
             summary_max_tokens: 256,
@@ -7985,6 +7990,7 @@ mod tests {
             .with_compaction(CompactionConfig {
                 context_window: 100,
                 input_limit: None,
+                compact_at: None,
                 reserve_tokens: 10,
                 keep_recent_tokens: 1,
                 summary_max_tokens: 256,
@@ -8084,6 +8090,7 @@ mod tests {
             .with_compaction(CompactionConfig {
                 context_window: 100,
                 input_limit: None,
+                compact_at: None,
                 reserve_tokens: 10,
                 keep_recent_tokens: 1,
                 summary_max_tokens: 256,

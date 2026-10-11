@@ -1,7 +1,7 @@
 """Run the long-context sweep: task × model × compaction trigger × attempt, headless.
 
-Each run copies a buggy task tree, runs `beyond-ai-agent run --json` in it with `--context-window`
-set so compaction fires at the arm's trigger, prices every request from the provider-reported usage
+Each run copies a buggy task tree, runs `beyond-ai-agent run --json` in it with compaction set to
+fire at the arm's trigger, prices every request from the provider-reported usage
 on the event stream (including compaction's own summarization calls, carried on `compacted`), then
 restores the pristine tests and grades with the repository's own suite.
 
@@ -30,8 +30,20 @@ from repos import BY_NAME, TASKS
 
 RESERVE = 16_384  # CompactionConfig::default().reserve_tokens; the arms leave it alone.
 
-# name → compaction trigger in tokens (None: the model's own window − reserve, today's default).
-ARMS: dict[str, int | None] = {"100k": 100_000, "200k": 200_000, "default": None}
+# name → compaction trigger in tokens. `default` is the model's own window − reserve (the trigger
+# before per-model caps); `model` is the binary's own per-model `compact_at` (`list-models` shows it).
+# A numeric arm sets both `--context-window` (trigger + reserve, which older binaries understand) and
+# `AI_AGENT_COMPACT_AT` (the trigger, which newer ones apply as-is); `default` sets
+# `AI_AGENT_COMPACT_AT=0` so a newer binary drops its per-model cap. Any `<n>k` arm name works.
+ARMS: dict[str, int | None] = {"100k": 100_000, "200k": 200_000, "default": None, "model": None}
+
+
+def arm_trigger(arm: str) -> int | None:
+    if arm in ARMS:
+        return ARMS[arm]
+    if arm.endswith("k") and arm[:-1].isdigit():
+        return int(arm[:-1]) * 1000
+    raise ValueError(f"unknown arm {arm!r}")
 
 # USD per MTok: (input, output, cache read, cache write 5m, cache write 1h); `long` is the
 # whole-request card above `long_over` prompt tokens. From crates/providers/src/rates/generated.rs.
@@ -236,12 +248,15 @@ def run_one(binary: Path, task: str, model: str, arm: str, attempt: int, cap_usd
     env["AI_DIRECT"] = "1"
     for k in [k for k in env if k.startswith("AI_AGENT_") or k == "AI_GATEWAY_URL"]:
         del env[k]
-    trigger = ARMS[arm] if arm in ARMS else None
+    trigger = arm_trigger(arm)
     window = (trigger + RESERVE) if trigger else None
     cmd = [str(binary), "run", "--json", "--model", model, "--max-steps", str(max_steps), *memory,
            "--session-dir", str(d / "sessions"), *extra]
     if window:
         cmd += ["--context-window", str(window)]
+        env["AI_AGENT_COMPACT_AT"] = str(trigger)
+    elif arm == "default":
+        env["AI_AGENT_COMPACT_AT"] = "0"
     cmd.append(prompt)
     live = Live(model)
     t0 = time.monotonic()
@@ -344,7 +359,8 @@ def main(argv: list[str]) -> None:
     ap = argparse.ArgumentParser(prog="run")
     ap.add_argument("--bin", default=str(HERE_ROOT / "target/release/beyond-ai-agent"))
     ap.add_argument("--models", default="claude-opus-5-5,claude-sonnet-5-5,gpt-6.1-sol")
-    ap.add_argument("--arms", default=",".join(ARMS))
+    ap.add_argument("--arms", default="100k,200k,default",
+                    help=f"comma-separated; known: {','.join(ARMS)}, or any <n>k")
     ap.add_argument("--tasks", default="")
     ap.add_argument("--attempts", type=int, default=1)
     ap.add_argument("--jobs", type=int, default=6)
