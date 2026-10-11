@@ -2194,7 +2194,14 @@ server and tool names, and loads what it needs.
   line per server listing tool names, within 4 KB; past that a server collapses to its count). A
   query is keywords, a server name, or exact names; results are the tools matching the most query
   terms (so "github add" is github's `add`, not every github tool and every `add`), best first, at most
-  `limit` (5 by default). Stateless, like `todo`.
+  `limit` (5 by default). Stateless, like `todo`. Matching (`tool_search::Index`, shared with Code
+  Mode's `tools.search`) is on normalized words, not phrases: names and descriptions are split on
+  `_`, `-`, `.` and camelCase humps, lowercased and plural-folded, so "get file contents",
+  `getFileContents` and `get-file-contents` all find `get_file_contents`, "list issue" finds
+  `list_issues`, and a word only the description has still matches (weakest). Deterministic: no
+  embeddings, ties in name order. An earlier Code Mode search matched the whole query as one
+  substring and returned `[]` for "get file contents"; `tests` in `tool_search.rs` pin these cases
+  against the real catalogs in `eval/mcp_catalogs/`.
 - [`agent_core::deferred`](../agent-core/src/deferred.rs): **a successful `tool_search` result loads
   every deferred tool it names.** The model read those names, so the transcript is the one record of
   what is loaded: it survives a resume, a `serve` reattach and a switch of dialect mid-session with
