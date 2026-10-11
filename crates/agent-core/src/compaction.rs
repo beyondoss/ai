@@ -1452,7 +1452,7 @@ mod tests {
         for (id, cap) in [
             ("claude-opus-5-5", 200_000),
             ("claude-fable-5-1", 200_000),
-            ("claude-sonnet-5-5", 128_000),
+            ("claude-sonnet-5-5", 200_000),
             ("claude-haiku-5-5", 90_000),
             ("gpt-6.1-sol", 240_000),
             ("gpt-5.6-sol", 240_000),
