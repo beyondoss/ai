@@ -31,11 +31,9 @@ use crate::tools::output::cap_listing_bytes;
 
 pub const NAME: &str = "memory";
 
-const DESCRIPTION: &str = "Memory store. `/memories` is durable, cross-session project knowledge \
-    (build/test commands, architecture decisions, debugging lessons, user preferences). `/session`, when \
-    present, is private working memory for THIS task that survives your own context compaction and is \
-    cleared when the session ends — write precise facts there you don't want summarized away. Keep each \
-    root's `MEMORY.md` as a lean index of one-line pointers to topic files.";
+const DESCRIPTION: &str = "Persistent memory. `/memories`: durable, cross-session project knowledge. \
+    `/session` (when mounted): this task's working memory, kept through compaction and cleared when the \
+    session ends. Each root's `MEMORY.md` is its index.";
 
 /// The `memory` tool. Holds the mounted stores, each an `Arc` cloned in at registration.
 pub struct Memory {
