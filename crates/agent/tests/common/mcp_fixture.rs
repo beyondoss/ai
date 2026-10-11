@@ -17,6 +17,7 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 use serde_json::{Value, json};
 
@@ -59,138 +60,175 @@ impl HttpMcpFixture {
 
 /// Start one fixture on a loopback port. The thread runs for the test process's life.
 pub fn spawn_http_mcp_fixture() -> HttpMcpFixture {
+    spawn(None)
+}
+
+/// A legacy server slow to answer `server/discover`: it holds that request `delay` — past the
+/// client's discover timeout — then answers it "method not found", while serving every other
+/// request at once (one thread per connection). A cold-start serverless MCP host looks like this.
+pub fn spawn_http_mcp_fixture_slow_discover(delay: Duration) -> HttpMcpFixture {
+    spawn(Some(delay))
+}
+
+fn spawn(slow_discover: Option<Duration>) -> HttpMcpFixture {
     let listener = beyond_ai_test_support::ports::listener();
     let addr = listener.local_addr().unwrap();
     let requests = Arc::new(Mutex::new(Vec::new()));
     let recorder = requests.clone();
     thread::spawn(move || {
         for stream in listener.incoming() {
-            let Ok(mut stream) = stream else { continue };
-            let mut buf = Vec::new();
-            let mut tmp = [0u8; 8192];
-            let mut header_end = None;
-            while header_end.is_none() {
-                let n = stream.read(&mut tmp).unwrap_or(0);
-                if n == 0 {
-                    break;
+            let Ok(stream) = stream else { continue };
+            let recorder = recorder.clone();
+            match slow_discover {
+                Some(delay) => {
+                    thread::spawn(move || serve(stream, &recorder, Some(delay)));
                 }
-                buf.extend_from_slice(&tmp[..n]);
-                header_end = buf.windows(4).position(|w| w == b"\r\n\r\n");
+                None => serve(stream, &recorder, None),
             }
-            let Some(pos) = header_end else { continue };
-            let headers_text = String::from_utf8_lossy(&buf[..pos]).into_owned();
-            let content_length: usize = headers_text
-                .lines()
-                .find_map(|l| {
-                    l.to_ascii_lowercase()
-                        .strip_prefix("content-length:")
-                        .map(|v| v.trim().parse().unwrap_or(0))
-                })
-                .unwrap_or(0);
-            let body_start = pos + 4;
-            while buf.len() < body_start + content_length {
-                let n = stream.read(&mut tmp).unwrap_or(0);
-                if n == 0 {
-                    break;
-                }
-                buf.extend_from_slice(&tmp[..n]);
-            }
-            // Every header, verbatim — the name lowercased so a lookup is case-insensitive, the
-            // value untouched so a test can assert on the exact bytes that arrived.
-            let headers: RequestHeaders = headers_text
-                .lines()
-                .skip(1)
-                .filter_map(|l| l.split_once(':'))
-                .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
-                .collect();
-            recorder.lock().unwrap().push(headers);
-
-            let body = &buf[body_start..buf.len().min(body_start + content_length)];
-            let request: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
-            let is_notification = request.get("id").is_none();
-            if is_notification {
-                let _ = stream.write_all(
-                    b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                );
-                continue;
-            }
-            let id = request.get("id").cloned().unwrap_or(Value::Null);
-            let method = request.get("method").and_then(Value::as_str).unwrap_or("");
-            let result = match method {
-                "server/discover" => json!({
-                    "resultType": "complete",
-                    "supportedVersions": ["2026-07-28", "2025-11-25"],
-                    "capabilities": { "tools": {} },
-                    "ttlMs": 0,
-                    "cacheScope": "private",
-                    "_meta": {
-                        "io.modelcontextprotocol/serverInfo": {
-                            "name": "mcp-fixture-http-server",
-                            "version": "0.0.0",
-                        }
-                    }
-                }),
-                "initialize" => json!({
-                    "protocolVersion": "2025-11-25",
-                    "capabilities": { "tools": {} },
-                    "serverInfo": { "name": "mcp-fixture-http-server", "version": "0.0.0" },
-                }),
-                "tools/list" => json!({ "tools": [
-                    {
-                        "name": "echo",
-                        "description": "Echoes back its `text` argument.",
-                        "inputSchema": {
-                            "type": "object",
-                            "properties": { "text": { "type": "string" } },
-                            "required": ["text"],
-                        },
-                    },
-                    {
-                        "name": "fail",
-                        "description": "Always fails, with an error message.",
-                        "inputSchema": { "type": "object", "properties": {} },
-                    },
-                ] }),
-                "tools/call" => {
-                    let name = request
-                        .pointer("/params/name")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default();
-                    if name == "fail" {
-                        json!({
-                            "content": [{ "type": "text", "text": "intentional http failure" }],
-                            "isError": true,
-                        })
-                    } else {
-                        let text = request
-                            .pointer("/params/arguments/text")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default();
-                        json!({ "content": [{ "type": "text", "text": text }], "isError": false })
-                    }
-                }
-                _ => {
-                    // Method not found — keep the Auto discover→initialize fallback fast if
-                    // discover is ever removed from this fixture again.
-                    let envelope = json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "error": { "code": -32601, "message": format!("Method not found: {method}") },
-                    });
-                    write_json(&mut stream, &envelope);
-                    continue;
-                }
-            };
-            write_json(
-                &mut stream,
-                &json!({ "jsonrpc": "2.0", "id": id, "result": result }),
-            );
         }
     });
     HttpMcpFixture {
         url: format!("http://{addr}/mcp"),
         requests,
     }
+}
+
+/// Answer one connection's one request.
+fn serve(
+    mut stream: std::net::TcpStream,
+    recorder: &Mutex<Vec<RequestHeaders>>,
+    slow_discover: Option<Duration>,
+) {
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 8192];
+    let mut header_end = None;
+    while header_end.is_none() {
+        let n = stream.read(&mut tmp).unwrap_or(0);
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        header_end = buf.windows(4).position(|w| w == b"\r\n\r\n");
+    }
+    let Some(pos) = header_end else { return };
+    let headers_text = String::from_utf8_lossy(&buf[..pos]).into_owned();
+    let content_length: usize = headers_text
+        .lines()
+        .find_map(|l| {
+            l.to_ascii_lowercase()
+                .strip_prefix("content-length:")
+                .map(|v| v.trim().parse().unwrap_or(0))
+        })
+        .unwrap_or(0);
+    let body_start = pos + 4;
+    while buf.len() < body_start + content_length {
+        let n = stream.read(&mut tmp).unwrap_or(0);
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&tmp[..n]);
+    }
+    // Every header, verbatim — the name lowercased so a lookup is case-insensitive, the
+    // value untouched so a test can assert on the exact bytes that arrived.
+    let headers: RequestHeaders = headers_text
+        .lines()
+        .skip(1)
+        .filter_map(|l| l.split_once(':'))
+        .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
+        .collect();
+    recorder.lock().unwrap().push(headers);
+
+    let body = &buf[body_start..buf.len().min(body_start + content_length)];
+    let request: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+    let is_notification = request.get("id").is_none();
+    if is_notification {
+        let _ = stream
+            .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        return;
+    }
+    let id = request.get("id").cloned().unwrap_or(Value::Null);
+    let method = request.get("method").and_then(Value::as_str).unwrap_or("");
+    if let Some(delay) = slow_discover
+        && method == "server/discover"
+    {
+        thread::sleep(delay);
+        let envelope = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": { "code": -32601, "message": "Method not found: server/discover" },
+        });
+        write_json(&mut stream, &envelope);
+        return;
+    }
+    let result = match method {
+        "server/discover" => json!({
+            "resultType": "complete",
+            "supportedVersions": ["2026-07-28", "2025-11-25"],
+            "capabilities": { "tools": {} },
+            "ttlMs": 0,
+            "cacheScope": "private",
+            "_meta": {
+                "io.modelcontextprotocol/serverInfo": {
+                    "name": "mcp-fixture-http-server",
+                    "version": "0.0.0",
+                }
+            }
+        }),
+        "initialize" => json!({
+            "protocolVersion": "2025-11-25",
+            "capabilities": { "tools": {} },
+            "serverInfo": { "name": "mcp-fixture-http-server", "version": "0.0.0" },
+        }),
+        "tools/list" => json!({ "tools": [
+            {
+                "name": "echo",
+                "description": "Echoes back its `text` argument.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": { "text": { "type": "string" } },
+                    "required": ["text"],
+                },
+            },
+            {
+                "name": "fail",
+                "description": "Always fails, with an error message.",
+                "inputSchema": { "type": "object", "properties": {} },
+            },
+        ] }),
+        "tools/call" => {
+            let name = request
+                .pointer("/params/name")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if name == "fail" {
+                json!({
+                    "content": [{ "type": "text", "text": "intentional http failure" }],
+                    "isError": true,
+                })
+            } else {
+                let text = request
+                    .pointer("/params/arguments/text")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                json!({ "content": [{ "type": "text", "text": text }], "isError": false })
+            }
+        }
+        _ => {
+            // Method not found — keep the Auto discover→initialize fallback fast if
+            // discover is ever removed from this fixture again.
+            let envelope = json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": { "code": -32601, "message": format!("Method not found: {method}") },
+            });
+            write_json(&mut stream, &envelope);
+            return;
+        }
+    };
+    write_json(
+        &mut stream,
+        &json!({ "jsonrpc": "2.0", "id": id, "result": result }),
+    );
 }
 
 fn write_json(stream: &mut std::net::TcpStream, value: &Value) {

@@ -2476,6 +2476,12 @@ async fn connect_stdio(
     let (proc, transport) = crate::tools::mcp_stdio::stdio_transport(cmd)
         .map_err(|e| format!("failed to spawn `{command}`: {e}"))?;
 
+    // A slow server's late discover answer must not fail the handshake — see `mcp_handshake`.
+    let transport = crate::tools::mcp_handshake::Guard::new(rmcp::transport::IntoTransport::<
+        rmcp::RoleClient,
+        std::io::Error,
+        _,
+    >::into_transport(transport));
     let client = McpHandler::for_dial(&config.name, dial)
         .serve_with_lifecycle(transport, client_lifecycle())
         .await
@@ -2584,8 +2590,12 @@ async fn connect_http(
         transport_config,
     );
 
+    // A slow server's late discover answer must not fail the handshake — see `mcp_handshake`.
     McpHandler::for_dial(&config.name, dial)
-        .serve_with_lifecycle(transport, client_lifecycle())
+        .serve_with_lifecycle(
+            crate::tools::mcp_handshake::Guard::new(transport),
+            client_lifecycle(),
+        )
         .await
         .map_err(|e| {
             let hint = match (&dial.http, &bearer_token) {

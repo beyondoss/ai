@@ -20,6 +20,7 @@ pub mod ls;
 pub mod mcp;
 pub mod mcp_apps;
 pub mod mcp_events;
+pub(crate) mod mcp_handshake;
 pub mod mcp_host;
 pub mod mcp_http_exit;
 pub mod mcp_manifest;
