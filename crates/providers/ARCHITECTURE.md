@@ -489,7 +489,6 @@ OpenRouter's Alibaba endpoint carries the tier on the cost side.
 - **Together Kimi K3** is held at list ($3 / $15 / cached $0.30) by an `[[override]]`: Together's
   API and pricing page show a promotion ($2.70 / $13.50 / $0.27) that ends 2026-10-11. The first
   sync after it ends fails until the override is removed.
-- **Together retires Llama 3.3 70B Turbo on 2026-10-22.** Its row needs a decision before then.
 - **DeepSeek's holiday calendar** must be extended before 2027-01-01, or weekday peak rows refuse.
 - **The seven OpenAI `*-pro` ids for GPT-5.6 and GPT-6 are not OpenAI models.** OpenAI makes "pro" a
   `reasoning.mode`. The rows exist only on OpenRouter, priced at the base model's card.

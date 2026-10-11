@@ -1808,11 +1808,12 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
     },
     // Groq / Together / Fireworks llama + qwen + open-weight ids people send. No Meta row, so
     // primary is a host that serves the model to a standard serverless key: Groq for GPT-OSS and
-    // Qwen3.8 27B, Together for Llama 3.3 / Qwen / Kimi / GLM / MiniMax / Inkling. A candidate the
+    // Qwen3.8 27B, Together for Qwen / Kimi / GLM / MiniMax / Inkling / Muse. A candidate the
     // host reserves for Enterprise or dedicated deployments is not listed (Groq
     // `llama-3.1-8b-instant` and `llama-3.3-70b-versatile`; Fireworks Llama 4, Kimi K2.6, GLM 5.1,
     // GLM 5.2 and Llama 3.3; Together Kimi K2.7 Code, GPT-OSS 20B, Gemma 4 31B and Qwen2.5 7B
-    // Turbo): it fails over on every request. Rows left with only OpenRouter are
+    // Turbo), nor one the host has retired (Together Llama 3.3 70B Turbo): it fails over on
+    // every request. Rows left with only OpenRouter are
     // `openrouter_only`, and keep their names so existing clients still resolve. Groq caches only
     // GPT-OSS; Together publishes no cache-write rate, so those rates equal input.
     ModelRoute {
@@ -1830,15 +1831,16 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
             TOOLS | STRUCTURED_OUTPUTS,
         ),
     },
+    // Together dropped Llama 3.3 70B Turbo from its serverless table and retires it 2026-10-22;
+    // Groq's copy is Enterprise-only and Fireworks' is not serverless. OpenRouter still serves it
+    // from about ten hosts, so the row is OpenRouter's, priced at its public card (Meta publishes
+    // no API rate).
     ModelRoute {
         model: "llama-3.3-70b-versatile",
         wire: WireFormat::OpenAi,
-        candidates: &together(
-            "meta-llama/Llama-3.3-70B-Instruct-Turbo",
-            "meta-llama/llama-3.3-70b-instruct",
-        ),
+        candidates: &openrouter_only("meta-llama/llama-3.3-70b-instruct"),
         responses: &[],
-        price: price("1.04", "1.04", "1.04", "1.04"), // no published cache rates; both equal input
+        price: price("0.22", "0.5", "0.11", "0.22"), // cache_write unpublished; equals input
         card: card(
             "Llama 3.3 70B Instruct",
             "meta-llama",
@@ -3353,11 +3355,13 @@ mod tests {
         }
     }
 
-    /// Llama 3.3 is served by Together and OpenRouter. Groq's `llama-3.3-70b-versatile` is
-    /// Enterprise-only and Fireworks' copy is not serverless, so neither is a candidate. The Groq id
-    /// stays the catalog name so clients that send it still resolve.
+    /// Llama 3.3 is served by OpenRouter alone. Together retires its Turbo copy 2026-10-22 and has
+    /// already dropped it from its serverless table; Groq's `llama-3.3-70b-versatile` is
+    /// Enterprise-only and Fireworks' copy is not serverless, so none is a candidate. The Groq id
+    /// stays the catalog name so clients that send it still resolve; Together's spelling no longer
+    /// does.
     #[test]
-    fn llama_3_3_names_together_and_openrouter() {
+    fn llama_3_3_is_served_by_openrouter() {
         let row = for_model("llama-3.3-70b-versatile");
         assert!(
             row.is_some(),
@@ -3365,17 +3369,15 @@ mod tests {
         );
         if let Some(row) = row {
             assert_eq!(row.wire, WireFormat::OpenAi);
-            assert_eq!(row.candidates.len(), 2);
-            assert_eq!(row.candidates[0].provider, ProviderId::Together);
             assert_eq!(
-                row.candidates[0].upstream_model,
-                "meta-llama/Llama-3.3-70B-Instruct-Turbo"
+                row.candidates,
+                &openrouter_only("meta-llama/llama-3.3-70b-instruct")[..]
             );
-            assert_eq!(row.candidates[1].provider, ProviderId::OpenRouter);
             assert_eq!(
-                for_model("meta-llama/Llama-3.3-70B-Instruct-Turbo").map(|r| r.model),
+                for_model("meta-llama/llama-3.3-70b-instruct").map(|r| r.model),
                 Some("llama-3.3-70b-versatile"),
             );
+            assert!(for_model("meta-llama/Llama-3.3-70B-Instruct-Turbo").is_none());
         }
     }
 
@@ -4100,12 +4102,6 @@ mod tests {
     #[test]
     fn direct_primaries_are_priced_at_their_vendor_rate() {
         for (model, primary, want) in [
-            // Together's Llama 3.3 70B Turbo (Groq's id is Enterprise-only); was 0.1 / 0.32.
-            (
-                "llama-3.3-70b-versatile",
-                ProviderId::Together,
-                ("1.04", "1.04", "1.04"),
-            ),
             // DeepSeek's peak rate; was 0.95526 / 1.91052, matching neither tier.
             (
                 "deepseek-v4-pro",

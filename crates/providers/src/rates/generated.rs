@@ -191,10 +191,6 @@ const TOGETHER_QWEN_QWEN3_8_2_4T_A95B: Card = Card::new(tr("2", "6", "0.25", "2"
 /// `together:Qwen/Qwen3.8-Flash`.
 const TOGETHER_QWEN_QWEN3_8_FLASH: Card = Card::new(tr("0.15", "0.47", "0.15", "0.15", None));
 
-/// `together:meta-llama/Llama-3.3-70B-Instruct-Turbo`.
-const TOGETHER_META_LLAMA_LLAMA_3_3_70B_INSTRUCT_TURBO: Card =
-    Card::new(tr("1.04", "1.04", "1.04", "1.04", None));
-
 /// `together:meta-models/Muse-Glimmer-30B`.
 const TOGETHER_META_MODELS_MUSE_GLIMMER_30B: Card =
     Card::new(tr("0.35", "1.5", "0.04", "0.35", None));
@@ -7083,12 +7079,8 @@ pub static ROW_RATES: &[RowRates] = &[
     },
     RowRates {
         model: "llama-3.3-70b-versatile",
-        list: Card::new(tr("1.04", "1.04", "1.04", "1.04", None)),
+        list: Card::new(tr("0.22", "0.5", "0.11", "0.22", None)),
         cost: &[
-            CandidateCost {
-                provider: ProviderId::Together,
-                card: CostCard::Own(&TOGETHER_META_LLAMA_LLAMA_3_3_70B_INSTRUCT_TURBO),
-            },
             CandidateCost {
                 provider: ProviderId::OpenRouter,
                 card: CostCard::OpenRouter(OR_META_LLAMA_LLAMA_3_3_70B_INSTRUCT),

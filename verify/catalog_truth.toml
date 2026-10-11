@@ -876,18 +876,6 @@ input_present = ["image", "file"]
 note = "File input is read on xAI /v1/responses, where every grok row reaches xAI (see the comment above grok-4.20). OpenRouter x-ai/grok-build-0.1 answers a PDF with 404 \"No endpoints found that support file input\" (2026-10-01), so a file request skips it."
 
 [[row]]
-model = "llama-3.3-70b-versatile"
-source = [
-  "https://www.together.ai/pricing",
-  "https://docs.together.ai/docs/serverless/models",
-]
-date = "2026-10-01"
-input = "1.04"
-output = "1.04"
-context_window = 131_072
-note = "Primary is Together meta-llama/Llama-3.3-70B-Instruct-Turbo (serverless: Yes)."
-
-[[row]]
 model = "meta/muse-glimmer-30b"
 source = [
   "https://www.together.ai/pricing",
@@ -1645,7 +1633,7 @@ provider = "together"
 id = "meta-llama/Llama-3.3-70B-Instruct-Turbo"
 source = "https://docs.together.ai/docs/deprecations"
 retires = "2026-10-22"
-note = "Together's deprecation page retires it 2026-10-22 (replacement meta-models/Muse-Glimmer-30B), and its serverless models table no longer lists it (CAT-16 live, 2026-10-10). The llama-3.3-70b-versatile row keeps its OpenRouter candidate until then; the Together candidate goes before the date."
+note = "Together's deprecation page retires it 2026-10-22 (replacement meta-models/Muse-Glimmer-30B), and its serverless models table no longer lists it (CAT-16 live, 2026-10-10). Removed from llama-3.3-70b-versatile on 2026-10-11, whose primary is now OpenRouter meta-llama/llama-3.3-70b-instruct (about ten live hosts); Groq's copy is Enterprise-only and Fireworks' is not serverless, so no keyed direct host remains."
 
 [[retired]]
 provider = "openrouter"
@@ -2164,13 +2152,6 @@ values = { "together.models" = "0.27", "together.docs" = "0.3" }
 follow = "together.models"
 reason = "The models API and the pricing page say $0.27 (the promotion's cached rate); the docs table pairs the promotional input and output with the list cached rate. The [[override]] below holds the list card either way."
 
-[[conflict]]
-card = "together:meta-llama/Llama-3.3-70B-Instruct-Turbo"
-field = "listed"
-values = { "together.models" = "0", "together.docs" = "absent" }
-follow = "together.models"
-reason = "The docs table no longer lists it (Together retires it 2026-10-22); the models API still prices it."
-
 [[override]]
 card = "together:moonshotai/Kimi-K3"
 source_says = { input = "2.7", output = "13.5", cache_read = "0.27" }
@@ -2301,11 +2282,6 @@ row = "Qwen/Qwen3.8-2.4T-A95B"
 [[card]]
 name = "together:Qwen/Qwen3.8-Flash"
 row = "Qwen/Qwen3.8-Flash"
-
-[[card]]
-name = "together:meta-llama/Llama-3.3-70B-Instruct-Turbo"
-row = "meta-llama/Llama-3.3-70B-Instruct-Turbo"
-note = "Together retires it 2026-10-22."
 
 [[card]]
 name = "together:meta-models/Muse-Glimmer-30B"
@@ -2846,7 +2822,7 @@ cost = { openrouter = "openrouter:meta-llama/llama-3.1-8b-instruct" }
 [[pricing]]
 model = "llama-3.3-70b-versatile"
 list_card = "list"
-cost = { together = "together:meta-llama/Llama-3.3-70B-Instruct-Turbo", openrouter = "openrouter:meta-llama/llama-3.3-70b-instruct" }
+cost = { openrouter = "openrouter:meta-llama/llama-3.3-70b-instruct" }
 
 [[pricing]]
 model = "meta-llama/llama-4-maverick"
