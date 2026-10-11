@@ -1068,8 +1068,46 @@ dialect instead), and a strict-schema third-party endpoint can 400 the whole req
 unrecognized field — `ModelCaps::unknown()`'s conservative default omits it unless a capability-table
 entry opts in. `no_cache` skips `prompt_cache_key`/`prompt_cache_retention` on both OpenAI dialects the
 same way it skips Anthropic's `cache_control` breakpoints — a one-off request has no follow-up turn to
-route back to the same cache node, so the affinity hint is pointless even on the Responses dialect,
-where sending it costs nothing extra (no cache-write premium to opt out of there, unlike Anthropic's).
+route back to the same cache node, so the affinity hint is pointless.
+
+### Why the Responses `prompt_cache_key` is a hash of the prefix, not the session id
+
+OpenAI serves a cached prefix only under the `prompt_cache_key` that wrote it. Measured with the
+same 3.5K-token prefix:
+
+- **gpt-6-luna:** each new key wrote the whole prefix (`cache_write_tokens: 3523`, billed at 1.25×
+  input on GPT-5.6+). A repeated key read it (`cached_tokens: 3523`).
+- **gpt-5.4-nano:** two keys never shared, and a repeated key hit (`cached_tokens: 2816`).
+
+A session-id key therefore re-wrote the instructions and tools on every new session's first request,
+even when the setup was identical.
+
+`openai_responses::prefix_cache_key` derives the key instead. It is a 64-bit FNV-1a hash of what
+every session with the same setup sends first: the system prompt and the tool definitions. FNV-1a is
+used because it is stable across builds, which `DefaultHasher` is not. The hash is seeded with
+`ModelRequest::cache_scope`, a hash of the credential that `GatewayClient::stream` sets. Sessions under
+one key share the prefix. Two keys never do, which means two tenants behind one gateway org cannot
+probe each other's cache.
+
+How the key is shaped depends on the model:
+
+- **GPT-5.6 and later:** the key only partitions the cache, so it is `pfx-<hash>`.
+- **Earlier models:** the key also routes, and OpenAI asks for about 15 requests a minute per key
+  before overflow scatters the cache. One agent session can reach that rate alone. So the session id
+  picks one of `ROUTING_BUCKETS` (4) keys per prefix: `pfx-<hash>-<0..3>`. A session keeps its bucket,
+  and a fleet's load is split four ways.
+
+Measured with the agent binary, fresh one-turn `run` sessions in a row, 3,149-token prefix:
+
+| Model                    | Session-id key (before)            | Prefix key (after)                                  |
+| ------------------------ | ---------------------------------- | --------------------------------------------------- |
+| gpt-6-luna               | every session's first request cold | session 1 wrote 3,146; sessions 2–3 read 3,146 each |
+| gpt-5.4-nano (4 buckets) | every session cold                 | sessions 1–3 cold; sessions 4–8 read 2,560 each     |
+
+Codex and Copilot keep the session id. Both are OAuth routes into an org other users share, so a
+prefix key would pool every user's cache, and their tokens rotate, so a credential scope would not
+hold still. The decoder now also reads `input_tokens_details.cache_write_tokens` into
+`TokenUsage::cache_write_tokens`. Before this, GPT-5.6+ cache writes were reported as plain input.
 
 ### Why malformed streamed tool arguments are recoverable, not fatal
 

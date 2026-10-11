@@ -587,6 +587,14 @@ impl ModelTransport for GatewayClient {
         // know (gpt-5.x reasoning-disable suppression, Azure's prompt_cache_retention suppression) —
         // reuses the same signals already computed above rather than adding a third detection path.
         req.is_copilot = via_copilot;
+        // Who may share the OpenAI prefix cache: everyone sending with this key, and no one else
+        // (`ModelRequest::cache_scope`). Only its 64-bit hash, mixed with the prompt prefix, ever
+        // leaves the process.
+        req.cache_scope = {
+            let mut h = crate::dialect::openai_responses::Fnv1a::new(0);
+            h.field(credential.key.expose().as_bytes());
+            h.finish()
+        };
         // pi-parity (models/dialects pass, Task C): a static-API-key Azure config sends `auth_header:
         // "api-key"` (checked first, unchanged), but Entra ID / Azure AD Bearer-token auth configures
         // `base_url` + `deployment_name` and correctly leaves `auth_header` unset (Bearer *is* the

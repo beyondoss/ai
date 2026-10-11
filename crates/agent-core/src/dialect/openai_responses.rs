@@ -786,23 +786,29 @@ fn build_scaffold(
         }
     }
 
-    // Prompt-cache affinity, same as the Chat Completions dialect: OpenAI caches prefixes
-    // automatically, so this is only a routing hint. Gated on `!req.no_cache` for the native/Azure
-    // routes — `ModelRequest::no_cache`'s own doc comment promises to skip OpenAI's
-    // `prompt_cache_key`/`prompt_cache_retention` too (equivalently to Anthropic's `cache_control`),
-    // matching pi's `cacheRetention === "none"` check (`openai-completions.ts`): a genuinely one-off
-    // request has no follow-up turn to route back to the same cache node, so the affinity hint is
-    // pointless even though sending it wouldn't itself cost a cache-write premium here. Codex is the one
-    // exception: pi's `openai-codex-responses.ts` sends `prompt_cache_key: clampOpenAIPromptCacheKey(
-    // options?.sessionId)` completely unconditionally — there's no `no_cache`-equivalent gate on that
-    // backend's own `buildRequestBody` at all, so Codex must send its cache key regardless (latent today
-    // since nothing sets `no_cache: true` in production yet, but a real divergence if that changes).
-    if (req.is_codex || !req.no_cache)
-        && let Some(key) = &req.cache_key
-    {
+    // `prompt_cache_key`. OpenAI reads a cached prefix only under the key that wrote it (measured on
+    // gpt-6-luna and gpt-5.4-nano: two keys never share, a repeated key hits), so the key decides
+    // who shares the cache. Natively it is derived from the stable prefix — see `prefix_cache_key` —
+    // so a new session with the same instructions and tools reads that prefix on its first request.
+    //
+    // Codex and Copilot keep the session id: they are OAuth routes into an org other users share,
+    // where a prefix key would pool every user's cache, and their tokens rotate, so a credential
+    // scope would not hold still. Codex also sends it unconditionally, as pi's
+    // `openai-codex-responses.ts` does (no `no_cache` gate on that backend); the other routes skip
+    // the key under `no_cache` (pi's `cacheRetention === "none"`).
+    if req.is_codex || req.is_copilot {
+        if (req.is_codex || !req.no_cache)
+            && let Some(key) = &req.cache_key
+        {
+            map.insert(
+                "prompt_cache_key".into(),
+                json!(super::openai::clamp_prompt_cache_key(key)),
+            );
+        }
+    } else if !req.no_cache {
         map.insert(
             "prompt_cache_key".into(),
-            json!(super::openai::clamp_prompt_cache_key(key)),
+            json!(prefix_cache_key(req, tools)),
         );
     }
     // pi's `azure-openai-responses.ts` never calls `resolveCacheRetention`/`getPromptCacheRetention` at
@@ -814,6 +820,85 @@ fn build_scaffold(
     }
 
     map
+}
+
+/// The `prompt_cache_key` for a native request: a hash of what every session with the same setup
+/// sends first — the instructions and the tool definitions — scoped by the credential
+/// (`ModelRequest::cache_scope`), so sessions under one key share the cached prefix and two keys never
+/// do. A prefix change (a tool loaded into `tools`, a new day in the system prompt) changes the key,
+/// but it would have missed the cache anyway.
+///
+/// GPT-5.6 and later only partition the cache by key; earlier models also route on it, and OpenAI
+/// asks for about 15 requests a minute per key before overflow routing scatters the cache. An agent
+/// session alone can reach that, so on those models the session id picks one of
+/// [`ROUTING_BUCKETS`] keys per prefix: a new session lands on a warm bucket once that many have
+/// run, and the load per key stays a fraction of the fleet's.
+fn prefix_cache_key(req: &ModelRequest, tools: &[crate::message::ToolDef]) -> String {
+    let mut h = Fnv1a::new(req.cache_scope);
+    h.field(req.system.as_deref().unwrap_or_default().as_bytes());
+    for t in tools {
+        h.field(t.name.as_bytes());
+        h.field(t.description.as_bytes());
+        // Streams the schema's JSON into the hash; no intermediate string.
+        let _ = serde_json::to_writer(&mut h, &t.input_schema);
+    }
+    let prefix = h.finish();
+    if key_routes(&req.model) {
+        let mut s = Fnv1a::new(0);
+        s.field(req.cache_key.as_deref().unwrap_or_default().as_bytes());
+        format!("pfx-{prefix:016x}-{}", s.finish() % ROUTING_BUCKETS)
+    } else {
+        format!("pfx-{prefix:016x}")
+    }
+}
+
+/// How many routing keys a prefix spreads over on a model that routes by key. See
+/// [`prefix_cache_key`].
+const ROUTING_BUCKETS: u64 = 4;
+
+/// Whether `prompt_cache_key` also routes the request (every model before GPT-5.6), rather than only
+/// partitioning the cache.
+fn key_routes(model: &str) -> bool {
+    !["gpt-5.6", "gpt-5.7", "gpt-5.8", "gpt-5.9", "gpt-6", "gpt-7"]
+        .iter()
+        .any(|p| model.starts_with(p))
+}
+
+/// FNV-1a, 64-bit. Stable across builds and platforms, unlike `DefaultHasher`, so every agent build
+/// derives the same key for the same prefix and keeps hitting the same cache.
+pub(crate) struct Fnv1a(u64);
+
+impl Fnv1a {
+    pub(crate) fn new(seed: u64) -> Self {
+        Self(0xcbf2_9ce4_8422_2325 ^ seed)
+    }
+
+    fn bytes(&mut self, b: &[u8]) {
+        for &x in b {
+            self.0 = (self.0 ^ u64::from(x)).wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+
+    /// One field, then a separator, so `("ab", "c")` and `("a", "bc")` differ.
+    pub(crate) fn field(&mut self, b: &[u8]) {
+        self.bytes(b);
+        self.bytes(&[0xff]);
+    }
+
+    pub(crate) fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+impl std::io::Write for Fnv1a {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.bytes(b);
+        Ok(b.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// A flat Responses function tool — the shape of both a top-level `tools` entry and an
@@ -1109,16 +1194,18 @@ impl Decoder {
 
         let response = data.get("response");
         let usage = response.and_then(|r| r.get("usage"));
-        let cached = u32_field(
-            usage.and_then(|u| u.get("input_tokens_details")),
-            "cached_tokens",
-        );
+        let details = usage.and_then(|u| u.get("input_tokens_details"));
+        let cached = u32_field(details, "cached_tokens");
+        // GPT-5.6 and later bill cache writes (1.25x input) and report them here; older models
+        // leave it 0.
+        let written = u32_field(details, "cache_write_tokens");
         let input_tokens = u32_field(usage, "input_tokens");
         // Like the Chat Completions dialect: `input_tokens` is the whole prompt including cached
-        // tokens, so bill the uncached remainder as `input_tokens` and report the cache hit
-        // separately.
+        // and freshly written tokens, so bill the remainder as `input_tokens` and report the cache
+        // read and write separately.
         self.usage.cache_read_tokens = cached;
-        self.usage.input_tokens = input_tokens.saturating_sub(cached);
+        self.usage.cache_write_tokens = written;
+        self.usage.input_tokens = input_tokens.saturating_sub(cached).saturating_sub(written);
         self.usage.output_tokens = u32_field(usage, "output_tokens");
         self.usage.reasoning_tokens = u32_field(
             usage.and_then(|u| u.get("output_tokens_details")),
@@ -2471,12 +2558,82 @@ data: {"type":"response.completed","response":{"status":"completed","usage":{"in
     }
 
     #[test]
-    fn prompt_cache_key_is_clamped_to_64_chars() {
+    fn a_session_id_prompt_cache_key_is_clamped_to_64_chars() {
         let long_key = "k".repeat(200);
-        let req =
-            ModelRequest::new("gpt-4o", vec![Message::user("hi")], 64).with_cache_key(long_key);
+        let req = ModelRequest::new("gpt-5.5", vec![Message::user("hi")], 64)
+            .with_cache_key(long_key)
+            .with_codex(true);
         let body = build_body(&req);
         assert_eq!(body["prompt_cache_key"].as_str().unwrap().len(), 64);
+    }
+
+    fn native_key(model: &str, session: &str, system: &str, scope: u64) -> String {
+        let mut req = ModelRequest::new(model, vec![Message::user("hi")], 64)
+            .with_cache_key(session)
+            .with_system(system)
+            .with_tools(vec![ToolDef {
+                name: "bash".into(),
+                description: "run a command".into(),
+                input_schema: json!({"type": "object"}),
+            }]);
+        req.cache_scope = scope;
+        build_body(&req)["prompt_cache_key"]
+            .as_str()
+            .expect("a prompt_cache_key")
+            .to_string()
+    }
+
+    #[test]
+    fn two_sessions_with_the_same_setup_share_one_prompt_cache_key() {
+        // GPT-5.6+: the key only partitions the cache, so one key per prefix and credential.
+        let a = native_key("gpt-6-luna", "session-a", "sys", 7);
+        assert_eq!(a, native_key("gpt-6-luna", "session-b", "sys", 7));
+        assert!(a.starts_with("pfx-") && a.len() <= 64, "{a}");
+        // A different prefix or a different credential never shares it.
+        assert_ne!(a, native_key("gpt-6-luna", "session-a", "other sys", 7));
+        assert_ne!(a, native_key("gpt-6-luna", "session-a", "sys", 8));
+    }
+
+    #[test]
+    fn a_model_that_routes_by_key_spreads_sessions_over_a_few_keys() {
+        // Before GPT-5.6 the key also routes, at ~15 requests a minute per key: the session picks
+        // one of `ROUTING_BUCKETS` keys for the prefix, and keeps it.
+        let keys: std::collections::HashSet<String> = (0..64)
+            .map(|i| native_key("gpt-5.4-nano", &format!("session-{i}"), "sys", 7))
+            .collect();
+        assert_eq!(keys.len() as u64, ROUTING_BUCKETS, "{keys:?}");
+        assert_eq!(
+            native_key("gpt-5.4-nano", "session-1", "sys", 7),
+            native_key("gpt-5.4-nano", "session-1", "sys", 7)
+        );
+        let prefix = |k: &str| k.rsplit_once('-').unwrap().0.to_string();
+        assert_eq!(
+            keys.iter()
+                .map(|k| prefix(k))
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn copilot_keeps_the_session_id_as_its_prompt_cache_key() {
+        let mut req = ModelRequest::new("gpt-5.5", vec![Message::user("hi")], 64)
+            .with_cache_key("session-abc");
+        req.is_copilot = true;
+        assert_eq!(build_body(&req)["prompt_cache_key"], "session-abc");
+    }
+
+    #[test]
+    fn fnv1a_matches_the_reference_vectors() {
+        let hash = |b: &[u8]| {
+            let mut h = Fnv1a::new(0);
+            std::io::Write::write_all(&mut h, b).unwrap();
+            h.finish()
+        };
+        assert_eq!(hash(b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(hash(b"a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(hash(b"foobar"), 0x8594_4171_f739_67e8);
     }
 
     #[test]
@@ -2738,6 +2895,26 @@ data: {"type":"response.completed","response":{"status":"completed","usage":{"in
                 stop_reason: StopReason::EndTurn
             })
         );
+    }
+
+    #[test]
+    fn separates_cache_writes_from_uncached_input() {
+        // GPT-5.6+ (measured on gpt-6-luna): a cold prefix reports its writes beside the reads.
+        const SSE: &str = r#"
+data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":3526,"output_tokens":5,"input_tokens_details":{"cache_write_tokens":3523,"cached_tokens":0}}}}
+"#;
+        let mut dec = Decoder::default();
+        let events = decode_sse(&mut dec, SSE).unwrap();
+        let usage = events
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::Usage(u) => Some(*u),
+                _ => None,
+            })
+            .expect("a usage event");
+        assert_eq!(usage.cache_write_tokens, 3523);
+        assert_eq!(usage.cache_read_tokens, 0);
+        assert_eq!(usage.input_tokens, 3);
     }
 
     #[test]

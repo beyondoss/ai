@@ -1132,10 +1132,11 @@ key `serve`'s `build_agent` pins from `persistence.session_id()`. `meta` (via `f
 reopened session's own recorded id) is always in scope by the time the `Agent` is built, even for a
 plain no-flag ephemeral run, so this costs nothing to always set. Without it, every turn of a `run`
 invocation — including each sequential positional-message turn in one process, and every `--continue`
-reattachment — picked no stable `prompt_cache_key`/`x-client-request-id` at all (see
-`agent-core/ARCHITECTURE.md`'s cache-node-affinity note and `client.rs`'s session-affinity headers),
-risking a cold cache/different backend node on each request rather than staying pinned to one warm
-node for the run's lifetime.
+reattachment — picked no stable `x-client-request-id` session-affinity header at all (`client.rs`).
+The session id also picks the session's routing bucket for the native OpenAI `prompt_cache_key` and
+is that key outright on Codex and Copilot. Otherwise the key is a hash of the prefix, so sessions
+with the same setup share a cache. See `agent-core/ARCHITECTURE.md`, "Why the Responses
+`prompt_cache_key` is a hash of the prefix, not the session id".
 
 **Deliberate divergence, awareness-only (pi-parity, not to be "fixed" toward pi's behavior): a session's
 file/header is created and fsync'd immediately — `SessionStore::create` (`session_store.rs`), called from
