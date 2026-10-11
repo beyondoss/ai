@@ -277,12 +277,17 @@ Maintenance is one command:
   today's main. Run it by hand with `gh workflow run rates-drift.yml`.
 - `mise run rates:audit` prints LiteLLM's and models.dev's disagreements (leads to check against
   the primary source, never corrections), and checks the cards against the vendors' own invoices:
-  every (day, model, token kind) line of OpenAI's and Anthropic's admin cost reports must equal
-  tokens × rate, except that a line from before a vendor's announced price change is checked at
-  the old rate (`[[superseded]]`). A model priced by prompt length (Claude Haiku 5.5) is checked
-  to lie between its two tiers: Anthropic's reports bucket context windows coarser than its
-  threshold (a 100,001-token prompt reads `0-200k`), so one day's line mixes both. The reports are the organization's spend, so they are read live
-  and never committed.
+  every line of OpenAI's and Anthropic's admin cost reports must equal tokens × the card's rate
+  for that line's class, tier and residency, except that a line from before a vendor's announced
+  price change is checked at the old rate (`[[superseded]]`). OpenAI's lines carry their own token
+  `quantity` and name everything that priced them (`priority | gpt-5.5, cached input`,
+  `gpt-6-luna, cache writes, long context`), so each is checked alone at the fast, flex or long
+  rate set. Anthropic's are joined with its usage report grouped by model, residency and speed: a
+  `- Fast -` line is the fast card, an `inference_geo: us` line is × `geo_us`. A line the card
+  has no rate for fails; none is skipped. A model priced by prompt length (Claude Haiku 5.5) is
+  checked to lie between its two tiers: Anthropic's reports bucket context windows coarser than
+  its threshold (a 100,001-token prompt reads `0-200k`), so one day's line mixes both. The reports
+  are the organization's spend, so they are read live and never committed.
 
 `crates/providers/tests/rates_truth.rs` checks the compiled table against the catalog: every row
 and candidate provider is priced, every list card's standard tier is the `ListPrice`, every card is
