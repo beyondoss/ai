@@ -11,7 +11,8 @@ mod common;
 
 use common::service::{Options, Service, host_claude_home};
 use common::{
-    spawn_model_server, turn_text, ws_connect_with_headers, ws_read_until_response, ws_send,
+    spawn_model_server, turn_text, turn_tool_use, ws_connect_with_headers, ws_read_until_response,
+    ws_send,
 };
 use serde_json::{Value, json};
 
@@ -47,7 +48,10 @@ fn assert_no_host_markers(raw: &str, markers: &[&str]) {
 /// equivalents do.
 #[tokio::test]
 async fn the_sandboxs_own_context_skill_agent_and_system_prompt_reach_the_model() {
-    let (base, requests) = spawn_model_server(vec![turn_text("hi")]);
+    let (base, requests) = spawn_model_server(vec![
+        turn_tool_use("t1", "read", r#"{"path":"skill:sandbox-skill"}"#),
+        turn_text("hi"),
+    ]);
     let (svc, _host_home, markers) = service_with_a_stocked_host_home(&base).await;
 
     svc.write_in_workspace(
@@ -87,17 +91,21 @@ async fn the_sandboxs_own_context_skill_agent_and_system_prompt_reach_the_model(
     ] {
         assert!(raw.contains(marker), "{marker} is missing from the prompt");
     }
-    // The advertised skill location is a sandbox path the model's own `read` can open.
-    assert!(
-        raw.contains(
-            &svc.workspace
-                .join(".claude/skills/sandbox-skill/SKILL.md")
-                .to_string_lossy()
-                .into_owned()
-        ),
-        "the advertised skill location must be the sandbox path: {raw}"
-    );
     assert_no_host_markers(&raw, &markers);
+    // The skill is listed by name, and the model's own `read` of that name opens the sandbox's
+    // `SKILL.md` through the exec endpoint — never a host path.
+    assert!(raw.contains("- sandbox-skill: "), "{raw}");
+    let loaded = requests.lock().unwrap()[1].clone();
+    let dir = svc
+        .workspace
+        .join(".claude/skills/sandbox-skill")
+        .to_string_lossy()
+        .into_owned();
+    assert!(
+        loaded.contains(&format!("[skill directory: {dir}]")) && loaded.contains("the skill body"),
+        "reading `skill:sandbox-skill` must load the sandbox's manifest: {loaded}"
+    );
+    assert_no_host_markers(&loaded, &markers);
 }
 
 /// A tenant's `~/.claude` inside its *own* sandbox counts too — that home is the tenant's, not the
