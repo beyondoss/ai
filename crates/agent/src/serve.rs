@@ -4812,10 +4812,11 @@ pub(crate) async fn serve_session(
                     // The live-prompt size at which to warn of an approaching compaction, against the
                     // *current* model's window (a `set_model` mid-session changes it), matching the reserve
                     // `build_agent` folds into this session's `CompactionConfig`.
+                    // Against the input budget, not the raw window: the same quantity the trigger uses.
+                    let caps = agent_core::capabilities(&current_model);
+                    let window = cfg.context_window.unwrap_or(caps.context_window);
                     let pressure_point = crate::memory::compaction_pressure_point(
-                        cfg.context_window.unwrap_or_else(|| {
-                            agent_core::capabilities(&current_model).context_window
-                        }),
+                        caps.input_limit.map_or(window, |limit| limit.min(window)),
                         cfg.compaction_reserve_tokens.unwrap_or_else(|| {
                             agent_core::CompactionConfig::default().reserve_tokens
                         }),
@@ -8790,10 +8791,10 @@ fn build_agent(
     // `serve_session`, not on `ServeConfig`, so multi-tenant WS sessions cannot inherit each other's kit.
     mcp_enabled: &crate::tools::mcp::McpEnabledSet,
 ) -> Agent {
+    let caps = agent_core::capabilities(model);
     let mut compaction = agent_core::CompactionConfig {
-        context_window: cfg
-            .context_window
-            .unwrap_or_else(|| agent_core::capabilities(model).context_window),
+        context_window: cfg.context_window.unwrap_or(caps.context_window),
+        input_limit: caps.input_limit,
         enabled: auto_compaction,
         ..agent_core::CompactionConfig::default()
     };
@@ -9811,9 +9812,12 @@ fn parse_images(images: Option<&Value>) -> Vec<agent_core::ImageSource> {
 /// `last_input_tokens` — a `set_model`/`cycle_model` mid-session means the context-window figure is
 /// always reported against what a client would actually be constrained by on the *next* turn, matching
 /// how a client would use this value (to decide whether compaction is coming soon), not as a historical
-/// record of what the previous turn's provider reported.
+/// record of what the previous turn's provider reported. `context_window` is the model's input budget
+/// ([`agent_core::models::ModelCaps::input_budget`]): the window, or the lower input cap a GPT-5-family
+/// model enforces — the figure the compaction trigger compares against, so `percent` reaches 100 where
+/// the vendor starts rejecting the prompt.
 fn session_stats(session: &Session, model: &str) -> Value {
-    let context_window = agent_core::models::capabilities(model).context_window;
+    let context_window = agent_core::models::capabilities(model).input_budget();
     // `last_input_tokens == 0` covers both "no turn has run yet" and pi's "immediately after
     // compaction, before a new reply" case (compaction never sets this field itself — only a real
     // provider response does) — both genuinely have no current-context figure to report, so `null`
@@ -12260,8 +12264,8 @@ mod tests {
         let mut session = Session::new();
         session.last_input_tokens = 10_000;
         let stats = session_stats(&session, "gpt-5-mini");
-        let expected_window = agent_core::models::capabilities("gpt-5-mini").context_window;
-        assert_eq!(stats["context_usage"]["context_window"], expected_window);
+        // gpt-5-mini's 400K window caps input at 272K: the figure compaction compares against.
+        assert_eq!(stats["context_usage"]["context_window"], 272_000);
     }
 
     #[test]

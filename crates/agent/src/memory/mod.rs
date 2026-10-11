@@ -453,18 +453,19 @@ pub const PRESSURE_NUDGE: &str = "<system-reminder>Your context is getting large
     current plan and progress. Then carry on.</system-reminder>";
 
 /// The live-prompt size at which to warn of an approaching compaction: 80% of the compaction threshold
-/// (`context_window - reserve_tokens`, the point [`agent_core::compaction::should_compact`] fires at).
+/// (`input_budget - reserve_tokens`, the point [`agent_core::compaction::should_compact`] fires at;
+/// `input_budget` is [`agent_core::CompactionConfig::input_budget`] — the window, or a lower input cap).
 /// This leaves runway — typically a few turns — for the model to checkpoint to `/session` before the cut.
 /// Integer math (÷5 ×4) so there is no float cast and no overflow even at a 1M-token window.
 ///
 /// Returns [`u32::MAX`] (a "never fires" sentinel — `live_prompt > MAX` is always false) when
-/// `reserve_tokens >= context_window`, i.e. the threshold is 0. That is a pathological or test-only config
+/// `reserve_tokens >= input_budget`, i.e. the threshold is 0. That is a pathological or test-only config
 /// with **no proactive window at all**: compaction fires the instant any real usage exists, so there is
 /// no runway to warn within. Without this guard the point would be 0, and `live_prompt > 0` is true on
 /// literally every turn — the nudge would fire on turn one of any small-window session, adding a spurious
 /// steer turn (and, against a fixed-response test server, potentially exhausting or stalling it).
-pub fn compaction_pressure_point(context_window: u32, reserve_tokens: u32) -> u32 {
-    let threshold = context_window.saturating_sub(reserve_tokens);
+pub fn compaction_pressure_point(input_budget: u32, reserve_tokens: u32) -> u32 {
+    let threshold = input_budget.saturating_sub(reserve_tokens);
     if threshold == 0 {
         return u32::MAX;
     }
