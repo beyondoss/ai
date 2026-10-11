@@ -8,7 +8,8 @@
 #   HARNESS=pi                  Harbor Pi 0.84.2 (FrontierHarness pin)
 #
 # Code Mode *with* MCP (local Harbor task, stdlib AST server — not the echo fixture):
-#   HARNESS=beyond-mcp              flattened mcp__ast__* tools
+#   HARNESS=beyond-mcp              flattened mcp__ast__* tools (--mcp-tool-loading eager)
+#   HARNESS=beyond-mcp-search       same catalog behind tool_search (--mcp-tool-loading search)
 #   HARNESS=beyond-mcp-code-mode    same catalog behind execute
 #
 # beyond* advertised default is read/write/edit/bash/ls/grep/find/todo. `web` stays
@@ -137,7 +138,7 @@ case "${HARNESS}" in
       --ae "OPENROUTER_API_KEY=${OPENROUTER_API_KEY}" \
       "$@"
     ;;
-  beyond-mcp|beyond-mcp-code-mode)
+  beyond-mcp|beyond-mcp-search|beyond-mcp-code-mode)
     ast_task="${ROOT}/crates/agent/eval/tasks/ast-hotspots"
     mcp_common=(
       --path "${ast_task}"
@@ -163,11 +164,14 @@ case "${HARNESS}" in
     export BEYOND_AI_AGENT_BIN="${BEYOND_AI_AGENT_BIN:-${DEFAULT_BIN}}"
     require_bin "${BEYOND_AI_AGENT_BIN}" \
       "build: cargo build -p beyond-ai-agent --release --target x86_64-unknown-linux-musl"
+    loading=eager
+    [[ "${HARNESS}" == "beyond-mcp-search" ]] && loading=search
     exec harbor run \
       "${mcp_common[@]}" \
       --agent harbor_beyond_agent:BeyondAiAgent \
       --model "${MODEL}" \
       --ak mcp_ast=true \
+      --ae "AI_AGENT_MCP_TOOL_LOADING=${loading}" \
       --ae AI_PROVIDER=openrouter \
       --ae AI_DIRECT=1 \
       --ae "OPENROUTER_API_KEY=${OPENROUTER_API_KEY}" \

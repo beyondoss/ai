@@ -505,6 +505,18 @@ enum Command {
         /// `serve`'s identical flag.
         #[usage(long, env = "AI_AGENT_CODE_MODE")]
         code_mode: bool,
+        /// How MCP tools reach the model (ignored under `--code-mode`). `search`: no MCP schema in the
+        /// prompt, only a catalog of server and tool names plus a `tool_search` tool; a tool it
+        /// loads is callable directly from the next step. `eager`: every MCP schema in every
+        /// request. `auto` (default): `search` once the schemas pass 8 KB (about ten typical tools).
+        /// Measured on three real servers (65 tools), the first request carries ~850 MCP tokens
+        /// instead of ~16,200 on Claude (~420 instead of ~6,000 on GPT), and each server first used
+        /// costs one extra model round trip (~1 s). The prompt cache survives a load on Claude 4.5+
+        /// and GPT-5.4+; on other models a load rewrites it once. Use `eager` for a few small tools
+        /// used every turn, `--code-mode` to chain many MCP calls in one step. `serve`'s identical
+        /// flag.
+        #[usage(long, env = "AI_AGENT_MCP_TOOL_LOADING")]
+        mcp_tool_loading: Option<beyond_ai_agent::tools::tool_search::McpLoading>,
         /// Block every call to this tool (comma-separated, repeatable), even though it stays visible
         /// and registered — unlike `--exclude-tools` (the model never sees an excluded tool exists at
         /// all), a denied call still surfaces to the model as a normal error `tool_result` explaining
@@ -1065,6 +1077,12 @@ enum Command {
         /// `run`'s identical flag.
         #[usage(long, env = "AI_AGENT_CODE_MODE")]
         code_mode: bool,
+        /// How MCP tools reach the model (ignored under `--code-mode`): `search` (a catalog plus
+        /// `tool_search`, loading tools on demand), `eager` (every MCP schema in every request), or
+        /// `auto` (the default: `search` once the schemas pass 8 KB). See `run --help` for the
+        /// measured tradeoffs. `run`'s identical flag.
+        #[usage(long, env = "AI_AGENT_MCP_TOOL_LOADING")]
+        mcp_tool_loading: Option<beyond_ai_agent::tools::tool_search::McpLoading>,
         /// Block every call to this tool (comma-separated, repeatable), even though it stays visible
         /// and registered — unlike `--exclude-tools`, a denied call still surfaces to the model as a
         /// normal error `tool_result` explaining it was blocked by policy, rather than the tool being
@@ -1882,6 +1900,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             no_tools,
             sequential_tools,
             code_mode,
+            mcp_tool_loading,
             deny_tool,
             deny_bash_pattern,
             deny_path,
@@ -1955,6 +1974,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 no_tools,
                 sequential_tools,
                 code_mode,
+                mcp_tool_loading.unwrap_or_default(),
                 deny_tool,
                 deny_bash_pattern,
                 deny_path,
@@ -2053,6 +2073,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             no_tools,
             sequential_tools,
             code_mode,
+            mcp_tool_loading,
             deny_tool,
             deny_bash_pattern,
             deny_path,
@@ -2560,6 +2581,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 agents: Vec::new(),
                 sequential_tools,
                 code_mode,
+                mcp_loading: mcp_tool_loading.unwrap_or_default(),
                 deny_tool,
                 deny_bash_pattern,
                 deny_path,
@@ -4041,6 +4063,7 @@ async fn run_task(
     no_tools: bool,
     sequential_tools: bool,
     code_mode: bool,
+    mcp_loading: tools::tool_search::McpLoading,
     deny_tool: Vec<String>,
     deny_bash_pattern: Vec<String>,
     deny_path: Vec<String>,
@@ -4492,6 +4515,7 @@ async fn run_task(
         web_timeout_ms,
         image_auto_resize,
         code_mode,
+        mcp_loading,
         nested_exclude,
         nested_deny: &deny_tool,
         mcp_tools: &mcp_tools,
@@ -4797,6 +4821,7 @@ async fn run_task(
                 fs_backend: fs_backend.clone(),
                 command_runner: exec_runner.clone(),
                 code_mode,
+                mcp_loading,
                 exclude_tools: tools_exclude.clone().unwrap_or_default(),
             },
             cwd: cwd.clone(),
@@ -5007,7 +5032,9 @@ async fn run_task(
     // Captured before each is moved into the builder chain below — `Agent` exposes no getter for
     // either back, and `run --export`'s own call to `export_html_full` further down needs the exact
     // system prompt/tool set this run actually used, not a recomputed (and possibly out-of-sync) guess.
-    let tool_defs = registry.definitions();
+    // Deferred MCP tools too: loadable all run long, so part of the tool set it had.
+    let mut tool_defs = registry.definitions();
+    tool_defs.extend(registry.deferred_definitions());
     let system_for_export = system.clone();
     let mut agent = Agent::new(Arc::new(client), model.clone())
         .with_tools(registry)

@@ -228,6 +228,7 @@ fn build_input<I: Items>(
     req: &ModelRequest,
     caps: &crate::models::ModelCaps,
     supports_vision: bool,
+    additional: Option<&crate::deferred::Loads<'_>>,
     sink: &mut I,
 ) -> std::result::Result<(), I::Error> {
     // Codex/ChatGPT's own backend wants the system prompt carried in a separate top-level
@@ -250,6 +251,9 @@ fn build_input<I: Items>(
             Role::User => {
                 push_user_content(sink, &m.content, supports_vision)?;
                 push_tool_results(sink, &m.content, supports_vision)?;
+                if let Some(loads) = additional {
+                    push_additional_tools(sink, &m.content, loads)?;
+                }
             }
             Role::Assistant => push_assistant_content(sink, &m.content, msg_index)?,
         }
@@ -523,6 +527,33 @@ fn push_tool_results<I: Items>(
     Ok(())
 }
 
+/// After a turn's `function_call_output`s, one `additional_tools` item carrying the deferred tools its
+/// `tool_search` results loaded (`crate::deferred`). Tools in that item become callable from that
+/// point in the conversation on, so the prefix before it — `tools` included — stays cached.
+fn push_additional_tools<I: Items>(
+    input: &mut I,
+    blocks: &[ContentBlock],
+    loads: &crate::deferred::Loads<'_>,
+) -> std::result::Result<(), I::Error> {
+    let tools: Vec<Value> = blocks
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::ToolResult { tool_use_id, .. } => loads.for_result(tool_use_id),
+            _ => None,
+        })
+        .flatten()
+        .map(|d| function_tool(d))
+        .collect();
+    if tools.is_empty() {
+        return Ok(());
+    }
+    input.item_value(json!({
+        "type": "additional_tools",
+        "role": "developer",
+        "tools": tools,
+    }))
+}
+
 /// A message item's replay id when the block never captured a real one from the wire (locally
 /// authored text — a compaction/branch summary — or a session persisted before this field existed).
 /// Deterministic and stable across rebuilds of the same request so it doesn't churn the prompt-cache
@@ -645,7 +676,11 @@ pub fn build_body(req: &ModelRequest) -> Value {
 ///
 /// Split out so [`build_body_bytes`] can stream the transcript without restating any of it, and
 /// so the two encoders cannot drift on a field.
-fn build_scaffold(req: &ModelRequest, caps: &crate::models::ModelCaps) -> Map<String, Value> {
+fn build_scaffold(
+    req: &ModelRequest,
+    caps: &crate::models::ModelCaps,
+    tools: &[crate::message::ToolDef],
+) -> Map<String, Value> {
     let mut map = Map::new();
     map.insert("model".into(), json!(req.model));
     map.insert("stream".into(), json!(true));
@@ -696,19 +731,8 @@ fn build_scaffold(req: &ModelRequest, caps: &crate::models::ModelCaps) -> Map<St
         map.insert("temperature".into(), json!(temperature));
     }
 
-    if !req.tools.is_empty() {
-        let tools: Vec<Value> = req
-            .tools
-            .iter()
-            .map(|t| {
-                json!({
-                    "type": "function",
-                    "name": t.name,
-                    "description": t.description,
-                    "parameters": t.input_schema,
-                })
-            })
-            .collect();
+    if !tools.is_empty() {
+        let tools: Vec<Value> = tools.iter().map(function_tool).collect();
         map.insert("tools".into(), Value::Array(tools));
     }
     if let Some(choice) = &req.tool_choice {
@@ -792,12 +816,26 @@ fn build_scaffold(req: &ModelRequest, caps: &crate::models::ModelCaps) -> Map<St
     map
 }
 
+/// A flat Responses function tool — the shape of both a top-level `tools` entry and an
+/// `additional_tools` item's.
+fn function_tool(t: &crate::message::ToolDef) -> Value {
+    json!({
+        "type": "function",
+        "name": t.name,
+        "description": t.description,
+        "parameters": t.input_schema,
+    })
+}
+
 /// The scaffolding plus the streamed `input`, emitted in sorted key order.
 struct WireBody<'a> {
     scaffold: &'a Map<String, Value>,
     req: &'a ModelRequest,
     caps: &'a crate::models::ModelCaps,
     supports_vision: bool,
+    /// Deferred tools to load natively with `additional_tools` items (`crate::deferred`); `None`
+    /// when the fallback already put them in `tools`.
+    additional: Option<&'a crate::deferred::Loads<'a>>,
 }
 
 impl serde::Serialize for WireBody<'_> {
@@ -827,7 +865,7 @@ impl serde::Serialize for WireInput<'_> {
         use serde::ser::SerializeSeq;
         let b = self.0;
         let mut sink = SeqItems(s.serialize_seq(None)?);
-        build_input(b.req, b.caps, b.supports_vision, &mut sink)?;
+        build_input(b.req, b.caps, b.supports_vision, b.additional, &mut sink)?;
         sink.0.end()
     }
 }
@@ -845,12 +883,23 @@ pub fn build_body_bytes(req: &ModelRequest) -> std::result::Result<Vec<u8>, serd
         req.host,
     );
     let supports_vision = caps.supports_vision && !req.block_images;
-    let scaffold = build_scaffold(req, &caps);
+    // Deferred tools (`crate::deferred`): on GPT-5.4+ through OpenAI itself a loaded tool arrives in
+    // an `additional_tools` item where it was loaded, leaving `tools` — and the cached prefix —
+    // untouched; anywhere else it joins `tools`.
+    let loads = crate::deferred::loads(req);
+    let native = crate::deferred::native(req, super::Dialect::OpenAiResponses);
+    let tools = if native {
+        std::borrow::Cow::Borrowed(req.tools.as_ref())
+    } else {
+        crate::deferred::with_loaded(req, &loads)
+    };
+    let scaffold = build_scaffold(req, &caps, &tools);
     serde_json::to_vec(&WireBody {
         scaffold: &scaffold,
         req,
         caps: &caps,
         supports_vision,
+        additional: (native && !loads.is_empty()).then_some(&loads),
     })
 }
 
@@ -1420,6 +1469,78 @@ mod tests {
     use super::*;
     use crate::dialect::decode_sse;
     use crate::message::{ImageSource, Message, ToolDef};
+
+    fn deferred_req(model: &str) -> ModelRequest {
+        let def = |name: &str| ToolDef {
+            name: name.into(),
+            description: format!("{name} tool"),
+            input_schema: json!({ "type": "object" }),
+        };
+        ModelRequest::new(
+            model,
+            vec![
+                Message::user("find issue 1"),
+                Message::assistant(vec![ContentBlock::tool_use(
+                    "call_1|fc_1",
+                    crate::deferred::TOOL_SEARCH,
+                    json!({ "query": "issue" }),
+                )]),
+                Message::tool_results(vec![ContentBlock::ToolResult {
+                    tool_use_id: "call_1|fc_1".into(),
+                    content: "Loaded mcp__gh__get_issue.".into(),
+                    is_error: false,
+                    images: Vec::new(),
+                }]),
+            ],
+            256,
+        )
+        .with_tools(vec![def(crate::deferred::TOOL_SEARCH)])
+        .with_deferred_tools(vec![def("mcp__gh__get_issue"), def("mcp__gh__list_prs")])
+    }
+
+    #[test]
+    fn deferred_tools_load_natively_through_an_additional_tools_item() {
+        let body = build_body(&deferred_req("gpt-6.1-sol"));
+        // `tools` stays the advertised set, so the cached prefix survives the load.
+        assert_eq!(body["tools"].as_array().unwrap().len(), 1);
+        let input = body["input"].as_array().unwrap();
+        let output_at = input
+            .iter()
+            .position(|i| i["type"] == "function_call_output")
+            .unwrap();
+        assert_eq!(
+            input[output_at + 1],
+            json!({
+                "type": "additional_tools",
+                "role": "developer",
+                "tools": [{
+                    "type": "function",
+                    "name": "mcp__gh__get_issue",
+                    "description": "mcp__gh__get_issue tool",
+                    "parameters": { "type": "object" },
+                }],
+            })
+        );
+    }
+
+    #[test]
+    fn deferred_tools_without_native_support_join_tools_once_loaded() {
+        let body = build_body(&deferred_req("gpt-5.2"));
+        let names: Vec<&str> = body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["tool_search", "mcp__gh__get_issue"]);
+        assert!(
+            !body["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|i| i["type"] == "additional_tools")
+        );
+    }
 
     #[test]
     fn two_function_calls_with_no_output_index_are_dropped_not_collapsed_onto_one_index() {

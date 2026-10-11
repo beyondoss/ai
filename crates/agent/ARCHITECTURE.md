@@ -942,7 +942,8 @@ The harness layers several capabilities over the bare tools + loop:
   Use read instead of cat (read paginates from the start). The `todo` protocol in the system prompt is a short
   full-replace / one-`in_progress` block (field tenses live on the tool schema).
 - **Code Mode** — `--code-mode` / `AI_AGENT_CODE_MODE` (both `run` and `serve`, off by default), and
-  **not linked into the default binary**. MCP tools stop being advertised as flattened
+  **not linked into the default binary**. Without it MCP tools load through `tool_search` or eagerly
+  (see "Deferred MCP tools" for the measured comparison of all three). MCP tools stop being advertised as flattened
   `mcp__<server>__<tool>` entries and become a deferred catalog inside one `execute` tool
   ([`tools/code_mode.rs`](src/tools/code_mode.rs)). The model writes a small JavaScript program; a
   confined QuickJS-NG runtime (`rquickjs`, no module loader, no `os`/`std` host modules, no Date /
@@ -2145,6 +2146,157 @@ the deny-list/approval inheritance already guards.
 Deferred (not v1): a disk/parse cache (ax's ~2 min) — the registry is rebuilt on every `set_model`, so a
 tool-held cache would reset mid-session, the same gotcha `todo`/`structured_output` documented; revisit
 as host-owned. And JS rendering — ax doesn't either; static DOM only.
+
+## Deferred MCP tools — tool search, no interpreter
+
+By default MCP tools are not sent to the model up front. Three typical servers (playwright 25 tools,
+github 26, filesystem 14) cost 16,225 Claude / 6,002 GPT tokens of schemas in every request when sent
+eagerly, before the model does anything — and each MCP name used to be repeated once more in the
+system prompt's `with tools: …` line (another ~925 tokens; that line now lists built-ins only, in every
+mode). Instead the model sees one tool, `tool_search`, whose description is a compact catalog of
+server and tool names, and loads what it needs.
+
+**The pieces.**
+
+- `ToolRegistry::register_deferred` ([`agent_core::tool`](../agent-core/src/tool.rs)): a deferred tool
+  is callable by name like any other but absent from `definitions()`. Its definition travels separately
+  on every request as `ModelRequest::deferred_tools` (sorted, so byte-stable).
+- [`tools/tool_search.rs`](src/tools/tool_search.rs): the tool. Its description is the catalog (one
+  line per server listing tool names, within 4 KB; past that a server collapses to its count). A
+  query is keywords, a server name, or exact names; results are the tools matching the most query
+  terms (so "github add" is github's `add`, not every github tool and every `add`), best first, at most
+  `limit` (5 by default). Stateless, like `todo`.
+- [`agent_core::deferred`](../agent-core/src/deferred.rs): **a successful `tool_search` result loads
+  every deferred tool it names.** The model read those names, so the transcript is the one record of
+  what is loaded: it survives a resume, a `serve` reattach and a switch of dialect mid-session with
+  nothing extra persisted. A compaction that summarizes the result away unloads the tool again; the
+  model searches again if it still needs it.
+- Each dialect puts a loaded tool in front of the model the cheapest way its vendor allows, below.
+
+`--mcp-tool-loading` / `AI_AGENT_MCP_TOOL_LOADING` (`run` and `serve`, inherited by subagents) picks
+`search`, `eager`, or `auto` (the default): `search` once the MCP tools' serialized definitions pass
+`AUTO_SEARCH_MIN_BYTES` (8 KB, about ten typical tools). `--code-mode` takes precedence over all three.
+A server's skill loader (`mcp__<server>__skill__read`) is never deferred, since `<available_skills>`
+tells the model to call it by name. Filtering: a deferred tool rides with `tool_search` — an allow-list
+that keeps `tool_search` keeps the catalog behind it (minus `--exclude-tools`), `--tools read,bash`
+drops both (as it drops eager MCP tools), and when `tool_search` itself is filtered out the deferred
+tools an allow-list named explicitly are advertised instead (`tool_search::refresh`). `get_mcp` and
+`--export` still list deferred tools.
+
+### Per provider: how a load reaches the model, and the prompt cache
+
+| Route                                                                                                        | Mechanism                                                                                                                                                                                                                                                                                                                                                     | Cache across a load                                                                                                                                                |
+| ------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Anthropic Messages, Claude Opus/Sonnet/Haiku 4.5+ and Fable/Mythos — direct, through the gateway, or Bedrock | Every deferred definition rides in `tools` with `defer_loading: true` (out of the model's context and the billed input); the cache breakpoint stays on the last advertised tool (a deferred one can't carry it). The `tool_search` result becomes `tool_reference` blocks only — a result holding one may hold nothing else — which the API expands in place. | Intact: `tools` never changes. Measured: the request after a load read the full prefix from cache and wrote only the new tail (11,425 read, 0 written in a probe). |
+| OpenAI Responses, GPT-5.4+ through OpenAI itself (direct or the gateway's byte relay)                        | Deferred definitions are not sent up front; an `additional_tools` developer item right after the `tool_search` output carries the loaded ones.                                                                                                                                                                                                                | Intact: the item is conversation, not prefix. Measured: 7,590 of 7,763 input tokens cached on the request after a load.                                            |
+| Everything else — Chat Completions, aggregators, older Claude, Codex/Copilot/Azure routes                    | The loaded definitions join `tools` from the next request on (`deferred::with_loaded`).                                                                                                                                                                                                                                                                       | One full rewrite per load, `tools` being the front of the prompt: 0 read / 11,416 written on Claude, 0 of 7,665 cached on GPT in the same probe.                   |
+
+The gateway's Messages → Chat Completions failover (OpenRouter) applies the fallback itself: a
+`defer_loading` tool goes on once a `tool_reference` loaded it, and the reference reads as
+`Loaded tool: <name>` (see the gateway's ARCHITECTURE.md). Every search costs one extra model round
+trip on every route.
+
+**Why a client-side `tool_search`, not the vendors' hosted search.** Anthropic's server-side tool search
+(`tool_search_tool_regex/bm25_20251119`) and OpenAI's hosted `tool_search` run the search inside the
+same response and so save that round trip (~1 s), but return `server_tool_use` /
+`tool_search_tool_result` (or `tool_search_call` / `tool_search_output`) items the message model would
+have to carry, replay verbatim, and drop on a dialect switch — a new block type through every dialect,
+compaction and the session format. A plain function tool needs none of that, works on every provider,
+and both vendors document a client-side path that keeps their cache benefit: Anthropic expands
+`tool_reference` blocks returned by a custom search tool, OpenAI accepts `additional_tools` anywhere in
+the input. Anthropic's `mid-conversation-tool-changes` beta (`tool_addition`) was not needed either.
+
+### Measured (2026-10-11, Claude Sonnet 5.5 and GPT-6.1 Sol)
+
+[`eval/mcp_loading.py`](eval/mcp_loading.py) reproduces every number here against release builds; it
+replays real servers' captured `tools/list` ([`eval/mcp_catalogs/`](eval/mcp_catalogs)) for the token
+and cache runs and runs the real servers for the tasks.
+
+**First request** — the agent's real first request, billed by the real API; MCP tokens are the total
+minus a run with no MCP server (4,614 Claude / 2,344 GPT):
+
+| MCP servers                     | Eager: Claude / GPT | Tool search: Claude / GPT | Code Mode: Claude / GPT |
+| ------------------------------- | ------------------- | ------------------------- | ----------------------- |
+| 1 (github, 26 tools)            | 6,532 / 2,109       | 567 / 263                 | 1,502 / 903             |
+| 3 (+playwright, filesystem; 65) | 16,225 / 6,002      | 848 / 416                 | 1,583 / 924             |
+| 7 (+4 more incl. notion; 112)   | 54,984 / 11,776     | 1,249 / 663               | 1,583 / 924             |
+
+Code Mode's catalog is capped at 4 KB, so at 7 servers it lists a subset and points at
+`tools.search()`; tool search's catalog lists every tool name up to its own 4 KB budget.
+
+**Cache over a session** — four user turns over the three replayed catalogs, the second and third each
+needing a tool from a server not yet used:
+
+| Model / mode         | Requests | Uncached in | Cache read | Cache write | Read share | Cost    |
+| -------------------- | -------- | ----------- | ---------- | ----------- | ---------- | ------- |
+| Claude / eager       | 7        | 22          | 146,332    | 2,033       | 0.986      | $0.0252 |
+| Claude / tool search | 9        | 26          | 51,889     | 2,629       | 0.951      | $0.0190 |
+| Claude / Code Mode   | 8        | 24          | 52,323     | 2,576       | 0.953      | $0.0181 |
+| GPT / eager          | 7        | 8,761       | 51,384     | —           | 0.854      | $0.0253 |
+| GPT / tool search    | 9        | 3,902       | 25,180     | —           | 0.866      | $0.0137 |
+| GPT / Code Mode      | 10       | 4,986       | 36,534     | —           | 0.880      | $0.0176 |
+
+Eager's Claude prefix was already warm from the first-request run, so its first request read rather
+than wrote 19,464 tokens — the comparison flatters eager.
+
+**Live tasks on the real servers** (2 runs each; each task needs a tool tool search has not loaded):
+
+| Task / model                | Mode        | Success | Requests | Wall   | Prompt tokens | Cost    |
+| --------------------------- | ----------- | ------- | -------- | ------ | ------------- | ------- |
+| github issue title / Claude | eager       | 2/2     | 2.0      | 3.1 s  | 43,545        | $0.0078 |
+|                             | tool search | 2/2     | 3.0      | 4.2 s  | 18,756        | $0.0062 |
+|                             | Code Mode   | 2/2     | 3.0      | 4.0 s  | 21,247        | $0.0063 |
+| github issue title / GPT    | eager       | 2/2     | 2.0      | 4.9 s  | 17,953        | $0.0204 |
+|                             | tool search | 2/2     | 3.0      | 5.9 s  | 9,994         | $0.0099 |
+|                             | Code Mode   | 2/2     | 5.0      | 9.4 s  | 20,026        | $0.0137 |
+| playwright JS link / Claude | eager       | 2/2     | 8.5      | 48.8 s | 190,924       | $0.0380 |
+|                             | tool search | 2/2     | 7.5      | 32.1 s | 56,726        | $0.0208 |
+|                             | Code Mode   | 2/2     | 6.5      | 27.8 s | 48,185        | $0.0203 |
+| playwright JS link / GPT    | eager       | 2/2     | 8.0      | 35.0 s | 88,916        | $0.0394 |
+|                             | tool search | 2/2     | 9.0      | 31.0 s | 40,091        | $0.0228 |
+|                             | Code Mode   | 2/2     | 8.0      | 37.5 s | 41,318        | $0.0249 |
+
+The github task isolates the latency of a load: one extra request, +1.1 s on Claude and +1.0 s on GPT.
+The playwright task's wall time is dominated by the browser (its first navigation fails in every mode
+and the model retries), so its timings are noisy; its costs are not.
+
+**Memory** — release builds, one MCP call through each path against a scripted local model, three
+replayed catalogs, transparent huge pages off for the measured process, median of 15:
+
+| Mode        | Idle anon | Peak anon | Peak file-backed | Peak total |
+| ----------- | --------- | --------- | ---------------- | ---------- |
+| eager       | 5.54 MiB  | 5.64 MiB  | 18.15 MiB        | 23.84 MiB  |
+| tool search | 5.64 MiB  | 5.84 MiB  | 18.39 MiB        | 24.31 MiB  |
+| Code Mode   | 4.88 MiB  | 5.18 MiB  | 19.76 MiB        | 24.97 MiB  |
+
+Heap is a wash (within the run-to-run noise). Code Mode's cost is code: +958 KB of `.text` in the
+binary (23.49 → 24.45 MB), +1.4 MiB of it resident once an `execute` has run, plus up to its 4 MiB JS
+heap cap while a program runs. Tool search adds no code worth measuring and no runtime.
+
+**Where `auto` switches.** A load costs one extra request: about a tenth of the cached prefix (~6k
+tokens → ~600) plus ~50 output tokens, roughly 850 input-token-equivalents on Claude and ~1 s. Eager
+costs 1.25× the schemas at every cache write (session start, after a 5-minute idle, after compaction)
+and 0.1× on every request. On cost alone search wins from ~500–700 Claude tokens of schemas (~1.5–2
+KB) in a 10–30 request session; `auto` waits until 8 KB (~2,800 Claude / ~1,000 GPT tokens) so a
+setup of a few small tools keeps its first call one step and ~1 s shorter. Every real server measured
+except sequential-thinking (one tool, 4.8 KB) is past it.
+
+### Choosing
+
+- **Default (`auto`)** — right for nearly everyone: big catalogs are searched, a couple of small tools
+  stay eager.
+- **`--mcp-tool-loading eager`** — a few small MCP tools the model uses on most turns, or a latency-
+  critical first call; also the A/B baseline.
+- **`--mcp-tool-loading search`** — force it for any catalog, e.g. many servers whose tools are rarely
+  needed in one session.
+- **`--code-mode`** — when one step should chain or fan out many MCP calls and filter their results
+  before the model sees them. First-request cost is close to tool search; it needs a
+  `--features code-mode` build and costs ~1 MB of resident code.
+
+Tests: [`tests/mcp_tool_search.rs`](tests/mcp_tool_search.rs) (found, loaded and called on Anthropic
+and on OpenAI Responses; prefix byte-stable across turns and runs; eager unchanged),
+[`tests/code_mode_eval.rs`](tests/code_mode_eval.rs) (Code Mode wins over `--mcp-tool-loading
+search`, unchanged), and the dialect and `deferred` unit tests in `agent-core`.
 
 ## MCP Apps (SEP-1865) — a pass-through host
 

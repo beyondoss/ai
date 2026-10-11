@@ -176,6 +176,11 @@ pub struct ModelRequest {
     /// turn, but a mid-run `Steering::request_tool_set` (Task #13) swaps it for a different one starting
     /// the very next turn.
     pub tools: Arc<[ToolDef]>,
+    /// Tools the model can load on demand but does not see up front (deferred MCP tools), sorted by
+    /// name. Each dialect turns a `tool_search` result that names one of these into a loaded tool —
+    /// natively where the vendor keeps the prompt cache intact, by appending it to `tools` otherwise.
+    /// See [`crate::deferred`]. Empty for every request without tool search.
+    pub deferred_tools: Arc<[ToolDef]>,
     /// Output token ceiling for the turn.
     pub max_tokens: u32,
     /// Extended thinking, when requested. `None` leaves it off (the default).
@@ -318,6 +323,7 @@ impl ModelRequest {
             system: None,
             messages: messages.into(),
             tools: Vec::new().into(),
+            deferred_tools: Vec::new().into(),
             max_tokens,
             thinking: None,
             reasoning_effort: None,
@@ -341,6 +347,12 @@ impl ModelRequest {
     /// `Arc<[ToolDef]>` (a `Vec<ToolDef>`, or an `Arc<[ToolDef]>` cloned from a cache).
     pub fn with_tools(mut self, tools: impl Into<Arc<[ToolDef]>>) -> Self {
         self.tools = tools.into();
+        self
+    }
+
+    /// Builder-style: attach the deferred tool catalog (see [`Self::deferred_tools`]).
+    pub fn with_deferred_tools(mut self, tools: impl Into<Arc<[ToolDef]>>) -> Self {
+        self.deferred_tools = tools.into();
         self
     }
 

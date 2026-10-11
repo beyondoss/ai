@@ -2874,7 +2874,20 @@ fn anthropic_req_to_openai(v: &Value, up: Upstream) -> Value {
         out.insert("stop".into(), stop.clone());
     }
     if let Some(tools) = v.get("tools").and_then(Value::as_array) {
-        let mapped: Vec<Value> = tools.iter().filter_map(anthropic_tool_to_openai).collect();
+        // Chat Completions has no deferred loading: a `defer_loading` tool goes on once a
+        // `tool_reference` in the conversation has loaded it, and not before — sending every
+        // deferred schema would be the very cost deferring it avoided.
+        let loaded = anthropic_tool_references(v);
+        let mapped: Vec<Value> = tools
+            .iter()
+            .filter(|t| {
+                t.get("defer_loading").and_then(Value::as_bool) != Some(true)
+                    || t.get("name")
+                        .and_then(Value::as_str)
+                        .is_some_and(|n| loaded.contains(n))
+            })
+            .filter_map(anthropic_tool_to_openai)
+            .collect();
         if !mapped.is_empty() {
             out.insert("tools".into(), Value::Array(mapped));
         }
@@ -2983,6 +2996,29 @@ fn anthropic_system_text(blocks: &[Value]) -> String {
         .filter_map(|b| b.get("text").and_then(Value::as_str).or_else(|| b.as_str()))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Names of the deferred tools a `tool_result`'s `tool_reference` blocks loaded, anywhere in the
+/// conversation.
+fn anthropic_tool_references(v: &Value) -> std::collections::HashSet<&str> {
+    let mut names = std::collections::HashSet::new();
+    let messages = v.get("messages").and_then(Value::as_array);
+    for block in messages
+        .into_iter()
+        .flatten()
+        .filter_map(|m| m.get("content").and_then(Value::as_array))
+        .flatten()
+        .filter(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"))
+        .filter_map(|b| b.get("content").and_then(Value::as_array))
+        .flatten()
+    {
+        if block.get("type").and_then(Value::as_str) == Some("tool_reference")
+            && let Some(name) = block.get("tool_name").and_then(Value::as_str)
+        {
+            names.insert(name);
+        }
+    }
+    names
 }
 
 fn anthropic_tool_to_openai(t: &Value) -> Option<Value> {
@@ -3227,6 +3263,17 @@ fn anthropic_tool_result_to_openai(b: &Value, carried: &mut Vec<Value>) -> Value
                     }
                     Some("image") => carried.extend(anthropic_image_part(x)),
                     Some("document") => carried.push(anthropic_document_to_openai(x)),
+                    // A tool search result: the tool it loaded joins `tools` (see
+                    // `anthropic_tool_references`), and the model reads which one here.
+                    Some("tool_reference") => {
+                        if let Some(name) = x.get("tool_name").and_then(Value::as_str) {
+                            if !text.is_empty() {
+                                text.push('\n');
+                            }
+                            text.push_str("Loaded tool: ");
+                            text.push_str(name);
+                        }
+                    }
                     Some(_) => carried.push(x.clone()),
                 }
             }

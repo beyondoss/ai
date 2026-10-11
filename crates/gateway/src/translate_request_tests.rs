@@ -453,6 +453,37 @@ fn tool_result_images_follow_the_tool_messages() {
     );
 }
 
+/// A client using Anthropic tool search (`defer_loading` + `tool_reference`) failing over to Chat
+/// Completions: a deferred tool goes on only once a reference loaded it, and the reference reads as
+/// text instead of reaching the provider as an unknown part.
+#[test]
+fn deferred_tools_join_tools_once_a_tool_reference_loads_them() {
+    let def = |name: &str, deferred: bool| json!({"name": name, "description": name, "input_schema": {"type": "object"}, "defer_loading": deferred});
+    let body = anth(json!({
+        "tools": [def("tool_search", false), def("mcp__gh__get_issue", true), def("mcp__gh__list_prs", true)],
+        "messages": [
+            {"role": "user", "content": "x"},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_1", "name": "tool_search", "input": {"query": "issue"}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": [
+                {"type": "tool_reference", "tool_name": "mcp__gh__get_issue"}
+            ]}]}
+        ]
+    }));
+    let v = m2c(&body, "gpt-5");
+    let names: Vec<&str> = v["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["function"]["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["tool_search", "mcp__gh__get_issue"], "{v}");
+    assert_eq!(
+        v["messages"][2]["content"],
+        "Loaded tool: mcp__gh__get_issue"
+    );
+    assert_eq!(roles(&v), ["user", "assistant", "tool"], "{v}");
+}
+
 #[test]
 fn tool_result_is_error_is_said_in_text() {
     let body = anth(json!({"messages": [

@@ -29,6 +29,7 @@ pub mod client;
 // of its own (see the module doc comment); nothing outside this crate names its types directly.
 mod codex_websocket;
 pub mod compaction;
+pub mod deferred;
 pub mod dialect;
 pub mod error;
 pub mod hooks;

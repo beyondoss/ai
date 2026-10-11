@@ -90,11 +90,47 @@ fn from_claude_code_name(name: &str, tools: &[ToolDef]) -> String {
 /// `cache_long` is set (see [`cache_control`]).
 pub fn build_body(req: &ModelRequest, is_oauth: bool) -> Value {
     let caps = crate::models::capabilities_for_route(&req.model, req.is_codex, req.is_azure);
+    build_tree(req, is_oauth, &caps, &Deferred::of(req))
+}
+
+/// [`build_body`] with the per-request inputs already computed, so [`build_body_bytes`]'s fallback
+/// does not compute them twice.
+fn build_tree(
+    req: &ModelRequest,
+    is_oauth: bool,
+    caps: &crate::models::ModelCaps,
+    deferred: &Deferred<'_>,
+) -> Value {
     let long = req.cache_long && caps.supports_long_cache;
     let cc = (!req.no_cache).then(|| cache_control(long));
-    let mut map = build_scaffold(req, &caps, is_oauth, &cc);
-    map.insert("messages".into(), build_messages(req, &caps, is_oauth, &cc));
+    let mut map = build_scaffold(req, caps, is_oauth, &cc, deferred);
+    map.insert(
+        "messages".into(),
+        build_messages(req, caps, is_oauth, &cc, deferred),
+    );
     Value::Object(map)
+}
+
+/// How this request's deferred tools reach the wire — see [`crate::deferred`]. Computed once per
+/// body, since the scaffold, the messages and [`streamable`] all need it.
+struct Deferred<'a> {
+    /// Claude 4.5+ on Anthropic's own route: `defer_loading` + `tool_reference`.
+    native: bool,
+    loads: crate::deferred::Loads<'a>,
+}
+
+impl<'a> Deferred<'a> {
+    fn of(req: &'a ModelRequest) -> Self {
+        Self {
+            native: crate::deferred::native(req, super::Dialect::Anthropic),
+            loads: crate::deferred::loads(req),
+        }
+    }
+
+    /// Whether [`encode_tool_references`] has anything to rewrite.
+    fn rewrites_messages(&self) -> bool {
+        self.native && !self.loads.is_empty()
+    }
 }
 
 /// Every wire field except `messages` — the fixed-size part of the body.
@@ -108,6 +144,7 @@ fn build_scaffold(
     caps: &crate::models::ModelCaps,
     is_oauth: bool,
     cc: &Option<Value>,
+    deferred: &Deferred<'_>,
 ) -> Map<String, Value> {
     // `is_codex`/`is_azure` are both OpenAI-only route flags (always `false` here, since Anthropic
     // requests never carry either) — passed through anyway for the same reason every other dialect's
@@ -192,21 +229,44 @@ fn build_scaffold(
         // omitted entirely.
         map.insert("thinking".into(), json!({ "type": "disabled" }));
     }
-    if !req.tools.is_empty() {
+    // Natively, `tools` is the advertised set then every deferred definition, the same bytes every
+    // turn; otherwise the deferred tools loaded so far join the advertised set (`crate::deferred`).
+    let advertised = if deferred.native {
+        std::borrow::Cow::Borrowed(req.tools.as_ref())
+    } else {
+        crate::deferred::with_loaded(req, &deferred.loads)
+    };
+    if !advertised.is_empty() {
         // Anchor breakpoint: the tool definitions (ten JSON schemas) are identical every turn and sit
         // at the front of the cache order, so this entry stays warm even when the rolling message
         // breakpoint is rewritten each turn. Requires stable tool ordering — see `definitions()`.
-        let mut tools = serde_json::to_value(req.tools.as_ref()).unwrap_or(Value::Null);
+        let mut tools = serde_json::to_value(advertised.as_ref()).unwrap_or(Value::Null);
         if is_oauth {
             canonicalize_tool_names(&mut tools);
         }
         if caps.supports_eager_tool_streaming {
             mark_eager_tool_streaming(&mut tools);
         }
+        // On the last *advertised* tool: a `defer_loading` tool can't carry `cache_control` (a 400),
+        // and deferred definitions are outside the cached prefix anyway.
         if let Some(cc) = &cc
             && caps.supports_cache_control_on_tools
         {
             mark_last_tool(&mut tools, cc);
+        }
+        if deferred.native
+            && let Some(list) = tools.as_array_mut()
+        {
+            for def in req.deferred_tools.iter() {
+                let mut tool = serde_json::to_value(def).unwrap_or(Value::Null);
+                if let Some(obj) = tool.as_object_mut() {
+                    obj.insert("defer_loading".into(), Value::Bool(true));
+                    if caps.supports_eager_tool_streaming {
+                        obj.insert("eager_input_streaming".into(), Value::Bool(true));
+                    }
+                }
+                list.push(tool);
+            }
         }
         map.insert("tools".into(), tools);
     }
@@ -234,6 +294,7 @@ fn build_messages(
     caps: &crate::models::ModelCaps,
     is_oauth: bool,
     cc: &Option<Value>,
+    deferred: &Deferred<'_>,
 ) -> Value {
     // Rolling breakpoint: cache the conversation prefix (tools + system + every prior message) up to
     // the final block, so next turn the whole accumulated transcript is a cache read, not a re-bill.
@@ -314,6 +375,9 @@ fn build_messages(
     if has_tool_result_image {
         encode_tool_result_images(&mut messages);
     }
+    if deferred.rewrites_messages() {
+        encode_tool_references(&mut messages, &deferred.loads);
+    }
     if is_oauth && has_tool_use {
         // Replayed assistant tool_use blocks in history need the same canonical casing the live model
         // just saw advertised in `tools` below — the stored name is always our own real one (this
@@ -347,8 +411,13 @@ fn build_messages(
 /// therefore hand the typed blocks straight to serde rather than describing Anthropic's schema in a
 /// second place that could drift from the first. The pruner stays the unconditional safety net it
 /// was built to be; this simply declines to run when it would have nothing to do.
-fn streamable(req: &ModelRequest, caps: &crate::models::ModelCaps, is_oauth: bool) -> bool {
-    if is_oauth || !caps.supports_vision || req.block_images {
+fn streamable(
+    req: &ModelRequest,
+    caps: &crate::models::ModelCaps,
+    is_oauth: bool,
+    deferred: &Deferred<'_>,
+) -> bool {
+    if is_oauth || !caps.supports_vision || req.block_images || deferred.rewrites_messages() {
         return false;
     }
     req.messages.iter().all(|m| {
@@ -558,12 +627,13 @@ pub fn build_body_bytes(
     is_oauth: bool,
 ) -> std::result::Result<Vec<u8>, serde_json::Error> {
     let caps = crate::models::capabilities_for_route(&req.model, req.is_codex, req.is_azure);
-    if !streamable(req, &caps, is_oauth) {
-        return serde_json::to_vec(&build_body(req, is_oauth));
+    let deferred = Deferred::of(req);
+    if !streamable(req, &caps, is_oauth, &deferred) {
+        return serde_json::to_vec(&build_tree(req, is_oauth, &caps, &deferred));
     }
     let long = req.cache_long && caps.supports_long_cache;
     let cc = (!req.no_cache).then(|| cache_control(long));
-    let scaffold = build_scaffold(req, &caps, is_oauth, &cc);
+    let scaffold = build_scaffold(req, &caps, is_oauth, &cc, &deferred);
     serde_json::to_vec(&WireBody {
         scaffold: &scaffold,
         messages: WireMessages { req, cc: &cc },
@@ -983,6 +1053,41 @@ fn encode_tool_result_images(messages: &mut Value) {
                 parts.push(json!({ "type": "image", "source": source }));
             }
             obj.insert("content".into(), Value::Array(parts));
+        }
+    }
+}
+
+/// Turn each `tool_search` result that loaded deferred tools into the `tool_reference` blocks the API
+/// expands into those tools' definitions, in place in the conversation (`crate::deferred`). Only
+/// references: a `tool_result` holding one may hold nothing else ("Tool definitions … cannot be
+/// mixed with other content"), and the model sees each loaded tool's full definition anyway.
+fn encode_tool_references(messages: &mut Value, loads: &crate::deferred::Loads<'_>) {
+    let Some(msgs) = messages.as_array_mut() else {
+        return;
+    };
+    for m in msgs {
+        let Some(content) = m.get_mut("content").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for block in content {
+            let Some(obj) = block.as_object_mut() else {
+                continue;
+            };
+            if obj.get("type").and_then(Value::as_str) != Some("tool_result") {
+                continue;
+            }
+            let Some(defs) = obj
+                .get("tool_use_id")
+                .and_then(Value::as_str)
+                .and_then(|id| loads.for_result(id))
+            else {
+                continue;
+            };
+            let refs = defs
+                .iter()
+                .map(|d| json!({ "type": "tool_reference", "tool_name": d.name }))
+                .collect();
+            obj.insert("content".into(), Value::Array(refs));
         }
     }
 }
@@ -1432,6 +1537,90 @@ mod tests {
         assert_eq!(body["messages"][0]["content"][0]["type"], "text");
         assert_eq!(body["tools"][0]["name"], "read");
         assert_eq!(body["tools"][0]["input_schema"]["type"], "object");
+    }
+
+    /// A transcript where `tool_search` loaded `mcp__gh__get_issue`, on `model`, with two deferred
+    /// tools.
+    fn deferred_req(model: &str) -> ModelRequest {
+        let def = |name: &str| ToolDef {
+            name: name.into(),
+            description: format!("{name} tool"),
+            input_schema: json!({ "type": "object" }),
+        };
+        ModelRequest::new(
+            model,
+            vec![
+                Message::user("find issue 1"),
+                Message::assistant(vec![ContentBlock::tool_use(
+                    "toolu_1",
+                    crate::deferred::TOOL_SEARCH,
+                    json!({ "query": "issue" }),
+                )]),
+                Message::tool_results(vec![ContentBlock::ToolResult {
+                    tool_use_id: "toolu_1".into(),
+                    content: "Loaded mcp__gh__get_issue.".into(),
+                    is_error: false,
+                    images: Vec::new(),
+                }]),
+            ],
+            256,
+        )
+        .with_tools(vec![def("read"), def(crate::deferred::TOOL_SEARCH)])
+        .with_deferred_tools(vec![def("mcp__gh__get_issue"), def("mcp__gh__list_prs")])
+    }
+
+    #[test]
+    fn deferred_tools_load_natively_with_defer_loading_and_tool_references() {
+        let req = deferred_req("claude-sonnet-5-5");
+        let body = build_body(&req, false);
+        let tools = body["tools"].as_array().unwrap();
+        let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        // Every deferred definition rides in `tools` on every turn, so the bytes never change.
+        assert_eq!(
+            names,
+            vec![
+                "read",
+                "tool_search",
+                "mcp__gh__get_issue",
+                "mcp__gh__list_prs"
+            ]
+        );
+        // The cache breakpoint is on the last advertised tool: a deferred one can't carry it.
+        assert_eq!(tools[1]["cache_control"]["type"], "ephemeral");
+        assert!(tools[1].get("defer_loading").is_none());
+        for t in &tools[2..] {
+            assert_eq!(t["defer_loading"], true);
+            assert!(t.get("cache_control").is_none());
+        }
+        // The search result becomes references only — text can't share a result with them.
+        assert_eq!(
+            body["messages"][2]["content"][0]["content"],
+            json!([{ "type": "tool_reference", "tool_name": "mcp__gh__get_issue" }])
+        );
+        // The streaming encoder defers to the tree for this rewrite, byte for byte.
+        let bytes = build_body_bytes(&req, false).unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), body);
+    }
+
+    #[test]
+    fn deferred_tools_without_native_support_join_tools_once_loaded() {
+        // Claude Sonnet 4 predates tool search.
+        let req = deferred_req("claude-sonnet-4-20250514");
+        let body = build_body(&req, false);
+        let names: Vec<&str> = body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["read", "tool_search", "mcp__gh__get_issue"]);
+        assert!(body["tools"][2].get("defer_loading").is_none());
+        // The breakpoint moves to the newly last tool.
+        assert_eq!(body["tools"][2]["cache_control"]["type"], "ephemeral");
+        assert_eq!(
+            body["messages"][2]["content"][0]["content"],
+            "Loaded mcp__gh__get_issue."
+        );
     }
 
     #[test]

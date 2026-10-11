@@ -224,6 +224,9 @@ pub struct Agent {
     /// mid-run switch never rebuilds it (or its JSON schemas) per turn; each request clones the `Arc`,
     /// not the definitions.
     tool_defs: Arc<[ToolDef]>,
+    /// The deferred tools' definitions ([`ToolRegistry::deferred_definitions`]), computed alongside
+    /// `tool_defs` and carried on every request as `ModelRequest::deferred_tools`.
+    deferred_tool_defs: Arc<[ToolDef]>,
     model: String,
     /// Stored as an `Arc<str>` so cloning it into each turn's `ModelRequest` (and every speculative
     /// request clone on the retry/hook paths) is a pointer bump, not a copy of the multi-KB prompt.
@@ -321,6 +324,7 @@ impl Agent {
             transport,
             tools: ToolRegistry::new(),
             tool_defs: Vec::new().into(),
+            deferred_tool_defs: Vec::new().into(),
             model,
             system: None,
             system_fn: None,
@@ -349,6 +353,7 @@ impl Agent {
     /// loop doesn't rebuild them (and their JSON schemas) every turn.
     pub fn with_tools(mut self, tools: ToolRegistry) -> Self {
         self.tool_defs = tools.definitions().into();
+        self.deferred_tool_defs = tools.deferred_definitions().into();
         self.tools = tools;
         self
     }
@@ -783,6 +788,7 @@ impl Agent {
         // which tools are live this turn.
         let mut current_tools = self.tools.clone();
         let mut current_tool_defs = self.tool_defs.clone();
+        let mut current_deferred_defs = self.deferred_tool_defs.clone();
         loop {
             if cancel.is_cancelled() {
                 close_out_pending_cancellation(session, &current_model);
@@ -839,6 +845,7 @@ impl Agent {
             // next request is built — so it takes effect starting the very next turn, never mid-turn.
             if let Some(new_tools) = steering.take_tool_switch() {
                 current_tool_defs = new_tools.definitions().into();
+                current_deferred_defs = new_tools.deferred_definitions().into();
                 current_tools = new_tools;
                 sink(AgentEvent::ToolsUpdated {
                     tool_names: current_tool_defs.iter().map(|d| d.name.clone()).collect(),
@@ -899,6 +906,7 @@ impl Agent {
                 self.max_tokens,
             )
             .with_tools(current_tool_defs.clone())
+            .with_deferred_tools(current_deferred_defs.clone())
             .with_cache_long(self.cache_long);
             // pi-parity (Task 1, serve pass 19): wire-layer enforcement twin of the ingestion-time
             // `block_images` gate — see `ModelRequest::block_images`'s doc comment. Setting this here,
