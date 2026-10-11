@@ -9240,7 +9240,7 @@ fn build_tools(
         );
         crate::tools::code_mode::restore_execute(
             &mut registry,
-            std::sync::Arc::new(crate::tools::code_mode::Execute::new(nested)),
+            nested,
             cfg.exclude_tools.as_deref(),
             cfg.no_tools,
         );

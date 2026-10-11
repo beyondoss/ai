@@ -951,7 +951,10 @@ The harness layers several capabilities over the bare tools + loop:
   clock, 64 nested calls, 256 KiB result, **4 MiB JS heap**, **128 KiB JS stack**, and **one QuickJS
   runtime per process** (a `serve` daemon never holds two heaps at once). QuickJS evaluates synchronously, so evaluation runs on the blocking pool under a local executor, never on the runtime thread other sessions share: a spinning script holds a pool thread until its interrupt (deadline, cancellation, or the call being dropped — a guard trips it) fires, and the one-heap slot is released when the evaluation really ends. Nested host calls are spawned back onto the session's runtime, under the script's deadline (which so holds across a nested await, not only while JS runs), and aborted by the same guard however the run ends — cancelled or dropped — so no host tool runs on after it. An allow-list of built-ins
   (`--tools read,bash`) still keeps `execute` so the deferred catalog is reachable; `--exclude-tools
-  execute` (or `--no-tools`) drops it. Subagents inherit the parent's flag so a child cannot
+  execute` (or `--no-tools`) drops it. An empty deferred catalog (no MCP servers, or every MCP tool
+  excluded or denied) registers no `execute` (`code_mode::execute_tool`): the JS context reaches
+  nothing else, so it would be ~270 schema tokens per request for a tool that can do nothing. A
+  registry rebuild (`set_model`, an MCP hot-plug) re-checks. Subagents inherit the parent's flag so a child cannot
   re-advertise the catalog the parent deferred. QuickJS is a cargo feature (`code-mode`) because idle
   RSS in a 768 MB guest is dominated by resident `.text` — linking the interpreter into every agent VM
   costs ~1 MB of code even when the operator never passes the flag (the same class of cost that
@@ -988,8 +991,8 @@ The harness layers several capabilities over the bare tools + loop:
   `max`), not thinking-on vs thinking-off. Iterate by changing one thing and re-running
   the expensive task
   (`TASKS=terminal-bench/polyglot-c-py`). TB has no MCP catalog, so beyond vs Code Mode on that
-  slice is a regression/overhead check (empty
-  `execute` still registers), not the MCP schema-token win. The Code Mode eval is
+  slice is a regression/overhead check (with no
+  MCP catalog `execute` is not registered at all), not the MCP schema-token win. The Code Mode eval is
   `HARNESS=beyond-mcp` vs `HARNESS=beyond-mcp-code-mode`: local Harbor task
   [`eval/tasks/ast-hotspots`](eval/tasks/ast-hotspots) plus a stdlib Python AST MCP (`list_functions`,
   `find_calls`, …) — tree-sitter-shaped, no native parser, useful on a coding guest. Flattened

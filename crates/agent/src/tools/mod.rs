@@ -706,7 +706,9 @@ pub fn default_registry_with_config(cfg: &ToolConfig<'_>) -> ToolRegistry {
     if cfg.code_mode {
         let nested =
             code_mode::select_deferred_tools(cfg.mcp_tools, cfg.nested_exclude, cfg.nested_deny);
-        reg.register(Arc::new(code_mode::Execute::new(nested)));
+        if let Some(execute) = code_mode::execute_tool(nested) {
+            reg.register(execute);
+        }
     } else {
         for tool in cfg.mcp_tools {
             reg.register(tool.clone());
@@ -1427,7 +1429,8 @@ mod tests {
             reg.get("mcp__filesystem__read_file").is_none(),
             "MCP tools must not be advertised when Code Mode is on"
         );
-        // Nested exclude drops the tool from execute's catalog too — registry still has execute.
+        // Nested exclude drops the tool from execute's catalog too — here the only one, so there is
+        // nothing left for execute to reach and it is not advertised.
         let reg = default_registry_with_config(&ToolConfig {
             mcp_tools: &mcp_tools,
             code_mode: true,
@@ -1435,8 +1438,27 @@ mod tests {
             nested_deny: &deny,
             ..ToolConfig::new()
         });
-        assert!(reg.get("execute").is_some());
+        assert!(reg.get("execute").is_none());
         assert!(reg.get("mcp__filesystem__read_file").is_none());
+    }
+
+    #[cfg(feature = "code-mode")]
+    #[test]
+    fn code_mode_with_an_empty_deferred_catalog_registers_no_execute() {
+        // An `execute` whose JS context reaches no tools costs ~270 schema tokens per request for
+        // nothing: no MCP servers means the registry is exactly the plain default.
+        let deny: Vec<String> = Vec::new();
+        let mut reg = default_registry_with_config(&ToolConfig {
+            code_mode: true,
+            nested_deny: &deny,
+            ..ToolConfig::new()
+        });
+        assert!(reg.get("execute").is_none());
+        assert_eq!(reg.len(), default_registry().len());
+        // Nor does the post-`--tools` restore put one back.
+        apply_filter(&mut reg, Some(&["read".to_string()]), None, false);
+        code_mode::restore_execute(&mut reg, Vec::new(), None, false);
+        assert!(reg.get("execute").is_none());
     }
 
     #[cfg(feature = "code-mode")]
@@ -1454,12 +1476,7 @@ mod tests {
         apply_filter(&mut reg, Some(&["read".to_string()]), None, false);
         assert!(reg.get("execute").is_none());
         let nested = code_mode::select_deferred_tools(&mcp_tools, &[], &deny);
-        code_mode::restore_execute(
-            &mut reg,
-            Arc::new(code_mode::Execute::new(nested)),
-            None,
-            false,
-        );
+        code_mode::restore_execute(&mut reg, nested, None, false);
         assert!(reg.get("read").is_some());
         assert!(reg.get("execute").is_some());
         assert!(reg.get("mcp__filesystem__read_file").is_none());
