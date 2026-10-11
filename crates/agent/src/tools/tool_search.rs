@@ -743,6 +743,23 @@ mod tests {
         // Only the tools matching the most query words: not every `get_*` and every `*_file*`.
         assert!(index.rank("get file contents").len() <= 3);
         assert!(index.rank("zzz qqq").is_empty());
+        // One word that every name of a server shares, the server's own name, or a common verb lists
+        // them all, not `[]` (the A/B's `tools.search("browser")` scare — see `mcp_stdio::stale`).
+        let count = |q: &str, prefix: &str| {
+            index
+                .rank(q)
+                .iter()
+                .filter(|&&i| names[i].starts_with(prefix))
+                .count()
+        };
+        assert_eq!(count("browser", "mcp__playwright__browser_"), 25);
+        assert_eq!(count("github", "mcp__github__"), 26);
+        assert!(
+            index
+                .rank("list")
+                .iter()
+                .any(|&i| names[i] == "mcp__github__list_issues")
+        );
         // A word only descriptions have finds every tool whose description has it.
         let hits: Vec<&str> = index
             .rank("accessibility")

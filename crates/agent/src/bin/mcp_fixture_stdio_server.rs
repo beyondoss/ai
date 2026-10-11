@@ -139,6 +139,8 @@ async fn main() {
     let stdin = tokio::io::stdin();
     let mut lines = BufReader::new(stdin).lines();
     let mut stdout = tokio::io::stdout();
+    let late_discover = std::env::var_os("MCP_FIXTURE_LATE_DISCOVER").is_some();
+    let mut held_discover: Option<Value> = None;
 
     loop {
         let line = match lines.next_line().await {
@@ -176,6 +178,28 @@ async fn main() {
                 break;
             }
             continue;
+        }
+
+        // `MCP_FIXTURE_LATE_DISCOVER`: a legacy server too slow to answer `server/discover` before
+        // the client gives up on it — the answer (method not found) goes out only once the client's
+        // fallback `initialize` has arrived, right before that initialize's own answer.
+        if late_discover {
+            if method == "server/discover" {
+                held_discover = Some(id);
+                continue;
+            }
+            if method == "initialize"
+                && let Some(held) = held_discover.take()
+            {
+                let late = json!({
+                    "jsonrpc": "2.0",
+                    "id": held,
+                    "error": { "code": -32601, "message": "Method not found" },
+                });
+                if write_json_line(&mut stdout, &late).await.is_err() {
+                    break;
+                }
+            }
         }
 
         match handle(method, params) {
