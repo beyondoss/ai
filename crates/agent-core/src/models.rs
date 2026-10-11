@@ -264,9 +264,14 @@ fn openai_gpt5_input_limit(m: &str, context_window: u32) -> Option<u32> {
 /// | Sonnet 5.x | 200K | measured | −12% (Sonnet 5.5); 100K no cheaper, 3× the compactions |
 /// | GPT-6, GPT-5.6 | 240K | provisional | under OpenAI's 272K surcharge, like the measured 200K (−50% on GPT-6.1 Sol) |
 /// | Haiku 5.5 | 90K | provisional | under its 100K price tier (5× above it) |
-/// | Grok | 180K | provisional | under xAI's 200K price tier |
+/// | Grok, Gemini, Claude Sonnet 4.5 | 180K | provisional | under their 200K long-context price tier |
 /// | open-weight families | 128K | provisional | quality drops between 32K and 128K |
-/// | everything else | none | — | today's `window − reserve` |
+/// | everything else | 200K | fallback | no model runs to its full window by default; the window still wins below 200K |
+///
+/// The fallback is an owner decision rather than a measurement: every family the sweep measured
+/// compacted cheaper at 200K with neutral quality, and an unlisted model (older Claude and GPT-5.x,
+/// an unknown or brand-new id) has no reason to differ. A model whose window is under 200K is
+/// unaffected (`trigger_tokens` takes the lower line).
 fn default_compact_at(m: &str) -> Option<u32> {
     // `m` is lowercased. Strip a vendor slug, then a Bedrock region/vendor prefix.
     let id = m.rsplit('/').next().unwrap_or(m);
@@ -283,7 +288,7 @@ fn default_compact_at(m: &str) -> Option<u32> {
         Some(90_000)
     } else if any(&["gpt-6", "gpt-5.6"]) {
         Some(240_000)
-    } else if any(&["grok"]) {
+    } else if any(&["grok", "gemini", "claude-sonnet-4-5", "claude-sonnet-4.5"]) {
         Some(180_000)
     } else if any(&[
         "deepseek", "glm", "kimi", "k2p7", "minimax", "qwen", "mimo", "gpt-oss", "llama", "gemma",
@@ -291,7 +296,7 @@ fn default_compact_at(m: &str) -> Option<u32> {
     ]) {
         Some(128_000)
     } else {
-        None
+        Some(200_000)
     }
 }
 
@@ -3821,15 +3826,19 @@ mod tests {
             ("gpt-oss-120b", Some(128_000)),
             ("meta/llama-3.1-70b-instruct", Some(128_000)),
             // Everything else keeps today's trigger.
-            ("claude-opus-4-8", None),
-            ("claude-sonnet-4-6", None),
-            ("claude-haiku-4-5", None),
-            ("gpt-5.5", None),
-            ("gpt-5-mini", None),
-            ("gpt-4o", None),
-            ("o3", None),
-            ("gemini-3.1-pro", None),
-            ("some-unknown-model", None),
+            // Under a 200K long-context price tier.
+            ("gemini-3.1-pro", Some(180_000)),
+            ("anthropic/claude-sonnet-4.5", Some(180_000)),
+            ("claude-sonnet-4-5", Some(180_000)),
+            // Everything else: the 200K fallback.
+            ("claude-opus-4-8", Some(200_000)),
+            ("claude-sonnet-4-6", Some(200_000)),
+            ("claude-haiku-4-5", Some(200_000)),
+            ("gpt-5.5", Some(200_000)),
+            ("gpt-5-mini", Some(200_000)),
+            ("gpt-4o", Some(200_000)),
+            ("o3", Some(200_000)),
+            ("some-unknown-model", Some(200_000)),
         ] {
             assert_eq!(capabilities(id).compact_at, want, "{id}");
         }

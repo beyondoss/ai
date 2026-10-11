@@ -218,8 +218,10 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
   uncapped default) and Sonnet 5.x 200K (−12%; at 100K no cheaper, −10%, with about 3× the compactions
   and more turns, so the research's provisional 128K moved up). **Provisional**, with their rationale:
   GPT-6 and GPT-5.6 240K (under OpenAI's 272K surcharge, like the measured 200K that cost −50% on
-  GPT-6.1 Sol), Haiku 5.5 90K (under its 100K tier), Grok 180K (under the 200K tier), open-weight
-  families 128K; everything else none (today's `window − reserve`). `crates/agent`'s `--compact-at`
+  GPT-6.1 Sol), Haiku 5.5 90K (under its 100K tier), Grok, Gemini and Claude Sonnet 4.5 180K (under their 200K
+  long-context tier), open-weight families 128K. **Everything else falls back to 200K** (an owner
+  decision: no model runs to its full window by default; a window under 200K is unaffected, and
+  `--compact-at 0` restores `window − reserve`). `crates/agent`'s `--compact-at`
   overrides any of them. `CompactionConfig::for_model`
   scales the reserve against the input budget and keep-recent against the trigger (half of it, so a
   compaction lands well under the line that fired it); the max-tokens leg of `is_hard_overflow` still measures prompt + output against the whole

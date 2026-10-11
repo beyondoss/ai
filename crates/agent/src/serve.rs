@@ -12239,10 +12239,10 @@ mod tests {
         let u = at(test_compaction("claude-opus-5-5"));
         assert_eq!(u["context_window"], 1_000_000);
         assert_eq!(u["compact_at"], 200_000);
-        // An uncapped model: window − reserve, today's trigger.
+        // An unlisted model: the 200K fallback.
         assert_eq!(
             at(test_compaction("claude-opus-4-8"))["compact_at"],
-            1_000_000 - 16_384
+            200_000
         );
         // `--compact-at n` sets it, `--compact-at 0` removes the model's cap.
         let pinned = resolve_compaction(
