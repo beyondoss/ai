@@ -404,7 +404,22 @@ The harness layers several capabilities over the bare tools + loop:
   reachable by an explicit `/skill:name`, which strips the raw YAML frontmatter and wraps the body in a
   `<skill name="..." location="...">` tag rather than leaking the frontmatter verbatim; `format_available`
   renders no `<available_skills>` wrapper at all (not an empty one) when every skill is
-  `disable-model-invocation`, matching pi. Both
+  `disable-model-invocation`, matching pi. **The listing is budgeted** the way Claude Code budgets
+  its own ("Skill descriptions are cut short"): one `- name: description` line per skill, each
+  description whitespace-collapsed and cut at a word boundary to `MAX_LISTED_DESCRIPTION_CHARS` (160
+  — the opening sentence of every skill in a measured real `~/.claude/skills`; Claude Code's 1,536
+  leans on usage-ranked dropping this agent doesn't do), and the block held to
+  `listing_budget_chars` (1% of the model's window at ~4 chars/token; `serve` sizes it off the
+  configured `--model`). Every name is always listed; past the budget, descriptions are kept in
+  relevance order — `--skill` root, then project, then user, then name — and the rest list by name
+  with a note to read them. No absolute path is listed: a skill is named `skill:<name>`, which `read`
+  resolves to the discovered `SKILL.md` (`Read::with_skills`, fed from `ToolConfig::skills` in `run`,
+  `serve` and subagents) and prefixes with `[skill directory: …]`, and `skill:<name>/<file>` reads a
+  file beside it. `skill://…` is refused with a pointer to the MCP tool: that spelling is an MCP
+  skill's URI. A Claude Code `when_to_use` is appended to `description`. The listing depends only on
+  the skill set and the budget, so the prefix stays byte-stable run to run
+  (`tests/run_prompt_prefix.rs`). Measured on this repo with a 23-skill Claude Code HOME: the listing
+  went from 6,610 to ~1,460 Claude tokens. Both
   skill/prompt-template discovery report name collisions (`discover_with_diagnostics`) — the same name
   shadowed across roots or within one root — surfaced via `get_commands`'s `collisions` field _and_
   `tracing::warn!`-logged at the point of detection, so an operator watching server logs notices a
@@ -4142,7 +4157,8 @@ is read-only, and a tenant's workspace is never on this filesystem at all.
   `project_trusted` as a _required_ parameter that adds or omits _only_ the project-local roots, and
   always scan the user roots regardless. Trust alone doesn't make a `SKILL.md`'s frontmatter cooperative,
   though — "trusted" means the operator opted the directory in, not that every file in it is benign —
-  so `skills::format_available` XML-escapes `name`/`description`/`path` before writing them into the
+  so `skills::format_available` escapes `&`/`<`/`>` in `name`/`description` (and collapses their
+  whitespace, so neither can start a line of its own) before writing them into the
   `<available_skills>` block, closing the narrower residual path of a crafted description closing the
   tag early and forging a fake instruction block after it.
 

@@ -4497,6 +4497,7 @@ async fn run_task(
         mcp_tools: &mcp_tools,
         fs_backend: fs_backend.clone(),
         command_runner: exec_runner.clone(),
+        skills: &skills,
         ..tools::ToolConfig::new()
     });
     tools::apply_filter(
@@ -4856,6 +4857,7 @@ async fn run_task(
             cwd: &cwd,
             include_context_files: !no_context_files,
             skills: &skills,
+            context_window: agent_core::capabilities(&model).context_window,
             has_read,
             has_todo,
             has_structured_output,
