@@ -592,14 +592,6 @@ raw_sha256 = "18a105cb5d5d7c244ee4543af7f6d35c8e4a624d2e2839575be94b718563d71e"
 sha256 = "fa117504eb4870c52e8c6e13ca58f9d374df6c017a45fc966eeac4a83b893785"
 
 [[source]]
-id = "openrouter.endpoints/qwen/qwen3.5-9b"
-url = "https://openrouter.ai/api/v1/models/qwen/qwen3.5-9b/endpoints"
-file = "openrouter/endpoints/qwen/qwen3.5-9b.json"
-fetched = "2026-10-10"
-raw_sha256 = "501d6fe05f9e578643ab895951607285ee5af450a2aca66725f1624c15e7f93e"
-sha256 = "43b2d86f1c03cdf28168196dc0bbf1188e9e9b1b0064c2e90f789d557723a05c"
-
-[[source]]
 id = "openrouter.endpoints/qwen/qwen3.6-plus"
 url = "https://openrouter.ai/api/v1/models/qwen/qwen3.6-plus/endpoints"
 file = "openrouter/endpoints/qwen/qwen3.6-plus.json"
@@ -747,9 +739,9 @@ sha256 = "b461b2dc4f6ab022fefa1384ef19fb37a69d8114d9aa6e2103461f09501f25d6"
 id = "openrouter.models"
 url = "https://openrouter.ai/api/v1/models?output_modalities=all"
 file = "openrouter/models.json"
-fetched = "2026-10-10"
-raw_sha256 = "3845aaae18360ac9fe00951f1b582983c251179fe7102f00f1d1cacfb6bf0359"
-sha256 = "f79c90c8cf14092196a518cb2988d08c988940e9cff51503342acbd29c53733d"
+fetched = "2026-10-11"
+raw_sha256 = "2a19cd573c456084c02bfcf2cd39746f9a23dd1c25aacdf659cf815164a8caa7"
+sha256 = "8225f14c47e8c349b5813914a47f982c69275f5f0cebed415df60fd45cfc263b"
 
 [[source]]
 id = "openrouter.pricing"

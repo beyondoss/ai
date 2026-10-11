@@ -4859,46 +4859,6 @@ static OR_QWEN_QWEN_2_5_7B_INSTRUCT: &[OrEndpoint] = &[
     },
 ];
 
-/// `qwen/qwen3.5-9b` (`GET /api/v1/models/qwen/qwen3.5-9b/endpoints`).
-static OR_QWEN_QWEN3_5_9B: &[OrEndpoint] = &[
-    OrEndpoint {
-        host: "Darkbloom",
-        tag: "darkbloom/fp4",
-        class: Class::Standard,
-        card: Card::new(tr("0.08", "0.13", "0.04", "0.08", None)),
-    },
-    OrEndpoint {
-        host: "DeepInfra",
-        tag: "deepinfra/bf16",
-        class: Class::Standard,
-        card: Card::new(tr("0.1", "0.15", "0.1", "0.1", None)),
-    },
-    OrEndpoint {
-        host: "Parasail",
-        tag: "parasail/bf16",
-        class: Class::Standard,
-        card: Card::new(tr("0.1", "0.25", "0.1", "0.1", None)),
-    },
-    OrEndpoint {
-        host: "SiliconFlow",
-        tag: "siliconflow/fp8",
-        class: Class::Standard,
-        card: Card::new(tr("0.1", "0.15", "0.1", "0.1", None)),
-    },
-    OrEndpoint {
-        host: "Together",
-        tag: "together",
-        class: Class::Standard,
-        card: Card::new(tr("0.17", "0.25", "0.17", "0.17", None)),
-    },
-    OrEndpoint {
-        host: "Venice",
-        tag: "venice/fp8",
-        class: Class::Standard,
-        card: Card::new(tr("0.1", "0.15", "0.1", "0.1", None)),
-    },
-];
-
 /// `qwen/qwen3.6-plus` (`GET /api/v1/models/qwen/qwen3.6-plus/endpoints`).
 static OR_QWEN_QWEN3_6_PLUS: &[OrEndpoint] = &[
     OrEndpoint {
@@ -7312,10 +7272,6 @@ pub static ROW_RATES: &[RowRates] = &[
             CandidateCost {
                 provider: ProviderId::Together,
                 card: CostCard::Own(&TOGETHER_QWEN_QWEN3_5_9B),
-            },
-            CandidateCost {
-                provider: ProviderId::OpenRouter,
-                card: CostCard::OpenRouter(OR_QWEN_QWEN3_5_9B),
             },
         ],
     },
