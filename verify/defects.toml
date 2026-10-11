@@ -2721,5 +2721,5 @@ evidence = "Direct to OpenRouter 2026-10-11, qwen/qwen3.8-max-prime: tool_choice
 claims = ["T1", "E1", "E2"]
 state = "fixed"
 test = "a_forced_tool_on_qwen3_8_max_prime_goes_as_an_instruction"
-fix = "FIX"
+fix = "29375f4"
 note = "Fixed the way the gateway serves Claude models that refuse forced tool use: providers::catalog::ToolThinking::ForcedAsInstruction marks the OpenRouter candidate, and translate::fit_tools_to_thinking sends a forced request as tool_choice auto with a closing {\"role\": \"system\", \"content\": \"Respond by calling the `NAME` tool.\"} (\"... one of the provided tools.\" for required), reasoning as the client asked. A call is very likely, not guaranteed: with auto and that closing system message the model called the tool 4 of 4 times (direct, 2026-10-11, a prompt that did not need it). Applied after translation, so a Messages tool_choice any or tool is covered. Also held by a_forced_tool_goes_as_an_instruction_where_thinking_cannot_go_off and qwen_candidates_whose_thinking_breaks_tools. Live 2026-10-11: VERIFY_CATALOG_ROW=qwen/qwen3.8-max-prime 13/13, CAT-6's forced named tool served with no auto retry."
