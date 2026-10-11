@@ -1361,7 +1361,8 @@ occasionally on these failovers. It is not a gateway fault. Likewise, a candidat
 reserves for Enterprise or dedicated deployments is not listed
 (Groq `llama-3.1-8b-instant` / `llama-3.3-70b-versatile` / `minimaxai/minimax-m2.7`, the
 Fireworks Llama 4 / Kimi K2.6 / GLM 5.1 / GLM 5.2 / Llama 3.3 ids, Together Kimi K2.7 Code, GPT-OSS 20B,
-Gemma 4 31B and Qwen2.5 7B Turbo).
+Gemma 4 31B and Qwen2.5 7B Turbo), nor one the host has retired (Together's Llama 3.3 70B Turbo,
+gone 2026-10-22, which leaves `llama-3.3-70b-versatile` an OpenRouter-only row).
 Rows left with only OpenRouter keep their names as OpenRouter-only rows. These ids are recorded in
 `verify/catalog_truth.toml`, and `no_candidate_is_retired_or_not_serverless` keeps them out. Those
 rows have no Responses arm — `previous_response_id` is OpenAI's store. OpenAI serves some GPT ids only

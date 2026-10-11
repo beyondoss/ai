@@ -115,10 +115,12 @@ const XAI: Route = Route {
     dead: &[],
     serves: "xai",
 };
-/// Together's own API (OpenAI-compatible Chat): an open-weights row whose primary is Together.
+/// Together's own API (OpenAI-compatible Chat): a row whose primary is Together. Muse Glimmer 30B
+/// is Together's named replacement for Llama 3.3 70B Turbo, this route's row until Together
+/// retired it (2026-10-22; the row is OpenRouter's now).
 const TOGETHER: Route = Route {
     name: "together",
-    model: "llama-3.3-70b-versatile",
+    model: "meta/muse-glimmer-30b",
     pools: &[("together", "TOGETHER_API_KEY")],
     dead: &[],
     serves: "together",
