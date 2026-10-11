@@ -208,16 +208,21 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
   enforces: the window less the max output, 272K of 400K and 922K of 1.05M. Triggering off the raw
   window put GPT-5.6's line at ~1.03M, past the 922K the API already rejects, so only overflow recovery
   ran. **A per-model cap can fire it earlier**: `ModelCaps::compact_at` (set in one place,
-  `models::provisional_compact_at`) is a quality or price line, not a hard limit, and the trigger is
+  `models::default_compact_at`) is a quality or price line, not a hard limit, and the trigger is
   `CompactionConfig::trigger_tokens` = `min(input_budget − reserve, compact_at)`. The cap _is_ the
   trigger rather than one more limit the reserve comes off: the reserve is headroom below a limit the
   vendor rejects past, and a cap already sits far under that, so `compact_at = 200K` compacts at 200K
-  (subtracting the reserve too would put Haiku 5.5's 90K line at 73.6K). The values are
-  **provisional**, from the 2026-10 context-economics research — Opus/Fable 5.x 200K (retrieval
-  drops 128–256K), Sonnet 5.x 128K, GPT-6 and GPT-5.6 240K (under OpenAI's 272K surcharge), Haiku 5.5
-  90K (under its 100K tier), Grok 180K (under the 200K tier), open-weight families 128K, everything
-  else none (today's `window − reserve`) — until the long-context eval (`crates/agent/eval/longctx`)
-  measures our own; `crates/agent`'s `--compact-at` overrides them. `CompactionConfig::for_model`
+  (subtracting the reserve too would put Haiku 5.5's 90K line at 73.6K). **Measured** by the
+  long-context eval's 2026-10 threshold sweep (`crates/agent/eval/longctx`; 100K / 200K / `window −
+  reserve`, n=3–4 per cell, quality neutral everywhere): Opus/Fable 5.x 200K (Opus 5.5 −15% vs the
+  uncapped default) and Sonnet 5.x 200K (−12%; at 100K no cheaper, −10%, with about 3× the compactions
+  and more turns, so the research's provisional 128K moved up). **Provisional**, with their rationale:
+  GPT-6 and GPT-5.6 240K (under OpenAI's 272K surcharge, like the measured 200K that cost −50% on
+  GPT-6.1 Sol), Haiku 5.5 90K (under its 100K tier), Grok, Gemini and Claude Sonnet 4.5 180K (under their 200K
+  long-context tier), open-weight families 128K. **Everything else falls back to 200K** (an owner
+  decision: no model runs to its full window by default; a window under 200K is unaffected, and
+  `--compact-at 0` restores `window − reserve`). `crates/agent`'s `--compact-at`
+  overrides any of them. `CompactionConfig::for_model`
   scales the reserve against the input budget and keep-recent against the trigger (half of it, so a
   compaction lands well under the line that fired it); the max-tokens leg of `is_hard_overflow` still measures prompt + output against the whole
   window; `models::tests::every_catalog_input_limit_bounds_the_input_budget` holds the table to

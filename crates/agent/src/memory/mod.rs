@@ -684,12 +684,12 @@ mod tests {
         assert!(p < 183_616, "must fire before the compaction cut");
         assert!(p > 183_616 / 2, "but not absurdly early");
         assert_eq!(p, 183_616 / 5 * 4);
-        // A per-model cap moves the nudge with it: 80% of Sonnet 5's 128K line.
+        // A per-model cap moves the nudge with it: 80% of Sonnet 5's 200K line.
         let sonnet =
             agent_core::CompactionConfig::for_model(&agent_core::capabilities("claude-sonnet-5"));
         assert_eq!(
             compaction_pressure_point(sonnet.trigger_tokens()),
-            128_000 / 5 * 4
+            200_000 / 5 * 4
         );
         // No proactive room (reserve >= window) disables the nudge (never-fires sentinel) rather than
         // collapsing to 0 — which, as `live_prompt > 0`, would fire on every turn.

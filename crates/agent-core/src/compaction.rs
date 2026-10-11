@@ -1452,7 +1452,7 @@ mod tests {
         for (id, cap) in [
             ("claude-opus-5-5", 200_000),
             ("claude-fable-5-1", 200_000),
-            ("claude-sonnet-5-5", 128_000),
+            ("claude-sonnet-5-5", 200_000),
             ("claude-haiku-5-5", 90_000),
             ("gpt-6.1-sol", 240_000),
             ("gpt-5.6-sol", 240_000),
@@ -1469,8 +1469,30 @@ mod tests {
             // The hard-overflow backstop still measures the vendor's limit, not the cap.
             assert!(!is_hard_overflow(&s, &cfg, StopReason::EndTurn, 0), "{id}");
         }
-        // Uncapped models keep today's trigger.
-        let cfg = CompactionConfig::for_model(&crate::models::capabilities("claude-opus-4-8"));
+        // An unlisted model gets the 200K fallback: a 1M window no longer runs to its end.
+        for id in ["claude-opus-4-8", "some-new-1m-model"] {
+            let caps = crate::models::ModelCaps {
+                context_window: 1_000_000,
+                ..crate::models::capabilities(id)
+            };
+            assert_eq!(
+                CompactionConfig::for_model(&caps).trigger_tokens(),
+                200_000,
+                "{id}"
+            );
+        }
+        // A window under the fallback is unchanged: `window - reserve` is still the lower line.
+        let small = crate::models::capabilities("some-unknown-model");
+        assert_eq!(small.context_window, 128_000);
+        assert_eq!(
+            CompactionConfig::for_model(&small).trigger_tokens(),
+            128_000 - 16_384
+        );
+        // `--compact-at 0` (no cap) still restores the full-window trigger.
+        let cfg = CompactionConfig {
+            compact_at: None,
+            ..CompactionConfig::for_model(&crate::models::capabilities("claude-opus-4-8"))
+        };
         assert_eq!(cfg.trigger_tokens(), 1_000_000 - 16_384);
     }
 

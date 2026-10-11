@@ -110,8 +110,9 @@ pub struct ModelCaps {
     /// Where compaction should fire on this model, in prompt tokens, when that is earlier than the
     /// window allows: a quality or price line rather than a hard limit. The trigger is
     /// `min(input_budget − reserve, compact_at)` (see `CompactionConfig::trigger_tokens`). `None`:
-    /// only the window and input limit bound it. **Provisional**: set by [`provisional_compact_at`]
-    /// from the 2026-10 context-economics research, pending our own long-context eval.
+    /// only the window and input limit bound it. Set by [`default_compact_at`]: measured by our
+    /// long-context eval for Claude Opus/Fable and Sonnet 5.x, provisional (with a stated price or
+    /// quality rationale) for the rest.
     pub compact_at: Option<u32>,
     /// Which output-ceiling field name to emit on the wire.
     pub max_tokens_field: MaxTokensField,
@@ -244,36 +245,50 @@ fn openai_gpt5_input_limit(m: &str, context_window: u32) -> Option<u32> {
     }
 }
 
-/// **PROVISIONAL** per-model compaction trigger caps ([`ModelCaps::compact_at`]), from the 2026-10
-/// context-economics research: each sits below where that family's long-context retrieval measurably
-/// degrades, or below its long-context price tier, whichever comes first. They are starting values,
-/// not measurements on our own agent: the long-context eval (`crates/agent/eval/longctx`) chooses the
-/// real ones, and `--compact-at` overrides them per run. One table, keyed on the id after any
-/// vendor-slug (`anthropic/…`) or Bedrock-region (`us.anthropic.…`) prefix.
+/// Per-model compaction trigger caps ([`ModelCaps::compact_at`]). Two kinds of row:
 ///
-/// | family | cap | why |
-/// |---|---|---|
-/// | Opus / Fable 5.x | 200K | retrieval drops between 128K and 256K |
-/// | Sonnet 5.x | 128K | already degraded at 128K on 8-needle retrieval |
-/// | GPT-6, GPT-5.6 | 240K | under OpenAI's 272K long-context surcharge |
-/// | Haiku 5.5 | 90K | under its 100K price tier (5× above it) |
-/// | Grok | 180K | under xAI's 200K price tier |
-/// | open-weight families | 128K | quality drops between 32K and 128K |
-/// | everything else | none | today's `window − reserve` |
-fn provisional_compact_at(m: &str) -> Option<u32> {
+/// - **Measured** by our long-context eval (`crates/agent/eval/longctx`, the 2026-10 threshold
+///   sweep: 100K / 200K / `window − reserve`, n=3–4 per cell, quality neutral everywhere). Opus 5.5
+///   at 200K cost −15% against the uncapped default. Sonnet 5.5 at 200K cost −12%; at 100K it was no
+///   cheaper (−10%), took about 3× the compactions and more turns, and one run hit its spend cap, so
+///   Sonnet's earlier 128K guess moved up to 200K. (GPT-6.1 Sol at 200K: −50%.)
+/// - **Provisional**, from the 2026-10 context-economics research, with the rationale beside it:
+///   untested on our agent, each sits under a price tier or a measured retrieval drop.
+///
+/// `--compact-at` overrides any of them per run. One table, keyed on the id after any vendor-slug
+/// (`anthropic/…`) or Bedrock-region (`us.anthropic.…`) prefix.
+///
+/// | family | cap | status | why |
+/// |---|---|---|---|
+/// | Opus / Fable 5.x | 200K | measured | −15% (Opus 5.5), quality neutral |
+/// | Sonnet 5.x | 200K | measured | −12% (Sonnet 5.5); 100K no cheaper, 3× the compactions |
+/// | GPT-6, GPT-5.6 | 240K | provisional | under OpenAI's 272K surcharge, like the measured 200K (−50% on GPT-6.1 Sol) |
+/// | Haiku 5.5 | 90K | provisional | under its 100K price tier (5× above it) |
+/// | Grok, Gemini, Claude Sonnet 4.5 | 180K | provisional | under their 200K long-context price tier |
+/// | open-weight families | 128K | provisional | quality drops between 32K and 128K |
+/// | everything else | 200K | fallback | no model runs to its full window by default; the window still wins below 200K |
+///
+/// The fallback is an owner decision rather than a measurement: every family the sweep measured
+/// compacted cheaper at 200K with neutral quality, and an unlisted model (older Claude and GPT-5.x,
+/// an unknown or brand-new id) has no reason to differ. A model whose window is under 200K is
+/// unaffected (`trigger_tokens` takes the lower line).
+fn default_compact_at(m: &str) -> Option<u32> {
     // `m` is lowercased. Strip a vendor slug, then a Bedrock region/vendor prefix.
     let id = m.rsplit('/').next().unwrap_or(m);
     let id = id.rsplit_once("anthropic.").map_or(id, |(_, rest)| rest);
     let any = |prefixes: &[&str]| prefixes.iter().any(|p| id.starts_with(p));
-    if any(&["claude-opus-5", "claude-fable-5", "fable-5"]) {
+    if any(&[
+        "claude-opus-5",
+        "claude-fable-5",
+        "fable-5",
+        "claude-sonnet-5",
+    ]) {
         Some(200_000)
-    } else if any(&["claude-sonnet-5"]) {
-        Some(128_000)
     } else if any(&["claude-haiku-5-5", "claude-haiku-5.5"]) {
         Some(90_000)
     } else if any(&["gpt-6", "gpt-5.6"]) {
         Some(240_000)
-    } else if any(&["grok"]) {
+    } else if any(&["grok", "gemini", "claude-sonnet-4-5", "claude-sonnet-4.5"]) {
         Some(180_000)
     } else if any(&[
         "deepseek", "glm", "kimi", "k2p7", "minimax", "qwen", "mimo", "gpt-oss", "llama", "gemma",
@@ -281,7 +296,7 @@ fn provisional_compact_at(m: &str) -> Option<u32> {
     ]) {
         Some(128_000)
     } else {
-        None
+        Some(200_000)
     }
 }
 
@@ -618,7 +633,7 @@ fn capabilities_lc(m: &str) -> ModelCaps {
         return capabilities_lc(native);
     }
     let mut caps = capabilities_impl_lc(m);
-    caps.compact_at = provisional_compact_at(m);
+    caps.compact_at = default_compact_at(m);
     // `is_fireworks_anthropic_wire_model` re-lowercases internally, so guard it behind the
     // allocation-free `is_fireworks_model` prefix check (which it also requires): the overwhelming
     // non-Fireworks common path then never touches it, and only a genuine Fireworks id pays that
@@ -3774,7 +3789,7 @@ mod tests {
     }
 
     #[test]
-    fn provisional_compact_at_per_model_family() {
+    fn default_compact_at_per_model_family() {
         for (id, want) in [
             // Opus / Fable 5.x: 200K.
             ("claude-opus-5", Some(200_000)),
@@ -3784,10 +3799,10 @@ mod tests {
             ("fable-5-1", Some(200_000)),
             ("anthropic/claude-opus-5.5", Some(200_000)),
             ("us.anthropic.claude-opus-5-5-v1:0", Some(200_000)),
-            // Sonnet 5.x: 128K.
-            ("claude-sonnet-5", Some(128_000)),
-            ("claude-sonnet-5-5", Some(128_000)),
-            ("claude-sonnet-5.5", Some(128_000)),
+            // Sonnet 5.x: 200K (measured; was a provisional 128K).
+            ("claude-sonnet-5", Some(200_000)),
+            ("claude-sonnet-5-5", Some(200_000)),
+            ("claude-sonnet-5.5", Some(200_000)),
             // Haiku 5.5: 90K, under its 100K price tier.
             ("claude-haiku-5-5", Some(90_000)),
             // GPT-6 and GPT-5.6: 240K, under the 272K surcharge.
@@ -3811,15 +3826,19 @@ mod tests {
             ("gpt-oss-120b", Some(128_000)),
             ("meta/llama-3.1-70b-instruct", Some(128_000)),
             // Everything else keeps today's trigger.
-            ("claude-opus-4-8", None),
-            ("claude-sonnet-4-6", None),
-            ("claude-haiku-4-5", None),
-            ("gpt-5.5", None),
-            ("gpt-5-mini", None),
-            ("gpt-4o", None),
-            ("o3", None),
-            ("gemini-3.1-pro", None),
-            ("some-unknown-model", None),
+            // Under a 200K long-context price tier.
+            ("gemini-3.1-pro", Some(180_000)),
+            ("anthropic/claude-sonnet-4.5", Some(180_000)),
+            ("claude-sonnet-4-5", Some(180_000)),
+            // Everything else: the 200K fallback.
+            ("claude-opus-4-8", Some(200_000)),
+            ("claude-sonnet-4-6", Some(200_000)),
+            ("claude-haiku-4-5", Some(200_000)),
+            ("gpt-5.5", Some(200_000)),
+            ("gpt-5-mini", Some(200_000)),
+            ("gpt-4o", Some(200_000)),
+            ("o3", Some(200_000)),
+            ("some-unknown-model", Some(200_000)),
         ] {
             assert_eq!(capabilities(id).compact_at, want, "{id}");
         }
@@ -3831,7 +3850,7 @@ mod tests {
     }
 
     #[test]
-    fn every_provisional_compact_at_sits_under_its_input_budget() {
+    fn every_default_compact_at_sits_under_its_input_budget() {
         // A cap at or above the budget would be dead weight; one this close to it would leave no
         // reserve. Every row the table sets must sit at least the default reserve below the budget.
         for id in [

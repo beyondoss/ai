@@ -374,8 +374,8 @@ enum Command {
         #[usage(long, env = "AI_AGENT_CONTEXT_WINDOW")]
         context_window: Option<u32>,
         /// Compact once the prompt passes this many tokens, even when the window allows more. Defaults
-        /// to the model's own provisional cap (`list-models` shows it; most models have none, so the
-        /// trigger stays `window − reserve`). `0` removes the cap. `--context-window` still bounds it:
+        /// to the model's own cap (`list-models` shows it; 200K for any model not given its own).
+        /// `0` removes the cap, so the trigger is `window − reserve` again. `--context-window` still bounds it:
         /// the lower of the two lines fires. `serve`'s identical flag.
         #[usage(long, env = "AI_AGENT_COMPACT_AT")]
         compact_at: Option<u32>,
@@ -945,8 +945,8 @@ enum Command {
         #[usage(long, env = "AI_AGENT_CONTEXT_WINDOW")]
         context_window: Option<u32>,
         /// Compact once the prompt passes this many tokens, even when the window allows more. Defaults
-        /// to the model's own provisional cap (`list-models` shows it; most models have none, so the
-        /// trigger stays `window − reserve`). `0` removes the cap. `--context-window` still bounds it:
+        /// to the model's own cap (`list-models` shows it; 200K for any model not given its own).
+        /// `0` removes the cap, so the trigger is `window − reserve` again. `--context-window` still bounds it:
         /// the lower of the two lines fires. `run`'s identical flag.
         #[usage(long, env = "AI_AGENT_COMPACT_AT")]
         compact_at: Option<u32>,
@@ -2825,7 +2825,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let caps = agent_core::capabilities(model);
                 let thinking = caps.reasoning_effort
                     || caps.thinking != agent_core::models::ThinkingShape::None;
-                // Where compaction fires with no overrides: the provisional cap, else window − reserve.
+                // Where compaction fires with no overrides: the model's cap, else window − reserve.
                 let trigger = agent_core::CompactionConfig::for_model(&caps).trigger_tokens();
                 println!(
                     "{:<22} {:>10} {:>10} {:>9} {:<8} {:<6}",

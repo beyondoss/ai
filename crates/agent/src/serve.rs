@@ -564,7 +564,7 @@ pub struct ServeConfig {
     pub no_session_persistence: bool,
     /// The operator's compaction flags: `--context-window`, `--compact-at`, the reserve and keep-recent
     /// budgets, and the tool-masking knobs. Each `None` defers to the current model's own value (its
-    /// window, its provisional `ModelCaps::compact_at`), re-read on every `set_model`, so a switch gets
+    /// window, its `ModelCaps::compact_at`), re-read on every `set_model`, so a switch gets
     /// the new model's real budget instead of a stale operator number; a `Some` pins it across
     /// switches. Resolved by [`compaction_config`].
     pub compaction: CompactionFlags,
@@ -9859,7 +9859,7 @@ fn parse_images(images: Option<&Value>) -> Vec<agent_core::ImageSource> {
 }
 
 /// The compaction policy a session runs on `model`: the model's window and input limit, its
-/// (provisional) [`agent_core::models::ModelCaps::compact_at`], and the operator's overrides. The one
+/// [`agent_core::models::ModelCaps::compact_at`], and the operator's overrides. The one
 /// place `build_agent`, the pressure nudge and `context_usage` resolve it, so all three agree on where
 /// compaction fires. `enabled` is left at its default; `build_agent` applies the live flag.
 pub(crate) fn compaction_config(cfg: &ServeConfig, model: &str) -> agent_core::CompactionConfig {
@@ -12235,14 +12235,14 @@ mod tests {
         session.last_input_tokens = 10_000;
         let at =
             |c: agent_core::CompactionConfig| session_stats(&session, &c)["context_usage"].clone();
-        // A capped model: the provisional cap, under a 1M input budget.
+        // A capped model: its cap, under a 1M input budget.
         let u = at(test_compaction("claude-opus-5-5"));
         assert_eq!(u["context_window"], 1_000_000);
         assert_eq!(u["compact_at"], 200_000);
-        // An uncapped model: window − reserve, today's trigger.
+        // An unlisted model: the 200K fallback.
         assert_eq!(
             at(test_compaction("claude-opus-4-8"))["compact_at"],
-            1_000_000 - 16_384
+            200_000
         );
         // `--compact-at n` sets it, `--compact-at 0` removes the model's cap.
         let pinned = resolve_compaction(
