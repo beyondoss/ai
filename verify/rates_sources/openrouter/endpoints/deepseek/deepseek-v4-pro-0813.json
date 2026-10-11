@@ -381,7 +381,7 @@
           "completion": "0.000005",
           "discount": 0,
           "input_cache_read": "0.000000219",
-          "prompt": "0.0000003"
+          "prompt": "0.00000036"
         },
         "provider_name": "Wafer",
         "quantization": "unknown",

@@ -57,10 +57,10 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.00000788",
-          "discount": 0,
-          "input_cache_read": "0.00000056",
-          "prompt": "0.00000225"
+          "completion": "0.00000490136",
+          "discount": 0.378,
+          "input_cache_read": "0.00000034832",
+          "prompt": "0.0000013995"
         },
         "provider_name": "Baidu",
         "quantization": "fp4",
@@ -70,10 +70,10 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.0000044",
-          "discount": 0,
-          "input_cache_read": "0.00000026",
-          "prompt": "0.0000014"
+          "completion": "0.0000043956",
+          "discount": 0.001,
+          "input_cache_read": "0.00000025974",
+          "prompt": "0.0000013986"
         },
         "provider_name": "Baidu",
         "quantization": "fp8",
@@ -174,10 +174,10 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.00000168",
-          "discount": 0.58,
-          "input_cache_read": "0.000000105",
-          "prompt": "0.000000273"
+          "completion": "0.0000016",
+          "discount": 0.6,
+          "input_cache_read": "0.0000001",
+          "prompt": "0.00000026"
         },
         "provider_name": "Decart",
         "quantization": "mxfp4",
@@ -239,7 +239,7 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.00000546",
+          "completion": "0.00000195",
           "discount": 0,
           "input_cache_read": "0.0000002",
           "prompt": "0.00000125"
@@ -252,10 +252,10 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.0000044",
+          "completion": "0.0000006",
           "discount": 0,
-          "input_cache_read": "0.000000132",
-          "prompt": "0.000000198"
+          "input_cache_read": "0.0000001",
+          "prompt": "0.00000015"
         },
         "provider_name": "InferenceNet",
         "quantization": "fp4",
@@ -294,7 +294,7 @@
           "completion": "0.000006",
           "discount": 0,
           "input_cache_read": "0.000000137",
-          "prompt": "0.000002"
+          "prompt": "0.0000004"
         },
         "provider_name": "Morph",
         "quantization": "fp8",

@@ -407,7 +407,7 @@
       "id": "moonshotai/kimi-k3",
       "name": "MoonshotAI: Kimi K3",
       "pricing": {
-        "completion": "0.000012",
+        "completion": "0.00001",
         "input_cache_read": "0.00000055",
         "prompt": "0.0000008"
       }
@@ -1264,8 +1264,8 @@
       "name": "Z.ai: GLM 5.3",
       "pricing": {
         "completion": "0.0000048",
-        "input_cache_read": "0.000000038",
-        "prompt": "0.000000039"
+        "input_cache_read": "0.00000005",
+        "prompt": "0.00000007"
       }
     },
     {

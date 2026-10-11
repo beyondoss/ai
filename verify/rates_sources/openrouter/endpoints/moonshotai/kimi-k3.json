@@ -162,7 +162,7 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.000015",
+          "completion": "0.00001",
           "discount": 0,
           "input_cache_read": "0.00000055",
           "prompt": "0.0000008"
@@ -217,7 +217,7 @@
           "completion": "0.0000149",
           "discount": 0,
           "input_cache_read": "0.00000029",
-          "prompt": "0.000000289"
+          "prompt": "0.00000075"
         },
         "provider_name": "Morph",
         "quantization": "fp8",
@@ -305,10 +305,10 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.00001489",
+          "completion": "0.00003",
           "discount": 0,
-          "input_cache_read": "0.00000028",
-          "prompt": "0.00000029"
+          "input_cache_read": "0.0000003",
+          "prompt": "0.00000195"
         },
         "provider_name": "Wafer",
         "quantization": "unknown",
@@ -318,7 +318,7 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.000014",
+          "completion": "0.000029",
           "discount": 0,
           "input_cache_read": "0.0000003",
           "prompt": "0.0000028"

@@ -110,10 +110,10 @@
         "context_length": 262144,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.000003",
+          "completion": "0.0000025",
           "discount": 0,
           "input_cache_read": "0.00000002",
-          "prompt": "0.000000049"
+          "prompt": "0.00000004"
         },
         "provider_name": "DekaLLM",
         "quantization": "unknown",
@@ -213,14 +213,27 @@
         "context_length": 262144,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.0000014",
-          "discount": 0.3,
-          "input_cache_read": "0.000000035",
-          "prompt": "0.00000014"
+          "completion": "0.000003",
+          "discount": 0,
+          "input_cache_read": "0.00000002",
+          "prompt": "0.00000005"
         },
         "provider_name": "Reka",
         "quantization": "fp8",
         "tag": "reka/fp8"
+      },
+      {
+        "context_length": 262144,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.00000135",
+          "discount": 0,
+          "input_cache_read": "0.000000018",
+          "prompt": "0.00000004"
+        },
+        "provider_name": "Tenstorrent",
+        "quantization": "fp4",
+        "tag": "tenstorrent/fp4"
       },
       {
         "context_length": 262144,
