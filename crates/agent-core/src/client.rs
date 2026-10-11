@@ -624,6 +624,9 @@ impl ModelTransport for GatewayClient {
             .as_ref()
             .and_then(|d| d.aggregator_host)
             .is_some_and(|host| host == crate::models::AggregatorHost::OpenAiCodex);
+        // The long prompt-cache TTL rides only on a route documented to take it; anywhere else the
+        // request silently keeps the provider's default TTL. See `long_cache_reaches`.
+        req.cache_long &= long_cache_reaches(credential.direct.as_ref(), dialect, &req.model);
         // `req.host` was already computed above, before dialect selection — see that assignment's own
         // comment.
         // Anthropic's own OAuth identity-spoofing headers (`CLAUDE_CODE_BETA`/`CLAUDE_CLI_IDENTITY`
@@ -937,6 +940,39 @@ pub struct LineFramer {
 /// pathologically long one from a misbehaving provider/gateway) can grow the buffer before the
 /// stream errors out instead of the process running out of memory.
 const MAX_BUFFERED_LINE_BYTES: usize = 32 * 1024 * 1024;
+
+/// Whether the long prompt-cache TTL (Anthropic `cache_control.ttl: "1h"`, OpenAI
+/// `prompt_cache_retention: "24h"`) can go to the route this request takes. `serve` asks for it by
+/// default, so it must never reach a host that 400s on the field or bills it in a way we cannot see.
+/// Only routes whose docs say they take it qualify:
+///
+/// - **The gateway** (`direct: None`), for the Anthropic and Responses wires. Its Claude upstreams
+///   all take `ttl: "1h"` — Anthropic as a byte relay, Bedrock (rows only for Claude 4.5+), and the
+///   OpenRouter failover, which copies the `cache_control` object as is — and it relays Responses to
+///   OpenAI. Chat Completions is excluded: through the gateway that wire reaches third-party hosts
+///   (Groq, Together, …) with no documented `prompt_cache_retention`.
+/// - **Anthropic direct** (API key or OAuth).
+/// - **Bedrock direct**, for Claude 4.5 and later only: Bedrock rejects `ttl` with a
+///   `ValidationException` on the 5-minute-only models (3.7 Sonnet, 3.5 Sonnet v2).
+/// - **OpenAI direct**, on the Responses wire. Azure keeps its own suppression in the dialect.
+///
+/// Everything else — Copilot, Codex, OpenRouter direct (Chat Completions, where nothing documents
+/// `prompt_cache_retention`), Fireworks and the other BYO hosts — keeps the default TTL.
+fn long_cache_reaches(direct: Option<&DirectRouting>, dialect: Dialect, model: &str) -> bool {
+    use crate::models::AggregatorHost as Host;
+    let Some(direct) = direct else {
+        return matches!(dialect, Dialect::Anthropic | Dialect::OpenAiResponses);
+    };
+    if direct.copilot_dynamic_headers {
+        return false;
+    }
+    match (direct.aggregator_host, dialect) {
+        (Some(Host::Anthropic), Dialect::Anthropic) => true,
+        (Some(Host::Bedrock), Dialect::Anthropic) => crate::deferred::claude_4_5_or_later(model),
+        (Some(Host::OpenAi), Dialect::OpenAiResponses) => true,
+        _ => false,
+    }
+}
 
 /// Find the next SSE line terminator in `buf`, returning `(start, len)` where `len` is how many bytes
 /// the terminator itself occupies — `1` for a bare `\n` or a bare `\r`, `2` for a `\r\n` pair (treated
@@ -3404,6 +3440,125 @@ mod tests {
             !request.contains("\"reasoning\":{\"effort\":\"none\"}"),
             "Copilot-routed gpt-5.2 must not get an explicit reasoning-disable, got:\n{request}"
         );
+    }
+
+    #[tokio::test]
+    async fn long_cache_ttl_reaches_only_a_route_documented_to_take_it() {
+        use crate::models::AggregatorHost as Host;
+        let routing = |host: Option<Host>, copilot: bool| DirectRouting {
+            route: RouteOverride::Direct {
+                base_url: "http://127.0.0.1:1".to_string(),
+                path: "/v1/messages",
+            },
+            static_headers: Vec::new(),
+            copilot_dynamic_headers: copilot,
+            auth_header: None,
+            auth_header_prefix: None,
+            dialect_override: None,
+            deployment_name: None,
+            query: None,
+            aggregator_host: host,
+        };
+        let claude = "claude-opus-4-8";
+        let cases: &[(Option<DirectRouting>, Dialect, &str, bool)] = &[
+            // The gateway: Anthropic and Responses wires, never Chat Completions.
+            (None, Dialect::Anthropic, claude, true),
+            (None, Dialect::OpenAiResponses, "gpt-5.5", true),
+            (None, Dialect::OpenAi, "kimi-k2.6", false),
+            (
+                Some(routing(Some(Host::Anthropic), false)),
+                Dialect::Anthropic,
+                claude,
+                true,
+            ),
+            (
+                Some(routing(Some(Host::OpenAi), false)),
+                Dialect::OpenAiResponses,
+                "gpt-5.5",
+                true,
+            ),
+            // Bedrock: 4.5+ only (3.7 Sonnet throws a ValidationException on `ttl`).
+            (
+                Some(routing(Some(Host::Bedrock), false)),
+                Dialect::Anthropic,
+                "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+                true,
+            ),
+            (
+                Some(routing(Some(Host::Bedrock), false)),
+                Dialect::Anthropic,
+                "us.anthropic.claude-3-7-sonnet-20250219-v1:0",
+                false,
+            ),
+            // Undocumented hosts keep the default TTL.
+            (Some(routing(None, true)), Dialect::Anthropic, claude, false),
+            (
+                Some(routing(None, false)),
+                Dialect::Anthropic,
+                claude,
+                false,
+            ),
+            (
+                Some(routing(Some(Host::KimiCoding), false)),
+                Dialect::Anthropic,
+                "kimi-k2.6",
+                false,
+            ),
+            (
+                Some(routing(Some(Host::OpenRouter), false)),
+                Dialect::OpenAi,
+                claude,
+                false,
+            ),
+            (
+                Some(routing(Some(Host::OpenAiCodex), false)),
+                Dialect::OpenAiResponses,
+                "gpt-5.5",
+                false,
+            ),
+        ];
+        for (direct, dialect, model, want) in cases {
+            assert_eq!(
+                long_cache_reaches(direct.as_ref(), *dialect, model),
+                *want,
+                "{:?} {dialect:?} {model}",
+                direct.as_ref().map(|d| d.aggregator_host)
+            );
+        }
+
+        // End to end: `stream` applies the gate before the body is built, so a Copilot-routed
+        // Claude request asking for the long TTL goes out with the default one.
+        let listener = beyond_ai_test_support::ports::listener();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 16384];
+            let n = stream.read(&mut buf).unwrap();
+            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            request
+        });
+        let mut copilot = routing(None, true);
+        copilot.route = RouteOverride::Direct {
+            base_url: format!("http://{addr}"),
+            path: "/v1/messages",
+        };
+        let client = GatewayClient::with_credential_source(
+            "http://127.0.0.1:1".to_string(),
+            Arc::new(DirectTestCredential(copilot)),
+        )
+        .unwrap();
+        let req = ModelRequest::new(claude, vec![crate::message::Message::user("hi")], 100)
+            .with_system("sys")
+            .with_cache_long(true);
+        let mut events = client.stream(req).await.unwrap();
+        while events.next().await.is_some() {}
+        let request = server.join().unwrap();
+        assert!(request.contains("\"cache_control\""), "{request}");
+        assert!(!request.contains("\"ttl\""), "{request}");
     }
 
     /// pi-parity (pass 15): proves `GatewayClient::stream` actually sets [`ModelRequest::is_azure`] on

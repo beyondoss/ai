@@ -1258,6 +1258,65 @@ fn run_binary_no_compaction_flag_suppresses_proactive_compaction_on_a_resumed_se
     );
 }
 
+/// The first wire body of a one-turn `run` with `extra` flags.
+fn run_first_body(extra: &[&str]) -> String {
+    let (base, bodies) = spawn_model_server(vec![turn_text("ok")]);
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let output = run_cmd(bin)
+        .args([
+            "run",
+            "hi",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--no-session-persistence",
+        ])
+        .args(extra)
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+    assert!(
+        output.status.success(),
+        "binary failed.\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    bodies.lock().unwrap()[0].clone()
+}
+
+#[test]
+fn run_defaults_to_the_5_minute_cache_ttl_and_takes_an_explicit_1h() {
+    let body = run_first_body(&[]);
+    assert!(body.contains(r#""cache_control""#), "{body}");
+    assert!(!body.contains(r#""ttl""#), "`run` must default to 5 minutes: {body}");
+    let body = run_first_body(&["--cache-ttl", "1h"]);
+    assert!(body.contains(r#""ttl":"1h""#), "{body}");
+}
+
+#[test]
+fn serve_defaults_to_the_1_hour_cache_ttl_and_takes_an_explicit_5m() {
+    for (extra, want_1h) in [(&[][..], true), (&["--cache-ttl", "5m"][..], false)] {
+        let dir = tempfile::tempdir().unwrap();
+        let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+        let (base, bodies) = spawn_model_server(vec![turn_text("ok")]);
+        let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+        let mut child = serve_cmd(bin, &base, &session_file)
+            .args(extra)
+            .spawn_guarded();
+        let mut stdin = child.stdin.take().unwrap();
+        let mut stdout = common::child_frames(&mut child);
+        writeln!(stdin, "{}", json!({ "type": "prompt", "message": "hi" })).unwrap();
+        stdin.flush().unwrap();
+        read_until_response(&mut stdout, "prompt");
+        drop(stdin);
+        child.wait().unwrap();
+        let body = bodies.lock().unwrap()[0].clone();
+        assert_eq!(body.contains(r#""ttl":"1h""#), want_1h, "{extra:?}: {body}");
+    }
+}
+
 #[test]
 fn run_binary_cache_long_flag_reaches_the_wire_request() {
     let (base, bodies) = spawn_model_server(vec![turn_text("ok")]);

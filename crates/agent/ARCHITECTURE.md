@@ -1393,6 +1393,97 @@ parallel-safe unit test rather than something only assertable by mutating proces
 
 ---
 
+## Prompt-cache TTL by mode
+
+A cache entry lives 5 minutes, or 1 hour on request, and every read restarts the clock. In an agent
+loop the gap between two requests is a tool call, usually seconds. In a conversation it is a person
+reading, reviewing a diff, or away at a meeting. A gap past the TTL loses the cached prefix, and the
+next request writes the whole transcript again.
+
+| Mode    | Default TTL | Why                                                                              |
+| ------- | ----------- | -------------------------------------------------------------------------------- |
+| `serve` | `1h`        | A person drives it. Pauses past five minutes are the normal case.                |
+| `run`   | `5m`        | Requests are spaced by tool calls. The cache rarely idles past five minutes.     |
+| child   | `5m`        | A subagent is a `run`-shaped loop, and nothing reads its cache after it returns. |
+
+`--cache-ttl 5m|1h` (or `AI_AGENT_CACHE_TTL`) overrides the default for either mode: `1h` for a `run`
+whose tools can take longer than five minutes, `5m` for a `serve` driven by automation. `--cache-long`
+still means `--cache-ttl 1h`. The choice reaches the wire as `ModelRequest::cache_long`. On Anthropic it
+becomes `cache_control.ttl: "1h"`. On OpenAI Responses it becomes `prompt_cache_retention: "24h"`, which
+carries no surcharge.
+
+### Where the long TTL is sent
+
+`GatewayClient::stream` clears `cache_long` on any route not documented to take it
+(`client::long_cache_reaches`). The request then keeps the provider's default TTL and never fails.
+
+| Route                                      | Long TTL | Evidence                                                                                                                       |
+| ------------------------------------------ | -------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| Gateway, Anthropic wire                    | yes      | Byte relay to Anthropic and to Bedrock (rows only for 4.5+). The OpenRouter failover copies `cache_control`, `ttl` included.   |
+| Gateway, Responses wire                    | yes      | Relayed to OpenAI.                                                                                                             |
+| Gateway, Chat Completions wire             | no       | Reaches third-party hosts. None of them documents `prompt_cache_retention`.                                                    |
+| Anthropic direct (API key or OAuth)        | yes      | Probe: `ephemeral_1h_input_tokens: 19007` on Haiku 4.5.                                                                        |
+| Bedrock direct, Claude 4.5+                | yes      | Probe: `ephemeral_1h_input_tokens: 19007` on `us.anthropic.claude-haiku-4-5-20251001-v1:0`.                                    |
+| Bedrock direct, older Claude               | no       | Bedrock documents a `ValidationException` for `ttl` on 5-minute-only models.                                                   |
+| OpenAI direct, Responses                   | yes      | `prompt_cache_retention` is an OpenAI field. Azure is suppressed separately, in the dialect.                                   |
+| OpenRouter direct                          | no       | The agent speaks Chat Completions to OpenRouter and stamps no `cache_control` there, so there is nothing for a TTL to ride on. |
+| Copilot, Codex, Fireworks, other BYO hosts | no       | No documented support.                                                                                                         |
+
+Vertex has no route in this crate. Its docs list `ttl: "1h"` for Claude 4+ in the same shape, so a
+Vertex route would join the Anthropic row. OpenRouter itself takes the TTL on both `/api/v1/messages` and
+Chat Completions. The probe got `ephemeral_1h_input_tokens` on the first and a 2× write charge on the
+second, which is what the gateway's failover relies on.
+
+A Bedrock-spelled id (`[region.]anthropic.<claude id>[-v1:0]`) resolves to the native id's
+capabilities (`models::bedrock_claude_id`). Before that it fell through to `ModelCaps::unknown()`, which
+dropped the long TTL and also capped output at 4,096 tokens.
+
+### Break-even
+
+Let `c` be the input price and `r` the cache-read multiplier: 0.1, or 0.05 on Opus 5.5 and Sonnet 5.5. A
+5-minute write costs `1.25c` per token and a 1-hour write `2c`.
+
+- **What 1h costs:** `0.75c` more on every token written. Each token is written once while the cache
+  stays warm, so over a session that is `0.75c × W`. `W` is the final prefix plus any rewrites forced by
+  compaction or by a gap longer than an hour.
+- **What 5m costs:** each gap of 5 to 60 minutes turns a read of the prefix `P_i` into a rewrite,
+  `(1.25 − r)c × P_i` extra.
+
+The 1-hour TTL pays off when
+
+    Σ_i (1.25 − r) · P_i  >  0.75 · W
+
+With `r = 0.1` that is `Σ P_i > 0.65 W`. With `r = 0.05` it is `Σ P_i > 0.625 W`. Either one pause late in a
+session, when the prefix is near its final size, or two pauses around the midpoint, pays for the 1-hour
+writes. A gap longer than an hour misses under both TTLs. The 1-hour rewrite then costs `0.75c × P` more,
+which is already counted in `W`.
+
+Worked example on Opus 5.5 ($4/M input, `r = 0.05`) with a 400K prefix:
+
+- one 20-minute pause costs the 5-minute TTL `$2.00 − $0.08 = $1.92`;
+- writing that prefix at 1 hour costs `$1.20` extra;
+- so 1h wins by $0.72 on one pause. It loses $1.20 on a session that never pauses.
+
+A conversation pauses, so `serve` takes 1 hour. A `run` loop's gaps are tool calls, so it takes 5 minutes.
+
+### Why not adaptive
+
+Adaptive would start at 5 minutes and switch to 1 hour after the first gap longer than five minutes. It
+is not better on either mode.
+
+- **Against static 1h,** the first pause still misses, and the rewrite then happens at the 1-hour price.
+  That costs `(1.25 − r) × P_1` more than static 1h, where `P_1` is the prefix at the first pause. It
+  saves `0.75 × W` only on a session that never pauses at all.
+- **For `serve`,** that trade favors adaptive only if most conversations either never pause or pause for
+  the first time while the prefix is still a small fraction of its final size. Nothing measured here
+  shows either.
+- **For `run`,** a long gap means a slow tool, and a second slow tool is not predicted by the first.
+
+Shipping it would also mean carrying per-session gap state across `serve`'s `Agent` rebuilds. The
+static default is predictable and testable, and `--cache-ttl` covers the exceptions.
+
+---
+
 ## Core Mechanism
 
 ### Tool dispatch
