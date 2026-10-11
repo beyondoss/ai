@@ -363,7 +363,10 @@ The harness layers several capabilities over the bare tools + loop:
   Beyond's uniform "empty or whitespace-only counts as absent" rule closes that gap rather than matching
   it — not a parity target;**
   project instruction files, global then
-  cwd→root, **one file per directory**, `AGENTS.md` winning over `CLAUDE.md`, matched case-insensitively
+  cwd→root, **one file per directory**, `AGENTS.md` winning over `CLAUDE.md`, matched case-insensitively,
+  each cut to `MAX_CONTEXT_FILE_PROMPT_BYTES` (32 KiB, Codex's `project_doc_max_bytes` default) at a
+  line boundary with a visible `[truncated: <path> is N KiB; only its first 32 KiB is included here —
+  read the file for the rest]` marker — on this host and for a sandbox's files alike
   — a read failure on the winning name (permission denied, a dangling symlink) falls
   back to trying the other one before giving up on the directory, matching pi's own
   `loadContextFileFromDir` (the prior version committed to a name the moment it was _seen_, so either
@@ -939,8 +942,10 @@ The harness layers several capabilities over the bare tools + loop:
   prefers those over bash for search and file contents. Do not `bash grep`/`rg`/`cat`/`sed`; if you
   must sample via bash, `| head` that grep/cat/ls only — never `| head`/`| tail` installs or tests
   (hides exit status; unbounded grep/cat overflowed the ~50KB bash cap, and bash keeps the tail).
-  Use read instead of cat (read paginates from the start). The `todo` protocol in the system prompt is a short
-  full-replace / one-`in_progress` block (field tenses live on the tool schema).
+  Use read instead of cat (read paginates from the start). The `todo` protocol in the system prompt says only what
+  the tool can't: use it for multi-step work, and move an item as you start and finish it. Full
+  replacement, one `in_progress`, the field tenses and "empty clears" live on the tool's description
+  and schema, said once.
 - **Code Mode** — `--code-mode` / `AI_AGENT_CODE_MODE` (both `run` and `serve`, off by default), and
   **not linked into the default binary**. MCP tools stop being advertised as flattened
   `mcp__<server>__<tool>` entries and become a deferred catalog inside one `execute` tool

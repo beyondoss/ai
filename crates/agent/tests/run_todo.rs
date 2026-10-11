@@ -167,8 +167,12 @@ fn the_tool_and_its_protocol_are_advertised_to_the_model_by_default() {
         body.contains("todo_protocol"),
         "system prompt must explain the tool"
     );
-    assert!(body.contains("fully replaces the previous list"));
+    assert!(body.contains("multi-step work only"));
+    // Full replacement and the one-`in_progress` rule ride on the tool itself, said once.
+    assert!(body.contains("Fully replaces the previous list"));
     assert!(body.contains("exactly one item `in_progress`"));
+    // ...and nowhere else: the tool description doesn't repeat the schema.
+    assert_eq!(body.matches("ully replaces the previous").count(), 1);
 }
 
 #[test]

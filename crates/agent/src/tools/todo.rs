@@ -130,8 +130,8 @@ impl Tool for Todo {
     }
 
     fn description(&self) -> &str {
-        "Track progress on multi-step work. Send the COMPLETE list every call — it fully replaces the \
-         previous one. Keep exactly one item `in_progress`."
+        // The schema says the rest (full replacement, one `in_progress`, empty clears) — once.
+        "Track progress on multi-step work."
     }
 
     fn input_schema(&self) -> Value {
@@ -149,7 +149,7 @@ impl Tool for Todo {
                             "status": {
                                 "type": "string",
                                 "enum": ["pending", "in_progress", "completed"],
-                                "description": "At most one item may be `in_progress`."
+                                "description": "Keep exactly one item `in_progress` while working."
                             }
                         },
                         "required": ["content", "activeForm", "status"]

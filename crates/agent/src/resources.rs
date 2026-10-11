@@ -393,15 +393,14 @@ run. If the payload you send does not match the schema, you will be told what wa
 the tool again with a corrected one.
 </structured_output_protocol>";
 
-/// How to drive the `todo` tool. Gated on [`PromptOptions::has_todo`]. Field names and tenses also
-/// live on the tool schema; this is the protocol the schema cannot express (full-replace, one
-/// `in_progress`, skip trivial, empty clears).
+/// How to drive the `todo` tool. Gated on [`PromptOptions::has_todo`]. Only what the tool's own
+/// description and schema can't say: *when* to use it and *when* to move an item. Full replacement,
+/// one `in_progress`, the field tenses and "empty clears" are all on the schema already, which the
+/// model reads with the tool.
 const TODO_GUIDANCE: &str = "\
 <todo_protocol>
-Multi-step work only — skip trivial one-step requests. Each call fully replaces the previous list: \
-send the COMPLETE list, not a delta. Items: `content` (imperative), `activeForm` (present continuous), \
-`status` pending|in_progress|completed. Keep exactly one item `in_progress`; mark it when you start, \
-`completed` when done — don't batch. Empty list clears.
+Use `todo` for multi-step work only — skip trivial one-step requests. Mark an item `in_progress` when \
+you start it and `completed` as soon as it is done; don't batch updates.
 </todo_protocol>";
 
 /// The cheap, time-varying tail of the system prompt: the current date and working directory. Does no
@@ -507,6 +506,35 @@ fn load_context_files_with_home(cwd: &Path, home: Option<&Path>) -> Vec<(String,
     out
 }
 
+/// Cap on one `AGENTS.md`/`CLAUDE.md` as injected into the system prompt — Codex's
+/// `project_doc_max_bytes` default (32 KiB). These files ride every request; a longer one is cut at a
+/// line boundary with a visible marker naming the file and its full size, so the model knows the rest
+/// exists and where to read it. Applies on this host and to a sandbox's files alike.
+pub const MAX_CONTEXT_FILE_PROMPT_BYTES: usize = 32 * 1024;
+
+/// `body` (the contents of `path`) cut to [`MAX_CONTEXT_FILE_PROMPT_BYTES`] at the last line that
+/// fits, plus a marker — or `body` untouched when it already fits.
+fn cap_context_file(path: &str, body: String) -> String {
+    if body.len() <= MAX_CONTEXT_FILE_PROMPT_BYTES {
+        return body;
+    }
+    let mut end = body[..MAX_CONTEXT_FILE_PROMPT_BYTES]
+        .rfind('\n')
+        .map_or(0, |i| i + 1);
+    if end == 0 {
+        end = MAX_CONTEXT_FILE_PROMPT_BYTES;
+        while !body.is_char_boundary(end) {
+            end -= 1;
+        }
+    }
+    format!(
+        "{}\n\n[truncated: {path} is {} KiB; only its first 32 KiB is included here — read the file \
+         for the rest]",
+        body[..end].trim_end(),
+        body.len().div_ceil(1024),
+    )
+}
+
 /// Cap on one backend-side `AGENTS.md`/`CLAUDE.md`/`SYSTEM.md`/`APPEND_SYSTEM.md` — the same value
 /// (and the same reasoning) as `skills::MAX_SKILL_FILE_LEN`: these are instruction files, and
 /// anything approaching a megabyte is a build artifact that landed on the wrong name. The on-host
@@ -549,7 +577,9 @@ pub async fn load_context_files_via(
             let path = dir.join(name);
             match crate::tools::fs::read_text_capped(backend, &path, MAX_CONTEXT_FILE_LEN).await {
                 Ok(body) if !body.trim().is_empty() => {
-                    out.push((path.display().to_string(), body));
+                    let path = path.display().to_string();
+                    let body = cap_context_file(&path, body);
+                    out.push((path, body));
                     break;
                 }
                 // Absent, empty, oversized or unreadable: try the next candidate, exactly as the
@@ -629,7 +659,9 @@ fn load_context_file_from_dir(dir: &Path) -> Option<(String, String)> {
     for candidate in [agents, claude].into_iter().flatten() {
         match fs::read_to_string(&candidate) {
             Ok(body) if !body.trim().is_empty() => {
-                return Some((candidate.display().to_string(), body));
+                let path = candidate.display().to_string();
+                let body = cap_context_file(&path, body);
+                return Some((path, body));
             }
             Ok(_) => {} // empty file: treated as absent, try the next candidate
             Err(e) => {
@@ -1677,6 +1709,34 @@ mod tests {
     }
 
     #[test]
+    fn a_context_file_over_32_kib_is_cut_with_a_marker_and_a_short_one_is_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let line = "Follow the house style in every file you touch.\n";
+        std::fs::write(dir.path().join("AGENTS.md"), line.repeat(10)).unwrap();
+        let (_, body) = load_context_file_from_dir(dir.path()).unwrap();
+        assert_eq!(body, line.repeat(10));
+
+        let big = line.repeat(2_000); // ~94 KiB
+        std::fs::write(dir.path().join("AGENTS.md"), &big).unwrap();
+        let (path, body) = load_context_file_from_dir(dir.path()).unwrap();
+        let (kept, marker) = body.rsplit_once("\n\n").unwrap();
+        assert!(kept.len() <= MAX_CONTEXT_FILE_PROMPT_BYTES);
+        assert!(kept.ends_with("touch."), "cut on a line boundary");
+        assert_eq!(
+            marker,
+            format!(
+                "[truncated: {path} is {} KiB; only its first 32 KiB is included here — read the \
+                 file for the rest]",
+                big.len().div_ceil(1024)
+            )
+        );
+        // One line longer than the cap is cut, not dropped.
+        let capped = cap_context_file("x.md", "y".repeat(40_000));
+        assert!(capped.starts_with(&"y".repeat(1_000)));
+        assert!(capped.ends_with("read the file for the rest]"));
+    }
+
+    #[test]
     fn the_todo_protocol_is_advertised_only_when_the_tool_is_registered() {
         // Same gate-on-what's-registered discipline as `<available_skills>`/`<available_agents>`: a
         // process (or subagent child) whose registry never advertised `todo` must not carry the
@@ -1684,8 +1744,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let with = build_static_system_prompt(&section_opts(tmp.path(), true, false));
         assert!(with.contains("<todo_protocol>"));
-        assert!(with.contains("fully replaces the previous list"));
-        assert!(with.contains("exactly one item `in_progress`"));
+        assert!(with.contains("multi-step work only"));
+        assert!(with.contains("don't batch"));
+        // Full replacement, one `in_progress` and the field tenses are on the tool's schema and
+        // description, which the model reads with the tool; the prompt doesn't repeat them.
+        assert!(!with.contains("activeForm"));
+        assert!(!with.contains("fully replaces"));
 
         let without = build_static_system_prompt(&section_opts(tmp.path(), false, false));
         assert!(!without.contains("todo_protocol"));
