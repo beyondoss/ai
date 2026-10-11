@@ -558,6 +558,17 @@ enum Entry {
         #[serde(default)]
         data: Value,
     },
+    /// A message rewritten in place: from here on, the message entry `target_id` reads as `message`
+    /// (the last edit in file order wins). Written by [`SessionStore::record_edits`] for tool-output
+    /// masking (`agent_core::compaction::mask_tool_results`), which changes old tool results without
+    /// changing the message count, so an append can't carry it. Non-destructive and O(edited): the
+    /// original stays on disk, and an older binary skips this line as an unknown entry and simply
+    /// reloads the unmasked transcript — a valid, just larger, state.
+    MessageEdit {
+        target_id: String,
+        #[serde(flatten)]
+        message: Message,
+    },
 }
 
 /// File-tracking details persisted alongside an [`Entry::BranchSummary`] — the branch-summary analog
@@ -1219,6 +1230,14 @@ impl SessionStore {
                     );
                     tip = Some(id);
                 }
+                // Rewrites the target's content in place; never moves the tip (see `Entry::MessageEdit`).
+                Ok(Entry::MessageEdit { target_id, message }) => {
+                    if let Some(node) = nodes.get_mut(&target_id)
+                        && node.as_message().is_some()
+                    {
+                        node.content = Arc::new(NodeContent::Message(message));
+                    }
+                }
                 // Purely a provenance record (see `Entry::Compaction`'s doc comment) — the very next
                 // entry in the file is the real, live message this compaction produced, so this one
                 // must never itself move the tip. Still indexed by id (Track L25) so `SessionStore::tree`
@@ -1581,6 +1600,88 @@ impl SessionStore {
             self.nodes.insert(id, node);
         }
         self.persisted = messages.len();
+        Ok(())
+    }
+
+    /// Write the tool results a masking pass rewrote in place since they were stored — at the message
+    /// `indices` in `agent_core::Session::edited` — as [`Entry::MessageEdit`]s.
+    /// [`Self::append_new`] is count-keyed and never sees a change that keeps the count.
+    ///
+    /// Only a tool result's `content` and `images` are taken from `messages`; everything else stays as
+    /// stored. The in-memory transcript can differ from disk in ways that must not be persisted: a
+    /// cross-model resume scrubs tool-call ids and thinking in memory only
+    /// (`Session::scrub_cross_model_state`), so writing the whole in-memory message would pair a
+    /// scrubbed result id against the stored, unscrubbed `tool_use` id, and the original model would
+    /// reject the reloaded transcript. A message whose block layout no longer matches what is stored
+    /// is left alone.
+    ///
+    /// Idempotent: an index whose stored results already match writes nothing, so a caller passes the
+    /// session's list on every persist without tracking what it wrote. An index past what is stored
+    /// is skipped too: [`Self::append_new`] writes those as they are. Only message entries count
+    /// toward an index (a custom entry on the active path holds no message slot).
+    pub fn record_edits(&mut self, messages: &[Message], indices: &[usize]) -> std::io::Result<()> {
+        if indices.is_empty() {
+            return Ok(());
+        }
+        let ids: Vec<&String> = self
+            .active
+            .iter()
+            .filter(|id| {
+                self.nodes
+                    .get(*id)
+                    .is_some_and(|n| n.as_message().is_some())
+            })
+            .collect();
+        let mut buf = Vec::new();
+        let mut staged = Vec::new();
+        for &i in indices {
+            let (Some(id), Some(m)) = (ids.get(i), messages.get(i)) else {
+                continue;
+            };
+            let Some(stored) = self.nodes[*id].as_message() else {
+                continue;
+            };
+            if i >= self.persisted || stored.content.len() != m.content.len() {
+                continue;
+            }
+            let mut edited = stored.clone();
+            for (old, new) in edited.content.iter_mut().zip(&m.content) {
+                if let (
+                    ContentBlock::ToolResult {
+                        content, images, ..
+                    },
+                    ContentBlock::ToolResult {
+                        content: c,
+                        images: im,
+                        ..
+                    },
+                ) = (old, new)
+                {
+                    *content = c.clone();
+                    *images = im.clone();
+                }
+            }
+            if edited == *stored {
+                continue;
+            }
+            write_line(
+                &mut buf,
+                &Entry::MessageEdit {
+                    target_id: (*id).clone(),
+                    message: edited.clone(),
+                },
+            )?;
+            staged.push(((*id).clone(), edited));
+        }
+        if buf.is_empty() {
+            return Ok(());
+        }
+        self.log.append(&buf)?;
+        for (id, m) in staged {
+            if let Some(node) = self.nodes.get_mut(&id) {
+                node.content = Arc::new(NodeContent::Message(m));
+            }
+        }
         Ok(())
     }
 
@@ -4488,7 +4589,7 @@ pub(crate) fn read_listing(
         Entry::ModelChange { .. } | Entry::ThinkingLevelChange { .. } => return None,
         Entry::TitleChange { .. } => return None,
         Entry::Label { .. } => return None,
-        Entry::Custom { .. } => return None,
+        Entry::Custom { .. } | Entry::MessageEdit { .. } => return None,
     };
 
     // A streaming line count, not a tree walk: it counts every `Message` line in the file, which for a
@@ -4544,7 +4645,8 @@ pub(crate) fn read_listing(
             | Ok(Entry::BranchSummary { .. })
             | Ok(Entry::Compaction { .. })
             | Ok(Entry::Label { .. })
-            | Ok(Entry::Custom { .. }) => {}
+            | Ok(Entry::Custom { .. })
+            | Ok(Entry::MessageEdit { .. }) => {}
             // Whole-session-scoped: the most recent one anywhere in the file wins (Task #18, pi-parity
             // fix, for `model`/`thinking_level`) — so a `list_sessions`/`list_all_sessions` listing shows
             // the session's actual last-used model rather than its frozen creation-time one. Safe here
@@ -7701,6 +7803,125 @@ mod tests {
             Some("bookmark"),
             "a plain `rewrite` must not clear labels — only `reset_for_new_session` does"
         );
+    }
+
+    #[test]
+    fn record_edits_persists_in_place_rewrites_idempotently_and_survives_a_compaction() {
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo.create(SessionMeta::new("/w", "m")).unwrap();
+        let mut messages = vec![
+            Message::user("task"),
+            Message::assistant(vec![agent_core::ContentBlock::tool_use(
+                "c0",
+                "read",
+                json!({"path": "a"}),
+            )]),
+            Message::tool_result("c0", "x".repeat(2_000), false),
+            Message::assistant(vec![agent_core::ContentBlock::text("ok")]),
+        ];
+        store.append_new(&messages).unwrap();
+        // A custom entry on the active path holds no message slot: indices still count messages.
+        store.append_custom("note", json!({})).unwrap();
+        messages[2] = Message::tool_result("c0", "[masked]", false);
+        // Index 9 is past the list, 4 past what is stored: both skipped.
+        store.record_edits(&messages, &[2, 4, 9]).unwrap();
+        let len = fs::metadata(store.path()).unwrap().len();
+        store.record_edits(&messages, &[2]).unwrap();
+        assert_eq!(
+            fs::metadata(store.path()).unwrap().len(),
+            len,
+            "an edit already stored writes nothing"
+        );
+
+        let (mut reopened, restored) = repo.open_id(&store.meta().id.clone()).unwrap();
+        assert_eq!(*restored.messages, messages, "the edit reloads");
+        // The original output is still on disk, under the edit.
+        assert!(
+            fs::read_to_string(reopened.path())
+                .unwrap()
+                .contains(&"x".repeat(2_000))
+        );
+
+        // A compaction after the edit carries the edited content into the new active path.
+        let compacted = vec![
+            Message::user(format!(
+                "{}\n\nrecap",
+                agent_core::compaction::SUMMARY_MARKER
+            )),
+            messages[1].clone(),
+            messages[2].clone(),
+            messages[3].clone(),
+        ];
+        reopened.append_new(&messages).unwrap();
+        reopened
+            .rewrite_compacted(
+                &compacted,
+                CompactionMeta {
+                    tokens_before: 1,
+                    provenance: Default::default(),
+                },
+            )
+            .unwrap();
+        let (_, restored) = repo.open_id(&store.meta().id.clone()).unwrap();
+        assert_eq!(*restored.messages, compacted);
+    }
+
+    #[test]
+    fn record_edits_never_persists_a_cross_model_scrub() {
+        // A GPT session resumed on Claude: the scrub truncates `call|item` ids in memory only. A
+        // masking pass then rewrites a result; the edit must carry the masked content under the
+        // *stored* id, or the reloaded transcript pairs `call_1` against `call_1|fc_1` and the original
+        // model rejects it.
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo.create(SessionMeta::new("/w", "gpt-5.5")).unwrap();
+        let mut session = Session::new();
+        session.user("task");
+        session.push(
+            Message::assistant(vec![agent_core::ContentBlock::tool_use(
+                "call_1|fc_1",
+                "read",
+                json!({"path": "a"}),
+            )])
+            .with_model_id("gpt-5.5"),
+        );
+        session.push(Message::tool_result(
+            "call_1|fc_1",
+            "x".repeat(2_000),
+            false,
+        ));
+        session.push(
+            Message::assistant(vec![agent_core::ContentBlock::text("ok")]).with_model_id("gpt-5.5"),
+        );
+        store.append_new(&session.messages).unwrap();
+
+        session.scrub_cross_model_state("claude-opus-5-5");
+        let plan = agent_core::compaction::mask_tool_results(&session.messages, 1, &[]).unwrap();
+        assert!(
+            format!("{:?}", plan.messages[2]).contains("\"call_1\""),
+            "scrubbed in memory"
+        );
+        store.record_edits(&plan.messages, &plan.edited).unwrap();
+
+        let (_, restored) = repo.open_id(&store.meta().id.clone()).unwrap();
+        let agent_core::ContentBlock::ToolResult {
+            tool_use_id,
+            content,
+            ..
+        } = &restored.messages[2].content[0]
+        else {
+            panic!("{:?}", restored.messages[2]);
+        };
+        assert_eq!(
+            tool_use_id, "call_1|fc_1",
+            "the stored id, not the scrubbed one"
+        );
+        assert!(content.starts_with(agent_core::compaction::MASKED_PREFIX));
+        // And it is idempotent against the scrubbed list too.
+        let len = fs::metadata(store.path()).unwrap().len();
+        store.record_edits(&plan.messages, &plan.edited).unwrap();
+        assert_eq!(fs::metadata(store.path()).unwrap().len(), len);
     }
 
     #[test]

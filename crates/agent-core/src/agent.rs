@@ -77,6 +77,16 @@ pub enum AgentEvent {
     },
     /// The run finished normally (the model ended its turn and no steering was queued).
     AgentEnd { steps: u32 },
+    /// An automatic compaction's first step masked old tool output instead of (or before) summarizing:
+    /// `masked` tool results older than the kept turns were replaced by one-line placeholders (see
+    /// [`compaction::mask_tool_results`]). `tokens_before` is the live prompt estimate when it fired;
+    /// `tokens_freed` the estimate of what the pass removed. A [`Self::CompactionStart`] follows in the
+    /// same turn only when this didn't bring the prompt back under the trigger.
+    ToolOutputMasked {
+        masked: usize,
+        tokens_before: u32,
+        tokens_freed: u32,
+    },
     /// A compaction round has begun — [`Agent::compact`] confirmed a worthwhile prefix exists and is
     /// about to make its first summarization model call. Emitted before [`Compacted`](Self::Compacted),
     /// which reports the same round's outcome once it finishes; a caller tracking "is a compaction
@@ -871,7 +881,13 @@ impl Agent {
             // cancellation is routed through `finish_compaction` rather than a bare `?`, so it gets the
             // same session/steering cleanup every other cancellation exit in this loop uses instead of
             // leaving the session on a dangling `user` turn (see `cancel_run`'s doc comment).
-            if self.compaction.enabled && compaction::should_compact(session, &self.compaction) {
+            //
+            // Masking old tool output comes first: when it frees enough to get back under the
+            // trigger, no summary is needed this time (see `mask_tool_output`).
+            if self.compaction.enabled
+                && compaction::should_compact(session, &self.compaction)
+                && !self.mask_tool_output(session, &mut sink)
+            {
                 let result = self
                     .compact_or_report(session, CompactionReason::Threshold, &cancel, &mut sink)
                     .await;
@@ -2519,6 +2535,62 @@ impl Agent {
             usage,
         });
         Ok(CompactOutcome::Compacted)
+    }
+
+    /// The first step of an automatic compaction: mask old tool output
+    /// ([`compaction::mask_tool_results`]) when that frees at least `mask_min_free_tokens` (capped at a
+    /// quarter of the trigger, so a small model can reach it). Returns whether the prompt is now back
+    /// under the trigger, in which case no summary is needed.
+    ///
+    /// **Batched, never incremental.** It runs only when the prompt has crossed the trigger, and a pass
+    /// that frees too little is not applied, so history is rewritten at most once per fill cycle: every
+    /// turn in between sends a byte-identical prefix and reads it from the prompt cache. Masking a
+    /// little every turn instead invalidates the cache from the first edited message on, each turn,
+    /// which costs 2–3× more than not masking at all. A pass that is applied but leaves the prompt over
+    /// the trigger falls through to the summary in the same turn, which then summarizes the masked
+    /// transcript (one cache invalidation, not two).
+    ///
+    /// The live-size snapshot drops by the estimate of what was freed, so the next check sees the
+    /// smaller prompt before the next provider usage report corrects it. Request blocks riding a masked
+    /// message move to its new content, so a host's per-message model context survives the pass.
+    fn mask_tool_output(
+        &self,
+        session: &mut Session,
+        sink: &mut (dyn FnMut(AgentEvent) + Send),
+    ) -> bool {
+        let cfg = &self.compaction;
+        if !cfg.mask_tool_output {
+            return false;
+        }
+        let Some(plan) = compaction::mask_tool_results(
+            &session.messages,
+            cfg.mask_keep_turns,
+            &session.compaction.modified_files,
+        ) else {
+            return false;
+        };
+        if plan.freed < cfg.mask_min_free_tokens.min(cfg.trigger_tokens() / 4) {
+            return false;
+        }
+        let tokens_before = session
+            .last_input_tokens
+            .saturating_add(compaction::trailing_tokens(session));
+        for b in &mut session.request_blocks {
+            if session.messages.get(b.index) == Some(&b.anchor)
+                && let Some(m) = plan.messages.get(b.index)
+            {
+                b.anchor = m.clone();
+            }
+        }
+        session.messages = Arc::new(plan.messages);
+        session.edited = plan.edited;
+        session.last_input_tokens = session.last_input_tokens.saturating_sub(plan.freed);
+        sink(AgentEvent::ToolOutputMasked {
+            masked: plan.masked,
+            tokens_before,
+            tokens_freed: plan.freed,
+        });
+        !compaction::should_compact(session, cfg)
     }
 
     /// Persist the session through the host's [`CheckpointHook`], containing a panic in the host's own
@@ -5514,6 +5586,7 @@ mod tests {
                 AgentEvent::TurnEnd { .. } => "turn_end",
                 AgentEvent::Steered { .. } => "steered",
                 AgentEvent::AgentEnd { .. } => "agent_end",
+                AgentEvent::ToolOutputMasked { .. } => "tool_output_masked",
                 AgentEvent::CompactionStart { .. } => "compaction_start",
                 AgentEvent::Compacted { .. } => "compacted",
                 AgentEvent::CompactionFailed { .. } => "compaction_failed",
@@ -7483,6 +7556,7 @@ mod tests {
                 keep_recent_tokens: 1,
                 summary_max_tokens: 256,
                 enabled: true,
+                ..CompactionConfig::default()
             });
         let mut session = Session::new();
         session.user("seed task with enough text to fill several estimated tokens here please");
@@ -7635,6 +7709,7 @@ mod tests {
                 keep_recent_tokens: 1,
                 summary_max_tokens: 256,
                 enabled: true,
+                ..CompactionConfig::default()
             });
         let mut session = Session::new();
         session.user("seed task with enough text to fill several estimated tokens here please");
@@ -7732,6 +7807,7 @@ mod tests {
                 keep_recent_tokens: 1,
                 summary_max_tokens: 256,
                 enabled: true,
+                ..CompactionConfig::default()
             });
         let mut session = Session::new();
         session.user("seed task with enough text to fill several estimated tokens here please");
@@ -7845,6 +7921,7 @@ mod tests {
                 keep_recent_tokens: 1,
                 summary_max_tokens: 256,
                 enabled: false,
+                ..CompactionConfig::default()
             });
         let mut session = Session::new();
         session.user("seed task");
@@ -7926,6 +8003,7 @@ mod tests {
             keep_recent_tokens: 1,
             summary_max_tokens: 256,
             enabled: false,
+            ..CompactionConfig::default()
         });
 
         let mut reason_seen = None;
@@ -7995,6 +8073,7 @@ mod tests {
                 keep_recent_tokens: 1,
                 summary_max_tokens: 256,
                 enabled: true,
+                ..CompactionConfig::default()
             });
         let mut session = Session::new();
         session.user("seed task");
@@ -8095,6 +8174,7 @@ mod tests {
                 keep_recent_tokens: 1,
                 summary_max_tokens: 256,
                 enabled: true,
+                ..CompactionConfig::default()
             });
         let mut session = Session::new();
         session.user("seed task with enough text to fill several estimated tokens here please");
@@ -12207,6 +12287,225 @@ mod tests {
         assert!(
             compacted_event_seen,
             "the Compacted event after the panicking CompactionStart must still reach the sink"
+        );
+    }
+
+    // ---- masking old tool output before summarizing ----------------------------------------------
+
+    /// `lead` chars of task text, then `turns` read turns returning 4,000 chars each (about 1,000
+    /// tokens), with the live-size snapshot set to the whole estimate so the trigger sees it.
+    fn masking_session(lead: usize, turns: usize) -> Session {
+        let mut s = Session::new();
+        s.user(format!("the task {}", "t".repeat(lead)));
+        for i in 0..turns {
+            s.push(Message::assistant(vec![ContentBlock::tool_use(
+                format!("c{i}"),
+                "read",
+                json!({ "path": format!("src/f{i}.rs") }),
+            )]));
+            s.push(Message::tool_result(
+                format!("c{i}"),
+                "x".repeat(4_000),
+                false,
+            ));
+        }
+        s.last_input_tokens = compaction::estimate_messages_tokens(&s.messages);
+        s.last_usage_message_count = s.messages.len();
+        s
+    }
+
+    /// Compaction at a 10K-token trigger, keeping 2 turns unmasked, a pass needing 2,500 tokens freed.
+    fn masking_config() -> CompactionConfig {
+        CompactionConfig {
+            compact_at: Some(10_000),
+            reserve_tokens: 0,
+            keep_recent_tokens: 1,
+            mask_keep_turns: 2,
+            mask_min_free_tokens: 2_500,
+            ..CompactionConfig::default()
+        }
+    }
+
+    fn kinds(events: &[AgentEvent]) -> Vec<&'static str> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::ToolOutputMasked { .. } => Some("masked"),
+                AgentEvent::CompactionStart { .. } => Some("compaction_start"),
+                AgentEvent::Compacted { .. } => Some("compacted"),
+                AgentEvent::CompactionFailed { .. } => Some("compaction_failed"),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn is_masked(m: &Message) -> bool {
+        m.content.iter().any(|b| {
+            matches!(b, ContentBlock::ToolResult { content, .. }
+                if content.starts_with(compaction::MASKED_PREFIX))
+        })
+    }
+
+    #[tokio::test]
+    async fn masking_alone_brings_the_prompt_under_the_trigger_without_a_summary() {
+        // ~12.5K tokens, 10 of 12 results maskable: about 9.7K freed, so no summary is needed.
+        let mock = Arc::new(MockTransport::new(vec![turn::text("done")]));
+        let agent = Agent::new(mock.clone(), "claude-opus-4-8").with_compaction(masking_config());
+        let mut session = masking_session(0, 12);
+        let mut events = Vec::new();
+        agent
+            .run_events(&mut session, |ev| events.push(ev))
+            .await
+            .unwrap();
+
+        assert_eq!(kinds(&events), ["masked"]);
+        assert_eq!(mock.calls(), 1, "no summarization call");
+        let AgentEvent::ToolOutputMasked {
+            masked,
+            tokens_freed,
+            ..
+        } = events
+            .iter()
+            .find(|e| matches!(e, AgentEvent::ToolOutputMasked { .. }))
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(*masked, 10);
+        assert!(*tokens_freed > 9_000, "{tokens_freed}");
+        // The request the model saw carries the placeholders for the old turns only.
+        let sent = &mock.requests()[0].messages;
+        assert!(is_masked(&sent[2]) && is_masked(&sent[20]));
+        assert!(!is_masked(&sent[22]) && !is_masked(&sent[24]));
+        assert_eq!(session.edited, (1..=10).map(|t| 2 * t).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn a_pass_that_frees_too_little_is_not_applied_and_the_summary_runs() {
+        // Keeping 11 of 12 turns leaves one ~1K-token result to mask: under the 2,500 minimum.
+        let mock = Arc::new(MockTransport::new(vec![
+            turn::text("## Goal\nsummary"),
+            turn::text("done"),
+        ]));
+        let cfg = CompactionConfig {
+            mask_keep_turns: 11,
+            ..masking_config()
+        };
+        let agent = Agent::new(mock.clone(), "claude-opus-4-8").with_compaction(cfg);
+        let mut session = masking_session(0, 12);
+        let mut events = Vec::new();
+        agent
+            .run_events(&mut session, |ev| events.push(ev))
+            .await
+            .unwrap();
+        assert_eq!(kinds(&events), ["compaction_start", "compacted"]);
+        assert!(session.messages.iter().all(|m| !is_masked(m)));
+    }
+
+    #[tokio::test]
+    async fn masking_runs_first_then_the_summary_when_still_over_the_trigger() {
+        // 20K tokens of task text that masking can't touch: the pass is applied (it frees enough),
+        // the prompt is still over 10K, so the summary runs in the same turn — over the masked
+        // transcript, so only one rewrite reaches the cache.
+        let mock = Arc::new(MockTransport::new(vec![
+            turn::text("## Goal\nsummary"),
+            turn::text("done"),
+        ]));
+        let agent = Agent::new(mock.clone(), "claude-opus-4-8").with_compaction(masking_config());
+        let mut session = masking_session(80_000, 12);
+        let mut events = Vec::new();
+        agent
+            .run_events(&mut session, |ev| events.push(ev))
+            .await
+            .unwrap();
+        assert_eq!(kinds(&events), ["masked", "compaction_start", "compacted"]);
+        let summary_prompt = format!("{:?}", mock.requests()[0].messages);
+        assert!(
+            summary_prompt.contains(compaction::MASKED_PREFIX),
+            "the summary is made from the masked transcript"
+        );
+        assert!(
+            session.edited.is_empty(),
+            "the compaction's rewrite carries it"
+        );
+    }
+
+    #[tokio::test]
+    async fn masking_off_goes_straight_to_the_summary() {
+        let mock = Arc::new(MockTransport::new(vec![
+            turn::text("## Goal\nsummary"),
+            turn::text("done"),
+        ]));
+        let cfg = CompactionConfig {
+            mask_tool_output: false,
+            ..masking_config()
+        };
+        let agent = Agent::new(mock.clone(), "claude-opus-4-8").with_compaction(cfg);
+        let mut session = masking_session(0, 12);
+        let mut events = Vec::new();
+        agent
+            .run_events(&mut session, |ev| events.push(ev))
+            .await
+            .unwrap();
+        assert_eq!(kinds(&events), ["compaction_start", "compacted"]);
+    }
+
+    #[tokio::test]
+    async fn history_is_not_rewritten_again_between_masking_passes() {
+        // After one pass, the next turns stay under the trigger: each request's history must be the
+        // previous request's history plus the new turn, byte for byte — a stable, cacheable prefix.
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(EchoTool));
+        let mock = Arc::new(MockTransport::new(vec![
+            turn::tool_call("n1", "echo", r#"{"text":"one"}"#),
+            turn::tool_call("n2", "echo", r#"{"text":"two"}"#),
+            turn::tool_call("n3", "echo", r#"{"text":"three"}"#),
+            turn::text("done"),
+        ]));
+        let agent = Agent::new(mock.clone(), "claude-opus-4-8")
+            .with_tools(tools)
+            .with_compaction(masking_config());
+        let mut session = masking_session(0, 12);
+        let mut events = Vec::new();
+        agent
+            .run_events(&mut session, |ev| events.push(ev))
+            .await
+            .unwrap();
+        assert_eq!(
+            kinds(&events),
+            ["masked"],
+            "one pass, then no more rewrites"
+        );
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 4);
+        for pair in requests.windows(2) {
+            let (prev, next) = (&pair[0].messages, &pair[1].messages);
+            assert!(next.len() > prev.len());
+            assert_eq!(
+                &next[..prev.len()],
+                &prev[..],
+                "history rewritten between passes"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn masking_moves_a_request_block_to_its_messages_new_content() {
+        let mock = Arc::new(MockTransport::new(vec![turn::text("done")]));
+        let agent = Agent::new(mock.clone(), "claude-opus-4-8").with_compaction(masking_config());
+        let mut session = masking_session(0, 12);
+        // Pin a block to an old tool-result message, as an MCP app's context record would be.
+        let tail = session.messages.len();
+        Arc::make_mut(&mut session.messages).truncate(3);
+        assert!(session.attach_request_block("app context"));
+        let full = masking_session(0, 12);
+        Arc::make_mut(&mut session.messages).extend_from_slice(&full.messages[3..tail]);
+        agent.run_events(&mut session, |_| {}).await.unwrap();
+        let sent = &mock.requests()[0].messages;
+        assert!(is_masked(&sent[2]));
+        assert!(
+            format!("{:?}", sent[2]).contains("app context"),
+            "the block rides the masked message"
         );
     }
 }

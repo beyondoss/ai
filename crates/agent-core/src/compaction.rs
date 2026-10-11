@@ -153,6 +153,16 @@ pub struct CompactionConfig {
     pub summary_max_tokens: u32,
     /// Whether automatic (threshold-triggered) compaction is on. Manual/overflow compaction ignores it.
     pub enabled: bool,
+    /// Whether an automatic compaction first tries [`mask_tool_results`]: elide old tool output and
+    /// summarize only if that doesn't free enough. See [`MaskPlan`].
+    pub mask_tool_output: bool,
+    /// Tool results in the last this-many turns (assistant messages) are never masked.
+    pub mask_keep_turns: usize,
+    /// A masking pass is applied only when it frees at least this many tokens (or a quarter of the
+    /// trigger, on a model whose trigger is too small for this to be reachable). Every pass rewrites
+    /// history and so invalidates the prompt cache from its first edit on; a pass must buy back enough
+    /// context to pay for that. Our `clear_at_least`.
+    pub mask_min_free_tokens: u32,
 }
 
 impl CompactionConfig {
@@ -244,6 +254,9 @@ impl Default for CompactionConfig {
             keep_recent_tokens: 20_000,
             summary_max_tokens: 4_096,
             enabled: true,
+            mask_tool_output: true,
+            mask_keep_turns: 10,
+            mask_min_free_tokens: 25_000,
         }
     }
 }
@@ -1093,6 +1106,171 @@ pub fn apply_summary(session: &mut Session, first_kept: usize, summary: &str, to
     // stale, reset alongside the index it's paired with rather than left to (harmlessly, since the
     // trailing slice is empty either way) dangle.
     session.last_output_tokens = 0;
+    // The rewrite above carries any masked content into the new list; the old indices mean nothing now.
+    session.edited.clear();
+}
+
+/// The text a masked tool result starts with — how [`mask_tool_results`] recognizes its own work and
+/// never masks a result twice.
+pub const MASKED_PREFIX: &str = "[tool output elided to save context:";
+
+/// A tool result is worth masking only past this many characters: anything shorter costs about what
+/// its placeholder does.
+const MASK_MIN_CHARS: usize = 1_000;
+
+/// The input fields a placeholder quotes, first match wins: what identifies the call well enough for
+/// the model to re-run it if it needs the output back.
+const MASK_KEY_ARGS: [&str; 7] = [
+    "path",
+    "file_path",
+    "command",
+    "cmd",
+    "pattern",
+    "url",
+    "query",
+];
+
+/// The result of [`mask_tool_results`]: a masked copy of the transcript, not yet applied.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MaskPlan {
+    /// The transcript with the old tool results replaced by placeholders.
+    pub messages: Vec<Message>,
+    /// Indices of the messages that changed — what a persistence layer writes as edits.
+    pub edited: Vec<usize>,
+    /// How many tool results were masked.
+    pub masked: usize,
+    /// Estimated tokens freed (chars/4 of the elided output, plus 1,200 per dropped image).
+    pub freed: u32,
+}
+
+/// Plan a masking pass: replace every tool result older than the last `keep_turns` turns (assistant
+/// messages) with a one-line placeholder naming the call — `[tool output elided to save context:
+/// read(path=src/lib.rs), 48213 chars. Run the tool again if you need it.]` — and drop its images.
+/// `None` when nothing is worth masking.
+///
+/// Masking is the cheaper first step before a summary: old tool output is most of a coding transcript
+/// and the part the model needs least once it has acted on it (arXiv 2508.21433 found masking matches
+/// summarizing at about half the cost). There is deliberately no tool to recall a masked result: in
+/// arXiv 2609.20804 one was rarely called and bought no accuracy; the placeholder says how to get the
+/// output back by re-running the call.
+///
+/// Kept unmasked, besides the recent turns:
+/// - results of calls on a path in `keep_paths` (the files being edited: the session's modified-files
+///   provenance plus this transcript's own `write`/`edit` targets), whose content the model is likely
+///   still working against;
+/// - error results within the last `2 * keep_turns` turns: a recent failure is what the model is
+///   usually fixing;
+/// - results under [`MASK_MIN_CHARS`], and results already masked.
+///
+/// Pure and idempotent: masking a masked transcript plans nothing. Only `ToolResult` blocks change, in
+/// place, so message count, roles and every `tool_use_id` pairing are exactly as they were — the
+/// [`find_cut`] invariants hold across a pass by construction.
+pub fn mask_tool_results(
+    messages: &[Message],
+    keep_turns: usize,
+    keep_paths: &[String],
+) -> Option<MaskPlan> {
+    // The first message of the kept window: the `keep_turns`-th assistant message from the end.
+    let turn_start = |turns: usize| {
+        messages
+            .iter()
+            .enumerate()
+            .rev()
+            .filter(|(_, m)| m.role == Role::Assistant)
+            .nth(turns.max(1) - 1)
+            .map(|(i, _)| i)
+    };
+    let boundary = turn_start(keep_turns)?;
+    let error_boundary = turn_start(keep_turns.saturating_mul(2)).unwrap_or(0);
+    let (_, modified) = extract_file_ops(messages);
+    let protected = |input: &Value| {
+        ["path", "file_path"].iter().any(|k| {
+            input
+                .get(k)
+                .and_then(Value::as_str)
+                .is_some_and(|p| keep_paths.iter().chain(&modified).any(|m| m == p))
+        })
+    };
+    let calls: std::collections::HashMap<&str, (&str, &Value)> = messages[..boundary]
+        .iter()
+        .flat_map(|m| m.content.iter())
+        .filter_map(|b| match b {
+            ContentBlock::ToolUse {
+                id, name, input, ..
+            } => Some((id.as_str(), (name.as_str(), input))),
+            _ => None,
+        })
+        .collect();
+
+    let mut out = messages.to_vec();
+    let mut edited = Vec::new();
+    let (mut masked, mut freed) = (0usize, 0u32);
+    for (i, m) in out[..boundary].iter_mut().enumerate() {
+        if m.role != Role::User {
+            continue;
+        }
+        let mut changed = false;
+        for b in &mut m.content {
+            let ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+                images,
+            } = b
+            else {
+                continue;
+            };
+            let chars = content.chars().count();
+            if content.starts_with(MASKED_PREFIX)
+                || (chars < MASK_MIN_CHARS && images.is_empty())
+                || (*is_error && i >= error_boundary)
+            {
+                continue;
+            }
+            let call = calls.get(tool_use_id.as_str()).copied();
+            if call.is_some_and(|(_, input)| protected(input)) {
+                continue;
+            }
+            let placeholder = mask_placeholder(call, chars, images.len());
+            freed = freed
+                .saturating_add(chars.div_ceil(4) as u32)
+                .saturating_add(1_200 * images.len() as u32)
+                .saturating_sub(placeholder.chars().count().div_ceil(4) as u32);
+            *content = Arc::from(placeholder);
+            images.clear();
+            masked += 1;
+            changed = true;
+        }
+        if changed {
+            edited.push(i);
+        }
+    }
+    (masked > 0).then_some(MaskPlan {
+        messages: out,
+        edited,
+        masked,
+        freed,
+    })
+}
+
+/// The one-line stand-in for an elided tool result: the call it answered, and how big it was.
+fn mask_placeholder(call: Option<(&str, &Value)>, chars: usize, images: usize) -> String {
+    let what = match call {
+        Some((name, input)) => match MASK_KEY_ARGS
+            .iter()
+            .find_map(|k| input.get(k).and_then(Value::as_str).map(|v| (k, v)))
+        {
+            Some((k, v)) => format!("{name}({k}={})", truncate_chars(v, 120)),
+            None => format!("{name}()"),
+        },
+        None => "a tool call".to_string(),
+    };
+    let images = match images {
+        0 => String::new(),
+        1 => " and 1 image".to_string(),
+        n => format!(" and {n} images"),
+    };
+    format!("{MASKED_PREFIX} {what}, {chars} chars{images}. Run the tool again if you need it.]")
 }
 
 /// The `tokens_before` an [`apply_summary`] summary message records in its leading
@@ -2571,5 +2749,202 @@ mod tests {
             previous_summary(&round2_prefix),
             Some("The model planned the work.")
         );
+    }
+
+    // ---- masking old tool output ----------------------------------------------------------------
+
+    /// A task, then `n` turns of `name` calls on `src/f{i}.rs`, each returning `chars` of output.
+    fn tool_history(n: usize, name: &str, chars: usize) -> Vec<Message> {
+        let mut out = vec![Message::user("the task")];
+        for i in 0..n {
+            out.push(Message::assistant(vec![ContentBlock::tool_use(
+                format!("c{i}"),
+                name,
+                json!({ "path": format!("src/f{i}.rs") }),
+            )]));
+            out.push(Message::tool_result(
+                format!("c{i}"),
+                "x".repeat(chars),
+                false,
+            ));
+        }
+        out
+    }
+
+    fn result_content(m: &Message) -> &str {
+        match &m.content[0] {
+            ContentBlock::ToolResult { content, .. } => content,
+            other => panic!("not a tool result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn masking_elides_results_older_than_the_kept_turns_and_nothing_else() {
+        let history = tool_history(6, "read", 4_000);
+        let plan = mask_tool_results(&history, 2, &[]).expect("something to mask");
+        // Turns 0..4 masked (their results sit at 2, 4, 6, 8); the last two turns untouched.
+        assert_eq!(plan.masked, 4);
+        assert_eq!(plan.edited, vec![2, 4, 6, 8]);
+        for i in [2, 4, 6, 8] {
+            let c = result_content(&plan.messages[i]);
+            assert!(c.starts_with(MASKED_PREFIX), "{c}");
+            assert!(c.contains("read(path=src/f"), "names the call: {c}");
+            assert!(c.contains("4000 chars"), "{c}");
+        }
+        for i in [10, 12] {
+            assert_eq!(plan.messages[i], history[i], "kept turn {i} changed");
+        }
+        // Each masked result frees its output less its placeholder.
+        assert!(
+            plan.freed > 4 * 900 && plan.freed < 4 * 1_000,
+            "{}",
+            plan.freed
+        );
+        // Everything but the elided results is byte-identical.
+        for (i, (a, b)) in history.iter().zip(&plan.messages).enumerate() {
+            if !plan.edited.contains(&i) {
+                assert_eq!(a, b, "message {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn masking_keeps_every_pairing_and_alternation_invariant() {
+        // A turn with several parallel calls, a steer folded onto the results, an image result.
+        let mut history = vec![Message::user("the task")];
+        for t in 0..4 {
+            history.push(Message::assistant(vec![
+                ContentBlock::tool_use(format!("a{t}"), "bash", json!({ "command": "make" })),
+                ContentBlock::tool_use(format!("b{t}"), "grep", json!({ "pattern": "fn " })),
+            ]));
+            history.push(Message {
+                content: vec![
+                    ContentBlock::ToolResult {
+                        tool_use_id: format!("a{t}"),
+                        content: "y".repeat(3_000).into(),
+                        is_error: false,
+                        images: vec![],
+                    },
+                    ContentBlock::ToolResult {
+                        tool_use_id: format!("b{t}"),
+                        content: "z".repeat(3_000).into(),
+                        is_error: false,
+                        images: vec![],
+                    },
+                    ContentBlock::text("also check the docs"),
+                ],
+                ..Message::user("")
+            });
+        }
+        let plan = mask_tool_results(&history, 1, &[]).unwrap();
+        let masked = &plan.messages;
+        assert_eq!(masked.len(), history.len());
+        assert!(masked.windows(2).all(|w| w[0].role != w[1].role));
+        for (a, b) in history.iter().zip(masked) {
+            assert_eq!(a.role, b.role);
+            assert_eq!(a.content.len(), b.content.len());
+            for (x, y) in a.content.iter().zip(&b.content) {
+                match (x, y) {
+                    (
+                        ContentBlock::ToolResult { tool_use_id: i, .. },
+                        ContentBlock::ToolResult { tool_use_id: j, .. },
+                    ) => assert_eq!(i, j, "pairing id changed"),
+                    _ => assert_eq!(x, y, "a non-result block changed"),
+                }
+            }
+        }
+        assert!(result_content(&masked[2]).contains("bash(command=make)"));
+        // The cut search still finds the same assistant boundary on the masked transcript.
+        assert_eq!(find_cut(masked, 1), find_cut(&history, 1));
+    }
+
+    #[test]
+    fn masking_keeps_edited_files_recent_errors_short_results_and_its_own_work() {
+        let mut history = tool_history(8, "read", 4_000);
+        // Turn 1 edits src/f1.rs; its read result (index 4) stays. Turn 2's file is protected by
+        // provenance from an earlier compaction.
+        history.push(Message::assistant(vec![ContentBlock::tool_use(
+            "e",
+            "edit",
+            json!({ "path": "src/f1.rs" }),
+        )]));
+        history.push(Message::tool_result("e", "ok", false));
+        // An old error (turn 0) and a recent one (turn 4: older than the 3 kept turns, inside 2 × 3).
+        for i in [2, 10] {
+            let c = history[i].content[0].clone();
+            if let ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                ..
+            } = c
+            {
+                history[i] = Message {
+                    content: vec![ContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                        is_error: true,
+                        images: vec![],
+                    }],
+                    ..history[i].clone()
+                };
+            }
+        }
+        // A short result (turn 3) costs about what its placeholder would.
+        history[8] = Message::tool_result("c3", "short", false);
+
+        let plan = mask_tool_results(&history, 3, &["src/f2.rs".to_string()]).unwrap();
+        let masked = |i: usize| result_content(&plan.messages[i]).starts_with(MASKED_PREFIX);
+        assert!(masked(2), "an old error is masked");
+        assert!(!masked(4), "src/f1.rs is being edited");
+        assert!(
+            !masked(6),
+            "src/f2.rs is in the provenance's modified files"
+        );
+        assert!(!masked(8), "too short to be worth it");
+        assert!(!masked(10), "a recent error stays");
+        assert!(masked(12));
+        // Idempotent: a masked transcript has nothing left to mask.
+        assert_eq!(
+            mask_tool_results(&plan.messages, 3, &["src/f2.rs".to_string()]),
+            None
+        );
+    }
+
+    #[test]
+    fn masking_drops_images_and_counts_them() {
+        let mut history = tool_history(3, "read", 10);
+        history[2] = Message {
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "c0".into(),
+                content: "screenshot".into(),
+                is_error: false,
+                images: vec![crate::message::ImageSource::base64("image/png", "AAAA")],
+            }],
+            ..history[2].clone()
+        };
+        let plan = mask_tool_results(&history, 1, &[]).unwrap();
+        assert_eq!(plan.masked, 1, "only the image result is worth masking");
+        let ContentBlock::ToolResult {
+            content, images, ..
+        } = &plan.messages[2].content[0]
+        else {
+            panic!()
+        };
+        assert!(images.is_empty());
+        assert!(content.contains("and 1 image"), "{content}");
+        assert!(plan.freed > 1_000, "{}", plan.freed);
+    }
+
+    #[test]
+    fn masking_needs_more_turns_than_it_keeps() {
+        assert_eq!(
+            mask_tool_results(&tool_history(2, "read", 4_000), 2, &[]),
+            None
+        );
+        assert_eq!(
+            mask_tool_results(&tool_history(2, "read", 4_000), 3, &[]),
+            None
+        );
+        assert!(mask_tool_results(&tool_history(3, "read", 4_000), 2, &[]).is_some());
     }
 }

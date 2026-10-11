@@ -82,6 +82,14 @@ pub struct Session {
     /// rewritten or dropped.
     #[serde(skip)]
     pub request_blocks: Vec<RequestBlock>,
+    /// Indices of messages the last tool-output masking pass rewrote in place
+    /// ([`crate::compaction::mask_tool_results`]), for a persistence layer to write as edits: an
+    /// append-only store keyed on message count never sees a change that keeps the count. Writing an
+    /// edit must be idempotent (skip a message already stored as it is), so a persistence layer reads
+    /// this freely and never drains it. Replaced by each masking pass; cleared when a compaction
+    /// replaces the list, whose own rewrite carries the masked content. Never serialized.
+    #[serde(skip)]
+    pub edited: Vec<usize>,
 }
 
 /// One block attached for the model to a message of a [`Session`] — see

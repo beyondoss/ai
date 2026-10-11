@@ -131,8 +131,8 @@ def cmd_report(a) -> None:
     base = load(base_label, a.arm)
     family = lambda t: "mcp" if t in mcp_tasks.MCP_TASKS else "prefix" if t in prefix_tasks.PREFIX_TASKS else "code"
     print(f"Base {base_label}, candidate {labels[1][0]} (`-cm`: candidate with --code-mode, MCP tasks only).\n")
-    print("| arm | model | family | n | pass (95% CI) | $/task | wall s/task | TTFT first / median s | turns | first-request tok | cache-read share | compactions |")
-    print("|---|---|---|---|---|---|---|---|---|---|---|---|")
+    print("| arm | model | family | n | pass (95% CI) | $/task | wall s/task | TTFT first / median s | turns | first-request tok | cache-read share | compactions | maskings |")
+    print("|---|---|---|---|---|---|---|---|---|---|---|---|---|")
     data = {lab: load(lab, a.arm) for lab, *_ in labels}
     for lab, *_ in labels:
         cell = defaultdict(list)
@@ -144,7 +144,8 @@ def cmd_report(a) -> None:
             avg = lambda key: sum(r.get(key) or 0 for r in rs) / n
             print(f"| {lab} | {m} | {f} | {n} | {k}/{n} ({lo:.0%}–{hi:.0%}) | ${avg('usd'):.2f} | {avg('wall_s'):.0f} "
                   f"| {med([r.get('ttft_first') for r in rs]):.2f} / {med([r.get('ttft_median') for r in rs]):.2f} "
-                  f"| {avg('turns'):.0f} | {avg('first_prompt'):.0f} | {avg('cache_read_share'):.0%} | {avg('compactions'):.2f} |")
+                  f"| {avg('turns'):.0f} | {avg('first_prompt'):.0f} | {avg('cache_read_share'):.0%} | {avg('compactions'):.2f} "
+                  f"| {avg('maskings'):.2f} |")
     print("\nPaired against the base (task × attempt). Verdicts: pass = McNemar p<0.05 or the Δ-fixed CI excludes 0; "
           "cost and time = the bootstrap CI of the difference excludes 0.\n")
     print("| arm | model | family | pairs | pass cand-only / base-only (p) | Δ fixed (95% CI) | pass verdict | Δ $ (95% CI) | cost verdict | Δ wall s (95% CI) | time verdict | Δ first-request tok |")
