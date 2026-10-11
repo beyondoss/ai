@@ -829,7 +829,8 @@ the stop sequence the client asked for.
 400 on `tool_choice` `any` / `tool` (`ClaudeModel::forced_tool_choice`). For those, Chat `required`
 or a named function becomes `auto` plus a closing mid-conversation system message ("Respond by
 calling one of the provided tools." / "Respond by calling the `get_time` tool."), which is
-Anthropic's documented migration for these models. The message is appended after the cache
+Anthropic's documented migration for these models. Haiku 5.5 is not one of them: it accepts a
+forced `tool_choice` (its migration guide; measured 2026-10-11), so it keeps the hard `any` / `tool`. The message is appended after the cache
 breakpoints, so the cached prefix is untouched, and only when the request ends on a user turn (the
 only place such a message is valid). It is an instruction, not a guarantee. Measured live
 (2026-09-30): `required` with no fitting tool ("tell me a joke") still called a tool 6/6 on Sonnet
@@ -1313,11 +1314,12 @@ wire (`route::Endpoint::of_upstream_path`, a sub-resource reading as its parent)
 with the OpenAI one (and gets `include_usage`).
 
 That is what makes **Claude failover real today**: every Claude row Anthropic still serves
-(Fable 5 / 5.1, Opus 5 / 5.5, Sonnet 5 / 5.5, Haiku 4.5, plus the 4.x snapshots Opus 4.5 / 4.6 /
+(Fable 5 / 5.1, Opus 5 / 5.5, Sonnet 5 / 5.5, Haiku 4.5 / 5.5, plus the 4.x snapshots Opus 4.5 / 4.6 /
 4.7 / 4.8 and Sonnet 4.5 / 4.6) routes to Anthropic first and falls back to OpenRouter's Chat Completions endpoint
 under the vendor-slug spelling (`claude-opus-5` → `anthropic/claude-opus-5`; `claude-opus-4-8` →
-`anthropic/claude-opus-4.8`). `claude-haiku-4-5` and `claude-opus-4-8` insert Amazon Bedrock's
-Messages API as an independent second source (`us.anthropic.claude-haiku-4-5-20251001-v1:0` /
+`anthropic/claude-opus-4.8`). `claude-haiku-4-5`, `claude-haiku-5-5` and `claude-opus-4-8` insert
+Amazon Bedrock's Messages API as an independent second source
+(`us.anthropic.claude-haiku-4-5-20251001-v1:0` / `us.anthropic.claude-haiku-5-5` /
 `us.anthropic.claude-opus-4-8`) before OpenRouter. GPT rows do the same shape on the Chat
 Completions wire (`gpt-5.2` → `openai/gpt-5.2`) plus an OpenAI-only `/v1/responses` arm —
 the table covers the current 4 / 4.1 / 4o / 5 / 5.x / 6 and o-series ids OpenRouter listed on
@@ -2733,7 +2735,7 @@ key.** AWS now serves Claude on the same `/anthropic/v1/messages` wire Anthropic
 data row: static host (default `us-east-1`, overridable), Anthropic dialect, `XApiKey` scheme, pool
 key from `AI_POOL_KEY_BEDROCK` / `AWS_BEARER_TOKEN_BEDROCK`. The catalog puts it second on the
 Claude rows whose Bedrock inference-profile ids were live-verified (`claude-haiku-4-5`,
-`claude-opus-4-8`), so a 5xx from `api.anthropic.com` on those models fails over to a genuinely
+`claude-haiku-5-5`, `claude-opus-4-8`), so a 5xx from `api.anthropic.com` on those models fails over to a genuinely
 independent supply. Other Claude rows stay Anthropic → OpenRouter until those ids are checked.
 The client still sends `anthropic-version: 2023-06-01`; that header is required on Bedrock's
 Messages path the same way it is on Anthropic's.

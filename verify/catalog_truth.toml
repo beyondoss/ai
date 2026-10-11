@@ -3,7 +3,8 @@
 # One [[row]] per catalog row whose primary candidate is a direct vendor. Every field is the value
 # the PRIMARY vendor publishes, read from `source` on `date`. A field the vendor does not publish is
 # omitted, never guessed. Prices are USD per million tokens, as the vendor wrote them; the standard
-# tier only (not batch/flex; DeepSeek peak; xAI < 200k prompt; OpenAI <= 272K input).
+# tier only (not batch/flex; DeepSeek peak; xAI < 200k prompt; OpenAI <= 272K input; Claude Haiku 5.5
+# <= 100K prompt).
 #
 # A row whose primary is OpenRouter may also have an entry when the model's maker sells it through
 # its own API and publishes the facts (Z.ai's GLM, Moonshot's Kimi, OpenAI's Codex ids): the card
@@ -128,6 +129,22 @@ cache_read = "0.10"
 cache_write = "1.25"
 context_window = 200_000
 max_output_tokens = 64_000
+
+[[row]]
+model = "claude-haiku-5-5"
+source = [
+  "https://platform.claude.com/docs/en/about-claude/pricing.md",
+  "https://platform.claude.com/docs/en/about-claude/models/overview.md",
+  "https://platform.claude.com/docs/en/models/haiku-5-5/overview.md",
+]
+date = "2026-10-11"
+input = "0.10"
+output = "0.50"
+cache_read = "0.01"
+cache_write = "0.125"
+context_window = 1_000_000
+max_output_tokens = 128_000
+note = "Priced by prompt length: these are the rates for prompts up to 100,000 tokens. A prompt over 100,000 tokens (cache reads and writes included) bills every token at $0.50 / $2.50, cache read $0.05, 5m write $0.625, 1h write $1 (pricing.md, 'Long context pricing'); the generated card carries that tier."
 
 [[row]]
 model = "claude-opus-4-5"
@@ -1643,13 +1660,6 @@ retires = "2026-10-21"
 note = "OpenRouter's listing schedules the model's removal for 2026-10-21 (CAT-16 live, 2026-10-10). The qwen/qwen3.5-9b row keeps its Together primary; this candidate goes before the date."
 
 [[not_carried]]
-provider = "anthropic"
-id = "claude-haiku-5-5"
-source = "https://platform.claude.com/docs/en/about-claude/models/overview.md"
-date = "2026-10-10"
-reason = "New on Anthropic's model list (CAT-16 live, 2026-10-10). Not yet a row: it is the one Claude model with a long-context price tier (above 100K prompt tokens, https://platform.claude.com/docs/en/about-claude/pricing.md), so its card needs that tier and a live-verified Bedrock/OpenRouter candidate set first. Add it as a row with both."
-
-[[not_carried]]
 provider = "openai"
 id = "chat-latest"
 source = "https://developers.openai.com/api/docs/models/chat-latest"
@@ -2019,6 +2029,12 @@ url = "https://platform.claude.com/docs/en/about-claude/pricing.md"
 quote = "For Claude 4.6 and later models, using `inference_geo: \"us\"` applies a 1.1x pricing multiplier."
 
 [[prose]]
+id = "anthropic.long_context"
+value = ">100000"
+url = "https://platform.claude.com/docs/en/about-claude/pricing.md"
+quote = "Claude Haiku 5.5 is priced by prompt length: a request whose prompt is over 100,000 tokens pays higher prices. A request's prompt length counts all of its input tokens, including cache reads and cache writes."
+
+[[prose]]
 id = "bedrock.regional"
 value = "1.1"
 url = "https://platform.claude.com/docs/en/about-claude/pricing.md"
@@ -2186,6 +2202,12 @@ row = "Claude Haiku 4.5"
 tools = "anthropic"
 
 [[card]]
+name = "anthropic:claude-haiku-5-5"
+row = "Claude Haiku 5.5"
+geo_us = "anthropic.geo_us"
+tools = "anthropic"
+
+[[card]]
 name = "anthropic:claude-opus-4-5"
 row = "Claude Opus 4.5"
 tools = "anthropic"
@@ -2246,6 +2268,10 @@ tools = "anthropic"
 [[card]]
 name = "bedrock:claude-haiku-4-5"
 row = "Claude Haiku 4.5"
+
+[[card]]
+name = "bedrock:claude-haiku-5-5"
+row = "Claude Haiku 5.5"
 
 [[card]]
 name = "bedrock:claude-opus-4-8"
@@ -2553,6 +2579,11 @@ cost = { anthropic = "list", openrouter = "openrouter:anthropic/claude-fable-5.1
 model = "claude-haiku-4-5"
 list_card = "anthropic:claude-haiku-4-5"
 cost = { anthropic = "list", bedrock = "bedrock:claude-haiku-4-5", openrouter = "openrouter:anthropic/claude-haiku-4.5" }
+
+[[pricing]]
+model = "claude-haiku-5-5"
+list_card = "anthropic:claude-haiku-5-5"
+cost = { anthropic = "list", bedrock = "bedrock:claude-haiku-5-5", openrouter = "openrouter:anthropic/claude-haiku-5.5" }
 
 [[pricing]]
 model = "claude-opus-4-5"

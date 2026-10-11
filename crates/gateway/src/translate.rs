@@ -1816,15 +1816,17 @@ pub(crate) enum ClaudeGen {
 pub(crate) struct ClaudeModel {
     pub(crate) reasoning: ClaudeGen,
     /// Whether forced `tool_choice` (`any` / `tool`) is accepted. Claude Fable 5.1, Mythos 5.1,
-    /// Opus 5.5 and Sonnet 5.5 reject it with a 400.
+    /// Opus 5.5 and Sonnet 5.5 reject it with a 400. Haiku 5.5 accepts it ("Claude Haiku 5.5
+    /// accepts a forced `tool_choice` (`any` or a named tool)", its migration guide; measured
+    /// 2026-10-11).
     pub(crate) forced_tool_choice: bool,
     /// Whether `{"role": "system"}` may appear inside `messages`: Opus 4.8 and later, Fable,
-    /// Mythos, Sonnet 5.5 and later. Not Sonnet 5 or older (the docs list it as unsupported), and
-    /// never a model that is not Claude.
+    /// Mythos, Sonnet and Haiku 5.5 and later. Not Sonnet 5 or older (the docs list it as
+    /// unsupported), and never a model that is not Claude.
     pub(crate) mid_system: bool,
     /// Whether the request should carry `thinking.block_binding` (see
     /// `bind_thinking_with_drop_block`): a model that binds thinking to its conversation (Fable
-    /// 5.1, Opus 5.5 and Sonnet 5.5 and later; not Mythos 5.1, which skips that check), spelled as
+    /// 5.1, Opus, Sonnet and Haiku 5.5 and later; not Mythos 5.1, which skips that check), spelled as
     /// Anthropic's own API spells it. Bedrock (`…anthropic.claude-…`) and OpenRouter
     /// (`anthropic/…`) spellings are excluded: whether those hosts accept the beta header that the
     /// field requires is unverified, and a field without its header is a 400.
@@ -1875,7 +1877,7 @@ impl ClaudeModel {
                     (4, 6) => ClaudeGen::Adaptive46,
                     _ => ClaudeGen::Budget,
                 },
-                forced_tool_choice: version < (5, 5),
+                forced_tool_choice: family == "haiku" || version < (5, 5),
                 mid_system: match family {
                     "opus" => version >= (4, 8),
                     _ => version >= (5, 5),
@@ -9596,6 +9598,8 @@ mod tests {
             ("claude-mythos-5-1", Adaptive, false),
             ("claude-opus-4-6", Adaptive46, true),
             ("claude-sonnet-4-6", Adaptive46, true),
+            ("claude-haiku-5-5", Adaptive, true),
+            ("us.anthropic.claude-haiku-5-5", Adaptive, true),
             ("claude-haiku-4-5", Budget, true),
             ("anthropic.claude-haiku-4-5-20251001-v1:0", Budget, true),
             ("claude-sonnet-4-20250514", Budget, true),

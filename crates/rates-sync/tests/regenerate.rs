@@ -115,7 +115,8 @@ fn readers_fail_loudly_on_layout_changes() {
     assert!(vendors::together_api(&t, "zai-org/GLM-9").is_err());
 
     let b = snapshot("bedrock/foundation-models-us-east-1.json");
-    assert!(vendors::bedrock(&b, "Claude Haiku 4.5").is_ok());
+    let flat = vendors::bedrock(&b, "Claude Haiku 4.5").unwrap();
+    assert_eq!(flat.regional_long, vendors::BedrockScope::default());
     let odd = b.replace(
         "\"USE1-MP:USE1_OutputTokenCount-Units\"",
         "\"USE1-MP:USE1_Mystery-Units\"",
@@ -125,4 +126,94 @@ fn readers_fail_loudly_on_layout_changes() {
         vendors::bedrock(&odd, "Claude Haiku 4.5").is_err(),
         "an unrecognized usage type"
     );
+}
+
+/// Claude Haiku 5.5 is priced by prompt length. Anthropic's model table splits it into two rows,
+/// "(for prompts up to 100,000 tokens)" and "(for prompts over 100,000 tokens)", and AWS gives it
+/// a second `long_ctx` SKU per token kind in each scope. Both readers keep the tiers apart, and
+/// fail on a split they cannot read as one threshold.
+#[test]
+fn prompt_length_tiers_are_read_apart() {
+    let a = snapshot("anthropic/pricing.md");
+    let m = vendors::anthropic(&a)
+        .unwrap()
+        .model("Claude Haiku 5.5")
+        .unwrap();
+    let r = |s: &str| rates_sync::dec::Rate::per_million(s).unwrap();
+    assert_eq!(m.standard.input, r("0.10"));
+    assert_eq!(m.standard.cache_write_1h, Some(r("0.20")));
+    let (n, long) = m.long.expect("a long tier");
+    assert_eq!(n, 100_000);
+    assert_eq!(
+        (
+            long.input,
+            long.output,
+            long.cache_read,
+            long.cache_write,
+            long.cache_write_1h
+        ),
+        (
+            r("0.50"),
+            Some(r("2.50")),
+            Some(r("0.05")),
+            Some(r("0.625")),
+            Some(r("1"))
+        )
+    );
+    // A flat model has no tier.
+    let flat = vendors::anthropic(&a)
+        .unwrap()
+        .model("Claude Haiku 4.5")
+        .unwrap();
+    assert!(flat.long.is_none());
+    // The two halves must name one threshold.
+    let skew = a.replace(
+        "Claude Haiku 5.5 (for prompts over 100,000 tokens)",
+        "Claude Haiku 5.5 (for prompts over 200,000 tokens)",
+    );
+    assert_ne!(skew, a);
+    assert!(
+        vendors::anthropic(&skew)
+            .unwrap()
+            .model("Claude Haiku 5.5")
+            .is_err()
+    );
+    // Half a split is not a model.
+    let half = a.replace(
+        "Claude Haiku 5.5 (for prompts over 100,000 tokens)",
+        "Claude Haiku 5.6 (for prompts over 100,000 tokens)",
+    );
+    assert!(
+        vendors::anthropic(&half)
+            .unwrap()
+            .model("Claude Haiku 5.5")
+            .is_err()
+    );
+    // A label the reader does not know is an error, not a guess.
+    let odd = a.replace(
+        "(for prompts over 100,000 tokens)",
+        "(for prompts beyond 100,000 tokens)",
+    );
+    assert!(
+        vendors::anthropic(&odd)
+            .unwrap()
+            .model("Claude Haiku 5.5")
+            .is_err()
+    );
+
+    let b = snapshot("bedrock/foundation-models-us-east-1.json");
+    let h = vendors::bedrock(&b, "Claude Haiku 5.5").unwrap();
+    assert_eq!(h.global.output, Some(r("0.5")));
+    assert_eq!(h.global_long.output, Some(r("2.5")));
+    assert_eq!(h.regional.output, Some(r("0.55")));
+    assert_eq!(h.regional_long.output, Some(r("2.75")));
+    assert_eq!(h.regional_long.cache_write_1h, Some(r("1.1")));
+    // Two long-context output SKUs in one scope is still an error.
+    // (The Global long output SKU, re-spelled as a second Regional one.)
+    let dup = b.replace(
+        "USE1_output_tokens_long_ctx_global_standard-Units",
+        "USE1_output_tokens_long_ctx_standard_2-Units",
+    );
+    assert_ne!(dup, b);
+    assert!(vendors::bedrock(&dup, "Claude Haiku 5.5").is_err());
 }

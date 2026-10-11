@@ -251,6 +251,38 @@ fn a_cross_check_disagreement_is_broken() {
 }
 
 #[test]
+fn a_long_tier_cross_check_disagreement_is_broken() {
+    // Anthropic's over-100K Haiku 5.5 output moves; AWS's Global long_ctx SKU does not.
+    let r = run(|t, _| {
+        replace(
+            t,
+            "anthropic.pricing",
+            "| $0.05 / MTok             | $2.50 / MTok           |",
+            "| $0.05 / MTok             | $3 / MTok              |",
+        );
+    });
+    broken(&r, "crosscheck", "are not Anthropic's list");
+}
+
+#[test]
+fn a_moved_long_threshold_is_broken() {
+    // Both Haiku 5.5 rows now split at 120,000; the quoted rule (and AWS) still say 100,000.
+    let r = run(|t, _| {
+        let a = t.get_mut("anthropic.pricing").unwrap();
+        *a = a
+            .replace(
+                "Claude Haiku 5.5 (for prompts up to 100,000 tokens)",
+                "Claude Haiku 5.5 (for prompts up to 120,000 tokens)",
+            )
+            .replace(
+                "Claude Haiku 5.5 (for prompts over 100,000 tokens)",
+                "Claude Haiku 5.5 (for prompts over 120,000 tokens)",
+            );
+    });
+    broken(&r, "crosscheck", "[[prose]] anthropic.long_context says");
+}
+
+#[test]
 fn a_stale_override_is_broken() {
     // Together's models API re-fetched after the promotion's end date.
     let r = run(|_, e| e.get_mut("together.models").unwrap().fetched = "2099-01-01".into());

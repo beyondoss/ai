@@ -104,6 +104,14 @@ raw_sha256 = "3cd9817f4e9cafa4996a693a3413c8d555a8a50007be8e888e6c3ec8db72c86c"
 sha256 = "d4789bd8a2447f05d1457ea61a195e1b9389c53a3dd8e458c044722706f69619"
 
 [[source]]
+id = "openrouter.endpoints/anthropic/claude-haiku-5.5"
+url = "https://openrouter.ai/api/v1/models/anthropic/claude-haiku-5.5/endpoints"
+file = "openrouter/endpoints/anthropic/claude-haiku-5.5.json"
+fetched = "2026-10-11"
+raw_sha256 = "46a717da25bb6d4c6b5af51eccc358f19dc9b2bbbfc8d81c48f62b0f48a5c619"
+sha256 = "33073106d6a8aa8dd8aa11e2eb022936d6b57ed67b54a91fe631655242b611a6"
+
+[[source]]
 id = "openrouter.endpoints/anthropic/claude-opus-4.5"
 url = "https://openrouter.ai/api/v1/models/anthropic/claude-opus-4.5/endpoints"
 file = "openrouter/endpoints/anthropic/claude-opus-4.5.json"
@@ -740,8 +748,8 @@ id = "openrouter.models"
 url = "https://openrouter.ai/api/v1/models?output_modalities=all"
 file = "openrouter/models.json"
 fetched = "2026-10-11"
-raw_sha256 = "2a19cd573c456084c02bfcf2cd39746f9a23dd1c25aacdf659cf815164a8caa7"
-sha256 = "8225f14c47e8c349b5813914a47f982c69275f5f0cebed415df60fd45cfc263b"
+raw_sha256 = "9599617c12740f60cb2ec49d41108180f012360b30593e5756983272c6293b7c"
+sha256 = "261ceff46893c0deaf1101bf3b3d9c8e152513fd95fc3a6f7d7d8d6459a4be7f"
 
 [[source]]
 id = "openrouter.pricing"

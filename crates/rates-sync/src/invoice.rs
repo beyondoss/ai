@@ -368,17 +368,22 @@ pub fn anthropic(table: &Table, key: &str, days: u64, now: u64) -> Result<Vec<Ch
         let Some((card_name, card)) = card_for(table, "anthropic", &model) else {
             continue;
         };
-        let s = &card.standard;
-        let (field, rate) = match tt.as_str() {
-            "uncached_input_tokens" => ("input", s.input),
-            "cache_read_input_tokens" => ("cache_read", s.cache_read),
-            "cache_creation.ephemeral_5m_input_tokens" => ("cache_write", s.cache_write_5m),
-            "cache_creation.ephemeral_1h_input_tokens" => match s.cache_write_1h {
-                Some(r) => ("cache_write_1h", r),
-                None => continue,
-            },
-            _ => ("output", s.output),
+        let rate_of = |s: &crate::build::Tr| match tt.as_str() {
+            "uncached_input_tokens" => Some(("input", s.input)),
+            "cache_read_input_tokens" => Some(("cache_read", s.cache_read)),
+            "cache_creation.ephemeral_5m_input_tokens" => Some(("cache_write", s.cache_write_5m)),
+            "cache_creation.ephemeral_1h_input_tokens" => {
+                s.cache_write_1h.map(|r| ("cache_write_1h", r))
+            }
+            _ => Some(("output", s.output)),
         };
+        let Some((field, rate)) = rate_of(&card.standard) else {
+            continue;
+        };
+        // A model priced by prompt length (Claude Haiku 5.5): the reports bucket context windows
+        // coarser than its threshold (a 100,001-token prompt reads "0-200k"), so a day's line mixes
+        // both tiers and is checked to lie between them.
+        let long = card.long.as_ref().and_then(rate_of).map(|(_, r)| r);
         let Some(cents) = costs
             .get(&(day.clone(), model.clone(), tt.clone()))
             .copied()
@@ -388,6 +393,16 @@ pub fn anthropic(table: &Table, key: &str, days: u64, now: u64) -> Result<Vec<Ch
         let billed = cents / 100.0;
         #[allow(clippy::cast_precision_loss)]
         let expected = tokens as f64 * usd(rate) / 1e6;
+        #[allow(clippy::cast_precision_loss)]
+        let ok = match long {
+            Some(l) => {
+                let most = tokens as f64 * usd(l) / 1e6;
+                close(billed, expected)
+                    || close(billed, most)
+                    || (expected..=most).contains(&billed)
+            }
+            None => close(billed, expected),
+        };
         out.push(Check {
             vendor: "anthropic",
             card: card_name.to_owned(),
@@ -398,7 +413,7 @@ pub fn anthropic(table: &Table, key: &str, days: u64, now: u64) -> Result<Vec<Ch
             tokens,
             billed,
             expected,
-            ok: close(billed, expected),
+            ok,
             superseded: false,
         });
     }
