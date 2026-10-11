@@ -57,10 +57,10 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.0000044",
-          "discount": 0,
-          "input_cache_read": "0.00000026",
-          "prompt": "0.0000014"
+          "completion": "0.0000011",
+          "discount": 0.75,
+          "input_cache_read": "0.000000065",
+          "prompt": "0.00000035"
         },
         "provider_name": "Baidu",
         "quantization": "fp8",
@@ -148,10 +148,10 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.0000026477",
+          "completion": "0.0000022001",
           "discount": 0,
-          "input_cache_read": "0.0000001955",
-          "prompt": "0.0000008424"
+          "input_cache_read": "0.0000001222",
+          "prompt": "0.0000007"
         },
         "provider_name": "Decart",
         "quantization": "fp4",
@@ -239,7 +239,7 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.0000022",
+          "completion": "0.0000011",
           "discount": 0,
           "input_cache_read": "0.0000002",
           "prompt": "0.0000006"
@@ -265,10 +265,10 @@
         "context_length": 262124,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.0000034",
+          "completion": "0.0000031",
           "discount": 0,
-          "input_cache_read": "0.0000002",
-          "prompt": "0.00000075"
+          "input_cache_read": "0.00000019",
+          "prompt": "0.00000065"
         },
         "provider_name": "Io Net",
         "quantization": "fp8",
@@ -343,10 +343,10 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.000006",
+          "completion": "0.000005",
           "discount": 0,
-          "input_cache_read": "0.000000108",
-          "prompt": "0.000001995"
+          "input_cache_read": "0.00000006",
+          "prompt": "0.00000025"
         },
         "provider_name": "Morph",
         "quantization": "fp8",
@@ -501,8 +501,8 @@
         "pricing": {
           "completion": "0.0000048",
           "discount": 0,
-          "input_cache_read": "0.000000038",
-          "prompt": "0.000000039"
+          "input_cache_read": "0.00000005",
+          "prompt": "0.00000007"
         },
         "provider_name": "Wafer",
         "quantization": "unknown",

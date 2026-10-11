@@ -1953,7 +1953,7 @@ static OR_DEEPSEEK_DEEPSEEK_V4_PRO_0813: &[OrEndpoint] = &[
         host: "Wafer",
         tag: "wafer",
         class: Class::Standard,
-        card: Card::new(tr("0.3", "5", "0.219", "0.3", None)),
+        card: Card::new(tr("0.36", "5", "0.219", "0.36", None)),
     },
 ];
 
@@ -1975,7 +1975,7 @@ static OR_DEEPSEEK_DEEPSEEK_V4_1_FLASH: &[OrEndpoint] = &[
         host: "Baidu",
         tag: "baidu/fp8",
         class: Class::Standard,
-        card: Card::new(tr("0.1497", "0.5988", "0.002994", "0.1497", None)),
+        card: Card::new(tr("0.0348", "0.1392", "0.000696", "0.0348", None)),
     },
     OrEndpoint {
         host: "BaseTen",
@@ -2059,7 +2059,7 @@ static OR_DEEPSEEK_DEEPSEEK_V4_1_FLASH: &[OrEndpoint] = &[
         host: "InferenceNet",
         tag: "inference-net/fp8",
         class: Class::Standard,
-        card: Card::new(tr("0.077", "0.66", "0.01", "0.077", None)),
+        card: Card::new(tr("0.077", "0.4", "0.01", "0.077", None)),
     },
     OrEndpoint {
         host: "Ionstream",
@@ -2083,7 +2083,7 @@ static OR_DEEPSEEK_DEEPSEEK_V4_1_FLASH: &[OrEndpoint] = &[
         host: "Morph",
         tag: "morph/fp8",
         class: Class::Standard,
-        card: Card::new(tr("0.03", "0.3", "0.01", "0.03", None)),
+        card: Card::new(tr("0.042", "0.6", "0.009", "0.042", None)),
     },
     OrEndpoint {
         host: "Novita",
@@ -2095,7 +2095,7 @@ static OR_DEEPSEEK_DEEPSEEK_V4_1_FLASH: &[OrEndpoint] = &[
         host: "OpenInference",
         tag: "open-inference/fp4",
         class: Class::Standard,
-        card: Card::new(tr("0.00011", "0.36", "0.00011", "0.00011", None)),
+        card: Card::new(tr("0.055", "0.36", "0.0045", "0.055", None)),
     },
     OrEndpoint {
         host: "Parasail",
@@ -2113,7 +2113,7 @@ static OR_DEEPSEEK_DEEPSEEK_V4_1_FLASH: &[OrEndpoint] = &[
         host: "Relace",
         tag: "relace",
         class: Class::Standard,
-        card: Card::new(tr("0.0001", "0.6", "0.005", "0.0001", None)),
+        card: Card::new(tr("0.05", "0.6", "0.005", "0.05", None)),
     },
     OrEndpoint {
         host: "Sail Research",
@@ -2149,7 +2149,7 @@ static OR_DEEPSEEK_DEEPSEEK_V4_1_FLASH: &[OrEndpoint] = &[
         host: "Wafer",
         tag: "wafer",
         class: Class::Standard,
-        card: Card::new(tr("0.05", "0.65", "0.049", "0.05", None)),
+        card: Card::new(tr("0.035", "0.6", "0.034", "0.035", None)),
     },
 ];
 
@@ -2478,12 +2478,6 @@ static OR_META_MUSE_GLIMMER_30B: &[OrEndpoint] = &[
         tag: "deepinfra/bf16",
         class: Class::Standard,
         card: Card::new(tr("0.3", "1.2", "0.04", "0.3", None)),
-    },
-    OrEndpoint {
-        host: "Phala",
-        tag: "phala",
-        class: Class::Standard,
-        card: Card::new(tr("0.3", "1.1", "0.04", "0.3", None)),
     },
     OrEndpoint {
         host: "Together",
@@ -2835,7 +2829,7 @@ static OR_MOONSHOTAI_KIMI_K3: &[OrEndpoint] = &[
         host: "InferenceNet",
         tag: "inference-net/fp4",
         class: Class::Standard,
-        card: Card::new(tr("0.8", "15", "0.55", "0.8", None)),
+        card: Card::new(tr("0.8", "10", "0.55", "0.8", None)),
     },
     OrEndpoint {
         host: "Makora",
@@ -2859,7 +2853,7 @@ static OR_MOONSHOTAI_KIMI_K3: &[OrEndpoint] = &[
         host: "Morph",
         tag: "morph/fp8",
         class: Class::Standard,
-        card: Card::new(tr("0.289", "14.9", "0.29", "0.289", None)),
+        card: Card::new(tr("0.75", "14.9", "0.29", "0.75", None)),
     },
     OrEndpoint {
         host: "Parasail",
@@ -2901,13 +2895,13 @@ static OR_MOONSHOTAI_KIMI_K3: &[OrEndpoint] = &[
         host: "Wafer",
         tag: "wafer",
         class: Class::Standard,
-        card: Card::new(tr("0.29", "14.89", "0.28", "0.29", None)),
+        card: Card::new(tr("1.95", "30", "0.3", "1.95", None)),
     },
     OrEndpoint {
         host: "Wafer",
         tag: "wafer/us",
         class: Class::Standard,
-        card: Card::new(tr("2.8", "14", "0.3", "2.8", None)),
+        card: Card::new(tr("2.8", "29", "0.3", "2.8", None)),
     },
 ];
 
@@ -5266,7 +5260,7 @@ static OR_QWEN_QWEN3_8_27B: &[OrEndpoint] = &[
         host: "DekaLLM",
         tag: "dekallm",
         class: Class::Standard,
-        card: Card::new(tr("0.049", "3", "0.02", "0.049", None)),
+        card: Card::new(tr("0.04", "2.5", "0.02", "0.04", None)),
     },
     OrEndpoint {
         host: "Ionstream",
@@ -5314,7 +5308,13 @@ static OR_QWEN_QWEN3_8_27B: &[OrEndpoint] = &[
         host: "Reka",
         tag: "reka/fp8",
         class: Class::Standard,
-        card: Card::new(tr("0.14", "1.4", "0.035", "0.14", None)),
+        card: Card::new(tr("0.05", "3", "0.02", "0.05", None)),
+    },
+    OrEndpoint {
+        host: "Tenstorrent",
+        tag: "tenstorrent/fp4",
+        class: Class::Standard,
+        card: Card::new(tr("0.04", "1.35", "0.018", "0.04", None)),
     },
     OrEndpoint {
         host: "Venice",
@@ -5862,7 +5862,7 @@ static OR_Z_AI_GLM_5_1: &[OrEndpoint] = &[
         host: "Baidu",
         tag: "baidu/fp8",
         class: Class::Standard,
-        card: Card::new(tr("1.4", "4.4", "0.26", "1.4", None)),
+        card: Card::new(tr("0.9646", "3.0316", "0.17914", "0.9646", None)),
     },
     OrEndpoint {
         host: "Chutes",
@@ -5956,13 +5956,13 @@ static OR_Z_AI_GLM_5_2: &[OrEndpoint] = &[
         host: "Baidu",
         tag: "baidu/fast",
         class: Class::Fast,
-        card: Card::new(tr("2.25", "7.88", "0.56", "2.25", None)),
+        card: Card::new(tr("1.3995", "4.90136", "0.34832", "1.3995", None)),
     },
     OrEndpoint {
         host: "Baidu",
         tag: "baidu/fp8",
         class: Class::Standard,
-        card: Card::new(tr("1.4", "4.4", "0.26", "1.4", None)),
+        card: Card::new(tr("1.3986", "4.3956", "0.25974", "1.3986", None)),
     },
     OrEndpoint {
         host: "BaseTen",
@@ -6010,7 +6010,7 @@ static OR_Z_AI_GLM_5_2: &[OrEndpoint] = &[
         host: "Decart",
         tag: "decart/mxfp4",
         class: Class::Standard,
-        card: Card::new(tr("0.273", "1.68", "0.105", "0.273", None)),
+        card: Card::new(tr("0.26", "1.6", "0.1", "0.26", None)),
     },
     OrEndpoint {
         host: "DeepInfra",
@@ -6040,13 +6040,13 @@ static OR_Z_AI_GLM_5_2: &[OrEndpoint] = &[
         host: "Inceptron",
         tag: "inceptron/fp4",
         class: Class::Standard,
-        card: Card::new(tr("1.25", "5.46", "0.2", "1.25", None)),
+        card: Card::new(tr("1.25", "1.95", "0.2", "1.25", None)),
     },
     OrEndpoint {
         host: "InferenceNet",
         tag: "inference-net/fp4",
         class: Class::Standard,
-        card: Card::new(tr("0.198", "4.4", "0.132", "0.198", None)),
+        card: Card::new(tr("0.15", "0.6", "0.1", "0.15", None)),
     },
     OrEndpoint {
         host: "Mistral",
@@ -6064,7 +6064,7 @@ static OR_Z_AI_GLM_5_2: &[OrEndpoint] = &[
         host: "Morph",
         tag: "morph/fp8",
         class: Class::Standard,
-        card: Card::new(tr("2", "6", "0.137", "2", None)),
+        card: Card::new(tr("0.4", "6", "0.137", "0.4", None)),
     },
     OrEndpoint {
         host: "Nebius",
@@ -6164,7 +6164,7 @@ static OR_Z_AI_GLM_5_3: &[OrEndpoint] = &[
         host: "Baidu",
         tag: "baidu/fp8",
         class: Class::Standard,
-        card: Card::new(tr("1.4", "4.4", "0.26", "1.4", None)),
+        card: Card::new(tr("0.35", "1.1", "0.065", "0.35", None)),
     },
     OrEndpoint {
         host: "BaseTen",
@@ -6206,7 +6206,7 @@ static OR_Z_AI_GLM_5_3: &[OrEndpoint] = &[
         host: "Decart",
         tag: "decart/fp4",
         class: Class::Standard,
-        card: Card::new(tr("0.8424", "2.6477", "0.1955", "0.8424", None)),
+        card: Card::new(tr("0.7", "2.2001", "0.1222", "0.7", None)),
     },
     OrEndpoint {
         host: "DeepInfra",
@@ -6248,7 +6248,7 @@ static OR_Z_AI_GLM_5_3: &[OrEndpoint] = &[
         host: "Inceptron",
         tag: "inceptron/fp4",
         class: Class::Standard,
-        card: Card::new(tr("0.6", "2.2", "0.2", "0.6", None)),
+        card: Card::new(tr("0.6", "1.1", "0.2", "0.6", None)),
     },
     OrEndpoint {
         host: "InferenceNet",
@@ -6260,7 +6260,7 @@ static OR_Z_AI_GLM_5_3: &[OrEndpoint] = &[
         host: "Io Net",
         tag: "io-net/fp8",
         class: Class::Standard,
-        card: Card::new(tr("0.75", "3.4", "0.2", "0.75", None)),
+        card: Card::new(tr("0.65", "3.1", "0.19", "0.65", None)),
     },
     OrEndpoint {
         host: "Makora",
@@ -6296,7 +6296,7 @@ static OR_Z_AI_GLM_5_3: &[OrEndpoint] = &[
         host: "Morph",
         tag: "morph/fp8",
         class: Class::Standard,
-        card: Card::new(tr("1.995", "6", "0.108", "1.995", None)),
+        card: Card::new(tr("0.25", "5", "0.06", "0.25", None)),
     },
     OrEndpoint {
         host: "Novita",
@@ -6368,7 +6368,7 @@ static OR_Z_AI_GLM_5_3: &[OrEndpoint] = &[
         host: "Wafer",
         tag: "wafer/us",
         class: Class::Standard,
-        card: Card::new(tr("0.039", "4.8", "0.038", "0.039", None)),
+        card: Card::new(tr("0.07", "4.8", "0.05", "0.07", None)),
     },
     OrEndpoint {
         host: "Z.AI",
@@ -6462,13 +6462,13 @@ static OR_Z_AI_GLM_5_3_FLASH: &[OrEndpoint] = &[
         host: "Inceptron",
         tag: "inceptron/fp8",
         class: Class::Standard,
-        card: Card::new(tr("0.09", "0.55", "0.099", "0.09", None)),
+        card: Card::new(tr("0.12", "0.55", "0.099", "0.12", None)),
     },
     OrEndpoint {
         host: "InferenceNet",
         tag: "inference-net/fp4",
         class: Class::Standard,
-        card: Card::new(tr("0.07", "0.5", "0.04", "0.07", None)),
+        card: Card::new(tr("0.07", "0.05", "0.03", "0.07", None)),
     },
     OrEndpoint {
         host: "Modal",
@@ -6480,7 +6480,7 @@ static OR_Z_AI_GLM_5_3_FLASH: &[OrEndpoint] = &[
         host: "Morph",
         tag: "morph/fp8",
         class: Class::Standard,
-        card: Card::new(tr("0.111", "0.75", "0.015", "0.111", None)),
+        card: Card::new(tr("0.06", "0.75", "0.015", "0.06", None)),
     },
     OrEndpoint {
         host: "Near AI",
@@ -6570,7 +6570,7 @@ static OR_Z_AI_GLM_5_3_FLASH: &[OrEndpoint] = &[
         host: "Wafer",
         tag: "wafer",
         class: Class::Standard,
-        card: Card::new(tr("0.03", "0.5", "0.012", "0.03", None)),
+        card: Card::new(tr("0.06", "0.5", "0.012", "0.06", None)),
     },
     OrEndpoint {
         host: "Z.AI",
