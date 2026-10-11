@@ -200,9 +200,16 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
   discarded payload mutation, instead of unwinding the whole run. None of these hook traits return a
   `Result` a panic could be redirected through instead, so this is the mechanism that actually needs to
   catch the unwind.
-- **Compaction** — when the live prompt strictly exceeds `context_window − reserve` (landing exactly on
+- **Compaction** — when the live prompt strictly exceeds `input_budget − reserve` (landing exactly on
   the threshold still leaves the full reserve intact, so `compaction::should_compact` requires `>`, not
-  pi-mismatched `>=`) (or the provider rejects an
+  pi-mismatched `>=`; `input_budget` is `min(context_window, input_limit)` —
+  `ModelCaps::input_limit` records a vendor input cap below the window, as OpenAI's GPT-5/GPT-6 API
+  enforces: the window less the max output, 272K of 400K and 922K of 1.05M. Triggering off the raw
+  window put GPT-5.6's line at ~1.03M, past the 922K the API already rejects, so only overflow recovery
+  ran. `CompactionConfig::for_model` scales the reserve and keep-recent budgets against the input
+  budget; the max-tokens leg of `is_hard_overflow` still measures prompt + output against the whole
+  window; `models::tests::every_catalog_input_limit_bounds_the_input_budget` holds the table to
+  `verify/catalog_truth.toml`'s `input_limit` rows) (or the provider rejects an
   overflow), [`compaction`](src/compaction.rs) summarizes the prefix via one model call and splices a
   summary in, keeping recent turns verbatim (`Agent::compact`, auto-trigger, compact-and-retry).
   `Agent::compact` returns a `CompactOutcome` (`Compacted`/`TooSmall`/`AlreadyCompacted`), not a bare
@@ -266,7 +273,7 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
   allowlist checked first, so a provider's rate-limit/service-unavailable message (which can happen to
   contain "too many tokens") is never misread as a context overflow worth compacting for. A second,
   non-error-based detector (`compaction::is_hard_overflow`) fires regardless of whether auto-compaction
-  is enabled: if the live prompt already meets the _raw_ `context_window` (a silent overflow — the
+  is enabled: if the live prompt already meets the raw input budget (a silent overflow — the
   request that got there still succeeded, no error was ever raised), or a `StopReason::MaxTokens` stop
   lands where the live prompt plus the next turn's full output budget would meet it (the window, not
   `max_tokens`, is plausibly the real constraint), the run compacts anyway — disabling proactive

@@ -577,6 +577,9 @@ pub struct ToolConfig<'a> {
     /// same reason: the registry is rebuilt on every `set_model`, and a backend that reconnected per
     /// rebuild would be a bug rather than a cost.
     pub fs_backend: Option<Arc<dyn fs::FsBackend>>,
+    /// Discovered skills, so `read` resolves the `skill:<name>` paths the system prompt's listing
+    /// names them by ([`crate::skills::SKILL_SCHEME`]). Empty: the scheme names nothing.
+    pub skills: &'a [crate::skills::Skill],
 }
 
 impl<'a> ToolConfig<'a> {
@@ -631,7 +634,9 @@ pub fn default_registry_with_config(cfg: &ToolConfig<'_>) -> ToolRegistry {
     let mut reg = ToolRegistry::new();
     // One backend, shared by all six filesystem tools — so they cannot disagree about which
     // filesystem they are acting on, and a `read` can always see what a `write` just wrote.
-    let mut read_tool = read::Read::new(root).with_image_auto_resize(cfg.image_auto_resize);
+    let mut read_tool = read::Read::new(root)
+        .with_image_auto_resize(cfg.image_auto_resize)
+        .with_skills(cfg.skills);
     let mut write_tool = write::Write::new(root);
     let mut edit_tool = edit::Edit::new(root);
     let mut ls_tool = ls::Ls::new(root);

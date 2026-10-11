@@ -1056,6 +1056,7 @@ impl Subagent {
             web_timeout_ms: self.ctx.tool_cfg.web_timeout_ms,
             fs_backend: self.ctx.tool_cfg.fs_backend.clone(),
             command_runner: self.ctx.tool_cfg.command_runner.clone(),
+            skills: &self.ctx.skills,
         });
         let allow = self.effective_tools(def);
         super::apply_filter(&mut registry, Some(&allow), None, false);
@@ -1125,6 +1126,10 @@ impl Subagent {
                 // already reflects; kept honest here so the two can't disagree.
                 include_context_files: self.ctx.include_context_files,
                 skills: &self.ctx.skills,
+                context_window: agent_core::capabilities(
+                    def.model.as_deref().unwrap_or(&self.ctx.parent_model),
+                )
+                .context_window,
                 has_read: registry.get("read").is_some(),
                 has_todo: registry.get(crate::tools::todo::NAME).is_some(),
                 has_structured_output: registry

@@ -175,6 +175,9 @@ pub struct PromptOptions<'a> {
     /// upstream, matching `--no-skills`'s existing "skip outright rather than discover-then-discard"
     /// pattern) to build a prompt with no skills at all.
     pub skills: &'a [Skill],
+    /// The model's context window, in tokens. Sizes the skill listing's budget
+    /// ([`skills::listing_budget_chars`]: 1% of it), the way Claude Code scales its own.
+    pub context_window: u32,
     /// Whether the registered tool set includes `read`. A model with no way to open a file it doesn't
     /// already have inline can't act on a skill's own `SKILL.md` contents (skills are discovered by path,
     /// not inlined into the prompt — invoking one relies on the model reading the file itself), so
@@ -330,7 +333,10 @@ pub(crate) fn build_static_system_prompt_with_context(
     // file a skill invocation points at (skills are discovered by path, not inlined; see `has_read`'s
     // own doc comment) just adds dead weight the model can never act on.
     if opts.has_read {
-        let available = skills::format_available(opts.skills);
+        let available = skills::format_available(
+            opts.skills,
+            skills::listing_budget_chars(opts.context_window),
+        );
         if !available.is_empty() {
             s.push_str("\n\n");
             s.push_str(&available);
@@ -1272,6 +1278,7 @@ mod tests {
             cwd: tmp.path(),
             include_context_files: false,
             skills: &[],
+            context_window: 200_000,
             has_read: true,
             has_todo: false,
             has_structured_output: false,
@@ -1309,6 +1316,7 @@ mod tests {
             cwd: tmp.path(),
             include_context_files: false,
             skills: &[],
+            context_window: 200_000,
             has_read: true,
             has_todo: false,
             has_structured_output: false,
@@ -1345,6 +1353,7 @@ mod tests {
             cwd: tmp.path(),
             include_context_files: false,
             skills: &[],
+            context_window: 200_000,
             has_read: true,
             has_todo: false,
             has_structured_output: false,
@@ -1378,6 +1387,7 @@ mod tests {
             cwd: tmp.path(),
             include_context_files: false,
             skills: &[],
+            context_window: 200_000,
             has_read: true,
             has_todo: false,
             has_structured_output: false,
@@ -1415,6 +1425,7 @@ mod tests {
             cwd: tmp.path(),
             include_context_files: false,
             skills: std::slice::from_ref(&skill),
+            context_window: 200_000,
             has_read: true,
             has_todo: false,
             has_structured_output: false,
@@ -1453,6 +1464,7 @@ mod tests {
             cwd: tmp.path(),
             include_context_files: false,
             skills: std::slice::from_ref(&skill),
+            context_window: 200_000,
             has_read: true,
             has_todo: false,
             has_structured_output: false,
@@ -1490,6 +1502,7 @@ mod tests {
             cwd: tmp.path(),
             include_context_files: false,
             skills: std::slice::from_ref(&skill),
+            context_window: 200_000,
             has_read: false,
             has_todo: false,
             has_structured_output: false,
@@ -1519,6 +1532,7 @@ mod tests {
             cwd: tmp.path(),
             include_context_files: false,
             skills: &[],
+            context_window: 200_000,
             has_read: true,
             has_todo: false,
             has_structured_output: false,
@@ -1549,6 +1563,7 @@ mod tests {
             cwd: tmp.path(),
             include_context_files: false,
             skills: &[],
+            context_window: 200_000,
             has_read: true,
             has_todo: false,
             has_structured_output: false,
@@ -1575,6 +1590,7 @@ mod tests {
             cwd: tmp.path(),
             include_context_files: false,
             skills: &[],
+            context_window: 200_000,
             has_read: true,
             has_todo: false,
             has_structured_output: false,
@@ -1648,6 +1664,7 @@ mod tests {
             cwd,
             include_context_files: false,
             skills: &[],
+            context_window: 200_000,
             has_read: true,
             has_todo,
             has_structured_output,
@@ -1749,6 +1766,7 @@ mod tests {
             cwd: tmp.path(),
             include_context_files: true,
             skills: &[],
+            context_window: 200_000,
             has_read: true,
             has_todo: false,
             has_structured_output: false,
@@ -1783,6 +1801,7 @@ mod tests {
             cwd: tmp.path(),
             include_context_files: false,
             skills: &[],
+            context_window: 200_000,
             has_read: true,
             has_todo: false,
             has_structured_output: false,
@@ -1818,6 +1837,7 @@ mod tests {
             cwd: tmp.path(),
             include_context_files: false,
             skills: &[],
+            context_window: 200_000,
             has_read: true,
             has_todo: false,
             has_structured_output: false,

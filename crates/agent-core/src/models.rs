@@ -101,6 +101,12 @@ pub struct ModelCaps {
     pub context_window: u32,
     /// A safe default per-turn output ceiling for the model.
     pub max_output: u32,
+    /// The most input tokens one request may carry, when the vendor caps input below
+    /// `context_window` — OpenAI's GPT-5/GPT-6 API counts the max output inside the window and
+    /// rejects input past the window less that output (`verify/catalog_truth.toml`'s `input_limit`:
+    /// 272K of 400K, 922K of 1.05M). `None`: the window bounds input on its own. Compaction triggers
+    /// against [`Self::input_budget`], not the raw window — see that method.
+    pub input_limit: Option<u32>,
     /// Which output-ceiling field name to emit on the wire.
     pub max_tokens_field: MaxTokensField,
     /// Whether the model honors the 1-hour prompt-cache TTL (`cache_control.ttl = "1h"`).
@@ -169,12 +175,22 @@ pub struct ModelCaps {
 }
 
 impl ModelCaps {
+    /// The most prompt tokens a request can carry: `min(context_window, input_limit)`. What every
+    /// input-side budget (the compaction trigger, the pressure nudge, a summarization call's input)
+    /// must size against — sizing against the raw window on a model with a lower input cap puts the
+    /// trigger past the point the vendor already rejects the request.
+    pub fn input_budget(&self) -> u32 {
+        self.input_limit
+            .map_or(self.context_window, |limit| limit.min(self.context_window))
+    }
+
     /// Conservative defaults for an unknown model id: the universally-accepted `max_tokens` field, no
     /// long cache, no thinking — every choice that can't make a request invalid.
     const fn unknown() -> Self {
         Self {
             context_window: 128_000,
             max_output: 4_096,
+            input_limit: None,
             max_tokens_field: MaxTokensField::MaxTokens,
             supports_long_cache: false,
             supports_vision: false,
@@ -205,6 +221,20 @@ fn gpt5_supports_xhigh(m: &str) -> bool {
         || m.starts_with("gpt-5.4")
         || m.starts_with("gpt-5.5")
         || m.starts_with("gpt-5.6")
+}
+
+/// OpenAI's input cap for a GPT-5/GPT-6-family id served at `context_window`: the window less the
+/// max output, the rule the API enforces on every measured row (`verify/catalog_truth.toml`, e.g.
+/// "Input tokens exceed the configured limit of 272000 tokens"). 128K max output everywhere except
+/// `gpt-5-pro` (272K, so 128K of input). `None` for a window this table already states at or below
+/// the cap (the bare `gpt-5.4`/`gpt-5.5` rows' 272K, chat-latest's 128K, codex-spark's 128K).
+fn openai_gpt5_input_limit(m: &str, context_window: u32) -> Option<u32> {
+    match context_window {
+        1_050_000 => Some(922_000),
+        400_000 if m == "gpt-5-pro" => Some(128_000),
+        400_000 => Some(272_000),
+        _ => None,
+    }
 }
 
 /// Adjust a native-OpenAI-family `ModelCaps` (o-series/gpt-4/gpt-5) for a vendor-slug id (e.g.
@@ -373,6 +403,7 @@ fn github_copilot_claude_overrides(m: &str) -> Option<ModelCaps> {
     Some(ModelCaps {
         context_window,
         max_output,
+        input_limit: None,
         max_tokens_field: MaxTokensField::MaxTokens,
         supports_long_cache: true,
         supports_vision: true,
@@ -484,6 +515,7 @@ fn nvidia_caps(m: &str) -> Option<ModelCaps> {
     Some(ModelCaps {
         context_window,
         max_output,
+        input_limit: None,
         max_tokens_field: MaxTokensField::MaxTokens,
         // pi's `isNvidia` denylist excludes this provider from `supportsLongCacheRetention`.
         supports_long_cache: false,
@@ -672,6 +704,7 @@ fn capabilities_impl_lc(m: &str) -> ModelCaps {
             return ModelCaps {
                 context_window: 1_000_000,
                 max_output,
+                input_limit: None,
                 max_tokens_field: MaxTokensField::MaxTokens,
                 supports_long_cache: true,
                 supports_vision: true,
@@ -705,6 +738,7 @@ fn capabilities_impl_lc(m: &str) -> ModelCaps {
             return ModelCaps {
                 context_window: 200_000,
                 max_output,
+                input_limit: None,
                 max_tokens_field: MaxTokensField::MaxTokens,
                 // Prompt caching (the 1-hour TTL included) is supported on every current Claude 3.x
                 // id — pi's catalogue defaults `supportsLongCacheRetention` to `true` and no gen-3
@@ -744,6 +778,7 @@ fn capabilities_impl_lc(m: &str) -> ModelCaps {
             return ModelCaps {
                 context_window: 216_000,
                 max_output: 16_000,
+                input_limit: None,
                 max_tokens_field: MaxTokensField::MaxTokens,
                 supports_long_cache: true,
                 supports_vision: true,
@@ -786,6 +821,7 @@ fn capabilities_impl_lc(m: &str) -> ModelCaps {
         return ModelCaps {
             context_window: 200_000,
             max_output,
+            input_limit: None,
             max_tokens_field: MaxTokensField::MaxTokens,
             supports_long_cache: true,
             supports_vision: true,
@@ -839,6 +875,7 @@ fn capabilities_impl_lc(m: &str) -> ModelCaps {
         let caps = ModelCaps {
             context_window: 200_000,
             max_output: 100_000,
+            input_limit: None,
             // Every o-series id speaks the Responses API (`api` below), which always sends
             // `max_output_tokens` regardless of this field (see `dialect/openai_responses.rs::build_body`)
             // — `max_tokens_field` is only ever read by the Chat Completions dialect. Still set correctly
@@ -890,6 +927,7 @@ fn capabilities_impl_lc(m: &str) -> ModelCaps {
             let caps = ModelCaps {
                 context_window: 128_000,
                 max_output: 16_384,
+                input_limit: None,
                 max_tokens_field: MaxTokensField::MaxTokens,
                 supports_long_cache: true,
                 supports_vision: true,
@@ -915,6 +953,7 @@ fn capabilities_impl_lc(m: &str) -> ModelCaps {
             let caps = ModelCaps {
                 context_window: 128_000,
                 max_output: 32_000,
+                input_limit: None,
                 // Unread: Responses-routed (see the o-series branch above for why this is still set
                 // correctly rather than to a harmless-but-wrong value).
                 max_tokens_field: MaxTokensField::MaxCompletionTokens,
@@ -988,6 +1027,7 @@ fn capabilities_impl_lc(m: &str) -> ModelCaps {
         let caps = ModelCaps {
             context_window,
             max_output,
+            input_limit: openai_gpt5_input_limit(m, context_window),
             // Unread: Responses-routed (see the o-series branch above for why this is still set
             // correctly rather than to a harmless-but-wrong value).
             max_tokens_field: MaxTokensField::MaxCompletionTokens,
@@ -1018,6 +1058,7 @@ fn capabilities_impl_lc(m: &str) -> ModelCaps {
         let caps = ModelCaps {
             context_window: 1_050_000,
             max_output: 128_000,
+            input_limit: Some(922_000), // 1.05M less the 128K max output.
             max_tokens_field: MaxTokensField::MaxCompletionTokens,
             supports_long_cache: true,
             supports_vision: true,
@@ -1061,6 +1102,7 @@ fn capabilities_impl_lc(m: &str) -> ModelCaps {
             let caps = ModelCaps {
                 context_window: 1_047_576,
                 max_output,
+                input_limit: None,
                 max_tokens_field: MaxTokensField::MaxTokens,
                 supports_long_cache: true,
                 supports_vision: true,
@@ -1085,6 +1127,7 @@ fn capabilities_impl_lc(m: &str) -> ModelCaps {
             let caps = ModelCaps {
                 context_window: 128_000,
                 max_output: 4_096,
+                input_limit: None,
                 max_tokens_field: MaxTokensField::MaxTokens,
                 supports_long_cache: true,
                 supports_vision: true,
@@ -1115,6 +1158,7 @@ fn capabilities_impl_lc(m: &str) -> ModelCaps {
             let caps = ModelCaps {
                 context_window: 128_000,
                 max_output: 4_096,
+                input_limit: None,
                 max_tokens_field: MaxTokensField::MaxTokens,
                 supports_long_cache: true,
                 supports_vision: false,
@@ -1145,6 +1189,7 @@ fn capabilities_impl_lc(m: &str) -> ModelCaps {
         let caps = ModelCaps {
             context_window,
             max_output,
+            input_limit: None,
             max_tokens_field: MaxTokensField::MaxTokens,
             supports_long_cache: true,
             // Bare "gpt-4" (pi's catalogue: `input: ["text"]`) predates GPT-4's vision support
@@ -1250,6 +1295,7 @@ fn capabilities_impl_lc(m: &str) -> ModelCaps {
             return ModelCaps {
                 context_window,
                 max_output,
+                input_limit: None,
                 max_tokens_field: MaxTokensField::MaxCompletionTokens,
                 supports_long_cache: true,
                 supports_vision: false,
@@ -1270,6 +1316,7 @@ fn capabilities_impl_lc(m: &str) -> ModelCaps {
         return ModelCaps {
             context_window: 1_000_000,
             max_output: 384_000,
+            input_limit: None,
             max_tokens_field: MaxTokensField::MaxCompletionTokens,
             supports_long_cache: true,
             supports_vision: false,
@@ -1331,6 +1378,7 @@ fn capabilities_impl_lc(m: &str) -> ModelCaps {
         return ModelCaps {
             context_window,
             max_output,
+            input_limit: None,
             max_tokens_field: MaxTokensField::MaxCompletionTokens,
             supports_long_cache: true,
             supports_vision,
@@ -1369,6 +1417,7 @@ fn capabilities_impl_lc(m: &str) -> ModelCaps {
         return ModelCaps {
             context_window: 262_144,
             max_output: 65_536,
+            input_limit: None,
             max_tokens_field: MaxTokensField::MaxTokens,
             // pi's `isAntLing` denylist excludes this provider from `supportsLongCacheRetention`.
             supports_long_cache: false,
@@ -1448,6 +1497,7 @@ fn capabilities_impl_lc(m: &str) -> ModelCaps {
         return ModelCaps {
             context_window,
             max_output,
+            input_limit: None,
             max_tokens_field: MaxTokensField::MaxTokens,
             // Not in pi's Together/Cloudflare/NVIDIA/Ant-Ling `supportsLongCacheRetention` denylist.
             supports_long_cache: true,
@@ -1556,6 +1606,7 @@ fn capabilities_impl_lc(m: &str) -> ModelCaps {
         return ModelCaps {
             context_window,
             max_output,
+            input_limit: None,
             max_tokens_field: MaxTokensField::MaxCompletionTokens,
             supports_long_cache: true,
             // "glm-5v*" is the vision-capable id in the current native/coding-cn catalogue; HuggingFace
@@ -1633,6 +1684,7 @@ fn capabilities_impl_lc(m: &str) -> ModelCaps {
             return ModelCaps {
                 context_window: 1_048_576,
                 max_output: 131_072,
+                input_limit: None,
                 max_tokens_field: MaxTokensField::MaxTokens,
                 supports_long_cache: true,
                 supports_vision: true,
@@ -1736,6 +1788,7 @@ fn capabilities_impl_lc(m: &str) -> ModelCaps {
         return ModelCaps {
             context_window,
             max_output,
+            input_limit: None,
             max_tokens_field: MaxTokensField::MaxTokens,
             supports_long_cache: true,
             supports_vision,
@@ -1799,6 +1852,7 @@ fn capabilities_impl_lc(m: &str) -> ModelCaps {
         return ModelCaps {
             context_window,
             max_output,
+            input_limit: None,
             max_tokens_field: MaxTokensField::MaxCompletionTokens,
             supports_long_cache: true,
             supports_vision,
@@ -1891,6 +1945,7 @@ fn capabilities_impl_lc(m: &str) -> ModelCaps {
         return ModelCaps {
             context_window,
             max_output,
+            input_limit: None,
             max_tokens_field: MaxTokensField::MaxTokens,
             supports_long_cache: true,
             supports_vision,
@@ -1933,6 +1988,7 @@ fn capabilities_impl_lc(m: &str) -> ModelCaps {
         return ModelCaps {
             context_window: 131_072,
             max_output: 16_384,
+            input_limit: None,
             max_tokens_field: MaxTokensField::MaxCompletionTokens,
             supports_long_cache: true,
             supports_vision: false,
@@ -1972,6 +2028,7 @@ fn capabilities_impl_lc(m: &str) -> ModelCaps {
             return ModelCaps {
                 context_window: 40_960,
                 max_output: 8_192,
+                input_limit: None,
                 max_tokens_field: MaxTokensField::MaxTokens,
                 supports_long_cache: false,
                 supports_vision: false,
@@ -1998,6 +2055,7 @@ fn capabilities_impl_lc(m: &str) -> ModelCaps {
             return ModelCaps {
                 context_window: 983_616,
                 max_output: 131_072,
+                input_limit: None,
                 max_tokens_field: MaxTokensField::MaxTokens,
                 supports_long_cache: false,
                 supports_vision: true,
@@ -2051,6 +2109,7 @@ fn capabilities_impl_lc(m: &str) -> ModelCaps {
             return ModelCaps {
                 context_window,
                 max_output,
+                input_limit: None,
                 max_tokens_field: MaxTokensField::MaxTokens,
                 supports_long_cache: false,
                 supports_vision,
@@ -2099,6 +2158,7 @@ fn capabilities_impl_lc(m: &str) -> ModelCaps {
             return ModelCaps {
                 context_window,
                 max_output,
+                input_limit: None,
                 max_tokens_field: MaxTokensField::MaxTokens,
                 supports_long_cache: false,
                 supports_vision,
@@ -2131,6 +2191,7 @@ fn capabilities_impl_lc(m: &str) -> ModelCaps {
             return ModelCaps {
                 context_window: 262_144,
                 max_output: 131_072,
+                input_limit: None,
                 max_tokens_field: MaxTokensField::MaxTokens,
                 supports_long_cache: false,
                 supports_vision: false,
@@ -2160,6 +2221,7 @@ fn capabilities_impl_lc(m: &str) -> ModelCaps {
             return ModelCaps {
                 context_window: 262_144,
                 max_output: 4_096,
+                input_limit: None,
                 max_tokens_field: MaxTokensField::MaxTokens,
                 supports_long_cache: false,
                 supports_vision: false,
@@ -2185,6 +2247,7 @@ fn capabilities_impl_lc(m: &str) -> ModelCaps {
         return ModelCaps {
             context_window: 262_144,
             max_output: 65_536,
+            input_limit: None,
             max_tokens_field: MaxTokensField::MaxTokens,
             supports_long_cache: false,
             // HuggingFace's Qwen3.5/3.6 lineup (`huggingface.models.ts`) is real vision-capable —
@@ -2219,6 +2282,7 @@ fn capabilities_impl_lc(m: &str) -> ModelCaps {
         return ModelCaps {
             context_window: 131_072,
             max_output: 40_960,
+            input_limit: None,
             max_tokens_field: MaxTokensField::MaxCompletionTokens,
             supports_long_cache: true,
             supports_vision: m == "gemma-4-31b",
@@ -2246,6 +2310,7 @@ fn capabilities_impl_lc(m: &str) -> ModelCaps {
         return ModelCaps {
             context_window: 256_000,
             max_output: 128_000,
+            input_limit: None,
             max_tokens_field: MaxTokensField::MaxTokens,
             supports_long_cache: true,
             supports_vision: false,
@@ -2288,6 +2353,7 @@ fn capabilities_impl_lc(m: &str) -> ModelCaps {
         return ModelCaps {
             context_window: 131_072,
             max_output: 65_536,
+            input_limit: None,
             max_tokens_field: MaxTokensField::MaxCompletionTokens,
             supports_long_cache: true,
             supports_vision: false,
@@ -2318,6 +2384,7 @@ fn capabilities_impl_lc(m: &str) -> ModelCaps {
             return ModelCaps {
                 context_window: 131_072,
                 max_output: 4_096,
+                input_limit: None,
                 max_tokens_field: MaxTokensField::MaxCompletionTokens,
                 supports_long_cache: true,
                 supports_vision: false,
@@ -2343,6 +2410,7 @@ fn capabilities_impl_lc(m: &str) -> ModelCaps {
             return ModelCaps {
                 context_window: 131_072,
                 max_output: 131_072,
+                input_limit: None,
                 max_tokens_field: MaxTokensField::MaxCompletionTokens,
                 supports_long_cache: true,
                 supports_vision: false,
@@ -2368,6 +2436,7 @@ fn capabilities_impl_lc(m: &str) -> ModelCaps {
             return ModelCaps {
                 context_window: 131_072,
                 max_output: 8_192,
+                input_limit: None,
                 max_tokens_field: MaxTokensField::MaxCompletionTokens,
                 supports_long_cache: true,
                 supports_vision: true,
@@ -2389,6 +2458,7 @@ fn capabilities_impl_lc(m: &str) -> ModelCaps {
             return ModelCaps {
                 context_window: 131_072,
                 max_output: 131_072,
+                input_limit: None,
                 max_tokens_field: MaxTokensField::MaxCompletionTokens,
                 supports_long_cache: true,
                 supports_vision: false,
@@ -2409,6 +2479,7 @@ fn capabilities_impl_lc(m: &str) -> ModelCaps {
         return ModelCaps {
             context_window: 131_072,
             max_output: 32_768,
+            input_limit: None,
             max_tokens_field: MaxTokensField::MaxCompletionTokens,
             supports_long_cache: true,
             supports_vision: m.contains("llama-4"),
@@ -2454,6 +2525,7 @@ fn capabilities_impl_lc(m: &str) -> ModelCaps {
         return ModelCaps {
             context_window,
             max_output,
+            input_limit: None,
             max_tokens_field: MaxTokensField::MaxTokens,
             // Not in this table's Together/Cloudflare/NVIDIA/Ant-Ling `supportsLongCacheRetention`
             // denylist by name, but Gemini has no equivalent 1-hour prompt-cache concept in this
@@ -2512,6 +2584,7 @@ fn capabilities_impl_lc(m: &str) -> ModelCaps {
         return ModelCaps {
             context_window: 262_144,
             max_output,
+            input_limit: None,
             max_tokens_field: MaxTokensField::MaxTokens,
             supports_long_cache: false,
             supports_vision: true,
@@ -2542,6 +2615,7 @@ fn capabilities_impl_lc(m: &str) -> ModelCaps {
         return ModelCaps {
             context_window: 32_768,
             max_output: 32_768,
+            input_limit: None,
             max_tokens_field: MaxTokensField::MaxCompletionTokens,
             supports_long_cache: false,
             supports_vision: false,
@@ -2580,6 +2654,7 @@ fn capabilities_impl_lc(m: &str) -> ModelCaps {
         return ModelCaps {
             context_window,
             max_output,
+            input_limit: None,
             max_tokens_field: MaxTokensField::MaxCompletionTokens,
             supports_long_cache: true,
             supports_vision,
@@ -2614,6 +2689,7 @@ fn capabilities_impl_lc(m: &str) -> ModelCaps {
         return ModelCaps {
             context_window,
             max_output,
+            input_limit: None,
             max_tokens_field: MaxTokensField::MaxTokens,
             supports_long_cache: true,
             supports_vision: false,
@@ -2645,6 +2721,7 @@ fn capabilities_impl_lc(m: &str) -> ModelCaps {
         return ModelCaps {
             context_window: 128_000,
             max_output: 32_000,
+            input_limit: None,
             max_tokens_field: MaxTokensField::MaxCompletionTokens,
             supports_long_cache: true,
             supports_vision: false,
@@ -2740,6 +2817,10 @@ fn capabilities_for_route_lc(m: &str, is_codex: bool, is_azure: bool) -> ModelCa
         "gpt-5.5" if is_azure => caps.context_window = 1_050_000,
         _ => {}
     }
+    // A route that changed an OpenAI GPT-5 id's window re-derives the input cap from the new window.
+    if m.starts_with("gpt-5") && !m.contains("chat-latest") {
+        caps.input_limit = openai_gpt5_input_limit(m, caps.context_window);
+    }
     // The 7 ids natively disable-capable (`GPT5_DISABLE_CAPABLE` in `capabilities`'s own gpt-5 branch)
     // all lose that explicit "off" signal on either non-native route — see this function's own doc
     // comment for the Azure-null vs Codex-key-absent distinction (functionally identical here: neither
@@ -2812,7 +2893,11 @@ fn capabilities_for_route_with_copilot_lc(
             caps.context_window = 264_000;
             caps.max_output = 64_000;
         }
-        "gpt-5.4" | "gpt-5.5" => caps.context_window = 400_000,
+        // Copilot proxies OpenAI, whose input cap is the window less the 128K max output.
+        "gpt-5.4" | "gpt-5.5" => {
+            caps.context_window = 400_000;
+            caps.input_limit = openai_gpt5_input_limit(m, 400_000);
+        }
         "gemini-2.5-pro" | "gemini-3-flash-preview" => {
             caps.context_window = 128_000;
             caps.max_output = 64_000;
@@ -3529,6 +3614,70 @@ mod tests {
     }
 
     #[test]
+    fn gpt5_family_input_budget_is_the_window_less_the_max_output() {
+        // OpenAI caps GPT-5/GPT-6 input at the window less the max output (catalog_truth.toml).
+        for (id, budget) in [
+            ("gpt-5", 272_000),
+            ("gpt-5-mini", 272_000),
+            ("gpt-5-pro", 128_000),
+            ("gpt-5.2-pro", 272_000),
+            ("openai/gpt-5.2", 272_000),
+            ("gpt-5.4-pro", 922_000),
+            ("gpt-5.6", 922_000),
+            ("gpt-5.6-sol", 922_000),
+            ("gpt-6-astra", 922_000),
+            // At or below the cap already: the window bounds input on its own.
+            ("gpt-5.4", 272_000),
+            ("gpt-5-chat-latest", 128_000),
+        ] {
+            assert_eq!(capabilities(id).input_budget(), budget, "{id}");
+        }
+        let claude = capabilities("claude-opus-4-8");
+        assert_eq!(claude.input_limit, None);
+        assert_eq!(claude.input_budget(), claude.context_window);
+        // A route that widens the window re-derives the cap from it.
+        assert_eq!(
+            capabilities_for_route("gpt-5.4", false, true).input_budget(),
+            922_000
+        );
+        assert_eq!(
+            capabilities_for_route_with_copilot("gpt-5.5", false, false, true).input_budget(),
+            272_000
+        );
+        assert_eq!(
+            capabilities_for_route("gpt-5.4-mini", true, false).input_budget(),
+            272_000
+        );
+    }
+
+    #[test]
+    fn every_catalog_input_limit_bounds_the_input_budget() {
+        // `verify/catalog_truth.toml` records each vendor input cap below the window (with the API's
+        // own rejection as evidence). A capability table that states a larger budget for the same id
+        // puts the compaction trigger past the point the vendor rejects the prompt.
+        let truth = include_str!("../../../verify/catalog_truth.toml");
+        let mut checked = 0;
+        for row in truth.split("\n[[").filter(|b| b.starts_with("row]]")) {
+            let field = |key: &str| {
+                row.lines()
+                    .find_map(|l| l.strip_prefix(key)?.trim().strip_prefix('='))
+                    .map(|v| v.trim().trim_matches('"').replace('_', ""))
+            };
+            let (Some(model), Some(limit)) = (field("model "), field("input_limit ")) else {
+                continue;
+            };
+            let limit: u32 = limit.parse().unwrap();
+            let budget = capabilities(&model).input_budget();
+            assert!(
+                budget <= limit,
+                "{model}: input budget {budget} exceeds the vendor's input cap {limit}"
+            );
+            checked += 1;
+        }
+        assert!(checked >= 20, "parsed only {checked} input_limit rows");
+    }
+
+    #[test]
     fn gpt_5_3_codex_spark_is_narrower_than_the_rest_of_the_family() {
         let c = capabilities("gpt-5.3-codex-spark");
         assert_eq!(c.context_window, 128_000);
@@ -3814,6 +3963,7 @@ mod tests {
         // that still leaves room for the turn's own output.
         let caps = ModelCaps {
             max_output: 4_096,
+            input_limit: None,
             ..capabilities("claude-opus-4-5")
         };
         let (thinking, _) = thinking_for_level(&caps, ThinkingLevel::XHigh);
