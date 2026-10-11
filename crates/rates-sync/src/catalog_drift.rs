@@ -144,6 +144,11 @@ struct OrCard {
     max_output: Option<u64>,
     /// (prompt, completion) per token, as listed, for display.
     pricing: Option<(String, String)>,
+    /// A prompt-length tier OpenRouter lists (`pricing.overrides` with `min_prompt_tokens`):
+    /// (threshold, prompt, completion) per token. Shown beside the base price, so a reviewer
+    /// never reads the first tier as the model's whole price (Claude Haiku 5.5: $0.10 / $0.50 up
+    /// to 100K prompt tokens, $0.50 / $2.50 over).
+    long: Option<(u64, String, String)>,
 }
 
 const COMPARED_PARAMS: &[&str] = &[
@@ -232,6 +237,19 @@ impl Hosts {
                         .as_str()
                         .zip(m["pricing"]["completion"].as_str())
                         .map(|(a, b)| (a.to_owned(), b.to_owned())),
+                    long: m["pricing"]["overrides"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .find_map(|o| {
+                            let n = o["min_prompt_tokens"].as_u64()?;
+                            // A key an override omits inherits the base price.
+                            let p = o["prompt"].as_str().or(m["pricing"]["prompt"].as_str())?;
+                            let c = o["completion"]
+                                .as_str()
+                                .or(m["pricing"]["completion"].as_str())?;
+                            Some((n, p.to_owned(), c.to_owned()))
+                        }),
                 },
             );
             v.push(Listed {
@@ -342,9 +360,16 @@ impl Hosts {
 
     /// OpenRouter's listed (prompt, completion) price, per million tokens, for display.
     fn or_price(&self, slug: &str) -> Option<[String; 4]> {
-        let (p, c) = self.or_cards.get(slug)?.pricing.as_ref()?;
+        let card = self.or_cards.get(slug)?;
+        let (p, c) = card.pricing.as_ref()?;
         let pm = |s: &str| crate::dec::Rate::per_token(s).ok()?.table_text().ok();
-        Some([pm(p)?, pm(c)?, String::new(), String::new()])
+        let (mut input, mut output) = (pm(p)?, pm(c)?);
+        // `min_prompt_tokens` applies when the prompt is strictly greater than it.
+        if let Some((n, lp, lc)) = &card.long {
+            input = format!("{input} (${} over {n} prompt tokens)", pm(lp)?);
+            output = format!("{output} (${} over {n} prompt tokens)", pm(lc)?);
+        }
+        Some([input, output, String::new(), String::new()])
     }
 
     /// The listing entry for a candidate id: by id or alias, or by a dated snapshot of it
