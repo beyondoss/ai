@@ -145,9 +145,9 @@ fn build_scaffold(
     }
     // Anthropic forbids `temperature` alongside extended thinking (thinking requires an implicit
     // temperature of 1) — matches pi's own `!options?.thinkingEnabled` gate (`anthropic-messages.ts`).
-    // Separately, a handful of models (`claude-opus-4-7`/`claude-opus-4-8` — our own default model)
-    // reject `temperature` outright regardless of thinking state (pi: `compat.supportsTemperature`) —
-    // gated on the capability table rather than thinking state alone.
+    // Separately, Claude 4.7 and later (Opus 4.7 / 4.8 — our own default model — / 5 / 5.5, Sonnet
+    // 5 / 5.5, Haiku 5.5, Fable) reject a non-default `temperature` outright regardless of thinking
+    // state — gated on the capability table (`supports_temperature`) rather than thinking state alone.
     if let (Some(temperature), None, true) =
         (req.temperature, &req.thinking, caps.supports_temperature)
     {

@@ -658,15 +658,17 @@ fn capabilities_impl_lc(m: &str) -> ModelCaps {
             } else {
                 "xhigh"
             };
-            // opus-4-7 and opus-4-8 reject `temperature` outright — pi's `compat.supportsTemperature:
-            // false` is set on exactly these two ids in `anthropic.models.ts` and no other gen6+ entry
-            // (opus-4-6, sonnet-4-6, sonnet-5, fable-5 all default to supported). Our own DEFAULT_MODEL
-            // is `claude-opus-4-8`, so this is a live, reachable 400 without the gate.
-            // claude-haiku-5-5 too: "`temperature` is deprecated for this model" (400, measured
-            // 2026-10-11; its migration guide: "Omit `temperature`, `top_p`, and `top_k`").
-            let supports_temperature = !(m.starts_with("claude-opus-4-7")
-                || m.starts_with("claude-opus-4-8")
-                || m.starts_with("claude-haiku-5-5"));
+            // Claude 4.7 and later reject a non-default `temperature` (and `top_p` / `top_k`) on every
+            // request, thinking or not: "On Claude Fable 5.1, Claude Mythos 5.1, Claude Fable 5,
+            // Claude Mythos 5, Claude Mythos Preview, Claude Opus 5.5, Claude Opus 5, Claude Opus
+            // 4.8, Claude Opus 4.7, Claude Sonnet 5.5, Claude Sonnet 5, and Claude Haiku 5.5,
+            // non-default `temperature`, `top_p`, or `top_k` values return a 400 error"
+            // (build-with-claude/thinking.md). Measured 2026-10-11 on each: `temperature: 0.2` is
+            // a 400 "`temperature` is deprecated for this model"; opus-4-6 and sonnet-4-6 accept it.
+            // So only the two 4.6 ids keep it (pi gated just opus-4-7/4-8, which left the rest of the
+            // family a live 400; our own DEFAULT_MODEL is `claude-opus-4-8`).
+            let supports_temperature =
+                m.starts_with("claude-opus-4-6") || m.starts_with("claude-sonnet-4-6");
             return ModelCaps {
                 context_window: 1_000_000,
                 max_output,
@@ -3347,12 +3349,22 @@ mod tests {
     }
 
     #[test]
-    fn only_opus_4_7_opus_4_8_and_haiku_5_5_reject_temperature() {
-        // pi: `compat.supportsTemperature: false` is set on exactly the two Opus ids in
-        // `anthropic.models.ts`; Haiku 5.5 answers `temperature` with a 400 (measured 2026-10-11).
-        // Every other current id (including the rest of gen6+, legacy Budget-shape Claude, and
-        // every OpenAI-wire model) defaults to supporting it.
-        for id in ["claude-opus-4-7", "claude-opus-4-8", "claude-haiku-5-5"] {
+    fn claude_4_7_and_later_reject_temperature() {
+        // thinking.md: a non-default temperature is a 400 on Claude 4.7 and later, every request
+        // (measured on each 2026-10-11). The 4.6 ids, legacy Budget-shape Claude and every
+        // OpenAI-wire model accept it.
+        for id in [
+            "claude-opus-4-7",
+            "claude-opus-4-8",
+            "claude-opus-5",
+            "claude-opus-5-5",
+            "claude-sonnet-5",
+            "claude-sonnet-5-5",
+            "anthropic/claude-sonnet-5.5",
+            "claude-haiku-5-5",
+            "claude-fable-5",
+            "claude-fable-5-1",
+        ] {
             assert!(
                 !capabilities(id).supports_temperature,
                 "{id} should reject temperature"
@@ -3360,13 +3372,10 @@ mod tests {
         }
         for id in [
             "claude-opus-4-6",
-            "claude-opus-5",
             "claude-sonnet-4-6",
-            "claude-sonnet-5",
-            "claude-fable-5",
-            "claude-fable-5-1",
             "claude-opus-4-5",
             "claude-sonnet-4-5",
+            "claude-haiku-4-5",
             "claude-3-5-sonnet-20241022",
             "gpt-4o",
             "o3",
