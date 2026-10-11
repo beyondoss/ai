@@ -6267,6 +6267,7 @@ impl ProxyHttp for AiProxy {
                     {
                         t.tools = translate::ToolNames::default();
                         t.gateway_cache = false;
+                        t.cache_1h = false;
                         if t.client != to {
                             // Translation builds `Value`s of the body: its heap is held in the
                             // body budget for the step, or the body is refused (D216).
@@ -6274,13 +6275,14 @@ impl ProxyHttp for AiProxy {
                             // The tool names this attempt's response maps calls back through, and
                             // whether its cache breakpoints are the gateway's (per attempt: a
                             // failover candidate on another wire re-decides both).
-                            (buf, t.tools, t.gateway_cache) = translate::request_with_tools(
-                                t.client,
-                                to,
-                                &buf,
-                                upstream_model,
-                                fast,
-                            );
+                            (buf, t.tools, t.gateway_cache, t.cache_1h) =
+                                translate::request_with_tools(
+                                    t.client,
+                                    to,
+                                    &buf,
+                                    upstream_model,
+                                    fast,
+                                );
                             changed = true;
                         } else if to == route::Endpoint::Responses {
                             let len = buf.len();
@@ -7494,6 +7496,18 @@ impl ProxyHttp for AiProxy {
                 .is_some_and(|t| t.gateway_cache)
         {
             usage.bill_gateway_cache_writes(usage.wire.unwrap_or(rc.dialect));
+        }
+        // A client's 1-hour breakpoints, carried onto Chat Completions (the OpenRouter failover):
+        // billed at the 1-hour rate upstream, reported with no TTL split (see
+        // `translate::chat_cache_is_1h`).
+        if cache_hit.is_none()
+            && rc
+                .auto
+                .as_ref()
+                .and_then(|a| a.translate.as_ref())
+                .is_some_and(|t| t.cache_1h)
+        {
+            usage.attribute_cache_writes_1h();
         }
 
         let m = &self.state.metrics;
