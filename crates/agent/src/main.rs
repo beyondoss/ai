@@ -4511,7 +4511,7 @@ async fn run_task(
             tools::code_mode::select_deferred_tools(&mcp_tools, nested_exclude, &deny_tool);
         tools::code_mode::restore_execute(
             &mut registry,
-            std::sync::Arc::new(tools::code_mode::Execute::new(nested)),
+            nested,
             tools_exclude.as_deref(),
             no_tools,
         );
