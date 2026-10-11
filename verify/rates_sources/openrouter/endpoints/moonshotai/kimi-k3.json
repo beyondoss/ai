@@ -217,7 +217,7 @@
           "completion": "0.0000149",
           "discount": 0,
           "input_cache_read": "0.00000029",
-          "prompt": "0.0000003"
+          "prompt": "0.000000289"
         },
         "provider_name": "Morph",
         "quantization": "fp8",
@@ -307,8 +307,8 @@
         "pricing": {
           "completion": "0.00001489",
           "discount": 0,
-          "input_cache_read": "0.0000003",
-          "prompt": "0.00000031"
+          "input_cache_read": "0.00000028",
+          "prompt": "0.00000029"
         },
         "provider_name": "Wafer",
         "quantization": "unknown",
