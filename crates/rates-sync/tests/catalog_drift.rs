@@ -122,6 +122,8 @@ struct World {
     priced: Vec<&'static str>,
     /// Extra Together models.
     together: Vec<&'static str>,
+    /// OpenRouter slugs listed with a prompt-length tier over 100K.
+    tiered: Vec<&'static str>,
     deprecations: Option<&'static str>,
 }
 
@@ -132,6 +134,7 @@ fn base() -> World {
         anthropic: vec![("claude-sonata-4-7", "2026-05-01T00:00:00Z", None)],
         priced: vec!["Claude Sonata 4.7"],
         together: Vec::new(),
+        tiered: Vec::new(),
         deprecations: None,
     }
 }
@@ -210,7 +213,13 @@ fn run(w: &World) -> Vec<Finding> {
             entries: store.entries.clone(),
             text,
         },
-        openrouter: json!({ "data": w.or.iter().map(|(s, c, x, e)| or_model(s, *c, *x, *e)).collect::<Vec<_>>() })
+        openrouter: json!({ "data": w.or.iter().map(|(s, c, x, e)| {
+            let mut m = or_model(s, *c, *x, *e);
+            if w.tiered.contains(s) {
+                m["pricing"]["overrides"] = json!([{ "min_prompt_tokens": 100000, "prompt": "0.00001", "completion": "0.00005" }]);
+            }
+            m
+        }).collect::<Vec<_>>() })
             .to_string(),
         endpoints: w
             .or
@@ -435,6 +444,24 @@ fn needs_human_no_rate() {
         "add-claude-sonata-4-8",
         "no rate: anthropic:claude-sonata-4-8",
     );
+}
+
+/// A needs-human finding priced from OpenRouter's listing shows its prompt-length tier too, so
+/// the first tier is never read as the whole price (Claude Haiku 5.5 was shown as $0.1 / $0.5,
+/// its up-to-100K tier only).
+#[test]
+fn a_listed_price_tier_is_shown_beside_the_base_price() {
+    let mut w = with_48();
+    w.priced.pop();
+    w.tiered.push("anthropic/claude-sonata-4.8");
+    let fs = run(&w);
+    let f = fs
+        .iter()
+        .find(|f| f.slug == "add-claude-sonata-4-8")
+        .unwrap_or_else(|| panic!("no finding: {fs:#?}"));
+    let p = f.prices.as_ref().expect("priced from OpenRouter");
+    assert_eq!(p[0], "2 ($10 over 100000 prompt tokens)", "{p:?}");
+    assert_eq!(p[1], "10 ($50 over 100000 prompt tokens)", "{p:?}");
 }
 
 #[test]
