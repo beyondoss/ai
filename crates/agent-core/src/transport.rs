@@ -192,9 +192,16 @@ pub struct ModelRequest {
     /// the provider default (auto when tools are present) and emits nothing on the wire — so the
     /// default request shape is unchanged. See [`ToolChoice`].
     pub tool_choice: Option<ToolChoice>,
-    /// A stable per-conversation cache key, for prompt-cache affinity. OpenAI routes cache hits by
-    /// `prompt_cache_key`; supplying a consistent value keeps a session pinned to a warm cache node.
+    /// A stable per-conversation id, for session affinity: the `session_id`/`x-client-request-id`
+    /// headers, the pooled Codex WebSocket, and the `prompt_cache_key` on Codex, Copilot and Chat
+    /// Completions. Native OpenAI Responses derive their key from the prefix instead and use this
+    /// only to pick a routing bucket (`dialect::openai_responses::prefix_cache_key`).
     pub cache_key: Option<String>,
+    /// Who may share this request's prompt cache: a hash of the credential it is sent with, set by
+    /// `GatewayClient::stream`. The OpenAI Responses dialect mixes it into the prefix-derived
+    /// `prompt_cache_key` so sessions under one key share a cached prefix and two keys (two tenants
+    /// behind one gateway org) never do. `0` when unset.
+    pub cache_scope: u64,
     /// Use the 1-hour prompt-cache TTL instead of the default 5 minutes. Worth it for a long-running
     /// agent that may pause more than 5 minutes between turns (a slow tool, a thinking user), at a
     /// higher cache-write price.
@@ -329,6 +336,7 @@ impl ModelRequest {
             reasoning_effort: None,
             tool_choice: None,
             cache_key: None,
+            cache_scope: 0,
             cache_long: false,
             no_cache: false,
             user_id: None,
