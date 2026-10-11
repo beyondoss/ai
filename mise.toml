@@ -107,6 +107,14 @@ if [ -f .env ]; then set -a; . ./.env; set +a; fi
 cargo run -q -p beyond-ai-rates-sync -- catalog-drift "$@"
 """
 
+[tasks."pricing:vectors"]
+description = "Recompute every golden vector's expect in verify/pricing_vectors.json with the independent exact-rational reference pricer (verify/pricing_reference.py) against the compiled rate table, printing what changed. Add a vector as a {name, why, row} entry and run this. CI checks the file reproduces (crates/rates-sync/tests/pricing_reference.rs)."
+run = """
+mkdir -p target
+cargo run -q -p beyond-ai-rates-sync -- dump --json > target/rate-table.json
+python3 -I verify/pricing_reference.py target/rate-table.json verify/pricing_vectors.json --write
+"""
+
 [tasks."rates:audit"]
 description = "Second opinions on the rate table: LiteLLM and models.dev disagreements (leads, never corrections), and the vendors' own invoices (OpenAI/Anthropic admin cost APIs) checked line by line against the cards. Auto-loads .env; the invoice check needs OPENAI_ADMIN_KEY / ANTHROPIC_ADMIN_KEY."
 run = """

@@ -244,8 +244,9 @@ Maintenance is one command:
 - `mise run rates:sync` re-fetches every source, rewrites the changed snapshots, regenerates the
   table, prints the diff, and sets `RATE_VERSION` (`rates-sync rate-version`: `{today}.{hash}` of
   the table a fresh build links, also written to `verify/pricing_vectors.json`'s `rate_version`;
-  unchanged when the hash already matches). Review the diff, and recompute any golden vector
-  whose rates moved (`golden_vectors_price_exactly` names it).
+  unchanged when the hash already matches). Review the diff, and run `mise run pricing:vectors`
+  to recompute every golden vector whose rates moved (`golden_vectors_price_exactly` names it).
+  The vectors are only ever written by the reference pricer, never from this crate's output.
 - `mise run rates:generate` regenerates from the committed snapshots, offline.
   `rates_generated_from_sources` (`crates/rates-sync/tests/regenerate.rs`, per PR) does the same
   and diffs it with the committed file, so the table can only be what the snapshots and rules say.
@@ -315,8 +316,14 @@ produced the logged amounts.
   `rate_version`. A new table means new vectors. `crates/providers/tests/pricing_vectors.rs` is
   the reference consumer.
 
-The vectors were computed by a second, independent implementation in exact rationals, not by this
-crate, and this crate's test checks every one. They cover every refusal code, every class, every
+The vectors are computed by a second, independent implementation in exact rationals,
+`verify/pricing_reference.py`, not by this crate. It reads the compiled table as decimal strings
+(`rates-sync dump --json`) and shares nothing else with `pricing.rs`: every rule in it is written
+from this contract. `mise run pricing:vectors` fills each vector's `expect` from its `row` (a new
+vector is a new `{name, why, row}` entry); CI holds both implementations to the file:
+`golden_vectors_reproduce_from_the_reference_pricer` (`crates/rates-sync/tests/pricing_reference.rs`)
+re-runs the reference and diffs, and `crates/providers/tests/pricing_vectors.rs` re-prices every
+vector with this crate. They cover every refusal code, every class, every
 cost basis, both wires, the tier boundaries exactly at and one past the threshold (OpenAI `>`, xAI
 `>=`, Claude Haiku 5.5 `>` on Anthropic, Bedrock and OpenRouter, with cache reads, 5-minute and
 1-hour writes counted in the prompt), the off-peak window edges, cache reads plus 5-minute plus 1-hour writes plus tools plus fast
