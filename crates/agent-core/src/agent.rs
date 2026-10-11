@@ -110,6 +110,10 @@ pub enum AgentEvent {
         /// entry ids (the `compact` RPC) resolves this against its own pre-compaction active-path id list
         /// (parallel to `session.messages` by construction) to recover the actual id pi's field names.
         first_kept: usize,
+        /// Provider-reported usage of this round's summarization call(s) (one, or two for a split
+        /// turn). These calls never surface as `Stream(Usage)` events, so a caller pricing a run from
+        /// the event stream adds this to get the true total.
+        usage: TokenUsage,
     },
     /// The run is ending abnormally (transport failure after retries, malformed SSE, or the step
     /// ceiling). A terminal marker on the event stream so a streaming client sees *why* a run stopped
@@ -2390,6 +2394,9 @@ impl Agent {
         let prefix: Vec<Message> = session.messages[..first_kept].to_vec();
         let file_ops = compaction::merge_provenance(&session.compaction, &prefix, reason);
 
+        // What the summarization call(s) below cost. They run outside the conversational loop, so no
+        // `Stream(Usage)` event carries them; `Compacted.usage` is the only place a caller sees them.
+        let mut usage = TokenUsage::default();
         let summary = match cut.turn_start {
             None => {
                 // Clean boundary: unchanged, single-call path.
@@ -2400,7 +2407,9 @@ impl Agent {
                     &file_ops,
                     custom_instructions,
                 ));
-                turn_text(&self.run_utility_turn(req, cancel).await?)
+                let turn = self.run_utility_turn(req, cancel).await?;
+                add_usage(&mut usage, &turn.usage);
+                turn_text(&turn)
             }
             Some(turn_start) => {
                 // Split turn: summarize the closed-off history and the in-progress turn's own prefix
@@ -2422,7 +2431,7 @@ impl Agent {
                 let history = async {
                     if turn_start == 0 {
                         // Nothing precedes the split turn — no history to summarize, no call to make.
-                        return Ok("No prior history.".to_string());
+                        return Ok(("No prior history.".to_string(), TokenUsage::default()));
                     }
                     // The closed-off side is nothing but a still-current prior summary (a compaction's
                     // summary message is always `session.messages[0]`; `find_split_cut` only ever bumps
@@ -2433,7 +2442,7 @@ impl Agent {
                         && let Some(prev) =
                             compaction::previous_summary(&session.messages[..turn_start])
                     {
-                        return Ok(prev.to_string());
+                        return Ok((prev.to_string(), TokenUsage::default()));
                     }
                     let req = self.with_reasoning(compaction::summary_request(
                         &self.model,
@@ -2442,7 +2451,8 @@ impl Agent {
                         &file_ops,
                         custom_instructions,
                     ));
-                    Ok::<_, Error>(turn_text(&self.run_utility_turn(req, cancel).await?))
+                    let turn = self.run_utility_turn(req, cancel).await?;
+                    Ok::<_, Error>((turn_text(&turn), turn.usage))
                 };
                 // Unlike `history` above, the turn-prefix call never takes `custom_instructions` — it
                 // summarizes the SPLIT_TURN_INSTRUCTION template's "context for the retained suffix,"
@@ -2456,10 +2466,13 @@ impl Agent {
                         &file_ops,
                         None,
                     ));
-                    Ok::<_, Error>(turn_text(&self.run_utility_turn(req, cancel).await?))
+                    let turn = self.run_utility_turn(req, cancel).await?;
+                    Ok::<_, Error>((turn_text(&turn), turn.usage))
                 };
-                let history = history.await?;
-                let turn_prefix = turn_prefix.await?;
+                let (history, history_usage) = history.await?;
+                add_usage(&mut usage, &history_usage);
+                let (turn_prefix, turn_prefix_usage) = turn_prefix.await?;
+                add_usage(&mut usage, &turn_prefix_usage);
                 compaction::merge_split_summary(&history, &turn_prefix)
             }
         };
@@ -2503,6 +2516,7 @@ impl Agent {
             summary,
             tokens_after,
             first_kept,
+            usage,
         });
         Ok(CompactOutcome::Compacted)
     }
@@ -2663,6 +2677,19 @@ impl Agent {
 ///
 /// `turn.stop_reason == StopReason::Aborted` never reaches here — see [`Agent::run_utility_turn`],
 /// every caller's actual entry point.
+fn add_usage(total: &mut TokenUsage, u: &TokenUsage) {
+    total.input_tokens = total.input_tokens.saturating_add(u.input_tokens);
+    total.output_tokens = total.output_tokens.saturating_add(u.output_tokens);
+    total.cache_read_tokens = total.cache_read_tokens.saturating_add(u.cache_read_tokens);
+    total.cache_write_tokens = total
+        .cache_write_tokens
+        .saturating_add(u.cache_write_tokens);
+    total.cache_write_1h_tokens = total
+        .cache_write_1h_tokens
+        .saturating_add(u.cache_write_1h_tokens);
+    total.reasoning_tokens = total.reasoning_tokens.saturating_add(u.reasoning_tokens);
+}
+
 fn turn_text(turn: &Turn) -> String {
     turn.blocks
         .iter()
@@ -8391,6 +8418,52 @@ mod tests {
         assert_eq!(text.matches("<todo_list>").count(), 1, "got: {text}");
         assert_eq!(text.matches("<read-files>").count(), 1, "got: {text}");
         assert!(text.contains("[>] Wire the retry loop"), "got: {text}");
+    }
+
+    #[tokio::test]
+    async fn compacted_event_carries_the_summarization_call_usage() {
+        // The summarization call runs outside the conversational loop, so no `Stream(Usage)` event
+        // carries its tokens. Without them on `Compacted`, a `run --json` caller pricing a run from
+        // the event stream silently under-counts every compaction.
+        let mut session = Session::new();
+        session.messages = Arc::new(vec![
+            Message::user("look at this"),
+            Message::assistant(vec![ContentBlock::text("ok, looking")]),
+            Message::user("now something else"),
+            Message::assistant(vec![ContentBlock::text("done")]),
+        ]);
+        session.last_input_tokens = 12345;
+        let billed = TokenUsage {
+            input_tokens: 9000,
+            output_tokens: 700,
+            cache_read_tokens: 11,
+            cache_write_tokens: 22,
+            ..TokenUsage::default()
+        };
+        let mut summary_turn = turn::text("summary");
+        summary_turn.insert(summary_turn.len() - 1, StreamEvent::Usage(billed));
+        let mock = Arc::new(MockTransport::new(vec![summary_turn]));
+        let agent = Agent::new(mock, "claude-opus-4-8").with_compaction(CompactionConfig {
+            keep_recent_tokens: 1,
+            ..CompactionConfig::default()
+        });
+        let mut seen = None;
+        let compacted = agent
+            .compact(
+                &mut session,
+                CompactionReason::Manual,
+                &CancellationToken::new(),
+                &mut |ev| {
+                    if let AgentEvent::Compacted { usage, .. } = ev {
+                        seen = Some(usage);
+                    }
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(compacted.compacted());
+        assert_eq!(seen, Some(billed));
     }
 
     #[tokio::test]
