@@ -74,6 +74,63 @@ fn tool_ends<'a>(events: &'a [Value], name: &str) -> Vec<&'a Value> {
 }
 
 #[test]
+fn a_long_index_is_cut_at_4_kb_in_the_prompt_and_read_whole_through_the_tool() {
+    // The prompt carries at most 4 KB of `MEMORY.md` (it is re-sent on every request), with a note
+    // naming the left-out lines; the tool still reads the whole index (its own 25 KB cap is unchanged).
+    let home = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let index: String = (0..150)
+        .map(|i| format!("- [topic-{i}](topic-{i}.md) — pointer number {i} to a memory\n"))
+        .collect();
+    let seed = run_in(
+        home.path(),
+        work.path(),
+        vec![
+            mem_turn(
+                "toolu_0",
+                serde_json::json!({"command": "create", "path": "/memories/MEMORY.md", "file_text": index}),
+            ),
+            turn_text("ok"),
+        ],
+        &[],
+    );
+    assert!(seed.2);
+    assert_eq!(
+        std::fs::read_to_string(memory_dir(home.path()).join("MEMORY.md")).unwrap(),
+        index
+    );
+
+    let (events, bodies, ok) = run_in(
+        home.path(),
+        work.path(),
+        vec![
+            mem_turn(
+                "toolu_1",
+                serde_json::json!({"command": "view", "path": "/memories/MEMORY.md"}),
+            ),
+            turn_text("done"),
+        ],
+        &[],
+    );
+    assert!(ok);
+    let first = common::body_json(&bodies[0]);
+    let system = first["system"].to_string();
+    assert!(system.contains("[topic-0](topic-0.md)"), "{system}");
+    assert!(!system.contains("[topic-149]"), "the prompt's index is cut");
+    assert!(
+        system
+            .contains("more lines — read the full index with `memory` `view /memories/MEMORY.md`]"),
+        "{system}"
+    );
+    let view = tool_ends(&events, "memory");
+    assert!(
+        view[0]["result"].as_str().unwrap().contains("[topic-149]"),
+        "the tool reads the whole index: {}",
+        view[0]
+    );
+}
+
+#[test]
 fn persists_to_disk_then_injects_the_index_and_recalls_it() {
     let home = tempfile::tempdir().unwrap();
     let work = tempfile::tempdir().unwrap();

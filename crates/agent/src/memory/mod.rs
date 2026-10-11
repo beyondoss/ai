@@ -55,6 +55,13 @@ pub const INDEX_MAX_LINES: usize = 200;
 /// Byte cap companion to [`INDEX_MAX_LINES`] — whichever bites first wins.
 pub const INDEX_MAX_BYTES: usize = 25 * 1024;
 
+/// Cap on the index as **injected into the system prompt**, at a line boundary. Tighter than the
+/// 200-line / 25 KB read cap above, which stays what `view` and [`MemoryBackend::index`] return: 25 KB
+/// of index is ~6K tokens re-sent with every request, and the prompt only needs enough of it for the
+/// model to know what exists. Past the cap, a note says how many lines were left out and how to read
+/// the whole index (`view <root>/MEMORY.md`).
+pub const PROMPT_INDEX_MAX_BYTES: usize = 4 * 1024;
+
 /// A failure inside a [`MemoryBackend`]. The tool maps the model-correctable variants to
 /// [`agent_core::ToolError::InvalidInput`] (the model can fix its own call) and [`MemoryError::Backend`]
 /// to [`agent_core::ToolError::Execution`] (a store/IO failure it can't).
@@ -379,57 +386,79 @@ impl MountKind {
     }
 }
 
-/// The `## Memory` guidance for the durable, cross-session store. Tells the model the store exists, how
-/// to reach it, and the curation discipline that keeps it useful instead of a junk drawer.
+/// The `## Memory` guidance for the durable, cross-session store: what belongs there and the curation
+/// discipline that keeps it useful. The tool's own schema carries the commands and their semantics
+/// (`create` refuses an existing path, `str_replace` needs a unique match), so they aren't repeated here.
 pub const MEMORY_GUIDANCE: &str = "\
 ## Memory (durable, cross-session)
 
-You have a persistent, cross-session memory store at `/memories`, reached through the `memory` tool \
-(commands: `view`, `create`, `str_replace`, `insert`, `delete`, `rename`, `search`). It survives across \
-sessions on this project — use it for durable facts that would help *future* sessions: build and test \
-commands, non-obvious architecture decisions, debugging lessons, the user's stated preferences.
-
-- `MEMORY.md` under `/memories` is the index. Keep it a lean list of one-line pointers to topic files — \
-do not put memory content in it. Store one fact per topic file, then add a pointer in `MEMORY.md`.
-- `create` makes a *new* file and fails if one already exists; edit an existing memory with \
-`str_replace`/`insert`. Update rather than duplicate; delete a memory once you learn it is wrong.
-- Save only what is genuinely useful to a future session and not already obvious from the repo, its \
-docs, or version history. Convert relative dates to absolute ones.";
+`/memories` (the `memory` tool) persists across sessions on this project. Save what a *future* session \
+needs and can't get from the repo, its docs or history: build and test commands, non-obvious \
+architecture decisions, debugging lessons, the user's stated preferences. One fact per topic file, \
+plus a one-line pointer in `/memories/MEMORY.md` — the index, never the content. Update rather than \
+duplicate, delete a memory once it proves wrong, and write absolute dates.";
 
 /// Guidance for the per-session working-memory store — the scratchpad that survives compaction. Framed
 /// deliberately in contrast to [`MEMORY_GUIDANCE`]: precise, task-local, ephemeral.
 pub const SESSION_GUIDANCE: &str = "\
 ## Working memory (this session)
 
-You also have a private working-memory store at `/session`, reached through the same `memory` tool by \
-using a `/session/...` path. It is scoped to *this task* and is cleared when the session ends — it is \
-**not** durable project knowledge (that goes in `/memories`).
-
-Its purpose is to survive your own context compaction. When your conversation grows long it is \
-compacted into a lossy summary that drops specifics; anything you saved to `/session` stays intact. So \
-as you work, record the exact facts you would not want summarized away — precise values, file paths and \
-line numbers, command outputs, decisions and their rationale, your current plan and progress. After a \
-compaction, read them back with `memory` `view /session` before continuing. Keep `/session/MEMORY.md` \
-as a lean index of pointers, same as `/memories`.";
+`/session` (same tool) is private to this task and cleared when the session ends — not project \
+knowledge. It survives your context compaction, whose summary drops specifics: as you work, record \
+there the exact values, paths and line numbers, command outputs, decisions and current plan you can't \
+afford to lose, and `view /session` after a compaction. `/session/MEMORY.md` is its pointer index.";
 
 /// Render the injected `Memory` sections for the given mounts, each as its guidance followed by its
-/// current (already-bounded) index. `entries` pairs a [`MountKind`] with what its backend's
-/// [`MemoryBackend::index`] returned. Used by [`crate::resources`] when assembling the system prompt.
+/// current index, cut to [`PROMPT_INDEX_MAX_BYTES`] with a note when longer. `entries` pairs a
+/// [`MountKind`] with what its backend's [`MemoryBackend::index`] returned. An empty index adds
+/// nothing: the guidance already names the file, and "is currently empty" was a sentence per mount on
+/// every request. Used by [`crate::resources`] when assembling the system prompt.
 pub fn render_sections(entries: &[(MountKind, String)]) -> String {
     entries
         .iter()
         .map(|(kind, index)| {
             let guidance = kind.guidance();
             let index = index.trim();
-            let root = kind.root();
             if index.is_empty() {
-                format!("{guidance}\n\nYour `{root}/MEMORY.md` index is currently empty.")
-            } else {
-                format!("{guidance}\n\nCurrent `{root}/MEMORY.md` index:\n\n{index}")
+                return guidance.to_string();
             }
+            let root = kind.root();
+            format!(
+                "{guidance}\n\nCurrent `{root}/MEMORY.md` index:\n\n{}",
+                prompt_index(index, root)
+            )
         })
         .collect::<Vec<_>>()
         .join("\n\n")
+}
+
+/// `index` cut at the last line that fits [`PROMPT_INDEX_MAX_BYTES`], with a note naming how many
+/// lines were left out and how to read them. A first line longer than the cap is cut at a char
+/// boundary rather than dropping the whole index.
+fn prompt_index(index: &str, root: &str) -> String {
+    if index.len() <= PROMPT_INDEX_MAX_BYTES {
+        return index.to_string();
+    }
+    let mut end = 0;
+    for line in index.split_inclusive('\n') {
+        if end + line.len() > PROMPT_INDEX_MAX_BYTES {
+            break;
+        }
+        end += line.len();
+    }
+    if end == 0 {
+        end = PROMPT_INDEX_MAX_BYTES;
+        while !index.is_char_boundary(end) {
+            end -= 1;
+        }
+    }
+    let omitted = index[end..].lines().count();
+    format!(
+        "{}\n[index truncated at 4 KB for the prompt: {omitted} more line{} — read the full index with \
+         `memory` `view {root}/MEMORY.md`]",
+        index[..end].trim_end(),
+        if omitted == 1 { "" } else { "s" },
+    )
 }
 
 /// The active nudge pushed as a mid-run steer on each compaction, when a `/session` working-memory mount
@@ -564,9 +593,9 @@ mod tests {
 
     #[test]
     fn render_sections_handles_empty_populated_and_multi_mount() {
-        // A single empty durable mount.
+        // A single empty durable mount: the guidance alone, no "is currently empty" sentence.
         let empty = render_sections(&[(MountKind::Durable, String::new())]);
-        assert!(empty.contains("currently empty"));
+        assert_eq!(empty, MEMORY_GUIDANCE);
         assert!(empty.contains("/memories/MEMORY.md"));
 
         // A populated durable mount.
@@ -583,6 +612,40 @@ mod tests {
         assert!(both.contains("Working memory (this session)"));
         assert!(both.contains("Current `/memories/MEMORY.md` index"));
         assert!(both.contains("Current `/session/MEMORY.md` index"));
+    }
+
+    #[test]
+    fn the_injected_index_is_cut_at_4_kb_with_a_note_but_a_short_one_is_whole() {
+        let line =
+            |i: usize| format!("- [topic-{i}](topic-{i}.md) — a one-line pointer to a memory");
+        let short: String = (0..10).map(|i| line(i) + "\n").collect();
+        let rendered = render_sections(&[(MountKind::Durable, short.clone())]);
+        assert!(rendered.ends_with(short.trim_end()), "{rendered}");
+        assert!(!rendered.contains("truncated"));
+
+        let long: String = (0..200).map(|i| line(i) + "\n").collect();
+        let rendered = render_sections(&[(MountKind::Durable, long.clone())]);
+        let index = rendered.split_once("index:\n\n").unwrap().1;
+        let (kept, note) = index.rsplit_once('\n').unwrap();
+        assert!(kept.len() <= PROMPT_INDEX_MAX_BYTES, "{}", kept.len());
+        assert!(kept.ends_with("memory"), "cut on a line boundary: {kept}");
+        let kept_lines = kept.lines().count();
+        assert_eq!(
+            note,
+            format!(
+                "[index truncated at 4 KB for the prompt: {} more lines — read the full index \
+                 with `memory` `view /memories/MEMORY.md`]",
+                200 - kept_lines
+            )
+        );
+        // The session mount's note names its own root.
+        let rendered = render_sections(&[(MountKind::Session, long)]);
+        assert!(rendered.contains("`view /session/MEMORY.md`"));
+        // One giant line is cut, not dropped.
+        let giant = "x".repeat(10_000);
+        let rendered = render_sections(&[(MountKind::Durable, giant)]);
+        assert!(rendered.contains(&"x".repeat(100)));
+        assert!(rendered.contains("1 more line —"), "{rendered}");
     }
 
     #[test]
