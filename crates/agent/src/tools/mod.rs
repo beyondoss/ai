@@ -34,6 +34,7 @@ pub mod read;
 pub mod structured_output;
 pub mod subagent;
 pub mod todo;
+pub mod tool_search;
 pub mod web;
 pub mod write;
 
@@ -536,6 +537,9 @@ pub struct ToolConfig<'a> {
     /// (hiding the catalog behind an `execute` that does not exist would strand it). The CLI rejects
     /// `--code-mode` on a density-default binary before this constructor runs.
     pub code_mode: bool,
+    /// How MCP tools reach the model when Code Mode is off: deferred behind `tool_search`, eager, or
+    /// (the default) whichever the catalog's size makes cheaper. See [`tool_search`].
+    pub mcp_loading: tool_search::McpLoading,
     /// `--exclude-tools` names applied to the nested Code Mode catalog (so an excluded MCP tool is
     /// unreachable through `execute` as well as missing from the advertised set).
     pub nested_exclude: &'a [String],
@@ -702,6 +706,7 @@ pub fn default_registry_with_config(cfg: &ToolConfig<'_>) -> ToolRegistry {
     // server can't shadow a built-in by name (the `mcp__<server>__<tool>` prefix already prevents that).
     // Code Mode defers that catalog: MCP tools stay callable from `execute` but are not advertised.
     // Without `--features code-mode` there is no interpreter to hide them behind, so they stay direct.
+    // Otherwise `cfg.mcp_loading` picks: deferred behind `tool_search` (no interpreter) or eager.
     #[cfg(feature = "code-mode")]
     if cfg.code_mode {
         let nested =
@@ -710,16 +715,12 @@ pub fn default_registry_with_config(cfg: &ToolConfig<'_>) -> ToolRegistry {
             reg.register(execute);
         }
     } else {
-        for tool in cfg.mcp_tools {
-            reg.register(tool.clone());
-        }
+        tool_search::register_mcp(&mut reg, cfg.mcp_tools, cfg.mcp_loading);
     }
     #[cfg(not(feature = "code-mode"))]
     {
         let _ = cfg.code_mode;
-        for tool in cfg.mcp_tools {
-            reg.register(tool.clone());
-        }
+        tool_search::register_mcp(&mut reg, cfg.mcp_tools, cfg.mcp_loading);
     }
     reg
 }
@@ -742,7 +743,24 @@ pub fn apply_filter(
     exclude: Option<&[String]>,
     no_tools: bool,
 ) {
-    reg.retain(|name| filter_allows(name, tools, exclude, no_tools));
+    // A deferred MCP tool rides with `tool_search`: an allow-list that keeps `tool_search` keeps the
+    // catalog behind it (minus `--exclude-tools`), as `--tools read,bash` drops both — the same
+    // reach an allow-list has over eagerly loaded MCP tools. `tool_search::refresh` then rebuilds
+    // its catalog over what is left.
+    let keeps_search = filter_allows(tool_search::NAME, tools, exclude, no_tools)
+        && tools.is_some_and(|allow| allow.iter().any(|a| a == tool_search::NAME));
+    let deferred: std::collections::HashSet<String> = reg
+        .deferred_tools()
+        .iter()
+        .map(|t| t.name().to_string())
+        .collect();
+    reg.retain(|name| {
+        filter_allows(name, tools, exclude, no_tools)
+            || (keeps_search
+                && deferred.contains(name)
+                && filter_allows(name, None, exclude, no_tools))
+    });
+    tool_search::refresh(reg);
 }
 
 /// Whether [`apply_filter`] keeps a tool named `name` — the one predicate, so a caller that runs a

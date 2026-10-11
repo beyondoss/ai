@@ -965,7 +965,10 @@ message stays `developer` on OpenAI's own API and becomes `system` on every othe
 host (DeepSeek, Mistral, OpenRouter, … know no `developer` role; a same-wire Chat body gets the same off OpenAI and OpenRouter, see "`developer` off OpenAI"); tool `strict` crosses both
 ways; structured output is `strict: true` onto OpenAI only when the schema qualifies (every object
 closed with `additionalProperties: false`, every property required; Anthropic allows optional
-ones); an Anthropic `tool_result` that is an error says so in the tool text (`Error: …`); a
+ones); an Anthropic `tool_result` that is an error says so in the tool text (`Error: …`); Anthropic
+tool search onto Chat Completions (which has no deferred loading) sends a `defer_loading` tool only
+once a `tool_reference` in the conversation has loaded it, and the reference reads as
+`Loaded tool: <name>` in the tool text; a
 Responses `reasoning.summary` asks current Claude for `display: "summarized"`. Images or files a
 tool returned stay with it: inside the `tool_result` on Messages, and on Chat Completions (whose
 tool message holds text) as a user message right after the run of tool messages. Other hosts' tool

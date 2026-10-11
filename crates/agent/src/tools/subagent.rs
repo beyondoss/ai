@@ -109,6 +109,8 @@ pub struct ChildToolConfig {
     /// Inherit the parent's Code Mode so a child doesn't re-advertise the MCP catalog the parent
     /// deferred.
     pub code_mode: bool,
+    /// Inherit the parent's MCP tool loading for the same reason.
+    pub mcp_loading: crate::tools::tool_search::McpLoading,
     /// The parent's `--exclude-tools` list, applied to the child's nested Code Mode catalog.
     pub exclude_tools: Vec<String>,
 }
@@ -1048,6 +1050,7 @@ impl Subagent {
             image_auto_resize: self.ctx.tool_cfg.image_auto_resize,
             root: root.to_path_buf(),
             code_mode: self.ctx.tool_cfg.code_mode,
+            mcp_loading: self.ctx.tool_cfg.mcp_loading,
             nested_exclude: &self.ctx.tool_cfg.exclude_tools,
             nested_deny: &self.ctx.deny_tool,
             mcp_tools: &mcp_tools,

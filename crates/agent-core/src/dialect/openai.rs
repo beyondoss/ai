@@ -739,9 +739,12 @@ fn build_scaffold(
     if req.cache_long && caps.supports_long_cache && !req.no_cache {
         map.insert("prompt_cache_retention".into(), json!("24h"));
     }
-    if !req.tools.is_empty() {
-        let tools: Vec<Value> = req
-            .tools
+    // Chat Completions has no deferred loading: a deferred tool a `tool_search` result loaded joins
+    // `tools` from the next request on (`crate::deferred`).
+    let loads = crate::deferred::loads(req);
+    let tools = crate::deferred::with_loaded(req, &loads);
+    if !tools.is_empty() {
+        let tools: Vec<Value> = tools
             .iter()
             .map(|t| json!({
                 "type": "function",

@@ -5,7 +5,7 @@
 //! (Read/Write/Edit/Bash) and the Beyond primitives (fork/sync/logs) are all just registered tools,
 //! and tests register a mock tool to exercise the loop without a real capability.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -309,9 +309,16 @@ pub trait Tool: Send + Sync {
 }
 
 /// A name-keyed set of tools available to one agent.
+///
+/// A tool is either *advertised* (its definition goes in every request's tool list) or *deferred*
+/// ([`register_deferred`](Self::register_deferred)): callable by name like any other, but kept out of
+/// [`definitions`](Self::definitions). Deferred definitions travel separately
+/// ([`deferred_definitions`](Self::deferred_definitions) → `ModelRequest::deferred_tools`) and reach
+/// the model only once a `tool_search` result names them — see [`crate::deferred`].
 #[derive(Default, Clone)]
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
+    deferred: HashSet<String>,
 }
 
 impl ToolRegistry {
@@ -323,8 +330,40 @@ impl ToolRegistry {
     /// Register a tool, keyed by its `name()`. A later registration with the same name replaces the
     /// earlier one (last-wins), which is how an extension overrides a built-in.
     pub fn register(&mut self, tool: Arc<dyn Tool>) -> &mut Self {
+        self.deferred.remove(tool.name());
         self.tools.insert(tool.name().to_string(), tool);
         self
+    }
+
+    /// Register a tool the model can call but does not see up front — see the type's doc comment.
+    /// Same last-wins keying as [`register`](Self::register).
+    pub fn register_deferred(&mut self, tool: Arc<dyn Tool>) -> &mut Self {
+        self.deferred.insert(tool.name().to_string());
+        self.tools.insert(tool.name().to_string(), tool);
+        self
+    }
+
+    /// Whether `name` is registered as a deferred tool.
+    pub fn is_deferred(&self, name: &str) -> bool {
+        self.deferred.contains(name)
+    }
+
+    /// The deferred tools, sorted by name.
+    pub fn deferred_tools(&self) -> Vec<Arc<dyn Tool>> {
+        let mut out: Vec<Arc<dyn Tool>> = self
+            .deferred
+            .iter()
+            .filter_map(|n| self.tools.get(n).cloned())
+            .collect();
+        out.sort_by(|a, b| a.name().cmp(b.name()));
+        out
+    }
+
+    /// Every registered name, advertised and deferred, sorted.
+    pub fn names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.tools.keys().cloned().collect();
+        names.sort();
+        names
     }
 
     /// Look up a tool by the name the model called.
@@ -337,7 +376,22 @@ impl ToolRegistry {
     /// block, and a cache hit needs a byte-identical prefix — `HashMap` iteration order would cold-miss
     /// the cache after every `serve` reattach.
     pub fn definitions(&self) -> Vec<ToolDef> {
-        let mut defs: Vec<ToolDef> = self.tools.values().map(|t| t.definition()).collect();
+        self.sorted_definitions(false)
+    }
+
+    /// The deferred tools' definitions, sorted by name — the same stability contract as
+    /// [`definitions`](Self::definitions), since the Anthropic dialect sends them on every request.
+    pub fn deferred_definitions(&self) -> Vec<ToolDef> {
+        self.sorted_definitions(true)
+    }
+
+    fn sorted_definitions(&self, deferred: bool) -> Vec<ToolDef> {
+        let mut defs: Vec<ToolDef> = self
+            .tools
+            .iter()
+            .filter(|(name, _)| self.deferred.contains(name.as_str()) == deferred)
+            .map(|(_, t)| t.definition())
+            .collect();
         defs.sort_by(|a, b| a.name.cmp(&b.name));
         defs
     }
@@ -358,6 +412,8 @@ impl ToolRegistry {
     /// registry needing separate concepts for each.
     pub fn retain(&mut self, mut predicate: impl FnMut(&str) -> bool) -> &mut Self {
         self.tools.retain(|name, _| predicate(name));
+        let tools = &self.tools;
+        self.deferred.retain(|name| tools.contains_key(name));
         self
     }
 }
@@ -451,6 +507,31 @@ mod tests {
         }
         let names: Vec<String> = reg.definitions().into_iter().map(|d| d.name).collect();
         assert_eq!(names, vec!["bash", "edit", "read", "write"]);
+    }
+
+    #[test]
+    fn deferred_tools_are_callable_but_not_advertised() {
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(Named("read")));
+        reg.register_deferred(Arc::new(Named("mcp__b__z")));
+        reg.register_deferred(Arc::new(Named("mcp__a__y")));
+        let advertised: Vec<String> = reg.definitions().into_iter().map(|d| d.name).collect();
+        assert_eq!(advertised, vec!["read"]);
+        let deferred: Vec<String> = reg
+            .deferred_definitions()
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
+        assert_eq!(deferred, vec!["mcp__a__y", "mcp__b__z"]);
+        assert!(reg.get("mcp__a__y").is_some());
+        assert_eq!(reg.names(), vec!["mcp__a__y", "mcp__b__z", "read"]);
+        // A plain re-registration advertises it again.
+        reg.register(Arc::new(Named("mcp__a__y")));
+        assert!(!reg.is_deferred("mcp__a__y"));
+        // `retain` scopes deferred tools too.
+        reg.retain(|n| n != "mcp__b__z");
+        assert!(reg.deferred_tools().is_empty());
+        assert!(reg.get("mcp__b__z").is_none());
     }
 
     #[tokio::test]

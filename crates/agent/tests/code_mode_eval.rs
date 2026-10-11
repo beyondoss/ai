@@ -134,7 +134,7 @@ fn eval_fat_mcp_catalog_drops_advertised_schema_bytes() {
         home.path(),
         cwd.path(),
         "just say hi",
-        &[],
+        &["--mcp-tool-loading", "eager"],
         vec![turn_text("hi")],
     );
     assert!(ok, "flattened run failed: {stderr}");
@@ -143,11 +143,12 @@ fn eval_fat_mcp_catalog_drops_advertised_schema_bytes() {
         "flattened run recorded no model request"
     );
 
+    // Code Mode takes precedence over tool search: asking for both is Code Mode, unchanged.
     let (ok, _stdout, stderr, code_bodies) = run_against(
         home.path(),
         cwd.path(),
         "just say hi",
-        &["--code-mode"],
+        &["--code-mode", "--mcp-tool-loading", "search"],
         vec![turn_text("hi")],
     );
     assert!(ok, "code-mode run failed: {stderr}");
@@ -190,6 +191,15 @@ fn eval_fat_mcp_catalog_drops_advertised_schema_bytes() {
     assert!(
         code_names.iter().any(|n| n == "execute"),
         "code-mode must advertise execute: {code_names:?}"
+    );
+    assert!(
+        !code_names.iter().any(|n| n == "tool_search")
+            && request_json(&code_bodies[0])["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|t| t.get("defer_loading").is_none()),
+        "code-mode must not also defer behind tool_search: {code_names:?}"
     );
     assert!(
         code_bytes < flat_bytes,
@@ -291,6 +301,9 @@ fn live_grok(code_mode: bool) -> (bool, String, String) {
         .current_dir(cwd.path());
     if code_mode {
         cmd.arg("--code-mode");
+    } else {
+        // The flattened baseline this smoke compares against.
+        cmd.args(["--mcp-tool-loading", "eager"]);
     }
     let output = cmd.output().expect("spawn live agent");
     (

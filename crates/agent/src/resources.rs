@@ -131,11 +131,18 @@ pub fn default_system_prompt(
         .collect::<Vec<_>>()
         .join("\n");
 
+    // Built-ins only: an MCP tool's name already rides in its own definition (or in `tool_search`'s
+    // catalog), and repeating dozens of them here cost ~900 tokens on a three-server setup for nothing.
+    let builtins: Vec<&str> = names
+        .iter()
+        .map(String::as_str)
+        .filter(|n| crate::tools::mcp::server_name_from_registered(n).is_none())
+        .collect();
     format!(
         "You are the Beyond coding agent. You operate inside a real working directory with tools: {}. \
          Use them to accomplish the user's task directly — inspect before you change, make minimal \
          edits, and verify your work. Be concise.\n\nGuidelines:\n{guidelines}",
-        names.join(", ")
+        builtins.join(", ")
     )
 }
 

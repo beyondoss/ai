@@ -738,6 +738,9 @@ pub struct ServeConfig {
     /// reapplies it every rebuild. A no-op unless the binary was built with `--features code-mode`;
     /// the CLI rejects `--code-mode` on a density-default binary before this is set.
     pub code_mode: bool,
+    /// How MCP tools reach the model when Code Mode is off (`--mcp-tool-loading`). Fixed for the
+    /// process; `build_tools` reapplies it every rebuild. See `tools::tool_search`.
+    pub mcp_loading: crate::tools::tool_search::McpLoading,
     /// Block every call to a tool named here, even though it stays registered/visible to the model —
     /// unlike `exclude_tools` (the model never learns it exists), a denied call still surfaces as a
     /// normal error `tool_result` explaining it was blocked by policy. Installs an `AgentHooks` gate
@@ -6087,6 +6090,7 @@ pub(crate) async fn serve_session(
                         ("allowlist".to_string(), v)
                     }
                 };
+                // `names`, not `definitions`: a tool deferred behind `tool_search` is still loaded.
                 let tools: Vec<String> = build_tools(
                     &cfg,
                     cfg.image_auto_resize,
@@ -6094,9 +6098,8 @@ pub(crate) async fn serve_session(
                     &mcp_enabled,
                     &skills,
                 )
-                .definitions()
+                .names()
                 .into_iter()
-                .map(|d| d.name)
                 .filter(|n| n.starts_with("mcp__"))
                 .collect();
                 let catalogs = cfg.mcp_catalog.filter_enabled(&mcp_enabled);
@@ -6618,14 +6621,15 @@ pub(crate) async fn serve_session(
                 // variable around), plus `session`'s own running token totals — previously omitted
                 // entirely via the plainer `export_html_with_entries`.
                 let system_prompt = full_system(&static_system, &cwd, &mcp_skills);
-                let tool_defs = build_tools(
+                let registry = build_tools(
                     &cfg,
                     cfg.image_auto_resize,
                     &exec_cell,
                     &mcp_enabled,
                     &skills,
-                )
-                .definitions();
+                );
+                let mut tool_defs = registry.definitions();
+                tool_defs.extend(registry.deferred_definitions());
                 let usage = crate::export::UsageTotals {
                     input_tokens: session.input_tokens,
                     output_tokens: session.output_tokens,
@@ -8777,6 +8781,7 @@ fn build_subagent_ctx(
             fs_backend: Some(exec.backend()),
             command_runner: Some(exec.runner()),
             code_mode: cfg.code_mode,
+            mcp_loading: cfg.mcp_loading,
             exclude_tools: cfg.exclude_tools.clone().unwrap_or_default(),
         },
         cwd: cwd.to_path_buf(),
@@ -9202,6 +9207,7 @@ fn build_tools(
         web_timeout_ms: cfg.web_timeout_ms,
         image_auto_resize,
         code_mode: cfg.code_mode,
+        mcp_loading: cfg.mcp_loading,
         nested_exclude,
         nested_deny: &cfg.deny_tool,
         mcp_tools: &mcp_tools,
