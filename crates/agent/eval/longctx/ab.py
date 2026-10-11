@@ -4,8 +4,10 @@
     ab.py report --base <sha> --cand <sha>
 
 Builds each commit from `git archive` in its own target dir (the binary is cached under
-`$LONGCTX_WORK/bin`, the target dir deleted), then runs every task × model × attempt with default
-compaction on both. MCP tasks get a third arm, the candidate with `--code-mode` (built with
+`$LONGCTX_WORK/bin`, the target dir deleted), then runs every task × model × attempt on both at
+the same compaction arm (`--arm`, default `default`: window − reserve, no per-model cap; `model` uses
+each binary's own per-model trigger). `--base-arg`/`--cand-arg` pass extra agent flags to one side, so
+one commit can be A/B'd against itself with a mechanism toggled (the labels then carry the flags). MCP tasks get a third arm, the candidate with `--code-mode` (built with
 `--features code-mode`); the plain candidate arm is tool search, the default. Results go to
 `$LONGCTX_WORK/ab/<label>/…`; the report pairs each candidate arm against the base on task × attempt.
 """
@@ -56,22 +58,33 @@ def build(sha: str, code_mode: bool = False) -> Path:
     return out
 
 
-def arms(base: str, cand: str) -> list[tuple[str, str, bool, list[str], bool]]:
+def tag(flags: list[str]) -> str:
+    """A label suffix naming extra agent flags: `--no-tool-masking` → `+no-tool-masking`."""
+    return "".join("+" + f.lstrip("-").replace("=", "-").replace(" ", "-") for f in flags)
+
+
+def arms(a) -> list[tuple[str, str, bool, list[str], bool]]:
     """(label, sha, code-mode build, extra flags, MCP tasks only)."""
-    b, c = resolve(base)[:10], resolve(cand)[:10]
-    return [(b, base, False, [], False), (c, cand, False, [], False), (f"{c}-cm", cand, True, ["--code-mode"], True)]
+    b, c = resolve(a.base)[:10], resolve(a.cand)[:10]
+    bx, cx = list(a.base_arg), list(a.cand_arg)
+    out = [(b + tag(bx), a.base, False, bx, False), (c + tag(cx), a.cand, False, cx, False)]
+    if out[0][0] == out[1][0]:
+        raise SystemExit("base and candidate are the same commit with the same flags")
+    if not cx:  # the Code Mode arm only makes sense against the plain candidate
+        out.append((f"{c}-cm", a.cand, True, ["--code-mode"], True))
+    return out
 
 
 def cmd_run(a) -> None:
     code = a.tasks.split(",") if a.tasks else list(TASKS)
     mcp = a.mcp_tasks.split(",") if a.mcp_tasks else list(mcp_tasks.MCP_TASKS)
     ctx = a.ctx_tasks.split(",") if a.ctx_tasks else list(prefix_tasks.PREFIX_TASKS)
-    for label, sha, cm, extra, mcp_only in arms(a.base, a.cand):
+    for label, sha, cm, extra, mcp_only in arms(a):
         binary = build(sha, cm)
         names = mcp if mcp_only else code + ctx + mcp
         if not names:
             continue
-        argv = ["--bin", str(binary), "--models", a.models, "--arms", "default", "--tasks", ",".join(names),
+        argv = ["--bin", str(binary), "--models", a.models, "--arms", a.arm, "--tasks", ",".join(names),
                 "--attempts", str(a.attempts), "--jobs", str(a.jobs), "--cap-usd", str(a.cap_usd),
                 "--budget-usd", str(a.budget_usd), "--runs-dir", str(tasks.work_dir() / "ab" / label),
                 "--label", label]
@@ -81,10 +94,10 @@ def cmd_run(a) -> None:
     cmd_report(a)
 
 
-def load(label: str) -> dict[tuple, dict]:
+def load(label: str, arm: str) -> dict[tuple, dict]:
     root = tasks.work_dir() / "ab" / label
     out = {}
-    for p in root.glob("*/*/default/*/result.json"):
+    for p in root.glob(f"*/*/{arm}/*/result.json"):
         r = json.loads(p.read_text())
         out[(r["task"], r["model"], r["attempt"])] = r
     return out
@@ -113,14 +126,14 @@ def med(xs: list) -> float:
 
 
 def cmd_report(a) -> None:
-    labels = arms(a.base, a.cand)
+    labels = arms(a)
     base_label = labels[0][0]
-    base = load(base_label)
+    base = load(base_label, a.arm)
     family = lambda t: "mcp" if t in mcp_tasks.MCP_TASKS else "prefix" if t in prefix_tasks.PREFIX_TASKS else "code"
     print(f"Base {base_label}, candidate {labels[1][0]} (`-cm`: candidate with --code-mode, MCP tasks only).\n")
     print("| arm | model | family | n | pass (95% CI) | $/task | wall s/task | TTFT first / median s | turns | first-request tok | cache-read share | compactions |")
     print("|---|---|---|---|---|---|---|---|---|---|---|---|")
-    data = {lab: load(lab) for lab, *_ in labels}
+    data = {lab: load(lab, a.arm) for lab, *_ in labels}
     for lab, *_ in labels:
         cell = defaultdict(list)
         for (t, m, n), r in data[lab].items():
@@ -170,6 +183,9 @@ def main(argv: list[str]) -> None:
         p.add_argument("--jobs", type=int, default=6)
         p.add_argument("--cap-usd", type=float, default=12.0)
         p.add_argument("--budget-usd", type=float, default=150.0)
+        p.add_argument("--arm", default="default", help="compaction arm for both sides (see run.ARMS)")
+        p.add_argument("--base-arg", action="append", default=[], help="extra agent flag, base side only")
+        p.add_argument("--cand-arg", action="append", default=[], help="extra agent flag, candidate side only")
     a = ap.parse_args(argv)
     {"run": cmd_run, "report": cmd_report}[a.cmd](a)
 

@@ -42,7 +42,7 @@ description = "Code Mode evals: catalog-token A/B + execute composition (needs -
 run = "cargo test -p beyond-ai-agent --features code-mode --test code_mode_eval -- --nocapture"
 
 [tasks."eval:longctx"]
-description = "Long-context compaction sweep (crates/agent/eval/longctx): multi-bug repair tasks in 11 real Python repos × model × compaction trigger, headless, graded by each repo's own tests. Spends real money: `-- --estimate` first, `--budget-usd` caps it. Reads keys from .env. Args go to run.py (--models, --arms 100k,200k,default, --tasks, --attempts, --jobs)."
+description = "Long-context compaction sweep (crates/agent/eval/longctx): multi-bug repair tasks in 11 real Python repos × model × compaction trigger, headless, graded by each repo's own tests. Spends real money: `-- --estimate` first, `--budget-usd` caps it. Reads keys from .env. Args go to run.py (--models, --arms 100k,200k,default,model or any <n>k, --tasks, --attempts, --jobs)."
 run = """
 cargo build -q --release -p beyond-ai-agent
 python3 crates/agent/eval/longctx/run.py --bin target/release/beyond-ai-agent "$@"
@@ -54,7 +54,7 @@ description = "Tabulate the long-context sweep's results (pass rate with Wilson 
 run = "python3 crates/agent/eval/longctx/report.py"
 
 [tasks."eval:ab"]
-description = "Before/after no-regression gate: build BASE and CAND (commit SHAs) in separate target dirs, run the longctx code tasks plus the MCP tasks (Playwright + GitHub + filesystem servers) on both with default compaction, and the MCP tasks on CAND with --code-mode too. Prints per-arm pass rate (Wilson CI), paired McNemar + bootstrap verdicts, $/task, wall, TTFT, turns, first-request tokens, cache-read share, compactions. `BASE=<sha> CAND=<sha> mise run eval:ab -- --attempts 2`. Spends real money; reads keys from .env, GitHub token from `gh auth token`."
+description = "Before/after no-regression gate: build BASE and CAND (commit SHAs) in separate target dirs, run the longctx code tasks plus the MCP tasks (Playwright + GitHub + filesystem servers) on both at one compaction arm (`--arm`, default `default`), and the MCP tasks on CAND with --code-mode too; `--base-arg`/`--cand-arg` add agent flags to one side (A/B a mechanism against itself). Prints per-arm pass rate (Wilson CI), paired McNemar + bootstrap verdicts, $/task, wall, TTFT, turns, first-request tokens, cache-read share, compactions. `BASE=<sha> CAND=<sha> mise run eval:ab -- --attempts 2`. Spends real money; reads keys from .env, GitHub token from `gh auth token`."
 run = 'python3 crates/agent/eval/longctx/ab.py run --base "${BASE:?set BASE=<sha>}" --cand "${CAND:?set CAND=<sha>}" "$@"'
 
 [tasks."check:rs"]

@@ -481,24 +481,24 @@ pub const PRESSURE_NUDGE: &str = "<system-reminder>Your context is getting large
     `/session`: exact values, file paths and line numbers, key decisions and their rationale, and your \
     current plan and progress. Then carry on.</system-reminder>";
 
-/// The live-prompt size at which to warn of an approaching compaction: 80% of the compaction threshold
-/// (`input_budget - reserve_tokens`, the point [`agent_core::compaction::should_compact`] fires at;
-/// `input_budget` is [`agent_core::CompactionConfig::input_budget`] — the window, or a lower input cap).
-/// This leaves runway — typically a few turns — for the model to checkpoint to `/session` before the cut.
-/// Integer math (÷5 ×4) so there is no float cast and no overflow even at a 1M-token window.
+/// The live-prompt size at which to warn of an approaching compaction: 80% of `trigger`, the prompt size
+/// compaction fires past ([`agent_core::CompactionConfig::trigger_tokens`]: the input budget less the
+/// reserve, or a lower per-model `compact_at`). Taking the resolved trigger, not its ingredients, is what
+/// keeps the nudge in step with whatever moves the trigger. This leaves runway — typically a few turns —
+/// for the model to checkpoint to `/session` before the cut. Integer math (÷5 ×4) so there is no float
+/// cast and no overflow even at a 1M-token window.
 ///
-/// Returns [`u32::MAX`] (a "never fires" sentinel — `live_prompt > MAX` is always false) when
-/// `reserve_tokens >= input_budget`, i.e. the threshold is 0. That is a pathological or test-only config
-/// with **no proactive window at all**: compaction fires the instant any real usage exists, so there is
-/// no runway to warn within. Without this guard the point would be 0, and `live_prompt > 0` is true on
-/// literally every turn — the nudge would fire on turn one of any small-window session, adding a spurious
-/// steer turn (and, against a fixed-response test server, potentially exhausting or stalling it).
-pub fn compaction_pressure_point(input_budget: u32, reserve_tokens: u32) -> u32 {
-    let threshold = input_budget.saturating_sub(reserve_tokens);
-    if threshold == 0 {
+/// Returns [`u32::MAX`] (a "never fires" sentinel — `live_prompt > MAX` is always false) when `trigger`
+/// is 0 (`reserve_tokens >= input_budget`): a pathological or test-only config with **no proactive window
+/// at all**: compaction fires the instant any real usage exists, so there is no runway to warn within.
+/// Without this guard the point would be 0, and `live_prompt > 0` is true on literally every turn — the
+/// nudge would fire on turn one of any small-window session, adding a spurious steer turn (and, against a
+/// fixed-response test server, potentially exhausting or stalling it).
+pub fn compaction_pressure_point(trigger: u32) -> u32 {
+    if trigger == 0 {
         return u32::MAX;
     }
-    threshold / 5 * 4
+    trigger / 5 * 4
 }
 
 /// The full prompt size a [`agent_core::message::TokenUsage`] report implies — uncached input plus
@@ -679,19 +679,24 @@ mod tests {
 
     #[test]
     fn pressure_point_is_below_the_compaction_threshold_with_runway() {
-        // threshold = 200_000 - 16_384 = 183_616; 80% = 146_892 (÷5×4 rounds the 183_616/5).
-        let p = compaction_pressure_point(200_000, 16_384);
-        assert!(p < 200_000 - 16_384, "must fire before the compaction cut");
-        assert!(p > (200_000 - 16_384) / 2, "but not absurdly early");
+        // trigger = 200_000 - 16_384 = 183_616; 80% = 146_892 (÷5×4 rounds the 183_616/5).
+        let p = compaction_pressure_point(183_616);
+        assert!(p < 183_616, "must fire before the compaction cut");
+        assert!(p > 183_616 / 2, "but not absurdly early");
         assert_eq!(p, 183_616 / 5 * 4);
-        // A window with no proactive room (reserve >= window) disables the nudge (never-fires sentinel)
-        // rather than collapsing to 0 — which, as `live_prompt > 0`, would fire on every turn.
-        assert_eq!(compaction_pressure_point(0, 16_384), u32::MAX);
-        assert_eq!(compaction_pressure_point(100, 200), u32::MAX);
-        assert_eq!(compaction_pressure_point(200, 200), u32::MAX);
-        // A real (if small) window still yields a finite, sub-threshold point.
-        assert_eq!(compaction_pressure_point(300, 200), (300 - 200) / 5 * 4);
-        assert_eq!(compaction_pressure_point(u32::MAX, 0), u32::MAX / 5 * 4);
+        // A per-model cap moves the nudge with it: 80% of Sonnet 5's 128K line.
+        let sonnet =
+            agent_core::CompactionConfig::for_model(&agent_core::capabilities("claude-sonnet-5"));
+        assert_eq!(
+            compaction_pressure_point(sonnet.trigger_tokens()),
+            128_000 / 5 * 4
+        );
+        // No proactive room (reserve >= window) disables the nudge (never-fires sentinel) rather than
+        // collapsing to 0 — which, as `live_prompt > 0`, would fire on every turn.
+        assert_eq!(compaction_pressure_point(0), u32::MAX);
+        // A real (if small) trigger still yields a finite, sub-threshold point.
+        assert_eq!(compaction_pressure_point(100), 100 / 5 * 4);
+        assert_eq!(compaction_pressure_point(u32::MAX), u32::MAX / 5 * 4);
     }
 
     #[test]

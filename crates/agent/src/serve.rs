@@ -169,7 +169,9 @@
 //!     Idle, it reads the last `todo` call still in the transcript, falling back to the list a past
 //!     compaction folded into `Session::compaction`; mid-run, it reads the live mirror (`LiveStats`).
 //!   - `{type:"get_session_stats"}`      → token/step accounting + message-type breakdown
-//!     (`user_messages`/`assistant_messages`/`tool_calls`/`tool_results`/`total_messages`)
+//!     (`user_messages`/`assistant_messages`/`tool_calls`/`tool_results`/`total_messages`), plus
+//!     `context_usage: {tokens, context_window, compact_at, percent}` — `compact_at` is where
+//!     compaction fires, at or below `context_window` (the input budget `percent` is against)
 //!   - `{type:"get_commands"}`           → discoverable skills + prompt templates, each entry carrying
 //!     `{name, source, description, scope, path}` — `scope` (Task #39 pi-parity fix, previously
 //!     omitted) is `"user"`/`"project"`/`"temporary"` (which discovery root it actually came from),
@@ -565,6 +567,11 @@ pub struct ServeConfig {
     /// to a model with a different real window (via `set_model`) gets that model's true budget instead
     /// of a stale operator-supplied number. `Some` pins a fixed budget that survives model switches.
     pub context_window: Option<u32>,
+    /// `--compact-at`: compact once the prompt passes this many tokens, even when the window allows
+    /// more. `None` defers to the model's own (provisional) `ModelCaps::compact_at`, re-read on every
+    /// model switch; `Some(0)` turns the cap off (the window alone sets the trigger); `Some(n)` pins
+    /// it across switches. See [`compaction_config`].
+    pub compact_at: Option<u32>,
     /// The per-turn output token ceiling (`Agent::with_max_tokens`). `None` defers to `Agent::new`'s
     /// own model-aware default (the model's own capability-table `max_output`, floored at
     /// `DEFAULT_MAX_TOKENS`) — matches `context_window`'s own "unset means model-derived" convention.
@@ -4837,16 +4844,10 @@ pub(crate) async fn serve_session(
                     let steer_on_compact = steering.clone();
                     let pressure_armed_sink = pressure_armed.clone();
                     // The live-prompt size at which to warn of an approaching compaction, against the
-                    // *current* model's window (a `set_model` mid-session changes it), matching the reserve
-                    // `build_agent` folds into this session's `CompactionConfig`.
-                    // Against the input budget, not the raw window: the same quantity the trigger uses.
-                    let caps = agent_core::capabilities(&current_model);
-                    let window = cfg.context_window.unwrap_or(caps.context_window);
+                    // *current* model (a `set_model` mid-session changes it): the same trigger
+                    // `build_agent` hands this session's `Agent`.
                     let pressure_point = crate::memory::compaction_pressure_point(
-                        caps.input_limit.map_or(window, |limit| limit.min(window)),
-                        cfg.compaction_reserve_tokens.unwrap_or_else(|| {
-                            agent_core::CompactionConfig::default().reserve_tokens
-                        }),
+                        compaction_config(&cfg, &current_model).trigger_tokens(),
                     );
 
                     // Mark this session busy for the reaper's benefit (daemon mode). Already set at
@@ -5701,7 +5702,8 @@ pub(crate) async fn serve_session(
 
                 let frame = match result {
                     Ok(()) => {
-                        let mut data = session_stats(&session, &current_model);
+                        let mut data =
+                            session_stats(&session, &compaction_config(&cfg, &current_model));
                         if let Value::Object(m) = &mut data {
                             m.insert("refused".into(), json!(refused.load(Ordering::Relaxed)));
                             // Present exactly when this prompt asked for typed output, so a client can
@@ -6328,7 +6330,7 @@ pub(crate) async fn serve_session(
                 }
             }
             "get_state" => {
-                let mut data = session_stats(&session, &current_model);
+                let mut data = session_stats(&session, &compaction_config(&cfg, &current_model));
                 if let Value::Object(m) = &mut data {
                     insert_session_identity(m, &persistence, service.as_deref());
                     m.insert("model".into(), json!(current_model));
@@ -6886,7 +6888,7 @@ pub(crate) async fn serve_session(
                 // while idle" convention) — previously omitted, unlike the busy-mode arm's
                 // `LiveStats::snapshot()`-derived `pending_tool_ids`, so idle and busy reported
                 // different field sets for the same command.
-                let mut data = session_stats(&session, &current_model);
+                let mut data = session_stats(&session, &compaction_config(&cfg, &current_model));
                 if let Value::Object(m) = &mut data {
                     insert_session_identity(m, &persistence, service.as_deref());
                     m.insert("pending_tool_ids".into(), json!(Vec::<String>::new()));
@@ -8688,15 +8690,6 @@ fn build_gateway_client(cfg: &ServeConfig, model: &str) -> Result<GatewayClient,
     Ok(client)
 }
 
-/// Build the [`Agent`] for the current model + thinking budget + auto-compaction/auto-retry flags.
-/// Called once at startup and again on every `set_model`/`set_thinking`/`cycle_model`/
-/// `cycle_thinking_level`/`set_auto_compaction`/`set_auto_retry`, so a client can re-tune the run
-/// without restarting `serve`. The transport, tools, system prompt, loop bounds, and cache settings are
-/// the same each time; only the model id, thinking budget, and the two flags vary. Compaction's
-/// `context_window` defaults to `model`'s own capabilities; an explicit `--context-window` overrides
-/// that and stays pinned across a model switch (the operator's compaction budget, not the dialect's) —
-/// left unset, each switch picks up the *new* model's real window instead of a stale operator number.
-/// `reserve_tokens`/`keep_recent_tokens` default to `CompactionConfig::default()`, overridable
 /// Build the subagent context once, at startup. Its transport factory closes over a clone of `cfg` and
 /// calls [`build_gateway_client`] per child model — the same model-switch-safe recipe the parent uses —
 /// so the ctx is valid for the whole session regardless of parent model switches.
@@ -8804,7 +8797,16 @@ fn build_subagent_ctx(
     })
 }
 
-/// independently of `context_window`.
+/// Build the [`Agent`] for the current model + thinking budget + auto-compaction/auto-retry flags.
+/// Called once at startup and again on every `set_model`/`set_thinking`/`cycle_model`/
+/// `cycle_thinking_level`/`set_auto_compaction`/`set_auto_retry`, so a client can re-tune the run
+/// without restarting `serve`. The transport, tools, system prompt, loop bounds, and cache settings are
+/// the same each time; only the model id, thinking budget, and the two flags vary. Compaction's
+/// `context_window` defaults to `model`'s own capabilities; an explicit `--context-window` overrides
+/// that and stays pinned across a model switch (the operator's compaction budget, not the dialect's) —
+/// left unset, each switch picks up the *new* model's real window instead of a stale operator number.
+/// `reserve_tokens`/`keep_recent_tokens` default to `CompactionConfig::default()`, overridable
+/// independently of `context_window` — all resolved by [`compaction_config`].
 // 11 arguments, all independent inputs every call site already has on hand from `cfg`/local
 // runtime-switchable state — bundling them into a struct would just be a second place those same
 // fields live, not a reduction in what the function needs to know (see `client.rs::send_with_retry`
@@ -8851,19 +8853,10 @@ fn build_agent(
     // prompt's listing names them by.
     skills: &[crate::skills::Skill],
 ) -> Agent {
-    let caps = agent_core::capabilities(model);
-    let mut compaction = agent_core::CompactionConfig {
-        context_window: cfg.context_window.unwrap_or(caps.context_window),
-        input_limit: caps.input_limit,
+    let compaction = agent_core::CompactionConfig {
         enabled: auto_compaction,
-        ..agent_core::CompactionConfig::default()
+        ..compaction_config(cfg, model)
     };
-    if let Some(reserve) = cfg.compaction_reserve_tokens {
-        compaction.reserve_tokens = reserve;
-    }
-    if let Some(keep_recent) = cfg.compaction_keep_recent_tokens {
-        compaction.keep_recent_tokens = keep_recent;
-    }
 
     let mut registry = build_tools(cfg, image_auto_resize, exec, mcp_enabled, skills);
     // Registered here, not in `build_tools`, because this is where `write_locks` is in scope — the ctx
@@ -9869,18 +9862,63 @@ fn parse_images(images: Option<&Value>) -> Vec<agent_core::ImageSource> {
         .unwrap_or_default()
 }
 
+/// The compaction policy a session runs on `model`: the model's window and input limit, its
+/// (provisional) [`agent_core::models::ModelCaps::compact_at`], and the operator's overrides. The one
+/// place `build_agent`, the pressure nudge and `context_usage` resolve it, so all three agree on where
+/// compaction fires. `enabled` is left at its default; `build_agent` applies the live flag.
+pub(crate) fn compaction_config(cfg: &ServeConfig, model: &str) -> agent_core::CompactionConfig {
+    resolve_compaction(
+        model,
+        cfg.context_window,
+        cfg.compact_at,
+        cfg.compaction_reserve_tokens,
+        cfg.compaction_keep_recent_tokens,
+    )
+}
+
+/// [`compaction_config`] from the raw flag values, shared with `run`. `context_window` and the two
+/// budgets override the model's own when given (reserve and keep-recent are the struct's absolute
+/// defaults otherwise, as before). `compact_at`: `None` takes the model's cap, `Some(0)` removes it,
+/// `Some(n)` sets it. A cap also bounds `keep_recent_tokens` to half of itself unless that was set
+/// explicitly: a compaction must keep less than the line that fires it, or every turn re-fires.
+pub fn resolve_compaction(
+    model: &str,
+    context_window: Option<u32>,
+    compact_at: Option<u32>,
+    reserve_tokens: Option<u32>,
+    keep_recent_tokens: Option<u32>,
+) -> agent_core::CompactionConfig {
+    let caps = agent_core::capabilities(model);
+    let d = agent_core::CompactionConfig::default();
+    let compact_at = compact_at.map_or(caps.compact_at, |n| (n > 0).then_some(n));
+    agent_core::CompactionConfig {
+        context_window: context_window.unwrap_or(caps.context_window),
+        input_limit: caps.input_limit,
+        compact_at,
+        reserve_tokens: reserve_tokens.unwrap_or(d.reserve_tokens),
+        keep_recent_tokens: keep_recent_tokens.unwrap_or_else(|| {
+            compact_at.map_or(d.keep_recent_tokens, |cap| {
+                d.keep_recent_tokens.min(cap / 2)
+            })
+        }),
+        ..d
+    }
+}
+
 /// Token + step accounting for a session, including the prompt-cache reads/writes that make the
 /// Anthropic cache breakpoints observable. Shared by the `prompt` response and `get_state`.
 /// `model` is the session's *currently active* model, not necessarily the one that produced
 /// `last_input_tokens` — a `set_model`/`cycle_model` mid-session means the context-window figure is
 /// always reported against what a client would actually be constrained by on the *next* turn, matching
 /// how a client would use this value (to decide whether compaction is coming soon), not as a historical
-/// record of what the previous turn's provider reported. `context_window` is the model's input budget
-/// ([`agent_core::models::ModelCaps::input_budget`]): the window, or the lower input cap a GPT-5-family
-/// model enforces — the figure the compaction trigger compares against, so `percent` reaches 100 where
-/// the vendor starts rejecting the prompt.
-fn session_stats(session: &Session, model: &str) -> Value {
-    let context_window = agent_core::models::capabilities(model).input_budget();
+/// record of what the previous turn's provider reported. `compaction` is that model's resolved policy
+/// ([`compaction_config`]). `context_window` is its input budget
+/// ([`agent_core::CompactionConfig::input_budget`]): the window, or the lower input cap a GPT-5-family
+/// model enforces, so `percent` reaches 100 where the vendor starts rejecting the prompt. `compact_at`
+/// is where compaction actually fires ([`agent_core::CompactionConfig::trigger_tokens`]), which a
+/// per-model cap puts well below that.
+fn session_stats(session: &Session, compaction: &agent_core::CompactionConfig) -> Value {
+    let context_window = compaction.input_budget();
     // `last_input_tokens == 0` covers both "no turn has run yet" and pi's "immediately after
     // compaction, before a new reply" case (compaction never sets this field itself — only a real
     // provider response does) — both genuinely have no current-context figure to report, so `null`
@@ -9898,6 +9936,7 @@ fn session_stats(session: &Session, model: &str) -> Value {
         json!({
             "tokens": tokens,
             "context_window": context_window,
+            "compact_at": compaction.trigger_tokens(),
             "percent": (tokens as f64 / context_window as f64 * 100.0),
         })
     });
@@ -12171,13 +12210,59 @@ mod tests {
         assert!(lock_ignoring_poison(&slot).is_none());
     }
 
+    /// `model`'s compaction policy with no operator overrides.
+    fn test_compaction(model: &str) -> agent_core::CompactionConfig {
+        resolve_compaction(model, None, None, None, None)
+    }
+
+    #[test]
+    fn context_usage_reports_where_compaction_fires_with_every_override() {
+        let mut session = Session::new();
+        session.last_input_tokens = 10_000;
+        let at =
+            |c: agent_core::CompactionConfig| session_stats(&session, &c)["context_usage"].clone();
+        // A capped model: the provisional cap, under a 1M input budget.
+        let u = at(test_compaction("claude-opus-5-5"));
+        assert_eq!(u["context_window"], 1_000_000);
+        assert_eq!(u["compact_at"], 200_000);
+        // An uncapped model: window − reserve, today's trigger.
+        assert_eq!(
+            at(test_compaction("claude-opus-4-8"))["compact_at"],
+            1_000_000 - 16_384
+        );
+        // `--compact-at n` sets it, `--compact-at 0` removes the model's cap.
+        let pinned = resolve_compaction("claude-opus-5-5", None, Some(150_000), None, None);
+        assert_eq!(at(pinned)["compact_at"], 150_000);
+        let off = resolve_compaction("claude-opus-5-5", None, Some(0), None, None);
+        assert_eq!(at(off)["compact_at"], 1_000_000 - 16_384);
+        // `--context-window` still bounds both figures; the lower of the two lines wins.
+        let small = resolve_compaction("claude-opus-5-5", Some(100_000), None, None, None);
+        assert_eq!(at(small)["context_window"], 100_000);
+        assert_eq!(at(small)["compact_at"], 100_000 - 16_384);
+    }
+
+    #[test]
+    fn a_small_compact_at_keeps_less_than_it_fires_at() {
+        // keep_recent must stay under the trigger, or every compaction lands back over it.
+        let c = resolve_compaction("claude-opus-5-5", None, Some(30_000), None, None);
+        assert_eq!(c.keep_recent_tokens, 15_000);
+        // The model defaults are all far above 2 × keep_recent: untouched.
+        assert_eq!(
+            test_compaction("claude-haiku-5-5").keep_recent_tokens,
+            20_000
+        );
+        // An explicit keep-recent is the operator's call.
+        let c = resolve_compaction("claude-opus-5-5", None, Some(30_000), None, Some(25_000));
+        assert_eq!(c.keep_recent_tokens, 25_000);
+    }
+
     #[test]
     fn session_stats_reports_no_context_usage_before_any_turn_has_run() {
         // pi: agent-session-stats.test.ts — `contextUsage` is `null` when nothing has run yet (and,
         // by the same field, immediately after a compaction that hasn't been followed by a real reply
         // — compaction never sets `last_input_tokens` itself, only a real provider response does).
         let session = Session::new();
-        let stats = session_stats(&session, "claude-opus-4-8");
+        let stats = session_stats(&session, &test_compaction("claude-opus-4-8"));
         assert_eq!(stats["context_usage"], Value::Null, "got: {stats}");
     }
 
@@ -12230,7 +12315,7 @@ mod tests {
         ]));
         session.user("second request");
 
-        let stats = session_stats(&session, "claude-opus-4-8");
+        let stats = session_stats(&session, &test_compaction("claude-opus-4-8"));
         assert_eq!(stats["total_messages"], 5, "got: {stats}");
         assert_eq!(
             stats["user_messages"], 2,
@@ -12265,7 +12350,7 @@ mod tests {
             stop_reason: None,
         });
 
-        let stats = session_stats(&session, "claude-opus-4-8");
+        let stats = session_stats(&session, &test_compaction("claude-opus-4-8"));
         assert_eq!(stats["user_messages"], 1, "got: {stats}");
         assert_eq!(stats["tool_results"], 1, "got: {stats}");
     }
@@ -12274,7 +12359,7 @@ mod tests {
     fn session_stats_reports_context_usage_against_the_currently_active_model() {
         let mut session = Session::new();
         session.last_input_tokens = 50_000;
-        let stats = session_stats(&session, "claude-opus-4-8");
+        let stats = session_stats(&session, &test_compaction("claude-opus-4-8"));
         let usage = &stats["context_usage"];
         assert_eq!(usage["tokens"], 50_000);
         let context_window = agent_core::models::capabilities("claude-opus-4-8").context_window;
@@ -12296,7 +12381,7 @@ mod tests {
         let mut session = Session::new();
         session.last_input_tokens = 50_000;
         session.last_usage_message_count = session.messages.len(); // snapshot taken with no messages yet
-        let stats_before = session_stats(&session, "claude-opus-4-8");
+        let stats_before = session_stats(&session, &test_compaction("claude-opus-4-8"));
         assert_eq!(
             stats_before["context_usage"]["tokens"], 50_000,
             "no trailing messages yet: {stats_before}"
@@ -12304,7 +12389,7 @@ mod tests {
 
         // ~100 estimated tokens' worth of message appended since the snapshot (400 chars / 4).
         session.push(agent_core::Message::user("x".repeat(400)));
-        let stats_after = session_stats(&session, "claude-opus-4-8");
+        let stats_after = session_stats(&session, &test_compaction("claude-opus-4-8"));
         let tokens_after = stats_after["context_usage"]["tokens"].as_u64().unwrap();
         assert!(
             tokens_after > 50_000,
@@ -12326,7 +12411,7 @@ mod tests {
         // the new model's window, not the one that produced `last_input_tokens`.
         let mut session = Session::new();
         session.last_input_tokens = 10_000;
-        let stats = session_stats(&session, "gpt-5-mini");
+        let stats = session_stats(&session, &test_compaction("gpt-5-mini"));
         // gpt-5-mini's 400K window caps input at 272K: the figure compaction compares against.
         assert_eq!(stats["context_usage"]["context_window"], 272_000);
     }
@@ -12371,7 +12456,7 @@ mod tests {
         session.input_tokens = 999_999;
         session.output_tokens = 999_999;
 
-        let stats = session_stats(&session, "claude-opus-4-8");
+        let stats = session_stats(&session, &test_compaction("claude-opus-4-8"));
         assert_eq!(stats["input_tokens"], 150, "got: {stats}");
         assert_eq!(stats["output_tokens"], 30, "got: {stats}");
         assert_eq!(stats["cache_read_tokens"], 5, "got: {stats}");
@@ -12415,7 +12500,7 @@ mod tests {
             "sanity: the running counter itself stayed at zero"
         );
 
-        let stats = session_stats(&reloaded, "claude-opus-4-8");
+        let stats = session_stats(&reloaded, &test_compaction("claude-opus-4-8"));
         assert_eq!(
             stats["input_tokens"], 1_000,
             "must reflect the full persisted history, not the fresh process's zeroed counter: {stats}"

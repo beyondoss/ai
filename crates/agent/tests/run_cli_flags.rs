@@ -156,6 +156,7 @@ fn run_binary_list_models_prints_capability_columns_not_just_bare_ids() {
     // Header row names the columns.
     assert!(stdout.contains("context"), "stdout: {stdout}");
     assert!(stdout.contains("max-out"), "stdout: {stdout}");
+    assert!(stdout.contains("compact-at"), "stdout: {stdout}");
     assert!(stdout.contains("thinking"), "stdout: {stdout}");
     assert!(stdout.contains("vision"), "stdout: {stdout}");
 
@@ -1021,6 +1022,82 @@ fn run_binary_omits_session_affinity_header_for_a_non_fireworks_model() {
         !lower.contains("session_id:"),
         "native (non-Fireworks) gpt-4o must not get the session_id header either: {}",
         bodies[0]
+    );
+}
+
+/// Model calls a `run` against a resumed ~400-token session makes with `args` (and `env`) added: 2
+/// when compaction fires first (the summary, then the answer), 1 when it doesn't.
+fn model_calls_on_a_resumed_session(args: &[&str], env: &[(&str, &str)]) -> usize {
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = {
+        use agent_core::{ContentBlock, Message, Session};
+        use beyond_ai_agent::session_store::{SessionMeta, SessionRepo};
+
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut store = repo.create(SessionMeta::new("/w", "claude-test")).unwrap();
+        let mut seed = Session::new();
+        for _ in 0..2 {
+            seed.user("u".repeat(400));
+            seed.push(Message::assistant(vec![ContentBlock::text(
+                "a".repeat(400),
+            )]));
+        }
+        store.append_new(&seed.messages).unwrap();
+        store.path().to_string_lossy().into_owned()
+    };
+    let (base, bodies) = spawn_model_server(vec![turn_text("SUMMARY"), turn_text("answered")]);
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let output = run_cmd(bin)
+        .args([
+            "run",
+            "continue please",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--session",
+            &session_file,
+            "--compaction-keep-recent-tokens",
+            "1",
+            "--no-session-persistence",
+            "--no-session-memory",
+        ])
+        .args(args)
+        .envs(env.iter().copied())
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+    assert!(
+        output.status.success(),
+        "binary failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    bodies.lock().unwrap().len()
+}
+
+#[test]
+fn run_binary_compact_at_flag_and_env_set_the_trigger() {
+    // `--compact-at` must reach the `Agent`'s trigger, not just parse: a 200-token cap on a model
+    // with a 128K window compacts the resumed session first. No cap, no compaction.
+    assert_eq!(model_calls_on_a_resumed_session(&[], &[]), 1, "no cap");
+    assert_eq!(
+        model_calls_on_a_resumed_session(&["--compact-at", "200"], &[]),
+        2,
+        "--compact-at"
+    );
+    assert_eq!(
+        model_calls_on_a_resumed_session(&[], &[("AI_AGENT_COMPACT_AT", "200")]),
+        2,
+        "AI_AGENT_COMPACT_AT"
+    );
+    // `0` removes the cap rather than firing at zero.
+    assert_eq!(
+        model_calls_on_a_resumed_session(&["--compact-at", "0"], &[]),
+        1,
+        "--compact-at 0"
     );
 }
 

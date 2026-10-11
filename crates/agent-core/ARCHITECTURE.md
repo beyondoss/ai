@@ -200,14 +200,26 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
   discarded payload mutation, instead of unwinding the whole run. None of these hook traits return a
   `Result` a panic could be redirected through instead, so this is the mechanism that actually needs to
   catch the unwind.
-- **Compaction** — when the live prompt strictly exceeds `input_budget − reserve` (landing exactly on
+- **Compaction** — when the live prompt strictly exceeds `input_budget − reserve`, or a lower per-model
+  `compact_at` (below) (landing exactly on
   the threshold still leaves the full reserve intact, so `compaction::should_compact` requires `>`, not
   pi-mismatched `>=`; `input_budget` is `min(context_window, input_limit)` —
   `ModelCaps::input_limit` records a vendor input cap below the window, as OpenAI's GPT-5/GPT-6 API
   enforces: the window less the max output, 272K of 400K and 922K of 1.05M. Triggering off the raw
   window put GPT-5.6's line at ~1.03M, past the 922K the API already rejects, so only overflow recovery
-  ran. `CompactionConfig::for_model` scales the reserve and keep-recent budgets against the input
-  budget; the max-tokens leg of `is_hard_overflow` still measures prompt + output against the whole
+  ran. **A per-model cap can fire it earlier**: `ModelCaps::compact_at` (set in one place,
+  `models::provisional_compact_at`) is a quality or price line, not a hard limit, and the trigger is
+  `CompactionConfig::trigger_tokens` = `min(input_budget − reserve, compact_at)`. The cap _is_ the
+  trigger rather than one more limit the reserve comes off: the reserve is headroom below a limit the
+  vendor rejects past, and a cap already sits far under that, so `compact_at = 200K` compacts at 200K
+  (subtracting the reserve too would put Haiku 5.5's 90K line at 73.6K). The values are
+  **provisional**, from the 2026-10 context-economics research — Opus/Fable 5.x 200K (retrieval
+  drops 128–256K), Sonnet 5.x 128K, GPT-6 and GPT-5.6 240K (under OpenAI's 272K surcharge), Haiku 5.5
+  90K (under its 100K tier), Grok 180K (under the 200K tier), open-weight families 128K, everything
+  else none (today's `window − reserve`) — until the long-context eval (`crates/agent/eval/longctx`)
+  measures our own; `crates/agent`'s `--compact-at` overrides them. `CompactionConfig::for_model`
+  scales the reserve against the input budget and keep-recent against the trigger (half of it, so a
+  compaction lands well under the line that fired it); the max-tokens leg of `is_hard_overflow` still measures prompt + output against the whole
   window; `models::tests::every_catalog_input_limit_bounds_the_input_budget` holds the table to
   `verify/catalog_truth.toml`'s `input_limit` rows) (or the provider rejects an
   overflow), [`compaction`](src/compaction.rs) summarizes the prefix via one model call and splices a

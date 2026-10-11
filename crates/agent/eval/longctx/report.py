@@ -67,7 +67,7 @@ def main(argv: list[str]) -> None:
     cell: dict[tuple[str, str], list[dict]] = defaultdict(list)
     for r in rows:
         cell[(r["model"], r["arm"])].append(r)
-    arm_order = {"100k": 0, "200k": 1, "default": 2}
+    arm_order = {"100k": 0, "200k": 1, "model": 2, "default": 3}
     print("| model | trigger | n | pass (95% CI) | bugs fixed | $/run | turns | compactions | peak ctx | fails w/ compaction | killed |")
     print("|---|---|---|---|---|---|---|---|---|---|---|")
     for (m, a) in sorted(cell, key=lambda k: (k[0], arm_order.get(k[1], 9))):
@@ -91,7 +91,7 @@ def main(argv: list[str]) -> None:
     print("|---|---|---|---|---|---|---|")
     for m in sorted({m for m, _ in cell}):
         base = {(r["task"], r["attempt"]): r for r in cell.get((m, "default"), [])}
-        for a in ("100k", "200k"):
+        for a in sorted({x for mm, x in cell if mm == m and x != "default"}, key=lambda x: arm_order.get(x, 9)):
             arm = {(r["task"], r["attempt"]): r for r in cell.get((m, a), [])}
             keys = sorted(set(base) & set(arm))
             if not keys:
