@@ -399,16 +399,30 @@ to the provider.
 
 Each row adds:
 
-| Field                                                      | From                                                                      |
-| ---------------------------------------------------------- | ------------------------------------------------------------------------- |
-| `wire` (`openai` / `anthropic`)                            | the row; it tells a caller which SDK matches                              |
-| `context_window`, `max_output_tokens`                      | `ModelCard`; `max_output_tokens` is `null` on embeddings                  |
-| `max_output_published`                                     | `ModelCard`; `false` when `max_output_tokens` is the 32,768 placeholder   |
-| `input_modalities` (`text` `image` `file` `audio` `video`) | `ModelCard`                                                               |
-| `output_modalities` (`text` / `embeddings`)                | the row's endpoint                                                        |
-| `capabilities` (`tools` `reasoning` `structured_outputs`)  | `ModelCard`                                                               |
-| `endpoints`                                                | all three generation paths (translation serves each), or `/v1/embeddings` |
-| `pricing` (`input` `output` `cache_read` `cache_write`)    | `ListPrice`, USD per million tokens (`pricing_unit` says so once)         |
+| Field                                                       | From                                                                      |
+| ----------------------------------------------------------- | ------------------------------------------------------------------------- |
+| `wire` (`openai` / `anthropic`)                             | the row; it tells a caller which SDK matches                              |
+| `context_window`, `max_output_tokens`                       | `ModelCard`; `max_output_tokens` is `null` on embeddings                  |
+| `max_output_published`                                      | `ModelCard`; `false` when `max_output_tokens` is the 32,768 placeholder   |
+| `input_modalities` (`text` `image` `file` `audio` `video`)  | `ModelCard`                                                               |
+| `output_modalities` (`text` / `embeddings`)                 | the row's endpoint                                                        |
+| `capabilities` (`tools` `reasoning` `structured_outputs`)   | `ModelCard`                                                               |
+| `endpoints`                                                 | all three generation paths (translation serves each), or `/v1/embeddings` |
+| `pricing` (`input` `output` `cache_read` `cache_write`)     | `ListPrice`, USD per million tokens (`pricing_unit` says so once)         |
+| `data_use`, `data_use_terms` (only where the vendor trains) | `ModelCard::data_use`: `"trains_on_inputs"` and the vendor's terms page   |
+
+**Rows whose vendor trains on what they serve are reached only by name.** Meta's Muse Spark
+Contributor tier (`meta/muse-spark-1.2-contributor`, `meta/muse-spark-1.3-contributor`) is
+discounted "in exchange for permission to use your prompts and completions to train future Meta
+models". The catalog marks such a row `DataUse::TrainsOnInputs` (owner decision, 2026-10-11), and
+`GET /v1/models` lists it with `"data_use": "trains_on_inputs"` and `data_use_terms` (Meta's
+pricing page). It is served only when the request names it: by its catalog id (body `model` or
+`x-beyond-model`), a candidate's spelling of it, or a dated snapshot. Nothing else picks one. The
+walk only reorders or filters the named row's own candidates (`x-beyond-order`, `x-beyond-split`,
+`x-beyond-only`, the session pin, failover), and no other row lists a training endpoint. An
+`ALIASES` entry never resolves to one (`providers::catalog::for_model`). A name that is not a row
+is a 404, never the nearest row. catalog-drift neither aliases a retired name to one nor generates
+its successor without a human. Tested end to end in `tests/catalog_data_use.rs` (CAT-17).
 
 `providers::catalog::ModelCard` states the limits **every** candidate of the row enforces, so a
 request sized from the card is accepted wherever the walk lands: the primary vendor's

@@ -25,8 +25,8 @@ pub mod pricing;
 pub mod rates;
 
 pub use catalog::{
-    Candidate, ListPrice, MAX_CANDIDATES, ModelCard, ModelRoute, endpoint_of_path, for_model,
-    wire_of_path,
+    Candidate, DataUse, ListPrice, MAX_CANDIDATES, ModelCard, ModelRoute, endpoint_of_path,
+    for_model, wire_of_path,
 };
 
 /// Every upstream this codebase can route to, by either path. The gateway's 12 `/{name}/…` routes and

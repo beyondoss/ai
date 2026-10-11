@@ -510,6 +510,23 @@ catalog: Moonshot Kimi K2.6/K2.7 Code, Z.ai GLM 5.1–5.3, Alibaba Qwen. Alibaba
 and qwen3.7-plus at 256K. Those rows' list card is Together's flat rate (the primary), and
 OpenRouter's Alibaba endpoint carries the tier on the cost side.
 
+### Data use
+
+`ModelCard::data_use` says what a row's vendor may do with the prompts and completions it serves.
+`DataUse::Standard` is every vendor's API terms. `DataUse::TrainsOnInputs { terms }` is a model
+whose terms grant the vendor the right to train on them: Meta's Muse Spark Contributor tier
+(`meta/muse-spark-1.2-contributor`, `meta/muse-spark-1.3-contributor`, priced at Meta's
+discounted rate "in exchange for permission to use your prompts and completions to train future
+Meta models"). Such a row is reached only by name:
+
+- `for_model` never resolves an `ALIASES` entry to one.
+- No other row lists one of its candidates, so no walk of another row lands there.
+- catalog-drift neither aliases to one nor generates its successor without a human.
+- `GET /v1/models` labels it `"data_use": "trains_on_inputs"` with `data_use_terms`.
+
+`rows_that_train_on_inputs_are_reached_only_by_name` and
+`the_models_list_labels_rows_that_train_on_inputs` hold it (claim CAT-17). Pricing is unaffected.
+
 ### Known gaps
 
 - **xAI at exactly 200,000 prompt tokens**: the pricing table says "reaches" (≥, which we use).
@@ -589,6 +606,8 @@ than two candidates vanishing from one host at once is a broken listing, reporte
    `REFUSES_*` lists, `FAST_MODE_MODELS`), no measured `input_limit` / `output_limit`, no
    `follows`, and no `[[schema_unenforced]]`, `[[conflict]]`, `[[superseded]]` or
    `[[promo]]` entry.
+8. the predecessor's vendor does not train on what it serves (`ModelCard::data_use`,
+   `DataUse::TrainsOnInputs`): carrying such a row is an owner decision, made row by row.
 
 A successor's edit: a `ModelRoute` in sorted position with the predecessor's wire, candidate order
 and paths, each host's listed id, the predecessor's card limits and capability bits, the vendor
@@ -600,7 +619,8 @@ snapshots its cards and OpenRouter slug read.
 Retirements of a row's candidates are a **retirement** when some, not all, retire, the primary is
 not one of them, and none has a hand-kept rule or a truth-file measurement: they leave
 `candidates` / `responses` and `[[pricing]]`, an unused `[[card]]` goes, and a `[[retired]]` entry
-records each. When every candidate retires and a newer row in the row's line exists, the row is
+records each. When every candidate retires and a newer row in the row's line exists, and that row does not
+train on inputs (an alias is a name the caller did not mean for it), the row is
 removed and `(name, successor)` joins `ALIASES`, so a request for the old name is served and billed
 as the successor. Anything else (a retiring primary, a whole row with no successor) is needs-human.
 

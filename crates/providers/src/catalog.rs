@@ -181,6 +181,36 @@ pub struct ModelCard {
     pub input: u8,
     /// Capability bits: [`TOOLS`], [`REASONING`], [`STRUCTURED_OUTPUTS`].
     pub features: u8,
+    /// What the row's vendor may do with a request's prompts and completions. See [`DataUse`].
+    pub data_use: DataUse,
+}
+
+/// What a row's vendor may do with the prompts and completions it serves.
+///
+/// A row whose terms let the vendor train on them ([`DataUse::TrainsOnInputs`]) is served only to
+/// a caller who names it: by its catalog name, a candidate's spelling of it, or a dated snapshot.
+/// Nothing that picks a row the caller did not name may reach one. [`for_model`] never resolves an
+/// [`ALIASES`] entry to one, no other row lists one of its candidates (so no `x-beyond-order`,
+/// `x-beyond-split` or `x-beyond-only` walk of another row can land there), and catalog-drift
+/// neither aliases a retired name to one nor generates its successor without a human. `GET
+/// /v1/models` labels it (`"data_use": "trains_on_inputs"`, with the terms page).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataUse {
+    /// The vendor's API terms: no training on API traffic is granted by using this row.
+    Standard,
+    /// The vendor's terms for this model grant it the right to train on prompts and completions
+    /// (Meta's Muse Spark Contributor tier). `terms` is the page that says so.
+    TrainsOnInputs {
+        /// The vendor's page granting it.
+        terms: &'static str,
+    },
+}
+
+impl DataUse {
+    /// Whether the vendor may train on what the row serves.
+    pub const fn trains_on_inputs(self) -> bool {
+        matches!(self, Self::TrainsOnInputs { .. })
+    }
 }
 
 impl ModelCard {
@@ -247,8 +277,21 @@ const fn card(
         max_output_published: true,
         input,
         features,
+        data_use: DataUse::Standard,
     }
 }
+
+/// `card`, for a model whose vendor may train on what it serves (see [`DataUse`]).
+const fn trains_on_inputs(card: ModelCard, terms: &'static str) -> ModelCard {
+    ModelCard {
+        data_use: DataUse::TrainsOnInputs { terms },
+        ..card
+    }
+}
+
+/// Meta's terms for the Muse Spark Contributor tier: "Heavily discounted token pricing in exchange
+/// for permission to use your prompts and completions to train future Meta models."
+const META_CONTRIBUTOR_TERMS: &str = "https://llama.developer.meta.com/docs/pricing-rate-limits";
 
 /// A card whose vendor publishes no max output: it lists [`UNPUBLISHED_MAX_OUTPUT`], unenforced.
 const fn card_unpublished_output(
@@ -1960,7 +2003,8 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
     },
     // Meta's Muse Spark Contributor tier: "heavily discounted token pricing in exchange for
     // permission to use your prompts and completions to train future Meta models" (Meta's pricing
-    // page), so a request on these rows is training data for Meta. We hold no Meta key, and
+    // page), so a request on these rows is training data for Meta: `DataUse::TrainsOnInputs`, served
+    // only to a caller who names the row (owner decision 2026-10-11). We hold no Meta key, and
     // OpenRouter's only host is Meta on OpenRouter's own key (D156), so they are OpenRouter-only,
     // at Meta's own rate, which OpenRouter's card matches. OpenRouter serves them only to an
     // account that has confirmed 18+ age (403 otherwise).
@@ -1970,13 +2014,16 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &openrouter_only("meta/muse-spark-1.2-contributor"),
         responses: &[],
         price: price("0.1", "0.2", "0.002", "0.1"), // cache_write unpublished; equals input
-        card: card_unpublished_output(
-            "Muse Spark 1.2 Contributor",
-            "meta",
-            1787336476,
-            1_048_576,
-            IN_TEXT | IN_IMAGE | IN_FILE | IN_VIDEO,
-            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        card: trains_on_inputs(
+            card_unpublished_output(
+                "Muse Spark 1.2 Contributor",
+                "meta",
+                1787336476,
+                1_048_576,
+                IN_TEXT | IN_IMAGE | IN_FILE | IN_VIDEO,
+                TOOLS | REASONING | STRUCTURED_OUTPUTS,
+            ),
+            META_CONTRIBUTOR_TERMS,
         ),
     },
     ModelRoute {
@@ -1985,13 +2032,16 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &openrouter_only("meta/muse-spark-1.3-contributor"),
         responses: &[],
         price: price("0.1", "0.2", "0.002", "0.1"), // cache_write unpublished; equals input
-        card: card_unpublished_output(
-            "Muse Spark 1.3 Contributor",
-            "meta",
-            1788381519,
-            1_048_576,
-            IN_TEXT | IN_IMAGE | IN_FILE | IN_VIDEO,
-            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        card: trains_on_inputs(
+            card_unpublished_output(
+                "Muse Spark 1.3 Contributor",
+                "meta",
+                1788381519,
+                1_048_576,
+                IN_TEXT | IN_IMAGE | IN_FILE | IN_VIDEO,
+                TOOLS | REASONING | STRUCTURED_OUTPUTS,
+            ),
+            META_CONTRIBUTOR_TERMS,
         ),
     },
     ModelRoute {
@@ -2456,8 +2506,11 @@ pub fn for_model(name: &str) -> Option<&'static ModelRoute> {
                 })
             })
             .or_else(|| {
+                // An alias names a retired row, not this one: never a row that trains on inputs.
                 let (_, to) = ALIASES.iter().find(|(a, _)| a.eq_ignore_ascii_case(name))?;
-                MODEL_ROUTES.iter().find(|r| r.model == *to)
+                MODEL_ROUTES
+                    .iter()
+                    .find(|r| r.model == *to && !r.card.data_use.trains_on_inputs())
             }),
     }
 }
@@ -2532,6 +2585,12 @@ pub fn models_list_json(keep: impl Fn(&ModelRoute) -> bool) -> String {
             } else {
                 ",\"endpoints\":[\"/v1/chat/completions\",\"/v1/messages\",\"/v1/responses\"]"
             });
+            if let DataUse::TrainsOnInputs { terms } = c.data_use {
+                let _ = write!(
+                    out,
+                    ",\"data_use\":\"trains_on_inputs\",\"data_use_terms\":\"{terms}\""
+                );
+            }
             let p = r.price;
             let _ = write!(
                 out,
@@ -2574,6 +2633,78 @@ mod tests {
                 "{m} has no row of its own"
             );
         }
+    }
+
+    /// The rows whose vendor may train on what they serve are Meta's two Muse Spark Contributor
+    /// rows, each with its terms page, and nothing that picks a row the caller did not name reaches
+    /// one: no alias resolves to it, and no other row lists one of its candidates (so no order,
+    /// split or only walk of another row lands there). Named directly, each resolves.
+    /// claim: CAT-17
+    #[test]
+    fn rows_that_train_on_inputs_are_reached_only_by_name() {
+        let training: Vec<&ModelRoute> = MODEL_ROUTES
+            .iter()
+            .filter(|r| r.card.data_use.trains_on_inputs())
+            .collect();
+        assert_eq!(
+            training.iter().map(|r| r.model).collect::<Vec<_>>(),
+            [
+                "meta/muse-spark-1.2-contributor",
+                "meta/muse-spark-1.3-contributor"
+            ]
+        );
+        for r in &training {
+            assert_eq!(
+                r.card.data_use,
+                DataUse::TrainsOnInputs {
+                    terms: META_CONTRIBUTOR_TERMS
+                }
+            );
+            assert!(META_CONTRIBUTOR_TERMS.starts_with("https://"));
+            assert_eq!(for_model(r.model).map(|x| x.model), Some(r.model));
+            for c in r.candidates.iter().chain(r.responses) {
+                assert_eq!(for_model(c.upstream_model).map(|x| x.model), Some(r.model));
+                for other in MODEL_ROUTES.iter().filter(|o| o.model != r.model) {
+                    assert!(
+                        !other.candidates.iter().chain(other.responses).any(|o| {
+                            o.provider == c.provider && o.upstream_model == c.upstream_model
+                        }),
+                        "{} lists {}'s endpoint {}",
+                        other.model,
+                        r.model,
+                        c.upstream_model
+                    );
+                }
+            }
+        }
+        for (from, to) in ALIASES {
+            assert!(
+                for_model(to).is_some_and(|r| !r.card.data_use.trains_on_inputs()),
+                "alias {from} -> {to} reaches a row that trains on inputs"
+            );
+        }
+    }
+
+    /// `GET /v1/models` labels a row that trains on inputs, and only such a row.
+    /// claim: CAT-17
+    #[test]
+    fn the_models_list_labels_rows_that_train_on_inputs() {
+        let v: serde_json::Value = serde_json::from_str(&models_list_json(|_| true)).unwrap();
+        let data = v["data"].as_array().unwrap();
+        for m in data {
+            let row = for_model(m["id"].as_str().unwrap()).unwrap();
+            if row.card.data_use.trains_on_inputs() {
+                assert_eq!(m["data_use"], "trains_on_inputs", "{}", row.model);
+                assert_eq!(m["data_use_terms"], META_CONTRIBUTOR_TERMS, "{}", row.model);
+            } else {
+                assert!(m.get("data_use").is_none(), "{}", row.model);
+                assert!(m.get("data_use_terms").is_none(), "{}", row.model);
+            }
+        }
+        assert_eq!(
+            data.iter().filter(|m| m.get("data_use").is_some()).count(),
+            2
+        );
     }
 
     /// Product floor: managed `/v1` should list a full current generation, not a handful of
