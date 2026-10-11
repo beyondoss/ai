@@ -6319,7 +6319,7 @@ impl ProxyHttp for AiProxy {
                             // A candidate whose thinking breaks tools gets them with thinking off
                             // (D171, D172): every candidate of its row refuses or garbles the
                             // combination, so steering around it would not help.
-                            changed |= translate::thinking_off_for_tools(&mut buf, tool_thinking);
+                            changed |= translate::fit_tools_to_thinking(&mut buf, tool_thinking);
                         }
                         // A candidate that answers only streams, for a client that did not ask
                         // for one: ask it for the stream and assemble the answer into the

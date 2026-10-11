@@ -460,6 +460,12 @@ pub enum ToolThinking {
     /// offering tools goes with thinking off unless the client asked for reasoning itself
     /// (`reasoning_effort` or `reasoning`), which it then gets as asked.
     OffWithTools,
+    /// Always thinks (OpenRouter: "Reasoning is mandatory for this endpoint and cannot be
+    /// disabled") and refuses a forced `tool_choice` while thinking, so a forced request can never
+    /// be served as sent (D269). It goes as `auto` with a closing system message naming what must
+    /// be called, as a Claude model that refuses forced tool use gets it: a call is then very
+    /// likely, not guaranteed.
+    ForcedAsInstruction,
 }
 
 /// Candidates whose thinking and tools conflict. Measured 2026-10-01: forced `tool_choice` is a 400
@@ -468,6 +474,10 @@ pub enum ToolThinking {
 /// answered a tool call as text 5 of 32 times at Together and 4 of 32 at OpenRouter (so skipping
 /// either candidate would not help), 0 of 48 with thinking off; Qwen3.8 Flash, 3.7 Max and 3.6 Plus
 /// 0 of 16 each.
+/// Measured 2026-10-11 at OpenRouter (Alibaba): Qwen3.8 Omni Flash refuses `required` while
+/// thinking and calls the tool with thinking off; Qwen3.8 Max Prime refuses `required` and a named
+/// function alike, and cannot think off (400 "Reasoning is mandatory"), and with `auto` and a
+/// closing system message to call the tool it called it 4 of 4 times.
 const TOOL_THINKING: &[(ProviderId, &str, ToolThinking)] = &[
     (
         ProviderId::Together,
@@ -487,6 +497,16 @@ const TOOL_THINKING: &[(ProviderId, &str, ToolThinking)] = &[
     (
         ProviderId::OpenRouter,
         "qwen/qwen3.8-flash",
+        ToolThinking::OffWhenForced,
+    ),
+    (
+        ProviderId::OpenRouter,
+        "qwen/qwen3.8-max-prime",
+        ToolThinking::ForcedAsInstruction,
+    ),
+    (
+        ProviderId::OpenRouter,
+        "qwen/qwen3.8-omni-flash",
         ToolThinking::OffWhenForced,
     ),
 ];
@@ -2210,6 +2230,43 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
             1_000_000,
             131_072,
             IN_TEXT | IN_IMAGE | IN_VIDEO,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
+    },
+    // Alibaba-only on OpenRouter: Together serves neither, and we hold no Alibaba key, so each
+    // rides OpenRouter's shared Alibaba pool (D156). Max Prime is Qwen3.8 Max's faster SKU; Alibaba
+    // prices it only for China (Beijing), so the list is OpenRouter's card. Omni Flash's list is
+    // Alibaba International's own rate, which OpenRouter's card matches. OpenRouter caps the
+    // prompt at 983,616 tokens on both.
+    ModelRoute {
+        model: "qwen/qwen3.8-max-prime",
+        wire: WireFormat::OpenAi,
+        candidates: &openrouter_only("qwen/qwen3.8-max-prime"),
+        responses: &[],
+        price: price("4", "12", "0.5", "4"), // cache_write unpublished; equals input
+        card: card(
+            "Qwen3.8 Max Prime",
+            "qwen",
+            1790191228,
+            983_616,
+            131_072,
+            IN_TEXT | IN_IMAGE | IN_VIDEO,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
+    },
+    ModelRoute {
+        model: "qwen/qwen3.8-omni-flash",
+        wire: WireFormat::OpenAi,
+        candidates: &openrouter_only("qwen/qwen3.8-omni-flash"),
+        responses: &[],
+        price: price("0.15", "0.47", "0.016", "0.15"), // cache_write unpublished; equals input
+        card: card(
+            "Qwen3.8 Omni Flash",
+            "qwen",
+            1789959954,
+            983_616,
+            131_072,
+            IN_TEXT | IN_IMAGE | IN_AUDIO | IN_VIDEO,
             TOOLS | REASONING | STRUCTURED_OUTPUTS,
         ),
     },
@@ -4352,23 +4409,26 @@ mod tests {
         );
     }
 
-    /// Qwen3.7 Plus (thinking garbles tool calls, refuses a forced one) and Qwen3.8 Flash (refuses
-    /// a forced one) on both their candidates, and no other candidate in the catalog.
+    /// Qwen3.7 Plus (thinking garbles tool calls, refuses a forced one), Qwen3.8 Flash and Omni
+    /// Flash (refuse a forced one) and Qwen3.8 Max Prime (refuses a forced one and always thinks)
+    /// on every candidate, and no other candidate in the catalog.
     /// claim: T1
-    /// defect: D171, D172
+    /// defect: D171, D172, D269
     #[test]
     fn qwen_candidates_whose_thinking_breaks_tools() {
-        use ToolThinking::{Free, OffWhenForced, OffWithTools};
-        for (model, want) in [
-            ("qwen/qwen3.7-plus", OffWithTools),
-            ("qwen/qwen3.8-flash", OffWhenForced),
-            ("qwen/qwen3.6-plus", Free),
-            ("qwen/qwen3.7-max", Free),
+        use ToolThinking::{ForcedAsInstruction, Free, OffWhenForced, OffWithTools};
+        for (model, want, n) in [
+            ("qwen/qwen3.7-plus", OffWithTools, 2),
+            ("qwen/qwen3.8-flash", OffWhenForced, 2),
+            ("qwen/qwen3.8-omni-flash", OffWhenForced, 1),
+            ("qwen/qwen3.8-max-prime", ForcedAsInstruction, 1),
+            ("qwen/qwen3.6-plus", Free, 2),
+            ("qwen/qwen3.7-max", Free, 2),
         ] {
             let row = for_model(model);
             assert!(row.is_some(), "{model}");
             if let Some(r) = row {
-                assert_eq!(r.candidates.len(), 2, "{model}");
+                assert_eq!(r.candidates.len(), n, "{model}");
                 for c in r.candidates {
                     assert_eq!(tool_thinking(c), want, "{model} {:?}", c.provider);
                 }
@@ -4380,7 +4440,7 @@ mod tests {
             .flat_map(|r| r.candidates)
             .filter(|c| tool_thinking(c) != Free)
             .count();
-        assert_eq!(marked, 4);
+        assert_eq!(marked, 6);
     }
 
     /// `developer` is read as OpenAI defines it only by OpenAI and OpenRouter (which maps it per

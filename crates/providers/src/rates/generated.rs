@@ -5346,6 +5346,26 @@ static OR_QWEN_QWEN3_8_FLASH: &[OrEndpoint] = &[
     },
 ];
 
+/// `qwen/qwen3.8-max-prime` (`GET /api/v1/models/qwen/qwen3.8-max-prime/endpoints`).
+static OR_QWEN_QWEN3_8_MAX_PRIME: &[OrEndpoint] = &[
+    OrEndpoint {
+        host: "Alibaba",
+        tag: "alibaba",
+        class: Class::Standard,
+        card: Card::new(tr("4", "12", "0.5", "4", None)),
+    },
+];
+
+/// `qwen/qwen3.8-omni-flash` (`GET /api/v1/models/qwen/qwen3.8-omni-flash/endpoints`).
+static OR_QWEN_QWEN3_8_OMNI_FLASH: &[OrEndpoint] = &[
+    OrEndpoint {
+        host: "Alibaba",
+        tag: "alibaba",
+        class: Class::Standard,
+        card: Card::new(tr("0.15", "0.47", "0.016", "0.15", None)),
+    },
+];
+
 /// `thinkingmachines/inkling` (`GET /api/v1/models/thinkingmachines/inkling/endpoints`).
 static OR_THINKINGMACHINES_INKLING: &[OrEndpoint] = &[
     OrEndpoint {
@@ -7624,6 +7644,26 @@ pub static ROW_RATES: &[RowRates] = &[
             CandidateCost {
                 provider: ProviderId::OpenRouter,
                 card: CostCard::OpenRouter(OR_QWEN_QWEN3_8_FLASH),
+            },
+        ],
+    },
+    RowRates {
+        model: "qwen/qwen3.8-max-prime",
+        list: Card::new(tr("4", "12", "0.5", "4", None)),
+        cost: &[
+            CandidateCost {
+                provider: ProviderId::OpenRouter,
+                card: CostCard::OpenRouter(OR_QWEN_QWEN3_8_MAX_PRIME),
+            },
+        ],
+    },
+    RowRates {
+        model: "qwen/qwen3.8-omni-flash",
+        list: Card::new(tr("0.15", "0.47", "0.016", "0.15", None)),
+        cost: &[
+            CandidateCost {
+                provider: ProviderId::OpenRouter,
+                card: CostCard::OpenRouter(OR_QWEN_QWEN3_8_OMNI_FLASH),
             },
         ],
     },

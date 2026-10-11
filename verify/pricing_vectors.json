@@ -1,6 +1,6 @@
 {
   "about": "Golden vectors for the pricing contract (crates/providers/ARCHITECTURE.md, 'Pricing contract'). Each row is an ai.usage row; expect is what price(row) must return. An implementation must reproduce every one exactly. Absent row fields take their defaults: usage_wire anthropic, counts 0, strings null, booleans false, server_tools {}.",
-  "rate_version": "2026-10-11.0d1d710a6cafed93",
+  "rate_version": "2026-10-11.f1aa042f51ab136d",
   "vectors": [
     {
       "name": "anthropic_basic",
