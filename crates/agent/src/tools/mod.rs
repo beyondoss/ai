@@ -577,6 +577,9 @@ pub struct ToolConfig<'a> {
     /// same reason: the registry is rebuilt on every `set_model`, and a backend that reconnected per
     /// rebuild would be a bug rather than a cost.
     pub fs_backend: Option<Arc<dyn fs::FsBackend>>,
+    /// Discovered skills, so `read` resolves the `skill:<name>` paths the system prompt's listing
+    /// names them by ([`crate::skills::SKILL_SCHEME`]). Empty: the scheme names nothing.
+    pub skills: &'a [crate::skills::Skill],
 }
 
 impl<'a> ToolConfig<'a> {
@@ -631,7 +634,9 @@ pub fn default_registry_with_config(cfg: &ToolConfig<'_>) -> ToolRegistry {
     let mut reg = ToolRegistry::new();
     // One backend, shared by all six filesystem tools — so they cannot disagree about which
     // filesystem they are acting on, and a `read` can always see what a `write` just wrote.
-    let mut read_tool = read::Read::new(root).with_image_auto_resize(cfg.image_auto_resize);
+    let mut read_tool = read::Read::new(root)
+        .with_image_auto_resize(cfg.image_auto_resize)
+        .with_skills(cfg.skills);
     let mut write_tool = write::Write::new(root);
     let mut edit_tool = edit::Edit::new(root);
     let mut ls_tool = ls::Ls::new(root);
@@ -701,7 +706,9 @@ pub fn default_registry_with_config(cfg: &ToolConfig<'_>) -> ToolRegistry {
     if cfg.code_mode {
         let nested =
             code_mode::select_deferred_tools(cfg.mcp_tools, cfg.nested_exclude, cfg.nested_deny);
-        reg.register(Arc::new(code_mode::Execute::new(nested)));
+        if let Some(execute) = code_mode::execute_tool(nested) {
+            reg.register(execute);
+        }
     } else {
         for tool in cfg.mcp_tools {
             reg.register(tool.clone());
@@ -1422,7 +1429,8 @@ mod tests {
             reg.get("mcp__filesystem__read_file").is_none(),
             "MCP tools must not be advertised when Code Mode is on"
         );
-        // Nested exclude drops the tool from execute's catalog too — registry still has execute.
+        // Nested exclude drops the tool from execute's catalog too — here the only one, so there is
+        // nothing left for execute to reach and it is not advertised.
         let reg = default_registry_with_config(&ToolConfig {
             mcp_tools: &mcp_tools,
             code_mode: true,
@@ -1430,8 +1438,27 @@ mod tests {
             nested_deny: &deny,
             ..ToolConfig::new()
         });
-        assert!(reg.get("execute").is_some());
+        assert!(reg.get("execute").is_none());
         assert!(reg.get("mcp__filesystem__read_file").is_none());
+    }
+
+    #[cfg(feature = "code-mode")]
+    #[test]
+    fn code_mode_with_an_empty_deferred_catalog_registers_no_execute() {
+        // An `execute` whose JS context reaches no tools costs ~270 schema tokens per request for
+        // nothing: no MCP servers means the registry is exactly the plain default.
+        let deny: Vec<String> = Vec::new();
+        let mut reg = default_registry_with_config(&ToolConfig {
+            code_mode: true,
+            nested_deny: &deny,
+            ..ToolConfig::new()
+        });
+        assert!(reg.get("execute").is_none());
+        assert_eq!(reg.len(), default_registry().len());
+        // Nor does the post-`--tools` restore put one back.
+        apply_filter(&mut reg, Some(&["read".to_string()]), None, false);
+        code_mode::restore_execute(&mut reg, Vec::new(), None, false);
+        assert!(reg.get("execute").is_none());
     }
 
     #[cfg(feature = "code-mode")]
@@ -1449,12 +1476,7 @@ mod tests {
         apply_filter(&mut reg, Some(&["read".to_string()]), None, false);
         assert!(reg.get("execute").is_none());
         let nested = code_mode::select_deferred_tools(&mcp_tools, &[], &deny);
-        code_mode::restore_execute(
-            &mut reg,
-            Arc::new(code_mode::Execute::new(nested)),
-            None,
-            false,
-        );
+        code_mode::restore_execute(&mut reg, nested, None, false);
         assert!(reg.get("read").is_some());
         assert!(reg.get("execute").is_some());
         assert!(reg.get("mcp__filesystem__read_file").is_none());

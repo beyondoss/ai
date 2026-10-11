@@ -73,6 +73,9 @@ pub struct Read {
     root: std::path::PathBuf,
     /// Where the bytes actually come from. Defaults to the host filesystem.
     backend: std::sync::Arc<dyn FsBackend>,
+    /// Discovered skills by name → `SKILL.md` path, so a `skill:<name>[/<file>]` path resolves
+    /// (see [`crate::skills::SKILL_SCHEME`]). Empty: the scheme names nothing.
+    skills: std::sync::Arc<[(String, std::path::PathBuf)]>,
 }
 
 impl Default for Read {
@@ -81,6 +84,7 @@ impl Default for Read {
             image_auto_resize: true,
             root: std::path::PathBuf::new(),
             backend: std::sync::Arc::new(LocalFs::new()),
+            skills: std::sync::Arc::new([]),
         }
     }
 }
@@ -104,6 +108,55 @@ impl Read {
     pub fn with_backend(mut self, backend: std::sync::Arc<dyn FsBackend>) -> Self {
         self.backend = backend;
         self
+    }
+
+    /// Resolve `skill:<name>[/<file>]` against these skills — the short name the system prompt's
+    /// skill listing gives instead of an absolute manifest path.
+    pub fn with_skills(mut self, skills: &[crate::skills::Skill]) -> Self {
+        self.skills = skills
+            .iter()
+            .map(|s| (s.name.clone(), s.path.clone()))
+            .collect();
+        self
+    }
+
+    /// `rest` (what follows `skill:`) → the file to read, plus the skill's directory when `rest`
+    /// names the skill itself. A name may in principle contain `/`, so the whole of `rest` is tried as
+    /// a name before splitting off a file path at the first `/`.
+    fn resolve_skill(&self, rest: &str) -> Result<(String, Option<String>), ToolError> {
+        if rest.starts_with("//") {
+            return Err(ToolError::InvalidInput(format!(
+                "`skill:{rest}` is an MCP-served skill's URI: load it with the skill's MCP tool, \
+                 passing the URI as `uri`. `read` loads this machine's skills as `skill:<name>`."
+            )));
+        }
+        let find = |name: &str| self.skills.iter().find(|(n, _)| n == name);
+        let rest = rest.trim_end_matches('/');
+        let (manifest, file) = match find(rest) {
+            Some((_, m)) => (m, None),
+            None => match rest.split_once('/').and_then(|(n, f)| Some((find(n)?, f))) {
+                Some(((_, m), f)) => (m, Some(f)),
+                None => {
+                    let known: Vec<&str> = self.skills.iter().map(|(n, _)| n.as_str()).collect();
+                    return Err(ToolError::InvalidInput(format!(
+                        "no skill named `{rest}` (known: {})",
+                        if known.is_empty() {
+                            "none".to_string()
+                        } else {
+                            known.join(", ")
+                        }
+                    )));
+                }
+            },
+        };
+        let dir = manifest.parent().unwrap_or(std::path::Path::new(""));
+        Ok(match file {
+            None => (
+                manifest.display().to_string(),
+                Some(dir.display().to_string()),
+            ),
+            Some(f) => (dir.join(f).display().to_string(), None),
+        })
     }
 }
 
@@ -260,6 +313,22 @@ impl Tool for Read {
             .get("path")
             .and_then(Value::as_str)
             .ok_or_else(|| ToolError::InvalidInput("missing `path`".into()))?;
+        let Some(rest) = path.strip_prefix(crate::skills::SKILL_SCHEME) else {
+            return self.read_path(path, &input).await;
+        };
+        let (file, dir) = self.resolve_skill(rest)?;
+        let mut out = self.read_path(&file, &input).await?;
+        // The model needs the real directory for `bash` (a skill's scripts) and for any path the
+        // skill names relative to itself.
+        if let Some(dir) = dir {
+            out.text = format!("[skill directory: {dir}]\n{}", out.text);
+        }
+        Ok(out)
+    }
+}
+
+impl Read {
+    async fn read_path(&self, path: &str, input: &Value) -> Result<ToolOutput, ToolError> {
         let backend = self.backend.as_ref();
         let (path, meta) = resolve_read_path(
             backend,
@@ -1056,6 +1125,71 @@ mod tests {
         let mut f = tempfile::NamedTempFile::new().unwrap();
         f.write_all(contents.as_bytes()).unwrap();
         f
+    }
+
+    fn skill_at(dir: &std::path::Path, name: &str) -> crate::skills::Skill {
+        let skill_dir = dir.join("synced").join("0f-uuid").join(name);
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: x\n---\nDo the thing.\n",
+        )
+        .unwrap();
+        std::fs::write(skill_dir.join("reference.md"), "More detail.\n").unwrap();
+        crate::skills::Skill {
+            name: name.into(),
+            description: "d".into(),
+            path: skill_dir.join("SKILL.md"),
+            disable_model_invocation: false,
+            scope: "user",
+            body: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn skill_scheme_reads_the_manifest_and_names_its_directory() {
+        // The system prompt lists skills as `skill:<name>`, not by absolute path; `read` maps the
+        // name back to the discovered `SKILL.md` and tells the model where the skill lives.
+        let tmp = tempfile::tempdir().unwrap();
+        let skill = skill_at(tmp.path(), "pdf");
+        let read = Read::default().with_skills(std::slice::from_ref(&skill));
+        let out = read.run(json!({ "path": "skill:pdf" })).await.unwrap();
+        let dir = skill.path.parent().unwrap().display().to_string();
+        assert!(
+            out.text.starts_with(&format!("[skill directory: {dir}]\n")),
+            "{}",
+            out.text
+        );
+        assert!(out.text.contains("Do the thing."), "{}", out.text);
+        // A file the skill references, relative to its directory.
+        let out = read
+            .run(json!({ "path": "skill:pdf/reference.md" }))
+            .await
+            .unwrap();
+        assert!(out.text.contains("More detail."), "{}", out.text);
+        assert!(!out.text.contains("[skill directory"));
+    }
+
+    #[tokio::test]
+    async fn skill_scheme_with_an_unknown_name_says_which_skills_exist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let read = Read::default().with_skills(&[skill_at(tmp.path(), "pdf")]);
+        let err = read
+            .run(json!({ "path": "skill:nope" }))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("no skill named `nope`") && err.contains("pdf"),
+            "{err}"
+        );
+        // An MCP skill's `skill://` URI loads through its server's tool, not `read`.
+        let err = read
+            .run(json!({ "path": "skill://pdf/SKILL.md" }))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("MCP tool"), "{err}");
     }
 
     #[tokio::test]

@@ -133,10 +133,15 @@ pub fn merge_provenance(
 /// Tunables for automatic compaction.
 #[derive(Debug, Clone, Copy)]
 pub struct CompactionConfig {
-    /// The model's context window, in tokens. The trigger compares the live prompt size against it.
+    /// The model's context window, in tokens: prompt plus output. The trigger compares the live
+    /// prompt size against [`Self::input_budget`], which this bounds.
     pub context_window: u32,
-    /// Headroom left below the window: compaction fires once the prompt crosses
-    /// `context_window - reserve_tokens`, leaving room for the next turn's output + slack.
+    /// The most input tokens one request may carry, when the model caps input below the window
+    /// ([`crate::models::ModelCaps::input_limit`]: OpenAI's GPT-5 family, 922K of a 1.05M window).
+    /// `None`: the window alone bounds input.
+    pub input_limit: Option<u32>,
+    /// Headroom left below the input budget: compaction fires once the prompt crosses
+    /// `input_budget() - reserve_tokens`, leaving room for the next turn's growth + slack.
     pub reserve_tokens: u32,
     /// Roughly how many tokens of recent conversation to keep verbatim after a compaction.
     pub keep_recent_tokens: u32,
@@ -167,22 +172,41 @@ impl CompactionConfig {
     /// absolute reserve and half the remaining budget already exceeds `keep_recent_tokens`. Only the
     /// genuinely small windows — the ones that were broken — see different numbers.
     pub fn for_window(context_window: u32) -> Self {
+        Self::for_limits(context_window, None)
+    }
+
+    /// [`Self::for_window`] for a model's capabilities: the window plus its input cap, so the trigger
+    /// lands below the point the vendor rejects input (OpenAI's GPT-5 family caps input at the window
+    /// less the max output — trigger at `window - reserve` there never fires before the 400 does).
+    pub fn for_model(caps: &crate::models::ModelCaps) -> Self {
+        Self::for_limits(caps.context_window, caps.input_limit)
+    }
+
+    fn for_limits(context_window: u32, input_limit: Option<u32>) -> Self {
         let d = Self::default();
-        // Never hand the reserve more than a quarter of the window: at the absolute 16_384 a 32k model
+        let input_budget = input_limit.map_or(context_window, |l| l.min(context_window));
+        // Never hand the reserve more than a quarter of the budget: at the absolute 16_384 a 32k model
         // would surrender half its context to headroom before the first token is sent.
-        let reserve_tokens = d.reserve_tokens.min(context_window / 4);
+        let reserve_tokens = d.reserve_tokens.min(input_budget / 4);
         // What's actually usable once the reserve is set aside — and the exact quantity the trigger
         // compares against, so `keep_recent_tokens` must stay a fraction of *this*, not of the window.
-        let trigger_budget = context_window.saturating_sub(reserve_tokens);
+        let trigger_budget = input_budget.saturating_sub(reserve_tokens);
         // Half the trigger budget: a compaction lands the context at roughly 50% of the threshold, so
         // there's real room to work before the next one fires rather than re-triggering immediately.
         let keep_recent_tokens = d.keep_recent_tokens.min(trigger_budget / 2);
         Self {
             context_window,
+            input_limit,
             reserve_tokens,
             keep_recent_tokens,
             ..d
         }
+    }
+
+    /// The most prompt tokens a request can carry: `min(context_window, input_limit)`.
+    pub fn input_budget(&self) -> u32 {
+        self.input_limit
+            .map_or(self.context_window, |l| l.min(self.context_window))
     }
 }
 
@@ -195,6 +219,7 @@ impl Default for CompactionConfig {
         // verbatim context per round than the reference, for no documented reason.
         Self {
             context_window: 200_000,
+            input_limit: None,
             reserve_tokens: 16_384,
             keep_recent_tokens: 20_000,
             summary_max_tokens: 4_096,
@@ -402,27 +427,28 @@ pub fn trailing_tokens(session: &Session) -> u32 {
 /// the real, current context size — not the cumulative totals.
 ///
 /// Strict `>`, matching pi's own `shouldCompact` (`compaction.ts`): landing exactly on
-/// `context_window - reserve_tokens` still leaves the full reserve intact, so it isn't yet a reason to
-/// fire — only actually exceeding it is.
+/// `input_budget() - reserve_tokens` still leaves the full reserve intact, so it isn't yet a reason
+/// to fire — only actually exceeding it is.
 pub fn should_compact(session: &Session, cfg: &CompactionConfig) -> bool {
     session.last_input_tokens > 0
         && session
             .last_input_tokens
             .saturating_add(trailing_tokens(session))
-            > cfg.context_window.saturating_sub(cfg.reserve_tokens)
+            > cfg.input_budget().saturating_sub(cfg.reserve_tokens)
 }
 
 /// A hard overflow signal, independent of [`should_compact`]'s (possibly-disabled) soft threshold: the
 /// live prompt has already reached — or a turn's own shape strongly implies it's about to reach — the
-/// model's *raw* `context_window`, not just the reserve-adjusted budget `should_compact` guards.
+/// model's raw input budget, not just the reserve-adjusted budget `should_compact` guards.
 /// Disabling [`CompactionConfig::enabled`] is a preference about when to compact *proactively*, with
 /// headroom to spare; it isn't license to keep sending requests that are already guaranteed to overflow
 /// on the very next turn, so callers check this regardless of that flag.
 ///
 /// Two ways this fires — both driven by the provider's own reported usage, not by parsing an error:
-/// - The live prompt (last turn's usage + anything appended since) already meets or exceeds the raw
-///   window on its own — a silent overflow no error was ever raised for (the request that pushed it
-///   there still succeeded).
+/// - The live prompt (last turn's usage + anything appended since) already meets or exceeds the
+///   input budget ([`CompactionConfig::input_budget`]: the raw window, or a lower input cap) on its
+///   own — a silent overflow no error was ever raised for (the request that pushed it there still
+///   succeeded).
 /// - `stop_reason` is [`StopReason::MaxTokens`] *and* the live prompt plus the full output budget the
 ///   next turn would request together would meet or exceed the window — a turn getting cut off by the
 ///   output-token ceiling is normally unremarkable (a model that simply wanted to keep writing), but
@@ -437,7 +463,7 @@ pub fn is_hard_overflow(
     let live_prompt = session
         .last_input_tokens
         .saturating_add(trailing_tokens(session));
-    live_prompt >= cfg.context_window
+    live_prompt >= cfg.input_budget()
         || (stop_reason == StopReason::MaxTokens
             && live_prompt.saturating_add(next_max_tokens) >= cfg.context_window)
 }
@@ -1090,6 +1116,70 @@ mod tests {
             );
             assert_eq!(cfg.context_window, window);
         }
+    }
+
+    #[test]
+    fn gpt_5_6_triggers_at_its_input_limit_less_the_reserve_not_its_window() {
+        // GPT-5.6: a 1.05M window, but OpenAI rejects input past 922K. The old trigger
+        // (`window - reserve`, ~1.03M) sat past that cap, so proactive compaction never fired.
+        let cfg = CompactionConfig::for_model(&crate::models::capabilities("gpt-5.6-sol"));
+        assert_eq!(cfg.context_window, 1_050_000);
+        assert_eq!(cfg.input_budget(), 922_000);
+        let threshold = 922_000 - cfg.reserve_tokens;
+        let mut s = Session::new();
+        s.last_input_tokens = threshold;
+        assert!(!should_compact(&s, &cfg), "exactly at the threshold");
+        s.last_input_tokens = threshold + 1;
+        assert!(should_compact(&s, &cfg), "one past it");
+        // Same budgets as any large window: only the base the reserve comes off moved.
+        let d = CompactionConfig::default();
+        assert_eq!(cfg.reserve_tokens, d.reserve_tokens);
+        assert_eq!(cfg.keep_recent_tokens, d.keep_recent_tokens);
+    }
+
+    #[test]
+    fn compaction_fires_before_every_input_limited_model_rejects_the_prompt() {
+        // Regression: for every model whose vendor caps input below the window, the soft trigger
+        // lands strictly below the cap and the hard-overflow check fires at it.
+        for id in [
+            "gpt-5",
+            "gpt-5-mini",
+            "gpt-5-pro",
+            "gpt-5.4-pro",
+            "gpt-5.5-pro",
+            "gpt-5.6",
+            "gpt-5.6-terra",
+            "gpt-6-astra",
+            "openai/gpt-5.2",
+        ] {
+            let caps = crate::models::capabilities(id);
+            let limit = caps.input_limit.expect(id);
+            assert!(limit < caps.context_window, "{id}");
+            let cfg = CompactionConfig::for_model(&caps);
+            let mut s = Session::new();
+            s.last_input_tokens = limit - 1;
+            assert!(
+                should_compact(&s, &cfg),
+                "{id}: no proactive compaction below the cap"
+            );
+            assert!(!is_hard_overflow(&s, &cfg, StopReason::EndTurn, 0), "{id}");
+            s.last_input_tokens = limit;
+            assert!(
+                is_hard_overflow(&s, &cfg, StopReason::EndTurn, 0),
+                "{id}: at the cap"
+            );
+        }
+    }
+
+    #[test]
+    fn a_max_tokens_stop_still_measures_prompt_plus_output_against_the_window() {
+        // The input cap moves only the input-side checks: a max-tokens cut-off compares prompt +
+        // next output against the whole window, which still holds both.
+        let cfg = CompactionConfig::for_model(&crate::models::capabilities("gpt-5.6"));
+        let mut s = Session::new();
+        s.last_input_tokens = 900_000;
+        assert!(!is_hard_overflow(&s, &cfg, StopReason::MaxTokens, 128_000));
+        assert!(is_hard_overflow(&s, &cfg, StopReason::MaxTokens, 150_000));
     }
 
     fn convo() -> Vec<Message> {

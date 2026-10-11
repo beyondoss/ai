@@ -3024,7 +3024,13 @@ pub(crate) async fn serve_session(
     let mut sandbox_append = discovered.append_system.take();
     timing.mark("discover prompt templates/skills");
 
-    let startup_tools = build_tools(&cfg, cfg.image_auto_resize, &exec_cell, &mcp_enabled);
+    let startup_tools = build_tools(
+        &cfg,
+        cfg.image_auto_resize,
+        &exec_cell,
+        &mcp_enabled,
+        &skills,
+    );
     let has_read = startup_tools.get("read").is_some();
     let has_todo = startup_tools.get(crate::tools::todo::NAME).is_some();
 
@@ -3310,6 +3316,9 @@ pub(crate) async fn serve_session(
             cwd: &cwd,
             include_context_files: cfg.context_files,
             skills: &skills,
+            // The skill listing's budget follows the configured `--model`, at every static rebuild:
+            // a mid-session `set_model` keeps the listing (and the cached prefix) as it was.
+            context_window: agent_core::capabilities(&cfg.model).context_window,
             has_read,
             has_todo,
             has_structured_output: structured_output.is_some(),
@@ -3547,6 +3556,7 @@ pub(crate) async fn serve_session(
         memory_tool.as_ref(),
         approval.as_ref(),
         &mcp_enabled,
+        &skills,
     );
     timing.mark("build agent");
     // Persistent across every `prompt` call (not just the one currently in flight), so `steer`/
@@ -3579,7 +3589,14 @@ pub(crate) async fn serve_session(
     // command below reports as a clean error rather than a side door around that restriction. A direct
     // `Arc<dyn Tool>` handle, not routed through `agent`/the model loop: the host `bash` RPC command runs
     // independent of any conversation turn.
-    let bash_tool = build_tools(&cfg, cfg.image_auto_resize, &exec_cell, &mcp_enabled).get("bash");
+    let bash_tool = build_tools(
+        &cfg,
+        cfg.image_auto_resize,
+        &exec_cell,
+        &mcp_enabled,
+        &skills,
+    )
+    .get("bash");
     // The same deny-list `build_agent` installs as an `AgentHooks` gate on the model's own tool calls —
     // built once here rather than inline in the `bash` RPC arm below, since `--deny-tool`/
     // `--deny-bash-pattern`/`--deny-path` are fixed for the whole process (`build_agent`'s doc comment).
@@ -3846,6 +3863,7 @@ pub(crate) async fn serve_session(
                         memory_tool.as_ref(),
                         approval.as_ref(),
                         &mcp_enabled,
+                        &skills,
                     );
                     let _ = out_tx.send(response(
                         $id,
@@ -3932,6 +3950,7 @@ pub(crate) async fn serve_session(
                                 memory_tool.as_ref(),
                                 approval.as_ref(),
                                 &mcp_enabled,
+                                    &skills,
                                 );
                         }
                         let _ = out_tx.send(response(
@@ -4078,6 +4097,7 @@ pub(crate) async fn serve_session(
                                 memory_tool.as_ref(),
                                 approval.as_ref(),
                                 &mcp_enabled,
+                                &skills,
                             );
                     }
                     let _ = out_tx.send(response(
@@ -4170,6 +4190,7 @@ pub(crate) async fn serve_session(
                                 memory_tool.as_ref(),
                                 approval.as_ref(),
                                 &mcp_enabled,
+                                &skills,
                             );
                     }
                     let _ = out_tx.send(response(
@@ -4525,6 +4546,7 @@ pub(crate) async fn serve_session(
                                 cwd: &cwd,
                                 include_context_files: cfg.context_files,
                                 skills: &skills,
+                                context_window: agent_core::capabilities(&cfg.model).context_window,
                                 has_read,
                                 has_todo,
                                 has_structured_output: structured_output.is_some(),
@@ -4556,6 +4578,7 @@ pub(crate) async fn serve_session(
                             memory_tool.as_ref(),
                             approval.as_ref(),
                             &mcp_enabled,
+                            &skills,
                         );
                     }
                     Ok(_) => {}
@@ -4599,6 +4622,7 @@ pub(crate) async fn serve_session(
                         memory_tool.as_ref(),
                         approval.as_ref(),
                         &mcp_enabled,
+                        &skills,
                     );
                 }
                 agent.set_system(full_system(&static_system, &cwd, &mcp_skills));
@@ -4812,10 +4836,11 @@ pub(crate) async fn serve_session(
                     // The live-prompt size at which to warn of an approaching compaction, against the
                     // *current* model's window (a `set_model` mid-session changes it), matching the reserve
                     // `build_agent` folds into this session's `CompactionConfig`.
+                    // Against the input budget, not the raw window: the same quantity the trigger uses.
+                    let caps = agent_core::capabilities(&current_model);
+                    let window = cfg.context_window.unwrap_or(caps.context_window);
                     let pressure_point = crate::memory::compaction_pressure_point(
-                        cfg.context_window.unwrap_or_else(|| {
-                            agent_core::capabilities(&current_model).context_window
-                        }),
+                        caps.input_limit.map_or(window, |limit| limit.min(window)),
                         cfg.compaction_reserve_tokens.unwrap_or_else(|| {
                             agent_core::CompactionConfig::default().reserve_tokens
                         }),
@@ -6044,6 +6069,7 @@ pub(crate) async fn serve_session(
                             memory_tool.as_ref(),
                             approval.as_ref(),
                             &mcp_enabled,
+                            &skills,
                         );
                         emit!(response(id, "set_mcp_enabled", true, Some(data), None));
                     }
@@ -6061,13 +6087,18 @@ pub(crate) async fn serve_session(
                         ("allowlist".to_string(), v)
                     }
                 };
-                let tools: Vec<String> =
-                    build_tools(&cfg, cfg.image_auto_resize, &exec_cell, &mcp_enabled)
-                        .definitions()
-                        .into_iter()
-                        .map(|d| d.name)
-                        .filter(|n| n.starts_with("mcp__"))
-                        .collect();
+                let tools: Vec<String> = build_tools(
+                    &cfg,
+                    cfg.image_auto_resize,
+                    &exec_cell,
+                    &mcp_enabled,
+                    &skills,
+                )
+                .definitions()
+                .into_iter()
+                .map(|d| d.name)
+                .filter(|n| n.starts_with("mcp__"))
+                .collect();
                 let catalogs = cfg.mcp_catalog.filter_enabled(&mcp_enabled);
                 let resources: Vec<_> = catalogs
                     .iter()
@@ -6194,6 +6225,7 @@ pub(crate) async fn serve_session(
                             memory_tool.as_ref(),
                             approval.as_ref(),
                             &mcp_enabled,
+                            &skills,
                         );
                         emit!(response(
                             id,
@@ -6235,6 +6267,7 @@ pub(crate) async fn serve_session(
                                 memory_tool.as_ref(),
                                 approval.as_ref(),
                                 &mcp_enabled,
+                                &skills,
                             );
                             let out_tx = out_tx.clone();
                             let service = service.clone();
@@ -6585,8 +6618,14 @@ pub(crate) async fn serve_session(
                 // variable around), plus `session`'s own running token totals — previously omitted
                 // entirely via the plainer `export_html_with_entries`.
                 let system_prompt = full_system(&static_system, &cwd, &mcp_skills);
-                let tool_defs = build_tools(&cfg, cfg.image_auto_resize, &exec_cell, &mcp_enabled)
-                    .definitions();
+                let tool_defs = build_tools(
+                    &cfg,
+                    cfg.image_auto_resize,
+                    &exec_cell,
+                    &mcp_enabled,
+                    &skills,
+                )
+                .definitions();
                 let usage = crate::export::UsageTotals {
                     input_tokens: session.input_tokens,
                     output_tokens: session.output_tokens,
@@ -6973,6 +7012,7 @@ pub(crate) async fn serve_session(
                         cwd: &cwd,
                         include_context_files: cfg.context_files,
                         skills: &skills,
+                        context_window: agent_core::capabilities(&cfg.model).context_window,
                         has_read,
                         has_todo,
                         has_structured_output: structured_output.is_some(),
@@ -7009,6 +7049,7 @@ pub(crate) async fn serve_session(
                     memory_tool.as_ref(),
                     approval.as_ref(),
                     &mcp_enabled,
+                    &skills,
                 );
                 emit!(response(id, "reload", true, None, None));
             }
@@ -7102,6 +7143,7 @@ pub(crate) async fn serve_session(
                                         memory_tool.as_ref(),
                                         approval.as_ref(),
                                         &mcp_enabled,
+                                        &skills,
                                     );
                                     emit!(response(
                                         id,
@@ -7161,6 +7203,7 @@ pub(crate) async fn serve_session(
                             memory_tool.as_ref(),
                             approval.as_ref(),
                             &mcp_enabled,
+                            &skills,
                         );
                         emit!(response(
                             id,
@@ -7192,6 +7235,7 @@ pub(crate) async fn serve_session(
                             memory_tool.as_ref(),
                             approval.as_ref(),
                             &mcp_enabled,
+                            &skills,
                         );
                         emit!(response(
                             id,
@@ -7261,6 +7305,7 @@ pub(crate) async fn serve_session(
                                     memory_tool.as_ref(),
                                     approval.as_ref(),
                                     &mcp_enabled,
+                                    &skills,
                                 );
                                 let (thinking, reasoning_effort) = agent_core::thinking_for_level(
                                     &agent_core::capabilities(&current_model),
@@ -7368,6 +7413,7 @@ pub(crate) async fn serve_session(
                                     memory_tool.as_ref(),
                                     approval.as_ref(),
                                     &mcp_enabled,
+                                    &skills,
                                 );
                                 let mut resp_data =
                                     model_switch_response(&current_model, current_level);
@@ -7426,6 +7472,7 @@ pub(crate) async fn serve_session(
                             memory_tool.as_ref(),
                             approval.as_ref(),
                             &mcp_enabled,
+                            &skills,
                         );
                         let (thinking, reasoning_effort) = agent_core::thinking_for_level(
                             &agent_core::capabilities(&current_model),
@@ -7483,6 +7530,7 @@ pub(crate) async fn serve_session(
                         memory_tool.as_ref(),
                         approval.as_ref(),
                         &mcp_enabled,
+                        &skills,
                     );
                     emit!(response(
                         id,
@@ -7523,6 +7571,7 @@ pub(crate) async fn serve_session(
                         memory_tool.as_ref(),
                         approval.as_ref(),
                         &mcp_enabled,
+                        &skills,
                     );
                     emit!(response(
                         id,
@@ -7572,6 +7621,7 @@ pub(crate) async fn serve_session(
                         memory_tool.as_ref(),
                         approval.as_ref(),
                         &mcp_enabled,
+                        &skills,
                     );
                     emit!(response(
                         id,
@@ -7614,6 +7664,7 @@ pub(crate) async fn serve_session(
                         memory_tool.as_ref(),
                         approval.as_ref(),
                         &mcp_enabled,
+                        &skills,
                     );
                     emit!(response(
                         id,
@@ -7902,6 +7953,7 @@ pub(crate) async fn serve_session(
                                     memory_tool.as_ref(),
                                     approval.as_ref(),
                                     &mcp_enabled,
+                                    &skills,
                                 );
                             }
                             emit!(response(
@@ -8683,6 +8735,7 @@ fn build_subagent_ctx(
         cfg.image_auto_resize,
         exec,
         &crate::tools::mcp::McpEnabledSet::new(),
+        skills,
     );
     crate::tools::apply_filter(
         &mut probe,
@@ -8789,11 +8842,14 @@ fn build_agent(
     // Session-scoped MCP server enablement (see `set_mcp_enabled`). Same lifetime as `exec`: per
     // `serve_session`, not on `ServeConfig`, so multi-tenant WS sessions cannot inherit each other's kit.
     mcp_enabled: &crate::tools::mcp::McpEnabledSet,
+    // The session's discovered skills, so `read` resolves the `skill:<name>` paths the system
+    // prompt's listing names them by.
+    skills: &[crate::skills::Skill],
 ) -> Agent {
+    let caps = agent_core::capabilities(model);
     let mut compaction = agent_core::CompactionConfig {
-        context_window: cfg
-            .context_window
-            .unwrap_or_else(|| agent_core::capabilities(model).context_window),
+        context_window: cfg.context_window.unwrap_or(caps.context_window),
+        input_limit: caps.input_limit,
         enabled: auto_compaction,
         ..agent_core::CompactionConfig::default()
     };
@@ -8804,7 +8860,7 @@ fn build_agent(
         compaction.keep_recent_tokens = keep_recent;
     }
 
-    let mut registry = build_tools(cfg, image_auto_resize, exec, mcp_enabled);
+    let mut registry = build_tools(cfg, image_auto_resize, exec, mcp_enabled, skills);
     // Registered here, not in `build_tools`, because this is where `write_locks` is in scope — the ctx
     // needs the same registry every child shares. Reused across rebuilds; the ctx's factory handles the
     // per-child model itself, so a `set_model` rebuild doesn't invalidate it.
@@ -9121,6 +9177,7 @@ fn build_tools(
     image_auto_resize: bool,
     exec: &crate::exec_endpoint::ExecCell,
     mcp_enabled: &crate::tools::mcp::McpEnabledSet,
+    skills: &[crate::skills::Skill],
 ) -> agent_core::ToolRegistry {
     // Task #34 (pi-parity fix): previously always called the plain `default_registry_with_prefix`,
     // hardcoding `image_auto_resize: true` regardless of `cfg.image_auto_resize` — `run`'s identical
@@ -9154,6 +9211,7 @@ fn build_tools(
         // the cell per call, so a re-point cannot be missed by a rebuild that never happens.
         fs_backend: Some(exec.backend()),
         command_runner: Some(exec.runner()),
+        skills,
         // In service mode a relative path the model writes belongs in the tenant's workspace, not
         // wherever this replica's process happens to have been started. Empty (= the process cwd)
         // for every other caller, which is the pre-service behavior.
@@ -9182,7 +9240,7 @@ fn build_tools(
         );
         crate::tools::code_mode::restore_execute(
             &mut registry,
-            std::sync::Arc::new(crate::tools::code_mode::Execute::new(nested)),
+            nested,
             cfg.exclude_tools.as_deref(),
             cfg.no_tools,
         );
@@ -9811,9 +9869,12 @@ fn parse_images(images: Option<&Value>) -> Vec<agent_core::ImageSource> {
 /// `last_input_tokens` — a `set_model`/`cycle_model` mid-session means the context-window figure is
 /// always reported against what a client would actually be constrained by on the *next* turn, matching
 /// how a client would use this value (to decide whether compaction is coming soon), not as a historical
-/// record of what the previous turn's provider reported.
+/// record of what the previous turn's provider reported. `context_window` is the model's input budget
+/// ([`agent_core::models::ModelCaps::input_budget`]): the window, or the lower input cap a GPT-5-family
+/// model enforces — the figure the compaction trigger compares against, so `percent` reaches 100 where
+/// the vendor starts rejecting the prompt.
 fn session_stats(session: &Session, model: &str) -> Value {
-    let context_window = agent_core::models::capabilities(model).context_window;
+    let context_window = agent_core::models::capabilities(model).input_budget();
     // `last_input_tokens == 0` covers both "no turn has run yet" and pi's "immediately after
     // compaction, before a new reply" case (compaction never sets this field itself — only a real
     // provider response does) — both genuinely have no current-context figure to report, so `null`
@@ -12260,8 +12321,8 @@ mod tests {
         let mut session = Session::new();
         session.last_input_tokens = 10_000;
         let stats = session_stats(&session, "gpt-5-mini");
-        let expected_window = agent_core::models::capabilities("gpt-5-mini").context_window;
-        assert_eq!(stats["context_usage"]["context_window"], expected_window);
+        // gpt-5-mini's 400K window caps input at 272K: the figure compaction compares against.
+        assert_eq!(stats["context_usage"]["context_window"], 272_000);
     }
 
     #[test]

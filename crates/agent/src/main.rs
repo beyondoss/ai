@@ -4497,6 +4497,7 @@ async fn run_task(
         mcp_tools: &mcp_tools,
         fs_backend: fs_backend.clone(),
         command_runner: exec_runner.clone(),
+        skills: &skills,
         ..tools::ToolConfig::new()
     });
     tools::apply_filter(
@@ -4511,7 +4512,7 @@ async fn run_task(
             tools::code_mode::select_deferred_tools(&mcp_tools, nested_exclude, &deny_tool);
         tools::code_mode::restore_execute(
             &mut registry,
-            std::sync::Arc::new(tools::code_mode::Execute::new(nested)),
+            nested,
             tools_exclude.as_deref(),
             no_tools,
         );
@@ -4856,6 +4857,7 @@ async fn run_task(
             cwd: &cwd,
             include_context_files: !no_context_files,
             skills: &skills,
+            context_window: agent_core::capabilities(&model).context_window,
             has_read,
             has_todo,
             has_structured_output,
@@ -4981,9 +4983,10 @@ async fn run_task(
         });
     // Matches `serve`'s own `build_agent`: defaults to the model's own capability-table context
     // window when `--context-window` isn't given, then applies the reserve/keep-recent overrides.
+    let caps = agent_core::capabilities(&model);
     let mut compaction = agent_core::CompactionConfig {
-        context_window: context_window
-            .unwrap_or_else(|| agent_core::capabilities(&model).context_window),
+        context_window: context_window.unwrap_or(caps.context_window),
+        input_limit: caps.input_limit,
         ..agent_core::CompactionConfig::default()
     };
     if let Some(reserve) = compaction_reserve_tokens {
@@ -4998,7 +5001,7 @@ async fn run_task(
     // The live-prompt size at which to warn the model that a compaction is approaching (see
     // `run_turn_once`), derived from the same resolved window/reserve the agent will compact against.
     let pressure_point = beyond_ai_agent::memory::compaction_pressure_point(
-        compaction.context_window,
+        compaction.input_budget(),
         compaction.reserve_tokens,
     );
     // Captured before each is moved into the builder chain below — `Agent` exposes no getter for

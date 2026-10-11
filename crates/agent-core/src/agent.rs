@@ -313,11 +313,12 @@ impl Agent {
     pub fn new(transport: Arc<dyn ModelTransport>, model: impl Into<String>) -> Self {
         let model = model.into();
         let caps = crate::models::capabilities(&model);
-        // Both compaction budgets scale with the model's real window (see `for_window`) — reading the
+        // Both compaction budgets scale with the model's real input budget (see `for_window`; the
+        // window, or the lower input cap OpenAI's GPT-5 family enforces) — reading the
         // reserve back off the *scaled* config rather than off `Default` matters here, because
         // `scaled_summary_max_tokens` sizes the summarization call against the headroom that actually
         // exists on this model, not against a 200k model's.
-        let compaction = CompactionConfig::for_window(caps.context_window);
+        let compaction = CompactionConfig::for_model(&caps);
         let summary_max_tokens =
             scaled_summary_max_tokens(compaction.reserve_tokens, caps.max_output);
         Self {
@@ -2614,7 +2615,7 @@ impl Agent {
             .unwrap_or(self.compaction.reserve_tokens);
         let input_token_budget = self
             .compaction
-            .context_window
+            .input_budget()
             .saturating_sub(reserve_tokens);
         let req = self.with_reasoning(crate::branch_summary::branch_summary_request(
             &self.model,
@@ -7468,6 +7469,7 @@ mod tests {
             .with_max_steps(12)
             .with_compaction(CompactionConfig {
                 context_window: 100,
+                input_limit: None,
                 reserve_tokens: 10,
                 keep_recent_tokens: 1,
                 summary_max_tokens: 256,
@@ -7497,6 +7499,68 @@ mod tests {
             &session.messages[0].content[0],
             ContentBlock::Text { text, .. } if text.contains("compacted")
         ));
+    }
+
+    #[tokio::test]
+    async fn gpt_5_6_compacts_proactively_below_its_922k_input_cap() {
+        // Regression: GPT-5.6's 1.05M window put the trigger (`window - reserve`) at ~1.03M, past
+        // OpenAI's 922K input cap — only overflow recovery ever ran. A turn reporting 910K input
+        // (under the old trigger, over the new one) must now compact on the threshold.
+        fn big_tool_turn(id: &str) -> Vec<StreamEvent> {
+            vec![
+                StreamEvent::MessageStart,
+                StreamEvent::ToolUseStart {
+                    index: 0,
+                    id: id.into(),
+                    name: "echo".into(),
+                },
+                StreamEvent::InputJsonDelta {
+                    index: 0,
+                    partial_json: r#"{"text":"a"}"#.into(),
+                },
+                StreamEvent::ContentBlockStop { index: 0 },
+                StreamEvent::Usage(TokenUsage {
+                    input_tokens: 910_000,
+                    output_tokens: 5,
+                    ..Default::default()
+                }),
+                StreamEvent::MessageStop {
+                    stop_reason: StopReason::ToolUse,
+                },
+            ]
+        }
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(EchoTool));
+        let mock = Arc::new(MockTransport::new(vec![
+            big_tool_turn("t1"),
+            big_tool_turn("t2"),
+            turn::text("## Goal\nsummary of earlier work"),
+            turn::text("all done"),
+        ]));
+        let model = "gpt-5.6-sol";
+        let seeded = Agent::new(mock.clone(), model).compaction;
+        assert_eq!(seeded.input_budget(), 922_000);
+        let agent = Agent::new(mock.clone(), model)
+            .with_tools(tools)
+            .with_max_steps(12)
+            // Keep-recent shrunk only so this tiny transcript has a cut; the trigger is the model's.
+            .with_compaction(CompactionConfig {
+                keep_recent_tokens: 1,
+                ..seeded
+            });
+        let mut session = Session::new();
+        session.user("seed task with enough text to fill several estimated tokens here please");
+        let mut reasons = Vec::new();
+        agent
+            .run_events(&mut session, |ev| {
+                if let AgentEvent::CompactionStart { reason } = ev {
+                    reasons.push(reason);
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(reasons, vec![CompactionReason::Threshold]);
+        assert_eq!(mock.calls(), 4);
     }
 
     #[test]
@@ -7556,6 +7620,7 @@ mod tests {
             .with_max_steps(12)
             .with_compaction(CompactionConfig {
                 context_window: 100,
+                input_limit: None,
                 reserve_tokens: 10,
                 keep_recent_tokens: 1,
                 summary_max_tokens: 256,
@@ -7651,6 +7716,7 @@ mod tests {
             .with_max_steps(6)
             .with_compaction(CompactionConfig {
                 context_window: 100,
+                input_limit: None,
                 reserve_tokens: 10,
                 keep_recent_tokens: 1,
                 summary_max_tokens: 256,
@@ -7762,6 +7828,7 @@ mod tests {
             .with_tools(tools)
             .with_compaction(CompactionConfig {
                 context_window: 100,
+                input_limit: None,
                 reserve_tokens: 10,
                 keep_recent_tokens: 1,
                 summary_max_tokens: 256,
@@ -7841,6 +7908,7 @@ mod tests {
         ]));
         let agent = Agent::new(mock.clone(), "claude-opus-4-8").with_compaction(CompactionConfig {
             context_window: 100,
+            input_limit: None,
             reserve_tokens: 10,
             keep_recent_tokens: 1,
             summary_max_tokens: 256,
@@ -7908,6 +7976,7 @@ mod tests {
             .with_tools(tools)
             .with_compaction(CompactionConfig {
                 context_window: 100,
+                input_limit: None,
                 reserve_tokens: 10,
                 keep_recent_tokens: 1,
                 summary_max_tokens: 256,
@@ -8006,6 +8075,7 @@ mod tests {
             .with_max_steps(12)
             .with_compaction(CompactionConfig {
                 context_window: 100,
+                input_limit: None,
                 reserve_tokens: 10,
                 keep_recent_tokens: 1,
                 summary_max_tokens: 256,
