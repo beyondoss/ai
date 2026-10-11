@@ -368,6 +368,9 @@ impl Bash {
         }));
         let streamed = Arc::new(AtomicBool::new(false));
         let last_emit = Arc::new(Mutex::new(Instant::now()));
+        let scan = tracing::enabled!(target: "bash_lag", tracing::Level::INFO)
+            .then(|| Mutex::new(FailureScan::new()));
+        let scan = scan.as_ref();
 
         // pi emits an initial empty update the moment execution starts.
         if let Some(p) = progress {
@@ -388,6 +391,9 @@ impl Bash {
             let last_emit = last_emit.clone();
             move |bytes: &[u8]| {
                 streamed.store(true, Ordering::Relaxed);
+                if let Some(scan) = scan {
+                    lock(scan).feed(bytes);
+                }
                 let mut a = lock(&acc);
                 a.append(bytes);
                 if let Some(p) = progress {
@@ -447,6 +453,7 @@ impl Bash {
             if let Some(p) = progress {
                 emit_update(p, &snap);
             }
+            record_failure_lead(scan, streamed.load(Ordering::Relaxed), "cancelled", None);
             let text = clean(format_output(&snap, ""));
             return Err(ToolError::Execution(append_status(
                 &text,
@@ -477,6 +484,15 @@ impl Bash {
         if let Some(p) = progress {
             emit_update(p, &snap);
         }
+
+        let outcome = match (result.timed_out, result.code, result.signal) {
+            (true, ..) => "timeout",
+            (false, Some(0), _) => "success",
+            (false, Some(_), _) => "exit",
+            (false, None, Some(_)) => "signal",
+            (false, None, None) => "unknown",
+        };
+        record_failure_lead(scan, streamed.load(Ordering::Relaxed), outcome, result.code);
 
         if result.timed_out {
             let secs = timeout_ms / 1000;
@@ -684,6 +700,118 @@ fn clean_str(s: &str) -> Cow<'_, str> {
         return stripped;
     }
     Cow::Owned(stripped.chars().filter(|&c| is_keepable(c)).collect())
+}
+
+/// Lines that usually mean a command has already failed, though it may keep running. Used only to
+/// measure how long `bash` keeps the model waiting after the first visible failure
+/// ([`record_failure_lead`]); nothing here changes what the tool returns. Each pattern is checked against
+/// one ANSI-stripped output line.
+const FAILURE_PATTERNS: &[(&str, &str)] = &[
+    ("fail_line", r"^\s*FAIL\s+\S"), // jest, vitest, nextest, `go test` package summary
+    ("go_test_fail", r"^\s*--- FAIL: "),
+    ("cargo_test_failed", r"^test \S.* \.\.\. FAILED$"),
+    ("rust_panic", r"panicked at "),
+    ("go_panic", r"^panic: "),
+    ("error_line", r"^error(\[E\d{4}\])?: "), // rustc, cargo, git, many CLIs
+    ("tsc_error", r"error TS\d+: "),
+    ("assertion_error", r"AssertionError"),
+    ("python_traceback", r"^Traceback \(most recent call last\):"),
+    ("pytest_failed", r"^(FAILED|ERROR) \S"),
+    ("npm_err", r"^npm ERR! "),
+    ("build_failed", r"BUILD FAILED"),
+    ("make_error", r"^make(\[\d+\])?: \*\*\* "),
+];
+
+/// Longest prefix of a single line [`FailureScan`] keeps. Failure markers sit at the start of a line;
+/// a multi-megabyte minified line must not grow the buffer.
+const MAX_SCAN_LINE: usize = 4096;
+
+fn failure_patterns() -> Option<&'static regex::RegexSet> {
+    static SET: OnceLock<Option<regex::RegexSet>> = OnceLock::new();
+    SET.get_or_init(|| regex::RegexSet::new(FAILURE_PATTERNS.iter().map(|(_, re)| re)).ok())
+        .as_ref()
+}
+
+/// Finds the first failure-looking line in a command's output stream and when it arrived.
+struct FailureScan {
+    started: Instant,
+    line: Vec<u8>,
+    /// Time since `started` and index into [`FAILURE_PATTERNS`] of the first match. Scanning stops
+    /// once set.
+    hit: Option<(Duration, usize)>,
+}
+
+impl FailureScan {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            line: Vec::new(),
+            hit: None,
+        }
+    }
+
+    fn feed(&mut self, mut bytes: &[u8]) {
+        while self.hit.is_none() {
+            let end = bytes.iter().position(|&b| b == b'\n' || b == b'\r');
+            let room = MAX_SCAN_LINE.saturating_sub(self.line.len());
+            let take = end.unwrap_or(bytes.len());
+            self.line.extend_from_slice(&bytes[..take.min(room)]);
+            let Some(end) = end else { return };
+            self.check_line();
+            bytes = &bytes[end + 1..];
+        }
+    }
+
+    /// Check the final line when the output doesn't end with a newline.
+    fn finish(&mut self) {
+        if self.hit.is_none() {
+            self.check_line();
+        }
+    }
+
+    fn check_line(&mut self) {
+        if self.line.is_empty() {
+            return;
+        }
+        if let Some(set) = failure_patterns() {
+            let line = String::from_utf8_lossy(&self.line);
+            let line = match ansi_re() {
+                Some(re) => re.replace_all(&line, ""),
+                None => line,
+            };
+            if let Some(i) = set.matches(&line).iter().next() {
+                self.hit = Some((self.started.elapsed(), i));
+            }
+        }
+        self.line.clear();
+    }
+}
+
+/// Log one `bash_lag` event per call: total runtime and, when output streamed, when the first
+/// failure-looking line appeared. `elapsed_ms - first_failure_ms` on a failed call is how long the model
+/// waited after the failure was already visible. Off unless `RUST_LOG` enables the `bash_lag` target, in
+/// which case `scan` is `None` and nothing is scanned. Carries pattern names only, never output.
+fn record_failure_lead(
+    scan: Option<&Mutex<FailureScan>>,
+    streamed: bool,
+    outcome: &'static str,
+    exit_code: Option<i32>,
+) {
+    let Some(scan) = scan else { return };
+    let mut scan = lock(scan);
+    scan.finish();
+    let first = scan.hit.filter(|_| streamed);
+    let millis = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
+    tracing::info!(
+        target: "bash_lag",
+        outcome,
+        exit_code,
+        streamed,
+        elapsed_ms = millis(scan.started.elapsed()),
+        first_failure_ms = first.map(|(at, _)| millis(at)),
+        pattern = first.map(|(_, i)| FAILURE_PATTERNS[i].0),
+        "bash call finished"
+    );
 }
 
 #[cfg(test)]
@@ -1716,5 +1844,101 @@ mod tests {
             "{msg}"
         );
         assert!(msg.contains("does not exist"), "{msg}");
+    }
+
+    fn scan(chunks: &[&[u8]]) -> Option<&'static str> {
+        let mut s = FailureScan::new();
+        for c in chunks {
+            s.feed(c);
+        }
+        s.finish();
+        s.hit.map(|(_, i)| FAILURE_PATTERNS[i].0)
+    }
+
+    #[test]
+    fn failure_scan_matches_each_runner_line() {
+        for (line, name) in [
+            ("FAIL src/auth.test.ts", "fail_line"),
+            ("        FAIL [   0.012s] crate::tests::boom", "fail_line"),
+            ("FAIL\texample.com/pkg\t0.01s", "fail_line"),
+            ("--- FAIL: TestRefresh (0.00s)", "go_test_fail"),
+            ("test auth::refresh ... FAILED", "cargo_test_failed"),
+            ("thread 'main' panicked at src/main.rs:2:5:", "rust_panic"),
+            ("panic: runtime error: index out of range", "go_panic"),
+            ("error[E0308]: mismatched types", "error_line"),
+            ("error: could not compile `foo`", "error_line"),
+            ("src/a.ts(3,1): error TS2322: Type", "tsc_error"),
+            ("E   AssertionError: assert 1 == 2", "assertion_error"),
+            ("Traceback (most recent call last):", "python_traceback"),
+            ("FAILED tests/test_a.py::test_b - assert 0", "pytest_failed"),
+            ("npm ERR! code ELIFECYCLE", "npm_err"),
+            ("BUILD FAILED in 3s", "build_failed"),
+            ("make[2]: *** [Makefile:12: all] Error 1", "make_error"),
+        ] {
+            let bytes = format!("{line}\n");
+            assert_eq!(scan(&[bytes.as_bytes()]), Some(name), "{line}");
+        }
+    }
+
+    #[test]
+    fn failure_scan_ignores_passing_output() {
+        let out = b"PASS src/a.test.ts\ntest a ... ok\nTests: 12 passed, 0 failed\n\
+                    test result: ok. 3 passed; 0 failed\nok  \texample.com/pkg\t0.1s\n";
+        assert_eq!(scan(&[out]), None);
+    }
+
+    #[test]
+    fn failure_scan_joins_lines_split_across_chunks_and_strips_ansi() {
+        assert_eq!(
+            scan(&[b"PASS a\nFA", b"IL src/b.test.ts\n"]),
+            Some("fail_line")
+        );
+        assert_eq!(
+            scan(&[b"\x1b[1m\x1b[41m FAIL \x1b[0m src/b.test.ts\n"]),
+            Some("fail_line")
+        );
+        assert_eq!(scan(&[b"progress 10%\rerror: boom\r"]), Some("error_line"));
+        // An unterminated final line is checked at `finish`.
+        assert_eq!(scan(&[b"ok\npanic: boom"]), Some("go_panic"));
+    }
+
+    #[test]
+    fn failure_scan_keeps_the_first_hit_and_bounds_long_lines() {
+        let mut s = FailureScan::new();
+        s.feed(b"error: first\npanic: second\n");
+        assert_eq!(
+            s.hit.map(|(_, i)| FAILURE_PATTERNS[i].0),
+            Some("error_line")
+        );
+
+        let mut s = FailureScan::new();
+        s.feed(&vec![b'x'; MAX_SCAN_LINE * 4]);
+        assert_eq!(s.line.len(), MAX_SCAN_LINE);
+        s.feed(b"\nFAIL a\n");
+        assert_eq!(s.hit.map(|(_, i)| FAILURE_PATTERNS[i].0), Some("fail_line"));
+    }
+
+    #[test]
+    fn records_a_bash_lag_event_per_call() {
+        let captured = crate::tracing_test::capture(|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let r = Bash::real()
+                    .run(json!({"command": "echo 'FAIL x'; exit 1"}))
+                    .await;
+                assert!(r.is_err());
+            });
+        });
+        assert!(
+            captured
+                .messages()
+                .iter()
+                .any(|m| m == "bash call finished"),
+            "got: {:?}",
+            captured.messages()
+        );
     }
 }

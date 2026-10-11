@@ -76,6 +76,19 @@ pub fn default_system_prompt(
             &mut seen,
         );
     }
+    // `bash` returns only when the command exits, so a test run that fails early and keeps going
+    // leaves the model waiting for the rest of the suite. Narrow runs and fail-fast flags end it at
+    // the first failure.
+    if has("bash") {
+        add(
+            "bash waits for the whole command to exit. When iterating on failures, run only the \
+             affected tests with the runner's fail-fast flag (`pytest -x`, `jest --bail`, \
+             `vitest run --bail 1`, `go test -failfast`); run the full suite once at the end."
+                .to_string(),
+            &mut guidelines,
+            &mut seen,
+        );
+    }
     // pi's own per-tool `promptGuidelines` (`read.ts`/`edit.ts`/`write.ts`) — declared on the tool
     // definition itself and collected from whatever's actually registered. Adapted, not ported
     // verbatim: pi's edit tool takes an `edits[].oldText`/`newText` array, ours takes `edits[].old_string`/
@@ -978,6 +991,10 @@ mod tests {
             "got: {prompt}"
         );
         assert!(!prompt.contains("Use bash for file operations like ls, rg, find"));
+        assert!(
+            prompt.contains("fail-fast flag (`pytest -x`"),
+            "got: {prompt}"
+        );
 
         let mut only_bash = agent_core::tool::ToolRegistry::new();
         only_bash.register(std::sync::Arc::new(crate::tools::bash::Bash::real()));

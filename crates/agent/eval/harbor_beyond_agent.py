@@ -190,6 +190,8 @@ class BeyondAiAgent(BaseInstalledAgent):
             "AI_PROVIDER": provider,
             "AI_DIRECT": self._get_env("AI_DIRECT") or "1",
             "AI_AGENT_MODEL": model,
+            # `bash_lag` events land in beyond.stderr; summarize with eval/bash_lag.py.
+            "RUST_LOG": self._get_env("RUST_LOG") or "error,bash_lag=info",
         }
         api_key = self._get_env("OPENROUTER_API_KEY")
         if api_key:
