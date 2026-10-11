@@ -111,10 +111,13 @@ $(jq -r .markdown <<<"$f")"
   cargo build -q -p beyond-ai
   log="$RUNNER_TEMP/live-$slug.log"
   set +e
-  VERIFY_LIVE=1 VERIFY_CATALOG_ROW="$row" cargo nextest run -p beyond-ai-verify --test catalog_live \
-    --profile verify --no-fail-fast -E 'test(/^(CAT-1|BIL-13|CAT-7)::/)' >"$log" 2>&1 </dev/null
+  # The job sets CARGO_TERM_COLOR=always; the result is parsed below, so no color codes.
+  CARGO_TERM_COLOR=never VERIFY_LIVE=1 VERIFY_CATALOG_ROW="$row" cargo nextest run --color never \
+    -p beyond-ai-verify --test catalog_live --profile verify --no-fail-fast \
+    -E 'test(/^(CAT-1|BIL-13|CAT-7)::/)' >"$log" 2>&1 </dev/null
   code=$?
   set -e
+  sed -i 's/\x1b\[[0-9;]*m//g' "$log"
   results=$(grep -E '^ +(PASS|FAIL|SIGSEGV|TIMEOUT|SLOW|LEAK)|^ +Summary|INCONCLUSIVE' "$log" | sed 's/^ *//' || true)
   if [ "$code" != 0 ] || ! grep -q ' passed' <<<"$results"; then
     tail -40 "$log"
