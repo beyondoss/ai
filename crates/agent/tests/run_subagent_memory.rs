@@ -44,7 +44,8 @@ fn a_child_writes_shared_memory_a_later_child_reads_it_and_it_lands_in_the_paren
     let work = tempfile::tempdir().unwrap();
 
     // `scribe` is deliberately scoped to `tools: read` (no `memory` listed) — it must still get the
-    // shared memory tool. `recaller` needs no tools at all; it recalls from the injected index.
+    // shared memory tool. `recaller` needs no tools at all; it recalls from the injected index, which a
+    // child only carries when its definition opts in (`memory-index: true`).
     write_agent(
         work.path(),
         "scribe",
@@ -54,7 +55,7 @@ fn a_child_writes_shared_memory_a_later_child_reads_it_and_it_lands_in_the_paren
     write_agent(
         work.path(),
         "recaller",
-        "description: recalls facts\ntools: read\n",
+        "description: recalls facts\ntools: read\nmemory-index: true\n",
         "You are the recaller.",
     );
 

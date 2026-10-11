@@ -88,6 +88,8 @@ fn def(
         tools: tools.map(|t| t.into_iter().map(str::to_string).collect()),
         model: model.map(str::to_string),
         isolation,
+        skills: None,
+        memory_index: false,
         system: format!("You are {name}."),
         path: std::path::PathBuf::from(format!("/tmp/{name}.md")),
         scope: "user",
@@ -97,15 +99,25 @@ fn def(
 /// A ctx over the given defs and factory, with everything else defaulted to something inert. `cwd` is a
 /// tempdir so a stray relative path can't touch the real tree.
 fn ctx(defs: Vec<AgentDef>, factory: Factory) -> (Arc<SubagentCtx>, tempfile::TempDir) {
+    ctx_with(defs, factory, Vec::new(), Vec::new())
+}
+
+/// [`ctx`] with the parent's discovered skills and memory mounts.
+fn ctx_with(
+    defs: Vec<AgentDef>,
+    factory: Factory,
+    skills: Vec<crate::skills::Skill>,
+    memory_mounts: Vec<crate::memory::Mount>,
+) -> (Arc<SubagentCtx>, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let ctx = Arc::new(SubagentCtx {
         factory: factory.into_transport_factory(),
         agents: Arc::new(defs),
-        skills: Arc::new(Vec::new()),
+        skills: Arc::new(skills),
         write_locks: Arc::new(agent_core::WriteLockRegistry::new()),
         mcp_tools: Vec::new(),
         mcp_enabled: Default::default(),
-        memory_mounts: Vec::new(),
+        memory_mounts,
         tool_cfg: ChildToolConfig {
             image_auto_resize: true,
             ..Default::default()
@@ -250,6 +262,93 @@ async fn the_childs_system_prompt_is_its_definition_body() {
         system.contains("You are scout."),
         "def body must be in the child prompt: {system}"
     );
+}
+
+/// The parent's skills and a durable memory store whose index carries a marker.
+fn skills_and_memory() -> (
+    Vec<crate::skills::Skill>,
+    Vec<crate::memory::Mount>,
+    tempfile::TempDir,
+) {
+    let mem = tempfile::tempdir().unwrap();
+    std::fs::write(
+        mem.path().join("MEMORY.md"),
+        "- [x](x.md) — INDEX-MARKER-41\n",
+    )
+    .unwrap();
+    let skill = |name: &str| crate::skills::Skill {
+        name: name.into(),
+        description: format!("SKILL-DESC-{name}"),
+        path: std::path::PathBuf::from(format!("/s/{name}/SKILL.md")),
+        disable_model_invocation: false,
+        scope: "user",
+        body: None,
+    };
+    let mounts = vec![crate::memory::Mount {
+        kind: crate::memory::MountKind::Durable,
+        backend: Arc::new(crate::memory::file::FileBackend::at(
+            mem.path().to_path_buf(),
+        )),
+    }];
+    (vec![skill("pdf"), skill("lint")], mounts, mem)
+}
+
+#[tokio::test]
+async fn a_child_gets_no_skills_listing_or_memory_index_unless_its_definition_asks() {
+    // ~11K uncached tokens per spawn on a real HOME: the child is spawned for one task and rarely needs
+    // the parent's whole skills listing or memory index. It keeps the memory tool and guidance (shared
+    // `/session`), and `read skill:<name>` still loads any skill.
+    let factory = Factory::default().reply("parent-model", "ok");
+    let f2 = factory.clone();
+    let (skills, mounts, _mem) = skills_and_memory();
+    let (ctx, _d) = ctx_with(
+        vec![def("scout", None, None, Isolation::None)],
+        factory,
+        skills,
+        mounts,
+    );
+    run(
+        &Subagent::new(ctx),
+        json!({ "agent": "scout", "task": "do it" }),
+    )
+    .await
+    .unwrap();
+    let system = f2.request_to("parent-model").system.unwrap_or_default();
+    assert!(!system.contains("<available_skills>"), "{system}");
+    assert!(!system.contains("INDEX-MARKER-41"), "{system}");
+    assert!(
+        system.contains("## Memory (durable, cross-session)"),
+        "{system}"
+    );
+}
+
+#[tokio::test]
+async fn a_definition_opts_its_child_into_named_skills_and_the_memory_index() {
+    let factory = Factory::default()
+        .reply("model-a", "ok")
+        .reply("model-b", "ok");
+    let f2 = factory.clone();
+    let (skills, mounts, _mem) = skills_and_memory();
+    let mut named = def("named", Some("model-a"), None, Isolation::None);
+    named.skills = Some(vec!["pdf".into()]);
+    named.memory_index = true;
+    let mut all = def("all", Some("model-b"), None, Isolation::None);
+    all.skills = Some(vec!["all".into()]);
+    let (ctx, _d) = ctx_with(vec![named, all], factory, skills, mounts);
+    let tool = Subagent::new(ctx);
+    run(&tool, json!({ "agent": "named", "task": "t" }))
+        .await
+        .unwrap();
+    run(&tool, json!({ "agent": "all", "task": "t" }))
+        .await
+        .unwrap();
+    let a = f2.request_to("model-a").system.unwrap_or_default();
+    assert!(a.contains("- pdf: SKILL-DESC-pdf"), "{a}");
+    assert!(!a.contains("lint"), "{a}");
+    assert!(a.contains("INDEX-MARKER-41"), "{a}");
+    let b = f2.request_to("model-b").system.unwrap_or_default();
+    assert!(b.contains("- pdf: ") && b.contains("- lint: "), "{b}");
+    assert!(!b.contains("INDEX-MARKER-41"), "{b}");
 }
 
 #[tokio::test]
