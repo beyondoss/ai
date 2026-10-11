@@ -21,6 +21,7 @@ from collections import defaultdict
 from pathlib import Path
 
 import mcp_tasks
+import prefix_tasks
 import run
 import tasks
 from repos import TASKS
@@ -64,9 +65,10 @@ def arms(base: str, cand: str) -> list[tuple[str, str, bool, list[str], bool]]:
 def cmd_run(a) -> None:
     code = a.tasks.split(",") if a.tasks else list(TASKS)
     mcp = a.mcp_tasks.split(",") if a.mcp_tasks else list(mcp_tasks.MCP_TASKS)
+    ctx = a.ctx_tasks.split(",") if a.ctx_tasks else list(prefix_tasks.PREFIX_TASKS)
     for label, sha, cm, extra, mcp_only in arms(a.base, a.cand):
         binary = build(sha, cm)
-        names = mcp if mcp_only else code + mcp
+        names = mcp if mcp_only else code + ctx + mcp
         if not names:
             continue
         argv = ["--bin", str(binary), "--models", a.models, "--arms", "default", "--tasks", ",".join(names),
@@ -114,7 +116,7 @@ def cmd_report(a) -> None:
     labels = arms(a.base, a.cand)
     base_label = labels[0][0]
     base = load(base_label)
-    family = lambda t: "mcp" if t in mcp_tasks.MCP_TASKS else "code"
+    family = lambda t: "mcp" if t in mcp_tasks.MCP_TASKS else "prefix" if t in prefix_tasks.PREFIX_TASKS else "code"
     print(f"Base {base_label}, candidate {labels[1][0]} (`-cm`: candidate with --code-mode, MCP tasks only).\n")
     print("| arm | model | family | n | pass (95% CI) | $/task | wall s/task | TTFT first / median s | turns | first-request tok | cache-read share | compactions |")
     print("|---|---|---|---|---|---|---|---|---|---|---|---|")
@@ -163,6 +165,7 @@ def main(argv: list[str]) -> None:
         p.add_argument("--models", default="claude-opus-5-5,claude-sonnet-5-5,gpt-6.1-sol")
         p.add_argument("--tasks", default="", help="code tasks (default: all)")
         p.add_argument("--mcp-tasks", default="", help="MCP tasks (default: all)")
+        p.add_argument("--ctx-tasks", default="", help="prompt-prefix tasks (default: all)")
         p.add_argument("--attempts", type=int, default=1)
         p.add_argument("--jobs", type=int, default=6)
         p.add_argument("--cap-usd", type=float, default=12.0)

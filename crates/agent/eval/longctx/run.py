@@ -24,6 +24,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import mcp_tasks
+import prefix_tasks
 import tasks
 from repos import BY_NAME, TASKS
 
@@ -207,7 +208,14 @@ def run_one(binary: Path, task: str, model: str, arm: str, attempt: int, cap_usd
     home.mkdir()
     env = load_env()
     server = None
-    if task in mcp_tasks.MCP_TASKS:
+    checker = None
+    memory = ["--no-memory"]
+    if task in prefix_tasks.PREFIX_TASKS:
+        tree.mkdir()
+        prompt, checker = prefix_tasks.PREFIX_TASKS[task](home, tree)
+        memory = []  # the memory index is part of what these tasks measure
+        repos = []
+    elif task in mcp_tasks.MCP_TASKS:
         tree.mkdir()
         prompt, want = mcp_tasks.MCP_TASKS[task](tree)
         server, base = serve_dir(tree / "site")
@@ -230,7 +238,7 @@ def run_one(binary: Path, task: str, model: str, arm: str, attempt: int, cap_usd
         del env[k]
     trigger = ARMS[arm] if arm in ARMS else None
     window = (trigger + RESERVE) if trigger else None
-    cmd = [str(binary), "run", "--json", "--model", model, "--max-steps", str(max_steps), "--no-memory",
+    cmd = [str(binary), "run", "--json", "--model", model, "--max-steps", str(max_steps), *memory,
            "--session-dir", str(d / "sessions"), *extra]
     if window:
         cmd += ["--context-window", str(window)]
@@ -280,6 +288,9 @@ def run_one(binary: Path, task: str, model: str, arm: str, attempt: int, cap_usd
         raise RuntimeError(f"{d}: agent exited {p.returncode} before any request; see stderr.txt")
     if repos:
         g = grade(repos, tree)
+    elif checker:
+        ok = bool(checker())
+        g = dict(passed=ok, fixed=int(ok), broken=1, regressed=0, fixed_frac=float(ok))
     else:
         ok = mcp_tasks.check(task, tree, want)
         g = dict(passed=ok, fixed=int(ok), broken=1, regressed=0, fixed_frac=float(ok))

@@ -990,8 +990,9 @@ The harness layers several capabilities over the bare tools + loop:
   --json` stream, plus `Compacted.usage` for the summarization calls, which no `Stream(Usage)`
   event carries. `BASE=<sha> CAND=<sha> mise run eval:ab` reuses the same tasks as a
   before/after no-regression gate ([`eval/longctx/ab.py`](eval/longctx/ab.py)): both commits at
-  default compaction, plus four MCP tasks run with Playwright, GitHub and filesystem servers
-  configured, on the candidate both with tool search and with `--code-mode`.
+  default compaction, plus four prompt-prefix tasks (the one fact each needs sits where the skills,
+  memory-index or context-file budget can cut it) and four MCP tasks run with Playwright, GitHub
+  and filesystem servers configured, on the candidate both with tool search and with `--code-mode`.
 
   ```sh
   cargo test -p beyond-ai-agent --test code_mode_density
