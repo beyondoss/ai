@@ -2297,12 +2297,31 @@ fn cat7(trial: &str, arm: Arm) -> Result<(), Failed> {
                         .and_then(|s| s.parse::<f64>().ok())
                         .map(|x| x * 1e6)
                 };
-                for (field, card, k) in [
+                // A vendor-announced promotion (`[[promo]]`) that OpenRouter lists while the card
+                // keeps the standard rate is the documented exception, until its end date.
+                let promo = promo(arm.row.model);
+                for (i, (field, card, k)) in [
                     ("input", p.input, "prompt"),
                     ("output", p.output, "completion"),
-                ] {
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    let promo_rate =
+                        promo.map(|(input, output, _)| if i == 0 { input } else { output });
                     match per_m(k) {
                         Some(v) if price_eq(card, v) => {}
+                        Some(v)
+                            if promo_rate
+                                .is_some_and(|r| (r - v).abs() <= r.abs() * 1e-6 + 1e-9) =>
+                        {
+                            note(
+                                trial,
+                                &format!(
+                                    "{field}: OpenRouter lists the documented promotional rate {v}; the card keeps {card}"
+                                ),
+                            );
+                        }
                         Some(v) => {
                             problems.push(format!("{field}: card {card}, OpenRouter lists {v}"))
                         }
