@@ -87,9 +87,9 @@ def cmd_run(a) -> None:
         argv = ["--bin", str(binary), "--models", a.models, "--arms", a.arm, "--tasks", ",".join(names),
                 "--attempts", str(a.attempts), "--jobs", str(a.jobs), "--cap-usd", str(a.cap_usd),
                 "--budget-usd", str(a.budget_usd), "--runs-dir", str(tasks.work_dir() / "ab" / label),
+                "--hard-cap-usd", str(a.hard_cap_usd), *(["--ledger", a.ledger] if a.ledger else []),
                 "--label", label]
-        for e in extra:
-            argv += ["--agent-arg", e]
+        argv += [f"--agent-arg={e}" for e in extra]  # `=`: a value starting with `--` is otherwise a flag
         run.main(argv)
     cmd_report(a)
 
@@ -184,9 +184,11 @@ def main(argv: list[str]) -> None:
         p.add_argument("--jobs", type=int, default=6)
         p.add_argument("--cap-usd", type=float, default=12.0)
         p.add_argument("--budget-usd", type=float, default=150.0)
+        p.add_argument("--ledger", default="", help="spend ledger shared across invocations (see run.py)")
+        p.add_argument("--hard-cap-usd", type=float, default=float("inf"), help="with --ledger: total spend cap")
         p.add_argument("--arm", default="default", help="compaction arm for both sides (see run.ARMS)")
-        p.add_argument("--base-arg", action="append", default=[], help="extra agent flag, base side only")
-        p.add_argument("--cand-arg", action="append", default=[], help="extra agent flag, candidate side only")
+        p.add_argument("--base-arg", action="append", default=[], help="extra agent flag, base side only (write --base-arg=--flag)")
+        p.add_argument("--cand-arg", action="append", default=[], help="extra agent flag, candidate side only (write --cand-arg=--flag)")
     a = ap.parse_args(argv)
     {"run": cmd_run, "report": cmd_report}[a.cmd](a)
 
