@@ -1660,6 +1660,70 @@
       }
     },
     {
+      "name": "openrouter_service_tier_auto_reported",
+      "why": "Meta, through OpenRouter, answers every Muse Spark request with service_tier \"auto\" (the request default echoed back) and bills the standard rate: auto is the standard class. Counts and cost as measured 2026-10-11 (14 in, 99 out, $0.0000212).",
+      "row": {
+        "price_model": "meta/muse-spark-1.3-contributor",
+        "provider": "openrouter",
+        "input_tokens": 14,
+        "output_tokens": 99,
+        "service_tier": "auto",
+        "upstream_cost_usd": "0.0000212",
+        "served_by": "Meta",
+        "usage_wire": "openai",
+        "unix_secs": 1791734052
+      },
+      "expect": {
+        "status": "priced",
+        "basis": "reported",
+        "cost_micros": 22,
+        "price_micros": 22,
+        "cost_class": "standard",
+        "price_class": "standard",
+        "cost_long": false,
+        "price_long": false
+      }
+    },
+    {
+      "name": "openrouter_service_tier_auto_dearest_endpoint",
+      "why": "No reported cost: priced at the dearest standard-class endpoint plus the 5.5% credit fee, estimated. auto selects the standard class.",
+      "row": {
+        "price_model": "meta/muse-spark-1.2-contributor",
+        "provider": "openrouter",
+        "input_tokens": 2000,
+        "cache_read_tokens": 500,
+        "output_tokens": 800,
+        "service_tier": "auto",
+        "usage_wire": "openai",
+        "unix_secs": 1791734052
+      },
+      "expect": {
+        "status": "estimated",
+        "basis": "dearest_endpoint",
+        "cost_micros": 328,
+        "price_micros": 328,
+        "cost_class": "standard",
+        "price_class": "standard",
+        "cost_long": false,
+        "price_long": false
+      }
+    },
+    {
+      "name": "anthropic_service_tier_auto_refused",
+      "why": "auto is the standard class only where a provider echoes it; Anthropic and Bedrock report standard, so anything else from them is still refused.",
+      "row": {
+        "price_model": "claude-opus-4-8",
+        "provider": "anthropic",
+        "input_tokens": 100,
+        "output_tokens": 10,
+        "service_tier": "auto",
+        "unix_secs": 1791734052
+      },
+      "expect": {
+        "unpriced": "unknown_class"
+      }
+    },
+    {
       "name": "openrouter_reported_cost_exponent",
       "why": "usage.cost may arrive in exponent form.",
       "row": {

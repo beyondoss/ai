@@ -620,8 +620,11 @@ Qwen3.7 Plus client that did ask for reasoning gets it, with the risk. Qwen3.8 M
 forced tool the same way but cannot think off (400 "Reasoning is mandatory for this endpoint and
 cannot be disabled", D269), so a forced request goes as `"tool_choice":"auto"` with a closing system
 message naming the tool to call (or any of them, for `"required"`), as a Claude model that refuses
-forced tool use gets it: a call is very likely, not guaranteed. Applied after translation, so a Messages `tool_choice` `any` or a named tool is
-covered too.
+forced tool use gets it: a call is very likely, not guaranteed. Meta's Muse Spark (both Contributor rows) accepts only `"auto"`, refusing
+`"required"`, a named function and `"none"` with a 400 (D270): a forced request goes the same way,
+and `"none"` goes with the root `tools` and `tool_choice` cut out, so no tool can be called
+(`ToolThinking::AutoOnly`). Applied after translation, so a Messages `tool_choice` `any` or a
+named tool is covered too.
 
 **`developer` off OpenAI.** A same-wire Chat Completions `developer` message is sent as `system` to
 any host but OpenAI and OpenRouter (`providers::catalog::reads_developer_role`,

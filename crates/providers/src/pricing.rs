@@ -825,7 +825,10 @@ impl Tokens {
 fn served_class(r: &UsageRow<'_>) -> Result<Class, Unpriced> {
     let tier = match r.service_tier {
         // `default` (OpenAI), `standard` (Anthropic), `on_demand` (Groq): the standard tier.
-        None | Some("default" | "standard" | "on_demand") => Class::Standard,
+        // `auto` is the request's default echoed back unresolved (Meta, through OpenRouter,
+        // reports it on every Muse Spark answer and bills the standard rate): no other tier was
+        // asked for, so none was served.
+        None | Some("default" | "standard" | "on_demand" | "auto") => Class::Standard,
         Some("priority" | "fast") => Class::Fast,
         Some("ultrafast") => Class::Ultrafast,
         Some("flex") => Class::Flex,
@@ -1271,6 +1274,33 @@ mod tests {
         })
         .unwrap();
         assert_eq!((or.cost.multiplier, or.price.multiplier), (10_550, 10_550));
+    }
+
+    /// A reported `service_tier: "auto"` (Meta through OpenRouter, on every Muse Spark answer) is
+    /// the standard class; from Anthropic, which reports `standard`, it is still refused.
+    /// claim: BIL-24
+    /// defect: D271
+    #[test]
+    fn service_tier_auto_is_the_standard_class() {
+        let muse = price(&UsageRow {
+            service_tier: Some("auto"),
+            usage_wire: WireFormat::OpenAi,
+            upstream_cost_usd: Some("0.0000212"),
+            ..row("meta/muse-spark-1.3-contributor", "openrouter")
+        })
+        .unwrap();
+        assert_eq!(
+            (muse.cost.class, muse.price.class),
+            (Class::Standard, Class::Standard)
+        );
+        assert_eq!(muse.price.micros, 22);
+        assert_eq!(
+            price(&UsageRow {
+                service_tier: Some("auto"),
+                ..row("claude-opus-4-8", "anthropic")
+            }),
+            Err(Unpriced::UnknownClass)
+        );
     }
 
     #[test]

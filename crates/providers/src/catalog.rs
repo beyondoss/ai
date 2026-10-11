@@ -509,6 +509,12 @@ pub enum ToolThinking {
     /// be called, as a Claude model that refuses forced tool use gets it: a call is then very
     /// likely, not guaranteed.
     ForcedAsInstruction,
+    /// Accepts only `tool_choice: "auto"`: Meta's Muse Spark answers `"none"`, `"required"` and a
+    /// named function alike with 400 "only `\"auto\"` is supported for `tool_choice`" (D270). A
+    /// forced request goes as [`Self::ForcedAsInstruction`] does; a `"none"` request goes with
+    /// `tools` and `tool_choice` removed, so no tool can be called (a conversation that holds
+    /// earlier tool calls and results is still served without them).
+    AutoOnly,
 }
 
 /// Candidates whose thinking and tools conflict. Measured 2026-10-01: forced `tool_choice` is a 400
@@ -520,7 +526,10 @@ pub enum ToolThinking {
 /// Measured 2026-10-11 at OpenRouter (Alibaba): Qwen3.8 Omni Flash refuses `required` while
 /// thinking and calls the tool with thinking off; Qwen3.8 Max Prime refuses `required` and a named
 /// function alike, and cannot think off (400 "Reasoning is mandatory"), and with `auto` and a
-/// closing system message to call the tool it called it 4 of 4 times.
+/// closing system message to call the tool it called it 4 of 4 times. Meta's Muse Spark (OpenRouter,
+/// Meta) refuses every `tool_choice` but `auto`; with `auto` and the closing message it called the
+/// tool 4 of 4 times, and with `tools` removed it answered a conversation holding a tool call and
+/// its result (2026-10-11).
 const TOOL_THINKING: &[(ProviderId, &str, ToolThinking)] = &[
     (
         ProviderId::Together,
@@ -541,6 +550,16 @@ const TOOL_THINKING: &[(ProviderId, &str, ToolThinking)] = &[
         ProviderId::OpenRouter,
         "qwen/qwen3.8-flash",
         ToolThinking::OffWhenForced,
+    ),
+    (
+        ProviderId::OpenRouter,
+        "meta/muse-spark-1.2-contributor",
+        ToolThinking::AutoOnly,
+    ),
+    (
+        ProviderId::OpenRouter,
+        "meta/muse-spark-1.3-contributor",
+        ToolThinking::AutoOnly,
     ),
     (
         ProviderId::OpenRouter,
@@ -4583,12 +4602,14 @@ mod tests {
     /// defect: D171, D172, D269
     #[test]
     fn qwen_candidates_whose_thinking_breaks_tools() {
-        use ToolThinking::{ForcedAsInstruction, Free, OffWhenForced, OffWithTools};
+        use ToolThinking::{AutoOnly, ForcedAsInstruction, Free, OffWhenForced, OffWithTools};
         for (model, want, n) in [
             ("qwen/qwen3.7-plus", OffWithTools, 2),
             ("qwen/qwen3.8-flash", OffWhenForced, 2),
             ("qwen/qwen3.8-omni-flash", OffWhenForced, 1),
             ("qwen/qwen3.8-max-prime", ForcedAsInstruction, 1),
+            ("meta/muse-spark-1.2-contributor", AutoOnly, 1),
+            ("meta/muse-spark-1.3-contributor", AutoOnly, 1),
             ("qwen/qwen3.6-plus", Free, 2),
             ("qwen/qwen3.7-max", Free, 2),
         ] {
@@ -4607,7 +4628,7 @@ mod tests {
             .flat_map(|r| r.candidates)
             .filter(|c| tool_thinking(c) != Free)
             .count();
-        assert_eq!(marked, 6);
+        assert_eq!(marked, 8);
     }
 
     /// `developer` is read as OpenAI defines it only by OpenAI and OpenRouter (which maps it per

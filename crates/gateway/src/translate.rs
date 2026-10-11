@@ -4919,7 +4919,9 @@ pub fn developer_as_system(body: &mut Vec<u8>) -> bool {
 /// refuses it while thinking; under `OffWithTools` any tool request does, unless the client asked
 /// for reasoning itself. Under `ForcedAsInstruction` (the candidate cannot think off) a forced
 /// request goes as `"tool_choice":"auto"` with a closing system message naming what must be called
-/// instead. Every other byte stays as sent. `true` when the body changed.
+/// instead. Under `AutoOnly` a forced request goes that way too, and a `"tool_choice":"none"`
+/// request goes with its root `tools` and `tool_choice` cut out by span (D270). Every other byte
+/// stays as sent. `true` when the body changed.
 pub fn fit_tools_to_thinking(body: &mut Vec<u8>, rule: providers::catalog::ToolThinking) -> bool {
     use providers::catalog::ToolThinking;
     if rule == ToolThinking::Free || memchr::memmem::find(body, b"\"tools\"").is_none() {
@@ -4938,7 +4940,14 @@ pub fn fit_tools_to_thinking(body: &mut Vec<u8>, rule: providers::catalog::ToolT
     }
     let choice = last("tool_choice").map(|m| &body[m.value.0..m.value.1]);
     let forced = choice.is_some_and(|v| v == b"\"required\"" || v.first() == Some(&b'{'));
-    if rule == ToolThinking::ForcedAsInstruction {
+    if rule == ToolThinking::AutoOnly && choice == Some(&b"\"none\""[..]) {
+        let tools = peek::remove_root_members(body, "tools");
+        return peek::remove_root_members(body, "tool_choice") || tools;
+    }
+    if matches!(
+        rule,
+        ToolThinking::ForcedAsInstruction | ToolThinking::AutoOnly
+    ) {
         let Some(choice) = choice.filter(|_| forced) else {
             return false;
         };
@@ -8916,6 +8925,41 @@ mod tests {
             assert!(!fit_tools_to_thinking(&mut b, rule));
             assert_eq!(b, body);
         }
+    }
+
+    /// A candidate that accepts only `auto` gets a forced tool as an instruction, and `none` as no
+    /// tools at all; `auto` is sent as it came.
+    /// claim: T1
+    /// defect: D270
+    #[test]
+    fn an_auto_only_candidate_gets_none_as_no_tools_and_forced_as_an_instruction() {
+        use providers::catalog::ToolThinking::AutoOnly;
+        let run = |body: &str| {
+            let mut b = body.as_bytes().to_vec();
+            let changed = fit_tools_to_thinking(&mut b, AutoOnly);
+            (changed, String::from_utf8(b).unwrap())
+        };
+        assert_eq!(
+            run(
+                r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"tools":[{}],"tool_choice":"none","n":1}"#
+            ),
+            (
+                true,
+                r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"n":1}"#.to_owned()
+            )
+        );
+        let (changed, out) = run(
+            r#"{"messages":[{"role":"user","content":"hi"}],"tools":[{}],"tool_choice":"required"}"#,
+        );
+        assert!(changed);
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["tool_choice"], "auto");
+        assert_eq!(
+            v["messages"][1],
+            json!({"role": "system", "content": "Respond by calling one of the provided tools."})
+        );
+        let auto = r#"{"messages":[],"tools":[{}],"tool_choice":"auto"}"#;
+        assert_eq!(run(auto), (false, auto.to_owned()));
     }
 
     /// A candidate that always thinks gets a forced tool as `auto` plus a closing system message
