@@ -1458,6 +1458,13 @@ note = "Absent from the serverless models table; a serverless key gets 400 model
 
 [[not_serverless]]
 provider = "together"
+id = "google/gemma-4-26B-A4B-it"
+source = "https://docs.together.ai/docs/serverless/models"
+date = "2026-10-11"
+note = "Listed by /v1/models at $0, absent from the serverless models table; a serverless key gets 400 model_not_available \"Unable to access non-serverless model google/gemma-4-26B-A4B-it\" (2026-10-11). google/gemma-4-26b-a4b-it is OpenRouter-only."
+
+[[not_serverless]]
+provider = "together"
 id = "Qwen/Qwen2.5-7B-Instruct-Turbo"
 source = "https://docs.together.ai/docs/serverless/models"
 date = "2026-10-01"
@@ -2644,6 +2651,11 @@ cost = { deepseek = "list", together = "together:deepseek-ai/DeepSeek-V4.1-Flash
 model = "deepseek-v4-pro"
 list_card = "deepseek:deepseek-v4-pro"
 cost = { deepseek = "list", together = "together:deepseek-ai/DeepSeek-V4-Pro-0813", openrouter = "openrouter:deepseek/deepseek-v4-pro-0813" }
+
+[[pricing]]
+model = "google/gemma-4-26b-a4b-it"
+list_card = "list"
+cost = { openrouter = "openrouter:google/gemma-4-26b-a4b-it" }
 
 [[pricing]]
 model = "google/gemma-4-31b-it"
