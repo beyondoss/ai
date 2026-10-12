@@ -1,6 +1,6 @@
-//! `--tool-tuning edit-schema=…`, the edit tool's A/B surfaces, and the filler-pair rule every
-//! surface shares. Each case below is a shape the longctx eval actually saw GPT models send (see
-//! "Edit tool surface" in ARCHITECTURE.md).
+//! The filler-pair rule: what `edit` does with a top-level `old_string`/`new_string` sent beside
+//! `edits[]`. Each case below is a shape the longctx eval actually saw GPT models send (see "Edit tool
+//! surface" in ARCHITECTURE.md).
 
 use serde_json::{Value, json};
 
@@ -11,10 +11,6 @@ fn tmp(contents: &str) -> tempfile::NamedTempFile {
     let mut f = tempfile::NamedTempFile::new().unwrap();
     f.write_all(contents.as_bytes()).unwrap();
     f
-}
-
-fn tools(schema: EditSchema) -> Vec<Edit> {
-    Edit::default().with_options(EditOptions { schema })
 }
 
 async fn run_on(
@@ -145,115 +141,4 @@ async fn applies_replace_all_to_the_one_entry_left_after_dropping_filler() {
     .await;
     r.unwrap();
     assert_eq!(after, "y y y");
-}
-
-fn props(t: &Edit) -> Vec<String> {
-    let s = t.input_schema();
-    let mut p: Vec<String> = s["properties"]
-        .as_object()
-        .unwrap()
-        .keys()
-        .cloned()
-        .collect();
-    p.sort();
-    p
-}
-
-fn required(t: &Edit) -> Vec<String> {
-    let mut r: Vec<String> = t.input_schema()["required"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|v| v.as_str().unwrap().to_string())
-        .collect();
-    r.sort();
-    r
-}
-
-#[test]
-fn combined_schema_is_unchanged() {
-    let t = tools(EditSchema::Combined);
-    assert_eq!(t.len(), 1);
-    assert_eq!(t[0].name(), "edit");
-    assert_eq!(
-        props(&t[0]),
-        ["edits", "new_string", "old_string", "path", "replace_all"]
-    );
-    assert_eq!(required(&t[0]), ["path"]);
-}
-
-#[test]
-fn edits_only_schema_advertises_no_top_level_pair() {
-    let t = tools(EditSchema::EditsOnly);
-    assert_eq!(t.len(), 1);
-    assert_eq!(t[0].name(), "edit");
-    assert_eq!(props(&t[0]), ["edits", "path"]);
-    assert_eq!(required(&t[0]), ["edits", "path"]);
-}
-
-#[test]
-fn split_schema_is_a_single_edit_plus_multi_edit() {
-    let t = tools(EditSchema::Split);
-    let names: Vec<&str> = t.iter().map(|t| t.name()).collect();
-    assert_eq!(names, ["edit", MULTI_EDIT]);
-    assert_eq!(
-        props(&t[0]),
-        ["new_string", "old_string", "path", "replace_all"]
-    );
-    assert_eq!(required(&t[0]), ["new_string", "old_string", "path"]);
-    assert_eq!(props(&t[1]), ["edits", "path"]);
-    assert!(t[0].description().contains("multi_edit"));
-    assert!(t[1].description().contains("`edit`"));
-}
-
-#[tokio::test]
-async fn every_surface_accepts_the_other_shape_rather_than_failing_on_schema() {
-    // A model that ignores the advertised shape still gets its edit applied.
-    for schema in [EditSchema::EditsOnly, EditSchema::Split] {
-        for t in tools(schema) {
-            let (r, after) = run_on(
-                &t,
-                "alpha",
-                json!({ "old_string": "alpha", "new_string": "A" }),
-            )
-            .await;
-            r.unwrap();
-            assert_eq!(after, "A");
-            let (r, after) = run_on(
-                &t,
-                "alpha",
-                json!({ "edits": [{ "old_string": "alpha", "new_string": "A" }] }),
-            )
-            .await;
-            r.unwrap();
-            assert_eq!(after, "A");
-        }
-    }
-}
-
-#[test]
-fn multi_edit_declares_its_write_target_so_dispatch_serializes_it() {
-    let t = tools(EditSchema::Split);
-    assert!(t[1].write_target(&json!({ "path": "a.txt" })).is_some());
-}
-
-/// Under the `json-key-order` feature serde_json keeps insertion order, so the schema reaches the wire
-/// with `path` first and `old_string` before `new_string` — the order the source writes them in.
-#[cfg(feature = "json-key-order")]
-#[test]
-fn json_key_order_feature_serializes_properties_in_source_order() {
-    let s = serde_json::to_string(&Edit::default().input_schema()).unwrap();
-    let pos = |k: &str| s.find(&format!("\"{k}\"")).unwrap();
-    assert!(pos("path") < pos("edits"));
-    assert!(pos("old_string") < pos("new_string"));
-}
-
-/// Without it (the default build) serde_json sorts keys: what every eval run so far was sent.
-#[cfg(not(feature = "json-key-order"))]
-#[test]
-fn default_build_serializes_schema_keys_alphabetically() {
-    let s = serde_json::to_string(&Edit::default().input_schema()).unwrap();
-    let pos = |k: &str| s.find(&format!("\"{k}\"")).unwrap();
-    assert!(pos("edits") < pos("path"));
-    assert!(pos("new_string") < pos("old_string"));
 }

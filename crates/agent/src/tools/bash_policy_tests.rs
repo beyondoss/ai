@@ -1,8 +1,7 @@
-//! `BashPolicy`: the detached-job path (idle and wall-clock yields, wait, kill, cleanup) and the
-//! timeout-guidance text. The default policy's behavior is covered by `bash.rs`'s own tests.
+//! `BashPolicy`: the detached-job path (idle and wall-clock yields, wait, kill, cleanup). The default
+//! policy's behavior is covered by `bash.rs`'s own tests.
 
 use super::*;
-use crate::tools::exec::ExecResult;
 
 fn idle(ms: u64) -> BashPolicy {
     BashPolicy {
@@ -51,7 +50,6 @@ fn the_default_policy_leaves_the_schema_and_description_alone() {
     assert_eq!(schema["required"], json!(["command"]));
     assert!(schema["properties"].get("job").is_none());
     assert!(!bash.description().contains("job"));
-    assert!(!bash.description().contains("Set `timeout_ms` to fit"));
     // Opting into an all-default policy is the same as not opting in.
     let same = Bash::real().with_policy(BashPolicy::default());
     assert_eq!(same.description(), bash.description());
@@ -251,69 +249,4 @@ async fn cancelling_a_detachable_call_kills_the_command_and_keeps_its_output() {
         "{msg}"
     );
     drop(rx);
-}
-
-#[test]
-fn timeout_guidance_adds_sizing_advice_to_the_description() {
-    let desc = Bash::real()
-        .with_policy(BashPolicy {
-            timeout_guidance: true,
-            ..BashPolicy::default()
-        })
-        .description()
-        .to_string();
-    assert!(
-        desc.contains("Set `timeout_ms` to fit the command"),
-        "{desc}"
-    );
-    // The default and the ceiling are unchanged; only the advice is new.
-    assert!(desc.contains("30 minutes"), "{desc}");
-}
-
-#[tokio::test]
-async fn timeout_guidance_adds_the_stuck_hint_only_to_a_timeout() {
-    let guided = |result: ExecResult| {
-        Bash::with_runner(Arc::new(FixedRunner(result))).with_policy(BashPolicy {
-            timeout_guidance: true,
-            ..BashPolicy::default()
-        })
-    };
-    let ToolError::Execution(msg) = guided(ExecResult {
-        timed_out: true,
-        ..Default::default()
-    })
-    .run(json!({ "command": "x", "timeout_ms": 5000 }))
-    .await
-    .unwrap_err() else {
-        panic!("expected an execution error")
-    };
-    assert!(msg.contains("Command timed out after 5 seconds"), "{msg}");
-    assert!(msg.contains("faulthandler_timeout"), "{msg}");
-
-    let ToolError::Execution(msg) = guided(ExecResult {
-        code: Some(1),
-        ..Default::default()
-    })
-    .run(json!({ "command": "x" }))
-    .await
-    .unwrap_err() else {
-        panic!("expected an execution error")
-    };
-    assert!(!msg.contains("faulthandler_timeout"), "{msg}");
-}
-
-/// Returns one canned result without running anything.
-struct FixedRunner(ExecResult);
-
-#[async_trait]
-impl CommandRunner for FixedRunner {
-    async fn run(
-        &self,
-        _program: &str,
-        _args: &[String],
-        _cwd: Option<&str>,
-        _timeout: Duration,
-    ) -> std::io::Result<ExecResult> {
-        Ok(self.0.clone())
-    }
 }

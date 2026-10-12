@@ -1,5 +1,5 @@
-//! `StepBudget` in the real loop: where each message lands in the transcript, the wrap-up grant,
-//! and that the default changes nothing. The decision logic itself is unit-tested in
+//! `StepBudget` in the real loop: the wrap-up grant, where its message lands in the transcript, and
+//! that the default changes nothing. The decision logic itself is unit-tested in
 //! `step_budget.rs`.
 
 use std::sync::Arc;
@@ -88,35 +88,9 @@ async fn the_default_budget_injects_nothing() {
 }
 
 #[tokio::test]
-async fn the_notice_rides_the_tool_results_turn_when_the_threshold_is_reached() {
-    let budget = StepBudget {
-        notice_at: Some(2),
-        ..StepBudget::default()
-    };
-    let (session, result, fired) = run(&agent(tool_turns(10), 5, budget)).await;
-    assert!(matches!(result, Err(Error::MaxSteps(5))));
-    assert_eq!(fired, vec![(StepBudgetKind::Notice, 2)]);
-    let notices: Vec<_> = user_texts(&session)
-        .into_iter()
-        .filter(|(_, t)| t.contains("[step budget]"))
-        .collect();
-    assert_eq!(notices.len(), 1, "{notices:?}");
-    let (idx, text) = &notices[0];
-    assert!(text.contains("2 of this run's 5 steps remain"), "{text}");
-    // In the same message as a tool result: no extra user turn, so role alternation holds.
-    assert!(
-        session.messages[*idx]
-            .content
-            .iter()
-            .any(|b| matches!(b, ContentBlock::ToolResult { .. }))
-    );
-}
-
-#[tokio::test]
 async fn the_wrap_up_grants_extra_steps_and_the_error_still_names_the_ceiling() {
     let budget = StepBudget {
         wrap_up_steps: Some(2),
-        ..StepBudget::default()
     };
     // Keeps calling tools through the grant: the run ends at 4 + 2 steps.
     let (session, result, fired) = run(&agent(tool_turns(10), 4, budget)).await;
@@ -134,39 +108,10 @@ async fn the_wrap_up_grants_extra_steps_and_the_error_still_names_the_ceiling() 
 async fn a_model_that_stops_during_the_wrap_up_ends_cleanly() {
     let budget = StepBudget {
         wrap_up_steps: Some(3),
-        continue_nudge: true,
-        ..StepBudget::default()
     };
     let mut turns = tool_turns(3);
     turns.push(turn::text("reverted the broken edit; summary"));
     let (_session, result, fired) = run(&agent(turns, 3, budget)).await;
     assert!(result.is_ok(), "{result:?}");
-    // No nudge after a wrap-up: the model was told to stop.
     assert_eq!(fired, vec![(StepBudgetKind::WrapUp, 3)]);
-}
-
-#[tokio::test]
-async fn an_early_stop_is_nudged_once_then_allowed() {
-    let budget = StepBudget {
-        continue_nudge: true,
-        ..StepBudget::default()
-    };
-    let turns = vec![
-        turn::tool_call("t0", "noop", "{}"),
-        turn::text("I did not complete the task."),
-        turn::tool_call("t1", "noop", "{}"),
-        turn::text("Done now."),
-    ];
-    let (session, result, fired) = run(&agent(turns, 10, budget)).await;
-    assert!(result.is_ok(), "{result:?}");
-    assert_eq!(fired, vec![(StepBudgetKind::Nudge, 8)]);
-    let texts = user_texts(&session);
-    let nudge = texts
-        .iter()
-        .find(|(_, t)| t.contains("[step budget]"))
-        .expect("nudge in transcript");
-    assert!(nudge.1.contains("8 of 10 steps left"), "{}", nudge.1);
-    // Its own user turn, right after the assistant's stop.
-    assert_eq!(session.messages[nudge.0 - 1].role, Role::Assistant);
-    assert_eq!(session.steps, 4);
 }

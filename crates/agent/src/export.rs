@@ -946,7 +946,7 @@ fn language_class_for_tool_result(
     tool_name: &str,
     input: &serde_json::Value,
 ) -> Option<&'static str> {
-    if !matches!(tool_name, "read" | "write" | "edit" | "multi_edit") {
+    if !matches!(tool_name, "read" | "write" | "edit") {
         return None;
     }
     let path = input.get("path").and_then(serde_json::Value::as_str)?;
@@ -1012,7 +1012,7 @@ fn strip_control_chars(text: &str) -> Cow<'_, str> {
 /// specific-casing; the rest already read fine as JSON (a pattern, a path, a glob).
 fn render_tool_call(out: &mut String, name: &str, input: &serde_json::Value) {
     match name {
-        "edit" | "multi_edit" => render_edit_call(out, input),
+        "edit" => render_edit_call(out, input),
         "write" => render_write_call(out, input),
         "bash" => render_bash_call(out, input),
         "read" => render_read_call(out, input),

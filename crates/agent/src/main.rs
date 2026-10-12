@@ -289,18 +289,10 @@ enum Command {
         /// Opt-in cap on model turns before bailing with an error (default: unbounded).
         #[usage(long)]
         max_steps: Option<u32>,
-        /// Experimental, needs `--max-steps`: once this many steps or fewer remain, tell the model
-        /// once ("N of M steps remain"). Off by default.
-        #[usage(long, env = "AI_AGENT_MAX_STEPS_NOTICE")]
-        max_steps_notice: Option<u32>,
         /// Experimental, needs `--max-steps`: when the last step's tools finish, grant this many
         /// more steps to leave the workspace consistent and summarize. Off by default.
         #[usage(long, env = "AI_AGENT_MAX_STEPS_WRAP_UP")]
         max_steps_wrap_up: Option<u32>,
-        /// Experimental, needs `--max-steps`: when the model stops with at least 20% of its steps
-        /// left, ask it once to keep going if the task is not complete. Off by default.
-        #[usage(long, env = "AI_AGENT_MAX_STEPS_CONTINUE_NUDGE")]
-        max_steps_continue_nudge: bool,
         /// Per-turn output token ceiling. `serve`'s identical flag; defaults to the model's own
         /// capability-table `max_output` (see `agent_core::models::capabilities`) when omitted.
         #[usage(long, env = "AI_AGENT_MAX_TOKENS")]
@@ -413,7 +405,7 @@ enum Command {
         #[usage(long, env = "AI_AGENT_NO_CACHED_SUMMARY")]
         no_cached_summary: bool,
         /// Compaction changes under evaluation, by name (comma-separated), all off by default:
-        /// `state`, `tail`, `mask-breakeven`, `mask-best-start` (see
+        /// `state`, `tail`, `mask-breakeven` (see
         /// `agent_core::CompactionCandidates`). An unknown name is an error. `serve`'s identical
         /// flag.
         #[usage(long, env = "AI_AGENT_COMPACTION_CANDIDATES", delimiter = ',')]
@@ -514,10 +506,6 @@ enum Command {
         /// default.
         #[usage(long, env = "AI_AGENT_BASH_YIELD_SECS")]
         bash_yield_secs: Option<u64>,
-        /// Experimental: tell the model to size `bash`'s `timeout_ms` to the command, and add a
-        /// "probably stuck" hint to a timed-out result. Off by default.
-        #[usage(long, env = "AI_AGENT_BASH_TIMEOUT_GUIDANCE")]
-        bash_timeout_guidance: bool,
         /// Run `bash` commands through this shell instead of the auto-resolved one (`/bin/bash`, else
         /// `bash` on `$PATH`, else `sh`). Matches pi's own `shellPath` setting. `serve`'s identical flag.
         #[usage(long, env = "AI_AGENT_BASH_SHELL_PATH")]
@@ -538,12 +526,6 @@ enum Command {
         /// The `web` tool's per-request timeout (ms). Default 30,000. `serve`'s identical flag.
         #[usage(long, env = "AI_AGENT_WEB_TIMEOUT_MS")]
         web_timeout_ms: Option<u64>,
-        /// An A/B knob on how a built-in tool presents itself to the model, `KEY=VALUE` (repeatable or
-        /// comma-separated), e.g. `edit-schema=split` or `bash-test-digest=pytest` (keys: `edit-schema`,
-        /// `bash-max-bytes`, `bash-test-digest`, `test-guideline`, `search-tool`, `tool-guidelines`). Every default is the production behavior; an unknown key or value is
-        /// an error. See `tools::tuning`. `serve`'s identical flag.
-        #[usage(long, env = "AI_AGENT_TOOL_TUNING")]
-        tool_tuning: Vec<String>,
         /// Run the filesystem tools (`read`/`write`/`edit`/`ls`/`grep`/`find`) against a remote
         /// **exec endpoint** instead of this host. Any URL that accepts
         /// `POST {command, args, cwd, timeout_ms}` and answers `{exit_code, stdout, stderr}`.
@@ -1015,7 +997,7 @@ enum Command {
         #[usage(long, env = "AI_AGENT_NO_CACHED_SUMMARY")]
         no_cached_summary: bool,
         /// Compaction changes under evaluation, by name (comma-separated), all off by default:
-        /// `state`, `tail`, `mask-breakeven`, `mask-best-start` (see
+        /// `state`, `tail`, `mask-breakeven` (see
         /// `agent_core::CompactionCandidates`). An unknown name is an error. `run`'s identical
         /// flag.
         #[usage(long, env = "AI_AGENT_COMPACTION_CANDIDATES", delimiter = ',')]
@@ -1163,12 +1145,6 @@ enum Command {
         /// The `web` tool's per-request timeout (ms). Default 30,000. `serve`'s identical flag.
         #[usage(long, env = "AI_AGENT_WEB_TIMEOUT_MS")]
         web_timeout_ms: Option<u64>,
-        /// An A/B knob on how a built-in tool presents itself to the model, `KEY=VALUE` (repeatable or
-        /// comma-separated), e.g. `edit-schema=split` or `bash-test-digest=pytest` (keys: `edit-schema`,
-        /// `bash-max-bytes`, `bash-test-digest`, `test-guideline`, `search-tool`, `tool-guidelines`). Every default is the production behavior; an unknown key or value is
-        /// an error. See `tools::tuning`. `run`'s identical flag.
-        #[usage(long, env = "AI_AGENT_TOOL_TUNING")]
-        tool_tuning: Vec<String>,
         /// Point every session's tools at a remote exec endpoint by default. A multi-tenant server
         /// leaves this unset and uses the `set_exec_endpoint` command per session instead.
         #[usage(long, env = "AI_AGENT_EXEC_URL", conflicts = "exec_cmd")]
@@ -2009,9 +1985,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             gateway_url,
             key,
             max_steps,
-            max_steps_notice,
             max_steps_wrap_up,
-            max_steps_continue_nudge,
             max_tokens,
             cache_ttl,
             cache_long,
@@ -2047,13 +2021,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             bash_timeout_ms,
             bash_idle_yield_secs,
             bash_yield_secs,
-            bash_timeout_guidance,
             bash_shell_path,
             bash_command_prefix,
             web_allow_private,
             web_allow_host,
             web_timeout_ms,
-            tool_tuning,
             exec_url,
             exec_header,
             exec_max_response_bytes,
@@ -2099,9 +2071,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 key,
                 max_steps,
                 agent_core::StepBudget {
-                    notice_at: max_steps_notice,
                     wrap_up_steps: max_steps_wrap_up,
-                    continue_nudge: max_steps_continue_nudge,
                 },
                 max_tokens,
                 CacheTtl::resolve(cache_ttl, cache_long, CacheTtl::FiveMinutes),
@@ -2142,14 +2112,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     wall_yield: bash_yield_secs
                         .filter(|&s| s > 0)
                         .map(std::time::Duration::from_secs),
-                    timeout_guidance: bash_timeout_guidance,
                 },
                 bash_shell_path,
                 bash_command_prefix,
                 web_allow_private,
                 web_allow_host,
                 web_timeout_ms,
-                tools::ToolTuning::parse(&tool_tuning)?,
                 exec_url,
                 exec_header,
                 exec_max_response_bytes,
@@ -2257,7 +2225,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             web_allow_private,
             web_allow_host,
             web_timeout_ms,
-            tool_tuning,
             exec_url,
             exec_header,
             exec_max_response_bytes,
@@ -2412,17 +2379,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             // `--system-prompt`/`--append-system-prompt` may each name an existing, readable file
             // instead of literal text (pi-parity fix — matches pi's own `resolvePromptInput`). `run`'s
             // identical resolution (`main.rs::resolve_prompt_input`).
-            let tool_tuning = tools::ToolTuning::parse(&tool_tuning)?;
             let system = system_prompt
                 .as_deref()
                 .map(resolve_prompt_input)
                 .unwrap_or_else(|| {
                     // Shell-path override doesn't affect this registry's use (listing tool
                     // names/descriptions for the default system prompt) — `describe()` doesn't mention it.
-                    // The tuning does: the edit bullets follow the advertised edit schema.
                     let mut reg = tools::default_registry_with_config(&tools::ToolConfig {
                         bash_timeout_ms,
-                        tuning: tool_tuning,
                         ..tools::ToolConfig::new()
                     });
                     tools::apply_filter(
@@ -2431,11 +2395,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         exclude_tools.as_deref(),
                         no_tools,
                     );
-                    beyond_ai_agent::resources::default_system_prompt_with(
-                        &reg,
-                        &prompt_guidelines,
-                        &tool_tuning,
-                    )
+                    beyond_ai_agent::resources::default_system_prompt(&reg, &prompt_guidelines)
                 });
             // `--append-system-prompt` is repeatable (pi-parity fix: previously a second occurrence
             // silently clobbered the first instead of accumulating) — each occurrence is resolved
@@ -2771,7 +2731,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 web_allow_private,
                 web_allow_hosts: web_allow_host,
                 web_timeout_ms,
-                tool_tuning,
                 exec_url,
                 exec_header,
                 exec_max_response_bytes: exec_max_response_bytes.map_or(
@@ -4281,7 +4240,6 @@ async fn run_task(
     web_allow_private: bool,
     web_allow_host: Vec<String>,
     web_timeout_ms: Option<u64>,
-    tool_tuning: tools::ToolTuning,
     exec_url: Option<String>,
     exec_header: Vec<String>,
     exec_max_response_bytes: Option<u64>,
@@ -4745,7 +4703,6 @@ async fn run_task(
         web_allow_private,
         web_allow_hosts: &web_allow_host,
         web_timeout_ms,
-        tuning: tool_tuning,
         image_auto_resize,
         code_mode,
         mcp_loading,
@@ -5049,7 +5006,6 @@ async fn run_task(
                 web_allow_private,
                 web_allow_hosts: web_allow_host.clone(),
                 web_timeout_ms,
-                tuning: tool_tuning,
                 image_auto_resize,
                 // A child acts on the same machine as its parent. Handing down `None` here was a
                 // sandbox escape: the model could reach the host simply by delegating to a subagent.
@@ -5100,11 +5056,8 @@ async fn run_task(
     // `build_system_prompt` can tell "an explicit override was given" apart from "nothing given, use the
     // built-in default" — an explicit flag must win outright over a trusted project's on-disk
     // `SYSTEM.md`, which previously always won regardless (pi-parity fix).
-    let default_base = beyond_ai_agent::resources::default_system_prompt_with(
-        &registry,
-        &prompt_guidelines,
-        &tool_tuning,
-    );
+    let default_base =
+        beyond_ai_agent::resources::default_system_prompt(&registry, &prompt_guidelines);
     // Skills are discovered by path, not inlined into the prompt — invoking one relies on the model
     // being able to open its `SKILL.md` itself, so advertising them at all when `read` isn't registered
     // (a restricted `--tools`/`--exclude-tools` invocation) just adds dead weight (pi-parity fix).

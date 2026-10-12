@@ -373,29 +373,6 @@ impl OutputAccumulator {
         self
     }
 
-    /// Builder-style: a different display cap than [`DEFAULT_MAX_BYTES`] (`--tool-tuning
-    /// bash-max-bytes`). The rolling tail scales with it, as in [`Self::with_prefix`].
-    pub fn with_max_bytes(mut self, max_bytes: usize) -> Self {
-        self.max_bytes = max_bytes;
-        self.rolling_cap = (max_bytes * 2).max(1);
-        self
-    }
-
-    /// Force the spill file to exist and hold the complete output so far, returning its path — for a
-    /// caller that drops lines from output that was *not* truncated (see `bash_output`'s digest), so
-    /// what it drops stays readable. `None` when spilling is off or failed.
-    pub fn persist(&mut self) -> Option<String> {
-        self.ensure_temp_file();
-        if let Some(w) = self.temp_writer.as_mut()
-            && w.flush().is_err()
-        {
-            self.mark_spill_broken();
-        }
-        self.temp_path
-            .as_ref()
-            .map(|p| p.to_string_lossy().into_owned())
-    }
-
     /// Builder-style: shrink the spill file's byte budget. Test-only — production always runs the
     /// real [`MAX_SPILL_BYTES`], and a test that had to actually emit 128 MiB to reach it would be
     /// writing that much to the same tmpfs the budget exists to protect.
@@ -867,7 +844,7 @@ fn truncate_str_to_bytes_from_end(s: &str, max_bytes: usize) -> &str {
 /// partial document presented as complete, which is a worse failure than admitting the bytes are gone.
 /// The totals in the same marker (`of {total_lines}`) already describe the *complete* stream, so this
 /// segment names what's actually on disk against it.
-pub(crate) fn full_output_segment(snapshot: &OutputSnapshot) -> String {
+fn full_output_segment(snapshot: &OutputSnapshot) -> String {
     // No file was written because writing one here would have put it on a machine the model cannot
     // reach (see `OutputAccumulator::without_spill`). The marker's job is to be *actionable*, and the
     // action is one the model can take unaided: re-run with the output redirected into its own

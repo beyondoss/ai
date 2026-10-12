@@ -64,7 +64,7 @@ pub const DEFAULT_MAX_DEPTH: u32 = 1;
 
 /// Tools whose presence makes a child able to mutate the filesystem. `bash` counts even though it
 /// declares no `write_target` — precisely *because* it declares none, which is what makes it unlockable.
-const WRITE_CAPABLE_TOOLS: [&str; 4] = ["write", "edit", "multi_edit", "bash"];
+const WRITE_CAPABLE_TOOLS: [&str; 3] = ["write", "edit", "bash"];
 
 /// Disambiguates the per-child prompt-cache keys of a long-lived `serve` process.
 static CHILD_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -116,8 +116,6 @@ pub struct ChildToolConfig {
     pub mcp_loading: crate::tools::tool_search::McpLoading,
     /// The parent's `--exclude-tools` list, applied to the child's nested Code Mode catalog.
     pub exclude_tools: Vec<String>,
-    /// The parent's `--tool-tuning`, so a child's tools present themselves the same way.
-    pub tuning: crate::tools::ToolTuning,
 }
 
 /// Everything a [`Subagent`] needs to build and run a child. Shared by `Arc` across every depth level,
@@ -1066,7 +1064,6 @@ impl Subagent {
             fs_backend: self.ctx.tool_cfg.fs_backend.clone(),
             command_runner: self.ctx.tool_cfg.command_runner.clone(),
             skills: &self.ctx.skills,
-            tuning: self.ctx.tool_cfg.tuning,
         });
         let allow = self.effective_tools(def);
         super::apply_filter(&mut registry, Some(&allow), None, false);
@@ -1103,11 +1100,8 @@ impl Subagent {
         memory_sections: &[(crate::memory::MountKind, String)],
         shared: Option<&SharedChildSetup>,
     ) -> String {
-        let default_base = crate::resources::default_system_prompt_with(
-            registry,
-            &self.ctx.prompt_guidelines,
-            &self.ctx.tool_cfg.tuning,
-        );
+        let default_base =
+            crate::resources::default_system_prompt(registry, &self.ctx.prompt_guidelines);
         let body = def.system.trim();
         // Reuse the fan-out's single cwd→root walk when this child shares the parent cwd (T8-F9). A
         // worktree-isolated child's `root` is its own checkout, so the shared files (walked from — and

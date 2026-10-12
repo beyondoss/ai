@@ -38,32 +38,7 @@ pub fn default_system_prompt(
     registry: &agent_core::ToolRegistry,
     extra_guidelines: &[String],
 ) -> String {
-    default_system_prompt_with(
-        registry,
-        extra_guidelines,
-        &crate::tools::ToolTuning::default(),
-    )
-}
-
-/// [`default_system_prompt`] under `--tool-tuning`'s prompt knobs (`test-guideline`). The default
-/// tuning renders byte-for-byte what [`default_system_prompt`] always has.
-pub fn default_system_prompt_with(
-    registry: &agent_core::ToolRegistry,
-    extra_guidelines: &[String],
-    tuning: &crate::tools::ToolTuning,
-) -> String {
-    use crate::tools::tuning::{TestGuideline, ToolGuidelines};
-    let pytest_guideline = tuning.test_guideline == TestGuideline::Pytest;
-    let tool_guidelines = tuning.tool_guidelines;
-    let defs = registry.definitions();
-    // Whether `edit` takes an `edits[]` array (the default and `edit-schema=edits`) or one
-    // old_string/new_string with a separate `multi_edit` (`edit-schema=split`) — read off the schema
-    // actually advertised, so the guidelines can never describe parameters the tool does not have.
-    let edit_takes_array = defs
-        .iter()
-        .find(|d| d.name == "edit")
-        .is_some_and(|d| d.input_schema["properties"]["edits"].is_object());
-    let names: Vec<String> = defs.into_iter().map(|d| d.name).collect();
+    let names: Vec<String> = registry.definitions().into_iter().map(|d| d.name).collect();
     let has = |n: &str| names.iter().any(|x| x == n);
 
     let mut guidelines: Vec<String> = Vec::new();
@@ -73,18 +48,9 @@ pub fn default_system_prompt_with(
             guidelines.push(g);
         }
     };
-    // The content-search tool: `grep`, or the merged `search` under `search-tool=merged`.
-    let search_tool = if has("grep") {
-        Some("grep")
-    } else if has(crate::tools::search::NAME) {
-        Some(crate::tools::search::NAME)
-    } else {
-        None
-    };
     // Matches pi's own conditional exactly: when `bash` is the only exploration tool registered (none
     // of `grep`/`find`/`ls`), the model needs to be told it's the fallback for those operations too.
-    if has("bash") && !has("grep") && !has("find") && !has("ls") && !has(crate::tools::search::NAME)
-    {
+    if has("bash") && !has("grep") && !has("find") && !has("ls") {
         add(
             "Use bash for file operations like ls, rg, find".to_string(),
             &mut guidelines,
@@ -100,77 +66,22 @@ pub fn default_system_prompt_with(
     // bare "pipe head": Kimi generalized that to `pip install | tail`, which hides exit status.
     // Only fires when all three tools are actually registered: a read-only child must not be told
     // to bash grep/cat.
-    //
-    // Under `test-guideline=pytest` tests get their own bullet below, so the pipe rule keeps only its
-    // install half.
-    let piped = if pytest_guideline {
-        "installs"
-    } else {
-        "installs or tests"
-    };
-    let prefer = tool_guidelines == ToolGuidelines::Default
-        && has("read")
-        && has("bash")
-        && search_tool.is_some();
-    if let Some(search) = search_tool.filter(|_| prefer) {
+    let prefer = has("grep") && has("read") && has("bash");
+    if prefer {
         add(
-            format!(
-                "Prefer {search}/read over bash for search and file contents. Do not `bash grep`/`rg`/`cat`/`sed`; \
-                 if you must sample via bash, `| head` that grep/cat/ls only — never `| head`/`| tail` \
-                 {piped} (hides exit status)."
-            ),
+            "Prefer grep/read over bash for search and file contents. Do not `bash grep`/`rg`/`cat`/`sed`; \
+             if you must sample via bash, `| head` that grep/cat/ls only — never `| head`/`| tail` \
+             installs or tests (hides exit status)."
+                .to_string(),
             &mut guidelines,
             &mut seen,
         );
-    }
-    // `tool-guidelines=neutral`: no preference between the tools and bash, only the fact that makes
-    // bounding output the model's job — bash keeps the tail. Claude ignored the preference anyway
-    // (Sonnet: 0% grep/read on code tasks); whether GPT's ~100% tool use depends on it is the question.
-    if tool_guidelines == ToolGuidelines::Neutral && has("bash") {
-        let tools = match (search_tool, has("read")) {
-            (Some(search), true) => format!("the {search}/read tools"),
-            (Some(search), false) => format!("the {search} tool"),
-            (None, true) => "the read tool".to_string(),
-            (None, false) => String::new(),
-        };
-        if !tools.is_empty() {
-            add(
-                format!(
-                    "Search and read with {tools} or with bash, whichever fits. Bound what you print: \
-                     bash keeps only the last {} of output, so `| head` a broad grep/cat/ls; read \
-                     paginates from the start.",
-                    crate::tools::output::format_size(tuning.bash.max_bytes as u64)
-                ),
-                &mut guidelines,
-                &mut seen,
-            );
-        }
     }
     // The pipe rule is about `bash`, not about grep: when the bullet above that carries it does not
-    // fire (grep excluded, or a non-default `tool-guidelines`), it stands alone rather than vanishing.
+    // fire (`--exclude-tools grep`, a per-vendor tool-set arm), it stands alone rather than vanishing.
     if has("bash") && !prefer {
         add(
-            format!(
-                "Never pipe {} through `| head`/`| tail`; it hides the exit status.",
-                if pytest_guideline {
-                    "installs"
-                } else {
-                    "installs or test runs"
-                }
-            ),
-            &mut guidelines,
-            &mut seen,
-        );
-    }
-    // `test-guideline=pytest`: say what to run, not only what not to pipe. Gated on `bash` alone, so
-    // it survives an `--exclude-tools grep` that drops the bullet above.
-    if pytest_guideline && has("bash") {
-        add(
-            "Run tests with `-q --tb=short` (e.g. `python -m pytest tests -q --tb=short`), even when you \
-             were given the plain command; add `-x` to stop at the first failure while fixing one thing, \
-             and select with `-k` or `path::test_name` to re-check it. Don't pipe test runs through \
-             `head`/`tail` (that hides the exit status); if you need the full log, redirect it to a file \
-             and read the file."
+            "Never pipe installs or test runs through `| head`/`| tail`; it hides the exit status."
                 .to_string(),
             &mut guidelines,
             &mut seen,
@@ -186,7 +97,7 @@ pub fn default_system_prompt_with(
         // Pi's own wording is just the first sentence. The second is ours: GLM-5.3 still
         // `bash cat`'d whole logs through the 50KB tail-truncated cap. Only mention bash
         // when the tool is actually registered — a read-only child must not be told about it.
-        let read_g = if has("bash") && tool_guidelines == ToolGuidelines::Default {
+        let read_g = if has("bash") {
             "Use read to examine files instead of cat or sed. Never bash-cat; read paginates from \
              the start, bash truncates from the tail."
         } else {
@@ -194,33 +105,7 @@ pub fn default_system_prompt_with(
         };
         add(read_g.to_string(), &mut guidelines, &mut seen);
     }
-    if has("edit") && !edit_takes_array {
-        add(
-            "Use edit for one precise change (old_string must match exactly once)".to_string(),
-            &mut guidelines,
-            &mut seen,
-        );
-    }
-    if has(crate::tools::edit::MULTI_EDIT) {
-        for g in [
-            "When changing multiple separate locations in one file, use one multi_edit call with one \
-             entry per change in edits[] instead of multiple edit calls",
-            "Each edits[].old_string is matched against the original file, not after earlier edits are \
-             applied. Do not emit overlapping or nested edits. Merge nearby changes into one edit.",
-        ] {
-            add(g.to_string(), &mut guidelines, &mut seen);
-        }
-    }
-    if has("edit") && !edit_takes_array {
-        add(
-            "Keep old_string as small as possible while still being unique in the file. Do not pad \
-             with large unchanged regions."
-                .to_string(),
-            &mut guidelines,
-            &mut seen,
-        );
-    }
-    if has("edit") && edit_takes_array {
+    if has("edit") {
         for g in [
             "Use edit for precise changes (edits[].old_string must match exactly)",
             "When changing multiple separate locations in one file, use one edit call with multiple \
@@ -1197,45 +1082,6 @@ mod tests {
     }
 
     #[test]
-    fn test_guideline_pytest_names_the_flags_and_moves_the_test_pipe_rule_to_its_own_bullet() {
-        let reg = crate::tools::default_registry();
-        let tuning = crate::tools::ToolTuning::parse(&["test-guideline=pytest"]).unwrap();
-        let prompt = default_system_prompt_with(&reg, &[], &tuning);
-        assert!(prompt.contains("`-q --tb=short`"), "got: {prompt}");
-        assert!(
-            prompt.contains("never `| head`/`| tail` installs (hides exit status)"),
-            "got: {prompt}"
-        );
-        assert!(!prompt.contains("installs or tests"), "got: {prompt}");
-
-        // Without grep the prefer bullet goes, but the test bullet must stay.
-        let mut no_grep = crate::tools::default_registry();
-        crate::tools::apply_filter(&mut no_grep, None, Some(&["grep".to_string()]), false);
-        let prompt = default_system_prompt_with(&no_grep, &[], &tuning);
-        assert!(prompt.contains("`-q --tb=short`"), "got: {prompt}");
-        assert!(prompt.contains("Don't pipe test runs"), "got: {prompt}");
-
-        // The default tuning is byte-for-byte the untuned prompt.
-        assert_eq!(
-            default_system_prompt_with(&reg, &[], &crate::tools::ToolTuning::default()),
-            default_system_prompt(&reg, &[])
-        );
-    }
-
-    fn tuned(entries: &[&str]) -> crate::tools::ToolTuning {
-        crate::tools::ToolTuning::parse(entries).unwrap()
-    }
-
-    fn tuned_registry(t: crate::tools::ToolTuning) -> agent_core::ToolRegistry {
-        let mut reg = crate::tools::default_registry_with_config(&crate::tools::ToolConfig {
-            tuning: t,
-            ..crate::tools::ToolConfig::new()
-        });
-        crate::tools::apply_filter(&mut reg, None, None, false);
-        reg
-    }
-
-    #[test]
     fn the_test_pipe_rule_survives_excluding_grep_find_and_ls() {
         // The rule lived inside the grep/read bullet, so `--exclude-tools grep,find,ls` (the per-vendor
         // tool-set arm) silently dropped it. It is about bash, so it now stands alone.
@@ -1249,107 +1095,6 @@ mod tests {
             "got: {prompt}"
         );
         assert!(prompt.contains("Use bash for file operations like ls, rg, find"));
-    }
-
-    #[test]
-    fn tool_guidelines_neutral_and_none_drop_the_preference_but_keep_the_pipe_rule() {
-        let t = tuned(&["tool-guidelines=neutral"]);
-        let prompt = default_system_prompt_with(&tuned_registry(t), &[], &t);
-        assert!(!prompt.contains("Prefer grep/read"), "got: {prompt}");
-        assert!(!prompt.contains("Never bash-cat"), "got: {prompt}");
-        assert!(
-            prompt
-                .contains("Search and read with the grep/read tools or with bash, whichever fits."),
-            "got: {prompt}"
-        );
-        assert!(
-            prompt.contains("bash keeps only the last 50.0KB"),
-            "got: {prompt}"
-        );
-        assert!(
-            prompt.contains("Never pipe installs or test runs"),
-            "got: {prompt}"
-        );
-
-        // The cap it names is the one bash actually applies.
-        let t = tuned(&["tool-guidelines=neutral", "bash-max-bytes=16k"]);
-        let prompt = default_system_prompt_with(&tuned_registry(t), &[], &t);
-        assert!(
-            prompt.contains("bash keeps only the last 16.0KB"),
-            "got: {prompt}"
-        );
-
-        let t = tuned(&["tool-guidelines=none"]);
-        let prompt = default_system_prompt_with(&tuned_registry(t), &[], &t);
-        assert!(!prompt.contains("Prefer grep/read"), "got: {prompt}");
-        assert!(!prompt.contains("whichever fits"), "got: {prompt}");
-        assert!(!prompt.contains("Never bash-cat"), "got: {prompt}");
-        assert!(prompt.contains("Use read to examine files instead of cat or sed."));
-        assert!(
-            prompt.contains("Never pipe installs or test runs"),
-            "got: {prompt}"
-        );
-
-        // With the pytest test guideline the standalone rule keeps only installs.
-        let t = tuned(&["tool-guidelines=none", "test-guideline=pytest"]);
-        let prompt = default_system_prompt_with(&tuned_registry(t), &[], &t);
-        assert!(
-            prompt.contains("Never pipe installs through"),
-            "got: {prompt}"
-        );
-        assert!(prompt.contains("`-q --tb=short`"), "got: {prompt}");
-    }
-
-    #[test]
-    fn a_merged_search_tool_is_the_search_tool_the_guidelines_name() {
-        let t = tuned(&["search-tool=merged"]);
-        let prompt = default_system_prompt_with(&tuned_registry(t), &[], &t);
-        assert!(
-            prompt.contains("Prefer search/read over bash"),
-            "got: {prompt}"
-        );
-        assert!(
-            !prompt.contains("Use bash for file operations"),
-            "got: {prompt}"
-        );
-        assert!(
-            !prompt.contains("Never pipe installs or test runs"),
-            "got: {prompt}"
-        );
-    }
-
-    #[test]
-    fn edit_guidelines_follow_the_advertised_edit_schema() {
-        // `edit-schema=split`: `edit` has no edits[], so telling the model to fill edits[].old_string
-        // would name a parameter that does not exist; the multi-edit advice moves to `multi_edit`.
-        let split = crate::tools::default_registry_with_config(&crate::tools::ToolConfig {
-            tuning: crate::tools::ToolTuning::parse(&["edit-schema=split"]).unwrap(),
-            ..crate::tools::ToolConfig::new()
-        });
-        let prompt = default_system_prompt(&split, &[]);
-        assert!(prompt.contains("multi_edit"), "got: {prompt}");
-        assert!(
-            prompt.contains("Use edit for one precise change"),
-            "got: {prompt}"
-        );
-        assert!(
-            !prompt.contains("Use edit for precise changes (edits[]"),
-            "got: {prompt}"
-        );
-        assert!(
-            !prompt.contains("use one edit call with multiple"),
-            "got: {prompt}"
-        );
-
-        // `edit-schema=edits` keeps edits[], so it keeps today's bullets verbatim.
-        let edits = crate::tools::default_registry_with_config(&crate::tools::ToolConfig {
-            tuning: crate::tools::ToolTuning::parse(&["edit-schema=edits"]).unwrap(),
-            ..crate::tools::ToolConfig::new()
-        });
-        assert_eq!(
-            default_system_prompt(&edits, &[]),
-            default_system_prompt(&crate::tools::default_registry(), &[])
-        );
     }
 
     #[test]

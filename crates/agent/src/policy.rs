@@ -224,7 +224,7 @@ impl AgentHooks for ToolPolicy {
                 ));
             }
         }
-        if matches!(name, "write" | "edit" | "multi_edit") && !self.denied_paths.is_empty() {
+        if (name == "write" || name == "edit") && !self.denied_paths.is_empty() {
             let path = input.get("path").and_then(Value::as_str)?;
             // The same canonical form `WriteLockRegistry` keys on, and — crucially — the same one the
             // `write`/`edit` tools themselves compute: resolved against *this policy's root* (the tools'
@@ -342,21 +342,6 @@ mod tests {
                 .await
                 .is_some(),
             "`edit` must be gated by `deny_path` the same way `write` is"
-        );
-
-        // So is `edit-schema=split`'s `multi_edit`: a second name for the same write must not be a
-        // way around the deny list.
-        assert!(
-            policy
-                .before_tool_call(
-                    "multi_edit",
-                    &json!({"path": secret.to_str().unwrap(), "edits": [{"old_string": "a", "new_string": "b"}]}),
-                    &session,
-                    &cancel,
-                )
-                .await
-                .is_some(),
-            "`multi_edit` must be gated by `deny_path` the same way `edit` is"
         );
 
         // An unrelated path is untouched.
