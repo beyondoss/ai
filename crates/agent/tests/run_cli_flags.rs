@@ -165,6 +165,12 @@ fn run_binary_list_models_prints_capability_columns_not_just_bare_ids() {
         .lines()
         .find(|l| l.contains("claude-opus-4-8"))
         .unwrap_or_else(|| panic!("no claude-opus-4-8 row: {stdout}"));
+    // Every natively served catalog model is listed with its trigger: Haiku 5.5 compacts at 90K.
+    let haiku_line = stdout
+        .lines()
+        .find(|l| l.starts_with("claude-haiku-5-5 "))
+        .unwrap_or_else(|| panic!("no claude-haiku-5-5 row: {stdout}"));
+    assert!(haiku_line.contains("90K"), "{haiku_line}");
     // Task #39 (pi-parity fix, cosmetic): humanized (`"1M"`), not the raw integer — matches pi's own
     // `--list-models` `formatTokenCount`.
     assert!(

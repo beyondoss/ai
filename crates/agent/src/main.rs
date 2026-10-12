@@ -2804,18 +2804,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             // case-insensitive `contains`, which that query would never match at all.
             let models: Vec<&str> = match &search {
                 Some(query) => {
-                    let mut scored: Vec<(&str, f64)> = serve::available_models()
+                    let mut scored: Vec<(&str, f64)> = serve::listed_models()
                         .iter()
                         .filter_map(|m| fuzzy_match(query, m).map(|score| (*m, score)))
                         .collect();
                     // Lower score is a better match (mirrors pi's own ascending sort) — a stable sort
-                    // keeps `available_models()`'s own relative order as the tie-break, same as pi's
+                    // keeps `listed_models()`'s own relative order as the tie-break, same as pi's
                     // `Array.prototype.sort` (stable per spec).
                     scored
                         .sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
                     scored.into_iter().map(|(m, _)| m).collect()
                 }
-                None => serve::available_models().to_vec(),
+                None => serve::listed_models().to_vec(),
             };
             println!(
                 "{:<22} {:>10} {:>10} {:>9} {:<8} {:<6}",

@@ -856,7 +856,10 @@ The harness layers several capabilities over the bare tools + loop:
   both `set_model`/`cycle_model` echo back the same `model_info` capability shape
   `get_available_models`' own entries carry — context window, max output, reasoning/vision support —
   so a client doesn't need a separate round trip just to learn the new model's capabilities)/
-  `get_available_models`(always the full known-model hint list, _never_ narrowed by `--models` — that
+  `get_available_models`(always the full shown-model list, `serve::listed_models`: the hint list, then
+  every chat model in the provider catalog that a native provider serves under its bare id, which
+  `list-models` prints too and a test holds to the catalog; partial ids still resolve against the short
+  hint list alone, so `--model haiku` stays unambiguous; _never_ narrowed by `--models` — that
   flag only scopes `cycle_model`'s own candidate list; a client's model picker needs the full catalog to
   offer a "show everything" view the way pi's own `/model` selector can Tab out of its scope-defaulted
   view)/

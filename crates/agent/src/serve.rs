@@ -234,7 +234,7 @@
 //!     `followUpMode`. Takes effect immediately (owned by the `Steering` handle itself, no `Agent`
 //!     rebuild), including mid-run.
 //!   - `{type:"get_available_models"}`   → `data: {models: [{id, provider, context_window, reasoning}
-//!     …]}` — always the full, non-exhaustive known-model hint list, never narrowed by `--models`
+//!     …]}` — always the full shown-model list (`listed_models`: the resolution hint list plus every natively served catalog chat model), never narrowed by `--models`
 //!     (that only scopes `cycle_model`'s own candidate list — see its entry above), each entry's
 //!     capability fields read from the same `agent_core::capabilities` table every wire decision
 //!     already consults (pi's own structured `Model<any>`, minus pricing — gateway-owned, out of scope
@@ -5369,7 +5369,7 @@ pub(crate) async fn serve_session(
                                             "get_available_models" => {
                                                 // Always the full known-model hint list, never scoped by `--models` — see the
                                                 // idle-mode handler's identical comment for why.
-                                                let models: Vec<Value> = available_models().iter().map(|m| model_info(m)).collect();
+                                                let models: Vec<Value> = listed_models().iter().map(|m| model_info(m)).collect();
                                                 let _ = out_tx.send(response(cid, "get_available_models", true, Some(json!({ "models": models })), None));
                                             }
                                             // A run is actively in flight — no retry backoff is pending yet
@@ -7731,7 +7731,7 @@ pub(crate) async fn serve_session(
                 // own `/model` selector defaults its view to the scope but still lets the operator Tab
                 // to the full catalog; since this RPC has no such secondary toggle, it always answers
                 // with the unscoped list and leaves any scoped-vs-all UI distinction to the client.
-                let models: Vec<Value> = available_models().iter().map(|m| model_info(m)).collect();
+                let models: Vec<Value> = listed_models().iter().map(|m| model_info(m)).collect();
                 emit!(response(
                     id,
                     "get_available_models",
@@ -9276,6 +9276,33 @@ pub fn available_models() -> &'static [&'static str] {
         "o3",
         "o4-mini",
     ]
+}
+
+/// Every model to *show*: [`available_models`], then every other chat model in the provider
+/// catalog that a native provider serves under its bare id (`providers::for_model_id`): the current
+/// Claude, GPT and o-series, Grok, DeepSeek and Groq-hosted rows. What `list-models` and
+/// `get_available_models` list, so a model's capabilities and compaction trigger are visible the day
+/// its catalog row lands.
+///
+/// Not what a partial `--model`/`set_model` id resolves against: that stays [`available_models`],
+/// whose short, unambiguous list keeps `--model sonnet` or `--model haiku` resolving to one id
+/// instead of erroring on several. Vendor-slug rows (`qwen/…`, aggregator-only) and embedding models
+/// are left out.
+pub fn listed_models() -> &'static [&'static str] {
+    static LISTED: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+    LISTED.get_or_init(|| {
+        let mut out = available_models().to_vec();
+        for row in providers::catalog::MODEL_ROUTES {
+            if !row.model.contains('/')
+                && row.card.max_output_tokens > 0
+                && providers::for_model_id(row.model).is_some()
+                && !out.contains(&row.model)
+            {
+                out.push(row.model);
+            }
+        }
+        out
+    })
 }
 
 /// One resolved entry in a `--models` scope: a model id plus an optional thinking level pinned via a
@@ -12202,6 +12229,36 @@ mod tests {
             generation: 2,
         });
         assert!(lock_ignoring_poison(&slot).is_none());
+    }
+
+    #[test]
+    fn every_natively_served_catalog_chat_model_is_listed() {
+        // A model the catalog routes but `list-models`/`get_available_models` never show has no
+        // visible capabilities or compaction trigger (claude-haiku-5-5's 90K was missing).
+        let listed = listed_models();
+        for row in providers::catalog::MODEL_ROUTES {
+            if row.model.contains('/') || row.card.max_output_tokens == 0 {
+                continue;
+            }
+            if providers::for_model_id(row.model).is_some() {
+                assert!(listed.contains(&row.model), "{} is not listed", row.model);
+            }
+        }
+        for id in [
+            "claude-haiku-5-5",
+            "claude-opus-5-5",
+            "claude-sonnet-5-5",
+            "gpt-6.1-sol",
+        ] {
+            assert!(listed.contains(&id), "{id}");
+        }
+        assert!(!listed.contains(&"text-embedding-3-small"));
+        // The hint list leads, in its own order, and partial ids still resolve against it alone.
+        assert_eq!(&listed[..available_models().len()], available_models());
+        assert_eq!(
+            resolve_model_id("haiku", available_models()).unwrap().0,
+            "claude-haiku-4-5"
+        );
     }
 
     /// `model`'s compaction policy with no operator overrides.
