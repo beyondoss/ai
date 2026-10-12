@@ -262,7 +262,8 @@ fn openai_gpt5_input_limit(m: &str, context_window: u32) -> Option<u32> {
 /// |---|---|---|---|
 /// | Opus / Fable 5.x | 200K | measured | −15% (Opus 5.5), quality neutral |
 /// | Sonnet 5.x | 200K | measured | −12% (Sonnet 5.5); 100K no cheaper, 3× the compactions |
-/// | GPT-6, GPT-5.6 | 240K | provisional | under OpenAI's 272K surcharge, like the measured 200K (−50% on GPT-6.1 Sol) |
+/// | GPT-6 family | 500K | provisional (owner decision: quality over cost) | Codex's default for GPT-6.1 Sol, raised from 272K to 500K in 2026-10 ("carefully tested… the new sweet spot", per the Codex lead); under the 922K input limit. Past 272K OpenAI bills the whole request at 2× input and 1.5× output, so this trades cost for context |
+/// | GPT-5.6 | 240K | provisional | under OpenAI's 272K surcharge, like the measured 200K (−50% on GPT-6.1 Sol) |
 /// | Haiku 5.5 | 90K | provisional | under its 100K price tier (5× above it) |
 /// | Grok, Gemini, Claude Sonnet 4.5 | 180K | provisional | under their 200K long-context price tier |
 /// | open-weight families | 128K | provisional | quality drops between 32K and 128K |
@@ -286,7 +287,10 @@ fn default_compact_at(m: &str) -> Option<u32> {
         Some(200_000)
     } else if any(&["claude-haiku-5-5", "claude-haiku-5.5"]) {
         Some(90_000)
-    } else if any(&["gpt-6", "gpt-5.6"]) {
+    } else if any(&["gpt-6"]) {
+        // Codex's 2026-10 default; costs 2× input / 1.5× output past 272K (see the table).
+        Some(500_000)
+    } else if any(&["gpt-5.6"]) {
         Some(240_000)
     } else if any(&["grok", "gemini", "claude-sonnet-4-5", "claude-sonnet-4.5"]) {
         Some(180_000)
@@ -3805,13 +3809,15 @@ mod tests {
             ("claude-sonnet-5.5", Some(200_000)),
             // Haiku 5.5: 90K, under its 100K price tier.
             ("claude-haiku-5-5", Some(90_000)),
-            // GPT-6 and GPT-5.6: 240K, under the 272K surcharge.
-            ("gpt-6-astra", Some(240_000)),
-            ("gpt-6.1-sol", Some(240_000)),
-            ("gpt-6-luna", Some(240_000)),
+            // GPT-6 family: 500K, Codex's default (past the 272K surcharge, by choice).
+            ("gpt-6", Some(500_000)),
+            ("gpt-6-astra", Some(500_000)),
+            ("gpt-6.1-sol", Some(500_000)),
+            ("gpt-6-luna", Some(500_000)),
+            ("openai/gpt-6-astra", Some(500_000)),
+            // GPT-5.6: 240K, under the 272K surcharge.
             ("gpt-5.6", Some(240_000)),
             ("gpt-5.6-sol", Some(240_000)),
-            ("openai/gpt-6-astra", Some(240_000)),
             // Grok: 180K, under the 200K tier.
             ("grok-4.3", Some(180_000)),
             ("x-ai/grok-4.6", Some(180_000)),
@@ -3845,7 +3851,7 @@ mod tests {
         // Route variants read the same table.
         assert_eq!(
             capabilities_for_route("gpt-6-astra", true, false).compact_at,
-            Some(240_000)
+            Some(500_000)
         );
     }
 
@@ -3859,6 +3865,9 @@ mod tests {
             "claude-sonnet-5-5",
             "claude-haiku-5-5",
             "gpt-6-astra",
+            "gpt-6.1-sol",
+            "gpt-6-luna",
+            "gpt-6",
             "gpt-5.6-sol",
             "grok-4.6",
             "deepseek-v4-pro",
