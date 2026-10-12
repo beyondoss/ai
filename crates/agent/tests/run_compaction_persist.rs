@@ -70,7 +70,10 @@ fn a_compacted_run_reloads_as_the_summary_and_everything_after_it() {
     // answer after the compaction was never written at all.
     let dir = tempfile::tempdir().unwrap();
     let session_file = seeded_session(dir.path());
-    let (base, _) = spawn_model_server(vec![turn_text("SUMMARY ONE"), turn_text("answered")]);
+    let (base, _) = spawn_model_server(vec![
+        turn_text("## Goal\nSUMMARY ONE"),
+        turn_text("answered"),
+    ]);
     run(&base, &session_file, "continue please");
 
     let (_, session) = SessionStore::open(session_file.clone().into()).unwrap();

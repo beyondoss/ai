@@ -1841,39 +1841,6 @@ mod tests {
     }
 
     #[test]
-    fn a_mid_conversation_system_message_goes_out_as_role_system_in_place() {
-        // The cached compaction summary's `instruction_as_system` candidate: a role-system message
-        // after the trailing tool results, not folded into the top-level `system` (which would
-        // invalidate the cached history). Its block takes the rolling breakpoint, which the API
-        // accepts on a plain (not turn-scoped) system message.
-        let req = ModelRequest::new(
-            "claude-haiku-5-5",
-            vec![
-                Message::user("hi"),
-                Message::assistant(vec![ContentBlock::tool_use("tu_1", "read", json!({}))]),
-                Message::tool_result("tu_1", "out", false),
-                Message {
-                    role: crate::message::Role::System,
-                    ..Message::user("write the checkpoint")
-                },
-            ],
-            256,
-        )
-        .with_system("you are the agent");
-        let body = build_body(&req, false);
-        assert_eq!(body["system"][0]["text"], "you are the agent");
-        let messages = body["messages"].as_array().unwrap();
-        assert_eq!(messages.len(), 4);
-        assert_eq!(messages[3]["role"], "system");
-        assert_eq!(messages[3]["content"][0]["text"], "write the checkpoint");
-        assert_eq!(
-            messages[3]["content"][0]["cache_control"]["type"],
-            "ephemeral"
-        );
-        assert!(messages[2]["content"][0].get("cache_control").is_none());
-    }
-
-    #[test]
     fn build_body_stamps_cache_breakpoints() {
         let req = ModelRequest::new(
             "claude-opus-4-8",

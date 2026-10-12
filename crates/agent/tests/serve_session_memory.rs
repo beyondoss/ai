@@ -71,7 +71,7 @@ fn a_fact_written_to_session_survives_compaction_and_is_recovered_after_the_remi
         turn_text("noted"),
         // The summarization call the manual `compact` makes — deliberately drops the specific, exactly as
         // a real summarizing model usually would.
-        turn_text("The user shared some configuration details."),
+        turn_text("## Goal\nThe user shared some configuration details."),
         // Prompt 2 (post-compaction): the model reads its working memory back to recover the exact value.
         mem_turn(
             "toolu_2",

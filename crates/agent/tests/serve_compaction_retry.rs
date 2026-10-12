@@ -152,7 +152,7 @@ fn serve_compact_forwards_custom_instructions_to_the_summarization_call() {
     let (base, bodies) = spawn_model_server(vec![
         turn_text("answer one"),
         turn_text("answer two"),
-        turn_text("SUMMARY"),
+        turn_text("## Goal\nSUMMARY"),
     ]);
 
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
@@ -356,7 +356,8 @@ fn serve_proactively_compacts_a_resumed_large_session_on_its_very_next_prompt() 
     // the new prompt — if compaction didn't fire before the prompt's own turn, the second scripted
     // response would be consumed as the (unsummarized) prompt's answer instead, and this test's
     // assertions on call count / compacted-event ordering would catch the mismatch.
-    let (base, bodies) = spawn_model_server(vec![turn_text("SUMMARY"), turn_text("answered")]);
+    let (base, bodies) =
+        spawn_model_server(vec![turn_text("## Goal\nSUMMARY"), turn_text("answered")]);
 
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = Command::new(bin)
@@ -435,7 +436,7 @@ fn serve_compact_preserves_pre_compaction_entries_in_get_tree() {
     let (base, _bodies) = spawn_model_server(vec![
         turn_text("answer one"),
         turn_text("answer two"),
-        turn_text("SUMMARY"),
+        turn_text("## Goal\nSUMMARY"),
     ]);
 
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
@@ -518,7 +519,7 @@ fn serve_compact_reports_first_kept_entry_id_naming_a_real_pre_compaction_entry(
     let (base, _bodies) = spawn_model_server(vec![
         turn_text("answer one"),
         turn_text("answer two"),
-        turn_text("SUMMARY"),
+        turn_text("## Goal\nSUMMARY"),
     ]);
 
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");

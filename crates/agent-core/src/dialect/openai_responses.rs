@@ -1688,16 +1688,20 @@ mod tests {
     }
 
     #[test]
-    fn a_compacted_conversation_with_a_closing_system_message_maps_in_order() {
+    fn a_compacted_conversation_with_a_closing_summary_instruction_maps_in_order() {
         // Cross-dialect: a session compacted on Claude (a summary user message carrying the
-        // deterministic `<user-requests>` block) resumed on gpt-6-luna, then summarized again with the
-        // instruction as a mid-conversation system message (the `system-role` compaction candidate).
-        // The summary goes out as plain user input, the instruction as an instruction-role entry
-        // after the tool output, in place.
+        // deterministic `<user-requests>` block) resumed on gpt-6-luna, then summarized again from the
+        // cached conversation: the instruction is user text beside the trailing tool result. The
+        // summary goes out as plain user input, and so does the instruction, which (like any text in a
+        // message holding tool results) is emitted ahead of that message's tool output.
         let summary = format!(
             "{}\n\nCompacted from 9000 tokens\n\n## Goal\nfix it\n\n<user-requests>\nfix it\n</user-requests>",
             crate::compaction::SUMMARY_MARKER
         );
+        let mut results = Message::tool_result("call_1|fc_1", "contents", false);
+        results
+            .content
+            .push(ContentBlock::text("write the checkpoint"));
         let req = ModelRequest::new(
             "gpt-6-luna",
             vec![
@@ -1707,11 +1711,7 @@ mod tests {
                     "read",
                     json!({ "path": "a.rs" }),
                 )]),
-                Message::tool_result("call_1|fc_1", "contents", false),
-                Message {
-                    role: Role::System,
-                    ..Message::user("write the checkpoint")
-                },
+                results,
             ],
             256,
         )
@@ -1723,11 +1723,9 @@ mod tests {
         assert_eq!(input[1]["role"], "user");
         assert_eq!(input[1]["content"][0]["text"], summary);
         assert_eq!(input[2]["type"], "function_call");
-        assert_eq!(input[3]["type"], "function_call_output");
-        assert_eq!(
-            input[4],
-            json!({ "role": role, "content": "write the checkpoint" })
-        );
+        assert_eq!(input[3]["role"], "user");
+        assert_eq!(input[3]["content"][0]["text"], "write the checkpoint");
+        assert_eq!(input[4]["type"], "function_call_output");
         assert_eq!(input.len(), 5);
     }
 

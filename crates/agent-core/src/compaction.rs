@@ -53,7 +53,8 @@ pub enum SummarySource {
     /// off, the reason is an overflow, or the conversation didn't fit.
     Rerender,
     /// The re-render, after the cached call ran and its reply was turned down: a tool call, a blank
-    /// reply, an error, or (under [`CompactionCandidates::check_summary`]) not a checkpoint.
+    /// reply, an error, a reply that is not a checkpoint ([`checkpoint_body`]), or one cut off at the
+    /// output limit or looping ([`is_runaway`]).
     CachedRejected,
 }
 
@@ -245,7 +246,9 @@ pub struct CompactionConfig {
     pub mask_min_free_tokens: u32,
     /// Whether the summarization call is the live conversation plus a closing instruction (its
     /// prefix read from the prompt cache; see `Agent::conversation_summary_request`), falling back to
-    /// the [`summary_request`] re-render only when that doesn't fit. `false`: always re-render.
+    /// the [`summary_request`] re-render when that doesn't fit, errors, or its reply is not a
+    /// checkpoint ([`checkpoint_body`]), is cut off at the output limit, or loops ([`is_runaway`]).
+    /// `false`: always re-render.
     pub cached_summary: bool,
     /// Changes under evaluation, all off by default. See [`CompactionCandidates`].
     pub candidates: CompactionCandidates,
@@ -256,29 +259,6 @@ pub struct CompactionConfig {
 /// Each field names the eval finding it answers, with the replay evidence behind it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CompactionCandidates {
-    /// The cached summary's closing instruction goes in a mid-conversation `system`-role message after
-    /// the trailing tool results, not in a `<system-reminder>` text block inside that user message.
-    /// The role-`system` message is the provider's operator channel and sits after the cached prefix,
-    /// so the cache hit is unchanged (a top-level `system` edit would invalidate every message).
-    ///
-    /// Why: Claude Haiku 5.5 refused the cached summary in 30 of 33 eval compactions ("I'm not going
-    /// to produce that checkpoint summary; the transcript stays with me"), 0 of 10 on the re-render.
-    /// Replaying ten of those compaction points: the same text as a system message, 0 of 31 refused;
-    /// in the user turn, 24 of 31. A conversation that ends on the model's turn (nothing for a system
-    /// message to follow) falls back to the user turn, and a provider that rejects the role (Claude
-    /// Sonnet 5 answers 400) falls back to the re-render.
-    pub instruction_as_system: bool,
-    /// The cached summary's instruction is framed as a handoff the model writes for itself
-    /// ([`HANDOFF_FRAMING`]) rather than "stop working, reply with nothing but a summary of this
-    /// conversation" plus [`SUMMARY_SYSTEM`]. The structured format is unchanged. Replay: 0 of 30
-    /// refused in the user turn, against 24 of 31 for the current text; changing only "another LLM"
-    /// to "you" left 15 of 20 refusing, so it is the framing, not one phrase.
-    pub handoff_framing: bool,
-    /// The cached summary's reply is accepted only if it is a checkpoint — it has the format's
-    /// `## Goal` heading — and any preamble before that heading is dropped. Anything else (a refusal,
-    /// "I'll keep working instead") falls back to the re-render, as a tool call or blank reply already
-    /// does; so does a cached call that errors. A safety net that holds whatever the wording.
-    pub check_summary: bool,
     /// Every summary is one current-state document: the [`STATE_FORMAT`] template on both paths, with
     /// [`STATE_RULES`] (state as of the newest messages, in-flight step included; one document, never
     /// appended to; no pasted code; about 1,500 words; the user credited only with the user's words),
@@ -313,15 +293,7 @@ pub struct CompactionCandidates {
 
 impl CompactionCandidates {
     /// Every candidate's CLI name, in the order `--help` lists them.
-    pub const NAMES: &[&str] = &[
-        "system-role",
-        "handoff",
-        "check",
-        "state",
-        "tail",
-        "mask-breakeven",
-        "mask-best-start",
-    ];
+    pub const NAMES: &[&str] = &["state", "tail", "mask-breakeven", "mask-best-start"];
 
     /// The candidates `names` turns on (the CLI's `--compaction-candidates`); an unknown name is an
     /// error naming the valid ones, so a typo in an eval arm fails the run instead of silently
@@ -330,9 +302,6 @@ impl CompactionCandidates {
         let mut c = Self::default();
         for name in names {
             match name.as_ref().trim() {
-                "system-role" => c.instruction_as_system = true,
-                "handoff" => c.handoff_framing = true,
-                "check" => c.check_summary = true,
                 "state" => c.state_template = true,
                 "tail" => c.sees_tail = true,
                 "mask-breakeven" => c.mask_breakeven = true,
@@ -1358,32 +1327,16 @@ pub fn summary_request_with(
         .with_no_cache(true)
 }
 
-/// The closing user instruction of the cached summarization call — the one that sends the live
-/// conversation itself rather than a re-render of it (`Agent::conversation_summary_request`). Its
-/// request keeps the conversation's own system prompt (that is what makes the prefix a cache hit), so
-/// [`SUMMARY_SYSTEM`]'s guardrails ride here instead, ahead of the same structured format
-/// ([`SUMMARY_INSTRUCTION`]). The request carries the conversation's tools too, so it also says not
-/// to call one. A conversation that opens with an earlier summary gets the incremental rules; the
-/// read/modified-file tags and `custom_instructions` are added exactly as [`summary_request`] adds
-/// them, and the host still appends the carried provenance to whatever comes back.
-pub fn conversation_summary_instruction(
-    messages: &[Message],
-    file_ops: &CompactionProvenance,
-    custom_instructions: Option<&str>,
-) -> String {
-    let body = conversation_summary_body(
-        messages,
-        file_ops,
-        custom_instructions,
-        &CompactionCandidates::default(),
-    );
-    format!("<system-reminder>{body}</system-reminder>")
-}
-
-/// The opening of the cached summary instruction under [`CompactionCandidates::handoff_framing`]: a
-/// checkpoint the model writes for itself from what the transcript shows, explicitly not its
-/// reasoning, in place of the "stop working, reply with nothing but a summary" opener plus
-/// [`SUMMARY_SYSTEM`]. Byte-for-byte the text the replay probe measured (0 of 30 refused).
+/// The opening of the cached summary instruction on the Anthropic wire ([`SummaryFraming::Handoff`]):
+/// a checkpoint the model writes for itself from what the transcript shows, explicitly not its
+/// reasoning.
+///
+/// Why this framing there, not [`SummaryFraming::Compact`]'s "stop working, reply with nothing but a
+/// summary" plus [`SUMMARY_SYSTEM`]: Claude Haiku 5.5 refused that in 30 of 33 eval compactions ("I'm
+/// not going to produce that checkpoint summary; the transcript stays with me"), and the refusal
+/// became the summary. Replaying real compaction points: 24 of 31 refused under the old text, 0 of 30
+/// under this one; Claude Sonnet 5.5, 0 of 5. Changing only "another LLM" to "you" left 15 of 20
+/// refusing, so it is the framing, not one phrase. Byte for byte the text the replay measured.
 pub const HANDOFF_FRAMING: &str = "Context checkpoint. Pause the task for this one reply and do not \
 call any tools. To free context, the conversation above will be replaced by the checkpoint you write \
 now; only the most recent turns stay verbatim after it, so spend the least on them. You continue this \
@@ -1397,41 +1350,68 @@ values, commands and their key outputs, error messages. A specific you drop is g
 /// opener — the part [`HANDOFF_FRAMING`] keeps.
 const SUMMARY_FORMAT_START: &str = "Use this EXACT format:";
 
-/// [`conversation_summary_instruction`]'s text without the `<system-reminder>` wrapper, under the
-/// given candidates' framing: what a role-`system` message carries
-/// ([`CompactionCandidates::instruction_as_system`]), and what the user-turn form wraps.
-pub fn conversation_summary_body(
+/// How the cached summary instruction opens. Chosen per wire dialect by `Agent::compact`, because
+/// the replays disagree by model family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SummaryFraming {
+    /// [`HANDOFF_FRAMING`], then the format. The Anthropic wire: it stops Claude Haiku 5.5's
+    /// refusals (24 of 31 → 0 of 30).
+    Handoff,
+    /// "Stop working on the task now…" plus [`SUMMARY_SYSTEM`], then the format. Every other wire.
+    /// GPT-6 Luna, replayed as production sends it (the Responses dialect emits the instruction ahead
+    /// of the trailing tool output), wrote a clean checkpoint 10 of 10 times under this text; under
+    /// the handoff text it called a tool instead 4 of 15 times and looped `- ` to the output limit
+    /// 2 of 15.
+    Compact,
+}
+
+/// The closing user instruction of the cached summarization call — the one that sends the live
+/// conversation itself rather than a re-render of it (`Agent::conversation_summary_request`), as a
+/// `<system-reminder>` block beside the trailing tool results. Its request keeps the conversation's
+/// own system prompt (that is what makes the prefix a cache hit), so [`SUMMARY_SYSTEM`] does not ride
+/// as a system prompt: `framing` opens the instruction ([`SummaryFraming`]), then the structured
+/// format ([`SUMMARY_INSTRUCTION`]'s, or [`STATE_RULES`] and [`STATE_FORMAT`] under
+/// [`CompactionCandidates::state_template`]). The request carries the conversation's tools too, so it
+/// also says not to call one. A conversation that opens with an earlier summary gets the incremental
+/// rules; the read/modified-file tags and `custom_instructions` are added exactly as
+/// [`summary_request`] adds them, and the host still appends the carried provenance to whatever comes
+/// back.
+pub fn conversation_summary_instruction(
     messages: &[Message],
     file_ops: &CompactionProvenance,
     custom_instructions: Option<&str>,
     candidates: &CompactionCandidates,
+    framing: SummaryFraming,
 ) -> String {
-    let mut out = String::new();
+    let mut out = String::from("<system-reminder>");
     let state = candidates.state_template;
-    if candidates.handoff_framing {
-        out.push_str(HANDOFF_FRAMING);
-        if state {
-            out.push_str(STATE_RULES);
-            out.push_str(STATE_FORMAT);
-        } else {
-            let at = SUMMARY_INSTRUCTION.find(SUMMARY_FORMAT_START).unwrap_or(0);
-            out.push_str(&SUMMARY_INSTRUCTION[at..]);
+    match framing {
+        SummaryFraming::Handoff => {
+            out.push_str(HANDOFF_FRAMING);
+            if state {
+                out.push_str(STATE_RULES);
+                out.push_str(STATE_FORMAT);
+            } else {
+                let at = SUMMARY_INSTRUCTION.find(SUMMARY_FORMAT_START).unwrap_or(0);
+                out.push_str(&SUMMARY_INSTRUCTION[at..]);
+            }
         }
-    } else {
-        out.push_str(
-            "Stop working on the task now. Do not call any tools. This conversation is about to be \
-             compacted: reply with nothing but a structured summary of it, which will replace \
-             everything above except the most recent turns (those stay verbatim, so spend the least \
-             on them).\n\n",
-        );
-        out.push_str(SUMMARY_SYSTEM);
-        out.push_str("\n\n");
-        if state {
-            out.push_str(STATE_INTRO);
-            out.push_str(STATE_RULES);
-            out.push_str(STATE_FORMAT);
-        } else {
-            out.push_str(SUMMARY_INSTRUCTION);
+        SummaryFraming::Compact => {
+            out.push_str(
+                "Stop working on the task now. Do not call any tools. This conversation is about to \
+                 be compacted: reply with nothing but a structured summary of it, which will replace \
+                 everything above except the most recent turns (those stay verbatim, so spend the \
+                 least on them).\n\n",
+            );
+            out.push_str(SUMMARY_SYSTEM);
+            out.push_str("\n\n");
+            if state {
+                out.push_str(STATE_INTRO);
+                out.push_str(STATE_RULES);
+                out.push_str(STATE_FORMAT);
+            } else {
+                out.push_str(SUMMARY_INSTRUCTION);
+            }
         }
     }
     if state && previous_summary(messages).is_some() {
@@ -1461,13 +1441,40 @@ pub fn conversation_summary_body(
         out.push_str("\n\nAdditional focus: ");
         out.push_str(custom);
     }
+    out.push_str("</system-reminder>");
     out
 }
 
-/// The checkpoint in a cached summary reply, for [`CompactionCandidates::check_summary`]: the text
+/// The longest run of identical consecutive lines (blank lines skipped, whitespace trimmed) at which a
+/// cached summary reply counts as a runaway loop ([`is_runaway`]).
+pub const RUNAWAY_REPEATED_LINES: usize = 10;
+
+/// Whether a summary reply is a degenerate loop: [`RUNAWAY_REPEATED_LINES`] or more identical lines
+/// in a row. Such a reply can still open with `## Goal`, so [`checkpoint_body`] alone accepts it.
+///
+/// Why: GPT-6 Luna, replaying real compaction points, twice wrote a few thousand chars of checkpoint
+/// and then `- ` lines (14,267 and 15,152 in a row) until its output limit. No other reply in the
+/// replays (220, across Haiku, Sonnet and Luna) and no summary the eval kept (55) repeated a line
+/// even twice in a row. A loop that ends at the output limit is caught by that stop reason too; this
+/// catches one that stops on its own.
+pub fn is_runaway(reply: &str) -> bool {
+    let mut run = 0;
+    let mut prev = "";
+    for line in reply.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        run = if line == prev { run + 1 } else { 1 };
+        if run >= RUNAWAY_REPEATED_LINES {
+            return true;
+        }
+        prev = line;
+    }
+    false
+}
+
+/// The checkpoint in a cached summary reply, which is accepted only if it has one: the text
 /// from the format's `## Goal` heading on (any preamble before it dropped — "I'm stopping here, as
 /// you asked. Here is the checkpoint."), or `None` when there is no such heading, i.e. the reply is
-/// not a checkpoint (a refusal, or the model carrying on with the task in prose). The heading match
+/// not a checkpoint (a refusal, or the model carrying on with the task in prose), and the re-render
+/// runs instead. A safety net that holds whatever the instruction's wording. The heading match
 /// tolerates `#`–`###` and any case, since every instruction this module writes asks for that format.
 pub fn checkpoint_body(reply: &str) -> Option<&str> {
     let mut at = 0;
@@ -3593,50 +3600,108 @@ mod tests {
     }
 
     #[test]
-    fn the_shipped_instruction_is_the_default_body_wrapped() {
-        let messages = vec![Message::user("the task")];
+    fn the_cached_instruction_is_the_handoff_framing_then_the_format_and_tails() {
+        let prior = Message::user(format!("{SUMMARY_MARKER}\n\n## Goal\nold"));
+        let messages = vec![prior, Message::assistant(vec![ContentBlock::text("ok")])];
         let ops = CompactionProvenance {
             read_files: vec!["src/a.rs".into()],
+            modified_files: vec!["src/b.rs".into()],
             ..Default::default()
         };
-        let body = conversation_summary_body(
+        let text = conversation_summary_instruction(
             &messages,
             &ops,
             Some("focus"),
             &CompactionCandidates::default(),
+            SummaryFraming::Handoff,
         );
-        assert_eq!(
-            conversation_summary_instruction(&messages, &ops, Some("focus")),
-            format!("<system-reminder>{body}</system-reminder>")
+        let format =
+            &SUMMARY_INSTRUCTION[SUMMARY_INSTRUCTION.find(SUMMARY_FORMAT_START).unwrap()..];
+        assert!(text.starts_with(&format!("<system-reminder>{HANDOFF_FRAMING}{format}")));
+        assert!(!text.contains(SUMMARY_SYSTEM));
+        assert!(!text.contains("another LLM"));
+        assert!(
+            text.contains("Fold it in: PRESERVE"),
+            "the prior-summary rules ride along"
         );
-        assert!(body.starts_with("Stop working on the task now."));
-        assert!(body.contains(SUMMARY_SYSTEM) && body.contains(SUMMARY_INSTRUCTION));
-        assert!(body.ends_with("<read-files>\nsrc/a.rs\n</read-files>\n\nAdditional focus: focus"));
+        assert!(text.ends_with(
+            "<read-files>\nsrc/a.rs\n</read-files>\n\n<modified-files>\nsrc/b.rs\n</modified-files>\
+             \n\nAdditional focus: focus</system-reminder>"
+        ));
     }
 
     #[test]
-    fn the_handoff_body_swaps_the_framing_and_keeps_the_format_and_tails() {
+    fn the_compact_framing_keeps_the_old_opener_and_the_same_tails() {
         let prior = Message::user(format!("{SUMMARY_MARKER}\n\n## Goal\nold"));
         let messages = vec![prior, Message::assistant(vec![ContentBlock::text("ok")])];
         let ops = CompactionProvenance {
-            modified_files: vec!["src/b.rs".into()],
+            read_files: vec!["src/a.rs".into()],
             ..Default::default()
         };
-        let candidates = CompactionCandidates {
-            handoff_framing: true,
-            ..Default::default()
-        };
-        let body = conversation_summary_body(&messages, &ops, None, &candidates);
-        let format =
-            &SUMMARY_INSTRUCTION[SUMMARY_INSTRUCTION.find(SUMMARY_FORMAT_START).unwrap()..];
-        assert!(body.starts_with(&format!("{HANDOFF_FRAMING}{format}")));
-        assert!(!body.contains(SUMMARY_SYSTEM));
-        assert!(!body.contains("another LLM"));
-        assert!(
-            body.contains("Fold it in: PRESERVE"),
-            "the prior-summary rules ride along"
+        let text = conversation_summary_instruction(
+            &messages,
+            &ops,
+            None,
+            &CompactionCandidates::default(),
+            SummaryFraming::Compact,
         );
-        assert!(body.ends_with("<modified-files>\nsrc/b.rs\n</modified-files>"));
+        assert!(text.starts_with("<system-reminder>Stop working on the task now."));
+        assert!(text.contains(SUMMARY_SYSTEM) && text.contains(SUMMARY_INSTRUCTION));
+        assert!(!text.contains(HANDOFF_FRAMING));
+        assert!(text.contains("Fold it in: PRESERVE"));
+        assert!(text.ends_with("<read-files>\nsrc/a.rs\n</read-files></system-reminder>"));
+        let state = conversation_summary_instruction(
+            &messages,
+            &ops,
+            None,
+            &CompactionCandidates {
+                state_template: true,
+                ..Default::default()
+            },
+            SummaryFraming::Compact,
+        );
+        assert!(state.contains(&format!(
+            "{STATE_INTRO}{STATE_RULES}{STATE_FORMAT}{STATE_FOLD_IN}"
+        )));
+    }
+
+    /// The two runaways GPT-6 Luna wrote in the replay, rebuilt exactly: the captured text up to the
+    /// loop, then the loop (`- ` lines) as many times as it ran before the output limit.
+    fn luna_runaways() -> [String; 2] {
+        [
+            format!(
+                "{}{}-",
+                include_str!("../tests/fixtures/luna_runaway_marshmallow_head.txt"),
+                "- \n".repeat(15_152)
+            ),
+            format!(
+                "{}{}",
+                include_str!("../tests/fixtures/luna_runaway_sqlparse_head.txt"),
+                "- \n".repeat(14_267)
+            ),
+        ]
+    }
+
+    #[test]
+    fn a_runaway_loop_is_caught_though_it_opens_as_a_checkpoint() {
+        for reply in luna_runaways() {
+            assert!(
+                checkpoint_body(&reply).is_some(),
+                "it passes the heading check"
+            );
+            assert!(is_runaway(&reply));
+        }
+        // The marshmallow reply's text before the loop is a sound checkpoint.
+        let head = include_str!("../tests/fixtures/luna_runaway_marshmallow_head.txt");
+        assert!(!is_runaway(head));
+        // A real summary: bullets, a code fence, blank lines, a few repeats that aren't a run.
+        let ok = "## Goal\nfix it\n\n## Progress\n- a\n- a\n- b\n\n```\nx\n```\n- \n- c\n- \n";
+        assert!(!is_runaway(ok));
+        let nine = format!("## Goal\n{}", "- \n".repeat(RUNAWAY_REPEATED_LINES - 1));
+        assert!(!is_runaway(&nine));
+        // Blank lines between the repeats don't hide a loop.
+        let spaced = format!("## Goal\n{}", "- \n\n".repeat(RUNAWAY_REPEATED_LINES));
+        assert!(is_runaway(&spaced));
     }
 
     #[test]
@@ -3667,22 +3732,25 @@ mod tests {
             Ok(CompactionCandidates::default())
         );
         assert_eq!(
-            CompactionCandidates::from_names(&["system-role", " check", ""]),
+            CompactionCandidates::from_names(&["state", " tail", ""]),
             Ok(CompactionCandidates {
-                instruction_as_system: true,
-                check_summary: true,
+                state_template: true,
+                sees_tail: true,
                 ..Default::default()
             })
         );
         let all = CompactionCandidates::from_names(CompactionCandidates::NAMES).unwrap();
-        assert!(all.instruction_as_system && all.handoff_framing && all.check_summary);
-        let err = CompactionCandidates::from_names(&["sytem-role"]).unwrap_err();
-        assert!(
-            err.contains("sytem-role") && err.contains("system-role"),
-            "{err}"
-        );
-        // A promoted candidate's name is unknown now, not a silent no-op.
-        for gone in ["bash-edits", "carry-request"] {
+        assert!(all.state_template && all.sees_tail && all.mask_best_start);
+        let err = CompactionCandidates::from_names(&["sate"]).unwrap_err();
+        assert!(err.contains("sate") && err.contains("state"), "{err}");
+        // A promoted or deleted candidate's name is unknown now, not a silent no-op.
+        for gone in [
+            "system-role",
+            "handoff",
+            "check",
+            "bash-edits",
+            "carry-request",
+        ] {
             assert!(CompactionCandidates::from_names(&[gone]).is_err(), "{gone}");
         }
     }
@@ -3755,34 +3823,22 @@ mod tests {
     }
 
     #[test]
-    fn the_state_template_rides_the_cached_body_under_either_framing() {
+    fn the_state_template_rides_the_cached_instruction() {
         let prior = vec![Message::user(format!("{SUMMARY_MARKER}\n\n## Goal\nold"))];
-        let ops = CompactionProvenance::default();
-        let legacy = conversation_summary_body(
+        let text = conversation_summary_instruction(
             &prior,
-            &ops,
+            &CompactionProvenance::default(),
             None,
             &CompactionCandidates {
                 state_template: true,
                 ..Default::default()
             },
+            SummaryFraming::Handoff,
         );
-        assert!(legacy.contains(SUMMARY_SYSTEM));
-        assert!(legacy.contains(&format!(
-            "{STATE_INTRO}{STATE_RULES}{STATE_FORMAT}{STATE_FOLD_IN}"
+        assert!(text.starts_with(&format!(
+            "<system-reminder>{HANDOFF_FRAMING}{STATE_RULES}{STATE_FORMAT}{STATE_FOLD_IN}"
         )));
-        assert!(!legacy.contains(SUMMARY_INSTRUCTION) && !legacy.contains("Fold it in: PRESERVE"));
-        let handoff = conversation_summary_body(
-            &prior,
-            &ops,
-            None,
-            &CompactionCandidates {
-                state_template: true,
-                handoff_framing: true,
-                ..Default::default()
-            },
-        );
-        assert!(handoff.starts_with(&format!("{HANDOFF_FRAMING}{STATE_RULES}{STATE_FORMAT}")));
+        assert!(!text.contains(SUMMARY_INSTRUCTION) && !text.contains("Fold it in: PRESERVE"));
     }
 
     #[test]

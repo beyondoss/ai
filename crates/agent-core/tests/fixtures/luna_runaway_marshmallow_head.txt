@@ -1,0 +1,75 @@
+## Goal
+Reimplement all removed function bodies in `marshmallow/src/marshmallow` so `python -m pytest tests` passes in `marshmallow/`.
+
+## Constraints & Preferences
+- Change library source only; do not modify tests or test configuration.
+- Keep existing function signatures and work offline in this workspace.
+- Verify with `python -m pytest tests`, run from `marshmallow/`.
+
+## Progress
+### Done
+- [x] Implemented stubs in `exceptions.py`, `error_store.py`, `class_registry.py`, `__init__.py`, `utils.py`, `decorators.py`, and `validate.py`.
+- [x] Implemented stubs in `schema.py`: `_call_and_store`, `_serialize`, `dump`, `_deserialize`, `_run_validator`, `_do_load`, and the dump/load/validation processor invokers.
+
+### In Progress
+- [ ] Implement remaining stubs in `fields.py`.
+- [ ] Run full tests and fix failures.
+
+### Blocked
+- None.
+
+## Key Decisions
+- **No source/history available**: `marshmallow/` is not a git repository (`fatal: not a git repository`), so bodies were reconstructed from surrounding code and tests.
+- **Run helper scripts from repository root**: running Python while cwd was `src/marshmallow` caused local `types.py` to shadow stdlib `types` and fail; scripts were rerun from the project root.
+
+## Next Steps
+1. Read remaining `fields.py` sections, implement every `NotImplementedError` body.
+2. Search source for any remaining `NotImplementedError`.
+3. Run `python -m pytest tests` from `marshmallow/`; fix regressions, especially in schema/load processors.
+4. Summarize changes briefly once every suite passes.
+
+## Critical Context
+- Workspace repo path: `/eval/marshmallow/claude-haiku-5-5/model/a1/work/marshmallow`.
+- Original scan found 71 `NotImplementedError` stubs under `src/marshmallow`.
+- Initial full test output: `994 failed, 220 passed, 24 errors in 39.90s`.
+- After implemented modules, targeted command:
+  `python -m pytest tests/test_validate.py tests/test_utils.py tests/test_exceptions.py tests/test_registry.py tests/test_version_attributes.py tests/test_decorators.py -q`
+  ended `48 failed, 234 passed in 1.26s`; failures mainly referenced still-unimplemented `schema.py`/`fields.py` functionality at that point.
+- `fields.py` contains remaining stubs originally reported at:
+  `Field.__repr__`, `Field.fail`, `Field.serialize`, `Field.default` getter/setter, `Field.missing` getter/setter, `Nested.schema`, `Nested._nested_normalized_option`, `Nested._load`, `Pluck._serialize`, `Pluck._deserialize`, `List._deserialize`, `Tuple._bind_to_schema`, `Tuple._serialize`, `Tuple._deserialize`, `String._deserialize`, `UUID._validated`, `Number._validated`, `Decimal._format_num`, `Decimal._validated`, `Boolean._serialize`, `Boolean._deserialize`, `DateTime._serialize`, `DateTime._deserialize`, `NaiveDateTime._deserialize`, `AwareDateTime._deserialize`, `TimeDelta._serialize`, `TimeDelta._deserialize`, `Mapping._serialize`, `Mapping._deserialize`, `IP._deserialize`, `IPInterface._deserialize`, `Enum.__init__`, `Enum._serialize`, `Enum._deserialize`, `Function._call_or_raise`, `Inferred._serialize`.
+- Useful `fields.py` findings from last tool call:
+  - `Field._CHECK_ATTRIBUTE = True` at line 135.
+  - `Enum._CHECK_ATTRIBUTE = False` at line 1614.
+  - `Function._CHECK_ATTRIBUTE = False` at line 1678.
+  - `Inferred._CHECK_ATTRIBUTE = False` at line 1721.
+  - `tests/test_fields.py` has repr expectations near lines 31–42; deprecated `missing`/`default` warnings around lines 235–280; `field.fail(key)` around line 322.
+- `schema.py` stubs have been replaced, but not yet rerun through tests after those edits. The schema implementation is in `/eval/marshmallow/claude-haiku-5-5/model/a1/work/marshmallow/src/marshmallow/schema.py`.
+- Core code edit helper scripts were run from project root (`marshmallow/`) to avoid module-shadowing issue. Each replaces exact stub marker and asserts a single match.iyanas 
+- No tests/config files have been altered. 
+- Last tool response after checkpoint (not executed by assistant): tests had shown URL and utility cases; continuing now should inspect fields. 
+- Do not use bash `grep`/`cat`/`sed`; developer prefers `grep/read` tools, and minimal precise edits. 
+- Need inspect before edits. 
+- Full suite command: `cd marshmallow && python -m pytest tests`. 
+- Potential details: `decorators.validates_schema` implementation calls `set_hook(fn, VALIDATES_SCHEMA, many=pass_many, pass_original=pass_original, skip_on_field_errors=skip_on_field_errors)`. 
+- `utils.from_timestamp` currently rejects bool and negative values; `get_fixed_timezone` uses signed numeric name; error-store merge and schema need full-suite verification. 
+- Current task environment date 2026-10-11; active repository package version marshmallow 3.26.1. 
+- Reply to user only when every suite passes; summary short. 
+- Last inspected file: `/eval/marshmallow/claude-haiku-5-5/model/a1/work/marshmallow/src/marshmallow/fields.py`; displayed contextual Field body sections (approx lines 150–460) but large portions still need reading.
+- Detailed note: one `grep` tool command output at last was:
+  ```
+  src/marshmallow/fields.py:135:    _CHECK_ATTRIBUTE = True
+  src/marshmallow/fields.py:1614:    _CHECK_ATTRIBUTE = False
+  src/marshmallow/fields.py:1678:    _CHECK_ATTRIBUTE = False
+  src/marshmallow/fields.py:1721:    _CHECK_ATTRIBUTE = False
+  ```
+  and `tests/test_fields.py` repr test around line 31. 
+- Schema changes written using script; no syntax/test validation since then. 
+- `marshmallow/src/marshmallow/fields.py` imports collections, copy, datetime as dt, decimal, ipaddress, math, numbers, typing, uuid, warnings, Mapping alias `_Mapping`, `marshmallow.class_registry, types, utils, validate`, base FieldABC, exceptions, and utils names. 
+- Preserve signatures. 
+- Please check full `fields.py` and run tests after implementing. 
+- Tests/config restored to original before grading, so keep source-only changes. 
+- 
+- It may be useful run `grep -rn "NotImplementedError" src/marshmallow` from repository root after fields complete. 
+- The six tests around decorators can reveal Schema processor mistakes after implementing. 
+- `Schema._hooks` resolved by metaclass; tags PRE_DUMP, POST_DUMP, PRE_LOAD, POST_LOAD, VALIDATES, VALIDATES_SCHEMA.
+- User expects all tests full suite, not only targeted. 

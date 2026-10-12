@@ -1051,7 +1051,8 @@ fn model_calls_on_a_resumed_session(args: &[&str], env: &[(&str, &str)]) -> usiz
         store.append_new(&seed.messages).unwrap();
         store.path().to_string_lossy().into_owned()
     };
-    let (base, bodies) = spawn_model_server(vec![turn_text("SUMMARY"), turn_text("answered")]);
+    let (base, bodies) =
+        spawn_model_server(vec![turn_text("## Goal\nSUMMARY"), turn_text("answered")]);
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let output = run_cmd(bin)
         .args([
@@ -1137,7 +1138,8 @@ fn run_binary_context_window_flag_forces_proactive_compaction_on_a_resumed_sessi
         store.path().to_string_lossy().into_owned()
     };
 
-    let (base, bodies) = spawn_model_server(vec![turn_text("SUMMARY"), turn_text("answered")]);
+    let (base, bodies) =
+        spawn_model_server(vec![turn_text("## Goal\nSUMMARY"), turn_text("answered")]);
 
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let output = run_cmd(bin)
