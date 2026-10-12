@@ -2605,6 +2605,20 @@ impl Agent {
             // the clean-boundary case above, just discovered a call later.
             return Ok(CompactOutcome::AlreadyCompacted);
         }
+        // What the summary must not lack, appended from the transcript and the carry
+        // (`CompactionCandidates::validate_summary`).
+        let validated;
+        let summary = if candidates.validate_summary {
+            validated = compaction::validate_summary(
+                summary,
+                &prefix,
+                &session.messages[first_kept..],
+                &file_ops.user_requests,
+            );
+            validated.as_str()
+        } else {
+            summary
+        };
         // Append the carried provenance deterministically rather than trusting the summarizing model to
         // have preserved it in its own prose — see `compaction`'s module doc on the deterministic-carry
         // channel. Both blocks come from `file_ops` (this round's already-merged provenance), so they
@@ -13716,5 +13730,56 @@ mod tests {
             last_text(&session.messages[0])
                 .contains("<modified-files>\npkg/src/m.py\n</modified-files>")
         );
+    }
+
+    #[tokio::test]
+    async fn bridge_and_validate_shape_the_spliced_summary() {
+        let mock = Arc::new(MockTransport::new(vec![turn::text("## Goal\nfix it")]));
+        let agent = summary_agent(
+            &mock,
+            rerender_config(compaction::CompactionCandidates {
+                state_template: true,
+                bridge_line: true,
+                validate_summary: true,
+                ..Default::default()
+            }),
+        );
+        let mut session = masking_session(0, 12);
+        session.messages = Arc::new({
+            let mut m = (*session.messages).clone();
+            m[0] = Message::user("Fix the parser.\n- Do not edit the tests.");
+            m[1] = Message::assistant(vec![ContentBlock::tool_use(
+                "c0",
+                "bash",
+                json!({ "command": "pytest -q" }),
+            )]);
+            m[2] = Message::tool_result("c0", "..FF.\n=== 2 failed, 3 passed ===", false);
+            m
+        });
+        let tokens_before = session.last_input_tokens;
+        compact_once(&agent, &mut session).await;
+        let text = last_text(&session.messages[0]);
+        assert!(
+            text.starts_with(&format!(
+                "{}\n\n{}\n\n## Goal\nfix it",
+                compaction::SUMMARY_MARKER,
+                compaction::BRIDGE_LINE
+            )),
+            "{text}"
+        );
+        assert!(!text.contains("Compacted from"));
+        assert_eq!(session.compaction.tokens_before, Some(tokens_before));
+        assert!(text.contains(
+            "## Latest test result (from the transcript)\n`pytest -q` → === 2 failed, 3 passed ==="
+        ));
+        assert!(text.contains("## Constraints (the user's words)\n- Do not edit the tests."));
+        assert!(
+            text.contains(
+                "## Next Step\n1. Re-run `pytest -q` and continue from what still fails."
+            )
+        );
+        // The appended sections sit in the prose, before the host's carry blocks.
+        assert!(text.find("## Next Step").unwrap() < text.find("<user-requests>").unwrap());
+        assert_well_formed(&session.messages);
     }
 }

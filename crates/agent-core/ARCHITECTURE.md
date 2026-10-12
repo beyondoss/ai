@@ -475,6 +475,13 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
     backwards, Codex-style. The default carries the first and the latest three at 4,000 each.
     Summaries keep ~17% of user constraints against 93–99.7% when the user's words are re-appended
     verbatim.
+  - `validate_summary` (`validate`): before the carry is appended, `validate_summary` appends what
+    the summary lacks, deterministically and without rewriting it: the latest test tally with its
+    command (when the kept suffix shows none and the summary lacks the prefix's last tally's
+    `<n> <word>` pairs), the user's constraint lines from the request carry that it doesn't contain,
+    and a next step when no `Next Step(s)` heading has a body. Only 55% of eval summaries mention a
+    tally and 34–40% kept the "don't edit tests" constraint; judge-and-repair gains 2.6–8.8 points in
+    the literature, and this is its zero-cost version.
 
 - **The deterministic-carry channel** — `apply_summary` is deliberately destructive: it _replaces_
   `session.messages` with `[summary, …kept_suffix]`, and `SessionStore::open` reloads that

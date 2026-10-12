@@ -385,6 +385,14 @@ pub struct CompactionCandidates {
     /// are re-appended verbatim; Codex carries all of them (up to 20K tokens). The first-plus-three
     /// window drops whatever the user said in between.
     pub carry_all_requests: bool,
+    /// The summary is checked deterministically before the carry is appended
+    /// ([`validate_summary`]): the latest test tally (when the kept suffix has none), the user's
+    /// constraint lines from the request carry, and a next step are appended when it lacks them.
+    ///
+    /// Why: only 55% of eval summaries mention a test tally and 34–40% kept the "don't edit tests"
+    /// constraint; judge-and-repair loops gain 2.6–8.8 points in the literature, and this is their
+    /// zero-cost version for the three things a continuation needs most.
+    pub validate_summary: bool,
 }
 
 impl CompactionCandidates {
@@ -399,6 +407,7 @@ impl CompactionCandidates {
         "state-sections",
         "short",
         "carry-all",
+        "validate",
     ];
 
     /// The candidates `names` turns on (the CLI's `--compaction-candidates`); an unknown name is an
@@ -417,6 +426,7 @@ impl CompactionCandidates {
                 "state-sections" => c.state_sections = true,
                 "short" => c.short_summary = true,
                 "carry-all" => c.carry_all_requests = true,
+                "validate" => c.validate_summary = true,
                 "" => {}
                 other => {
                     return Err(format!(
@@ -1288,6 +1298,151 @@ pub(crate) fn tally_pairs(line: &str) -> Vec<(&str, &'static str)> {
         }
     }
     out
+}
+
+/// The last test tally in `messages`' tool results, newest first: `(command, tally line)`, the
+/// command being the matching `bash` call's (or the tool's name). `None` when no result has one.
+fn latest_tally(messages: &[Message]) -> Option<(String, String)> {
+    let (id, line) = messages
+        .iter()
+        .rev()
+        .flat_map(|m| m.content.iter().rev())
+        .find_map(|b| match b {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                ..
+            } => content
+                .lines()
+                .rev()
+                .find(|l| is_tally_line(l))
+                .map(|l| (tool_use_id, l.trim())),
+            _ => None,
+        })?;
+    let command = messages
+        .iter()
+        .flat_map(|m| &m.content)
+        .find_map(|b| match b {
+            ContentBlock::ToolUse {
+                id: use_id,
+                name,
+                input,
+                ..
+            } if use_id == id => Some(
+                input
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .unwrap_or(name)
+                    .to_string(),
+            ),
+            _ => None,
+        })
+        .unwrap_or_else(|| "the tests".to_string());
+    Some((
+        truncate_chars(command.trim(), VALIDATE_LINE_MAX_CHARS),
+        truncate_chars(line, VALIDATE_LINE_MAX_CHARS),
+    ))
+}
+
+/// The most constraint lines [`validate_summary`] appends, each cut to [`VALIDATE_LINE_MAX_CHARS`].
+const VALIDATE_CONSTRAINTS_KEPT: usize = 8;
+const VALIDATE_LINE_MAX_CHARS: usize = 300;
+
+/// `text` lowercased with its whitespace runs collapsed to one space, for a forgiving substring test.
+fn normalized(text: &str) -> String {
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+/// A summary under [`CompactionCandidates::validate_summary`]: `summary` with what it is missing
+/// appended, deterministically, from the transcript and the carry — never rewritten:
+/// - the latest test result, when the kept suffix (`tail`) shows none and the summary lacks the
+///   prefix's last tally (its `<n> <word>` pairs);
+/// - the user's constraint lines (`do not`, `don't`, `never`, `must`, `only`, `no `) from the carried
+///   requests that the summary doesn't contain;
+/// - a next step, when no `Next Step(s)` heading has a body: re-run the latest test command, or
+///   continue the in-progress item.
+pub fn validate_summary(
+    summary: &str,
+    prefix: &[Message],
+    tail: &[Message],
+    user_requests: &[String],
+) -> String {
+    let mut out = summary.to_string();
+    let in_tail = latest_tally(tail);
+    let latest = in_tail.clone().or_else(|| latest_tally(prefix));
+    if in_tail.is_none()
+        && let Some((command, line)) = &latest
+    {
+        let pairs = tally_pairs(line);
+        let present = if pairs.is_empty() {
+            summary.contains(line.as_str())
+        } else {
+            pairs
+                .iter()
+                .all(|(n, w)| summary.contains(&format!("{n} {w}")))
+        };
+        if !present {
+            out.push_str(&format!(
+                "\n\n## Latest test result (from the transcript)\n`{command}` → {line}"
+            ));
+        }
+    }
+
+    let have = normalized(summary);
+    let mut missing: Vec<String> = Vec::new();
+    for line in user_requests.iter().flat_map(|r| r.lines()) {
+        let line = line.trim().trim_start_matches(['-', '*', '•']).trim();
+        let lower = line.to_lowercase();
+        let constraint = ["do not", "don't", "never", "must", "only", "no "]
+            .iter()
+            .any(|w| lower.contains(w));
+        if !constraint || line.len() < 8 || have.contains(&normalized(line)) {
+            continue;
+        }
+        let line = truncate_chars(line, VALIDATE_LINE_MAX_CHARS);
+        if !missing.contains(&line) {
+            missing.push(line);
+        }
+        if missing.len() == VALIDATE_CONSTRAINTS_KEPT {
+            break;
+        }
+    }
+    if !missing.is_empty() {
+        out.push_str("\n\n## Constraints (the user's words)\n");
+        out.push_str(
+            &missing
+                .iter()
+                .map(|l| format!("- {l}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+    }
+
+    if !has_next_step(summary) {
+        match &latest {
+            Some((command, _)) => out.push_str(&format!(
+                "\n\n## Next Step\n1. Re-run `{command}` and continue from what still fails."
+            )),
+            None => out.push_str("\n\n## Next Step\n1. Continue the In Progress item above."),
+        }
+    }
+    out
+}
+
+/// Whether `summary` has a `Next Step`/`Next Steps` heading with something under it.
+fn has_next_step(summary: &str) -> bool {
+    let mut lines = summary.lines();
+    while let Some(line) = lines.next() {
+        if line.starts_with('#') && line.to_lowercase().contains("next step") {
+            return lines
+                .take_while(|l| !l.starts_with('#'))
+                .any(|l| !l.trim().is_empty());
+        }
+    }
+    false
 }
 
 /// Truncate a string to at most `max` characters, appending a marker that notes the elision.
@@ -4628,5 +4783,65 @@ mod tests {
             format_user_requests_with(&kept, false),
             format_user_requests(&kept)
         );
+    }
+
+    fn test_run(id: &str, output: &str) -> Vec<Message> {
+        vec![
+            Message::assistant(vec![ContentBlock::tool_use(
+                id,
+                "bash",
+                json!({ "command": "python -m pytest tests -q" }),
+            )]),
+            Message::tool_result(id, output, false),
+        ]
+    }
+
+    #[test]
+    fn validate_appends_the_latest_tally_constraints_and_a_next_step() {
+        let mut prefix = vec![Message::user("the task")];
+        prefix.extend(test_run("1", "....F\n=== 1 failed, 4 passed in 0.2s ==="));
+        prefix.extend(test_run("2", "......\n=== 6 passed in 0.2s ==="));
+        let requests = [
+            "Fix the parser.\nRules:\n- Do not modify the tests.\n- Keep each signature."
+                .to_string(),
+        ];
+        let out = validate_summary("## Goal\nfix it", &prefix, &[], &requests);
+        assert!(
+            out.contains(
+                "## Latest test result (from the transcript)\n`python -m pytest tests -q` → === 6 passed in 0.2s ==="
+            ),
+            "the newest tally, not the older one: {out}"
+        );
+        assert!(out.contains("## Constraints (the user's words)\n- Do not modify the tests."));
+        assert!(
+            !out.contains("Keep each signature"),
+            "not a constraint word"
+        );
+        assert!(out.ends_with(
+            "## Next Step\n1. Re-run `python -m pytest tests -q` and continue from what still fails."
+        ));
+        assert!(out.starts_with("## Goal\nfix it\n\n"));
+    }
+
+    #[test]
+    fn validate_appends_nothing_a_summary_already_has() {
+        let mut prefix = vec![Message::user("the task")];
+        prefix.extend(test_run("1", "=== 1 failed, 4 passed ==="));
+        let requests = ["Do not   modify the tests.".to_string()];
+        let summary = "## Goal\nx\n\n## Constraints & Preferences\n- do not modify the tests.\n\n\
+                       ## Tests\n4 passed, 1 failed\n\n## Next Steps\n1. Fix test_x";
+        assert_eq!(validate_summary(summary, &prefix, &[], &requests), summary);
+        // A tally in the kept suffix is the model's to see: nothing appended for the older one.
+        let tail = test_run("2", "=== 5 passed ===");
+        let summary = "## Goal\nx\n\n## Next Step\n1. Finish.";
+        assert_eq!(validate_summary(summary, &prefix, &tail, &[]), summary);
+        // No tally anywhere and an empty next-step section: the generic step.
+        let out = validate_summary(
+            "## Goal\nx\n\n## Next Steps\n\n## Critical Context\n- y",
+            &[],
+            &[],
+            &[],
+        );
+        assert!(out.ends_with("## Next Step\n1. Continue the In Progress item above."));
     }
 }
