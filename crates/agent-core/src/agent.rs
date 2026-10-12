@@ -2653,16 +2653,21 @@ impl Agent {
 
     /// The first step of an automatic compaction: mask old tool output
     /// ([`compaction::mask_tool_results`]) when that frees at least `mask_min_free_tokens` (capped at a
-    /// quarter of the trigger, so a small model can reach it). Returns whether the prompt is now back
-    /// under the trigger, in which case no summary is needed.
+    /// quarter of the trigger, so a small model can reach it) **and** that brings the prompt back
+    /// under the trigger. Returns whether it did, in which case no summary is needed.
     ///
     /// **Batched, never incremental.** It runs only when the prompt has crossed the trigger, and a pass
     /// that frees too little is not applied, so history is rewritten at most once per fill cycle: every
     /// turn in between sends a byte-identical prefix and reads it from the prompt cache. Masking a
     /// little every turn instead invalidates the cache from the first edited message on, each turn,
-    /// which costs 2–3× more than not masking at all. A pass that is applied but leaves the prompt over
-    /// the trigger falls through to the summary in the same turn, which then summarizes the masked
-    /// transcript (one cache invalidation, not two).
+    /// which costs 2–3× more than not masking at all.
+    ///
+    /// **A pass that wouldn't get under the trigger is not applied either**, and the summary runs on
+    /// the unmasked conversation. The summary replaces the old turns anyway, so masking them first
+    /// saves nothing, and it costs a lot: the summary call is the live conversation read from the
+    /// prompt cache (`conversation_summary_request`), and a mask rewrites that conversation from its
+    /// first edited message on, so the summary paid full price for the whole masked transcript. On
+    /// Sonnet 5.5, those summaries read 88–105K uncached ($0.21–0.23) against $0.06 at 98% cache read.
     ///
     /// The live-size snapshot drops by the estimate of what was freed, so the next check sees the
     /// smaller prompt before the next provider usage report corrects it. Request blocks riding a masked
@@ -2683,12 +2688,14 @@ impl Agent {
         ) else {
             return false;
         };
-        if plan.freed < cfg.mask_min_free_tokens.min(cfg.trigger_tokens() / 4) {
-            return false;
-        }
         let tokens_before = session
             .last_input_tokens
             .saturating_add(compaction::trailing_tokens(session));
+        if plan.freed < cfg.mask_min_free_tokens.min(cfg.trigger_tokens() / 4)
+            || tokens_before.saturating_sub(plan.freed) > cfg.trigger_tokens()
+        {
+            return false;
+        }
         for b in &mut session.request_blocks {
             if session.messages.get(b.index) == Some(&b.anchor)
                 && let Some(m) = plan.messages.get(b.index)
@@ -2704,7 +2711,7 @@ impl Agent {
             tokens_before,
             tokens_freed: plan.freed,
         });
-        !compaction::should_compact(session, cfg)
+        true
     }
 
     /// Persist the session through the host's [`CheckpointHook`], containing a panic in the host's own
@@ -12523,31 +12530,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn masking_runs_first_then_the_summary_when_still_over_the_trigger() {
-        // 20K tokens of task text that masking can't touch: the pass is applied (it frees enough),
-        // the prompt is still over 10K, so the summary runs in the same turn — over the masked
-        // transcript, so only one rewrite reaches the cache.
+    async fn a_mask_that_cannot_reach_the_trigger_is_skipped_so_the_summary_reads_the_cache() {
+        // 20K tokens of task text masking can't touch: a pass would free enough but leave the prompt
+        // over the trigger, so the summary is needed anyway. Masking first would rewrite the very
+        // conversation the summary call reads from cache (measured on Sonnet 5.5: 88–105K uncached
+        // instead of 98% cache read). So no pass: the summary request is turn 1's request, byte for
+        // byte, plus the instruction — the same prefix and cache breakpoints.
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(EchoTool));
         let mock = Arc::new(MockTransport::new(vec![
+            tool_turn_with_usage("t1", 31_000),
             turn::text("## Goal\nsummary"),
             turn::text("done"),
         ]));
-        let agent = Agent::new(mock.clone(), "claude-opus-4-8").with_compaction(masking_config());
+        let agent = Agent::new(mock.clone(), "claude-opus-4-8")
+            .with_tools(tools)
+            .with_system("you are the agent")
+            .with_compaction(masking_config());
         let mut session = masking_session(80_000, 12);
+        session.last_input_tokens = 0;
         let mut events = Vec::new();
         agent
             .run_events(&mut session, |ev| events.push(ev))
             .await
             .unwrap();
-        assert_eq!(kinds(&events), ["masked", "compaction_start", "compacted"]);
-        let summary_prompt = format!("{:?}", mock.requests()[0].messages);
-        assert!(
-            summary_prompt.contains(compaction::MASKED_PREFIX),
-            "the summary is made from the masked transcript"
+        assert_eq!(
+            kinds(&events),
+            ["compaction_start", "compacted"],
+            "no masking pass"
         );
-        assert!(
-            session.edited.is_empty(),
-            "the compaction's rewrite carries it"
+        let reqs = mock.requests();
+        let (turn, summary) = (&reqs[0], &reqs[1]);
+        let n = turn.messages.len();
+        assert_eq!(
+            &summary.messages[..n],
+            &turn.messages[..],
+            "the cached prefix"
         );
+        assert_eq!(summary.system, turn.system);
+        assert_eq!(summary.tools, turn.tools);
+        assert!(!format!("{:?}", summary.messages).contains(compaction::MASKED_PREFIX));
     }
 
     #[tokio::test]

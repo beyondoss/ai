@@ -333,9 +333,12 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
   modified files plus this transcript's own `write`/`edit` targets), errors within `2 × mask_keep_turns`
   turns, results under 1,000 chars, and results already masked. The pass is applied only when it frees
   at least `mask_min_free_tokens` (default 25K, capped at a quarter of the trigger so a small model can
-  reach it — our `clear_at_least`); if it then leaves the prompt under the trigger, no summary runs
-  (`AgentEvent::ToolOutputMasked`, no `CompactionStart`), otherwise the summary runs in the same turn
-  over the masked transcript. **Batched, never incremental**: it only runs past the trigger and a
+  reach it — our `clear_at_least`) **and** brings the prompt back under the trigger; then no summary
+  runs (`AgentEvent::ToolOutputMasked`, no `CompactionStart`). A pass that would leave the prompt over
+  the trigger is not applied: the summary runs on the unmasked conversation, because the summary
+  replaces the old turns anyway and the cached summary call reads the live conversation from cache — a
+  mask first rewrites it, and on Sonnet 5.5 those summaries read 88–105K uncached ($0.21–0.23) against
+  $0.06 at 98% cache read. **Batched, never incremental**: it only runs past the trigger and a
   too-small pass is not applied, so history is rewritten at most once per fill cycle and every turn in
   between reads a byte-identical prefix from the cache (masking a little every turn invalidates the
   cache each turn and costs 2–3× more). No recall tool: in the evidence one was rarely called and
