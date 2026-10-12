@@ -322,7 +322,7 @@ fn serve_cycle_model_scoped_by_the_models_flag_cycles_only_the_scope_but_lists_t
         .collect();
     assert_eq!(
         all_models,
-        beyond_ai_agent::serve::available_models()
+        beyond_ai_agent::serve::listed_models()
             .iter()
             .map(|s| s.to_string())
             .collect::<Vec<_>>(),
