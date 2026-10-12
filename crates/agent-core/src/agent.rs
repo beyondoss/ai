@@ -181,6 +181,9 @@ const DEFAULT_MAX_TOKENS: u32 = 4096;
 /// re-render (or `summary_max_tokens`, if that is smaller): under this a structured checkpoint summary
 /// gets cut short.
 const MIN_CACHED_SUMMARY_TOKENS: u32 = 2_048;
+/// How many recent turns `compaction::growth_per_turn` averages over for the masking pay-off
+/// candidates (`CompactionCandidates::mask_breakeven`).
+const MASK_GROWTH_TURNS: usize = 10;
 /// Cap on tool-call groups dispatched concurrently within one turn. A model usually batches a
 /// handful, but nothing bounds how many it requests; without a cap a turn asking for dozens of
 /// `bash`/`grep` calls would spawn that many subprocesses / parallel walks at once (and `grep` itself
@@ -2443,6 +2446,13 @@ impl Agent {
             file_ops.user_requests =
                 compaction::merge_user_requests(&file_ops.user_requests, &prefix);
         }
+        if candidates.track_bash_edits {
+            for path in compaction::extract_bash_writes(&prefix) {
+                if !file_ops.modified_files.contains(&path) {
+                    file_ops.modified_files.push(path);
+                }
+            }
+        }
         // The kept suffix, shown read-only to a re-render so its summary is current
         // (`CompactionCandidates::sees_tail`; the cached call sees it anyway).
         let tail: &[Message] = if candidates.sees_tail {
@@ -2818,6 +2828,35 @@ impl Agent {
             || tokens_before.saturating_sub(plan.freed) > cfg.trigger_tokens()
         {
             return false;
+        }
+        // Candidates under evaluation: apply the pass only when it pays for its cache rewrite before
+        // the freed room refills, optionally from a later start (see `CompactionCandidates`).
+        let candidates = cfg.candidates;
+        let mut plan = plan;
+        if candidates.mask_breakeven || candidates.mask_best_start {
+            let growth = compaction::growth_per_turn(&session.messages, MASK_GROWTH_TURNS);
+            let write_premium = if self.cache_long { 2.0 } else { 1.25 };
+            if candidates.mask_best_start {
+                let need = cfg
+                    .mask_min_free()
+                    .max(tokens_before.saturating_sub(cfg.trigger_tokens()));
+                match compaction::best_mask_start(
+                    &session.messages,
+                    &plan,
+                    need,
+                    growth,
+                    write_premium,
+                ) {
+                    Some(restricted) => plan = restricted,
+                    None => return false,
+                }
+            } else {
+                let first = plan.edited.first().copied().unwrap_or(0);
+                let rewrite = compaction::estimate_messages_tokens(&plan.messages[first..]);
+                if compaction::mask_net_saving(plan.freed, rewrite, growth, write_premium) < 0.0 {
+                    return false;
+                }
+            }
         }
         for b in &mut session.request_blocks {
             if session.messages.get(b.index) == Some(&b.anchor)
@@ -13646,5 +13685,115 @@ mod tests {
             !summary.contains("<user-requests>"),
             "nothing carries requests by default"
         );
+    }
+
+    /// A 10K-trigger masking setup where masking the three oldest results (~2.9K tokens) gets under
+    /// the trigger but cannot pay for rewriting the ~9K tokens after them before the room refills
+    /// (growth ~1K tokens a turn): `0.1 · 2.9K · 2.9 ≈ 0.85K` saved against `1.15 · 9K ≈ 10K` paid.
+    fn costly_mask_config(candidates: compaction::CompactionCandidates) -> CompactionConfig {
+        CompactionConfig {
+            mask_keep_turns: 9,
+            candidates,
+            ..masking_config()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_mask_that_cannot_pay_for_its_rewrite_is_applied_by_default() {
+        let mock = Arc::new(MockTransport::new(vec![turn::text("done")]));
+        let agent = Agent::new(mock.clone(), "claude-opus-4-8")
+            .with_compaction(costly_mask_config(Default::default()));
+        let mut session = masking_session(0, 12);
+        let mut events = Vec::new();
+        agent
+            .run_events(&mut session, |ev| events.push(ev))
+            .await
+            .unwrap();
+        assert_eq!(kinds(&events), ["masked"]);
+    }
+
+    #[tokio::test]
+    async fn the_breakeven_candidates_skip_a_mask_that_cannot_pay_for_its_rewrite() {
+        for candidates in [
+            compaction::CompactionCandidates {
+                mask_breakeven: true,
+                ..Default::default()
+            },
+            compaction::CompactionCandidates {
+                mask_best_start: true,
+                ..Default::default()
+            },
+        ] {
+            let mock = Arc::new(MockTransport::new(vec![
+                turn::text("## Goal\nsummary"),
+                turn::text("done"),
+            ]));
+            let agent = Agent::new(mock.clone(), "claude-opus-4-8")
+                .with_compaction(costly_mask_config(candidates));
+            let mut session = masking_session(0, 12);
+            let mut events = Vec::new();
+            agent
+                .run_events(&mut session, |ev| events.push(ev))
+                .await
+                .unwrap();
+            assert_eq!(
+                kinds(&events),
+                ["compaction_start", "compacted"],
+                "{candidates:?}"
+            );
+            assert!(session.messages.iter().all(|m| !is_masked(m)));
+        }
+    }
+
+    #[tokio::test]
+    async fn the_breakeven_candidate_keeps_a_mask_that_pays() {
+        // Ten of twelve results masked: ~9.7K freed against a ~2.4K rewrite.
+        let mock = Arc::new(MockTransport::new(vec![turn::text("done")]));
+        let agent = Agent::new(mock.clone(), "claude-opus-4-8").with_compaction(CompactionConfig {
+            candidates: compaction::CompactionCandidates {
+                mask_breakeven: true,
+                ..Default::default()
+            },
+            ..masking_config()
+        });
+        let mut session = masking_session(0, 12);
+        let mut events = Vec::new();
+        agent
+            .run_events(&mut session, |ev| events.push(ev))
+            .await
+            .unwrap();
+        assert_eq!(kinds(&events), ["masked"]);
+    }
+
+    #[tokio::test]
+    async fn the_bash_edits_candidate_lists_files_written_through_bash() {
+        async fn modified(candidates: compaction::CompactionCandidates) -> (Vec<String>, String) {
+            let mock = Arc::new(MockTransport::new(vec![turn::text("## Goal\nsummary")]));
+            let agent = summary_agent(&mock, rerender_config(candidates));
+            let mut session = masking_session(0, 12);
+            session.messages = Arc::new({
+                let mut m = (*session.messages).clone();
+                m[1] = Message::assistant(vec![ContentBlock::tool_use(
+                    "c0",
+                    "bash",
+                    json!({ "command": "cd pkg && sed -i 's/a/b/' src/m.py && python -m pytest -q" }),
+                )]);
+                m
+            });
+            compact_once(&agent, &mut session).await;
+            (
+                session.compaction.modified_files.clone(),
+                last_text(&session.messages[0]).to_string(),
+            )
+        }
+        let (files, summary) = modified(Default::default()).await;
+        assert!(files.is_empty() && !summary.contains("<modified-files>"));
+        let (files, summary) = modified(compaction::CompactionCandidates {
+            track_bash_edits: true,
+            ..Default::default()
+        })
+        .await;
+        assert_eq!(files, ["pkg/src/m.py"]);
+        assert!(summary.contains("<modified-files>\npkg/src/m.py\n</modified-files>"));
     }
 }

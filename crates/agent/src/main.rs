@@ -413,7 +413,8 @@ enum Command {
         #[usage(long, env = "AI_AGENT_NO_CACHED_SUMMARY")]
         no_cached_summary: bool,
         /// Compaction changes under evaluation, by name (comma-separated), all off by default:
-        /// `system-role`, `handoff`, `check`, `state`, `tail`, `carry-request` (see
+        /// `system-role`, `handoff`, `check`, `state`, `tail`, `carry-request`, `bash-edits`,
+        /// `mask-breakeven`, `mask-best-start` (see
         /// `agent_core::CompactionCandidates`). An unknown name is an error. `serve`'s identical
         /// flag.
         #[usage(long, env = "AI_AGENT_COMPACTION_CANDIDATES", delimiter = ',')]
@@ -1002,7 +1003,8 @@ enum Command {
         #[usage(long, env = "AI_AGENT_NO_CACHED_SUMMARY")]
         no_cached_summary: bool,
         /// Compaction changes under evaluation, by name (comma-separated), all off by default:
-        /// `system-role`, `handoff`, `check`, `state`, `tail`, `carry-request` (see
+        /// `system-role`, `handoff`, `check`, `state`, `tail`, `carry-request`, `bash-edits`,
+        /// `mask-breakeven`, `mask-best-start` (see
         /// `agent_core::CompactionCandidates`). An unknown name is an error. `run`'s identical
         /// flag.
         #[usage(long, env = "AI_AGENT_COMPACTION_CANDIDATES", delimiter = ',')]

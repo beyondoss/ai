@@ -23,6 +23,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 pub mod agent;
+pub mod bash_writes;
 pub mod branch_summary;
 pub mod client;
 // Internal to `client.rs`'s `GatewayClient` — the live Codex WebSocket transport has no public seam

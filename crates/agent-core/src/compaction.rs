@@ -300,6 +300,23 @@ pub struct CompactionCandidates {
     /// exact request is not visible in this prefix. From the work, the task is to…"), and only 34–40%
     /// kept the "don't edit tests" constraint.
     pub carry_requests: bool,
+    /// Files a `bash` command wrote ([`crate::bash_writes::written_paths`]) join the modified-files
+    /// provenance, beside `write`/`edit` targets. Claude Sonnet 5.5 made 2 `write`/`edit` calls in
+    /// 17 eval runs and edited through `bash`, so 19 of its 23 summaries' `<modified-files>` missed
+    /// files it had changed (102 in all); over the eval's 4,623 bash commands the parser recovers
+    /// all of them, 25 of 25 sampled being real edits.
+    pub track_bash_edits: bool,
+    /// A masking pass is applied only when it pays for its cache rewrite before the freed room
+    /// refills: `0.1 · freed · (freed / growth) ≥ (w − 0.1) · rewrite` ([`mask_net_saving`]), with
+    /// `rewrite` the tokens from the first edited message on, `growth` the transcript's recent
+    /// tokens per turn ([`growth_per_turn`]) and `w` the cache-write price (1.25×, 2× at the 1-hour
+    /// TTL). In the eval, 7 of 12 passes earned back their rewrite; this rule agrees with the
+    /// outcome on 9 of the 12.
+    pub mask_breakeven: bool,
+    /// Like [`Self::mask_breakeven`], but the pass may start later: of the plan's edits, it keeps those
+    /// from the start that maximizes the same net saving ([`best_mask_start`]), so an early result that
+    /// frees little stops forcing a rewrite of everything after it.
+    pub mask_best_start: bool,
 }
 
 impl CompactionCandidates {
@@ -311,6 +328,9 @@ impl CompactionCandidates {
         "state",
         "tail",
         "carry-request",
+        "bash-edits",
+        "mask-breakeven",
+        "mask-best-start",
     ];
 
     /// The candidates `names` turns on (the CLI's `--compaction-candidates`); an unknown name is an
@@ -326,6 +346,9 @@ impl CompactionCandidates {
                 "state" => c.state_template = true,
                 "tail" => c.sees_tail = true,
                 "carry-request" => c.carry_requests = true,
+                "bash-edits" => c.track_bash_edits = true,
+                "mask-breakeven" => c.mask_breakeven = true,
+                "mask-best-start" => c.mask_best_start = true,
                 "" => {}
                 other => {
                     return Err(format!(
@@ -1717,6 +1740,112 @@ fn mask_placeholder(call: Option<(&str, &Value)>, chars: usize, images: usize) -
         n => format!(" and {n} images"),
     };
     format!("{MASKED_PREFIX} {what}, {chars} chars{images}. Run the tool again if you need it.]")
+}
+
+/// Every file a `bash` call in `messages` wrote, by [`crate::bash_writes::written_paths`], in
+/// first-seen order, deduped — what [`CompactionCandidates::track_bash_edits`] adds to the
+/// modified-files provenance.
+pub fn extract_bash_writes(messages: &[Message]) -> Vec<String> {
+    let mut out = Vec::new();
+    for b in messages.iter().flat_map(|m| &m.content) {
+        if let ContentBlock::ToolUse { name, input, .. } = b
+            && name == "bash"
+            && let Some(command) = input.get("command").and_then(Value::as_str)
+        {
+            for path in crate::bash_writes::written_paths(command) {
+                if !out.contains(&path) {
+                    out.push(path);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// How fast the transcript grows: the estimated tokens of its last `turns` turns (from the
+/// `turns`-th last assistant message on), per turn. At least 1.
+pub fn growth_per_turn(messages: &[Message], turns: usize) -> u32 {
+    let starts: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .rev()
+        .filter(|(_, m)| m.role == Role::Assistant)
+        .map(|(i, _)| i)
+        .take(turns.max(1))
+        .collect();
+    let Some(&start) = starts.last() else {
+        return 1;
+    };
+    (estimate_messages_tokens(&messages[start..]) / starts.len() as u32).max(1)
+}
+
+/// What a masking pass saves, net, in base-input-token equivalents, before the room it frees
+/// refills: every turn until then reads `freed` fewer cached tokens (0.1× each), and the pass pays
+/// once to write `rewrite` tokens (from its first edited message on) at `write_premium` instead of
+/// reading them at 0.1×. `freed / growth` turns until the transcript is back where it was. Positive:
+/// the pass pays for itself. The model behind [`CompactionCandidates::mask_breakeven`].
+pub fn mask_net_saving(freed: u32, rewrite: u32, growth_per_turn: u32, write_premium: f64) -> f64 {
+    let turns = f64::from(freed) / f64::from(growth_per_turn.max(1));
+    0.1 * f64::from(freed) * turns - (write_premium - 0.1) * f64::from(rewrite)
+}
+
+/// For [`CompactionCandidates::mask_best_start`]: of `plan`'s edits, the restriction to those at or
+/// after some start index that maximizes [`mask_net_saving`], among starts that still free at least
+/// `min_freed` — or `None` when no start does. `original` is the transcript `plan` was made from.
+pub fn best_mask_start(
+    original: &[Message],
+    plan: &MaskPlan,
+    min_freed: u32,
+    growth_per_turn: u32,
+    write_premium: f64,
+) -> Option<MaskPlan> {
+    // Suffix sums over the edits, latest first: what masking from each edit on frees, and how many
+    // tokens of the masked transcript then sit at or after it (the rewrite).
+    let mut best: Option<(f64, usize)> = None;
+    let mut freed = 0u32;
+    let mut next = plan.messages.len();
+    let mut rewrite = 0u32;
+    for &i in plan.edited.iter().rev() {
+        freed = freed.saturating_add(
+            estimate_message_tokens(&original[i])
+                .saturating_sub(estimate_message_tokens(&plan.messages[i])),
+        );
+        rewrite = rewrite.saturating_add(estimate_messages_tokens(&plan.messages[i..next]));
+        next = i;
+        if freed < min_freed {
+            continue;
+        }
+        let net = mask_net_saving(freed, rewrite, growth_per_turn, write_premium);
+        if best.is_none_or(|(b, _)| net > b) {
+            best = Some((net, i));
+        }
+    }
+    let (net, start) = best?;
+    if net < 0.0 {
+        return None;
+    }
+    let mut messages = original.to_vec();
+    let (mut edited, mut masked, mut kept_freed) = (Vec::new(), 0usize, 0u32);
+    for &i in plan.edited.iter().filter(|&&i| i >= start) {
+        kept_freed = kept_freed.saturating_add(
+            estimate_message_tokens(&original[i])
+                .saturating_sub(estimate_message_tokens(&plan.messages[i])),
+        );
+        masked += plan.messages[i]
+            .content
+            .iter()
+            .zip(&original[i].content)
+            .filter(|(new, old)| new != old)
+            .count();
+        messages[i] = plan.messages[i].clone();
+        edited.push(i);
+    }
+    Some(MaskPlan {
+        messages,
+        edited,
+        masked,
+        freed: kept_freed,
+    })
 }
 
 /// The `tokens_before` an [`apply_summary`] summary message records in its leading
@@ -3697,5 +3826,93 @@ mod tests {
             previous_summary(std::slice::from_ref(&message)),
             Some("## Goal\nx")
         );
+    }
+
+    #[test]
+    fn bash_writes_are_extracted_from_bash_calls_only() {
+        let messages = vec![
+            Message::assistant(vec![
+                ContentBlock::tool_use("1", "bash", json!({ "command": "echo x > a.txt" })),
+                ContentBlock::tool_use("2", "read", json!({ "path": "b.txt" })),
+            ]),
+            Message::assistant(vec![ContentBlock::tool_use(
+                "3",
+                "bash",
+                json!({ "command": "sed -i 's/x/y/' a.txt c.py" }),
+            )]),
+        ];
+        assert_eq!(extract_bash_writes(&messages), ["a.txt", "c.py"]);
+    }
+
+    #[test]
+    fn growth_per_turn_averages_the_recent_turns() {
+        let mut messages = vec![Message::user("x".repeat(40_000))];
+        for i in 0..4 {
+            messages.push(Message::assistant(vec![ContentBlock::text(
+                "a".repeat(400),
+            )]));
+            messages.push(Message::user(format!("{i}{}", "u".repeat(3_599))));
+        }
+        // Each turn is ~1,000 tokens; the 10K-token task before the window is not growth.
+        assert_eq!(growth_per_turn(&messages, 2), 1_000);
+        assert_eq!(
+            growth_per_turn(&messages, 10),
+            1_000,
+            "fewer turns than asked: all of them"
+        );
+        assert_eq!(growth_per_turn(&[Message::user("x")], 10), 1);
+    }
+
+    #[test]
+    fn mask_net_saving_matches_the_eval_passes() {
+        // s500 pallets-parsers Sonnet, turn 75: 63,819 freed, 102,647 rewritten, refilled in ~43
+        // turns; it paid (45 turns followed). Turn 198: 33,302 freed, 148,989 rewritten, ~17 turns
+        // to refill; it did not (19 turns followed, break-even 51).
+        assert!(mask_net_saving(63_819, 102_647, 63_819 / 43, 1.25) > 0.0);
+        assert!(mask_net_saving(33_302, 148_989, 33_302 / 17, 1.25) < 0.0);
+        // The 1-hour TTL's 2× write moves the line: 15 turns of 0.1 × 30K saved (45K) pays for a 30K
+        // rewrite at 1.25× (34.5K extra) but not at 2× (57K).
+        assert!(mask_net_saving(30_000, 30_000, 2_000, 1.25) > 0.0);
+        assert!(mask_net_saving(30_000, 30_000, 2_000, 2.0) < 0.0);
+    }
+
+    #[test]
+    fn best_mask_start_skips_an_early_result_that_forces_a_large_rewrite() {
+        // An old 1.2K-char result, then a large protected one (a file being edited), then a large
+        // maskable one, then the kept window. Masking from the first result rewrites the protected
+        // one too, for ~300 tokens more freed; starting at the large result does not.
+        let mut messages = vec![Message::user("the task")];
+        let call = |messages: &mut Vec<Message>, id: &str, path: &str, chars: usize| {
+            messages.push(Message::assistant(vec![ContentBlock::tool_use(
+                id,
+                "read",
+                json!({ "path": path }),
+            )]));
+            messages.push(Message::tool_result(id, "r".repeat(chars), false));
+        };
+        call(&mut messages, "a", "small.py", 1_200);
+        call(&mut messages, "b", "edited.py", 40_000);
+        call(&mut messages, "c", "big.py", 40_000);
+        for i in 0..2 {
+            call(&mut messages, &format!("k{i}"), "recent.py", 400);
+        }
+        let plan = mask_tool_results(&messages, 2, u32::MAX, &["edited.py".into()]).unwrap();
+        assert_eq!(
+            plan.edited,
+            [2, 6],
+            "the full plan masks the small and the big result"
+        );
+        let best = best_mask_start(&messages, &plan, 1_000, 2_000, 1.25).unwrap();
+        assert_eq!(best.edited, [6]);
+        assert_eq!(best.masked, 1);
+        assert!(best.freed > 9_000 && best.freed < plan.freed);
+        assert_eq!(
+            best.messages[2], messages[2],
+            "the early result is left alone"
+        );
+        // Nothing pays: no plan at all.
+        assert!(best_mask_start(&messages, &plan, 1_000, 1_000_000, 1.25).is_none());
+        // A floor no start reaches: none either.
+        assert!(best_mask_start(&messages, &plan, 1_000_000, 2_000, 1.25).is_none());
     }
 }
