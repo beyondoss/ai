@@ -76,10 +76,10 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.00000065736",
-          "discount": 0.834,
-          "input_cache_read": "0.000000006972",
-          "prompt": "0.00000021912"
+          "completion": "0.00000074844",
+          "discount": 0.811,
+          "input_cache_read": "0.000000007938",
+          "prompt": "0.00000024948"
         },
         "provider_name": "Baidu",
         "quantization": "fp8",
@@ -300,6 +300,19 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
+          "completion": "0.000008",
+          "discount": 0,
+          "input_cache_read": "0.00000004",
+          "prompt": "0.0000004"
+        },
+        "provider_name": "Reka",
+        "quantization": "unknown",
+        "tag": "reka"
+      },
+      {
+        "context_length": 1048576,
+        "max_prompt_tokens": null,
+        "pricing": {
           "completion": "0.000003",
           "discount": 0,
           "input_cache_read": "0.000000033",
@@ -380,8 +393,8 @@
         "pricing": {
           "completion": "0.000005",
           "discount": 0,
-          "input_cache_read": "0.000000219",
-          "prompt": "0.00000036"
+          "input_cache_read": "0.0000002",
+          "prompt": "0.00000025"
         },
         "provider_name": "Wafer",
         "quantization": "unknown",

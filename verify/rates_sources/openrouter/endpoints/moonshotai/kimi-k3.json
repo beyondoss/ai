@@ -58,10 +58,10 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.000015",
+          "completion": "0.0000095",
           "discount": 0,
-          "input_cache_read": "0.0000003",
-          "prompt": "0.000003"
+          "input_cache_read": "0.000000185",
+          "prompt": "0.00000185"
         },
         "provider_name": "Chutes",
         "quantization": "mxfp4",
@@ -165,7 +165,7 @@
           "completion": "0.00001",
           "discount": 0,
           "input_cache_read": "0.00000055",
-          "prompt": "0.0000008"
+          "prompt": "0.00000073"
         },
         "provider_name": "InferenceNet",
         "quantization": "fp4",
@@ -217,7 +217,7 @@
           "completion": "0.0000149",
           "discount": 0,
           "input_cache_read": "0.00000029",
-          "prompt": "0.00000075"
+          "prompt": "0.000001"
         },
         "provider_name": "Morph",
         "quantization": "fp8",
@@ -305,10 +305,10 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.00003",
+          "completion": "0.000024",
           "discount": 0,
           "input_cache_read": "0.0000003",
-          "prompt": "0.00000195"
+          "prompt": "0.00000072"
         },
         "provider_name": "Wafer",
         "quantization": "unknown",
@@ -318,7 +318,7 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.000029",
+          "completion": "0.0000155",
           "discount": 0,
           "input_cache_read": "0.0000003",
           "prompt": "0.0000028"

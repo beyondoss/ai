@@ -47,10 +47,10 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.0000001392",
-          "discount": 0.884,
-          "input_cache_read": "0.000000000696",
-          "prompt": "0.0000000348"
+          "completion": "0.0000012",
+          "discount": 0,
+          "input_cache_read": "0.000000006",
+          "prompt": "0.0000003"
         },
         "provider_name": "Baidu",
         "quantization": "fp8",
@@ -245,19 +245,6 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.0000012",
-          "discount": 0,
-          "input_cache_read": "0.000000005",
-          "prompt": "0.00000012"
-        },
-        "provider_name": "DekaLLM",
-        "quantization": "unknown",
-        "tag": "dekallm"
-      },
-      {
-        "context_length": 1048576,
-        "max_prompt_tokens": null,
-        "pricing": {
           "completion": "0.00000066",
           "discount": 0,
           "input_cache_read": "0.000000006",
@@ -310,7 +297,7 @@
         "context_length": 1040000,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.0000004",
+          "completion": "0.00000055",
           "discount": 0,
           "input_cache_read": "0.00000001",
           "prompt": "0.000000077"
@@ -388,10 +375,10 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.00000036",
+          "completion": "0.000001188",
           "discount": 0,
-          "input_cache_read": "0.0000000045",
-          "prompt": "0.000000055"
+          "input_cache_read": "0.0000000336",
+          "prompt": "0.0000000336"
         },
         "provider_name": "OpenInference",
         "quantization": "fp4",
@@ -429,7 +416,7 @@
         "pricing": {
           "completion": "0.0000006",
           "discount": 0,
-          "input_cache_read": "0.000000005",
+          "input_cache_read": "0.000000008",
           "prompt": "0.00000005"
         },
         "provider_name": "Relace",
@@ -505,10 +492,10 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.0000006",
+          "completion": "0.00000099",
           "discount": 0,
           "input_cache_read": "0.000000034",
-          "prompt": "0.000000035"
+          "prompt": "0.00000007"
         },
         "provider_name": "Wafer",
         "quantization": "unknown",
