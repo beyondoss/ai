@@ -419,6 +419,11 @@ enum Command {
         /// flag.
         #[usage(long, env = "AI_AGENT_COMPACTION_CANDIDATES", delimiter = ',')]
         compaction_candidates: Option<Vec<String>>,
+        /// A different model to write compaction summaries (e.g. `claude-sonnet-5-5` for a weak
+        /// session model). Every summary is then a re-render, without the session's reasoning
+        /// settings. Unset: the session's own model. Under evaluation.
+        #[usage(long, env = "AI_AGENT_COMPACTION_SUMMARIZER_MODEL")]
+        compaction_summarizer_model: Option<String>,
         /// Compaction headroom (tokens) reserved below the context window before it fires. Defaults to
         /// `CompactionConfig::default()`'s 16,384. `serve`'s identical flag.
         #[usage(long, env = "AI_AGENT_COMPACTION_RESERVE_TOKENS")]
@@ -1022,6 +1027,11 @@ enum Command {
         /// flag.
         #[usage(long, env = "AI_AGENT_COMPACTION_CANDIDATES", delimiter = ',')]
         compaction_candidates: Option<Vec<String>>,
+        /// A different model to write compaction summaries (e.g. `claude-sonnet-5-5` for a weak
+        /// session model). Every summary is then a re-render, without the session's reasoning
+        /// settings. Unset: the session's own model. Under evaluation.
+        #[usage(long, env = "AI_AGENT_COMPACTION_SUMMARIZER_MODEL")]
+        compaction_summarizer_model: Option<String>,
         /// Per-turn output token ceiling. Defaults to the model's own capability-table `max_output`
         /// (see `agent_core::models::capabilities`), floored at a sane minimum — only pass this to
         /// override that, e.g. capping generation length or lifting it past the model-derived default.
@@ -2034,6 +2044,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             tool_masking_min_tokens,
             no_cached_summary,
             compaction_candidates,
+            compaction_summarizer_model,
             compaction_reserve_tokens,
             compaction_keep_recent_tokens,
             branch_summary_reserve_tokens,
@@ -2124,6 +2135,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 tool_masking_min_tokens,
                 no_cached_summary,
                 compaction_candidates,
+                compaction_summarizer_model,
                 compaction_reserve_tokens,
                 compaction_keep_recent_tokens,
                 branch_summary_reserve_tokens,
@@ -2233,6 +2245,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             tool_masking_min_tokens,
             no_cached_summary,
             compaction_candidates,
+            compaction_summarizer_model,
             cache_ttl,
             cache_long,
             thinking,
@@ -2739,6 +2752,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 session_id,
                 continue_session,
                 no_session_persistence,
+                compaction_summarizer_model,
                 compaction: serve::CompactionFlags {
                     context_window,
                     compact_at,
@@ -4264,6 +4278,7 @@ async fn run_task(
     tool_masking_min_tokens: Option<u32>,
     no_cached_summary: bool,
     compaction_candidates: Option<Vec<String>>,
+    compaction_summarizer_model: Option<String>,
     compaction_reserve_tokens: Option<u32>,
     compaction_keep_recent_tokens: Option<u32>,
     branch_summary_reserve_tokens: Option<u32>,
@@ -5188,6 +5203,24 @@ async fn run_task(
     timing.mark("open session");
     timing.print();
 
+    // `--compaction-summarizer-model`: credentials and routing are model-keyed, so the summarizer gets
+    // a transport of its own, built the way a subagent's is.
+    let summarizer = match compaction_summarizer_model {
+        Some(m) => {
+            let client = build_run_gateway_client(
+                raw_gateway_key.clone(),
+                &gateway,
+                &m,
+                &provider_env,
+                retry_max_retries,
+                retry_base_delay_ms,
+                retry_max_backoff_ms,
+                idle_timeout_ms,
+            )?;
+            Some((m, Arc::new(client) as Arc<dyn agent_core::ModelTransport>))
+        }
+        None => None,
+    };
     let mut client = match key {
         GatewayCredential::Static(key) => GatewayClient::new(gateway, key)?,
         GatewayCredential::Oauth(source) => GatewayClient::with_credential_source(gateway, source)?,
@@ -5296,6 +5329,9 @@ async fn run_task(
     // `agent_core::Agent::with_branch_summary_reserve_tokens`'s own doc comment.
     if let Some(reserve) = branch_summary_reserve_tokens {
         agent = agent.with_branch_summary_reserve_tokens(reserve);
+    }
+    if let Some((model, transport)) = summarizer {
+        agent = agent.with_summarizer(model, transport);
     }
     // Unlike `serve`, `run` has no thinking-level cycling — these are applied as-is, with no per-model
     // default derivation when omitted (matching `run`'s prior behavior of not setting either at all).

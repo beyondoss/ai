@@ -482,6 +482,13 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
     and a next step when no `Next Step(s)` heading has a body. Only 55% of eval summaries mention a
     tally and 34–40% kept the "don't edit tests" constraint; judge-and-repair gains 2.6–8.8 points in
     the literature, and this is its zero-cost version.
+  - Not a candidate flag, since it names a model: `Agent::with_summarizer` (the CLI's
+    `--compaction-summarizer-model`) has a different model, over its own transport, write every
+    summary — a stronger summarizer for a weak session model (swapping only the summarizer moved
+    SWE-bench Verified 6.5 points in one study). Every summary is then a re-render (`run_rerender`):
+    the cached call reads the conversation's prompt cache, which only the session's own model can.
+    The session's thinking and effort settings are model-specific, so the summarizer runs without
+    them.
 
 - **The deterministic-carry channel** — `apply_summary` is deliberately destructive: it _replaces_
   `session.messages` with `[summary, …kept_suffix]`, and `SessionStore::open` reloads that

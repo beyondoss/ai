@@ -324,6 +324,9 @@ pub struct Agent {
     /// cost/bandwidth policy, a text-only audit log) doesn't need a fake non-vision model id to get it.
     /// See [`Self::with_block_images`].
     block_images: bool,
+    /// A different model (and the transport that reaches it) to write compaction summaries, set by
+    /// [`Self::with_summarizer`]. `None`: the session's own model writes them.
+    summarizer: Option<(String, Arc<dyn ModelTransport>)>,
 }
 
 /// The summarization call's own output budget, scaled from the model's real ceiling rather than a
@@ -380,7 +383,22 @@ impl Agent {
             checkpoint: Arc::new(NoCheckpoint),
             branch_summary_reserve_tokens: None,
             block_images: false,
+            summarizer: None,
         }
+    }
+
+    /// Have `model`, reached through `transport` (credentials and routing are model-keyed, so a
+    /// different model needs its own), write every compaction summary — e.g. Claude Sonnet 5.5 for a
+    /// Claude Haiku 5.5 or gpt-6-luna session. Every summary is then a re-render: the cached call
+    /// replays the live conversation's prompt cache, which only the session's own model can read. The
+    /// session's thinking and effort settings are model-specific, so the summarizer runs without them.
+    pub fn with_summarizer(
+        mut self,
+        model: impl Into<String>,
+        transport: Arc<dyn ModelTransport>,
+    ) -> Self {
+        self.summarizer = Some((model.into(), transport));
+        self
     }
 
     /// Set the tools the model may call. The advertised definitions are computed here, once, so the
@@ -2188,10 +2206,24 @@ impl Agent {
         cancel: &CancellationToken,
         partial_out: &mut Option<Turn>,
     ) -> Result<Turn> {
+        self.run_turn_on(&self.transport, req, emit, cancel, partial_out)
+            .await
+    }
+
+    /// [`Self::run_turn`] over `transport` — this agent's own, or a summarizer's
+    /// ([`Self::with_summarizer`]).
+    async fn run_turn_on(
+        &self,
+        transport: &Arc<dyn ModelTransport>,
+        req: ModelRequest,
+        emit: &mut (dyn FnMut(StreamEvent) + Send),
+        cancel: &CancellationToken,
+        partial_out: &mut Option<Turn>,
+    ) -> Result<Turn> {
         let mut attempt = 0u32;
         loop {
             match self
-                .run_turn_once(req.clone(), emit, cancel, partial_out)
+                .run_turn_once(transport, req.clone(), emit, cancel, partial_out)
                 .await
             {
                 Ok(turn) => return Ok(turn),
@@ -2233,6 +2265,7 @@ impl Agent {
     /// gone — leaving only an empty placeholder in history.
     async fn run_turn_once(
         &self,
+        transport: &Arc<dyn ModelTransport>,
         mut req: ModelRequest,
         emit: &mut (dyn FnMut(StreamEvent) + Send),
         cancel: &CancellationToken,
@@ -2255,7 +2288,7 @@ impl Agent {
         let cancelled = cancel.cancelled();
         futures::pin_mut!(cancelled);
         let mut stream = {
-            let stream_fut = self.transport.stream(req);
+            let stream_fut = transport.stream(req);
             futures::pin_mut!(stream_fut);
             match select(stream_fut, cancelled.as_mut()).await {
                 Either::Left((res, _)) => res?,
@@ -2326,14 +2359,44 @@ impl Agent {
         // failure — only the finished summary text ever matters to its caller — so the partial turn a
         // mid-stream failure might leave behind is simply discarded here, unlike the main conversational
         // loop's own call to `run_turn`.
+        self.run_utility_turn_on(&self.transport, req, cancel).await
+    }
+
+    /// [`Self::run_utility_turn`] over `transport`.
+    async fn run_utility_turn_on(
+        &self,
+        transport: &Arc<dyn ModelTransport>,
+        req: ModelRequest,
+        cancel: &CancellationToken,
+    ) -> Result<Turn> {
         let mut discarded_partial = None;
         let turn = self
-            .run_turn(req, &mut |_| {}, cancel, &mut discarded_partial)
+            .run_turn_on(transport, req, &mut |_| {}, cancel, &mut discarded_partial)
             .await?;
         if turn.stop_reason == StopReason::Aborted {
             return Err(Error::Cancelled);
         }
         Ok(turn)
+    }
+
+    /// A compaction re-render's model call: `build` makes the request for a model name. On the
+    /// summarizer's model and transport when one is set ([`Self::with_summarizer`]), without this
+    /// session's reasoning settings; else on the session's own, with them.
+    async fn run_rerender(
+        &self,
+        build: impl FnOnce(&str) -> ModelRequest,
+        cancel: &CancellationToken,
+    ) -> Result<Turn> {
+        match &self.summarizer {
+            Some((model, transport)) => {
+                self.run_utility_turn_on(transport, build(model), cancel)
+                    .await
+            }
+            None => {
+                self.run_utility_turn(self.with_reasoning(build(&self.model)), cancel)
+                    .await
+            }
+        }
     }
 
     /// Summarize the conversation prefix in place, keeping the recent turns verbatim. Makes one
@@ -2472,7 +2535,11 @@ impl Agent {
         // the task), cut off at the output limit or a runaway loop (`is_runaway`), and a call that
         // errors, fall through to the re-render below.
         let mut summary_source = SummarySource::Rerender;
-        let cached = match self.compaction.cached_summary && reason != CompactionReason::Overflow {
+        // A summarizer on another model can't read this conversation's prompt cache: re-render.
+        let cached = match self.compaction.cached_summary
+            && reason != CompactionReason::Overflow
+            && self.summarizer.is_none()
+        {
             true => {
                 match self.conversation_summary_request(session, &file_ops, custom_instructions) {
                     Some(req) => {
@@ -2516,16 +2583,22 @@ impl Agent {
             (None, turn_start) => match turn_start {
                 None => {
                     // Clean boundary (or any boundary, under the state template): one call.
-                    let req = self.with_reasoning(compaction::summary_request_with(
-                        &self.model,
-                        &prefix,
-                        tail,
-                        self.compaction.summary_max_tokens,
-                        &file_ops,
-                        custom_instructions,
-                        &candidates,
-                    ));
-                    let turn = self.run_utility_turn(req, cancel).await?;
+                    let turn = self
+                        .run_rerender(
+                            |model| {
+                                compaction::summary_request_with(
+                                    model,
+                                    &prefix,
+                                    tail,
+                                    self.compaction.summary_max_tokens,
+                                    &file_ops,
+                                    custom_instructions,
+                                    &candidates,
+                                )
+                            },
+                            cancel,
+                        )
+                        .await?;
                     add_usage(&mut usage, &turn.usage);
                     turn_text(&turn)
                 }
@@ -2562,14 +2635,20 @@ impl Agent {
                         {
                             return Ok((prev.to_string(), TokenUsage::default()));
                         }
-                        let req = self.with_reasoning(compaction::summary_request(
-                            &self.model,
-                            &session.messages[..turn_start],
-                            self.compaction.summary_max_tokens,
-                            &file_ops,
-                            custom_instructions,
-                        ));
-                        let turn = self.run_utility_turn(req, cancel).await?;
+                        let turn = self
+                            .run_rerender(
+                                |model| {
+                                    compaction::summary_request(
+                                        model,
+                                        &session.messages[..turn_start],
+                                        self.compaction.summary_max_tokens,
+                                        &file_ops,
+                                        custom_instructions,
+                                    )
+                                },
+                                cancel,
+                            )
+                            .await?;
                         Ok::<_, Error>((turn_text(&turn), turn.usage))
                     };
                     // Unlike `history` above, the turn-prefix call never takes `custom_instructions` — it
@@ -2577,16 +2656,22 @@ impl Agent {
                     // not the closed-off conversation `custom_instructions` is meant to steer. Matches pi's
                     // `generateTurnPrefixSummary`, whose signature doesn't accept custom instructions at all.
                     let turn_prefix = async {
-                        let req = self.with_reasoning(compaction::summary_request_with(
-                            &self.model,
-                            &session.messages[turn_start..first_kept],
-                            tail,
-                            turn_prefix_max_tokens,
-                            &file_ops,
-                            None,
-                            &candidates,
-                        ));
-                        let turn = self.run_utility_turn(req, cancel).await?;
+                        let turn = self
+                            .run_rerender(
+                                |model| {
+                                    compaction::summary_request_with(
+                                        model,
+                                        &session.messages[turn_start..first_kept],
+                                        tail,
+                                        turn_prefix_max_tokens,
+                                        &file_ops,
+                                        None,
+                                        &candidates,
+                                    )
+                                },
+                                cancel,
+                            )
+                            .await?;
                         Ok::<_, Error>((turn_text(&turn), turn.usage))
                     };
                     let (history, history_usage) = history.await?;
@@ -13560,6 +13645,34 @@ mod tests {
             text.contains(compaction::STATE_FORMAT) && text.contains(compaction::STATE_FOLD_IN)
         );
         assert!(!text.contains(compaction::SUMMARY_INSTRUCTION));
+    }
+
+    #[tokio::test]
+    async fn a_summarizer_model_writes_the_summary_as_a_re_render_on_its_own_transport() {
+        let own = Arc::new(MockTransport::new(vec![]));
+        let other = Arc::new(MockTransport::new(vec![turn::text("## Goal\nby sonnet")]));
+        // The cached call is on, and still skipped: it can only run on the session's own model.
+        let agent = summary_agent(&own, candidates_config(Default::default()))
+            .with_thinking(2_048)
+            .with_summarizer("claude-sonnet-5-5", other.clone());
+        let mut session = masking_session(0, 12);
+        compact_once(&agent, &mut session).await;
+        assert_eq!(own.calls(), 0, "nothing on the session's own transport");
+        let reqs = other.requests();
+        assert!(!reqs.is_empty());
+        for req in &reqs {
+            assert_eq!(req.model, "claude-sonnet-5-5");
+            assert_eq!(
+                req.system.as_deref(),
+                Some(compaction::SUMMARY_SYSTEM),
+                "a re-render"
+            );
+            assert!(
+                req.thinking.is_none(),
+                "the session's reasoning stays with it"
+            );
+        }
+        assert!(last_text(&session.messages[0]).contains("by sonnet"));
     }
 
     #[tokio::test]

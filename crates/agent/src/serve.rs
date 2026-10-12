@@ -567,6 +567,9 @@ pub struct ServeConfig {
     /// the new model's real budget instead of a stale operator number; a `Some` pins it across
     /// switches. Resolved by [`compaction_config`].
     pub compaction: CompactionFlags,
+    /// `--compaction-summarizer-model`: a different model to write compaction summaries
+    /// (`Agent::with_summarizer`), reached through its own transport. `None`: the session's model.
+    pub compaction_summarizer_model: Option<String>,
     /// The per-turn output token ceiling (`Agent::with_max_tokens`). `None` defers to `Agent::new`'s
     /// own model-aware default (the model's own capability-table `max_output`, floored at
     /// `DEFAULT_MAX_TOKENS`) — matches `context_window`'s own "unset means model-derived" convention.
@@ -8882,6 +8885,16 @@ fn build_agent(
     // survives a model switch.
     if let Some(reserve) = cfg.branch_summary_reserve_tokens {
         agent = agent.with_branch_summary_reserve_tokens(reserve);
+    }
+    // `--compaction-summarizer-model`: its own transport (credentials are model-keyed), built only
+    // when the flag is set. A model that can't be reached leaves the session's own summarizing.
+    if let Some(summarizer) = &cfg.compaction_summarizer_model {
+        match build_gateway_client(cfg, summarizer) {
+            Ok(client) => agent = agent.with_summarizer(summarizer.clone(), Arc::new(client)),
+            Err(e) => {
+                tracing::warn!(model = %summarizer, error = %e, "compaction summarizer unavailable")
+            }
+        }
     }
     // `level` (the portable ladder) supplies the default thinking/reasoning-effort pair for whichever
     // mechanism `model`'s capabilities actually call for; `thinking`, when present, is an explicit raw
