@@ -167,6 +167,10 @@ pub enum AgentEvent {
 
 /// Default per-turn output token ceiling.
 const DEFAULT_MAX_TOKENS: u32 = 4096;
+/// The smallest output budget the cached summary call shrinks to before falling back to the
+/// re-render (or `summary_max_tokens`, if that is smaller): under this a structured checkpoint summary
+/// gets cut short.
+const MIN_CACHED_SUMMARY_TOKENS: u32 = 2_048;
 /// Cap on tool-call groups dispatched concurrently within one turn. A model usually batches a
 /// handful, but nothing bounds how many it requests; without a cap a turn asking for dozens of
 /// `bash`/`grep` calls would spawn that many subprocesses / parallel walks at once (and `grep` itself
@@ -2591,9 +2595,10 @@ impl Agent {
     /// The instruction replaces the trailing user message's own content, keeping only its tool results
     /// (a new user message if the conversation ends on the model's turn), so roles still alternate,
     /// every `tool_use` keeps its result, the cached prefix (which ends before that message) is
-    /// untouched, and nothing the user is asking right now competes with the instruction. `None` when the conversation is too close to the limit to add the instruction and
-    /// still leave `summary_max_tokens` of output: the caller falls back to the re-render, which
-    /// truncates tool results and always fits.
+    /// untouched, and nothing the user is asking right now competes with the instruction. The output budget is
+    /// `summary_max_tokens`, shrunk to the room the window leaves. `None` when the input itself
+    /// doesn't fit the input budget, or the room left is under [`MIN_CACHED_SUMMARY_TOKENS`]: the
+    /// caller falls back to the re-render, which truncates tool results and always fits.
     fn conversation_summary_request(
         &self,
         session: &Session,
@@ -2615,8 +2620,15 @@ impl Agent {
             compaction::estimate_messages_tokens(&session.messages)
         };
         let prompt = live.saturating_add(compaction::estimate_tokens(&instruction));
+        // Output shrinks to fit rather than giving up the cache: a trigger at `window − reserve`
+        // (a small window, a user-set `--context-window`) can overshoot by a few thousand tokens,
+        // and a shorter summary read from cache beats a full-price re-render. Only an input that
+        // doesn't fit, or room for less than `MIN_CACHED_SUMMARY_TOKENS`, falls back.
+        let max_tokens = cfg
+            .summary_max_tokens
+            .min(cfg.context_window.saturating_sub(prompt));
         if prompt > cfg.input_budget()
-            || prompt.saturating_add(cfg.summary_max_tokens) > cfg.context_window
+            || max_tokens < MIN_CACHED_SUMMARY_TOKENS.min(cfg.summary_max_tokens)
         {
             return None;
         }
@@ -2645,7 +2657,7 @@ impl Agent {
         Some(self.with_reasoning(self.conversation_request(
             self.model.clone(),
             Arc::new(messages),
-            cfg.summary_max_tokens,
+            max_tokens,
             &self.tool_defs,
             &self.deferred_tool_defs,
         )))
@@ -12787,6 +12799,40 @@ mod tests {
         assert!(summary.tools.is_empty());
         assert_eq!(summary.messages.len(), 1);
         assert!(summary.no_cache, "a one-off prompt: no cache write premium");
+    }
+
+    #[tokio::test]
+    async fn the_summary_output_shrinks_to_fit_instead_of_losing_the_cache() {
+        // The trigger at `window − reserve` (a small window, or a user-set one as the eval harness
+        // passes): the prompt overshoots it by a few thousand tokens, so the full summary
+        // budget no longer fits. The cached call still runs, with the output it has room for.
+        let mock = Arc::new(MockTransport::new(vec![
+            turn::text("## Goal\nthe summary"),
+            turn::text("done"),
+        ]));
+        let cfg = CompactionConfig {
+            context_window: 20_000,
+            compact_at: None,
+            reserve_tokens: 10_000,
+            ..summary_config()
+        };
+        // Trigger 10K; the prompt is ~13K, leaving ~7K of a window whose reserve gives the summary 8K.
+        let agent = summary_agent(&mock, cfg);
+        let budget = agent.compaction.summary_max_tokens;
+        let mut session = masking_session(0, 12);
+        agent.run_events(&mut session, |_| {}).await.unwrap();
+        let summary = &mock.requests()[0];
+        assert_eq!(
+            summary.system.as_deref(),
+            Some("you are the agent"),
+            "the cached path"
+        );
+        assert!(!summary.no_cache);
+        assert!(
+            summary.max_tokens < budget && summary.max_tokens >= MIN_CACHED_SUMMARY_TOKENS,
+            "{} of {budget}",
+            summary.max_tokens
+        );
     }
 
     #[tokio::test]
