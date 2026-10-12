@@ -818,6 +818,8 @@ fn two_file_edit() -> Value {
 
 #[tokio::test]
 async fn a_childs_multi_file_edit_is_blocked_when_any_entry_path_is_denied() {
+    // The gate decides the call before any file applies, so a denied file blocks the whole call:
+    // a.txt is not edited either, even though files otherwise apply on their own.
     let (ctx, _seen, dir) = ctx_with_gate_call(
         vec![def("worker", None, Some(vec!["edit"]), Isolation::None)],
         "edit",
@@ -874,5 +876,38 @@ async fn a_childs_multi_file_edit_asks_approval_for_every_file_it_writes() {
     assert_eq!(
         std::fs::read_to_string(dir.path().join("b.txt")).unwrap(),
         "BETA\n"
+    );
+}
+
+#[tokio::test]
+async fn a_childs_approved_multi_file_edit_lands_only_the_files_that_apply() {
+    // One approval covers the whole call; after it, each file applies on its own: a.txt lands and
+    // b.txt, whose entry matches nothing, is left as it was.
+    let (ctx, seen, dir) = ctx_with_gate_call(
+        vec![def("worker", None, Some(vec!["edit"]), Isolation::None)],
+        "edit",
+        json!({ "path": "a.txt", "edits": [
+            { "old_string": "alpha", "new_string": "ALPHA" },
+            { "path": "b.txt", "old_string": "nope", "new_string": "x" },
+        ]}),
+        true,
+        Vec::new(),
+    );
+    std::fs::write(dir.path().join("a.txt"), "alpha\n").unwrap();
+    std::fs::write(dir.path().join("b.txt"), "beta\n").unwrap();
+    run(
+        &Subagent::new(ctx),
+        json!({ "agent": "worker", "task": "edit" }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(seen.lock().unwrap().len(), 1);
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+        "ALPHA\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("b.txt")).unwrap(),
+        "beta\n"
     );
 }

@@ -2,10 +2,11 @@
 //! exact first, then a normalized fuzzy fallback (NFKC + unified quotes/dashes/spaces + per-line
 //! trailing-whitespace) so a model's slightly-off `old_string` still lands.
 //!
-//! An `edits[]` entry may name its own `path`; the top-level `path` is the default. A call whose
-//! entries name several files plans every file before writing any, so a failure anywhere writes
-//! nothing. A failed match never applies anything new: it only explains itself — the other file the
-//! text is in, "already applied", the closest lines, or where each ambiguous match sits.
+//! An `edits[]` entry may name its own `path`; the top-level `path` is the default. Each file applies
+//! on its own — all of its entries or none — so a call across several files can land some and fail
+//! others; its result lists both, and it is an error only when no file was written. A failed match
+//! never applies anything new: it only explains itself — the other file the text is in, "already
+//! applied", the closest lines, or where each ambiguous match sits.
 
 use std::borrow::Cow;
 use std::cell::OnceCell;
@@ -75,7 +76,8 @@ impl Tool for Edit {
         "Apply exact-match replacements to a file. Pass an `edits` array of {old_string, new_string} \
          (each `old_string` must match exactly once), or a single old_string/new_string. With \
          `replace_all`, a single edit replaces every occurrence. An entry's own `path` sends it to \
-         another file; a multi-file call writes every file or none."
+         another file. Each file applies on its own (all of its edits or none); the result lists \
+         which files were edited and which FAILED, so resend only the failed ones."
     }
     fn input_schema(&self) -> Value {
         json!({
@@ -151,9 +153,11 @@ impl Tool for Edit {
     }
 }
 
-/// One file's share of a call: its resolved path and its entries as `(index in the call, old, new)`.
+/// One file's share of a call: its resolved path, the path as the model spelled it (`shown`, the
+/// first spelling when several name one file), and its entries as `(index in the call, old, new)`.
 struct FileEdits {
     path: String,
+    shown: String,
     edits: Vec<(usize, String, String)>,
 }
 
@@ -185,9 +189,22 @@ impl From<ToolError> for PlanError {
 /// `old_string`).
 struct FilePlan {
     path: String,
+    shown: String,
     text: Option<String>,
     result: Result<(Vec<u8>, usize, Option<std::time::SystemTime>), PlanError>,
 }
+
+/// A planned file on its way to disk: `(path, shown, bytes, mtime, replacements)`.
+type PlannedWrite = (
+    String,
+    String,
+    Vec<u8>,
+    Option<std::time::SystemTime>,
+    usize,
+);
+
+/// A file of the call that was not written, as the model spelled it, and why.
+type Failed = (String, ToolError);
 
 impl Edit {
     async fn run_inner(
@@ -221,20 +238,31 @@ impl Edit {
         }
         // A call that changes nothing is an error, as it always was; one file of a multi-file call
         // that changes nothing is not. Models that fill every property pad a batch with `old == new`
-        // entries, and failing the whole atomic call over a file they only padded would turn harmless
-        // filler into a lost batch. Such a file is skipped, and the result says so.
+        // entries, and reporting a file they only padded as failed would send the model back to
+        // "fix" a harmless no-op. Such a file is skipped, and the result says so.
         let mut unchanged: Vec<String> = Vec::new();
         if multi && plans.iter().any(|p| p.result.is_ok()) {
             plans.retain(|p| match &p.result {
                 Err(e) if e.unchanged => {
-                    unchanged.push(p.path.clone());
+                    unchanged.push(p.shown.clone());
                     false
                 }
                 _ => true,
             });
         }
-        if plans.iter().any(|p| p.result.is_err()) {
-            return Err(self.explain_failure(plans).await);
+        // Each file applies on its own: all of its entries or none of them. A file that cannot be
+        // planned is explained now, while the call's files are still in memory to search, and the
+        // others are written anyway. The call is an error only when no file lands.
+        let mut failed = self.explain_failures(&plans).await;
+        let writes: Vec<PlannedWrite> = plans
+            .into_iter()
+            .filter_map(|p| {
+                let (bytes, applied, mtime) = p.result.ok()?;
+                Some((p.path, p.shown, bytes, mtime, applied))
+            })
+            .collect();
+        if writes.is_empty() {
+            return Err(nothing_edited(failed, multi));
         }
 
         // The writes run inside a **spawned task that owns the write-lock guard**, so the guard is
@@ -248,92 +276,83 @@ impl Edit {
         // `spawn_blocking`-with-the-guard-moved-in arrangement enforced, expressed in a way that
         // survives the write being an `async` backend call rather than a synchronous one.
         //
-        // Files are written in call order and the first refusal stops the rest. Every file was
-        // planned before any write, so the only way to land part of a multi-file call is the disk
-        // changing underneath it; the result then names exactly which files were and were not written.
-        let writes: Vec<(String, Vec<u8>, Option<std::time::SystemTime>, usize)> = plans
-            .into_iter()
-            .filter_map(|p| {
-                let (bytes, applied, mtime) = p.result.ok()?;
-                Some((p.path, bytes, mtime, applied))
-            })
-            .collect();
+        // Files are written in call order, each on its own: one that changed on disk since it was
+        // read, or whose write fails, is reported, and the files after it are still written.
         let backend = self.backend.clone();
         let handle = tokio::spawn(async move {
             let _write_lock = write_lock;
-            let mut landed: Vec<(String, usize)> = Vec::new();
-            let mut pending = writes.into_iter();
-            for (path, content, mtime, applied) in pending.by_ref() {
+            let mut landed: Vec<(String, String, usize)> = Vec::new();
+            let mut refused: Vec<(String, String, Option<ToolError>)> = Vec::new();
+            for (path, shown, content, mtime, applied) in writes {
                 match backend
                     .write_if_unchanged(Path::new(&path), content, mtime)
                     .await
                 {
-                    Ok(true) => landed.push((path, applied)),
-                    Ok(false) => {
-                        let rest: Vec<String> = pending.map(|w| w.0).collect();
-                        return (landed, Some((path, None, rest)));
-                    }
-                    Err(e) => {
-                        let rest: Vec<String> = pending.map(|w| w.0).collect();
-                        return (landed, Some((path, Some(ToolError::from(e)), rest)));
-                    }
+                    Ok(true) => landed.push((path, shown, applied)),
+                    Ok(false) => refused.push((path, shown, None)),
+                    Err(e) => refused.push((path, shown, Some(ToolError::from(e)))),
                 }
             }
-            (landed, None)
+            (landed, refused)
         });
-        let (landed, failed) = match handle.await {
+        let (landed, refused) = match handle.await {
             Ok(result) => result,
             Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
             Err(e) => return Err(ToolError::Execution(format!("edit task failed: {e}"))),
         };
-        for (path, _) in &landed {
+        for (path, _, _) in &landed {
             self.touched.record(path);
         }
-        let done = landed
-            .iter()
-            .map(|(path, applied)| {
-                format!(
-                    "edited {path} ({applied} replacement{})",
-                    if *applied == 1 { "" } else { "s" }
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        let Some((path, err, rest)) = failed else {
-            if unchanged.is_empty() {
-                return Ok(done.into());
-            }
-            return Ok(format!(
-                "{done}\nleft {} as it was: its edits replace text with itself",
-                unchanged.join(", ")
-            )
-            .into());
-        };
-        let why = match err {
-            None => format!(
-                "{path} was modified on disk after it was read; the edit was aborted to avoid \
-                 discarding that change — re-read the file and retry"
-            ),
-            // A single-file call surfaces the backend's own error untouched, as it always has.
-            Some(e) if landed.is_empty() && rest.is_empty() => return Err(e),
-            Some(e) => format!("writing {path} failed: {}", error_text(&e)),
-        };
-        if landed.is_empty() && rest.is_empty() {
-            return Err(ToolError::Execution(why));
+        for (path, shown, err) in refused {
+            let err = match err {
+                None => ToolError::Execution(format!(
+                    "{path} was modified on disk after it was read; the edit was aborted to avoid \
+                     discarding that change — re-read the file and retry"
+                )),
+                // A single-file call surfaces the backend's own error untouched, as it always has.
+                Some(e) if !multi => e,
+                Some(e) => {
+                    ToolError::Execution(format!("writing {path} failed: {}", error_text(&e)))
+                }
+            };
+            failed.push((shown, err));
         }
-        let mut msg = String::new();
-        if !landed.is_empty() {
-            msg.push_str(&done);
-            msg.push('\n');
+        if landed.is_empty() {
+            return Err(nothing_edited(failed, multi));
         }
-        msg.push_str(&format!("NOT edited: {why}"));
-        if !rest.is_empty() {
-            msg.push_str(&format!(
-                "\nNOT edited (not attempted): {}",
-                rest.join(", ")
+
+        // A single-file call names the resolved file, as it always has. A multi-file call names each
+        // file as the model spelled it, so a failed file's entries can be resent under that path.
+        let mut out = String::new();
+        if !failed.is_empty() {
+            out.push_str(&format!(
+                "edited {} of {} files; resend only the FAILED files' edits (the edited files are \
+                 done):\n",
+                landed.len(),
+                landed.len() + failed.len()
             ));
         }
-        Err(ToolError::Execution(msg))
+        for (i, (path, shown, applied)) in landed.iter().enumerate() {
+            if i > 0 {
+                out.push('\n');
+            }
+            out.push_str(&format!(
+                "edited {} ({applied} replacement{})",
+                if multi { shown } else { path },
+                if *applied == 1 { "" } else { "s" }
+            ));
+        }
+        if !unchanged.is_empty() {
+            out.push_str(&format!(
+                "\nleft {} as it was: its edits replace text with itself",
+                unchanged.join(", ")
+            ));
+        }
+        for (shown, e) in &failed {
+            out.push('\n');
+            push_failed(&mut out, shown, e);
+        }
+        Ok(out.into())
     }
 
     /// Split a call's entries by file, in first-seen order, keeping each entry's index in the call so
@@ -349,6 +368,7 @@ impl Edit {
                 Some(f) => f.edits.push((i, e.old, e.new)),
                 None => files.push(FileEdits {
                     path,
+                    shown: raw.to_string(),
                     edits: vec![(i, e.old, e.new)],
                 }),
             }
@@ -379,7 +399,7 @@ impl Edit {
         total_edits: usize,
         keep_text: bool,
     ) -> FilePlan {
-        let FileEdits { path, edits } = file;
+        let FileEdits { path, shown, edits } = file;
         // One `stat`, taken **before** the read, serves three purposes.
         //
         // Kind first: a FIFO/socket/device must be refused on its type before anything opens it —
@@ -399,22 +419,22 @@ impl Edit {
         let p = Path::new(path.as_str());
         let meta = match self.backend.stat(p).await {
             Ok(m) => m,
-            Err(e) => return FilePlan::failed(path, ToolError::from(e)),
+            Err(e) => return FilePlan::failed(path, shown, ToolError::from(e)),
         };
         if let Some(m) = &meta {
             if m.kind == FileKind::Other {
                 let err = super::non_regular_file_error(&path, "edit");
-                return FilePlan::failed(path, err);
+                return FilePlan::failed(path, shown, err);
             }
             if !m.writable {
                 let err = ToolError::Execution(format!("{path} is not writable"));
-                return FilePlan::failed(path, err);
+                return FilePlan::failed(path, shown, err);
             }
         }
         let mtime = meta.as_ref().and_then(|m| m.mtime);
         let raw_bytes = match self.backend.read_bytes(p, 0, MAX_EDIT_BYTES).await {
             Ok(b) => b,
-            Err(e) => return FilePlan::failed(path, ToolError::from(e)),
+            Err(e) => return FilePlan::failed(path, shown, ToolError::from(e)),
         };
 
         // The match/splice work is pure CPU over an in-memory string and can run for tens of
@@ -430,7 +450,8 @@ impl Edit {
                 return (None, Err(PlanError::from(err)));
             };
             let result = plan_edits(&plan_path, &raw, &edits, replace_all, total_edits);
-            (keep_text.then_some(raw), result)
+            // A file that will be written is searched in its new bytes (see `explain_failures`).
+            ((keep_text && result.is_err()).then_some(raw), result)
         })
         .await
         {
@@ -441,24 +462,36 @@ impl Edit {
         };
         FilePlan {
             path,
+            shown,
             text,
             result: result.map(|(bytes, applied)| (bytes, applied, mtime)),
         }
     }
 
-    /// The error for a call with at least one unplannable file. Nothing has been written. A missing
-    /// `old_string` found verbatim in another file of the call, or one `read`/`write`/`edit` touched,
-    /// is named (it is almost always the file the model meant); otherwise the in-file hint stands.
-    async fn explain_failure(&self, plans: Vec<FilePlan>) -> ToolError {
+    /// Each unplannable file, as the model spelled it, with why. Nothing has been written yet. A
+    /// missing `old_string` found verbatim in another file of the call, or one `read`/`write`/`edit`
+    /// touched, is named (it is almost always the file the model meant); otherwise the in-file hint
+    /// stands. A file of the call that is about to be written is searched in its new text, so the
+    /// hint never points at text this same call is replacing.
+    async fn explain_failures(&self, plans: &[FilePlan]) -> Vec<Failed> {
+        // The common case — every file planned — pays nothing here: the batch below is per-byte work
+        // on the runtime thread, so it is built only on the error path.
+        if plans.iter().all(|p| p.result.is_ok()) {
+            return Vec::new();
+        }
         let batch: Vec<(&str, &str)> = plans
             .iter()
-            .filter_map(|p| Some((p.path.as_str(), p.text.as_deref()?)))
+            .filter_map(|p| {
+                let text = match &p.result {
+                    Ok((bytes, _, _)) => std::str::from_utf8(bytes).ok()?,
+                    Err(_) => p.text.as_deref()?,
+                };
+                Some((p.path.as_str(), text))
+            })
             .collect();
-        let mut errors: Vec<ToolError> = Vec::new();
-        let mut valid: Vec<&str> = Vec::new();
-        for p in &plans {
+        let mut failed: Vec<Failed> = Vec::new();
+        for p in plans {
             let Err(failure) = &p.result else {
-                valid.push(&p.path);
                 continue;
             };
             let elsewhere = match &failure.missing {
@@ -473,35 +506,9 @@ impl Edit {
                     elsewhere.join(", ")
                 )
             };
-            errors.push(with_note(&failure.err, &note));
+            failed.push((p.shown.clone(), with_note(&failure.err, &note)));
         }
-        if plans.len() == 1
-            && let Some(e) = errors.pop()
-        {
-            return e;
-        }
-        let all_input = errors
-            .iter()
-            .all(|e| matches!(e, ToolError::InvalidInput(_)));
-        let mut msg = String::from(
-            "no file was edited: a multi-file edit writes every file or none. Fix these and resend \
-             the whole call:",
-        );
-        for e in &errors {
-            msg.push_str("\n- ");
-            msg.push_str(&error_text(e));
-        }
-        if !valid.is_empty() {
-            msg.push_str(&format!(
-                "\n(edits for {} were valid but not written)",
-                valid.join(", ")
-            ));
-        }
-        if all_input {
-            ToolError::InvalidInput(msg)
-        } else {
-            ToolError::Execution(msg)
-        }
+        failed
     }
 
     /// Up to three files, other than `here`, that contain `old` verbatim: first the call's own other
@@ -550,9 +557,10 @@ const ELSEWHERE_MAX_BYTES: usize = 1024 * 1024;
 const ELSEWHERE_HITS: usize = 3;
 
 impl FilePlan {
-    fn failed(path: String, err: ToolError) -> Self {
+    fn failed(path: String, shown: String, err: ToolError) -> Self {
         Self {
             path,
+            shown,
             text: None,
             result: Err(PlanError::from(err)),
         }
@@ -565,6 +573,37 @@ fn error_text(e: &ToolError) -> Cow<'_, str> {
         ToolError::InvalidInput(m) | ToolError::Execution(m) => Cow::Borrowed(m),
         ToolError::Io(io) => Cow::Owned(io.to_string()),
     }
+}
+
+/// The error for a call that wrote no file. A single-file call's error is that file's own, exactly as
+/// it always was; a multi-file call lists each file under its FAILED line.
+fn nothing_edited(mut failed: Vec<Failed>, multi: bool) -> ToolError {
+    if !multi && let Some((_, e)) = failed.pop() {
+        return e;
+    }
+    let all_input = failed
+        .iter()
+        .all(|(_, e)| matches!(e, ToolError::InvalidInput(_)));
+    let mut msg = String::from(
+        "no file was edited (each file applies on its own, and every one failed). Fix these and \
+         resend:",
+    );
+    for (shown, e) in &failed {
+        msg.push('\n');
+        push_failed(&mut msg, shown, e);
+    }
+    if all_input {
+        ToolError::InvalidInput(msg)
+    } else {
+        ToolError::Execution(msg)
+    }
+}
+
+/// One failed file of a multi-file result: its [`agent_core::tool::edit_failed_line`] header, then why.
+fn push_failed(out: &mut String, shown: &str, e: &ToolError) {
+    out.push_str(&agent_core::tool::edit_failed_line(shown));
+    out.push('\n');
+    out.push_str(&error_text(e));
 }
 
 /// `e` with `note` appended to its message, same variant.

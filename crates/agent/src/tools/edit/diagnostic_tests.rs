@@ -22,16 +22,17 @@ fn invalid(r: Result<ToolOutput, ToolError>) -> String {
 
 #[tokio::test]
 async fn not_found_names_the_other_file_in_the_call_that_holds_the_text() {
-    // The cross-file batch shape: the model sent b.py's text under a.py's entry.
-    let dir = files(&[("a.py", "alpha = 1\n"), ("b.py", "beta = 2\n")]);
-    let msg = invalid(
-        Edit::new(dir.path())
-            .run(json!({ "path": "a.py", "edits": [
-                { "old_string": "beta = 2", "new_string": "beta = 20" },
-                { "path": "b.py", "old_string": "beta", "new_string": "BETA" },
-            ]}))
-            .await,
-    );
+    // The cross-file batch shape: the model sent b.py's text under a.py's entry. b.py's own entry
+    // still lands, and a.py's failure names b.py.
+    let dir = files(&[("a.py", "alpha = 1\n"), ("b.py", "beta = 2\ngamma = 3\n")]);
+    let msg = Edit::new(dir.path())
+        .run(json!({ "path": "a.py", "edits": [
+            { "old_string": "beta = 2", "new_string": "beta = 20" },
+            { "path": "b.py", "old_string": "gamma", "new_string": "GAMMA" },
+        ]}))
+        .await
+        .unwrap()
+        .text;
     let b = dir.path().join("b.py");
     assert!(
         msg.contains(&format!("That text is in {}", b.display())),
@@ -41,7 +42,31 @@ async fn not_found_names_the_other_file_in_the_call_that_holds_the_text() {
         !msg.contains("Closest match"),
         "the file is named instead: {msg}"
     );
-    assert_eq!(std::fs::read_to_string(&b).unwrap(), "beta = 2\n");
+    assert_eq!(
+        std::fs::read_to_string(&b).unwrap(),
+        "beta = 2\nGAMMA = 3\n"
+    );
+}
+
+#[tokio::test]
+async fn not_found_never_names_a_file_whose_text_this_call_replaced() {
+    // b.py held the text when the call was planned, but b.py's own entry rewrites it: b.py is
+    // searched as it will be written, so it is not named.
+    let dir = files(&[("a.py", "alpha = 1\n"), ("b.py", "beta = 2\n")]);
+    let msg = Edit::new(dir.path())
+        .run(json!({ "path": "a.py", "edits": [
+            { "old_string": "beta = 2", "new_string": "beta = 20" },
+            { "path": "b.py", "old_string": "beta", "new_string": "BETA" },
+        ]}))
+        .await
+        .unwrap()
+        .text;
+    assert!(!msg.contains("That text is in"), "{msg}");
+    assert!(msg.contains("FAILED a.py (not edited):"), "{msg}");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("b.py")).unwrap(),
+        "BETA = 2\n"
+    );
 }
 
 #[tokio::test]

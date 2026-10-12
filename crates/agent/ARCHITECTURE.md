@@ -1720,16 +1720,44 @@ sent under one `path`) and **not unique** (25.9%). Two changes follow, both defa
 
 - **Per-entry `path`.** An `edits[]` entry may name its own file; a blank one means the top-level
   `path`, which may be omitted when every entry names its own. The call is split by file (two
-  spellings of one file — `a.py`, `./a.py`, a symlink — are one file, keyed by `write_key`), and every
-  file is stat'd, read and planned before **any** is written: one bad entry anywhere writes nothing,
-  and the error lists each failing file plus the files that were valid but not written. A file whose
-  entries all match but replace text with itself is skipped (and named in the result) when another
-  file changes — Luna pads batches with `old == new` entries, and failing a whole atomic call over a
-  padded file lost real edits in the first A/B attempt; a call that changes no file still errors.
-  Writes then go in call order under one dispatch lock over every file (`Tool::write_targets`,
-  below); the only way to land part of a call is the disk changing between plan and write, and that
-  result names which files landed and which did not. A single-file call reads and behaves exactly as
-  before. Replayed through the real tool against the 174 remaining Luna@main errors, giving each
+  spellings of one file — `a.py`, `./a.py`, a symlink — are one file, keyed by `write_key`).
+  **Each file applies on its own**: all of its entries or none of them, exactly as a single-file
+  call does, independent of the call's other files. Every file is stat'd, read and planned, then each
+  plannable one is written (in call order, under one dispatch lock over every file —
+  `Tool::write_targets`, below); a file that changed on disk since it was read is refused and the
+  files after it are still written. The call is an **error only when no file was written**. When
+  some land and some fail, the result is a success that lists both, so the model resends only the
+  failed files:
+
+  ```
+  edited 2 of 3 files; resend only the FAILED files' edits (the edited files are done):
+  edited a.py (1 replacement)
+  edited c.py (1 replacement)
+  FAILED b.py (not edited):
+  `old_string` not found in edits[1]: "beta = 999" in /work/b.py
+  <the usual diagnosis>
+  ```
+
+  Each file is named as the call spelled it (so it can be resent under the same `path`); a
+  call where every file fails is an error of the same shape, opening "no file was edited". A file
+  whose entries all match but replace text with itself is skipped (named in a "left … as it was"
+  line, neither edited nor failed) when another file changes — Luna pads batches with `old == new`
+  entries; a call that changes no file still errors. A single-file call reads and behaves exactly as
+  before.
+
+  Why per file and not all-or-nothing across files: the first version was atomic across files, and
+  its Luna A/B showed no gain (edit errors 27.6% → 25.7% per call). Luna packs a call — 3.9 entries
+  across 1.4 files on average — so one bad entry sank whole batches: in the candidate arm 131 of
+  303 failed calls were all-or-nothing rejections, and 112 of those (85.5%) had at least one file
+  the tool itself reported valid (288 of their 768 entries). Replaying those calls with each file
+  applied on its own (ground truth: the rejection's own list of valid files, which the shadow file
+  states agree with on all 320 files they could check) cuts the entries lost to failed calls from
+  32.5% to 26.4% and the pooled per-call error rate from 25.2% to 15.9%. The write-lock grouping,
+  `--deny-path` and approval still decide the **whole** call before anything applies: a denied file
+  blocks every file of the call, and one approval covers the call's whole sorted set of files.
+  What a call _did_ write — `TouchedFiles`, and compaction's modified files
+  (`agent_core::tool::edit_failed_paths` subtracts each `FAILED` line from the call's
+  `written_paths`) — counts only the files that landed. Replayed through the real tool against the 174 remaining Luna@main errors, giving each
   wrong-file entry the one file that holds its text as its `path` rescues 35 calls (20.1%), with no
   apply anywhere the model did not name — the tool never routes on its own. The analysis had
   estimated 43 (24.7%) by checking only that the text _exists_ in the other file; on the real tool 8

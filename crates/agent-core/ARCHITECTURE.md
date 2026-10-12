@@ -447,7 +447,9 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
 
   Three things ride it, for the same reason:
   - **File awareness** — `extract_file_ops` (read vs. modified paths from `read`/`write`/`edit` calls;
-    the modified side is `tool::written_paths`, so every file a multi-file `edit` names counts),
+    the modified side is `tool::written_paths`, so every file a multi-file `edit` names counts — less
+    the files its result reports `FAILED` (`tool::edit_failed_paths`), since each file of such a call
+    applies on its own),
     plus `extract_bash_writes` (files a `bash` command wrote), accumulated and deduped across rounds,
     rendered by `format_file_operations` as `<read-files>`/`<modified-files>`. The bash side parses
     the command text (`bash_writes::written_paths`: redirects, `tee`, `sed -i`, `perl -i`, `mv`/`cp`

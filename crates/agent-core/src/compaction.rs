@@ -948,12 +948,16 @@ fn truncate_chars(s: &str, max: usize) -> String {
 pub fn extract_file_ops(messages: &[Message]) -> (Vec<String>, Vec<String>) {
     let mut read = Vec::new();
     let mut modified = Vec::new();
-    for m in messages {
+    for (i, m) in messages.iter().enumerate() {
         for b in &m.content {
-            if let ContentBlock::ToolUse { name, input, .. } = b {
+            if let ContentBlock::ToolUse {
+                id, name, input, ..
+            } = b
+            {
                 // A multi-file `edit` names a file per entry, so the modified side reads every path
-                // the call writes, not just the top-level one.
-                let (bucket, paths) = match name.as_str() {
+                // the call writes, not just the top-level one — less the files its result reports it
+                // did not write, since each file applies on its own.
+                let (bucket, mut paths) = match name.as_str() {
                     "read" => (
                         &mut read,
                         input
@@ -966,6 +970,13 @@ pub fn extract_file_ops(messages: &[Message]) -> (Vec<String>, Vec<String>) {
                     "write" | "edit" => (&mut modified, crate::tool::written_paths(name, input)),
                     _ => continue,
                 };
+                if name == "edit"
+                    && paths.len() > 1
+                    && let Some(result) = tool_result_text(&messages[i + 1..], id)
+                {
+                    let failed: Vec<&str> = crate::tool::edit_failed_paths(result).collect();
+                    paths.retain(|p| !failed.contains(&p.as_str()));
+                }
                 for path in paths {
                     if !bucket.contains(&path) {
                         bucket.push(path);
@@ -975,6 +986,19 @@ pub fn extract_file_ops(messages: &[Message]) -> (Vec<String>, Vec<String>) {
         }
     }
     (read, modified)
+}
+
+/// The text of the `tool_result` answering call `id`, searched from the message after the call's (the
+/// next one, in a well-formed transcript).
+fn tool_result_text<'a>(after: &'a [Message], id: &str) -> Option<&'a str> {
+    after.iter().flat_map(|m| &m.content).find_map(|b| match b {
+        ContentBlock::ToolResult {
+            tool_use_id,
+            content,
+            ..
+        } if tool_use_id == id => Some(content.as_ref()),
+        _ => None,
+    })
 }
 
 /// The `todos` array from the **last** `todo` tool call in `messages`, or `None` if there wasn't one.
@@ -2547,6 +2571,65 @@ mod tests {
         let (read, modified) = extract_file_ops(&messages);
         assert!(read.is_empty());
         assert_eq!(modified, vec!["a.py", "b.py", "c.py"]);
+    }
+
+    #[test]
+    fn extract_file_ops_counts_only_the_files_a_multi_file_edit_wrote() {
+        // Each file of a multi-file `edit` applies on its own; one its result reports FAILED was not
+        // modified — whether the call partly landed (1) or wrote nothing (2). A single-file call's
+        // failure carries no FAILED line and counts its path as it always did (3).
+        let two = |a: &str, b: &str| {
+            json!({ "path": a, "edits": [
+                { "old_string": "x", "new_string": "y" },
+                { "path": b, "old_string": "x", "new_string": "y" },
+            ]})
+        };
+        let messages = vec![
+            Message::assistant(vec![ContentBlock::tool_use(
+                "1",
+                "edit",
+                two("a.py", "b.py"),
+            )]),
+            Message::tool_result(
+                "1",
+                format!(
+                    "edited 1 of 2 files; resend only the FAILED files' edits (the edited files \
+                     are done):\nedited a.py (1 replacement)\n{}\n`old_string` not found",
+                    crate::tool::edit_failed_line("b.py")
+                ),
+                false,
+            ),
+            Message::assistant(vec![ContentBlock::tool_use(
+                "2",
+                "edit",
+                two("c.py", "d.py"),
+            )]),
+            Message::tool_result(
+                "2",
+                format!(
+                    "no file was edited (each file applies on its own, and every one failed). Fix \
+                     these and resend:\n{}\nx\n{}\ny",
+                    crate::tool::edit_failed_line("c.py"),
+                    crate::tool::edit_failed_line("d.py")
+                ),
+                true,
+            ),
+            Message::assistant(vec![ContentBlock::tool_use(
+                "3",
+                "edit",
+                json!({ "path": "e.py", "old_string": "x", "new_string": "y" }),
+            )]),
+            Message::tool_result("3", "`old_string` not found", true),
+            // A blank top-level path names no file.
+            Message::assistant(vec![ContentBlock::tool_use(
+                "4",
+                "edit",
+                json!({ "path": "", "edits": [{ "path": "f.py", "old_string": "x", "new_string": "y" }] }),
+            )]),
+            Message::tool_result("4", "edited f.py (1 replacement)", false),
+        ];
+        let (_, modified) = extract_file_ops(&messages);
+        assert_eq!(modified, vec!["a.py", "e.py", "f.py"]);
     }
 
     #[test]

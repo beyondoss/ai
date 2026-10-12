@@ -1,4 +1,4 @@
-//! Per-entry `path`: one `edit` call across several files, planned in full before any write.
+//! Per-entry `path`: one `edit` call across several files, each applied on its own.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
@@ -23,6 +23,14 @@ fn read(dir: &tempfile::TempDir, name: &str) -> String {
     std::fs::read_to_string(dir.path().join(name)).unwrap()
 }
 
+/// The text of a call that edited at least one file.
+fn output(r: Result<ToolOutput, ToolError>) -> String {
+    match r {
+        Ok(o) => o.text,
+        Err(e) => panic!("expected some file edited, got {e:?}"),
+    }
+}
+
 fn message(r: Result<ToolOutput, ToolError>) -> String {
     match r {
         Ok(o) => panic!("expected an error, got {:?}", o.text),
@@ -43,15 +51,10 @@ async fn entries_naming_their_own_path_edit_several_files_in_one_call() {
         .unwrap();
     assert_eq!(read(&dir, "a.py"), "alpha = 10\n");
     assert_eq!(read(&dir, "b.py"), "beta = 20\n");
-    let a = dir.path().join("a.py");
-    let b = dir.path().join("b.py");
+    // Each file as the model spelled it, so a failed one could be resent under the same path.
     assert_eq!(
         out.text,
-        format!(
-            "edited {} (1 replacement)\nedited {} (1 replacement)",
-            a.display(),
-            b.display()
-        )
+        "edited a.py (1 replacement)\nedited b.py (1 replacement)"
     );
 }
 
@@ -84,45 +87,108 @@ async fn a_blank_entry_path_means_the_top_level_one() {
 }
 
 #[tokio::test]
-async fn one_failing_file_writes_no_file_and_reports_each_one() {
+async fn a_failing_file_is_reported_and_the_others_are_still_edited() {
     let dir = files(&[
         ("a.py", "alpha = 1\n"),
         ("b.py", "beta = 2\n"),
         ("c.py", "gamma = 3\n"),
     ]);
+    let touched = Arc::new(crate::tools::TouchedFiles::default());
+    let text = output(
+        Edit::new(dir.path())
+            .with_touched(touched.clone())
+            .run(json!({ "path": "a.py", "edits": [
+                { "old_string": "alpha = 1", "new_string": "alpha = 10" },
+                { "path": "b.py", "old_string": "beta = 999", "new_string": "beta = 20" },
+                { "path": "c.py", "old_string": "gamma = 3", "new_string": "gamma = 30" },
+            ]}))
+            .await,
+    );
+    assert_eq!(read(&dir, "a.py"), "alpha = 10\n");
+    assert_eq!(read(&dir, "b.py"), "beta = 2\n", "b.py's own entry failed");
+    assert_eq!(read(&dir, "c.py"), "gamma = 30\n");
+    // The summary line, every edited file, then each failed file under its FAILED line with the
+    // usual diagnosis.
+    let b = dir.path().join("b.py");
+    let expected_head = format!(
+        "edited 2 of 3 files; resend only the FAILED files' edits (the edited files are done):\n\
+         edited a.py (1 replacement)\n\
+         edited c.py (1 replacement)\n\
+         FAILED b.py (not edited):\n\
+         `old_string` not found in edits[1]: \"beta = 999\" in {}",
+        b.display()
+    );
+    assert!(text.starts_with(&expected_head), "{text}");
+    assert_eq!(
+        agent_core::tool::edit_failed_paths(&text).collect::<Vec<_>>(),
+        vec!["b.py"]
+    );
+    // Only the files that landed count as touched.
+    let mut recent = touched.recent();
+    recent.sort();
+    let landed = |n: &str| dir.path().join(n).display().to_string();
+    assert_eq!(recent, vec![landed("a.py"), landed("c.py")]);
+}
+
+#[tokio::test]
+async fn a_call_where_every_file_fails_is_an_error_that_lists_each_one() {
+    let dir = files(&[("a.py", "alpha = 1\n"), ("b.py", "beta = 2\n")]);
     let r = Edit::new(dir.path())
         .run(json!({ "path": "a.py", "edits": [
-            { "old_string": "alpha = 1", "new_string": "alpha = 10" },
-            { "path": "b.py", "old_string": "beta = 999", "new_string": "beta = 20" },
-            { "path": "c.py", "old_string": "gamma = 3", "new_string": "gamma = 30" },
+            { "old_string": "nope", "new_string": "x" },
+            { "path": "b.py", "old_string": "beta = 2", "new_string": "beta = 20" },
+            { "path": "b.py", "old_string": "beta", "new_string": "BETA" },
         ]}))
         .await;
     assert!(matches!(r, Err(ToolError::InvalidInput(_))), "{r:?}");
     let msg = message(r);
-    assert!(msg.starts_with("no file was edited"), "{msg}");
-    assert!(msg.contains("not found in edits[1]"), "{msg}");
-    assert!(msg.contains("b.py"), "{msg}");
     assert!(
-        msg.contains("were valid but not written") && msg.contains("a.py") && msg.contains("c.py"),
+        msg.starts_with("no file was edited (each file applies on its own, and every one failed)"),
         "{msg}"
     );
-    assert_eq!(read(&dir, "a.py"), "alpha = 1\n", "a.py must be untouched");
-    assert_eq!(read(&dir, "c.py"), "gamma = 3\n", "c.py must be untouched");
+    assert!(
+        msg.contains("FAILED a.py (not edited):\n`old_string` not found"),
+        "{msg}"
+    );
+    assert!(
+        msg.contains("FAILED b.py (not edited):\nedits[1] and edits[2] overlap"),
+        "{msg}"
+    );
+    assert_eq!(
+        agent_core::tool::edit_failed_paths(&msg).collect::<Vec<_>>(),
+        vec!["a.py", "b.py"]
+    );
+    assert_eq!(read(&dir, "a.py"), "alpha = 1\n");
+    assert_eq!(read(&dir, "b.py"), "beta = 2\n");
 }
 
 #[tokio::test]
-async fn a_missing_file_in_the_batch_writes_nothing() {
+async fn a_missing_file_fails_on_its_own() {
     let dir = files(&[("a.py", "alpha = 1\n")]);
-    let r = Edit::new(dir.path())
-        .run(json!({ "path": "a.py", "edits": [
+    let edit = Edit::new(dir.path());
+    let text = output(
+        edit.run(json!({ "path": "a.py", "edits": [
             { "old_string": "alpha = 1", "new_string": "alpha = 10" },
             { "path": "missing.py", "old_string": "x", "new_string": "y" },
         ]}))
+        .await,
+    );
+    assert!(text.contains("FAILED missing.py (not edited):\n"), "{text}");
+    assert_eq!(read(&dir, "a.py"), "alpha = 10\n");
+    // With nothing else to land, a file that cannot be read is an execution failure, not a bad
+    // argument.
+    let r = edit
+        .run(json!({ "path": "a.py", "edits": [
+            { "path": "missing.py", "old_string": "x", "new_string": "y" },
+            { "path": "gone.py", "old_string": "x", "new_string": "y" },
+        ]}))
         .await;
-    // A file that cannot be read is an execution failure, not a bad argument.
     assert!(matches!(r, Err(ToolError::Execution(_))), "{r:?}");
-    assert!(message(r).contains("missing.py"));
-    assert_eq!(read(&dir, "a.py"), "alpha = 1\n");
+    let msg = message(r);
+    assert!(
+        msg.contains("missing.py") && msg.contains("gone.py"),
+        "{msg}"
+    );
 }
 
 #[tokio::test]
@@ -355,36 +421,62 @@ async fn a_remote_backend_plans_and_writes_every_file_through_the_backend() {
 }
 
 #[tokio::test]
-async fn a_file_changed_under_a_multi_file_write_is_reported_with_exactly_what_landed() {
-    // Every file planned fine, then b.py moved on before its guarded write: a.py has landed, b.py and
-    // the files after it were not written, and the result says which is which.
+async fn a_file_changed_before_its_write_fails_alone_and_the_rest_are_written() {
+    // Every file planned fine, then b.py moved on before its guarded write: a.py and c.py land, and
+    // b.py is reported as changed on disk.
     let fs = MemFs::with(&[
         ("/sbx/a.py", "alpha\n"),
         ("/sbx/b.py", "beta\n"),
         ("/sbx/c.py", "gamma\n"),
     ]);
     fs.refuse.lock().unwrap().insert("/sbx/b.py".into());
-    let r = Edit::new("/sbx")
-        .with_backend(fs.clone())
-        .run(json!({ "path": "a.py", "edits": [
-            { "old_string": "alpha", "new_string": "ALPHA" },
-            { "path": "b.py", "old_string": "beta", "new_string": "BETA" },
-            { "path": "c.py", "old_string": "gamma", "new_string": "GAMMA" },
-        ]}))
-        .await;
-    assert!(matches!(r, Err(ToolError::Execution(_))), "{r:?}");
-    let msg = message(r);
-    assert!(
-        msg.starts_with("edited /sbx/a.py (1 replacement)\nNOT edited: /sbx/b.py was modified"),
-        "{msg}"
+    let text = output(
+        Edit::new("/sbx")
+            .with_backend(fs.clone())
+            .run(json!({ "path": "a.py", "edits": [
+                { "old_string": "alpha", "new_string": "ALPHA" },
+                { "path": "b.py", "old_string": "beta", "new_string": "BETA" },
+                { "path": "c.py", "old_string": "gamma", "new_string": "GAMMA" },
+            ]}))
+            .await,
     );
-    assert!(
-        msg.ends_with("NOT edited (not attempted): /sbx/c.py"),
-        "{msg}"
+    assert_eq!(
+        text,
+        "edited 2 of 3 files; resend only the FAILED files' edits (the edited files are done):\n\
+         edited a.py (1 replacement)\n\
+         edited c.py (1 replacement)\n\
+         FAILED b.py (not edited):\n\
+         /sbx/b.py was modified on disk after it was read; the edit was aborted to avoid \
+         discarding that change — re-read the file and retry"
     );
     assert_eq!(fs.get("/sbx/a.py"), "ALPHA\n");
     assert_eq!(fs.get("/sbx/b.py"), "beta\n");
-    assert_eq!(fs.get("/sbx/c.py"), "gamma\n");
+    assert_eq!(fs.get("/sbx/c.py"), "GAMMA\n");
+}
+
+#[tokio::test]
+async fn a_remote_backend_applies_each_file_on_its_own() {
+    // The sandbox case: the file that plans is written through the backend, the one that does not
+    // is left as it was there, and nothing touches this host.
+    let fs = MemFs::with(&[
+        ("/sbx/repo/a.py", "alpha\n"),
+        ("/sbx/repo/pkg/b.py", "beta\n"),
+    ]);
+    let text = output(
+        Edit::new("/sbx/repo")
+            .with_backend(fs.clone())
+            .run(json!({ "path": "a.py", "edits": [
+                { "old_string": "alpha", "new_string": "ALPHA" },
+                { "path": "pkg/b.py", "old_string": "nope", "new_string": "x" },
+            ]}))
+            .await,
+    );
+    assert!(
+        text.starts_with("edited 1 of 2 files;") && text.contains("FAILED pkg/b.py (not edited):"),
+        "{text}"
+    );
+    assert_eq!(fs.get("/sbx/repo/a.py"), "ALPHA\n");
+    assert_eq!(fs.get("/sbx/repo/pkg/b.py"), "beta\n");
 }
 
 #[tokio::test]
@@ -424,14 +516,9 @@ async fn a_file_padded_only_with_no_op_entries_is_skipped_not_fatal() {
         .unwrap();
     assert_eq!(read(&dir, "a.py"), "ALPHA\n");
     assert_eq!(read(&dir, "b.py"), "beta\n");
-    let b = dir.path().join("b.py");
-    assert!(
-        out.text.ends_with(&format!(
-            "\nleft {} as it was: its edits replace text with itself",
-            b.display()
-        )),
-        "{}",
-        out.text
+    assert_eq!(
+        out.text,
+        "edited a.py (1 replacement)\nleft b.py as it was: its edits replace text with itself"
     );
 }
 
@@ -450,9 +537,9 @@ async fn a_multi_file_call_that_changes_nothing_still_errors() {
 }
 
 #[tokio::test]
-async fn a_no_op_file_does_not_excuse_a_failing_one() {
+async fn a_no_op_file_is_left_alone_beside_an_edited_and_a_failing_one() {
     let dir = files(&[("a.py", "alpha\n"), ("b.py", "beta\n"), ("c.py", "gamma\n")]);
-    let msg = message(
+    let text = output(
         Edit::new(dir.path())
             .run(json!({ "path": "a.py", "edits": [
                 { "old_string": "alpha", "new_string": "ALPHA" },
@@ -461,6 +548,16 @@ async fn a_no_op_file_does_not_excuse_a_failing_one() {
             ]}))
             .await,
     );
-    assert!(msg.contains("not found in edits[2]"), "{msg}");
-    assert_eq!(read(&dir, "a.py"), "alpha\n");
+    // The no-op file is neither edited nor failed: it does not count toward "2 files".
+    assert!(text.starts_with("edited 1 of 2 files;"), "{text}");
+    assert!(
+        text.contains("\nleft b.py as it was: its edits replace text with itself\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains("FAILED c.py (not edited):\n`old_string` not found in edits[2]"),
+        "{text}"
+    );
+    assert_eq!(read(&dir, "a.py"), "ALPHA\n");
+    assert_eq!(read(&dir, "c.py"), "gamma\n");
 }
