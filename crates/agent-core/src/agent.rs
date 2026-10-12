@@ -2461,20 +2461,16 @@ impl Agent {
         // The cached path first: the live conversation plus a closing instruction, read from the
         // prompt cache (see `conversation_summary_request`). It sees the whole conversation, the kept
         // turns and an open split turn included, so it needs no split. Skipped for an overflow (the
-        // provider already refused this conversation), when it doesn't fit, and if the model answers
-        // with a tool call or nothing, which fall through to the re-render below.
+        // provider already refused this conversation) and when it doesn't fit. A reply that is a tool
+        // call, blank, not a checkpoint (`checkpoint_body`: a refusal, or the model carrying on with
+        // the task), cut off at the output limit or a runaway loop (`is_runaway`), and a call that
+        // errors, fall through to the re-render below.
         let mut summary_source = SummarySource::Rerender;
         let cached = match self.compaction.cached_summary && reason != CompactionReason::Overflow {
             true => {
                 match self.conversation_summary_request(session, &file_ops, custom_instructions) {
                     Some(req) => {
                         summary_source = SummarySource::CachedRejected;
-                        // Under the candidates that reshape the request or police its reply, a
-                        // failed cached call is one more reason to re-render rather than a failed
-                        // compaction: a provider without mid-conversation system messages (Claude
-                        // Sonnet 5) answers 400 here.
-                        let recoverable =
-                            candidates.instruction_as_system || candidates.check_summary;
                         match self.run_utility_turn(req, cancel).await {
                             Ok(turn) => {
                                 add_usage(&mut usage, &turn.usage);
@@ -2483,22 +2479,22 @@ impl Agent {
                                     .blocks
                                     .iter()
                                     .any(|b| matches!(b, ContentBlock::ToolUse { .. }));
-                                let text =
-                                    (!called_a_tool && !text.trim().is_empty()).then_some(text);
-                                if candidates.check_summary {
-                                    text.and_then(|t| {
-                                        compaction::checkpoint_body(&t).map(str::to_string)
-                                    })
+                                // A reply cut off at the output limit, or looping, is not a
+                                // checkpoint even when it opens like one.
+                                if called_a_tool
+                                    || turn.stop_reason == StopReason::MaxTokens
+                                    || compaction::is_runaway(&text)
+                                {
+                                    None
                                 } else {
-                                    text
+                                    compaction::checkpoint_body(&text).map(str::to_string)
                                 }
                             }
                             Err(Error::Cancelled) => return Err(Error::Cancelled),
-                            Err(e) if recoverable => {
+                            Err(e) => {
                                 tracing::warn!(error = %e, "cached summary call failed; re-rendering");
                                 None
                             }
-                            Err(e) => return Err(e),
                         }
                     }
                     None => None,
@@ -2700,10 +2696,6 @@ impl Agent {
     /// `summary_max_tokens`, shrunk to the room the window leaves. `None` when the input itself
     /// doesn't fit the input budget, or the room left is under [`MIN_CACHED_SUMMARY_TOKENS`]: the
     /// caller falls back to the re-render, which truncates tool results and always fits.
-    ///
-    /// Under [`compaction::CompactionCandidates::instruction_as_system`] the instruction is a
-    /// role-`system` message after the trailing tool results instead, unwrapped; with no tool results
-    /// to follow (the conversation ends on text or on the model's turn) it stays in the user turn.
     fn conversation_summary_request(
         &self,
         session: &Session,
@@ -2711,13 +2703,18 @@ impl Agent {
         custom_instructions: Option<&str>,
     ) -> Option<ModelRequest> {
         let cfg = &self.compaction;
-        let body = compaction::conversation_summary_body(
+        // The handoff framing on the Anthropic wire, the compact one elsewhere: see `SummaryFraming`.
+        let framing = match crate::dialect::Dialect::for_model(&self.model) {
+            crate::dialect::Dialect::Anthropic => compaction::SummaryFraming::Handoff,
+            _ => compaction::SummaryFraming::Compact,
+        };
+        let instruction = compaction::conversation_summary_instruction(
             &session.messages,
             file_ops,
             custom_instructions,
             &cfg.candidates,
+            framing,
         );
-        let instruction = format!("<system-reminder>{body}</system-reminder>");
         // A session opened from disk has no usage snapshot yet: estimate it whole.
         let live = if session.last_input_tokens > 0 {
             session
@@ -2749,14 +2746,7 @@ impl Agent {
             Some(m) if m.role == Role::User => {
                 m.content
                     .retain(|b| matches!(b, ContentBlock::ToolResult { .. }));
-                if cfg.candidates.instruction_as_system && !m.content.is_empty() {
-                    messages.push(Message {
-                        role: Role::System,
-                        ..Message::user(body)
-                    });
-                } else {
-                    m.content.push(ContentBlock::text(instruction));
-                }
+                m.content.push(ContentBlock::text(instruction));
             }
             // A call still waiting for its result can't be followed by a plain user turn.
             Some(m)
@@ -8564,7 +8554,7 @@ mod tests {
         session.messages = Arc::new(session_messages);
 
         let mock = Arc::new(MockTransport::new(vec![turn::text(
-            "A prose summary that never mentions any file paths.",
+            "## Goal\nA prose summary that never mentions any file paths.",
         )]));
         let agent = Agent::new(mock, "claude-opus-4-8").with_compaction(CompactionConfig {
             keep_recent_tokens: 1,
@@ -8633,7 +8623,7 @@ mod tests {
         session.messages = Arc::new(planning_session());
 
         let mock = Arc::new(MockTransport::new(vec![turn::text(
-            "A prose summary that never mentions the plan.",
+            "## Goal\nA prose summary that never mentions the plan.",
         )]));
         let agent = Agent::new(mock, "claude-opus-4-8").with_compaction(aggressive_compaction());
         let compacted = agent
@@ -8674,8 +8664,8 @@ mod tests {
         session.messages = Arc::new(planning_session());
 
         let mock = Arc::new(MockTransport::new(vec![
-            turn::text("Round one prose."),
-            turn::text("Round two prose."),
+            turn::text("## Goal\nRound one prose."),
+            turn::text("## Goal\nRound two prose."),
         ]));
         let agent =
             Agent::new(mock.clone(), "claude-opus-4-8").with_compaction(aggressive_compaction());
@@ -8808,7 +8798,7 @@ mod tests {
             cache_write_tokens: 22,
             ..TokenUsage::default()
         };
-        let mut summary_turn = turn::text("summary");
+        let mut summary_turn = turn::text("## Goal\nsummary");
         summary_turn.insert(summary_turn.len() - 1, StreamEvent::Usage(billed));
         let mock = Arc::new(MockTransport::new(vec![summary_turn]));
         let agent = Agent::new(mock, "claude-opus-4-8").with_compaction(CompactionConfig {
@@ -8851,7 +8841,7 @@ mod tests {
         session.last_input_tokens = 12345;
 
         let mock = Arc::new(MockTransport::new(vec![turn::text(
-            "SUMMARY-TEXT-MARKER-771",
+            "## Goal\nSUMMARY-TEXT-MARKER-771",
         )]));
         let agent = Agent::new(mock, "claude-opus-4-8").with_compaction(CompactionConfig {
             keep_recent_tokens: 1,
@@ -8938,7 +8928,7 @@ mod tests {
             Message::assistant(vec![ContentBlock::text("didn't pan out")]),
         ];
         let mock = Arc::new(MockTransport::new(vec![turn::text(
-            "A prose summary that never mentions any file paths.",
+            "## Goal\nA prose summary that never mentions any file paths.",
         )]));
         let agent = Agent::new(mock, "claude-opus-4-8");
         let cancel = CancellationToken::new();
@@ -9222,9 +9212,11 @@ mod tests {
             current: AtomicUsize::new(0),
             max_seen: AtomicUsize::new(0),
         });
+        // The re-render is the path that splits; the cached call would cover the turn in one.
         let agent =
             Agent::new(transport.clone(), "claude-opus-4-8").with_compaction(CompactionConfig {
                 keep_recent_tokens: 1,
+                cached_summary: false,
                 ..CompactionConfig::default()
             });
         let cancel = CancellationToken::new();
@@ -9532,7 +9524,7 @@ mod tests {
         let mut session = Session::new();
         session.messages = Arc::new(session_messages);
 
-        let mock = Arc::new(MockTransport::new(vec![turn::text("new summary")]));
+        let mock = Arc::new(MockTransport::new(vec![turn::text("## Goal\nnew summary")]));
         let agent = Agent::new(mock.clone(), "claude-opus-4-8").with_compaction(CompactionConfig {
             keep_recent_tokens: 1,
             ..CompactionConfig::default()
@@ -12542,7 +12534,9 @@ mod tests {
         let mut session = Session::new();
         session.messages = Arc::new(session_messages);
 
-        let mock = Arc::new(MockTransport::new(vec![turn::text("a real summary")]));
+        let mock = Arc::new(MockTransport::new(vec![turn::text(
+            "## Goal\na real summary",
+        )]));
         let agent = Agent::new(mock, "claude-opus-4-8").with_compaction(CompactionConfig {
             keep_recent_tokens: 1,
             ..CompactionConfig::default()
@@ -12873,9 +12867,13 @@ mod tests {
     }
 
     fn summary_agent(mock: &Arc<MockTransport>, cfg: CompactionConfig) -> Agent {
+        summary_agent_on("claude-opus-4-8", mock, cfg)
+    }
+
+    fn summary_agent_on(model: &str, mock: &Arc<MockTransport>, cfg: CompactionConfig) -> Agent {
         let mut tools = ToolRegistry::new();
         tools.register(Arc::new(EchoTool));
-        Agent::new(mock.clone(), "claude-opus-4-8")
+        Agent::new(mock.clone(), model)
             .with_tools(tools)
             .with_system("you are the agent")
             .with_cache_key("session-1")
@@ -12930,7 +12928,7 @@ mod tests {
             ContentBlock::ToolResult { .. }
         ));
         assert!(
-            last_text(closing).contains("Do not call any tools"),
+            last_text(closing).contains("do not call any tools"),
             "{closing:?}"
         );
         assert!(last_text(closing).contains("## Goal"));
@@ -12957,7 +12955,7 @@ mod tests {
         let reqs = mock.requests();
         let closing = reqs[0].messages.last().unwrap();
         assert_eq!(closing.content.len(), 1, "{closing:?}");
-        assert!(last_text(closing).contains("Do not call any tools"));
+        assert!(last_text(closing).contains("do not call any tools"));
         assert!(!format!("{closing:?}").contains("Reply with just"));
         // Everything before the prompt went out as the conversation had it.
         assert_eq!(reqs[0].messages.len(), 27);
@@ -13103,98 +13101,12 @@ mod tests {
         "I'm not going to produce that checkpoint summary; the transcript stays with me.";
 
     #[tokio::test]
-    async fn the_system_role_candidate_sends_the_instruction_as_a_system_message_after_the_prefix()
-    {
-        // Same cached prefix as the default path, byte for byte; the trailing tool results stay a
-        // user turn, and the instruction follows them as a role-system message with no wrapper.
-        let mock = Arc::new(MockTransport::new(vec![
-            tool_turn_with_usage("t1", 11_000),
-            turn::text("## Goal\nthe summary"),
-            turn::text("done"),
-        ]));
-        let agent = summary_agent(
-            &mock,
-            candidates_config(compaction::CompactionCandidates {
-                instruction_as_system: true,
-                ..Default::default()
-            }),
-        );
-        let mut session = masking_session(0, 4);
-        session.last_input_tokens = 0;
-        let mut events = Vec::new();
-        agent
-            .run_events(&mut session, |ev| events.push(ev))
-            .await
-            .unwrap();
-        let reqs = mock.requests();
-        let (turn, summary) = (&reqs[0], &reqs[1]);
-        let n = turn.messages.len();
-        assert_eq!(
-            &summary.messages[..n],
-            &turn.messages[..],
-            "the cached prefix"
-        );
-        assert_eq!(summary.system, turn.system);
-        assert_eq!(summary.tools, turn.tools);
-        assert!(!summary.no_cache);
-        assert_eq!(summary.messages.len(), n + 3);
-        let results = &summary.messages[n + 1];
-        assert_eq!(results.role, Role::User);
-        assert!(
-            results
-                .content
-                .iter()
-                .all(|b| matches!(b, ContentBlock::ToolResult { .. })),
-            "{results:?}"
-        );
-        let instruction = &summary.messages[n + 2];
-        assert_eq!(instruction.role, Role::System);
-        assert!(last_text(instruction).contains("## Goal"));
-        assert!(!last_text(instruction).contains("<system-reminder>"));
-        assert_eq!(summary_source(&events), Some(SummarySource::Cached));
-        // The system message rides only the request: the transcript keeps strict alternation.
-        assert!(session.messages.iter().all(|m| m.role != Role::System));
-        assert!(session.messages.windows(2).all(|w| w[0].role != w[1].role));
-    }
-
-    #[tokio::test]
-    async fn the_system_role_candidate_keeps_the_user_turn_when_no_tool_results_precede_it() {
-        // A pending prompt is dropped from the summary call, which leaves no tool results for a
-        // system message to follow: the instruction goes in the user turn as before.
-        let mock = Arc::new(MockTransport::new(vec![
-            turn::text("## Goal\nthe summary"),
-            turn::text("OK"),
-        ]));
-        let agent = summary_agent(
-            &mock,
-            candidates_config(compaction::CompactionCandidates {
-                instruction_as_system: true,
-                ..Default::default()
-            }),
-        );
-        let mut session = masking_session(0, 12);
-        session.push(Message::assistant(vec![ContentBlock::text("read them")]));
-        session.user("Reply with just: OK");
-        agent.run_events(&mut session, |_| {}).await.unwrap();
-        let closing = mock.requests()[0].messages.last().unwrap().clone();
-        assert_eq!(closing.role, Role::User);
-        assert!(last_text(&closing).starts_with("<system-reminder>"));
-        assert!(!format!("{closing:?}").contains("Reply with just"));
-    }
-
-    #[tokio::test]
-    async fn the_handoff_candidate_reframes_the_instruction_and_keeps_the_format() {
+    async fn the_cached_instruction_is_the_handoff_framing_and_keeps_the_format() {
         let mock = Arc::new(MockTransport::new(vec![
             turn::text("## Goal\nthe summary"),
             turn::text("done"),
         ]));
-        let agent = summary_agent(
-            &mock,
-            candidates_config(compaction::CompactionCandidates {
-                handoff_framing: true,
-                ..Default::default()
-            }),
-        );
+        let agent = summary_agent(&mock, summary_config());
         let mut session = masking_session(0, 12);
         agent.run_events(&mut session, |_| {}).await.unwrap();
         let closing = mock.requests()[0].messages.last().unwrap().clone();
@@ -13207,38 +13119,65 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn without_the_check_a_refusal_becomes_the_summary() {
-        // The shipped behavior the check candidate exists for: any non-blank prose is accepted.
+    async fn off_the_anthropic_wire_the_cached_instruction_keeps_the_compact_framing() {
         let mock = Arc::new(MockTransport::new(vec![
-            turn::text(REFUSAL),
+            turn::text("## Goal\nthe summary"),
             turn::text("done"),
         ]));
-        let agent = summary_agent(&mock, summary_config());
+        let agent = summary_agent_on("gpt-6-luna", &mock, summary_config());
         let mut session = masking_session(0, 12);
-        let mut events = Vec::new();
-        agent
-            .run_events(&mut session, |ev| events.push(ev))
-            .await
-            .unwrap();
-        assert_eq!(mock.calls(), 2);
-        assert!(last_text(&session.messages[0]).contains(REFUSAL));
-        assert_eq!(summary_source(&events), Some(SummarySource::Cached));
+        agent.run_events(&mut session, |_| {}).await.unwrap();
+        let closing = mock.requests()[0].messages.last().unwrap().clone();
+        let text = last_text(&closing);
+        assert!(text.starts_with("<system-reminder>Stop working on the task now."));
+        assert!(!text.contains(compaction::HANDOFF_FRAMING));
+        assert!(text.contains(compaction::SUMMARY_INSTRUCTION));
     }
 
     #[tokio::test]
-    async fn the_check_candidate_redoes_a_refusal_with_the_rerender() {
+    async fn a_cached_reply_cut_off_or_looping_is_redone_by_the_rerender() {
+        let cut_off = {
+            let mut t = turn::text("## Goal\nthe start of a summary");
+            *t.last_mut().unwrap() = StreamEvent::MessageStop {
+                stop_reason: StopReason::MaxTokens,
+            };
+            t
+        };
+        let looping = turn::text(&format!(
+            "## Goal\nfix it\n{}",
+            "- \n".repeat(compaction::RUNAWAY_REPEATED_LINES)
+        ));
+        for reply in [cut_off, looping] {
+            let mock = Arc::new(MockTransport::new(vec![
+                reply,
+                turn::text("## Goal\nthe summary"),
+                turn::text("done"),
+            ]));
+            let agent = summary_agent(&mock, summary_config());
+            let mut session = masking_session(0, 12);
+            let mut events = Vec::new();
+            agent
+                .run_events(&mut session, |ev| events.push(ev))
+                .await
+                .unwrap();
+            assert_eq!(
+                mock.requests()[1].system.as_deref(),
+                Some(compaction::SUMMARY_SYSTEM)
+            );
+            let summary = last_text(&session.messages[0]);
+            assert!(summary.contains("the summary") && !summary.contains("the start of"));
+            assert_eq!(summary_source(&events), Some(SummarySource::CachedRejected));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cached_refusal_is_redone_by_the_rerender() {
         let mock = Arc::new(MockTransport::new(vec![
             turn::text(REFUSAL),
             turn::text("## Goal\nthe summary"),
             turn::text("done"),
         ]));
-        let agent = summary_agent(
-            &mock,
-            candidates_config(compaction::CompactionCandidates {
-                check_summary: true,
-                ..Default::default()
-            }),
-        );
+        let agent = summary_agent(&mock, summary_config());
         let mut session = masking_session(0, 12);
         let mut events = Vec::new();
         agent
@@ -13254,20 +13193,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_check_candidate_drops_a_preamble_before_the_checkpoint() {
+    async fn a_preamble_before_the_cached_checkpoint_is_dropped() {
         let mock = Arc::new(MockTransport::new(vec![
             turn::text(
                 "I'm stopping here, as you asked. Here is the checkpoint.\n\n## Goal\nthe summary",
             ),
             turn::text("done"),
         ]));
-        let agent = summary_agent(
-            &mock,
-            candidates_config(compaction::CompactionCandidates {
-                check_summary: true,
-                ..Default::default()
-            }),
-        );
+        let agent = summary_agent(&mock, summary_config());
         let mut session = masking_session(0, 12);
         agent.run_events(&mut session, |_| {}).await.unwrap();
         assert_eq!(mock.calls(), 2);
@@ -13280,13 +13213,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_rejected_cached_call_is_re_rendered_only_under_a_candidate() {
-        // A provider without mid-conversation system messages answers 400. Under the system-role
-        // candidate that is one more reason to re-render; by default the error fails the compaction
-        // as before (and the run carries on unsummarized).
+    async fn a_failed_cached_call_is_re_rendered() {
+        // The cached call errors (here a 400): one more reason to re-render, not a failed compaction.
         fn rejected() -> Vec<Result<StreamEvent>> {
             vec![Err(Error::Transport(
-                "400 Bad Request: messages: role system is not supported".into(),
+                "400 Bad Request: invalid request".into(),
             ))]
         }
         fn ok(t: Vec<StreamEvent>) -> Vec<Result<StreamEvent>> {
@@ -13297,13 +13228,7 @@ mod tests {
             ok(turn::text("## Goal\nthe summary")),
             ok(turn::text("done")),
         ]));
-        let agent = summary_agent(
-            &mock,
-            candidates_config(compaction::CompactionCandidates {
-                instruction_as_system: true,
-                ..Default::default()
-            }),
-        );
+        let agent = summary_agent(&mock, summary_config());
         let mut session = masking_session(0, 12);
         let mut events = Vec::new();
         agent
@@ -13316,19 +13241,6 @@ mod tests {
             mock.requests()[1].system.as_deref(),
             Some(compaction::SUMMARY_SYSTEM)
         );
-
-        let mock = Arc::new(MockTransport::scripted(vec![
-            rejected(),
-            ok(turn::text("done")),
-        ]));
-        let agent = summary_agent(&mock, summary_config());
-        let mut session = masking_session(0, 12);
-        let mut events = Vec::new();
-        agent
-            .run_events(&mut session, |ev| events.push(ev))
-            .await
-            .unwrap();
-        assert_eq!(kinds(&events), ["compaction_start", "compaction_failed"]);
     }
 
     #[tokio::test]

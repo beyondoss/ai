@@ -358,7 +358,7 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
   `conversation_summary_request`: the request a turn would send (same model, system prompt, tools,
   deferred tools, cache key and TTL, reasoning; one helper, `conversation_request`, builds both) with
   the trailing user message replaced by `compaction::conversation_summary_instruction` (the
-  `SUMMARY_SYSTEM` guardrails, "do not call any tools", the `SUMMARY_INSTRUCTION` format, incremental
+  per-wire opener (`SummaryFraming`), "do not call any tools", the `SUMMARY_INSTRUCTION` format, incremental
   rules when the conversation opens with a summary, the file tags and any custom focus). Everything up
   to the previous turn's rolling breakpoint is a cache read, and the summarizer sees full tool results
   instead of 2,000-char excerpts. Only the trailing message's tool results are kept beside the
@@ -369,7 +369,8 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
   2,048 output tokens (short of `summary_max_tokens`, the output budget shrinks to the room left: a
   trigger at `window − reserve`, on a small window or a user-set `--context-window`, overshoots by a few
   thousand tokens, and a shorter cached summary beats a full-price re-render), for an overflow (the provider already refused this conversation), when the model answers
-  with a tool call or nothing, or with `cached_summary: false`. The re-render itself is now sent
+  with a tool call, nothing, or anything that is not a checkpoint, when the cached call errors, or with
+  `cached_summary: false`. The re-render itself is now sent
   `no_cache`: nothing re-reads that one-off prompt, so a breakpoint only bought a cache-write premium on
   all of it. The provenance carry is unchanged: host code appends it to whichever summary comes back.
   Measured on real models (summary call only, ~80–100K-token sessions; see the PR): cache-read share
@@ -379,31 +380,37 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
   summary: `cached`, `rerender` (no cached call ran), or `cached_rejected` (it ran and its reply was
   turned down, so the re-render wrote it).
 
+  **The opener depends on the wire, and the reply must be a checkpoint.** Claude Haiku 5.5 refused the
+  cached summary in 30 of 33 eval compactions ("I'm not going to produce that checkpoint summary; the
+  transcript stays with me"), and the refusal became the summary; 0 of 10 refused on the re-render.
+  Replaying ten of those compaction points from their persisted sessions reproduced it (24 of 31
+  refused) under the "stop working, reply with nothing but a summary" opener plus `SUMMARY_SYSTEM`.
+  On the Anthropic wire (`Dialect::for_model` of the agent's model) the instruction opens with
+  `HANDOFF_FRAMING` instead (`SummaryFraming::Handoff`): a checkpoint the model writes for itself from
+  what the transcript shows, not its reasoning, with the format unchanged. That gave 0 of 30 refusals on
+  Haiku and 0 of 5 on Sonnet 5.5. Swapping only "another LLM" for "you" did not help (15 of 20). Every
+  other wire keeps the old opener (`SummaryFraming::Compact`). GPT-6 Luna, replayed as production sends
+  it (the Responses dialect emits the instruction ahead of the trailing tool output), wrote a clean
+  checkpoint 10 of 10 times under it. Under the handoff text it called `todo` instead 4 of 15 times, and
+  2 of 15 times it looped `-` lines until the output limit.
+
+  Whatever the wording, a cached reply is accepted only if it is a checkpoint. It must have a `## Goal`
+  heading (`checkpoint_body`; a preamble before it is dropped). It must not be cut off at the output
+  limit (`StopReason::MaxTokens`). And it must not be a runaway loop (`is_runaway`: 10 identical
+  non-blank lines in a row). Luna's two loops opened with a real checkpoint, so the heading check alone
+  accepted them. No other reply in the replays (220) and no summary the eval kept (55) repeated a line
+  even twice in a row. Any other reply re-renders, as does a cached call that errors, instead of failing
+  the compaction. The pre-merge replay ran 5 compaction points each on Haiku (handoff) and Luna
+  (compact), in production ordering and at the production output budget. All 10 replies were accepted
+  checkpoints: no refusals, no tool calls and no loops. Two other fixes lost. A mid-conversation
+  `system`-role message also stopped the refusals (0 of 31), but Claude Sonnet 5 rejects that role with
+  a 400. The top-level `system` prompt invalidates the whole cached history and still refused 2 of 10.
+  Assistant prefill is a 400 on Haiku 5.5 and every 4.6+ Claude model.
+
 - **Candidates under evaluation** — `CompactionConfig::candidates` (`CompactionCandidates`, the CLI's
   `--compaction-candidates`) holds compaction changes being A/B tested, each off by default so
-  `Default` stays the shipped behavior. The first three answer one eval finding: Claude Haiku 5.5
-  refused the cached summary in 30 of 33 compactions ("I'm not going to produce that checkpoint
-  summary; the transcript stays with me"), and the refusal became the summary; 0 of 10 refused on the
-  re-render, and no other model was on the cached path often enough to tell (Sonnet 5.5: 2). Replaying
-  ten of those compaction points from their persisted sessions reproduced it (24 of 31 refused) and
-  separated two fixes:
-  - `instruction_as_system` (`system-role`): the instruction, unwrapped, as a role-`system` message
-    after the trailing tool results — the provider's operator channel, after the cached prefix, so
-    the cache hit is unchanged. 0 of 31 refused. Without tool results to follow (a pending prompt was
-    dropped, or the conversation ends on the model's turn) it stays in the user turn. Putting it in
-    the top-level `system` instead invalidates the whole cached history (measured: cache read fell
-    to the 3K-token tool block) and still refused 2 of 10.
-  - `handoff_framing` (`handoff`): the instruction opens with `HANDOFF_FRAMING` — a checkpoint the
-    model writes for itself from what the transcript shows, not its reasoning — instead of "stop
-    working, reply with nothing but a summary" plus `SUMMARY_SYSTEM`; the format is unchanged.
-    0 of 30 refused in the user turn. Swapping only "another LLM" for "you" did not help (15 of 20).
-  - `check_summary` (`check`): the cached reply must be a checkpoint (`checkpoint_body`: a `## Goal`
-    heading; a preamble before it is dropped), or it falls back to the re-render like a tool call or
-    a blank reply. Under this or `system-role`, a cached call that errors also falls back (Claude
-    Sonnet 5 rejects mid-conversation system messages with a 400) instead of failing the compaction.
-    Assistant prefill, the remaining idea, is a 400 on Haiku 5.5 and every 4.6+ Claude model.
-
-  Two more answer what the summaries said, across all 87 eval compactions:
+  `Default` stays the shipped behavior. Two answer what the summaries said, across all 87 eval
+  compactions:
   - `state_template` (`state`): every summary is one current-state document. A single-prompt
     agentic run is one long turn and `find_cut` always leaves the prefix ending on a tool result, so
     55 of 87 summaries took the split-turn path (51 opening "No prior history.") and each later round

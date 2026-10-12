@@ -129,7 +129,7 @@ fn run_masks_old_tool_output_instead_of_summarizing_and_persists_it() {
 fn run_without_tool_masking_summarizes_instead() {
     let dir = tempfile::tempdir().unwrap();
     let session_file = seeded_session(dir.path());
-    let (base, bodies) = spawn_model_server(vec![turn_text("SUMMARY"), turn_text("done")]);
+    let (base, bodies) = spawn_model_server(vec![turn_text("## Goal\nSUMMARY"), turn_text("done")]);
     run(&base, &session_file, &["--no-tool-masking"]);
     assert_eq!(bodies.lock().unwrap().len(), 2, "summary, then the answer");
     let (_, session) = SessionStore::open(session_file.into()).unwrap();
@@ -194,12 +194,13 @@ fn run_summarizes_from_the_cached_conversation_unless_told_not_to() {
     for (extra, cached) in [(&[][..], true), (&["--no-cached-summary"][..], false)] {
         let dir = tempfile::tempdir().unwrap();
         let session_file = seeded_session(dir.path());
-        let (base, bodies) = spawn_model_server(vec![turn_text("SUMMARY"), turn_text("done")]);
+        let (base, bodies) =
+            spawn_model_server(vec![turn_text("## Goal\nSUMMARY"), turn_text("done")]);
         let mut args = vec!["--no-tool-masking"];
         args.extend_from_slice(extra);
         run(&base, &session_file, &args);
         let body = bodies.lock().unwrap()[0].clone();
-        assert_eq!(body.contains("Do not call any tools"), cached, "{extra:?}");
+        assert_eq!(body.contains("do not call any tools"), cached, "{extra:?}");
         // The cached call carries the conversation's tools; the re-render carries none.
         assert_eq!(body.contains("\"tools\""), cached, "{extra:?}");
         // Either way the pending prompt waits for the real turn.

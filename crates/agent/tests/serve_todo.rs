@@ -168,7 +168,7 @@ fn a_compaction_carries_the_plan_into_the_summary_and_get_todos_still_finds_it()
         turn_text("planned, now working"),
         // The summarization call `compact` makes. It never mentions the plan — exactly as a real
         // summarizing model usually wouldn't.
-        turn_text("The model planned some work."),
+        turn_text("## Goal\nThe model planned some work."),
     ]);
 
     let mut child = serve_cmd(BIN, &base, &session_file)
@@ -225,7 +225,7 @@ fn the_plan_survives_a_serve_restart_past_a_compaction() {
         let (base, _bodies) = spawn_model_server(vec![
             todo_turn("toolu_1", &plan()),
             turn_text("planned"),
-            turn_text("A summary with no mention of the plan."),
+            turn_text("## Goal\nA summary with no mention of the plan."),
         ]);
         let mut child = serve_cmd(BIN, &base, &session_file)
             .args(["--compaction-keep-recent-tokens", "1"])
