@@ -10,8 +10,9 @@
 //! become errors carrying the output — same as pi's throw.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -22,10 +23,10 @@ use regex::Regex;
 use serde_json::{Value, json};
 
 use super::bash_output::BashOutput;
-use super::exec::{ChunkSink, CommandRunner, RealRunner};
+use super::exec::{ChunkSink, CommandRunner, ExecResult, RealRunner};
 use super::fs::local::LocalFs;
 use super::fs::{FsBackend, PathWorld};
-use super::output::{OutputSnapshot, TruncatedBy, format_output};
+use super::output::{OutputAccumulator, OutputSnapshot, TruncatedBy, format_output};
 
 /// Default command timeout (ms) when the model doesn't specify one. The reference agent has no default
 /// at all — a command runs to completion unless the model explicitly sets `timeout_ms` — which SIGKILLs
@@ -82,9 +83,46 @@ fn resolve_shell() -> &'static str {
     })
 }
 
+/// Experimental behaviors for long-running and hung commands, all off by default (see the bash
+/// section of `ARCHITECTURE.md` for the eval data behind each, and the A/B they exist for). With the
+/// default policy the tool behaves exactly as it did before these existed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BashPolicy {
+    /// Return to the model when a still-running command has printed nothing for this long
+    /// (`--bash-idle-yield-secs`). The command is not stopped: it keeps running as a detached job
+    /// the model can wait on or kill (see [`Bash::exec_detachable`]).
+    pub idle_yield: Option<Duration>,
+    /// Return to the model once a call has been waiting this long, output or not
+    /// (`--bash-yield-secs`) — the same detached job, on a wall-clock schedule.
+    pub wall_yield: Option<Duration>,
+    /// Advise the model to size `timeout_ms` to the command, and add a "probably stuck" hint to a
+    /// timed-out result (`--bash-timeout-guidance`). Text only; no behavior changes.
+    pub timeout_guidance: bool,
+}
+
+impl BashPolicy {
+    /// Whether a call may return before its command exits — the detached-job path.
+    fn detaches(&self) -> bool {
+        self.idle_yield.is_some() || self.wall_yield.is_some()
+    }
+}
+
+/// Appended to a timed-out result under [`BashPolicy::timeout_guidance`]. In the eval, every model
+/// that hit a timeout already guessed "infinite loop" on its own; this exists so the arm also says
+/// how to find it fast, and costs nothing when no timeout fires.
+const TIMEOUT_HINT: &str = "If it was not expected to take this long, it is probably stuck: an \
+                            infinite loop or a read that never returns. Rerun the narrowest failing \
+                            piece with a short `timeout_ms`; for pytest add `-x` and \
+                            `-o faulthandler_timeout=<seconds>` to print the stuck stack.";
+
 pub struct Bash {
     runner: Arc<dyn CommandRunner>,
     default_timeout_ms: u64,
+    /// See [`BashPolicy`]. Default: none of it.
+    policy: BashPolicy,
+    /// Commands still running after their call returned ([`BashPolicy::detaches`]). Owned by this
+    /// tool instance: dropping it (a registry rebuild, the end of the process) kills every one.
+    jobs: Arc<Jobs>,
     /// Overrides `resolve_shell()`'s auto-detection when set — see [`with_shell_path`](Self::with_shell_path).
     shell_path: Option<String>,
     /// The shell to use when [`Self::backend`] reports a remote world — see
@@ -139,8 +177,8 @@ pub struct Bash {
 /// `new()` would be a stale snapshot for exactly the session that attaches a sandbox mid-life. The
 /// runtime marker (`output.rs`'s `full_output_segment`) already tells the model what to do in each
 /// case; this only has to stop promising the case that may not happen.
-fn describe(default_timeout_ms: u64, max_bytes: usize) -> String {
-    format!(
+fn describe(default_timeout_ms: u64, max_bytes: usize, policy: &BashPolicy) -> String {
+    let mut text = format!(
         "Run a shell command via a resolved bash (falls back to sh) and return its combined \
          stdout/stderr. Supports an optional `cwd` and `timeout_ms` (defaults to {default_timeout_ms} ms \
          / {} minutes if omitted). Output is truncated to the last {} lines or {}, whichever is hit \
@@ -149,7 +187,32 @@ fn describe(default_timeout_ms: u64, max_bytes: usize) -> String {
         default_timeout_ms / 60_000,
         super::output::DEFAULT_MAX_LINES,
         super::output::format_size(max_bytes as u64),
-    )
+    );
+    if policy.timeout_guidance {
+        text.push_str(
+            " Set `timeout_ms` to fit the command, a few times how long you expect it to take, rather \
+             than relying on the default: a command that hangs (an infinite loop in new code, a test \
+             waiting on input) blocks you until its timeout fires.",
+        );
+    }
+    let early = match (policy.idle_yield, policy.wall_yield) {
+        (Some(idle), Some(wall)) => Some(format!(
+            "after {} s without new output, or {} s in any case,",
+            idle.as_secs(),
+            wall.as_secs()
+        )),
+        (Some(idle), None) => Some(format!("after {} s without new output", idle.as_secs())),
+        (None, Some(wall)) => Some(format!("after {} s", wall.as_secs())),
+        (None, None) => None,
+    };
+    if let Some(early) = early {
+        text.push_str(&format!(
+            " A command still running {early} returns early with its output so far and keeps \
+             running in the background as a numbered job: call `bash_job` with that number to wait \
+             for more of its output, or with `kill: true` to stop it."
+        ));
+    }
+    text
 }
 
 impl Bash {
@@ -158,10 +221,16 @@ impl Bash {
         Self {
             runner: Arc::new(RealRunner),
             default_timeout_ms: DEFAULT_TIMEOUT_MS,
+            policy: BashPolicy::default(),
+            jobs: Arc::default(),
             shell_path: None,
             remote_shell: None,
             command_prefix: None,
-            description: describe(DEFAULT_TIMEOUT_MS, super::output::DEFAULT_MAX_BYTES),
+            description: describe(
+                DEFAULT_TIMEOUT_MS,
+                super::output::DEFAULT_MAX_BYTES,
+                &BashPolicy::default(),
+            ),
             root: std::path::PathBuf::new(),
             backend: Arc::new(LocalFs::new()),
             output: BashOutput::default(),
@@ -171,7 +240,7 @@ impl Bash {
     /// Builder-style: override the default timeout applied when the model omits `timeout_ms`.
     pub fn with_default_timeout_ms(mut self, ms: u64) -> Self {
         self.default_timeout_ms = ms;
-        self.description = describe(ms, self.output.max_bytes);
+        self.description = describe(ms, self.output.max_bytes, &self.policy);
         self
     }
 
@@ -179,7 +248,15 @@ impl Bash {
     /// bash-max-bytes`/`bash-test-digest`). See [`BashOutput`].
     pub fn with_output(mut self, output: BashOutput) -> Self {
         self.output = output;
-        self.description = describe(self.default_timeout_ms, output.max_bytes);
+        self.description = describe(self.default_timeout_ms, output.max_bytes, &self.policy);
+        self
+    }
+
+    /// Builder-style: turn on the experimental long-command behaviors in `policy` (see
+    /// [`BashPolicy`]). The default policy changes nothing.
+    pub fn with_policy(mut self, policy: BashPolicy) -> Self {
+        self.policy = policy;
+        self.description = describe(self.default_timeout_ms, self.output.max_bytes, &policy);
         self
     }
 
@@ -238,10 +315,16 @@ impl Bash {
         Self {
             runner,
             default_timeout_ms: DEFAULT_TIMEOUT_MS,
+            policy: BashPolicy::default(),
+            jobs: Arc::default(),
             shell_path: None,
             remote_shell: None,
             command_prefix: None,
-            description: describe(DEFAULT_TIMEOUT_MS, super::output::DEFAULT_MAX_BYTES),
+            description: describe(
+                DEFAULT_TIMEOUT_MS,
+                super::output::DEFAULT_MAX_BYTES,
+                &BashPolicy::default(),
+            ),
             root: std::path::PathBuf::new(),
             backend: Arc::new(LocalFs::new()),
             output: BashOutput::default(),
@@ -369,6 +452,11 @@ impl Bash {
         };
         let args = vec!["-c".to_string(), resolved_command];
         let dur = Duration::from_millis(timeout_ms);
+        if self.policy.detaches() {
+            return self
+                .exec_detachable(args, cwd, dur, timeout_ms, &world, progress)
+                .await;
+        }
 
         // The spill file is written on *this* host. When the command ran somewhere else that is the
         // one machine whose filesystem the model cannot reach, so `Full output: /tmp/pi-bash-….log`
@@ -489,54 +577,459 @@ impl Bash {
             emit_update(p, &snap);
         }
 
-        if result.timed_out {
-            let secs = timeout_ms / 1000;
-            // No "(no output)" placeholder here: an empty-output timeout should read as just the
-            // status line ("Command timed out after Ns"), not "(no output)" glued in front of it —
-            // matching the reference agent's abort/timeout formatting, which substitutes nothing for
-            // empty content on this path specifically (the success/exit-code path below keeps the
-            // placeholder, since there the empty case is a genuinely silent command, not an interrupt).
-            let text = clean(format_output(&snap, ""));
-            return Err(ToolError::Execution(append_status(
-                &text,
-                &format!("Command timed out after {secs} seconds"),
-            )));
+        finish_result(
+            &snap,
+            digest,
+            &result,
+            timeout_ms,
+            self.policy.timeout_guidance,
+        )
+    }
+
+    /// The [`BashPolicy::detaches`] path: the command runs on its own task, and this call waits on it
+    /// only until it exits or a yield condition fires. On a yield the command keeps running as a
+    /// numbered [`Job`] and the model gets the output so far plus how to wait on or kill it.
+    ///
+    /// The command still carries its own `timeout_ms`, so a job nobody waits on is reaped by the same
+    /// backstop as a foreground command.
+    async fn exec_detachable(
+        &self,
+        args: Vec<String>,
+        cwd: Option<&str>,
+        dur: Duration,
+        timeout_ms: u64,
+        world: &PathWorld,
+        progress: Option<&ToolProgress>,
+    ) -> Result<ToolOutput, ToolError> {
+        let shared = Arc::new(JobShared::new(world.is_remote(), self.output));
+        if let Some(p) = progress {
+            p.emit("", None);
         }
-        let text = clean(digest.unwrap_or_else(|| format_output(&snap, "(no output)")));
-        match (result.code, result.signal) {
-            (Some(0), _) => Ok(text.into()),
-            // Non-zero exit is an error result that still carries the output — pi throws here too.
-            (Some(code), _) => Err(ToolError::Execution(append_status(
-                &text,
-                &format!("Command exited with code {code}"),
-            ))),
-            // Killed by a signal: `ExitStatus::code()` is `None` in exactly this case, and this arm
-            // used to fall in with `Some(0)` and report **success**. An OOM-killed build, a SIGSEGV, a
-            // SIGTERM'd server — every one of them came back to the model as a clean run, silently, and
-            // with `"(no output)"` if the command hadn't printed anything before dying. The model then
-            // proceeds as though the step succeeded. The timeout case never reaches here (it returns
-            // via the `timed_out` branch above), so a `None` code with a signal is unambiguous.
-            (None, Some(signal)) => {
-                let named = match crate::tools::exec::signal_name(signal) {
-                    Some(name) => format!("{name} ({signal})"),
-                    None => format!("signal {signal}"),
-                };
-                let hint = if signal == 9 {
-                    " — typically the OOM killer or an external `kill -9`"
-                } else {
-                    ""
-                };
-                Err(ToolError::Execution(append_status(
-                    &text,
-                    &format!("Command was killed by {named}{hint}"),
-                )))
+        let handle = {
+            let runner = self.runner.clone();
+            let shell = self.shell(world).to_string();
+            let cwd = cwd.map(str::to_string);
+            let shared = shared.clone();
+            tokio::spawn(async move {
+                let sink = |bytes: &[u8]| shared.append(bytes);
+                let spawned = |pgid: u32| shared.track(pgid);
+                let result = runner
+                    .run_streaming_tracked(&shell, &args, cwd.as_deref(), dur, &sink, &spawned)
+                    .await;
+                // Exited (or timed out and reaped): nothing left for anyone to kill.
+                shared.untrack();
+                result
+            })
+        };
+        let job = Job {
+            id: None,
+            shared,
+            handle,
+            started: Instant::now(),
+            timeout_ms,
+        };
+        self.attach(job, progress).await
+    }
+
+    /// Wait on `job` until it exits (its final result), a yield condition fires (detach it again and
+    /// report the output since the last report), or the call is cancelled (kill it, like a
+    /// foreground command).
+    async fn attach(
+        &self,
+        mut job: Job,
+        progress: Option<&ToolProgress>,
+    ) -> Result<ToolOutput, ToolError> {
+        enum Woke {
+            Exited(Result<std::io::Result<ExecResult>, tokio::task::JoinError>),
+            Output,
+            Deadline,
+            Cancelled,
+        }
+        let attached = Instant::now();
+        let mut last_emit: Option<Instant> = None;
+        loop {
+            let deadline = self.yield_deadline(&job, attached);
+            let cancelled = async {
+                match progress {
+                    Some(p) => p.cancelled().await,
+                    None => std::future::pending().await,
+                }
+            };
+            let woke = tokio::select! {
+                joined = &mut job.handle => Woke::Exited(joined),
+                () = job.shared.notify.notified() => Woke::Output,
+                () = tokio::time::sleep_until(deadline.into()) => Woke::Deadline,
+                () = cancelled => Woke::Cancelled,
+            };
+            match woke {
+                Woke::Exited(joined) => return self.finish_job(job, joined, progress),
+                Woke::Output => {
+                    if let Some(p) = progress
+                        && last_emit.is_none_or(|t| t.elapsed() >= UPDATE_THROTTLE)
+                    {
+                        last_emit = Some(Instant::now());
+                        let snap = lock(&job.shared.out).acc.snapshot(true);
+                        emit_update(p, &snap);
+                    }
+                }
+                Woke::Deadline => {
+                    if let Some(reason) = self.yield_reason(&job, attached) {
+                        return Ok(self.detach(job, reason));
+                    }
+                }
+                Woke::Cancelled => {
+                    let snap = job.shared.take_segment();
+                    // Dropping the job kills its process group (see `Job`'s `Drop`).
+                    drop(job);
+                    if let Some(p) = progress {
+                        emit_update(p, &snap);
+                    }
+                    let text = clean(format_output(&snap, ""));
+                    return Err(ToolError::Execution(append_status(
+                        &text,
+                        "Command cancelled",
+                    )));
+                }
             }
-            // No code and no signal: not reachable on Unix (the two are exhaustive there), and on a
-            // non-Unix host there is no signal concept to report. Genuinely unknown rather than known-
-            // bad, so this keeps the original benefit-of-the-doubt behavior instead of inventing a
-            // failure.
-            (None, None) => Ok(text.into()),
         }
+    }
+
+    /// The silence the idle yield measures starts at the later of the last output and this attach,
+    /// so a re-attached job always gets a full `idle_yield` before it is reported again.
+    fn yield_deadline(&self, job: &Job, attached: Instant) -> Instant {
+        let quiet_since = lock(&job.shared.out).last_output.max(attached);
+        let idle = self.policy.idle_yield.map(|d| quiet_since + d);
+        let wall = self.policy.wall_yield.map(|d| attached + d);
+        match (idle, wall) {
+            (Some(a), Some(b)) => a.min(b),
+            (Some(a), None) | (None, Some(a)) => a,
+            // Unreachable on this path (`detaches()` was true), but a far deadline is the honest
+            // answer for "never yield".
+            (None, None) => attached + Duration::from_secs(u64::from(u32::MAX)),
+        }
+    }
+
+    fn yield_reason(&self, job: &Job, attached: Instant) -> Option<YieldReason> {
+        let now = Instant::now();
+        let quiet_since = lock(&job.shared.out).last_output.max(attached);
+        if let Some(idle) = self.policy.idle_yield
+            && now >= quiet_since + idle
+        {
+            return Some(YieldReason::Quiet(now - quiet_since));
+        }
+        if let Some(wall) = self.policy.wall_yield
+            && now >= attached + wall
+        {
+            return Some(YieldReason::Waited(now - attached));
+        }
+        None
+    }
+
+    /// Park `job` in the table and tell the model what it has so far and how to come back to it.
+    fn detach(&self, mut job: Job, reason: YieldReason) -> ToolOutput {
+        let id = *job
+            .id
+            .get_or_insert_with(|| self.jobs.next.fetch_add(1, Ordering::Relaxed) + 1);
+        let snap = job.shared.take_segment();
+        let text = clean(format_output(&snap, ""));
+        let running = job.started.elapsed().as_secs();
+        let lead = match reason {
+            YieldReason::Quiet(quiet) => format!("No output for {} s", quiet.as_secs()),
+            YieldReason::Waited(waited) => format!("Waited {} s", waited.as_secs()),
+        };
+        let status = format!(
+            "{lead}. The command is still running ({running} s so far; it is killed at its {} s \
+             timeout). It continues in the background as job {id}: call bash_job with \
+             {{\"job\": {id}}} to wait for more output, or {{\"job\": {id}, \"kill\": true}} to stop \
+             it if you no longer need it (not `pkill`, which can match unrelated processes).",
+            job.timeout_ms / 1000
+        );
+        // Live probes: models mostly move on without waiting on or killing a job, so a hung one
+        // would spin until its timeout. Cap how many can pile up; the oldest goes first.
+        let evicted = {
+            let mut running = lock(&self.jobs.running);
+            running.insert(id, job);
+            let oldest = (running.len() > MAX_PARKED_JOBS)
+                .then(|| running.keys().min().copied())
+                .flatten();
+            oldest.and_then(|old| running.remove(&old).map(|j| (old, j)))
+        };
+        let status = match evicted {
+            // Dropped outside the table lock; dropping kills it.
+            Some((old, _job)) => format!(
+                "{status} Job {old} was killed to keep at most {MAX_PARKED_JOBS} background jobs."
+            ),
+            None => status,
+        };
+        append_status(&text, &status).into()
+    }
+
+    /// A job's command has exited: its final result, exactly as a foreground run would report it,
+    /// over the output produced since the last report.
+    fn finish_job(
+        &self,
+        job: Job,
+        joined: Result<std::io::Result<ExecResult>, tokio::task::JoinError>,
+        progress: Option<&ToolProgress>,
+    ) -> Result<ToolOutput, ToolError> {
+        let result = match joined {
+            Ok(Ok(result)) => result,
+            Ok(Err(e)) => return Err(ToolError::Execution(format!("spawn failed: {e}"))),
+            Err(e) => return Err(ToolError::Execution(format!("command task failed: {e}"))),
+        };
+        let (snap, digest) = {
+            let mut out = lock(&job.shared.out);
+            // A non-streaming runner (a remote endpoint) delivered nothing through the sink; its
+            // captured output is the whole story, as on the foreground path.
+            if !out.streamed {
+                out.acc.append(result.stdout.as_bytes());
+                if !result.stderr.is_empty() {
+                    if !result.stdout.is_empty() {
+                        out.acc.append(b"\n");
+                    }
+                    out.acc.append(result.stderr.as_bytes());
+                }
+            }
+            out.acc.finish();
+            // The same display cap and pytest digest as the foreground path.
+            self.output.finish(&mut out.acc)
+        };
+        if let Some(p) = progress {
+            emit_update(p, &snap);
+        }
+        finish_result(
+            &snap,
+            digest,
+            &result,
+            job.timeout_ms,
+            self.policy.timeout_guidance,
+        )
+    }
+
+    /// `bash_job`'s body: `{"job": N}` waits on job N, `{"job": N, "kill": true}` stops it.
+    async fn resume_job(
+        &self,
+        job: &Value,
+        input: &Value,
+        progress: Option<&ToolProgress>,
+    ) -> Result<ToolOutput, ToolError> {
+        let id = job
+            .as_u64()
+            .or_else(|| job.as_str().and_then(|s| s.trim().parse().ok()))
+            .ok_or_else(|| {
+                ToolError::InvalidInput(format!("`job` must be a job number, got {job}"))
+            })?;
+        let Some(mut job) = lock(&self.jobs.running).remove(&id) else {
+            return Err(ToolError::InvalidInput(format!(
+                "no running job {id}: it already exited and was reported, was killed, or never \
+                 existed"
+            )));
+        };
+        if input.get("kill").and_then(Value::as_bool) != Some(true) {
+            return self.attach(job, progress).await;
+        }
+        // Kill the group and wait for it, as the foreground timeout path does, so a caller that
+        // checks side effects right after sees the command gone.
+        #[cfg(unix)]
+        if let Some(pgid) = job.shared.untrack() {
+            let _ =
+                tokio::task::spawn_blocking(move || super::exec::kill_process_group(pgid)).await;
+        }
+        job.handle.abort();
+        let _ = tokio::time::timeout(Duration::from_secs(5), &mut job.handle).await;
+        let snap = job.shared.take_segment();
+        let running = job.started.elapsed().as_secs();
+        drop(job);
+        let text = clean(format_output(&snap, ""));
+        Ok(append_status(&text, &format!("Job {id} killed after {running} s.")).into())
+    }
+}
+
+/// Why a detached call returned before its command exited.
+enum YieldReason {
+    /// [`BashPolicy::idle_yield`]: no output for this long.
+    Quiet(Duration),
+    /// [`BashPolicy::wall_yield`]: this call waited this long.
+    Waited(Duration),
+}
+
+/// Most detached jobs one `bash` keeps; parking another kills the oldest.
+const MAX_PARKED_JOBS: usize = 4;
+
+/// Running commands whose call already returned, by job number.
+#[derive(Default)]
+struct Jobs {
+    next: AtomicU64,
+    running: Mutex<HashMap<u64, Job>>,
+}
+
+/// One command on the detached path, attached (owned by the call waiting on it) or parked in
+/// [`Jobs`]. Dropping it kills the command: a call whose future is dropped, or a tool whose table is
+/// dropped, never leaves a process behind.
+struct Job {
+    /// Assigned the first time the job is parked.
+    id: Option<u64>,
+    shared: Arc<JobShared>,
+    handle: tokio::task::JoinHandle<std::io::Result<ExecResult>>,
+    started: Instant,
+    timeout_ms: u64,
+}
+
+impl Drop for Job {
+    fn drop(&mut self) {
+        self.handle.abort();
+        // `abort` only drops the runner's future when the runtime next polls the task, which a
+        // process on its way out may never do — kill the group directly too.
+        #[cfg(unix)]
+        if let Some(pgid) = self.shared.untrack() {
+            super::exec::spawn_tracked_cleanup(move || super::exec::kill_process_group(pgid));
+        }
+    }
+}
+
+/// What the runner's task and the waiting call share.
+struct JobShared {
+    out: Mutex<JobOutput>,
+    /// Woken on every chunk, so the waiting call can stream progress and re-arm its idle deadline.
+    notify: tokio::sync::Notify,
+    /// The command's process group while it runs — what [`Job`]'s `Drop`, a kill, and
+    /// [`kill_live_jobs`] signal.
+    pgid: Mutex<Option<u32>>,
+    /// Where the command runs (no spill file when remote) and how its output is capped — what each
+    /// fresh per-report accumulator is built from.
+    remote: bool,
+    output: BashOutput,
+}
+
+struct JobOutput {
+    /// Output since the last report to the model.
+    acc: OutputAccumulator,
+    last_output: Instant,
+    /// Whether any chunk came through the sink at all — see `finish_job`'s fallback.
+    streamed: bool,
+}
+
+impl JobShared {
+    fn new(remote: bool, output: BashOutput) -> Self {
+        Self {
+            out: Mutex::new(JobOutput {
+                acc: output.accumulator(!remote),
+                last_output: Instant::now(),
+                streamed: false,
+            }),
+            notify: tokio::sync::Notify::new(),
+            pgid: Mutex::new(None),
+            remote,
+            output,
+        }
+    }
+
+    fn append(&self, bytes: &[u8]) {
+        {
+            let mut out = lock(&self.out);
+            out.acc.append(bytes);
+            out.last_output = Instant::now();
+            out.streamed = true;
+        }
+        self.notify.notify_one();
+    }
+
+    fn track(&self, pgid: u32) {
+        *lock(&self.pgid) = Some(pgid);
+        lock(&LIVE_JOB_GROUPS).push(pgid);
+    }
+
+    /// Forget the process group (it exited, or the caller is about to kill it), returning it if it
+    /// was still recorded.
+    fn untrack(&self) -> Option<u32> {
+        let pgid = lock(&self.pgid).take()?;
+        lock(&LIVE_JOB_GROUPS).retain(|&g| g != pgid);
+        Some(pgid)
+    }
+
+    /// The output since the last report, finished and snapshotted; the next report starts empty.
+    fn take_segment(&self) -> OutputSnapshot {
+        let mut out = lock(&self.out);
+        let fresh = self.output.accumulator(!self.remote);
+        let mut segment = std::mem::replace(&mut out.acc, fresh);
+        segment.finish();
+        segment.snapshot(true)
+    }
+}
+
+/// Process groups of every detached-path command still running, for [`kill_live_jobs`].
+static LIVE_JOB_GROUPS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+/// Kill every command still running on the detached path. The exit path calls this before
+/// `std::process::exit`, which runs no destructors: a job parked in a table would otherwise outlive
+/// the agent (and a hung one would spin until its timeout). The kills are tracked, so the
+/// `wait_for_pending_group_kills` that follows waits for them.
+pub fn kill_live_jobs() {
+    #[cfg(unix)]
+    for pgid in std::mem::take(&mut *lock(&LIVE_JOB_GROUPS)) {
+        super::exec::spawn_tracked_cleanup(move || super::exec::kill_process_group(pgid));
+    }
+}
+
+/// The model-facing result for a command that has exited (or timed out): the cleaned output plus the
+/// status line pi appends. Shared by the foreground path and a detached job's final report, so both
+/// read the same.
+fn finish_result(
+    snap: &OutputSnapshot,
+    digest: Option<String>,
+    result: &ExecResult,
+    timeout_ms: u64,
+    guidance: bool,
+) -> Result<ToolOutput, ToolError> {
+    if result.timed_out {
+        let secs = timeout_ms / 1000;
+        // No "(no output)" placeholder here: an empty-output timeout should read as just the
+        // status line ("Command timed out after Ns"), not "(no output)" glued in front of it —
+        // matching the reference agent's abort/timeout formatting, which substitutes nothing for
+        // empty content on this path specifically (the success/exit-code path below keeps the
+        // placeholder, since there the empty case is a genuinely silent command, not an interrupt).
+        let text = clean(format_output(snap, ""));
+        let mut status = format!("Command timed out after {secs} seconds");
+        if guidance {
+            status.push_str(". ");
+            status.push_str(TIMEOUT_HINT);
+        }
+        return Err(ToolError::Execution(append_status(&text, &status)));
+    }
+    let text = clean(digest.unwrap_or_else(|| format_output(snap, "(no output)")));
+    match (result.code, result.signal) {
+        (Some(0), _) => Ok(text.into()),
+        // Non-zero exit is an error result that still carries the output — pi throws here too.
+        (Some(code), _) => Err(ToolError::Execution(append_status(
+            &text,
+            &format!("Command exited with code {code}"),
+        ))),
+        // Killed by a signal: `ExitStatus::code()` is `None` in exactly this case, and this arm
+        // used to fall in with `Some(0)` and report **success**. An OOM-killed build, a SIGSEGV, a
+        // SIGTERM'd server — every one of them came back to the model as a clean run, silently, and
+        // with `"(no output)"` if the command hadn't printed anything before dying. The model then
+        // proceeds as though the step succeeded. The timeout case never reaches here (it returns
+        // via the `timed_out` branch above), so a `None` code with a signal is unambiguous.
+        (None, Some(signal)) => {
+            let named = match crate::tools::exec::signal_name(signal) {
+                Some(name) => format!("{name} ({signal})"),
+                None => format!("signal {signal}"),
+            };
+            let hint = if signal == 9 {
+                " — typically the OOM killer or an external `kill -9`"
+            } else {
+                ""
+            };
+            Err(ToolError::Execution(append_status(
+                &text,
+                &format!("Command was killed by {named}{hint}"),
+            )))
+        }
+        // No code and no signal: not reachable on Unix (the two are exhaustive there), and on a
+        // non-Unix host there is no signal concept to report. Genuinely unknown rather than known-
+        // bad, so this keeps the original benefit-of-the-doubt behavior instead of inventing a
+        // failure.
+        (None, None) => Ok(text.into()),
     }
 }
 
@@ -549,6 +1042,9 @@ impl Tool for Bash {
         &self.description
     }
     fn input_schema(&self) -> Value {
+        // The same under every policy: waiting on or killing a job is `bash_job`'s, not optional
+        // fields here. A model that fills every property (gpt-6-luna sends `"job": 0` on every
+        // call) would otherwise turn each command into a job lookup — seen in a live probe.
         json!({
             "type": "object",
             "properties": {
@@ -577,6 +1073,68 @@ impl Tool for Bash {
         progress: &ToolProgress,
     ) -> Result<ToolOutput, ToolError> {
         self.exec(input, Some(progress)).await
+    }
+}
+
+impl Bash {
+    /// Whether this tool can leave a command running past its call — the condition for registering
+    /// [`BashJob`] beside it.
+    pub fn detaches(&self) -> bool {
+        self.policy.detaches()
+    }
+}
+
+/// `bash_job`: wait on or kill a command `bash` left running (see [`BashPolicy`]). Registered only
+/// beside a detaching `bash`, and over that same instance, so the two share one job table.
+///
+/// A tool of its own rather than optional `job`/`kill` fields on `bash`, because some models fill
+/// every property of a schema: a live gpt-6-luna probe sent `"job": 0, "kill": false` on every
+/// `bash` call, and an optional `job` field turned each command into a failed job lookup.
+pub struct BashJob {
+    bash: Arc<Bash>,
+}
+
+impl BashJob {
+    pub fn new(bash: Arc<Bash>) -> Self {
+        Self { bash }
+    }
+}
+
+#[async_trait]
+impl Tool for BashJob {
+    fn name(&self) -> &str {
+        "bash_job"
+    }
+    fn description(&self) -> &str {
+        "Wait for or stop a command that `bash` left running in the background (its result said \
+         \"job N\"). Waiting returns the output printed since the last report: the final result once \
+         the command exits, or another report if it is still running. `kill: true` stops it instead."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "job": { "type": "integer", "description": "The job number from the `bash` result." },
+                "kill": { "type": "boolean", "description": "Stop the job instead of waiting for it." }
+            },
+            "required": ["job"]
+        })
+    }
+    // Waiting reads nothing, but the job it waits on mutates as freely as any `bash` command.
+    fn conservative_exclusive(&self) -> bool {
+        true
+    }
+    async fn run(&self, input: Value) -> Result<ToolOutput, ToolError> {
+        let job = input.get("job").cloned().unwrap_or(Value::Null);
+        self.bash.resume_job(&job, &input, None).await
+    }
+    async fn run_streaming(
+        &self,
+        input: Value,
+        progress: &ToolProgress,
+    ) -> Result<ToolOutput, ToolError> {
+        let job = input.get("job").cloned().unwrap_or(Value::Null);
+        self.bash.resume_job(&job, &input, Some(progress)).await
     }
 }
 
@@ -696,6 +1254,10 @@ fn clean_str(s: &str) -> Cow<'_, str> {
     }
     Cow::Owned(stripped.chars().filter(|&c| is_keepable(c)).collect())
 }
+
+#[cfg(test)]
+#[path = "bash_policy_tests.rs"]
+mod policy_tests;
 
 #[cfg(test)]
 mod tests {

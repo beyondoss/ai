@@ -8734,6 +8734,8 @@ fn build_subagent_ctx(
         memory_mounts,
         tool_cfg: subagent::ChildToolConfig {
             bash_timeout_ms: cfg.bash_timeout_ms,
+            // `serve` exposes no `BashPolicy` flags yet (the A/B runs through `run`).
+            bash_policy: Default::default(),
             bash_shell_path: cfg.bash_shell_path.clone(),
             bash_command_prefix: cfg.bash_command_prefix.clone(),
             remote_shell: cfg
@@ -9172,6 +9174,8 @@ fn build_tools(
     let nested_exclude = cfg.exclude_tools.as_deref().unwrap_or(empty);
     let mut registry = tools::default_registry_with_config(&tools::ToolConfig {
         bash_timeout_ms: cfg.bash_timeout_ms,
+        // No `BashPolicy` flags on `serve` yet: the A/B runs through `run`.
+        bash_policy: Default::default(),
         bash_shell_path: cfg.bash_shell_path.as_deref(),
         bash_command_prefix: cfg.bash_command_prefix.as_deref(),
         web_allow_private: cfg.web_allow_private,
