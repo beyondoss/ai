@@ -6,7 +6,7 @@
   "candidates": 209,
   "probed": 209,
   "good": 92,
-  "lines": 1671,
+  "lines": 1650,
   "stubs": [
     {
       "file": "pyparsing/actions.py",
@@ -414,17 +414,6 @@
       "indent": "        ",
       "sha1": "6275a635e5d79aa52f5781821e38a8940df3c7e7",
       "breaks": 121
-    },
-    {
-      "file": "pyparsing/core.py",
-      "qualname": "Or._setResultsName",
-      "line": 4306,
-      "end_line": 4326,
-      "lines": 21,
-      "doc": false,
-      "indent": "        ",
-      "sha1": "384771972250e64599f1d5b9d792651ad3ee6338",
-      "breaks": 12
     },
     {
       "file": "pyparsing/core.py",

@@ -59,6 +59,27 @@ def load(root: Path) -> list[dict]:
     return [json.loads(p.read_text()) for p in sorted(root.glob("runs/*/*/*/*/result.json"))]
 
 
+ENDS = ("completed", "max_steps", "wall", "cap", "error", "crash")
+
+
+def endings(rows: list[dict]) -> str:
+    """How runs ended, for one cell: `completed 5 · max_steps 2 …`, and how many cut-off runs left a
+    tree that doesn't parse (mid-edit) or a suite that hung."""
+    c = defaultdict(int)
+    for r in rows:
+        c[r.get("end_reason") or ("completed" if r.get("ended") else r.get("killed") or "?")] += 1
+    s = " · ".join(f"{k} {c[k]}" for k in (*ENDS, "?") if c[k])
+    mid = sum(1 for r in rows if r.get("tree_state") == "mid_edit")
+    hang = sum(1 for r in rows if r.get("tree_state") == "suite_hang")
+    return s + (f" (mid-edit {mid})" if mid else "") + (f" (suite hang {hang})" if hang else "")
+
+
+def errs(rows: list[dict]) -> str:
+    """Mean tool errors per run: `hard / soft` (soft: a Python error behind a zero exit)."""
+    n = len(rows) or 1
+    return f"{sum(r.get('tool_errors', 0) for r in rows) / n:.1f} / {sum(r.get('soft_errors', 0) for r in rows) / n:.1f}"
+
+
 def main(argv: list[str]) -> None:
     rows = load(tasks.work_dir())
     if not rows:
@@ -103,6 +124,20 @@ def main(argv: list[str]) -> None:
             base_usd = sum(base[k]["usd"] for k in keys) / len(keys)
             print(f"| {m} | {a} | {len(keys)} | {b} / {c} (p={mcnemar(b, c):.2f}) | {dq[0]:+.1%} ({dq[1]:+.1%}, {dq[2]:+.1%}) "
                   f"| {du[0]:+.2f} ({du[1]:+.2f}, {du[2]:+.2f}) | {du[0] / base_usd:+.0%} |")
+    print()
+    print("How runs ended. A cut-off run (max_steps, wall, cap) is graded on the tree it left; `mid-edit` is one")
+    print("whose library no longer parses. `last parseable` grades those on the last state in which it did.")
+    print()
+    print("| model | trigger | n | end reasons | pass excl. cut-off | mid-edit: bugs fixed final → last parseable | tool errors hard / soft per run |")
+    print("|---|---|---|---|---|---|---|")
+    for (m, a) in sorted(cell, key=lambda k: (k[0], arm_order.get(k[1], 9))):
+        rs = cell[(m, a)]
+        kept = [r for r in rs if not r.get("cut_off", bool(r.get("killed")))]
+        k = sum(r["passed"] for r in kept)
+        mids = [r for r in rs if r.get("last_parseable")]
+        mid = (f"{sum(r['fixed_frac'] for r in mids) / len(mids):.1%} → "
+               f"{sum(r['last_parseable']['fixed_frac'] for r in mids) / len(mids):.1%} ({len(mids)})") if mids else "–"
+        print(f"| {m} | {a} | {len(rs)} | {endings(rs)} | {k}/{len(kept)} | {mid} | {errs(rs)} |")
     print()
     tot = sum(r["usd"] for r in rows)
     print(f"{len(rows)} runs, total ${tot:.2f}; suspect commands in "

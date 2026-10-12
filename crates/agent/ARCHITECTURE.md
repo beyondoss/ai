@@ -1043,6 +1043,42 @@ The harness layers several capabilities over the bare tools + loop:
   memory-index or context-file budget can cut it) and four MCP tasks run with Playwright, GitHub
   and filesystem servers configured, on the candidate both with tool search and with `--code-mode`.
 
+  The code tasks' integrity guarantees, each checked by `mise run eval:validate` (local, no model
+  calls), which must pass before an A/B is trusted:
+  - **No answer key in reach.** A task tree is a clean copy of the pristine tree: no `__pycache__`,
+    `.pyc`, `.so`, `.egg-info`/`.dist-info`, VCS dir, vendored install or patch file, and no removed
+    body left verbatim elsewhere in the tree (boltons' vendored `OrderedMultiDict` copy and three
+    other duplicates were dropped from the specs). `tasks.build` refuses a tree that breaks either
+    rule, cached or fresh. The agent runs in [`sandbox.py`](eval/longctx/sandbox.py)'s user + mount +
+    PID namespace: the work dir (pristine trees, built tasks, every other run), the repo and all of
+    `/home` are empty read-only mounts with only the venv, its base interpreter (minus its
+    site-packages), the agent binary and `rg` bound back; `/tmp` is private per run; a fresh
+    `/proc`, `no_new_privs` and an unmapped host root close `/proc/<pid>/root`, sudo and the docker
+    socket. The validator walks the agent's whole reachable filesystem for any copy of a package
+    under test. The network stays open (the agent needs its provider); the prompt forbids fetching
+    and `suspect` flags it.
+  - **Graded in one place.** The workspace is `/tmp/longctx/work` in every run, arm and grade, so
+    no test sees the host run dir (boltons' `test_iter_find_files` strips characters, not a prefix,
+    and failed in every run dir containing an `f`, i.e. every `default` arm).
+  - **The pristine tree passes 100%.** Tests that can't pass in this environment for reasons no
+    reimplementation fixes are deselected for agent and grader alike (`Repo.deselect`: parso's 14
+    interpreter-message checks, pyparsing's railroad-diagram example); marshmallow gets a
+    metadata-only `dist-info` so `importlib.metadata.version` works as in upstream's installed test
+    env. Test ids holding a clock time (`now()` parameters) collapse to one id, which passes only if
+    every instance does; before that, two marshmallow ids could never match the baseline, so
+    marshmallow could not pass. The validator grades the perfect answer through `run.grade` in four
+    run-dir layouts and requires solved, identical results.
+  - **Endings are recorded, not guessed.** Each result carries `end_reason` (`completed`,
+    `max_steps`, `wall`, `cap`, `error`, `crash`), `cut_off`, `tree_state` (`ok`, `mid_edit` when a
+    library file no longer parses, `suite_hang`, `no_report`) and, for a mid-edit tree,
+    `last_parseable`: the grade of the last state in which every library file parsed, snapshotted
+    after each tool call outside the agent's view. The reports split cut-off runs out.
+  - **Errors the exit code hid.** `tool_errors` counts `is_error` results; `soft_errors` counts bash
+    results showing a traceback or an `AssertionError`/`SyntaxError`/`IndentationError` line behind
+    a zero exit (`pytest | tail`), each also marked `soft_error` on its `tool_end` event. Events
+    carry `t` (seconds since start), each turn's text is logged as `assistant_text`, and the result
+    keeps `final_text` and `started_at`.
+
   ```sh
   cargo test -p beyond-ai-agent --test code_mode_density
   cargo test -p beyond-ai-agent --features code-mode --test code_mode_eval -- --nocapture

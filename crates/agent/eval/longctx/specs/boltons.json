@@ -6,7 +6,7 @@
   "candidates": 350,
   "probed": 350,
   "good": 224,
-  "lines": 2505,
+  "lines": 2430,
   "stubs": [
     {
       "file": "boltons/cacheutils.py",
@@ -142,61 +142,6 @@
     },
     {
       "file": "boltons/dictutils.py",
-      "qualname": "OrderedMultiDict.__init__",
-      "line": 166,
-      "end_line": 174,
-      "lines": 9,
-      "doc": false,
-      "indent": "        ",
-      "sha1": "8bdc8ce775f8a597fdb1c396ef347a3b339f1776",
-      "breaks": 110
-    },
-    {
-      "file": "boltons/dictutils.py",
-      "qualname": "OrderedMultiDict._clear_ll",
-      "line": 184,
-      "end_line": 190,
-      "lines": 7,
-      "doc": false,
-      "indent": "        ",
-      "sha1": "f1fde4fb51e425f5fabb77089935e06169b1e834",
-      "breaks": 110
-    },
-    {
-      "file": "boltons/dictutils.py",
-      "qualname": "OrderedMultiDict.poplast",
-      "line": 405,
-      "end_line": 422,
-      "lines": 18,
-      "doc": true,
-      "indent": "        ",
-      "sha1": "ffa34e0d5a293da841ca41391405e74b5e5a8b0f",
-      "breaks": 1
-    },
-    {
-      "file": "boltons/dictutils.py",
-      "qualname": "OrderedMultiDict.iterkeys",
-      "line": 459,
-      "end_line": 473,
-      "lines": 15,
-      "doc": true,
-      "indent": "        ",
-      "sha1": "899d893c51ac78ea91dcb85c80d77db1b98549e2",
-      "breaks": 23
-    },
-    {
-      "file": "boltons/dictutils.py",
-      "qualname": "OrderedMultiDict.__reversed__",
-      "line": 613,
-      "end_line": 624,
-      "lines": 12,
-      "doc": false,
-      "indent": "        ",
-      "sha1": "2086a3708cfa5a1274a4688991b3fd9bf8755b8b",
-      "breaks": 1
-    },
-    {
-      "file": "boltons/dictutils.py",
       "qualname": "OneToOne.__setitem__",
       "line": 836,
       "end_line": 842,
@@ -292,17 +237,6 @@
       "doc": false,
       "indent": "    ",
       "sha1": "372f66204024cbf5fe28113f4a2dd7d212392e33",
-      "breaks": 2
-    },
-    {
-      "file": "boltons/ecoutils.py",
-      "qualname": "_args2sh",
-      "line": 408,
-      "end_line": 421,
-      "lines": 14,
-      "doc": false,
-      "indent": "    ",
-      "sha1": "32a2849c5ab12fa2160fccdf133ca19a03bb2fbb",
       "breaks": 2
     },
     {

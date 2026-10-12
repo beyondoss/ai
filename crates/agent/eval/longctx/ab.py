@@ -27,7 +27,7 @@ import prefix_tasks
 import run
 import tasks
 from repos import TASKS
-from report import boot_ci, mcnemar, wilson
+from report import boot_ci, endings, errs, mcnemar, wilson
 
 ROOT = run.HERE_ROOT
 
@@ -131,8 +131,8 @@ def cmd_report(a) -> None:
     base = load(base_label, a.arm)
     family = lambda t: "mcp" if t in mcp_tasks.MCP_TASKS else "prefix" if t in prefix_tasks.PREFIX_TASKS else "code"
     print(f"Base {base_label}, candidate {labels[1][0]} (`-cm`: candidate with --code-mode, MCP tasks only).\n")
-    print("| arm | model | family | n | pass (95% CI) | $/task | wall s/task | TTFT first / median s | turns | first-request tok | cache-read share | compactions | maskings |")
-    print("|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+    print("| arm | model | family | n | pass (95% CI) | $/task | wall s/task | TTFT first / median s | turns | first-request tok | cache-read share | compactions | maskings | end reasons | tool errors hard / soft |")
+    print("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
     data = {lab: load(lab, a.arm) for lab, *_ in labels}
     for lab, *_ in labels:
         cell = defaultdict(list)
@@ -145,11 +145,12 @@ def cmd_report(a) -> None:
             print(f"| {lab} | {m} | {f} | {n} | {k}/{n} ({lo:.0%}–{hi:.0%}) | ${avg('usd'):.2f} | {avg('wall_s'):.0f} "
                   f"| {med([r.get('ttft_first') for r in rs]):.2f} / {med([r.get('ttft_median') for r in rs]):.2f} "
                   f"| {avg('turns'):.0f} | {avg('first_prompt'):.0f} | {avg('cache_read_share'):.0%} | {avg('compactions'):.2f} "
-                  f"| {avg('maskings'):.2f} |")
+                  f"| {avg('maskings'):.2f} | {endings(rs)} | {errs(rs)} |")
     print("\nPaired against the base (task × attempt). Verdicts: pass = McNemar p<0.05 or the Δ-fixed CI excludes 0; "
-          "cost and time = the bootstrap CI of the difference excludes 0.\n")
-    print("| arm | model | family | pairs | pass cand-only / base-only (p) | Δ fixed (95% CI) | pass verdict | Δ $ (95% CI) | cost verdict | Δ wall s (95% CI) | time verdict | Δ first-request tok |")
-    print("|---|---|---|---|---|---|---|---|---|---|---|---|")
+          "cost and time = the bootstrap CI of the difference excludes 0. A pair where either side was cut off "
+          "(max_steps, wall, cap) is still counted; `cut-off pairs` says how many.\n")
+    print("| arm | model | family | pairs | pass cand-only / base-only (p) | Δ fixed (95% CI) | pass verdict | Δ $ (95% CI) | cost verdict | Δ wall s (95% CI) | time verdict | Δ first-request tok | cut-off pairs |")
+    print("|---|---|---|---|---|---|---|---|---|---|---|---|---|")
     for lab, *_ in labels[1:]:
         groups = defaultdict(list)
         for key, r in data[lab].items():
@@ -164,7 +165,8 @@ def cmd_report(a) -> None:
             dfp = sum(x.get("first_prompt", 0) - y.get("first_prompt", 0) for _, x, y in ps) / len(ps)
             print(f"| {lab} | {m} | {f} | {len(ps)} | {b} / {c} ({mcnemar(b, c):.2f}) | {dq[0]:+.1%} ({dq[1]:+.1%}, {dq[2]:+.1%}) "
                   f"| {verdict_pass(b, c, dq)} | {du[0]:+.2f} ({du[1]:+.2f}, {du[2]:+.2f}) | {verdict_cost(du)} "
-                  f"| {dw[0]:+.0f} ({dw[1]:+.0f}, {dw[2]:+.0f}) | {verdict_cost(dw)} | {dfp:+.0f} |")
+                  f"| {dw[0]:+.0f} ({dw[1]:+.0f}, {dw[2]:+.0f}) | {verdict_cost(dw)} | {dfp:+.0f} "
+                  f"| {sum(1 for _, x, y in ps if x.get('cut_off', bool(x.get('killed'))) or y.get('cut_off', bool(y.get('killed'))))} |")
 
 
 def main(argv: list[str]) -> None:
