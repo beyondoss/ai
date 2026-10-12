@@ -159,6 +159,84 @@ impl ToolProgress {
 /// would reject every call the loop ever makes to it.
 pub const MODEL_SUPPORTS_VISION_KEY: &str = "_model_supports_vision";
 
+/// An `edit` call's `edits` array, decoding the JSON-encoded-string form some models send in its
+/// place. `None` when there is no array. The `edit` tool parses its entries through this, so every
+/// other reader of a call's targets ([`written_paths`]) sees exactly the entries the tool will apply.
+pub fn edit_entries(input: &Value) -> Option<std::borrow::Cow<'_, [Value]>> {
+    match input.get("edits")? {
+        Value::Array(a) => Some(std::borrow::Cow::Borrowed(a.as_slice())),
+        Value::String(s) => match serde_json::from_str::<Value>(s).ok()? {
+            Value::Array(a) => Some(std::borrow::Cow::Owned(a)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// An `edits[]` entry's own `path`, when it names one. A blank one is absent: models that fill every
+/// advertised property send `""` to mean "the default".
+pub fn edit_entry_path(entry: &Value) -> Option<&str> {
+    entry
+        .get("path")
+        .and_then(Value::as_str)
+        .filter(|p| !p.trim().is_empty())
+}
+
+/// The raw `path` arguments a `write` or `edit` call writes, first-seen order, deduped: the top-level
+/// `path`, then each `edits[]` entry's own (see [`edit_entry_path`]). Empty for any other tool.
+///
+/// The one reading of "which files does this call write" shared by the dispatch write lock (via the
+/// `edit` tool's [`Tool::write_targets`]), `--deny-path`, approval scoping, and compaction's
+/// modified-files provenance — so none of them can miss a file a multi-file `edit` writes. These are
+/// the files a call *may* write; which of an `edit`'s files it did not is in its result
+/// ([`edit_failed_paths`]).
+pub fn written_paths(tool: &str, input: &Value) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if !matches!(tool, "write" | "edit") {
+        return out;
+    }
+    // A blank top-level `path` on an `edit` names no file: models that fill every property send `""`
+    // beside entries that each name their own.
+    if let Some(p) = input
+        .get("path")
+        .and_then(Value::as_str)
+        .filter(|p| tool == "write" || !p.trim().is_empty())
+    {
+        out.push(p.to_string());
+    }
+    if tool == "edit"
+        && let Some(entries) = edit_entries(input)
+    {
+        for p in entries.iter().filter_map(edit_entry_path) {
+            if !out.iter().any(|o| o == p) {
+                out.push(p.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// The line a multi-file `edit` result opens each file it did **not** write with: `FAILED <path> (not
+/// edited):`, the path as the call spelled it, then the reason on the lines below. Each file of such a
+/// call applies on its own, so a result can list edited and failed files side by side; this line is
+/// how both the model and [`edit_failed_paths`] tell them apart.
+pub fn edit_failed_line(path: &str) -> String {
+    format!("{EDIT_FAILED_PREFIX}{path}{EDIT_FAILED_SUFFIX}")
+}
+
+const EDIT_FAILED_PREFIX: &str = "FAILED ";
+const EDIT_FAILED_SUFFIX: &str = " (not edited):";
+
+/// The paths an `edit` result reports as not written (see [`edit_failed_line`]), as the call spelled
+/// them. Empty for a result with no such line — every single-file result, so a failed single-file call
+/// counts its path as it always did.
+pub fn edit_failed_paths(result: &str) -> impl Iterator<Item = &str> {
+    result.lines().filter_map(|l| {
+        l.strip_prefix(EDIT_FAILED_PREFIX)?
+            .strip_suffix(EDIT_FAILED_SUFFIX)
+    })
+}
+
 /// A tool's successful output: text for the model, plus any images it produced (a screenshot, a
 /// rendered chart, `read` on an image file) and an optional hint to end the run.
 ///
@@ -271,6 +349,14 @@ pub trait Tool: Send + Sync {
     /// the default `None` and stay fully concurrent.
     fn write_target(&self, _input: &Value) -> Option<String> {
         None
+    }
+
+    /// Every path this call would write, for a tool that can write several in one call (`edit` with
+    /// per-entry `path`s). The loop groups calls that share *any* of these and locks all of them, in
+    /// sorted order (see [`WriteLockRegistry::lock_all`](crate::WriteLockRegistry::lock_all)).
+    /// Defaults to [`write_target`](Tool::write_target), so a single-path tool overrides only that.
+    fn write_targets(&self, input: &Value) -> Vec<String> {
+        self.write_target(input).into_iter().collect()
     }
 
     /// Whether this call's mutation scope can't be named by [`write_target`](Tool::write_target) at

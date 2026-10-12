@@ -113,6 +113,24 @@ impl WriteLockRegistry {
         reservation.into_guard(guard)
     }
 
+    /// Acquire every key's lock, for one call that writes several files (a multi-file `edit`), and
+    /// hold them all in one guard. Keys are taken in **sorted** order, deduped: two multi-key holders
+    /// then always contend on their lowest shared key first, so they cannot deadlock, and a single-key
+    /// [`lock`](Self::lock) never holds more than one. `None` for no keys (a call that writes
+    /// nothing). Cancelled midway, the keys already held are released as the partial guard drops.
+    pub async fn lock_all(&self, keys: &[String]) -> Option<WriteLockGuard> {
+        let mut sorted: Vec<&str> = keys.iter().map(String::as_str).collect();
+        sorted.sort_unstable();
+        sorted.dedup();
+        let (first, rest) = sorted.split_first()?;
+        let mut guard = self.lock(first).await;
+        for key in rest {
+            let next = self.lock(key).await;
+            guard.also.push(next);
+        }
+        Some(guard)
+    }
+
     #[cfg(test)]
     fn key_count(&self) -> usize {
         self.locks
@@ -161,6 +179,7 @@ impl PendingLock {
             guard: Some(guard),
             locks: self.locks.clone(),
             key: std::mem::take(&mut self.key),
+            also: Vec::new(),
         }
     }
 }
@@ -184,6 +203,8 @@ pub struct WriteLockGuard {
     guard: Option<OwnedMutexGuard<()>>,
     locks: LockMap,
     key: String,
+    /// The other keys of a [`WriteLockRegistry::lock_all`], released (after this one) as the guard drops.
+    also: Vec<WriteLockGuard>,
 }
 
 impl Drop for WriteLockGuard {
@@ -198,6 +219,51 @@ impl Drop for WriteLockGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn lock_all_holds_every_key_and_opposite_orders_do_not_deadlock() {
+        use std::time::Duration;
+
+        let registry = Arc::new(WriteLockRegistry::new());
+        let both = registry
+            .lock_all(&["b.rs".into(), "a.rs".into(), "a.rs".into()])
+            .await;
+        assert!(registry.lock_all(&[]).await.is_none());
+        // A single-key locker on either path waits while the multi-key guard is held.
+        for key in ["a.rs", "b.rs"] {
+            let blocked = tokio::time::timeout(Duration::from_millis(30), registry.lock(key)).await;
+            assert!(blocked.is_err(), "{key} must be held by lock_all");
+        }
+        drop(both);
+        assert_eq!(
+            registry.key_count(),
+            0,
+            "every key is evicted once released"
+        );
+
+        // Two multi-key lockers naming the same keys in opposite orders both finish: sorted
+        // acquisition means neither can hold one key while waiting on the other's.
+        let (r1, r2) = (registry.clone(), registry.clone());
+        let t1 = tokio::spawn(async move {
+            for _ in 0..50 {
+                let _g = r1.lock_all(&["x.rs".into(), "y.rs".into()]).await;
+                tokio::task::yield_now().await;
+            }
+        });
+        let t2 = tokio::spawn(async move {
+            for _ in 0..50 {
+                let _g = r2.lock_all(&["y.rs".into(), "x.rs".into()]).await;
+                tokio::task::yield_now().await;
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            t1.await.unwrap();
+            t2.await.unwrap();
+        })
+        .await
+        .expect("opposite-order lock_all callers deadlocked");
+        assert_eq!(registry.key_count(), 0);
+    }
 
     #[tokio::test]
     async fn same_key_serializes_concurrent_lockers() {

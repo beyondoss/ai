@@ -1042,20 +1042,40 @@ fn render_generic_call(out: &mut String, name: &str, input: &serde_json::Value) 
 /// edit shape (`crate::tools::edit::parse_edits`, the same parser the tool itself uses, so exported
 /// rendering never disagrees with what actually ran).
 fn render_edit_call(out: &mut String, input: &serde_json::Value) {
-    let path = input.get("path").and_then(serde_json::Value::as_str);
     let Ok(edits) = crate::tools::edit::parse_edits(input) else {
         return render_generic_call(out, "edit", input);
     };
-    let title = match path {
-        Some(p) => format!("Edited <code>{}</code>", html_escape(p)),
-        None => "Edit".to_string(),
+    // A multi-file call (entries naming their own `path`) lists every file, and labels each diff
+    // whose file differs from the one before it.
+    let paths = agent_core::tool::written_paths("edit", input);
+    let title = if paths.is_empty() {
+        "Edit".to_string()
+    } else {
+        let names: Vec<String> = paths
+            .iter()
+            .map(|p| format!("<code>{}</code>", html_escape(p)))
+            .collect();
+        format!("Edited {}", names.join(", "))
     };
     let _ = writeln!(
         out,
         "<div class=\"tool-call\"><div class=\"tool-title\">{title}</div>"
     );
-    for (old, new) in &edits {
-        out.push_str(&diff_pair_html(old, new));
+    let top = input.get("path").and_then(serde_json::Value::as_str);
+    let mut shown = top;
+    for e in &edits {
+        let file = e.path.as_deref().or(top);
+        if paths.len() > 1 && file != shown {
+            if let Some(f) = file {
+                let _ = writeln!(
+                    out,
+                    "<div class=\"tool-title\"><code>{}</code></div>",
+                    html_escape(f)
+                );
+            }
+            shown = file;
+        }
+        out.push_str(&diff_pair_html(&e.old, &e.new));
     }
     out.push_str("</div>\n");
 }

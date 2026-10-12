@@ -288,15 +288,23 @@ pub fn scope_key(tool: &str, input: &Value, root: &std::path::Path, world: &Path
             Some(command) => format!("cmd:{command}"),
             None => "cmd:<none>".to_string(),
         },
-        "write" | "edit" => match input.get("path").and_then(Value::as_str) {
-            Some(path) => {
-                // The same form the tools themselves write to, so `./x`, `../dir/x` and (locally) a
-                // symlink to `x` all resolve to one remembered decision rather than three.
-                let target = crate::tools::write_key(root, path, world);
-                format!("path:{target}")
+        "write" | "edit" => {
+            // The same form the tools themselves write to, so `./x`, `../dir/x` and (locally) a
+            // symlink to `x` all resolve to one remembered decision rather than three. A multi-file
+            // `edit` is keyed on its whole sorted set of files: an "always" for one file never
+            // approves a call that also writes another.
+            let mut targets: Vec<String> = agent_core::tool::written_paths(tool, input)
+                .iter()
+                .map(|p| format!("path:{}", crate::tools::write_key(root, p, world)))
+                .collect();
+            targets.sort_unstable();
+            targets.dedup();
+            if targets.is_empty() {
+                "path:<none>".to_string()
+            } else {
+                targets.join("\n")
             }
-            None => "path:<none>".to_string(),
-        },
+        }
         other => format!("tool:{other}"),
     }
 }
@@ -545,6 +553,35 @@ mod tests {
                 root,
                 &PathWorld::Local
             )
+        );
+    }
+
+    #[test]
+    fn a_multi_file_edit_keys_on_its_whole_sorted_set_of_files() {
+        // An "always allow a.md" must not approve a call that also writes b.md, and the key must not
+        // depend on which file the model happened to put first.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let key = |input: Value| scope_key("edit", &input, root, &PathWorld::Local);
+        let single = key(json!({ "path": "a.md", "old_string": "x", "new_string": "y" }));
+        let ab = key(json!({ "path": "a.md", "edits": [
+            { "old_string": "x", "new_string": "y" },
+            { "path": "b.md", "old_string": "x", "new_string": "y" }
+        ]}));
+        let ba = key(json!({ "path": "b.md", "edits": [
+            { "path": "a.md", "old_string": "x", "new_string": "y" },
+            { "old_string": "x", "new_string": "y" }
+        ]}));
+        assert_ne!(single, ab, "one file's decision must not cover two");
+        assert_eq!(ab, ba);
+        assert_eq!(ab.lines().count(), 2, "{ab}");
+        assert!(ab.lines().all(|l| l.starts_with("path:/")), "{ab}");
+        // An entry naming the top-level file adds nothing: still the single-file key.
+        assert_eq!(
+            single,
+            key(json!({ "path": "a.md", "edits": [
+                { "path": "./a.md", "old_string": "x", "new_string": "y" }
+            ]}))
         );
     }
 

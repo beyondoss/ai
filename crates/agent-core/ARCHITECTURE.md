@@ -446,7 +446,10 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
   to the model's prose — never trusting the prose itself.
 
   Three things ride it, for the same reason:
-  - **File awareness** — `extract_file_ops` (read vs. modified paths from `read`/`write`/`edit` calls),
+  - **File awareness** — `extract_file_ops` (read vs. modified paths from `read`/`write`/`edit` calls;
+    the modified side is `tool::written_paths`, so every file a multi-file `edit` names counts — less
+    the files its result reports `FAILED` (`tool::edit_failed_paths`), since each file of such a call
+    applies on its own),
     plus `extract_bash_writes` (files a `bash` command wrote), accumulated and deduped across rounds,
     rendered by `format_file_operations` as `<read-files>`/`<modified-files>`. The bash side parses
     the command text (`bash_writes::written_paths`: redirects, `tee`, `sed -i`, `perl -i`, `mv`/`cp`
@@ -607,8 +610,9 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
   instead of discarding it.
 - **Cross-run file-mutation exclusivity** — `Agent::with_write_locks` shares a `WriteLockRegistry`
   (`write_lock.rs`) across every `Agent` rebuild for a process's lifetime (not just one turn's grouping):
-  a tool's `write_target(input)` path acquires the registry's per-path async lock for the tool's whole
-  serial run, so two `Agent`s built back-to-back (a `set_model` rebuild, or two sessions sharing one
+  a group's targets acquire the registry's per-path async locks for the group's whole serial run
+  (`WriteLockRegistry::lock_all`, which takes them in sorted order so two multi-path holders cannot
+  deadlock), so two `Agent`s built back-to-back (a `set_model` rebuild, or two sessions sharing one
   registry) can't race a same-path `edit`/`write` against each other. Layered on top of, not a
   replacement for, the intra-turn write-target grouping described below. `WriteLockRegistry`'s map entry
   for a key is evicted (pi-parity fix) once its last holder releases it — the returned `WriteLockGuard`
@@ -819,7 +823,7 @@ Session.messages (Arc, shared) ──► ModelRequest ──► ModelTransport::
        │                                                              │                              │
        │                                                          return Ok(())          sink(ToolStart) × N (call order)
        │                                                                                              │
-       │                                            group by write_target → buffer_unordered(≤8 groups)  ◄── bounded; same-path serial
+       │                                            group by write_targets → buffer_unordered(≤8 groups) ◄── bounded; same-path serial
        │                                                                                              │
        │                                                              sink(ToolEnd) × N (call order, post-join)
        │                                                                                              │
@@ -978,11 +982,13 @@ the turn completes as if the model ended normally, with no token accounting, rat
 Once an assistant turn's `tool_uses()` are collected, the calls are dispatched concurrently — but with
 two guards, so concurrency never costs correctness:
 
-- **Same-path calls are serialized.** Each call is grouped by `Tool::write_target(input)` (the path it
-  would mutate, or a unique `solo:<i>` key for read-only/path-less calls). Calls sharing a target run
-  _sequentially in call order_ within their group, because two tools that read-modify-write the same
-  file (the model batching two `edit`s on one source) would otherwise race and drop or interleave a
-  write. Distinct groups still run concurrently against each other.
+- **Same-path calls are serialized.** Each call is grouped by `Tool::write_targets(input)` (the paths
+  it would mutate — `write_target`'s one path by default, every file of a multi-file `edit` — or a
+  group of its own for read-only/path-less calls). Calls sharing **any** target run _sequentially in
+  call order_ within their group (`group_by_write_targets`; a multi-file call joins every group it
+  touches), because two tools that read-modify-write the same file (the model batching two `edit`s on
+  one source) would otherwise race and drop or interleave a write. Distinct groups still run
+  concurrently against each other.
 - **Concurrency is bounded.** Groups are run through `futures::stream::buffer_unordered` with a cap of
   `MAX_CONCURRENT_TOOL_GROUPS` (8), so a turn requesting dozens of `bash`/`grep` calls can't spawn that
   many subprocesses / parallel walks at once (`grep` itself fans out over CPU cores, which would
@@ -1127,7 +1133,7 @@ in `benches/decode.rs` (framing is ~4× faster on coalesced chunks: ~2 allocatio
       ├──no complete tool_use blocks──► Ok(()) [done]                     │
       │                                                                    │
       └──complete tool_use blocks present──► [dispatch tools: grouped, bounded] ┘
-            ToolStart×N → group by write_target → buffer_unordered(≤8) → ToolEnd×N + tool_results pushed
+            ToolStart×N → group by write_targets → buffer_unordered(≤8) → ToolEnd×N + tool_results pushed
 ```
 
 | From              | Event                                   | To                    | Guard                                                                                                                       | What Actually Happens                                                                                                                                                                                                                                                                                                             |

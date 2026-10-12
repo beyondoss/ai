@@ -225,22 +225,32 @@ impl AgentHooks for ToolPolicy {
             }
         }
         if (name == "write" || name == "edit") && !self.denied_paths.is_empty() {
-            let path = input.get("path").and_then(Value::as_str)?;
-            // The same canonical form `WriteLockRegistry` keys on, and — crucially — the same one the
-            // `write`/`edit` tools themselves compute: resolved against *this policy's root* (the tools'
-            // root; the process cwd when empty) and symlink-followed when the target already exists, so
-            // a pattern like `--deny-path '/etc/**'` can't be sidestepped with a `./`/`..`-laden or
-            // relative spelling of the same path. Resolving against a different root than the tools use
-            // would check a path that is not the one about to be written.
-            let target = crate::tools::write_key(&self.root, path, &self.world());
-            if let Some(m) = self.denied_paths.iter().find(|m| m.is_match(&target)) {
-                return Some(format!(
-                    "path '{target}' is denied by policy (matches {:?})",
-                    m.glob().glob()
-                ));
+            // Every file the call writes — a multi-file `edit` names one per entry, and checking only
+            // the top-level `path` would let an entry write a denied file.
+            for path in agent_core::tool::written_paths(name, input) {
+                if let Some(reason) = self.denied_path_reason(&path) {
+                    return Some(reason);
+                }
             }
         }
         None
+    }
+}
+
+impl ToolPolicy {
+    fn denied_path_reason(&self, path: &str) -> Option<String> {
+        // The same canonical form `WriteLockRegistry` keys on, and — crucially — the same one the
+        // `write`/`edit` tools themselves compute: resolved against *this policy's root* (the tools'
+        // root; the process cwd when empty) and symlink-followed when the target already exists, so
+        // a pattern like `--deny-path '/etc/**'` can't be sidestepped with a `./`/`..`-laden or
+        // relative spelling of the same path. Resolving against a different root than the tools use
+        // would check a path that is not the one about to be written.
+        let target = crate::tools::write_key(&self.root, path, &self.world());
+        let m = self.denied_paths.iter().find(|m| m.is_match(&target))?;
+        Some(format!(
+            "path '{target}' is denied by policy (matches {:?})",
+            m.glob().glob()
+        ))
     }
 }
 
@@ -307,6 +317,37 @@ mod tests {
                 .is_none(),
             "bash-pattern deny-listing must only ever apply to the `bash` tool itself"
         );
+    }
+
+    #[tokio::test]
+    async fn denies_a_multi_file_edit_when_any_entry_names_a_denied_path() {
+        // The top-level `path` is fine; the second entry writes the secret. Checking only the
+        // top-level path would let a per-entry `path` walk straight past `--deny-path`, including in
+        // the JSON-string `edits` form the tool also accepts.
+        let dir = tempfile::tempdir().unwrap();
+        let policy = ToolPolicy::new().deny_path("*.env");
+        let session = agent_core::Session::new();
+        let cancel = CancellationToken::new();
+        let ok = dir.path().join("notes.md");
+        let secret = dir.path().join("secrets.env");
+        let entries = json!([
+            { "old_string": "a", "new_string": "b" },
+            { "path": secret.to_str().unwrap(), "old_string": "a", "new_string": "b" }
+        ]);
+        for edits in [entries.clone(), json!(entries.to_string())] {
+            let reason = policy
+                .before_tool_call(
+                    "edit",
+                    &json!({ "path": ok.to_str().unwrap(), "edits": edits }),
+                    &session,
+                    &cancel,
+                )
+                .await;
+            assert!(
+                reason.as_deref().is_some_and(|r| r.contains("secrets.env")),
+                "got {reason:?}"
+            );
+        }
     }
 
     #[tokio::test]
