@@ -424,15 +424,7 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
     in this prefix…"). Each genuine user turn's text, deduped, capped at 4,000 chars; past four, the
     first and the latest. Persisted on the compaction record like the rest of the provenance, and handed to the re-render beside the file tags (its `<previous-summary>` has carry blocks stripped, so it would otherwise never see the user's words again).
 
-  And three about what compaction keeps and when masking pays:
-  - `track_bash_edits` (`bash-edits`): files a `bash` command wrote join the modified-files
-    provenance (`extract_bash_writes`, over `bash_writes::written_paths`: redirects, `tee`, `sed -i`,
-    `perl -i`, `mv`/`cp` destinations, and Python heredocs or `-c` that `open(…, 'w')` or
-    `write_text` a literal or a name bound to one, joined onto the last `cd`). A parser, not a
-    filesystem diff, so the provenance stays derivable from the transcript. Claude Sonnet 5.5 edited
-    almost only through `bash` (2 `write`/`edit` calls in 17 runs), so 19 of its 23 summaries missed
-    changed files (102); over the eval's 4,623 bash commands the parser recovers all of them, and 25
-    of 25 sampled hits are real edits.
+  And two about when masking pays:
   - `mask_breakeven` (`mask-breakeven`): a masking pass applies only if `mask_net_saving` is positive —
     `0.1 · freed · (freed / growth) ≥ (w − 0.1) · rewrite`: turns of cheaper reads until the freed room
     refills (`growth_per_turn` over the last 10 turns) against rewriting everything from the first
@@ -460,8 +452,15 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
 
   Two things ride it, for the same reason:
   - **File awareness** — `extract_file_ops` (read vs. modified paths from `read`/`write`/`edit` calls),
-    accumulated and deduped across rounds, rendered by `format_file_operations` as
-    `<read-files>`/`<modified-files>`.
+    plus `extract_bash_writes` (files a `bash` command wrote), accumulated and deduped across rounds,
+    rendered by `format_file_operations` as `<read-files>`/`<modified-files>`. The bash side parses
+    the command text (`bash_writes::written_paths`: redirects, `tee`, `sed -i`, `perl -i`, `mv`/`cp`
+    destinations, and Python heredocs or `-c` that `open(…, 'w')` or `write_text` a literal or a name
+    bound to one, joined onto the last `cd`) rather than diffing the filesystem, so the provenance
+    stays derivable from the transcript. Claude Sonnet 5.5 edited almost only through `bash` (2
+    `write`/`edit` calls in 17 eval runs), so 19 of its 23 summaries missed changed files (102); over
+    the eval's 4,623 bash commands the parser recovers all of them, and 25 of 25 sampled hits are real
+    edits.
   - **The model's plan** — `extract_todos` (the last `todo` call's list), rendered by `format_todo_list`
     as `<todo_list>`. _Last-wins_, not accumulated: the `todo` tool's contract is a full replace, so
     folding two rounds' lists together would resurrect steps the model deliberately dropped — and an

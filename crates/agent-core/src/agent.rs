@@ -2446,11 +2446,9 @@ impl Agent {
             file_ops.user_requests =
                 compaction::merge_user_requests(&file_ops.user_requests, &prefix);
         }
-        if candidates.track_bash_edits {
-            for path in compaction::extract_bash_writes(&prefix) {
-                if !file_ops.modified_files.contains(&path) {
-                    file_ops.modified_files.push(path);
-                }
+        for path in compaction::extract_bash_writes(&prefix) {
+            if !file_ops.modified_files.contains(&path) {
+                file_ops.modified_files.push(path);
             }
         }
         // The kept suffix, shown read-only to a re-render so its summary is current
@@ -13774,34 +13772,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_bash_edits_candidate_lists_files_written_through_bash() {
-        async fn modified(candidates: compaction::CompactionCandidates) -> (Vec<String>, String) {
-            let mock = Arc::new(MockTransport::new(vec![turn::text("## Goal\nsummary")]));
-            let agent = summary_agent(&mock, rerender_config(candidates));
-            let mut session = masking_session(0, 12);
-            session.messages = Arc::new({
-                let mut m = (*session.messages).clone();
-                m[1] = Message::assistant(vec![ContentBlock::tool_use(
-                    "c0",
-                    "bash",
-                    json!({ "command": "cd pkg && sed -i 's/a/b/' src/m.py && python -m pytest -q" }),
-                )]);
-                m
-            });
-            compact_once(&agent, &mut session).await;
-            (
-                session.compaction.modified_files.clone(),
-                last_text(&session.messages[0]).to_string(),
-            )
-        }
-        let (files, summary) = modified(Default::default()).await;
-        assert!(files.is_empty() && !summary.contains("<modified-files>"));
-        let (files, summary) = modified(compaction::CompactionCandidates {
-            track_bash_edits: true,
-            ..Default::default()
-        })
-        .await;
-        assert_eq!(files, ["pkg/src/m.py"]);
-        assert!(summary.contains("<modified-files>\npkg/src/m.py\n</modified-files>"));
+    async fn files_written_through_bash_join_the_modified_files() {
+        let mock = Arc::new(MockTransport::new(vec![turn::text("## Goal\nsummary")]));
+        let agent = summary_agent(&mock, rerender_config(Default::default()));
+        let mut session = masking_session(0, 12);
+        session.messages = Arc::new({
+            let mut m = (*session.messages).clone();
+            m[1] = Message::assistant(vec![ContentBlock::tool_use(
+                "c0",
+                "bash",
+                json!({ "command": "cd pkg && sed -i 's/a/b/' src/m.py && python -m pytest -q" }),
+            )]);
+            m
+        });
+        compact_once(&agent, &mut session).await;
+        assert_eq!(session.compaction.modified_files, ["pkg/src/m.py"]);
+        assert!(
+            last_text(&session.messages[0])
+                .contains("<modified-files>\npkg/src/m.py\n</modified-files>")
+        );
     }
 }
