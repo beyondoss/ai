@@ -1148,6 +1148,15 @@ const CARRY_BLOCKS: [(&str, &str); 5] = [
     ("<memory-notes>", "</memory-notes>"),
 ];
 
+/// A summarizing model's reply with any carry blocks it echoed at its end removed, so the host's
+/// fresh copies are the only ones. The cached call sees the previous summary, blocks and all, as the
+/// conversation's first message, and a model that writes its checkpoint in the same shape ends it the
+/// same way: measured live on Claude Haiku 5.5, the blocks doubled every round (1, 2, 2, 4, 4 over five
+/// rounds) before this. Only the tail is touched, as in [`previous_summary`].
+pub fn strip_echoed_carry(reply: &str) -> &str {
+    strip_carry_blocks(reply)
+}
+
 /// Strip every trailing [`CARRY_BLOCKS`] block from a summary body, leaving only the model's own prose.
 ///
 /// Peels from the tail rather than searching the whole body: the blocks are only ever *appended*, in a

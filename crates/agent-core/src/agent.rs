@@ -2552,6 +2552,8 @@ impl Agent {
                 }
             },
         };
+        // Blocks the model echoed would sit beside the fresh copies appended below.
+        let summary = compaction::strip_echoed_carry(&summary);
         if summary.trim().is_empty() {
             // A genuine summarization call ran (unlike the two early no-ops above, which never call the
             // model at all) but came back blank — functionally the same "nothing new to say" no-op as
@@ -13583,5 +13585,26 @@ mod tests {
         assert_eq!(summary.matches("<user-requests>").count(), 1);
         assert!(summary.contains("on luna") && summary.contains("the task"));
         assert_well_formed(&session.messages);
+    }
+
+    #[tokio::test]
+    async fn carry_blocks_a_model_echoes_are_replaced_not_doubled() {
+        // The cached call sees the previous summary, blocks included, and a model that mirrors its
+        // shape ends with them too (live on Haiku 5.5 they doubled every round). Only the host's
+        // fresh copies survive.
+        let mock = Arc::new(MockTransport::new(vec![turn::text(
+            "## Goal\nthe state\n\n<read-files>\nsrc/stale.rs\n</read-files>\n\n<user-requests>\nthe task\n</user-requests>\n",
+        )]));
+        let agent = summary_agent(&mock, summary_config());
+        let mut session = summarized_session(12);
+        compact_once(&agent, &mut session).await;
+        let summary = last_text(&session.messages[0]);
+        assert_eq!(summary.matches("<read-files>").count(), 1, "{summary}");
+        assert!(!summary.contains("src/stale.rs"));
+        assert!(summary.contains("<read-files>\nsrc/f0.rs"));
+        assert!(
+            !summary.contains("<user-requests>"),
+            "nothing carries requests by default"
+        );
     }
 }

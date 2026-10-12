@@ -448,6 +448,9 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
   - **The user's requests**, under the `carry-request` candidate only (see "Candidates under
     evaluation") — `merge_user_requests`, rendered by `format_user_requests` as `<user-requests>`.
 
+  `compact` first strips any blocks the model echoed at the end of its own reply (`strip_echoed_carry`):
+  the cached call sees the previous summary, blocks included, and a model that mirrors its shape ends
+  the same way — live on Haiku 5.5 they doubled every round (1, 2, 2, 4, 4 over five) before this.
   `previous_summary` strips these blocks back off the body before it is fed forward — both into the
   incremental summarization prompt (or the model echoes a stale copy into its prose alongside the fresh
   ones) and into `compact`'s own `turn_start == 1` verbatim-reuse path (or every split-turn round appends
