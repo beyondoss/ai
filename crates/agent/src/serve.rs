@@ -428,8 +428,7 @@ use tokio::sync::mpsc;
 
 use crate::gateway_credential::{GatewayCredential, resolve_gateway_credential};
 use crate::session_store::{
-    BranchInfo, BranchSummaryDetails, CompactionMeta, SessionMeta, SessionRepo, SessionStore,
-    search_sessions,
+    BranchInfo, BranchSummaryDetails, SessionMeta, SessionRepo, SessionStore, search_sessions,
 };
 use crate::tools;
 
@@ -1106,7 +1105,6 @@ impl ShutdownSignal {
 async fn persist_blocking(
     mut persistence: Persistence,
     session: Session,
-    tokens_before: Option<u32>,
 ) -> (Persistence, std::io::Result<()>) {
     // `persist` never panics itself (it handles its own I/O errors internally — see the `Err` arm
     // below for what a caller does with the returned `Result`), and this task is never cancelled
@@ -1114,7 +1112,7 @@ async fn persist_blocking(
     // panicked. Re-raise that panic rather than `.expect()`ing (denied by the workspace's
     // panic-surface lints) on what would otherwise look like an ordinary recoverable error.
     match tokio::task::spawn_blocking(move || {
-        let r = persistence.persist(&session, tokens_before);
+        let r = persistence.persist(&session);
         (persistence, r)
     })
     .await
@@ -1130,10 +1128,11 @@ async fn persist_blocking(
 async fn persist_messages_blocking(
     mut persistence: Persistence,
     messages: Arc<Vec<agent_core::Message>>,
+    provenance: agent_core::CompactionProvenance,
 ) -> (Persistence, std::io::Result<()>) {
     match tokio::task::spawn_blocking(move || {
         let r = simulated_checkpoint_write(&persistence.meta.id)
-            .and_then(|()| persistence.persist_messages(&messages));
+            .and_then(|()| persistence.persist_messages(&messages, &provenance));
         (persistence, r)
     })
     .await
@@ -1181,10 +1180,12 @@ async fn open_persistence_blocking(
 /// does the actual (blocking) append.
 struct ChannelCheckpoint(mpsc::UnboundedSender<Checkpoint>);
 
-/// One mid-run checkpoint on its way to the session loop: the transcript snapshot, and the
-/// acknowledgement the loop sends once it is on disk.
+/// One mid-run checkpoint on its way to the session loop: the transcript snapshot, its compaction
+/// provenance (whose generation tells the store a compaction happened since its last write; see
+/// [`SessionStore::persist`]), and the acknowledgement the loop sends once it is on disk.
 type Checkpoint = (
     Arc<Vec<agent_core::Message>>,
+    agent_core::CompactionProvenance,
     tokio::sync::oneshot::Sender<Result<(), String>>,
 );
 
@@ -1203,7 +1204,11 @@ impl agent_core::CheckpointHook for ChannelCheckpoint {
     /// one that never happened.
     async fn checkpoint(&self, session: &Session) -> Result<(), String> {
         let (ack, persisted) = tokio::sync::oneshot::channel();
-        if self.0.send((session.messages.clone(), ack)).is_err() {
+        if self
+            .0
+            .send((session.messages.clone(), session.compaction.clone(), ack))
+            .is_err()
+        {
             return Err("the session loop is gone".into());
         }
         persisted
@@ -1523,47 +1528,36 @@ impl Persistence {
         self.store.as_ref().is_some_and(SessionStore::superseded)
     }
 
-    /// Persist the session after a turn: non-destructively rewrite the transcript (see
-    /// `SessionStore::rewrite_compacted`) if compaction fired this round, otherwise write any messages
-    /// a masking pass rewrote in place (`SessionStore::record_edits`) and append just the new messages.
-    /// Mid-run checkpoints only append, so a masking pass reaches disk here, at the end of the turn; a
-    /// crash before then reloads the unmasked transcript, which is valid, just larger. `tokens_before` is `Some` (carrying `AgentEvent::Compacted`'s own value) exactly
-    /// when a compaction fired.
-    fn persist(&mut self, session: &Session, tokens_before: Option<u32>) -> std::io::Result<()> {
+    /// Persist the session after a turn ([`SessionStore::persist`]): a compaction not yet on disk is
+    /// written as one, non-destructively; then any tool results a masking pass rewrote in place; then
+    /// the new messages. Mid-run checkpoints skip the masked results (they carry no `edited` list),
+    /// so a masking pass reaches disk here, at the end of the turn; a crash before then reloads the
+    /// unmasked transcript, which is valid, just larger.
+    fn persist(&mut self, session: &Session) -> std::io::Result<()> {
         let Some(store) = &mut self.store else {
             return Ok(());
         };
-        let r = match tokens_before {
-            Some(tokens_before) => store.rewrite_compacted(
-                &session.messages,
-                CompactionMeta {
-                    tokens_before,
-                    // Fix 2 (pi-parity fix): persist this round's folded-forward file-provenance onto
-                    // the new `Entry::Compaction` record — otherwise it never reaches disk at all, and
-                    // a restart/reattach after this round forgets every file this session has ever
-                    // touched (see `Entry::Compaction::read_files`'s own doc comment).
-                    provenance: session.compaction.clone(),
-                },
-            ),
-            // A masking pass rewrote old messages in place (`Session::edited`); append can't see that.
-            None => store
-                .record_edits(&session.messages, &session.edited)
-                .and_then(|()| store.append_new(&session.messages)),
-        };
+        let r = store.persist(&session.messages, &session.compaction, &session.edited);
         if let Err(e) = &r {
             eprintln!("serve: failed to persist session: {e}");
         }
         r
     }
 
-    /// Incremental persist for a mid-run checkpoint (see [`ChannelCheckpoint`]) — always a plain
-    /// append, never a compacted rewrite: compaction only ever runs at a turn's *start*, strictly
-    /// before that turn's own checkpoint(s), so the session a checkpoint carries is never mid-compaction.
-    fn persist_messages(&mut self, messages: &[agent_core::Message]) -> std::io::Result<()> {
+    /// Incremental persist for a mid-run checkpoint (see [`ChannelCheckpoint`]). Keyed on the
+    /// compaction generation, not just the message count: a checkpoint right after a mid-run
+    /// compaction (`Agent::compact` takes one) writes the rewrite then and there, so a later
+    /// checkpoint, once the list outgrows its old length, can never chain the post-compaction tail
+    /// onto the uncompacted history — what a crash before the end of the turn used to leave behind.
+    fn persist_messages(
+        &mut self,
+        messages: &[agent_core::Message],
+        provenance: &agent_core::CompactionProvenance,
+    ) -> std::io::Result<()> {
         let Some(store) = &mut self.store else {
             return Ok(());
         };
-        let r = store.append_new(messages);
+        let r = store.persist(messages, provenance, &[]);
         if let Err(e) = &r {
             eprintln!("serve: failed to persist checkpoint: {e}");
         }
@@ -4231,6 +4225,13 @@ pub(crate) async fn serve_session(
             // A compaction ends in a checkpoint, which waits until it is on disk (see
             // `ChannelCheckpoint`): persist checkpoints while it runs, as the prompt loop does. Scoped
             // so the compaction's borrows (`session`, the `compacted_*` slots) end with it.
+            // The pre-compaction active path, for `first_kept_entry_id` below: the compaction's own
+            // checkpoint rewrites the store before the call returns.
+            let ids_before: Vec<String> = persistence
+                .store
+                .as_ref()
+                .map(|s| s.active_ids().to_vec())
+                .unwrap_or_default();
             let result = {
                 let compaction_cancel = CancellationToken::new();
                 let mut on_event = |ev: AgentEvent| {
@@ -4271,9 +4272,9 @@ pub(crate) async fn serve_session(
                 loop {
                     tokio::select! {
                         biased;
-                        Some((messages, ack)) = checkpoint_rx.recv() => {
+                        Some((messages, provenance, ack)) = checkpoint_rx.recv() => {
                             let (p, r) = write_then_ack(
-                                persist_messages_blocking(persistence, messages),
+                                persist_messages_blocking(persistence, messages, provenance),
                                 ack,
                             )
                             .await;
@@ -4289,16 +4290,12 @@ pub(crate) async fn serve_session(
             match result {
                 Ok(outcome) => {
                     // The tree entry that begins the retained (post-compaction) portion of history —
-                    // resolved *before* `persist_blocking` below rewrites `persistence`'s own store.
-                    let first_kept_entry_id = compacted_first_kept.and_then(|first_kept| {
-                        persistence
-                            .store
-                            .as_ref()
-                            .and_then(|s| s.active_ids().get(first_kept).cloned())
-                    });
+                    // resolved against the active path as it was before the compaction rewrote it.
+                    let first_kept_entry_id =
+                        compacted_first_kept.and_then(|first_kept| ids_before.get(first_kept).cloned());
                     while checkpoint_rx.try_recv().is_ok() {}
                     let (p, persist_result) =
-                        persist_blocking(persistence, session.clone(), compacted_tokens_before)
+                        persist_blocking(persistence, session.clone())
                             .await;
                     persistence = p;
                     match persist_result {
@@ -4721,18 +4718,10 @@ pub(crate) async fn serve_session(
                     )
                 });
                 let cancel = CancellationToken::new();
-                // The sink sets this to the compaction's `tokens_before` when the loop compacts
-                // mid-run, so we know to non-destructively rewrite (not append) the persisted
-                // transcript afterwards. 0 doubles as "no compaction fired this run" — see
-                // `Persistence::persist`; in practice a real compaction's `tokens_before` is never
-                // legitimately 0 (`should_compact`/`compact` only ever fire once real usage has been
-                // recorded). Reset (not recreated) at the top of each retry attempt below, so the value
-                // read after the loop always reflects only the most recent attempt.
-                let tokens_before = Arc::new(AtomicU32::new(0));
                 // Whether the run's *last* turn ended in a refusal — set from every `TurnEnd`, so by
                 // the time the run returns it reflects only the final one (any refusal earlier in a
                 // multi-turn run is superseded once the model goes on to call tools or answer plainly).
-                // Also reset per retry attempt, for the same reason as `tokens_before`.
+                // Reset per retry attempt, so the value read after the loop reflects only the last.
                 let refused = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 // Whether an auto-triggered compaction is *currently* in flight this instant — pi's
                 // `isCompacting`, surfaced from `get_state`. Set on `AgentEvent::CompactionStart`,
@@ -4813,7 +4802,6 @@ pub(crate) async fn serve_session(
                 let own_injection = crate::tools::mcp_events::injection_batch(&cmd);
                 let mut steered_injections: Vec<u64> = Vec::new();
                 let result = 'retry: loop {
-                    tokens_before.store(0, Ordering::Relaxed);
                     refused.store(false, Ordering::Relaxed);
                     is_compacting.store(false, Ordering::Relaxed);
                     pending_deferred.clear();
@@ -4825,7 +4813,6 @@ pub(crate) async fn serve_session(
                     let tx = out_tx.clone();
                     let mcp_task_journal = mcp_task_tx.clone();
                     let mcp_journal_session = persistence.session_id().to_owned();
-                    let tokens_before_sink = tokens_before.clone();
                     let refused_sink = refused.clone();
                     let is_compacting_sink = is_compacting.clone();
                     // Live token/step counters a `get_state`/`get_session_stats` sent while this run is in
@@ -4880,8 +4867,7 @@ pub(crate) async fn serve_session(
                                 matches!(ev, AgentEvent::CompactionStart { .. }),
                                 Ordering::Relaxed,
                             );
-                            if let AgentEvent::Compacted { tokens_before, .. } = ev {
-                                tokens_before_sink.store(tokens_before, Ordering::Relaxed);
+                            if let AgentEvent::Compacted { .. } = ev {
                                 // The context just dropped — re-arm the pressure nudge for the next
                                 // fill cycle.
                                 pressure_armed_sink.store(true, Ordering::Relaxed);
@@ -5028,12 +5014,12 @@ pub(crate) async fn serve_session(
                                 // right after this loop, below, before it can leak into some later, unrelated
                                 // turn — see that drain's own comment for why "harmless, the final persist
                                 // is a superset" isn't quite true on its own.
-                                Some((messages, ack)) = checkpoint_rx.recv() => {
+                                Some((messages, provenance, ack)) = checkpoint_rx.recv() => {
                                     // The agent is waiting on the acknowledgement before it dispatches
                                     // the next tool, and acts on a failure — the tool does not run (see
                                     // `ChannelCheckpoint`). Sent only once the write is done.
                                     let (p, r) = write_then_ack(
-                                        persist_messages_blocking(persistence, messages),
+                                        persist_messages_blocking(persistence, messages, provenance),
                                         ack,
                                     )
                                     .await;
@@ -5537,14 +5523,8 @@ pub(crate) async fn serve_session(
 
                     // Persist whatever this attempt produced (even a failed one may have committed a tool
                     // round-trip or two before the error) before deciding whether to retry.
-                    let compacted_tokens_before = match tokens_before.load(Ordering::Relaxed) {
-                        0 => None,
-                        n => Some(n),
-                    };
                     {
-                        let (p, r) =
-                            persist_blocking(persistence, session.clone(), compacted_tokens_before)
-                                .await;
+                        let (p, r) = persist_blocking(persistence, session.clone()).await;
                         persistence = p;
                         persist_error = r.err().map(|e| e.to_string());
                     }
@@ -5658,7 +5638,7 @@ pub(crate) async fn serve_session(
                                 if let Some(record) = withheld_error_record.take() {
                                     session.push(record);
                                     let (p, r) =
-                                        persist_blocking(persistence, session.clone(), None).await;
+                                        persist_blocking(persistence, session.clone()).await;
                                     persistence = p;
                                     if let Err(e) = r {
                                         persist_error = Some(e.to_string());
@@ -8255,7 +8235,7 @@ pub(crate) async fn serve_session(
                     "{label}\n$ {command}\n\n{status_line}{}{result_text}",
                     if is_error { "(error)\n" } else { "" }
                 )));
-                let (p, r) = persist_blocking(persistence, session.clone(), None).await;
+                let (p, r) = persist_blocking(persistence, session.clone()).await;
                 persistence = p;
                 if let Err(e) = r {
                     eprintln!("serve: failed to persist host bash result: {e}");
@@ -12530,7 +12510,7 @@ mod tests {
                     ..Default::default()
                 }),
         );
-        persistence.persist(&session, None).unwrap();
+        persistence.persist(&session).unwrap();
         drop(persistence);
         drop(session);
 

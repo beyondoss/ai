@@ -970,6 +970,12 @@ pub struct SessionStore {
     meta: SessionMeta,
     /// How many messages are already on disk (on the active path) — the append cursor.
     persisted: usize,
+    /// `Session::compaction.compactions` as of the last write: the compaction generation on disk.
+    /// A session ahead of it was compacted since, and [`Self::persist`] writes that rewrite before
+    /// anything else — the signal `persisted` (a message count) can't give, since a compaction's
+    /// shrink looks to it like nothing new. Set from the session `open` returns, so a legacy file
+    /// whose provenance never restored starts in step with what it reloads.
+    compactions_written: u32,
     /// Every known node (message), by id — spans the whole tree, not just the active path.
     nodes: HashMap<String, Node>,
     /// Ids of the messages on the currently active path, root-first, parallel to `Session.messages`.
@@ -1042,6 +1048,7 @@ impl SessionStore {
             log,
             meta,
             persisted: 0,
+            compactions_written: 0,
             nodes: HashMap::new(),
             active: Vec::new(),
             branch_summary_details: HashMap::new(),
@@ -1434,6 +1441,7 @@ impl SessionStore {
                 log,
                 meta,
                 persisted,
+                compactions_written: session.compaction.compactions,
                 nodes,
                 active,
                 branch_summary_details,
@@ -1601,6 +1609,39 @@ impl SessionStore {
         }
         self.persisted = messages.len();
         Ok(())
+    }
+
+    /// Persist a session's transcript, whatever happened to it since the last write: a compaction
+    /// (`provenance.compactions` ahead of what is on disk) is written as one with
+    /// [`Self::rewrite_compacted`] — its `tokens_before` read back off the summary — then any tool
+    /// results a masking pass rewrote in place ([`Self::record_edits`]), then whatever is new
+    /// ([`Self::append_new`]). Every persist path (`run`'s, `serve`'s checkpoints, end of turn and
+    /// manual `compact`) goes through this, so none can append a post-compaction tail onto the
+    /// uncompacted history: `append_new` alone is count-keyed and reads a compaction's shrink as
+    /// "nothing new", then, once the list outgrows its old length, chains the wrong messages on.
+    pub fn persist(
+        &mut self,
+        messages: &[Message],
+        provenance: &CompactionProvenance,
+        edited: &[usize],
+    ) -> std::io::Result<()> {
+        if provenance.compactions != self.compactions_written {
+            let tokens_before = messages
+                .first()
+                .and_then(agent_core::compaction::summary_tokens_before)
+                .unwrap_or(0);
+            self.rewrite_compacted(
+                messages,
+                CompactionMeta {
+                    tokens_before,
+                    provenance: provenance.clone(),
+                },
+            )?;
+            self.compactions_written = provenance.compactions;
+            return Ok(());
+        }
+        self.record_edits(messages, edited)?;
+        self.append_new(messages)
     }
 
     /// Write the tool results a masking pass rewrote in place since they were stored — at the message
@@ -1878,6 +1919,7 @@ impl SessionStore {
         self.active = new_active;
         self.persisted = messages.len();
         if full_reset {
+            self.compactions_written = 0;
             self.labels.clear();
             self.model_changes.clear();
             self.level_changes.clear();

@@ -4087,62 +4087,20 @@ impl agent_core::CheckpointHook for DirectCheckpoint {
 }
 
 /// `run`'s session store (`None` when not persisting), shared by [`DirectCheckpoint`], the
-/// end-of-turn [`persist_run`] and the run journal, plus how many compactions it holds.
-#[derive(Clone)]
-struct RunStore {
-    store: Arc<std::sync::Mutex<Option<SessionStore>>>,
-    /// `session.compaction.compactions` as of the last write: behind it means a compaction rewrote
-    /// the transcript since, and the next persist must write that rewrite.
-    compactions: Arc<std::sync::atomic::AtomicU32>,
-}
+/// end-of-turn [`persist_run`] and the run journal.
+type RunStore = Arc<std::sync::Mutex<Option<SessionStore>>>;
 
-impl RunStore {
-    /// `store`, holding `session` as opened (its compaction count is what is already on disk).
-    fn new(store: Option<SessionStore>, session: &Session) -> Self {
-        Self {
-            store: Arc::new(std::sync::Mutex::new(store)),
-            compactions: Arc::new(session.compaction.compactions.into()),
-        }
-    }
-}
-
-/// Persist `session`: a compaction since the last write is written as one
-/// ([`SessionStore::rewrite_compacted`]); otherwise messages a masking pass rewrote in place are
-/// written as edits ([`SessionStore::record_edits`]) and whatever is new is appended. Called at every
-/// checkpoint and after each whole turn (a checkpoint never fires for the turn's own final assistant
-/// message; see `agent_core::Agent::run_turn`'s doc comment on where checkpoints land). A no-op when
-/// `run` isn't persisting at all, or when nothing is new.
-///
-/// `append_new` alone is count-keyed and cannot see a compaction's shrink: `run` used to skip every
-/// message after a compaction until the list grew past its old length, then chain the wrong tail onto
-/// the uncompacted history, so a resumed session lost the compaction and the turns after it.
-/// `Agent::compact` checkpoints right after the rewrite, so it lands before anything else is appended.
+/// Persist `session` ([`SessionStore::persist`]: a compaction since the last write, then any masked
+/// results, then whatever is new). Called at every checkpoint and after each whole turn (a checkpoint
+/// never fires for the turn's own final assistant message; see `agent_core::Agent::run_turn`'s doc
+/// comment on where checkpoints land). A no-op when `run` isn't persisting at all, or when nothing is
+/// new. `Agent::compact` checkpoints right after its rewrite, so it lands before anything else.
 fn persist_run(run: &RunStore, session: &Session) -> std::io::Result<()> {
-    use std::sync::atomic::Ordering::Relaxed;
-    let mut guard = run.store.lock().unwrap_or_else(|e| e.into_inner());
+    let mut guard = run.lock().unwrap_or_else(|e| e.into_inner());
     let Some(store) = guard.as_mut() else {
         return Ok(());
     };
-    let compactions = session.compaction.compactions;
-    if compactions != run.compactions.load(Relaxed) {
-        let tokens_before = session
-            .messages
-            .first()
-            .and_then(agent_core::compaction::summary_tokens_before)
-            .unwrap_or(0);
-        store.rewrite_compacted(
-            &session.messages,
-            beyond_ai_agent::session_store::CompactionMeta {
-                tokens_before,
-                provenance: session.compaction.clone(),
-            },
-        )?;
-        run.compactions.store(compactions, Relaxed);
-        return Ok(());
-    }
-    // A masking pass rewrote old messages in place (`Session::edited`), which an append can't see.
-    store.record_edits(&session.messages, &session.edited)?;
-    store.append_new(&session.messages)
+    store.persist(&session.messages, &session.compaction, &session.edited)
 }
 
 /// Expand an explicit `/skill:name` invocation first (its own prefix, so it can't collide with a
@@ -5157,15 +5115,14 @@ async fn run_task(
     // turn was ever persisted (the `persist_run` calls below, after `run_turn` returns), so a
     // crash mid-turn — after several tool round-trips already ran real commands/edited real files —
     // lost all record of them with no session trace at all.
-    let store = RunStore::new(store, &session);
+    let store: RunStore = Arc::new(std::sync::Mutex::new(store));
     let run_journal = store
-        .store
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .is_some()
         .then(|| {
             RUN_JOURNAL.get_or_init(|| RunJournal {
-                store: store.store.clone(),
+                store: store.clone(),
                 session_id: meta.id.clone(),
             })
         });
@@ -5430,7 +5387,7 @@ async fn run_task(
 
     if let Some(export) = export {
         let (branches, events) = {
-            let guard = store.store.lock().unwrap_or_else(|e| e.into_inner());
+            let guard = store.lock().unwrap_or_else(|e| e.into_inner());
             match guard.as_ref() {
                 Some(s) => (s.abandoned_branches(), s.export_events().to_vec()),
                 None => (Vec::new(), Vec::new()),
@@ -5928,7 +5885,7 @@ mod tests {
         let store =
             SessionStore::create(session_path.clone(), SessionMeta::new("/w", "claude-test"))
                 .unwrap();
-        let store = RunStore::new(Some(store), &Session::new());
+        let store: RunStore = Arc::new(std::sync::Mutex::new(Some(store)));
 
         let read_args = serde_json::json!({ "path": target.to_str().unwrap() }).to_string();
         let transport = Arc::new(MockTransport::new(vec![
