@@ -226,8 +226,13 @@ fn build_scaffold(
     } else if caps.reasoning_disableable {
         // No thinking requested this turn, but the model can be told so explicitly rather than
         // relying on Anthropic's own undocumented default for whatever it does when the field is
-        // omitted entirely.
-        map.insert("thinking".into(), json!({ "type": "disabled" }));
+        // omitted entirely. Sonnet 5.5's "off" is `between_tools`: it rejects `disabled` with a 400.
+        let off = if crate::models::thinking_off_is_between_tools(&req.model) {
+            "between_tools"
+        } else {
+            "disabled"
+        };
+        map.insert("thinking".into(), json!({ "type": off }));
     }
     // Natively, `tools` is the advertised set then every deferred definition, the same bytes every
     // turn; otherwise the deferred tools loaded so far join the advertised set (`crate::deferred`).
@@ -1674,6 +1679,44 @@ mod tests {
             "claude-opus-4-8 must never receive `temperature`, got: {:#?}",
             body.get("temperature")
         );
+    }
+
+    #[test]
+    fn no_thinking_on_sonnet_5_5_is_between_tools_not_disabled() {
+        // Sonnet 5.5 answers `{"type": "disabled"}` with a 400 ("send thinking {type:
+        // between_tools} instead"); every other disableable id keeps `disabled`.
+        for model in [
+            "claude-sonnet-5-5",
+            "claude-sonnet-5.5",
+            "us.anthropic.claude-sonnet-5-5-v1:0",
+            "anthropic/claude-sonnet-5.5",
+        ] {
+            let body = build_body(
+                &ModelRequest::new(model, vec![Message::user("hi")], 256),
+                false,
+            );
+            assert_eq!(
+                body["thinking"],
+                json!({ "type": "between_tools" }),
+                "{model}"
+            );
+        }
+        for model in [
+            "claude-sonnet-5",
+            "claude-haiku-5-5",
+            "claude-opus-5-5",
+            "claude-opus-4-8",
+        ] {
+            let body = build_body(
+                &ModelRequest::new(model, vec![Message::user("hi")], 256),
+                false,
+            );
+            assert_eq!(body["thinking"], json!({ "type": "disabled" }), "{model}");
+        }
+        // Thinking requested: unchanged, adaptive.
+        let req = ModelRequest::new("claude-sonnet-5-5", vec![Message::user("hi")], 4096)
+            .with_thinking(1024);
+        assert_eq!(build_body(&req, false)["thinking"]["type"], "adaptive");
     }
 
     #[test]

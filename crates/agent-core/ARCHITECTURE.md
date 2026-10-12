@@ -648,7 +648,9 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
 - **Explicit reasoning/thinking disable** — `ModelCaps::reasoning_disableable` (per exact model id, not
   per `ThinkingShape`) drives an explicit "off" signal (Anthropic `{"type":"disabled"}`, OpenAI
   `{"effort":"none"}`) on a turn that isn't requesting thinking, for a model capable of one — instead of
-  omitting the field and trusting the provider's undocumented default.
+  omitting the field and trusting the provider's undocumented default. Claude Sonnet 5.5 and later
+  Sonnets reject `disabled`; their "off" is `{"type":"between_tools"}`
+  (`models::thinking_off_is_between_tools`, parsed like the gateway's `ClaudeModel::of`).
 - **`ThinkingLevel::Off` is not a legal state for every model** — a model with a reasoning mechanism it
   can't explicitly disable (`reasoning_disableable == false`; most of the OpenAI gpt-5 codex/pro line,
   `claude-fable-5`) has no way to actually turn reasoning off: sending `Off` there doesn't disable
