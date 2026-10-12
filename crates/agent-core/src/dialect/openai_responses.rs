@@ -1688,6 +1688,50 @@ mod tests {
     }
 
     #[test]
+    fn a_compacted_conversation_with_a_closing_system_message_maps_in_order() {
+        // Cross-dialect: a session compacted on Claude (a summary user message carrying the
+        // deterministic `<user-requests>` block) resumed on gpt-6-luna, then summarized again with the
+        // instruction as a mid-conversation system message (the `system-role` compaction candidate).
+        // The summary goes out as plain user input, the instruction as an instruction-role entry
+        // after the tool output, in place.
+        let summary = format!(
+            "{}\n\nCompacted from 9000 tokens\n\n## Goal\nfix it\n\n<user-requests>\nfix it\n</user-requests>",
+            crate::compaction::SUMMARY_MARKER
+        );
+        let req = ModelRequest::new(
+            "gpt-6-luna",
+            vec![
+                Message::user(summary.clone()),
+                Message::assistant(vec![ContentBlock::tool_use(
+                    "call_1|fc_1",
+                    "read",
+                    json!({ "path": "a.rs" }),
+                )]),
+                Message::tool_result("call_1|fc_1", "contents", false),
+                Message {
+                    role: Role::System,
+                    ..Message::user("write the checkpoint")
+                },
+            ],
+            256,
+        )
+        .with_system("be brief");
+        let body = build_body(&req);
+        let input = body["input"].as_array().unwrap();
+        let role = instruction_role("gpt-6-luna", &crate::models::capabilities("gpt-6-luna"));
+        assert_eq!(input[0], json!({ "role": role, "content": "be brief" }));
+        assert_eq!(input[1]["role"], "user");
+        assert_eq!(input[1]["content"][0]["text"], summary);
+        assert_eq!(input[2]["type"], "function_call");
+        assert_eq!(input[3]["type"], "function_call_output");
+        assert_eq!(
+            input[4],
+            json!({ "role": role, "content": "write the checkpoint" })
+        );
+        assert_eq!(input.len(), 5);
+    }
+
+    #[test]
     fn build_body_sends_temperature_when_set() {
         let req = ModelRequest::new("gpt-4o", vec![Message::user("hi")], 256).with_temperature(0.4);
         assert_eq!(build_body(&req)["temperature"], 0.4);
