@@ -357,8 +357,10 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
   instruction: a pending user prompt there wins over it (measured on gpt-6-luna, a pending "reply with
   just OK" made the summary "OK"), and it is in the kept suffix anyway. One call covers a split turn,
   since the model sees the whole turn. It falls back to the `summary_request` re-render when the
-  conversation can't take the instruction plus `summary_max_tokens` of output under the input budget
-  and window, for an overflow (the provider already refused this conversation), when the model answers
+  conversation plus the instruction exceeds the input budget, or leaves the window room for fewer than
+  2,048 output tokens (short of `summary_max_tokens`, the output budget shrinks to the room left: a
+  trigger at `window − reserve`, on a small window or a user-set `--context-window`, overshoots by a few
+  thousand tokens, and a shorter cached summary beats a full-price re-render), for an overflow (the provider already refused this conversation), when the model answers
   with a tool call or nothing, or with `cached_summary: false`. The re-render itself is now sent
   `no_cache`: nothing re-reads that one-off prompt, so a breakpoint only bought a cache-write premium on
   all of it. The provenance carry is unchanged: host code appends it to whichever summary comes back.
