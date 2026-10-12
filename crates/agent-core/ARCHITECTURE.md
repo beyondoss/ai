@@ -217,8 +217,10 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
   reserve`, n=3–4 per cell, quality neutral everywhere): Opus/Fable 5.x 200K (Opus 5.5 −15% vs the
   uncapped default) and Sonnet 5.x 200K (−12%; at 100K no cheaper, −10%, with about 3× the compactions
   and more turns, so the research's provisional 128K moved up). **Provisional**, with their rationale:
-  GPT-6 and GPT-5.6 240K (under OpenAI's 272K surcharge, like the measured 200K that cost −50% on
-  GPT-6.1 Sol), Haiku 5.5 90K (under its 100K tier), Grok, Gemini and Claude Sonnet 4.5 180K (under their 200K
+  the GPT-6 family 500K (an owner decision, quality over cost: Codex raised GPT-6.1 Sol's default
+  from 272K to 500K in 2026-10, "carefully tested… the new sweet spot" per its lead; under the 922K input
+  limit, but past 272K OpenAI bills the whole request at 2× input and 1.5× output), GPT-5.6 240K (under
+  that 272K surcharge, like the measured 200K that cost −50% on GPT-6.1 Sol), Haiku 5.5 90K (under its 100K tier), Grok, Gemini and Claude Sonnet 4.5 180K (under their 200K
   long-context tier), open-weight families 128K. **Everything else falls back to 200K** (an owner
   decision: no model runs to its full window by default; a window under 200K is unaffected, and
   `--compact-at 0` restores `window − reserve`). `crates/agent`'s `--compact-at`
