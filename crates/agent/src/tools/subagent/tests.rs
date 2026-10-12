@@ -664,6 +664,27 @@ fn ctx_with_gate(
     Arc<std::sync::Mutex<Vec<crate::approval::ApprovalRequest>>>,
     tempfile::TempDir,
 ) {
+    ctx_with_gate_call(
+        defs,
+        "bash",
+        json!({ "command": command }),
+        allow,
+        Vec::new(),
+    )
+}
+
+/// [`ctx_with_gate`] for any one tool call, with the parent's `--deny-path` globs.
+fn ctx_with_gate_call(
+    defs: Vec<AgentDef>,
+    tool: &'static str,
+    input: Value,
+    allow: bool,
+    deny_path: Vec<String>,
+) -> (
+    Arc<SubagentCtx>,
+    Arc<std::sync::Mutex<Vec<crate::approval::ApprovalRequest>>>,
+    tempfile::TempDir,
+) {
     let dir = tempfile::tempdir().unwrap();
     let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
     let gate = Arc::new(RecordingGate {
@@ -673,10 +694,10 @@ fn ctx_with_gate(
         },
         seen: seen.clone(),
     });
-    let args = json!({ "command": command }).to_string();
+    let args = input.to_string();
     let factory: TransportFactory = Arc::new(move |_model: &str| {
         Ok(Arc::new(agent_core::MockTransport::new(vec![
-            agent_core::mock::turn::tool_call("t1", "bash", &args),
+            agent_core::mock::turn::tool_call("t1", tool, &args),
             agent_core::mock::turn::text("finished"),
         ])) as Arc<dyn ModelTransport>)
     });
@@ -700,10 +721,10 @@ fn ctx_with_gate(
         prompt_guidelines: Vec::new(),
         parent_model: "parent-model".to_string(),
         parent_cache_key: "parent-key".to_string(),
-        parent_tools: vec!["bash".to_string()],
+        parent_tools: vec![tool.to_string()],
         deny_tool: Vec::new(),
         deny_bash_pattern: Vec::new(),
-        deny_path: Vec::new(),
+        deny_path,
         child_max_steps: None,
         max_depth: DEFAULT_MAX_DEPTH,
         approval: Some(crate::approval::ApprovalRuntime::new(
@@ -785,4 +806,73 @@ async fn an_allowed_child_call_actually_runs() {
         .unwrap();
     assert_eq!(seen.lock().unwrap().len(), 1);
     assert!(marker.exists(), "an approved child call must have run");
+}
+
+/// A child's multi-file `edit`: a.txt via the top-level `path`, b.txt via its entry's own.
+fn two_file_edit() -> Value {
+    json!({ "path": "a.txt", "edits": [
+        { "old_string": "alpha", "new_string": "ALPHA" },
+        { "path": "b.txt", "old_string": "beta", "new_string": "BETA" },
+    ]})
+}
+
+#[tokio::test]
+async fn a_childs_multi_file_edit_is_blocked_when_any_entry_path_is_denied() {
+    let (ctx, _seen, dir) = ctx_with_gate_call(
+        vec![def("worker", None, Some(vec!["edit"]), Isolation::None)],
+        "edit",
+        two_file_edit(),
+        true,
+        vec!["**/b.txt".to_string()],
+    );
+    std::fs::write(dir.path().join("a.txt"), "alpha\n").unwrap();
+    std::fs::write(dir.path().join("b.txt"), "beta\n").unwrap();
+    run(
+        &Subagent::new(ctx),
+        json!({ "agent": "worker", "task": "edit" }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+        "alpha\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("b.txt")).unwrap(),
+        "beta\n"
+    );
+}
+
+#[tokio::test]
+async fn a_childs_multi_file_edit_asks_approval_for_every_file_it_writes() {
+    let (ctx, seen, dir) = ctx_with_gate_call(
+        vec![def("worker", None, Some(vec!["edit"]), Isolation::None)],
+        "edit",
+        two_file_edit(),
+        true,
+        Vec::new(),
+    );
+    std::fs::write(dir.path().join("a.txt"), "alpha\n").unwrap();
+    std::fs::write(dir.path().join("b.txt"), "beta\n").unwrap();
+    run(
+        &Subagent::new(ctx),
+        json!({ "agent": "worker", "task": "edit" }),
+    )
+    .await
+    .unwrap();
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    let key = &seen[0].scope_key;
+    assert!(
+        key.lines().count() == 2 && key.contains("a.txt") && key.contains("b.txt"),
+        "{key}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+        "ALPHA\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("b.txt")).unwrap(),
+        "BETA\n"
+    );
 }

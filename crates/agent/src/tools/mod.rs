@@ -493,6 +493,35 @@ pub(crate) fn is_writable(path: &str) -> bool {
     }
 }
 
+/// The files this registry's `read`/`write`/`edit` have touched, most recent last, bounded. `edit`
+/// searches them when an `old_string` is missing from its own file, so the error can name the file the
+/// text is actually in — the model's most common edit error is sending one file's text to another.
+///
+/// Registry-scoped: a `set_model` rebuild starts it empty, which only costs that hint until the model
+/// reads or edits again. Paths are stored resolved, the form the tools do I/O with.
+#[derive(Default)]
+pub struct TouchedFiles(std::sync::Mutex<std::collections::VecDeque<String>>);
+
+impl TouchedFiles {
+    const CAP: usize = 32;
+
+    pub fn record(&self, path: &str) {
+        let mut q = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(i) = q.iter().position(|p| p == path) {
+            q.remove(i);
+        } else if q.len() == Self::CAP {
+            q.pop_front();
+        }
+        q.push_back(path.to_string());
+    }
+
+    /// Newest first.
+    pub fn recent(&self) -> Vec<String> {
+        let q = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        q.iter().rev().cloned().collect()
+    }
+}
+
 /// Everything [`default_registry_with_config`] needs to build the tool set.
 ///
 /// This replaces what used to be a ladder of five `default_registry_with_prefix_and_…` functions, each
@@ -643,11 +672,13 @@ pub fn default_registry_with_config(cfg: &ToolConfig<'_>) -> ToolRegistry {
     let mut reg = ToolRegistry::new();
     // One backend, shared by all six filesystem tools — so they cannot disagree about which
     // filesystem they are acting on, and a `read` can always see what a `write` just wrote.
+    let touched = Arc::new(TouchedFiles::default());
     let mut read_tool = read::Read::new(root)
         .with_image_auto_resize(cfg.image_auto_resize)
-        .with_skills(cfg.skills);
-    let mut write_tool = write::Write::new(root);
-    let mut edit_tool = edit::Edit::new(root);
+        .with_skills(cfg.skills)
+        .with_touched(touched.clone());
+    let mut write_tool = write::Write::new(root).with_touched(touched.clone());
+    let mut edit_tool = edit::Edit::new(root).with_touched(touched);
     let mut ls_tool = ls::Ls::new(root);
     let mut grep_tool = grep::Grep::new(root);
     let mut find_tool = find::Find::new(root);

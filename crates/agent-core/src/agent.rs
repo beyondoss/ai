@@ -184,6 +184,53 @@ const MIN_CACHED_SUMMARY_TOKENS: u32 = 2_048;
 /// fans out over CPU cores, compounding it). The cap throttles in-flight groups; results scatter by
 /// index, so the call-order transcript is unaffected — only peak concurrency is bounded.
 const MAX_CONCURRENT_TOOL_GROUPS: usize = 8;
+
+/// Partition a turn's calls (given each call's [`Tool::write_targets`](crate::tool::Tool::write_targets),
+/// in call order) into dispatch groups: calls sharing **any** target land in one group, run serially in
+/// call order; a call with no target is a group of its own. A multi-file `edit` can join two paths'
+/// groups into one, so the union is transitive. Returns `(the group's targets, its call indices)`.
+fn group_by_write_targets(
+    targets: impl Iterator<Item = Vec<String>>,
+) -> Vec<(Vec<String>, Vec<usize>)> {
+    let mut groups: Vec<(Vec<String>, Vec<usize>)> = Vec::new();
+    let mut owner: HashMap<String, usize> = HashMap::new();
+    for (i, call_targets) in targets.enumerate() {
+        let mut hit: Vec<usize> = call_targets
+            .iter()
+            .filter_map(|t| owner.get(t).copied())
+            .collect();
+        hit.sort_unstable();
+        hit.dedup();
+        let g = match hit.first() {
+            Some(&g) => g,
+            None => {
+                groups.push((Vec::new(), Vec::new()));
+                groups.len() - 1
+            }
+        };
+        for &other in hit.iter().skip(1) {
+            let (ts, is) = std::mem::take(&mut groups[other]);
+            for t in &ts {
+                owner.insert(t.clone(), g);
+            }
+            groups[g].0.extend(ts);
+            groups[g].1.extend(is);
+        }
+        for t in call_targets {
+            if owner.get(&t) != Some(&g) {
+                owner.insert(t.clone(), g);
+                groups[g].0.push(t);
+            }
+        }
+        groups[g].1.push(i);
+    }
+    groups.retain(|g| !g.1.is_empty());
+    for g in &mut groups {
+        g.1.sort_unstable();
+    }
+    groups
+}
+
 /// One tool call's dispatch outcome: `(text, images, is_error, terminate)`. Hooks rewrite the text and
 /// error flag; images and the terminate hint pass through untouched.
 type ToolCallResult = (String, Vec<ImageSource>, bool, bool);
@@ -1422,21 +1469,13 @@ impl Agent {
                 t.as_ref().and_then(|t| t.execution_mode())
                     == Some(crate::tool::ToolExecutionMode::Sequential)
             });
-            let mut groups: HashMap<String, (Option<String>, Vec<usize>)> = HashMap::new();
-            for (i, (_, _name, input)) in calls.iter().enumerate() {
-                let target = resolved[i].as_ref().and_then(|t| t.write_target(input));
-                // Build the group key from a borrow of `target` — no `String` clone ([T1-F7]); the
-                // owned `target` then moves into the group's entry below.
-                let key = match target.as_deref() {
-                    Some(path) => format!("path:{path}"),
-                    None => format!("solo:{i}"),
-                };
-                groups
-                    .entry(key)
-                    .or_insert_with(|| (target, Vec::new()))
-                    .1
-                    .push(i);
-            }
+            let groups =
+                group_by_write_targets(calls.iter().enumerate().map(|(i, (_, _, input))| {
+                    resolved[i]
+                        .as_ref()
+                        .map(|t| t.write_targets(input))
+                        .unwrap_or_default()
+                }));
             let this = self;
             let malformed = &malformed;
             // Read-only reborrow, shared across every hook invocation below: by this point the
@@ -1632,20 +1671,20 @@ impl Agent {
                         // `Arc` ([T1-F2]). Collected eagerly so the transient `&mut outcomes` borrow is
                         // released before the group futures (which each own their slice) are built.
                         let grouped: Vec<_> = groups
-                            .into_values()
-                            .map(|(target, indices)| {
+                            .into_iter()
+                            .map(|(targets, indices)| {
                                 let slots: Vec<(usize, Option<GateOutcome>)> = indices
                                     .into_iter()
                                     .map(|i| (i, outcomes[i].take()))
                                     .collect();
-                                (target, slots)
+                                (targets, slots)
                             })
                             .collect();
                         // One shared borrow of the registry for every group, instead of cloning the
                         // whole `HashMap<String, Arc<dyn Tool>>` into each ([T1-F1]) — the groups only
                         // ever look tools up by name, never mutate the registry.
                         let current_tools = &current_tools;
-                        let group_runs = grouped.into_iter().map(|(target, slots)| {
+                        let group_runs = grouped.into_iter().map(|(targets, slots)| {
                             let calls = &calls;
                             let prog_tx = prog_tx.clone();
                             let res_tx = res_tx.clone();
@@ -1663,12 +1702,10 @@ impl Agent {
                                 // the in-flight write's clone are gone — i.e. after the write has physically
                                 // landed — not the instant cancellation drops this future while the detached
                                 // `spawn_blocking` runs on regardless (see `write_lock.rs`).
-                                let write_guard = match &target {
-                                    Some(path) => {
-                                        Some(std::sync::Arc::new(write_locks.lock(path).await))
-                                    }
-                                    None => None,
-                                };
+                                let write_guard = write_locks
+                                    .lock_all(&targets)
+                                    .await
+                                    .map(std::sync::Arc::new);
                                 for (i, outcome) in slots {
                                     let (id, name, input) = &calls[i];
                                     // Per call: (text, images, is_error, terminate). Hooks rewrite the *text*
@@ -2067,15 +2104,19 @@ impl Agent {
                 cancelled_mid_dispatch = true;
                 break;
             }
-            let target = tools.get(name).and_then(|t| t.write_target(&coerced));
+            let targets = tools
+                .get(name)
+                .map(|t| t.write_targets(&coerced))
+                .unwrap_or_default();
             // `Arc` so a clone can ride into a tool's non-cancellable `spawn_blocking` write and keep the
             // registry lock held until the write has physically landed, rather than releasing it the
             // instant this interleaved dispatch abandons the tool future on cancellation — see the
             // matching guard in the default group path, and `write_lock.rs`.
-            let write_guard = match &target {
-                Some(path) => Some(std::sync::Arc::new(self.write_locks.lock(path).await)),
-                None => None,
-            };
+            let write_guard = self
+                .write_locks
+                .lock_all(&targets)
+                .await
+                .map(std::sync::Arc::new);
             let (prog_tx, mut prog_rx) =
                 futures::channel::mpsc::unbounded::<crate::tool::ToolUpdate>();
             let progress =
@@ -6294,6 +6335,39 @@ mod tests {
             }
             other => panic!("expected two ordered tool_result messages, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_multi_target_call_joins_every_group_it_touches() {
+        let t = |ps: &[&str]| ps.iter().map(|p| p.to_string()).collect::<Vec<_>>();
+        // 0 edits a; 1 reads; 2 writes b; 3 is a multi-file edit of {b, c}; 4 writes c; 5 edits a+b.
+        let groups = group_by_write_targets(
+            vec![
+                t(&["a"]),
+                t(&[]),
+                t(&["b"]),
+                t(&["b", "c"]),
+                t(&["c"]),
+                t(&["a", "b"]),
+            ]
+            .into_iter(),
+        );
+        let mut by_calls: Vec<(Vec<usize>, Vec<String>)> = groups
+            .into_iter()
+            .map(|(mut ts, is)| {
+                ts.sort();
+                (is, ts)
+            })
+            .collect();
+        by_calls.sort();
+        assert_eq!(
+            by_calls,
+            vec![
+                (vec![0, 2, 3, 4, 5], t(&["a", "b", "c"])),
+                (vec![1], t(&[])),
+            ],
+            "call 5 merges a's group into b/c's; indices stay in call order"
+        );
     }
 
     #[tokio::test]

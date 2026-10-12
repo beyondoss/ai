@@ -76,6 +76,8 @@ pub struct Read {
     /// Discovered skills by name → `SKILL.md` path, so a `skill:<name>[/<file>]` path resolves
     /// (see [`crate::skills::SKILL_SCHEME`]). Empty: the scheme names nothing.
     skills: std::sync::Arc<[(String, std::path::PathBuf)]>,
+    /// Shared with `write`/`edit`; see [`super::TouchedFiles`].
+    touched: std::sync::Arc<super::TouchedFiles>,
 }
 
 impl Default for Read {
@@ -85,6 +87,7 @@ impl Default for Read {
             root: std::path::PathBuf::new(),
             backend: std::sync::Arc::new(LocalFs::new()),
             skills: std::sync::Arc::new([]),
+            touched: std::sync::Arc::default(),
         }
     }
 }
@@ -107,6 +110,12 @@ impl Read {
     /// Read from somewhere other than the host filesystem. See [`super::fs`].
     pub fn with_backend(mut self, backend: std::sync::Arc<dyn FsBackend>) -> Self {
         self.backend = backend;
+        self
+    }
+
+    /// Record text files read in a registry-wide [`super::TouchedFiles`].
+    pub fn with_touched(mut self, touched: std::sync::Arc<super::TouchedFiles>) -> Self {
+        self.touched = touched;
         self
     }
 
@@ -314,7 +323,15 @@ impl Tool for Read {
             .and_then(Value::as_str)
             .ok_or_else(|| ToolError::InvalidInput("missing `path`".into()))?;
         let Some(rest) = path.strip_prefix(crate::skills::SKILL_SCHEME) else {
-            return self.read_path(path, &input).await;
+            let out = self.read_path(path, &input).await?;
+            if out.images.is_empty() {
+                self.touched.record(&super::resolve_against_in(
+                    &self.root,
+                    path,
+                    &self.backend.world(),
+                ));
+            }
+            return Ok(out);
         };
         let (file, dir) = self.resolve_skill(rest)?;
         let mut out = self.read_path(&file, &input).await?;

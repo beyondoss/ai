@@ -1,10 +1,15 @@
-//! `edit` — string replacement in a file (unique match unless `replace_all`). Matching is exact
-//! first, then a normalized fuzzy fallback (NFKC + unified quotes/dashes/spaces + per-line
+//! `edit` — string replacement in one or more files (unique match unless `replace_all`). Matching is
+//! exact first, then a normalized fuzzy fallback (NFKC + unified quotes/dashes/spaces + per-line
 //! trailing-whitespace) so a model's slightly-off `old_string` still lands.
+//!
+//! An `edits[]` entry may name its own `path`; the top-level `path` is the default. A call whose
+//! entries name several files plans every file before writing any, so a failure anywhere writes
+//! nothing. A failed match never applies anything new: it only explains itself — the other file the
+//! text is in, "already applied", the closest lines, or where each ambiguous match sits.
 
 use std::borrow::Cow;
 use std::cell::OnceCell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use agent_core::tool::{Tool, ToolProgress};
@@ -12,8 +17,8 @@ use agent_core::{ToolError, ToolOutput, WriteLockGuard};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-use super::fs::FsBackend;
 use super::fs::local::LocalFs;
+use super::fs::{FileKind, FsBackend};
 
 /// Ceiling on the file size `edit` will load. Matching requires the whole file in memory, so this
 /// bounds that; a file beyond it fails to match rather than exhausting memory.
@@ -25,6 +30,8 @@ pub struct Edit {
     root: PathBuf,
     /// Where the read and the write actually land. Defaults to the host filesystem.
     backend: Arc<dyn FsBackend>,
+    /// Files `read`/`write`/`edit` touched, searched when an `old_string` is not in its own file.
+    touched: Arc<super::TouchedFiles>,
 }
 
 impl Default for Edit {
@@ -38,12 +45,19 @@ impl Edit {
         Self {
             root: root.into(),
             backend: Arc::new(LocalFs::new()),
+            touched: Arc::default(),
         }
     }
 
     /// Edit somewhere other than the host filesystem. See [`super::fs`].
     pub fn with_backend(mut self, backend: Arc<dyn FsBackend>) -> Self {
         self.backend = backend;
+        self
+    }
+
+    /// Share a registry-wide [`super::TouchedFiles`] with `read`/`write`.
+    pub fn with_touched(mut self, touched: Arc<super::TouchedFiles>) -> Self {
+        self.touched = touched;
         self
     }
 
@@ -60,7 +74,8 @@ impl Tool for Edit {
     fn description(&self) -> &str {
         "Apply exact-match replacements to a file. Pass an `edits` array of {old_string, new_string} \
          (each `old_string` must match exactly once), or a single old_string/new_string. With \
-         `replace_all`, a single edit replaces every occurrence."
+         `replace_all`, a single edit replaces every occurrence. An entry's own `path` sends it to \
+         another file; a multi-file call writes every file or none."
     }
     fn input_schema(&self) -> Value {
         json!({
@@ -73,6 +88,7 @@ impl Tool for Edit {
                     "items": {
                         "type": "object",
                         "properties": {
+                            "path": { "type": "string", "description": "This entry's file, if not the top-level path." },
                             "old_string": { "type": "string" },
                             "new_string": { "type": "string" }
                         },
@@ -92,6 +108,16 @@ impl Tool for Edit {
             .get("path")
             .and_then(Value::as_str)
             .map(|p| super::write_key(&self.root, p, &self.backend.world()))
+    }
+
+    /// Every file the call names — the top-level `path` and each entry's own — so dispatch locks all
+    /// of them and serializes this call against any same-turn call touching one.
+    fn write_targets(&self, input: &Value) -> Vec<String> {
+        let world = self.backend.world();
+        agent_core::tool::written_paths("edit", input)
+            .iter()
+            .map(|p| super::write_key(&self.root, p, &world))
+            .collect()
     }
 
     /// Argument parsing stays on the caller's task (it's a few `Value` lookups); everything from the
@@ -125,28 +151,210 @@ impl Tool for Edit {
     }
 }
 
+/// One file's share of a call: its resolved path and its entries as `(index in the call, old, new)`.
+struct FileEdits {
+    path: String,
+    edits: Vec<(usize, String, String)>,
+}
+
+/// Why a file's edits could not be planned. `missing` is the (LF) `old_string` that matched nothing,
+/// so the caller can look for it in the call's other files and the touched ones; `hint` is the
+/// in-file diagnosis to show when it is found nowhere else.
+struct PlanError {
+    err: ToolError,
+    missing: Option<String>,
+    hint: String,
+}
+
+impl From<ToolError> for PlanError {
+    fn from(err: ToolError) -> Self {
+        Self {
+            err,
+            missing: None,
+            hint: String::new(),
+        }
+    }
+}
+
+/// One file, planned: the bytes to write and the mtime the guarded write compares against, or why not.
+/// `text` is the file as read, kept only for a multi-file call (to search for another entry's missing
+/// `old_string`).
+struct FilePlan {
+    path: String,
+    text: Option<String>,
+    result: Result<(Vec<u8>, usize, Option<std::time::SystemTime>), PlanError>,
+}
+
 impl Edit {
     async fn run_inner(
         &self,
         input: Value,
         write_lock: Option<Arc<WriteLockGuard>>,
     ) -> Result<ToolOutput, ToolError> {
-        let path = input
-            .get("path")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ToolError::InvalidInput("missing `path`".into()))?;
-        let path = self.resolve(path);
-        let edits = parse_edits(&input)?;
+        let top = input.get("path").and_then(Value::as_str);
+        // A missing top-level `path` is only fine when every entry names its own file.
+        let entries = match (top, parse_edits(&input)) {
+            (Some(_), parsed) => parsed?,
+            (None, Ok(e)) if e.iter().all(|e| e.path.is_some()) => e,
+            (None, _) => return Err(ToolError::InvalidInput("missing `path`".into())),
+        };
         let replace_all = input
             .get("replace_all")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        if replace_all && edits.len() != 1 {
+        if replace_all && entries.len() != 1 {
             return Err(ToolError::InvalidInput(
                 "`replace_all` applies only to a single edit".into(),
             ));
         }
+        let total_edits = entries.len();
+        let files = self.group_by_file(top, entries);
+        let multi = files.len() > 1;
 
+        let mut plans = Vec::with_capacity(files.len());
+        for file in files {
+            plans.push(self.plan_file(file, replace_all, total_edits, multi).await);
+        }
+        if plans.iter().any(|p| p.result.is_err()) {
+            return Err(self.explain_failure(plans).await);
+        }
+
+        // The writes run inside a **spawned task that owns the write-lock guard**, so the guard is
+        // released only once every write has actually landed.
+        //
+        // The hazard this closes: dropping a future cancels it, but `tokio::spawn`ing one does not —
+        // a spawned task runs to completion even after its `JoinHandle` is dropped. Were the guard
+        // held by this future instead, a cancelled dispatch would drop it the instant the future was
+        // abandoned, leaving a write physically in flight with the lock already free, and a second
+        // turn or session could acquire it and interleave. This is the same invariant the previous
+        // `spawn_blocking`-with-the-guard-moved-in arrangement enforced, expressed in a way that
+        // survives the write being an `async` backend call rather than a synchronous one.
+        //
+        // Files are written in call order and the first refusal stops the rest. Every file was
+        // planned before any write, so the only way to land part of a multi-file call is the disk
+        // changing underneath it; the result then names exactly which files were and were not written.
+        let writes: Vec<(String, Vec<u8>, Option<std::time::SystemTime>, usize)> = plans
+            .into_iter()
+            .filter_map(|p| {
+                let (bytes, applied, mtime) = p.result.ok()?;
+                Some((p.path, bytes, mtime, applied))
+            })
+            .collect();
+        let backend = self.backend.clone();
+        let handle = tokio::spawn(async move {
+            let _write_lock = write_lock;
+            let mut landed: Vec<(String, usize)> = Vec::new();
+            let mut pending = writes.into_iter();
+            for (path, content, mtime, applied) in pending.by_ref() {
+                match backend
+                    .write_if_unchanged(Path::new(&path), content, mtime)
+                    .await
+                {
+                    Ok(true) => landed.push((path, applied)),
+                    Ok(false) => {
+                        let rest: Vec<String> = pending.map(|w| w.0).collect();
+                        return (landed, Some((path, None, rest)));
+                    }
+                    Err(e) => {
+                        let rest: Vec<String> = pending.map(|w| w.0).collect();
+                        return (landed, Some((path, Some(ToolError::from(e)), rest)));
+                    }
+                }
+            }
+            (landed, None)
+        });
+        let (landed, failed) = match handle.await {
+            Ok(result) => result,
+            Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+            Err(e) => return Err(ToolError::Execution(format!("edit task failed: {e}"))),
+        };
+        for (path, _) in &landed {
+            self.touched.record(path);
+        }
+        let done = landed
+            .iter()
+            .map(|(path, applied)| {
+                format!(
+                    "edited {path} ({applied} replacement{})",
+                    if *applied == 1 { "" } else { "s" }
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let Some((path, err, rest)) = failed else {
+            return Ok(done.into());
+        };
+        let why = match err {
+            None => format!(
+                "{path} was modified on disk after it was read; the edit was aborted to avoid \
+                 discarding that change — re-read the file and retry"
+            ),
+            // A single-file call surfaces the backend's own error untouched, as it always has.
+            Some(e) if landed.is_empty() && rest.is_empty() => return Err(e),
+            Some(e) => format!("writing {path} failed: {}", error_text(&e)),
+        };
+        if landed.is_empty() && rest.is_empty() {
+            return Err(ToolError::Execution(why));
+        }
+        let mut msg = String::new();
+        if !landed.is_empty() {
+            msg.push_str(&done);
+            msg.push('\n');
+        }
+        msg.push_str(&format!("NOT edited: {why}"));
+        if !rest.is_empty() {
+            msg.push_str(&format!(
+                "\nNOT edited (not attempted): {}",
+                rest.join(", ")
+            ));
+        }
+        Err(ToolError::Execution(msg))
+    }
+
+    /// Split a call's entries by file, in first-seen order, keeping each entry's index in the call so
+    /// errors name the right `edits[i]`. Two spellings of one file (`a.py`, `./a.py`, a symlink) are one
+    /// file — keyed by the same canonical form the write lock uses — so their entries are matched and
+    /// overlap-checked together instead of written twice.
+    fn group_by_file(&self, top: Option<&str>, entries: Vec<EditEntry>) -> Vec<FileEdits> {
+        let mut files: Vec<FileEdits> = Vec::new();
+        for (i, e) in entries.into_iter().enumerate() {
+            let raw = e.path.as_deref().or(top).unwrap_or_default();
+            let path = self.resolve(raw);
+            match files.iter_mut().find(|f| f.path == path) {
+                Some(f) => f.edits.push((i, e.old, e.new)),
+                None => files.push(FileEdits {
+                    path,
+                    edits: vec![(i, e.old, e.new)],
+                }),
+            }
+        }
+        if files.len() > 1 {
+            let world = self.backend.world();
+            let mut merged: Vec<(String, FileEdits)> = Vec::new();
+            for f in files {
+                let key = super::write_key(&self.root, &f.path, &world);
+                match merged.iter_mut().find(|(k, _)| *k == key) {
+                    Some((_, m)) => {
+                        m.edits.extend(f.edits);
+                        m.edits.sort_by_key(|e| e.0);
+                    }
+                    None => merged.push((key, f)),
+                }
+            }
+            files = merged.into_iter().map(|(_, f)| f).collect();
+        }
+        files
+    }
+
+    /// Stat, read and plan one file's edits. Never writes.
+    async fn plan_file(
+        &self,
+        file: FileEdits,
+        replace_all: bool,
+        total_edits: usize,
+        keep_text: bool,
+    ) -> FilePlan {
+        let FileEdits { path, edits } = file;
         // One `stat`, taken **before** the read, serves three purposes.
         //
         // Kind first: a FIFO/socket/device must be refused on its type before anything opens it —
@@ -163,19 +371,26 @@ impl Edit {
         // the baseline and the read, the baseline is stale, the guard fires, and the edit is refused —
         // a false alarm the model can retry. Taking it after would mean stale *content* paired with a
         // fresh timestamp, so the guard would stay silent and the edit would clobber the other write.
-        let p = std::path::Path::new(path.as_str());
-        let meta = self.backend.stat(p).await?;
+        let p = Path::new(path.as_str());
+        let meta = match self.backend.stat(p).await {
+            Ok(m) => m,
+            Err(e) => return FilePlan::failed(path, ToolError::from(e)),
+        };
         if let Some(m) = &meta {
-            if m.kind == super::fs::FileKind::Other {
-                return Err(super::non_regular_file_error(&path, "edit"));
+            if m.kind == FileKind::Other {
+                let err = super::non_regular_file_error(&path, "edit");
+                return FilePlan::failed(path, err);
             }
             if !m.writable {
-                return Err(ToolError::Execution(format!("{path} is not writable")));
+                let err = ToolError::Execution(format!("{path} is not writable"));
+                return FilePlan::failed(path, err);
             }
         }
-        let initial_mtime = meta.as_ref().and_then(|m| m.mtime);
-
-        let raw_bytes = self.backend.read_bytes(p, 0, MAX_EDIT_BYTES).await?;
+        let mtime = meta.as_ref().and_then(|m| m.mtime);
+        let raw_bytes = match self.backend.read_bytes(p, 0, MAX_EDIT_BYTES).await {
+            Ok(b) => b,
+            Err(e) => return FilePlan::failed(path, ToolError::from(e)),
+        };
 
         // The match/splice work is pure CPU over an in-memory string and can run for tens of
         // milliseconds on a multi-MB file, so it stays on a blocking worker — inline it would pin a
@@ -183,242 +398,343 @@ impl Edit {
         // session's event pump and abort/steer loop. See `tests/tool_reactor_stall.rs`.
         // So is validating the bytes as UTF-8 — a pass over every byte of the file.
         let plan_path = path.clone();
-        let (content, ok) = match tokio::task::spawn_blocking(move || {
-            let raw = String::from_utf8(raw_bytes).map_err(|_| {
-                ToolError::Execution(format!("read {plan_path}: file is not valid UTF-8"))
-            })?;
-            plan_edits(&plan_path, &raw, edits, replace_all)
+        let (text, result) = match tokio::task::spawn_blocking(move || {
+            let Ok(raw) = String::from_utf8(raw_bytes) else {
+                let err =
+                    ToolError::Execution(format!("read {plan_path}: file is not valid UTF-8"));
+                return (None, Err(PlanError::from(err)));
+            };
+            let result = plan_edits(&plan_path, &raw, &edits, replace_all, total_edits);
+            (keep_text.then_some(raw), result)
         })
         .await
         {
-            Ok(result) => result?,
+            Ok(r) => r,
             // The closure returns its errors as `Err`, so a `JoinError` can only be a panic inside it.
             // Re-raise rather than dressing it up as an ordinary tool failure.
             Err(e) => std::panic::resume_unwind(e.into_panic()),
         };
-
-        // The write runs inside a **spawned task that owns the write-lock guard**, so the guard is
-        // released only once the write has actually landed.
-        //
-        // The hazard this closes: dropping a future cancels it, but `tokio::spawn`ing one does not —
-        // a spawned task runs to completion even after its `JoinHandle` is dropped. Were the guard
-        // held by this future instead, a cancelled dispatch would drop it the instant the future was
-        // abandoned, leaving the write physically in flight with the lock already free, and a second
-        // turn or session could acquire it and interleave. This is the same invariant the previous
-        // `spawn_blocking`-with-the-guard-moved-in arrangement enforced, expressed in a way that
-        // survives the write being an `async` backend call rather than a synchronous one.
-        let backend = self.backend.clone();
-        let write_path = path.clone();
-        let handle = tokio::spawn(async move {
-            let _write_lock = write_lock;
-            backend
-                .write_if_unchanged(std::path::Path::new(&write_path), content, initial_mtime)
-                .await
-        });
-        let unchanged = match handle.await {
-            Ok(result) => result?,
-            Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
-            Err(e) => return Err(ToolError::Execution(format!("edit task failed: {e}"))),
-        };
-        if !unchanged {
-            return Err(ToolError::Execution(format!(
-                "{path} was modified on disk after it was read; the edit was aborted to avoid \
-                 discarding that change — re-read the file and retry"
-            )));
+        FilePlan {
+            path,
+            text,
+            result: result.map(|(bytes, applied)| (bytes, applied, mtime)),
         }
-        Ok(ok)
+    }
+
+    /// The error for a call with at least one unplannable file. Nothing has been written. A missing
+    /// `old_string` found verbatim in another file of the call, or one `read`/`write`/`edit` touched,
+    /// is named (it is almost always the file the model meant); otherwise the in-file hint stands.
+    async fn explain_failure(&self, plans: Vec<FilePlan>) -> ToolError {
+        let batch: Vec<(&str, &str)> = plans
+            .iter()
+            .filter_map(|p| Some((p.path.as_str(), p.text.as_deref()?)))
+            .collect();
+        let mut errors: Vec<ToolError> = Vec::new();
+        let mut valid: Vec<&str> = Vec::new();
+        for p in &plans {
+            let Err(failure) = &p.result else {
+                valid.push(&p.path);
+                continue;
+            };
+            let elsewhere = match &failure.missing {
+                Some(old) => self.find_elsewhere(old, &p.path, &batch).await,
+                None => Vec::new(),
+            };
+            let note = if elsewhere.is_empty() {
+                failure.hint.clone()
+            } else {
+                format!(
+                    "\nThat text is in {}: edit that file instead (an `edits[]` entry can set its own `path`).",
+                    elsewhere.join(", ")
+                )
+            };
+            errors.push(with_note(&failure.err, &note));
+        }
+        if plans.len() == 1
+            && let Some(e) = errors.pop()
+        {
+            return e;
+        }
+        let all_input = errors
+            .iter()
+            .all(|e| matches!(e, ToolError::InvalidInput(_)));
+        let mut msg = String::from(
+            "no file was edited: a multi-file edit writes every file or none. Fix these and resend \
+             the whole call:",
+        );
+        for e in &errors {
+            msg.push_str("\n- ");
+            msg.push_str(&error_text(e));
+        }
+        if !valid.is_empty() {
+            msg.push_str(&format!(
+                "\n(edits for {} were valid but not written)",
+                valid.join(", ")
+            ));
+        }
+        if all_input {
+            ToolError::InvalidInput(msg)
+        } else {
+            ToolError::Execution(msg)
+        }
+    }
+
+    /// Up to three files, other than `here`, that contain `old` verbatim: first the call's own other
+    /// files (already in memory), then the most recently touched files. Error path only, and bounded:
+    /// at most [`ELSEWHERE_FILES`] touched files are opened, each at most [`ELSEWHERE_MAX_BYTES`].
+    async fn find_elsewhere(&self, old: &str, here: &str, batch: &[(&str, &str)]) -> Vec<String> {
+        let mut hits: Vec<String> = Vec::new();
+        for (path, text) in batch {
+            if *path != here && strip_crlf_cow(text).contains(old) {
+                hits.push(path.to_string());
+            }
+        }
+        let candidates = self
+            .touched
+            .recent()
+            .into_iter()
+            .filter(|p| p != here && !batch.iter().any(|(b, _)| b == p))
+            .take(ELSEWHERE_FILES);
+        for path in candidates {
+            if hits.len() >= ELSEWHERE_HITS {
+                break;
+            }
+            let p = Path::new(&path);
+            let Ok(Some(meta)) = self.backend.stat(p).await else {
+                continue;
+            };
+            if meta.kind != FileKind::File || meta.len > ELSEWHERE_MAX_BYTES as u64 {
+                continue;
+            }
+            let Ok(bytes) = self.backend.read_bytes(p, 0, ELSEWHERE_MAX_BYTES).await else {
+                continue;
+            };
+            if std::str::from_utf8(&bytes).is_ok_and(|text| strip_crlf_cow(text).contains(old)) {
+                hits.push(path);
+            }
+        }
+        hits.truncate(ELSEWHERE_HITS);
+        hits
     }
 }
 
-/// The pure, synchronous heart of an `edit`: match, splice, and produce the bytes to write.
+/// How many touched files a missing `old_string` is looked for in, how large each may be, and how many
+/// hits are named.
+const ELSEWHERE_FILES: usize = 12;
+const ELSEWHERE_MAX_BYTES: usize = 1024 * 1024;
+const ELSEWHERE_HITS: usize = 3;
+
+impl FilePlan {
+    fn failed(path: String, err: ToolError) -> Self {
+        Self {
+            path,
+            text: None,
+            result: Err(PlanError::from(err)),
+        }
+    }
+}
+
+/// A `ToolError`'s own message, without the variant's `invalid tool input:` style prefix.
+fn error_text(e: &ToolError) -> Cow<'_, str> {
+    match e {
+        ToolError::InvalidInput(m) | ToolError::Execution(m) => Cow::Borrowed(m),
+        ToolError::Io(io) => Cow::Owned(io.to_string()),
+    }
+}
+
+/// `e` with `note` appended to its message, same variant.
+fn with_note(e: &ToolError, note: &str) -> ToolError {
+    match e {
+        ToolError::InvalidInput(m) => ToolError::InvalidInput(format!("{m}{note}")),
+        ToolError::Execution(m) => ToolError::Execution(format!("{m}{note}")),
+        ToolError::Io(io) => ToolError::Execution(format!("{io}{note}")),
+    }
+}
+
+/// The pure, synchronous heart of an `edit`: match, splice, and produce the bytes to write for one
+/// file, plus how many replacements that is.
 ///
 /// Deliberately does **no I/O**. Reading, the writability and kind pre-checks, and the guarded write
 /// all happen in [`Edit::run_inner`] against the backend, which is what lets the same matching logic
-/// serve a file on this host and one on a machine we're only talking to. Returns the new file contents
-/// together with the success message, so the caller does the writing.
+/// serve a file on this host and one on a machine we're only talking to.
+///
+/// `edits` carries each entry's index in the whole call, so a multi-file call's errors name the right
+/// `edits[i]`; `total_edits` is the call's entry count, which decides whether an index is named at all.
 fn plan_edits(
     path: &str,
     raw: &str,
-    edits: Vec<(String, String)>,
+    edits: &[(usize, String, String)],
     replace_all: bool,
-) -> Result<(Vec<u8>, ToolOutput), ToolError> {
-    {
-        let raw = raw.to_string();
-        // Match in a normalized LF space with the BOM stripped, then restore the file's original
-        // line endings + BOM on write. A CRLF file whose `old_string` uses `\n` (the common case)
-        // would otherwise never match — a silent, unrecoverable failure.
-        let had_bom = raw.starts_with('\u{feff}');
-        let body = raw.strip_prefix('\u{feff}').unwrap_or(&raw);
-        // A file can mix `\r\n` and bare `\n` endings across lines (different tools/editors touched
-        // different lines). CRLF is only reintroduced wholesale when the file is *consistently* CRLF;
-        // otherwise untouched spans are spliced back in from the original bytes verbatim (via
-        // `body_map`) so an edit to one line can never flip another, untouched line's ending.
-        //
-        // A bare `\n` is one whose preceding byte isn't `\r` — a single scan for that (no allocation)
-        // is exactly equivalent to the old `body.replace("\r\n","").contains('\n')`, which copied the
-        // whole file just to compute this one bool: a `\n` is consumed by that `replace` iff it's the
-        // second byte of a `\r\n` pair, i.e. iff its predecessor is `\r` (and a `\r` before a `\n` can
-        // never itself be the tail of an earlier match, so `replace` always collapses it).
-        let bytes = body.as_bytes();
-        let has_bare_lf = bytes
-            .iter()
-            .enumerate()
-            .any(|(i, &c)| c == b'\n' && (i == 0 || bytes[i - 1] != b'\r'));
-        let has_cr = body.contains('\r');
-        // Exactly the old `!has_bare_lf && body.contains("\r\n")`: a lone `\r` with no following `\n`
-        // is *not* a pure-CRLF file (its replacements keep bare `\n`), so the `\r\n` check is load-
-        // bearing — but it's gated behind `has_cr` so a pure-LF file never pays for it.
-        let is_pure_crlf = !has_bare_lf && has_cr && body.contains("\r\n");
-        // Only a file that actually contains a `\r` needs the CRLF→LF copy + its offset map back to the
-        // original bytes; the common case (pure-LF source) borrows `body` verbatim and splices with raw
-        // offsets, skipping the whole-file copy, the 4×-file-size `Vec<u32>` map, and the UTF-8
-        // re-validation `strip_crlf_with_map` would otherwise pay on every single edit.
-        let (working, body_map): (Cow<str>, Option<Vec<u32>>) = if has_cr {
-            let (w, map) = strip_crlf_with_map(body);
-            (Cow::Owned(w), Some(map))
-        } else {
-            (Cow::Borrowed(body), None)
-        };
-        let working = working.as_ref();
+    total_edits: usize,
+) -> Result<(Vec<u8>, usize), PlanError> {
+    // Match in a normalized LF space with the BOM stripped, then restore the file's original
+    // line endings + BOM on write. A CRLF file whose `old_string` uses `\n` (the common case)
+    // would otherwise never match — a silent, unrecoverable failure.
+    let had_bom = raw.starts_with('\u{feff}');
+    let body = raw.strip_prefix('\u{feff}').unwrap_or(raw);
+    // A file can mix `\r\n` and bare `\n` endings across lines (different tools/editors touched
+    // different lines). CRLF is only reintroduced wholesale when the file is *consistently* CRLF;
+    // otherwise untouched spans are spliced back in from the original bytes verbatim (via
+    // `body_map`) so an edit to one line can never flip another, untouched line's ending.
+    //
+    // A bare `\n` is one whose preceding byte isn't `\r` — a single scan for that (no allocation)
+    // is exactly equivalent to the old `body.replace("\r\n","").contains('\n')`, which copied the
+    // whole file just to compute this one bool: a `\n` is consumed by that `replace` iff it's the
+    // second byte of a `\r\n` pair, i.e. iff its predecessor is `\r` (and a `\r` before a `\n` can
+    // never itself be the tail of an earlier match, so `replace` always collapses it).
+    let bytes = body.as_bytes();
+    let has_bare_lf = bytes
+        .iter()
+        .enumerate()
+        .any(|(i, &c)| c == b'\n' && (i == 0 || bytes[i - 1] != b'\r'));
+    let has_cr = body.contains('\r');
+    // Exactly the old `!has_bare_lf && body.contains("\r\n")`: a lone `\r` with no following `\n`
+    // is *not* a pure-CRLF file (its replacements keep bare `\n`), so the `\r\n` check is load-
+    // bearing — but it's gated behind `has_cr` so a pure-LF file never pays for it.
+    let is_pure_crlf = !has_bare_lf && has_cr && body.contains("\r\n");
+    // Only a file that actually contains a `\r` needs the CRLF→LF copy + its offset map back to the
+    // original bytes; the common case (pure-LF source) borrows `body` verbatim and splices with raw
+    // offsets, skipping the whole-file copy, the 4×-file-size `Vec<u32>` map, and the UTF-8
+    // re-validation `strip_crlf_with_map` would otherwise pay on every single edit.
+    let (working, body_map): (Cow<str>, Option<Vec<u32>>) = if has_cr {
+        let (w, map) = strip_crlf_with_map(body);
+        (Cow::Owned(w), Some(map))
+    } else {
+        (Cow::Borrowed(body), None)
+    };
+    let working = working.as_ref();
 
-        // Resolve every edit to byte ranges against the *original* text (not the running result), so
-        // multi-edit semantics are order-independent and an earlier edit's output can't accidentally
-        // match a later `old_string`.
-        //
-        // `working` itself never changes across this loop, so its normalized form (needed by
-        // `find_spans`'s ambiguity check on every edit, fuzzy or not) is computed once here rather than
-        // once per edit — a multi-edit call used to renormalize the whole file from scratch for every
-        // element of `edits`, even though the input to that normalization was always identical.
-        //
-        // The *offset map* back to the original bytes, though, is only read when an edit actually falls
-        // through to the fuzzy path — so it's built lazily, at most once, and not at all on the exact
-        // path that virtually every call takes. See `normalize_only`.
-        let norm_working = normalize_only(working);
-        let working_map: OnceCell<Vec<u32>> = OnceCell::new();
-        let total_edits = edits.len();
-        // `(start, end, replacement, edit_index)` — `edit_index` rides along purely so the overlap
-        // check below can name which `edits[i]`/`edits[j]` collided (pi-parity fix: matching pi's own
-        // `edit-diff.ts`, which tracks each resolved edit's `editIndex` for exactly this).
-        let mut ranges: Vec<(usize, usize, String, usize)> = Vec::new();
-        for (i, (old, new)) in edits.iter().enumerate() {
-            // `old`/`new` are matched/spliced in LF space. Only allocate a normalized copy when the
-            // string actually carries a `\r\n`; the common case (a model's `old_string` is already
-            // LF-only) borrows it untouched.
-            let old = strip_crlf_cow(old);
-            let new = strip_crlf_cow(new);
-            for (start, end) in find_spans(
-                working,
-                &norm_working,
-                &working_map,
-                &old,
-                replace_all,
-                i,
-                total_edits,
-            )
-            .map_err(|msg| ToolError::InvalidInput(format!("{msg} in {path}")))?
-            {
-                ranges.push((start, end, new.clone().into_owned(), i));
+    // Resolve every edit to byte ranges against the *original* text (not the running result), so
+    // multi-edit semantics are order-independent and an earlier edit's output can't accidentally
+    // match a later `old_string`.
+    //
+    // `working` itself never changes across this loop, so its normalized form (needed by
+    // `find_spans`'s ambiguity check on every edit, fuzzy or not) is computed once here rather than
+    // once per edit — a multi-edit call used to renormalize the whole file from scratch for every
+    // element of `edits`, even though the input to that normalization was always identical.
+    //
+    // The *offset map* back to the original bytes, though, is only read when an edit actually falls
+    // through to the fuzzy path — so it's built lazily, at most once, and not at all on the exact
+    // path that virtually every call takes. See `normalize_only`.
+    let norm_working = normalize_only(working);
+    let working_map: OnceCell<Vec<u32>> = OnceCell::new();
+    // `(start, end, replacement, edit_index)` — `edit_index` rides along purely so the overlap
+    // check below can name which `edits[i]`/`edits[j]` collided (pi-parity fix: matching pi's own
+    // `edit-diff.ts`, which tracks each resolved edit's `editIndex` for exactly this).
+    let mut ranges: Vec<(usize, usize, String, usize)> = Vec::new();
+    for (i, old, new) in edits {
+        // `old`/`new` are matched/spliced in LF space. Only allocate a normalized copy when the
+        // string actually carries a `\r\n`; the common case (a model's `old_string` is already
+        // LF-only) borrows it untouched.
+        let old = strip_crlf_cow(old);
+        let new = strip_crlf_cow(new);
+        let spans = match find_spans(working, &norm_working, &working_map, &old, replace_all) {
+            Ok(spans) => spans,
+            Err(miss) => {
+                return Err(miss_error(
+                    miss,
+                    path,
+                    working,
+                    &norm_working,
+                    &old,
+                    &new,
+                    *i,
+                    total_edits,
+                ));
             }
-        }
-
-        // Reject overlapping edits rather than silently corrupting.
-        ranges.sort_by_key(|r| r.0);
-        for pair in ranges.windows(2) {
-            if pair[0].1 > pair[1].0 {
-                // pi-parity fix: pi's own overlap error names the two colliding `edits[i]`/`edits[j]`
-                // indices ("edits[${previous.editIndex}] and edits[${current.editIndex}] overlap in
-                // ${path}...") whenever there's more than one edit to disambiguate between — with only
-                // a single edit in the call, naming an index nobody asked for would just be noise.
-                let msg = if total_edits > 1 {
-                    format!(
-                        "edits[{}] and edits[{}] overlap in {path}; they must touch disjoint regions",
-                        pair[0].3, pair[1].3
-                    )
-                } else {
-                    format!("edits overlap in {path}; they must touch disjoint regions")
-                };
-                return Err(ToolError::InvalidInput(msg));
-            }
-        }
-
-        // Splice the replacements in a single pass. Untouched spans are copied from `body` (the
-        // original bytes, via `body_map`), not `working`, so a mixed-line-ending file's untouched
-        // lines keep their exact original ending rather than being reconstructed from LF space.
-        // Translate a `working`-space offset back to an original-`body` offset. With a `\r` present the
-        // `body_map` built above does it; on the borrowed pure-LF path `working` *is* `body`, so the
-        // offset already indexes `body` directly.
-        let orig = |off: usize| match &body_map {
-            Some(map) => map[off] as usize,
-            None => off,
         };
-        let mut out = String::with_capacity(body.len());
-        let mut cursor = 0usize;
-        for (start, end, new, _edit_index) in &ranges {
-            out.push_str(&body[orig(cursor)..orig(*start)]);
-            if is_pure_crlf {
-                out.push_str(&new.replace('\n', "\r\n"));
-            } else {
-                out.push_str(new);
-            }
-            cursor = *end;
+        for (start, end) in spans {
+            ranges.push((start, end, new.clone().into_owned(), *i));
         }
-        out.push_str(&body[orig(cursor)..]);
-
-        if out == body {
-            return Err(ToolError::InvalidInput(format!(
-                "edit made no changes to {path}"
-            )));
-        }
-
-        let restored = if had_bom {
-            format!("\u{feff}{out}")
-        } else {
-            out
-        };
-        let applied = ranges.len();
-        // No diff/patch attached, deliberately: pi computes both too, but only for its interactive
-        // terminal's own rendering — the model gets this same bare confirmation there as well. See
-        // ARCHITECTURE.md's "Why `edit`'s result carries no diff/patch data" for the full reasoning
-        // (no reader exists today on the model, wire-protocol, or export side).
-        Ok((
-            restored.into_bytes(),
-            format!(
-                "edited {path} ({applied} replacement{})",
-                if applied == 1 { "" } else { "s" }
-            )
-            .into(),
-        ))
     }
+
+    // Reject overlapping edits rather than silently corrupting.
+    ranges.sort_by_key(|r| r.0);
+    for pair in ranges.windows(2) {
+        if pair[0].1 > pair[1].0 {
+            // pi-parity fix: pi's own overlap error names the two colliding `edits[i]`/`edits[j]`
+            // indices ("edits[${previous.editIndex}] and edits[${current.editIndex}] overlap in
+            // ${path}...") whenever there's more than one edit to disambiguate between — with only
+            // a single edit in the call, naming an index nobody asked for would just be noise.
+            let msg = if total_edits > 1 {
+                format!(
+                    "edits[{}] and edits[{}] overlap in {path}; they must touch disjoint regions",
+                    pair[0].3, pair[1].3
+                )
+            } else {
+                format!("edits overlap in {path}; they must touch disjoint regions")
+            };
+            return Err(ToolError::InvalidInput(msg).into());
+        }
+    }
+
+    // Splice the replacements in a single pass. Untouched spans are copied from `body` (the
+    // original bytes, via `body_map`), not `working`, so a mixed-line-ending file's untouched
+    // lines keep their exact original ending rather than being reconstructed from LF space.
+    // Translate a `working`-space offset back to an original-`body` offset. With a `\r` present the
+    // `body_map` built above does it; on the borrowed pure-LF path `working` *is* `body`, so the
+    // offset already indexes `body` directly.
+    let orig = |off: usize| match &body_map {
+        Some(map) => map[off] as usize,
+        None => off,
+    };
+    let mut out = String::with_capacity(body.len());
+    let mut cursor = 0usize;
+    for (start, end, new, _edit_index) in &ranges {
+        out.push_str(&body[orig(cursor)..orig(*start)]);
+        if is_pure_crlf {
+            out.push_str(&new.replace('\n', "\r\n"));
+        } else {
+            out.push_str(new);
+        }
+        cursor = *end;
+    }
+    out.push_str(&body[orig(cursor)..]);
+
+    if out == body {
+        return Err(ToolError::InvalidInput(format!("edit made no changes to {path}")).into());
+    }
+
+    let restored = if had_bom {
+        format!("\u{feff}{out}")
+    } else {
+        out
+    };
+    // No diff/patch attached, deliberately: pi computes both too, but only for its interactive
+    // terminal's own rendering — the model gets this same bare confirmation there as well. See
+    // ARCHITECTURE.md's "Why `edit`'s result carries no diff/patch data" for the full reasoning
+    // (no reader exists today on the model, wire-protocol, or export side).
+    Ok((restored.into_bytes(), ranges.len()))
+}
+
+/// Why an `old_string` resolved to no spans.
+enum Miss {
+    Empty,
+    NotFound,
+    NotUnique(usize),
 }
 
 /// Byte `(start, end)` spans in `working` to replace. Tries an **exact** match first; if that finds
 /// nothing, falls back to a **fuzzy** match in a normalized space (NFKC + unified quotes/dashes/
 /// spaces + per-line trailing-whitespace stripped) and maps the hit back to original byte offsets —
 /// so a model's `old_string` carrying a curly quote, an em-dash, an nbsp, or stray trailing
-/// whitespace still lands instead of failing "not found". Errors if `old` is empty, absent, or
+/// whitespace still lands instead of failing "not found". Misses if `old` is empty, absent, or
 /// (without `replace_all`) ambiguous. Spans can be wider than `old` when the file's bytes differ from
 /// the normalized needle (e.g. a 3-byte em-dash matched by a 1-byte `-`), which is why this returns
 /// real end offsets rather than `start + old.len()`.
 ///
-/// `norm_work`/`map` are `working`'s own normalization, computed once by the caller (`run`) outside its
-/// per-edit loop rather than recomputed here on every call — `working` is the same text for every edit
-/// in a multi-edit call, so normalizing it again per edit was pure repeated work.
-///
-/// `edit_index`/`total_edits` identify which element of a multi-edit `edits` array this call is
-/// resolving — threaded through only so a "not found" error (see [`not_found_message`]) can name the
-/// specific `edits[i]` that failed, matching pi's `edit-diff.ts` (`getNotFoundError(path, editIndex,
-/// totalEdits)`); they otherwise play no role in the matching logic itself.
+/// `norm_work`/`map` are `working`'s own normalization, computed once by the caller (`plan_edits`)
+/// outside its per-edit loop rather than recomputed here on every call — `working` is the same text
+/// for every edit in a multi-edit call, so normalizing it again per edit was pure repeated work.
 fn find_spans(
     working: &str,
     norm_work: &str,
     map: &OnceCell<Vec<u32>>,
     old: &str,
     replace_all: bool,
-    edit_index: usize,
-    total_edits: usize,
-) -> Result<Vec<(usize, usize)>, String> {
+) -> Result<Vec<(usize, usize)>, Miss> {
     if old.is_empty() {
-        return Err("`old_string` is empty".into());
+        return Err(Miss::Empty);
     }
     let exact: Vec<(usize, usize)> = working
         .match_indices(old)
@@ -443,20 +759,13 @@ fn find_spans(
         } else {
             norm_work.matches(norm_old.as_str()).count()
         };
-        return disambiguate(
-            exact,
-            fuzzy_count,
-            old,
-            replace_all,
-            edit_index,
-            total_edits,
-        );
+        return disambiguate(exact, fuzzy_count, replace_all);
     }
 
     // Fuzzy fallback: no exact match anywhere, so search — and splice — in normalized space, mapping
     // matches back via the normalized→original byte-offset table.
     if norm_old.is_empty() {
-        return Err(not_found_message(old, edit_index, total_edits));
+        return Err(Miss::NotFound);
     }
     // Only here — on a real fuzzy fallback — is the offset map actually needed, so only here is it
     // built. Normalizing `working` a second time to produce it is deliberate: it keeps the eager,
@@ -467,20 +776,7 @@ fn find_spans(
         .map(|(i, _)| (map[i] as usize, map[i + norm_old.len()] as usize))
         .collect();
     let count = fuzzy.len();
-    disambiguate(fuzzy, count, old, replace_all, edit_index, total_edits)
-}
-
-/// pi's `getNotFoundError` (`edit-diff.ts`): the plain "not found" wording when there's only one edit
-/// in the call (the common case, where "which edit" is already unambiguous — naming an index nobody
-/// asked for would just be noise), or a wording that names the specific `edits[i]` when the call has
-/// more than one, so the model doesn't have to guess which of several `old_string`s in the batch is the
-/// one that didn't match.
-fn not_found_message(old: &str, edit_index: usize, total_edits: usize) -> String {
-    if total_edits > 1 {
-        format!("`old_string` not found in edits[{edit_index}]: {old:?}")
-    } else {
-        format!("`old_string` not found: {old:?}")
-    }
+    disambiguate(fuzzy, count, replace_all)
 }
 
 /// Apply the uniqueness/absence rules shared by the exact and fuzzy passes. `spans` is what would
@@ -489,18 +785,307 @@ fn not_found_message(old: &str, edit_index: usize, total_edits: usize) -> String
 fn disambiguate(
     spans: Vec<(usize, usize)>,
     fuzzy_count: usize,
-    old: &str,
     replace_all: bool,
-    edit_index: usize,
-    total_edits: usize,
-) -> Result<Vec<(usize, usize)>, String> {
+) -> Result<Vec<(usize, usize)>, Miss> {
     match spans.len() {
-        0 => Err(not_found_message(old, edit_index, total_edits)),
-        _ if fuzzy_count > 1 && !replace_all => Err(format!(
-            "`old_string` is not unique ({fuzzy_count} matches): {old:?}; add surrounding context"
-        )),
+        0 => Err(Miss::NotFound),
+        _ if fuzzy_count > 1 && !replace_all => Err(Miss::NotUnique(fuzzy_count)),
         _ => Ok(spans),
     }
+}
+
+/// pi's `getNotFoundError` (`edit-diff.ts`): the plain "not found" wording when there's only one edit
+/// in the call (the common case, where "which edit" is already unambiguous — naming an index nobody
+/// asked for would just be noise), or a wording that names the specific `edits[i]` when the call has
+/// more than one, so the model doesn't have to guess which of several `old_string`s in the batch is the
+/// one that didn't match.
+fn not_found_message(old: &str, edit_index: usize, total_edits: usize) -> String {
+    let old = echo(old);
+    if total_edits > 1 {
+        format!("`old_string` not found in edits[{edit_index}]: {old}")
+    } else {
+        format!("`old_string` not found: {old}")
+    }
+}
+
+/// The error for a miss, with its diagnosis. Error path only, so the scans here (line splits, the
+/// closest-window score) cost nothing on a successful edit.
+#[allow(clippy::too_many_arguments)]
+fn miss_error(
+    miss: Miss,
+    path: &str,
+    working: &str,
+    norm_work: &str,
+    old: &str,
+    new: &str,
+    edit_index: usize,
+    total_edits: usize,
+) -> PlanError {
+    match miss {
+        Miss::Empty => ToolError::InvalidInput(format!("`old_string` is empty in {path}")).into(),
+        Miss::NotUnique(count) => {
+            let lines: Vec<&str> = working.split('\n').collect();
+            let norm_old = normalize_only(old);
+            let starts: Vec<usize> = if norm_old.is_empty() {
+                working.match_indices(old).map(|(i, _)| i).collect()
+            } else {
+                norm_work
+                    .match_indices(norm_old.as_str())
+                    .map(|(i, _)| i)
+                    .collect()
+            };
+            // Normalization never adds or drops a `\n`, so a line number in normalized space is the
+            // same line in `working`.
+            let text = if norm_old.is_empty() {
+                working
+            } else {
+                norm_work
+            };
+            let note = not_unique_note(&lines, text, &starts);
+            ToolError::InvalidInput(cap(format!(
+                "`old_string` is not unique ({count} matches): {}; add surrounding context in \
+                 {path}{note}",
+                echo(old)
+            )))
+            .into()
+        }
+        Miss::NotFound => PlanError {
+            err: ToolError::InvalidInput(format!(
+                "{} in {path}",
+                not_found_message(old, edit_index, total_edits)
+            )),
+            missing: Some(old.to_string()),
+            hint: cap(not_found_hint(working, old, new)),
+        },
+    }
+}
+
+/// How much of an `old_string` an error echoes back. The model has the full text; the echo only has
+/// to identify it.
+const ECHO_CHARS: usize = 200;
+/// The ceiling on any one diagnosis this tool appends, in bytes.
+const HINT_MAX_BYTES: usize = 1600;
+/// Snippet bounds: lines shown, and characters per line.
+const SNIPPET_LINES: usize = 12;
+const SNIPPET_LINE_CHARS: usize = 160;
+/// How many of a non-unique match's locations are listed.
+const LIST_MATCHES: usize = 8;
+
+/// `s` quoted, cut to [`ECHO_CHARS`].
+fn echo(s: &str) -> String {
+    match s.char_indices().nth(ECHO_CHARS) {
+        Some((cut, _)) => format!("{:?}… ({} chars)", &s[..cut], s.chars().count()),
+        None => format!("{s:?}"),
+    }
+}
+
+/// `s` cut to [`HINT_MAX_BYTES`] on a char boundary.
+fn cap(mut s: String) -> String {
+    if s.len() > HINT_MAX_BYTES {
+        let mut cut = HINT_MAX_BYTES;
+        while !s.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        s.truncate(cut);
+        s.push('…');
+    }
+    s
+}
+
+/// Where a missed `old_string`'s edit stands in this file: already applied (its `new_string` is here),
+/// or the closest lines to what was sent, so the model can correct the text without re-reading.
+fn not_found_hint(working: &str, old: &str, new: &str) -> String {
+    let lines: Vec<&str> = working.split('\n').collect();
+    // A short `new_string` (or a deletion) is present by coincidence too often to mean anything.
+    if new.trim().chars().count() >= 8
+        && let Some(at) = working.find(new)
+    {
+        let line = working[..at].bytes().filter(|&b| b == b'\n').count() + 1;
+        return format!(
+            "\n`new_string` is already present at line {line}: this edit looks already applied."
+        );
+    }
+    let Some((first, last)) = closest_lines(&lines, old) else {
+        return String::new();
+    };
+    let shown = last.min(first + SNIPPET_LINES - 1);
+    let mut out = format!("\nClosest match in the file (lines {first}-{last}):");
+    for (n, line) in lines[first - 1..shown].iter().enumerate() {
+        let line = match line.char_indices().nth(SNIPPET_LINE_CHARS) {
+            Some((cut, _)) => format!("{}…", &line[..cut]),
+            None => (*line).to_string(),
+        };
+        out.push_str(&format!("\n{:>6}\t{line}", first + n));
+    }
+    if shown < last {
+        out.push_str("\n     …");
+    }
+    out
+}
+
+/// Bounds on the closest-window search: `old`'s lines scored, and the file's.
+const CLOSEST_OLD_LINES: usize = 24;
+const CLOSEST_FILE_LINES: usize = 20_000;
+const CLOSEST_LINE_BYTES: usize = 256;
+
+/// The 1-based inclusive line range of `lines` most like `old`. Each of `old`'s (trimmed) lines is
+/// scored against each file line — 1 for an exact match, else the byte-bigram Dice coefficient — and
+/// the score accumulates on the window that pairing implies (file line − old line), so the window
+/// where the most lines line up wins. `None` when nothing scores at least half a line, or past the
+/// size bounds (a file of more than [`CLOSEST_FILE_LINES`] lines gets no snippet).
+fn closest_lines(lines: &[&str], old: &str) -> Option<(usize, usize)> {
+    if lines.len() > CLOSEST_FILE_LINES {
+        return None;
+    }
+    let old_lines: Vec<&str> = old.split('\n').collect();
+    let first = old_lines.iter().position(|l| !l.trim().is_empty())?;
+    let last = old_lines.iter().rposition(|l| !l.trim().is_empty())?;
+    let old_lines = &old_lines[first..=last.min(first + CLOSEST_OLD_LINES - 1)];
+    let olds: Vec<(&str, Vec<u16>)> = old_lines
+        .iter()
+        .map(|l| {
+            let t = l.trim();
+            (t, bigrams(t))
+        })
+        .collect();
+    let mut score = vec![0f32; lines.len()];
+    for (j, line) in lines.iter().enumerate() {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let grams = bigrams(t);
+        for (i, (o, og)) in olds.iter().enumerate() {
+            if o.is_empty() || j < i {
+                continue;
+            }
+            score[j - i] += if *o == t { 1.0 } else { dice(og, &grams) };
+        }
+    }
+    let (best, top) =
+        score.iter().enumerate().fold(
+            (0, 0f32),
+            |acc, (i, &s)| if s > acc.1 { (i, s) } else { acc },
+        );
+    if top < 0.5 {
+        return None;
+    }
+    Some((best + 1, (best + old_lines.len()).min(lines.len())))
+}
+
+/// `s`'s byte bigrams, sorted (a multiset), from at most [`CLOSEST_LINE_BYTES`] of it.
+fn bigrams(s: &str) -> Vec<u16> {
+    let b = &s.as_bytes()[..s.len().min(CLOSEST_LINE_BYTES)];
+    let mut g: Vec<u16> = b
+        .windows(2)
+        .map(|w| u16::from(w[0]) << 8 | u16::from(w[1]))
+        .collect();
+    g.sort_unstable();
+    g
+}
+
+/// Dice similarity of two sorted bigram multisets.
+fn dice(a: &[u16], b: &[u16]) -> f32 {
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
+    let (mut i, mut j, mut shared) = (0, 0, 0usize);
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Equal => {
+                shared += 1;
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    (2 * shared) as f32 / (a.len() + b.len()) as f32
+}
+
+/// Each ambiguous match's line, with the definition it sits in when one is found.
+fn not_unique_note(lines: &[&str], text: &str, starts: &[usize]) -> String {
+    let mut out = String::from("\nMatches at");
+    let mut line = 1usize;
+    let mut pos = 0usize;
+    for (k, &start) in starts.iter().take(LIST_MATCHES).enumerate() {
+        line += text[pos..start].bytes().filter(|&b| b == b'\n').count();
+        pos = start;
+        out.push_str(if k == 0 { " line " } else { ", line " });
+        out.push_str(&line.to_string());
+        if let Some(scope) = enclosing_scope(lines, line - 1) {
+            out.push_str(&format!(" (in `{scope}`)"));
+        }
+    }
+    if starts.len() > LIST_MATCHES {
+        out.push_str(&format!(" and {} more", starts.len() - LIST_MATCHES));
+    }
+    out.push('.');
+    out
+}
+
+/// How far back [`enclosing_scope`] looks, and how much of the header it shows.
+const SCOPE_SCAN_LINES: usize = 400;
+const SCOPE_CHARS: usize = 80;
+
+/// The nearest line above `at` (0-based) that is less indented and opens a definition — `def`,
+/// `class`, `fn`, `impl` and their kin, after any visibility/async modifiers. Language-agnostic by
+/// design: indentation plus a keyword is enough to tell two matches apart for the model.
+fn enclosing_scope<'a>(lines: &[&'a str], at: usize) -> Option<&'a str> {
+    let indent = |l: &str| l.len() - l.trim_start().len();
+    let depth = indent(lines.get(at)?);
+    if depth == 0 {
+        return None;
+    }
+    for &l in lines[at.saturating_sub(SCOPE_SCAN_LINES)..at].iter().rev() {
+        let t = l.trim_start();
+        if t.is_empty() || indent(l) >= depth {
+            continue;
+        }
+        if opens_definition(t) {
+            let t = t.trim_end();
+            return Some(match t.char_indices().nth(SCOPE_CHARS) {
+                Some((cut, _)) => &t[..cut],
+                None => t,
+            });
+        }
+    }
+    None
+}
+
+fn opens_definition(mut t: &str) -> bool {
+    const MODIFIERS: [&str; 10] = [
+        "pub(crate) ",
+        "pub(super) ",
+        "pub ",
+        "async ",
+        "export ",
+        "default ",
+        "static ",
+        "public ",
+        "private ",
+        "protected ",
+    ];
+    while let Some(rest) = MODIFIERS.iter().find_map(|m| t.strip_prefix(m)) {
+        t = rest;
+    }
+    [
+        "def ",
+        "class ",
+        "fn ",
+        "impl ",
+        "impl<",
+        "function ",
+        "func ",
+        "struct ",
+        "enum ",
+        "trait ",
+        "interface ",
+        "mod ",
+    ]
+    .iter()
+    .any(|k| t.starts_with(k))
 }
 
 /// Fold a single scalar toward an ASCII canonical for fuzzy matching: smart quotes → `'`/`"`, the
@@ -738,12 +1323,22 @@ fn strip_crlf_cow(s: &str) -> Cow<'_, str> {
     }
 }
 
+/// One replacement as the call sent it: the entry's own file (`None` = the top-level `path`), and the
+/// text to swap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EditEntry {
+    pub path: Option<String>,
+    pub old: String,
+    pub new: String,
+}
+
 /// Accept either the `edits` array form (pi-style) or the single old_string/new_string form. Also
 /// recovers the case where a model sends `edits` as a JSON-encoded *string* instead of an array. When
 /// a call sends **both** an `edits` array and top-level `old_string`/`new_string`, the pair is
 /// appended as one more edit (pi's behavior: a model that carries both shapes over from a prior
 /// turn/retry means both) unless it is filler ([`is_filler`]), and it is the edit when `edits` is
-/// `[]`. A pair that conflicts with an entry is still appended, so the overlap check rejects it.
+/// `[]`. A pair that conflicts with an entry is still appended, so the overlap check rejects it. The
+/// pair always targets the top-level `path`; an entry may name its own.
 ///
 /// Why filler is dropped: GPT-6 Luna and Sol fill every advertised property, so the pair arrived
 /// beside `edits[]` in all their calls, and was filler in 81% of Luna's. Replaying 1,900 logged edit
@@ -752,35 +1347,39 @@ fn strip_crlf_cow(s: &str) -> Cow<'_, str> {
 /// `pub(crate)`: also used by `export` to render an `edit` tool call's before/after as a real diff
 /// instead of raw JSON — reusing this rather than re-parsing `input` independently keeps the exported
 /// rendering in sync with whatever shape this tool actually accepts (including the JSON-string quirk).
-pub(crate) fn parse_edits(input: &Value) -> Result<Vec<(String, String)>, ToolError> {
-    // Some models emit `edits` as a JSON string; parse it back into a value first.
-    let edits_value = match input.get("edits") {
-        Some(Value::String(s)) => serde_json::from_str::<Value>(s).ok(),
-        other => other.cloned(),
-    };
+pub(crate) fn parse_edits(input: &Value) -> Result<Vec<EditEntry>, ToolError> {
     let legacy = match (
         input.get("old_string").and_then(Value::as_str),
         input.get("new_string").and_then(Value::as_str),
     ) {
-        (Some(o), Some(n)) => Some((o.to_string(), n.to_string())),
+        (Some(o), Some(n)) => Some(EditEntry {
+            path: None,
+            old: o.to_string(),
+            new: n.to_string(),
+        }),
         _ => None,
     };
-    if let Some(arr) = edits_value.as_ref().and_then(Value::as_array) {
+    // Some models emit `edits` as a JSON string; `edit_entries` parses it back into an array.
+    if let Some(arr) = agent_core::tool::edit_entries(input) {
         if arr.is_empty() {
             // `edits: []` beside a real pair means the pair is the edit (59 of the eval's GPT edit
             // errors were exactly this).
             return match legacy {
-                Some(pair) if !pair.0.is_empty() => Ok(vec![pair]),
+                Some(pair) if !pair.old.is_empty() => Ok(vec![pair]),
                 _ => Err(ToolError::InvalidInput("`edits` is empty".into())),
             };
         }
-        let mut edits: Vec<(String, String)> = arr
+        let mut edits: Vec<EditEntry> = arr
             .iter()
             .map(|e| {
                 let old = e.get("old_string").and_then(Value::as_str);
                 let new = e.get("new_string").and_then(Value::as_str);
                 match (old, new) {
-                    (Some(o), Some(n)) => Ok((o.to_string(), n.to_string())),
+                    (Some(o), Some(n)) => Ok(EditEntry {
+                        path: agent_core::tool::edit_entry_path(e).map(str::to_string),
+                        old: o.to_string(),
+                        new: n.to_string(),
+                    }),
                     _ => Err(ToolError::InvalidInput(
                         "each edit needs old_string and new_string".into(),
                     )),
@@ -800,13 +1399,14 @@ pub(crate) fn parse_edits(input: &Value) -> Result<Vec<(String, String)>, ToolEr
 }
 
 /// A top-level pair that cannot change the file beyond what `edits` already does: empty (with a
-/// blank replacement), a no-op, or an exact copy of an entry. Models that fill every schema property
-/// send these as placeholders. A pair whose `old_string` merely *equals* an entry's but replaces it
-/// differently is a conflict, not filler, and keeps erroring.
-fn is_filler((old, new): &(String, String), edits: &[(String, String)]) -> bool {
-    (old.is_empty() && new.trim().is_empty())
-        || old == new
-        || edits.iter().any(|(o, n)| o == old && n == new)
+/// blank replacement), a no-op, or an exact copy of an entry — of *any* entry, whichever file it
+/// names: a model filling every property copies an entry's text, not its routing. A pair whose
+/// `old_string` merely *equals* an entry's but replaces it differently is a conflict, not filler, and
+/// keeps erroring.
+fn is_filler(pair: &EditEntry, edits: &[EditEntry]) -> bool {
+    (pair.old.is_empty() && pair.new.trim().is_empty())
+        || pair.old == pair.new
+        || edits.iter().any(|e| e.old == pair.old && e.new == pair.new)
 }
 
 #[cfg(test)]
@@ -1606,3 +2206,11 @@ mod tests {
 #[cfg(test)]
 #[path = "edit/pair_tests.rs"]
 mod pair_tests;
+
+#[cfg(test)]
+#[path = "edit/multi_file_tests.rs"]
+mod multi_file_tests;
+
+#[cfg(test)]
+#[path = "edit/diagnostic_tests.rs"]
+mod diagnostic_tests;

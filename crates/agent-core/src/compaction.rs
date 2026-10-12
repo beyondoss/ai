@@ -951,17 +951,25 @@ pub fn extract_file_ops(messages: &[Message]) -> (Vec<String>, Vec<String>) {
     for m in messages {
         for b in &m.content {
             if let ContentBlock::ToolUse { name, input, .. } = b {
-                let Some(path) = input.get("path").and_then(|p| p.as_str()) else {
-                    continue;
-                };
-                let bucket = match name.as_str() {
-                    "read" => &mut read,
-                    "write" | "edit" => &mut modified,
+                // A multi-file `edit` names a file per entry, so the modified side reads every path
+                // the call writes, not just the top-level one.
+                let (bucket, paths) = match name.as_str() {
+                    "read" => (
+                        &mut read,
+                        input
+                            .get("path")
+                            .and_then(|p| p.as_str())
+                            .map(str::to_string)
+                            .into_iter()
+                            .collect(),
+                    ),
+                    "write" | "edit" => (&mut modified, crate::tool::written_paths(name, input)),
                     _ => continue,
                 };
-                let path = path.to_string();
-                if !bucket.contains(&path) {
-                    bucket.push(path);
+                for path in paths {
+                    if !bucket.contains(&path) {
+                        bucket.push(path);
+                    }
                 }
             }
         }
@@ -2511,6 +2519,34 @@ mod tests {
         let (read, modified) = extract_file_ops(&convo());
         assert_eq!(read, vec!["src/foo.rs"]);
         assert_eq!(modified, vec!["src/foo.rs"]);
+    }
+
+    #[test]
+    fn extract_file_ops_counts_every_file_a_multi_file_edit_writes() {
+        // Entry paths (including the JSON-string `edits` form) are modified files too; a blank entry
+        // path means the top-level one and adds nothing.
+        let messages = vec![
+            Message::assistant(vec![ContentBlock::tool_use(
+                "1",
+                "edit",
+                json!({ "path": "a.py", "edits": [
+                    { "old_string": "x", "new_string": "y" },
+                    { "path": "b.py", "old_string": "x", "new_string": "y" },
+                    { "path": "", "old_string": "z", "new_string": "w" },
+                ]}),
+            )]),
+            Message::tool_result("1", "edited", false),
+            Message::assistant(vec![ContentBlock::tool_use(
+                "2",
+                "edit",
+                json!({ "path": "a.py",
+                        "edits": "[{\"path\":\"c.py\",\"old_string\":\"x\",\"new_string\":\"y\"}]" }),
+            )]),
+            Message::tool_result("2", "edited", false),
+        ];
+        let (read, modified) = extract_file_ops(&messages);
+        assert!(read.is_empty());
+        assert_eq!(modified, vec!["a.py", "b.py", "c.py"]);
     }
 
     #[test]

@@ -17,6 +17,8 @@ pub struct Write {
     root: PathBuf,
     /// Where the write actually lands. Defaults to the host filesystem.
     backend: Arc<dyn FsBackend>,
+    /// Shared with `read`/`edit`; see [`super::TouchedFiles`].
+    touched: Arc<super::TouchedFiles>,
 }
 
 impl Default for Write {
@@ -30,7 +32,14 @@ impl Write {
         Self {
             root: root.into(),
             backend: Arc::new(LocalFs::new()),
+            touched: Arc::default(),
         }
+    }
+
+    /// Record written files in a registry-wide [`super::TouchedFiles`].
+    pub fn with_touched(mut self, touched: Arc<super::TouchedFiles>) -> Self {
+        self.touched = touched;
+        self
     }
 
     /// Write somewhere other than the host filesystem. See [`super::fs`].
@@ -116,6 +125,7 @@ impl Tool for Write {
         // session file). `create_dir_all` above ensures the sibling temp's directory exists.
         let len = content.len();
         self.backend.write_bytes(p, content.into_bytes()).await?;
+        self.touched.record(path);
         Ok(format!("wrote {len} bytes to {path}").into())
     }
 }

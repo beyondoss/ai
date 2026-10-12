@@ -1664,7 +1664,8 @@ as `write("/home/…/f")` would.
   Node's `fs.writeFile`/`fs.readFile` (what pi's `write`/`read` tools are built on), which open the given
   path directly and so do follow a trailing symlink.
 - **`edit`** accepts either an `edits: [{old_string,new_string}]` array (applied in order) or a
-  single `old_string`/`new_string` pair. Each `old_string` must match **exactly once** in the current
+  single `old_string`/`new_string` pair. An entry may name its own `path` (default: the top-level
+  one), so one call can edit several files — see "Edit tool surface" below. Each `old_string` must match **exactly once** in the current
   content unless it's a single-edit call with `replace_all: true` — uniqueness is the only safety
   check; there is no diff/dry-run, the file is rewritten on success. Writability is checked before any of
   that match/diff work runs — a read-only file fails fast rather than after paying for fuzzy-matching's
@@ -1710,7 +1711,37 @@ blank `new_string`, `old == new`, or an exact duplicate of an entry. When `edits
 non-empty `old_string` is the edit. A real, different pair is still applied; one that conflicts with an
 entry (same `old_string`, different `new_string`) still errors on the overlap check. `replace_all` is
 checked after, so it applies to the one entry left. Replaying 1,900 logged edit calls under this rule
-cut Luna's error rate from 53.2% to 19.7% and Sol's from 17.7% to 5.5%.
+cut Luna's error rate from 53.2% to 19.7% and Sol's from 17.7% to 5.5%. The pair always targets the
+top-level `path`, and a pair copying _any_ entry is filler, whichever file that entry names.
+
+After that rule, Luna still failed 27.3% of its edit calls. The two largest causes were the call
+shape, not the text: **wrong file** (28.7% of errors — a batch whose entries belonged to two files,
+sent under one `path`) and **not unique** (25.9%). Two changes follow, both default behaviour:
+
+- **Per-entry `path`.** An `edits[]` entry may name its own file; a blank one means the top-level
+  `path`, which may be omitted when every entry names its own. The call is split by file (two
+  spellings of one file — `a.py`, `./a.py`, a symlink — are one file, keyed by `write_key`), and every
+  file is stat'd, read and planned before **any** is written: one bad entry anywhere writes nothing,
+  and the error lists each failing file plus the files that were valid but not written. Writes then
+  go in call order under one dispatch lock over every file (`Tool::write_targets`, below); the only
+  way to land part of a call is the disk changing between plan and write, and that result names which
+  files landed and which did not. A single-file call reads and behaves exactly as before. Replayed
+  through the real tool against the 174 remaining Luna@main errors, giving each wrong-file entry the
+  one file that holds its text as its `path` rescues 32 calls (18.4%), with no apply anywhere the
+  model did not name — the tool never routes on its own. The analysis had estimated 43 (24.7%) by
+  checking only that the text _exists_ in the other file; on the real tool 8 of those entries are not
+  unique there, 3 are already applied there, and 4 calls still overlap in their own file.
+- **A failed match explains itself, and never applies anything new.** "Not found" names the other
+  file the exact text is in — another file of the same call, or one of the twelve files `read`,
+  `write` or `edit` most recently touched (`tools::TouchedFiles`, registry-scoped: a `set_model`
+  rebuild starts it empty). Otherwise, when the `new_string` (8+ characters) is already in the file,
+  it says "already applied at line N"; otherwise it shows the closest lines with their numbers (each
+  of the `old_string`'s lines is scored against each file line, exact = 1 else byte-bigram Dice, and
+  the scores add up along the window that pairing implies; at most 12 lines shown, no snippet for a
+  file over 20,000 lines or a best window under half a line). "Not unique" lists each match's line and
+  its enclosing definition — the nearest less-indented `def`/`class`/`fn`/`impl` (and kin) line above
+  it, scanning at most 400 lines. The echoed `old_string` is cut to 200 characters and each diagnosis
+  to 1,600 bytes. All of this runs only on the error path.
 
 ### Tool-surface arms that lost (deleted)
 
@@ -1847,7 +1878,9 @@ path resolution, and both produce a _plausible wrong answer_ rather than an erro
 path that isn't on this machine. `tools::write_key` is the single definition of "which file is this
 call about", consumed by `write`/`edit`'s `write_target`, by `ToolPolicy`'s `--deny-path` check, and
 by `approval::scope_key` — the latter two being security controls that must not resolve a path
-differently from the tool that writes it.
+differently from the tool that writes it. Which _raw_ paths a call names is likewise defined once,
+`agent_core::tool::written_paths` (the top-level `path` plus every `edits[]` entry's own), so none of
+those consumers can miss a file a multi-file `edit` writes.
 
 Because `ShellFs` is generic over the _runner_ rather than over a transport, it runs over
 `RealRunner` on this host, against the same files `LocalFs` sees. `tests/fs_backend_parity.rs` uses
