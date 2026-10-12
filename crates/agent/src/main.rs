@@ -2349,13 +2349,19 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             // `--system-prompt`/`--append-system-prompt` may each name an existing, readable file
             // instead of literal text (pi-parity fix — matches pi's own `resolvePromptInput`). `run`'s
             // identical resolution (`main.rs::resolve_prompt_input`).
+            let tool_tuning = tools::ToolTuning::parse(&tool_tuning)?;
             let system = system_prompt
                 .as_deref()
                 .map(resolve_prompt_input)
                 .unwrap_or_else(|| {
                     // Shell-path override doesn't affect this registry's use (listing tool
                     // names/descriptions for the default system prompt) — `describe()` doesn't mention it.
-                    let mut reg = tools::default_registry_with(bash_timeout_ms, None);
+                    // The tuning does: the edit bullets follow the advertised edit schema.
+                    let mut reg = tools::default_registry_with_config(&tools::ToolConfig {
+                        bash_timeout_ms,
+                        tuning: tool_tuning,
+                        ..tools::ToolConfig::new()
+                    });
                     tools::apply_filter(
                         &mut reg,
                         tools.as_deref(),
@@ -2695,7 +2701,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 web_allow_private,
                 web_allow_hosts: web_allow_host,
                 web_timeout_ms,
-                tool_tuning: tools::ToolTuning::parse(&tool_tuning)?,
+                tool_tuning,
                 exec_url,
                 exec_header,
                 exec_max_response_bytes: exec_max_response_bytes.map_or(

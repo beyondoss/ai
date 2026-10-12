@@ -97,3 +97,47 @@ fn an_unknown_tool_tuning_entry_fails_startup() {
     );
     assert!(bodies.is_empty(), "no request may be sent");
 }
+
+#[test]
+fn serve_builds_its_default_system_prompt_from_the_tuned_registry() {
+    // `serve` renders its default system prompt from a registry of its own; under
+    // `edit-schema=split` the edit bullets must describe `edit` + `multi_edit`, not edits[].
+    use std::io::Write as _;
+
+    use common::{SpawnGuarded as _, read_until_response, serve_cmd};
+
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+    let (base, bodies) = spawn_model_server(vec![turn_text("ok")]);
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file)
+        .args(["--tool-tuning", "edit-schema=split"])
+        .spawn_guarded();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = common::child_frames(&mut child);
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({ "type": "prompt", "message": "hi" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "prompt");
+    drop(stdin);
+    child.wait().unwrap();
+
+    let request = bodies.lock().unwrap()[0].clone();
+    assert!(
+        request.contains("Use edit for one precise change"),
+        "{request}"
+    );
+    assert!(
+        !request.contains("Use edit for precise changes (edits[]"),
+        "{request}"
+    );
+    let names: Vec<String> = edit_tools(&request)
+        .iter()
+        .map(|t| t["name"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(names, ["edit", "multi_edit"]);
+}
