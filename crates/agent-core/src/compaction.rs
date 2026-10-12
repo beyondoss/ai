@@ -314,6 +314,23 @@ pub struct CompactionCandidates {
     /// re-failed the same command within 30 calls, and summaries that list work as done are
     /// followed by re-verification of it.
     pub bridge_line: bool,
+    /// The summary format adds `## Tests & Errors (latest)` and `## Failed approaches / don't
+    /// retry`, and `## Next Steps` becomes one `## Next Step` that must follow from the state,
+    /// "Verify and finish" allowed: on the default template ([`shape_default_format`], the cached
+    /// body and the re-render alike) and, under [`Self::state_template`], its own
+    /// [`STATE_FORMAT_SECTIONS`].
+    ///
+    /// Why: only 55% of eval summaries mention a test tally, 20% of compactions re-fail the same
+    /// command within 30 calls, and summarized agents often fail to stop. Claude Code, Anthropic's
+    /// SDK compaction prompt, OpenHands and ACON all keep test state and failures in their own
+    /// sections.
+    pub state_sections: bool,
+    /// A ~700-word target with per-section caps: [`SHORT_RULE`] after the default template's format,
+    /// or, under [`Self::state_template`], [`STATE_RULES_SHORT`] in place of "about 1,500 words".
+    ///
+    /// Why: median summary length grew 771 → 2,167 words by the fifth round, and the evidence on
+    /// length disagrees, so it is measured rather than assumed.
+    pub short_summary: bool,
 }
 
 impl CompactionCandidates {
@@ -325,6 +342,8 @@ impl CompactionCandidates {
         "mask-best-start",
         "head-tail",
         "bridge",
+        "state-sections",
+        "short",
     ];
 
     /// The candidates `names` turns on (the CLI's `--compaction-candidates`); an unknown name is an
@@ -340,6 +359,8 @@ impl CompactionCandidates {
                 "mask-best-start" => c.mask_best_start = true,
                 "head-tail" => c.head_tail_results = true,
                 "bridge" => c.bridge_line = true,
+                "state-sections" => c.state_sections = true,
+                "short" => c.short_summary = true,
                 "" => {}
                 other => {
                     return Err(format!(
@@ -585,6 +606,98 @@ doing and what it last showed]\n\n### Blocked\n- [Issues preventing progress, if
 Decisions\n- **[Decision]** (user | assistant): [Brief rationale]\n\n## Next Steps\n1. [Ordered list of \
 what should happen next]\n\n## Critical Context\n- [Data, examples and references needed to continue: \
 exact values, commands and their key outputs, file:line references]\n- [Or \"(none)\"]";
+
+/// [`STATE_RULES`] with a ~700-word target and per-section caps in place of "about 1,500 words", for
+/// [`CompactionCandidates::short_summary`]. Reads the same with or without
+/// [`STATE_FORMAT_SECTIONS`].
+pub const STATE_RULES_SHORT: &str = "Rules:\n- Describe the state as of the NEWEST messages: what is \
+done, the step in flight right now (what the last messages were doing and what they showed), and what \
+comes next. The latest test results and errors replace older ones.\n- Write one document. Never paste \
+file contents, diffs or function bodies (they can be re-read from disk): name a function by its \
+signature, and quote a command, an error or a test count on one line. Use a code block only for a \
+signature.\n- Credit the user only with what the user's own messages say; decisions the assistant made \
+are the assistant's, under Key Decisions.\n- At most about 700 words in all. Caps: Goal and Constraints \
+as the user put them; Done at most 12 one-line items (group related ones); In Progress, Blocked, the \
+test and error state and the next step a few lines each; failed approaches and Key Decisions at most 6 \
+items each; Critical Context at most 12 lines. Spend the words on specifics, copied verbatim: file \
+paths with line numbers, identifiers, exact values, commands and their key outputs, error messages.\n\n";
+
+/// [`STATE_FORMAT`] plus the test state and failed approaches, with one next step, for
+/// [`CompactionCandidates::state_sections`]. `## Goal` still opens it ([`checkpoint_body`]).
+pub const STATE_FORMAT_SECTIONS: &str = "Use this EXACT format:\n\n## Goal\n[The user's request, in \
+their words where possible, with every constraint they set.]\n\n## Constraints & Preferences\n- \
+[Constraints and preferences the user stated]\n- [Or \"(none)\"]\n\n## Progress\n### Done\n- [x] \
+[Completed and verified work]\n\n### In Progress\n- [ ] [The step in flight as of the newest messages: \
+what it is doing and what it last showed]\n\n### Blocked\n- [Issues preventing progress, if \
+any]\n\n## Tests & Errors (latest)\n- Command: [the exact test command last run, verbatim]\n- Result: \
+[its tally verbatim, e.g. \"3 failed, 120 passed\"]\n- Failing: [the failing test IDs, verbatim]\n- \
+Errors: [one line per distinct current error, verbatim]\n- [Or \"(none run yet)\"]\n\n## Failed \
+approaches / don't retry\n- [An approach or command that failed or was reverted, and why, so it is not \
+tried again]\n- [Or \"(none)\"]\n\n## Key Decisions\n- **[Decision]** (user | assistant): [Brief \
+rationale]\n\n## Next Step\n[Exactly one next action, and it must follow from the state above. If the \
+work looks complete: \"Verify and finish: <the final check>\".]\n\n## Critical Context\n- [Data, \
+examples and references needed to continue: exact values, commands and their key outputs, file:line \
+references]\n- [Or \"(none)\"]";
+
+/// The state template's rules under `candidates`: [`STATE_RULES_SHORT`] or [`STATE_RULES`].
+fn state_rules(candidates: &CompactionCandidates) -> &'static str {
+    if candidates.short_summary {
+        STATE_RULES_SHORT
+    } else {
+        STATE_RULES
+    }
+}
+
+/// The state template's format under `candidates`: [`STATE_FORMAT_SECTIONS`] or [`STATE_FORMAT`].
+fn state_format(candidates: &CompactionCandidates) -> &'static str {
+    if candidates.state_sections {
+        STATE_FORMAT_SECTIONS
+    } else {
+        STATE_FORMAT
+    }
+}
+
+/// The two sections [`CompactionCandidates::state_sections`] adds to the default template, ahead of
+/// its `## Key Decisions`.
+pub const SECTIONS_BLOCK: &str = "## Tests & Errors (latest)\n- Command: [the exact test command last \
+run, verbatim]\n- Result: [its tally verbatim, e.g. \"3 failed, 120 passed\"]\n- Failing: [the failing \
+test IDs, verbatim]\n- Errors: [one line per distinct current error, verbatim]\n- [Or \"(none run \
+yet)\"]\n\n## Failed approaches / don't retry\n- [An approach or command that failed or was reverted, \
+and why, so it is not tried again]\n- [Or \"(none)\"]\n\n";
+
+/// What [`CompactionCandidates::state_sections`] puts in place of the default template's `## Next
+/// Steps` list.
+pub const NEXT_STEP_BLOCK: &str = "## Next Step\n[Exactly one next action, and it must follow from \
+the state above. If the work looks complete: \"Verify and finish: <the final check>\".]";
+
+/// [`CompactionCandidates::short_summary`]'s length rule for the default template, which has no word
+/// target of its own.
+pub const SHORT_RULE: &str = "\n\nAt most about 700 words in all. Caps: Goal and Constraints as the \
+user put them; Done at most 12 one-line items (group related ones); In Progress, Blocked, the test and \
+error state and the next step a few lines each; failed approaches and Key Decisions at most 6 items \
+each; Critical Context at most 12 lines.";
+
+/// The default template's instruction (`SUMMARY_INSTRUCTION`, `UPDATE_INSTRUCTION`, or the cached
+/// body's format part) under [`CompactionCandidates::state_sections`] and
+/// [`CompactionCandidates::short_summary`]: [`SECTIONS_BLOCK`] before `## Key Decisions`, the `##
+/// Next Steps` heading and its placeholder line replaced by [`NEXT_STEP_BLOCK`], and [`SHORT_RULE`]
+/// appended. Unchanged text when neither is on (the state template has its own variants).
+pub(crate) fn shape_default_format(text: &str, candidates: &CompactionCandidates) -> String {
+    let mut s = text.to_string();
+    if candidates.state_sections {
+        if let Some(at) = s.find("## Key Decisions") {
+            s.insert_str(at, SECTIONS_BLOCK);
+        }
+        if let Some(at) = s.find("## Next Steps\n") {
+            let end = s[at..].find("\n\n").map_or(s.len(), |e| at + e);
+            s.replace_range(at..end, NEXT_STEP_BLOCK);
+        }
+    }
+    if candidates.short_summary {
+        s.push_str(SHORT_RULE);
+    }
+    s
+}
 
 /// Appended to a re-render's instruction when it carries the kept suffix
 /// ([`CompactionCandidates::sees_tail`]).
@@ -1454,9 +1567,13 @@ pub fn summary_request_with(
             prompt.push_str(&render_prefix_with(&prefix[1..], head_tail));
             prompt.push_str("</new-activity>\n\n");
             if state {
-                format!("{STATE_UPDATE_INTRO}{STATE_RULES}{STATE_FORMAT}")
+                format!(
+                    "{STATE_UPDATE_INTRO}{}{}",
+                    state_rules(candidates),
+                    state_format(candidates)
+                )
             } else {
-                UPDATE_INSTRUCTION.to_string()
+                shape_default_format(UPDATE_INSTRUCTION, candidates)
             }
         }
         None => {
@@ -1467,11 +1584,15 @@ pub fn summary_request_with(
             prompt.push_str(&render_prefix_with(prefix, head_tail));
             prompt.push_str("\n</conversation>\n\n");
             if state {
-                format!("{STATE_INTRO}{STATE_RULES}{STATE_FORMAT}")
+                format!(
+                    "{STATE_INTRO}{}{}",
+                    state_rules(candidates),
+                    state_format(candidates)
+                )
             } else if is_split_turn(prefix) {
                 SPLIT_TURN_INSTRUCTION.to_string()
             } else {
-                SUMMARY_INSTRUCTION.to_string()
+                shape_default_format(SUMMARY_INSTRUCTION, candidates)
             }
         }
     };
@@ -1578,11 +1699,14 @@ pub fn conversation_summary_instruction(
         SummaryFraming::Handoff => {
             out.push_str(HANDOFF_FRAMING);
             if state {
-                out.push_str(STATE_RULES);
-                out.push_str(STATE_FORMAT);
+                out.push_str(state_rules(candidates));
+                out.push_str(state_format(candidates));
             } else {
                 let at = SUMMARY_INSTRUCTION.find(SUMMARY_FORMAT_START).unwrap_or(0);
-                out.push_str(&SUMMARY_INSTRUCTION[at..]);
+                out.push_str(&shape_default_format(
+                    &SUMMARY_INSTRUCTION[at..],
+                    candidates,
+                ));
             }
         }
         SummaryFraming::Compact => {
@@ -1596,10 +1720,10 @@ pub fn conversation_summary_instruction(
             out.push_str("\n\n");
             if state {
                 out.push_str(STATE_INTRO);
-                out.push_str(STATE_RULES);
-                out.push_str(STATE_FORMAT);
+                out.push_str(state_rules(candidates));
+                out.push_str(state_format(candidates));
             } else {
-                out.push_str(SUMMARY_INSTRUCTION);
+                out.push_str(&shape_default_format(SUMMARY_INSTRUCTION, candidates));
             }
         }
     }
@@ -4323,5 +4447,98 @@ mod tests {
         }
         apply_summary(&mut session, 2, "s", 7);
         assert_eq!(summary_tokens_before(&session.messages[0]), Some(7));
+    }
+
+    #[test]
+    fn state_sections_and_short_swap_the_state_templates_format_and_length() {
+        let on = CompactionCandidates {
+            state_template: true,
+            state_sections: true,
+            short_summary: true,
+            ..Default::default()
+        };
+        let ops = CompactionProvenance::default();
+        let prefix = vec![Message::user("the task"), Message::assistant(vec![])];
+        let req = summary_request_with("m", &prefix, &[], 100, &ops, None, &on);
+        let ContentBlock::Text { text, .. } = &req.messages[0].content[0] else {
+            panic!("text");
+        };
+        assert!(text.ends_with(&format!(
+            "{STATE_INTRO}{STATE_RULES_SHORT}{STATE_FORMAT_SECTIONS}"
+        )));
+        for heading in [
+            "## Tests & Errors (latest)",
+            "## Failed approaches / don't retry",
+            "## Next Step\n",
+        ] {
+            assert!(STATE_FORMAT_SECTIONS.contains(heading), "{heading}");
+        }
+        assert!(!STATE_FORMAT_SECTIONS.contains("## Next Steps"));
+        assert!(
+            checkpoint_body(STATE_FORMAT_SECTIONS.trim_start_matches("Use this EXACT format:"))
+                .is_some()
+        );
+        assert!(STATE_RULES_SHORT.contains("700 words") && !STATE_RULES_SHORT.contains("1,500"));
+        let cached =
+            conversation_summary_instruction(&prefix, &ops, None, &on, SummaryFraming::Handoff);
+        assert!(cached.contains(STATE_RULES_SHORT) && cached.contains(STATE_FORMAT_SECTIONS));
+        // Either alone.
+        let sections = CompactionCandidates {
+            state_template: true,
+            state_sections: true,
+            ..Default::default()
+        };
+        let body = conversation_summary_instruction(
+            &prefix,
+            &ops,
+            None,
+            &sections,
+            SummaryFraming::Compact,
+        );
+        assert!(body.contains(STATE_RULES) && body.contains(STATE_FORMAT_SECTIONS));
+    }
+
+    #[test]
+    fn sections_and_short_reshape_the_default_template_on_both_paths() {
+        let on = CompactionCandidates {
+            state_sections: true,
+            short_summary: true,
+            ..Default::default()
+        };
+        let ops = CompactionProvenance::default();
+        let prefix = vec![Message::user("the task"), Message::assistant(vec![])];
+        let handoff =
+            conversation_summary_instruction(&prefix, &ops, None, &on, SummaryFraming::Handoff);
+        let compact =
+            conversation_summary_instruction(&prefix, &ops, None, &on, SummaryFraming::Compact);
+        let req = summary_request_with("m", &prefix, &[], 100, &ops, None, &on);
+        let ContentBlock::Text { text: rerender, .. } = &req.messages[0].content[0] else {
+            panic!("text");
+        };
+        for body in [handoff.as_str(), compact.as_str(), &**rerender] {
+            let tests = body
+                .find("## Tests & Errors (latest)")
+                .expect("tests section");
+            let failed = body.find("## Failed approaches").expect("failed section");
+            let decisions = body.find("## Key Decisions").expect("decisions");
+            assert!(tests < failed && failed < decisions, "{body}");
+            assert!(body.contains(NEXT_STEP_BLOCK) && !body.contains("## Next Steps"));
+            assert!(body.contains(SHORT_RULE));
+            assert!(checkpoint_body(body).is_some());
+        }
+        // The incremental re-render's template too.
+        let update = shape_default_format(UPDATE_INSTRUCTION, &on);
+        assert!(update.contains(SECTIONS_BLOCK) && update.contains(NEXT_STEP_BLOCK));
+        assert!(!update.contains("## Next Steps\n1."));
+        // Off: byte for byte the shipped text.
+        let off = CompactionCandidates::default();
+        assert_eq!(
+            shape_default_format(SUMMARY_INSTRUCTION, &off),
+            SUMMARY_INSTRUCTION
+        );
+        assert_eq!(
+            shape_default_format(UPDATE_INSTRUCTION, &off),
+            UPDATE_INSTRUCTION
+        );
     }
 }

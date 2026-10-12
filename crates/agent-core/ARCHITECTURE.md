@@ -456,6 +456,19 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
     `CompactionProvenance::tokens_before` instead, which `session_store.rs`'s `persist` prefers to
     parsing the line; `previous_summary` and the export strip the bridge, so it never reaches a
     summarizer prompt or stacks. Codex, opencode and every other major harness add such a line.
+  - `state_sections` (`state-sections`): the format adds `## Tests & Errors (latest)` (the last test
+    command, its tally and failing IDs, one line per current error, all verbatim) and `## Failed
+    approaches / don't retry`, and `## Next Steps` becomes one `## Next Step` that must follow from the
+    state ("Verify and finish" allowed). On the default template `shape_default_format` makes the
+    change on the cached body and the re-render alike; under `state` it is `STATE_FORMAT_SECTIONS`.
+    Only 55% of eval summaries mention a test tally, 20% of compactions re-fail the same command within
+    30 calls, and summarized agents often fail to stop; Claude Code, Anthropic's SDK prompt, OpenHands
+    and ACON keep these as sections.
+  - `short_summary` (`short`): a ~700-word target with per-section caps (Done at most 12 one-line
+    items; failed approaches and Key Decisions at most 6; Critical Context at most 12 lines):
+    `SHORT_RULE` after the default template's format, or `STATE_RULES_SHORT` in place of "about 1,500
+    words" under `state`. Median summary length grew 771 → 2,167 words by the fifth round, and the
+    evidence on length disagrees, so it is measured.
 
 - **The deterministic-carry channel** — `apply_summary` is deliberately destructive: it _replaces_
   `session.messages` with `[summary, …kept_suffix]`, and `SessionStore::open` reloads that
