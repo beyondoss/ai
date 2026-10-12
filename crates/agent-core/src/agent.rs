@@ -2684,6 +2684,7 @@ impl Agent {
         let Some(plan) = compaction::mask_tool_results(
             &session.messages,
             cfg.mask_keep_turns,
+            cfg.mask_keep_tokens(),
             &session.compaction.modified_files,
         ) else {
             return false;
@@ -2691,7 +2692,7 @@ impl Agent {
         let tokens_before = session
             .last_input_tokens
             .saturating_add(compaction::trailing_tokens(session));
-        if plan.freed < cfg.mask_min_free_tokens.min(cfg.trigger_tokens() / 4)
+        if plan.freed < cfg.mask_min_free()
             || tokens_before.saturating_sub(plan.freed) > cfg.trigger_tokens()
         {
             return false;
@@ -12448,6 +12449,8 @@ mod tests {
             reserve_tokens: 0,
             keep_recent_tokens: 1,
             mask_keep_turns: 2,
+            // A fixed turn window, so each test sets exactly which results are old.
+            mask_keep_tokens: Some(u32::MAX),
             mask_min_free_tokens: 2_500,
             ..CompactionConfig::default()
         }
@@ -12509,7 +12512,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_pass_that_frees_too_little_is_not_applied_and_the_summary_runs() {
-        // Keeping 11 of 12 turns leaves one ~1K-token result to mask: under the 2,500 minimum.
+        // Keeping 11 of 12 turns leaves one result to mask, about 975 tokens freed: under the minimum
+        // (a tenth of the 10K trigger).
         let mock = Arc::new(MockTransport::new(vec![
             turn::text("## Goal\nsummary"),
             turn::text("done"),
@@ -12570,6 +12574,43 @@ mod tests {
         assert_eq!(summary.system, turn.system);
         assert_eq!(summary.tools, turn.tools);
         assert!(!format!("{:?}", summary.messages).contains(compaction::MASKED_PREFIX));
+    }
+
+    #[tokio::test]
+    async fn masking_qualifies_on_a_small_trigger_when_the_recent_turns_hold_most_context() {
+        // Haiku 5.5's shape: a 90K trigger, twelve turns of ~8K tokens. A fixed ten-turn window kept
+        // ~80K and left ~16K to free, under a 22.5K bar, so masking never ran (0 of 21 compactions in
+        // the sweep). The scaled defaults keep ~22.5K of recent transcript and need 9K freed.
+        let mock = Arc::new(MockTransport::new(vec![turn::text("done")]));
+        let agent =
+            Agent::new(mock.clone(), "claude-haiku-5-5").with_compaction(CompactionConfig {
+                keep_recent_tokens: 1,
+                ..CompactionConfig::for_model(&crate::models::capabilities("claude-haiku-5-5"))
+            });
+        let mut session = Session::new();
+        session.user("the task");
+        for i in 0..12 {
+            session.push(Message::assistant(vec![ContentBlock::tool_use(
+                format!("c{i}"),
+                "read",
+                json!({ "path": format!("src/f{i}.rs") }),
+            )]));
+            session.push(Message::tool_result(
+                format!("c{i}"),
+                "x".repeat(32_000),
+                false,
+            ));
+        }
+        session.last_input_tokens = compaction::estimate_messages_tokens(&session.messages);
+        session.last_usage_message_count = session.messages.len();
+        assert!(session.last_input_tokens > 90_000);
+        let mut events = Vec::new();
+        agent
+            .run_events(&mut session, |ev| events.push(ev))
+            .await
+            .unwrap();
+        assert_eq!(kinds(&events), ["masked"], "masking alone, no summary");
+        assert_eq!(mock.calls(), 1);
     }
 
     #[tokio::test]

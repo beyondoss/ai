@@ -7939,7 +7939,8 @@ mod tests {
         store.append_new(&session.messages).unwrap();
 
         session.scrub_cross_model_state("claude-opus-5-5");
-        let plan = agent_core::compaction::mask_tool_results(&session.messages, 1, &[]).unwrap();
+        let plan =
+            agent_core::compaction::mask_tool_results(&session.messages, 1, u32::MAX, &[]).unwrap();
         assert!(
             format!("{:?}", plan.messages[2]).contains("\"call_1\""),
             "scrubbed in memory"
