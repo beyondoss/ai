@@ -1282,6 +1282,8 @@ impl SessionStore {
                         todos,
                         memory_notes,
                         user_requests,
+                        // The record's own `tokens_before` is the persisted count.
+                        tokens_before: None,
                     });
                     compactions.insert(
                         id,
@@ -1633,9 +1635,14 @@ impl SessionStore {
         edited: &[usize],
     ) -> std::io::Result<()> {
         if provenance.compactions != self.compactions_written {
-            let tokens_before = messages
-                .first()
-                .and_then(agent_core::compaction::summary_tokens_before)
+            // A summary message under the `bridge` candidate doesn't carry the count; the provenance does.
+            let tokens_before = provenance
+                .tokens_before
+                .or_else(|| {
+                    messages
+                        .first()
+                        .and_then(agent_core::compaction::summary_tokens_before)
+                })
                 .unwrap_or(0);
             self.rewrite_compacted(
                 messages,
@@ -8122,6 +8129,7 @@ mod tests {
             todos: None,
             memory_notes: vec![],
             user_requests: vec!["Fix the parser; don't touch the tests.".to_string()],
+            tokens_before: None,
         };
         store
             .rewrite_compacted(
@@ -8276,6 +8284,7 @@ mod tests {
             todos: None,
             memory_notes: vec![],
             user_requests: vec![],
+            tokens_before: None,
         };
         store
             .rewrite_compacted(
@@ -8302,6 +8311,7 @@ mod tests {
             todos: None,
             memory_notes: vec![],
             user_requests: vec![],
+            tokens_before: None,
         };
         store
             .rewrite_compacted(

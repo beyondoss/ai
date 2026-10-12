@@ -2611,7 +2611,16 @@ impl Agent {
             compaction::format_todo_list(file_ops.todos.as_ref()),
             compaction::format_memory_notes(&file_ops.memory_notes)
         );
-        compaction::apply_summary(session, first_kept, &summary, tokens_before);
+        if candidates.bridge_line {
+            file_ops.tokens_before = Some(tokens_before);
+        }
+        compaction::apply_summary_with(
+            session,
+            first_kept,
+            &summary,
+            tokens_before,
+            candidates.bridge_line,
+        );
         session.compaction = file_ops;
         // Computed from the freshly-rebuilt list (summary + kept suffix), not `trailing_tokens` — that
         // one measures a delta since the last real usage snapshot, which `apply_summary` just reset to
@@ -8755,6 +8764,7 @@ mod tests {
             modified_files: vec![],
             memory_notes: vec![],
             user_requests: vec![],
+            tokens_before: None,
         };
 
         let mock = Arc::new(MockTransport::new(vec![turn::text("turn prefix summary")]));

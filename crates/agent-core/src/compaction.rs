@@ -110,6 +110,11 @@ pub struct CompactionProvenance {
     /// can paraphrase.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub user_requests: Vec<String>,
+    /// The most recent round's pre-compaction prompt size, when its summary message doesn't carry
+    /// the `"Compacted from {N} tokens"` line ([`CompactionCandidates::bridge_line`] hides it from the
+    /// model). A persistence layer prefers this to [`summary_tokens_before`]. Reset every round.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_before: Option<u32>,
 }
 
 /// A carried user request longer than this many characters is truncated (with a marker).
@@ -203,6 +208,8 @@ pub fn merge_provenance(
         todos: extract_todos(messages).or_else(|| previous.todos.clone()),
         memory_notes,
         user_requests: merge_user_requests(&previous.user_requests, messages),
+        // `Agent::compact` sets it for a round whose summary hides the line.
+        tokens_before: None,
     }
 }
 
@@ -297,6 +304,16 @@ pub struct CompactionCandidates {
     /// Why: test runners print their tally last. In the eval, 66% of the long test results had their
     /// pass/fail tally only after character 2,000, so the summarizer never saw it.
     pub head_tail_results: bool,
+    /// The spliced summary message opens with [`BRIDGE_LINE`] — newer messages win, work listed as
+    /// Done is on disk — in place of the `"Compacted from {N} tokens"` line, which only an export
+    /// reads and which the model otherwise sees (the count rides
+    /// [`CompactionProvenance::tokens_before`] instead).
+    ///
+    /// Why: nothing told the model how the checkpoint relates to the verbatim messages after it.
+    /// Codex, opencode and every other major harness add such a line; 20% of eval compactions
+    /// re-failed the same command within 30 calls, and summaries that list work as done are
+    /// followed by re-verification of it.
+    pub bridge_line: bool,
 }
 
 impl CompactionCandidates {
@@ -307,6 +324,7 @@ impl CompactionCandidates {
         "mask-breakeven",
         "mask-best-start",
         "head-tail",
+        "bridge",
     ];
 
     /// The candidates `names` turns on (the CLI's `--compaction-candidates`); an unknown name is an
@@ -321,6 +339,7 @@ impl CompactionCandidates {
                 "mask-breakeven" => c.mask_breakeven = true,
                 "mask-best-start" => c.mask_best_start = true,
                 "head-tail" => c.head_tail_results = true,
+                "bridge" => c.bridge_line = true,
                 "" => {}
                 other => {
                     return Err(format!(
@@ -1275,7 +1294,7 @@ pub fn previous_summary(prefix: &[Message]) -> Option<&str> {
         return None;
     };
     let body = text.strip_prefix(SUMMARY_MARKER)?.trim_start();
-    let body = strip_leading_tokens_before_line(body);
+    let body = strip_bridge_line(strip_leading_tokens_before_line(body));
     Some(strip_carry_blocks(body))
 }
 
@@ -1320,6 +1339,14 @@ fn strip_carry_blocks(body: &str) -> &str {
         };
         body = &body[..start];
     }
+}
+
+/// Strip a leading [`BRIDGE_LINE`] (see [`apply_summary_with`]) if present, so it never feeds a
+/// summarizer prompt or stacks across rounds; otherwise returns `body` unchanged.
+pub fn strip_bridge_line(body: &str) -> &str {
+    body.strip_prefix(BRIDGE_LINE)
+        .map(str::trim_start)
+        .unwrap_or(body)
 }
 
 /// Strip an optional leading `"Compacted from {N} tokens\n\n"` line (see `apply_summary`) if present;
@@ -1693,11 +1720,31 @@ pub fn format_file_operations(read_files: &[String], modified_files: &[String]) 
 /// `entry.tokensBefore` (`template.js:1294-1299`). `previous_summary` strips this line back out before
 /// handing the body to an incremental re-summarization prompt.
 pub fn apply_summary(session: &mut Session, first_kept: usize, summary: &str, tokens_before: u32) {
+    apply_summary_with(session, first_kept, summary, tokens_before, false);
+}
+
+/// What the spliced summary message opens with under [`CompactionCandidates::bridge_line`]: how
+/// the checkpoint relates to the verbatim messages after it.
+pub const BRIDGE_LINE: &str = "Checkpoint of earlier work. Messages after it are newer and win where \
+they differ. Work listed as Done is on disk: don't redo or re-verify it unless something newer \
+contradicts it.";
+
+/// [`apply_summary`], with `bridge` ([`CompactionCandidates::bridge_line`]) opening the message with
+/// [`BRIDGE_LINE`] in place of the `"Compacted from {N} tokens"` line.
+pub fn apply_summary_with(
+    session: &mut Session,
+    first_kept: usize,
+    summary: &str,
+    tokens_before: u32,
+    bridge: bool,
+) {
     let kept = &session.messages[first_kept..];
     let mut new_messages = Vec::with_capacity(1 + kept.len());
-    new_messages.push(Message::user(format!(
-        "{SUMMARY_MARKER}\n\nCompacted from {tokens_before} tokens\n\n{summary}"
-    )));
+    new_messages.push(Message::user(if bridge {
+        format!("{SUMMARY_MARKER}\n\n{BRIDGE_LINE}\n\n{summary}")
+    } else {
+        format!("{SUMMARY_MARKER}\n\nCompacted from {tokens_before} tokens\n\n{summary}")
+    }));
     new_messages.extend_from_slice(kept);
     session.messages = Arc::new(new_messages);
     // Request-only blocks on kept messages move with them; ones on summarized messages go with them.
@@ -3062,6 +3109,7 @@ mod tests {
             todos: None,
             memory_notes: vec![],
             user_requests: vec![],
+            tokens_before: None,
         };
         let messages = vec![Message::assistant(vec![ContentBlock::tool_use(
             "1",
@@ -4239,5 +4287,41 @@ mod tests {
             ..Default::default()
         };
         assert!(text(&on).contains("2 failed, 98 passed"));
+    }
+
+    #[test]
+    fn the_bridge_line_replaces_the_token_count_and_never_stacks() {
+        let mut session = Session::new();
+        for m in convo() {
+            session.push(m);
+        }
+        apply_summary_with(&mut session, 2, "## Goal\nround one", 9_000, true);
+        let text = match &session.messages[0].content[0] {
+            ContentBlock::Text { text, .. } => text.to_string(),
+            _ => panic!("text"),
+        };
+        assert_eq!(
+            text,
+            format!("{SUMMARY_MARKER}\n\n{BRIDGE_LINE}\n\n## Goal\nround one")
+        );
+        assert!(!text.contains("Compacted from"));
+        assert_eq!(summary_tokens_before(&session.messages[0]), None);
+        // Read back for the next round without the bridge, so a rewrite never repeats it.
+        let prev = previous_summary(&session.messages).unwrap().to_string();
+        assert_eq!(prev, "## Goal\nround one");
+        session.push(Message::assistant(vec![ContentBlock::text("more")]));
+        session.push(Message::user("again"));
+        apply_summary_with(&mut session, 1, &prev, 9_000, true);
+        let ContentBlock::Text { text, .. } = &session.messages[0].content[0] else {
+            panic!("text");
+        };
+        assert_eq!(text.matches(BRIDGE_LINE).count(), 1);
+        // Off: byte-for-byte the old message.
+        let mut session = Session::new();
+        for m in convo() {
+            session.push(m);
+        }
+        apply_summary(&mut session, 2, "s", 7);
+        assert_eq!(summary_tokens_before(&session.messages[0]), Some(7));
     }
 }

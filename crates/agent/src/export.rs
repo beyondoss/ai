@@ -1565,7 +1565,8 @@ fn parse_summary_marker(text: &str) -> Option<(&'static str, &'static str, Optio
             .and_then(|r| r.strip_prefix("\n\n"))
         {
             let (tokens_before, body) = if class == "compaction" {
-                parse_compaction_tokens_before(body)
+                let (n, body) = parse_compaction_tokens_before(body);
+                (n, agent_core::compaction::strip_bridge_line(body))
             } else {
                 (None, body)
             };

@@ -449,6 +449,13 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
     of the elided middle (`is_signal_line`: `3 failed, 120 passed`, `test result:`, `Ran N tests`,
     `FAILED`, `Error`, `Traceback`; at most 30). Test runners print their tally last: 66% of the eval's
     long test results had it only after character 2,000, where the head cut never reached.
+  - `bridge_line` (`bridge`): the spliced summary message opens with `BRIDGE_LINE` — "Checkpoint of
+    earlier work. Messages after it are newer and win where they differ. Work listed as Done is on disk:
+    don't redo or re-verify it unless something newer contradicts it." — in place of the "Compacted from
+    N tokens" line, which only an export reads (`apply_summary_with`). The count rides
+    `CompactionProvenance::tokens_before` instead, which `session_store.rs`'s `persist` prefers to
+    parsing the line; `previous_summary` and the export strip the bridge, so it never reaches a
+    summarizer prompt or stacks. Codex, opencode and every other major harness add such a line.
 
 - **The deterministic-carry channel** — `apply_summary` is deliberately destructive: it _replaces_
   `session.messages` with `[summary, …kept_suffix]`, and `SessionStore::open` reloads that
