@@ -496,16 +496,6 @@ enum Command {
         /// (30 minutes). `serve`'s identical flag.
         #[usage(long, env = "AI_AGENT_BASH_TIMEOUT_MS")]
         bash_timeout_ms: Option<u64>,
-        /// Experimental: when a running `bash` command prints nothing for this many seconds, return
-        /// its output so far to the model and keep the command running as a background job it can
-        /// wait on or kill. Off by default.
-        #[usage(long, env = "AI_AGENT_BASH_IDLE_YIELD_SECS")]
-        bash_idle_yield_secs: Option<u64>,
-        /// Experimental: return a running `bash` command's output to the model every this many
-        /// seconds, keeping the command running as a background job it can wait on or kill. Off by
-        /// default.
-        #[usage(long, env = "AI_AGENT_BASH_YIELD_SECS")]
-        bash_yield_secs: Option<u64>,
         /// Run `bash` commands through this shell instead of the auto-resolved one (`/bin/bash`, else
         /// `bash` on `$PATH`, else `sh`). Matches pi's own `shellPath` setting. `serve`'s identical flag.
         #[usage(long, env = "AI_AGENT_BASH_SHELL_PATH")]
@@ -2019,8 +2009,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             no_block_images,
             no_image_auto_resize,
             bash_timeout_ms,
-            bash_idle_yield_secs,
-            bash_yield_secs,
             bash_shell_path,
             bash_command_prefix,
             web_allow_private,
@@ -2105,14 +2093,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 no_block_images,
                 no_image_auto_resize,
                 bash_timeout_ms,
-                tools::bash::BashPolicy {
-                    idle_yield: bash_idle_yield_secs
-                        .filter(|&s| s > 0)
-                        .map(std::time::Duration::from_secs),
-                    wall_yield: bash_yield_secs
-                        .filter(|&s| s > 0)
-                        .map(std::time::Duration::from_secs),
-                },
                 bash_shell_path,
                 bash_command_prefix,
                 web_allow_private,
@@ -4234,7 +4214,6 @@ async fn run_task(
     no_block_images: bool,
     no_image_auto_resize: bool,
     bash_timeout_ms: Option<u64>,
-    bash_policy: tools::bash::BashPolicy,
     bash_shell_path: Option<String>,
     bash_command_prefix: Option<String>,
     web_allow_private: bool,
@@ -4697,7 +4676,6 @@ async fn run_task(
     let nested_exclude = tools_exclude.as_deref().unwrap_or(empty);
     let mut registry = tools::default_registry_with_config(&tools::ToolConfig {
         bash_timeout_ms,
-        bash_policy,
         bash_shell_path: bash_shell_path.as_deref(),
         bash_command_prefix: bash_command_prefix.as_deref(),
         web_allow_private,
@@ -4997,7 +4975,6 @@ async fn run_task(
             memory_mounts: mounts.clone(),
             tool_cfg: subagent::ChildToolConfig {
                 bash_timeout_ms,
-                bash_policy,
                 bash_shell_path: bash_shell_path.clone(),
                 bash_command_prefix: bash_command_prefix.clone(),
                 // `run` never probes a target for its shell (only `serve --service` does), so a

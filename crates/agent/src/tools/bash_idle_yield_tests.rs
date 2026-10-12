@@ -1,14 +1,8 @@
-//! `BashPolicy`: the detached-job path (idle and wall-clock yields, wait, kill, cleanup). The default
-//! policy's behavior is covered by `bash.rs`'s own tests.
+//! `bash`'s idle yield: a quiet command becomes a job (wait, kill, cleanup, the growing window), and
+//! the wait-for-exit mode `serve`'s host command uses. The rest of `bash` is covered by `bash.rs`'s
+//! own tests.
 
 use super::*;
-
-fn idle(ms: u64) -> BashPolicy {
-    BashPolicy {
-        idle_yield: Some(Duration::from_millis(ms)),
-        ..BashPolicy::default()
-    }
-}
 
 fn text(r: Result<ToolOutput, ToolError>) -> String {
     match r {
@@ -26,9 +20,9 @@ fn alive(pid: &str) -> bool {
         .is_ok_and(|s| s.success())
 }
 
-/// A detaching `bash` and the `bash_job` over it, as the registry pairs them.
-fn detaching(policy: BashPolicy) -> (Arc<Bash>, BashJob) {
-    let bash = Arc::new(Bash::real().with_policy(policy));
+/// A `bash` with a `ms` idle window and the `bash_job` over it, as the registry pairs them.
+fn detaching(ms: u64) -> (Arc<Bash>, BashJob) {
+    let bash = Arc::new(Bash::real().with_idle_yield(Some(Duration::from_millis(ms))));
     let jobs = BashJob::new(bash.clone());
     (bash, jobs)
 }
@@ -44,24 +38,16 @@ async fn wait_dead(pid: &str) -> bool {
 }
 
 #[test]
-fn the_default_policy_leaves_the_schema_and_description_alone() {
+fn bash_yields_after_sixty_quiet_seconds_and_bash_job_rides_with_it() {
     let bash = Bash::real();
-    let schema = bash.input_schema();
-    assert_eq!(schema["required"], json!(["command"]));
-    assert!(schema["properties"].get("job").is_none());
-    assert!(!bash.description().contains("job"));
-    // Opting into an all-default policy is the same as not opting in.
-    let same = Bash::real().with_policy(BashPolicy::default());
-    assert_eq!(same.description(), bash.description());
-}
-
-#[test]
-fn a_detaching_policy_keeps_the_bash_schema_and_adds_bash_job() {
-    let (bash, jobs) = detaching(idle(60_000));
-    assert_eq!(bash.input_schema(), Bash::real().input_schema());
+    assert!(bash.detaches());
     let desc = bash.description();
     assert!(desc.contains("60 s without new output"), "{desc}");
     assert!(desc.contains("`bash_job`"), "{desc}");
+    // `bash`'s own schema has no job fields (see `input_schema`).
+    let schema = bash.input_schema();
+    assert_eq!(schema["required"], json!(["command"]));
+    assert!(schema["properties"].get("job").is_none());
 
     let names = |reg: &agent_core::ToolRegistry| {
         reg.definitions()
@@ -69,20 +55,30 @@ fn a_detaching_policy_keeps_the_bash_schema_and_adds_bash_job() {
             .map(|d| d.name.clone())
             .collect::<Vec<_>>()
     };
-    let plain = crate::tools::default_registry_with_config(&crate::tools::ToolConfig::new());
-    assert!(!names(&plain).contains(&"bash_job".to_string()));
-    let detaching = crate::tools::default_registry_with_config(&crate::tools::ToolConfig {
-        bash_policy: idle(60_000),
+    let has_job = |reg: &agent_core::ToolRegistry| names(reg).contains(&JOB_TOOL.to_string());
+    let reg = crate::tools::default_registry_with_config(&crate::tools::ToolConfig::new());
+    assert!(has_job(&reg));
+    let waits = crate::tools::default_registry_with_config(&crate::tools::ToolConfig {
+        bash_waits_for_exit: true,
         ..crate::tools::ToolConfig::new()
     });
-    assert!(names(&detaching).contains(&"bash_job".to_string()));
+    assert!(!has_job(&waits));
+    // Filters keep or drop `bash_job` with `bash`, whatever they name.
+    let only_bash = ["read".to_string(), "bash".to_string()];
+    let mut allowed = crate::tools::default_registry();
+    crate::tools::apply_filter(&mut allowed, Some(&only_bash), None, false);
+    assert!(has_job(&allowed));
+    let mut excluded = crate::tools::default_registry();
+    crate::tools::apply_filter(&mut excluded, None, Some(&["bash".to_string()]), false);
+    assert!(!has_job(&excluded));
+    let (_, jobs) = detaching(60_000);
     assert_eq!(jobs.input_schema()["required"], json!(["job"]));
 }
 
 #[tokio::test]
 async fn a_model_that_fills_every_field_still_runs_its_command() {
     // gpt-6-luna sends every schema property on every call; `bash` must not read a stray `job`.
-    let (bash, _jobs) = detaching(idle(60_000));
+    let (bash, _jobs) = detaching(60_000);
     let out = text(
         bash.run(json!({ "command": "echo ran", "job": 0, "kill": false }))
             .await,
@@ -94,7 +90,7 @@ async fn a_model_that_fills_every_field_still_runs_its_command() {
 async fn a_quiet_command_returns_early_and_keeps_running_until_killed() {
     let tmp = tempfile::tempdir().unwrap();
     let pidfile = tmp.path().join("pid");
-    let (bash, jobs) = detaching(idle(500));
+    let (bash, jobs) = detaching(500);
     let started = Instant::now();
     let out = text(
         bash.run(json!({
@@ -125,7 +121,7 @@ async fn a_quiet_command_returns_early_and_keeps_running_until_killed() {
 
 #[tokio::test]
 async fn a_command_that_keeps_printing_is_never_interrupted() {
-    let (bash, _jobs) = detaching(idle(1_500));
+    let (bash, _jobs) = detaching(1_500);
     let out = text(
         bash.run(json!({
             "command": "for i in 1 2 3 4 5 6; do echo tick-$i; sleep 0.4; done"
@@ -143,7 +139,7 @@ async fn a_command_that_keeps_printing_is_never_interrupted() {
 async fn waiting_on_a_job_reports_only_the_new_output_and_its_exit() {
     // The re-attach starts right after the first yield (~1 s) and gets a fresh 1 s of quiet, so
     // `second` at ~1.5 s lands inside it and the job runs to its exit in that call.
-    let (bash, jobs) = detaching(idle(1_000));
+    let (bash, jobs) = detaching(1_000);
     let first = text(
         bash.run(json!({ "command": "echo first; sleep 1.5; echo second; exit 3" }))
             .await,
@@ -163,27 +159,36 @@ async fn waiting_on_a_job_reports_only_the_new_output_and_its_exit() {
 }
 
 #[tokio::test]
-async fn the_wall_yield_fires_even_while_output_flows() {
-    let (bash, jobs) = detaching(BashPolicy {
-        wall_yield: Some(Duration::from_millis(800)),
-        ..BashPolicy::default()
-    });
-    let out = text(
-        bash.run(json!({ "command": "while true; do echo spin; sleep 0.1; done" }))
+async fn each_wait_on_a_silent_job_allows_a_longer_silence() {
+    // A legitimately silent build: reported once after the first 0.5 s window, then one wait (a 2 s
+    // window) covers the rest. A fixed 0.5 s window would report it three more times.
+    let (bash, jobs) = detaching(500);
+    let first = text(
+        bash.run(json!({ "command": "sleep 1.8; echo built" }))
             .await,
     );
-    assert!(out.contains("spin"), "{out}");
-    assert!(out.contains("Waited"), "{out}");
-    assert!(out.contains("job 1"), "{out}");
-    let killed = text(jobs.run(json!({ "job": 1, "kill": true })).await);
-    assert!(killed.contains("Job 1 killed"), "{killed}");
+    assert!(first.contains("job 1"), "{first}");
+    assert!(first.contains("after 2 s without new output"), "{first}");
+    let done = text(jobs.run(json!({ "job": 1 })).await);
+    assert!(done.contains("built"), "one wait covers the build: {done}");
+    assert!(!done.contains("still running"), "{done}");
+}
+
+#[tokio::test]
+async fn waiting_for_exit_never_yields() {
+    // `serve`'s host `bash` command has no `bash_job` to come back with.
+    let bash = Bash::real().with_idle_yield(None);
+    assert!(!bash.detaches());
+    assert!(!bash.description().contains("bash_job"));
+    let out = text(bash.run(json!({ "command": "sleep 0.6; echo done" })).await);
+    assert!(out.contains("done") && !out.contains("job"), "{out}");
 }
 
 #[tokio::test]
 async fn dropping_the_tool_kills_a_parked_job() {
     let tmp = tempfile::tempdir().unwrap();
     let pidfile = tmp.path().join("pid");
-    let (bash, jobs) = detaching(idle(300));
+    let (bash, jobs) = detaching(300);
     let out = text(
         bash.run(json!({
             "command": format!("echo $$ > {}; sleep 60", pidfile.display())
@@ -205,7 +210,7 @@ async fn dropping_the_tool_kills_a_parked_job() {
 
 #[tokio::test]
 async fn parking_past_the_cap_kills_the_oldest_job() {
-    let (bash, jobs) = detaching(idle(200));
+    let (bash, jobs) = detaching(200);
     let mut last = String::new();
     for _ in 0..=MAX_PARKED_JOBS {
         last = text(bash.run(json!({ "command": "sleep 60" })).await);
@@ -228,7 +233,7 @@ async fn cancelling_a_detachable_call_kills_the_command_and_keeps_its_output() {
     let (tx, rx) = futures::channel::mpsc::unbounded();
     let cancel = agent_core::CancellationToken::new();
     let progress = ToolProgress::new(tx, "id".into(), "bash".into(), cancel.clone());
-    let (bash, _jobs) = detaching(idle(30_000));
+    let (bash, _jobs) = detaching(30_000);
     let run = bash.run_streaming(
         json!({ "command": "printf 'partial-output\\n'; sleep 30" }),
         &progress,

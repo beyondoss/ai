@@ -2893,6 +2893,8 @@ fn deleted_experiment_flags_fail_startup_as_unknown() {
         &["--max-steps-notice", "5"],
         &["--max-steps-continue-nudge"],
         &["--bash-timeout-guidance"],
+        &["--bash-idle-yield-secs", "60"],
+        &["--bash-yield-secs", "60"],
         &["--compaction-candidates", "mask-best-start"],
     ] {
         let output = run_cmd(bin)
