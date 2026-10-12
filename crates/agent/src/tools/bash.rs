@@ -1,7 +1,8 @@
 //! `bash` — run a shell command via a resolved `bash` (falling back to `sh`) and stream/return its
 //! combined output.
 //!
-//! Output handling mirrors pi: raw stdout+stderr feed one [`OutputAccumulator`] (tail-truncated for
+//! Output handling mirrors pi: raw stdout+stderr feed one
+//! [`OutputAccumulator`](super::output::OutputAccumulator) (tail-truncated for
 //! display, full stream spilled to a temp file → `Full output: <path>`, except when the command ran
 //! on a machine this process cannot write a readable file to — see [`describe`]), and while the
 //! command runs the tool emits an initial empty update then **throttled snapshots** (the whole
@@ -20,10 +21,11 @@ use async_trait::async_trait;
 use regex::Regex;
 use serde_json::{Value, json};
 
+use super::bash_output::BashOutput;
 use super::exec::{ChunkSink, CommandRunner, RealRunner};
 use super::fs::local::LocalFs;
 use super::fs::{FsBackend, PathWorld};
-use super::output::{OutputAccumulator, OutputSnapshot, TruncatedBy, format_output};
+use super::output::{OutputSnapshot, TruncatedBy, format_output};
 
 /// Default command timeout (ms) when the model doesn't specify one. The reference agent has no default
 /// at all — a command runs to completion unless the model explicitly sets `timeout_ms` — which SIGKILLs
@@ -116,6 +118,8 @@ pub struct Bash {
     /// are on one machine" structural here rather than a comment; see
     /// [`ToolConfig::command_runner`](super::ToolConfig::command_runner).
     backend: Arc<dyn FsBackend>,
+    /// The display cap and the optional pytest digest — see [`BashOutput`].
+    output: BashOutput,
 }
 
 /// Build the model-facing tool description, stating the *actual* default timeout (a model omitting
@@ -135,7 +139,7 @@ pub struct Bash {
 /// `new()` would be a stale snapshot for exactly the session that attaches a sandbox mid-life. The
 /// runtime marker (`output.rs`'s `full_output_segment`) already tells the model what to do in each
 /// case; this only has to stop promising the case that may not happen.
-fn describe(default_timeout_ms: u64) -> String {
+fn describe(default_timeout_ms: u64, max_bytes: usize) -> String {
     format!(
         "Run a shell command via a resolved bash (falls back to sh) and return its combined \
          stdout/stderr. Supports an optional `cwd` and `timeout_ms` (defaults to {default_timeout_ms} ms \
@@ -144,7 +148,7 @@ fn describe(default_timeout_ms: u64) -> String {
          file you can read, or has to be re-run redirected to a file.",
         default_timeout_ms / 60_000,
         super::output::DEFAULT_MAX_LINES,
-        super::output::format_size(super::output::DEFAULT_MAX_BYTES as u64),
+        super::output::format_size(max_bytes as u64),
     )
 }
 
@@ -157,16 +161,25 @@ impl Bash {
             shell_path: None,
             remote_shell: None,
             command_prefix: None,
-            description: describe(DEFAULT_TIMEOUT_MS),
+            description: describe(DEFAULT_TIMEOUT_MS, super::output::DEFAULT_MAX_BYTES),
             root: std::path::PathBuf::new(),
             backend: Arc::new(LocalFs::new()),
+            output: BashOutput::default(),
         }
     }
 
     /// Builder-style: override the default timeout applied when the model omits `timeout_ms`.
     pub fn with_default_timeout_ms(mut self, ms: u64) -> Self {
         self.default_timeout_ms = ms;
-        self.description = describe(ms);
+        self.description = describe(ms, self.output.max_bytes);
+        self
+    }
+
+    /// Builder-style: how a finished command's output is shaped for the model (`--tool-tuning
+    /// bash-max-bytes`/`bash-test-digest`). See [`BashOutput`].
+    pub fn with_output(mut self, output: BashOutput) -> Self {
+        self.output = output;
+        self.description = describe(self.default_timeout_ms, output.max_bytes);
         self
     }
 
@@ -228,9 +241,10 @@ impl Bash {
             shell_path: None,
             remote_shell: None,
             command_prefix: None,
-            description: describe(DEFAULT_TIMEOUT_MS),
+            description: describe(DEFAULT_TIMEOUT_MS, super::output::DEFAULT_MAX_BYTES),
             root: std::path::PathBuf::new(),
             backend: Arc::new(LocalFs::new()),
+            output: BashOutput::default(),
         }
     }
 
@@ -361,11 +375,7 @@ impl Bash {
         // would name a path it can never read — and, on a replica serving other tenants, would put a
         // tenant's command output on the host besides. No file is created at all; the marker tells the
         // model to redirect the output into its own sandbox instead.
-        let acc = Arc::new(Mutex::new(if world.is_remote() {
-            OutputAccumulator::new().without_spill()
-        } else {
-            OutputAccumulator::new()
-        }));
+        let acc = Arc::new(Mutex::new(self.output.accumulator(!world.is_remote())));
         let streamed = Arc::new(AtomicBool::new(false));
         let last_emit = Arc::new(Mutex::new(Instant::now()));
 
@@ -467,10 +477,11 @@ impl Bash {
             }
         }
 
-        let snap = {
+        let (snap, digest) = {
             let mut a = lock(&acc);
             a.finish();
-            a.snapshot(true) // persist the full output to the temp file if truncated
+            // Persists the full output to the temp file if truncated (or if the digest drops lines).
+            self.output.finish(&mut a)
         };
 
         // pi flushes a final snapshot before returning the result.
@@ -491,7 +502,7 @@ impl Bash {
                 &format!("Command timed out after {secs} seconds"),
             )));
         }
-        let text = clean(format_output(&snap, "(no output)"));
+        let text = clean(digest.unwrap_or_else(|| format_output(&snap, "(no output)")));
         match (result.code, result.signal) {
             (Some(0), _) => Ok(text.into()),
             // Non-zero exit is an error result that still carries the output — pi throws here too.

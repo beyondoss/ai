@@ -1641,14 +1641,32 @@ as `write("/home/…/f")` would.
   slightly-off `old_string` land and can never conflate two genuinely different characters. Edits
   resolve to byte ranges against the _original_ text (order-independent, overlap-rejected). When a
   call sends **both** forms, the top-level pair is appended as one more edit (pi's behavior) — see
-  "Edit tool surface" below for why that is an A/B knob.
+  "`--tool-tuning`" below for why that is an A/B knob.
 
-#### Edit tool surface — the `--tool-tuning` A/B knobs
+- **`ls`** sorts directories first, then alphabetically; dot-entries are hidden unless `all: true` —
+  both deliberate divergences from the reference agent, kept rather than "fixed" to match it (dotfiles
+  hidden by default cuts real noise like `.git`/editor swapfiles; directories-first is a UX improvement
+  independent of parity). Caps the listing at `limit` (default 500, overridable) so a
+  `node_modules`-sized directory can't flood context, appending a bracketed `[N more entries; M total —
+  use limit={2x} for more, or narrow with a subpath or use find/grep]` marker when it truncates — the
+  `limit={2x}` suggestion matches `grep`/`find`'s own truncation notices (and pi's own `ls.ts`, whose
+  `"${effectiveLimit} entries limit reached. Use limit=${effectiveLimit * 2} for more"` this was
+  originally missing entirely); the "narrow with a subpath or use find/grep" half is additional,
+  Beyond-specific guidance kept alongside it, not replaced by it. Matches the reference agent on: a
+  missing path or non-directory path gets a clean `Path not found: {path}`/`Not a directory: {path}`
+  message instead of a raw OS errno string; each entry's directory-ness follows symlinks
+  (`std::fs::metadata` on the entry's full path, not the lstat-like `DirEntry::file_type`), so a symlink
+  to a directory gets the `/` suffix; an entry that can't be stat'd at all (permission race mid-`readdir`,
+  dangling symlink) is silently skipped rather than guessed at as a plain file.
+
+### `--tool-tuning` — A/B knobs on how tools present themselves
 
 `--tool-tuning KEY=VALUE` (repeatable or comma-separated, `serve` too; `tools::tuning`) holds knobs
 whose only purpose is an eval comparison. Every default is the production behavior; an unknown key or
 value fails startup, so a typo in an eval arm can never quietly run the control. Subagents inherit the
 parent's tuning (`ChildToolConfig::tuning`).
+
+#### Edit tool surface
 
 The evidence (longctx eval, 380 runs): GPT-6 Luna and Sol fill **every** advertised property, so 100%
 of their edit calls carried `edits[]` _and_ a top-level `old_string`/`new_string`. The pair was filler
@@ -1677,21 +1695,19 @@ unification makes this binary-wide, so it is a separate eval binary rather than 
 (`streamed_body_is_byte_identical_to_the_tree` ×2, `reasoning_details_arriving_before_the_matching_tool_call_are_still_attached`);
 the bodies differ only in key order.
 
-- **`ls`** sorts directories first, then alphabetically; dot-entries are hidden unless `all: true` —
-  both deliberate divergences from the reference agent, kept rather than "fixed" to match it (dotfiles
-  hidden by default cuts real noise like `.git`/editor swapfiles; directories-first is a UX improvement
-  independent of parity). Caps the listing at `limit` (default 500, overridable) so a
-  `node_modules`-sized directory can't flood context, appending a bracketed `[N more entries; M total —
-  use limit={2x} for more, or narrow with a subpath or use find/grep]` marker when it truncates — the
-  `limit={2x}` suggestion matches `grep`/`find`'s own truncation notices (and pi's own `ls.ts`, whose
-  `"${effectiveLimit} entries limit reached. Use limit=${effectiveLimit * 2} for more"` this was
-  originally missing entirely); the "narrow with a subpath or use find/grep" half is additional,
-  Beyond-specific guidance kept alongside it, not replaced by it. Matches the reference agent on: a
-  missing path or non-directory path gets a clean `Path not found: {path}`/`Not a directory: {path}`
-  message instead of a raw OS errno string; each entry's directory-ness follows symlinks
-  (`std::fs::metadata` on the entry's full path, not the lstat-like `DirEntry::file_type`), so a symlink
-  to a directory gets the `/` suffix; an entry that can't be stat'd at all (permission race mid-`readdir`,
-  dangling symlink) is silently skipped rather than guessed at as a plain file.
+#### Bash output and the test guideline
+
+The evidence: test output was 18.9% of GPT-6 Luna's prompt tokens, against 2.7–3.1% for every other
+model. Luna ran the task's bare `python -m pytest tests` (41% of its test calls) and never filtered, so
+pytest's default long tracebacks filled the cap (median result 13 KB; 29% hit 50 KiB). Tracebacks were
+74% of those bytes, the short test summary 24%, passing-test noise under 1%. The other models pipe
+through `| head`/`| tail`, which the default guideline forbids without offering an alternative.
+
+| Key                | Values                    | Effect                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| ------------------ | ------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `bash-max-bytes`   | bytes or `Nk`, 1k–50k     | `bash`'s display cap (`OutputAccumulator::with_max_bytes`); the tail is kept, the rolling window scales with it, and the tool description states the new number. Global: it cuts every long command, not only tests.                                                                                                                                                                                                                                                                                             |
+| `bash-test-digest` | `off` (default), `pytest` | `tools/bash_output.rs`: a finished command whose (already tail-capped) output is over 16 KiB and carries a pytest banner (`FAILURES`/`ERRORS`, `short test summary info`, or the final counts line) is shown as the first 6 KiB of the FAILURES/ERRORS section, the summary block (4 KiB cap, with a count of what was dropped) and the counts line. The full output is always left readable: the digest forces the spill file even when the plain path would not have written one. Timeouts are never digested. |
+| `test-guideline`   | `default`, `pytest`       | `pytest` adds a bullet, gated on `bash` alone, naming `-q --tb=short`, `-x` and `-k`/node ids and saying to redirect to a file rather than pipe; the grep/read bullet then keeps only the install half of its pipe rule. Rendered by `resources::default_system_prompt_with`, which `run`, `serve` and subagents call with their tuning.                                                                                                                                                                         |
 
 ### Search tools — gitignore-aware tree walks, deterministic output
 

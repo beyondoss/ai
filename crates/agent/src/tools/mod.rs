@@ -9,6 +9,7 @@ use std::sync::Arc;
 use agent_core::{Tool, ToolError, ToolRegistry};
 
 pub mod bash;
+pub mod bash_output;
 pub mod code_mode;
 pub mod edit;
 pub mod exec;
@@ -679,7 +680,7 @@ pub fn default_registry_with_config(cfg: &ToolConfig<'_>) -> ToolRegistry {
         (None, Some(ms)) => bash::Bash::real().with_default_timeout_ms(ms),
         (None, None) => bash::Bash::real(),
     };
-    bash = bash.with_root(root);
+    bash = bash.with_root(root).with_output(cfg.tuning.bash);
     // `bash` asks the filesystem backend which world it is in, rather than being told once, because
     // `ExecCell` can be re-pointed mid-session (`set_exec_endpoint`) with no registry rebuild — a
     // captured world would keep resolving `~` and validating `cwd` against the machine the session
