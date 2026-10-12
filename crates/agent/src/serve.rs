@@ -9899,6 +9899,8 @@ pub struct CompactionFlags {
     pub tool_masking_min_tokens: Option<u32>,
     /// `--no-cached-summary`: always summarize from a re-rendered transcript.
     pub no_cached_summary: bool,
+    /// `--compaction-candidates`: the changes under evaluation this run turns on.
+    pub candidates: agent_core::CompactionCandidates,
 }
 
 /// [`compaction_config`] from the raw flag values, shared with `run`. `context_window` and the two
@@ -9929,6 +9931,7 @@ pub fn resolve_compaction(model: &str, flags: &CompactionFlags) -> agent_core::C
             .tool_masking_min_tokens
             .unwrap_or(d.mask_min_free_tokens),
         cached_summary: !flags.no_cached_summary,
+        candidates: flags.candidates,
         ..d
     }
 }

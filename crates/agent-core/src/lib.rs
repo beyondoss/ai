@@ -50,7 +50,9 @@ pub use branch_summary::{
     BRANCH_SUMMARY_INSTRUCTION, BRANCH_SUMMARY_MARKER, branch_summary_request,
 };
 pub use client::GatewayClient;
-pub use compaction::{CompactionConfig, CompactionProvenance, CompactionReason};
+pub use compaction::{
+    CompactionCandidates, CompactionConfig, CompactionProvenance, CompactionReason, SummarySource,
+};
 pub use error::{Error, Result, ToolError};
 pub use hooks::{AgentHooks, CheckpointHook, NoCheckpoint, NoHooks};
 pub use message::{
