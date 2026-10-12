@@ -19,66 +19,12 @@ use super::fs::local::LocalFs;
 /// bounds that; a file beyond it fails to match rather than exhausting memory.
 const MAX_EDIT_BYTES: usize = 64 * 1024 * 1024;
 
-/// Which argument shape the edit tool advertises (`--tool-tuning edit-schema=…`). An A/B knob: the
-/// longctx eval found GPT models fill *every* advertised property, so the combined schema's optional
-/// top-level pair arrives alongside `edits[]` in 100% of their calls. See "Edit tool surface" in
-/// `crates/agent/ARCHITECTURE.md`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum EditSchema {
-    /// `edits[]` plus an optional top-level `old_string`/`new_string`/`replace_all` — the default.
-    #[default]
-    Combined,
-    /// `path` + `edits[]` only (pi's shape).
-    EditsOnly,
-    /// `edit` takes one `old_string`/`new_string`/`replace_all`; a second tool, `multi_edit`, takes
-    /// `edits[]` (Claude Code's Edit/MultiEdit split).
-    Split,
-}
-
-impl std::str::FromStr for EditSchema {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "combined" => Ok(Self::Combined),
-            "edits" => Ok(Self::EditsOnly),
-            "split" => Ok(Self::Split),
-            other => Err(format!(
-                "invalid edit-schema {other:?}; expected combined, edits or split"
-            )),
-        }
-    }
-}
-
-/// The edit tool's tuning knobs, carried by [`super::ToolTuning`].
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct EditOptions {
-    pub schema: EditSchema,
-}
-
-/// The name of the multi-edit tool [`EditSchema::Split`] registers next to `edit`.
-pub const MULTI_EDIT: &str = "multi_edit";
-
-/// Which face of the one implementation a registered instance shows the model.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Surface {
-    /// `edit` under [`EditSchema::Combined`].
-    Combined,
-    /// `edit` under [`EditSchema::EditsOnly`], or `multi_edit` under [`EditSchema::Split`].
-    Edits,
-    /// `edit` under [`EditSchema::Split`].
-    Single,
-}
-
 pub struct Edit {
     /// Relative `path` arguments resolve against this. Empty = the process cwd. See
     /// [`super::resolve_against`].
     root: PathBuf,
     /// Where the read and the write actually land. Defaults to the host filesystem.
     backend: Arc<dyn FsBackend>,
-    surface: Surface,
-    /// `multi_edit` rather than `edit` (only under [`EditSchema::Split`]).
-    multi: bool,
 }
 
 impl Default for Edit {
@@ -92,35 +38,6 @@ impl Edit {
         Self {
             root: root.into(),
             backend: Arc::new(LocalFs::new()),
-            surface: Surface::Combined,
-            multi: false,
-        }
-    }
-
-    /// The tool(s) `opts` asks for: `edit` alone, or `edit` + `multi_edit` under
-    /// [`EditSchema::Split`]. Both share one backend, so they can never disagree about the file.
-    pub fn with_options(self, opts: EditOptions) -> Vec<Self> {
-        match opts.schema {
-            EditSchema::Combined => vec![self],
-            EditSchema::EditsOnly => vec![Self {
-                surface: Surface::Edits,
-                ..self
-            }],
-            EditSchema::Split => {
-                let multi = Self {
-                    root: self.root.clone(),
-                    backend: self.backend.clone(),
-                    surface: Surface::Edits,
-                    multi: true,
-                };
-                vec![
-                    Self {
-                        surface: Surface::Single,
-                        ..self
-                    },
-                    multi,
-                ]
-            }
         }
     }
 
@@ -138,75 +55,36 @@ impl Edit {
 #[async_trait]
 impl Tool for Edit {
     fn name(&self) -> &str {
-        if self.multi { MULTI_EDIT } else { "edit" }
+        "edit"
     }
     fn description(&self) -> &str {
-        match (self.surface, self.multi) {
-            (Surface::Combined, _) => {
-                "Apply exact-match replacements to a file. Pass an `edits` array of {old_string, new_string} \
-                 (each `old_string` must match exactly once), or a single old_string/new_string. With \
-                 `replace_all`, a single edit replaces every occurrence."
-            }
-            (Surface::Edits, false) => {
-                "Apply exact-match replacements to a file. Pass an `edits` array of {old_string, new_string}; \
-                 each `old_string` must match exactly once."
-            }
-            (Surface::Edits, true) => {
-                "Apply several exact-match replacements to one file in a single call. Pass an `edits` array \
-                 of {old_string, new_string}; each `old_string` must match exactly once. For one change, \
-                 use `edit`."
-            }
-            (Surface::Single, _) => {
-                "Replace one exact-match `old_string` in a file with `new_string`. `old_string` must match \
-                 exactly once unless `replace_all` is set. For several changes to one file, use `multi_edit`."
-            }
-        }
+        "Apply exact-match replacements to a file. Pass an `edits` array of {old_string, new_string} \
+         (each `old_string` must match exactly once), or a single old_string/new_string. With \
+         `replace_all`, a single edit replaces every occurrence."
     }
-    /// Properties are written in the order a model should emit them (path first, `old_string` before
-    /// `new_string`). serde_json sorts object keys unless built with `preserve_order`, so that order only
-    /// reaches the wire under the `json-key-order` cargo feature — see ARCHITECTURE.md.
     fn input_schema(&self) -> Value {
-        let path = json!({ "type": "string", "description": "File to edit." });
-        let edits = json!({
-            "type": "array",
-            "description": "Ordered replacements; each old_string must match exactly once.",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "old_string": { "type": "string" },
-                    "new_string": { "type": "string" }
+        json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "File to edit." },
+                "edits": {
+                    "type": "array",
+                    "description": "Ordered replacements; each old_string must match exactly once.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "old_string": { "type": "string" },
+                            "new_string": { "type": "string" }
+                        },
+                        "required": ["old_string", "new_string"]
+                    }
                 },
-                "required": ["old_string", "new_string"]
-            }
-        });
-        match self.surface {
-            Surface::Combined => json!({
-                "type": "object",
-                "properties": {
-                    "path": path,
-                    "edits": edits,
-                    "old_string": { "type": "string", "description": "Single-edit form: exact text to replace." },
-                    "new_string": { "type": "string", "description": "Single-edit form: replacement text." },
-                    "replace_all": { "type": "boolean", "description": "Single-edit form: replace every occurrence." }
-                },
-                "required": ["path"]
-            }),
-            Surface::Edits => json!({
-                "type": "object",
-                "properties": { "path": path, "edits": edits },
-                "required": ["path", "edits"]
-            }),
-            Surface::Single => json!({
-                "type": "object",
-                "properties": {
-                    "path": path,
-                    "old_string": { "type": "string", "description": "Exact text to replace." },
-                    "new_string": { "type": "string", "description": "Replacement text." },
-                    "replace_all": { "type": "boolean", "description": "Replace every occurrence instead of exactly one." }
-                },
-                "required": ["path", "old_string", "new_string"]
-            }),
-        }
+                "old_string": { "type": "string", "description": "Single-edit form: exact text to replace." },
+                "new_string": { "type": "string", "description": "Single-edit form: replacement text." },
+                "replace_all": { "type": "boolean", "description": "Single-edit form: replace every occurrence." }
+            },
+            "required": ["path"]
+        })
     }
 
     fn write_target(&self, input: &Value) -> Option<String> {
@@ -258,8 +136,6 @@ impl Edit {
             .and_then(Value::as_str)
             .ok_or_else(|| ToolError::InvalidInput("missing `path`".into()))?;
         let path = self.resolve(path);
-        // Every surface accepts every shape: the schema steers what a model sends, but a model that
-        // sends the other form anyway still gets its edit applied rather than a schema error.
         let edits = parse_edits(&input)?;
         let replace_all = input
             .get("replace_all")
@@ -1728,5 +1604,5 @@ mod tests {
 }
 
 #[cfg(test)]
-#[path = "edit/tuning_tests.rs"]
-mod tuning_tests;
+#[path = "edit/pair_tests.rs"]
+mod pair_tests;

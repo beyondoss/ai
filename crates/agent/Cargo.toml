@@ -238,12 +238,6 @@ listenfd = "1"
 default = []
 # Links QuickJS-NG. Off by default and MUST stay off in `.github/workflows/release-agent.yml`.
 code-mode = ["dep:rquickjs"]
-# serde_json keeps object keys in insertion order instead of sorting them. Off by default: every
-# shipped build so far sorts. An A/B arm for the edit tool (see "Edit tool surface" in
-# ARCHITECTURE.md): tool schemas reach the model in source order (path, old_string, new_string), and
-# the model's own earlier tool calls are echoed back in the order it wrote them, not alphabetized.
-# Feature unification makes this binary-wide, so it is a separate eval binary, not a flag.
-json-key-order = ["serde_json/preserve_order"]
 
 # Catalog-token + composition evals (and the ignored live Grok/OpenRouter eval). Requires the
 # feature so `CARGO_BIN_EXE_beyond-ai-agent` is the binary that actually links QuickJS;

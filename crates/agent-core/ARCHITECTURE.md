@@ -426,7 +426,7 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
     split-template summaries stale against the newest messages; the cached call, which sees the whole
     conversation, 40%.
 
-  And two about when masking pays:
+  And one about when masking pays:
   - `mask_breakeven` (`mask-breakeven`): a masking pass applies only if `mask_net_saving` is positive —
     `0.1 · freed · (freed / growth) ≥ (w − 0.1) · rewrite`: turns of cheaper reads until the freed room
     refills (`growth_per_turn` over the last 10 turns) against rewriting everything from the first
@@ -436,11 +436,9 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
     Note the counterfactual: since a pass applies only when it lands under the trigger, skipping it
     means summarizing now, which is cheaper per turn and loses verbatim context; the rule prices only
     the rewrite.
-  - `mask_best_start` (`mask-best-start`): the same rule, but the pass keeps only the plan's edits from
-    the start that maximizes the net saving (`best_mask_start`), so an early result that frees little
-    stops forcing a rewrite of everything after it (a large protected result, say). Moving the start
-    later helps only where the skipped region holds little maskable output relative to its size;
-    coding transcripts front-load file reads, so expect it to match `mask-breakeven` most of the time.
+
+  A second masking candidate, `mask-best-start` (the same rule over the plan's edits from the start
+  that maximizes the net saving), was deleted: offline it changed the start of 1 of 29 passes.
 
 - **The deterministic-carry channel** — `apply_summary` is deliberately destructive: it _replaces_
   `session.messages` with `[summary, …kept_suffix]`, and `SessionStore::open` reloads that
@@ -840,24 +838,22 @@ Error exits (no session mutation for the failed turn):
   stream() / stream item Err  ──► Err(Transport(..))            [network/non-2xx (after retries), bad UTF-8/SSE,
                                                                  mid-stream `event: error`, truncated stream]
 
-**Step budget (experimental, `Agent::with_step_budget`, all off by default).** `step_budget.rs` holds
-three behaviors for a run with a `max_steps` ceiling. They exist for an A/B. In the longctx eval,
-gpt-6-luna hit `MaxSteps(150)` in 7 of 22 code runs, each within two steps of an untested edit. Two of
-those scored 0% because an edit had left the tree broken. Luna also quit 4 runs early with 35–80% of its
-steps left. Without a ceiling, or with the default `StepBudget`, the loop is unchanged.
+**Step budget (experimental, `Agent::with_step_budget`, off by default).** `step_budget.rs` holds one
+behavior for a run with a `max_steps` ceiling, for an A/B. In the longctx eval, gpt-6-luna hit
+`MaxSteps(150)` in 7 of 22 code runs, each within two steps of an untested edit. Two of those scored 0%
+because an edit had left the tree broken. Without a ceiling, or with the default `StepBudget`, the loop
+is unchanged.
 
-- `notice_at: Some(n)`: once `limit - steps <= n`, a one-time `[step budget] N of M steps remain…` text
-  block is appended to that tool-results turn, after any steer.
 - `wrap_up_steps: Some(k)`: when a tool-results turn uses the last allowed step, the per-call `limit`
   grows by `k`, and the same turn gets a "fix or revert anything broken, start no new work, summarize"
   block. Using the grant ends in `Error::MaxSteps(max_steps)`, still the *configured* ceiling.
-- `continue_nudge: true`: when the model ends its turn with nothing queued and at least
-  `NUDGE_MIN_REMAINING_PCT` (20%) of the ceiling left, the loop pushes one user turn asking it to keep
-  going if the task isn't complete, then continues. This never happens after a wrap-up.
 
-Each fires at most once per call and is reported as `AgentEvent::StepBudget { message, steps }`. Folding
-into the tool-results turn, or pushing a user turn after an assistant stop, keeps role alternation valid,
-the same way the steer and follow-up lanes do.
+It fires at most once per call and is reported as `AgentEvent::StepBudget { message, steps }`. Folding
+into the tool-results turn keeps role alternation valid, the same way the steer lane does.
+
+Two sibling arms were deleted. A one-time "N of M steps remain" notice near the ceiling made Luna rush
+more, and one run broke mid-edit (220 regressions). A continue nudge when the model stopped with 20%+ of
+its steps left made runs 274% costlier and ended with broken trees.
 
 Recoverable (no error): a streamed tool call whose JSON args never parse keeps its `tool_use` block
 (with an empty `{}` input) and is fed back as an error `tool_result` the model can correct — the run
@@ -1390,7 +1386,7 @@ both fields `None` and never reads them.
 | ------------------------------------------------- | ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `DEFAULT_MAX_TOKENS` / `Agent::with_max_tokens`   | model-aware (≥ 4096)          | Per-turn output ceiling (`max_tokens`/`max_completion_tokens` per dialect). `Agent::new` seeds it from `capabilities(model).max_output` (floored at 4096); the compaction `context_window` is likewise seeded from `capabilities`. Both still overridable via the builders                                                                                                                                                                                                                                                                                                                              |
 | `Agent::with_max_steps`                           | `None` (unbounded)            | Opt-in loop-iteration ceiling; when set, the iteration after the ceiling is reached returns `Error::MaxSteps` before sending a request. Unbounded by default (matching pi's own loop): the run is already bounded by cancellation and token spend, and every finite default this crate shipped (24, then 50) got hit by legitimate deep tasks without a recorded runaway to its name. `Error::MaxSteps` is resumable: the check runs before any per-turn state is touched, so a fresh `run`/`run_events_steered` call against the same session simply continues past it with a new per-call step budget |
-| `Agent::with_step_budget`                         | `StepBudget::default()` (off) | Experimental notice / wrap-up / continue-nudge around `max_steps` (see "Step budget" above). Inert without a ceiling                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `Agent::with_step_budget`                         | `StepBudget::default()` (off) | Experimental wrap-up grant past `max_steps` (see "Step budget" above). Inert without a ceiling                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | `Agent::with_system`                              | `None`                        | System prompt; hoisted to each dialect's native system field (Anthropic top-level `system`, OpenAI leading `system` message)                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | `Agent::with_system_fn`                           | `None`                        | Per-turn system-prompt callback, re-evaluated every turn; takes priority over `with_system` when both are set                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | `Agent::with_tools`                               | empty                         | The tool set advertised to the model; definitions + JSON Schemas computed once here, shared via `Arc<[ToolDef]>` for the agent's lifetime (mid-run overridable — see `Steering::request_tool_set`)                                                                                                                                                                                                                                                                                                                                                                                                      |

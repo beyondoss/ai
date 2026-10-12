@@ -9,7 +9,6 @@ use std::sync::Arc;
 use agent_core::{Tool, ToolError, ToolRegistry};
 
 pub mod bash;
-pub mod bash_output;
 pub mod code_mode;
 pub mod edit;
 pub mod exec;
@@ -33,16 +32,12 @@ pub(crate) mod mcp_wire;
 pub mod memory;
 pub mod output;
 pub mod read;
-pub mod search;
 pub mod structured_output;
 pub mod subagent;
 pub mod todo;
 pub mod tool_search;
-pub mod tuning;
 pub mod web;
 pub mod write;
-
-pub use tuning::ToolTuning;
 
 /// Normalize a filesystem tool's `path` argument the way `bash` gets for free from the real shell it
 /// spawns: expand a leading `~` or `~/` to the user's home directory, fold non-ASCII Unicode space
@@ -510,8 +505,8 @@ pub(crate) fn is_writable(path: &str) -> bool {
 pub struct ToolConfig<'a> {
     /// `bash`'s default timeout, applied when the model omits `timeout_ms` (`--bash-timeout-ms`).
     pub bash_timeout_ms: Option<u64>,
-    /// `bash`'s experimental long-command behaviors (`--bash-idle-yield-secs`, `--bash-yield-secs`,
-    /// `--bash-timeout-guidance`). The default changes nothing.
+    /// `bash`'s experimental long-command behaviors (`--bash-idle-yield-secs`, `--bash-yield-secs`).
+    /// The default changes nothing.
     pub bash_policy: bash::BashPolicy,
     /// Which shell `bash` runs commands through (`--bash-shell-path`). Trusted as already validated at
     /// CLI-argument time rather than re-checked on every registry rebuild (`set_model` rebuilds).
@@ -593,9 +588,6 @@ pub struct ToolConfig<'a> {
     /// Discovered skills, so `read` resolves the `skill:<name>` paths the system prompt's listing
     /// names them by ([`crate::skills::SKILL_SCHEME`]). Empty: the scheme names nothing.
     pub skills: &'a [crate::skills::Skill],
-    /// `--tool-tuning`: the A/B knobs on how built-in tools present themselves. `Default` is the
-    /// production behavior. See [`tuning`].
-    pub tuning: ToolTuning,
 }
 
 impl<'a> ToolConfig<'a> {
@@ -668,22 +660,10 @@ pub fn default_registry_with_config(cfg: &ToolConfig<'_>) -> ToolRegistry {
     }
     reg.register(Arc::new(read_tool));
     reg.register(Arc::new(write_tool));
-    // One `edit`, or `edit` + `multi_edit` under `edit-schema=split` (see `edit::EditSchema`).
-    for t in edit_tool.with_options(cfg.tuning.edit) {
-        reg.register(Arc::new(t));
-    }
-    // `search-tool=merged` advertises one `search` that routes to these three instead of them.
-    if cfg.tuning.search_tool == tuning::SearchTool::Merged {
-        reg.register(Arc::new(search::Search::new(
-            Arc::new(grep_tool),
-            Arc::new(find_tool),
-            Arc::new(ls_tool),
-        )));
-    } else {
-        reg.register(Arc::new(ls_tool));
-        reg.register(Arc::new(grep_tool));
-        reg.register(Arc::new(find_tool));
-    }
+    reg.register(Arc::new(edit_tool));
+    reg.register(Arc::new(ls_tool));
+    reg.register(Arc::new(grep_tool));
+    reg.register(Arc::new(find_tool));
     // `bash` runs wherever the filesystem tools do — see `ToolConfig::command_runner`.
     let mut bash = match (&cfg.command_runner, cfg.bash_timeout_ms) {
         (Some(runner), Some(ms)) => {
@@ -693,7 +673,7 @@ pub fn default_registry_with_config(cfg: &ToolConfig<'_>) -> ToolRegistry {
         (None, Some(ms)) => bash::Bash::real().with_default_timeout_ms(ms),
         (None, None) => bash::Bash::real(),
     };
-    bash = bash.with_root(root).with_output(cfg.tuning.bash);
+    bash = bash.with_root(root);
     // `bash` asks the filesystem backend which world it is in, rather than being told once, because
     // `ExecCell` can be re-pointed mid-session (`set_exec_endpoint`) with no registry rebuild — a
     // captured world would keep resolving `~` and validating `cwd` against the machine the session
@@ -1274,31 +1254,6 @@ mod tests {
             );
         }
         assert_eq!(reg.len(), 9);
-    }
-
-    #[test]
-    fn search_tool_merged_replaces_grep_find_and_ls_with_one_search() {
-        let reg = default_registry_with_config(&ToolConfig {
-            tuning: ToolTuning::parse(&["search-tool=merged"]).unwrap(),
-            ..ToolConfig::new()
-        });
-        assert!(reg.get(search::NAME).is_some());
-        for gone in ["grep", "find", "ls"] {
-            assert!(reg.get(gone).is_none(), "{gone} must not be advertised");
-        }
-        assert!(default_registry().get(search::NAME).is_none());
-    }
-
-    #[test]
-    fn edit_schema_split_registers_multi_edit_and_the_default_does_not() {
-        assert!(default_registry().get(edit::MULTI_EDIT).is_none());
-        let reg = default_registry_with_config(&ToolConfig {
-            tuning: ToolTuning::parse(&["edit-schema=split"]).unwrap(),
-            ..ToolConfig::new()
-        });
-        assert!(reg.get("edit").is_some());
-        assert!(reg.get(edit::MULTI_EDIT).is_some());
-        assert_eq!(reg.len(), 10);
     }
 
     #[test]

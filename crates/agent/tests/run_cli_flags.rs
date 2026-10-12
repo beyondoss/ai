@@ -2880,3 +2880,40 @@ fn run_binary_without_block_images_a_read_tool_image_carries_no_non_vision_place
         bodies[1]
     );
 }
+
+/// Flags whose eval arms lost were deleted, not left as no-ops: each must fail startup before any
+/// request, so a stale eval arm cannot quietly run the control.
+#[test]
+fn deleted_experiment_flags_fail_startup_as_unknown() {
+    let (base, bodies) = spawn_model_server(vec![turn_text("ok")]);
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    for flag in [
+        &["--tool-tuning", "edit-schema=split"][..],
+        &["--tool-tuning", "bash-test-digest=pytest"],
+        &["--max-steps-notice", "5"],
+        &["--max-steps-continue-nudge"],
+        &["--bash-timeout-guidance"],
+        &["--compaction-candidates", "mask-best-start"],
+    ] {
+        let output = run_cmd(bin)
+            .args([
+                "run",
+                "hi",
+                "--gateway-url",
+                &base,
+                "--key",
+                "bai_v1.test",
+                "--model",
+                "claude-test",
+                "--no-session-persistence",
+                "--max-steps",
+                "10",
+            ])
+            .args(flag)
+            .stdin(Stdio::null())
+            .output()
+            .expect("spawn binary");
+        assert!(!output.status.success(), "{flag:?} must fail startup");
+        assert!(bodies.lock().unwrap().is_empty(), "{flag:?} sent a request");
+    }
+}

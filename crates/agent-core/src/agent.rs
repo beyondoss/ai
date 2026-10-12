@@ -78,7 +78,7 @@ pub enum AgentEvent {
     /// The run finished normally (the model ended its turn and no steering was queued).
     AgentEnd { steps: u32 },
     /// A [`crate::StepBudget`] message was injected (see [`Agent::with_step_budget`]). `steps` is
-    /// the steps remaining for a notice or nudge, and the steps granted for a wrap-up.
+    /// the steps granted for a wrap-up.
     StepBudget {
         message: crate::StepBudgetKind,
         steps: u32,
@@ -271,7 +271,7 @@ pub struct Agent {
     /// Opt-in ceiling on loop iterations per `run` call. `None` (the default) runs until the model
     /// ends its turn, like pi's loop — see [`Self::with_max_steps`] for why unbounded is the default.
     max_steps: Option<u32>,
-    /// Experimental messages near and at `max_steps` — see [`Self::with_step_budget`].
+    /// An experimental wrap-up grant at `max_steps` — see [`Self::with_step_budget`].
     step_budget: crate::StepBudget,
     /// Extended-thinking budget, when enabled. Applied to every turn's request.
     thinking: Option<u32>,
@@ -451,9 +451,8 @@ impl Agent {
         self
     }
 
-    /// Experimental: tell the model about its step budget near the ceiling, grant a wrap-up past
-    /// it, or nudge an early stop (see [`crate::step_budget`]). Inert without
-    /// [`with_max_steps`](Self::with_max_steps); the default changes nothing.
+    /// Experimental: grant a few wrap-up steps past the ceiling (see [`crate::step_budget`]). Inert
+    /// without [`with_max_steps`](Self::with_max_steps); the default changes nothing.
     pub fn with_step_budget(mut self, step_budget: crate::StepBudget) -> Self {
         self.step_budget = step_budget;
         self
@@ -1287,17 +1286,6 @@ impl Agent {
                 // keeps the wire's role alternation valid.
                 let injected = steering.drain_at_stop();
                 if injected.is_empty() {
-                    // Stopping early with budget left: ask once whether the task is really done.
-                    // A plain user turn after the assistant's, like a follow-up.
-                    if let Some((remaining, text)) = budget.at_stop(steps_this_call) {
-                        session.user(text);
-                        let _ = self.checkpoint_guarded(session).await;
-                        sink(AgentEvent::StepBudget {
-                            message: crate::StepBudgetKind::Nudge,
-                            steps: remaining,
-                        });
-                        continue;
-                    }
                     sink(AgentEvent::AgentEnd {
                         steps: session.steps,
                     });
@@ -2813,33 +2801,15 @@ impl Agent {
         {
             return false;
         }
-        // Candidates under evaluation: apply the pass only when it pays for its cache rewrite before
-        // the freed room refills, optionally from a later start (see `CompactionCandidates`).
-        let candidates = cfg.candidates;
-        let mut plan = plan;
-        if candidates.mask_breakeven || candidates.mask_best_start {
+        // A candidate under evaluation: apply the pass only when it pays for its cache rewrite before
+        // the freed room refills (see `CompactionCandidates::mask_breakeven`).
+        if cfg.candidates.mask_breakeven {
             let growth = compaction::growth_per_turn(&session.messages, MASK_GROWTH_TURNS);
             let write_premium = if self.cache_long { 2.0 } else { 1.25 };
-            if candidates.mask_best_start {
-                let need = cfg
-                    .mask_min_free()
-                    .max(tokens_before.saturating_sub(cfg.trigger_tokens()));
-                match compaction::best_mask_start(
-                    &session.messages,
-                    &plan,
-                    need,
-                    growth,
-                    write_premium,
-                ) {
-                    Some(restricted) => plan = restricted,
-                    None => return false,
-                }
-            } else {
-                let first = plan.edited.first().copied().unwrap_or(0);
-                let rewrite = compaction::estimate_messages_tokens(&plan.messages[first..]);
-                if compaction::mask_net_saving(plan.freed, rewrite, growth, write_premium) < 0.0 {
-                    return false;
-                }
+            let first = plan.edited.first().copied().unwrap_or(0);
+            let rewrite = compaction::estimate_messages_tokens(&plan.messages[first..]);
+            if compaction::mask_net_saving(plan.freed, rewrite, growth, write_premium) < 0.0 {
+                return false;
             }
         }
         for b in &mut session.request_blocks {
@@ -13625,17 +13595,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_breakeven_candidates_skip_a_mask_that_cannot_pay_for_its_rewrite() {
-        for candidates in [
-            compaction::CompactionCandidates {
+    async fn the_breakeven_candidate_skips_a_mask_that_cannot_pay_for_its_rewrite() {
+        {
+            let candidates = compaction::CompactionCandidates {
                 mask_breakeven: true,
                 ..Default::default()
-            },
-            compaction::CompactionCandidates {
-                mask_best_start: true,
-                ..Default::default()
-            },
-        ] {
+            };
             let mock = Arc::new(MockTransport::new(vec![
                 turn::text("## Goal\nsummary"),
                 turn::text("done"),

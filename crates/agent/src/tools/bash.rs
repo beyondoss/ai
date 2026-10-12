@@ -22,7 +22,6 @@ use async_trait::async_trait;
 use regex::Regex;
 use serde_json::{Value, json};
 
-use super::bash_output::BashOutput;
 use super::exec::{ChunkSink, CommandRunner, ExecResult, RealRunner};
 use super::fs::local::LocalFs;
 use super::fs::{FsBackend, PathWorld};
@@ -95,9 +94,6 @@ pub struct BashPolicy {
     /// Return to the model once a call has been waiting this long, output or not
     /// (`--bash-yield-secs`) — the same detached job, on a wall-clock schedule.
     pub wall_yield: Option<Duration>,
-    /// Advise the model to size `timeout_ms` to the command, and add a "probably stuck" hint to a
-    /// timed-out result (`--bash-timeout-guidance`). Text only; no behavior changes.
-    pub timeout_guidance: bool,
 }
 
 impl BashPolicy {
@@ -106,14 +102,6 @@ impl BashPolicy {
         self.idle_yield.is_some() || self.wall_yield.is_some()
     }
 }
-
-/// Appended to a timed-out result under [`BashPolicy::timeout_guidance`]. In the eval, every model
-/// that hit a timeout already guessed "infinite loop" on its own; this exists so the arm also says
-/// how to find it fast, and costs nothing when no timeout fires.
-const TIMEOUT_HINT: &str = "If it was not expected to take this long, it is probably stuck: an \
-                            infinite loop or a read that never returns. Rerun the narrowest failing \
-                            piece with a short `timeout_ms`; for pytest add `-x` and \
-                            `-o faulthandler_timeout=<seconds>` to print the stuck stack.";
 
 pub struct Bash {
     runner: Arc<dyn CommandRunner>,
@@ -156,8 +144,6 @@ pub struct Bash {
     /// are on one machine" structural here rather than a comment; see
     /// [`ToolConfig::command_runner`](super::ToolConfig::command_runner).
     backend: Arc<dyn FsBackend>,
-    /// The display cap and the optional pytest digest — see [`BashOutput`].
-    output: BashOutput,
 }
 
 /// Build the model-facing tool description, stating the *actual* default timeout (a model omitting
@@ -177,7 +163,7 @@ pub struct Bash {
 /// `new()` would be a stale snapshot for exactly the session that attaches a sandbox mid-life. The
 /// runtime marker (`output.rs`'s `full_output_segment`) already tells the model what to do in each
 /// case; this only has to stop promising the case that may not happen.
-fn describe(default_timeout_ms: u64, max_bytes: usize, policy: &BashPolicy) -> String {
+fn describe(default_timeout_ms: u64, policy: &BashPolicy) -> String {
     let mut text = format!(
         "Run a shell command via a resolved bash (falls back to sh) and return its combined \
          stdout/stderr. Supports an optional `cwd` and `timeout_ms` (defaults to {default_timeout_ms} ms \
@@ -186,15 +172,8 @@ fn describe(default_timeout_ms: u64, max_bytes: usize, policy: &BashPolicy) -> S
          file you can read, or has to be re-run redirected to a file.",
         default_timeout_ms / 60_000,
         super::output::DEFAULT_MAX_LINES,
-        super::output::format_size(max_bytes as u64),
+        super::output::format_size(super::output::DEFAULT_MAX_BYTES as u64),
     );
-    if policy.timeout_guidance {
-        text.push_str(
-            " Set `timeout_ms` to fit the command, a few times how long you expect it to take, rather \
-             than relying on the default: a command that hangs (an infinite loop in new code, a test \
-             waiting on input) blocks you until its timeout fires.",
-        );
-    }
     let early = match (policy.idle_yield, policy.wall_yield) {
         (Some(idle), Some(wall)) => Some(format!(
             "after {} s without new output, or {} s in any case,",
@@ -226,29 +205,16 @@ impl Bash {
             shell_path: None,
             remote_shell: None,
             command_prefix: None,
-            description: describe(
-                DEFAULT_TIMEOUT_MS,
-                super::output::DEFAULT_MAX_BYTES,
-                &BashPolicy::default(),
-            ),
+            description: describe(DEFAULT_TIMEOUT_MS, &BashPolicy::default()),
             root: std::path::PathBuf::new(),
             backend: Arc::new(LocalFs::new()),
-            output: BashOutput::default(),
         }
     }
 
     /// Builder-style: override the default timeout applied when the model omits `timeout_ms`.
     pub fn with_default_timeout_ms(mut self, ms: u64) -> Self {
         self.default_timeout_ms = ms;
-        self.description = describe(ms, self.output.max_bytes, &self.policy);
-        self
-    }
-
-    /// Builder-style: how a finished command's output is shaped for the model (`--tool-tuning
-    /// bash-max-bytes`/`bash-test-digest`). See [`BashOutput`].
-    pub fn with_output(mut self, output: BashOutput) -> Self {
-        self.output = output;
-        self.description = describe(self.default_timeout_ms, output.max_bytes, &self.policy);
+        self.description = describe(ms, &self.policy);
         self
     }
 
@@ -256,7 +222,7 @@ impl Bash {
     /// [`BashPolicy`]). The default policy changes nothing.
     pub fn with_policy(mut self, policy: BashPolicy) -> Self {
         self.policy = policy;
-        self.description = describe(self.default_timeout_ms, self.output.max_bytes, &policy);
+        self.description = describe(self.default_timeout_ms, &policy);
         self
     }
 
@@ -320,14 +286,9 @@ impl Bash {
             shell_path: None,
             remote_shell: None,
             command_prefix: None,
-            description: describe(
-                DEFAULT_TIMEOUT_MS,
-                super::output::DEFAULT_MAX_BYTES,
-                &BashPolicy::default(),
-            ),
+            description: describe(DEFAULT_TIMEOUT_MS, &BashPolicy::default()),
             root: std::path::PathBuf::new(),
             backend: Arc::new(LocalFs::new()),
-            output: BashOutput::default(),
         }
     }
 
@@ -463,7 +424,7 @@ impl Bash {
         // would name a path it can never read — and, on a replica serving other tenants, would put a
         // tenant's command output on the host besides. No file is created at all; the marker tells the
         // model to redirect the output into its own sandbox instead.
-        let acc = Arc::new(Mutex::new(self.output.accumulator(!world.is_remote())));
+        let acc = Arc::new(Mutex::new(accumulator(!world.is_remote())));
         let streamed = Arc::new(AtomicBool::new(false));
         let last_emit = Arc::new(Mutex::new(Instant::now()));
 
@@ -565,11 +526,10 @@ impl Bash {
             }
         }
 
-        let (snap, digest) = {
+        let snap = {
             let mut a = lock(&acc);
             a.finish();
-            // Persists the full output to the temp file if truncated (or if the digest drops lines).
-            self.output.finish(&mut a)
+            a.snapshot(true) // persist the full output to the temp file if truncated
         };
 
         // pi flushes a final snapshot before returning the result.
@@ -577,13 +537,7 @@ impl Bash {
             emit_update(p, &snap);
         }
 
-        finish_result(
-            &snap,
-            digest,
-            &result,
-            timeout_ms,
-            self.policy.timeout_guidance,
-        )
+        finish_result(&snap, &result, timeout_ms)
     }
 
     /// The [`BashPolicy::detaches`] path: the command runs on its own task, and this call waits on it
@@ -601,7 +555,7 @@ impl Bash {
         world: &PathWorld,
         progress: Option<&ToolProgress>,
     ) -> Result<ToolOutput, ToolError> {
-        let shared = Arc::new(JobShared::new(world.is_remote(), self.output));
+        let shared = Arc::new(JobShared::new(world.is_remote()));
         if let Some(p) = progress {
             p.emit("", None);
         }
@@ -777,7 +731,7 @@ impl Bash {
             Ok(Err(e)) => return Err(ToolError::Execution(format!("spawn failed: {e}"))),
             Err(e) => return Err(ToolError::Execution(format!("command task failed: {e}"))),
         };
-        let (snap, digest) = {
+        let snap = {
             let mut out = lock(&job.shared.out);
             // A non-streaming runner (a remote endpoint) delivered nothing through the sink; its
             // captured output is the whole story, as on the foreground path.
@@ -791,19 +745,12 @@ impl Bash {
                 }
             }
             out.acc.finish();
-            // The same display cap and pytest digest as the foreground path.
-            self.output.finish(&mut out.acc)
+            out.acc.snapshot(true)
         };
         if let Some(p) = progress {
             emit_update(p, &snap);
         }
-        finish_result(
-            &snap,
-            digest,
-            &result,
-            job.timeout_ms,
-            self.policy.timeout_guidance,
-        )
+        finish_result(&snap, &result, job.timeout_ms)
     }
 
     /// `bash_job`'s body: `{"job": N}` waits on job N, `{"job": N, "kill": true}` stops it.
@@ -895,10 +842,9 @@ struct JobShared {
     /// The command's process group while it runs — what [`Job`]'s `Drop`, a kill, and
     /// [`kill_live_jobs`] signal.
     pgid: Mutex<Option<u32>>,
-    /// Where the command runs (no spill file when remote) and how its output is capped — what each
-    /// fresh per-report accumulator is built from.
+    /// Where the command runs (no spill file when remote) — what each fresh per-report accumulator
+    /// is built from.
     remote: bool,
-    output: BashOutput,
 }
 
 struct JobOutput {
@@ -910,17 +856,16 @@ struct JobOutput {
 }
 
 impl JobShared {
-    fn new(remote: bool, output: BashOutput) -> Self {
+    fn new(remote: bool) -> Self {
         Self {
             out: Mutex::new(JobOutput {
-                acc: output.accumulator(!remote),
+                acc: accumulator(!remote),
                 last_output: Instant::now(),
                 streamed: false,
             }),
             notify: tokio::sync::Notify::new(),
             pgid: Mutex::new(None),
             remote,
-            output,
         }
     }
 
@@ -950,7 +895,7 @@ impl JobShared {
     /// The output since the last report, finished and snapshotted; the next report starts empty.
     fn take_segment(&self) -> OutputSnapshot {
         let mut out = lock(&self.out);
-        let fresh = self.output.accumulator(!self.remote);
+        let fresh = accumulator(!self.remote);
         let mut segment = std::mem::replace(&mut out.acc, fresh);
         segment.finish();
         segment.snapshot(true)
@@ -971,15 +916,23 @@ pub fn kill_live_jobs() {
     }
 }
 
+/// A fresh output accumulator; `spill: false` when the command runs somewhere this process cannot
+/// write a file the model could read (see [`describe`]).
+fn accumulator(spill: bool) -> OutputAccumulator {
+    if spill {
+        OutputAccumulator::new()
+    } else {
+        OutputAccumulator::new().without_spill()
+    }
+}
+
 /// The model-facing result for a command that has exited (or timed out): the cleaned output plus the
 /// status line pi appends. Shared by the foreground path and a detached job's final report, so both
 /// read the same.
 fn finish_result(
     snap: &OutputSnapshot,
-    digest: Option<String>,
     result: &ExecResult,
     timeout_ms: u64,
-    guidance: bool,
 ) -> Result<ToolOutput, ToolError> {
     if result.timed_out {
         let secs = timeout_ms / 1000;
@@ -989,14 +942,12 @@ fn finish_result(
         // empty content on this path specifically (the success/exit-code path below keeps the
         // placeholder, since there the empty case is a genuinely silent command, not an interrupt).
         let text = clean(format_output(snap, ""));
-        let mut status = format!("Command timed out after {secs} seconds");
-        if guidance {
-            status.push_str(". ");
-            status.push_str(TIMEOUT_HINT);
-        }
-        return Err(ToolError::Execution(append_status(&text, &status)));
+        return Err(ToolError::Execution(append_status(
+            &text,
+            &format!("Command timed out after {secs} seconds"),
+        )));
     }
-    let text = clean(digest.unwrap_or_else(|| format_output(snap, "(no output)")));
+    let text = clean(format_output(snap, "(no output)"));
     match (result.code, result.signal) {
         (Some(0), _) => Ok(text.into()),
         // Non-zero exit is an error result that still carries the output — pi throws here too.
