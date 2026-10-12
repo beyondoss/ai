@@ -403,7 +403,7 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
     Sonnet 5 rejects mid-conversation system messages with a 400) instead of failing the compaction.
     Assistant prefill, the remaining idea, is a 400 on Haiku 5.5 and every 4.6+ Claude model.
 
-  Three more answer what the summaries said, across all 87 eval compactions:
+  Two more answer what the summaries said, across all 87 eval compactions:
   - `state_template` (`state`): every summary is one current-state document. A single-prompt
     agentic run is one long turn and `find_cut` always leaves the prefix ending on a tool result, so
     55 of 87 summaries took the split-turn path (51 opening "No prior history.") and each later round
@@ -418,11 +418,6 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
     (`TAIL_NOTE`), so its summary is current rather than as of the cut. A Haiku judge rated 93% of the
     split-template summaries stale against the newest messages; the cached call, which sees the whole
     conversation, 40%.
-  - `carry_requests` (`carry-request`): the user's own requests ride the deterministic carry
-    (`CompactionProvenance::user_requests`, `merge_user_requests`, `<user-requests>`), so no later round
-    has to re-infer them: 23 of 52 later-round summaries did ("The user's exact request is not visible
-    in this prefix…"). Each genuine user turn's text, deduped, capped at 4,000 chars; past four, the
-    first and the latest. Persisted on the compaction record like the rest of the provenance, and handed to the re-render beside the file tags (its `<previous-summary>` has carry blocks stripped, so it would otherwise never see the user's words again).
 
   And two about when masking pays:
   - `mask_breakeven` (`mask-breakeven`): a masking pass applies only if `mask_net_saving` is positive —
@@ -450,7 +445,7 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
   reopen, and `Agent::compact` re-renders it into every new summary by appending host-generated blocks
   to the model's prose — never trusting the prose itself.
 
-  Two things ride it, for the same reason:
+  Three things ride it, for the same reason:
   - **File awareness** — `extract_file_ops` (read vs. modified paths from `read`/`write`/`edit` calls),
     plus `extract_bash_writes` (files a `bash` command wrote), accumulated and deduped across rounds,
     rendered by `format_file_operations` as `<read-files>`/`<modified-files>`. The bash side parses
@@ -468,8 +463,13 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
     This is why `tools::todo` holds no state of its own (it couldn't: its registry is rebuilt on every
     `set_model`), and it is what `serve`'s `get_todos` falls back to once the `tool_use` block that
     carried the list has been compacted away.
-  - **The user's requests**, under the `carry-request` candidate only (see "Candidates under
-    evaluation") — `merge_user_requests`, rendered by `format_user_requests` as `<user-requests>`.
+  - **The user's requests** — `merge_user_requests`, rendered by `format_user_requests` as
+    `<user-requests>`, so no later round has to re-infer them: without the carry, 23 of 52 later-round
+    eval summaries did ("The user's exact request is not visible in this prefix…"), and only 34–40%
+    kept the "don't edit tests" constraint. Each genuine user turn's text, deduped, capped at 4,000
+    chars; past four, the first and the latest. Handed to the re-render beside the file tags too (its
+    `<previous-summary>` has carry blocks stripped, so it would otherwise never see the user's words
+    again).
 
   `compact` first strips any blocks the model echoed at the end of its own reply (`strip_echoed_carry`):
   the cached call sees the previous summary, blocks included, and a model that mirrors its shape ends

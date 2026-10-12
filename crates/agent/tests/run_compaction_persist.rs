@@ -98,10 +98,9 @@ fn a_compacted_run_reloads_as_the_summary_and_everything_after_it() {
     run(&base, &session_file, "and once more");
     let body = bodies.lock().unwrap()[0].clone();
     assert!(body.contains("SUMMARY ONE"), "{body}");
-    assert!(
-        !body.contains("question 0"),
-        "folded history resent: {body}"
-    );
+    // The user's own words ride the summary's `<user-requests>` carry by design; the folded turns
+    // themselves must not come back.
+    assert!(!body.contains("answer 0"), "folded history resent: {body}");
     let (_, session) = SessionStore::open(session_file.into()).unwrap();
     let m = &session.messages;
     assert_eq!(m.len(), before + 2, "{m:#?}");

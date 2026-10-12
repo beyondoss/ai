@@ -2442,10 +2442,6 @@ impl Agent {
         let tokens_before = session.last_input_tokens;
         let prefix: Vec<Message> = session.messages[..first_kept].to_vec();
         let mut file_ops = compaction::merge_provenance(&session.compaction, &prefix, reason);
-        if candidates.carry_requests {
-            file_ops.user_requests =
-                compaction::merge_user_requests(&file_ops.user_requests, &prefix);
-        }
         for path in compaction::extract_bash_writes(&prefix) {
             if !file_ops.modified_files.contains(&path) {
                 file_ops.modified_files.push(path);
@@ -13535,7 +13531,6 @@ mod tests {
     async fn carried_user_requests_survive_every_round_once() {
         let candidates = compaction::CompactionCandidates {
             state_template: true,
-            carry_requests: true,
             ..Default::default()
         };
         let mock = Arc::new(MockTransport::new(vec![
@@ -13624,13 +13619,12 @@ mod tests {
 
     #[tokio::test]
     async fn a_state_compacted_session_resumes_on_another_model_and_compacts_again() {
-        // Compacted on Claude under the state template and the request carry, then resumed on
-        // gpt-6-luna: the cross-model scrub leaves the summary alone, the next round recognizes it as
-        // the previous summary (one rewritten document, the carry block once), and the transcript
-        // stays well-formed throughout.
+        // Compacted on Claude under the state template, then resumed on gpt-6-luna: the cross-model
+        // scrub leaves the summary alone, the next round recognizes it as the previous summary (one
+        // rewritten document, the request carry block once), and the transcript stays well-formed
+        // throughout.
         let candidates = compaction::CompactionCandidates {
             state_template: true,
-            carry_requests: true,
             ..Default::default()
         };
         let mock = Arc::new(MockTransport::new(vec![turn::text("## Goal\non claude")]));

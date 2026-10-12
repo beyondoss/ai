@@ -100,8 +100,13 @@ pub struct CompactionProvenance {
     pub memory_notes: Vec<String>,
     /// The user's own requests from compacted prefixes, verbatim — each genuine user turn's text,
     /// in order, deduped, each capped at [`USER_REQUEST_MAX_CHARS`]; past [`USER_REQUESTS_KEPT`] the
-    /// first and the latest are kept. Filled only under [`CompactionCandidates::carry_requests`]
-    /// (see [`merge_user_requests`]), rendered by [`format_user_requests`].
+    /// first and the latest are kept. Folded forward by [`merge_user_requests`], rendered by
+    /// [`format_user_requests`].
+    ///
+    /// Why: without it, 23 of 52 later-round eval summaries re-inferred the request ("The user's exact
+    /// request is not visible in this prefix. From the work, the task is to…"), and only 34–40% kept
+    /// the "don't edit tests" constraint. Carried, the user's words sit outside anything a summarizer
+    /// can paraphrase.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub user_requests: Vec<String>,
 }
@@ -157,7 +162,8 @@ pub fn format_user_requests(requests: &[String]) -> String {
 /// record `reason` as the new `last_reason`.
 ///
 /// File paths accumulate (deduped by path, first-seen order); the `todo` list is replaced whenever this
-/// round's prefix contains one at all, and otherwise carried forward untouched. `messages` is the
+/// round's prefix contains one at all, and otherwise carried forward untouched; the user's requests
+/// accumulate by [`merge_user_requests`]. `messages` is the
 /// *whole* current-round prefix, including a leading prior-summary message if there is one — that
 /// message carries no `ToolUse` blocks (it's prose), so scanning it contributes nothing and this
 /// naturally reduces to "previous provenance + this round's new activity" without needing to slice it
@@ -195,8 +201,7 @@ pub fn merge_provenance(
         // must win over `previous`, or a cleared plan would silently reappear at the next compaction.
         todos: extract_todos(messages).or_else(|| previous.todos.clone()),
         memory_notes,
-        // Carried forward as is; `Agent::compact` adds this round's requests under `carry_requests`.
-        user_requests: previous.user_requests.clone(),
+        user_requests: merge_user_requests(&previous.user_requests, messages),
     }
 }
 
@@ -293,13 +298,6 @@ pub struct CompactionCandidates {
     /// already sees it (it sends the whole conversation): judged stale 40% of the time against 93%
     /// for the re-render's split template, which sees only the prefix.
     pub sees_tail: bool,
-    /// The user's own requests ride the deterministic carry, verbatim (`<user-requests>`, see
-    /// [`CompactionProvenance::user_requests`]), outside anything a summarizer can paraphrase.
-    ///
-    /// Why: after the first round, 23 of 52 eval summaries re-inferred the request ("The user's
-    /// exact request is not visible in this prefix. From the work, the task is to…"), and only 34–40%
-    /// kept the "don't edit tests" constraint.
-    pub carry_requests: bool,
     /// A masking pass is applied only when it pays for its cache rewrite before the freed room
     /// refills: `0.1 · freed · (freed / growth) ≥ (w − 0.1) · rewrite` ([`mask_net_saving`]), with
     /// `rewrite` the tokens from the first edited message on, `growth` the transcript's recent
@@ -321,7 +319,6 @@ impl CompactionCandidates {
         "check",
         "state",
         "tail",
-        "carry-request",
         "mask-breakeven",
         "mask-best-start",
     ];
@@ -338,7 +335,6 @@ impl CompactionCandidates {
                 "check" => c.check_summary = true,
                 "state" => c.state_template = true,
                 "tail" => c.sees_tail = true,
-                "carry-request" => c.carry_requests = true,
                 "mask-breakeven" => c.mask_breakeven = true,
                 "mask-best-start" => c.mask_best_start = true,
                 "" => {}
@@ -1338,8 +1334,7 @@ pub fn summary_request_with(
             modified.join("\n")
         ));
     }
-    // The carried requests (only ever filled under `carry_requests`): `<previous-summary>` has its carry
-    // blocks stripped, so without this the re-render never sees the user's own words again — which
+    // The carried requests: `<previous-summary>` has its carry blocks stripped, so without this the re-render never sees the user's own words again — which
     // the state template's Goal asks for. The cached call sees them in the summary message itself.
     if !file_ops.user_requests.is_empty() {
         prompt.push_str(&format!(
@@ -3686,8 +3681,10 @@ mod tests {
             err.contains("sytem-role") && err.contains("system-role"),
             "{err}"
         );
-        // A promoted candidate is an unknown name now, not a silent no-op.
-        assert!(CompactionCandidates::from_names(&["bash-edits"]).is_err());
+        // A promoted candidate's name is unknown now, not a silent no-op.
+        for gone in ["bash-edits", "carry-request"] {
+            assert!(CompactionCandidates::from_names(&[gone]).is_err(), "{gone}");
+        }
     }
 
     #[test]
