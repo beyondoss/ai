@@ -1346,6 +1346,15 @@ pub fn summary_request_with(
             modified.join("\n")
         ));
     }
+    // The carried requests (only ever filled under `carry_requests`): `<previous-summary>` has its carry
+    // blocks stripped, so without this the re-render never sees the user's own words again — which
+    // the state template's Goal asks for. The cached call sees them in the summary message itself.
+    if !file_ops.user_requests.is_empty() {
+        prompt.push_str(&format!(
+            "<user-requests>\n{}\n</user-requests>\n",
+            file_ops.user_requests.join("\n---\n")
+        ));
+    }
     prompt.push_str(&instruction);
     if !tail.is_empty() {
         prompt.push_str(TAIL_NOTE);

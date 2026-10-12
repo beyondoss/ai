@@ -422,7 +422,7 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
     (`CompactionProvenance::user_requests`, `merge_user_requests`, `<user-requests>`), so no later round
     has to re-infer them: 23 of 52 later-round summaries did ("The user's exact request is not visible
     in this prefix…"). Each genuine user turn's text, deduped, capped at 4,000 chars; past four, the
-    first and the latest. Persisted on the compaction record like the rest of the provenance.
+    first and the latest. Persisted on the compaction record like the rest of the provenance, and handed to the re-render beside the file tags (its `<previous-summary>` has carry blocks stripped, so it would otherwise never see the user's words again).
 
   And three about what compaction keeps and when masking pays:
   - `track_bash_edits` (`bash-edits`): files a `bash` command wrote join the modified-files

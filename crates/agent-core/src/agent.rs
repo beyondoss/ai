@@ -13581,9 +13581,17 @@ mod tests {
             CompactOutcome::Compacted
         );
         let prompt = prompt_of(&mock.requests()[1]);
+        let (previous, rest) = prompt.split_once("</previous-summary>").unwrap();
         assert!(
-            !prompt.contains("<user-requests>"),
+            !previous.contains("<user-requests>"),
             "stripped from <previous-summary>"
+        );
+        // ...and handed to the re-render once, beside the file tags, in the user's own words.
+        assert_eq!(rest.matches("<user-requests>").count(), 1);
+        assert!(
+            rest.contains(
+                "<user-requests>\nFix the parser. Do not edit the tests.\n</user-requests>"
+            )
         );
         let second = last_text(&session.messages[0]);
         assert_eq!(second.matches("<user-requests>").count(), 1, "{second}");
