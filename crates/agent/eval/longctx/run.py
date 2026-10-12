@@ -14,7 +14,13 @@ text is logged as an `assistant_text` event (the stream's deltas are not kept), 
 `tool_end` whose output shows a Python error behind a zero exit carries `soft_error`. The result
 records why the run ended (`end_reason`), whether the graded tree was cut off mid-edit or its suite
 hung (`tree_state`), and, for a tree that no longer parses, the grade of the last state in which
-every library file parsed (`last_parseable`).
+every library file parsed (`last_parseable`). A code task also logs each stubbed function's body as
+it changes (`units.jsonl`, see `Units`), which is what redone work is scored from.
+
+`--script` adds scripted user turns: each is injected as a steer once the run has finished its `at`
+turns (a `script` event marks the send, `steered` the injection), so a task can add or change a
+constraint mid-run and an eval can see whether it survives compaction. The agent then runs as
+`serve` over stdio rather than `run --json`; compare scripted runs with scripted runs.
 
 Results land in `$LONGCTX_WORK/runs/<task>/<model>/<arm>/a<n>/result.json`. A run with a result is
 never repeated, so an interrupted sweep resumes where it stopped.
@@ -26,6 +32,7 @@ import ast
 import datetime
 import fcntl
 import functools
+import hashlib
 import json
 import os
 import re
@@ -183,6 +190,7 @@ class Live:
         self.tool_errors = 0
         self.soft_errors = 0
         self.ended = False
+        self.steered: list[int] = []  # the turn after which each scripted steer was injected
         self.tok = dict(input=0, output=0, cache_read=0, cache_write=0)
         self.turn_t0: float | None = None
         self.ttft: list[float] = []
@@ -254,6 +262,10 @@ class Live:
             elif ev.get("name") == "bash" and _SOFT.search(str(ev.get("result", ""))):
                 self.soft_errors += 1
                 ev["soft_error"] = True  # logged with the event
+        elif k == "steered":
+            self.steered.append(self.turns)
+        elif k == "agent_start":
+            self.ended = False  # a scripted turn sent as a new prompt starts another run
         elif k == "agent_end":
             self.ended = True
 
@@ -334,14 +346,73 @@ def grade(repos: list, root: Path) -> dict:
                 tree_state=state, unparseable=bad[:10], per_repo=per)
 
 
+_COMMENT = re.compile(r"^\s*(#.*?)\s*$")
+
+
+class Units:
+    """Each stubbed function's body over the run, in `units.jsonl`: one line per change, with the
+    turn it was seen at (`step`), `state` (`stub` while it still raises the stub's NotImplementedError,
+    `impl` once it doesn't, `missing` if no def of that name is left), `digest` (the body's AST, so
+    comments and formatting don't count as a change) and its first comment lines (`comments`). The
+    initial stubbed state is logged at step 0. What redone work and per-function instructions are
+    scored from."""
+
+    def __init__(self, repos: list, tree: Path, out: Path):
+        self.want: dict[Path, set[str]] = {}
+        for r in repos:
+            spec = json.loads((tasks.work_dir() / "tasks" / f"{r.name}.json").read_text())["spec"]
+            for s in spec["stubs"]:
+                self.want.setdefault(tree / r.name / s["file"], set()).add(s["qualname"])
+        self.tree, self.out = tree, out
+        self.last: dict[tuple[str, str], tuple] = {}
+
+    def update(self, path: Path, src: bytes, mod: ast.Module, step: int, t: float | None) -> None:
+        names = self.want.get(path)
+        if not names:
+            return
+        lines = src.decode("utf-8", "replace").split("\n")
+        found: dict[str, tuple] = {}
+
+        def walk(node: ast.AST, prefix: str) -> None:
+            for child in ast.iter_child_nodes(node):
+                if isinstance(child, ast.ClassDef):
+                    walk(child, f"{prefix}{child.name}.")
+                elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    qual = f"{prefix}{child.name}"
+                    if qual in names and qual not in found:
+                        body = child.body
+                        if (body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant)
+                                and isinstance(body[0].value.value, str)):
+                            body = body[1:]
+                        stub = (len(body) == 1 and isinstance(body[0], ast.Raise)
+                                and "NotImplementedError" in ast.dump(body[0]) and qual in ast.dump(body[0]))
+                        span = lines[child.lineno - 1:child.end_lineno]  # a leading comment precedes body[0]
+                        comments = [m.group(1) for l in span if (m := _COMMENT.match(l))][:3]
+                        digest = hashlib.sha1("".join(ast.dump(s) for s in body).encode()).hexdigest()[:12]
+                        found[qual] = ("stub" if stub else "impl", digest, comments)
+                    walk(child, f"{prefix}{child.name}.<locals>.")
+
+        walk(mod, "")
+        rel = path.relative_to(self.tree).as_posix()
+        with open(self.out, "a") as f:
+            for q in sorted(names):
+                now = found.get(q, ("missing", None, []))
+                if self.last.get((rel, q)) != now:
+                    self.last[(rel, q)] = now
+                    f.write(json.dumps(dict(step=step, t=t, file=rel, qualname=q, state=now[0], digest=now[1],
+                                            comments=now[2])) + "\n")
+
+
 class Checkpoint:
     """The library source as of the last moment every file in it parsed, kept outside the agent's
     view. Polled after each tool call: only changed files are parsed and copied. A run cut off
-    mid-edit is graded on its final tree, and on this too (`last_parseable`)."""
+    mid-edit is graded on its final tree, and on this too (`last_parseable`). Each changed file that
+    parses is also handed to `units`."""
 
-    def __init__(self, repos: list, tree: Path, dest: Path):
+    def __init__(self, repos: list, tree: Path, dest: Path, units: Units | None = None):
         self.roots = [tree / r.name / r.src for r in repos]
         self.tree, self.dest = tree, dest
+        self.units = units
         self.mtimes: dict[Path, int] = {}
         self.bad: set[Path] = set()
         self.step = 0  # the turn the snapshot dates from
@@ -358,7 +429,7 @@ class Checkpoint:
                     pass
         return out
 
-    def poll(self, step: int) -> None:
+    def poll(self, step: int, t: float | None = None) -> None:
         now = self._files()
         changed = [p for p, m in now.items() if self.mtimes.get(p) != m]
         removed = [p for p in self.mtimes if p not in now]
@@ -366,10 +437,13 @@ class Checkpoint:
         for p in changed:
             try:
                 data[p] = p.read_bytes()
-                ast.parse(data[p])
+                mod = ast.parse(data[p])
                 self.bad.discard(p)
             except (SyntaxError, ValueError, OSError):
                 self.bad.add(p)
+                continue
+            if self.units:
+                self.units.update(p, data[p], mod, step, t)
         self.bad.difference_update(removed)
         # A file still being written (a background process, a parallel call) may parse half-done:
         # take the snapshot only if nothing moved while it was read.
@@ -404,7 +478,11 @@ def supports_compact_at(binary: Path) -> bool:
 
 
 def run_one(binary: Path, task: str, model: str, arm: str, attempt: int, cap_usd: float,
-            max_steps: int, wall_s: int, extra: list[str], runs_dir: Path, label: str) -> dict:
+            max_steps: int, wall_s: int, extra: list[str], runs_dir: Path, label: str,
+            script: list[dict] | None = None) -> dict:
+    """One run. `script` (see `--script`) adds user turns after the prompt, which needs a live
+    control channel: the agent then runs as `serve` over stdio, with the same flags, instead of
+    `run --json`."""
     d = runs_dir / task / model / arm / f"a{attempt}"
     res_path = d / "result.json"
     if res_path.exists():
@@ -463,8 +541,8 @@ def run_one(binary: Path, task: str, model: str, arm: str, attempt: int, cap_usd
         del env[k]
     trigger = arm_trigger(arm)
     window = (trigger + RESERVE) if trigger else None
-    cmd = [str(binary), "run", "--json", "--model", model, "--max-steps", str(max_steps), *memory,
-           "--session-dir", inside[d / "sessions"], *extra]
+    cmd = [str(binary), *(["serve"] if script else ["run", "--json"]), "--model", model, "--max-steps",
+           str(max_steps), *memory, "--session-dir", inside[d / "sessions"], *extra]
     if window:
         # A binary that knows `--compact-at` gets only that: an artificial `--context-window` would
         # also shrink what the cached summary may send (live prompt + summary budget must fit the
@@ -482,7 +560,7 @@ def run_one(binary: Path, task: str, model: str, arm: str, attempt: int, cap_usd
     if repos:
         cmd = sandbox.argv(tasks.view(list(inside.items()), binary=binary), sandbox.WS, cmd)
         cwd = d
-    checkpoint = Checkpoint(repos, tree, d / "checkpoint") if repos else None
+    checkpoint = Checkpoint(repos, tree, d / "checkpoint", Units(repos, tree, d / "units.jsonl")) if repos else None
     live = Live(model)
     started = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
     t0 = time.monotonic()
@@ -490,8 +568,29 @@ def run_one(binary: Path, task: str, model: str, arm: str, attempt: int, cap_usd
     with open(d / "events.jsonl", "w") as evf, open(d / "stderr.txt", "w") as errf:
         p = subprocess.Popen(cmd, cwd=cwd, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                              stderr=errf, text=True, start_new_session=True)
-        p.stdin.write(prompt)  # a few KB: fits the pipe buffer, so this never waits on the agent
-        p.stdin.close()
+        pending = list(script or [])
+        script_log: list[dict] = []
+
+        def send(frame: dict) -> None:
+            try:
+                p.stdin.write(json.dumps(frame) + "\n")
+                p.stdin.flush()
+            except BrokenPipeError:
+                pass
+
+        def deliver(mode: str, t: float) -> None:
+            """The next scripted turn: a `steer` mid-run, or a new `prompt` once the run has ended."""
+            item = pending.pop(0)
+            i = len(script_log)
+            send(dict(id=f"{mode}-{i + 1}", type=mode, message=item["message"]))
+            script_log.append(dict(i=i, at=item["at"], mode=mode, turn=live.turns, t=t))
+            evf.write(json.dumps(dict(kind="script", i=i, at=item["at"], mode=mode, turn=live.turns, t=t)) + "\n")
+
+        if script:
+            send(dict(id="prompt-0", type="prompt", message=prompt))
+        else:
+            p.stdin.write(prompt)  # a few KB: fits the pipe buffer, so this never waits on the agent
+            p.stdin.close()
 
         def kill(why: str) -> None:
             nonlocal killed
@@ -509,6 +608,20 @@ def run_one(binary: Path, task: str, model: str, arm: str, attempt: int, cap_usd
                 ev = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            if script:  # `serve` frames: the agent's events, and each command's response
+                if ev.get("type") == "response" and str(ev.get("id", "")).startswith("prompt-"):
+                    if not ev.get("success", True):
+                        live.errors.append(str(ev.get("error"))[:500])
+                    # A run that ended on its own gets the turns it never reached as new prompts; one
+                    # that hit an error or the step cap is over.
+                    if pending and live.ended and killed is None:
+                        deliver("prompt", round(time.monotonic() - t0, 3))
+                    else:
+                        p.stdin.close()
+                    continue
+                if ev.get("type") != "event" or not isinstance(ev.get("event"), dict):
+                    continue
+                ev = ev["event"]
             live.tick(ev)
             if ev.get("type") in _DROP or ev.get("kind") == "tool_progress":
                 continue
@@ -519,7 +632,9 @@ def run_one(binary: Path, task: str, model: str, arm: str, attempt: int, cap_usd
             if k == "turn_end" and (text := live.turn_text()):
                 evf.write(json.dumps(dict(kind="assistant_text", step=ev.get("step"), text=text, t=t)) + "\n")
             elif k == "tool_end" and checkpoint:
-                checkpoint.poll(live.turns)
+                checkpoint.poll(live.turns, t)
+            if k == "turn_end" and pending and live.turns >= pending[0]["at"]:
+                deliver("steer", t)
             if live.usd > cap_usd:
                 kill("cap")
         p.wait()
@@ -540,7 +655,7 @@ def run_one(binary: Path, task: str, model: str, arm: str, attempt: int, cap_usd
     end_reason = live.end_reason(killed)
     last_parseable = None
     if repos:
-        checkpoint.poll(live.turns)  # a kill can land mid-edit, after the last tool_end
+        checkpoint.poll(live.turns, round(wall, 3))  # a kill can land mid-edit, after the last tool_end
         g = grade(repos, tree)
         if g["tree_state"] == "mid_edit":
             # Grade the last state in which every library file parsed, on a copy of the final tree.
@@ -578,6 +693,7 @@ def run_one(binary: Path, task: str, model: str, arm: str, attempt: int, cap_usd
         ttft_median=sorted(live.ttft)[len(live.ttft) // 2] if live.ttft else None,
         tokens=live.tok, errors=live.errors[:5], suspect=live.suspect[:10],
         turns_after_first_compaction=(live.turns - first_c) if first_c is not None else None,
+        script_log=script_log, steered=live.steered,
         compaction_log=live.compactions, request_log=live.requests, **g,
     )
     shutil.rmtree(tree)  # graded; the event log and session hold the trajectory
@@ -629,7 +745,16 @@ def main(argv: list[str]) -> None:
     ap.add_argument("--label", default="", help="recorded on each result (e.g. the binary's commit)")
     ap.add_argument("--agent-arg", dest="extra", action="append", default=[],
                     help="extra flag passed through to `beyond-ai-agent run` (repeatable)")
+    ap.add_argument("--script", default="",
+                    help="JSON file of scripted user turns, [{\"at\": <turn>, \"message\": ...}]: each is "
+                         "injected as a steer once the run has finished that many turns, or sent as a new "
+                         "prompt if the run ended first. Runs the agent as `serve` over stdio.")
     a = ap.parse_args(argv)
+    script = json.loads(Path(a.script).read_text()) if a.script else None
+    if script and (not isinstance(script, list)
+                   or any(set(i) != {"at", "message"} or not isinstance(i["at"], int) for i in script)):
+        raise SystemExit(f"{a.script}: want [{{\"at\": <turn>, \"message\": <text>}}, ...]")
+    script = sorted(script, key=lambda i: i["at"]) if script else None
     todo = plan(a)
     if a.estimate:
         est = sum(PRIOR_USD[m] for _, m, _, _ in todo)
@@ -663,7 +788,7 @@ def main(argv: list[str]) -> None:
                   f"(spent ${ledger.spent():.2f})", flush=True)
             return None
         try:
-            r = run_one(binary, *item, a.cap_usd, a.max_steps, a.wall_min * 60, a.extra, runs_dir, a.label)
+            r = run_one(binary, *item, a.cap_usd, a.max_steps, a.wall_min * 60, a.extra, runs_dir, a.label, script)
         except Exception as e:  # one broken run must not stop the sweep; it has no result, so reruns retry it
             print(f"ERROR {item}: {e}", flush=True)
             r = None
