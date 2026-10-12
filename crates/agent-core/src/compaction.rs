@@ -289,11 +289,25 @@ pub struct CompactionCandidates {
     /// from the start that maximizes the same net saving ([`best_mask_start`]), so an early result that
     /// frees little stops forcing a rewrite of everything after it.
     pub mask_best_start: bool,
+    /// The re-render keeps a long tool result's head *and* tail ([`head_tail_chars`]): its first
+    /// [`HEAD_CHARS`] and last [`TAIL_CHARS`] characters, plus every line from the elided middle that
+    /// is a test tally or an error ([`is_signal_line`]), instead of only its first
+    /// [`TOOL_RESULT_MAX_CHARS`].
+    ///
+    /// Why: test runners print their tally last. In the eval, 66% of the long test results had their
+    /// pass/fail tally only after character 2,000, so the summarizer never saw it.
+    pub head_tail_results: bool,
 }
 
 impl CompactionCandidates {
     /// Every candidate's CLI name, in the order `--help` lists them.
-    pub const NAMES: &[&str] = &["state", "tail", "mask-breakeven", "mask-best-start"];
+    pub const NAMES: &[&str] = &[
+        "state",
+        "tail",
+        "mask-breakeven",
+        "mask-best-start",
+        "head-tail",
+    ];
 
     /// The candidates `names` turns on (the CLI's `--compaction-candidates`); an unknown name is an
     /// error naming the valid ones, so a typo in an eval arm fails the run instead of silently
@@ -306,6 +320,7 @@ impl CompactionCandidates {
                 "tail" => c.sees_tail = true,
                 "mask-breakeven" => c.mask_breakeven = true,
                 "mask-best-start" => c.mask_best_start = true,
+                "head-tail" => c.head_tail_results = true,
                 "" => {}
                 other => {
                     return Err(format!(
@@ -880,7 +895,18 @@ fn is_turn_start(m: &Message) -> bool {
 /// its `data` is opaque ciphertext the provider chose not to expose, never human-readable regardless
 /// of length.
 pub fn render_prefix(messages: &[Message]) -> String {
-    render_prefix_impl(messages, true)
+    render_prefix_impl(messages, ToolResults::Head)
+}
+
+/// [`render_prefix`], keeping a long tool result's head and tail ([`head_tail_chars`]) when
+/// `head_tail` is set ([`CompactionCandidates::head_tail_results`]).
+fn render_prefix_with(messages: &[Message], head_tail: bool) -> String {
+    let mode = if head_tail {
+        ToolResults::HeadTail
+    } else {
+        ToolResults::Head
+    };
+    render_prefix_impl(messages, mode)
 }
 
 /// Same rendering as [`render_prefix`], but drops `ToolResult` content entirely instead of rendering a
@@ -891,10 +917,21 @@ pub fn render_prefix(messages: &[Message]) -> String {
 /// is read once on return, so tool output's terseness matters more than its (already-truncated) detail.
 /// Tool-call *names* (via `ToolUse`) still survive, same as ordinary compaction.
 pub(crate) fn render_prefix_without_tool_results(messages: &[Message]) -> String {
-    render_prefix_impl(messages, false)
+    render_prefix_impl(messages, ToolResults::Drop)
 }
 
-fn render_prefix_impl(messages: &[Message], include_tool_results: bool) -> String {
+/// How [`render_prefix_impl`] renders a tool result's content.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ToolResults {
+    /// Left out (a branch summary).
+    Drop,
+    /// The first [`TOOL_RESULT_MAX_CHARS`].
+    Head,
+    /// Head, tail and the signal lines between them ([`head_tail_chars`]).
+    HeadTail,
+}
+
+fn render_prefix_impl(messages: &[Message], tool_results: ToolResults) -> String {
     let mut out = String::new();
     for m in messages {
         for b in &m.content {
@@ -916,10 +953,11 @@ fn render_prefix_impl(messages: &[Message], include_tool_results: bool) -> Strin
                 ContentBlock::ToolResult {
                     content, is_error, ..
                 } => {
-                    if !include_tool_results {
-                        continue;
-                    }
-                    let body = truncate_chars(content, TOOL_RESULT_MAX_CHARS);
+                    let body = match tool_results {
+                        ToolResults::Drop => continue,
+                        ToolResults::Head => truncate_chars(content, TOOL_RESULT_MAX_CHARS),
+                        ToolResults::HeadTail => head_tail_chars(content),
+                    };
                     let tag = if *is_error {
                         "tool error"
                     } else {
@@ -936,6 +974,129 @@ fn render_prefix_impl(messages: &[Message], include_tool_results: bool) -> Strin
                 // ciphertext, never worth spending prompt budget on regardless of length.
                 ContentBlock::RedactedThinking { .. } => {}
             }
+        }
+    }
+    out
+}
+
+/// How much of a long tool result's start [`head_tail_chars`] keeps.
+pub const HEAD_CHARS: usize = 500;
+/// How much of a long tool result's end [`head_tail_chars`] keeps.
+pub const TAIL_CHARS: usize = 1_500;
+/// At most this many signal lines are kept from the elided middle, each cut to
+/// [`SIGNAL_LINE_MAX_CHARS`].
+const SIGNAL_LINES_KEPT: usize = 30;
+const SIGNAL_LINE_MAX_CHARS: usize = 300;
+
+/// A tool result for the re-render under [`CompactionCandidates::head_tail_results`]: unchanged up to
+/// [`TOOL_RESULT_MAX_CHARS`]; past it, the first [`HEAD_CHARS`] and the last [`TAIL_CHARS`]
+/// characters, with every test-tally or error line of the elided middle ([`is_signal_line`], at most
+/// [`SIGNAL_LINES_KEPT`]) kept between them. A test run prints its tally last, past where a
+/// head-only cut stops.
+pub fn head_tail_chars(s: &str) -> String {
+    let n = s.chars().count();
+    if n <= TOOL_RESULT_MAX_CHARS {
+        return s.to_string();
+    }
+    let byte_at = |c: usize| s.char_indices().nth(c).map_or(s.len(), |(i, _)| i);
+    let (head_end, tail_start) = (byte_at(HEAD_CHARS), byte_at(n - TAIL_CHARS));
+    let (head, middle, tail) = (&s[..head_end], &s[head_end..tail_start], &s[tail_start..]);
+    let elided = n - HEAD_CHARS - TAIL_CHARS;
+    let signal: Vec<&str> = middle
+        .lines()
+        .map(str::trim_end)
+        .filter(|l| is_signal_line(l))
+        .collect();
+    let mut out = String::with_capacity(head.len() + tail.len() + 256);
+    out.push_str(head);
+    if signal.is_empty() {
+        out.push_str(&format!("… [{elided} characters elided] …"));
+    } else {
+        out.push_str(&format!(
+            "\n… [{elided} characters elided; their test-tally and error lines:]\n"
+        ));
+        for line in signal.iter().take(SIGNAL_LINES_KEPT) {
+            out.push_str(&truncate_chars(line, SIGNAL_LINE_MAX_CHARS));
+            out.push('\n');
+        }
+        if signal.len() > SIGNAL_LINES_KEPT {
+            out.push_str(&format!(
+                "[+{} more matching lines]\n",
+                signal.len() - SIGNAL_LINES_KEPT
+            ));
+        }
+        out.push_str("…\n");
+    }
+    out.push_str(tail);
+    out
+}
+
+/// Whether a line of tool output is worth keeping from an elided middle: a test tally
+/// ([`is_tally_line`]) or an error (`FAILED`, `Error`, `ERROR`, `Traceback`).
+pub(crate) fn is_signal_line(line: &str) -> bool {
+    is_tally_line(line)
+        || ["FAILED", "Error", "ERROR", "Traceback"]
+            .iter()
+            .any(|w| line.contains(w))
+}
+
+/// The outcome words a test runner prints after a count (`3 failed, 120 passed`). `errors` before
+/// `error`, so the longer word wins.
+const TALLY_WORDS: [&str; 8] = [
+    "passed",
+    "failed",
+    "errors",
+    "error",
+    "skipped",
+    "xfailed",
+    "xpassed",
+    "deselected",
+];
+
+/// Whether `line` is a test runner's tally: a count followed by an outcome word (pytest's
+/// `3 failed, 120 passed in 2.1s`, cargo's `test result: ok. 12 passed; 0 failed`), unittest's
+/// `Ran 45 tests` and `FAILED (failures=2)`.
+pub(crate) fn is_tally_line(line: &str) -> bool {
+    if line.contains("test result:") || line.contains("FAILED (") {
+        return true;
+    }
+    if let Some(at) = line.find("Ran ") {
+        let rest = &line[at + 4..];
+        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+        if digits > 0 && rest[digits..].starts_with(" test") {
+            return true;
+        }
+    }
+    !tally_pairs(line).is_empty()
+}
+
+/// The `(count, word)` pairs of a tally line, in order: `3 failed, 120 passed` →
+/// `[("3", "failed"), ("120", "passed")]`.
+pub(crate) fn tally_pairs(line: &str) -> Vec<(&str, &'static str)> {
+    let bytes = line.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if !bytes[i].is_ascii_digit() || (i > 0 && bytes[i - 1].is_ascii_alphanumeric()) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        let Some(rest) = line[i..].strip_prefix(' ') else {
+            continue;
+        };
+        let word = TALLY_WORDS.iter().find(|w| {
+            rest.starts_with(**w)
+                && !rest[w.len()..]
+                    .bytes()
+                    .next()
+                    .is_some_and(|b| b.is_ascii_alphanumeric())
+        });
+        if let Some(word) = word {
+            out.push((&line[start..i], *word));
         }
     }
     out
@@ -1254,6 +1415,7 @@ pub fn summary_request_with(
 ) -> ModelRequest {
     let (read, modified) = (&file_ops.read_files, &file_ops.modified_files);
     let state = candidates.state_template;
+    let head_tail = candidates.head_tail_results;
 
     let mut prompt = String::new();
     let instruction = match previous_summary(prefix) {
@@ -1262,7 +1424,7 @@ pub fn summary_request_with(
             prompt.push_str("<previous-summary>\n");
             prompt.push_str(prev);
             prompt.push_str("\n</previous-summary>\n\n<new-activity>\n");
-            prompt.push_str(&render_prefix(&prefix[1..]));
+            prompt.push_str(&render_prefix_with(&prefix[1..], head_tail));
             prompt.push_str("</new-activity>\n\n");
             if state {
                 format!("{STATE_UPDATE_INTRO}{STATE_RULES}{STATE_FORMAT}")
@@ -1275,7 +1437,7 @@ pub fn summary_request_with(
             // is wrapped in `<conversation>` tags, the same delimiting convention the incremental path
             // just below already applies to its own new-activity transcript via `<new-activity>`.
             prompt.push_str("<conversation>\n");
-            prompt.push_str(&render_prefix(prefix));
+            prompt.push_str(&render_prefix_with(prefix, head_tail));
             prompt.push_str("\n</conversation>\n\n");
             if state {
                 format!("{STATE_INTRO}{STATE_RULES}{STATE_FORMAT}")
@@ -1288,7 +1450,7 @@ pub fn summary_request_with(
     };
     if !tail.is_empty() {
         prompt.push_str("<recent-context>\n");
-        prompt.push_str(&render_prefix(tail));
+        prompt.push_str(&render_prefix_with(tail, head_tail));
         prompt.push_str("</recent-context>\n\n");
     }
     if !read.is_empty() {
@@ -3975,5 +4137,107 @@ mod tests {
         assert!(best_mask_start(&messages, &plan, 1_000, 1_000_000, 1.25).is_none());
         // A floor no start reaches: none either.
         assert!(best_mask_start(&messages, &plan, 1_000_000, 2_000, 1.25).is_none());
+    }
+
+    #[test]
+    fn head_tail_keeps_a_tally_printed_past_the_head_cut() {
+        let mut out = String::from("collecting ... collected 300 items\n");
+        for i in 0..200 {
+            out.push_str(&format!("tests/test_x.py::test_{i} PASSED\n"));
+        }
+        out.push_str("FAILED tests/test_x.py::test_7 - AssertionError: boom\n");
+        for i in 0..200 {
+            out.push_str(&format!("tests/test_y.py::test_{i} PASSED\n"));
+        }
+        out.push_str("=== 1 failed, 399 passed in 2.31s ===\n");
+        assert!(out.len() > 4 * TOOL_RESULT_MAX_CHARS);
+        // The head cut loses both the failure and the tally.
+        let head = truncate_chars(&out, TOOL_RESULT_MAX_CHARS);
+        assert!(!head.contains("1 failed") && !head.contains("test_7 -"));
+        let kept = head_tail_chars(&out);
+        assert!(kept.starts_with("collecting ... collected 300 items"));
+        assert!(kept.contains("1 failed, 399 passed"), "the tail");
+        assert!(
+            kept.contains("FAILED tests/test_x.py::test_7 - AssertionError: boom"),
+            "a failure line from the elided middle"
+        );
+        assert!(kept.contains("characters elided"));
+        assert!(kept.chars().count() < TOOL_RESULT_MAX_CHARS + 600);
+        // A short result is left alone.
+        assert_eq!(head_tail_chars("3 passed"), "3 passed");
+    }
+
+    #[test]
+    fn head_tail_bounds_the_signal_lines_it_keeps() {
+        let mut out = "x".repeat(600);
+        out.push('\n');
+        for i in 0..100 {
+            out.push_str(&format!("FAILED t.py::test_{i} - Error\n"));
+        }
+        out.push_str(&"y".repeat(1_600));
+        let kept = head_tail_chars(&out);
+        assert!(kept.contains("FAILED t.py::test_0 "));
+        assert!(!kept.contains("FAILED t.py::test_99 "));
+        assert!(kept.contains("[+70 more matching lines]"), "{kept}");
+    }
+
+    #[test]
+    fn tally_lines_are_recognized_across_runners() {
+        for line in [
+            "=== 3 failed, 120 passed, 2 skipped in 2.10s ===",
+            "test result: ok. 12 passed; 0 failed; 0 ignored",
+            "Ran 45 tests in 0.3s",
+            "FAILED (failures=2, errors=1)",
+            "1 error in 0.5s",
+        ] {
+            assert!(is_tally_line(line), "{line}");
+        }
+        for line in [
+            "passed the value",
+            "v2 passedthrough",
+            "line 12 of 40",
+            "abc3 failed",
+        ] {
+            assert!(!is_tally_line(line), "{line}");
+        }
+        assert_eq!(
+            tally_pairs("3 failed, 120 passed, 4 errors in 2s"),
+            [("3", "failed"), ("120", "passed"), ("4", "errors")]
+        );
+    }
+
+    #[test]
+    fn the_head_tail_candidate_reaches_the_re_render_only_when_named() {
+        let long = format!("{}\n=== 2 failed, 98 passed ===", "z".repeat(5_000));
+        let prefix = vec![
+            Message::user("the task"),
+            Message::assistant(vec![ContentBlock::tool_use(
+                "1",
+                "bash",
+                json!({ "command": "pytest" }),
+            )]),
+            Message::tool_result("1", long, false),
+        ];
+        let text = |c: &CompactionCandidates| {
+            let req = summary_request_with(
+                "m",
+                &prefix,
+                &[],
+                100,
+                &CompactionProvenance::default(),
+                None,
+                c,
+            );
+            let ContentBlock::Text { text, .. } = &req.messages[0].content[0] else {
+                panic!("text");
+            };
+            text.to_string()
+        };
+        assert!(!text(&CompactionCandidates::default()).contains("2 failed, 98 passed"));
+        let on = CompactionCandidates {
+            head_tail_results: true,
+            ..Default::default()
+        };
+        assert!(text(&on).contains("2 failed, 98 passed"));
     }
 }

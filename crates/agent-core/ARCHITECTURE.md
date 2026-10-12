@@ -442,6 +442,14 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
     later helps only where the skipped region holds little maskable output relative to its size;
     coding transcripts front-load file reads, so expect it to match `mask-breakeven` most of the time.
 
+  And these about what the summary says, from the summary-quality research (each measured by a
+  probe-based replay eval):
+  - `head_tail_results` (`head-tail`): the re-render keeps a long tool result's first 500 and last
+    1,500 characters (`head_tail_chars`) instead of its first 2,000, plus every test-tally or error line
+    of the elided middle (`is_signal_line`: `3 failed, 120 passed`, `test result:`, `Ran N tests`,
+    `FAILED`, `Error`, `Traceback`; at most 30). Test runners print their tally last: 66% of the eval's
+    long test results had it only after character 2,000, where the head cut never reached.
+
 - **The deterministic-carry channel** — `apply_summary` is deliberately destructive: it _replaces_
   `session.messages` with `[summary, …kept_suffix]`, and `SessionStore::open` reloads that
   post-compaction list, so anything living only inside a folded-away message is gone for good. A
