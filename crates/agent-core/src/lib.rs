@@ -67,7 +67,6 @@ pub use models::{
 };
 pub use session::{RequestBlock, Session};
 pub use steering::{ModelSwitch, QueueMode, Steering, SteeringMessage, TurnContextSource};
-pub use step_budget::{StepBudget, StepBudgetKind};
 pub use tls::ensure_provider;
 pub use tool::{Tool, ToolOutput, ToolProgress, ToolRegistry, ToolUpdate};
 pub use transport::{

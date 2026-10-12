@@ -286,13 +286,11 @@ enum Command {
         /// Virtual key (`bai_v1…`) or BYO provider key. Required; or set `AI_AGENT_KEY`.
         #[usage(long, env = "AI_AGENT_KEY")]
         key: Option<String>,
-        /// Opt-in cap on model turns before bailing with an error (default: unbounded).
+        /// Opt-in cap on model turns (default: unbounded). At the cap the model gets 5 more steps to
+        /// stop cleanly (fix or revert an edit that no longer parses, run the tests once, summarize);
+        /// a run that uses those too ends with an error.
         #[usage(long)]
         max_steps: Option<u32>,
-        /// Experimental, needs `--max-steps`: when the last step's tools finish, grant this many
-        /// more steps to leave the workspace consistent and summarize. Off by default.
-        #[usage(long, env = "AI_AGENT_MAX_STEPS_WRAP_UP")]
-        max_steps_wrap_up: Option<u32>,
         /// Per-turn output token ceiling. `serve`'s identical flag; defaults to the model's own
         /// capability-table `max_output` (see `agent_core::models::capabilities`) when omitted.
         #[usage(long, env = "AI_AGENT_MAX_TOKENS")]
@@ -405,8 +403,7 @@ enum Command {
         #[usage(long, env = "AI_AGENT_NO_CACHED_SUMMARY")]
         no_cached_summary: bool,
         /// Compaction changes under evaluation, by name (comma-separated), all off by default:
-        /// `state`, `tail`, `mask-breakeven` (see
-        /// `agent_core::CompactionCandidates`). An unknown name is an error. `serve`'s identical
+        /// `state`, `tail` (see `agent_core::CompactionCandidates`). An unknown name is an error. `serve`'s identical
         /// flag.
         #[usage(long, env = "AI_AGENT_COMPACTION_CANDIDATES", delimiter = ',')]
         compaction_candidates: Option<Vec<String>>,
@@ -987,8 +984,7 @@ enum Command {
         #[usage(long, env = "AI_AGENT_NO_CACHED_SUMMARY")]
         no_cached_summary: bool,
         /// Compaction changes under evaluation, by name (comma-separated), all off by default:
-        /// `state`, `tail`, `mask-breakeven` (see
-        /// `agent_core::CompactionCandidates`). An unknown name is an error. `run`'s identical
+        /// `state`, `tail` (see `agent_core::CompactionCandidates`). An unknown name is an error. `run`'s identical
         /// flag.
         #[usage(long, env = "AI_AGENT_COMPACTION_CANDIDATES", delimiter = ',')]
         compaction_candidates: Option<Vec<String>>,
@@ -1975,7 +1971,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             gateway_url,
             key,
             max_steps,
-            max_steps_wrap_up,
             max_tokens,
             cache_ttl,
             cache_long,
@@ -2058,9 +2053,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 gateway_url,
                 key,
                 max_steps,
-                agent_core::StepBudget {
-                    wrap_up_steps: max_steps_wrap_up,
-                },
                 max_tokens,
                 CacheTtl::resolve(cache_ttl, cache_long, CacheTtl::FiveMinutes),
                 thinking,
@@ -4181,7 +4173,6 @@ async fn run_task(
     gateway_url: Option<String>,
     key: Option<String>,
     max_steps: Option<u32>,
-    step_budget: agent_core::StepBudget,
     max_tokens: Option<u32>,
     cache_long: bool,
     thinking: Option<u32>,
@@ -5211,7 +5202,6 @@ async fn run_task(
         .with_tools(registry)
         .with_system(system)
         .with_max_steps(max_steps)
-        .with_step_budget(step_budget)
         .with_compaction(compaction)
         .with_cache_long(cache_long)
         .with_sequential_tools(sequential_tools)

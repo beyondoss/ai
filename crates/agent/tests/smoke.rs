@@ -853,12 +853,11 @@ fn smoke_auto_compaction_fires_live() {
     }
 }
 
-/// `Error::MaxSteps` is reached against a **real** model, and `run` surfaces it as a non-zero exit —
-/// the documented failure mode when the model never stops requesting tools. Pinning `--max-steps 1`
-/// against a prompt that inherently needs a tool call *plus* a final answer (≥2 steps) forces the
-/// ceiling: turn 1 runs the tool (steps=1), the loop check `steps >= max_steps` then bails with
-/// `Error::MaxSteps` before a second request. Proves the ceiling actually stops a live run rather than
-/// looping forever, and that the error propagates to the process exit code.
+/// The step ceiling halts a **real** run. Pinning `--max-steps 1` against a prompt that inherently
+/// needs a tool call *plus* a final answer (≥2 steps) forces the ceiling: turn 1 runs the tool
+/// (steps=1), and the wrap-up (`agent_core::step_budget`) grants a few more steps to stop cleanly.
+/// The model either answers within them (a clean exit) or uses them up, and `run` surfaces
+/// `Error::MaxSteps` as a non-zero exit. Either way the run ends rather than looping forever.
 #[test]
 #[ignore = "live provider smoke; run via `mise run test:smoke:agent` with a provider key set"]
 fn smoke_max_steps_halts_a_live_run() {
@@ -898,17 +897,12 @@ fn smoke_max_steps_halts_a_live_run() {
             "--- [{}] max-steps stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
             p.name
         );
-        assert!(
-            !output.status.success(),
-            "[{}] a run pinned to --max-steps 1 on a tool-requiring prompt must exit non-zero.\nstdout: {stdout}\nstderr: {stderr}",
-            p.name
-        );
-        // `main` returns the error, so the runtime prints its `Debug` form (`MaxSteps(1)`), not the
-        // `Display` string — accept either shape so a future switch to `Display` doesn't break this.
+        // A failure must be the step ceiling. `main` returns the error, so the runtime prints its
+        // `Debug` form (`MaxSteps(1)`), not the `Display` string — accept either shape.
         let low = stderr.to_lowercase();
         assert!(
-            low.contains("maxsteps") || low.contains("max steps"),
-            "[{}] the failure should be the step ceiling (Error::MaxSteps).\nstderr: {stderr}",
+            output.status.success() || low.contains("maxsteps") || low.contains("max steps"),
+            "[{}] the run must end in the wrap-up or on the step ceiling (Error::MaxSteps).\nstdout: {stdout}\nstderr: {stderr}",
             p.name
         );
     }

@@ -2895,7 +2895,9 @@ fn deleted_experiment_flags_fail_startup_as_unknown() {
         &["--bash-timeout-guidance"],
         &["--bash-idle-yield-secs", "60"],
         &["--bash-yield-secs", "60"],
+        &["--max-steps-wrap-up", "5"],
         &["--compaction-candidates", "mask-best-start"],
+        &["--compaction-candidates", "mask-breakeven"],
     ] {
         let output = run_cmd(bin)
             .args([

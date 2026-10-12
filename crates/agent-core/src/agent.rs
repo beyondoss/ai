@@ -77,12 +77,9 @@ pub enum AgentEvent {
     },
     /// The run finished normally (the model ended its turn and no steering was queued).
     AgentEnd { steps: u32 },
-    /// A [`crate::StepBudget`] message was injected (see [`Agent::with_step_budget`]). `steps` is
-    /// the steps granted for a wrap-up.
-    StepBudget {
-        message: crate::StepBudgetKind,
-        steps: u32,
-    },
+    /// The run reached its `max_steps` ceiling and the model was granted `steps` more to stop
+    /// cleanly (see [`crate::step_budget`]).
+    WrapUp { steps: u32 },
     /// An automatic compaction's first step masked old tool output instead of (or before) summarizing:
     /// `masked` tool results older than the kept turns were replaced by one-line placeholders (see
     /// [`compaction::mask_tool_results`]). `tokens_before` is the live prompt estimate when it fired;
@@ -181,9 +178,6 @@ const DEFAULT_MAX_TOKENS: u32 = 4096;
 /// re-render (or `summary_max_tokens`, if that is smaller): under this a structured checkpoint summary
 /// gets cut short.
 const MIN_CACHED_SUMMARY_TOKENS: u32 = 2_048;
-/// How many recent turns `compaction::growth_per_turn` averages over for the masking pay-off
-/// candidates (`CompactionCandidates::mask_breakeven`).
-const MASK_GROWTH_TURNS: usize = 10;
 /// Cap on tool-call groups dispatched concurrently within one turn. A model usually batches a
 /// handful, but nothing bounds how many it requests; without a cap a turn asking for dozens of
 /// `bash`/`grep` calls would spawn that many subprocesses / parallel walks at once (and `grep` itself
@@ -271,8 +265,6 @@ pub struct Agent {
     /// Opt-in ceiling on loop iterations per `run` call. `None` (the default) runs until the model
     /// ends its turn, like pi's loop — see [`Self::with_max_steps`] for why unbounded is the default.
     max_steps: Option<u32>,
-    /// An experimental wrap-up grant at `max_steps` — see [`Self::with_step_budget`].
-    step_budget: crate::StepBudget,
     /// Extended-thinking budget, when enabled. Applied to every turn's request.
     thinking: Option<u32>,
     /// Reasoning effort level (OpenAI reasoning models; Anthropic adaptive thinking). Applied to every
@@ -363,7 +355,6 @@ impl Agent {
             system_fn: None,
             max_tokens: caps.max_output.max(DEFAULT_MAX_TOKENS),
             max_steps: None,
-            step_budget: crate::StepBudget::default(),
             thinking: None,
             reasoning_effort: None,
             temperature: None,
@@ -446,15 +437,12 @@ impl Agent {
     /// any per-turn state is touched, so a fresh `run`/`prompt` continues with a new budget. Takes
     /// `impl Into<Option<u32>>` so both `with_max_steps(50)` and a config's `Option<u32>` pass
     /// straight through; `None` clears it.
+    ///
+    /// At the ceiling the model first gets [`crate::step_budget::WRAP_UP_STEPS`] more steps to stop
+    /// cleanly (see [`crate::step_budget`]). A model that stops within them ends the run normally;
+    /// one that uses them all gets `Error::MaxSteps` naming this ceiling.
     pub fn with_max_steps(mut self, max_steps: impl Into<Option<u32>>) -> Self {
         self.max_steps = max_steps.into();
-        self
-    }
-
-    /// Experimental: grant a few wrap-up steps past the ceiling (see [`crate::step_budget`]). Inert
-    /// without [`with_max_steps`](Self::with_max_steps); the default changes nothing.
-    pub fn with_step_budget(mut self, step_budget: crate::StepBudget) -> Self {
-        self.step_budget = step_budget;
         self
     }
 
@@ -789,8 +777,8 @@ impl Agent {
         // resume past by simply calling `run`/`run_events_steered` again with a fresh budget, rather
         // than a permanent dead end once the session's lifetime total crosses it once.
         let mut steps_this_call: u32 = 0;
-        // What `step_budget` has fired this call, and the ceiling as a wrap-up grant extended it.
-        let mut budget = crate::step_budget::BudgetState::new(self.step_budget, self.max_steps);
+        // Whether the wrap-up has fired this call, and the ceiling as its grant extended it.
+        let mut budget = crate::step_budget::BudgetState::new(self.max_steps);
         // The previous turn's stop reason, read by `is_hard_overflow`'s `MaxTokens` check. Re-derived
         // from `session`'s own last assistant message rather than hardcoded to `EndTurn` (pi-parity fix
         // — matches pi's own `isContextOverflow`, re-evaluated fresh from the persisted
@@ -1891,9 +1879,9 @@ impl Agent {
                     result_blocks.push(ContentBlock::Image { source });
                 }
             }
-            // A step-budget notice or wrap-up rides the same turn, after any steer.
+            // The wrap-up rides the same turn, after any steer.
             let budget_note = budget.after_tools(steps_this_call);
-            if let Some((_, _, text)) = &budget_note {
+            if let Some((_, text)) = &budget_note {
                 result_blocks.push(ContentBlock::text(text.clone()));
             }
             session.push(Message::tool_results(result_blocks));
@@ -1915,8 +1903,8 @@ impl Agent {
                     tags: steered_tags,
                 });
             }
-            if let Some((message, steps, _)) = budget_note {
-                sink(AgentEvent::StepBudget { message, steps });
+            if let Some((steps, _)) = budget_note {
+                sink(AgentEvent::WrapUp { steps });
             }
             if terminate {
                 // A tool requested completion (e.g. an `attempt_completion`/`exit` tool) and the whole
@@ -2800,17 +2788,6 @@ impl Agent {
             || tokens_before.saturating_sub(plan.freed) > cfg.trigger_tokens()
         {
             return false;
-        }
-        // A candidate under evaluation: apply the pass only when it pays for its cache rewrite before
-        // the freed room refills (see `CompactionCandidates::mask_breakeven`).
-        if cfg.candidates.mask_breakeven {
-            let growth = compaction::growth_per_turn(&session.messages, MASK_GROWTH_TURNS);
-            let write_premium = if self.cache_long { 2.0 } else { 1.25 };
-            let first = plan.edited.first().copied().unwrap_or(0);
-            let rewrite = compaction::estimate_messages_tokens(&plan.messages[first..]);
-            if compaction::mask_net_saving(plan.freed, rewrite, growth, write_premium) < 0.0 {
-                return false;
-            }
         }
         for b in &mut session.request_blocks {
             if session.messages.get(b.index) == Some(&b.anchor)
@@ -5823,7 +5800,7 @@ mod tests {
                 AgentEvent::TurnEnd { .. } => "turn_end",
                 AgentEvent::Steered { .. } => "steered",
                 AgentEvent::AgentEnd { .. } => "agent_end",
-                AgentEvent::StepBudget { .. } => "step_budget",
+                AgentEvent::WrapUp { .. } => "wrap_up",
                 AgentEvent::ToolOutputMasked { .. } => "tool_output_masked",
                 AgentEvent::CompactionStart { .. } => "compaction_start",
                 AgentEvent::Compacted { .. } => "compacted",
@@ -7702,8 +7679,8 @@ mod tests {
 
     #[tokio::test]
     async fn max_steps_is_enforced() {
-        // The model keeps asking for a tool forever.
-        let turns = vec![turn::tool_call("t", "echo", r#"{"text":"x"}"#); 10];
+        // The model keeps asking for a tool forever, through the wrap-up grant too.
+        let turns = vec![turn::tool_call("t", "echo", r#"{"text":"x"}"#); 20];
         let mut tools = ToolRegistry::new();
         tools.register(Arc::new(EchoTool));
         let mock = Arc::new(MockTransport::new(turns));
@@ -7718,12 +7695,15 @@ mod tests {
         // Resumable: the check runs before any per-turn state is touched, so a fresh `run` against the
         // *same* session (no rollback needed) can simply continue past the ceiling with a fresh budget
         // rather than the session being left in some unusable state. This fixture's model keeps
-        // requesting tools forever, so the second run hits its own fresh 3-step ceiling too — the
-        // point is that it *runs* 3 more steps rather than erroring immediately or corrupting state.
+        // requesting tools forever, so the second run hits its own fresh 3-step ceiling (and wrap-up)
+        // too — the point is that it *runs* them rather than erroring immediately or corrupting state.
         let steps_before = session.steps;
         let err = agent.run(&mut session, |_| {}).await.unwrap_err();
         assert!(matches!(err, Error::MaxSteps(3)));
-        assert_eq!(session.steps, steps_before + 3);
+        assert_eq!(
+            session.steps,
+            steps_before + 3 + crate::step_budget::WRAP_UP_STEPS
+        );
     }
 
     #[tokio::test]
@@ -13393,7 +13373,6 @@ mod tests {
             rerender_config(compaction::CompactionCandidates {
                 state_template: true,
                 sees_tail: true,
-                ..Default::default()
             }),
         );
         let mut session = masking_session(0, 12);
@@ -13569,68 +13548,16 @@ mod tests {
         );
     }
 
-    /// A 10K-trigger masking setup where masking the three oldest results (~2.9K tokens) gets under
-    /// the trigger but cannot pay for rewriting the ~9K tokens after them before the room refills
-    /// (growth ~1K tokens a turn): `0.1 · 2.9K · 2.9 ≈ 0.85K` saved against `1.15 · 9K ≈ 10K` paid.
-    fn costly_mask_config(candidates: compaction::CompactionCandidates) -> CompactionConfig {
-        CompactionConfig {
-            mask_keep_turns: 9,
-            candidates,
-            ..masking_config()
-        }
-    }
-
     #[tokio::test]
-    async fn a_mask_that_cannot_pay_for_its_rewrite_is_applied_by_default() {
-        let mock = Arc::new(MockTransport::new(vec![turn::text("done")]));
-        let agent = Agent::new(mock.clone(), "claude-opus-4-8")
-            .with_compaction(costly_mask_config(Default::default()));
-        let mut session = masking_session(0, 12);
-        let mut events = Vec::new();
-        agent
-            .run_events(&mut session, |ev| events.push(ev))
-            .await
-            .unwrap();
-        assert_eq!(kinds(&events), ["masked"]);
-    }
-
-    #[tokio::test]
-    async fn the_breakeven_candidate_skips_a_mask_that_cannot_pay_for_its_rewrite() {
-        {
-            let candidates = compaction::CompactionCandidates {
-                mask_breakeven: true,
-                ..Default::default()
-            };
-            let mock = Arc::new(MockTransport::new(vec![
-                turn::text("## Goal\nsummary"),
-                turn::text("done"),
-            ]));
-            let agent = Agent::new(mock.clone(), "claude-opus-4-8")
-                .with_compaction(costly_mask_config(candidates));
-            let mut session = masking_session(0, 12);
-            let mut events = Vec::new();
-            agent
-                .run_events(&mut session, |ev| events.push(ev))
-                .await
-                .unwrap();
-            assert_eq!(
-                kinds(&events),
-                ["compaction_start", "compacted"],
-                "{candidates:?}"
-            );
-            assert!(session.messages.iter().all(|m| !is_masked(m)));
-        }
-    }
-
-    #[tokio::test]
-    async fn the_breakeven_candidate_keeps_a_mask_that_pays() {
-        // Ten of twelve results masked: ~9.7K freed against a ~2.4K rewrite.
+    async fn a_mask_that_cannot_pay_for_its_rewrite_is_still_applied() {
+        // A 10K-trigger setup where masking the three oldest results (~2.9K tokens) gets under the
+        // trigger but cannot pay for rewriting the ~9K tokens after them before the room refills.
+        // Skipping it would not save that rewrite: the pass only runs at the trigger, so the
+        // alternative is summarizing now (the deleted `mask-breakeven` candidate: 27 compactions
+        // against 21 on Haiku, fixed fraction 0.898 against 0.971).
         let mock = Arc::new(MockTransport::new(vec![turn::text("done")]));
         let agent = Agent::new(mock.clone(), "claude-opus-4-8").with_compaction(CompactionConfig {
-            candidates: compaction::CompactionCandidates {
-                mask_breakeven: true,
-                ..Default::default()
-            },
+            mask_keep_turns: 9,
             ..masking_config()
         });
         let mut session = masking_session(0, 12);
