@@ -505,9 +505,10 @@ pub(crate) fn is_writable(path: &str) -> bool {
 pub struct ToolConfig<'a> {
     /// `bash`'s default timeout, applied when the model omits `timeout_ms` (`--bash-timeout-ms`).
     pub bash_timeout_ms: Option<u64>,
-    /// `bash`'s experimental long-command behaviors (`--bash-idle-yield-secs`, `--bash-yield-secs`).
-    /// The default changes nothing.
-    pub bash_policy: bash::BashPolicy,
+    /// `bash` waits for every command to exit instead of leaving one quiet for
+    /// [`bash::IDLE_YIELD`] running as a `bash_job` job. Only for a caller with no `bash_job` to come
+    /// back with: `serve`'s host `bash` command.
+    pub bash_waits_for_exit: bool,
     /// Which shell `bash` runs commands through (`--bash-shell-path`). Trusted as already validated at
     /// CLI-argument time rather than re-checked on every registry rebuild (`set_model` rebuilds).
     pub bash_shell_path: Option<&'a str>,
@@ -694,8 +695,8 @@ pub fn default_registry_with_config(cfg: &ToolConfig<'_>) -> ToolRegistry {
     if let Some(prefix) = cfg.bash_command_prefix {
         bash = bash.with_command_prefix(prefix);
     }
-    if cfg.bash_policy != bash::BashPolicy::default() {
-        bash = bash.with_policy(cfg.bash_policy);
+    if cfg.bash_waits_for_exit {
+        bash = bash.with_idle_yield(None);
     }
     let bash = Arc::new(bash);
     reg.register(bash.clone());
@@ -786,6 +787,8 @@ pub fn filter_allows(
     if no_tools {
         return false;
     }
+    // `bash_job` waits on what `bash` started, so it is kept or dropped with `bash`.
+    let name = if name == bash::JOB_TOOL { "bash" } else { name };
     if tools.is_some_and(|allow| !allow.iter().any(|a| a == name)) {
         return false;
     }
@@ -1242,6 +1245,8 @@ mod tests {
         for name in ["read", "write", "edit", "bash", "ls", "grep", "find"] {
             assert!(reg.get(name).is_some(), "missing coding tool: {name}");
         }
+        // … `bash`'s companion for a command still running after its call returned …
+        assert!(reg.get(bash::JOB_TOOL).is_some(), "missing bash_job");
         // … the model's own task list, and its window to the web (constructed, not advertised).
         assert!(reg.get("todo").is_some(), "missing todo tool");
         assert!(reg.get("web").is_some(), "missing web tool");
@@ -1253,7 +1258,7 @@ mod tests {
                 "vendor-specific tool leaked in: {name}"
             );
         }
-        assert_eq!(reg.len(), 9);
+        assert_eq!(reg.len(), 10);
     }
 
     #[test]
@@ -1261,7 +1266,7 @@ mod tests {
         let mut reg = default_registry();
         apply_filter(&mut reg, None, None, false);
         for name in [
-            "read", "write", "edit", "bash", "ls", "grep", "find", "todo",
+            "read", "write", "edit", "bash", "bash_job", "ls", "grep", "find", "todo",
         ] {
             assert!(reg.get(name).is_some(), "missing advertised tool: {name}");
         }
@@ -1269,7 +1274,7 @@ mod tests {
             reg.get("web").is_none(),
             "web must be opt-in via --tools, not advertised by default"
         );
-        assert_eq!(reg.len(), 8);
+        assert_eq!(reg.len(), 9);
     }
 
     #[test]
@@ -1360,8 +1365,8 @@ mod tests {
     fn apply_filter_unknown_names_are_silently_ignored() {
         let mut reg = default_registry();
         apply_filter(&mut reg, None, Some(&["does-not-exist".to_string()]), false);
-        // Unknown deny names are ignored; the advertised default (eight tools, no web) still applies.
-        assert_eq!(reg.len(), 8);
+        // Unknown deny names are ignored; the advertised default (nine tools, no web) still applies.
+        assert_eq!(reg.len(), 9);
         assert!(reg.get("read").is_some());
         assert!(reg.get("grep").is_some());
         assert!(reg.get("web").is_none());

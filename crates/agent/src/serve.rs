@@ -3030,6 +3030,7 @@ pub(crate) async fn serve_session(
         &exec_cell,
         &mcp_enabled,
         &skills,
+        false,
     );
     let has_read = startup_tools.get("read").is_some();
     let has_todo = startup_tools.get(crate::tools::todo::NAME).is_some();
@@ -3595,6 +3596,7 @@ pub(crate) async fn serve_session(
         &exec_cell,
         &mcp_enabled,
         &skills,
+        true,
     )
     .get("bash");
     // The same deny-list `build_agent` installs as an `AgentHooks` gate on the model's own tool calls —
@@ -6075,6 +6077,7 @@ pub(crate) async fn serve_session(
                     &exec_cell,
                     &mcp_enabled,
                     &skills,
+                    false,
                 )
                 .names()
                 .into_iter()
@@ -6605,6 +6608,7 @@ pub(crate) async fn serve_session(
                     &exec_cell,
                     &mcp_enabled,
                     &skills,
+                    false,
                 );
                 let mut tool_defs = registry.definitions();
                 tool_defs.extend(registry.deferred_definitions());
@@ -8709,6 +8713,7 @@ fn build_subagent_ctx(
         exec,
         &crate::tools::mcp::McpEnabledSet::new(),
         skills,
+        false,
     );
     crate::tools::apply_filter(
         &mut probe,
@@ -8732,8 +8737,6 @@ fn build_subagent_ctx(
         memory_mounts,
         tool_cfg: subagent::ChildToolConfig {
             bash_timeout_ms: cfg.bash_timeout_ms,
-            // `serve` exposes no `BashPolicy` flags yet (the A/B runs through `run`).
-            bash_policy: Default::default(),
             bash_shell_path: cfg.bash_shell_path.clone(),
             bash_command_prefix: cfg.bash_command_prefix.clone(),
             remote_shell: cfg
@@ -8836,7 +8839,7 @@ fn build_agent(
         ..compaction_config(cfg, model)
     };
 
-    let mut registry = build_tools(cfg, image_auto_resize, exec, mcp_enabled, skills);
+    let mut registry = build_tools(cfg, image_auto_resize, exec, mcp_enabled, skills, false);
     // Registered here, not in `build_tools`, because this is where `write_locks` is in scope — the ctx
     // needs the same registry every child shares. Reused across rebuilds; the ctx's factory handles the
     // per-child model itself, so a `set_model` rebuild doesn't invalidate it.
@@ -9148,12 +9151,15 @@ fn tool_root(cfg: &ServeConfig) -> std::path::PathBuf {
         .unwrap_or_default()
 }
 
+/// `bash_waits_for_exit`: see [`tools::ToolConfig::bash_waits_for_exit`] — only the host `bash`
+/// command's own instance sets it.
 fn build_tools(
     cfg: &ServeConfig,
     image_auto_resize: bool,
     exec: &crate::exec_endpoint::ExecCell,
     mcp_enabled: &crate::tools::mcp::McpEnabledSet,
     skills: &[crate::skills::Skill],
+    bash_waits_for_exit: bool,
 ) -> agent_core::ToolRegistry {
     // Task #34 (pi-parity fix): previously always called the plain `default_registry_with_prefix`,
     // hardcoding `image_auto_resize: true` regardless of `cfg.image_auto_resize` — `run`'s identical
@@ -9171,8 +9177,7 @@ fn build_tools(
     let nested_exclude = cfg.exclude_tools.as_deref().unwrap_or(empty);
     let mut registry = tools::default_registry_with_config(&tools::ToolConfig {
         bash_timeout_ms: cfg.bash_timeout_ms,
-        // No `BashPolicy` flags on `serve` yet: the A/B runs through `run`.
-        bash_policy: Default::default(),
+        bash_waits_for_exit,
         bash_shell_path: cfg.bash_shell_path.as_deref(),
         bash_command_prefix: cfg.bash_command_prefix.as_deref(),
         web_allow_private: cfg.web_allow_private,

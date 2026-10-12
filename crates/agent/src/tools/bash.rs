@@ -12,7 +12,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -22,7 +22,7 @@ use async_trait::async_trait;
 use regex::Regex;
 use serde_json::{Value, json};
 
-use super::exec::{ChunkSink, CommandRunner, ExecResult, RealRunner};
+use super::exec::{CommandRunner, ExecResult, RealRunner};
 use super::fs::local::LocalFs;
 use super::fs::{FsBackend, PathWorld};
 use super::output::{OutputAccumulator, OutputSnapshot, TruncatedBy, format_output};
@@ -82,34 +82,20 @@ fn resolve_shell() -> &'static str {
     })
 }
 
-/// Experimental behaviors for long-running and hung commands, all off by default (see the bash
-/// section of `ARCHITECTURE.md` for the eval data behind each, and the A/B they exist for). With the
-/// default policy the tool behaves exactly as it did before these existed.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct BashPolicy {
-    /// Return to the model when a still-running command has printed nothing for this long
-    /// (`--bash-idle-yield-secs`). The command is not stopped: it keeps running as a detached job
-    /// the model can wait on or kill (see [`Bash::exec_detachable`]).
-    pub idle_yield: Option<Duration>,
-    /// Return to the model once a call has been waiting this long, output or not
-    /// (`--bash-yield-secs`) — the same detached job, on a wall-clock schedule.
-    pub wall_yield: Option<Duration>,
-}
-
-impl BashPolicy {
-    /// Whether a call may return before its command exits — the detached-job path.
-    fn detaches(&self) -> bool {
-        self.idle_yield.is_some() || self.wall_yield.is_some()
-    }
-}
+/// How long a running command may print nothing before its call returns to the model with the output
+/// so far. The command is not stopped: it keeps running as a numbered job that `bash_job` waits on or
+/// kills. Silence is grounds to ask the model, never to kill: a clean release build of this repo goes
+/// 204 s without output. See "`bash` and hung commands" in `ARCHITECTURE.md` for the eval behind 60 s.
+pub const IDLE_YIELD: Duration = Duration::from_secs(60);
 
 pub struct Bash {
     runner: Arc<dyn CommandRunner>,
     default_timeout_ms: u64,
-    /// See [`BashPolicy`]. Default: none of it.
-    policy: BashPolicy,
-    /// Commands still running after their call returned ([`BashPolicy::detaches`]). Owned by this
-    /// tool instance: dropping it (a registry rebuild, the end of the process) kills every one.
+    /// The silence after which a call returns and leaves its command running as a job: [`IDLE_YIELD`],
+    /// or `None` to wait for every command to exit (see [`Self::with_idle_yield`]).
+    idle_yield: Option<Duration>,
+    /// Commands still running after their call returned. Owned by this tool instance: dropping it (a
+    /// registry rebuild, the end of the process) kills every one.
     jobs: Arc<Jobs>,
     /// Overrides `resolve_shell()`'s auto-detection when set — see [`with_shell_path`](Self::with_shell_path).
     shell_path: Option<String>,
@@ -163,7 +149,7 @@ pub struct Bash {
 /// `new()` would be a stale snapshot for exactly the session that attaches a sandbox mid-life. The
 /// runtime marker (`output.rs`'s `full_output_segment`) already tells the model what to do in each
 /// case; this only has to stop promising the case that may not happen.
-fn describe(default_timeout_ms: u64, policy: &BashPolicy) -> String {
+fn describe(default_timeout_ms: u64, idle_yield: Option<Duration>) -> String {
     let mut text = format!(
         "Run a shell command via a resolved bash (falls back to sh) and return its combined \
          stdout/stderr. Supports an optional `cwd` and `timeout_ms` (defaults to {default_timeout_ms} ms \
@@ -174,21 +160,12 @@ fn describe(default_timeout_ms: u64, policy: &BashPolicy) -> String {
         super::output::DEFAULT_MAX_LINES,
         super::output::format_size(super::output::DEFAULT_MAX_BYTES as u64),
     );
-    let early = match (policy.idle_yield, policy.wall_yield) {
-        (Some(idle), Some(wall)) => Some(format!(
-            "after {} s without new output, or {} s in any case,",
-            idle.as_secs(),
-            wall.as_secs()
-        )),
-        (Some(idle), None) => Some(format!("after {} s without new output", idle.as_secs())),
-        (None, Some(wall)) => Some(format!("after {} s", wall.as_secs())),
-        (None, None) => None,
-    };
-    if let Some(early) = early {
+    if let Some(idle) = idle_yield {
         text.push_str(&format!(
-            " A command still running {early} returns early with its output so far and keeps \
-             running in the background as a numbered job: call `bash_job` with that number to wait \
-             for more of its output, or with `kill: true` to stop it."
+            " A command still running after {} s without new output returns early with its output \
+             so far and keeps running in the background as a numbered job: call `bash_job` with that \
+             number to wait for more of its output, or with `kill: true` to stop it.",
+            idle.as_secs()
         ));
     }
     text
@@ -200,12 +177,12 @@ impl Bash {
         Self {
             runner: Arc::new(RealRunner),
             default_timeout_ms: DEFAULT_TIMEOUT_MS,
-            policy: BashPolicy::default(),
+            idle_yield: Some(IDLE_YIELD),
             jobs: Arc::default(),
             shell_path: None,
             remote_shell: None,
             command_prefix: None,
-            description: describe(DEFAULT_TIMEOUT_MS, &BashPolicy::default()),
+            description: describe(DEFAULT_TIMEOUT_MS, Some(IDLE_YIELD)),
             root: std::path::PathBuf::new(),
             backend: Arc::new(LocalFs::new()),
         }
@@ -214,15 +191,15 @@ impl Bash {
     /// Builder-style: override the default timeout applied when the model omits `timeout_ms`.
     pub fn with_default_timeout_ms(mut self, ms: u64) -> Self {
         self.default_timeout_ms = ms;
-        self.description = describe(ms, &self.policy);
+        self.description = describe(ms, self.idle_yield);
         self
     }
 
-    /// Builder-style: turn on the experimental long-command behaviors in `policy` (see
-    /// [`BashPolicy`]). The default policy changes nothing.
-    pub fn with_policy(mut self, policy: BashPolicy) -> Self {
-        self.policy = policy;
-        self.description = describe(self.default_timeout_ms, &policy);
+    /// Builder-style: a different idle window than [`IDLE_YIELD`], or `None` to wait for every command
+    /// to exit — for a caller with no `bash_job` to come back with (`serve`'s host `bash` command).
+    pub fn with_idle_yield(mut self, idle_yield: Option<Duration>) -> Self {
+        self.idle_yield = idle_yield;
+        self.description = describe(self.default_timeout_ms, idle_yield);
         self
     }
 
@@ -281,12 +258,12 @@ impl Bash {
         Self {
             runner,
             default_timeout_ms: DEFAULT_TIMEOUT_MS,
-            policy: BashPolicy::default(),
+            idle_yield: Some(IDLE_YIELD),
             jobs: Arc::default(),
             shell_path: None,
             remote_shell: None,
             command_prefix: None,
-            description: describe(DEFAULT_TIMEOUT_MS, &BashPolicy::default()),
+            description: describe(DEFAULT_TIMEOUT_MS, Some(IDLE_YIELD)),
             root: std::path::PathBuf::new(),
             backend: Arc::new(LocalFs::new()),
         }
@@ -413,139 +390,22 @@ impl Bash {
         };
         let args = vec!["-c".to_string(), resolved_command];
         let dur = Duration::from_millis(timeout_ms);
-        if self.policy.detaches() {
-            return self
-                .exec_detachable(args, cwd, dur, timeout_ms, &world, progress)
-                .await;
-        }
-
-        // The spill file is written on *this* host. When the command ran somewhere else that is the
-        // one machine whose filesystem the model cannot reach, so `Full output: /tmp/pi-bash-….log`
-        // would name a path it can never read — and, on a replica serving other tenants, would put a
-        // tenant's command output on the host besides. No file is created at all; the marker tells the
-        // model to redirect the output into its own sandbox instead.
-        let acc = Arc::new(Mutex::new(accumulator(!world.is_remote())));
-        let streamed = Arc::new(AtomicBool::new(false));
-        let last_emit = Arc::new(Mutex::new(Instant::now()));
-
-        // pi emits an initial empty update the moment execution starts.
-        if let Some(p) = progress {
-            p.emit("", None);
-        }
-
-        // Feed every raw chunk (both stdout and stderr, in arrival order) into the one accumulator, and
-        // emit a throttled snapshot as it grows. Always via the streaming path so the temp-file spill
-        // sees the *complete* output; a non-streaming runner (a test double, a remote endpoint)
-        // delivers no chunks and is handled by the fallback below.
-        //
-        // `sink` is declared at this scope (not nested in its own block) because `run_fut` borrows it
-        // and, unlike before this fix, is no longer awaited to completion in the same expression that
-        // constructs it — a cancellation races it instead (see below), so `sink` must outlive that race.
-        let sink = {
-            let acc = acc.clone();
-            let streamed = streamed.clone();
-            let last_emit = last_emit.clone();
-            move |bytes: &[u8]| {
-                streamed.store(true, Ordering::Relaxed);
-                let mut a = lock(&acc);
-                a.append(bytes);
-                if let Some(p) = progress {
-                    let mut le = lock(&last_emit);
-                    if le.elapsed() >= UPDATE_THROTTLE {
-                        *le = Instant::now();
-                        drop(le);
-                        // pi-parity fix (task 58): pi forces a spill to the temp file on *every* live
-                        // progress emit once the output is truncated (50KB), not just on the final
-                        // snapshot — `false` here left a live update in the 50-100KB range (`truncated`
-                        // already true, but under the ~100KB rolling cap that auto-spills during
-                        // `append`) reporting `truncated: true` with no `full_output_path` to point at
-                        // yet. `snapshot`'s own `persist_if_truncated` gate means this is a no-op unless
-                        // the 50KB mark has actually been crossed, and a no-op again once already
-                        // spilled, so this doesn't force an extra file open on every throttled tick.
-                        let snap = a.snapshot(true);
-                        emit_update(p, &snap);
-                    }
-                }
-            }
-        };
-        let sink: ChunkSink<'_> = &sink;
-        let run_fut = self
-            .runner
-            .run_streaming(self.shell(&world), &args, cwd, dur, sink);
-
-        // Races the runner against this call's own cancellation — the same token a caller trips via
-        // `abort_bash`/SIGTERM/etc (e.g. `serve`'s host `bash` RPC) — rather than being cancellable only
-        // by an external `Drop` of this whole future with no chance to finalize. `acc` is always current
-        // regardless of the throttled snapshots above (every chunk is appended unconditionally, matching
-        // pi's own accumulator), so on cancellation we flush exactly what's in it and return that, tagged
-        // "Command cancelled", instead of discarding it. Without `progress` there's no token to race
-        // against, so this just awaits the runner directly, unchanged from before.
-        let result = match progress {
-            Some(p) => {
-                tokio::pin!(run_fut);
-                tokio::select! {
-                    r = &mut run_fut => Some(r),
-                    () = p.cancelled() => None,
-                }
-            }
-            None => Some(run_fut.await),
-        };
-        let Some(result) = result
-            .transpose()
-            .map_err(|e: std::io::Error| ToolError::Execution(format!("spawn failed: {e}")))?
-        else {
-            // Cancelled mid-stream: dropping the pinned `run_fut` above (implicit at the end of the
-            // `Some(p)` match arm) kills the subprocess via its `kill_on_drop`/process-group guard, the
-            // same way an external `Drop` of this whole call already did before this fix — the only
-            // change is that we get a chance to flush `acc` first instead of losing it.
-            let snap = {
-                let mut a = lock(&acc);
-                a.finish();
-                a.snapshot(true)
-            };
-            if let Some(p) = progress {
-                emit_update(p, &snap);
-            }
-            let text = clean(format_output(&snap, ""));
-            return Err(ToolError::Execution(append_status(
-                &text,
-                "Command cancelled",
-            )));
-        };
-
-        // Fallback for a non-streaming runner (a test double, a remote endpoint): feed its final
-        // captured output, both streams.
-        if !streamed.load(Ordering::Relaxed) {
-            let mut a = lock(&acc);
-            a.append(result.stdout.as_bytes());
-            if !result.stderr.is_empty() {
-                if !result.stdout.is_empty() {
-                    a.append(b"\n");
-                }
-                a.append(result.stderr.as_bytes());
-            }
-        }
-
-        let snap = {
-            let mut a = lock(&acc);
-            a.finish();
-            a.snapshot(true) // persist the full output to the temp file if truncated
-        };
-
-        // pi flushes a final snapshot before returning the result.
-        if let Some(p) = progress {
-            emit_update(p, &snap);
-        }
-
-        finish_result(&snap, &result, timeout_ms)
+        self.exec_detachable(args, cwd, dur, timeout_ms, &world, progress)
+            .await
     }
 
-    /// The [`BashPolicy::detaches`] path: the command runs on its own task, and this call waits on it
-    /// only until it exits or a yield condition fires. On a yield the command keeps running as a
-    /// numbered [`Job`] and the model gets the output so far plus how to wait on or kill it.
+    /// The command runs on its own task, and this call waits on it only until it exits or it has been
+    /// quiet for the idle window ([`Self::idle_window`]). Then the command keeps running as a numbered
+    /// [`Job`] and the model gets the output so far plus how to wait on or kill it.
+    ///
+    /// Raw stdout+stderr feed one accumulator in arrival order, so the temp-file spill sees the
+    /// complete output. The spill file is written on *this* host: when the command ran somewhere
+    /// else, `Full output: /tmp/pi-bash-….log` would name a path the model can never read (and, on a
+    /// replica serving other tenants, put a tenant's output on the host), so none is created and the
+    /// marker says to redirect into the sandbox instead (see [`accumulator`]).
     ///
     /// The command still carries its own `timeout_ms`, so a job nobody waits on is reaped by the same
-    /// backstop as a foreground command.
+    /// backstop as a call that waits.
     async fn exec_detachable(
         &self,
         args: Vec<String>,
@@ -581,13 +441,14 @@ impl Bash {
             handle,
             started: Instant::now(),
             timeout_ms,
+            reports: 0,
         };
         self.attach(job, progress).await
     }
 
-    /// Wait on `job` until it exits (its final result), a yield condition fires (detach it again and
-    /// report the output since the last report), or the call is cancelled (kill it, like a
-    /// foreground command).
+    /// Wait on `job` until it exits (its final result), it has been quiet past its idle window (park
+    /// it and report the output since the last report), or the call is cancelled (kill it and return
+    /// what it printed, tagged "Command cancelled").
     async fn attach(
         &self,
         mut job: Job,
@@ -600,7 +461,9 @@ impl Bash {
             Cancelled,
         }
         let attached = Instant::now();
-        let mut last_emit: Option<Instant> = None;
+        // pi emits the first throttled snapshot one `UPDATE_THROTTLE` after the start, not on the
+        // first chunk.
+        let mut last_emit = attached;
         loop {
             let deadline = self.yield_deadline(&job, attached);
             let cancelled = async {
@@ -609,26 +472,31 @@ impl Bash {
                     None => std::future::pending().await,
                 }
             };
+            // Biased, output before exit: a chunk that lands just before the command exits still gets
+            // its live update, as it did when the sink emitted inline.
             let woke = tokio::select! {
-                joined = &mut job.handle => Woke::Exited(joined),
-                () = job.shared.notify.notified() => Woke::Output,
-                () = tokio::time::sleep_until(deadline.into()) => Woke::Deadline,
+                biased;
                 () = cancelled => Woke::Cancelled,
+                () = job.shared.notify.notified() => Woke::Output,
+                joined = &mut job.handle => Woke::Exited(joined),
+                () = tokio::time::sleep_until(deadline.into()) => Woke::Deadline,
             };
             match woke {
                 Woke::Exited(joined) => return self.finish_job(job, joined, progress),
                 Woke::Output => {
                     if let Some(p) = progress
-                        && last_emit.is_none_or(|t| t.elapsed() >= UPDATE_THROTTLE)
+                        && last_emit.elapsed() >= UPDATE_THROTTLE
                     {
-                        last_emit = Some(Instant::now());
+                        last_emit = Instant::now();
+                        // `true`: once the output is past the display cap, every live update
+                        // carries a spill path to point at (pi forces the spill on each emit).
                         let snap = lock(&job.shared.out).acc.snapshot(true);
                         emit_update(p, &snap);
                     }
                 }
                 Woke::Deadline => {
-                    if let Some(reason) = self.yield_reason(&job, attached) {
-                        return Ok(self.detach(job, reason));
+                    if let Some(quiet) = self.quiet_past_window(&job, attached) {
+                        return Ok(self.detach(job, quiet));
                     }
                 }
                 Woke::Cancelled => {
@@ -652,52 +520,60 @@ impl Bash {
     /// so a re-attached job always gets a full `idle_yield` before it is reported again.
     fn yield_deadline(&self, job: &Job, attached: Instant) -> Instant {
         let quiet_since = lock(&job.shared.out).last_output.max(attached);
-        let idle = self.policy.idle_yield.map(|d| quiet_since + d);
-        let wall = self.policy.wall_yield.map(|d| attached + d);
-        match (idle, wall) {
-            (Some(a), Some(b)) => a.min(b),
-            (Some(a), None) | (None, Some(a)) => a,
-            // Unreachable on this path (`detaches()` was true), but a far deadline is the honest
-            // answer for "never yield".
-            (None, None) => attached + Duration::from_secs(u64::from(u32::MAX)),
+        match self.idle_window(job) {
+            Some(idle) => quiet_since + idle,
+            // Never yield: a far deadline is the honest answer.
+            None => attached + Duration::from_secs(u64::from(u32::MAX)),
         }
     }
 
-    fn yield_reason(&self, job: &Job, attached: Instant) -> Option<YieldReason> {
-        let now = Instant::now();
-        let quiet_since = lock(&job.shared.out).last_output.max(attached);
-        if let Some(idle) = self.policy.idle_yield
-            && now >= quiet_since + idle
-        {
-            return Some(YieldReason::Quiet(now - quiet_since));
+    /// The silence this attach allows before reporting: [`Self::idle_yield`] for the call that
+    /// started the command, then [`IDLE_GROWTH`] times longer for each report since. A hung command
+    /// is reported after one window and costs one longer wait before the model kills it; a
+    /// legitimately silent build is reported once, and the wait that follows covers it. With a fixed
+    /// window, a silent 100 s build was reported twice and a 204 s one would be reported 3–4 times.
+    ///
+    /// `None` (never yield) when the command runs somewhere this host sees no output from as it
+    /// happens: a request/response exec endpoint streams nothing, so its silence says nothing about
+    /// the command.
+    fn idle_window(&self, job: &Job) -> Option<Duration> {
+        if job.shared.remote {
+            return None;
         }
-        if let Some(wall) = self.policy.wall_yield
-            && now >= attached + wall
-        {
-            return Some(YieldReason::Waited(now - attached));
-        }
-        None
+        let scale = IDLE_GROWTH.saturating_pow(job.reports);
+        self.idle_yield.map(|d| d.saturating_mul(scale))
+    }
+
+    /// How long the job has been quiet, when that is past its idle window.
+    fn quiet_past_window(&self, job: &Job, attached: Instant) -> Option<Duration> {
+        let quiet = lock(&job.shared.out).last_output.max(attached).elapsed();
+        (quiet >= self.idle_window(job)?).then_some(quiet)
     }
 
     /// Park `job` in the table and tell the model what it has so far and how to come back to it.
-    fn detach(&self, mut job: Job, reason: YieldReason) -> ToolOutput {
+    fn detach(&self, mut job: Job, quiet: Duration) -> ToolOutput {
         let id = *job
             .id
             .get_or_insert_with(|| self.jobs.next.fetch_add(1, Ordering::Relaxed) + 1);
         let snap = job.shared.take_segment();
         let text = clean(format_output(&snap, ""));
         let running = job.started.elapsed().as_secs();
-        let lead = match reason {
-            YieldReason::Quiet(quiet) => format!("No output for {} s", quiet.as_secs()),
-            YieldReason::Waited(waited) => format!("Waited {} s", waited.as_secs()),
-        };
+        job.reports = job.reports.saturating_add(1);
         let status = format!(
-            "{lead}. The command is still running ({running} s so far; it is killed at its {} s \
+            "No output for {} s. The command is still running ({running} s so far; it is killed at its {} s \
              timeout). It continues in the background as job {id}: call bash_job with \
              {{\"job\": {id}}} to wait for more output, or {{\"job\": {id}, \"kill\": true}} to stop \
              it if you no longer need it (not `pkill`, which can match unrelated processes).",
+            quiet.as_secs(),
             job.timeout_ms / 1000
         );
+        let status = match self.idle_window(&job) {
+            Some(next) => format!(
+                "{status} A wait returns when it exits, or after {} s without new output.",
+                next.as_secs()
+            ),
+            None => status,
+        };
         // Live probes: models mostly move on without waiting on or killing a job, so a hung one
         // would spin until its timeout. Cap how many can pile up; the oldest goes first.
         let evicted = {
@@ -718,8 +594,7 @@ impl Bash {
         append_status(&text, &status).into()
     }
 
-    /// A job's command has exited: its final result, exactly as a foreground run would report it,
-    /// over the output produced since the last report.
+    /// A job's command has exited: its final result over the output produced since the last report.
     fn finish_job(
         &self,
         job: Job,
@@ -733,8 +608,8 @@ impl Bash {
         };
         let snap = {
             let mut out = lock(&job.shared.out);
-            // A non-streaming runner (a remote endpoint) delivered nothing through the sink; its
-            // captured output is the whole story, as on the foreground path.
+            // A non-streaming runner (a test double, a remote endpoint) delivered nothing through the
+            // sink; its captured output is the whole story.
             if !out.streamed {
                 out.acc.append(result.stdout.as_bytes());
                 if !result.stderr.is_empty() {
@@ -775,7 +650,7 @@ impl Bash {
         if input.get("kill").and_then(Value::as_bool) != Some(true) {
             return self.attach(job, progress).await;
         }
-        // Kill the group and wait for it, as the foreground timeout path does, so a caller that
+        // Kill the group and wait for it, as the runner's own timeout path does, so a caller that
         // checks side effects right after sees the command gone.
         #[cfg(unix)]
         if let Some(pgid) = job.shared.untrack() {
@@ -792,13 +667,9 @@ impl Bash {
     }
 }
 
-/// Why a detached call returned before its command exited.
-enum YieldReason {
-    /// [`BashPolicy::idle_yield`]: no output for this long.
-    Quiet(Duration),
-    /// [`BashPolicy::wall_yield`]: this call waited this long.
-    Waited(Duration),
-}
+/// How much longer each wait on a job may sit silent than the last report's window (see
+/// [`Bash::idle_window`]): 60 s, then 240 s, then 960 s.
+const IDLE_GROWTH: u32 = 4;
 
 /// Most detached jobs one `bash` keeps; parking another kills the oldest.
 const MAX_PARKED_JOBS: usize = 4;
@@ -820,6 +691,9 @@ struct Job {
     handle: tokio::task::JoinHandle<std::io::Result<ExecResult>>,
     started: Instant,
     timeout_ms: u64,
+    /// How many times the model has been told this job is still running; widens
+    /// [`Bash::idle_window`].
+    reports: u32,
 }
 
 impl Drop for Job {
@@ -927,8 +801,7 @@ fn accumulator(spill: bool) -> OutputAccumulator {
 }
 
 /// The model-facing result for a command that has exited (or timed out): the cleaned output plus the
-/// status line pi appends. Shared by the foreground path and a detached job's final report, so both
-/// read the same.
+/// status line pi appends.
 fn finish_result(
     snap: &OutputSnapshot,
     result: &ExecResult,
@@ -993,7 +866,7 @@ impl Tool for Bash {
         &self.description
     }
     fn input_schema(&self) -> Value {
-        // The same under every policy: waiting on or killing a job is `bash_job`'s, not optional
+        // No `job` field: waiting on or killing a job is `bash_job`'s, not optional
         // fields here. A model that fills every property (gpt-6-luna sends `"job": 0` on every
         // call) would otherwise turn each command into a job lookup — seen in a live probe.
         json!({
@@ -1031,11 +904,15 @@ impl Bash {
     /// Whether this tool can leave a command running past its call — the condition for registering
     /// [`BashJob`] beside it.
     pub fn detaches(&self) -> bool {
-        self.policy.detaches()
+        self.idle_yield.is_some()
     }
 }
 
-/// `bash_job`: wait on or kill a command `bash` left running (see [`BashPolicy`]). Registered only
+/// [`BashJob`]'s name. It follows `bash` through every tool filter (`tools::filter_allows`): a `bash`
+/// whose quiet command became a job must always have the tool that waits on it.
+pub const JOB_TOOL: &str = "bash_job";
+
+/// `bash_job`: wait on or kill a command `bash` left running (see [`IDLE_YIELD`]). Registered only
 /// beside a detaching `bash`, and over that same instance, so the two share one job table.
 ///
 /// A tool of its own rather than optional `job`/`kill` fields on `bash`, because some models fill
@@ -1054,7 +931,7 @@ impl BashJob {
 #[async_trait]
 impl Tool for BashJob {
     fn name(&self) -> &str {
-        "bash_job"
+        JOB_TOOL
     }
     fn description(&self) -> &str {
         "Wait for or stop a command that `bash` left running in the background (its result said \
@@ -1207,13 +1084,13 @@ fn clean_str(s: &str) -> Cow<'_, str> {
 }
 
 #[cfg(test)]
-#[path = "bash_policy_tests.rs"]
-mod policy_tests;
+#[path = "bash_idle_yield_tests.rs"]
+mod idle_yield_tests;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::exec::ExecResult;
+    use crate::tools::exec::{ChunkSink, ExecResult};
     use crate::tools::output::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, Truncation, format_size};
 
     #[test]
