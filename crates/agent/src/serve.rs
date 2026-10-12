@@ -661,6 +661,8 @@ pub struct ServeConfig {
     pub web_allow_hosts: Vec<String>,
     /// `--web-timeout-ms`: the `web` tool's per-request timeout (default 30 s).
     pub web_timeout_ms: Option<u64>,
+    /// `--tool-tuning`: A/B knobs on how built-in tools present themselves. See [`crate::tools::tuning`].
+    pub tool_tuning: crate::tools::ToolTuning,
     /// A process-wide default exec endpoint, applied to every session at startup.
     ///
     /// For the single-tenant case (one server, one sandbox) this saves an RPC. A multi-tenant server
@@ -8742,6 +8744,7 @@ fn build_subagent_ctx(
             web_allow_private: cfg.web_allow_private,
             web_allow_hosts: cfg.web_allow_hosts.clone(),
             web_timeout_ms: cfg.web_timeout_ms,
+            tuning: cfg.tool_tuning,
             image_auto_resize: cfg.image_auto_resize,
             // The **cell**, not a snapshot: a child must act on whatever machine its parent is
             // pointed at *now*. Handing down `None` here was a sandbox escape — the parent's tools
@@ -9174,6 +9177,7 @@ fn build_tools(
         web_allow_private: cfg.web_allow_private,
         web_allow_hosts: &cfg.web_allow_hosts,
         web_timeout_ms: cfg.web_timeout_ms,
+        tuning: cfg.tool_tuning,
         image_auto_resize,
         code_mode: cfg.code_mode,
         mcp_loading: cfg.mcp_loading,

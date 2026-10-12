@@ -771,7 +771,7 @@ pub fn extract_file_ops(messages: &[Message]) -> (Vec<String>, Vec<String>) {
                 };
                 let bucket = match name.as_str() {
                     "read" => &mut read,
-                    "write" | "edit" => &mut modified,
+                    "write" | "edit" | "multi_edit" => &mut modified,
                     _ => continue,
                 };
                 let path = path.to_string();

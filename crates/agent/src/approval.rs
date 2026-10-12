@@ -60,7 +60,7 @@ const READ_ONLY_TOOLS: [&str; 8] = [
 
 /// Tools that mutate the filesystem through a path they name. `bash` is deliberately absent: it mutates
 /// anything reachable from its cwd, which is why it is gated by [`GatedSet::All`] rather than `Writes`.
-const WRITE_TOOLS: [&str; 2] = ["write", "edit"];
+const WRITE_TOOLS: [&str; 3] = ["write", "edit", "multi_edit"];
 
 /// How long a `write`/`bash` argument may be before it is truncated in the request sent to clients. The
 /// point is to show a human *what* is about to happen, not to fan a megabyte file body out to every
@@ -288,7 +288,7 @@ pub fn scope_key(tool: &str, input: &Value, root: &std::path::Path, world: &Path
             Some(command) => format!("cmd:{command}"),
             None => "cmd:<none>".to_string(),
         },
-        "write" | "edit" => match input.get("path").and_then(Value::as_str) {
+        "write" | "edit" | "multi_edit" => match input.get("path").and_then(Value::as_str) {
             Some(path) => {
                 // The same form the tools themselves write to, so `./x`, `../dir/x` and (locally) a
                 // symlink to `x` all resolve to one remembered decision rather than three.
@@ -448,6 +448,10 @@ mod tests {
         let g = GatedSet::Writes;
         assert!(g.is_gated("write"));
         assert!(g.is_gated("edit"));
+        assert!(
+            g.is_gated("multi_edit"),
+            "`edit-schema=split`'s multi-edit tool writes too"
+        );
         // `bash` can write anywhere; it belongs to `all`, not to a set defined by a `path` argument.
         assert!(!g.is_gated("bash"));
         assert!(!g.is_gated("read"));

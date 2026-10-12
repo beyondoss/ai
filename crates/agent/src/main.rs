@@ -506,6 +506,12 @@ enum Command {
         /// The `web` tool's per-request timeout (ms). Default 30,000. `serve`'s identical flag.
         #[usage(long, env = "AI_AGENT_WEB_TIMEOUT_MS")]
         web_timeout_ms: Option<u64>,
+        /// An A/B knob on how a built-in tool presents itself to the model, `KEY=VALUE` (repeatable or
+        /// comma-separated): `edit-schema=combined|edits|split`, `edit-pair=strict|lenient`. Every
+        /// default is the production behavior; an unknown key or value is an error. See
+        /// `tools::tuning`. `serve`'s identical flag.
+        #[usage(long, env = "AI_AGENT_TOOL_TUNING")]
+        tool_tuning: Vec<String>,
         /// Run the filesystem tools (`read`/`write`/`edit`/`ls`/`grep`/`find`) against a remote
         /// **exec endpoint** instead of this host. Any URL that accepts
         /// `POST {command, args, cwd, timeout_ms}` and answers `{exit_code, stdout, stderr}`.
@@ -1119,6 +1125,12 @@ enum Command {
         /// The `web` tool's per-request timeout (ms). Default 30,000. `serve`'s identical flag.
         #[usage(long, env = "AI_AGENT_WEB_TIMEOUT_MS")]
         web_timeout_ms: Option<u64>,
+        /// An A/B knob on how a built-in tool presents itself to the model, `KEY=VALUE` (repeatable or
+        /// comma-separated): `edit-schema=combined|edits|split`, `edit-pair=strict|lenient`. Every
+        /// default is the production behavior; an unknown key or value is an error. See
+        /// `tools::tuning`. `run`'s identical flag.
+        #[usage(long, env = "AI_AGENT_TOOL_TUNING")]
+        tool_tuning: Vec<String>,
         /// Point every session's tools at a remote exec endpoint by default. A multi-tenant server
         /// leaves this unset and uses the `set_exec_endpoint` command per session instead.
         #[usage(long, env = "AI_AGENT_EXEC_URL", conflicts = "exec_cmd")]
@@ -1994,6 +2006,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             web_allow_private,
             web_allow_host,
             web_timeout_ms,
+            tool_tuning,
             exec_url,
             exec_header,
             exec_max_response_bytes,
@@ -2074,6 +2087,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 web_allow_private,
                 web_allow_host,
                 web_timeout_ms,
+                tools::ToolTuning::parse(&tool_tuning)?,
                 exec_url,
                 exec_header,
                 exec_max_response_bytes,
@@ -2180,6 +2194,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             web_allow_private,
             web_allow_host,
             web_timeout_ms,
+            tool_tuning,
             exec_url,
             exec_header,
             exec_max_response_bytes,
@@ -2680,6 +2695,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 web_allow_private,
                 web_allow_hosts: web_allow_host,
                 web_timeout_ms,
+                tool_tuning: tools::ToolTuning::parse(&tool_tuning)?,
                 exec_url,
                 exec_header,
                 exec_max_response_bytes: exec_max_response_bytes.map_or(
@@ -4186,6 +4202,7 @@ async fn run_task(
     web_allow_private: bool,
     web_allow_host: Vec<String>,
     web_timeout_ms: Option<u64>,
+    tool_tuning: tools::ToolTuning,
     exec_url: Option<String>,
     exec_header: Vec<String>,
     exec_max_response_bytes: Option<u64>,
@@ -4648,6 +4665,7 @@ async fn run_task(
         web_allow_private,
         web_allow_hosts: &web_allow_host,
         web_timeout_ms,
+        tuning: tool_tuning,
         image_auto_resize,
         code_mode,
         mcp_loading,
@@ -4950,6 +4968,7 @@ async fn run_task(
                 web_allow_private,
                 web_allow_hosts: web_allow_host.clone(),
                 web_timeout_ms,
+                tuning: tool_tuning,
                 image_auto_resize,
                 // A child acts on the same machine as its parent. Handing down `None` here was a
                 // sandbox escape: the model could reach the host simply by delegating to a subagent.

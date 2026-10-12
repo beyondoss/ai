@@ -1639,7 +1639,44 @@ as `write("/home/…/f")` would.
   quotes, small/fullwidth dash forms, and a couple more unicode space code points — every addition the
   same kind of narrowly-scoped, single-family confusable pi's own set already folds, so it only helps a
   slightly-off `old_string` land and can never conflate two genuinely different characters. Edits
-  resolve to byte ranges against the _original_ text (order-independent, overlap-rejected).
+  resolve to byte ranges against the _original_ text (order-independent, overlap-rejected). When a
+  call sends **both** forms, the top-level pair is appended as one more edit (pi's behavior) — see
+  "Edit tool surface" below for why that is an A/B knob.
+
+#### Edit tool surface — the `--tool-tuning` A/B knobs
+
+`--tool-tuning KEY=VALUE` (repeatable or comma-separated, `serve` too; `tools::tuning`) holds knobs
+whose only purpose is an eval comparison. Every default is the production behavior; an unknown key or
+value fails startup, so a typo in an eval arm can never quietly run the control. Subagents inherit the
+parent's tuning (`ChildToolConfig::tuning`).
+
+The evidence (longctx eval, 380 runs): GPT-6 Luna and Sol fill **every** advertised property, so 100%
+of their edit calls carried `edits[]` _and_ a top-level `old_string`/`new_string`. The pair was filler
+— empty, `old == new`, or a copy of an entry — in 81% of Luna's and 69% of Sol's calls, and appending
+it caused 74% of Luna's edit errors (53% error rate). But Sol used the pair as a genuine extra edit in
+27% of its calls, so "ignore the pair" is not safe; only filler is.
+
+| Key           | Values                                 | Effect                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| ------------- | -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `edit-pair`   | `strict` (default), `lenient`          | `lenient` drops a filler pair (empty `old_string` with a blank `new_string`, `old == new`, or an exact duplicate of an entry) and uses the pair when `edits` is `[]`. A real, different pair is still applied; one that conflicts with an entry (same `old_string`, different `new_string`) still errors. `replace_all` is checked after, so it applies to the one entry left.                                                                                                  |
+| `edit-schema` | `combined` (default), `edits`, `split` | `edits` advertises `path` + `edits[]` only (pi's shape). `split` advertises a single-edit `edit` (`old_string`/`new_string`/`replace_all`, all but `replace_all` required) plus a `multi_edit` tool taking `edits[]` (Claude Code's Edit/MultiEdit). Every surface still _accepts_ every shape, so a model that ignores the schema still gets its edit. The system prompt's edit bullets are derived from the advertised schema, so they never name a parameter the tool lacks. |
+
+`multi_edit` is a second name for the same write, so every name-keyed write gate lists it: `ToolPolicy`'s
+`--deny-path`, the approval gate's `WRITE_TOOLS` and scope key, the subagent's write-capable set, and
+compaction's modified-files list.
+
+A third knob is compile-time: the **`json-key-order`** cargo feature turns on `serde_json/preserve_order`.
+Without it serde_json sorts object keys, which has two effects on what a model sees: tool schemas list
+`edits, new_string, old_string, path, replace_all`, and every earlier tool call is echoed back
+**alphabetized** (`{"edits":[{"new_string":…,"old_string":…}],"path":…}`), not in the order the model
+wrote it. Haiku's 54 invalid-JSON edits all began `{"edits": [{"new_string">`, never on a run's first
+edit (median 11 edits in), and a probe found schema order alone did not move Haiku's emission order
+while alphabetized history did — so the history echo, not the schema, is the suspect. Feature
+unification makes this binary-wide, so it is a separate eval binary rather than a flag. Under it, three
+`beyond-ai-agent-core` tests that pin alphabetical key order byte-for-byte fail
+(`streamed_body_is_byte_identical_to_the_tree` ×2, `reasoning_details_arriving_before_the_matching_tool_call_are_still_attached`);
+the bodies differ only in key order.
+
 - **`ls`** sorts directories first, then alphabetically; dot-entries are hidden unless `all: true` —
   both deliberate divergences from the reference agent, kept rather than "fixed" to match it (dotfiles
   hidden by default cuts real noise like `.git`/editor swapfiles; directories-first is a UX improvement

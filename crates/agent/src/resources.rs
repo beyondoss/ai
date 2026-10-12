@@ -38,7 +38,15 @@ pub fn default_system_prompt(
     registry: &agent_core::ToolRegistry,
     extra_guidelines: &[String],
 ) -> String {
-    let names: Vec<String> = registry.definitions().into_iter().map(|d| d.name).collect();
+    let defs = registry.definitions();
+    // Whether `edit` takes an `edits[]` array (the default and `edit-schema=edits`) or one
+    // old_string/new_string with a separate `multi_edit` (`edit-schema=split`) — read off the schema
+    // actually advertised, so the guidelines can never describe parameters the tool does not have.
+    let edit_takes_array = defs
+        .iter()
+        .find(|d| d.name == "edit")
+        .is_some_and(|d| d.input_schema["properties"]["edits"].is_object());
+    let names: Vec<String> = defs.into_iter().map(|d| d.name).collect();
     let has = |n: &str| names.iter().any(|x| x == n);
 
     let mut guidelines: Vec<String> = Vec::new();
@@ -94,7 +102,33 @@ pub fn default_system_prompt(
         };
         add(read_g.to_string(), &mut guidelines, &mut seen);
     }
-    if has("edit") {
+    if has("edit") && !edit_takes_array {
+        add(
+            "Use edit for one precise change (old_string must match exactly once)".to_string(),
+            &mut guidelines,
+            &mut seen,
+        );
+    }
+    if has(crate::tools::edit::MULTI_EDIT) {
+        for g in [
+            "When changing multiple separate locations in one file, use one multi_edit call with one \
+             entry per change in edits[] instead of multiple edit calls",
+            "Each edits[].old_string is matched against the original file, not after earlier edits are \
+             applied. Do not emit overlapping or nested edits. Merge nearby changes into one edit.",
+        ] {
+            add(g.to_string(), &mut guidelines, &mut seen);
+        }
+    }
+    if has("edit") && !edit_takes_array {
+        add(
+            "Keep old_string as small as possible while still being unique in the file. Do not pad \
+             with large unchanged regions."
+                .to_string(),
+            &mut guidelines,
+            &mut seen,
+        );
+    }
+    if has("edit") && edit_takes_array {
         for g in [
             "Use edit for precise changes (edits[].old_string must match exactly)",
             "When changing multiple separate locations in one file, use one edit call with multiple \
@@ -1067,6 +1101,40 @@ mod tests {
         assert!(
             prompt.contains("Use write only for new files or complete rewrites."),
             "got: {prompt}"
+        );
+    }
+
+    #[test]
+    fn edit_guidelines_follow_the_advertised_edit_schema() {
+        // `edit-schema=split`: `edit` has no edits[], so telling the model to fill edits[].old_string
+        // would name a parameter that does not exist; the multi-edit advice moves to `multi_edit`.
+        let split = crate::tools::default_registry_with_config(&crate::tools::ToolConfig {
+            tuning: crate::tools::ToolTuning::parse(&["edit-schema=split"]).unwrap(),
+            ..crate::tools::ToolConfig::new()
+        });
+        let prompt = default_system_prompt(&split, &[]);
+        assert!(prompt.contains("multi_edit"), "got: {prompt}");
+        assert!(
+            prompt.contains("Use edit for one precise change"),
+            "got: {prompt}"
+        );
+        assert!(
+            !prompt.contains("Use edit for precise changes (edits[]"),
+            "got: {prompt}"
+        );
+        assert!(
+            !prompt.contains("use one edit call with multiple"),
+            "got: {prompt}"
+        );
+
+        // `edit-schema=edits` keeps edits[], so it keeps today's bullets verbatim.
+        let edits = crate::tools::default_registry_with_config(&crate::tools::ToolConfig {
+            tuning: crate::tools::ToolTuning::parse(&["edit-schema=edits"]).unwrap(),
+            ..crate::tools::ToolConfig::new()
+        });
+        assert_eq!(
+            default_system_prompt(&edits, &[]),
+            default_system_prompt(&crate::tools::default_registry(), &[])
         );
     }
 

@@ -36,8 +36,11 @@ pub mod structured_output;
 pub mod subagent;
 pub mod todo;
 pub mod tool_search;
+pub mod tuning;
 pub mod web;
 pub mod write;
+
+pub use tuning::ToolTuning;
 
 /// Normalize a filesystem tool's `path` argument the way `bash` gets for free from the real shell it
 /// spawns: expand a leading `~` or `~/` to the user's home directory, fold non-ASCII Unicode space
@@ -585,6 +588,9 @@ pub struct ToolConfig<'a> {
     /// Discovered skills, so `read` resolves the `skill:<name>` paths the system prompt's listing
     /// names them by ([`crate::skills::SKILL_SCHEME`]). Empty: the scheme names nothing.
     pub skills: &'a [crate::skills::Skill],
+    /// `--tool-tuning`: the A/B knobs on how built-in tools present themselves. `Default` is the
+    /// production behavior. See [`tuning`].
+    pub tuning: ToolTuning,
 }
 
 impl<'a> ToolConfig<'a> {
@@ -657,7 +663,10 @@ pub fn default_registry_with_config(cfg: &ToolConfig<'_>) -> ToolRegistry {
     }
     reg.register(Arc::new(read_tool));
     reg.register(Arc::new(write_tool));
-    reg.register(Arc::new(edit_tool));
+    // One `edit`, or `edit` + `multi_edit` under `edit-schema=split` (see `edit::EditSchema`).
+    for t in edit_tool.with_options(cfg.tuning.edit) {
+        reg.register(Arc::new(t));
+    }
     reg.register(Arc::new(ls_tool));
     reg.register(Arc::new(grep_tool));
     reg.register(Arc::new(find_tool));
@@ -1243,6 +1252,18 @@ mod tests {
             );
         }
         assert_eq!(reg.len(), 9);
+    }
+
+    #[test]
+    fn edit_schema_split_registers_multi_edit_and_the_default_does_not() {
+        assert!(default_registry().get(edit::MULTI_EDIT).is_none());
+        let reg = default_registry_with_config(&ToolConfig {
+            tuning: ToolTuning::parse(&["edit-schema=split"]).unwrap(),
+            ..ToolConfig::new()
+        });
+        assert!(reg.get("edit").is_some());
+        assert!(reg.get(edit::MULTI_EDIT).is_some());
+        assert_eq!(reg.len(), 10);
     }
 
     #[test]
