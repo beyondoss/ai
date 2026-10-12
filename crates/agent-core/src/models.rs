@@ -350,6 +350,30 @@ pub fn is_mistral_model(model: &str) -> bool {
     is_mistral_id(&model.to_ascii_lowercase())
 }
 
+/// Whether "no thinking" on this Anthropic id is `thinking: {"type": "between_tools"}` rather than
+/// `{"type": "disabled"}`: Claude Sonnet 5.5 and later Sonnets reject `disabled` with a 400 ("To turn
+/// thinking off on this model, send thinking {type: between_tools} instead of {type: disabled}"), and
+/// an omitted `thinking` is adaptive thinking. `between_tools` does no extended thinking. Parsed the
+/// way the gateway's `ClaudeModel::of` parses it (`crates/gateway/src/translate.rs`), so a Bedrock or
+/// OpenRouter spelling (`us.anthropic.claude-sonnet-5-5-v1:0`, `anthropic/claude-sonnet-5.5`)
+/// counts too.
+pub fn thinking_off_is_between_tools(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    let Some(at) = m.find("claude-sonnet-") else {
+        return false;
+    };
+    let mut parts = m[at + "claude-sonnet-".len()..].split(['-', '.']);
+    let Some(major) = parts.next().and_then(|p| p.parse::<u32>().ok()) else {
+        return false;
+    };
+    let minor = parts
+        .next()
+        .filter(|p| p.len() <= 2)
+        .and_then(|p| p.parse::<u32>().ok())
+        .unwrap_or(0);
+    (major, minor) >= (5, 5)
+}
+
 /// Whether `model` is a DeepSeek id — `dialect::openai::build_body`'s assistant-replay path needs this
 /// specifically (not the broader `OpenAiReasoningFormat::DeepSeek` shape, which Moonshot/Kimi shares
 /// too) to backfill an empty `reasoning_content` on replay, matching pi's `compat
