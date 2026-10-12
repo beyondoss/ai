@@ -49,6 +49,10 @@ python3 crates/agent/eval/longctx/run.py --bin target/release/beyond-ai-agent "$
 python3 crates/agent/eval/longctx/report.py
 """
 
+[tasks."eval:validate"]
+description = "Check the long-context eval's integrity before trusting an A/B (local, no model calls): build every task (no compiled/packaged artifact, no removed body left verbatim in the tree), the pristine tree passes 100% in the grading env with stable test ids, the perfect answer grades as solved in every run-dir layout with identical results (path-independent), the stubbed tree fails, and the agent's sandbox reaches no pristine tree, other run or installed copy of a package under test. Args go to validate.py (--repos, --jobs)."
+run = 'python3 crates/agent/eval/longctx/validate.py "$@"'
+
 [tasks."eval:longctx:report"]
 description = "Tabulate the long-context sweep's results (pass rate with Wilson CI, $, turns, compactions, peak context; paired vs the default trigger)."
 run = "python3 crates/agent/eval/longctx/report.py"

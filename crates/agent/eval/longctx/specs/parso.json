@@ -6,7 +6,7 @@
   "candidates": 206,
   "probed": 206,
   "good": 123,
-  "lines": 2155,
+  "lines": 2149,
   "stubs": [
     {
       "file": "parso/cache.py",
@@ -898,17 +898,6 @@
       "indent": "        ",
       "sha1": "990d5183743cb65292be031aae887b3231c77c8a",
       "breaks": 56
-    },
-    {
-      "file": "parso/python/prefix.py",
-      "qualname": "PrefixPart.search_ancestor",
-      "line": 44,
-      "end_line": 49,
-      "lines": 6,
-      "doc": false,
-      "indent": "        ",
-      "sha1": "c40683fe4bec73b75e93a2198daa43296a5d2be4",
-      "breaks": 20
     },
     {
       "file": "parso/python/prefix.py",

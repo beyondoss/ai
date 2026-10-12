@@ -21,6 +21,19 @@ class Repo:
     pytest_args: tuple[str, ...] = ()
     # Files outside `tests` the grade also restores (pytest config, conftest).
     restore: tuple[str, ...] = field(default=("pyproject.toml", "setup.cfg", "tox.ini", "pytest.ini", "conftest.py"))
+    # Tests that fail on the pristine tree in this environment for a reason no reimplementation can
+    # fix (a missing optional dependency, the interpreter's own messages). Deselected for the agent and
+    # the grader alike (`PYTEST_ADDOPTS`), so the pristine tree passes 100% and every test the agent
+    # sees is passable. `validate.py` fails if the pristine tree fails anything else.
+    deselect: tuple[str, ...] = ()
+    # A distribution whose metadata the tests read (`importlib.metadata.version(...)`); upstream's test
+    # env installs the package. The harness puts a metadata-only `<dist>-<version>.dist-info` (name
+    # and version, no files) on PYTHONPATH instead of an installed copy.
+    dist: str = ""
+
+    @property
+    def version(self) -> str:
+        return self.tag.removeprefix("v")
 
 
 REPOS: tuple[Repo, ...] = (
@@ -32,11 +45,19 @@ REPOS: tuple[Repo, ...] = (
     Repo("boltons", "mahmoud/boltons", "24.1.0", "boltons", ("tests",)),
     Repo("mistune", "lepture/mistune", "v3.1.1", "src/mistune", ("tests",), pythonpath="src"),
     Repo("tabulate", "astanin/python-tabulate", "v0.9.0", "tabulate", ("test",)),
-    Repo("parso", "davidhalter/parso", "v0.8.4", "parso", ("test",)),
-    # The railroad-diagram tests need jinja2, which would put a pristine copy of the jinja task's
-    # package in the venv.
-    Repo("pyparsing", "pyparsing/pyparsing", "3.2.1", "pyparsing", ("tests",), pytest_args=("--ignore=tests/test_diagram.py",)),
-    Repo("marshmallow", "marshmallow-code/marshmallow", "3.26.1", "src/marshmallow", ("tests",), pythonpath="src", deps=("simplejson==3.19.3", "packaging")),
+    # parso checks its syntax errors against the running interpreter's; these 14 messages changed
+    # after parso 0.8.4 (CPython 3.12 wording).
+    Repo("parso", "davidhalter/parso", "v0.8.4", "parso", ("test",), deselect=tuple(
+        f"test/test_python_errors.py::test_python_exception_matches[{case}]" for case in (
+            "def f(x=3, y): pass", "lambda x=3, y: x", "yield from []", 'f"{*x}"', 'f"{}"', 'f"{#}"',
+            "f'{1!b}'", "f'{1:{5:{3}}}'", "f'{continue}'", "f'{1;1}'", "f'{a;}'", "f'{b\"\" \"\"}'",
+            r'''f"{'\\n'}"''', "f'{1=!b}'"))),
+    # The railroad-diagram tests (and `test_range_check`, which draws one) need jinja2, which would put
+    # a pristine copy of the jinja task's package in the venv.
+    Repo("pyparsing", "pyparsing/pyparsing", "3.2.1", "pyparsing", ("tests",), pytest_args=("--ignore=tests/test_diagram.py",),
+         deselect=("tests/test_examples.py::TestExamples::test_range_check",)),
+    Repo("marshmallow", "marshmallow-code/marshmallow", "3.26.1", "src/marshmallow", ("tests",), pythonpath="src",
+         deps=("simplejson==3.19.3", "packaging"), dist="marshmallow"),
 )
 
 BY_NAME = {r.name: r for r in REPOS}
