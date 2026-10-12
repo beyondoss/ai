@@ -39,6 +39,7 @@ pub mod models;
 pub mod session;
 pub mod session_title;
 pub mod steering;
+pub mod step_budget;
 pub mod tls;
 pub mod tool;
 pub mod transport;
@@ -65,6 +66,7 @@ pub use models::{
 };
 pub use session::{RequestBlock, Session};
 pub use steering::{ModelSwitch, QueueMode, Steering, SteeringMessage, TurnContextSource};
+pub use step_budget::{StepBudget, StepBudgetKind};
 pub use tls::ensure_provider;
 pub use tool::{Tool, ToolOutput, ToolProgress, ToolRegistry, ToolUpdate};
 pub use transport::{
@@ -74,3 +76,6 @@ pub use write_lock::{WriteLockGuard, WriteLockRegistry};
 // Re-exported because it appears in `Agent::run_events_cancellable`'s signature — callers shouldn't
 // need a direct `tokio-util` dependency to drive a cancellable run.
 pub use tokio_util::sync::CancellationToken;
+
+#[cfg(test)]
+mod step_budget_loop_tests;

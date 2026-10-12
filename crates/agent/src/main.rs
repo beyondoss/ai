@@ -289,6 +289,18 @@ enum Command {
         /// Opt-in cap on model turns before bailing with an error (default: unbounded).
         #[usage(long)]
         max_steps: Option<u32>,
+        /// Experimental, needs `--max-steps`: once this many steps or fewer remain, tell the model
+        /// once ("N of M steps remain"). Off by default.
+        #[usage(long, env = "AI_AGENT_MAX_STEPS_NOTICE")]
+        max_steps_notice: Option<u32>,
+        /// Experimental, needs `--max-steps`: when the last step's tools finish, grant this many
+        /// more steps to leave the workspace consistent and summarize. Off by default.
+        #[usage(long, env = "AI_AGENT_MAX_STEPS_WRAP_UP")]
+        max_steps_wrap_up: Option<u32>,
+        /// Experimental, needs `--max-steps`: when the model stops with at least 20% of its steps
+        /// left, ask it once to keep going if the task is not complete. Off by default.
+        #[usage(long, env = "AI_AGENT_MAX_STEPS_CONTINUE_NUDGE")]
+        max_steps_continue_nudge: bool,
         /// Per-turn output token ceiling. `serve`'s identical flag; defaults to the model's own
         /// capability-table `max_output` (see `agent_core::models::capabilities`) when omitted.
         #[usage(long, env = "AI_AGENT_MAX_TOKENS")]
@@ -1979,6 +1991,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             gateway_url,
             key,
             max_steps,
+            max_steps_notice,
+            max_steps_wrap_up,
+            max_steps_continue_nudge,
             max_tokens,
             cache_ttl,
             cache_long,
@@ -2062,6 +2077,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 gateway_url,
                 key,
                 max_steps,
+                agent_core::StepBudget {
+                    notice_at: max_steps_notice,
+                    wrap_up_steps: max_steps_wrap_up,
+                    continue_nudge: max_steps_continue_nudge,
+                },
                 max_tokens,
                 CacheTtl::resolve(cache_ttl, cache_long, CacheTtl::FiveMinutes),
                 thinking,
@@ -4188,6 +4208,7 @@ async fn run_task(
     gateway_url: Option<String>,
     key: Option<String>,
     max_steps: Option<u32>,
+    step_budget: agent_core::StepBudget,
     max_tokens: Option<u32>,
     cache_long: bool,
     thinking: Option<u32>,
@@ -5220,6 +5241,7 @@ async fn run_task(
         .with_tools(registry)
         .with_system(system)
         .with_max_steps(max_steps)
+        .with_step_budget(step_budget)
         .with_compaction(compaction)
         .with_cache_long(cache_long)
         .with_sequential_tools(sequential_tools)
