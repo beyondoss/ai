@@ -483,8 +483,8 @@ enum Entry {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         memory_notes: Vec<String>,
         /// The user's own requests carried across this round (see
-        /// `CompactionProvenance::user_requests`), restored the same way. Empty unless the run turned
-        /// on the `carry-request` compaction candidate.
+        /// `CompactionProvenance::user_requests`), restored the same way. Empty on a record written
+        /// before requests were carried.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         user_requests: Vec<String>,
     },

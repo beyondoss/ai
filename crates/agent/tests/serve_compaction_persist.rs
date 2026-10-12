@@ -121,8 +121,9 @@ fn a_crash_after_a_mid_run_compaction_reloads_the_compacted_session() {
         text(&m[0]).contains("SUMMARY OF THE SEED"),
         "the compaction is on disk: {m:#?}"
     );
+    // The summary carries the user's own words (`<user-requests>`); the folded turns are gone.
     assert!(
-        !m.iter().any(|m| text(m).contains("question 0")),
+        !m[1..].iter().any(|m| text(m).contains("question 0")),
         "the folded history is not on the active path: {m:#?}"
     );
     let reads = m
