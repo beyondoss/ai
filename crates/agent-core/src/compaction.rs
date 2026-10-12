@@ -300,12 +300,6 @@ pub struct CompactionCandidates {
     /// exact request is not visible in this prefix. From the work, the task is to…"), and only 34–40%
     /// kept the "don't edit tests" constraint.
     pub carry_requests: bool,
-    /// Files a `bash` command wrote ([`crate::bash_writes::written_paths`]) join the modified-files
-    /// provenance, beside `write`/`edit` targets. Claude Sonnet 5.5 made 2 `write`/`edit` calls in
-    /// 17 eval runs and edited through `bash`, so 19 of its 23 summaries' `<modified-files>` missed
-    /// files it had changed (102 in all); over the eval's 4,623 bash commands the parser recovers
-    /// all of them, 25 of 25 sampled being real edits.
-    pub track_bash_edits: bool,
     /// A masking pass is applied only when it pays for its cache rewrite before the freed room
     /// refills: `0.1 · freed · (freed / growth) ≥ (w − 0.1) · rewrite` ([`mask_net_saving`]), with
     /// `rewrite` the tokens from the first edited message on, `growth` the transcript's recent
@@ -328,7 +322,6 @@ impl CompactionCandidates {
         "state",
         "tail",
         "carry-request",
-        "bash-edits",
         "mask-breakeven",
         "mask-best-start",
     ];
@@ -346,7 +339,6 @@ impl CompactionCandidates {
                 "state" => c.state_template = true,
                 "tail" => c.sees_tail = true,
                 "carry-request" => c.carry_requests = true,
-                "bash-edits" => c.track_bash_edits = true,
                 "mask-breakeven" => c.mask_breakeven = true,
                 "mask-best-start" => c.mask_best_start = true,
                 "" => {}
@@ -1752,8 +1744,13 @@ fn mask_placeholder(call: Option<(&str, &Value)>, chars: usize, images: usize) -
 }
 
 /// Every file a `bash` call in `messages` wrote, by [`crate::bash_writes::written_paths`], in
-/// first-seen order, deduped — what [`CompactionCandidates::track_bash_edits`] adds to the
-/// modified-files provenance.
+/// first-seen order, deduped — what `Agent::compact` adds to the modified-files provenance, beside
+/// `write`/`edit` targets.
+///
+/// Why: Claude Sonnet 5.5 made 2 `write`/`edit` calls in 17 eval runs and edited through `bash`, so
+/// 19 of its 23 summaries' `<modified-files>` missed files it had changed (102 in all). Over the
+/// eval's 4,623 bash commands the parser recovers all of them, 25 of 25 sampled being real edits. A
+/// parser, not a filesystem diff, so the provenance stays derivable from the transcript.
 pub fn extract_bash_writes(messages: &[Message]) -> Vec<String> {
     let mut out = Vec::new();
     for b in messages.iter().flat_map(|m| &m.content) {
@@ -3689,6 +3686,8 @@ mod tests {
             err.contains("sytem-role") && err.contains("system-role"),
             "{err}"
         );
+        // A promoted candidate is an unknown name now, not a silent no-op.
+        assert!(CompactionCandidates::from_names(&["bash-edits"]).is_err());
     }
 
     #[test]
