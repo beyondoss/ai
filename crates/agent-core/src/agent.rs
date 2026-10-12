@@ -77,6 +77,12 @@ pub enum AgentEvent {
     },
     /// The run finished normally (the model ended its turn and no steering was queued).
     AgentEnd { steps: u32 },
+    /// A [`crate::StepBudget`] message was injected (see [`Agent::with_step_budget`]). `steps` is
+    /// the steps remaining for a notice or nudge, and the steps granted for a wrap-up.
+    StepBudget {
+        message: crate::StepBudgetKind,
+        steps: u32,
+    },
     /// An automatic compaction's first step masked old tool output instead of (or before) summarizing:
     /// `masked` tool results older than the kept turns were replaced by one-line placeholders (see
     /// [`compaction::mask_tool_results`]). `tokens_before` is the live prompt estimate when it fired;
@@ -262,6 +268,8 @@ pub struct Agent {
     /// Opt-in ceiling on loop iterations per `run` call. `None` (the default) runs until the model
     /// ends its turn, like pi's loop — see [`Self::with_max_steps`] for why unbounded is the default.
     max_steps: Option<u32>,
+    /// Experimental messages near and at `max_steps` — see [`Self::with_step_budget`].
+    step_budget: crate::StepBudget,
     /// Extended-thinking budget, when enabled. Applied to every turn's request.
     thinking: Option<u32>,
     /// Reasoning effort level (OpenAI reasoning models; Anthropic adaptive thinking). Applied to every
@@ -352,6 +360,7 @@ impl Agent {
             system_fn: None,
             max_tokens: caps.max_output.max(DEFAULT_MAX_TOKENS),
             max_steps: None,
+            step_budget: crate::StepBudget::default(),
             thinking: None,
             reasoning_effort: None,
             temperature: None,
@@ -436,6 +445,14 @@ impl Agent {
     /// straight through; `None` clears it.
     pub fn with_max_steps(mut self, max_steps: impl Into<Option<u32>>) -> Self {
         self.max_steps = max_steps.into();
+        self
+    }
+
+    /// Experimental: tell the model about its step budget near the ceiling, grant a wrap-up past
+    /// it, or nudge an early stop (see [`crate::step_budget`]). Inert without
+    /// [`with_max_steps`](Self::with_max_steps); the default changes nothing.
+    pub fn with_step_budget(mut self, step_budget: crate::StepBudget) -> Self {
+        self.step_budget = step_budget;
         self
     }
 
@@ -770,6 +787,8 @@ impl Agent {
         // resume past by simply calling `run`/`run_events_steered` again with a fresh budget, rather
         // than a permanent dead end once the session's lifetime total crosses it once.
         let mut steps_this_call: u32 = 0;
+        // What `step_budget` has fired this call, and the ceiling as a wrap-up grant extended it.
+        let mut budget = crate::step_budget::BudgetState::new(self.step_budget, self.max_steps);
         // The previous turn's stop reason, read by `is_hard_overflow`'s `MaxTokens` check. Re-derived
         // from `session`'s own last assistant message rather than hardcoded to `EndTurn` (pi-parity fix
         // — matches pi's own `isContextOverflow`, re-evaluated fresh from the persisted
@@ -873,10 +892,11 @@ impl Agent {
                     tool_names: current_tool_defs.iter().map(|d| d.name.clone()).collect(),
                 });
             }
-            if let Some(max_steps) = self.max_steps
-                && steps_this_call >= max_steps
+            if let Some(limit) = budget.limit
+                && steps_this_call >= limit
             {
-                let err = Error::MaxSteps(max_steps);
+                // The configured ceiling, not the wrap-up-extended one: callers match on it.
+                let err = Error::MaxSteps(self.max_steps.unwrap_or(limit));
                 sink(AgentEvent::Error {
                     message: err.to_string(),
                 });
@@ -1264,6 +1284,17 @@ impl Agent {
                 // keeps the wire's role alternation valid.
                 let injected = steering.drain_at_stop();
                 if injected.is_empty() {
+                    // Stopping early with budget left: ask once whether the task is really done.
+                    // A plain user turn after the assistant's, like a follow-up.
+                    if let Some((remaining, text)) = budget.at_stop(steps_this_call) {
+                        session.user(text);
+                        let _ = self.checkpoint_guarded(session).await;
+                        sink(AgentEvent::StepBudget {
+                            message: crate::StepBudgetKind::Nudge,
+                            steps: remaining,
+                        });
+                        continue;
+                    }
                     sink(AgentEvent::AgentEnd {
                         steps: session.steps,
                     });
@@ -1869,6 +1900,11 @@ impl Agent {
                     result_blocks.push(ContentBlock::Image { source });
                 }
             }
+            // A step-budget notice or wrap-up rides the same turn, after any steer.
+            let budget_note = budget.after_tools(steps_this_call);
+            if let Some((_, _, text)) = &budget_note {
+                result_blocks.push(ContentBlock::text(text.clone()));
+            }
             session.push(Message::tool_results(result_blocks));
             // Host-held context (an MCP App's `ui/update-model-context`) rides this same turn, as a
             // request-only block of its own — see `Steering::set_turn_context` and
@@ -1887,6 +1923,9 @@ impl Agent {
                     messages: steered_count,
                     tags: steered_tags,
                 });
+            }
+            if let Some((message, steps, _)) = budget_note {
+                sink(AgentEvent::StepBudget { message, steps });
             }
             if terminate {
                 // A tool requested completion (e.g. an `attempt_completion`/`exit` tool) and the whole
@@ -5767,6 +5806,7 @@ mod tests {
                 AgentEvent::TurnEnd { .. } => "turn_end",
                 AgentEvent::Steered { .. } => "steered",
                 AgentEvent::AgentEnd { .. } => "agent_end",
+                AgentEvent::StepBudget { .. } => "step_budget",
                 AgentEvent::ToolOutputMasked { .. } => "tool_output_masked",
                 AgentEvent::CompactionStart { .. } => "compaction_start",
                 AgentEvent::Compacted { .. } => "compacted",
