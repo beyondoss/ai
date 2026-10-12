@@ -9889,6 +9889,8 @@ pub struct CompactionFlags {
     pub no_tool_masking: bool,
     /// `--tool-masking-keep-turns`: turns whose tool output is never masked.
     pub tool_masking_keep_turns: Option<usize>,
+    /// `--tool-masking-keep-tokens`: recent tokens never masked when the kept turns hold more.
+    pub tool_masking_keep_tokens: Option<u32>,
     /// `--tool-masking-min-tokens`: the least a masking pass must free to be applied.
     pub tool_masking_min_tokens: Option<u32>,
     /// `--no-cached-summary`: always summarize from a re-rendered transcript.
@@ -9918,6 +9920,7 @@ pub fn resolve_compaction(model: &str, flags: &CompactionFlags) -> agent_core::C
         }),
         mask_tool_output: !flags.no_tool_masking,
         mask_keep_turns: flags.tool_masking_keep_turns.unwrap_or(d.mask_keep_turns),
+        mask_keep_tokens: flags.tool_masking_keep_tokens,
         mask_min_free_tokens: flags
             .tool_masking_min_tokens
             .unwrap_or(d.mask_min_free_tokens),

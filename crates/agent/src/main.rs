@@ -384,11 +384,16 @@ enum Command {
         /// placeholders, and summarizes only if that frees too little. `serve`'s identical flag.
         #[usage(long, env = "AI_AGENT_NO_TOOL_MASKING")]
         no_tool_masking: bool,
-        /// Turns (model responses) whose tool output masking never touches. Default 10.
+        /// Turns (model responses) whose tool output masking never touches. Default 10, shrunk to
+        /// `--tool-masking-keep-tokens` when those turns hold more.
         #[usage(long, env = "AI_AGENT_TOOL_MASKING_KEEP_TURNS")]
         tool_masking_keep_turns: Option<usize>,
+        /// Tokens of recent transcript masking never touches when the kept turns hold more. Default a
+        /// quarter of the compaction trigger.
+        #[usage(long, env = "AI_AGENT_TOOL_MASKING_KEEP_TOKENS")]
+        tool_masking_keep_tokens: Option<u32>,
         /// The least a masking pass must free, in tokens, to be applied (each pass invalidates the
-        /// prompt cache from its first edit). Default 25,000, or a quarter of the trigger if lower.
+        /// prompt cache from its first edit). Default 25,000, or a tenth of the trigger if lower.
         #[usage(long, env = "AI_AGENT_TOOL_MASKING_MIN_TOKENS")]
         tool_masking_min_tokens: Option<u32>,
         /// Make the compaction summary from a re-rendered transcript every time, instead of sending
@@ -955,11 +960,16 @@ enum Command {
         /// placeholders, and summarizes only if that frees too little. `run`'s identical flag.
         #[usage(long, env = "AI_AGENT_NO_TOOL_MASKING")]
         no_tool_masking: bool,
-        /// Turns (model responses) whose tool output masking never touches. Default 10.
+        /// Turns (model responses) whose tool output masking never touches. Default 10, shrunk to
+        /// `--tool-masking-keep-tokens` when those turns hold more.
         #[usage(long, env = "AI_AGENT_TOOL_MASKING_KEEP_TURNS")]
         tool_masking_keep_turns: Option<usize>,
+        /// Tokens of recent transcript masking never touches when the kept turns hold more. Default a
+        /// quarter of the compaction trigger.
+        #[usage(long, env = "AI_AGENT_TOOL_MASKING_KEEP_TOKENS")]
+        tool_masking_keep_tokens: Option<u32>,
         /// The least a masking pass must free, in tokens, to be applied (each pass invalidates the
-        /// prompt cache from its first edit). Default 25,000, or a quarter of the trigger if lower.
+        /// prompt cache from its first edit). Default 25,000, or a tenth of the trigger if lower.
         #[usage(long, env = "AI_AGENT_TOOL_MASKING_MIN_TOKENS")]
         tool_masking_min_tokens: Option<u32>,
         /// Make the compaction summary from a re-rendered transcript every time, instead of sending
@@ -1963,6 +1973,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             compact_at,
             no_tool_masking,
             tool_masking_keep_turns,
+            tool_masking_keep_tokens,
             tool_masking_min_tokens,
             no_cached_summary,
             compaction_reserve_tokens,
@@ -2042,6 +2053,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 compact_at,
                 no_tool_masking,
                 tool_masking_keep_turns,
+                tool_masking_keep_tokens,
                 tool_masking_min_tokens,
                 no_cached_summary,
                 compaction_reserve_tokens,
@@ -2139,6 +2151,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             compact_at,
             no_tool_masking,
             tool_masking_keep_turns,
+            tool_masking_keep_tokens,
             tool_masking_min_tokens,
             no_cached_summary,
             cache_ttl,
@@ -2643,6 +2656,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     keep_recent_tokens: compaction_keep_recent_tokens,
                     no_tool_masking,
                     tool_masking_keep_turns,
+                    tool_masking_keep_tokens,
                     tool_masking_min_tokens,
                     no_cached_summary,
                 },
@@ -4151,6 +4165,7 @@ async fn run_task(
     compact_at: Option<u32>,
     no_tool_masking: bool,
     tool_masking_keep_turns: Option<usize>,
+    tool_masking_keep_tokens: Option<u32>,
     tool_masking_min_tokens: Option<u32>,
     no_cached_summary: bool,
     compaction_reserve_tokens: Option<u32>,
@@ -5137,6 +5152,7 @@ async fn run_task(
             keep_recent_tokens: compaction_keep_recent_tokens,
             no_tool_masking,
             tool_masking_keep_turns,
+            tool_masking_keep_tokens,
             tool_masking_min_tokens,
             no_cached_summary,
         },

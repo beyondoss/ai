@@ -328,13 +328,17 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
 
 - **Masking old tool output before summarizing** — when the prompt crosses the trigger,
   `Agent::mask_tool_output` first plans `compaction::mask_tool_results`: every tool result older than
-  the last `mask_keep_turns` turns (assistant messages, default 10) becomes a one-line placeholder
+  the last `mask_keep_turns` turns (assistant messages, default 10), or older than the last
+  `mask_keep_tokens` of transcript when those turns hold more (default a quarter of the trigger), becomes
+  a one-line placeholder
   naming the call (`[tool output elided to save context: read(path=src/lib.rs), 48213 chars. Run the
   tool again if you need it.]`, images dropped). Kept: results of files being edited (the provenance's
   modified files plus this transcript's own `write`/`edit` targets), errors within `2 × mask_keep_turns`
   turns, results under 1,000 chars, and results already masked. The pass is applied only when it frees
-  at least `mask_min_free_tokens` (default 25K, capped at a quarter of the trigger so a small model can
-  reach it — our `clear_at_least`) **and** brings the prompt back under the trigger; then no summary
+  at least `mask_min_free_tokens` (default 25K, capped at a tenth of the trigger: 9K on Haiku's 90K —
+  our `clear_at_least`). Both budgets scale with the trigger because a fixed ten turns could be most of
+  a small trigger's context: on Haiku 5.5 masking never qualified in 21 compactions of the sweep, its
+  older output 1–17K against a 22.5K bar **and** brings the prompt back under the trigger; then no summary
   runs (`AgentEvent::ToolOutputMasked`, no `CompactionStart`). A pass that would leave the prompt over
   the trigger is not applied: the summary runs on the unmasked conversation, because the summary
   replaces the old turns anyway and the cached summary call reads the live conversation from cache — a

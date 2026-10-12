@@ -156,10 +156,15 @@ pub struct CompactionConfig {
     /// Whether an automatic compaction first tries [`mask_tool_results`]: elide old tool output and
     /// summarize only if that doesn't free enough. See [`MaskPlan`].
     pub mask_tool_output: bool,
-    /// Tool results in the last this-many turns (assistant messages) are never masked.
+    /// Tool results in the last this-many turns (assistant messages) are never masked...
     pub mask_keep_turns: usize,
-    /// A masking pass is applied only when it frees at least this many tokens (or a quarter of the
-    /// trigger, on a model whose trigger is too small for this to be reachable). Every pass rewrites
+    /// ...unless those turns hold more than this many tokens: then only the most recent this-many
+    /// tokens are kept. `None`: a quarter of the trigger ([`Self::mask_keep_tokens`]), so the window
+    /// scales with the model — on a 90K trigger the last ten turns can be most of the context, and a
+    /// fixed turn count left nothing to mask.
+    pub mask_keep_tokens: Option<u32>,
+    /// A masking pass is applied only when it frees at least this many tokens, or a tenth of the
+    /// trigger when that is less ([`Self::mask_min_free`]), so the bar scales with the model. Every pass rewrites
     /// history and so invalidates the prompt cache from its first edit on; a pass must buy back enough
     /// context to pay for that. Our `clear_at_least`.
     pub mask_min_free_tokens: u32,
@@ -228,6 +233,19 @@ impl CompactionConfig {
             .map_or(self.context_window, |l| l.min(self.context_window))
     }
 
+    /// The recent-transcript budget masking never touches: `mask_keep_tokens`, else a quarter of the
+    /// trigger.
+    pub fn mask_keep_tokens(&self) -> u32 {
+        self.mask_keep_tokens
+            .unwrap_or_else(|| self.trigger_tokens() / 4)
+    }
+
+    /// The least a masking pass must free to be applied: `mask_min_free_tokens`, capped at a tenth of
+    /// the trigger (90K → 9K, 200K → 20K, 500K → the 25K default).
+    pub fn mask_min_free(&self) -> u32 {
+        self.mask_min_free_tokens.min(self.trigger_tokens() / 10)
+    }
+
     /// The prompt size past which [`should_compact`] fires:
     /// `min(input_budget() − reserve_tokens, compact_at)`.
     ///
@@ -260,6 +278,7 @@ impl Default for CompactionConfig {
             enabled: true,
             mask_tool_output: true,
             mask_keep_turns: 10,
+            mask_keep_tokens: None,
             mask_min_free_tokens: 25_000,
             cached_summary: true,
         }
@@ -1203,7 +1222,8 @@ pub struct MaskPlan {
 }
 
 /// Plan a masking pass: replace every tool result older than the last `keep_turns` turns (assistant
-/// messages) with a one-line placeholder naming the call — `[tool output elided to save context:
+/// messages), or older than the last `keep_tokens` of transcript when those turns hold more, with a
+/// one-line placeholder naming the call — `[tool output elided to save context:
 /// read(path=src/lib.rs), 48213 chars. Run the tool again if you need it.]` — and drop its images.
 /// `None` when nothing is worth masking.
 ///
@@ -1227,6 +1247,7 @@ pub struct MaskPlan {
 pub fn mask_tool_results(
     messages: &[Message],
     keep_turns: usize,
+    keep_tokens: u32,
     keep_paths: &[String],
 ) -> Option<MaskPlan> {
     // The first message of the kept window: the `keep_turns`-th assistant message from the end.
@@ -1239,7 +1260,27 @@ pub fn mask_tool_results(
             .nth(turns.max(1) - 1)
             .map(|(i, _)| i)
     };
-    let boundary = turn_start(keep_turns)?;
+    // Or, when those turns are bigger than `keep_tokens`, the first assistant message of the suffix
+    // that holds about `keep_tokens` — whichever keeps less. Always at least the last turn.
+    let last_turn = turn_start(1)?;
+    let token_start = || {
+        let mut held = 0u32;
+        let i = messages.iter().rposition(|m| {
+            held = held.saturating_add(estimate_message_tokens(m));
+            held >= keep_tokens
+        })?;
+        Some(
+            messages[i..]
+                .iter()
+                .position(|m| m.role == Role::Assistant)
+                .map_or(last_turn, |k| i + k),
+        )
+    };
+    let boundary = turn_start(keep_turns)
+        .into_iter()
+        .chain(token_start())
+        .max()?
+        .min(last_turn);
     let error_boundary = turn_start(keep_turns.saturating_mul(2)).unwrap_or(0);
     let (_, modified) = extract_file_ops(messages);
     let protected = |input: &Value| {
@@ -2863,7 +2904,7 @@ mod tests {
     #[test]
     fn masking_elides_results_older_than_the_kept_turns_and_nothing_else() {
         let history = tool_history(6, "read", 4_000);
-        let plan = mask_tool_results(&history, 2, &[]).expect("something to mask");
+        let plan = mask_tool_results(&history, 2, u32::MAX, &[]).expect("something to mask");
         // Turns 0..4 masked (their results sit at 2, 4, 6, 8); the last two turns untouched.
         assert_eq!(plan.masked, 4);
         assert_eq!(plan.edited, vec![2, 4, 6, 8]);
@@ -2918,7 +2959,7 @@ mod tests {
                 ..Message::user("")
             });
         }
-        let plan = mask_tool_results(&history, 1, &[]).unwrap();
+        let plan = mask_tool_results(&history, 1, u32::MAX, &[]).unwrap();
         let masked = &plan.messages;
         assert_eq!(masked.len(), history.len());
         assert!(masked.windows(2).all(|w| w[0].role != w[1].role));
@@ -2974,7 +3015,7 @@ mod tests {
         // A short result (turn 3) costs about what its placeholder would.
         history[8] = Message::tool_result("c3", "short", false);
 
-        let plan = mask_tool_results(&history, 3, &["src/f2.rs".to_string()]).unwrap();
+        let plan = mask_tool_results(&history, 3, u32::MAX, &["src/f2.rs".to_string()]).unwrap();
         let masked = |i: usize| result_content(&plan.messages[i]).starts_with(MASKED_PREFIX);
         assert!(masked(2), "an old error is masked");
         assert!(!masked(4), "src/f1.rs is being edited");
@@ -2987,7 +3028,7 @@ mod tests {
         assert!(masked(12));
         // Idempotent: a masked transcript has nothing left to mask.
         assert_eq!(
-            mask_tool_results(&plan.messages, 3, &["src/f2.rs".to_string()]),
+            mask_tool_results(&plan.messages, 3, u32::MAX, &["src/f2.rs".to_string()]),
             None
         );
     }
@@ -3004,7 +3045,7 @@ mod tests {
             }],
             ..history[2].clone()
         };
-        let plan = mask_tool_results(&history, 1, &[]).unwrap();
+        let plan = mask_tool_results(&history, 1, u32::MAX, &[]).unwrap();
         assert_eq!(plan.masked, 1, "only the image result is worth masking");
         let ContentBlock::ToolResult {
             content, images, ..
@@ -3020,13 +3061,57 @@ mod tests {
     #[test]
     fn masking_needs_more_turns_than_it_keeps() {
         assert_eq!(
-            mask_tool_results(&tool_history(2, "read", 4_000), 2, &[]),
+            mask_tool_results(&tool_history(2, "read", 4_000), 2, u32::MAX, &[]),
             None
         );
         assert_eq!(
-            mask_tool_results(&tool_history(2, "read", 4_000), 3, &[]),
+            mask_tool_results(&tool_history(2, "read", 4_000), 3, u32::MAX, &[]),
             None
         );
-        assert!(mask_tool_results(&tool_history(3, "read", 4_000), 2, &[]).is_some());
+        assert!(mask_tool_results(&tool_history(3, "read", 4_000), 2, u32::MAX, &[]).is_some());
+    }
+
+    #[test]
+    fn a_token_budget_shrinks_the_kept_window_when_recent_turns_are_big() {
+        // Twelve turns of ~1K tokens: ten kept turns hold ~10K. With a 2,500-token budget only the
+        // last two or three turns stay; everything older is masked.
+        let history = tool_history(12, "read", 4_000);
+        let by_turns = mask_tool_results(&history, 10, u32::MAX, &[]).unwrap();
+        assert_eq!(by_turns.masked, 2);
+        let by_tokens = mask_tool_results(&history, 10, 2_500, &[]).unwrap();
+        assert!((9..=10).contains(&by_tokens.masked), "{}", by_tokens.masked);
+        // The last turn is always kept, however small the budget.
+        let tiny = mask_tool_results(&history, 10, 1, &[]).unwrap();
+        assert_eq!(tiny.masked, 11);
+        // A budget larger than the turns leaves the turn count in charge.
+        assert_eq!(
+            mask_tool_results(&history, 10, 1_000_000, &[])
+                .unwrap()
+                .masked,
+            2
+        );
+    }
+
+    #[test]
+    fn the_masking_budgets_scale_with_the_trigger() {
+        for (cap, keep, min_free) in [
+            (90_000, 22_500, 9_000),
+            (200_000, 50_000, 20_000),
+            (240_000, 60_000, 24_000),
+            (500_000, 125_000, 25_000),
+        ] {
+            let cfg = CompactionConfig {
+                context_window: 1_000_000,
+                compact_at: Some(cap),
+                ..CompactionConfig::default()
+            };
+            assert_eq!(cfg.mask_keep_tokens(), keep, "{cap}");
+            assert_eq!(cfg.mask_min_free(), min_free, "{cap}");
+        }
+        let pinned = CompactionConfig {
+            mask_keep_tokens: Some(7),
+            ..CompactionConfig::default()
+        };
+        assert_eq!(pinned.mask_keep_tokens(), 7);
     }
 }
