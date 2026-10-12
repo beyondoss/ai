@@ -422,7 +422,31 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
     (`CompactionProvenance::user_requests`, `merge_user_requests`, `<user-requests>`), so no later round
     has to re-infer them: 23 of 52 later-round summaries did ("The user's exact request is not visible
     in this prefix…"). Each genuine user turn's text, deduped, capped at 4,000 chars; past four, the
-    first and the latest. Persisted on the compaction record like the rest of the provenance.
+    first and the latest. Persisted on the compaction record like the rest of the provenance, and handed to the re-render beside the file tags (its `<previous-summary>` has carry blocks stripped, so it would otherwise never see the user's words again).
+
+  And three about what compaction keeps and when masking pays:
+  - `track_bash_edits` (`bash-edits`): files a `bash` command wrote join the modified-files
+    provenance (`extract_bash_writes`, over `bash_writes::written_paths`: redirects, `tee`, `sed -i`,
+    `perl -i`, `mv`/`cp` destinations, and Python heredocs or `-c` that `open(…, 'w')` or
+    `write_text` a literal or a name bound to one, joined onto the last `cd`). A parser, not a
+    filesystem diff, so the provenance stays derivable from the transcript. Claude Sonnet 5.5 edited
+    almost only through `bash` (2 `write`/`edit` calls in 17 runs), so 19 of its 23 summaries missed
+    changed files (102); over the eval's 4,623 bash commands the parser recovers all of them, and 25
+    of 25 sampled hits are real edits.
+  - `mask_breakeven` (`mask-breakeven`): a masking pass applies only if `mask_net_saving` is positive —
+    `0.1 · freed · (freed / growth) ≥ (w − 0.1) · rewrite`: turns of cheaper reads until the freed room
+    refills (`growth_per_turn` over the last 10 turns) against rewriting everything from the first
+    edited message at the cache-write price `w` (1.25×, 2× at the 1-hour TTL) instead of reading it.
+    Every one of the eval's 12 large cache rewrites outside a compaction was a masking pass; 7 earned
+    their rewrite back before the next mask or compaction, and this rule agrees with the outcome on 9.
+    Note the counterfactual: since a pass applies only when it lands under the trigger, skipping it
+    means summarizing now, which is cheaper per turn and loses verbatim context; the rule prices only
+    the rewrite.
+  - `mask_best_start` (`mask-best-start`): the same rule, but the pass keeps only the plan's edits from
+    the start that maximizes the net saving (`best_mask_start`), so an early result that frees little
+    stops forcing a rewrite of everything after it (a large protected result, say). Moving the start
+    later helps only where the skipped region holds little maskable output relative to its size;
+    coding transcripts front-load file reads, so expect it to match `mask-breakeven` most of the time.
 
 - **The deterministic-carry channel** — `apply_summary` is deliberately destructive: it _replaces_
   `session.messages` with `[summary, …kept_suffix]`, and `SessionStore::open` reloads that
