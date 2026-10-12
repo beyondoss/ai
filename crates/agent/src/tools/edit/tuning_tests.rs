@@ -1,5 +1,6 @@
-//! `--tool-tuning edit-schema=…` / `edit-pair=…`: the edit tool's A/B surfaces. Each case below is a
-//! shape the longctx eval actually saw GPT models send (see "Edit tool surface" in ARCHITECTURE.md).
+//! `--tool-tuning edit-schema=…`, the edit tool's A/B surfaces, and the filler-pair rule every
+//! surface shares. Each case below is a shape the longctx eval actually saw GPT models send (see
+//! "Edit tool surface" in ARCHITECTURE.md).
 
 use serde_json::{Value, json};
 
@@ -12,12 +13,8 @@ fn tmp(contents: &str) -> tempfile::NamedTempFile {
     f
 }
 
-fn tools(schema: EditSchema, pair: EditPair) -> Vec<Edit> {
-    Edit::default().with_options(EditOptions { schema, pair })
-}
-
-fn lenient() -> Edit {
-    tools(EditSchema::Combined, EditPair::Lenient).remove(0)
+fn tools(schema: EditSchema) -> Vec<Edit> {
+    Edit::default().with_options(EditOptions { schema })
 }
 
 async fn run_on(
@@ -39,22 +36,9 @@ fn invalid(r: Result<ToolOutput, ToolError>) -> String {
 }
 
 #[tokio::test]
-async fn strict_default_still_appends_a_filler_pair_and_errors_on_it() {
-    // The control arm: today's behavior, byte for byte. GPT's `old_string: ""` beside a real edit.
+async fn drops_an_empty_pair() {
     let (r, after) = run_on(
         &Edit::default(),
-        "alpha beta",
-        json!({ "edits": [{ "old_string": "alpha", "new_string": "ALPHA" }], "old_string": "", "new_string": "" }),
-    )
-    .await;
-    assert!(invalid(r).contains("`old_string` is empty"));
-    assert_eq!(after, "alpha beta");
-}
-
-#[tokio::test]
-async fn lenient_drops_an_empty_pair() {
-    let (r, after) = run_on(
-        &lenient(),
         "alpha beta",
         json!({ "edits": [{ "old_string": "alpha", "new_string": "ALPHA" }], "old_string": "", "new_string": "" }),
     )
@@ -64,12 +48,12 @@ async fn lenient_drops_an_empty_pair() {
 }
 
 #[tokio::test]
-async fn lenient_drops_a_no_op_pair_even_one_that_would_not_match() {
+async fn drops_a_no_op_pair_even_one_that_would_not_match() {
     // The anchor-to-itself workaround (`"import x"` → `"import x"`), and the placeholder that matches
     // nothing (`"unused"` → `"unused"`): neither can change the file, so neither may fail the call.
     for anchor in ["beta", "unused", "a"] {
         let (r, after) = run_on(
-            &lenient(),
+            &Edit::default(),
             "alpha beta",
             json!({ "edits": [{ "old_string": "alpha", "new_string": "ALPHA" }], "old_string": anchor, "new_string": anchor }),
         )
@@ -80,10 +64,10 @@ async fn lenient_drops_a_no_op_pair_even_one_that_would_not_match() {
 }
 
 #[tokio::test]
-async fn lenient_drops_a_pair_that_duplicates_an_entry() {
-    // Strict reads this as two overlapping edits of the same span.
+async fn drops_a_pair_that_duplicates_an_entry() {
+    // Appended, it would read as two overlapping edits of the same span.
     let (r, after) = run_on(
-        &lenient(),
+        &Edit::default(),
         "alpha beta",
         json!({ "edits": [{ "old_string": "alpha", "new_string": "ALPHA" }], "old_string": "alpha", "new_string": "ALPHA" }),
     )
@@ -93,10 +77,10 @@ async fn lenient_drops_a_pair_that_duplicates_an_entry() {
 }
 
 #[tokio::test]
-async fn lenient_still_applies_a_pair_that_is_a_real_different_edit() {
+async fn still_applies_a_pair_that_is_a_real_different_edit() {
     // Sol used the pair as a genuine extra edit in 27% of its calls; dropping it would lose work.
     let (r, after) = run_on(
-        &lenient(),
+        &Edit::default(),
         "alpha beta",
         json!({ "edits": [{ "old_string": "alpha", "new_string": "ALPHA" }], "old_string": "beta", "new_string": "BETA" }),
     )
@@ -106,10 +90,10 @@ async fn lenient_still_applies_a_pair_that_is_a_real_different_edit() {
 }
 
 #[tokio::test]
-async fn lenient_still_rejects_a_pair_that_conflicts_with_an_entry() {
+async fn still_rejects_a_pair_that_conflicts_with_an_entry() {
     // Same span, different replacement: which one the model meant is unknowable, so it stays an error.
     let (r, after) = run_on(
-        &lenient(),
+        &Edit::default(),
         "alpha beta",
         json!({ "edits": [{ "old_string": "alpha", "new_string": "ALPHA" }], "old_string": "alpha", "new_string": "omega" }),
     )
@@ -119,10 +103,10 @@ async fn lenient_still_rejects_a_pair_that_conflicts_with_an_entry() {
 }
 
 #[tokio::test]
-async fn lenient_keeps_an_empty_old_string_with_a_real_replacement_an_error() {
+async fn keeps_an_empty_old_string_with_a_real_replacement_an_error() {
     // Not filler: the model wrote something it wanted inserted, and there is no anchor to put it at.
     let (r, _) = run_on(
-        &lenient(),
+        &Edit::default(),
         "alpha beta",
         json!({ "edits": [{ "old_string": "alpha", "new_string": "ALPHA" }], "old_string": "", "new_string": "gamma" }),
     )
@@ -131,9 +115,9 @@ async fn lenient_keeps_an_empty_old_string_with_a_real_replacement_an_error() {
 }
 
 #[tokio::test]
-async fn lenient_uses_the_pair_when_edits_is_an_empty_array() {
+async fn uses_the_pair_when_edits_is_an_empty_array() {
     let (r, after) = run_on(
-        &lenient(),
+        &Edit::default(),
         "alpha beta",
         json!({ "edits": [], "old_string": "beta", "new_string": "BETA" }),
     )
@@ -142,27 +126,19 @@ async fn lenient_uses_the_pair_when_edits_is_an_empty_array() {
     assert_eq!(after, "alpha BETA");
     // …but an empty array beside an empty pair is still nothing to do.
     let (r, _) = run_on(
-        &lenient(),
+        &Edit::default(),
         "alpha",
         json!({ "edits": [], "old_string": "", "new_string": "" }),
-    )
-    .await;
-    assert!(invalid(r).contains("`edits` is empty"));
-    // Strict keeps today's error.
-    let (r, _) = run_on(
-        &Edit::default(),
-        "alpha beta",
-        json!({ "edits": [], "old_string": "beta", "new_string": "BETA" }),
     )
     .await;
     assert!(invalid(r).contains("`edits` is empty"));
 }
 
 #[tokio::test]
-async fn lenient_applies_replace_all_to_the_one_entry_left_after_dropping_filler() {
+async fn applies_replace_all_to_the_one_entry_left_after_dropping_filler() {
     // Sol set `replace_all: true` meaning its single edits[] entry; the filler pair made it "two edits".
     let (r, after) = run_on(
-        &lenient(),
+        &Edit::default(),
         "x x x",
         json!({ "edits": [{ "old_string": "x", "new_string": "y" }], "old_string": "", "new_string": "", "replace_all": true }),
     )
@@ -196,7 +172,7 @@ fn required(t: &Edit) -> Vec<String> {
 
 #[test]
 fn combined_schema_is_unchanged() {
-    let t = tools(EditSchema::Combined, EditPair::Strict);
+    let t = tools(EditSchema::Combined);
     assert_eq!(t.len(), 1);
     assert_eq!(t[0].name(), "edit");
     assert_eq!(
@@ -208,7 +184,7 @@ fn combined_schema_is_unchanged() {
 
 #[test]
 fn edits_only_schema_advertises_no_top_level_pair() {
-    let t = tools(EditSchema::EditsOnly, EditPair::Strict);
+    let t = tools(EditSchema::EditsOnly);
     assert_eq!(t.len(), 1);
     assert_eq!(t[0].name(), "edit");
     assert_eq!(props(&t[0]), ["edits", "path"]);
@@ -217,7 +193,7 @@ fn edits_only_schema_advertises_no_top_level_pair() {
 
 #[test]
 fn split_schema_is_a_single_edit_plus_multi_edit() {
-    let t = tools(EditSchema::Split, EditPair::Strict);
+    let t = tools(EditSchema::Split);
     let names: Vec<&str> = t.iter().map(|t| t.name()).collect();
     assert_eq!(names, ["edit", MULTI_EDIT]);
     assert_eq!(
@@ -234,7 +210,7 @@ fn split_schema_is_a_single_edit_plus_multi_edit() {
 async fn every_surface_accepts_the_other_shape_rather_than_failing_on_schema() {
     // A model that ignores the advertised shape still gets its edit applied.
     for schema in [EditSchema::EditsOnly, EditSchema::Split] {
-        for t in tools(schema, EditPair::Strict) {
+        for t in tools(schema) {
             let (r, after) = run_on(
                 &t,
                 "alpha",
@@ -257,7 +233,7 @@ async fn every_surface_accepts_the_other_shape_rather_than_failing_on_schema() {
 
 #[test]
 fn multi_edit_declares_its_write_target_so_dispatch_serializes_it() {
-    let t = tools(EditSchema::Split, EditPair::Strict);
+    let t = tools(EditSchema::Split);
     assert!(t[1].write_target(&json!({ "path": "a.txt" })).is_some());
 }
 

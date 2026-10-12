@@ -8,7 +8,6 @@
 //!
 //! Keys:
 //! - `edit-schema=combined|edits|split` — see [`edit::EditSchema`].
-//! - `edit-pair=strict|lenient` — see [`edit::EditPair`].
 //! - `bash-max-bytes=N` (bytes, or `Nk` for KiB; 1k–50k) — `bash`'s display cap, see
 //!   [`bash_output::BashOutput`].
 //! - `bash-test-digest=off|pytest` — see [`bash_output::BashOutput::pytest_digest`].
@@ -97,7 +96,6 @@ impl ToolTuning {
                 let (key, value) = (key.trim(), value.trim());
                 match key {
                     "edit-schema" => t.edit.schema = value.parse()?,
-                    "edit-pair" => t.edit.pair = value.parse()?,
                     "bash-max-bytes" => t.bash.max_bytes = parse_bytes(value)?,
                     "bash-test-digest" => {
                         t.bash.pytest_digest = match value {
@@ -147,8 +145,8 @@ impl ToolTuning {
                     other => {
                         return Err(format!(
                             "--tool-tuning: unknown key {other:?}; expected one of edit-schema, \
-                             edit-pair, bash-max-bytes, bash-test-digest, test-guideline, \
-                             search-tool, tool-guidelines"
+                             bash-max-bytes, bash-test-digest, test-guideline, search-tool, \
+                             tool-guidelines"
                         ));
                     }
                 }
@@ -161,7 +159,7 @@ impl ToolTuning {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use edit::{EditPair, EditSchema};
+    use edit::EditSchema;
 
     #[test]
     fn no_entries_is_the_production_default() {
@@ -170,15 +168,14 @@ mod tests {
             ToolTuning::default()
         );
         assert_eq!(ToolTuning::default().edit.schema, EditSchema::Combined);
-        assert_eq!(ToolTuning::default().edit.pair, EditPair::Strict);
     }
 
     #[test]
     fn parses_repeated_and_comma_separated_entries_later_wins() {
-        let t = ToolTuning::parse(&["edit-schema=split,edit-pair=lenient", "edit-schema=edits"])
+        let t = ToolTuning::parse(&["edit-schema=split,bash-max-bytes=8k", "edit-schema=edits"])
             .unwrap();
         assert_eq!(t.edit.schema, EditSchema::EditsOnly);
-        assert_eq!(t.edit.pair, EditPair::Lenient);
+        assert_eq!(t.bash.max_bytes, 8 * 1024);
     }
 
     #[test]
@@ -223,7 +220,7 @@ mod tests {
     fn unknown_keys_values_and_shapes_are_errors_not_silent_defaults() {
         for bad in [
             "edit-schema=nope",
-            "edit-pair=loose",
+            "edit-pair=lenient",
             "edit-shape=split",
             "edit-schema",
             "bash-max-bytes=0",

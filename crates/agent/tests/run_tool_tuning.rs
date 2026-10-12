@@ -77,7 +77,7 @@ fn edit_schema_tuning_changes_the_advertised_edit_tools() {
             .is_none()
     );
 
-    let (out, bodies) = run_with(&["edit-schema=split,edit-pair=lenient"]);
+    let (out, bodies) = run_with(&["edit-schema=split"]);
     assert!(
         out.status.success(),
         "{}",
