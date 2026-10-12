@@ -48,6 +48,9 @@ TASKS: dict[str, tuple[str, ...]] = {
     "parsers": ("parso", "pyparsing", "sqlparse"),  # 4666
     "utils": ("boltons", "toolz", "marshmallow"),  # 4287
     "text": ("mistune", "more-itertools", "tabulate"),  # 3988
+    # Five or six repos: an uncompacted Sonnet run passes 500K, so a 500K trigger actually fires.
+    "pallets-parsers": ("click", "jinja", "parso", "pyparsing", "sqlparse"),  # 9547
+    "utils-text": ("boltons", "toolz", "marshmallow", "mistune", "more-itertools", "tabulate"),  # 8275
     # Single small repos: cheap-model gate tasks whose context mostly stays under 100K.
     "toolz": ("toolz",),  # 681
     "sqlparse": ("sqlparse",),  # 840

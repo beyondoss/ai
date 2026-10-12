@@ -12,6 +12,7 @@ never repeated, so an interrupted sweep resumes where it stopped.
 from __future__ import annotations
 
 import fcntl
+import functools
 import json
 import os
 import re
@@ -35,8 +36,8 @@ RESERVE = 16_384  # CompactionConfig::default().reserve_tokens; the arms leave i
 
 # name → compaction trigger in tokens. `default` is the model's own window − reserve (the trigger
 # before per-model caps); `model` is the binary's own per-model `compact_at` (`list-models` shows it).
-# A numeric arm sets both `--context-window` (trigger + reserve, which older binaries understand) and
-# `AI_AGENT_COMPACT_AT` (the trigger, which newer ones apply as-is); `default` sets
+# A numeric arm sets `AI_AGENT_COMPACT_AT` (the trigger) and, only for a binary without
+# `--compact-at`, `--context-window` (trigger + reserve); `default` sets
 # `AI_AGENT_COMPACT_AT=0` so a newer binary drops its per-model cap. Any `<n>k` arm name works.
 ARMS: dict[str, int | None] = {"100k": 100_000, "200k": 200_000, "default": None, "model": None}
 
@@ -257,6 +258,12 @@ def grade(repos: list, root: Path) -> dict:
                 per_repo=per)
 
 
+@functools.cache
+def supports_compact_at(binary: Path) -> bool:
+    out = subprocess.run([str(binary), "run", "--help"], capture_output=True, text=True, timeout=60)
+    return "--compact-at" in out.stdout + out.stderr
+
+
 def run_one(binary: Path, task: str, model: str, arm: str, attempt: int, cap_usd: float,
             max_steps: int, wall_s: int, extra: list[str], runs_dir: Path, label: str) -> dict:
     d = runs_dir / task / model / arm / f"a{attempt}"
@@ -316,7 +323,11 @@ def run_one(binary: Path, task: str, model: str, arm: str, attempt: int, cap_usd
     cmd = [str(binary), "run", "--json", "--model", model, "--max-steps", str(max_steps), *memory,
            "--session-dir", str(d / "sessions"), *extra]
     if window:
-        cmd += ["--context-window", str(window)]
+        # A binary that knows `--compact-at` gets only that: an artificial `--context-window` would
+        # also shrink what the cached summary may send (live prompt + summary budget must fit the
+        # window), so a turn that overshoots the trigger falls back to a full re-render.
+        if not supports_compact_at(binary):
+            cmd += ["--context-window", str(window)]
         env["AI_AGENT_COMPACT_AT"] = str(trigger)
     elif arm == "default":
         env["AI_AGENT_COMPACT_AT"] = "0"
