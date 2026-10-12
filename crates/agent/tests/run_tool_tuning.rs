@@ -225,3 +225,34 @@ fn bash_max_bytes_is_what_the_bash_description_promises() {
     let (_, bodies) = run_with(&[]);
     assert!(bodies[0].contains("or 50.0KB, whichever"), "{}", bodies[0]);
 }
+
+fn tool_names(request: &str) -> Vec<String> {
+    let body = request.split_once("\r\n\r\n").map_or(request, |(_, b)| b);
+    let v: serde_json::Value = serde_json::from_str(body).unwrap();
+    v["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[test]
+fn search_tool_merged_advertises_one_search_and_tool_guidelines_reach_the_prompt() {
+    let (out, bodies) = run_with(&["search-tool=merged", "tool-guidelines=neutral"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let names = tool_names(&bodies[0]);
+    assert!(names.iter().any(|n| n == "search"), "{names:?}");
+    for gone in ["grep", "find", "ls"] {
+        assert!(!names.iter().any(|n| n == gone), "{names:?}");
+    }
+    assert!(
+        bodies[0].contains("Search and read with the search/read tools or with bash"),
+        "{}",
+        bodies[0]
+    );
+}

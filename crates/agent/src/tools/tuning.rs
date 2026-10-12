@@ -13,6 +13,8 @@
 //!   [`bash_output::BashOutput`].
 //! - `bash-test-digest=off|pytest` — see [`bash_output::BashOutput::pytest_digest`].
 //! - `test-guideline=default|pytest` — see [`TestGuideline`].
+//! - `search-tool=separate|merged` — see [`SearchTool`].
+//! - `tool-guidelines=default|neutral|none` — see [`ToolGuidelines`].
 
 use super::{bash_output, edit};
 
@@ -22,6 +24,30 @@ pub struct ToolTuning {
     pub edit: edit::EditOptions,
     pub bash: bash_output::BashOutput,
     pub test_guideline: TestGuideline,
+    pub search_tool: SearchTool,
+    pub tool_guidelines: ToolGuidelines,
+}
+
+/// How content and file-name search reach the model (`search-tool=…`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SearchTool {
+    /// `grep`, `find` and `ls`, as today.
+    #[default]
+    Separate,
+    /// One `search` tool routing to those three — see [`super::search`].
+    Merged,
+}
+
+/// What the system prompt says about the dedicated tools versus bash (`tool-guidelines=…`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ToolGuidelines {
+    /// "Prefer grep/read over bash…" and "Never bash-cat…", as today.
+    #[default]
+    Default,
+    /// One outcome-framed bullet: use the tools or bash, but bound what you print.
+    Neutral,
+    /// Neither bullet. pi's own one-line read guideline stays.
+    None,
 }
 
 /// What the system prompt tells the model about running tests (`test-guideline=…`).
@@ -95,10 +121,34 @@ impl ToolTuning {
                             }
                         }
                     }
+                    "search-tool" => {
+                        t.search_tool = match value {
+                            "separate" => SearchTool::Separate,
+                            "merged" => SearchTool::Merged,
+                            other => {
+                                return Err(format!(
+                                    "invalid search-tool {other:?}; expected separate or merged"
+                                ));
+                            }
+                        }
+                    }
+                    "tool-guidelines" => {
+                        t.tool_guidelines = match value {
+                            "default" => ToolGuidelines::Default,
+                            "neutral" => ToolGuidelines::Neutral,
+                            "none" => ToolGuidelines::None,
+                            other => {
+                                return Err(format!(
+                                    "invalid tool-guidelines {other:?}; expected default, neutral or none"
+                                ));
+                            }
+                        }
+                    }
                     other => {
                         return Err(format!(
                             "--tool-tuning: unknown key {other:?}; expected one of edit-schema, \
-                             edit-pair, bash-max-bytes, bash-test-digest, test-guideline"
+                             edit-pair, bash-max-bytes, bash-test-digest, test-guideline, \
+                             search-tool, tool-guidelines"
                         ));
                     }
                 }
@@ -152,6 +202,24 @@ mod tests {
     }
 
     #[test]
+    fn parses_the_tool_choice_knobs() {
+        let t = ToolTuning::parse(&["search-tool=merged,tool-guidelines=neutral"]).unwrap();
+        assert_eq!(t.search_tool, SearchTool::Merged);
+        assert_eq!(t.tool_guidelines, ToolGuidelines::Neutral);
+        assert_eq!(
+            ToolTuning::parse(&["tool-guidelines=none"])
+                .unwrap()
+                .tool_guidelines,
+            ToolGuidelines::None
+        );
+        assert_eq!(ToolTuning::default().search_tool, SearchTool::Separate);
+        assert_eq!(
+            ToolTuning::default().tool_guidelines,
+            ToolGuidelines::Default
+        );
+    }
+
+    #[test]
     fn unknown_keys_values_and_shapes_are_errors_not_silent_defaults() {
         for bad in [
             "edit-schema=nope",
@@ -163,6 +231,8 @@ mod tests {
             "bash-max-bytes=lots",
             "bash-test-digest=on",
             "test-guideline=terse",
+            "search-tool=unified",
+            "tool-guidelines=strong",
         ] {
             assert!(ToolTuning::parse(&[bad]).is_err(), "{bad} must be rejected");
         }

@@ -44,11 +44,13 @@ use crate::tools::fs::PathWorld;
 
 /// Tools that only ever read. `GatedSet::All` still skips them: asking a human to approve a `grep` is
 /// how an approval prompt gets trained away into a reflex.
-const READ_ONLY_TOOLS: [&str; 8] = [
+const READ_ONLY_TOOLS: [&str; 9] = [
     "read",
     "grep",
     "find",
     "ls",
+    // `--tool-tuning search-tool=merged`'s router over the three above.
+    "search",
     "todo",
     "logs",
     "structured_output",

@@ -33,6 +33,7 @@ pub(crate) mod mcp_wire;
 pub mod memory;
 pub mod output;
 pub mod read;
+pub mod search;
 pub mod structured_output;
 pub mod subagent;
 pub mod todo;
@@ -668,9 +669,18 @@ pub fn default_registry_with_config(cfg: &ToolConfig<'_>) -> ToolRegistry {
     for t in edit_tool.with_options(cfg.tuning.edit) {
         reg.register(Arc::new(t));
     }
-    reg.register(Arc::new(ls_tool));
-    reg.register(Arc::new(grep_tool));
-    reg.register(Arc::new(find_tool));
+    // `search-tool=merged` advertises one `search` that routes to these three instead of them.
+    if cfg.tuning.search_tool == tuning::SearchTool::Merged {
+        reg.register(Arc::new(search::Search::new(
+            Arc::new(grep_tool),
+            Arc::new(find_tool),
+            Arc::new(ls_tool),
+        )));
+    } else {
+        reg.register(Arc::new(ls_tool));
+        reg.register(Arc::new(grep_tool));
+        reg.register(Arc::new(find_tool));
+    }
     // `bash` runs wherever the filesystem tools do — see `ToolConfig::command_runner`.
     let mut bash = match (&cfg.command_runner, cfg.bash_timeout_ms) {
         (Some(runner), Some(ms)) => {
@@ -1253,6 +1263,19 @@ mod tests {
             );
         }
         assert_eq!(reg.len(), 9);
+    }
+
+    #[test]
+    fn search_tool_merged_replaces_grep_find_and_ls_with_one_search() {
+        let reg = default_registry_with_config(&ToolConfig {
+            tuning: ToolTuning::parse(&["search-tool=merged"]).unwrap(),
+            ..ToolConfig::new()
+        });
+        assert!(reg.get(search::NAME).is_some());
+        for gone in ["grep", "find", "ls"] {
+            assert!(reg.get(gone).is_none(), "{gone} must not be advertised");
+        }
+        assert!(default_registry().get(search::NAME).is_none());
     }
 
     #[test]
