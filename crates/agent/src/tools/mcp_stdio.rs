@@ -264,58 +264,22 @@ pub(crate) struct MessageCaps {
     tight: std::sync::Mutex<std::collections::HashMap<String, usize>>,
     /// Outbound bytes not yet ended by a newline.
     outbound: std::sync::Mutex<Vec<u8>>,
-    /// The handshake's requests, while it lasts — see [`MessageCaps::stale`].
-    handshake: std::sync::Mutex<Handshake>,
 }
-
-/// Request ids (their JSON text) of the handshake still in flight. All `None` once it is over.
-#[derive(Default, Debug)]
-struct Handshake {
-    /// `server/discover`, until it is answered or `initialize` follows it.
-    discover: Option<String>,
-    /// A `server/discover` the client gave up on by sending `initialize`.
-    abandoned: Option<String>,
-    /// That fallback `initialize`, until it is answered.
-    initialize: Option<String>,
-}
-
-impl Handshake {
-    fn tracking(&self) -> bool {
-        self.discover.is_some() || self.abandoned.is_some() || self.initialize.is_some()
-    }
-}
-
-/// The largest line [`MessageCaps::stale`] parses: handshake answers are small, and a line past
-/// this cannot be one.
-const HANDSHAKE_LINE_MAX: usize = 64 * 1024;
 
 impl MessageCaps {
     /// Note bytes written to the server; a completed request line that reads a `ui://` resource gets
-    /// the view cap, and the handshake's `server/discover` / `initialize` are tracked for
-    /// [`MessageCaps::stale`]. Only lines that mention one of those methods are parsed.
+    /// the view cap. Only lines that mention `resources/read` are parsed.
     fn wrote(&self, bytes: &[u8]) {
         let mut pending = lock(&self.outbound);
         pending.extend_from_slice(bytes);
         while let Some(end) = pending.iter().position(|&b| b == b'\n') {
             let line: Vec<u8> = pending.drain(..=end).collect();
-            let handshake =
-                contains(&line, b"server/discover") || contains(&line, b"\"initialize\"");
-            if !handshake && !contains(&line, b"resources/read") {
+            if !contains(&line, b"resources/read") {
                 continue;
             }
             let Ok(msg) = serde_json::from_slice::<Value>(&line) else {
                 continue;
             };
-            let id = msg.get("id").map(Value::to_string);
-            match msg["method"].as_str() {
-                Some("server/discover") => lock(&self.handshake).discover = id,
-                Some("initialize") => {
-                    let mut h = lock(&self.handshake);
-                    h.abandoned = h.discover.take();
-                    h.initialize = id;
-                }
-                _ => {}
-            }
             let is_view = msg["method"] == "resources/read"
                 && msg["params"]["uri"]
                     .as_str()
@@ -333,47 +297,6 @@ impl MessageCaps {
 
     fn peek(&self, id: &str) -> Option<usize> {
         lock(&self.tight).get(id).copied()
-    }
-
-    /// Whether `line` answers a `server/discover` the client already gave up on — dropped, not
-    /// delivered.
-    ///
-    /// rmcp's `Auto` handshake sends `server/discover` (id 0) and, if nothing answers within 10 s,
-    /// falls back to a legacy `initialize` (id 1) on the same connection. A server that was merely
-    /// slow — an `npx` cold start on a loaded host — then answers the discover *after* the
-    /// initialize went out, and rmcp, waiting for id 1, fails the whole handshake on it ("uncorrelated
-    /// error response: expected id 1, error response carried 0"), so the server's tools are lost for
-    /// the run. That answer is stale by construction: the request it answers was abandoned the moment
-    /// `initialize` followed it. Measured: 6 of 132 MCP runs in one A/B lost a server this way.
-    ///
-    /// Free once the handshake is over: answering the discover in time, or answering the
-    /// initialize, ends the tracking, so only the handshake's own (small) lines are ever parsed. A
-    /// full parse rather than [`scan_head`]: serializers that sort keys put `error` before `id`.
-    fn stale(&self, line: &[u8]) -> bool {
-        let mut h = lock(&self.handshake);
-        if !h.tracking() || line.len() > HANDSHAKE_LINE_MAX {
-            return false;
-        }
-        let Ok(msg) = serde_json::from_slice::<Value>(line) else {
-            return false;
-        };
-        let is_response = msg.get("method").is_none()
-            && (msg.get("result").is_some() || msg.get("error").is_some());
-        let Some(id) = msg.get("id").filter(|_| is_response).map(Value::to_string) else {
-            return false;
-        };
-        let id = Some(id);
-        if h.discover == id {
-            h.discover = None;
-        } else if h.abandoned == id {
-            h.abandoned = None;
-            return true;
-        } else if h.initialize == id {
-            // A server answers in order: with the initialize answered, an abandoned discover it
-            // never answered will not be.
-            *h = Handshake::default();
-        }
-        false
     }
 }
 
@@ -916,10 +839,6 @@ pub(crate) fn stdio_transport(
             }
             let body = line.strip_suffix(b"\n").unwrap_or(&line);
             let body = body.strip_suffix(b"\r").unwrap_or(body);
-            if pump_caps.stale(body) {
-                tracing::debug!("dropped a late answer to an abandoned MCP `server/discover`");
-                continue;
-            }
             let mut out = rescue(body).unwrap_or_else(|| body.to_vec());
             out.push(b'\n');
             if pump_side.write_all(&out).await.is_err() {
@@ -1171,42 +1090,6 @@ mod tests {
         .unwrap();
         assert!(matches!(got, Inbound::Line(_)), "{got:?}");
         assert_eq!(caps.peek("3"), Some(crate::tools::mcp_apps::MAX_VIEW_BYTES));
-    }
-
-    #[test]
-    fn a_late_answer_to_an_abandoned_discover_is_stale() {
-        let discover =
-            b"{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"server/discover\",\"params\":{}}\n";
-        let initialize =
-            b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n";
-        // Keys sorted, as serde_json writes them: `error` comes before `id`.
-        let late =
-            br#"{"error":{"code":-32601,"message":"Method not found"},"id":0,"jsonrpc":"2.0"}"#;
-        let init_ok = br#"{"id":1,"jsonrpc":"2.0","result":{"protocolVersion":"2025-11-25"}}"#;
-
-        // Answered in time: delivered, and the tracking ends with the handshake.
-        let caps = MessageCaps::default();
-        caps.wrote(discover);
-        assert!(!caps.stale(late));
-        caps.wrote(initialize);
-        assert!(!caps.stale(init_ok));
-        assert!(!lock(&caps.handshake).tracking());
-
-        // Answered after `initialize` followed it: dropped, once; the initialize answer goes on.
-        let caps = MessageCaps::default();
-        caps.wrote(discover);
-        caps.wrote(initialize);
-        assert!(caps.stale(late));
-        assert!(!caps.stale(init_ok));
-        assert!(!caps.stale(late), "only the one stale answer is dropped");
-        assert!(!lock(&caps.handshake).tracking());
-
-        // Never answered at all: the initialize answer still ends the tracking.
-        let caps = MessageCaps::default();
-        caps.wrote(discover);
-        caps.wrote(initialize);
-        assert!(!caps.stale(init_ok));
-        assert!(!lock(&caps.handshake).tracking());
     }
 
     #[test]
