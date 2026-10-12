@@ -50,38 +50,10 @@ impl std::str::FromStr for EditSchema {
     }
 }
 
-/// How a call that sends both `edits[]` and a top-level pair is read (`--tool-tuning edit-pair=…`).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum EditPair {
-    /// The pair is appended as one more edit, whatever it holds — the default (pi's behavior).
-    #[default]
-    Strict,
-    /// The pair is dropped when it is filler — `old_string` empty with a blank `new_string`,
-    /// `old_string == new_string`, or an exact duplicate of an `edits[]` entry — and it is the edit
-    /// when `edits` is `[]`. A pair that is a real, different edit is still applied, and one that
-    /// conflicts with an entry still errors: only a pair that cannot change the file is ignored.
-    Lenient,
-}
-
-impl std::str::FromStr for EditPair {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "strict" => Ok(Self::Strict),
-            "lenient" => Ok(Self::Lenient),
-            other => Err(format!(
-                "invalid edit-pair {other:?}; expected strict or lenient"
-            )),
-        }
-    }
-}
-
 /// The edit tool's tuning knobs, carried by [`super::ToolTuning`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct EditOptions {
     pub schema: EditSchema,
-    pub pair: EditPair,
 }
 
 /// The name of the multi-edit tool [`EditSchema::Split`] registers next to `edit`.
@@ -107,7 +79,6 @@ pub struct Edit {
     surface: Surface,
     /// `multi_edit` rather than `edit` (only under [`EditSchema::Split`]).
     multi: bool,
-    pair: EditPair,
 }
 
 impl Default for Edit {
@@ -123,19 +94,16 @@ impl Edit {
             backend: Arc::new(LocalFs::new()),
             surface: Surface::Combined,
             multi: false,
-            pair: EditPair::Strict,
         }
     }
 
     /// The tool(s) `opts` asks for: `edit` alone, or `edit` + `multi_edit` under
     /// [`EditSchema::Split`]. Both share one backend, so they can never disagree about the file.
     pub fn with_options(self, opts: EditOptions) -> Vec<Self> {
-        let pair = opts.pair;
         match opts.schema {
-            EditSchema::Combined => vec![Self { pair, ..self }],
+            EditSchema::Combined => vec![self],
             EditSchema::EditsOnly => vec![Self {
                 surface: Surface::Edits,
-                pair,
                 ..self
             }],
             EditSchema::Split => {
@@ -144,12 +112,10 @@ impl Edit {
                     backend: self.backend.clone(),
                     surface: Surface::Edits,
                     multi: true,
-                    pair,
                 };
                 vec![
                     Self {
                         surface: Surface::Single,
-                        pair,
                         ..self
                     },
                     multi,
@@ -294,7 +260,7 @@ impl Edit {
         let path = self.resolve(path);
         // Every surface accepts every shape: the schema steers what a model sends, but a model that
         // sends the other form anyway still gets its edit applied rather than a schema error.
-        let edits = parse_edits_with(&input, self.pair)?;
+        let edits = parse_edits(&input)?;
         let replace_all = input
             .get("replace_all")
             .and_then(Value::as_bool)
@@ -898,22 +864,19 @@ fn strip_crlf_cow(s: &str) -> Cow<'_, str> {
 
 /// Accept either the `edits` array form (pi-style) or the single old_string/new_string form. Also
 /// recovers the case where a model sends `edits` as a JSON-encoded *string* instead of an array. When
-/// a call sends **both** an `edits` array and top-level `old_string`/`new_string`, the legacy pair is
-/// appended as an extra edit rather than silently discarded — matches pi's behavior (a model that
-/// carries both shapes over from a prior turn/retry means both, not just the array).
+/// a call sends **both** an `edits` array and top-level `old_string`/`new_string`, the pair is
+/// appended as one more edit (pi's behavior: a model that carries both shapes over from a prior
+/// turn/retry means both) unless it is filler ([`is_filler`]), and it is the edit when `edits` is
+/// `[]`. A pair that conflicts with an entry is still appended, so the overlap check rejects it.
+///
+/// Why filler is dropped: GPT-6 Luna and Sol fill every advertised property, so the pair arrived
+/// beside `edits[]` in all their calls, and was filler in 81% of Luna's. Replaying 1,900 logged edit
+/// calls with filler dropped cut Luna's error rate from 53.2% to 19.7% and Sol's from 17.7% to 5.5%.
 ///
 /// `pub(crate)`: also used by `export` to render an `edit` tool call's before/after as a real diff
 /// instead of raw JSON — reusing this rather than re-parsing `input` independently keeps the exported
 /// rendering in sync with whatever shape this tool actually accepts (including the JSON-string quirk).
 pub(crate) fn parse_edits(input: &Value) -> Result<Vec<(String, String)>, ToolError> {
-    parse_edits_with(input, EditPair::Strict)
-}
-
-/// [`parse_edits`] under a chosen [`EditPair`] rule for a call that sends both forms.
-pub(crate) fn parse_edits_with(
-    input: &Value,
-    pair_rule: EditPair,
-) -> Result<Vec<(String, String)>, ToolError> {
     // Some models emit `edits` as a JSON string; parse it back into a value first.
     let edits_value = match input.get("edits") {
         Some(Value::String(s)) => serde_json::from_str::<Value>(s).ok(),
@@ -926,13 +889,12 @@ pub(crate) fn parse_edits_with(
         (Some(o), Some(n)) => Some((o.to_string(), n.to_string())),
         _ => None,
     };
-    let lenient = pair_rule == EditPair::Lenient;
     if let Some(arr) = edits_value.as_ref().and_then(Value::as_array) {
         if arr.is_empty() {
-            // Lenient: `edits: []` beside a real pair means the pair is the edit (59 of the eval's
-            // GPT edit errors were exactly this).
+            // `edits: []` beside a real pair means the pair is the edit (59 of the eval's GPT edit
+            // errors were exactly this).
             return match legacy {
-                Some(pair) if lenient && !pair.0.is_empty() => Ok(vec![pair]),
+                Some(pair) if !pair.0.is_empty() => Ok(vec![pair]),
                 _ => Err(ToolError::InvalidInput("`edits` is empty".into())),
             };
         }
@@ -950,7 +912,7 @@ pub(crate) fn parse_edits_with(
             })
             .collect::<Result<_, _>>()?;
         if let Some(pair) = legacy
-            && !(lenient && is_filler(&pair, &edits))
+            && !is_filler(&pair, &edits)
         {
             edits.push(pair);
         }

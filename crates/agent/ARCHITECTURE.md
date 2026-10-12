@@ -1678,8 +1678,8 @@ as `write("/home/…/f")` would.
   same kind of narrowly-scoped, single-family confusable pi's own set already folds, so it only helps a
   slightly-off `old_string` land and can never conflate two genuinely different characters. Edits
   resolve to byte ranges against the _original_ text (order-independent, overlap-rejected). When a
-  call sends **both** forms, the top-level pair is appended as one more edit (pi's behavior) — see
-  "`--tool-tuning`" below for why that is an A/B knob.
+  call sends **both** forms, the top-level pair is appended as one more edit (pi's behavior) unless it
+  is filler, and it is the edit when `edits` is `[]` — see "Edit tool surface" below.
 
 - **`ls`** sorts directories first, then alphabetically; dot-entries are hidden unless `all: true` —
   both deliberate divergences from the reference agent, kept rather than "fixed" to match it (dotfiles
@@ -1712,9 +1712,16 @@ of their edit calls carried `edits[]` _and_ a top-level `old_string`/`new_string
 it caused 74% of Luna's edit errors (53% error rate). But Sol used the pair as a genuine extra edit in
 27% of its calls, so "ignore the pair" is not safe; only filler is.
 
+So the edit tool drops a **filler pair** on every surface (`edit::parse_edits`, `is_filler`): empty
+`old_string` with a blank `new_string`, `old == new`, or an exact duplicate of an entry. When `edits` is
+`[]`, a pair with a non-empty `old_string` is the edit. A real, different pair is still applied; one
+that conflicts with an entry (same `old_string`, different `new_string`) still errors on the overlap
+check. `replace_all` is checked after, so it applies to the one entry left. Replaying 1,900 logged edit
+calls under this rule cut Luna's error rate from 53.2% to 19.7% and Sol's from 17.7% to 5.5%; it was
+the `edit-pair=lenient` arm and is now the only behavior.
+
 | Key           | Values                                 | Effect                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | ------------- | -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `edit-pair`   | `strict` (default), `lenient`          | `lenient` drops a filler pair (empty `old_string` with a blank `new_string`, `old == new`, or an exact duplicate of an entry) and uses the pair when `edits` is `[]`. A real, different pair is still applied; one that conflicts with an entry (same `old_string`, different `new_string`) still errors. `replace_all` is checked after, so it applies to the one entry left.                                                                                                  |
 | `edit-schema` | `combined` (default), `edits`, `split` | `edits` advertises `path` + `edits[]` only (pi's shape). `split` advertises a single-edit `edit` (`old_string`/`new_string`/`replace_all`, all but `replace_all` required) plus a `multi_edit` tool taking `edits[]` (Claude Code's Edit/MultiEdit). Every surface still _accepts_ every shape, so a model that ignores the schema still gets its edit. The system prompt's edit bullets are derived from the advertised schema, so they never name a parameter the tool lacks. |
 
 `multi_edit` is a second name for the same write, so every name-keyed write gate lists it: `ToolPolicy`'s

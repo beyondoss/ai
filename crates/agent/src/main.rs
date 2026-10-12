@@ -540,9 +540,8 @@ enum Command {
         #[usage(long, env = "AI_AGENT_WEB_TIMEOUT_MS")]
         web_timeout_ms: Option<u64>,
         /// An A/B knob on how a built-in tool presents itself to the model, `KEY=VALUE` (repeatable or
-        /// comma-separated), e.g. `edit-pair=lenient` or `bash-test-digest=pytest` (keys: `edit-schema`,
-        /// `edit-pair`, `bash-max-bytes`, `bash-test-digest`, `test-guideline`, `search-tool`,
-        /// `tool-guidelines`). Every default is the production behavior; an unknown key or value is
+        /// comma-separated), e.g. `edit-schema=split` or `bash-test-digest=pytest` (keys: `edit-schema`,
+        /// `bash-max-bytes`, `bash-test-digest`, `test-guideline`, `search-tool`, `tool-guidelines`). Every default is the production behavior; an unknown key or value is
         /// an error. See `tools::tuning`. `serve`'s identical flag.
         #[usage(long, env = "AI_AGENT_TOOL_TUNING")]
         tool_tuning: Vec<String>,
@@ -1167,9 +1166,8 @@ enum Command {
         #[usage(long, env = "AI_AGENT_WEB_TIMEOUT_MS")]
         web_timeout_ms: Option<u64>,
         /// An A/B knob on how a built-in tool presents itself to the model, `KEY=VALUE` (repeatable or
-        /// comma-separated), e.g. `edit-pair=lenient` or `bash-test-digest=pytest` (keys: `edit-schema`,
-        /// `edit-pair`, `bash-max-bytes`, `bash-test-digest`, `test-guideline`, `search-tool`,
-        /// `tool-guidelines`). Every default is the production behavior; an unknown key or value is
+        /// comma-separated), e.g. `edit-schema=split` or `bash-test-digest=pytest` (keys: `edit-schema`,
+        /// `bash-max-bytes`, `bash-test-digest`, `test-guideline`, `search-tool`, `tool-guidelines`). Every default is the production behavior; an unknown key or value is
         /// an error. See `tools::tuning`. `run`'s identical flag.
         #[usage(long, env = "AI_AGENT_TOOL_TUNING")]
         tool_tuning: Vec<String>,
