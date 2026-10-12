@@ -1099,8 +1099,11 @@ impl Subagent {
         memory_sections: &[(crate::memory::MountKind, String)],
         shared: Option<&SharedChildSetup>,
     ) -> String {
-        let default_base =
-            crate::resources::default_system_prompt(registry, &self.ctx.prompt_guidelines);
+        let default_base = crate::resources::default_system_prompt_with(
+            registry,
+            &self.ctx.prompt_guidelines,
+            &self.ctx.tool_cfg.tuning,
+        );
         let body = def.system.trim();
         // Reuse the fan-out's single cwd→root walk when this child shares the parent cwd (T8-F9). A
         // worktree-isolated child's `root` is its own checkout, so the shared files (walked from — and

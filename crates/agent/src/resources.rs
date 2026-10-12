@@ -38,6 +38,21 @@ pub fn default_system_prompt(
     registry: &agent_core::ToolRegistry,
     extra_guidelines: &[String],
 ) -> String {
+    default_system_prompt_with(
+        registry,
+        extra_guidelines,
+        &crate::tools::ToolTuning::default(),
+    )
+}
+
+/// [`default_system_prompt`] under `--tool-tuning`'s prompt knobs (`test-guideline`). The default
+/// tuning renders byte-for-byte what [`default_system_prompt`] always has.
+pub fn default_system_prompt_with(
+    registry: &agent_core::ToolRegistry,
+    extra_guidelines: &[String],
+    tuning: &crate::tools::ToolTuning,
+) -> String {
+    let pytest_guideline = tuning.test_guideline == crate::tools::tuning::TestGuideline::Pytest;
     let defs = registry.definitions();
     // Whether `edit` takes an `edits[]` array (the default and `edit-schema=edits`) or one
     // old_string/new_string with a separate `multi_edit` (`edit-schema=split`) — read off the schema
@@ -75,10 +90,32 @@ pub fn default_system_prompt(
     // Only fires when all three tools are actually registered: a read-only child must not be told
     // to bash grep/cat.
     if has("grep") && has("read") && has("bash") {
+        // Under `test-guideline=pytest` tests get their own bullet below, so this one keeps only the
+        // install half of its pipe rule.
+        let piped = if pytest_guideline {
+            "installs"
+        } else {
+            "installs or tests"
+        };
         add(
-            "Prefer grep/read over bash for search and file contents. Do not `bash grep`/`rg`/`cat`/`sed`; \
-             if you must sample via bash, `| head` that grep/cat/ls only — never `| head`/`| tail` \
-             installs or tests (hides exit status)."
+            format!(
+                "Prefer grep/read over bash for search and file contents. Do not `bash grep`/`rg`/`cat`/`sed`; \
+                 if you must sample via bash, `| head` that grep/cat/ls only — never `| head`/`| tail` \
+                 {piped} (hides exit status)."
+            ),
+            &mut guidelines,
+            &mut seen,
+        );
+    }
+    // `test-guideline=pytest`: say what to run, not only what not to pipe. Gated on `bash` alone, so
+    // it survives an `--exclude-tools grep` that drops the bullet above.
+    if pytest_guideline && has("bash") {
+        add(
+            "Run tests with `-q --tb=short` (e.g. `python -m pytest tests -q --tb=short`), even when you \
+             were given the plain command; add `-x` to stop at the first failure while fixing one thing, \
+             and select with `-k` or `path::test_name` to re-check it. Don't pipe test runs through \
+             `head`/`tail` (that hides the exit status); if you need the full log, redirect it to a file \
+             and read the file."
                 .to_string(),
             &mut guidelines,
             &mut seen,
@@ -1101,6 +1138,32 @@ mod tests {
         assert!(
             prompt.contains("Use write only for new files or complete rewrites."),
             "got: {prompt}"
+        );
+    }
+
+    #[test]
+    fn test_guideline_pytest_names_the_flags_and_moves_the_test_pipe_rule_to_its_own_bullet() {
+        let reg = crate::tools::default_registry();
+        let tuning = crate::tools::ToolTuning::parse(&["test-guideline=pytest"]).unwrap();
+        let prompt = default_system_prompt_with(&reg, &[], &tuning);
+        assert!(prompt.contains("`-q --tb=short`"), "got: {prompt}");
+        assert!(
+            prompt.contains("never `| head`/`| tail` installs (hides exit status)"),
+            "got: {prompt}"
+        );
+        assert!(!prompt.contains("installs or tests"), "got: {prompt}");
+
+        // Without grep the prefer bullet goes, but the test bullet must stay.
+        let mut no_grep = crate::tools::default_registry();
+        crate::tools::apply_filter(&mut no_grep, None, Some(&["grep".to_string()]), false);
+        let prompt = default_system_prompt_with(&no_grep, &[], &tuning);
+        assert!(prompt.contains("`-q --tb=short`"), "got: {prompt}");
+        assert!(prompt.contains("Don't pipe test runs"), "got: {prompt}");
+
+        // The default tuning is byte-for-byte the untuned prompt.
+        assert_eq!(
+            default_system_prompt_with(&reg, &[], &crate::tools::ToolTuning::default()),
+            default_system_prompt(&reg, &[])
         );
     }
 

@@ -512,7 +512,8 @@ enum Command {
         #[usage(long, env = "AI_AGENT_WEB_TIMEOUT_MS")]
         web_timeout_ms: Option<u64>,
         /// An A/B knob on how a built-in tool presents itself to the model, `KEY=VALUE` (repeatable or
-        /// comma-separated): `edit-schema=combined|edits|split`, `edit-pair=strict|lenient`. Every
+        /// comma-separated), e.g. `edit-pair=lenient` or `bash-test-digest=pytest` (keys: `edit-schema`,
+        /// `edit-pair`, `bash-max-bytes`, `bash-test-digest`, `test-guideline`). Every
         /// default is the production behavior; an unknown key or value is an error. See
         /// `tools::tuning`. `serve`'s identical flag.
         #[usage(long, env = "AI_AGENT_TOOL_TUNING")]
@@ -1136,7 +1137,8 @@ enum Command {
         #[usage(long, env = "AI_AGENT_WEB_TIMEOUT_MS")]
         web_timeout_ms: Option<u64>,
         /// An A/B knob on how a built-in tool presents itself to the model, `KEY=VALUE` (repeatable or
-        /// comma-separated): `edit-schema=combined|edits|split`, `edit-pair=strict|lenient`. Every
+        /// comma-separated), e.g. `edit-pair=lenient` or `bash-test-digest=pytest` (keys: `edit-schema`,
+        /// `edit-pair`, `bash-max-bytes`, `bash-test-digest`, `test-guideline`). Every
         /// default is the production behavior; an unknown key or value is an error. See
         /// `tools::tuning`. `run`'s identical flag.
         #[usage(long, env = "AI_AGENT_TOOL_TUNING")]
@@ -2381,7 +2383,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         exclude_tools.as_deref(),
                         no_tools,
                     );
-                    beyond_ai_agent::resources::default_system_prompt(&reg, &prompt_guidelines)
+                    beyond_ai_agent::resources::default_system_prompt_with(
+                        &reg,
+                        &prompt_guidelines,
+                        &tool_tuning,
+                    )
                 });
             // `--append-system-prompt` is repeatable (pi-parity fix: previously a second occurrence
             // silently clobbered the first instead of accumulating) — each occurrence is resolved
@@ -5042,8 +5048,11 @@ async fn run_task(
     // `build_system_prompt` can tell "an explicit override was given" apart from "nothing given, use the
     // built-in default" — an explicit flag must win outright over a trusted project's on-disk
     // `SYSTEM.md`, which previously always won regardless (pi-parity fix).
-    let default_base =
-        beyond_ai_agent::resources::default_system_prompt(&registry, &prompt_guidelines);
+    let default_base = beyond_ai_agent::resources::default_system_prompt_with(
+        &registry,
+        &prompt_guidelines,
+        &tool_tuning,
+    );
     // Skills are discovered by path, not inlined into the prompt — invoking one relies on the model
     // being able to open its `SKILL.md` itself, so advertising them at all when `read` isn't registered
     // (a restricted `--tools`/`--exclude-tools` invocation) just adds dead weight (pi-parity fix).
