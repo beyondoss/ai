@@ -278,18 +278,11 @@ pub struct CompactionCandidates {
     /// already sees it (it sends the whole conversation): judged stale 40% of the time against 93%
     /// for the re-render's split template, which sees only the prefix.
     pub sees_tail: bool,
-    /// A masking pass is applied only when it pays for its cache rewrite before the freed room
-    /// refills: `0.1 · freed · (freed / growth) ≥ (w − 0.1) · rewrite` ([`mask_net_saving`]), with
-    /// `rewrite` the tokens from the first edited message on, `growth` the transcript's recent
-    /// tokens per turn ([`growth_per_turn`]) and `w` the cache-write price (1.25×, 2× at the 1-hour
-    /// TTL). In the eval, 7 of 12 passes earned back their rewrite; this rule agrees with the
-    /// outcome on 9 of the 12.
-    pub mask_breakeven: bool,
 }
 
 impl CompactionCandidates {
     /// Every candidate's CLI name, in the order `--help` lists them.
-    pub const NAMES: &[&str] = &["state", "tail", "mask-breakeven"];
+    pub const NAMES: &[&str] = &["state", "tail"];
 
     /// The candidates `names` turns on (the CLI's `--compaction-candidates`); an unknown name is an
     /// error naming the valid ones, so a typo in an eval arm fails the run instead of silently
@@ -300,7 +293,6 @@ impl CompactionCandidates {
             match name.as_ref().trim() {
                 "state" => c.state_template = true,
                 "tail" => c.sees_tail = true,
-                "mask-breakeven" => c.mask_breakeven = true,
                 "" => {}
                 other => {
                     return Err(format!(
@@ -1763,33 +1755,6 @@ pub fn extract_bash_writes(messages: &[Message]) -> Vec<String> {
         }
     }
     out
-}
-
-/// How fast the transcript grows: the estimated tokens of its last `turns` turns (from the
-/// `turns`-th last assistant message on), per turn. At least 1.
-pub fn growth_per_turn(messages: &[Message], turns: usize) -> u32 {
-    let starts: Vec<usize> = messages
-        .iter()
-        .enumerate()
-        .rev()
-        .filter(|(_, m)| m.role == Role::Assistant)
-        .map(|(i, _)| i)
-        .take(turns.max(1))
-        .collect();
-    let Some(&start) = starts.last() else {
-        return 1;
-    };
-    (estimate_messages_tokens(&messages[start..]) / starts.len() as u32).max(1)
-}
-
-/// What a masking pass saves, net, in base-input-token equivalents, before the room it frees
-/// refills: every turn until then reads `freed` fewer cached tokens (0.1× each), and the pass pays
-/// once to write `rewrite` tokens (from its first edited message on) at `write_premium` instead of
-/// reading them at 0.1×. `freed / growth` turns until the transcript is back where it was. Positive:
-/// the pass pays for itself. The model behind [`CompactionCandidates::mask_breakeven`].
-pub fn mask_net_saving(freed: u32, rewrite: u32, growth_per_turn: u32, write_premium: f64) -> f64 {
-    let turns = f64::from(freed) / f64::from(growth_per_turn.max(1));
-    0.1 * f64::from(freed) * turns - (write_premium - 0.1) * f64::from(rewrite)
 }
 
 /// The `tokens_before` an [`apply_summary`] summary message records in its leading
@@ -3672,11 +3637,10 @@ mod tests {
             Ok(CompactionCandidates {
                 state_template: true,
                 sees_tail: true,
-                ..Default::default()
             })
         );
         let all = CompactionCandidates::from_names(CompactionCandidates::NAMES).unwrap();
-        assert!(all.state_template && all.sees_tail && all.mask_breakeven);
+        assert!(all.state_template && all.sees_tail);
         let err = CompactionCandidates::from_names(&["sate"]).unwrap_err();
         assert!(err.contains("sate") && err.contains("state"), "{err}");
         // A promoted or deleted candidate's name is unknown now, not a silent no-op.
@@ -3687,6 +3651,7 @@ mod tests {
             "bash-edits",
             "carry-request",
             "mask-best-start",
+            "mask-breakeven",
         ] {
             assert!(CompactionCandidates::from_names(&[gone]).is_err(), "{gone}");
         }
@@ -3840,37 +3805,5 @@ mod tests {
             )]),
         ];
         assert_eq!(extract_bash_writes(&messages), ["a.txt", "c.py"]);
-    }
-
-    #[test]
-    fn growth_per_turn_averages_the_recent_turns() {
-        let mut messages = vec![Message::user("x".repeat(40_000))];
-        for i in 0..4 {
-            messages.push(Message::assistant(vec![ContentBlock::text(
-                "a".repeat(400),
-            )]));
-            messages.push(Message::user(format!("{i}{}", "u".repeat(3_599))));
-        }
-        // Each turn is ~1,000 tokens; the 10K-token task before the window is not growth.
-        assert_eq!(growth_per_turn(&messages, 2), 1_000);
-        assert_eq!(
-            growth_per_turn(&messages, 10),
-            1_000,
-            "fewer turns than asked: all of them"
-        );
-        assert_eq!(growth_per_turn(&[Message::user("x")], 10), 1);
-    }
-
-    #[test]
-    fn mask_net_saving_matches_the_eval_passes() {
-        // s500 pallets-parsers Sonnet, turn 75: 63,819 freed, 102,647 rewritten, refilled in ~43
-        // turns; it paid (45 turns followed). Turn 198: 33,302 freed, 148,989 rewritten, ~17 turns
-        // to refill; it did not (19 turns followed, break-even 51).
-        assert!(mask_net_saving(63_819, 102_647, 63_819 / 43, 1.25) > 0.0);
-        assert!(mask_net_saving(33_302, 148_989, 33_302 / 17, 1.25) < 0.0);
-        // The 1-hour TTL's 2× write moves the line: 15 turns of 0.1 × 30K saved (45K) pays for a 30K
-        // rewrite at 1.25× (34.5K extra) but not at 2× (57K).
-        assert!(mask_net_saving(30_000, 30_000, 2_000, 1.25) > 0.0);
-        assert!(mask_net_saving(30_000, 30_000, 2_000, 2.0) < 0.0);
     }
 }
