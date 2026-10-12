@@ -509,6 +509,9 @@ pub(crate) fn is_writable(path: &str) -> bool {
 pub struct ToolConfig<'a> {
     /// `bash`'s default timeout, applied when the model omits `timeout_ms` (`--bash-timeout-ms`).
     pub bash_timeout_ms: Option<u64>,
+    /// `bash`'s experimental long-command behaviors (`--bash-idle-yield-secs`, `--bash-yield-secs`,
+    /// `--bash-timeout-guidance`). The default changes nothing.
+    pub bash_policy: bash::BashPolicy,
     /// Which shell `bash` runs commands through (`--bash-shell-path`). Trusted as already validated at
     /// CLI-argument time rather than re-checked on every registry rebuild (`set_model` rebuilds).
     pub bash_shell_path: Option<&'a str>,
@@ -701,7 +704,15 @@ pub fn default_registry_with_config(cfg: &ToolConfig<'_>) -> ToolRegistry {
     if let Some(prefix) = cfg.bash_command_prefix {
         bash = bash.with_command_prefix(prefix);
     }
-    reg.register(Arc::new(bash));
+    if cfg.bash_policy != bash::BashPolicy::default() {
+        bash = bash.with_policy(cfg.bash_policy);
+    }
+    let bash = Arc::new(bash);
+    reg.register(bash.clone());
+    // Over the same instance, so `bash_job` sees the jobs this `bash` parks.
+    if bash.detaches() {
+        reg.register(Arc::new(bash::BashJob::new(bash)));
+    }
     // Stateless: it validates and echoes the model's own full-replace list. See `todo`'s module doc for
     // why it holds nothing across calls (this registry is rebuilt on every `set_model`).
     reg.register(Arc::new(todo::Todo::new()));

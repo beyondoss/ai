@@ -85,6 +85,9 @@ pub type TransportFactory =
 #[derive(Clone, Default)]
 pub struct ChildToolConfig {
     pub bash_timeout_ms: Option<u64>,
+    /// The parent's [`crate::tools::bash::BashPolicy`], so a child's `bash` handles a hung command
+    /// the same way.
+    pub bash_policy: crate::tools::bash::BashPolicy,
     pub bash_shell_path: Option<String>,
     pub bash_command_prefix: Option<String>,
     /// The parent's probed remote shell (`bash` or `sh`), inherited so a child's `bash` asks the
@@ -1046,6 +1049,7 @@ impl Subagent {
         );
         let mut registry = super::default_registry_with_config(&super::ToolConfig {
             bash_timeout_ms: self.ctx.tool_cfg.bash_timeout_ms,
+            bash_policy: self.ctx.tool_cfg.bash_policy,
             bash_shell_path: self.ctx.tool_cfg.bash_shell_path.as_deref(),
             bash_command_prefix: self.ctx.tool_cfg.bash_command_prefix.as_deref(),
             remote_shell: self.ctx.tool_cfg.remote_shell,

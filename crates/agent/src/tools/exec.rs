@@ -87,6 +87,10 @@ pub fn signal_name(signal: i32) -> Option<&'static str> {
 /// `Send + Sync` because stdout and stderr are drained on separate concurrent tasks.
 pub type ChunkSink<'a> = &'a (dyn Fn(&[u8]) + Send + Sync);
 
+/// Told the spawned command's process-group id (its pid: the command leads its own group) once it
+/// starts — see [`CommandRunner::run_streaming_tracked`].
+pub type SpawnSink<'a> = &'a (dyn Fn(u32) + Send + Sync);
+
 /// Runs an external command. Implemented by [`RealRunner`] (production) and by test doubles that
 /// capture the invocation.
 #[async_trait]
@@ -117,6 +121,26 @@ pub trait CommandRunner: Send + Sync {
     ) -> std::io::Result<ExecResult> {
         let _ = on_chunk;
         self.run(program, args, cwd, timeout).await
+    }
+
+    /// Like [`run_streaming`](CommandRunner::run_streaming), but also reports the spawned command's
+    /// process-group id to `on_spawn` the moment it starts — for a caller that keeps the command
+    /// running past its own return (`bash`'s detached jobs) and so must be able to kill the group
+    /// itself, including from the exit path where no future is left to drop. Defaults to plain
+    /// `run_streaming`, never calling `on_spawn`: a runner with no local process (a remote endpoint)
+    /// has no group this host could signal.
+    async fn run_streaming_tracked(
+        &self,
+        program: &str,
+        args: &[String],
+        cwd: Option<&str>,
+        timeout: Duration,
+        on_chunk: ChunkSink<'_>,
+        on_spawn: SpawnSink<'_>,
+    ) -> std::io::Result<ExecResult> {
+        let _ = on_spawn;
+        self.run_streaming(program, args, cwd, timeout, on_chunk)
+            .await
     }
 
     /// Like [`run`](CommandRunner::run), but with `stdin` written to the command's standard input and
@@ -154,6 +178,9 @@ impl RealRunner {
     /// Shared spawn/capture body. `on_chunk`, when present, is called with each stdout/stderr chunk as
     /// it streams (live progress); `run`, `run_streaming` and `run_with_stdin` all funnel through here.
     /// `stdin` is `None` for everything a model runs — see the `.stdin(..)` comment below.
+    /// `on_spawn`, when present, is told the new process group's id (see
+    /// [`CommandRunner::run_streaming_tracked`]).
+    #[allow(clippy::too_many_arguments)]
     async fn exec(
         &self,
         program: &str,
@@ -162,6 +189,7 @@ impl RealRunner {
         timeout: Duration,
         on_chunk: Option<ChunkSink<'_>>,
         stdin: Option<&[u8]>,
+        on_spawn: Option<SpawnSink<'_>>,
     ) -> std::io::Result<ExecResult> {
         // No `PATH` manipulation here — `Command` inherits the parent process's environment
         // (including `PATH`) as-is. Pi-parity note: this is a deliberate, documented DIVERGENCE, not
@@ -204,6 +232,9 @@ impl RealRunner {
         // actually exited on its own; still armed on both the timeout branch and an external drop, so
         // either one reaches the whole process group.
         let mut guard = GroupKillGuard { pid: child.id() };
+        if let (Some(report), Some(pid)) = (on_spawn, child.id()) {
+            report(pid);
+        }
         // Streaming (`bash`'s live path) hands every chunk straight to `on_chunk`'s sink, then ignores
         // the `stdout`/`stderr`/`truncated` fields entirely (see the `Ok` arm's comment and `bash.rs`).
         // So when streaming we skip the ≤256 KiB head/tail `Capture` *and* the final `from_utf8_lossy`
@@ -427,7 +458,8 @@ impl CommandRunner for RealRunner {
         cwd: Option<&str>,
         timeout: Duration,
     ) -> std::io::Result<ExecResult> {
-        self.exec(program, args, cwd, timeout, None, None).await
+        self.exec(program, args, cwd, timeout, None, None, None)
+            .await
     }
 
     async fn run_streaming(
@@ -438,8 +470,29 @@ impl CommandRunner for RealRunner {
         timeout: Duration,
         on_chunk: ChunkSink<'_>,
     ) -> std::io::Result<ExecResult> {
-        self.exec(program, args, cwd, timeout, Some(on_chunk), None)
+        self.exec(program, args, cwd, timeout, Some(on_chunk), None, None)
             .await
+    }
+
+    async fn run_streaming_tracked(
+        &self,
+        program: &str,
+        args: &[String],
+        cwd: Option<&str>,
+        timeout: Duration,
+        on_chunk: ChunkSink<'_>,
+        on_spawn: SpawnSink<'_>,
+    ) -> std::io::Result<ExecResult> {
+        self.exec(
+            program,
+            args,
+            cwd,
+            timeout,
+            Some(on_chunk),
+            None,
+            Some(on_spawn),
+        )
+        .await
     }
 
     async fn run_with_stdin(
@@ -450,7 +503,7 @@ impl CommandRunner for RealRunner {
         timeout: Duration,
         stdin: &[u8],
     ) -> std::io::Result<ExecResult> {
-        self.exec(program, args, cwd, timeout, None, Some(stdin))
+        self.exec(program, args, cwd, timeout, None, Some(stdin), None)
             .await
     }
 }
