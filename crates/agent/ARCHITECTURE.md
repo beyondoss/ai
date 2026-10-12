@@ -1722,15 +1722,18 @@ sent under one `path`) and **not unique** (25.9%). Two changes follow, both defa
   `path`, which may be omitted when every entry names its own. The call is split by file (two
   spellings of one file — `a.py`, `./a.py`, a symlink — are one file, keyed by `write_key`), and every
   file is stat'd, read and planned before **any** is written: one bad entry anywhere writes nothing,
-  and the error lists each failing file plus the files that were valid but not written. Writes then
-  go in call order under one dispatch lock over every file (`Tool::write_targets`, below); the only
-  way to land part of a call is the disk changing between plan and write, and that result names which
-  files landed and which did not. A single-file call reads and behaves exactly as before. Replayed
-  through the real tool against the 174 remaining Luna@main errors, giving each wrong-file entry the
-  one file that holds its text as its `path` rescues 32 calls (18.4%), with no apply anywhere the
-  model did not name — the tool never routes on its own. The analysis had estimated 43 (24.7%) by
-  checking only that the text _exists_ in the other file; on the real tool 8 of those entries are not
-  unique there, 3 are already applied there, and 4 calls still overlap in their own file.
+  and the error lists each failing file plus the files that were valid but not written. A file whose
+  entries all match but replace text with itself is skipped (and named in the result) when another
+  file changes — Luna pads batches with `old == new` entries, and failing a whole atomic call over a
+  padded file lost real edits in the first A/B attempt; a call that changes no file still errors.
+  Writes then go in call order under one dispatch lock over every file (`Tool::write_targets`,
+  below); the only way to land part of a call is the disk changing between plan and write, and that
+  result names which files landed and which did not. A single-file call reads and behaves exactly as
+  before. Replayed through the real tool against the 174 remaining Luna@main errors, giving each
+  wrong-file entry the one file that holds its text as its `path` rescues 35 calls (20.1%), with no
+  apply anywhere the model did not name — the tool never routes on its own. The analysis had
+  estimated 43 (24.7%) by checking only that the text _exists_ in the other file; on the real tool 8
+  of those entries are not unique there and 4 calls still overlap in their own file.
 - **A failed match explains itself, and never applies anything new.** "Not found" names the other
   file the exact text is in — another file of the same call, or one of the twelve files `read`,
   `write` or `edit` most recently touched (`tools::TouchedFiles`, registry-scoped: a `set_model`

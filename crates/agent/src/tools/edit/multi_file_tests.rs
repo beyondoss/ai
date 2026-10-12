@@ -409,3 +409,58 @@ fn parse_edits_carries_each_entrys_path() {
     let paths: Vec<Option<&str>> = parsed.iter().map(|e| e.path.as_deref()).collect();
     assert_eq!(paths, vec![Some("b.py"), None]);
 }
+
+#[tokio::test]
+async fn a_file_padded_only_with_no_op_entries_is_skipped_not_fatal() {
+    // Luna pads a batch with `old == new` entries. A file that only gets those must not sink the
+    // files that really change; the result says it was left alone.
+    let dir = files(&[("a.py", "alpha\n"), ("b.py", "beta\n")]);
+    let out = Edit::new(dir.path())
+        .run(json!({ "path": "", "edits": [
+            { "path": "a.py", "old_string": "alpha", "new_string": "ALPHA" },
+            { "path": "b.py", "old_string": "beta", "new_string": "beta" },
+        ]}))
+        .await
+        .unwrap();
+    assert_eq!(read(&dir, "a.py"), "ALPHA\n");
+    assert_eq!(read(&dir, "b.py"), "beta\n");
+    let b = dir.path().join("b.py");
+    assert!(
+        out.text.ends_with(&format!(
+            "\nleft {} as it was: its edits replace text with itself",
+            b.display()
+        )),
+        "{}",
+        out.text
+    );
+}
+
+#[tokio::test]
+async fn a_multi_file_call_that_changes_nothing_still_errors() {
+    let dir = files(&[("a.py", "alpha\n"), ("b.py", "beta\n")]);
+    let msg = message(
+        Edit::new(dir.path())
+            .run(json!({ "path": "a.py", "edits": [
+                { "old_string": "alpha", "new_string": "alpha" },
+                { "path": "b.py", "old_string": "beta", "new_string": "beta" },
+            ]}))
+            .await,
+    );
+    assert!(msg.contains("edit made no changes to"), "{msg}");
+}
+
+#[tokio::test]
+async fn a_no_op_file_does_not_excuse_a_failing_one() {
+    let dir = files(&[("a.py", "alpha\n"), ("b.py", "beta\n"), ("c.py", "gamma\n")]);
+    let msg = message(
+        Edit::new(dir.path())
+            .run(json!({ "path": "a.py", "edits": [
+                { "old_string": "alpha", "new_string": "ALPHA" },
+                { "path": "b.py", "old_string": "beta", "new_string": "beta" },
+                { "path": "c.py", "old_string": "nope", "new_string": "x" },
+            ]}))
+            .await,
+    );
+    assert!(msg.contains("not found in edits[2]"), "{msg}");
+    assert_eq!(read(&dir, "a.py"), "alpha\n");
+}

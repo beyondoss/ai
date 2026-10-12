@@ -159,11 +159,14 @@ struct FileEdits {
 
 /// Why a file's edits could not be planned. `missing` is the (LF) `old_string` that matched nothing,
 /// so the caller can look for it in the call's other files and the touched ones; `hint` is the
-/// in-file diagnosis to show when it is found nowhere else.
+/// in-file diagnosis to show when it is found nowhere else. `unchanged` marks a file whose edits all
+/// matched but replace text with itself — fatal for a call on its own, skipped within a multi-file
+/// call that changes some other file.
 struct PlanError {
     err: ToolError,
     missing: Option<String>,
     hint: String,
+    unchanged: bool,
 }
 
 impl From<ToolError> for PlanError {
@@ -172,6 +175,7 @@ impl From<ToolError> for PlanError {
             err,
             missing: None,
             hint: String::new(),
+            unchanged: false,
         }
     }
 }
@@ -214,6 +218,20 @@ impl Edit {
         let mut plans = Vec::with_capacity(files.len());
         for file in files {
             plans.push(self.plan_file(file, replace_all, total_edits, multi).await);
+        }
+        // A call that changes nothing is an error, as it always was; one file of a multi-file call
+        // that changes nothing is not. Models that fill every property pad a batch with `old == new`
+        // entries, and failing the whole atomic call over a file they only padded would turn harmless
+        // filler into a lost batch. Such a file is skipped, and the result says so.
+        let mut unchanged: Vec<String> = Vec::new();
+        if multi && plans.iter().any(|p| p.result.is_ok()) {
+            plans.retain(|p| match &p.result {
+                Err(e) if e.unchanged => {
+                    unchanged.push(p.path.clone());
+                    false
+                }
+                _ => true,
+            });
         }
         if plans.iter().any(|p| p.result.is_err()) {
             return Err(self.explain_failure(plans).await);
@@ -282,7 +300,14 @@ impl Edit {
             .collect::<Vec<_>>()
             .join("\n");
         let Some((path, err, rest)) = failed else {
-            return Ok(done.into());
+            if unchanged.is_empty() {
+                return Ok(done.into());
+            }
+            return Ok(format!(
+                "{done}\nleft {} as it was: its edits replace text with itself",
+                unchanged.join(", ")
+            )
+            .into());
         };
         let why = match err {
             None => format!(
@@ -692,7 +717,10 @@ fn plan_edits(
     out.push_str(&body[orig(cursor)..]);
 
     if out == body {
-        return Err(ToolError::InvalidInput(format!("edit made no changes to {path}")).into());
+        return Err(PlanError {
+            unchanged: true,
+            ..ToolError::InvalidInput(format!("edit made no changes to {path}")).into()
+        });
     }
 
     let restored = if had_bom {
@@ -856,6 +884,7 @@ fn miss_error(
             )),
             missing: Some(old.to_string()),
             hint: cap(not_found_hint(working, old, new)),
+            unchanged: false,
         },
     }
 }
