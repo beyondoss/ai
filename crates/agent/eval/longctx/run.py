@@ -474,7 +474,10 @@ def run_one(binary: Path, task: str, model: str, arm: str, attempt: int, cap_usd
         env["AI_AGENT_COMPACT_AT"] = str(trigger)
     elif arm == "default":
         env["AI_AGENT_COMPACT_AT"] = "0"
-    cmd.append(prompt)
+    # The prompt goes in on stdin, not argv. It names the test command ("python -m pytest tests"),
+    # so a model that cleans up with `pkill -f pytest` would match the agent's own argv and kill it.
+    # A live probe saw exactly that. `run` reads piped stdin as the first message, trimmed, so the
+    # model sees the same text either way.
     cwd = tree
     if repos:
         cmd = sandbox.argv(tasks.view(list(inside.items()), binary=binary), sandbox.WS, cmd)
@@ -485,8 +488,10 @@ def run_one(binary: Path, task: str, model: str, arm: str, attempt: int, cap_usd
     t0 = time.monotonic()
     killed = None
     with open(d / "events.jsonl", "w") as evf, open(d / "stderr.txt", "w") as errf:
-        p = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=errf, text=True,
-                             start_new_session=True)
+        p = subprocess.Popen(cmd, cwd=cwd, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                             stderr=errf, text=True, start_new_session=True)
+        p.stdin.write(prompt)  # a few KB: fits the pipe buffer, so this never waits on the agent
+        p.stdin.close()
 
         def kill(why: str) -> None:
             nonlocal killed
