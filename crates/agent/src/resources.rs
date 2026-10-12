@@ -52,7 +52,9 @@ pub fn default_system_prompt_with(
     extra_guidelines: &[String],
     tuning: &crate::tools::ToolTuning,
 ) -> String {
-    let pytest_guideline = tuning.test_guideline == crate::tools::tuning::TestGuideline::Pytest;
+    use crate::tools::tuning::{TestGuideline, ToolGuidelines};
+    let pytest_guideline = tuning.test_guideline == TestGuideline::Pytest;
+    let tool_guidelines = tuning.tool_guidelines;
     let defs = registry.definitions();
     // Whether `edit` takes an `edits[]` array (the default and `edit-schema=edits`) or one
     // old_string/new_string with a separate `multi_edit` (`edit-schema=split`) — read off the schema
@@ -71,9 +73,18 @@ pub fn default_system_prompt_with(
             guidelines.push(g);
         }
     };
+    // The content-search tool: `grep`, or the merged `search` under `search-tool=merged`.
+    let search_tool = if has("grep") {
+        Some("grep")
+    } else if has(crate::tools::search::NAME) {
+        Some(crate::tools::search::NAME)
+    } else {
+        None
+    };
     // Matches pi's own conditional exactly: when `bash` is the only exploration tool registered (none
     // of `grep`/`find`/`ls`), the model needs to be told it's the fallback for those operations too.
-    if has("bash") && !has("grep") && !has("find") && !has("ls") {
+    if has("bash") && !has("grep") && !has("find") && !has("ls") && !has(crate::tools::search::NAME)
+    {
         add(
             "Use bash for file operations like ls, rg, find".to_string(),
             &mut guidelines,
@@ -89,19 +100,63 @@ pub fn default_system_prompt_with(
     // bare "pipe head": Kimi generalized that to `pip install | tail`, which hides exit status.
     // Only fires when all three tools are actually registered: a read-only child must not be told
     // to bash grep/cat.
-    if has("grep") && has("read") && has("bash") {
-        // Under `test-guideline=pytest` tests get their own bullet below, so this one keeps only the
-        // install half of its pipe rule.
-        let piped = if pytest_guideline {
-            "installs"
-        } else {
-            "installs or tests"
-        };
+    //
+    // Under `test-guideline=pytest` tests get their own bullet below, so the pipe rule keeps only its
+    // install half.
+    let piped = if pytest_guideline {
+        "installs"
+    } else {
+        "installs or tests"
+    };
+    let prefer = tool_guidelines == ToolGuidelines::Default
+        && has("read")
+        && has("bash")
+        && search_tool.is_some();
+    if let Some(search) = search_tool.filter(|_| prefer) {
         add(
             format!(
-                "Prefer grep/read over bash for search and file contents. Do not `bash grep`/`rg`/`cat`/`sed`; \
+                "Prefer {search}/read over bash for search and file contents. Do not `bash grep`/`rg`/`cat`/`sed`; \
                  if you must sample via bash, `| head` that grep/cat/ls only — never `| head`/`| tail` \
                  {piped} (hides exit status)."
+            ),
+            &mut guidelines,
+            &mut seen,
+        );
+    }
+    // `tool-guidelines=neutral`: no preference between the tools and bash, only the fact that makes
+    // bounding output the model's job — bash keeps the tail. Claude ignored the preference anyway
+    // (Sonnet: 0% grep/read on code tasks); whether GPT's ~100% tool use depends on it is the question.
+    if tool_guidelines == ToolGuidelines::Neutral && has("bash") {
+        let tools = match (search_tool, has("read")) {
+            (Some(search), true) => format!("the {search}/read tools"),
+            (Some(search), false) => format!("the {search} tool"),
+            (None, true) => "the read tool".to_string(),
+            (None, false) => String::new(),
+        };
+        if !tools.is_empty() {
+            add(
+                format!(
+                    "Search and read with {tools} or with bash, whichever fits. Bound what you print: \
+                     bash keeps only the last {} of output, so `| head` a broad grep/cat/ls; read \
+                     paginates from the start.",
+                    crate::tools::output::format_size(tuning.bash.max_bytes as u64)
+                ),
+                &mut guidelines,
+                &mut seen,
+            );
+        }
+    }
+    // The pipe rule is about `bash`, not about grep: when the bullet above that carries it does not
+    // fire (grep excluded, or a non-default `tool-guidelines`), it stands alone rather than vanishing.
+    if has("bash") && !prefer {
+        add(
+            format!(
+                "Never pipe {} through `| head`/`| tail`; it hides the exit status.",
+                if pytest_guideline {
+                    "installs"
+                } else {
+                    "installs or test runs"
+                }
             ),
             &mut guidelines,
             &mut seen,
@@ -131,7 +186,7 @@ pub fn default_system_prompt_with(
         // Pi's own wording is just the first sentence. The second is ours: GLM-5.3 still
         // `bash cat`'d whole logs through the 50KB tail-truncated cap. Only mention bash
         // when the tool is actually registered — a read-only child must not be told about it.
-        let read_g = if has("bash") {
+        let read_g = if has("bash") && tool_guidelines == ToolGuidelines::Default {
             "Use read to examine files instead of cat or sed. Never bash-cat; read paginates from \
              the start, bash truncates from the tail."
         } else {
@@ -1164,6 +1219,102 @@ mod tests {
         assert_eq!(
             default_system_prompt_with(&reg, &[], &crate::tools::ToolTuning::default()),
             default_system_prompt(&reg, &[])
+        );
+    }
+
+    fn tuned(entries: &[&str]) -> crate::tools::ToolTuning {
+        crate::tools::ToolTuning::parse(entries).unwrap()
+    }
+
+    fn tuned_registry(t: crate::tools::ToolTuning) -> agent_core::ToolRegistry {
+        let mut reg = crate::tools::default_registry_with_config(&crate::tools::ToolConfig {
+            tuning: t,
+            ..crate::tools::ToolConfig::new()
+        });
+        crate::tools::apply_filter(&mut reg, None, None, false);
+        reg
+    }
+
+    #[test]
+    fn the_test_pipe_rule_survives_excluding_grep_find_and_ls() {
+        // The rule lived inside the grep/read bullet, so `--exclude-tools grep,find,ls` (the per-vendor
+        // tool-set arm) silently dropped it. It is about bash, so it now stands alone.
+        let mut reg = crate::tools::default_registry();
+        let excluded: Vec<String> = ["grep", "find", "ls"].map(String::from).to_vec();
+        crate::tools::apply_filter(&mut reg, None, Some(&excluded), false);
+        let prompt = default_system_prompt(&reg, &[]);
+        assert!(!prompt.contains("Prefer grep/read"), "got: {prompt}");
+        assert!(
+            prompt.contains("Never pipe installs or test runs through `| head`/`| tail`"),
+            "got: {prompt}"
+        );
+        assert!(prompt.contains("Use bash for file operations like ls, rg, find"));
+    }
+
+    #[test]
+    fn tool_guidelines_neutral_and_none_drop_the_preference_but_keep_the_pipe_rule() {
+        let t = tuned(&["tool-guidelines=neutral"]);
+        let prompt = default_system_prompt_with(&tuned_registry(t), &[], &t);
+        assert!(!prompt.contains("Prefer grep/read"), "got: {prompt}");
+        assert!(!prompt.contains("Never bash-cat"), "got: {prompt}");
+        assert!(
+            prompt
+                .contains("Search and read with the grep/read tools or with bash, whichever fits."),
+            "got: {prompt}"
+        );
+        assert!(
+            prompt.contains("bash keeps only the last 50.0KB"),
+            "got: {prompt}"
+        );
+        assert!(
+            prompt.contains("Never pipe installs or test runs"),
+            "got: {prompt}"
+        );
+
+        // The cap it names is the one bash actually applies.
+        let t = tuned(&["tool-guidelines=neutral", "bash-max-bytes=16k"]);
+        let prompt = default_system_prompt_with(&tuned_registry(t), &[], &t);
+        assert!(
+            prompt.contains("bash keeps only the last 16.0KB"),
+            "got: {prompt}"
+        );
+
+        let t = tuned(&["tool-guidelines=none"]);
+        let prompt = default_system_prompt_with(&tuned_registry(t), &[], &t);
+        assert!(!prompt.contains("Prefer grep/read"), "got: {prompt}");
+        assert!(!prompt.contains("whichever fits"), "got: {prompt}");
+        assert!(!prompt.contains("Never bash-cat"), "got: {prompt}");
+        assert!(prompt.contains("Use read to examine files instead of cat or sed."));
+        assert!(
+            prompt.contains("Never pipe installs or test runs"),
+            "got: {prompt}"
+        );
+
+        // With the pytest test guideline the standalone rule keeps only installs.
+        let t = tuned(&["tool-guidelines=none", "test-guideline=pytest"]);
+        let prompt = default_system_prompt_with(&tuned_registry(t), &[], &t);
+        assert!(
+            prompt.contains("Never pipe installs through"),
+            "got: {prompt}"
+        );
+        assert!(prompt.contains("`-q --tb=short`"), "got: {prompt}");
+    }
+
+    #[test]
+    fn a_merged_search_tool_is_the_search_tool_the_guidelines_name() {
+        let t = tuned(&["search-tool=merged"]);
+        let prompt = default_system_prompt_with(&tuned_registry(t), &[], &t);
+        assert!(
+            prompt.contains("Prefer search/read over bash"),
+            "got: {prompt}"
+        );
+        assert!(
+            !prompt.contains("Use bash for file operations"),
+            "got: {prompt}"
+        );
+        assert!(
+            !prompt.contains("Never pipe installs or test runs"),
+            "got: {prompt}"
         );
     }
 

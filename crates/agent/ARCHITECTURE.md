@@ -958,7 +958,9 @@ The harness layers several capabilities over the bare tools + loop:
   prefers those over bash for search and file contents. Do not `bash grep`/`rg`/`cat`/`sed`; if you
   must sample via bash, `| head` that grep/cat/ls only — never `| head`/`| tail` installs or tests
   (hides exit status; unbounded grep/cat overflowed the ~50KB bash cap, and bash keeps the tail).
-  Use read instead of cat (read paginates from the start). The `todo` protocol in the system prompt says only what
+  When that bullet does not fire but `bash` is registered (e.g. `--exclude-tools grep`), the pipe rule
+  stands alone ("Never pipe installs or test runs through `| head`/`| tail`") instead of vanishing
+  with it. Use read instead of cat (read paginates from the start). The `todo` protocol in the system prompt says only what
   the tool can't: use it for multi-step work, and move an item as you start and finish it. Full
   replacement, one `in_progress`, the field tenses and "empty clears" live on the tool's description
   and schema, said once.
@@ -1744,6 +1746,24 @@ through `| head`/`| tail`, which the default guideline forbids without offering 
 | `bash-max-bytes`   | bytes or `Nk`, 1k–50k     | `bash`'s display cap (`OutputAccumulator::with_max_bytes`); the tail is kept, the rolling window scales with it, and the tool description states the new number. Global: it cuts every long command, not only tests.                                                                                                                                                                                                                                                                                             |
 | `bash-test-digest` | `off` (default), `pytest` | `tools/bash_output.rs`: a finished command whose (already tail-capped) output is over 16 KiB and carries a pytest banner (`FAILURES`/`ERRORS`, `short test summary info`, or the final counts line) is shown as the first 6 KiB of the FAILURES/ERRORS section, the summary block (4 KiB cap, with a count of what was dropped) and the counts line. The full output is always left readable: the digest forces the spill file even when the plain path would not have written one. Timeouts are never digested. |
 | `test-guideline`   | `default`, `pytest`       | `pytest` adds a bullet, gated on `bash` alone, naming `-q --tb=short`, `-x` and `-k`/node ids and saying to redirect to a file rather than pipe; the grep/read bullet then keeps only the install half of its pipe rule. Rendered by `resources::default_system_prompt_with`, which `run`, `serve` and subagents call with their tuning.                                                                                                                                                                         |
+
+#### Tool choice: search tools and the tools-over-bash guidelines
+
+The evidence: tool preference splits by vendor. On code tasks GPT uses the dedicated tools for ~100%
+of searches, views and listings; Sonnet for 0%, Opus 5% of searches, Haiku 15%. No Claude model
+called `ls`, and only Haiku `find`. Yet `grep`/`find`/`ls` cost ~981 Claude tokens of schema on every
+request, and the "prefer the tools" bullet Claude ignores is in every prompt. Within task × model,
+exploration-tool share showed no correlation with fixed fraction (ρ −0.10, n = 65; low power).
+
+| Key               | Values                         | Effect                                                                                                                                                                                                                                                                                                       |
+| ----------------- | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `search-tool`     | `separate` (default), `merged` | `merged` advertises one `search` (`tools/search.rs`) in place of `grep`/`find`/`ls`: with `pattern` it is `grep`, with only `glob` it is `find`, with neither it is `ls` — a router over the same three tools, so results and errors are theirs byte for byte. Listed with the read-only tools for approval. |
+| `tool-guidelines` | `default`, `neutral`, `none`   | `neutral` replaces "Prefer grep/read…" and "Never bash-cat…" with one bullet: use the tools or bash, whichever fits, but bound output because bash keeps only the last N (the real `bash-max-bytes`). `none` drops both. Either way the pipe rule stays as its own bash-gated bullet.                        |
+
+A per-vendor tool set (no `grep`/`find`/`ls` for Claude) needs no knob for an eval: `--exclude-tools
+grep,find,ls` on the Claude arms is exactly that, and the prompt follows the registry. Making it a
+default would need the tool set to follow `set_model`, and `serve`'s default system prompt is rendered
+once at startup from a model-agnostic registry, so that change is deferred until an arm wins.
 
 ### Search tools — gitignore-aware tree walks, deterministic output
 
