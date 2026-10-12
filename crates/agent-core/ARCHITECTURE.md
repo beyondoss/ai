@@ -403,6 +403,27 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
     Sonnet 5 rejects mid-conversation system messages with a 400) instead of failing the compaction.
     Assistant prefill, the remaining idea, is a 400 on Haiku 5.5 and every 4.6+ Claude model.
 
+  Three more answer what the summaries said, across all 87 eval compactions:
+  - `state_template` (`state`): every summary is one current-state document. A single-prompt
+    agentic run is one long turn and `find_cut` always leaves the prefix ending on a tool result, so
+    55 of 87 summaries took the split-turn path (51 opening "No prior history.") and each later round
+    reused the previous summary verbatim (`turn_start == 1`) and appended another section: 30 summaries
+    stack request sections, and re-split sizes grow 6.4K → 13K → 22.9K → 26.7K chars by round. Under
+    this candidate `compact` never splits; the re-render uses `STATE_INTRO` (or `STATE_UPDATE_INTRO`,
+    which rewrites the previous summary instead of appending to it), `STATE_RULES` (state as of the
+    newest messages, in-flight step included; one document; no pasted code; about 1,500 words; the
+    user credited only with the user's words) and `STATE_FORMAT` (the same headings, so `## Goal`
+    still marks a checkpoint); the cached call uses the same rules and format, with `STATE_FOLD_IN`.
+  - `sees_tail` (`tail`): the re-render also gets the kept suffix, read-only, in `<recent-context>`
+    (`TAIL_NOTE`), so its summary is current rather than as of the cut. A Haiku judge rated 93% of the
+    split-template summaries stale against the newest messages; the cached call, which sees the whole
+    conversation, 40%.
+  - `carry_requests` (`carry-request`): the user's own requests ride the deterministic carry
+    (`CompactionProvenance::user_requests`, `merge_user_requests`, `<user-requests>`), so no later round
+    has to re-infer them: 23 of 52 later-round summaries did ("The user's exact request is not visible
+    in this prefix…"). Each genuine user turn's text, deduped, capped at 4,000 chars; past four, the
+    first and the latest. Persisted on the compaction record like the rest of the provenance.
+
 - **The deterministic-carry channel** — `apply_summary` is deliberately destructive: it _replaces_
   `session.messages` with `[summary, …kept_suffix]`, and `SessionStore::open` reloads that
   post-compaction list, so anything living only inside a folded-away message is gone for good. A
@@ -424,7 +445,12 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
     This is why `tools::todo` holds no state of its own (it couldn't: its registry is rebuilt on every
     `set_model`), and it is what `serve`'s `get_todos` falls back to once the `tool_use` block that
     carried the list has been compacted away.
+  - **The user's requests**, under the `carry-request` candidate only (see "Candidates under
+    evaluation") — `merge_user_requests`, rendered by `format_user_requests` as `<user-requests>`.
 
+  `compact` first strips any blocks the model echoed at the end of its own reply (`strip_echoed_carry`):
+  the cached call sees the previous summary, blocks included, and a model that mirrors its shape ends
+  the same way — live on Haiku 5.5 they doubled every round (1, 2, 2, 4, 4 over five) before this.
   `previous_summary` strips these blocks back off the body before it is fed forward — both into the
   incremental summarization prompt (or the model echoes a stale copy into its prose alongside the fresh
   ones) and into `compact`'s own `turn_start == 1` verbatim-reuse path (or every split-turn round appends

@@ -98,6 +98,59 @@ pub struct CompactionProvenance {
     /// it becomes a guaranteed, zero-effort "here is what you recorded, recall the relevant ones" pointer.
     #[serde(default)]
     pub memory_notes: Vec<String>,
+    /// The user's own requests from compacted prefixes, verbatim — each genuine user turn's text,
+    /// in order, deduped, each capped at [`USER_REQUEST_MAX_CHARS`]; past [`USER_REQUESTS_KEPT`] the
+    /// first and the latest are kept. Filled only under [`CompactionCandidates::carry_requests`]
+    /// (see [`merge_user_requests`]), rendered by [`format_user_requests`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub user_requests: Vec<String>,
+}
+
+/// A carried user request longer than this many characters is truncated (with a marker).
+pub const USER_REQUEST_MAX_CHARS: usize = 4_000;
+
+/// At most this many user requests are carried: the first (the task as originally set) and the
+/// latest ones.
+pub const USER_REQUESTS_KEPT: usize = 4;
+
+/// `previous`'s carried requests plus every genuine user turn in `messages` (text only — the words
+/// the user typed or a steer injected, not tool results or a prior summary), deduped, capped per
+/// request at [`USER_REQUEST_MAX_CHARS`] and overall at [`USER_REQUESTS_KEPT`]: the first plus the
+/// latest. `messages` is the round's prefix; the leading summary message is skipped by
+/// `is_turn_start`.
+pub fn merge_user_requests(previous: &[String], messages: &[Message]) -> Vec<String> {
+    let mut out = previous.to_vec();
+    for m in messages.iter().filter(|m| is_turn_start(m)) {
+        let text: String = m
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Text { text, .. } => Some(&**text),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let text = truncate_chars(text.trim(), USER_REQUEST_MAX_CHARS);
+        if !text.is_empty() && !out.contains(&text) {
+            out.push(text);
+        }
+    }
+    if out.len() > USER_REQUESTS_KEPT {
+        out.drain(1..out.len() + 1 - USER_REQUESTS_KEPT);
+    }
+    out
+}
+
+/// Render the carried user requests as a `<user-requests>` block appended to a summary — the same
+/// deterministic-carry contract as [`format_file_operations`]. `""` when there are none.
+pub fn format_user_requests(requests: &[String]) -> String {
+    if requests.is_empty() {
+        return String::new();
+    }
+    format!(
+        "\n\n<user-requests>\nThe user's own words, verbatim (the first request, then the latest):\n{}\n</user-requests>",
+        requests.join("\n---\n")
+    )
 }
 
 /// Fold `previous`'s provenance forward with whatever the current round's prefix (`messages`) adds, and
@@ -142,6 +195,8 @@ pub fn merge_provenance(
         // must win over `previous`, or a cleared plan would silently reappear at the next compaction.
         todos: extract_todos(messages).or_else(|| previous.todos.clone()),
         memory_notes,
+        // Carried forward as is; `Agent::compact` adds this round's requests under `carry_requests`.
+        user_requests: previous.user_requests.clone(),
     }
 }
 
@@ -219,11 +274,44 @@ pub struct CompactionCandidates {
     /// "I'll keep working instead") falls back to the re-render, as a tool call or blank reply already
     /// does; so does a cached call that errors. A safety net that holds whatever the wording.
     pub check_summary: bool,
+    /// Every summary is one current-state document: the [`STATE_FORMAT`] template on both paths, with
+    /// [`STATE_RULES`] (state as of the newest messages, in-flight step included; one document, never
+    /// appended to; no pasted code; about 1,500 words; the user credited only with the user's words),
+    /// a previous summary rewritten rather than reused, and no split-turn decomposition.
+    ///
+    /// Why: a single-prompt agentic run is one long "turn", and `find_cut` always leaves the prefix
+    /// ending on a tool result, so 55 of 87 eval summaries took the split-turn path (51 opening "No
+    /// prior history.") and the structured template and [`UPDATE_INSTRUCTION`] almost never ran. Each
+    /// later round then reused the previous summary verbatim (`turn_start == 1`) and appended another
+    /// split-turn section: 30 summaries stack several request sections, re-split sizes grow
+    /// 6.4K → 13K → 22.9K → 26.7K chars by round, and the largest is 49K chars with 4 sections (Sol,
+    /// 98 code fences across its 16). The judge rated 93% of split-template summaries stale against the
+    /// newest messages, 41% of structured ones.
+    pub state_template: bool,
+    /// The re-render also shows the summarizer the kept suffix, read-only, in `<recent-context>`, so
+    /// its summary is current as of the newest messages rather than as of the cut. The cached call
+    /// already sees it (it sends the whole conversation): judged stale 40% of the time against 93%
+    /// for the re-render's split template, which sees only the prefix.
+    pub sees_tail: bool,
+    /// The user's own requests ride the deterministic carry, verbatim (`<user-requests>`, see
+    /// [`CompactionProvenance::user_requests`]), outside anything a summarizer can paraphrase.
+    ///
+    /// Why: after the first round, 23 of 52 eval summaries re-inferred the request ("The user's
+    /// exact request is not visible in this prefix. From the work, the task is to…"), and only 34–40%
+    /// kept the "don't edit tests" constraint.
+    pub carry_requests: bool,
 }
 
 impl CompactionCandidates {
     /// Every candidate's CLI name, in the order `--help` lists them.
-    pub const NAMES: &[&str] = &["system-role", "handoff", "check"];
+    pub const NAMES: &[&str] = &[
+        "system-role",
+        "handoff",
+        "check",
+        "state",
+        "tail",
+        "carry-request",
+    ];
 
     /// The candidates `names` turns on (the CLI's `--compaction-candidates`); an unknown name is an
     /// error naming the valid ones, so a typo in an eval arm fails the run instead of silently
@@ -235,6 +323,9 @@ impl CompactionCandidates {
                 "system-role" => c.instruction_as_system = true,
                 "handoff" => c.handoff_framing = true,
                 "check" => c.check_summary = true,
+                "state" => c.state_template = true,
+                "tail" => c.sees_tail = true,
+                "carry-request" => c.carry_requests = true,
                 "" => {}
                 other => {
                     return Err(format!(
@@ -434,6 +525,58 @@ suffix:\n\n## Original Request\n[What did the user ask for in this turn?]\n\n## 
 understand the retained recent work — copy exact file paths (with line numbers), literal values, \
 commands and their key outputs, and error messages verbatim]\n\nBe concise. Focus on what's needed to \
 understand the kept suffix.";
+
+/// [`CompactionCandidates::state_template`]'s opener for a summary with no previous one.
+pub const STATE_INTRO: &str = "The messages above are a conversation to summarize. Write a \
+checkpoint of it that the agent will continue the work from.\n\n";
+
+/// [`CompactionCandidates::state_template`]'s opener when a previous summary exists (the re-render's
+/// `<previous-summary>` + `<new-activity>` shape): rewrite, never append.
+pub const STATE_UPDATE_INTRO: &str = "The messages above are NEW conversation messages; the \
+checkpoint so far is in <previous-summary> tags. Rewrite both into ONE current checkpoint the agent \
+will continue the work from: a replacement for the previous summary, not an addition to it. Merge, \
+don't append: one Goal and one Progress section; move items from In Progress to Done as the new \
+messages completed them, drop what they made stale (old test counts, fixed errors, finished next \
+steps), and keep the user's Goal and Constraints word for word.\n\n";
+
+/// The cached call's equivalent of [`STATE_UPDATE_INTRO`], for a conversation that opens with a
+/// previous summary.
+pub const STATE_FOLD_IN: &str = "\n\nThe conversation opens with an earlier checkpoint (the message \
+starting \"[Earlier conversation compacted to save context]\"). Rewrite it and everything since into \
+ONE current checkpoint, a replacement rather than an addition: one Goal and one Progress section; move \
+items from In Progress to Done as they were completed, drop what newer messages made stale, and keep \
+the user's Goal and Constraints word for word.";
+
+/// The rules every [`CompactionCandidates::state_template`] summary is written under, one per eval
+/// finding: summaries that described the state at the cut rather than the newest step (judged stale
+/// in 74% of 87), stacked sections, pasted code (98 fences in 16 Sol summaries), and the agent's own
+/// decisions credited to "the user".
+pub const STATE_RULES: &str = "Rules:\n- Describe the state as of the NEWEST messages: what is done, \
+the step in flight right now (what the last messages were doing and what they showed), and what comes \
+next. The latest test results and errors replace older ones.\n- Write one document. Never paste file \
+contents, diffs or function bodies (they can be re-read from disk): name a function by its signature, \
+and quote a command, an error or a test count on one line. Use a code block only for a signature.\n- \
+Credit the user only with what the user's own messages say; decisions the assistant made are the \
+assistant's, under Key Decisions.\n- At most about 1,500 words. Spend them on specifics, copied \
+verbatim: file paths with line numbers, identifiers, exact values, commands and their key outputs, \
+error messages.\n\n";
+
+/// [`CompactionCandidates::state_template`]'s format: [`SUMMARY_INSTRUCTION`]'s headings (so
+/// [`checkpoint_body`] and a reader see the same shape), each asking for the current state.
+pub const STATE_FORMAT: &str = "Use this EXACT format:\n\n## Goal\n[The user's request, in their words \
+where possible, with every constraint they set.]\n\n## Constraints & Preferences\n- [Constraints and \
+preferences the user stated]\n- [Or \"(none)\"]\n\n## Progress\n### Done\n- [x] [Completed and \
+verified work]\n\n### In Progress\n- [ ] [The step in flight as of the newest messages: what it is \
+doing and what it last showed]\n\n### Blocked\n- [Issues preventing progress, if any]\n\n## Key \
+Decisions\n- **[Decision]** (user | assistant): [Brief rationale]\n\n## Next Steps\n1. [Ordered list of \
+what should happen next]\n\n## Critical Context\n- [Data, examples and references needed to continue: \
+exact values, commands and their key outputs, file:line references]\n- [Or \"(none)\"]";
+
+/// Appended to a re-render's instruction when it carries the kept suffix
+/// ([`CompactionCandidates::sees_tail`]).
+pub const TAIL_NOTE: &str = "\n\nThe <recent-context> messages come after the ones to summarize and \
+stay verbatim after your checkpoint. Do not summarize them; use them so the checkpoint is current: \
+work they show finished goes under Done, and the step they show in progress is the In Progress item.";
 
 /// Prefix marking a message as a compaction summary, so a later compaction recognizes it and updates
 /// it incrementally instead of re-summarizing it. Created by [`apply_summary`], detected by
@@ -997,12 +1140,22 @@ pub fn previous_summary(prefix: &[Message]) -> Option<&str> {
 
 /// The host-appended, deterministically-regenerated blocks a summary body carries at its tail, as
 /// `(open, close)` tag pairs. See [`format_file_operations`] / [`format_todo_list`].
-const CARRY_BLOCKS: [(&str, &str); 4] = [
+const CARRY_BLOCKS: [(&str, &str); 5] = [
+    ("<user-requests>", "</user-requests>"),
     ("<read-files>", "</read-files>"),
     ("<modified-files>", "</modified-files>"),
     ("<todo_list>", "</todo_list>"),
     ("<memory-notes>", "</memory-notes>"),
 ];
+
+/// A summarizing model's reply with any carry blocks it echoed at its end removed, so the host's
+/// fresh copies are the only ones. The cached call sees the previous summary, blocks and all, as the
+/// conversation's first message, and a model that writes its checkpoint in the same shape ends it the
+/// same way: measured live on Claude Haiku 5.5, the blocks doubled every round (1, 2, 2, 4, 4 over five
+/// rounds) before this. Only the tail is touched, as in [`previous_summary`].
+pub fn strip_echoed_carry(reply: &str) -> &str {
+    strip_carry_blocks(reply)
+}
 
 /// Strip every trailing [`CARRY_BLOCKS`] block from a summary body, leaving only the model's own prose.
 ///
@@ -1094,7 +1247,33 @@ pub fn summary_request(
     file_ops: &CompactionProvenance,
     custom_instructions: Option<&str>,
 ) -> ModelRequest {
+    summary_request_with(
+        model,
+        prefix,
+        &[],
+        max_tokens,
+        file_ops,
+        custom_instructions,
+        &CompactionCandidates::default(),
+    )
+}
+
+/// [`summary_request`] under the given candidates: [`CompactionCandidates::state_template`] swaps the
+/// template ([`STATE_INTRO`] or [`STATE_UPDATE_INTRO`], then [`STATE_RULES`] and [`STATE_FORMAT`],
+/// never the split-turn one), and a non-empty `tail` (the kept suffix, under
+/// [`CompactionCandidates::sees_tail`]) is rendered read-only in `<recent-context>` after the
+/// transcript, with [`TAIL_NOTE`] saying what it is for.
+pub fn summary_request_with(
+    model: &str,
+    prefix: &[Message],
+    tail: &[Message],
+    max_tokens: u32,
+    file_ops: &CompactionProvenance,
+    custom_instructions: Option<&str>,
+    candidates: &CompactionCandidates,
+) -> ModelRequest {
     let (read, modified) = (&file_ops.read_files, &file_ops.modified_files);
+    let state = candidates.state_template;
 
     let mut prompt = String::new();
     let instruction = match previous_summary(prefix) {
@@ -1105,7 +1284,11 @@ pub fn summary_request(
             prompt.push_str("\n</previous-summary>\n\n<new-activity>\n");
             prompt.push_str(&render_prefix(&prefix[1..]));
             prompt.push_str("</new-activity>\n\n");
-            UPDATE_INSTRUCTION
+            if state {
+                format!("{STATE_UPDATE_INTRO}{STATE_RULES}{STATE_FORMAT}")
+            } else {
+                UPDATE_INSTRUCTION.to_string()
+            }
         }
         None => {
             // Matches pi's own `generateSummary`/`generateTurnPrefixSummary`: the rendered transcript
@@ -1114,13 +1297,20 @@ pub fn summary_request(
             prompt.push_str("<conversation>\n");
             prompt.push_str(&render_prefix(prefix));
             prompt.push_str("\n</conversation>\n\n");
-            if is_split_turn(prefix) {
-                SPLIT_TURN_INSTRUCTION
+            if state {
+                format!("{STATE_INTRO}{STATE_RULES}{STATE_FORMAT}")
+            } else if is_split_turn(prefix) {
+                SPLIT_TURN_INSTRUCTION.to_string()
             } else {
-                SUMMARY_INSTRUCTION
+                SUMMARY_INSTRUCTION.to_string()
             }
         }
     };
+    if !tail.is_empty() {
+        prompt.push_str("<recent-context>\n");
+        prompt.push_str(&render_prefix(tail));
+        prompt.push_str("</recent-context>\n\n");
+    }
     if !read.is_empty() {
         prompt.push_str(&format!(
             "<read-files>\n{}\n</read-files>\n",
@@ -1133,7 +1323,10 @@ pub fn summary_request(
             modified.join("\n")
         ));
     }
-    prompt.push_str(instruction);
+    prompt.push_str(&instruction);
+    if !tail.is_empty() {
+        prompt.push_str(TAIL_NOTE);
+    }
     if let Some(custom) = custom_instructions {
         prompt.push_str("\n\nAdditional focus: ");
         prompt.push_str(custom);
@@ -1195,10 +1388,16 @@ pub fn conversation_summary_body(
     candidates: &CompactionCandidates,
 ) -> String {
     let mut out = String::new();
+    let state = candidates.state_template;
     if candidates.handoff_framing {
         out.push_str(HANDOFF_FRAMING);
-        let at = SUMMARY_INSTRUCTION.find(SUMMARY_FORMAT_START).unwrap_or(0);
-        out.push_str(&SUMMARY_INSTRUCTION[at..]);
+        if state {
+            out.push_str(STATE_RULES);
+            out.push_str(STATE_FORMAT);
+        } else {
+            let at = SUMMARY_INSTRUCTION.find(SUMMARY_FORMAT_START).unwrap_or(0);
+            out.push_str(&SUMMARY_INSTRUCTION[at..]);
+        }
     } else {
         out.push_str(
             "Stop working on the task now. Do not call any tools. This conversation is about to be \
@@ -1208,9 +1407,17 @@ pub fn conversation_summary_body(
         );
         out.push_str(SUMMARY_SYSTEM);
         out.push_str("\n\n");
-        out.push_str(SUMMARY_INSTRUCTION);
+        if state {
+            out.push_str(STATE_INTRO);
+            out.push_str(STATE_RULES);
+            out.push_str(STATE_FORMAT);
+        } else {
+            out.push_str(SUMMARY_INSTRUCTION);
+        }
     }
-    if previous_summary(messages).is_some() {
+    if state && previous_summary(messages).is_some() {
+        out.push_str(STATE_FOLD_IN);
+    } else if previous_summary(messages).is_some() {
         out.push_str(
             "\n\nThe conversation opens with an earlier checkpoint summary (the message starting \
              \"[Earlier conversation compacted to save context]\"). Fold it in: PRESERVE all of its \
@@ -2555,6 +2762,7 @@ mod tests {
             last_reason: Some(CompactionReason::Threshold),
             todos: None,
             memory_notes: vec![],
+            user_requests: vec![],
         };
         let messages = vec![Message::assistant(vec![ContentBlock::tool_use(
             "1",
@@ -3342,6 +3550,152 @@ mod tests {
         assert!(
             err.contains("sytem-role") && err.contains("system-role"),
             "{err}"
+        );
+    }
+
+    #[test]
+    fn summary_request_is_summary_request_with_no_candidates() {
+        let prefix = vec![
+            Message::user("the task"),
+            Message::assistant(vec![ContentBlock::tool_use(
+                "1",
+                "read",
+                json!({"path": "a"}),
+            )]),
+            Message::tool_result("1", "a", false),
+        ];
+        let ops = CompactionProvenance::default();
+        assert_eq!(
+            summary_request("m", &prefix, 100, &ops, Some("f")).messages,
+            summary_request_with(
+                "m",
+                &prefix,
+                &[],
+                100,
+                &ops,
+                Some("f"),
+                &CompactionCandidates::default()
+            )
+            .messages
+        );
+    }
+
+    #[test]
+    fn the_state_template_replaces_every_re_render_instruction() {
+        let state = CompactionCandidates {
+            state_template: true,
+            ..Default::default()
+        };
+        let ops = CompactionProvenance::default();
+        // A prefix ending mid-turn would get the split-turn template; the state template never does.
+        let split = vec![
+            Message::user("the task"),
+            Message::assistant(vec![ContentBlock::tool_use(
+                "1",
+                "read",
+                json!({"path": "a"}),
+            )]),
+            Message::tool_result("1", "a", false),
+        ];
+        assert!(is_split_turn(&split));
+        let text = |prefix: &[Message], tail: &[Message]| {
+            let req = summary_request_with("m", prefix, tail, 100, &ops, None, &state);
+            match &req.messages[0].content[0] {
+                ContentBlock::Text { text, .. } => text.to_string(),
+                _ => unreachable!(),
+            }
+        };
+        let fresh = text(&split, &[]);
+        assert!(fresh.ends_with(&format!("{STATE_INTRO}{STATE_RULES}{STATE_FORMAT}")));
+        assert!(!fresh.contains(SPLIT_TURN_INSTRUCTION) && !fresh.contains("<recent-context>"));
+        // With a previous summary: the rewrite-not-append opener.
+        let mut later = vec![Message::user(format!("{SUMMARY_MARKER}\n\n## Goal\nold"))];
+        later.extend_from_slice(&split[1..]);
+        let update = text(&later, &[]);
+        assert!(update.ends_with(&format!("{STATE_UPDATE_INTRO}{STATE_RULES}{STATE_FORMAT}")));
+        // A tail: rendered after the transcript, read-only, with the note saying so.
+        let tail = vec![Message::assistant(vec![ContentBlock::text("now testing")])];
+        let with_tail = text(&split, &tail);
+        assert!(with_tail.contains("<recent-context>\nAssistant: now testing\n</recent-context>"));
+        assert!(with_tail.ends_with(TAIL_NOTE));
+    }
+
+    #[test]
+    fn the_state_template_rides_the_cached_body_under_either_framing() {
+        let prior = vec![Message::user(format!("{SUMMARY_MARKER}\n\n## Goal\nold"))];
+        let ops = CompactionProvenance::default();
+        let legacy = conversation_summary_body(
+            &prior,
+            &ops,
+            None,
+            &CompactionCandidates {
+                state_template: true,
+                ..Default::default()
+            },
+        );
+        assert!(legacy.contains(SUMMARY_SYSTEM));
+        assert!(legacy.contains(&format!(
+            "{STATE_INTRO}{STATE_RULES}{STATE_FORMAT}{STATE_FOLD_IN}"
+        )));
+        assert!(!legacy.contains(SUMMARY_INSTRUCTION) && !legacy.contains("Fold it in: PRESERVE"));
+        let handoff = conversation_summary_body(
+            &prior,
+            &ops,
+            None,
+            &CompactionCandidates {
+                state_template: true,
+                handoff_framing: true,
+                ..Default::default()
+            },
+        );
+        assert!(handoff.starts_with(&format!("{HANDOFF_FRAMING}{STATE_RULES}{STATE_FORMAT}")));
+    }
+
+    #[test]
+    fn user_requests_are_the_users_own_turns_deduped_and_capped() {
+        let summary = Message::user(format!("{SUMMARY_MARKER}\n\nold"));
+        let messages = vec![
+            summary,
+            Message::user("first: fix the parser"),
+            Message::assistant(vec![ContentBlock::tool_use("1", "read", json!({}))]),
+            Message::tool_result("1", "the file", false),
+            Message::assistant(vec![ContentBlock::text("done?")]),
+            Message::user("first: fix the parser"),
+        ];
+        assert_eq!(
+            merge_user_requests(&[], &messages),
+            ["first: fix the parser"],
+            "the summary and tool results are not requests; a repeat is deduped"
+        );
+        let long = "y".repeat(USER_REQUEST_MAX_CHARS + 10);
+        let got = merge_user_requests(&[], &[Message::user(long)]);
+        assert!(
+            got[0].chars().count() < USER_REQUEST_MAX_CHARS + 50 && got[0].contains("truncated")
+        );
+        // Past the cap: the first request and the latest ones.
+        let previous: Vec<String> = (0..USER_REQUESTS_KEPT).map(|i| format!("r{i}")).collect();
+        let got = merge_user_requests(&previous, &[Message::user("newest")]);
+        assert_eq!(got.len(), USER_REQUESTS_KEPT);
+        assert_eq!(got.first().map(String::as_str), Some("r0"));
+        assert_eq!(got.last().map(String::as_str), Some("newest"));
+        assert!(!got.contains(&"r1".to_string()));
+    }
+
+    #[test]
+    fn the_user_requests_block_is_stripped_like_every_carry_block() {
+        let block = format_user_requests(&["fix it".into(), "and the docs".into()]);
+        assert!(block.contains("fix it\n---\nand the docs\n</user-requests>"));
+        assert_eq!(format_user_requests(&[]), "");
+        let body = format!(
+            "## Goal\nx{block}{}",
+            format_file_operations(&["a.rs".into()], &[])
+        );
+        let message = Message::user(format!(
+            "{SUMMARY_MARKER}\n\nCompacted from 5 tokens\n\n{body}"
+        ));
+        assert_eq!(
+            previous_summary(std::slice::from_ref(&message)),
+            Some("## Goal\nx")
         );
     }
 }

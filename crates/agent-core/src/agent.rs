@@ -2387,6 +2387,15 @@ impl Agent {
         else {
             return Ok(CompactOutcome::TooSmall);
         };
+        let candidates = self.compaction.candidates;
+        // Under the state template every round is one document, rewritten: no split-turn
+        // decomposition (its whole-session "turn" is what stacked sections), and the template itself
+        // asks for the step in flight, which is what the split was there to preserve.
+        let turn_start = if candidates.state_template {
+            None
+        } else {
+            cut.turn_start
+        };
         // Nothing new worth folding in since the last compaction: on a clean boundary, once a prior
         // summary occupies `messages[0]` (`apply_summary` always splices it in there), `find_cut`'s
         // backward token walk over `messages[1..]` only ever lands on a real cut by hitting the
@@ -2402,9 +2411,7 @@ impl Agent {
         // manual `compact` calls with little new in between are the main way this is reachable — an
         // *automatic* trigger can't, since `apply_summary` also resets `last_input_tokens` to 0 and
         // `should_compact` requires it to be positive to fire at all).
-        if cut.turn_start.is_none()
-            && compaction::previous_summary(&session.messages[..1]).is_some()
-        {
+        if turn_start.is_none() && compaction::previous_summary(&session.messages[..1]).is_some() {
             // `first_kept == 1` on a clean boundary means the prefix handed to the summarizer is
             // *exactly* the prior summary and nothing else — so the "fresh" summary is a summary of a
             // summary, `apply_summary` splices back a list of identical length, and the round is pure
@@ -2431,7 +2438,18 @@ impl Agent {
         let before = session.messages.len();
         let tokens_before = session.last_input_tokens;
         let prefix: Vec<Message> = session.messages[..first_kept].to_vec();
-        let file_ops = compaction::merge_provenance(&session.compaction, &prefix, reason);
+        let mut file_ops = compaction::merge_provenance(&session.compaction, &prefix, reason);
+        if candidates.carry_requests {
+            file_ops.user_requests =
+                compaction::merge_user_requests(&file_ops.user_requests, &prefix);
+        }
+        // The kept suffix, shown read-only to a re-render so its summary is current
+        // (`CompactionCandidates::sees_tail`; the cached call sees it anyway).
+        let tail: &[Message] = if candidates.sees_tail {
+            &session.messages[first_kept..]
+        } else {
+            &[]
+        };
 
         // What the summarization call(s) below cost. They run outside the conversational loop, so no
         // `Stream(Usage)` event carries them; `Compacted.usage` is the only place a caller sees them.
@@ -2441,7 +2459,6 @@ impl Agent {
         // turns and an open split turn included, so it needs no split. Skipped for an overflow (the
         // provider already refused this conversation), when it doesn't fit, and if the model answers
         // with a tool call or nothing, which fall through to the re-render below.
-        let candidates = self.compaction.candidates;
         let mut summary_source = SummarySource::Rerender;
         let cached = match self.compaction.cached_summary && reason != CompactionReason::Overflow {
             true => {
@@ -2488,17 +2505,19 @@ impl Agent {
         if cached.is_some() {
             summary_source = SummarySource::Cached;
         }
-        let summary = match (cached, cut.turn_start) {
+        let summary = match (cached, turn_start) {
             (Some(summary), _) => summary,
             (None, turn_start) => match turn_start {
                 None => {
-                    // Clean boundary: unchanged, single-call path.
-                    let req = self.with_reasoning(compaction::summary_request(
+                    // Clean boundary (or any boundary, under the state template): one call.
+                    let req = self.with_reasoning(compaction::summary_request_with(
                         &self.model,
                         &prefix,
+                        tail,
                         self.compaction.summary_max_tokens,
                         &file_ops,
                         custom_instructions,
+                        &candidates,
                     ));
                     let turn = self.run_utility_turn(req, cancel).await?;
                     add_usage(&mut usage, &turn.usage);
@@ -2552,12 +2571,14 @@ impl Agent {
                     // not the closed-off conversation `custom_instructions` is meant to steer. Matches pi's
                     // `generateTurnPrefixSummary`, whose signature doesn't accept custom instructions at all.
                     let turn_prefix = async {
-                        let req = self.with_reasoning(compaction::summary_request(
+                        let req = self.with_reasoning(compaction::summary_request_with(
                             &self.model,
                             &session.messages[turn_start..first_kept],
+                            tail,
                             turn_prefix_max_tokens,
                             &file_ops,
                             None,
+                            &candidates,
                         ));
                         let turn = self.run_utility_turn(req, cancel).await?;
                         Ok::<_, Error>((turn_text(&turn), turn.usage))
@@ -2570,6 +2591,8 @@ impl Agent {
                 }
             },
         };
+        // Blocks the model echoed would sit beside the fresh copies appended below.
+        let summary = compaction::strip_echoed_carry(&summary);
         if summary.trim().is_empty() {
             // A genuine summarization call ran (unlike the two early no-ops above, which never call the
             // model at all) but came back blank — functionally the same "nothing new to say" no-op as
@@ -2582,7 +2605,8 @@ impl Agent {
         // reflect every round so far, not just this one's new activity. `previous_summary` strips these
         // same blocks back off before the body is ever fed forward, so they never accumulate.
         let summary = format!(
-            "{summary}{}{}{}",
+            "{summary}{}{}{}{}",
+            compaction::format_user_requests(&file_ops.user_requests),
             compaction::format_file_operations(&file_ops.read_files, &file_ops.modified_files),
             compaction::format_todo_list(file_ops.todos.as_ref()),
             compaction::format_memory_notes(&file_ops.memory_notes)
@@ -8707,6 +8731,7 @@ mod tests {
             last_reason: Some(CompactionReason::Threshold),
             modified_files: vec![],
             memory_notes: vec![],
+            user_requests: vec![],
         };
 
         let mock = Arc::new(MockTransport::new(vec![turn::text("turn prefix summary")]));
@@ -13293,5 +13318,333 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(summary_source(&events), Some(SummarySource::Rerender));
+    }
+
+    /// A session that opens with an earlier compaction's summary, then `turns` tool round-trips and no
+    /// other user prompt: the single-prompt agentic shape of every eval run after its first round.
+    fn summarized_session(turns: usize) -> Session {
+        let mut s = Session::new();
+        s.push(Message::user(format!(
+            "{}\n\nCompacted from 9000 tokens\n\n## Goal\nthe old goal\n\n<user-requests>\nThe user's own words, verbatim (the first request, then the latest):\nthe task\n</user-requests>",
+            compaction::SUMMARY_MARKER
+        )));
+        for i in 0..turns {
+            s.push(Message::assistant(vec![ContentBlock::tool_use(
+                format!("c{i}"),
+                "read",
+                json!({ "path": format!("src/f{i}.rs") }),
+            )]));
+            s.push(Message::tool_result(
+                format!("c{i}"),
+                format!("result {i} {}", "x".repeat(4_000)),
+                false,
+            ));
+        }
+        s.last_input_tokens = compaction::estimate_messages_tokens(&s.messages);
+        s.last_usage_message_count = s.messages.len();
+        s
+    }
+
+    /// Roles alternate and every tool result answers a call in the message right before it.
+    fn assert_well_formed(messages: &[Message]) {
+        assert!(
+            messages.windows(2).all(|w| w[0].role != w[1].role),
+            "alternation"
+        );
+        for (i, m) in messages.iter().enumerate() {
+            for b in &m.content {
+                if let ContentBlock::ToolResult { tool_use_id, .. } = b {
+                    assert!(
+                        i > 0
+                            && messages[i - 1].content.iter().any(
+                                |c| matches!(c, ContentBlock::ToolUse { id, .. } if id == tool_use_id)
+                            ),
+                        "result {tool_use_id} has no call before it"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Re-render-only compaction (the cached call off) with these candidates.
+    fn rerender_config(candidates: compaction::CompactionCandidates) -> CompactionConfig {
+        CompactionConfig {
+            cached_summary: false,
+            candidates,
+            ..summary_config()
+        }
+    }
+
+    async fn compact_once(agent: &Agent, session: &mut Session) -> CompactOutcome {
+        agent
+            .compact(
+                session,
+                CompactionReason::Threshold,
+                &CancellationToken::new(),
+                &mut |_| {},
+                None,
+            )
+            .await
+            .unwrap()
+    }
+
+    fn prompt_of(req: &ModelRequest) -> String {
+        last_text(&req.messages[0]).to_string()
+    }
+
+    #[tokio::test]
+    async fn a_single_prompt_run_takes_the_split_turn_path_by_default() {
+        // The eval's 55-of-87: the whole run is one turn, so the first round is "No prior history."
+        // plus the split-turn template over everything.
+        let mock = Arc::new(MockTransport::new(vec![turn::text(
+            "## Original Request\nx",
+        )]));
+        let agent = summary_agent(&mock, rerender_config(Default::default()));
+        let mut session = masking_session(0, 12);
+        compact_once(&agent, &mut session).await;
+        assert_eq!(mock.calls(), 1);
+        assert!(prompt_of(&mock.requests()[0]).contains(compaction::SPLIT_TURN_INSTRUCTION));
+        assert!(last_text(&session.messages[0]).contains("No prior history."));
+    }
+
+    #[tokio::test]
+    async fn the_state_template_summarizes_a_single_prompt_run_as_one_document() {
+        let mock = Arc::new(MockTransport::new(vec![turn::text("## Goal\nthe state")]));
+        let agent = summary_agent(
+            &mock,
+            rerender_config(compaction::CompactionCandidates {
+                state_template: true,
+                ..Default::default()
+            }),
+        );
+        let mut session = masking_session(0, 12);
+        compact_once(&agent, &mut session).await;
+        assert_eq!(mock.calls(), 1, "one call, no split");
+        let prompt = prompt_of(&mock.requests()[0]);
+        assert!(prompt.contains(compaction::STATE_INTRO));
+        assert!(prompt.contains(compaction::STATE_RULES));
+        assert!(prompt.contains(compaction::STATE_FORMAT));
+        assert!(!prompt.contains(compaction::SPLIT_TURN_INSTRUCTION));
+        let summary = last_text(&session.messages[0]);
+        assert!(!summary.contains("No prior history.") && !summary.contains("split turn"));
+        assert_well_formed(&session.messages);
+    }
+
+    #[tokio::test]
+    async fn a_later_round_stacks_by_default_and_is_rewritten_under_the_state_template() {
+        // Default: the split turn starts right after the previous summary (`turn_start == 1`), so that
+        // summary is reused verbatim and a second request section is appended: stacking.
+        let mock = Arc::new(MockTransport::new(vec![turn::text(
+            "## Original Request\nnew",
+        )]));
+        let agent = summary_agent(&mock, rerender_config(Default::default()));
+        let mut session = summarized_session(12);
+        compact_once(&agent, &mut session).await;
+        let stacked = last_text(&session.messages[0]).to_string();
+        assert!(
+            stacked.contains("the old goal") && stacked.contains("**Turn Context (split turn):**")
+        );
+
+        // State template: one call over the previous summary plus the activity since, rewritten.
+        let mock = Arc::new(MockTransport::new(vec![turn::text(
+            "## Goal\nthe rewritten state",
+        )]));
+        let agent = summary_agent(
+            &mock,
+            rerender_config(compaction::CompactionCandidates {
+                state_template: true,
+                ..Default::default()
+            }),
+        );
+        let mut session = summarized_session(12);
+        compact_once(&agent, &mut session).await;
+        assert_eq!(mock.calls(), 1);
+        let prompt = prompt_of(&mock.requests()[0]);
+        assert!(
+            prompt.starts_with("<previous-summary>\n## Goal\nthe old goal\n</previous-summary>")
+        );
+        assert!(prompt.contains(compaction::STATE_UPDATE_INTRO));
+        let summary = last_text(&session.messages[0]);
+        assert_eq!(summary.matches("## Goal").count(), 1, "{summary}");
+        assert!(summary.contains("the rewritten state") && !summary.contains("the old goal"));
+        assert_well_formed(&session.messages);
+    }
+
+    #[tokio::test]
+    async fn the_tail_candidate_shows_the_rerender_the_kept_suffix_read_only() {
+        let mock = Arc::new(MockTransport::new(vec![turn::text("## Goal\nx")]));
+        let agent = summary_agent(
+            &mock,
+            rerender_config(compaction::CompactionCandidates {
+                state_template: true,
+                sees_tail: true,
+                ..Default::default()
+            }),
+        );
+        let mut session = masking_session(0, 12);
+        compact_once(&agent, &mut session).await;
+        let prompt = prompt_of(&mock.requests()[0]);
+        let (before, recent) = prompt
+            .split_once("<recent-context>\n")
+            .expect("a tail block");
+        // The kept suffix (the last call and its result) is in the tail block, not the transcript.
+        assert!(recent.contains("src/f11.rs") && !before.contains("src/f11.rs"));
+        assert!(prompt.contains(compaction::TAIL_NOTE));
+        // Read-only: what was kept is still kept verbatim after the summary.
+        assert!(format!("{:?}", session.messages[1..].to_vec()).contains("src/f11.rs"));
+    }
+
+    #[tokio::test]
+    async fn carried_user_requests_survive_every_round_once() {
+        let candidates = compaction::CompactionCandidates {
+            state_template: true,
+            carry_requests: true,
+            ..Default::default()
+        };
+        let mock = Arc::new(MockTransport::new(vec![
+            turn::text("## Goal\nround one"),
+            turn::text("## Goal\nround two"),
+        ]));
+        let agent = summary_agent(&mock, rerender_config(candidates));
+        let mut session = masking_session(0, 12);
+        session.messages = Arc::new({
+            let mut m = (*session.messages).clone();
+            m[0] = Message::user("Fix the parser. Do not edit the tests.");
+            m
+        });
+        compact_once(&agent, &mut session).await;
+        let first = last_text(&session.messages[0]).to_string();
+        assert!(
+            first.contains("<user-requests>")
+                && first.contains("Fix the parser. Do not edit the tests.")
+        );
+        assert_eq!(
+            session.compaction.user_requests,
+            ["Fix the parser. Do not edit the tests."]
+        );
+
+        // A second round, long after the request left the transcript: still there, exactly once,
+        // and the summarizer's own view of the previous summary has the block stripped.
+        for i in 12..24 {
+            session.push(Message::assistant(vec![ContentBlock::tool_use(
+                format!("c{i}"),
+                "read",
+                json!({ "path": format!("src/f{i}.rs") }),
+            )]));
+            session.push(Message::tool_result(
+                format!("c{i}"),
+                "x".repeat(4_000),
+                false,
+            ));
+        }
+        assert_eq!(
+            compact_once(&agent, &mut session).await,
+            CompactOutcome::Compacted
+        );
+        let prompt = prompt_of(&mock.requests()[1]);
+        assert!(
+            !prompt.contains("<user-requests>"),
+            "stripped from <previous-summary>"
+        );
+        let second = last_text(&session.messages[0]);
+        assert_eq!(second.matches("<user-requests>").count(), 1, "{second}");
+        assert!(second.contains("Fix the parser. Do not edit the tests."));
+        assert_well_formed(&session.messages);
+    }
+
+    #[tokio::test]
+    async fn the_cached_call_uses_the_state_template_too() {
+        let mock = Arc::new(MockTransport::new(vec![turn::text("## Goal\nx")]));
+        let agent = summary_agent(
+            &mock,
+            candidates_config(compaction::CompactionCandidates {
+                state_template: true,
+                ..Default::default()
+            }),
+        );
+        let mut session = summarized_session(12);
+        compact_once(&agent, &mut session).await;
+        let req = &mock.requests()[0];
+        assert_eq!(
+            req.system.as_deref(),
+            Some("you are the agent"),
+            "the cached path"
+        );
+        let text = last_text(req.messages.last().unwrap());
+        assert!(
+            text.contains(compaction::STATE_FORMAT) && text.contains(compaction::STATE_FOLD_IN)
+        );
+        assert!(!text.contains(compaction::SUMMARY_INSTRUCTION));
+    }
+
+    #[tokio::test]
+    async fn a_state_compacted_session_resumes_on_another_model_and_compacts_again() {
+        // Compacted on Claude under the state template and the request carry, then resumed on
+        // gpt-6-luna: the cross-model scrub leaves the summary alone, the next round recognizes it as
+        // the previous summary (one rewritten document, the carry block once), and the transcript
+        // stays well-formed throughout.
+        let candidates = compaction::CompactionCandidates {
+            state_template: true,
+            carry_requests: true,
+            ..Default::default()
+        };
+        let mock = Arc::new(MockTransport::new(vec![turn::text("## Goal\non claude")]));
+        let claude = summary_agent(&mock, rerender_config(candidates));
+        let mut session = masking_session(0, 12);
+        compact_once(&claude, &mut session).await;
+        let summary_before = session.messages[0].clone();
+
+        session.scrub_cross_model_state("gpt-6-luna");
+        assert_eq!(
+            session.messages[0], summary_before,
+            "the summary is plain user text"
+        );
+        for i in 12..24 {
+            session.push(Message::assistant(vec![ContentBlock::tool_use(
+                format!("c{i}"),
+                "read",
+                json!({ "path": format!("src/f{i}.rs") }),
+            )]));
+            session.push(Message::tool_result(
+                format!("c{i}"),
+                "x".repeat(4_000),
+                false,
+            ));
+        }
+        let mock = Arc::new(MockTransport::new(vec![turn::text("## Goal\non luna")]));
+        let luna =
+            Agent::new(mock.clone(), "gpt-6-luna").with_compaction(rerender_config(candidates));
+        assert_eq!(
+            compact_once(&luna, &mut session).await,
+            CompactOutcome::Compacted
+        );
+        let prompt = prompt_of(&mock.requests()[0]);
+        assert!(prompt.starts_with("<previous-summary>\n## Goal\non claude\n</previous-summary>"));
+        let summary = last_text(&session.messages[0]);
+        assert_eq!(summary.matches("## Goal").count(), 1);
+        assert_eq!(summary.matches("<user-requests>").count(), 1);
+        assert!(summary.contains("on luna") && summary.contains("the task"));
+        assert_well_formed(&session.messages);
+    }
+
+    #[tokio::test]
+    async fn carry_blocks_a_model_echoes_are_replaced_not_doubled() {
+        // The cached call sees the previous summary, blocks included, and a model that mirrors its
+        // shape ends with them too (live on Haiku 5.5 they doubled every round). Only the host's
+        // fresh copies survive.
+        let mock = Arc::new(MockTransport::new(vec![turn::text(
+            "## Goal\nthe state\n\n<read-files>\nsrc/stale.rs\n</read-files>\n\n<user-requests>\nthe task\n</user-requests>\n",
+        )]));
+        let agent = summary_agent(&mock, summary_config());
+        let mut session = summarized_session(12);
+        compact_once(&agent, &mut session).await;
+        let summary = last_text(&session.messages[0]);
+        assert_eq!(summary.matches("<read-files>").count(), 1, "{summary}");
+        assert!(!summary.contains("src/stale.rs"));
+        assert!(summary.contains("<read-files>\nsrc/f0.rs"));
+        assert!(
+            !summary.contains("<user-requests>"),
+            "nothing carries requests by default"
+        );
     }
 }

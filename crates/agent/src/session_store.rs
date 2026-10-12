@@ -482,6 +482,11 @@ enum Entry {
         /// it wrote to its working/durable memory.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         memory_notes: Vec<String>,
+        /// The user's own requests carried across this round (see
+        /// `CompactionProvenance::user_requests`), restored the same way. Empty unless the run turned
+        /// on the `carry-request` compaction candidate.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        user_requests: Vec<String>,
     },
     /// A record that the active model changed, anchored to whatever message was the tip at the moment
     /// it did — see [`SessionStore::record_model_change`]/[`SessionStore::model_at`]. `parent_id` here
@@ -1259,6 +1264,7 @@ impl SessionStore {
                     last_reason,
                     todos,
                     memory_notes,
+                    user_requests,
                     ..
                 }) => {
                     // Each record already carries every earlier round's file-provenance folded in (via
@@ -1275,6 +1281,7 @@ impl SessionStore {
                         last_reason,
                         todos,
                         memory_notes,
+                        user_requests,
                     });
                     compactions.insert(
                         id,
@@ -2128,6 +2135,7 @@ impl SessionStore {
             last_reason: meta.provenance.last_reason,
             todos: meta.provenance.todos,
             memory_notes: meta.provenance.memory_notes,
+            user_requests: meta.provenance.user_requests,
         };
 
         // An updated header snapshot (the new `compactions`/`dropped_messages` counters) first, then the
@@ -8113,6 +8121,7 @@ mod tests {
             last_reason: Some(agent_core::compaction::CompactionReason::Threshold),
             todos: None,
             memory_notes: vec![],
+            user_requests: vec!["Fix the parser; don't touch the tests.".to_string()],
         };
         store
             .rewrite_compacted(
@@ -8136,6 +8145,10 @@ mod tests {
         assert_eq!(
             restored.compaction.last_reason, provenance.last_reason,
             "last_reason must survive a fresh reopen"
+        );
+        assert_eq!(
+            restored.compaction.user_requests, provenance.user_requests,
+            "the carried user requests must survive a fresh reopen"
         );
         // The counter is restored from `SessionMeta::compactions` (already correctly persisted
         // separately), not trusted verbatim from the record itself — see `SessionStore::open`'s own
@@ -8262,6 +8275,7 @@ mod tests {
             last_reason: Some(agent_core::compaction::CompactionReason::Threshold),
             todos: None,
             memory_notes: vec![],
+            user_requests: vec![],
         };
         store
             .rewrite_compacted(
@@ -8287,6 +8301,7 @@ mod tests {
             last_reason: Some(agent_core::compaction::CompactionReason::Manual),
             todos: None,
             memory_notes: vec![],
+            user_requests: vec![],
         };
         store
             .rewrite_compacted(

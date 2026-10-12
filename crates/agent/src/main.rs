@@ -413,8 +413,9 @@ enum Command {
         #[usage(long, env = "AI_AGENT_NO_CACHED_SUMMARY")]
         no_cached_summary: bool,
         /// Compaction changes under evaluation, by name (comma-separated), all off by default:
-        /// `system-role`, `handoff`, `check` (see `agent_core::CompactionCandidates`). An unknown name
-        /// is an error. `serve`'s identical flag.
+        /// `system-role`, `handoff`, `check`, `state`, `tail`, `carry-request` (see
+        /// `agent_core::CompactionCandidates`). An unknown name is an error. `serve`'s identical
+        /// flag.
         #[usage(long, env = "AI_AGENT_COMPACTION_CANDIDATES", delimiter = ',')]
         compaction_candidates: Option<Vec<String>>,
         /// Compaction headroom (tokens) reserved below the context window before it fires. Defaults to
@@ -1001,8 +1002,9 @@ enum Command {
         #[usage(long, env = "AI_AGENT_NO_CACHED_SUMMARY")]
         no_cached_summary: bool,
         /// Compaction changes under evaluation, by name (comma-separated), all off by default:
-        /// `system-role`, `handoff`, `check` (see `agent_core::CompactionCandidates`). An unknown name
-        /// is an error. `run`'s identical flag.
+        /// `system-role`, `handoff`, `check`, `state`, `tail`, `carry-request` (see
+        /// `agent_core::CompactionCandidates`). An unknown name is an error. `run`'s identical
+        /// flag.
         #[usage(long, env = "AI_AGENT_COMPACTION_CANDIDATES", delimiter = ',')]
         compaction_candidates: Option<Vec<String>>,
         /// Per-turn output token ceiling. Defaults to the model's own capability-table `max_output`
