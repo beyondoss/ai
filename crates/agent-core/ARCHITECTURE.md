@@ -469,6 +469,12 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
     `SHORT_RULE` after the default template's format, or `STATE_RULES_SHORT` in place of "about 1,500
     words" under `state`. Median summary length grew 771 → 2,167 words by the fifth round, and the
     evidence on length disagrees, so it is measured.
+  - `carry_all_requests` (`carry-all`): every genuine user message rides
+    `<user-requests>` (`merge_user_requests_all`), each up to 8,000 characters and together up to
+    32,000 (~8K tokens); over budget the first is kept and the rest fill from the most recent
+    backwards, Codex-style. The default carries the first and the latest three at 4,000 each.
+    Summaries keep ~17% of user constraints against 93–99.7% when the user's words are re-appended
+    verbatim.
 
 - **The deterministic-carry channel** — `apply_summary` is deliberately destructive: it _replaces_
   `session.messages` with `[summary, …kept_suffix]`, and `SessionStore::open` reloads that

@@ -2442,6 +2442,12 @@ impl Agent {
         let tokens_before = session.last_input_tokens;
         let prefix: Vec<Message> = session.messages[..first_kept].to_vec();
         let mut file_ops = compaction::merge_provenance(&session.compaction, &prefix, reason);
+        // Every user message rather than the first plus the latest
+        // (`CompactionCandidates::carry_all_requests`).
+        if candidates.carry_all_requests {
+            file_ops.user_requests =
+                compaction::merge_user_requests_all(&session.compaction.user_requests, &prefix);
+        }
         for path in compaction::extract_bash_writes(&prefix) {
             if !file_ops.modified_files.contains(&path) {
                 file_ops.modified_files.push(path);
@@ -2606,7 +2612,10 @@ impl Agent {
         // same blocks back off before the body is ever fed forward, so they never accumulate.
         let summary = format!(
             "{summary}{}{}{}{}",
-            compaction::format_user_requests(&file_ops.user_requests),
+            compaction::format_user_requests_with(
+                &file_ops.user_requests,
+                candidates.carry_all_requests
+            ),
             compaction::format_file_operations(&file_ops.read_files, &file_ops.modified_files),
             compaction::format_todo_list(file_ops.todos.as_ref()),
             compaction::format_memory_notes(&file_ops.memory_notes)

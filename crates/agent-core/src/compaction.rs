@@ -131,6 +131,16 @@ pub const USER_REQUESTS_KEPT: usize = 4;
 /// `is_turn_start`.
 pub fn merge_user_requests(previous: &[String], messages: &[Message]) -> Vec<String> {
     let mut out = previous.to_vec();
+    push_user_turns(&mut out, messages, USER_REQUEST_MAX_CHARS);
+    if out.len() > USER_REQUESTS_KEPT {
+        out.drain(1..out.len() + 1 - USER_REQUESTS_KEPT);
+    }
+    out
+}
+
+/// Append each genuine user turn's text in `messages` to `out`, trimmed, capped at `max_chars`,
+/// skipping empty and already-carried ones.
+fn push_user_turns(out: &mut Vec<String>, messages: &[Message], max_chars: usize) {
     for m in messages.iter().filter(|m| is_turn_start(m)) {
         let text: String = m
             .content
@@ -141,25 +151,62 @@ pub fn merge_user_requests(previous: &[String], messages: &[Message]) -> Vec<Str
             })
             .collect::<Vec<_>>()
             .join("\n");
-        let text = truncate_chars(text.trim(), USER_REQUEST_MAX_CHARS);
+        let text = truncate_chars(text.trim(), max_chars);
         if !text.is_empty() && !out.contains(&text) {
             out.push(text);
         }
     }
-    if out.len() > USER_REQUESTS_KEPT {
-        out.drain(1..out.len() + 1 - USER_REQUESTS_KEPT);
+}
+
+/// Under [`CompactionCandidates::carry_all_requests`], one carried user message longer than this
+/// many characters is truncated (with a marker).
+pub const ALL_USER_REQUEST_MAX_CHARS: usize = 8_000;
+
+/// Under [`CompactionCandidates::carry_all_requests`], the carried user messages together stay
+/// within this many characters (~8K tokens).
+pub const ALL_USER_REQUESTS_BUDGET_CHARS: usize = 32_000;
+
+/// [`merge_user_requests`] under [`CompactionCandidates::carry_all_requests`]: every genuine user
+/// message, not the first and latest three — each capped at [`ALL_USER_REQUEST_MAX_CHARS`], together
+/// within [`ALL_USER_REQUESTS_BUDGET_CHARS`]. Over budget, the first is kept and the rest fill from the
+/// most recent backwards, so the middle ones go first (Codex's rule, plus the task as first set).
+pub fn merge_user_requests_all(previous: &[String], messages: &[Message]) -> Vec<String> {
+    let mut all = previous.to_vec();
+    push_user_turns(&mut all, messages, ALL_USER_REQUEST_MAX_CHARS);
+    let size = |s: &String| s.chars().count();
+    if all.iter().map(size).sum::<usize>() <= ALL_USER_REQUESTS_BUDGET_CHARS {
+        return all;
     }
+    let mut budget = ALL_USER_REQUESTS_BUDGET_CHARS.saturating_sub(size(&all[0]));
+    let mut kept_from = all.len();
+    while kept_from > 1 && size(&all[kept_from - 1]) <= budget {
+        kept_from -= 1;
+        budget -= size(&all[kept_from]);
+    }
+    let mut out = vec![all[0].clone()];
+    out.extend_from_slice(&all[kept_from..]);
     out
 }
 
 /// Render the carried user requests as a `<user-requests>` block appended to a summary — the same
 /// deterministic-carry contract as [`format_file_operations`]. `""` when there are none.
 pub fn format_user_requests(requests: &[String]) -> String {
+    format_user_requests_with(requests, false)
+}
+
+/// [`format_user_requests`], its header saying the block holds all of the user's messages when `all`
+/// ([`CompactionCandidates::carry_all_requests`]).
+pub fn format_user_requests_with(requests: &[String], all: bool) -> String {
     if requests.is_empty() {
         return String::new();
     }
+    let which = if all {
+        "all of the user's messages, oldest first"
+    } else {
+        "the first request, then the latest"
+    };
     format!(
-        "\n\n<user-requests>\nThe user's own words, verbatim (the first request, then the latest):\n{}\n</user-requests>",
+        "\n\n<user-requests>\nThe user's own words, verbatim ({which}):\n{}\n</user-requests>",
         requests.join("\n---\n")
     )
 }
@@ -331,6 +378,13 @@ pub struct CompactionCandidates {
     /// Why: median summary length grew 771 → 2,167 words by the fifth round, and the evidence on
     /// length disagrees, so it is measured rather than assumed.
     pub short_summary: bool,
+    /// Every genuine user message rides the request carry ([`merge_user_requests_all`]), each up to 8,000 characters and together up to ~8K
+    /// tokens, instead of the first and the latest three at 4,000 each.
+    ///
+    /// Why: summaries keep only ~17% of user constraints, against 93–99.7% when the user's messages
+    /// are re-appended verbatim; Codex carries all of them (up to 20K tokens). The first-plus-three
+    /// window drops whatever the user said in between.
+    pub carry_all_requests: bool,
 }
 
 impl CompactionCandidates {
@@ -344,6 +398,7 @@ impl CompactionCandidates {
         "bridge",
         "state-sections",
         "short",
+        "carry-all",
     ];
 
     /// The candidates `names` turns on (the CLI's `--compaction-candidates`); an unknown name is an
@@ -361,6 +416,7 @@ impl CompactionCandidates {
                 "bridge" => c.bridge_line = true,
                 "state-sections" => c.state_sections = true,
                 "short" => c.short_summary = true,
+                "carry-all" => c.carry_all_requests = true,
                 "" => {}
                 other => {
                     return Err(format!(
@@ -4539,6 +4595,38 @@ mod tests {
         assert_eq!(
             shape_default_format(UPDATE_INSTRUCTION, &off),
             UPDATE_INSTRUCTION
+        );
+    }
+
+    #[test]
+    fn carry_all_keeps_every_user_message_within_its_budget() {
+        let turns: Vec<Message> = (0..6)
+            .map(|i| Message::user(format!("request {i}")))
+            .collect();
+        // Under budget: all of them, in order, where the default keeps the first and latest three.
+        assert_eq!(
+            merge_user_requests_all(&[], &turns),
+            (0..6).map(|i| format!("request {i}")).collect::<Vec<_>>()
+        );
+        assert_eq!(merge_user_requests(&[], &turns).len(), USER_REQUESTS_KEPT);
+        // Over budget: the first, then the most recent that fit; the middle goes.
+        let big = |c: char| c.to_string().repeat(7_000);
+        let turns: Vec<Message> = ['a', 'b', 'c', 'd', 'e', 'f']
+            .into_iter()
+            .map(|c| Message::user(big(c)))
+            .collect();
+        let kept = merge_user_requests_all(&[], &turns);
+        assert_eq!(kept.len(), 4, "7K + 3 × 7K ≤ 32K < 7K + 4 × 7K");
+        assert_eq!(kept[0], big('a'));
+        assert_eq!(kept[1..], [big('d'), big('e'), big('f')]);
+        // One message past the per-message cap is truncated, not dropped.
+        let long = merge_user_requests_all(&[], &[Message::user("x".repeat(9_000))]);
+        assert!(long[0].starts_with(&"x".repeat(ALL_USER_REQUEST_MAX_CHARS)));
+        assert!(long[0].contains("more characters truncated"));
+        assert!(format_user_requests_with(&kept, true).contains("all of the user's messages"));
+        assert_eq!(
+            format_user_requests_with(&kept, false),
+            format_user_requests(&kept)
         );
     }
 }
