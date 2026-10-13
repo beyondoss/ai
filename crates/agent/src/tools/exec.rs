@@ -94,12 +94,14 @@ pub type SpawnSink<'a> = &'a (dyn Fn(Kill) + Send + Sync);
 /// How to stop a command that a tracked run started, wherever it runs.
 ///
 /// One shape for every place a command can live, so the code that keeps commands running past their
-/// call (`bash`'s jobs) kills a local process group, a remote stream and a command inside a container
-/// the same way, from the same three places: a `bash_job` kill, a dropped job, and the exit path.
+/// call (`bash`'s jobs) kills a local job, a remote stream and a command inside a container the same
+/// way, from the same three places: a `bash_job` kill, a dropped job, and the exit path.
 #[derive(Clone)]
 pub enum Kill {
-    /// A process group on this host, led by the command (its pid is the group id).
-    Group(u32),
+    /// A job's processes on this host: its process group, plus every process carrying its tag —
+    /// including the ones that left the group (`setsid`, `timeout`, a double fork). See
+    /// [`super::bash_proc`].
+    Procs(super::bash_proc::ProcGroup),
     /// The runner's own way to stop the command: close the exec stream (protocol v1.2), or run a kill
     /// inside the container a template transport reaches. Blocking, and returns once the runner has
     /// done everything it can — see [`Kill::kill`].
@@ -112,13 +114,26 @@ impl Kill {
     /// for its runner to confirm.
     pub fn kill(&self) {
         match self {
-            #[cfg(unix)]
-            Kill::Group(pgid) => kill_process_group(*pgid),
-            #[cfg(not(unix))]
-            Kill::Group(_) => {}
+            Kill::Procs(group) => group.kill(),
             Kill::Hook(hook) => hook(),
         }
     }
+}
+
+/// What a caller that keeps a command running past its own return (`bash`'s jobs) hears from
+/// [`CommandRunner::run_streaming_tracked`].
+pub struct JobHooks<'a> {
+    /// Every chunk of stdout/stderr, as for [`CommandRunner::run_streaming`].
+    pub on_chunk: ChunkSink<'a>,
+    /// How to stop the command, the moment it starts — see
+    /// [`CommandRunner::run_streaming_tracked`] for the promise calling it makes.
+    pub on_spawn: SpawnSink<'a>,
+    /// The shell exited, but processes it started are still running (`cmd &`, a daemon): the
+    /// shell's own result, and a short description of what is left. The call goes on — streaming
+    /// their output — until they have all exited, been killed, or hit the timeout. Only a runner
+    /// that can see the command's processes calls it (this host's); on a remote stream the endpoint
+    /// owns the process group, and the call simply ends when the shell does.
+    pub on_orphans: &'a (dyn Fn(&ExecResult, String) + Send + Sync),
 }
 
 /// Runs an external command. Implemented by [`RealRunner`] (production) and by test doubles that
@@ -153,14 +168,17 @@ pub trait CommandRunner: Send + Sync {
         self.run(program, args, cwd, timeout).await
     }
 
-    /// Like [`run_streaming`](CommandRunner::run_streaming), but also reports to `on_spawn`, the
-    /// moment the command starts, how to stop it ([`Kill`]) — for a caller that keeps the command
-    /// running past its own return (`bash`'s detached jobs) and so must be able to kill it itself,
-    /// including from the exit path where no future is left to drop.
+    /// Like [`run_streaming`](CommandRunner::run_streaming), for a caller that keeps the command
+    /// running past its own return (`bash`'s jobs): reports to [`JobHooks::on_spawn`], the moment
+    /// the command starts, how to stop it ([`Kill`]) — so it can be killed from a `bash_job` kill, a
+    /// dropped job, or the exit path where no future is left to drop. A runner that can see the
+    /// command's processes (this host's) also tells [`JobHooks::on_orphans`] when the shell exits
+    /// leaving some running, and keeps going until those exit too, so nothing the command started
+    /// is left untracked.
     ///
     /// **Calling `on_spawn` is a promise that the output is live**: every byte reaches `on_chunk` as
     /// the command produces it, so silence on the sink means the command is silent. `bash` measures
-    /// its idle yield on that promise. Defaults to plain `run_streaming`, never calling `on_spawn`: a
+    /// its idle yield on that promise. Defaults to plain `run_streaming`, calling neither hook: a
     /// runner that cannot see output as it happens (a v1.1 request/response endpoint) has nothing to
     /// measure silence with and nothing to kill.
     async fn run_streaming_tracked(
@@ -169,11 +187,9 @@ pub trait CommandRunner: Send + Sync {
         args: &[String],
         cwd: Option<&str>,
         timeout: Duration,
-        on_chunk: ChunkSink<'_>,
-        on_spawn: SpawnSink<'_>,
+        hooks: &JobHooks<'_>,
     ) -> std::io::Result<ExecResult> {
-        let _ = on_spawn;
-        self.run_streaming(program, args, cwd, timeout, on_chunk)
+        self.run_streaming(program, args, cwd, timeout, hooks.on_chunk)
             .await
     }
 
@@ -212,9 +228,8 @@ impl RealRunner {
     /// Shared spawn/capture body. `on_chunk`, when present, is called with each stdout/stderr chunk as
     /// it streams (live progress); `run`, `run_streaming` and `run_with_stdin` all funnel through here.
     /// `stdin` is `None` for everything a model runs — see the `.stdin(..)` comment below.
-    /// `on_spawn`, when present, is told the new process group's id (see
-    /// [`CommandRunner::run_streaming_tracked`]).
-    #[allow(clippy::too_many_arguments)]
+    /// `bash`'s jobs go through [`super::bash_proc::run_tracked`] instead
+    /// ([`CommandRunner::run_streaming_tracked`]).
     async fn exec(
         &self,
         program: &str,
@@ -223,7 +238,6 @@ impl RealRunner {
         timeout: Duration,
         on_chunk: Option<ChunkSink<'_>>,
         stdin: Option<&[u8]>,
-        on_spawn: Option<SpawnSink<'_>>,
     ) -> std::io::Result<ExecResult> {
         // No `PATH` manipulation here — `Command` inherits the parent process's environment
         // (including `PATH`) as-is. Pi-parity note: this is a deliberate, documented DIVERGENCE, not
@@ -266,9 +280,6 @@ impl RealRunner {
         // actually exited on its own; still armed on both the timeout branch and an external drop, so
         // either one reaches the whole process group.
         let mut guard = GroupKillGuard { pid: child.id() };
-        if let (Some(report), Some(pid)) = (on_spawn, child.id()) {
-            report(Kill::Group(pid));
-        }
         // Streaming (`bash`'s live path) hands every chunk straight to `on_chunk`'s sink, then ignores
         // the `stdout`/`stderr`/`truncated` fields entirely (see the `Ok` arm's comment and `bash.rs`).
         // So when streaming we skip the ≤256 KiB head/tail `Capture` *and* the final `from_utf8_lossy`
@@ -492,8 +503,7 @@ impl CommandRunner for RealRunner {
         cwd: Option<&str>,
         timeout: Duration,
     ) -> std::io::Result<ExecResult> {
-        self.exec(program, args, cwd, timeout, None, None, None)
-            .await
+        self.exec(program, args, cwd, timeout, None, None).await
     }
 
     async fn run_streaming(
@@ -504,7 +514,7 @@ impl CommandRunner for RealRunner {
         timeout: Duration,
         on_chunk: ChunkSink<'_>,
     ) -> std::io::Result<ExecResult> {
-        self.exec(program, args, cwd, timeout, Some(on_chunk), None, None)
+        self.exec(program, args, cwd, timeout, Some(on_chunk), None)
             .await
     }
 
@@ -514,19 +524,9 @@ impl CommandRunner for RealRunner {
         args: &[String],
         cwd: Option<&str>,
         timeout: Duration,
-        on_chunk: ChunkSink<'_>,
-        on_spawn: SpawnSink<'_>,
+        hooks: &JobHooks<'_>,
     ) -> std::io::Result<ExecResult> {
-        self.exec(
-            program,
-            args,
-            cwd,
-            timeout,
-            Some(on_chunk),
-            None,
-            Some(on_spawn),
-        )
-        .await
+        super::bash_proc::run_tracked(program, args, cwd, timeout, hooks).await
     }
 
     async fn run_with_stdin(
@@ -537,7 +537,7 @@ impl CommandRunner for RealRunner {
         timeout: Duration,
         stdin: &[u8],
     ) -> std::io::Result<ExecResult> {
-        self.exec(program, args, cwd, timeout, None, Some(stdin), None)
+        self.exec(program, args, cwd, timeout, None, Some(stdin))
             .await
     }
 }

@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use beyond_ai_agent::exec_endpoint::HttpExecRunner;
-use beyond_ai_agent::tools::exec::{CommandRunner, Kill};
+use beyond_ai_agent::tools::exec::{CommandRunner, ExecResult, JobHooks, Kill};
 use common::exec_mock::{ExecMock, StreamEnd, wait_group_gone};
 
 fn sh(script: &str) -> Vec<String> {
@@ -81,8 +81,11 @@ async fn a_tracked_runs_kill_closes_the_stream_and_returns_once_it_has() {
                     &long_command("kill-me"),
                     None,
                     Duration::from_secs(120),
-                    &|_: &[u8]| {},
-                    &on_spawn,
+                    &JobHooks {
+                        on_chunk: &|_: &[u8]| {},
+                        on_spawn: &on_spawn,
+                        on_orphans: &|_: &ExecResult, _: String| {},
+                    },
                 )
                 .await
         })
@@ -134,8 +137,11 @@ async fn a_v11_tracked_run_reports_no_kill() {
             &sh("printf hi"),
             None,
             Duration::from_secs(10),
-            &|_: &[u8]| {},
-            &move |_: Kill| *r.lock().unwrap() = true,
+            &JobHooks {
+                on_chunk: &|_: &[u8]| {},
+                on_spawn: &move |_: Kill| *r.lock().unwrap() = true,
+                on_orphans: &|_: &ExecResult, _: String| {},
+            },
         )
         .await
         .unwrap();

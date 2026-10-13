@@ -23,6 +23,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 pub mod agent;
+pub mod background;
 pub mod bash_writes;
 pub mod branch_summary;
 pub mod client;
@@ -48,7 +49,8 @@ pub mod transport;
 pub mod validation;
 pub mod write_lock;
 
-pub use agent::{Agent, AgentEvent, CompactOutcome};
+pub use agent::{Agent, AgentEvent, BackgroundReason, CompactOutcome};
+pub use background::Background;
 pub use branch_summary::{
     BRANCH_SUMMARY_INSTRUCTION, BRANCH_SUMMARY_MARKER, branch_summary_request,
 };
@@ -78,6 +80,8 @@ pub use write_lock::{WriteLockGuard, WriteLockRegistry};
 // need a direct `tokio-util` dependency to drive a cancellable run.
 pub use tokio_util::sync::CancellationToken;
 
+#[cfg(test)]
+mod background_loop_tests;
 #[cfg(test)]
 mod rate_limit_loop_tests;
 #[cfg(test)]

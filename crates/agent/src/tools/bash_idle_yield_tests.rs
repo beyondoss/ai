@@ -212,12 +212,12 @@ async fn dropping_the_tool_kills_a_parked_job() {
 async fn parking_past_the_cap_kills_the_oldest_job() {
     let (bash, jobs) = detaching(200);
     let mut last = String::new();
-    for _ in 0..=MAX_PARKED_JOBS {
+    for _ in 0..=MAX_YIELDED_JOBS {
         last = text(bash.run(json!({ "command": "sleep 60" })).await);
     }
-    let newest = MAX_PARKED_JOBS + 1;
+    let newest = MAX_YIELDED_JOBS + 1;
     assert!(last.contains(&format!("job {newest}")), "{last}");
-    assert!(last.contains("Job 1 was killed"), "{last}");
+    assert!(last.contains("Job 1 was stopped"), "{last}");
     assert!(
         jobs.run(json!({ "job": 1 })).await.is_err(),
         "job 1 is gone"

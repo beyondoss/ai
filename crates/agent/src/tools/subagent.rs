@@ -1061,6 +1061,9 @@ impl Subagent {
             fs_backend: self.ctx.tool_cfg.fs_backend.clone(),
             command_runner: self.ctx.tool_cfg.command_runner.clone(),
             skills: &self.ctx.skills,
+            // The child's own: its jobs end with it (its registry drops when it returns), after the
+            // one reminder its loop gives it at its stop.
+            bash_jobs: None,
         });
         let allow = self.effective_tools(def);
         super::apply_filter(&mut registry, Some(&allow), None, false);

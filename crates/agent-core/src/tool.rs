@@ -383,6 +383,14 @@ pub trait Tool: Send + Sync {
         None
     }
 
+    /// Work this tool leaves running past its calls, which the loop reports to the model without
+    /// being asked (finish notices, a stop reminder, a compaction carry — see [`crate::background`]).
+    /// `None` (the default) for a tool whose work ends with its call. Two tools over the same work
+    /// may both return it; the loop dedupes by pointer.
+    fn background(&self) -> Option<Arc<dyn crate::background::Background>> {
+        None
+    }
+
     /// The advertised definition sent to the model. Derived from the accessors; override only if a
     /// tool needs a non-default shape.
     fn definition(&self) -> ToolDef {
