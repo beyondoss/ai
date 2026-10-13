@@ -82,7 +82,7 @@ fn an_idle_session_wakes_when_a_job_ends() {
     // Ending in serve leaves the job running — and the reminder said so.
     assert!(
         bodies.lock().unwrap()[2].contains(
-            "If you end your turn now: job 1 keeps running, and you will be told when it exits."
+            "If you end your turn now, job 1 keeps running and you will be told when it exits ("
         ),
         "the serve reminder"
     );

@@ -8,10 +8,12 @@
 //!   text, the way a mid-run steer does ([`crate::steering`]). At a would-stop boundary, pending
 //!   notices are delivered first, as a user turn, and the run continues: a result that arrived while
 //!   the model was writing its last reply is never lost.
-//! - **One stop reminder** ([`Background::stop_reminder`]): at a would-stop boundary with nothing
-//!   to deliver, work still running that the model has not been reminded of is listed once, and the
-//!   run continues; the model may wait, stop it, or end again. Like the step-budget wrap-up
-//!   ([`crate::step_budget`]), it never repeats for the same work, so a model that ends again ends.
+//! - **One stop reminder per run** ([`Background::stop_reminder`]): at a would-stop boundary with
+//!   nothing to deliver, work still running that the model has not been reminded of is listed, and
+//!   the run continues; the model may wait for a result it still needs, or end again. Like the
+//!   step-budget wrap-up ([`crate::step_budget`]), the loop asks at most once per run — work started
+//!   or waited on after it does not earn a second — so a model that ends again ends; and a source
+//!   never lists the same work twice, so a later run (a `serve` prompt) is reminded only of new work.
 //! - **Compaction carry** ([`Background::carry`]): the work in flight is appended to every
 //!   compaction summary as a `<background-jobs>` block, outside anything the summarizer can drop, so
 //!   a compacted model does not relaunch a job it forgot. Rendered from live state at each
@@ -57,7 +59,7 @@ pub trait Background: Send + Sync {
 
     /// At a would-stop boundary with no notices pending: the work still running that no earlier
     /// reminder covered, as one text (starting with [`REMINDER_PREFIX`]), or `None`. Consumes: the
-    /// same work is never listed twice.
+    /// same work is never listed twice. The loop asks at most once per run.
     fn stop_reminder(&self) -> Option<String>;
 
     /// The work in flight right now (running, or ended with its result unread), for a compaction

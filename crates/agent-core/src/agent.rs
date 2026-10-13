@@ -875,6 +875,9 @@ impl Agent {
         let mut steps_this_call: u32 = 0;
         // Whether the wrap-up has fired this call, and the ceiling as its grant extended it.
         let mut budget = crate::step_budget::BudgetState::new(self.max_steps);
+        // Whether this call has already given the model its stop reminder: at most one per run, so
+        // a model that ends again ends — even if it started or waited on a job in between.
+        let mut stop_reminded = false;
         // The previous turn's stop reason, read by `is_hard_overflow`'s `MaxTokens` check. Re-derived
         // from `session`'s own last assistant message rather than hardcoded to `EndTurn` (pi-parity fix
         // — matches pi's own `isContextOverflow`, re-evaluated fresh from the persisted
@@ -1373,19 +1376,17 @@ impl Agent {
                 let injected = steering.drain_at_stop();
                 // Background work (see `crate::background`): a finish notice still pending is
                 // delivered before the run may end, so the model never stops without a result that
-                // already arrived; failing that, work still running is listed once, so ending
-                // with it is the model's informed choice. Either continues the run as a user turn.
+                // already arrived; failing that, work still running is listed — once per run — so
+                // ending with it is the model's informed choice. Either continues the run as a user
+                // turn.
                 let background = crate::background::collect(&self.tools);
-                let background_note = crate::background::take_notices(&background)
-                    .map(|t| (crate::BackgroundReason::Finished, t))
-                    .or_else(|| {
-                        if injected.is_empty() {
-                            crate::background::stop_reminder(&background)
-                                .map(|t| (crate::BackgroundReason::StillRunning, t))
-                        } else {
-                            None
-                        }
-                    });
+                let mut background_note = crate::background::take_notices(&background)
+                    .map(|t| (crate::BackgroundReason::Finished, t));
+                if background_note.is_none() && injected.is_empty() && !stop_reminded {
+                    background_note = crate::background::stop_reminder(&background)
+                        .map(|t| (crate::BackgroundReason::StillRunning, t));
+                    stop_reminded = background_note.is_some();
+                }
                 if injected.is_empty() && background_note.is_none() {
                     sink(AgentEvent::AgentEnd {
                         steps: session.steps,

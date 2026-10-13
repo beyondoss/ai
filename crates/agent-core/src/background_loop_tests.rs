@@ -100,6 +100,32 @@ impl Tool for Twin {
     }
 }
 
+/// A tool whose call starts new running work over the same script, as `bash` with
+/// `run_in_background` does.
+struct Start(Arc<Script>);
+
+#[async_trait]
+impl Tool for Start {
+    fn name(&self) -> &str {
+        "start"
+    }
+    fn description(&self) -> &str {
+        "starts work"
+    }
+    fn input_schema(&self) -> Value {
+        json!({ "type": "object", "properties": {} })
+    }
+    async fn run(&self, _input: Value) -> Result<ToolOutput, crate::error::ToolError> {
+        let mut running = self.0.running.lock().unwrap();
+        let next = format!("job {}", running.len() + 10);
+        running.push(next);
+        Ok("started".into())
+    }
+    fn background(&self) -> Option<Arc<dyn Background>> {
+        Some(self.0.clone())
+    }
+}
+
 fn agent(script: &Arc<Script>, notice_on_call: bool, turns: Vec<Vec<crate::StreamEvent>>) -> Agent {
     let mut tools = ToolRegistry::new();
     tools.register(Arc::new(Job {
@@ -107,6 +133,7 @@ fn agent(script: &Arc<Script>, notice_on_call: bool, turns: Vec<Vec<crate::Strea
         notice_on_call,
     }));
     tools.register(Arc::new(Twin(script.clone())));
+    tools.register(Arc::new(Start(script.clone())));
     Agent::new(Arc::new(MockTransport::new(turns)), "claude-opus-4-8").with_tools(tools)
 }
 
@@ -204,6 +231,29 @@ async fn running_work_is_reminded_once_then_the_run_ends() {
             .count(),
         2
     );
+}
+
+#[tokio::test]
+async fn work_started_after_the_reminder_does_not_earn_a_second_one() {
+    // The double fire the background A/B found: reminded, the model started (or waited on) a job
+    // and ended again — and was reminded again. Once per run: the second stop ends it.
+    let script = Arc::new(Script::default());
+    script.running.lock().unwrap().push("job 3".into());
+    let turns = vec![
+        turn::text("done"),
+        turn::tool_call("s", "start", "{}"),
+        turn::text("ending now"),
+    ];
+    let (session, fired) = run(&agent(&script, false, turns)).await;
+    let reminders = user_texts(&session)
+        .into_iter()
+        .filter(|(_, t)| t.starts_with("[background jobs]"))
+        .count();
+    assert_eq!(reminders, 1);
+    assert_eq!(fired.len(), 1);
+    assert_eq!(session.messages.last().unwrap().role, Role::Assistant);
+    // The source still has unreminded work: a later run (a `serve` prompt) is told of it.
+    assert!(script.stop_reminder().is_some());
 }
 
 #[tokio::test]

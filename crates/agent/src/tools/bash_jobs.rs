@@ -41,6 +41,9 @@ pub const MAX_ENDED_JOBS: usize = 8;
 pub const NOTICE_TAIL_LINES: usize = 20;
 /// Characters of a command quoted in notices, reminders and the carry.
 pub const COMMAND_CHARS: usize = 80;
+/// How every stop reminder ends: the one reason not to end the turn yet.
+pub(crate) const REMINDER_ASK: &str = "If you still need a job's result, wait for it with bash_job \
+                                       {\"job\": N}; otherwise just end your turn.";
 
 /// Why a job outlived its call — which also decides how long it may live: a yielded job never
 /// outlives the turn ([`BashJobs::end_turn`]); an intended one lives until it exits, is killed, or
@@ -86,8 +89,9 @@ pub(crate) struct Job {
     pub shared: Arc<JobShared>,
     pub handle: tokio::task::JoinHandle<()>,
     pub started: Instant,
-    /// How many times the model has been told this job is still running; widens the idle window.
-    pub reports: u32,
+    /// A stop reminder already listed it. On the job, not its table entry, so a `bash_job` wait
+    /// that takes it out and parks it again does not make it news to the next reminder.
+    pub reminded: bool,
     /// The model's command, truncated for notices.
     pub command: String,
 }
@@ -266,8 +270,6 @@ struct Parked {
     notified: bool,
     /// A notice already said its shell exited leaving processes running.
     orphan_notified: bool,
-    /// A stop reminder already listed it.
-    reminded: bool,
 }
 
 /// A running job stopped at the end of a turn, a run or a session — see [`BashJobs::end_turn`] and
@@ -336,7 +338,7 @@ impl BashJobs {
     pub(crate) fn lifetime(&self, kind: JobKind) -> &'static str {
         match (kind, *lock(&self.policy)) {
             (JobKind::Yielded, _) => "it is stopped when you end your turn",
-            (_, EndPolicy::StopAtEnd) => "it is stopped when the run ends",
+            (_, EndPolicy::StopAtEnd) => "it is stopped for you when the run ends",
             (_, EndPolicy::KeepRunning) => "it keeps running after your turn ends",
         }
     }
@@ -517,14 +519,14 @@ impl BashJobs {
             .iter_mut()
             .filter(|(_, p)| !p.job.shared.ended())
             .collect();
-        if running.iter().all(|(_, p)| p.reminded) {
+        if running.iter().all(|(_, p)| p.job.reminded) {
             return None;
         }
         let keep = *lock(&self.policy) == EndPolicy::KeepRunning;
         let mut lines = Vec::new();
         let (mut stopped, mut kept) = (Vec::new(), Vec::new());
         for (id, p) in running {
-            p.reminded = true;
+            p.job.reminded = true;
             lines.push(format!(
                 "- job {id}: `{}` ({})",
                 p.job.command,
@@ -537,18 +539,23 @@ impl BashJobs {
                 stopped.push(id.to_string());
             }
         }
+        // What ending does to each, then the one reason not to end yet: a result still needed. No
+        // "wait for one" offered unconditionally — read as an instruction, it sent models to wait
+        // out a server's silence — and no kill for a job the end stops anyway.
         let mut fates = Vec::new();
         if !stopped.is_empty() {
             fates.push(format!(
-                "{} {} {} stopped",
+                "{} {} {} stopped for you (no need to kill {})",
                 plural(stopped.len(), "job", "jobs"),
                 stopped.join(", "),
                 plural(stopped.len(), "is", "are"),
+                plural(stopped.len(), "it", "them"),
             ));
         }
         if !kept.is_empty() {
             fates.push(format!(
-                "{} {} {} running, and you will be told when {} exits",
+                "{} {} {} running and you will be told when {} exits (bash_job {{\"job\": N, \
+                 \"kill\": true}} stops one you no longer need)",
                 plural(kept.len(), "job", "jobs"),
                 kept.join(", "),
                 plural(kept.len(), "keeps", "keep"),
@@ -556,9 +563,8 @@ impl BashJobs {
             ));
         }
         Some(format!(
-            "{REMINDER_PREFIX} You are ending your turn with jobs still running:\n{}\nWait for one \
-             (bash_job {{\"job\": N}}), stop it (bash_job {{\"job\": N, \"kill\": true}}), or end your \
-             turn. If you end your turn now: {}.",
+            "{REMINDER_PREFIX} You are ending your turn with jobs still running:\n{}\nIf you end \
+             your turn now, {}. {REMINDER_ASK}",
             lines.join("\n"),
             fates.join("; ")
         ))
@@ -593,7 +599,6 @@ impl Parked {
             job,
             notified: false,
             orphan_notified: false,
-            reminded: false,
         }
     }
 

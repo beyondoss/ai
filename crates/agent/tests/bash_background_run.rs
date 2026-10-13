@@ -97,7 +97,9 @@ fn a_background_job_is_reminded_once_then_stopped_when_the_run_ends() {
     let started = tool_result(&events, "t1");
     assert!(started.contains("serving"), "{started}");
     assert!(
-        started.contains("Running in the background as job 1 (it is stopped when the run ends)."),
+        started.contains(
+            "Running in the background as job 1 (it is stopped for you when the run ends)."
+        ),
         "{started}"
     );
     assert_eq!(bodies.len(), 3, "one reminder turn, then the run ends");
@@ -107,7 +109,8 @@ fn a_background_job_is_reminded_once_then_stopped_when_the_run_ends() {
         "{reminded}"
     );
     assert!(
-        reminded.contains("If you end your turn now: job 1 is stopped."),
+        reminded
+            .contains("If you end your turn now, job 1 is stopped for you (no need to kill it)."),
         "{reminded}"
     );
     let stopped = events
@@ -122,6 +125,64 @@ fn a_background_job_is_reminded_once_then_stopped_when_the_run_ends() {
         .parse()
         .unwrap();
     assert!(wait_dead(pid), "the run's end stops a background job");
+}
+
+#[test]
+fn after_the_one_reminder_a_peek_and_a_new_job_do_not_earn_another() {
+    // The double fire the background A/B found (dev-server): reminded, the model waited on the
+    // server, ended again, and was reminded again. Once per run: the second stop ends it, and the
+    // run's end stops both jobs.
+    let (events, bodies, ok) = run_json(vec![
+        bash_turn(
+            "t1",
+            json!({ "command": "echo serving; sleep 94", "run_in_background": true }),
+        ),
+        turn_text("it is up"),
+        // The reminder's reply: peek at the server, then start another job.
+        turn_tool_use(
+            "t2",
+            "bash_job",
+            &json!({ "job": 1, "kill": false, "timeout_ms": 0 }).to_string(),
+        ),
+        bash_turn(
+            "t3",
+            json!({ "command": "echo watching; sleep 95", "run_in_background": true }),
+        ),
+        turn_text("done"),
+    ]);
+    assert!(ok, "run exits 0");
+    let peek = tool_result(&events, "t2");
+    assert!(peek.starts_with("Job 1 is still running ("), "{peek}");
+    assert_eq!(
+        bodies.len(),
+        5,
+        "one reminder turn; the second stop ends the run"
+    );
+    assert_eq!(
+        bodies
+            .iter()
+            .filter(|b| b.contains("[background jobs]"))
+            .count(),
+        bodies.len() - 2,
+        "the reminder is in every request after it, and only one was sent"
+    );
+    assert_eq!(
+        bodies[4]
+            .matches("You are ending your turn with jobs")
+            .count(),
+        1
+    );
+    let stopped = events
+        .iter()
+        .find(|e| e["kind"] == "bash_jobs_stopped")
+        .expect("the stopped jobs are recorded");
+    let ids: Vec<u64> = stopped["jobs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|j| j["job"].as_u64().unwrap())
+        .collect();
+    assert_eq!(ids, vec![1, 2]);
 }
 
 #[test]

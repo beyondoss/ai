@@ -192,7 +192,7 @@ CODE_GATE = ("marshmallow", "sqlparse", "tabulate", "toolz")
 
 BG_COLS = (("bash calls", "bash_calls"), ("run_in_background", "run_in_background"), ("shell `&`", "shell_background"),
            ("timeout_ms set (≤10 s)", None), ("timeout returns", "timeout_returns"), ("timeout kills", "timeout_kills"),
-           ("idle yields", "idle_yields"), ("notices", "notices"), ("reminders", "reminders"), ("sleep-polls", "sleep_polls"),
+           ("idle yields", "idle_yields"), ("job wait s", "job_wait_s"), ("notices", "notices"), ("reminders", "reminders"), ("sleep-polls", "sleep_polls"),
            ("launches", "launches"), ("duplicate launches", "duplicate_launches"), ("stopped at end", "jobs_stopped_at_end"))
 
 
