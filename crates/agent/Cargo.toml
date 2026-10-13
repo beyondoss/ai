@@ -160,15 +160,15 @@ libc = "0.2"
 # them, and released explicitly so a forked child's copy cannot keep them. Already in the build graph
 # at this version (transitively); its safe `fcntl` keeps the `unsafe` out of this crate, which forbids it.
 nix = { version = "0.31", default-features = false, features = ["fs"] }
-# `bash` job tracking (`tools/bash_proc.rs`): `pidfd_open`/`pidfd_send_signal` (signal or wait on one
-# exact process, immune to pid reuse) and `kill` without shelling out. Already in the build graph at
-# this version (through `tempfile`); its safe wrappers keep the `unsafe` out of this crate.
-rustix = { version = "1", features = ["process"] }
 # `export_html`'s markdown rendering (headers/bold/lists/code fences) for message text — pure Rust, no
 # vendored JS. Deliberately not paired with a syntax-highlighting crate (e.g. `syntect`): that pulls in
 # several MB of bundled syntax/theme data and would slow every build of this CLI, including `run`/
 # `serve`, which never touch export — see export.rs's module doc comment.
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+# `bash` job tracking (`tools/bash_proc.rs`): `pidfd_open`/`pidfd_send_signal` (signal or wait on one
+# exact process, immune to pid reuse) and `kill` without shelling out. Already in the build graph at
+# this version (through `tempfile`); its safe wrappers keep the `unsafe` out of this crate.
+rustix = { version = "1", features = ["process"] }
 # Confines the `web` tool's HTML parse to a seccomp allowlist (`tools::web::isolate`). AWS's own
 # filter compiler — the one Firecracker uses — so it is the same primitive the compute tier already
 # trusts, and its `unsafe` stays in a dependency rather than in a crate that forbids it.
