@@ -180,7 +180,53 @@ agent writes: with stdin, a request is about 4/3 of the file.
 
 The agent reads at most 16 MiB of any one response (`--exec-max-response-bytes`). A bigger response
 is an **error**, not a truncated result, because a cut-off JSON body can't be parsed honestly. The
-error says the command ran, so the model narrows the output rather than re-running it.
+error says the command ran, so the model narrows the output rather than re-running it. (That is
+v1.1. A v1.2 stream, below, is read a frame at a time, so huge output gets the same bounded tail and
+truncation marker as a local command.)
+
+#### Streaming (v1.2): make `bash` behave as it does locally
+
+Over v1.1, `bash` sees nothing until a command exits. It can't show progress, can't tell a silent
+build from a hung one, and can't stop a command it has given up on. Locally, a command that is
+silent for 60 s returns to the model as a numbered job that `bash_job` can wait on or kill. v1.2
+makes the same true remotely, and keeps your endpoint stateless: **the connection is the command's
+lifetime.**
+
+When the request carries `"stream": true`, answer `200` with `Content-Type: application/x-ndjson`
+and one JSON frame per line:
+
+```jsonc
+{"stdout":"aGVsbG8K"}   // output bytes, standard base64, at most 64 KiB decoded per frame
+{"stderr":"b29wcwo="}
+{}                      // heartbeat: send one after 5 s with no other frame
+{"exit_code":0}         // final, exactly one of: exit_code | signal | timed_out | error
+```
+
+- Write each frame as soon as you have it (you may coalesce up to 100 ms of output), and make sure
+  nothing in front of you buffers the response.
+- End the body right after the final frame. Use `{"signal":9}` for a signal, `{"timed_out":true}`
+  when you enforce `timeout_ms` (kill the whole process group first), and `{"error":"…"}` if you
+  fail after sending the 200.
+- **If the client disconnects before the final frame, you MUST kill the command's whole process
+  group** (grandchildren too) within 10 s. Kill it at once if you can, by watching the connection.
+  That is the only kill signal the agent sends: `bash_job` kill, a cancelled call and the agent's
+  own exit all just close the stream.
+- Keep answering requests without `stream` exactly as v1.1 does. The filesystem tools use them.
+
+The agent adopts streaming only after a probe at the first `bash` call proves it works: it runs
+`printf a; sleep 0.3; printf b` and needs two frames, the first arriving well before the end. A v1.1
+endpoint, or one whose frames arrive all at once, keeps v1.1 behavior: the call waits for the
+command to exit, and `bash`'s description says so. The full spec is the module doc of
+`crates/agent/src/exec_endpoint.rs`. To check your endpoint against it (framing, heartbeats,
+timeouts, and kill-on-disconnect measured with a grandchild's marker file), run:
+
+```sh
+AGENT_CONFORMANCE_EXEC_URL=https://exec.internal/run \
+AGENT_CONFORMANCE_EXEC_HEADER='Authorization: Bearer …' \
+  cargo test -p beyond-ai-agent --test exec_conformance -- --nocapture
+```
+
+The decoding vectors are in `crates/agent/tests/fixtures/exec/v1.2-frames.json`.
 
 #### Multi-tenant `serve`
 
@@ -222,6 +268,15 @@ quotes or `;` stays one argument on the far side and cannot be reparsed as synta
 `ssh` forwards stdin, so file writes go in one command. `docker exec` and `kubectl exec` forward it
 only with `-i` (`docker exec -i my-container {}`). Without `-i`, writes still work, but they fall
 back to one command per 48 KiB.
+
+A template's output streams, because the transport is a local process, so `bash` yields and shows
+progress as it does locally. Killing the transport does **not** kill the command: a SIGKILL or
+SIGTERM to `docker exec` leaves its command running in the container (measured). So every command
+runs under a small `sh` wrapper that starts it in its own session (`setsid`) and reports its process
+group on stderr (the agent strips that line). A kill (`bash_job`, a cancelled call, a timeout, the
+agent's exit) then runs `kill -KILL -<pgid>` through the same template. The target needs `sh`, and
+`setsid` for the kill to reach grandchildren (busybox and util-linux both have it). Without `setsid`,
+only the command's own process is killed.
 
 **Install `ripgrep` on the target if you can.** With `rg` present, results are byte-identical to
 running locally. Without it the fallback is POSIX `grep`, which diverges in two measured ways: it

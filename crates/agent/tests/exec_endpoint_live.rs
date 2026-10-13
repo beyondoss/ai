@@ -266,3 +266,84 @@ fn write_then_read_round_trips_through_the_target() {
         "the file must not appear on this host — that would mean the write never left"
     );
 }
+
+/// The runner the live flags describe, built in-process — for a test that needs to hold the job
+/// table itself.
+fn live_runner() -> Option<std::sync::Arc<dyn beyond_ai_agent::tools::exec::CommandRunner>> {
+    use beyond_ai_agent::exec_endpoint::{HttpExecRunner, TemplateRunner};
+    if let Ok(url) = std::env::var("AGENT_LIVE_EXEC_URL")
+        && !url.is_empty()
+    {
+        let mut r = HttpExecRunner::new(url).unwrap();
+        if let Ok(h) = std::env::var("AGENT_LIVE_EXEC_HEADER")
+            && !h.is_empty()
+        {
+            let (n, v) = HttpExecRunner::parse_header(&h).unwrap();
+            r = r.with_header(n, v);
+        }
+        return Some(std::sync::Arc::new(r));
+    }
+    let cmd = std::env::var("AGENT_LIVE_EXEC_CMD")
+        .ok()
+        .filter(|c| !c.is_empty())?;
+    Some(std::sync::Arc::new(TemplateRunner::parse(&cmd).unwrap()))
+}
+
+/// The kill a `bash_job` reports must be true **on the target**. Against a real `docker exec`
+/// (CI's `exec-live` shard), killing the local transport leaves the command running in the
+/// container, so this fails unless the kill went through the transport. The target's pid 1 is a
+/// plain `sleep` that never reaps, so "dead" is read from `/proc` (a zombie is dead), not `kill -0`.
+#[tokio::test]
+async fn a_killed_bash_job_dies_on_the_target() {
+    use common::remote_bash::{call, job_number, kill_job, remote_bash};
+    use std::time::{Duration, Instant};
+    let Some(runner) = live_runner() else {
+        eprintln!("skipping: set AGENT_LIVE_EXEC_CMD or AGENT_LIVE_EXEC_URL to run live tests");
+        return;
+    };
+    let (bash, jobs) = remote_bash(runner.clone(), Duration::from_secs(2));
+    let out = call(
+        bash.as_ref(),
+        json!({ "command": "(sleep 300) & echo \"pids $$ $!\"; sleep 300" }),
+    )
+    .await
+    .unwrap_or_else(|e| e);
+    let n = job_number(&out).unwrap_or_else(|| {
+        panic!("a silent command on a streaming target must yield as a job: {out}")
+    });
+    let pids: Vec<String> = out
+        .lines()
+        .find_map(|l| l.strip_prefix("pids "))
+        .unwrap_or_else(|| panic!("no pids in: {out}"))
+        .split_whitespace()
+        .map(str::to_string)
+        .collect();
+    let killed = kill_job(&jobs, n).await.unwrap();
+    assert!(killed.contains("killed"), "{killed}");
+
+    let alive = format!(
+        "alive() {{ s=$(cut -d' ' -f3 \"/proc/$1/stat\" 2>/dev/null); [ -n \"$s\" ] && [ \"$s\" != Z ]; }}; \
+         alive {} || alive {}",
+        pids[0], pids[1]
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let r = runner
+            .run(
+                "sh",
+                &["-c".to_string(), alive.clone()],
+                None,
+                Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
+        if r.code != Some(0) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the job's processes {pids:?} are still running on the target after bash_job kill"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
