@@ -1627,6 +1627,13 @@ reason = "Meta's flagship ($1.25 / $4.25 on Meta's Model API), but we hold no Me
 
 [[not_carried]]
 provider = "openrouter"
+id = "meta/muse-wonder"
+source = "https://openrouter.ai/api/v1/models/meta/muse-wonder/endpoints"
+date = "2026-10-12"
+reason = "Meta's new top tier ($4 / $20 on OpenRouter), the Muse Spark 1.3 shape: we hold no Meta key and OpenRouter's only host is Meta on OpenRouter's key (D156). Add it with a Meta pool key."
+
+[[not_carried]]
+provider = "openrouter"
 id = "thinkingmachines/inkling-small"
 source = "https://docs.together.ai/docs/deprecations"
 date = "2026-10-01"
