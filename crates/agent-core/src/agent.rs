@@ -216,6 +216,12 @@ const MIN_CACHED_SUMMARY_TOKENS: u32 = 2_048;
 /// index, so the call-order transcript is unaffected — only peak concurrency is bounded.
 const MAX_CONCURRENT_TOOL_GROUPS: usize = 8;
 
+/// The error result for a tool call the output token limit cut off (see [`Turn::not_run`]). Says the
+/// call didn't run and how to resend it so it fits — the same answer every dialect's length stop gets.
+const CUT_OFF_TOOL_CALL: &str = "not run: the response hit the output token limit while this tool \
+     call was being written, so its input was cut off. Re-issue it with less input per call — for \
+     example, split a large write or edit into several smaller ones.";
+
 /// Partition a turn's calls (given each call's [`Tool::write_targets`](crate::tool::Tool::write_targets),
 /// in call order) into dispatch groups: calls sharing **any** target land in one group, run serially in
 /// call order; a call with no target is a group of its own. A multi-file `edit` can join two paths'
@@ -1162,8 +1168,8 @@ impl Agent {
             let recovered_truncation_last_turn =
                 std::mem::replace(&mut truncation_recovered, false);
             last_stop_reason = turn.stop_reason;
-            let malformed: HashMap<String, String> =
-                std::mem::take(&mut turn.malformed).into_iter().collect();
+            let not_run: HashMap<String, String> =
+                std::mem::take(&mut turn.not_run).into_iter().collect();
             // Snapshot usage *before* appending this turn's own assistant message: `record_usage`
             // captures `messages.len()` as the boundary `trailing_tokens` estimates forward from, and
             // `turn.usage.input_tokens` describes the prompt that was sent *without* this response —
@@ -1254,12 +1260,14 @@ impl Agent {
                 })
                 .unwrap_or_default();
 
-            // Dispatch is gated on the presence of complete `tool_use` blocks alone, never on
-            // `stop_reason` — matching pi's `agent-loop.ts` (it dispatches off the assistant message's
-            // own content, full stop). A turn can legitimately end `MaxTokens` *after* the model already
-            // emitted one or more complete tool calls (e.g. it calls two tools, then starts trailing
-            // commentary that gets cut off) — gating on `stop_reason == ToolUse` there would silently
-            // drop tool calls the model actually made.
+            // Dispatch is gated on the presence of `tool_use` blocks, not on `stop_reason`: a turn can
+            // end `MaxTokens` *after* the model already emitted one or more whole tool calls (it calls
+            // two tools, then trailing commentary gets cut off), and those run. A whole call's input
+            // parsed as one JSON value, which only happens once the model's own closing `}` arrived —
+            // nothing the cut drops afterwards can belong to it. The call the cut landed in is the
+            // exception: `Turn::not_run` holds it, and it is answered with an error instead of run (pi's
+            // `agent-loop.ts` refuses *every* call on a length stop; we can tell whole from cut, so only
+            // the cut one is refused).
             if calls.is_empty() {
                 // Silent truncation: the provider replied successfully, but the response was cut off by
                 // `max_tokens` alone (no tool calls, so this isn't a "the model needs another turn to
@@ -1561,7 +1569,7 @@ impl Agent {
                         .unwrap_or_default()
                 }));
             let this = self;
-            let malformed = &malformed;
+            let not_run = &not_run;
             // Read-only reborrow, shared across every hook invocation below: by this point the
             // requesting assistant turn (this batch's own `tool_use` blocks) is already
             // `session.messages.last()` (the pre-dispatch checkpoint above established that same
@@ -1578,7 +1586,7 @@ impl Agent {
                     self.run_tool_calls_interleaved(
                         session_ref,
                         &calls,
-                        malformed,
+                        not_run,
                         cancel_ref,
                         &mut sink,
                         &current_tools,
@@ -1618,14 +1626,12 @@ impl Agent {
                             gate_cancelled = true;
                             break;
                         }
-                        if let Some(raw) = malformed.get(id) {
-                            // The model streamed a tool call whose argument fragments never formed valid
-                            // JSON. Feed that back as an error result the model can correct next turn rather
-                            // than aborting the whole run on one malformed call.
+                        if let Some(message) = not_run.get(id) {
+                            // The call's input never arrived whole — cut off by the output limit, or
+                            // JSON that doesn't parse (see `Turn::not_run`). Feed that back as an error
+                            // result the model can correct next turn rather than aborting the whole run.
                             outcomes[i] = Some(GateOutcome::Immediate((
-                                format!(
-                                    "tool call arguments were not valid JSON and could not be parsed: {raw}"
-                                ),
+                                message.clone(),
                                 Vec::new(),
                                 true,
                                 false,
@@ -2115,7 +2121,7 @@ impl Agent {
         &self,
         session: &Session,
         calls: &[(String, String, Value)],
-        malformed: &HashMap<String, String>,
+        not_run: &HashMap<String, String>,
         cancel: &CancellationToken,
         sink: &mut (dyn FnMut(AgentEvent) + Send),
         tools: &ToolRegistry,
@@ -2137,17 +2143,14 @@ impl Agent {
             // emits none of its own) — so a gate-resolved call that returns here without an end leaves
             // any client pairing the two events with a tool that started and never finished, hung
             // forever in the UI even though the run moved on and the model got its error result.
-            if let Some(raw) = malformed.get(id) {
-                let message = format!(
-                    "tool call arguments were not valid JSON and could not be parsed: {raw}"
-                );
+            if let Some(message) = not_run.get(id) {
                 sink(AgentEvent::ToolEnd {
                     id: id.clone(),
                     name: name.clone(),
                     result: message.clone(),
                     is_error: true,
                 });
-                results[i] = Some((message, Vec::new(), true, false));
+                results[i] = Some((message.clone(), Vec::new(), true, false));
                 continue;
             }
             // Pi-parity fix: same "look up the tool first" fix as the default gate loop above (see its
@@ -3704,23 +3707,19 @@ pub(crate) fn repair_json(s: &str) -> String {
     out
 }
 
-/// Best-effort recovery for tool-call JSON that's genuinely *incomplete* — cut off mid-stream by an
-/// output-token ceiling, not merely mis-escaped (`repair_json`'s job, tried first in
-/// [`Accumulator::flush_block`]'s fallback chain). Closes whatever string literal and structural
-/// containers (`{`/`[`) were still open when the buffer ended, so a large `write`/`edit` call whose
-/// argument value got cut off mid-string (the common real case — the value being streamed, e.g. file
-/// content, is typically the longest and thus likeliest field to still be open when a `max_tokens`
-/// ceiling hits) recovers a partial object instead of being discarded to `{}` entirely. Ported in
-/// spirit from pi's fallback to the `partial-json` library (`json-parse.ts`), hand-rolled here rather
-/// than pulling in a dependency for it.
+/// Closes up tool-call JSON that's genuinely *incomplete* — cut off mid-stream by an output-token
+/// ceiling, not merely mis-escaped (`repair_json`'s job) — for the *transcript only*. Closes whatever
+/// string literal and structural containers (`{`/`[`) were still open when the buffer ended, so the
+/// `tool_use` block of a large `write`/`edit` cut off mid-value records the partial object the model
+/// actually wrote instead of `{}`. The call itself never runs on the result
+/// ([`Accumulator::flush_block`] marks it unsettled either way): a closed-up `content` is truncated
+/// content, and running it would silently corrupt the file. Ported in spirit from pi's fallback to the
+/// `partial-json` library (`json-parse.ts`), hand-rolled here rather than pulling in a dependency.
 ///
 /// Not a full JSON5-style parser: doesn't attempt to complete a truncated literal (a bare `tru`, a
 /// lone `-`) or synthesize a value for a key truncated before its `:value` ever started — those
-/// remain invalid JSON and fall through to [`Accumulator::flush_block`]'s existing malformed-call
-/// recovery unchanged, exactly as they did before this function existed. Returns `None` when there's
-/// nothing to close (a balanced string that simply failed to parse for some other reason — this
-/// function isn't the right tool for that, and returning the input unchanged would just loop the
-/// caller back to the same failure).
+/// remain invalid JSON, and the block records `{}`. Returns `None` when there's nothing to close (a
+/// balanced string that simply failed to parse for some other reason).
 fn close_incomplete_json(s: &str) -> Option<String> {
     let mut stack: Vec<char> = Vec::new();
     let mut in_string = false;
@@ -3771,14 +3770,23 @@ fn close_incomplete_json(s: &str) -> Option<String> {
     Some(out)
 }
 
+/// The error result for a tool call whose streamed input isn't valid JSON (see [`Turn::not_run`]).
+fn invalid_tool_input_error(raw: &str) -> String {
+    format!("tool call arguments were not valid JSON and could not be parsed: {raw}")
+}
+
 /// The assembled result of one model turn.
 struct Turn {
     blocks: Vec<ContentBlock>,
     stop_reason: StopReason,
     usage: TokenUsage,
-    /// Tool calls whose streamed arguments never parsed as JSON, as `(tool_use_id, raw buffer)`. The
-    /// loop turns each into an error `tool_result` the model can correct, rather than aborting the run.
-    malformed: Vec<(String, String)>,
+    /// Tool calls whose input never arrived as one whole JSON value, as `(tool_use_id, the error
+    /// result it gets)`. None of them runs: the loop answers each at its gate, so the model can
+    /// correct it next turn rather than the run aborting. A call cut off by the output token limit
+    /// (the turn stopped `MaxTokens` before its input was whole) gets [`CUT_OFF_TOOL_CALL`] — closing
+    /// up a truncated `write`/`edit` and running it would silently write truncated content. Any other
+    /// is JSON the model emitted that doesn't parse.
+    not_run: Vec<(String, String)>,
 }
 
 /// One still-open content block's accumulated state, keyed by its `index` in [`Accumulator::open`].
@@ -3822,9 +3830,17 @@ struct Accumulator {
     blocks: Vec<ContentBlock>,
     stop_reason: StopReason,
     usage: TokenUsage,
-    /// Tool calls whose streamed JSON arguments failed to parse, as `(id, raw buffer)`. Surfaced on
-    /// the `Turn` so the loop can feed each back as a recoverable error `tool_result`.
-    malformed: Vec<(String, String)>,
+    /// Tool calls whose streamed input didn't arrive as one whole JSON value, in call order. Settled
+    /// into [`Turn::not_run`] by `finish`, once the stop reason is known.
+    unsettled: Vec<(String, UnsettledInput)>,
+}
+
+/// Why a tool call's streamed input isn't known to be whole (see [`Accumulator::unsettled`]).
+enum UnsettledInput {
+    /// No input bytes at all, recorded as `{}`.
+    Empty,
+    /// A buffer that doesn't parse, even after [`repair_json`]: the raw bytes.
+    Invalid(String),
 }
 
 impl Accumulator {
@@ -3955,24 +3971,28 @@ impl Accumulator {
         let block = match open_block {
             OpenBlock::Tool(id, name, args, thought_signature) => {
                 let input = if args.trim().is_empty() {
+                    // `{}` is the whole input of a tool that takes none — unless the response was cut
+                    // off right after this call opened, which only `finish` can tell.
+                    self.unsettled.push((id.clone(), UnsettledInput::Empty));
                     json!({})
                 } else {
-                    let parsed = serde_json::from_str(&args)
+                    match serde_json::from_str(&args)
                         .or_else(|_| serde_json::from_str(&repair_json(&args)))
-                        .or_else(|e| match close_incomplete_json(&args) {
-                            Some(closed) => serde_json::from_str(&closed),
-                            None => Err(e),
-                        });
-                    match parsed {
+                    {
                         Ok(v) => v,
-                        // Still doesn't parse even after both repair passes — a genuine protocol
-                        // glitch, not a tool failure. Keep the tool_use block (with an empty,
-                        // wire-valid input object so the next request doesn't 400) and record the
-                        // call as malformed; the loop feeds back an error result the model can
-                        // correct, instead of aborting the run.
+                        // Not one whole JSON value even after re-escaping, so this call never runs
+                        // (see `Turn::not_run`, settled in `finish`). Its `tool_use` block stays in
+                        // the transcript with whatever object closing the buffer recovers — what the
+                        // model actually wrote, so it can see how far it got — or a wire-valid `{}`
+                        // when nothing parses.
                         Err(_) => {
-                            self.malformed.push((id.clone(), args));
-                            json!({})
+                            let recorded = close_incomplete_json(&args)
+                                .and_then(|closed| serde_json::from_str::<Value>(&closed).ok())
+                                .filter(Value::is_object)
+                                .unwrap_or_else(|| json!({}));
+                            self.unsettled
+                                .push((id.clone(), UnsettledInput::Invalid(args)));
+                            recorded
                         }
                     }
                 };
@@ -4022,11 +4042,36 @@ impl Accumulator {
         for index in self.open.keys().copied().collect::<Vec<_>>() {
             self.flush_block(index);
         }
+        // Settle the calls whose input didn't arrive whole, now that the stop reason is known. A
+        // length stop cuts the response off mid-generation, and every dialect closes whatever block
+        // was open when it did — so an incomplete input in such a turn is a cut-off call, told to
+        // resend smaller. Outside a length stop the model itself emitted JSON that doesn't parse.
+        let length_stop = self.stop_reason == StopReason::MaxTokens;
+        let last_tool = match self.blocks.last() {
+            Some(ContentBlock::ToolUse { id, .. }) => Some(id.clone()),
+            _ => None,
+        };
+        let not_run = self
+            .unsettled
+            .into_iter()
+            .filter_map(|(id, input)| match input {
+                UnsettledInput::Invalid(_) if length_stop => {
+                    Some((id, CUT_OFF_TOOL_CALL.to_string()))
+                }
+                UnsettledInput::Invalid(raw) => Some((id, invalid_tool_input_error(&raw))),
+                // No input bytes at all is only a cut-off where the response ended; anywhere
+                // earlier it's a complete no-argument call.
+                UnsettledInput::Empty if length_stop && last_tool.as_ref() == Some(&id) => {
+                    Some((id, CUT_OFF_TOOL_CALL.to_string()))
+                }
+                UnsettledInput::Empty => None,
+            })
+            .collect();
         Turn {
             blocks: self.blocks,
             stop_reason: self.stop_reason,
             usage: self.usage,
-            malformed: self.malformed,
+            not_run,
         }
     }
 }
@@ -7694,54 +7739,433 @@ mod tests {
         }
     }
 
+    /// A tool that records every input it actually runs with — the assertion that a call did *not*
+    /// run is that its recorder stayed empty, not just that an error result came back.
+    struct Recorder {
+        name: &'static str,
+        ran: Arc<std::sync::Mutex<Vec<Value>>>,
+    }
+
+    impl Recorder {
+        fn new(name: &'static str) -> (Arc<Self>, Arc<std::sync::Mutex<Vec<Value>>>) {
+            let ran = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let tool = Arc::new(Self {
+                name,
+                ran: ran.clone(),
+            });
+            (tool, ran)
+        }
+    }
+
+    #[async_trait]
+    impl Tool for Recorder {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn description(&self) -> &str {
+            "records the inputs it runs with"
+        }
+        fn input_schema(&self) -> Value {
+            json!({ "type": "object" })
+        }
+        async fn run(
+            &self,
+            input: Value,
+        ) -> std::result::Result<crate::tool::ToolOutput, crate::error::ToolError> {
+            self.ran.lock().unwrap().push(input);
+            Ok(format!("{} ran", self.name).into())
+        }
+    }
+
+    /// One tool call's stream events: opened, `input` streamed in one delta (none when empty), closed.
+    fn tool_call_events(index: usize, id: &str, name: &str, input: &str) -> Vec<StreamEvent> {
+        let mut events = vec![StreamEvent::ToolUseStart {
+            index,
+            id: id.into(),
+            name: name.into(),
+        }];
+        if !input.is_empty() {
+            events.push(StreamEvent::InputJsonDelta {
+                index,
+                partial_json: input.into(),
+            });
+        }
+        events.push(StreamEvent::ContentBlockStop { index });
+        events
+    }
+
+    /// A turn made of `calls` (`(id, name, input)`), ending with `stop_reason`.
+    fn tool_turn(calls: &[(&str, &str, &str)], stop_reason: StopReason) -> Vec<StreamEvent> {
+        let mut events = vec![StreamEvent::MessageStart];
+        for (i, (id, name, input)) in calls.iter().enumerate() {
+            events.extend(tool_call_events(i, id, name, input));
+        }
+        events.push(StreamEvent::MessageStop { stop_reason });
+        events
+    }
+
+    /// The `(content, is_error)` of each tool result in `message`, in order.
+    fn tool_results(message: &Message) -> Vec<(String, bool)> {
+        message
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::ToolResult {
+                    content, is_error, ..
+                } => Some((content.to_string(), *is_error)),
+                _ => None,
+            })
+            .collect()
+    }
+
     #[tokio::test]
-    async fn a_tool_call_truncated_mid_value_string_recovers_a_partial_object_not_an_empty_one() {
-        // Unlike `malformed_tool_args_become_recoverable_error_result` above (truncated right after a
-        // key, before any value — genuinely unrecoverable), this stream is cut off mid-*value*, the
-        // shape `close_incomplete_json` exists to fix: the tool must see the actual partial content
-        // it received, not an empty `{}` with the call flagged as malformed.
-        let truncated_turn = vec![
-            StreamEvent::MessageStart,
-            StreamEvent::ToolUseStart {
-                index: 0,
-                id: "tu_1".into(),
-                name: "echo".into(),
-            },
-            StreamEvent::InputJsonDelta {
-                index: 0,
-                // `text` matches `EchoTool`'s own required field, so a successful recovery both
-                // produces a valid `tool_use` input *and* lets the tool actually run and echo it back
-                // — not merely parse, but genuinely usable end to end.
-                partial_json: r#"{"text":"hello wor"#.into(),
-            },
-            StreamEvent::ContentBlockStop { index: 0 },
-            StreamEvent::MessageStop {
-                stop_reason: StopReason::ToolUse,
-            },
-        ];
+    async fn a_tool_call_cut_off_at_max_tokens_is_not_run_and_is_told_to_resend_smaller() {
+        // The output limit landed inside a `write`'s `content`. Closing the buffer up gives a
+        // parseable `{"path":"a.txt","content":"hello wor"}`, and running that would write a
+        // truncated file with `is_error: false` — the model would never learn. The call must not
+        // run; it gets an error result saying it was cut off and how to resend it.
+        let (write, ran) = Recorder::new("write");
         let mut tools = ToolRegistry::new();
-        tools.register(Arc::new(EchoTool));
-        let (agent, _mock) = agent_with(vec![truncated_turn, turn::text("done")], tools);
+        tools.register(write);
+        let (agent, mock) = agent_with(
+            vec![
+                tool_turn(
+                    &[("tu_1", "write", r#"{"path":"a.txt","content":"hello wor"#)],
+                    StopReason::MaxTokens,
+                ),
+                turn::text("done"),
+            ],
+            tools,
+        );
+        let mut session = Session::new();
+        session.user("go");
+        let mut events = Vec::new();
+        agent
+            .run_events(&mut session, |e| events.push(e))
+            .await
+            .unwrap();
+
+        assert!(
+            ran.lock().unwrap().is_empty(),
+            "a cut-off call must not run"
+        );
+        // user, assistant(tool_use), user(tool_result), assistant(text): every tool_use answered,
+        // roles alternating, and the follow-up request carried the answer.
+        let roles: Vec<Role> = session.messages.iter().map(|m| m.role).collect();
+        assert_eq!(
+            roles,
+            [Role::User, Role::Assistant, Role::User, Role::Assistant]
+        );
+        // The transcript records what the model did write, so it can see how far it got.
+        assert_eq!(
+            session.messages[1].content,
+            vec![ContentBlock::tool_use(
+                "tu_1",
+                "write",
+                json!({ "path": "a.txt", "content": "hello wor" }),
+            )]
+        );
+        assert_eq!(
+            tool_results(&session.messages[2]),
+            [(CUT_OFF_TOOL_CALL.to_string(), true)]
+        );
+        assert_eq!(mock.calls(), 2);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                AgentEvent::ToolEnd { id, is_error: true, result, .. }
+                    if id == "tu_1" && result == CUT_OFF_TOOL_CALL
+            )),
+            "a client must see the refused call end"
+        );
+    }
+
+    #[tokio::test]
+    async fn whole_calls_before_the_cut_still_run_and_only_the_cut_call_is_refused() {
+        // A whole call's input parsed as one JSON value, which needs the model's own closing `}` —
+        // nothing the cut drops afterwards belongs to it, so it runs. Only the call the cut landed in
+        // is refused, and both answers ride one user turn in call order.
+        let (read, read_ran) = Recorder::new("read");
+        let (write, write_ran) = Recorder::new("write");
+        let mut tools = ToolRegistry::new();
+        tools.register(read);
+        tools.register(write);
+        let (agent, _mock) = agent_with(
+            vec![
+                tool_turn(
+                    &[
+                        ("tu_1", "read", r#"{"path":"a.txt"}"#),
+                        ("tu_2", "write", r#"{"path":"b.txt","content":"par"#),
+                    ],
+                    StopReason::MaxTokens,
+                ),
+                turn::text("done"),
+            ],
+            tools,
+        );
         let mut session = Session::new();
         session.user("go");
         agent.run(&mut session, |_| {}).await.unwrap();
 
+        assert_eq!(read_ran.lock().unwrap().len(), 1, "the whole call runs");
+        assert!(
+            write_ran.lock().unwrap().is_empty(),
+            "the cut call does not"
+        );
+        assert_eq!(
+            tool_results(&session.messages[2]),
+            [
+                ("read ran".to_string(), false),
+                (CUT_OFF_TOOL_CALL.to_string(), true)
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unclosed_input_without_a_length_stop_is_malformed_not_closed_up_and_run() {
+        // No length stop, so nothing cut this input off: the model emitted JSON that never closes.
+        // Closing it up would still be a guess about where the value ended — not run, reported as
+        // invalid JSON, with the partial object kept in the transcript.
+        let (write, ran) = Recorder::new("write");
+        let mut tools = ToolRegistry::new();
+        tools.register(write);
+        let (agent, _mock) = agent_with(
+            vec![
+                tool_turn(
+                    &[("tu_1", "write", r#"{"path":"a.txt","content":"hello wor"#)],
+                    StopReason::ToolUse,
+                ),
+                turn::text("done"),
+            ],
+            tools,
+        );
+        let mut session = Session::new();
+        session.user("go");
+        agent.run(&mut session, |_| {}).await.unwrap();
+
+        assert!(ran.lock().unwrap().is_empty());
         match &session.messages[1].content[0] {
-            ContentBlock::ToolUse { input, .. } => {
-                assert_eq!(input["text"], "hello wor", "got: {input:?}");
-            }
+            ContentBlock::ToolUse { input, .. } => assert_eq!(input["content"], "hello wor"),
             other => panic!("expected a tool_use block, got {other:?}"),
         }
-        // Not flagged as malformed, and the tool actually ran on the recovered partial value — a real
-        // echoed result, not an error placeholder.
-        match &session.messages[2].content[0] {
-            ContentBlock::ToolResult {
-                is_error, content, ..
-            } => {
-                assert!(!is_error, "recovered call must not be treated as malformed");
-                assert_eq!(content.as_ref(), "hello wor");
+        let results = tool_results(&session.messages[2]);
+        assert!(results[0].1);
+        assert!(
+            results[0].0.contains("not valid JSON"),
+            "got: {}",
+            results[0].0
+        );
+    }
+
+    #[tokio::test]
+    async fn a_call_cut_off_before_any_input_is_refused_but_an_earlier_no_argument_call_runs() {
+        // No input bytes at all is `{}` — the whole input of a tool that takes none. It's only a
+        // cut-off where the response ended.
+        let (ping, ping_ran) = Recorder::new("ping");
+        let (write, write_ran) = Recorder::new("write");
+        let mut tools = ToolRegistry::new();
+        tools.register(ping);
+        tools.register(write);
+        let (agent, _mock) = agent_with(
+            vec![
+                tool_turn(
+                    &[("tu_1", "ping", ""), ("tu_2", "write", "")],
+                    StopReason::MaxTokens,
+                ),
+                turn::text("done"),
+            ],
+            tools,
+        );
+        let mut session = Session::new();
+        session.user("go");
+        agent.run(&mut session, |_| {}).await.unwrap();
+
+        assert_eq!(ping_ran.lock().unwrap().len(), 1);
+        assert!(write_ran.lock().unwrap().is_empty());
+        assert_eq!(
+            tool_results(&session.messages[2]),
+            [
+                ("ping ran".to_string(), false),
+                (CUT_OFF_TOOL_CALL.to_string(), true)
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_interleaved_dispatch_path_refuses_a_cut_off_call_too() {
+        // A `Sequential` tool in the batch routes it through `run_tool_calls_interleaved`, which has
+        // its own gate — it must refuse the cut call, and still emit its `ToolEnd`.
+        struct SeqTool;
+        #[async_trait]
+        impl Tool for SeqTool {
+            fn name(&self) -> &str {
+                "seq"
             }
-            other => panic!("expected a tool_result block, got {other:?}"),
+            fn description(&self) -> &str {
+                "forces the interleaved dispatch path"
+            }
+            fn input_schema(&self) -> Value {
+                json!({ "type": "object" })
+            }
+            async fn run(
+                &self,
+                _: Value,
+            ) -> std::result::Result<crate::tool::ToolOutput, crate::error::ToolError> {
+                Ok("seq ran".into())
+            }
+            fn execution_mode(&self) -> Option<crate::tool::ToolExecutionMode> {
+                Some(crate::tool::ToolExecutionMode::Sequential)
+            }
+        }
+        let (write, ran) = Recorder::new("write");
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(SeqTool));
+        tools.register(write);
+        let (agent, _mock) = agent_with(
+            vec![
+                tool_turn(
+                    &[
+                        ("tu_1", "seq", "{}"),
+                        ("tu_2", "write", r#"{"path":"b.txt","content":"par"#),
+                    ],
+                    StopReason::MaxTokens,
+                ),
+                turn::text("done"),
+            ],
+            tools,
+        );
+        let mut session = Session::new();
+        session.user("go");
+        let mut events = Vec::new();
+        agent
+            .run_events(&mut session, |e| events.push(e))
+            .await
+            .unwrap();
+
+        assert!(ran.lock().unwrap().is_empty());
+        assert_eq!(
+            tool_results(&session.messages[2]),
+            [
+                ("seq ran".to_string(), false),
+                (CUT_OFF_TOOL_CALL.to_string(), true)
+            ]
+        );
+        assert!(events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolEnd { id, is_error: true, .. } if id == "tu_2"
+        )));
+    }
+
+    #[tokio::test]
+    async fn every_dialect_s_length_stop_refuses_the_cut_off_call_and_runs_the_whole_one() {
+        // Recorded wire shapes of each dialect's length stop, decoded by the real decoders: a whole
+        // `read` call, then a `write` whose `content` the output limit cut off. Each dialect closes
+        // the open block itself at the stop, so the loop sees the same shape from all three.
+        const ANTHROPIC: &str = r#"
+event: message_start
+data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","content":[],"model":"claude-opus-4-8","stop_reason":null,"usage":{"input_tokens":10,"output_tokens":1}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"read","input":{}}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"a.txt\"}"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: content_block_start
+data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_2","name":"write","input":{}}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"b.txt\",\"content\":\"line one\\nline tw"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":1}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":4096}}
+
+event: message_stop
+data: {"type":"message_stop"}
+"#;
+        const CHAT_COMPLETIONS: &str = r#"
+data: {"choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
+
+data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"read","arguments":"{\"path\":\"a.txt\"}"}}]},"finish_reason":null}]}
+
+data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"call_2","type":"function","function":{"name":"write","arguments":"{\"path\":\"b.txt\",\"content\":\"line one\\nline tw"}}]},"finish_reason":null}]}
+
+data: {"choices":[{"index":0,"delta":{},"finish_reason":"length"}]}
+
+data: [DONE]
+"#;
+        const RESPONSES: &str = r#"
+data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"read","arguments":""}}
+
+data: {"type":"response.function_call_arguments.delta","output_index":0,"delta":"{\"path\":\"a.txt\"}"}
+
+data: {"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"read","arguments":"{\"path\":\"a.txt\"}"}}
+
+data: {"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","id":"fc_2","call_id":"call_2","name":"write","arguments":""}}
+
+data: {"type":"response.function_call_arguments.delta","output_index":1,"delta":"{\"path\":\"b.txt\",\"content\":\"line one\\nline tw"}
+
+data: {"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":10,"output_tokens":4096}}}
+"#;
+        let wires: [(&str, Box<dyn crate::dialect::StreamDecoder>, &str); 3] = [
+            (
+                "anthropic",
+                Box::new(crate::dialect::anthropic::Decoder::default()),
+                ANTHROPIC,
+            ),
+            (
+                "chat completions",
+                Box::new(crate::dialect::openai::Decoder::default()),
+                CHAT_COMPLETIONS,
+            ),
+            (
+                "responses",
+                Box::new(crate::dialect::openai_responses::Decoder::default()),
+                RESPONSES,
+            ),
+        ];
+        for (wire, mut decoder, sse) in wires {
+            let events = crate::dialect::decode_sse(decoder.as_mut(), sse).unwrap();
+            assert_eq!(
+                events.last(),
+                Some(&StreamEvent::MessageStop {
+                    stop_reason: StopReason::MaxTokens
+                }),
+                "{wire}: a length stop"
+            );
+            let (read, read_ran) = Recorder::new("read");
+            let (write, write_ran) = Recorder::new("write");
+            let mut tools = ToolRegistry::new();
+            tools.register(read);
+            tools.register(write);
+            let (agent, _mock) = agent_with(vec![events, turn::text("done")], tools);
+            let mut session = Session::new();
+            session.user("go");
+            agent.run(&mut session, |_| {}).await.unwrap();
+
+            assert_eq!(
+                read_ran.lock().unwrap().len(),
+                1,
+                "{wire}: the whole call runs"
+            );
+            assert!(
+                write_ran.lock().unwrap().is_empty(),
+                "{wire}: the cut call must not run"
+            );
+            assert_eq!(
+                tool_results(&session.messages[2]),
+                [
+                    ("read ran".to_string(), false),
+                    (CUT_OFF_TOOL_CALL.to_string(), true)
+                ],
+                "{wire}"
+            );
         }
     }
 
