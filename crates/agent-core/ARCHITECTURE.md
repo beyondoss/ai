@@ -1031,9 +1031,27 @@ with its open string/`{`/`[` closed — the partial object the model actually wr
 when even that doesn't parse, and `finish` settles the call once the stop reason is known: in a
 `MaxTokens` turn it is a cut-off call (see the dispatch section above); otherwise the model itself
 emitted JSON that doesn't parse. Either way it lands in `Turn::not_run` with its error `tool_result`
-("cut off at the output token limit" or "arguments were not valid JSON"), which the gate feeds back so
-the model can correct it, rather than aborting the run. An empty buffer
-is `{}`, the whole input of a tool that takes none, unless it is the last block of a `MaxTokens` turn.
+(`CUT_OFF_TOOL_CALL`, or `invalid_tool_input_error`'s diagnosis below), which the gate feeds back so
+the model can correct it, rather than aborting the run. An empty buffer is `{}`, the whole input of a
+tool that takes none, unless it is the last block of a `MaxTokens` turn.
+
+`invalid_tool_input_error` says what was wrong, where, and how to resend — never the whole input (a
+broken `write` can be tens of kilobytes, and the model has it in its own `tool_use` block). It names
+serde's error, then quotes at most 60 bytes before and 40 bytes from the failure point, cut from the
+input after `repair_json` (the text the parse actually failed on), single-line. A failure that is the
+`>` right after a quoted name in key position — Haiku's XML parameter syntax leaking into JSON as
+`"new_string">RAW`, all 89 recorded Haiku edit failures — gets its own hint:
+
+> not run: the tool call's input is not valid JSON (expected `:` at line 1 column 25). Parsing failed
+> after `{"edits": [{"new_string"`, at `>        try:\n            value = getter…`. "new_string"> is
+> XML parameter syntax; JSON needs "new_string": "…", with quotes, backslashes and newlines inside the
+> value escaped (\", \\, \n). Resend the whole call as JSON.
+
+An input that ends early is told "It ends with `…` before the JSON is complete. Resend the whole call
+as one complete JSON object."; anything else gets the excerpt and "Resend the whole call as one JSON
+object, with quotes, backslashes and newlines inside string values escaped (\", \\, \n)." The input is
+never repaired into a call that runs: a guessed `new_string` can be silently wrong, while a resend
+costs one turn (retries already recovered 72 of 88 recorded failures with the old, bare message).
 
 Edge case: `stop_reason` defaults to `StopReason::EndTurn` and usage defaults to `0`/`0` if the stream
 never delivers a `MessageStop`/`Usage` event before closing cleanly (e.g. a non-conformant upstream) —
