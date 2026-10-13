@@ -4923,6 +4923,31 @@ pub fn strip_item_references(body: &mut Vec<u8>) -> bool {
     peek::remove_items(body, &items, |k| refs.get(k).copied().unwrap_or(false))
 }
 
+/// A Messages body for a candidate that does not accept fine-grained tool input streaming
+/// (`providers::catalog::serves_eager_input_streaming`, D272: Bedrock's older serving stack 400s
+/// the field, and a 400 is not failed over): every `eager_input_streaming` member of each root
+/// `tools` element is cut out by span. The tools then stream the API's default way, each parameter
+/// buffered and validated before it is sent. Every other byte stays as sent; one `memmem` keeps a
+/// body without the field unwalked. `true` when the body changed.
+pub fn strip_eager_input_streaming(body: &mut Vec<u8>) -> bool {
+    if memchr::memmem::find(body, b"eager_input_streaming").is_none() {
+        return false;
+    }
+    // Every root `tools`: a parser may keep either one, and neither may carry the field.
+    let Some(members) = peek::root_members(body) else {
+        return false;
+    };
+    let opens: Vec<usize> = members
+        .iter()
+        .filter(|m| m.key_is(body, "tools") && body.get(m.value.0) == Some(&b'['))
+        .map(|m| m.value.0)
+        .collect();
+    // Last first: a cut never moves an earlier array.
+    opens.into_iter().rev().fold(false, |changed, open| {
+        peek::remove_element_members(body, open, "eager_input_streaming") || changed
+    })
+}
+
 /// A body for a candidate that answers only streams (`providers::catalog::stream_only`, D147),
 /// asking for a stream when the client did not: every root `stream` member (and, with `usage`,
 /// every `stream_options`) is cut out by span, and `"stream":true` (with
@@ -9305,6 +9330,30 @@ mod tests {
         let mut only = br#"{"input":[{"type":"item_reference","id":"msg_1"}]}"#.to_vec();
         assert!(strip_item_references(&mut only));
         assert_eq!(only, br#"{"input":[]}"#);
+    }
+
+    /// A Bedrock-bound Messages body loses each tool's `eager_input_streaming` — first, middle or
+    /// last member, any value, an escaped key spelling — and nothing else, byte for byte, with the
+    /// spacing as sent. The string elsewhere (a prompt, a tool's description) is not a member of a
+    /// tool and stays; a body without it is untouched (D272).
+    /// defect: D272
+    #[test]
+    fn strip_eager_input_streaming_cuts_only_the_tool_field() {
+        let mut body = br#"{"model":"m","tools":[{"eager_input_streaming":true,"name":"a","input_schema":{"type":"object"}}, {"name":"b", "eager_input_streaming" : false, "description":"eager_input_streaming"}, {"name":"c","input_schema":{"properties":{"eager_input_streaming":{"type":"boolean"}}},"eager_input_streaming":true},{"name":"d"}],"messages":[{"role":"user","content":"\"eager_input_streaming\":true"}]}"#.to_vec();
+        assert!(strip_eager_input_streaming(&mut body));
+        assert_eq!(
+            String::from_utf8(body).unwrap(),
+            r#"{"model":"m","tools":[{"name":"a","input_schema":{"type":"object"}}, {"name":"b", "description":"eager_input_streaming"}, {"name":"c","input_schema":{"properties":{"eager_input_streaming":{"type":"boolean"}}}},{"name":"d"}],"messages":[{"role":"user","content":"\"eager_input_streaming\":true"}]}"#
+        );
+        // Mentioned, but on no tool: untouched.
+        let mentioned = br#"{"model":"m","tools":[{"name":"a"}],"messages":[{"role":"user","content":"eager_input_streaming"}]}"#;
+        let mut body = mentioned.to_vec();
+        assert!(!strip_eager_input_streaming(&mut body));
+        assert_eq!(body, mentioned);
+        // A tool whose only member is the field is left an empty object, still valid JSON.
+        let mut only = br#"{"tools":[{"eager_input_streaming":true}]}"#.to_vec();
+        assert!(strip_eager_input_streaming(&mut only));
+        assert_eq!(only, br#"{"tools":[{}]}"#);
     }
 
     #[test]

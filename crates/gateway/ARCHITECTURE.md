@@ -1475,6 +1475,28 @@ _and_ from Bedrock. A 5xx from Anthropic on those rows therefore fails over to B
 OpenRouter is what is left if Bedrock is down or unkeyed too. Other Claude rows still go
 Anthropic → OpenRouter until a live-verified Bedrock inference-profile id is added.
 
+**Fine-grained tool streaming on the Bedrock arm (D272).** Claude Code and this repo's agent mark
+each tool `eager_input_streaming: true` (the older spelling is the
+`fine-grained-tool-streaming-2025-05-14` beta). A Messages client's body is relayed to Bedrock as
+bytes, so the field went too. But only Bedrock's newer serving stack takes it. The claude-api
+skill says older deployments (Haiku 4.5 among them) answer the unknown field with a 400, and a 400
+is relayed, not failed over. So an Anthropic outage would have turned every tool request on those
+rows into a hard failure at the very candidate meant to absorb it. Whether a candidate takes the
+field is a per-candidate capability, `providers::catalog::serves_eager_input_streaming`: true for
+direct Anthropic and for the Bedrock profiles in `BEDROCK_EAGER_INPUT_STREAMING` (an allowlist, so
+a new Bedrock row starts without it), false for every other Bedrock candidate. Today the allowlist
+is `us.anthropic.claude-opus-4-8` alone. It matches Claude Code's model catalog, which enables the
+field on Bedrock for Opus 4.7+, Sonnet 4.6+ and Fable, and never for either Haiku.
+
+On an attempt at a candidate that doesn't take it, `request_body_filter` cuts each root `tools`
+element's `eager_input_streaming` member out by span (`translate::strip_eager_input_streaming`;
+every other byte stays as sent), and `retain_managed_client_headers` drops the beta token. The only
+cost is granularity: Bedrock buffers each tool parameter before streaming it. The cut is per
+attempt, on the replayed client body, so direct Anthropic still receives the client's exact bytes,
+and its prompt cache key never moves. The Bedrock-bound body is stripped the same way on every
+turn, so Bedrock's own cache key is stable too. A candidate on another wire never sees the field:
+translation rebuilds each tool from its name, description and schema.
+
 ### Stored-response references (`item_reference`)
 
 **What it is.** A Responses input item `{"type":"item_reference","id":"msg_…"}` stands in for an

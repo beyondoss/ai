@@ -6,6 +6,8 @@
 //! - An image on a row whose card lists no image input is a 400 before any upstream sees it, as is
 //!   a request offering tools on a row whose card lists none.
 //! - An OpenRouter candidate is asked not to compress a prompt that overflows its window.
+//! - A Bedrock candidate not known to take fine-grained tool streaming gets a tool request without
+//!   it (`eager_input_streaming` and its beta), while direct Anthropic gets the client's bytes.
 //!
 //! Run via `mise run test:integration:rs` (needs `nats-server` on PATH).
 
@@ -529,4 +531,109 @@ async fn a_pdf_request_skips_a_candidate_that_reads_none() {
     .await;
     assert_eq!(provider_of(&resp).as_deref(), Some("openrouter"));
     assert_eq!(openrouter.hits(), 2);
+}
+
+/// A Messages tool request with fine-grained tool streaming on: each tool's
+/// `eager_input_streaming`, as Claude Code and this repo's agent send it, and the beta that came
+/// before it.
+fn eager_tools_body(model: &str, prompt: &str) -> Value {
+    json!({"model": model, "max_tokens": 64,
+           "tools": [
+               {"name": "write", "description": "Write a file",
+                "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}},
+                "eager_input_streaming": true},
+               {"name": "read", "eager_input_streaming": true,
+                "input_schema": {"type": "object"}}
+           ],
+           "messages": [{"role": "user", "content": prompt}]})
+}
+
+const FINE_GRAINED_BETAS: &str = "fine-grained-tool-streaming-2025-05-14,prompt-caching-2024-07-31";
+
+/// When Anthropic fails, a Claude tool request fails over to Bedrock. Bedrock's older serving stack
+/// (Haiku 4.5) answers a tool's `eager_input_streaming` with a 400, which is relayed rather than
+/// failed over, so an Anthropic outage would turn into hard failures. A Bedrock candidate not known
+/// to take the field (both Haiku rows) gets it, and the fine-grained-tool-streaming beta, stripped;
+/// Opus 4.8, on Bedrock's newer stack, keeps both. Direct Anthropic gets the client's bytes as sent,
+/// so its prompt cache key does not move.
+/// claim: CAT-6
+/// defect: D272
+#[tokio::test]
+async fn a_bedrock_failover_strips_eager_input_streaming_where_the_profile_does_not_take_it() {
+    let (pubkey, sk) = test_keypair(72);
+    let key = billing_vkey(&sk, 72);
+    // A prompt past the 64 KiB retry buffer takes the full-body path (a subrequest per attempt).
+    let large = "x".repeat(100 * 1024);
+    for (model, takes_it, prompt) in [
+        ("claude-haiku-4-5", false, "write it"),
+        ("claude-haiku-5-5", false, "write it"),
+        ("claude-opus-4-8", true, "write it"),
+        ("claude-haiku-4-5", false, large.as_str()),
+    ] {
+        let anthropic = MockUpstream::start(Mode::AnthropicStatus(500)).await;
+        let bedrock = MockUpstream::start(Mode::AnthropicJson).await;
+        let gw = Gateway::builder(unused_nats_port(), &anthropic.authority(), &b64(&pubkey))
+            .providers(&["anthropic", "bedrock", "openrouter"])
+            .provider_authority("bedrock", &bedrock.authority())
+            .provider_authority("openrouter", &GatewayBuilder::dead_authority())
+            .start()
+            .await;
+        let case = format!("{model}, {}-byte prompt", prompt.len());
+        let body = eager_tools_body(model, prompt);
+        let sent = body.to_string();
+        let resp = post(
+            &gw,
+            &key,
+            "/v1/messages",
+            // Anthropic first, as an Anthropic outage meets it (the session pin may lead with
+            // either first-party host).
+            &[
+                ("anthropic-beta", FINE_GRAINED_BETAS),
+                ("x-beyond-order", "anthropic,bedrock"),
+            ],
+            &body,
+        )
+        .await;
+        assert_eq!(resp.status().as_u16(), 200, "{case}");
+        assert_eq!(provider_of(&resp).as_deref(), Some("bedrock"), "{case}");
+
+        let direct = anthropic.captured().expect("Anthropic was tried first");
+        assert_eq!(
+            String::from_utf8(direct.body).unwrap(),
+            sent,
+            "{case}: direct Anthropic gets the client's bytes"
+        );
+        assert_eq!(
+            direct.anthropic_beta.as_deref(),
+            Some(FINE_GRAINED_BETAS),
+            "{case}"
+        );
+
+        let cap = bedrock.captured().expect("Bedrock served the failover");
+        let got: Value = serde_json::from_slice(&cap.body).unwrap();
+        let mut want = body.clone();
+        if !takes_it {
+            for tool in want["tools"].as_array_mut().unwrap() {
+                tool.as_object_mut()
+                    .unwrap()
+                    .remove("eager_input_streaming");
+            }
+        }
+        assert_eq!(got["tools"], want["tools"], "{case}");
+        assert_eq!(got["messages"], want["messages"], "{case}");
+        assert_eq!(
+            String::from_utf8_lossy(&cap.body).contains("eager_input_streaming"),
+            takes_it,
+            "{case}"
+        );
+        assert_eq!(
+            cap.anthropic_beta.as_deref(),
+            Some(if takes_it {
+                FINE_GRAINED_BETAS
+            } else {
+                "prompt-caching-2024-07-31"
+            }),
+            "{case}"
+        );
+    }
 }
