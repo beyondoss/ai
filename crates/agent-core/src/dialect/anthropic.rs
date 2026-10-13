@@ -2647,6 +2647,7 @@ data: {"type":"message_stop"}
                 aborted: false,
                 usage: None,
                 stop_reason: None,
+                prior_turn_tokens: None,
             }],
             256,
         )
@@ -3335,10 +3336,11 @@ data: {"type":"message_stop"}
 
     #[test]
     fn max_tokens_is_clamped_when_the_live_prompt_nears_the_context_window() {
-        // claude-3-5-sonnet: 200_000 context window. A ~150_000-token prompt (600_000 chars, the
-        // chars/4 estimator) leaves 200_000 - 150_000 - 4_096 (CONTEXT_CLAMP_MARGIN) = 45_904 tokens of
-        // headroom — less than the request's own (artificially large, to force the clamp) max_tokens.
-        let big_text = "x".repeat(600_000);
+        // claude-3-5-sonnet: 200_000 context window. A ~150_000-token prompt (345_000 chars at
+        // Claude's 2.3 chars/token for prose, `token_size`) leaves 200_000 - 150_000 - 4_096
+        // (CONTEXT_CLAMP_MARGIN) = 45_904 tokens of headroom — less than the request's own
+        // (artificially large, to force the clamp) max_tokens.
+        let big_text = "x".repeat(345_000);
         let req = ModelRequest::new("claude-3-5-sonnet", vec![Message::user(big_text)], 50_000);
         let body = build_body(&req, false);
         assert_eq!(

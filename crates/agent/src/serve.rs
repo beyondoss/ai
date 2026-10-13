@@ -8873,7 +8873,8 @@ fn build_subagent_ctx(
 /// `context_window` defaults to `model`'s own capabilities; an explicit `--context-window` overrides
 /// that and stays pinned across a model switch (the operator's compaction budget, not the dialect's) —
 /// left unset, each switch picks up the *new* model's real window instead of a stale operator number.
-/// `reserve_tokens`/`keep_recent_tokens` default to `CompactionConfig::default()`, overridable
+/// `reserve_tokens` defaults to `CompactionConfig::default()`'s and `keep_recent_tokens` to the model
+/// family's (in real tokens, `agent_core::TokenFamily::keep_recent_tokens`), both overridable
 /// independently of `context_window` — all resolved by [`compaction_config`].
 // 11 arguments, all independent inputs every call site already has on hand from `cfg`/local
 // runtime-switchable state — bundling them into a struct would just be a second place those same
@@ -9999,13 +10000,17 @@ pub struct CompactionFlags {
 }
 
 /// [`compaction_config`] from the raw flag values, shared with `run`. `context_window` and the two
-/// budgets override the model's own when given (reserve and keep-recent are the struct's absolute
-/// defaults otherwise, as before). A `compact_at` cap also bounds `keep_recent_tokens` to half of
+/// budgets override the model's own when given (the reserve is the struct's absolute default
+/// otherwise, as before; keep-recent and the masking bar are the model family's, in real tokens —
+/// see `agent_core::TokenFamily`). A `compact_at` cap also bounds `keep_recent_tokens` to half of
 /// itself unless that was set explicitly: a compaction must keep less than the line that fires it, or
 /// every turn re-fires.
 pub fn resolve_compaction(model: &str, flags: &CompactionFlags) -> agent_core::CompactionConfig {
     let caps = agent_core::capabilities(model);
     let d = agent_core::CompactionConfig::default();
+    // The model's family, price tier and family defaults.
+    let m = agent_core::CompactionConfig::for_model(model);
+    let keep_recent = m.family.keep_recent_tokens();
     let compact_at = flags
         .compact_at
         .map_or(caps.compact_at, |n| (n > 0).then_some(n));
@@ -10014,19 +10019,19 @@ pub fn resolve_compaction(model: &str, flags: &CompactionFlags) -> agent_core::C
         input_limit: caps.input_limit,
         compact_at,
         reserve_tokens: flags.reserve_tokens.unwrap_or(d.reserve_tokens),
-        keep_recent_tokens: flags.keep_recent_tokens.unwrap_or_else(|| {
-            compact_at.map_or(d.keep_recent_tokens, |cap| {
-                d.keep_recent_tokens.min(cap / 2)
-            })
-        }),
+        keep_recent_tokens: flags
+            .keep_recent_tokens
+            .unwrap_or_else(|| compact_at.map_or(keep_recent, |cap| keep_recent.min(cap / 2))),
         mask_tool_output: !flags.no_tool_masking,
         mask_keep_turns: flags.tool_masking_keep_turns.unwrap_or(d.mask_keep_turns),
         mask_keep_tokens: flags.tool_masking_keep_tokens,
         mask_min_free_tokens: flags
             .tool_masking_min_tokens
-            .unwrap_or(d.mask_min_free_tokens),
+            .unwrap_or(m.mask_min_free_tokens),
         cached_summary: !flags.no_cached_summary,
         candidates: flags.candidates,
+        family: m.family,
+        price_tier: m.price_tier,
         ..d
     }
 }
@@ -10056,9 +10061,13 @@ fn session_stats(session: &Session, compaction: &agent_core::CompactionConfig) -
     // the context window, so a client reading `context_usage` sees the same live-prompt size the
     // compaction trigger itself is actually watching, not a stale undercount.
     let context_usage = (session.last_input_tokens > 0).then(|| {
-        let tokens = session
-            .last_input_tokens
-            .saturating_add(agent_core::compaction::trailing_tokens(session));
+        let tokens =
+            session
+                .last_input_tokens
+                .saturating_add(agent_core::compaction::trailing_tokens(
+                    session,
+                    compaction.family,
+                ));
         json!({
             "tokens": tokens,
             "context_window": context_window,
@@ -12453,11 +12462,19 @@ mod tests {
             },
         );
         assert_eq!(c.keep_recent_tokens, 15_000);
-        // The model defaults are all far above 2 × keep_recent: untouched.
+        // The model defaults are all above 2 × keep_recent: the family's own value, in real tokens
+        // (Haiku's 90K cap leaves room for Claude's 40.5K; GPT keeps 22K).
         assert_eq!(
             test_compaction("claude-haiku-5-5").keep_recent_tokens,
-            20_000
+            40_500
         );
+        assert_eq!(test_compaction("gpt-6-luna").keep_recent_tokens, 22_000);
+        assert_eq!(test_compaction("kimi-k3").keep_recent_tokens, 20_000);
+        // The family and its price tier ride along.
+        let haiku = test_compaction("claude-haiku-5-5");
+        assert_eq!(haiku.family, agent_core::TokenFamily::Claude);
+        assert_eq!(haiku.price_tier, Some(100_000));
+        assert_eq!(haiku.mask_min_free(), 14_400);
         // An explicit keep-recent is the operator's call.
         let c = resolve_compaction(
             "claude-opus-5-5",
@@ -12523,6 +12540,7 @@ mod tests {
             aborted: false,
             usage: None,
             stop_reason: None,
+            prior_turn_tokens: None,
         });
         session.push(agent_core::Message::assistant(vec![
             agent_core::ContentBlock::text("done reading both files"),
@@ -12562,6 +12580,7 @@ mod tests {
             aborted: false,
             usage: None,
             stop_reason: None,
+            prior_turn_tokens: None,
         });
 
         let stats = session_stats(&session, &test_compaction("claude-opus-4-8"));

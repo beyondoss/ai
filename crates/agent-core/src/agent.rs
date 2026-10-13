@@ -112,18 +112,21 @@ pub enum AgentEvent {
         /// Why this compaction fired — the full folded-forward provenance (file-ops, round count)
         /// lands on `Session::compaction`, not duplicated onto every event.
         reason: CompactionReason,
-        /// Estimated input tokens at the moment this compaction fired (before the reset).
+        /// The live prompt size the last usage report gave when this compaction fired (before the
+        /// reset): system prompt and tools included.
         tokens_before: u32,
         /// The generated summary text actually spliced into the session (with the deterministic
         /// file-operations list already appended — see `compaction::format_file_operations`) — pi's own
         /// `CompactionResult.summary`. A caller (the `compact` RPC, a `run --json` client) that wants to
         /// show the operator what got summarized would otherwise have no way to see it at all.
         summary: String,
-        /// Estimated total tokens across the post-compaction message list (summary + kept suffix) — pi's
-        /// own `CompactionResult.estimatedTokensAfter`, computed the same way (`estimate_messages_tokens`
-        /// summed over every message), not `trailing_tokens`'s since-last-snapshot delta, which is
-        /// always 0 immediately after `apply_summary` resets that snapshot to point past the rebuilt
-        /// list's end.
+        /// The post-compaction prompt, in real tokens and on the same footing as `tokens_before`
+        /// (system prompt and tools included) — pi's `CompactionResult.estimatedTokensAfter`: the live
+        /// size, less the real size of the summarized prefix ([`crate::token_size::message_sizes`],
+        /// exact for every measured turn), plus the summary message's estimate. Against the next
+        /// request's real prompt on the eval runs: median 0.995–1.002× on Claude, 0.99–1.01× on GPT
+        /// (the chars/4 sum of the messages it replaced was 2.0–2.6× low on Claude and left out the
+        /// ~3.3K system prompt and tools).
         tokens_after: u32,
         /// The pre-compaction index (into the *old* `session.messages`, before [`compaction::apply_summary`]
         /// spliced the summary in) of the first message this round kept rather than folded away — pi's own
@@ -293,14 +296,15 @@ const MID_STREAM_MAX_BACKOFF: Duration = Duration::from_secs(5);
 pub enum CompactOutcome {
     /// A worthwhile prefix was found and folded into a fresh summary.
     Compacted,
-    /// No cut point exists at all yet ([`compaction::find_split_cut`] returned `None`) — too few
+    /// No cut point exists at all yet ([`compaction::plan_cut`] returned `None`) — too few
     /// messages, or no clean assistant boundary to summarize up to. Matches pi's "Nothing to compact
     /// (session too small)".
     TooSmall,
     /// A cut point exists, but there's nothing new worth a fresh summary: either a prior summary
-    /// already covers everything up to a clean boundary and nothing since has grown past
-    /// `keep_recent_tokens`, or (rare) a genuine summarization call ran and the model's own response
-    /// came back blank. Matches pi's "Already compacted".
+    /// already covers everything up to a clean boundary and everything since still fits in
+    /// `keep_recent_tokens` (and the prompt is under the trigger, or nothing could get it there), or
+    /// (rare) a genuine summarization call ran and the model's own response came back blank. Matches
+    /// pi's "Already compacted".
     AlreadyCompacted,
 }
 
@@ -430,7 +434,7 @@ impl Agent {
         // reserve back off the *scaled* config rather than off `Default` matters here, because
         // `scaled_summary_max_tokens` sizes the summarization call against the headroom that actually
         // exists on this model, not against a 200k model's.
-        let compaction = CompactionConfig::for_model(&caps);
+        let compaction = CompactionConfig::for_model(&model);
         let summary_max_tokens =
             scaled_summary_max_tokens(compaction.reserve_tokens, caps.max_output);
         Self {
@@ -2537,59 +2541,51 @@ impl Agent {
         // (via `compact_or_report`): the inner layer already caught, so the outer one never has
         // anything left to catch.
         let mut sink = move |ev: AgentEvent| catch_sink_panic(|| sink(ev));
-        let Some(cut) =
-            compaction::find_split_cut(&session.messages, self.compaction.keep_recent_tokens)
+        let cfg = &self.compaction;
+        // Every message's real size: measured turns exactly, the rest by the family's calibrated
+        // estimate (see `token_size`).
+        let sizes =
+            crate::token_size::message_sizes(&session.messages, cfg.family, Some(&self.model));
+        let live = compaction::live_tokens(session, &sizes, cfg.family);
+        // An automatic compaction fires past the trigger and must get back under it; an overflow, under
+        // the window. A manual one keeps the configured tail whatever the size.
+        let must_fit = match reason {
+            CompactionReason::Manual => false,
+            CompactionReason::Overflow => true,
+            CompactionReason::Threshold => live > cfg.trigger_tokens(),
+        };
+        let Some(first_kept) = compaction::plan_cut(&session.messages, &sizes, cfg, live, must_fit)
         else {
             return Ok(CompactOutcome::TooSmall);
         };
-        let candidates = self.compaction.candidates;
+        let candidates = cfg.candidates;
         // Under the state template every round is one document, rewritten: no split-turn
         // decomposition (its whole-session "turn" is what stacked sections), and the template itself
         // asks for the step in flight, which is what the split was there to preserve.
         let turn_start = if candidates.state_template {
             None
         } else {
-            cut.turn_start
+            compaction::split_turn_start(&session.messages, &sizes, first_kept)
         };
-        // Nothing new worth folding in since the last compaction: on a clean boundary, once a prior
-        // summary occupies `messages[0]` (`apply_summary` always splices it in there), `find_cut`'s
-        // backward token walk over `messages[1..]` only ever lands on a real cut by hitting the
-        // `keep_recent_tokens` budget early; if that walk instead exhausts the whole suffix without
-        // ever reaching budget, everything since the last summary already fits under the recent-token
-        // window on its own — there's no old-enough content yet to be worth a fresh summarization
-        // call. This is the clean-boundary analog of the `turn_start == 1` reuse a few lines below for
-        // the split-turn case. Matches pi's own `prepareCompaction` skip condition ("should skip
-        // repeated compactions when kept messages still fit") — broader than just `first_kept == 1`
-        // (literally zero new messages): e.g. `[summary, user, assistant, user, assistant]` under the
-        // real default `keep_recent_tokens` lands `first_kept == 2`, which a narrower `== 1` check
-        // would miss even though nothing here is large enough to justify re-summarizing yet (repeated
-        // manual `compact` calls with little new in between are the main way this is reachable — an
-        // *automatic* trigger can't, since `apply_summary` also resets `last_input_tokens` to 0 and
-        // `should_compact` requires it to be positive to fire at all).
-        if turn_start.is_none() && compaction::previous_summary(&session.messages[..1]).is_some() {
-            // `first_kept == 1` on a clean boundary means the prefix handed to the summarizer is
-            // *exactly* the prior summary and nothing else — so the "fresh" summary is a summary of a
-            // summary, `apply_summary` splices back a list of identical length, and the round is pure
-            // loss: one paid model call, zero tokens freed, and (because a summary is already bounded
-            // by `summary_max_tokens`) no realistic shrink either. Unlike the broader budget check
-            // below this holds *regardless* of how much has landed since — the content since the
-            // summary is all in the kept suffix, which this cut doesn't touch. Bailing here, before
-            // `CompactionStart` is even emitted, is what keeps `Compacted` an honest signal that the
-            // caller made progress; the overflow-retry paths in `run_events_steered` branch on exactly
-            // that and would otherwise re-prompt the identical request forever.
-            if cut.first_kept == 1 {
-                return Ok(CompactOutcome::AlreadyCompacted);
-            }
-            let since_last_summary: u32 = session.messages[1..]
-                .iter()
-                .map(compaction::estimate_message_tokens)
-                .fold(0u32, |acc, n| acc.saturating_add(n));
-            if since_last_summary < self.compaction.keep_recent_tokens {
-                return Ok(CompactOutcome::AlreadyCompacted);
-            }
+        // Nothing new worth folding in since the last compaction: once a prior summary occupies
+        // `messages[0]` (`apply_summary` always splices it in there), `first_kept == 1` on a clean
+        // boundary means everything since the summary still fits in `keep_recent_tokens` (`find_cut`
+        // keeps the longest suffix that fits), and `plan_cut` found no reason to cut deeper — the
+        // prefix handed to the summarizer would be *exactly* the prior summary, so the "fresh" summary
+        // is a summary of a summary, `apply_summary` splices back a list of identical length, and the
+        // round is pure loss: one paid model call, zero tokens freed. Matches pi's own
+        // `prepareCompaction` skip condition ("should skip repeated compactions when kept messages
+        // still fit"). Bailing here, before `CompactionStart` is even emitted, is what keeps
+        // `Compacted` an honest signal that the caller made progress; the overflow-retry paths in
+        // `run_events_steered` branch on exactly that and would otherwise re-prompt the identical
+        // request forever.
+        if turn_start.is_none()
+            && first_kept == 1
+            && compaction::previous_summary(&session.messages[..1]).is_some()
+        {
+            return Ok(CompactOutcome::AlreadyCompacted);
         }
         sink(AgentEvent::CompactionStart { reason });
-        let first_kept = cut.first_kept;
         let before = session.messages.len();
         let tokens_before = session.last_input_tokens;
         let prefix: Vec<Message> = session.messages[..first_kept].to_vec();
@@ -2618,10 +2614,20 @@ impl Agent {
         // the task), cut off at the output limit or a runaway loop (`is_runaway`), and a call that
         // errors, fall through to the re-render below.
         let mut summary_source = SummarySource::Rerender;
-        let cached = match self.compaction.cached_summary && reason != CompactionReason::Overflow {
+        let cached = match cfg.cached_summary && reason != CompactionReason::Overflow {
             true => {
-                match self.conversation_summary_request(session, &file_ops, custom_instructions) {
-                    Some(req) => {
+                match self
+                    .conversation_summary_request(session, &file_ops, custom_instructions, live)
+                    .filter(|(_, prompt)| {
+                        // Past the model's price tier, the cached call would bill every token at the
+                        // higher rate (5× on Haiku 5.5): send the re-render instead when it fits under
+                        // the tier. 13 of 94 cached Haiku summaries crossed its 100K tier; re-renders
+                        // measured 16–21K.
+                        !cfg.price_tier.is_some_and(|tier| {
+                            *prompt > tier && rerender_tokens(&prefix, tail, cfg.family) <= tier
+                        })
+                    }) {
+                    Some((req, _)) => {
                         summary_source = SummarySource::CachedRejected;
                         match self.run_utility_turn(req, cancel).await {
                             Ok(turn) => {
@@ -2770,10 +2776,14 @@ impl Agent {
         );
         compaction::apply_summary(session, first_kept, &summary, tokens_before);
         session.compaction = file_ops;
-        // Computed from the freshly-rebuilt list (summary + kept suffix), not `trailing_tokens` — that
-        // one measures a delta since the last real usage snapshot, which `apply_summary` just reset to
-        // point past this very list's end, so it would report a meaningless 0 here.
-        let tokens_after = compaction::estimate_messages_tokens(&session.messages);
+        // The live prompt less the real size of what was summarized, plus the summary message: system
+        // prompt, tools and the kept suffix stay as measured.
+        let tokens_after = live
+            .saturating_sub(crate::token_size::total(&sizes[..first_kept]))
+            .saturating_add(crate::token_size::message_tokens(
+                &session.messages[0],
+                cfg.family,
+            ));
         // The rewrite just replaced (typically most of) the session's history with the new summary —
         // this already spent one or two real, paid-for model calls to produce. Checkpoint immediately:
         // without this, a crash between the rewrite landing here and the next natural checkpoint (which
@@ -2853,12 +2863,16 @@ impl Agent {
     /// `summary_max_tokens`, shrunk to the room the window leaves. `None` when the input itself
     /// doesn't fit the input budget, or the room left is under [`MIN_CACHED_SUMMARY_TOKENS`]: the
     /// caller falls back to the re-render, which truncates tool results and always fits.
+    ///
+    /// Returns the request with its estimated prompt size: the live conversation (`live`, anchored on
+    /// the last usage report) plus the instruction.
     fn conversation_summary_request(
         &self,
         session: &Session,
         file_ops: &compaction::CompactionProvenance,
         custom_instructions: Option<&str>,
-    ) -> Option<ModelRequest> {
+        live: u32,
+    ) -> Option<(ModelRequest, u32)> {
         let cfg = &self.compaction;
         // The handoff framing on the Anthropic wire, the compact one elsewhere: see `SummaryFraming`.
         let framing = match crate::dialect::Dialect::for_model(&self.model) {
@@ -2872,15 +2886,7 @@ impl Agent {
             &cfg.candidates,
             framing,
         );
-        // A session opened from disk has no usage snapshot yet: estimate it whole.
-        let live = if session.last_input_tokens > 0 {
-            session
-                .last_input_tokens
-                .saturating_add(compaction::trailing_tokens(session))
-        } else {
-            compaction::estimate_messages_tokens(&session.messages)
-        };
-        let prompt = live.saturating_add(compaction::estimate_tokens(&instruction));
+        let prompt = live.saturating_add(crate::token_size::text_tokens(&instruction, cfg.family));
         // Output shrinks to fit rather than giving up the cache: a trigger at `window − reserve`
         // (a small window, a user-set `--context-window`) can overshoot by a few thousand tokens,
         // and a shorter summary read from cache beats a full-price re-render. Only an input that
@@ -2915,13 +2921,14 @@ impl Agent {
             }
             _ => messages.push(Message::user(instruction)),
         }
-        Some(self.with_reasoning(self.conversation_request(
+        let req = self.with_reasoning(self.conversation_request(
             self.model.clone(),
             Arc::new(messages),
             max_tokens,
             &self.tool_defs,
             &self.deferred_tool_defs,
-        )))
+        ));
+        Some((req, prompt))
     }
 
     /// The first step of an automatic compaction: mask old tool output
@@ -2954,8 +2961,12 @@ impl Agent {
         if !cfg.mask_tool_output {
             return false;
         }
+        let sizes =
+            crate::token_size::message_sizes(&session.messages, cfg.family, Some(&self.model));
         let Some(plan) = compaction::mask_tool_results(
             &session.messages,
+            &sizes,
+            cfg.family,
             cfg.mask_keep_turns,
             cfg.mask_keep_tokens(),
             &session.compaction.modified_files,
@@ -2964,7 +2975,7 @@ impl Agent {
         };
         let tokens_before = session
             .last_input_tokens
-            .saturating_add(compaction::trailing_tokens(session));
+            .saturating_add(compaction::trailing_tokens(session, cfg.family));
         if plan.freed < cfg.mask_min_free()
             || tokens_before.saturating_sub(plan.freed) > cfg.trigger_tokens()
         {
@@ -2979,6 +2990,7 @@ impl Agent {
         }
         session.messages = Arc::new(plan.messages);
         session.edited = plan.edited;
+        session.forget_anchor();
         session.last_input_tokens = session.last_input_tokens.saturating_sub(plan.freed);
         sink(AgentEvent::ToolOutputMasked {
             masked: plan.masked,
@@ -3155,6 +3167,23 @@ fn add_usage(total: &mut TokenUsage, u: &TokenUsage) {
         .cache_write_1h_tokens
         .saturating_add(u.cache_write_1h_tokens);
     total.reasoning_tokens = total.reasoning_tokens.saturating_add(u.reasoning_tokens);
+}
+
+/// About how big the re-render ([`compaction::summary_request_with`]) of `prefix` (and `tail`, when
+/// it rides along) would be: its rendered transcript at the family's prose rate, plus a margin for
+/// the instruction, file lists and system prompt.
+fn rerender_tokens(
+    prefix: &[Message],
+    tail: &[Message],
+    family: crate::token_size::TokenFamily,
+) -> u32 {
+    const INSTRUCTION_MARGIN: u32 = 4_000;
+    crate::token_size::text_tokens(&compaction::render_prefix(prefix), family)
+        .saturating_add(crate::token_size::text_tokens(
+            &compaction::render_prefix(tail),
+            family,
+        ))
+        .saturating_add(INSTRUCTION_MARGIN)
 }
 
 fn turn_text(turn: &Turn) -> String {
@@ -4313,7 +4342,7 @@ mod tests {
         // The turn just completed; its own assistant message must already be visible to
         // `trailing_tokens`, not swallowed into the usage-snapshot boundary that was just recorded.
         assert!(
-            compaction::trailing_tokens(&session) > 0,
+            compaction::trailing_tokens(&session, crate::token_size::TokenFamily::Other) > 0,
             "expected the just-appended assistant message to count as trailing context, got 0 \
              (last_usage_message_count={}, messages.len()={})",
             session.last_usage_message_count,
@@ -9706,7 +9735,7 @@ data: {"type":"response.incomplete","response":{"status":"incomplete","incomplet
         // A real, whole-list estimate, not `trailing_tokens`'s since-last-snapshot delta — which
         // `apply_summary` resets to point past the rebuilt list's end, so it would report 0 here.
         assert_eq!(
-            compaction::trailing_tokens(&session),
+            compaction::trailing_tokens(&session, crate::token_size::TokenFamily::Other),
             0,
             "sanity: trailing_tokens is 0 immediately after apply_summary, confirming tokens_after \
              can't have come from it"
@@ -13387,7 +13416,11 @@ data: {"type":"response.incomplete","response":{"status":"incomplete","incomplet
                 false,
             ));
         }
-        s.last_input_tokens = compaction::estimate_messages_tokens(&s.messages);
+        s.last_input_tokens = crate::token_size::total(&crate::token_size::message_sizes(
+            &s.messages,
+            crate::token_size::TokenFamily::Other,
+            None,
+        ));
         s.last_usage_message_count = s.messages.len();
         s
     }
@@ -13535,7 +13568,7 @@ data: {"type":"response.incomplete","response":{"status":"incomplete","incomplet
         let agent =
             Agent::new(mock.clone(), "claude-haiku-5-5").with_compaction(CompactionConfig {
                 keep_recent_tokens: 1,
-                ..CompactionConfig::for_model(&crate::models::capabilities("claude-haiku-5-5"))
+                ..CompactionConfig::for_model("claude-haiku-5-5")
             });
         let mut session = Session::new();
         session.user("the task");
@@ -13551,7 +13584,11 @@ data: {"type":"response.incomplete","response":{"status":"incomplete","incomplet
                 false,
             ));
         }
-        session.last_input_tokens = compaction::estimate_messages_tokens(&session.messages);
+        session.last_input_tokens = crate::token_size::total(&crate::token_size::message_sizes(
+            &session.messages,
+            crate::token_size::TokenFamily::Other,
+            None,
+        ));
         session.last_usage_message_count = session.messages.len();
         assert!(session.last_input_tokens > 90_000);
         let mut events = Vec::new();
@@ -14084,7 +14121,11 @@ data: {"type":"response.incomplete","response":{"status":"incomplete","incomplet
                 false,
             ));
         }
-        s.last_input_tokens = compaction::estimate_messages_tokens(&s.messages);
+        s.last_input_tokens = crate::token_size::total(&crate::token_size::message_sizes(
+            &s.messages,
+            crate::token_size::TokenFamily::Other,
+            None,
+        ));
         s.last_usage_message_count = s.messages.len();
         s
     }

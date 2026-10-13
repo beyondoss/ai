@@ -2294,6 +2294,7 @@ data: {"type":"response.completed","response":{"status":"completed","usage":{"in
                 aborted: false,
                 usage: None,
                 stop_reason: None,
+                prior_turn_tokens: None,
             }],
             64,
         );
@@ -2489,6 +2490,7 @@ data: {"type":"response.completed","response":{"status":"completed","usage":{"in
             aborted: false,
             usage: None,
             stop_reason: None,
+            prior_turn_tokens: None,
         };
 
         let native_body = build_body(&ModelRequest::new(

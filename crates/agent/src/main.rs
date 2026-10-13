@@ -411,8 +411,9 @@ enum Command {
         /// `CompactionConfig::default()`'s 16,384. `serve`'s identical flag.
         #[usage(long, env = "AI_AGENT_COMPACTION_RESERVE_TOKENS")]
         compaction_reserve_tokens: Option<u32>,
-        /// Roughly how many tokens of recent conversation compaction keeps verbatim. Defaults to
-        /// `CompactionConfig::default()`'s 20,000. `serve`'s identical flag.
+        /// At most how many real prompt tokens of recent conversation compaction keeps verbatim.
+        /// Defaults to the model family's: 40,500 on Claude, 22,000 on GPT, 20,000 otherwise.
+        /// `serve`'s identical flag.
         #[usage(long, env = "AI_AGENT_COMPACTION_KEEP_RECENT_TOKENS")]
         compaction_keep_recent_tokens: Option<u32>,
         /// Token budget reserved below the context window when summarizing an abandoned tree branch —
@@ -1053,8 +1054,8 @@ enum Command {
         /// `CompactionConfig::default()`'s 16,384.
         #[usage(long, env = "AI_AGENT_COMPACTION_RESERVE_TOKENS")]
         compaction_reserve_tokens: Option<u32>,
-        /// Roughly how many tokens of recent conversation compaction keeps verbatim. Defaults to
-        /// `CompactionConfig::default()`'s 20,000.
+        /// At most how many real prompt tokens of recent conversation compaction keeps verbatim.
+        /// Defaults to the model family's: 40,500 on Claude, 22,000 on GPT, 20,000 otherwise.
         #[usage(long, env = "AI_AGENT_COMPACTION_KEEP_RECENT_TOKENS")]
         compaction_keep_recent_tokens: Option<u32>,
         /// Token budget reserved below the context window when summarizing an abandoned tree branch —
@@ -2863,7 +2864,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let thinking = caps.reasoning_effort
                     || caps.thinking != agent_core::models::ThinkingShape::None;
                 // Where compaction fires with no overrides: the model's cap, else window − reserve.
-                let trigger = agent_core::CompactionConfig::for_model(&caps).trigger_tokens();
+                let trigger = agent_core::CompactionConfig::for_model(model).trigger_tokens();
                 println!(
                     "{:<22} {:>10} {:>10} {:>9} {:<8} {:<6}",
                     model,

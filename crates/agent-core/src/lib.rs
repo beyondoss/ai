@@ -44,6 +44,7 @@ pub mod session_title;
 pub mod steering;
 pub mod step_budget;
 pub mod tls;
+pub mod token_size;
 pub mod tool;
 pub mod transport;
 pub mod validation;
@@ -71,6 +72,7 @@ pub use models::{
 pub use session::{RequestBlock, Session};
 pub use steering::{ModelSwitch, QueueMode, Steering, SteeringMessage, TurnContextSource};
 pub use tls::ensure_provider;
+pub use token_size::TokenFamily;
 pub use tool::{Tool, ToolOutput, ToolProgress, ToolRegistry, ToolUpdate};
 pub use transport::{
     ModelRequest, ModelTransport, ReasoningEffort, ReasoningSummary, ServiceTier, ToolChoice,
@@ -82,6 +84,8 @@ pub use tokio_util::sync::CancellationToken;
 
 #[cfg(test)]
 mod background_loop_tests;
+#[cfg(test)]
+mod compaction_sizing_tests;
 #[cfg(test)]
 mod rate_limit_loop_tests;
 #[cfg(test)]

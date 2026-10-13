@@ -219,7 +219,8 @@ The harness layers several capabilities over the bare tools + loop:
   explicit `--thinking` override — both are CLI-only surfaces (no RPC command sets either, unlike
   `compaction_enabled`, since a one-shot `run` has no live session to toggle mid-run).
   `default_compaction_reserve_tokens`/`default_compaction_keep_recent_tokens` are a per-operator
-  override of `agent_core::CompactionConfig::default()`'s own built-in 16,384/20,000 — the same
+  override of `agent_core::CompactionConfig::default()`'s own built-in 16,384 reserve and the model
+  family's keep-recent (real tokens: 40,500 on Claude, 22,000 on GPT, 20,000 otherwise) — the same
   "override the built-in default" relationship `default_reasoning_effort` has to `agent_core`'s own
   reasoning default, not a replacement of it. `SettingsStore`
   reuses
@@ -3534,8 +3535,11 @@ truly unbounded historical total — inherent to deriving anything from `session
 regression this fix introduces. Session-restore also got more precise for the same reason: reopening a
 session now seeds `Session::last_input_tokens`/`last_output_tokens`/`last_usage_message_count` (the
 proactive-compaction trigger signal) from the most recent message's own exact `usage`, when one exists,
-instead of always falling back to the coarser whole-transcript char/4 estimate that remains the fallback
-for a session with no `usage`-carrying message at all (one written before this field existed).
+instead of always falling back to a whole-transcript estimate that remains the fallback for a session
+with no `usage`-carrying message at all (one written before this field existed) and for one reopened
+between a compaction and its next reply (whose kept usage measured the pre-compaction prompt) —
+`agent_core::Session::restore_usage_snapshot`, which sizes every persisted
+`Message::prior_turn_tokens` turn exactly.
 
 Fix 6 (pi-parity gap) reuses this same message-summing approach one layer further out:
 `serve::message_export_usage_totals` reshapes `message_usage_totals`'s result into

@@ -200,6 +200,18 @@ pub struct Message {
     /// message on every `prompt()` call rather than trusted only within the run that produced it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_reason: Option<StopReason>,
+    /// The real prompt tokens of the turn before this assistant message — `messages[i - 2]` (the
+    /// previous assistant message) and `messages[i - 1]` (the user message answering it) — as the
+    /// provider measured them: this message's request's prompt size minus the previous request's
+    /// ([`TokenUsage::prompt_tokens`]). An anchor for sizing the conversation in real tokens (see
+    /// [`crate::token_size`]): exact for the hidden thinking, tokenizer and framing a character count
+    /// cannot see. Stamped by [`Session::push`](crate::session::Session::push) from the size
+    /// [`Session::record_usage`](crate::session::Session::record_usage) recorded; `None` when the two
+    /// requests are not comparable (the first request, the first after a compaction, a masking pass,
+    /// a model switch or a reopen, or an error turn between them) and on every message persisted
+    /// before this field existed. Persisted, so a reopened session keeps every measured turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prior_turn_tokens: Option<u32>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -217,6 +229,7 @@ impl Message {
             aborted: false,
             usage: None,
             stop_reason: None,
+            prior_turn_tokens: None,
         }
     }
 
@@ -230,6 +243,7 @@ impl Message {
             aborted: false,
             usage: None,
             stop_reason: None,
+            prior_turn_tokens: None,
         }
     }
 
@@ -248,6 +262,7 @@ impl Message {
             aborted: false,
             usage: None,
             stop_reason: None,
+            prior_turn_tokens: None,
         }
     }
 
@@ -270,6 +285,7 @@ impl Message {
             aborted: false,
             usage: None,
             stop_reason: None,
+            prior_turn_tokens: None,
         }
     }
 
@@ -292,6 +308,7 @@ impl Message {
             aborted: false,
             usage: None,
             stop_reason: None,
+            prior_turn_tokens: None,
         }
     }
 
@@ -308,6 +325,7 @@ impl Message {
             aborted: false,
             usage: None,
             stop_reason: None,
+            prior_turn_tokens: None,
         }
     }
 
@@ -429,6 +447,17 @@ pub struct TokenUsage {
     /// `completion_tokens_details.reasoning_tokens`); 0 when folded into `output_tokens`.
     #[serde(default)]
     pub reasoning_tokens: u32,
+}
+
+impl TokenUsage {
+    /// The whole prompt the request carried: uncached input plus everything read from or written to
+    /// the prompt cache (each counted once on every dialect — see `dialect`). Saturating: the fields
+    /// come straight from provider usage with no upper bound.
+    pub fn prompt_tokens(&self) -> u32 {
+        self.input_tokens
+            .saturating_add(self.cache_read_tokens)
+            .saturating_add(self.cache_write_tokens)
+    }
 }
 
 /// An incremental event from a streaming model response. The dialect adapters normalize both
