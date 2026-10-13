@@ -443,6 +443,12 @@ enum Command {
         /// previously with no CLI flag or persisted override at all, unlike its two siblings above).
         #[usage(long, env = "AI_AGENT_RETRY_MAX_BACKOFF_MS")]
         retry_max_backoff_ms: Option<u64>,
+        /// How long one model turn keeps retrying a rate limit (429) or overload (529) before the run
+        /// fails, in seconds. Each wait honours the provider's retry-after hint, else backs off
+        /// exponentially (0.5s doubling, 60s cap). Defaults to 300; 0 fails on the first rate limit.
+        /// `serve`'s identical flag.
+        #[usage(long, env = "AI_AGENT_RETRY_RATE_LIMIT_SECS")]
+        retry_rate_limit_secs: Option<u64>,
         /// Disable the whole-run auto-retry-after-error loop outright — pi's `RetrySettings.enabled:
         /// false` (`settings-manager.ts:28`). Matches this codebase's own `--no-x` convention for
         /// negating an on-by-default behavior (`--no-compaction`, `--no-skills`, ...). Only gates the
@@ -1077,6 +1083,12 @@ enum Command {
         /// pi-parity feature).
         #[usage(long, env = "AI_AGENT_RETRY_MAX_BACKOFF_MS")]
         retry_max_backoff_ms: Option<u64>,
+        /// How long one model turn keeps retrying a rate limit (429) or overload (529) before the run
+        /// fails, in seconds. Each wait honours the provider's retry-after hint, else backs off
+        /// exponentially (0.5s doubling, 60s cap). Defaults to 300; 0 fails on the first rate limit.
+        /// `run`'s identical flag.
+        #[usage(long, env = "AI_AGENT_RETRY_RATE_LIMIT_SECS")]
+        retry_rate_limit_secs: Option<u64>,
         /// Idle-read timeout between response chunks on the gateway HTTP client, in milliseconds —
         /// overrides `agent_core::client::GatewayClient`'s built-in default. `run`'s identical flag
         /// (Task #38, pi-parity fix: `serve` previously had no equivalent at all, so
@@ -1998,6 +2010,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             retry_max_retries,
             retry_base_delay_ms,
             retry_max_backoff_ms,
+            retry_rate_limit_secs,
             no_retry,
             idle_timeout_ms,
             block_images,
@@ -2079,6 +2092,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 retry_max_retries,
                 retry_base_delay_ms,
                 retry_max_backoff_ms,
+                retry_rate_limit_secs,
                 no_retry,
                 idle_timeout_ms,
                 block_images,
@@ -2187,6 +2201,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             retry_max_retries,
             retry_base_delay_ms,
             retry_max_backoff_ms,
+            retry_rate_limit_secs,
             idle_timeout_ms,
             block_images,
             no_block_images,
@@ -2694,6 +2709,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 retry_max_retries,
                 retry_base_delay_ms: retry_base_delay_ms.map(std::time::Duration::from_millis),
                 retry_max_backoff_ms: retry_max_backoff_ms.map(std::time::Duration::from_millis),
+                retry_rate_limit_secs,
                 idle_timeout_ms,
                 block_images,
                 image_auto_resize,
@@ -3724,6 +3740,7 @@ async fn run_turn(
         if let Some(life) = life {
             life.set_attempt(attempt);
         }
+        let steps_before = session.steps;
         let result = run_turn_once(
             agent,
             session,
@@ -3737,9 +3754,15 @@ async fn run_turn(
             heartbeat,
         )
         .await;
+        // The retry budget is per stall, not per run: an attempt that committed a step before failing
+        // made progress, so a long run that recovers from one blip doesn't carry it against the next.
+        if session.steps > steps_before {
+            attempt = 0;
+        }
         match &result {
             Err(e)
                 if attempt < retry_policy.max_retries
+                    && !cancel.is_cancelled()
                     && beyond_ai_agent::retry::is_retryable_whole_run(e) =>
             {
                 attempt += 1;
@@ -3748,11 +3771,16 @@ async fn run_turn(
                     "\n[transient error, retrying {attempt}/{}: {e}]",
                     retry_policy.max_retries
                 );
+                // Ctrl-C during the wait ends the run now, not after it — with the closing error
+                // record still in place, so the persisted transcript stays well-formed.
+                tokio::select! {
+                    () = tokio::time::sleep(delay) => {}
+                    () = cancel.cancelled() => return Err(agent_core::Error::Cancelled),
+                }
                 // The failed attempt's closing error record must not survive into the retry — see
                 // `Session::pop_error_record`'s doc comment (this is the same run resuming from
                 // scratch, not a fresh prompt).
                 session.pop_error_record();
-                tokio::time::sleep(delay).await;
             }
             _ => return result,
         }
@@ -3919,6 +3947,24 @@ async fn run_turn_once(
                         life.observe(&ev);
                     }
                     session_steers(&ev);
+                    if let agent_core::AgentEvent::Retry {
+                        attempt,
+                        delay_ms,
+                        rate_limited,
+                        message,
+                    } = &ev
+                    {
+                        // A rate-limit wait can run for minutes; say so rather than look hung.
+                        let what = if *rate_limited {
+                            "rate limited"
+                        } else {
+                            "stream error"
+                        };
+                        eprintln!(
+                            "\n[{what}, retrying in {:.1}s (attempt {attempt}): {message}]",
+                            *delay_ms as f64 / 1000.0
+                        );
+                    }
                     let agent_core::AgentEvent::Stream(ev) = &ev else {
                         return;
                     };
@@ -4199,6 +4245,7 @@ async fn run_task(
     retry_max_retries: Option<u32>,
     retry_base_delay_ms: Option<u64>,
     retry_max_backoff_ms: Option<u64>,
+    retry_rate_limit_secs: Option<u64>,
     no_retry: bool,
     idle_timeout_ms: Option<u64>,
     block_images: bool,
@@ -5205,6 +5252,9 @@ async fn run_task(
         .with_compaction(compaction)
         .with_cache_long(cache_long)
         .with_sequential_tools(sequential_tools)
+        .with_rate_limit_retry(beyond_ai_agent::retry::rate_limit_policy(
+            retry_rate_limit_secs,
+        ))
         .with_cache_key(meta.id.clone())
         // Shared with every subagent (see the `write_locks` construction above) so the parent's own
         // edits and a child's serialize on the same path.
@@ -6193,11 +6243,15 @@ mod tests {
     #[tokio::test]
     async fn run_turn_recovers_from_a_whole_run_transient_failure() {
         // Every attempt agent_core's own mid-stream retry makes fails with a retryable error (matches
-        // `is_retryable_mid_stream`'s "overloaded" check), exhausting it — the resulting `Err` is
+        // `is_retryable_mid_stream`'s "stream ended before" check), exhausting it — the resulting `Err` is
         // exactly what propagates out to `agent.run(...)` inside `run_turn_once`. Our new whole-run
         // wrapper (`run_turn`) must catch that and retry the whole call again, which finally succeeds.
         let mut turns: Vec<Vec<Result<StreamEvent, Error>>> = (0..INNER_RETRY_ATTEMPTS)
-            .map(|_| vec![Err(Error::Transport("overloaded_error: overloaded".into()))])
+            .map(|_| {
+                vec![Err(Error::Transport(
+                    "Anthropic stream ended before message_stop".into(),
+                ))]
+            })
             .collect();
         turns.push(turn::text("recovered").into_iter().map(Ok).collect());
         let transport = std::sync::Arc::new(MockTransport::scripted(turns));
@@ -6239,7 +6293,11 @@ mod tests {
         let total_attempts =
             (beyond_ai_agent::retry::MAX_RUN_RETRIES as usize + 1) * INNER_RETRY_ATTEMPTS;
         let turns: Vec<Vec<Result<StreamEvent, Error>>> = (0..total_attempts)
-            .map(|_| vec![Err(Error::Transport("overloaded_error: overloaded".into()))])
+            .map(|_| {
+                vec![Err(Error::Transport(
+                    "Anthropic stream ended before message_stop".into(),
+                ))]
+            })
             .collect();
         let transport = std::sync::Arc::new(MockTransport::scripted(turns));
         let agent = Agent::new(transport.clone(), "claude-test");
@@ -6276,7 +6334,11 @@ mod tests {
         // ones — proving the recovery opportunity was skipped specifically because retry is disabled,
         // not because none was scripted.
         let mut turns: Vec<Vec<Result<StreamEvent, Error>>> = (0..INNER_RETRY_ATTEMPTS)
-            .map(|_| vec![Err(Error::Transport("overloaded_error: overloaded".into()))])
+            .map(|_| {
+                vec![Err(Error::Transport(
+                    "Anthropic stream ended before message_stop".into(),
+                ))]
+            })
             .collect();
         turns.push(
             turn::text("would have recovered")
@@ -6316,6 +6378,107 @@ mod tests {
         // Only agent_core's own internal (mid-stream) retries ran; our whole-run wrapper made no
         // second attempt at all, so the final scripted (would-have-succeeded) turn was never reached.
         assert_eq!(transport.calls(), INNER_RETRY_ATTEMPTS);
+    }
+
+    #[tokio::test]
+    async fn the_whole_run_retry_ceiling_counts_stalls_not_blips_over_a_long_run() {
+        // The eval failure's other half: a long run that recovered from earlier blips died on a later
+        // one because the ceiling counted every retry of the run. With a ceiling of 1, a run that fails,
+        // recovers and commits a step, then fails again must still get its retry — the second failure
+        // is a new stall, not the run's second strike.
+        let fail = || {
+            (0..INNER_RETRY_ATTEMPTS)
+                .map(|_| {
+                    vec![Err(Error::Transport(
+                        "Anthropic stream ended before message_stop".into(),
+                    ))]
+                })
+                .collect::<Vec<Vec<Result<StreamEvent, Error>>>>()
+        };
+        let mut turns = fail();
+        turns.push(
+            turn::tool_call("t1", "missing", "{}")
+                .into_iter()
+                .map(Ok)
+                .collect(),
+        );
+        turns.extend(fail());
+        turns.push(turn::text("finished").into_iter().map(Ok).collect());
+        let transport = std::sync::Arc::new(MockTransport::scripted(turns));
+        let agent = Agent::new(transport.clone(), "claude-test");
+        let mut session = Session::new();
+        session.user("hi");
+        let policy = beyond_ai_agent::retry::RunRetryPolicy::from_overrides(
+            Some(1),
+            Some(std::time::Duration::from_millis(1)),
+        );
+
+        run_turn(
+            &agent,
+            &mut session,
+            false,
+            &agent_core::CancellationToken::new(),
+            &policy,
+            &AtomicBool::new(false),
+            &agent_core::Steering::new(),
+            false,
+            u32::MAX,
+            None,
+            std::time::Duration::ZERO,
+        )
+        .await
+        .expect("a failure after progress is a fresh stall with its own retry");
+        assert_eq!(transport.calls(), 2 * INNER_RETRY_ATTEMPTS + 2);
+        assert!(format!("{:?}", session.messages).contains("finished"));
+    }
+
+    #[tokio::test]
+    async fn cancel_during_a_whole_run_retry_wait_returns_at_once_with_the_record_kept() {
+        let turns: Vec<Vec<Result<StreamEvent, Error>>> = (0..INNER_RETRY_ATTEMPTS)
+            .map(|_| {
+                vec![Err(Error::Transport(
+                    "Anthropic stream ended before message_stop".into(),
+                ))]
+            })
+            .collect();
+        let transport = std::sync::Arc::new(MockTransport::scripted(turns));
+        let agent = Agent::new(transport.clone(), "claude-test");
+        let mut session = Session::new();
+        session.user("hi");
+        // A 60s whole-run backoff the cancel has to cut short.
+        let policy = beyond_ai_agent::retry::RunRetryPolicy::from_overrides(
+            Some(3),
+            Some(std::time::Duration::from_secs(60)),
+        );
+        let cancel = agent_core::CancellationToken::new();
+        let trigger = cancel.clone();
+        tokio::spawn(async move {
+            // After agent_core's own ~1.75s of mid-stream retries, inside the whole-run wait.
+            tokio::time::sleep(std::time::Duration::from_millis(3000)).await;
+            trigger.cancel();
+        });
+        let started = std::time::Instant::now();
+        let err = run_turn(
+            &agent,
+            &mut session,
+            false,
+            &cancel,
+            &policy,
+            &AtomicBool::new(false),
+            &agent_core::Steering::new(),
+            false,
+            u32::MAX,
+            None,
+            std::time::Duration::ZERO,
+        )
+        .await
+        .expect_err("cancelled");
+        assert!(matches!(err, Error::Cancelled), "{err:?}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        assert!(
+            session.messages.last().unwrap().error_message.is_some(),
+            "the closing error record stays, so the transcript keeps its role alternation"
+        );
     }
 
     #[test]

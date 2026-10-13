@@ -9,6 +9,22 @@
 //! same session, up to [`MAX_RUN_RETRIES`] times, with exponential backoff. Matches pi's own default
 //! (`agent-session.ts`'s `maxRetries: 3`, `baseDelayMs: 2000`).
 
+//!
+//! The ceiling counts retries *without progress*: `run_turn` (`main.rs`) and `serve`'s loop reset it
+//! whenever the failed attempt still committed a step, so a long run that recovered from three blips
+//! over an hour doesn't die on the fourth. Rate limits are mostly not this layer's job: `agent_core`
+//! waits them out per turn under a time budget (`agent_core::rate_limit`, `--retry-rate-limit-secs`),
+//! and an error that spent that budget is never retried here.
+
+/// The per-turn rate-limit policy for `--retry-rate-limit-secs` (`None`: the 5-minute default).
+pub fn rate_limit_policy(secs: Option<u64>) -> agent_core::rate_limit::RateLimitRetry {
+    let mut policy = agent_core::rate_limit::RateLimitRetry::default();
+    if let Some(secs) = secs {
+        policy.budget = std::time::Duration::from_secs(secs);
+    }
+    policy
+}
+
 /// Ceiling on automatic whole-run retries after a run ends in a transient-looking error.
 pub const MAX_RUN_RETRIES: u32 = 3;
 pub const RUN_RETRY_BASE_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
@@ -181,7 +197,11 @@ pub fn is_retryable_whole_run(e: &agent_core::Error) -> bool {
     let agent_core::Error::Transport(msg) = e else {
         return false;
     };
-    if agent_core::agent::is_context_overflow(e) {
+    // A turn that already spent its whole rate-limit budget (`agent_core::rate_limit`) must fail
+    // here, not start the same multi-minute wait over again from the top.
+    if agent_core::agent::is_context_overflow(e)
+        || msg.contains(agent_core::rate_limit::BUDGET_EXHAUSTED)
+    {
         return false;
     }
     // A quota/billing-exhaustion 429 (`"gateway returned 429 …: insufficient_quota…"`) still contains
@@ -428,6 +448,27 @@ mod tests {
             is_retryable_whole_run(&e),
             "an ordinary rate-limit 429 without quota language must still be retried"
         );
+    }
+
+    #[test]
+    fn whole_run_does_not_restart_a_spent_rate_limit_budget() {
+        // `agent_core` already waited this 429 out for its whole budget; the "429" digits must not
+        // send it round again.
+        let e = Error::Transport(format!(
+            "{}: still rate limited after 9 retries over 298.2s (budget 300s); last error: \
+             api.openai.com returned 429 Too Many Requests (retry-after-ms: 1000): rate_limit_exceeded",
+            agent_core::rate_limit::BUDGET_EXHAUSTED
+        ));
+        assert!(!is_retryable_whole_run(&e));
+    }
+
+    #[test]
+    fn rate_limit_policy_overrides_only_the_budget() {
+        let default = agent_core::rate_limit::RateLimitRetry::default();
+        assert_eq!(rate_limit_policy(None), default);
+        let p = rate_limit_policy(Some(42));
+        assert_eq!(p.budget, std::time::Duration::from_secs(42));
+        assert_eq!(p.max_wait, default.max_wait);
     }
 
     #[test]

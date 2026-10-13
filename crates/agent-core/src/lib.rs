@@ -37,6 +37,7 @@ pub mod hooks;
 pub mod message;
 pub mod mock;
 pub mod models;
+pub mod rate_limit;
 pub mod session;
 pub mod session_title;
 pub mod steering;
@@ -77,5 +78,7 @@ pub use write_lock::{WriteLockGuard, WriteLockRegistry};
 // need a direct `tokio-util` dependency to drive a cancellable run.
 pub use tokio_util::sync::CancellationToken;
 
+#[cfg(test)]
+mod rate_limit_loop_tests;
 #[cfg(test)]
 mod step_budget_loop_tests;
