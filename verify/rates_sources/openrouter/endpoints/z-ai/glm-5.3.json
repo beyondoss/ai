@@ -57,10 +57,10 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.0000011",
-          "discount": 0.75,
-          "input_cache_read": "0.000000065",
-          "prompt": "0.00000035"
+          "completion": "0.0000006248",
+          "discount": 0.858,
+          "input_cache_read": "0.00000003692",
+          "prompt": "0.0000001988"
         },
         "provider_name": "Baidu",
         "quantization": "fp8",
@@ -148,10 +148,10 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.0000022001",
+          "completion": "0.00000304",
           "discount": 0,
-          "input_cache_read": "0.0000001222",
-          "prompt": "0.0000007"
+          "input_cache_read": "0.00000022",
+          "prompt": "0.00000096"
         },
         "provider_name": "Decart",
         "quantization": "fp4",
@@ -239,7 +239,7 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.0000011",
+          "completion": "0.0000006248",
           "discount": 0,
           "input_cache_read": "0.0000002",
           "prompt": "0.0000006"
@@ -265,10 +265,10 @@
         "context_length": 262124,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.0000031",
+          "completion": "0.0000029",
           "discount": 0,
           "input_cache_read": "0.00000019",
-          "prompt": "0.00000065"
+          "prompt": "0.00000049"
         },
         "provider_name": "Io Net",
         "quantization": "fp8",
@@ -346,7 +346,7 @@
           "completion": "0.000005",
           "discount": 0,
           "input_cache_read": "0.00000006",
-          "prompt": "0.00000025"
+          "prompt": "0.000000055"
         },
         "provider_name": "Morph",
         "quantization": "fp8",
@@ -405,7 +405,7 @@
         "tag": "primeintellect"
       },
       {
-        "context_length": 1048576,
+        "context_length": 262144,
         "max_prompt_tokens": null,
         "pricing": {
           "completion": "0.0000042",
@@ -457,6 +457,19 @@
         "tag": "siliconflow/fp8"
       },
       {
+        "context_length": 1044480,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.0000025",
+          "discount": 0,
+          "input_cache_read": "0.0000001",
+          "prompt": "0.0000006"
+        },
+        "provider_name": "Tenstorrent",
+        "quantization": "fp8",
+        "tag": "tenstorrent/fp8"
+      },
+      {
         "context_length": 1048575,
         "max_prompt_tokens": null,
         "pricing": {
@@ -501,8 +514,8 @@
         "pricing": {
           "completion": "0.0000048",
           "discount": 0,
-          "input_cache_read": "0.00000005",
-          "prompt": "0.00000007"
+          "input_cache_read": "0.000000059",
+          "prompt": "0.000000079"
         },
         "provider_name": "Wafer",
         "quantization": "unknown",

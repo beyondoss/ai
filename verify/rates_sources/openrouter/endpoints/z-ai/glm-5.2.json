@@ -57,10 +57,10 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.00000490136",
-          "discount": 0.378,
-          "input_cache_read": "0.00000034832",
-          "prompt": "0.0000013995"
+          "completion": "0.00000265556",
+          "discount": 0.663,
+          "input_cache_read": "0.00000018872",
+          "prompt": "0.00000075825"
         },
         "provider_name": "Baidu",
         "quantization": "fp4",
@@ -70,10 +70,10 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.0000043956",
-          "discount": 0.001,
-          "input_cache_read": "0.00000025974",
-          "prompt": "0.0000013986"
+          "completion": "0.000000528",
+          "discount": 0.88,
+          "input_cache_read": "0.0000000312",
+          "prompt": "0.000000168"
         },
         "provider_name": "Baidu",
         "quantization": "fp8",
@@ -135,10 +135,10 @@
         "context_length": 262144,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.000006",
+          "completion": "0.000008",
           "discount": 0,
-          "input_cache_read": "0.00000026",
-          "prompt": "0.0000005"
+          "input_cache_read": "0.00000019",
+          "prompt": "0.00000019"
         },
         "provider_name": "Cloudflare",
         "quantization": "unknown",
@@ -239,10 +239,10 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.00000195",
+          "completion": "0.000001056",
           "discount": 0,
-          "input_cache_read": "0.0000002",
-          "prompt": "0.00000125"
+          "input_cache_read": "0.00000014",
+          "prompt": "0.00000095"
         },
         "provider_name": "Inceptron",
         "quantization": "fp4",
@@ -252,10 +252,10 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.0000006",
+          "completion": "0.0000024",
           "discount": 0,
-          "input_cache_read": "0.0000001",
-          "prompt": "0.00000015"
+          "input_cache_read": "0.000000132",
+          "prompt": "0.000000198"
         },
         "provider_name": "InferenceNet",
         "quantization": "fp4",
@@ -368,10 +368,10 @@
         "context_length": 1024000,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.00000174592",
-          "discount": 0.6032,
-          "input_cache_read": "0.000000103168",
-          "prompt": "0.00000055552"
+          "completion": "0.0000020196",
+          "discount": 0.541,
+          "input_cache_read": "0.00000011934",
+          "prompt": "0.0000006426"
         },
         "provider_name": "StreamLake",
         "quantization": "fp8",
