@@ -920,8 +920,27 @@ Dispatch gates on the presence of complete `tool_use` blocks alone (pi-parity fi
 truncated turn that already emitted one or more complete tool calls before running out of room (the
 model calls two tools, then starts trailing commentary that gets cut off) used to be silently treated
 as "done, no tools to run" whenever `stop_reason != ToolUse`, dropping the calls the model actually
-made. See `agent.rs::tests::tool_call_dispatches_even_when_stop_reason_is_max_tokens`. The one
-exception is `StopReason::Refusal`, checked unconditionally *before* `calls` is even collected (a
+made. See `agent.rs::tests::tool_call_dispatches_even_when_stop_reason_is_max_tokens`.
+
+The call the length stop cut off never runs. Every dialect's length stop (Anthropic `max_tokens`, Chat
+Completions `length`, Responses `incomplete` for `max_output_tokens`, all `StopReason::MaxTokens`)
+closes whatever block was open when the output limit hit, so a `write`/`edit` cut off mid-`content`
+arrives as a closed block with an incomplete input. `Accumulator::finish` puts every call in a
+`MaxTokens` turn whose input didn't parse as one whole JSON value (or that has no input bytes and is
+the turn's last block) in `Turn::not_run` with `CUT_OFF_TOOL_CALL` as its error result: "not run:
+the response hit the output token limit while this tool call was being written, so its input was cut
+off. Re-issue it with less input per call — for example, split a large write or edit into several
+smaller ones." Running a closed-up truncated input would write the truncated content with
+`is_error: false`, so the model never learns and the file is silently wrong. Whole calls earlier in
+the same turn still run: a whole input parsed as one JSON value, which needs the model's own closing
+`}`, so nothing the cut drops afterwards can belong to it. pi's `agent-loop.ts` refuses every call on
+a length stop because it can't tell whole from cut; we can, so refusing the whole ones would only throw
+away work the model then repeats. Responses' `incomplete` for `content_filter` maps to `Refusal`, not
+`MaxTokens`, the same as Chat Completions' `content_filter` — "resend smaller" is the wrong advice
+there. See `agent.rs::tests::every_dialect_s_length_stop_refuses_the_cut_off_call_and_runs_the_whole_one`.
+
+The one exception to dispatching whole calls is `StopReason::Refusal`, checked unconditionally *before*
+`calls` is even collected (a
 separate pi-parity fix — a refusal blocking dispatch is dialect-agnostic, matching pi's own
 unconditional "error"/"aborted" return in `agent-loop.ts` ahead of any look at `message.content`): a
 turn that streamed one or more complete `tool_use` blocks before being cut off with a refusal must not
@@ -1005,15 +1024,16 @@ message never reorders blocks relative to when the model announced them, even th
 block may finish streaming its content first. A dialect whose wire never interleaves (Anthropic in
 practice, OpenAI Chat Completions' text) just always uses index 0, so exactly one index is ever open and
 this degenerates to the single-current-block behavior every dialect used before this design. Parsing a
-non-empty tool-argument buffer tries three tiers in order before giving up: the raw buffer as-is; then
-`repair_json` (fixes mis-escaping — a raw control byte or stray backslash inside a string, not a
-structural problem); then `close_incomplete_json` (closes whatever string/`{`/`[` were still open when
-the buffer ended — a genuinely _incomplete_ stream, e.g. a long `write`/`edit` value cut off by an
-output-token ceiling, recovering a partial object instead of discarding it to `{}`). If the buffered
-tool arguments still never parse as JSON after all three, the tool call is recorded in
-`Turn::malformed` and its `ToolUse` block keeps a wire-valid empty `{}` input; the loop then feeds an
-error `tool_result` ("arguments were not valid JSON") back to the model so it can correct, rather than
-aborting the run.
+non-empty tool-argument buffer tries the raw buffer as-is, then `repair_json` (fixes mis-escaping — a
+raw control byte or stray backslash inside a string, not a structural problem). A buffer that parses
+neither way never runs. Its `ToolUse` block records what `close_incomplete_json` recovers (the buffer
+with its open string/`{`/`[` closed — the partial object the model actually wrote) or a wire-valid `{}`
+when even that doesn't parse, and `finish` settles the call once the stop reason is known: in a
+`MaxTokens` turn it is a cut-off call (see the dispatch section above); otherwise the model itself
+emitted JSON that doesn't parse. Either way it lands in `Turn::not_run` with its error `tool_result`
+("cut off at the output token limit" or "arguments were not valid JSON"), which the gate feeds back so
+the model can correct it, rather than aborting the run. An empty buffer
+is `{}`, the whole input of a tool that takes none, unless it is the last block of a `MaxTokens` turn.
 
 Edge case: `stop_reason` defaults to `StopReason::EndTurn` and usage defaults to `0`/`0` if the stream
 never delivers a `MessageStop`/`Usage` event before closing cleanly (e.g. a non-conformant upstream) —
@@ -1183,25 +1203,25 @@ in `benches/decode.rs` (framing is ~4× faster on coalesced chunks: ~2 allocatio
 | (loop top)        | iteration begins                        | Err(MaxSteps)         | a `max_steps` ceiling was opted in and `steps >= max_steps`                                                                 | No request sent; session unchanged                                                                                                                                                                                                                                                                                                |
 | (loop top)        | iteration begins                        | request built         | no ceiling set (default), or `steps < max_steps`                                                                            | `ModelRequest` cloned (Arc pointers) from session + cached tool defs                                                                                                                                                                                                                                                              |
 | request built     | `transport.stream()` / stream item      | Err(Transport)        | network/HTTP/decode err (after retries), mid-stream `event: error`, truncated stream                                        | An `Error` event is sunk; if real content had already streamed before the failure, it's kept — pushed as an assistant turn tagged `error_message` (not discarded) — otherwise a bare closing record; error returned from `run`/`run_events`                                                                                       |
-| request built     | stream exhausts                         | turn assembled        | always                                                                                                                      | `Accumulator::finish()` returns `Turn`; malformed tool args become recoverable error `tool_result`s                                                                                                                                                                                                                               |
+| request built     | stream exhausts                         | turn assembled        | always                                                                                                                      | `Accumulator::finish()` returns `Turn`; malformed tool args and a call the length stop cut off become recoverable error `tool_result`s (`Turn::not_run`), never run                                                                                                                                                               |
 | any await point   | `cancel` tripped                        | Err(Cancelled)        | client abort                                                                                                                | Stream/tool futures dropped (HTTP + subprocess killed); no `Error` event (not a fault). If nothing had streamed yet (pre-connect, or the top-of-loop check), the pending `user` turn is still closed out with an aborted assistant record — not left dangling — so a later prompt can't stack a second consecutive `user` message |
 | turn assembled    | —                                       | turn pushed           | —                                                                                                                           | `session.push(assistant)`, `record_usage`, `steps += 1`, `TurnEnd` sunk                                                                                                                                                                                                                                                           |
 | turn pushed       | no complete `tool_use` blocks           | done (`Ok`)           | `calls.is_empty()` — `stop_reason` is not consulted (pi-parity fix; see the turn-loop diagram above)                        | Returns to caller; session ends on the assistant turn                                                                                                                                                                                                                                                                             |
-| turn pushed       | complete `tool_use` blocks present      | dispatching tools     | `!calls.is_empty()`, regardless of `stop_reason` — e.g. still dispatches under `MaxTokens` if the calls themselves finished | `ToolStart` sunk per call, in call order; the `tool_use` turn is checkpointed here too — _before_ any tool runs — so a crash mid-dispatch never loses the record of which calls the model asked for                                                                                                                               |
+| turn pushed       | complete `tool_use` blocks present      | dispatching tools     | `!calls.is_empty()`, regardless of `stop_reason` — e.g. still dispatches under `MaxTokens` if the calls themselves finished | `ToolStart` sunk per call, in call order; the `tool_use` turn is checkpointed here too — _before_ any tool runs — so a crash mid-dispatch never loses the record of which calls the model asked for. A cut-off call is answered with an error at its gate, never run                                                              |
 | dispatching tools | all groups resolve (`buffer_unordered`) | (loop top, next iter) | —                                                                                                                           | `ToolEnd` sunk + one `tool_results` user message pushed, in call order (carrying any tool images + mid-run steer text); checkpointed again here; ends the run early instead if every call set `terminate`                                                                                                                         |
 
 ### Per-block accumulation (`Accumulator`)
 
-| From          | Event              | To        | What Actually Happens                                                                                                                                                                                                                                                         |
-| ------------- | ------------------ | --------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| none open     | `TextDelta`        | text open | Appends to the text buffer                                                                                                                                                                                                                                                    |
-| text open     | `TextDelta`        | text open | Appends                                                                                                                                                                                                                                                                       |
-| text open     | `ToolUseStart`     | tool open | Flushes the text buffer as a `ContentBlock::Text`                                                                                                                                                                                                                             |
-| none open     | `ToolUseStart`     | tool open | Opens `(id, name, "")`                                                                                                                                                                                                                                                        |
-| tool open     | `InputJsonDelta`   | tool open | Appends to the JSON argument buffer                                                                                                                                                                                                                                           |
-| text open     | `ContentBlockStop` | none open | Flushes text block                                                                                                                                                                                                                                                            |
-| tool open     | `ContentBlockStop` | none open | Parses the JSON buffer (raw, then `repair_json`, then `close_incomplete_json`); on parse failure even after both repairs, records the call in `Turn::malformed` and pushes `ToolUse` with a wire-valid empty `{}` input (the loop then feeds back a recoverable error result) |
-| thinking open | `ContentBlockStop` | none open | Flushes a `Thinking { text, signature }` block (from `ThinkingDelta`/`SignatureDelta`)                                                                                                                                                                                        |
+| From          | Event              | To        | What Actually Happens                                                                                                                                                                                                                                                                                |
+| ------------- | ------------------ | --------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| none open     | `TextDelta`        | text open | Appends to the text buffer                                                                                                                                                                                                                                                                           |
+| text open     | `TextDelta`        | text open | Appends                                                                                                                                                                                                                                                                                              |
+| text open     | `ToolUseStart`     | tool open | Flushes the text buffer as a `ContentBlock::Text`                                                                                                                                                                                                                                                    |
+| none open     | `ToolUseStart`     | tool open | Opens `(id, name, "")`                                                                                                                                                                                                                                                                               |
+| tool open     | `InputJsonDelta`   | tool open | Appends to the JSON argument buffer                                                                                                                                                                                                                                                                  |
+| text open     | `ContentBlockStop` | none open | Flushes text block                                                                                                                                                                                                                                                                                   |
+| tool open     | `ContentBlockStop` | none open | Parses the JSON buffer (raw, then `repair_json`); on failure records the call as unsettled — `finish` puts it in `Turn::not_run`, as cut off under a `MaxTokens` stop, else as invalid JSON — and pushes `ToolUse` with `close_incomplete_json`'s partial object or a wire-valid `{}`; it never runs |
+| thinking open | `ContentBlockStop` | none open | Flushes a `Thinking { text, signature }` block (from `ThinkingDelta`/`SignatureDelta`)                                                                                                                                                                                                               |
 
 ## Why It Behaves This Way
 
@@ -1333,8 +1353,10 @@ hold still. The decoder now also reads `input_tokens_details.cache_write_tokens`
 
 A streamed tool call whose JSON args never parse is a protocol glitch, not a model mistake the model
 can't recover from. Rather than abort the run, the loop keeps the `tool_use` block (with a wire-valid
-empty `{}` input so the next request doesn't 400) and feeds back an error `tool_result` naming the
-problem, which the model corrects on the next turn — the same shape as any other recoverable tool error.
+object input so the next request doesn't 400) and feeds back an error `tool_result` naming the problem,
+which the model corrects on the next turn — the same shape as any other recoverable tool error. It
+never runs the call on a guessed repair: closing up an unclosed input is a guess about where a value
+ended, and for a `write`/`edit` a wrong guess is a silently wrong file.
 
 ### Why dialect selection is a model-id prefix check, not configuration
 
@@ -1373,7 +1395,7 @@ both fields `None` and never reads them.
 - UTF-8 validity of each framed SSE line (`Error::Transport("invalid UTF-8 in SSE stream")`).
 - JSON well-formedness of each SSE `data:` payload (`Error::Transport("malformed SSE json")`).
 - JSON well-formedness of a streamed tool call's assembled arguments — a parse failure is _not_ fatal;
-  it becomes a recoverable error `tool_result` (`Turn::malformed`).
+  it becomes a recoverable error `tool_result` (`Turn::not_run`).
 - in-band provider errors (`event: error`) and streams truncated before their terminal marker
   (`Error::Transport`).
 

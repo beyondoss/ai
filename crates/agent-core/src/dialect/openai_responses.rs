@@ -1214,6 +1214,19 @@ impl Decoder {
 
         let mut stop_reason = match status {
             Some("completed") => StopReason::EndTurn,
+            // `incomplete` names its cause: the output limit (`max_output_tokens`) is a length stop,
+            // but a content filter is a refusal — the Chat Completions dialect maps its own
+            // `content_filter` the same way. A cut-off tool call is told to resend smaller, which is
+            // the wrong advice for a filtered one.
+            Some("incomplete")
+                if response
+                    .and_then(|r| r.get("incomplete_details"))
+                    .and_then(|d| d.get("reason"))
+                    .and_then(Value::as_str)
+                    == Some("content_filter") =>
+            {
+                StopReason::Refusal
+            }
             Some("incomplete") => StopReason::MaxTokens,
             // `"failed"`/`"cancelled"` already returned early above.
             Some(other) => {
@@ -3003,6 +3016,34 @@ data: {"type":"response.incomplete","response":{"status":"incomplete","usage":{"
         assert_eq!(usage.output_tokens, 12);
         assert_eq!(usage.cache_read_tokens, 5);
         assert_eq!(usage.cache_write_tokens, 0);
+    }
+
+    #[test]
+    fn incomplete_for_the_output_limit_is_a_length_stop_but_a_content_filter_is_a_refusal() {
+        // A length stop tells a cut-off tool call to resend smaller; that's the wrong advice for a
+        // filtered response, which the Chat Completions dialect already maps to `Refusal`.
+        let stop = |reason: &str| {
+            let sse = format!(
+                "data: {{\"type\":\"response.incomplete\",\"response\":{{\"status\":\"incomplete\",\
+                 \"incomplete_details\":{{\"reason\":\"{reason}\"}}}}}}\n"
+            );
+            decode_sse(&mut Decoder::default(), &sse)
+                .unwrap()
+                .last()
+                .cloned()
+        };
+        assert_eq!(
+            stop("max_output_tokens"),
+            Some(StreamEvent::MessageStop {
+                stop_reason: StopReason::MaxTokens
+            })
+        );
+        assert_eq!(
+            stop("content_filter"),
+            Some(StreamEvent::MessageStop {
+                stop_reason: StopReason::Refusal
+            })
+        );
     }
 
     #[test]
