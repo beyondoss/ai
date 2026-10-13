@@ -22,6 +22,12 @@ turns (a `script` event marks the send, `steered` the injection), so a task can 
 constraint mid-run and an eval can see whether it survives compaction. The agent then runs as
 `serve` over stdio rather than `run --json`; compare scripted runs with scripted runs.
 
+A background task (`bg_tasks.py`: a server to start and curl, an API plus its worker, a watcher, a
+slow build) runs in the same sandbox and is graded by its own `check`, which starts the agent's code
+afresh. Every sandboxed run records `processes_left` (what the agent left running when it exited,
+from the sandbox's report) and `bg` (`bg_metrics.py`: `run_in_background` uses, `timeout_ms` returns
+and kills, finish notices, sleep-polls, duplicate launches).
+
 Results land in `$LONGCTX_WORK/runs/<task>/<model>/<arm>/a<n>/result.json`. A run with a result is
 never repeated, so an interrupted sweep resumes where it stopped.
 """
@@ -29,6 +35,7 @@ never repeated, so an interrupted sweep resumes where it stopped.
 from __future__ import annotations
 
 import ast
+import contextlib
 import datetime
 import fcntl
 import functools
@@ -45,6 +52,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import bg_metrics
+import bg_tasks
 import mcp_tasks
 import prefix_tasks
 import sandbox
@@ -175,8 +184,9 @@ When every suite passes, reply with a short summary of what you implemented."""
 class Live:
     """Folds the event stream into run metrics as it arrives."""
 
-    def __init__(self, model: str):
+    def __init__(self, model: str, flag_net: bool = True):
         self.model = model
+        self.flag_net = flag_net  # a background task's curl to its own localhost server is not suspect
         self.usd = 0.0
         self.compaction_usd = 0.0
         self.turns = 0
@@ -254,7 +264,7 @@ class Live:
         elif k == "tool_start":
             self.tools += 1
             cmd = json.dumps(ev.get("input", {}))
-            if ev.get("name") == "bash" and _SUSPECT.search(cmd):
+            if ev.get("name") == "bash" and self.flag_net and _SUSPECT.search(cmd):
                 self.suspect.append(cmd[:300])
         elif k == "tool_end":
             if ev.get("is_error"):
@@ -477,12 +487,18 @@ def supports_compact_at(binary: Path) -> bool:
     return "--compact-at" in out.stdout + out.stderr
 
 
-def run_one(binary: Path, task: str, model: str, arm: str, attempt: int, cap_usd: float,
-            max_steps: int, wall_s: int, extra: list[str], runs_dir: Path, label: str,
-            script: list[dict] | None = None) -> dict:
+def run_one(*args, **kwargs) -> dict:
     """One run. `script` (see `--script`) adds user turns after the prompt, which needs a live
     control channel: the agent then runs as `serve` over stdio, with the same flags, instead of
-    `run --json`."""
+    `run --json`. Whatever a task holds for the run (a background task's ports and port squatter)
+    is released however the run ends."""
+    with contextlib.ExitStack() as held:
+        return _run_one(held, *args, **kwargs)
+
+
+def _run_one(held: contextlib.ExitStack, binary: Path, task: str, model: str, arm: str, attempt: int, cap_usd: float,
+             max_steps: int, wall_s: int, extra: list[str], runs_dir: Path, label: str,
+             script: list[dict] | None = None) -> dict:
     d = runs_dir / task / model / arm / f"a{attempt}"
     res_path = d / "result.json"
     if res_path.exists():
@@ -505,8 +521,16 @@ def run_one(binary: Path, task: str, model: str, arm: str, attempt: int, cap_usd
     env = load_env()
     server = None
     checker = None
+    bg = None
     memory = ["--no-memory"]
-    if task in prefix_tasks.PREFIX_TASKS:
+    if task in bg_tasks.BG_TASKS:
+        tree.mkdir()
+        bg = bg_tasks.BG_TASKS[task](tree)
+        held.callback(bg.close)
+        prompt = bg.prompt
+        env.update(tasks.test_env([]))  # the code tasks' environment: the venv first on PATH
+        repos = []
+    elif task in prefix_tasks.PREFIX_TASKS:
         tree.mkdir()
         prompt, checker = prefix_tasks.PREFIX_TASKS[task](home, tree)
         memory = []  # the memory index is part of what these tasks measure
@@ -530,10 +554,12 @@ def run_one(binary: Path, task: str, model: str, arm: str, attempt: int, cap_usd
     # The run's own temp dir: a full shared /tmp must not fail the agent's test runs (ENOSPC).
     (d / "tmp").mkdir(exist_ok=True)
     (d / "sessions").mkdir(exist_ok=True)
-    # A code task runs in the sandbox, which sees these four dirs at fixed paths and nothing else of
-    # the work dir. HOME is the run's own either way: no user CLAUDE.md, skills, settings or memory.
+    # A code or background task runs in the sandbox, which sees these four dirs at fixed paths and
+    # nothing else of the work dir, and reports what the agent left running when it exited. HOME is
+    # the run's own either way: no user CLAUDE.md, skills, settings or memory.
+    sandboxed = bool(repos) or bg is not None
     inside = {tree: sandbox.WS, home: f"{sandbox.ROOT}/home", d / "tmp": f"{sandbox.ROOT}/tmp",
-              d / "sessions": f"{sandbox.ROOT}/sessions"} if repos else {p: str(p) for p in (tree, home, d / "tmp", d / "sessions")}
+              d / "sessions": f"{sandbox.ROOT}/sessions"} if sandboxed else {p: str(p) for p in (tree, home, d / "tmp", d / "sessions")}
     env["HOME"] = inside[home]
     env["TMPDIR"] = inside[d / "tmp"]
     env["AI_DIRECT"] = "1"
@@ -557,11 +583,12 @@ def run_one(binary: Path, task: str, model: str, arm: str, attempt: int, cap_usd
     # A live probe saw exactly that. `run` reads piped stdin as the first message, trimmed, so the
     # model sees the same text either way.
     cwd = tree
-    if repos:
-        cmd = sandbox.argv(tasks.view(list(inside.items()), binary=binary), sandbox.WS, cmd)
+    if sandboxed:
+        cmd = sandbox.argv(tasks.view(list(inside.items()), binary=binary), sandbox.WS, cmd,
+                           leftovers=str(d / "leftovers.json"))
         cwd = d
     checkpoint = Checkpoint(repos, tree, d / "checkpoint", Units(repos, tree, d / "units.jsonl")) if repos else None
-    live = Live(model)
+    live = Live(model, flag_net=bg is None)
     started = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
     t0 = time.monotonic()
     killed = None
@@ -648,6 +675,11 @@ def run_one(binary: Path, task: str, model: str, arm: str, attempt: int, cap_usd
     wall = time.monotonic() - t0
     if server:
         server.shutdown()
+    # What the agent left running when it exited (the sandbox's report; None if unsandboxed or lost).
+    try:
+        leftovers = json.loads((d / "leftovers.json").read_text()) if sandboxed else None
+    except (OSError, json.JSONDecodeError):
+        leftovers = None
     if not live.requests and killed is None:
         # Never reached the model (credentials, bad flag): not a data point. Leave no result so a
         # rerun retries it.
@@ -667,6 +699,9 @@ def run_one(binary: Path, task: str, model: str, arm: str, attempt: int, cap_usd
             last_parseable = dict(step=checkpoint.step, passed=a["passed"], fixed=a["fixed"], fixed_frac=a["fixed_frac"],
                                   regressed=a["regressed"], tree_state=a["tree_state"])
         shutil.rmtree(d / "checkpoint", ignore_errors=True)
+    elif bg:
+        ok, why = bg.check(leftovers)
+        g = dict(passed=ok, fixed=int(ok), broken=1, regressed=0, fixed_frac=float(ok), check=why)
     elif checker:
         ok = bool(checker())
         g = dict(passed=ok, fixed=int(ok), broken=1, regressed=0, fixed_frac=float(ok))
@@ -680,7 +715,7 @@ def run_one(binary: Path, task: str, model: str, arm: str, attempt: int, cap_usd
         trigger=(window - RESERVE) if window else None,
         exit=p.returncode, killed=killed, ended=live.ended, wall_s=round(wall, 1), started_at=started,
         end_reason=end_reason, cut_off=end_reason in _CUT_OFF, last_parseable=last_parseable,
-        sandboxed=bool(repos), tool_errors=live.tool_errors, soft_errors=live.soft_errors,
+        sandboxed=sandboxed, tool_errors=live.tool_errors, soft_errors=live.soft_errors,
         final_text=live.final_text[:4000],
         usd=round(live.usd, 4), compaction_usd=round(live.compaction_usd, 4),
         turns=live.turns, tools=live.tools, requests=len(live.requests),
@@ -694,7 +729,9 @@ def run_one(binary: Path, task: str, model: str, arm: str, attempt: int, cap_usd
         tokens=live.tok, errors=live.errors[:5], suspect=live.suspect[:10],
         turns_after_first_compaction=(live.turns - first_c) if first_c is not None else None,
         script_log=script_log, steered=live.steered,
-        compaction_log=live.compactions, request_log=live.requests, **g,
+        compaction_log=live.compactions, request_log=live.requests,
+        processes_left=len(leftovers) if leftovers is not None else None, leftovers=(leftovers or [])[:10],
+        bg=bg_metrics.metrics(bg_metrics.load(d / "events.jsonl"), bg.launches if bg else ()), **g,
     )
     shutil.rmtree(tree)  # graded; the event log and session hold the trajectory
     res_path.write_text(json.dumps(res))
@@ -802,7 +839,7 @@ def main(argv: list[str]) -> None:
             tot = spent
         print(f"{r['task']:15} {r['model']:18} {r['arm']:8} a{r['attempt']} pass={int(r['passed'])} "
               f"fixed={r['fixed']}/{r['broken']} ${r['usd']:.2f} turns={r['turns']} comp={r['compactions']} "
-              f"mask={r.get('maskings', 0)} "
+              f"mask={r.get('maskings', 0)} left={r.get('processes_left')} "
               f"peak={r['peak_prompt'] // 1000}K killed={r['killed']}  [run total ${tot:.2f}, ledger ${ledger.spent():.2f}]",
               flush=True)
         return r

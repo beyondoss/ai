@@ -50,7 +50,7 @@ python3 crates/agent/eval/longctx/report.py
 """
 
 [tasks."eval:validate"]
-description = "Check the long-context eval's integrity before trusting an A/B (local, no model calls): build every task (no compiled/packaged artifact, no removed body left verbatim in the tree), the pristine tree passes 100% in the grading env with stable test ids, the perfect answer grades as solved in every run-dir layout with identical results (path-independent), the stubbed tree fails, and the agent's sandbox reaches no pristine tree, other run or installed copy of a package under test. Args go to validate.py (--repos, --jobs)."
+description = "Check the long-context eval's integrity before trusting an A/B (local, no model calls): build every task (no compiled/packaged artifact, no removed body left verbatim in the tree), the pristine tree passes 100% in the grading env with stable test ids, the perfect answer grades as solved in every run-dir layout with identical results (path-independent), the stubbed tree fails, and the agent's sandbox reaches no pristine tree, other run or installed copy of a package under test; then the eight background-process tasks set up at once: each untouched task fails and its reference solution passes (three times each), ports distinct and released, the real build matches, the sandbox leftover report and the bg metrics. Args go to validate.py (--repos, --jobs, --bg-only, --real-run)."
 run = 'python3 crates/agent/eval/longctx/validate.py "$@"'
 
 [tasks."eval:longctx:report"]
@@ -58,7 +58,7 @@ description = "Tabulate the long-context sweep's results (pass rate with Wilson 
 run = "python3 crates/agent/eval/longctx/report.py"
 
 [tasks."eval:ab"]
-description = "Before/after no-regression gate: build BASE and CAND (commit SHAs) in separate target dirs, run the longctx code tasks plus the MCP tasks (Playwright + GitHub + filesystem servers) on both at one compaction arm (`--arm`, default `default`), and the MCP tasks on CAND with --code-mode too; `--base-arg`/`--cand-arg` add agent flags to one side (A/B a mechanism against itself). Prints per-arm pass rate (Wilson CI), paired McNemar + bootstrap verdicts, $/task, wall, TTFT, turns, first-request tokens, cache-read share, compactions. `BASE=<sha> CAND=<sha> mise run eval:ab -- --attempts 2`. Spends real money; reads keys from .env, GitHub token from `gh auth token`."
+description = "Before/after no-regression gate: build BASE and CAND (commit SHAs) in separate target dirs, run the longctx code tasks plus the MCP tasks (Playwright + GitHub + filesystem servers) and the background-process tasks on both at one compaction arm (`--arm`, default `default`), and the MCP tasks on CAND with --code-mode too; `--base-arg`/`--cand-arg` add agent flags to one side (A/B a mechanism against itself). Prints per-arm pass rate (Wilson CI), paired McNemar + bootstrap verdicts, $/task, wall, TTFT, turns, first-request tokens, cache-read share, compactions. `BASE=<sha> CAND=<sha> mise run eval:ab -- --attempts 2`. Spends real money; reads keys from .env, GitHub token from `gh auth token`."
 run = 'python3 crates/agent/eval/longctx/ab.py run --base "${BASE:?set BASE=<sha>}" --cand "${CAND:?set CAND=<sha>}" "$@"'
 
 [tasks."check:rs"]
