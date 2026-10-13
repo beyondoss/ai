@@ -19,9 +19,12 @@
 /// run, a summary.
 pub const WRAP_UP_STEPS: u32 = 5;
 
+/// How the wrap-up text starts — one of [`crate::background::NOTE_PREFIXES`].
+pub const NOTE_PREFIX: &str = "[step budget]";
+
 pub(crate) fn wrap_up_text(max: u32, extra: u32) -> String {
     format!(
-        "[step budget] This run's {max} steps are used up. You have {extra} more, only to stop \
+        "{NOTE_PREFIX} This run's {max} steps are used up. You have {extra} more, only to stop \
          cleanly. Do not continue the task: write no new code and do not finish a change in \
          progress. Only if a file you edited now fails to parse or import, revert or fix that one \
          problem. Run the test suite once to confirm. Then reply with a short summary of what is \

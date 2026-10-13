@@ -472,7 +472,13 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
     kept the "don't edit tests" constraint. Each genuine user turn's text, deduped, capped at 4,000
     chars; past four, the first and the latest. Handed to the re-render beside the file tags too (its
     `<previous-summary>` has carry blocks stripped, so it would otherwise never see the user's words
-    again).
+    again). Harness notes riding user turns (background notices and reminders, the step-budget
+    wrap-up — `background::is_note`) are not the user's words and are skipped.
+  - **Work still running** — the tools' `Background::carry`, as `<background-jobs>`, so a compacted
+    model does not start a job again that it forgot. The one block **not** in
+    `CompactionProvenance`: it is rendered from live state at each compaction, because it describes
+    processes, and a persisted copy would list dead jobs as running after a restart. Stripped and
+    re-rendered like the rest.
 
   `compact` first strips any blocks the model echoed at the end of its own reply (`strip_echoed_carry`):
   the cached call sees the previous summary, blocks included, and a model that mirrors its shape ends
@@ -879,6 +885,21 @@ the grant and end with 171 regressions; the current text forbids continuing the 
 Two sibling arms were deleted. A one-time "N of M steps remain" notice near the ceiling made Luna rush
 more, and one run broke mid-edit (220 regressions). A continue nudge when the model stopped with 20%+ of
 its steps left made runs 274% costlier and ended with broken trees.
+
+**Background work (`background.rs`).** A tool whose work outlives its call (the `agent` crate's `bash`
+jobs) returns a `Background` from `Tool::background`; the loop collects them from the registry at each
+use (deduped by pointer, so two tools over one table report it once) and asks three things. After a
+tool batch, `take_notices` (finish notices for work that ended unattended, each delivered once) folds
+into the tool-results turn after any steer, as the wrap-up does. At a would-stop, pending notices are
+delivered first — pushed as a user turn after any drained follow-ups, checkpointed, and the run
+continues — so a run never ends without a result that already arrived; with none, `stop_reminder`
+lists work still running that no earlier reminder covered, once per piece of work, so a model that
+ends again ends. A pending stop request still wins over both. Each delivery is reported as
+`AgentEvent::Background { reason: finished | still_running, text, wake }` (`wake` is for a host that
+starts a turn itself to deliver a notice). Every text starts with one of `background::NOTE_PREFIXES`
+(`[job `, `[background jobs]`, `[step budget]`), which `merge_user_requests` skips: a run of harness
+notes would otherwise push the user's own words out of the four carried requests. `carry` is the third
+question: see the `<background-jobs>` block under the deterministic-carry channel.
 
 Recoverable (no error): a streamed tool call whose JSON args never parse keeps its `tool_use` block
 (with an empty `{}` input) and is fed back as an error `tool_result` the model can correct — the run

@@ -4712,7 +4712,13 @@ async fn run_task(
     };
     let empty: &[String] = &[];
     let nested_exclude = tools_exclude.as_deref().unwrap_or(empty);
+    // `bash`'s jobs belong to the run: they outlive any one turn (a second `-m` message sees them),
+    // and the end of the run stops them and says which (see the end of this function).
+    let bash_jobs = std::sync::Arc::new(tools::bash_jobs::BashJobs::new(
+        tools::bash_jobs::EndPolicy::StopAtEnd,
+    ));
     let mut registry = tools::default_registry_with_config(&tools::ToolConfig {
+        bash_jobs: Some(bash_jobs.clone()),
         bash_timeout_ms,
         bash_shell_path: bash_shell_path.as_deref(),
         bash_command_prefix: bash_command_prefix.as_deref(),
@@ -5412,6 +5418,8 @@ async fn run_task(
         std::time::Duration::from_secs(lifecycle_heartbeat_secs),
     )
     .await;
+    // A yielded job never outlives the turn that started it (the stop reminder said so).
+    let mut stopped_jobs = bash_jobs.end_turn();
     // Persist whatever's in `session` regardless of outcome: `run_events_cancellable` mutates
     // `session` in place as it streams, so a cancelled turn still leaves behind whatever
     // assistant/tool content had already landed — the same partial-content guarantee `serve` gives
@@ -5455,6 +5463,7 @@ async fn run_task(
             std::time::Duration::from_secs(lifecycle_heartbeat_secs),
         )
         .await;
+        stopped_jobs.extend(bash_jobs.end_turn());
         persist_run(&store, &session)?;
         if broken_pipe.load(Ordering::Relaxed) {
             emit_cli_lifecycle(life.as_ref(), &session, CliTerminal::Aborted, None).await;
@@ -5509,6 +5518,31 @@ async fn run_task(
             Ok(path) => eprintln!("[exported transcript to {}]", path.display()),
             Err(e) => eprintln!("[failed to export transcript: {e}]"),
         }
+    }
+
+    // The run is over, so are its jobs: the yielded ones stopped at the end of their turn (above),
+    // the intended ones stop now. The model was told once, at its stop, which were still running
+    // and that ending stops them. Say which were stopped — a `--json` consumer gets one
+    // `bash_jobs_stopped` line (before any structured output, which stays last), each job with its
+    // `kind`.
+    let mut stopped = stopped_jobs;
+    stopped.extend(bash_jobs.stop_all());
+    if !stopped.is_empty() {
+        if json {
+            let line =
+                serde_json::json!({ "kind": "bash_jobs_stopped", "jobs": stopped }).to_string();
+            write_stdout_or_exit(&line, &cancel, &broken_pipe);
+            write_stdout_or_exit("\n", &cancel, &broken_pipe);
+        }
+        let list: Vec<String> = stopped
+            .iter()
+            .map(|j| format!("job {} `{}` ({} s)", j.job, j.command, j.running_secs))
+            .collect();
+        eprintln!(
+            "[stopped {} background job(s) still running at the end of the run: {}]",
+            stopped.len(),
+            list.join(", ")
+        );
     }
 
     eprintln!(

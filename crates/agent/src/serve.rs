@@ -2872,6 +2872,13 @@ pub(crate) async fn serve_session(
         Some(_) => crate::exec_endpoint::ExecCell::strict(),
         None => crate::exec_endpoint::ExecCell::new(),
     };
+    // `bash` jobs outlive the run that started them here: ending a turn leaves them running, and the
+    // idle loop below starts a turn when one ends (see the `bash_jobs_wake` arm). They end with the
+    // session (its cell drops), and a transcript switch stops them (they belong to its history).
+    let bash_jobs = exec_cell.bash_jobs().clone();
+    bash_jobs.set_policy(crate::tools::bash_jobs::EndPolicy::KeepRunning);
+    let mut bash_jobs_wake = bash_jobs.subscribe();
+    let mut bash_jobs_session = persistence.session_id().to_string();
     // Per-session MCP kit gate (which configured servers' tools are advertised). Defaults to all
     // enabled — matching prior behavior — and is cleared on session switch so tenants cannot inherit
     // each other's enablement the way they must not inherit each other's exec endpoint.
@@ -4424,6 +4431,13 @@ pub(crate) async fn serve_session(
         if mcp_resumer.session_id() != persistence.session_id() {
             mcp_resumer = start_mcp_resumer!();
         }
+        // The transcript changed (`new_session`, `switch_session`, `fork`, …): the jobs the old one
+        // started belong to its history, not the new one's, so they stop here rather than wake the
+        // new transcript with notices about commands it never ran.
+        if bash_jobs_session != persistence.session_id() {
+            bash_jobs.stop_all();
+            bash_jobs_session = persistence.session_id().to_string();
+        }
         // Checked here because every write path — a run's persist, a mid-run checkpoint, a title, a
         // label, a compaction rewrite — comes back through this loop before the next command is read.
         // Another owner has created a newer epoch on this session's storage, so nothing this process
@@ -4476,6 +4490,25 @@ pub(crate) async fn serve_session(
                 Some((kind, data)) = mcp_task_rx.recv() => {
                     journal_mcp!(kind, data);
                     continue;
+                }
+                // A `bash` job ended while nothing was running: the session wakes, and the notice
+                // is the input of an ordinary `prompt` turn (persisted, streamed, retried like any
+                // other). Last in this biased select, so a client's own command that is already
+                // waiting goes first — its run then delivers the notice itself, at its first tool
+                // results or its stop, and this arm finds nothing left to take. Several jobs ending
+                // together fold into one turn (`bash_job_notice_due`'s settle).
+                () = bash_job_notice_due(&bash_jobs, &mut bash_jobs_wake) => {
+                    let Some(text) = agent_core::Background::take_notices(bash_jobs.as_ref()) else {
+                        continue;
+                    };
+                    if let Some(frame) = event_frame(AgentEvent::Background {
+                        reason: agent_core::BackgroundReason::Finished,
+                        text: text.clone(),
+                        wake: true,
+                    }) {
+                        emit!(frame);
+                    }
+                    json!({ "type": "prompt", "message": text, "bash_jobs_wake": true }).to_string()
                 }
             }
         };
@@ -5692,6 +5725,23 @@ pub(crate) async fn serve_session(
                         }
                     }
                 };
+
+                // The turn is over, however it ended: its yielded `bash` jobs (a foreground command
+                // that went quiet or kept printing) stop with it, as the stop reminder told the model
+                // — an idle session must not accumulate hung loops. Intended jobs keep running. Said
+                // to the client before the terminal response, like `run`'s `--json` line.
+                let stopped_jobs = {
+                    let jobs = bash_jobs.clone();
+                    tokio::task::spawn_blocking(move || jobs.end_turn())
+                        .await
+                        .unwrap_or_default()
+                };
+                if !stopped_jobs.is_empty() {
+                    emit!(OutFrame::Value(json!({
+                        "type": "bash_jobs_stopped",
+                        "jobs": stopped_jobs,
+                    })));
+                }
 
                 let frame = match result {
                     Ok(()) => {
@@ -9212,6 +9262,9 @@ fn build_tools(
         fs_backend: Some(exec.backend()),
         command_runner: Some(exec.runner()),
         skills,
+        // The session's, not this registry's: a rebuild (`set_model`) keeps the jobs, the host
+        // `bash` command adopts into the same table, and the idle session wakes on it.
+        bash_jobs: Some(exec.bash_jobs().clone()),
         // In service mode a relative path the model writes belongs in the tenant's workspace, not
         // wherever this replica's process happens to have been started. Empty (= the process cwd)
         // for every other caller, which is the pre-service behavior.
@@ -12112,6 +12165,32 @@ fn ack(id: Option<String>, command: &str) -> OutFrame {
 /// `response`/`ack`. `to_value` would build a full owned `Value` tree from `ev` only for the writer
 /// task to immediately walk that same tree again via its own `to_string` — twice the allocation and
 /// serialization work for the one frame kind that can least afford it.
+/// How long an idle session waits, once a `bash` job's notice is due, before it wakes: jobs that end
+/// together (a `make -j` fan-out, a server and its watcher) then fold into one turn rather than one
+/// turn each.
+const BASH_JOBS_WAKE_SETTLE: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Resolves once a parked `bash` job's finish notice is due, after [`BASH_JOBS_WAKE_SETTLE`].
+/// Level-triggered: the state is re-checked every time this future is created and after every
+/// change, so a change that landed while the session was busy is never missed.
+async fn bash_job_notice_due(
+    jobs: &crate::tools::bash_jobs::BashJobs,
+    wake: &mut tokio::sync::watch::Receiver<u64>,
+) {
+    loop {
+        // Seen before checking, so a job that ends between the check and the wait still wakes it.
+        wake.borrow_and_update();
+        if jobs.has_notice() {
+            tokio::time::sleep(BASH_JOBS_WAKE_SETTLE).await;
+            return;
+        }
+        if wake.changed().await.is_err() {
+            // The table is gone (it never is while the session runs): never wake.
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
 fn event_frame(ev: AgentEvent) -> Option<OutFrame> {
     #[derive(serde::Serialize)]
     struct EventFrame<'a> {

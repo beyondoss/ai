@@ -18,6 +18,11 @@
 //! lists ([`format_file_operations`]) and the model's `todo` list ([`format_todo_list`]) — and both are
 //! there for the same reason: they are the run's working state, and losing them silently degrades the
 //! model rather than failing loudly. Anything else added here should clear the same bar.
+//!
+//! One block rides the same tail without being persisted here: `<background-jobs>`, the work tools
+//! left running ([`crate::background`]). It is rendered from live state at every compaction, because
+//! a persisted copy would describe dead processes after a restart; it is stripped and re-rendered
+//! like the rest.
 
 use std::sync::Arc;
 
@@ -120,7 +125,8 @@ pub const USER_REQUEST_MAX_CHARS: usize = 4_000;
 pub const USER_REQUESTS_KEPT: usize = 4;
 
 /// `previous`'s carried requests plus every genuine user turn in `messages` (text only — the words
-/// the user typed or a steer injected, not tool results or a prior summary), deduped, capped per
+/// the user typed or a steer injected, not tool results, a prior summary, or a harness note — see
+/// [`crate::background::is_note`]), deduped, capped per
 /// request at [`USER_REQUEST_MAX_CHARS`] and overall at [`USER_REQUESTS_KEPT`]: the first plus the
 /// latest. `messages` is the round's prefix; the leading summary message is skipped by
 /// `is_turn_start`.
@@ -131,7 +137,12 @@ pub fn merge_user_requests(previous: &[String], messages: &[Message]) -> Vec<Str
             .content
             .iter()
             .filter_map(|b| match b {
-                ContentBlock::Text { text, .. } => Some(&**text),
+                // A harness note (a background job's notice, the step-budget wrap-up) rides a user
+                // turn but is not the user's words, and a run of them would push the real requests
+                // out of the kept window.
+                ContentBlock::Text { text, .. } if !crate::background::is_note(text) => {
+                    Some(&**text)
+                }
                 _ => None,
             })
             .collect::<Vec<_>>()
@@ -1139,12 +1150,16 @@ pub fn previous_summary(prefix: &[Message]) -> Option<&str> {
 
 /// The host-appended, deterministically-regenerated blocks a summary body carries at its tail, as
 /// `(open, close)` tag pairs. See [`format_file_operations`] / [`format_todo_list`].
-const CARRY_BLOCKS: [(&str, &str); 5] = [
+const CARRY_BLOCKS: [(&str, &str); 6] = [
     ("<user-requests>", "</user-requests>"),
     ("<read-files>", "</read-files>"),
     ("<modified-files>", "</modified-files>"),
     ("<todo_list>", "</todo_list>"),
     ("<memory-notes>", "</memory-notes>"),
+    (
+        crate::background::CARRY_OPEN,
+        crate::background::CARRY_CLOSE,
+    ),
 ];
 
 /// A summarizing model's reply with any carry blocks it echoed at its end removed, so the host's

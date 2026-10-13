@@ -10,10 +10,8 @@
 //! become errors carrying the output — same as pi's throw.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use agent_core::tool::Tool;
@@ -22,10 +20,14 @@ use async_trait::async_trait;
 use regex::Regex;
 use serde_json::{Value, json};
 
-use super::exec::{CommandRunner, ExecResult, Kill, RealRunner};
+use super::bash_jobs::{
+    BashJobs, COMMAND_CHARS, Job, JobEnd, JobKind, JobShared, MAX_INTENDED_JOBS, MAX_YIELDED_JOBS,
+};
+use super::bash_proc::truncate_command;
+use super::exec::{CommandRunner, ExecResult, JobHooks, Kill, RealRunner};
 use super::fs::local::LocalFs;
 use super::fs::{FsBackend, PathWorld};
-use super::output::{OutputAccumulator, OutputSnapshot, TruncatedBy, format_output};
+use super::output::{OutputSnapshot, TruncatedBy, format_output};
 
 /// Default command timeout (ms) when the model doesn't specify one. The reference agent has no default
 /// at all — a command runs to completion unless the model explicitly sets `timeout_ms` — which SIGKILLs
@@ -88,15 +90,33 @@ fn resolve_shell() -> &'static str {
 /// 204 s without output. See "`bash` and hung commands" in `ARCHITECTURE.md` for the eval behind 60 s.
 pub const IDLE_YIELD: Duration = Duration::from_secs(60);
 
+/// How long the call that starts a command may stream the output of one that never goes quiet (a
+/// server logging requests, a watcher) before it returns with the output so far and leaves the
+/// command running as a job. Without it such a command held its call until the 30-minute timeout.
+/// 10 minutes is well above the 3 min 44 s a clean release build of this repo takes, so a build or a
+/// test suite that prints as it goes still finishes inside the call that started it.
+pub const OUTPUT_CEILING: Duration = Duration::from_secs(600);
+
+/// The longest one `bash_job` wait lasts, quiet or not, before it reports the job still running.
+/// 5 minutes is above the 3 min 44 s a clean release build of this repo takes, so the one wait that
+/// follows a build's first yield (at 60 s of silence) covers the rest of it; it also caps the growing
+/// idle window (60 s, 240 s, then 960 s) so no wait blocks the model for a quarter of an hour.
+pub const WAIT_CEILING: Duration = Duration::from_secs(300);
+
 pub struct Bash {
     runner: Arc<dyn CommandRunner>,
     default_timeout_ms: u64,
     /// The silence after which a call returns and leaves its command running as a job: [`IDLE_YIELD`],
     /// or `None` to wait for every command to exit (see [`Self::with_idle_yield`]).
     idle_yield: Option<Duration>,
-    /// Commands still running after their call returned. Owned by this tool instance: dropping it (a
-    /// registry rebuild, the end of the process) kills every one.
-    jobs: Arc<Jobs>,
+    /// The call that starts a command returns by [`OUTPUT_CEILING`] however much it prints.
+    call_ceiling: Duration,
+    /// A `bash_job` wait returns by [`WAIT_CEILING`].
+    wait_ceiling: Duration,
+    /// Commands still running after their call returned, and ended ones not yet reported. Shared
+    /// with every `bash`/`bash_job` built over the same table (see [`Self::with_jobs`]); dropping
+    /// the last holder kills every job.
+    jobs: Arc<BashJobs>,
     /// Overrides `resolve_shell()`'s auto-detection when set — see [`with_shell_path`](Self::with_shell_path).
     shell_path: Option<String>,
     /// The shell to use when [`Self::backend`] reports a remote world — see
@@ -162,12 +182,14 @@ fn describe(default_timeout_ms: u64, idle_yield: Option<Duration>) -> String {
     );
     if let Some(idle) = idle_yield {
         text.push_str(&format!(
-            " A command still running after {} s without new output returns early with its output \
-             so far and keeps running in the background as a numbered job: call `bash_job` with that \
-             number to wait for more of its output, or with `kill: true` to stop it. (A remote \
-             sandbox that cannot stream output as it happens is the exception: there the call \
-             waits for the command to finish.)",
-            idle.as_secs()
+            " A command still running after {} s without new output (or still printing after {} \
+             minutes) returns early with its output so far and keeps running in the background as a \
+             numbered job; so does a process a command leaves running (`cmd &`). You are told when a \
+             job exits, without asking: do not poll or sleep. Call `bash_job` with the number to wait \
+             for it, or with `kill: true` to stop it. (A remote sandbox that cannot stream output as \
+             it happens is the exception: there the call waits for the command to finish.)",
+            idle.as_secs(),
+            OUTPUT_CEILING.as_secs() / 60,
         ));
     }
     text
@@ -180,6 +202,8 @@ impl Bash {
             runner: Arc::new(RealRunner),
             default_timeout_ms: DEFAULT_TIMEOUT_MS,
             idle_yield: Some(IDLE_YIELD),
+            call_ceiling: OUTPUT_CEILING,
+            wait_ceiling: WAIT_CEILING,
             jobs: Arc::default(),
             shell_path: None,
             remote_shell: None,
@@ -188,6 +212,26 @@ impl Bash {
             root: std::path::PathBuf::new(),
             backend: Arc::new(LocalFs::new()),
         }
+    }
+
+    /// Builder-style: keep jobs in `jobs` rather than a table of this tool's own — the session's,
+    /// so a registry rebuild (`set_model`) keeps them, and so the host can stop them or wake on them.
+    pub fn with_jobs(mut self, jobs: Arc<BashJobs>) -> Self {
+        self.jobs = jobs;
+        self
+    }
+
+    /// Builder-style: different ceilings than [`OUTPUT_CEILING`] (the call that starts a command)
+    /// and [`WAIT_CEILING`] (a `bash_job` wait). For tests.
+    pub fn with_ceilings(mut self, call: Duration, wait: Duration) -> Self {
+        self.call_ceiling = call;
+        self.wait_ceiling = wait;
+        self
+    }
+
+    /// The job table this tool parks commands in.
+    pub fn jobs(&self) -> &Arc<BashJobs> {
+        &self.jobs
     }
 
     /// Builder-style: override the default timeout applied when the model omits `timeout_ms`.
@@ -261,6 +305,8 @@ impl Bash {
             runner,
             default_timeout_ms: DEFAULT_TIMEOUT_MS,
             idle_yield: Some(IDLE_YIELD),
+            call_ceiling: OUTPUT_CEILING,
+            wait_ceiling: WAIT_CEILING,
             jobs: Arc::default(),
             shell_path: None,
             remote_shell: None,
@@ -392,22 +438,25 @@ impl Bash {
         };
         let args = vec!["-c".to_string(), resolved_command];
         let dur = Duration::from_millis(timeout_ms);
-        self.exec_detachable(args, cwd, dur, timeout_ms, &world, progress)
+        self.exec_detachable(args, cwd, dur, timeout_ms, &world, progress, command)
             .await
     }
 
-    /// The command runs on its own task, and this call waits on it only until it exits or it has been
-    /// quiet for the idle window ([`Self::idle_window`]). Then the command keeps running as a numbered
-    /// [`Job`] and the model gets the output so far plus how to wait on or kill it.
+    /// The command runs on its own task, and this call waits on it until it exits, it has been quiet
+    /// for the idle window ([`Self::idle_window`]), it has kept printing for the call's ceiling
+    /// ([`OUTPUT_CEILING`]), or its shell exits leaving processes running. In every case but the first
+    /// the command keeps running as a numbered job (see [`super::bash_jobs`]): the model gets the
+    /// output so far plus how to wait on or stop it, and is told without asking when it ends.
     ///
     /// Raw stdout+stderr feed one accumulator in arrival order, so the temp-file spill sees the
     /// complete output. The spill file is written on *this* host: when the command ran somewhere
     /// else, `Full output: /tmp/pi-bash-….log` would name a path the model can never read (and, on a
     /// replica serving other tenants, put a tenant's output on the host), so none is created and the
-    /// marker says to redirect into the sandbox instead (see [`accumulator`]).
+    /// marker says to redirect into the sandbox instead (see [`super::bash_jobs::accumulator`]).
     ///
     /// The command still carries its own `timeout_ms`, so a job nobody waits on is reaped by the same
     /// backstop as a call that waits.
+    #[allow(clippy::too_many_arguments)]
     async fn exec_detachable(
         &self,
         args: Vec<String>,
@@ -416,8 +465,9 @@ impl Bash {
         timeout_ms: u64,
         world: &PathWorld,
         progress: Option<&ToolProgress>,
+        command: &str,
     ) -> Result<ToolOutput, ToolError> {
-        let shared = Arc::new(JobShared::new(world.is_remote()));
+        let shared = Arc::new(JobShared::new(world.is_remote(), &self.jobs));
         if let Some(p) = progress {
             p.emit("", None);
         }
@@ -427,38 +477,51 @@ impl Bash {
             let cwd = cwd.map(str::to_string);
             let shared = shared.clone();
             tokio::spawn(async move {
-                let sink = |bytes: &[u8]| shared.append(bytes);
-                let spawned = |kill: Kill| shared.track(kill);
+                // Records an end even if this task is aborted or panics, so a waiting call never
+                // waits on a task that is gone.
+                let mut finished = FinishOnDrop(Some(shared.clone()));
+                let on_chunk = |bytes: &[u8]| shared.append(bytes);
+                let on_spawn = |kill: Kill| shared.track(kill);
+                let on_orphans = |shell: &ExecResult, left: String| shared.orphaned(shell, left);
+                let hooks = JobHooks {
+                    on_chunk: &on_chunk,
+                    on_spawn: &on_spawn,
+                    on_orphans: &on_orphans,
+                };
                 let result = runner
-                    .run_streaming_tracked(&shell, &args, cwd.as_deref(), dur, &sink, &spawned)
+                    .run_streaming_tracked(&shell, &args, cwd.as_deref(), dur, &hooks)
                     .await;
                 // Exited (or timed out and reaped): nothing left for anyone to kill.
                 shared.untrack();
-                result
+                finished.0 = None;
+                shared.finish(result.map_err(|e| format!("spawn failed: {e}")));
             })
         };
         let job = Job {
             id: None,
+            kind: JobKind::Yielded,
             shared,
             handle,
             started: Instant::now(),
             timeout_ms,
             reports: 0,
+            command: truncate_command(command, COMMAND_CHARS),
         };
-        self.attach(job, progress).await
+        self.attach(job, progress, self.call_ceiling).await
     }
 
-    /// Wait on `job` until it exits (its final result), it has been quiet past its idle window (park
-    /// it and report the output since the last report), or the call is cancelled (kill it and return
-    /// what it printed, tagged "Command cancelled").
+    /// Wait on `job` until it ends (its final result), its shell exits leaving processes running
+    /// (adopt them as a job), it yields — quiet past its idle window, or still going at `ceiling` —
+    /// (park it and report the output since the last report), or the call is cancelled (kill it and
+    /// return what it printed, tagged "Command cancelled").
     async fn attach(
         &self,
-        mut job: Job,
+        job: Job,
         progress: Option<&ToolProgress>,
+        ceiling: Duration,
     ) -> Result<ToolOutput, ToolError> {
         enum Woke {
-            Exited(Result<std::io::Result<ExecResult>, tokio::task::JoinError>),
-            Output,
+            Changed,
             Deadline,
             Cancelled,
         }
@@ -467,43 +530,53 @@ impl Bash {
         // first chunk.
         let mut last_emit = attached;
         loop {
-            let deadline = self.yield_deadline(&job, attached);
+            if let Some(end) = job.shared.take_end() {
+                return self.finish_job(job, end, progress);
+            }
+            if job.kind == JobKind::Yielded
+                && let Some((shell, left)) = job.shared.orphans()
+            {
+                return self.adopt(job, &shell, &left, progress).await;
+            }
+            let deadline = self.yield_deadline(&job, attached, ceiling);
             let cancelled = async {
                 match progress {
                     Some(p) => p.cancelled().await,
                     None => std::future::pending().await,
                 }
             };
-            // Biased, output before exit: a chunk that lands just before the command exits still gets
-            // its live update, as it did when the sink emitted inline.
             let woke = tokio::select! {
                 biased;
                 () = cancelled => Woke::Cancelled,
-                () = job.shared.notify.notified() => Woke::Output,
-                joined = &mut job.handle => Woke::Exited(joined),
+                () = job.shared.notify.notified() => Woke::Changed,
                 () = tokio::time::sleep_until(deadline.into()) => Woke::Deadline,
             };
             match woke {
-                Woke::Exited(joined) => return self.finish_job(job, joined, progress),
-                Woke::Output => {
+                Woke::Changed => {
+                    // New output gets its live update even when the command ended right behind it
+                    // (the final snapshot follows from `finish_job`).
                     if let Some(p) = progress
                         && last_emit.elapsed() >= UPDATE_THROTTLE
                     {
-                        last_emit = Instant::now();
-                        // `true`: once the output is past the display cap, every live update
-                        // carries a spill path to point at (pi forces the spill on each emit).
-                        let snap = lock(&job.shared.out).acc.snapshot(true);
-                        emit_update(p, &snap);
+                        let mut out = job.shared.out();
+                        if out.last_output > last_emit {
+                            last_emit = Instant::now();
+                            // `true`: once the output is past the display cap, every live update
+                            // carries a spill path to point at (pi forces the spill on each emit).
+                            let snap = out.acc.snapshot(true);
+                            drop(out);
+                            emit_update(p, &snap);
+                        }
                     }
                 }
                 Woke::Deadline => {
-                    if let Some(quiet) = self.quiet_past_window(&job, attached) {
-                        return Ok(self.detach(job, quiet));
+                    if let Some(reason) = self.yield_reason(&job, attached, ceiling) {
+                        return Ok(self.detach(job, reason));
                     }
                 }
                 Woke::Cancelled => {
                     let snap = job.shared.take_segment();
-                    // Dropping the job kills its process group (see `Job`'s `Drop`).
+                    // Dropping the job kills its processes (see `Job`'s `Drop`).
                     drop(job);
                     if let Some(p) = progress {
                         emit_update(p, &snap);
@@ -518,12 +591,13 @@ impl Bash {
         }
     }
 
-    /// The silence the idle yield measures starts at the later of the last output and this attach,
-    /// so a re-attached job always gets a full `idle_yield` before it is reported again.
-    fn yield_deadline(&self, job: &Job, attached: Instant) -> Instant {
-        let quiet_since = lock(&job.shared.out).last_output.max(attached);
+    /// When this attach yields: after the idle window of silence (measured from the later of the
+    /// last output and this attach, so a re-attached job always gets a full window), or at
+    /// `ceiling`, whichever is first.
+    fn yield_deadline(&self, job: &Job, attached: Instant, ceiling: Duration) -> Instant {
+        let quiet_since = job.shared.out().last_output.max(attached);
         match self.idle_window(job) {
-            Some(idle) => quiet_since + idle,
+            Some(idle) => (quiet_since + idle).min(attached + ceiling),
             // Never yield: a far deadline is the honest answer.
             None => attached + Duration::from_secs(u64::from(u32::MAX)),
         }
@@ -540,77 +614,125 @@ impl Bash {
     /// about the command. A remote runner whose output is live (exec protocol v1.2, a template
     /// transport) says so by reporting a [`Kill`], and from then on yields exactly as local does.
     fn idle_window(&self, job: &Job) -> Option<Duration> {
-        if job.shared.remote && !job.shared.live.load(Ordering::Relaxed) {
+        if job.shared.remote && !job.shared.live.load(std::sync::atomic::Ordering::Relaxed) {
             return None;
         }
         let scale = IDLE_GROWTH.saturating_pow(job.reports);
         self.idle_yield.map(|d| d.saturating_mul(scale))
     }
 
-    /// How long the job has been quiet, when that is past its idle window.
-    fn quiet_past_window(&self, job: &Job, attached: Instant) -> Option<Duration> {
-        let quiet = lock(&job.shared.out).last_output.max(attached).elapsed();
-        (quiet >= self.idle_window(job)?).then_some(quiet)
+    /// Why this attach should return now, if it should.
+    fn yield_reason(&self, job: &Job, attached: Instant, ceiling: Duration) -> Option<Yield> {
+        let window = self.idle_window(job)?;
+        let quiet = job.shared.out().last_output.max(attached).elapsed();
+        if quiet >= window {
+            return Some(Yield::Quiet(quiet));
+        }
+        let waited = attached.elapsed();
+        (waited >= ceiling).then_some(Yield::Ceiling(waited))
     }
 
-    /// Park `job` in the table and tell the model what it has so far and how to come back to it.
-    fn detach(&self, mut job: Job, quiet: Duration) -> ToolOutput {
-        let id = *job
-            .id
-            .get_or_insert_with(|| self.jobs.next.fetch_add(1, Ordering::Relaxed) + 1);
+    /// Park `job` in the table and tell the model what it has so far, why the call returned, and
+    /// how to come back to it.
+    fn detach(&self, mut job: Job, reason: Yield) -> ToolOutput {
+        let id = self.jobs.assign_id(&mut job);
         let snap = job.shared.take_segment();
         let text = clean(format_output(&snap, ""));
         let running = job.started.elapsed().as_secs();
         job.reports = job.reports.saturating_add(1);
+        let why = match reason {
+            Yield::Quiet(quiet) => format!("No output for {} s.", quiet.as_secs()),
+            Yield::Ceiling(waited) => format!(
+                "Still printing after {} s, so this call returned with the output so far.",
+                waited.as_secs()
+            ),
+        };
+        let wait = match self.idle_window(&job) {
+            Some(next) => format!(
+                " A wait returns when it exits, after {} s without new output, or after {} s.",
+                next.as_secs(),
+                self.wait_ceiling.as_secs()
+            ),
+            None => String::new(),
+        };
         let status = format!(
-            "No output for {} s. The command is still running ({running} s so far; it is killed at its {} s \
-             timeout). It continues in the background as job {id}: call bash_job with \
-             {{\"job\": {id}}} to wait for more output, or {{\"job\": {id}, \"kill\": true}} to stop \
-             it if you no longer need it (not `pkill`, which can match unrelated processes).",
-            quiet.as_secs(),
+            "{why} The command is still running ({running} s so far; it is stopped at its {} s \
+             timeout, or when you end your turn) as job {id}. You will be told when it exits, so do \
+             not poll it or sleep: keep \
+             working, or wait for it with bash_job {{\"job\": {id}}}.{wait} bash_job {{\"job\": \
+             {id}, \"kill\": true}} stops it (not `pkill`, which can match unrelated processes).",
             job.timeout_ms / 1000
         );
-        let status = match self.idle_window(&job) {
-            Some(next) => format!(
-                "{status} A wait returns when it exits, or after {} s without new output.",
-                next.as_secs()
-            ),
-            None => status,
-        };
-        // Live probes: models mostly move on without waiting on or killing a job, so a hung one
-        // would spin until its timeout. Cap how many can pile up; the oldest goes first.
-        let evicted = {
-            let mut running = lock(&self.jobs.running);
-            running.insert(id, job);
-            let oldest = (running.len() > MAX_PARKED_JOBS)
-                .then(|| running.keys().min().copied())
-                .flatten();
-            oldest.and_then(|old| running.remove(&old).map(|j| (old, j)))
-        };
-        let status = match evicted {
-            // Dropped outside the table lock; dropping kills it.
-            Some((old, _job)) => format!(
-                "{status} Job {old} was killed to keep at most {MAX_PARKED_JOBS} background jobs."
+        let status = match self.jobs.park_yielded(job) {
+            // Dropped at the end of this arm, outside the table lock; dropping kills it.
+            Some((old, _evicted)) => format!(
+                "{status} Job {old} was stopped: at most {MAX_YIELDED_JOBS} jobs that went quiet or \
+                 kept printing are kept running, the oldest stopped first."
             ),
             None => status,
         };
         append_status(&text, &status).into()
     }
 
-    /// A job's command has exited: its final result over the output produced since the last report.
+    /// The command's shell exited but left processes running (`cmd &`): they are tracked as a job
+    /// of their own — never evicted, since the command meant them — unless [`MAX_INTENDED_JOBS`] are
+    /// already running, in which case they are stopped and the model is told which jobs to stop.
+    async fn adopt(
+        &self,
+        mut job: Job,
+        shell: &ExecResult,
+        left: &str,
+        progress: Option<&ToolProgress>,
+    ) -> Result<ToolOutput, ToolError> {
+        let snap = job.shared.take_segment();
+        if let Some(p) = progress {
+            emit_update(p, &snap);
+        }
+        let text = clean(format_output(&snap, ""));
+        let shell_status = exit_status_line(shell, job.timeout_ms);
+        job.kind = JobKind::Adopted;
+        let timeout_secs = job.timeout_ms / 1000;
+        let note = match self.jobs.park_intended(job) {
+            Ok(id) => format!(
+                "The command exited but left {left} running; it is tracked as job {id}: bash_job \
+                 {{\"job\": {id}, \"kill\": true}} stops it. You will be told when it exits (it is \
+                 stopped at its {timeout_secs} s timeout)."
+            ),
+            Err((job, running)) => {
+                if let Some(group) = job.shared.untrack() {
+                    let _ = tokio::task::spawn_blocking(move || group.kill()).await;
+                }
+                drop(job);
+                format!(
+                    "The command exited but left {left} running. It was stopped: \
+                     {MAX_INTENDED_JOBS} jobs that commands left running are already running \
+                     ({running}). Stop one with bash_job {{\"job\": N, \"kill\": true}}, then run \
+                     this again."
+                )
+            }
+        };
+        let text = match &shell_status {
+            Some(line) => append_status(&text, line),
+            None => text,
+        };
+        let text = append_status(&text, &note);
+        if shell_status.is_some() {
+            Err(ToolError::Execution(text))
+        } else {
+            Ok(text.into())
+        }
+    }
+
+    /// A job has ended: its final result over the output produced since the last report.
     fn finish_job(
         &self,
         job: Job,
-        joined: Result<std::io::Result<ExecResult>, tokio::task::JoinError>,
+        end: JobEnd,
         progress: Option<&ToolProgress>,
     ) -> Result<ToolOutput, ToolError> {
-        let result = match joined {
-            Ok(Ok(result)) => result,
-            Ok(Err(e)) => return Err(ToolError::Execution(format!("spawn failed: {e}"))),
-            Err(e) => return Err(ToolError::Execution(format!("command task failed: {e}"))),
-        };
+        let result = end.result.map_err(ToolError::Execution)?;
         let snap = {
-            let mut out = lock(&job.shared.out);
+            let mut out = job.shared.out();
             // A non-streaming runner (a test double, a remote endpoint) delivered nothing through the
             // sink; its captured output is the whole story.
             if !out.streamed {
@@ -628,10 +750,25 @@ impl Bash {
         if let Some(p) = progress {
             emit_update(p, &snap);
         }
+        // The shell's own exit was reported when its leftover processes were adopted; this is
+        // their end.
+        if job.shared.orphans().is_some() && !result.timed_out {
+            let text = clean(format_output(&snap, "(no new output)"));
+            let secs = end.at.duration_since(job.started).as_secs();
+            let id = job.id.unwrap_or_default();
+            return Ok(append_status(
+                &text,
+                &format!(
+                    "The processes job {id} left running have exited ({secs} s after it started)."
+                ),
+            )
+            .into());
+        }
         finish_result(&snap, &result, job.timeout_ms)
     }
 
-    /// `bash_job`'s body: `{"job": N}` waits on job N, `{"job": N, "kill": true}` stops it.
+    /// `bash_job`'s body: `{"job": N}` waits on job N (or returns its result, if it already
+    /// ended), `{"job": N, "kill": true}` stops it.
     async fn resume_job(
         &self,
         job: &Value,
@@ -644,17 +781,18 @@ impl Bash {
             .ok_or_else(|| {
                 ToolError::InvalidInput(format!("`job` must be a job number, got {job}"))
             })?;
-        let Some(mut job) = lock(&self.jobs.running).remove(&id) else {
+        let Some(mut job) = self.jobs.take(id) else {
             return Err(ToolError::InvalidInput(format!(
-                "no running job {id}: it already exited and was reported, was killed, or never \
-                 existed"
+                "no job {id}: it was already reported, was stopped, or never existed (jobs do not \
+                 survive a restart of the agent)"
             )));
         };
-        if input.get("kill").and_then(Value::as_bool) != Some(true) {
-            return self.attach(job, progress).await;
+        if input.get("kill").and_then(Value::as_bool) != Some(true) || job.shared.ended() {
+            return self.attach(job, progress, self.wait_ceiling).await;
         }
-        // Kill it and wait for the kill, as the runner's own timeout path does, so a caller that
-        // checks side effects right after sees the command gone.
+        // Kill it — every process it started, or its remote stream — and wait for the kill, as the
+        // runner's own timeout path does, so a caller that checks side effects right after sees the
+        // command gone.
         if let Some(kill) = job.shared.untrack() {
             let _ = tokio::task::spawn_blocking(move || kill.kill()).await;
         }
@@ -668,150 +806,32 @@ impl Bash {
     }
 }
 
+/// Why an attach returned before its command ended.
+enum Yield {
+    /// No output for this long: at least the idle window.
+    Quiet(Duration),
+    /// Still printing after this long: the call's ceiling.
+    Ceiling(Duration),
+}
+
+/// Records a job's end when its runner task is dropped (aborted) or panics before recording one.
+struct FinishOnDrop(Option<Arc<JobShared>>);
+
+impl Drop for FinishOnDrop {
+    fn drop(&mut self) {
+        if let Some(shared) = self.0.take() {
+            shared.untrack();
+            shared.finish(Err("the command's task ended before it did".into()));
+        }
+    }
+}
+
 /// How much longer each wait on a job may sit silent than the last report's window (see
-/// [`Bash::idle_window`]): 60 s, then 240 s, then 960 s.
+/// [`Bash::idle_window`]): 60 s, then 240 s, then 960 s (a wait is still capped at
+/// [`WAIT_CEILING`]).
 const IDLE_GROWTH: u32 = 4;
 
-/// Most detached jobs one `bash` keeps; parking another kills the oldest.
-const MAX_PARKED_JOBS: usize = 4;
-
-/// Running commands whose call already returned, by job number.
-#[derive(Default)]
-struct Jobs {
-    next: AtomicU64,
-    running: Mutex<HashMap<u64, Job>>,
-}
-
-/// One command on the detached path, attached (owned by the call waiting on it) or parked in
-/// [`Jobs`]. Dropping it kills the command: a call whose future is dropped, or a tool whose table is
-/// dropped, never leaves a process behind.
-struct Job {
-    /// Assigned the first time the job is parked.
-    id: Option<u64>,
-    shared: Arc<JobShared>,
-    handle: tokio::task::JoinHandle<std::io::Result<ExecResult>>,
-    started: Instant,
-    timeout_ms: u64,
-    /// How many times the model has been told this job is still running; widens
-    /// [`Bash::idle_window`].
-    reports: u32,
-}
-
-impl Drop for Job {
-    fn drop(&mut self) {
-        self.handle.abort();
-        // `abort` only drops the runner's future when the runtime next polls the task, which a
-        // process on its way out may never do — kill the group directly too.
-        #[cfg(unix)]
-        if let Some(kill) = self.shared.untrack() {
-            super::exec::spawn_tracked_cleanup(move || kill.kill());
-        }
-    }
-}
-
-/// What the runner's task and the waiting call share.
-struct JobShared {
-    out: Mutex<JobOutput>,
-    /// Woken on every chunk, so the waiting call can stream progress and re-arm its idle deadline.
-    notify: tokio::sync::Notify,
-    /// How to stop the command while it runs — what [`Job`]'s `Drop`, a kill, and
-    /// [`kill_live_jobs`] use.
-    kill: Mutex<Option<Kill>>,
-    /// This job's key in [`LIVE_JOBS`].
-    key: u64,
-    /// The runner reported a [`Kill`], which promises the output is live — see
-    /// [`Bash::idle_window`].
-    live: std::sync::atomic::AtomicBool,
-    /// Where the command runs (no spill file when remote) — what each fresh per-report accumulator
-    /// is built from.
-    remote: bool,
-}
-
-struct JobOutput {
-    /// Output since the last report to the model.
-    acc: OutputAccumulator,
-    last_output: Instant,
-    /// Whether any chunk came through the sink at all — see `finish_job`'s fallback.
-    streamed: bool,
-}
-
-impl JobShared {
-    fn new(remote: bool) -> Self {
-        Self {
-            out: Mutex::new(JobOutput {
-                acc: accumulator(!remote),
-                last_output: Instant::now(),
-                streamed: false,
-            }),
-            notify: tokio::sync::Notify::new(),
-            kill: Mutex::new(None),
-            key: NEXT_JOB_KEY.fetch_add(1, Ordering::Relaxed),
-            live: std::sync::atomic::AtomicBool::new(false),
-            remote,
-        }
-    }
-
-    fn append(&self, bytes: &[u8]) {
-        {
-            let mut out = lock(&self.out);
-            out.acc.append(bytes);
-            out.last_output = Instant::now();
-            out.streamed = true;
-        }
-        self.notify.notify_one();
-    }
-
-    fn track(&self, kill: Kill) {
-        *lock(&self.kill) = Some(kill.clone());
-        lock(&LIVE_JOBS).push((self.key, kill));
-        self.live.store(true, Ordering::Relaxed);
-        // The waiting call computed its idle deadline before the output was known to be live; wake
-        // it to recompute.
-        self.notify.notify_one();
-    }
-
-    /// Forget how to kill the command (it exited, or the caller is about to kill it), returning the
-    /// kill if it was still recorded.
-    fn untrack(&self) -> Option<Kill> {
-        let kill = lock(&self.kill).take()?;
-        lock(&LIVE_JOBS).retain(|(k, _)| *k != self.key);
-        Some(kill)
-    }
-
-    /// The output since the last report, finished and snapshotted; the next report starts empty.
-    fn take_segment(&self) -> OutputSnapshot {
-        let mut out = lock(&self.out);
-        let fresh = accumulator(!self.remote);
-        let mut segment = std::mem::replace(&mut out.acc, fresh);
-        segment.finish();
-        segment.snapshot(true)
-    }
-}
-
-/// How to stop every detached-path command still running, by job key, for [`kill_live_jobs`].
-static LIVE_JOBS: Mutex<Vec<(u64, Kill)>> = Mutex::new(Vec::new());
-static NEXT_JOB_KEY: AtomicU64 = AtomicU64::new(0);
-
-/// Kill every command still running on the detached path. The exit path calls this before
-/// `std::process::exit`, which runs no destructors: a job parked in a table would otherwise outlive
-/// the agent (and a hung one would spin until its timeout). The kills are tracked, so the
-/// `wait_for_pending_group_kills` that follows waits for them.
-pub fn kill_live_jobs() {
-    #[cfg(unix)]
-    for (_, kill) in std::mem::take(&mut *lock(&LIVE_JOBS)) {
-        super::exec::spawn_tracked_cleanup(move || kill.kill());
-    }
-}
-
-/// A fresh output accumulator; `spill: false` when the command runs somewhere this process cannot
-/// write a file the model could read (see [`describe`]).
-fn accumulator(spill: bool) -> OutputAccumulator {
-    if spill {
-        OutputAccumulator::new()
-    } else {
-        OutputAccumulator::new().without_spill()
-    }
-}
+pub use super::bash_jobs::kill_live_jobs;
 
 /// The model-facing result for a command that has exited (or timed out): the cleaned output plus the
 /// status line pi appends.
@@ -820,53 +840,54 @@ fn finish_result(
     result: &ExecResult,
     timeout_ms: u64,
 ) -> Result<ToolOutput, ToolError> {
-    if result.timed_out {
-        let secs = timeout_ms / 1000;
-        // No "(no output)" placeholder here: an empty-output timeout should read as just the
-        // status line ("Command timed out after Ns"), not "(no output)" glued in front of it —
-        // matching the reference agent's abort/timeout formatting, which substitutes nothing for
-        // empty content on this path specifically (the success/exit-code path below keeps the
-        // placeholder, since there the empty case is a genuinely silent command, not an interrupt).
-        let text = clean(format_output(snap, ""));
-        return Err(ToolError::Execution(append_status(
-            &text,
-            &format!("Command timed out after {secs} seconds"),
-        )));
+    // No "(no output)" placeholder on a timeout: an empty-output timeout should read as just the
+    // status line ("Command timed out after Ns"), not "(no output)" glued in front of it — matching
+    // the reference agent's abort/timeout formatting, which substitutes nothing for empty content on
+    // this path specifically (the success/exit-code path keeps the placeholder, since there the empty
+    // case is a genuinely silent command, not an interrupt).
+    let empty = if result.timed_out { "" } else { "(no output)" };
+    let text = clean(format_output(snap, empty));
+    match exit_status_line(result, timeout_ms) {
+        None => Ok(text.into()),
+        Some(status) => Err(ToolError::Execution(append_status(&text, &status))),
     }
-    let text = clean(format_output(snap, "(no output)"));
+}
+
+/// The status line for a command that did not succeed, or `None` for one that did. Only an exit code
+/// of literally `0` is success.
+fn exit_status_line(result: &ExecResult, timeout_ms: u64) -> Option<String> {
+    if result.timed_out {
+        return Some(format!(
+            "Command timed out after {} seconds",
+            timeout_ms / 1000
+        ));
+    }
     match (result.code, result.signal) {
-        (Some(0), _) => Ok(text.into()),
+        (Some(0), _) => None,
         // Non-zero exit is an error result that still carries the output — pi throws here too.
-        (Some(code), _) => Err(ToolError::Execution(append_status(
-            &text,
-            &format!("Command exited with code {code}"),
-        ))),
+        (Some(code), _) => Some(format!("Command exited with code {code}")),
         // Killed by a signal: `ExitStatus::code()` is `None` in exactly this case, and this arm
         // used to fall in with `Some(0)` and report **success**. An OOM-killed build, a SIGSEGV, a
         // SIGTERM'd server — every one of them came back to the model as a clean run, silently, and
         // with `"(no output)"` if the command hadn't printed anything before dying. The model then
         // proceeds as though the step succeeded. The timeout case never reaches here (it returns
-        // via the `timed_out` branch above), so a `None` code with a signal is unambiguous.
+        // above), so a `None` code with a signal is unambiguous.
         (None, Some(signal)) => {
-            let named = match crate::tools::exec::signal_name(signal) {
-                Some(name) => format!("{name} ({signal})"),
-                None => format!("signal {signal}"),
-            };
             let hint = if signal == 9 {
                 " — typically the OOM killer or an external `kill -9`"
             } else {
                 ""
             };
-            Err(ToolError::Execution(append_status(
-                &text,
-                &format!("Command was killed by {named}{hint}"),
-            )))
+            Some(format!(
+                "Command was killed by {}{hint}",
+                super::bash_jobs::signal_text(signal)
+            ))
         }
         // No code and no signal: not reachable on Unix (the two are exhaustive there), and on a
         // non-Unix host there is no signal concept to report. Genuinely unknown rather than known-
         // bad, so this keeps the original benefit-of-the-doubt behavior instead of inventing a
         // failure.
-        (None, None) => Ok(text.into()),
+        (None, None) => None,
     }
 }
 
@@ -898,6 +919,11 @@ impl Tool for Bash {
     // (e.g. `edit foo.py` batched with `bash: black foo.py`) would run fully concurrently against it.
     fn conservative_exclusive(&self) -> bool {
         true
+    }
+
+    // The job table: finish notices, the stop reminder and the compaction carry (see `bash_jobs`).
+    fn background(&self) -> Option<Arc<dyn agent_core::Background>> {
+        Some(self.jobs.clone())
     }
 
     async fn run(&self, input: Value) -> Result<ToolOutput, ToolError> {
@@ -947,9 +973,12 @@ impl Tool for BashJob {
         JOB_TOOL
     }
     fn description(&self) -> &str {
-        "Wait for or stop a command that `bash` left running in the background (its result said \
-         \"job N\"). Waiting returns the output printed since the last report: the final result once \
-         the command exits, or another report if it is still running. `kill: true` stops it instead."
+        "Wait for or stop a job: a command `bash` left running in the background (its result or a \
+         notice said \"job N\"). Waiting returns the output printed since the last report: the final \
+         result once the command exits (at once, if it already has), or another report if it is \
+         still running. `kill: true` stops it and every process it started instead. You are told \
+         when a job exits without calling this, so only call it to wait when you have nothing else \
+         to do."
     }
     fn input_schema(&self) -> Value {
         json!({
@@ -965,6 +994,9 @@ impl Tool for BashJob {
     fn conservative_exclusive(&self) -> bool {
         true
     }
+    fn background(&self) -> Option<Arc<dyn agent_core::Background>> {
+        Some(self.bash.jobs.clone())
+    }
     async fn run(&self, input: Value) -> Result<ToolOutput, ToolError> {
         let job = input.get("job").cloned().unwrap_or(Value::Null);
         self.bash.resume_job(&job, &input, None).await
@@ -979,9 +1011,9 @@ impl Tool for BashJob {
     }
 }
 
-/// Lock a mutex, recovering the data on poison rather than panicking (the crate forbids `unwrap`).
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
+/// Output hygiene for text quoted outside a `bash` result (a job's finish notice): see [`clean`].
+pub(crate) fn clean_output(s: &str) -> String {
+    clean_str(s).into_owned()
 }
 
 /// Emit one streamed progress snapshot: the cleaned output so far, plus truncation + full-output-path
@@ -1099,6 +1131,10 @@ fn clean_str(s: &str) -> Cow<'_, str> {
 #[cfg(test)]
 #[path = "bash_idle_yield_tests.rs"]
 mod idle_yield_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "bash_jobs_tests.rs"]
+mod jobs_tests;
 
 #[cfg(test)]
 mod tests {

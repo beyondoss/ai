@@ -142,8 +142,8 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
 use crate::tools::exec::{
-    ChunkSink, CommandRunner, ExecResult, Kill, STREAM_HEAD, STREAM_TAIL, SpawnSink, drain_capped,
-    feed_stdin,
+    ChunkSink, CommandRunner, ExecResult, JobHooks, Kill, STREAM_HEAD, STREAM_TAIL, SpawnSink,
+    drain_capped, feed_stdin,
 };
 
 pub mod conformance;
@@ -437,11 +437,19 @@ impl CommandRunner for HttpExecRunner {
         args: &[String],
         cwd: Option<&str>,
         timeout: Duration,
-        on_chunk: ChunkSink<'_>,
-        on_spawn: SpawnSink<'_>,
+        hooks: &JobHooks<'_>,
     ) -> std::io::Result<ExecResult> {
-        self.run_stream(program, args, cwd, timeout, on_chunk, Some(on_spawn))
-            .await
+        // No `on_orphans`: the endpoint owns the command's process group, and ends the stream (and
+        // kills the group) when the shell exits.
+        self.run_stream(
+            program,
+            args,
+            cwd,
+            timeout,
+            hooks.on_chunk,
+            Some(hooks.on_spawn),
+        )
+        .await
     }
 }
 
@@ -697,17 +705,16 @@ impl CommandRunner for TemplateRunner {
         args: &[String],
         cwd: Option<&str>,
         timeout: Duration,
-        on_chunk: ChunkSink<'_>,
-        on_spawn: SpawnSink<'_>,
+        hooks: &JobHooks<'_>,
     ) -> std::io::Result<ExecResult> {
         self.exec(
             program,
             args,
             cwd,
             timeout,
-            Some(on_chunk),
+            Some(hooks.on_chunk),
             None,
-            Some(on_spawn),
+            Some(hooks.on_spawn),
         )
         .await
     }
@@ -1173,6 +1180,10 @@ pub struct ExecCell {
     /// (`serve --service`) sets it, because there the host is the *replica* — a tenant's `bash`
     /// landing on it is not a stale-config bug but a breach. Fixed at construction.
     strict: bool,
+    /// The session's `bash` jobs. Here because they share the cell's lifetime and reach: one per
+    /// session, handed to every registry rebuild (`build_tools` takes the cell), so a `set_model`
+    /// keeps them running.
+    bash_jobs: std::sync::Arc<crate::tools::bash_jobs::BashJobs>,
 }
 
 /// What a strict cell answers when nothing is configured. Static text: it reaches the model as a
@@ -1190,9 +1201,14 @@ impl ExecCell {
     /// stale-config bug but a breach.
     pub fn strict() -> Self {
         Self {
-            target: std::sync::Arc::default(),
             strict: true,
+            ..Self::default()
         }
+    }
+
+    /// The session's `bash` job table — see [`crate::tools::bash_jobs`].
+    pub fn bash_jobs(&self) -> &std::sync::Arc<crate::tools::bash_jobs::BashJobs> {
+        &self.bash_jobs
     }
 
     /// Re-point at `target`, or back to the host with `None`. Takes effect on the next tool call.
@@ -1275,26 +1291,25 @@ impl CommandRunner for CellRunner {
     }
 
     /// Forwarded, not left to the default: without it a `bash` job behind a cell — every `serve`
-    /// session's — reported no [`Kill`], so the exit path could not reach it and a remote job never
-    /// yielded.
+    /// session's — reported no [`Kill`], so the exit path could not reach it, a remote job never
+    /// yielded, and on this host a leftover `cmd &` went untracked.
     async fn run_streaming_tracked(
         &self,
         program: &str,
         args: &[String],
         cwd: Option<&str>,
         timeout: Duration,
-        on_chunk: ChunkSink<'_>,
-        on_spawn: SpawnSink<'_>,
+        hooks: &crate::tools::exec::JobHooks<'_>,
     ) -> std::io::Result<ExecResult> {
         match self.0.resolve().map_err(std::io::Error::other)? {
             Some(t) => {
                 t.runner()
-                    .run_streaming_tracked(program, args, cwd, timeout, on_chunk, on_spawn)
+                    .run_streaming_tracked(program, args, cwd, timeout, hooks)
                     .await
             }
             None => {
                 crate::tools::exec::RealRunner
-                    .run_streaming_tracked(program, args, cwd, timeout, on_chunk, on_spawn)
+                    .run_streaming_tracked(program, args, cwd, timeout, hooks)
                     .await
             }
         }

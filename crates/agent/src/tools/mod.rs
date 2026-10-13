@@ -9,6 +9,8 @@ use std::sync::Arc;
 use agent_core::{Tool, ToolError, ToolRegistry};
 
 pub mod bash;
+pub mod bash_jobs;
+pub mod bash_proc;
 pub mod code_mode;
 pub mod edit;
 pub mod exec;
@@ -618,6 +620,11 @@ pub struct ToolConfig<'a> {
     /// Discovered skills, so `read` resolves the `skill:<name>` paths the system prompt's listing
     /// names them by ([`crate::skills::SKILL_SCHEME`]). Empty: the scheme names nothing.
     pub skills: &'a [crate::skills::Skill],
+    /// The job table `bash` parks commands in (see [`bash_jobs`]). `Some` for a host that owns the
+    /// jobs past one registry — `serve`'s session (so `set_model` keeps them, and the idle session
+    /// can wake on them), `run` (which stops them at the end and says which). `None`: a table of
+    /// this registry's own, dropped (killing its jobs) with it — a subagent's.
+    pub bash_jobs: Option<Arc<bash_jobs::BashJobs>>,
 }
 
 impl<'a> ToolConfig<'a> {
@@ -728,6 +735,9 @@ pub fn default_registry_with_config(cfg: &ToolConfig<'_>) -> ToolRegistry {
     }
     if cfg.bash_waits_for_exit {
         bash = bash.with_idle_yield(None);
+    }
+    if let Some(jobs) = &cfg.bash_jobs {
+        bash = bash.with_jobs(jobs.clone());
     }
     let bash = Arc::new(bash);
     reg.register(bash.clone());

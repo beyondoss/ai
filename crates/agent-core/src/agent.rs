@@ -80,6 +80,16 @@ pub enum AgentEvent {
     /// The run reached its `max_steps` ceiling and the model was granted `steps` more to stop
     /// cleanly (see [`crate::step_budget`]).
     WrapUp { steps: u32 },
+    /// Background work a tool left running was reported to the model without it asking (see
+    /// [`crate::background`]): `text` was folded into a tool-results turn, or pushed as a user turn
+    /// at a would-stop boundary, and the transcript holding it checkpointed. A host that starts a
+    /// turn itself to deliver a notice (`serve`'s idle wake) emits this too, with `wake: true`.
+    Background {
+        reason: BackgroundReason,
+        text: String,
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        wake: bool,
+    },
     /// An automatic compaction's first step masked old tool output instead of (or before) summarizing:
     /// `masked` tool results older than the kept turns were replaced by one-line placeholders (see
     /// [`compaction::mask_tool_results`]). `tokens_before` is the live prompt estimate when it fired;
@@ -180,6 +190,17 @@ pub enum AgentEvent {
     /// unshipped `packages/agent/src/harness/agent-harness.ts` (zero references from
     /// `packages/coding-agent`), not to a real pi event.
     ToolsUpdated { tool_names: Vec<String> },
+}
+
+/// Why [`AgentEvent::Background`] fired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackgroundReason {
+    /// Work ended unattended; the text is its finish notice ([`crate::Background::take_notices`]).
+    Finished,
+    /// The model was about to stop with work still running; the text is the one-time reminder
+    /// ([`crate::Background::stop_reminder`]).
+    StillRunning,
 }
 
 /// Default per-turn output token ceiling.
@@ -1342,11 +1363,41 @@ impl Agent {
                 // as new user turns. The last message is the assistant's, so pushing user turns here
                 // keeps the wire's role alternation valid.
                 let injected = steering.drain_at_stop();
-                if injected.is_empty() {
+                // Background work (see `crate::background`): a finish notice still pending is
+                // delivered before the run may end, so the model never stops without a result that
+                // already arrived; failing that, work still running is listed once, so ending
+                // with it is the model's informed choice. Either continues the run as a user turn.
+                let background = crate::background::collect(&self.tools);
+                let background_note = crate::background::take_notices(&background)
+                    .map(|t| (crate::BackgroundReason::Finished, t))
+                    .or_else(|| {
+                        if injected.is_empty() {
+                            crate::background::stop_reminder(&background)
+                                .map(|t| (crate::BackgroundReason::StillRunning, t))
+                        } else {
+                            None
+                        }
+                    });
+                if injected.is_empty() && background_note.is_none() {
                     sink(AgentEvent::AgentEnd {
                         steps: session.steps,
                     });
                     return Ok(());
+                }
+                if injected.is_empty()
+                    && let Some((reason, text)) = background_note
+                {
+                    session.user(text.clone());
+                    if let Some(context) = steering.take_turn_context() {
+                        session.attach_request_block(context);
+                    }
+                    let _ = self.checkpoint_guarded(session).await;
+                    sink(AgentEvent::Background {
+                        reason,
+                        text,
+                        wake: false,
+                    });
+                    continue;
                 }
                 let count = injected.len();
                 let tags: Vec<u64> = injected.iter().filter_map(|m| m.tag).collect();
@@ -1358,6 +1409,10 @@ impl Agent {
                             msg.text, msg.images,
                         ));
                     }
+                }
+                // A finish notice drained alongside the follow-ups rides after them.
+                if let Some((_, text)) = &background_note {
+                    session.user(text.clone());
                 }
                 // A user turn just started, so host-held context rides it — as a block of its own
                 // on the request, never in the user's text and never persisted (see
@@ -1375,6 +1430,13 @@ impl Agent {
                     messages: count,
                     tags,
                 });
+                if let Some((reason, text)) = background_note {
+                    sink(AgentEvent::Background {
+                        reason,
+                        text,
+                        wake: false,
+                    });
+                }
                 continue;
             }
 
@@ -1938,6 +2000,13 @@ impl Agent {
                     result_blocks.push(ContentBlock::Image { source });
                 }
             }
+            // Background work that ended while these tools ran (or since the last turn) rides the
+            // same turn, after any steer: the model learns of it without polling.
+            let background = crate::background::collect(&self.tools);
+            let notices = crate::background::take_notices(&background);
+            if let Some(text) = &notices {
+                result_blocks.push(ContentBlock::text(text.clone()));
+            }
             // The wrap-up rides the same turn, after any steer.
             let budget_note = budget.after_tools(steps_this_call);
             if let Some((_, text)) = &budget_note {
@@ -1960,6 +2029,13 @@ impl Agent {
                 sink(AgentEvent::Steered {
                     messages: steered_count,
                     tags: steered_tags,
+                });
+            }
+            if let Some(text) = notices {
+                sink(AgentEvent::Background {
+                    reason: crate::BackgroundReason::Finished,
+                    text,
+                    wake: false,
                 });
             }
             if let Some((steps, _)) = budget_note {
@@ -2676,12 +2752,17 @@ impl Agent {
         // channel. Both blocks come from `file_ops` (this round's already-merged provenance), so they
         // reflect every round so far, not just this one's new activity. `previous_summary` strips these
         // same blocks back off before the body is ever fed forward, so they never accumulate.
+        //
+        // The background-jobs block is the exception that is not in `file_ops`: it is rendered from
+        // the tools' live state (see `crate::background`), because it describes processes, not
+        // history.
         let summary = format!(
-            "{summary}{}{}{}{}",
+            "{summary}{}{}{}{}{}",
             compaction::format_user_requests(&file_ops.user_requests),
             compaction::format_file_operations(&file_ops.read_files, &file_ops.modified_files),
             compaction::format_todo_list(file_ops.todos.as_ref()),
-            compaction::format_memory_notes(&file_ops.memory_notes)
+            compaction::format_memory_notes(&file_ops.memory_notes),
+            crate::background::format_carry(&crate::background::collect(&self.tools)),
         );
         compaction::apply_summary(session, first_kept, &summary, tokens_before);
         session.compaction = file_ops;
@@ -5907,6 +5988,7 @@ mod tests {
                 AgentEvent::ModelSwitched { .. } => "model_switched",
                 AgentEvent::Retry { .. } => "retry",
                 AgentEvent::ToolsUpdated { .. } => "tools_updated",
+                AgentEvent::Background { .. } => "background",
             }
         }
         let mut out: Vec<&'static str> = Vec::new();

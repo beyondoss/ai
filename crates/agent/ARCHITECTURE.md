@@ -1327,6 +1327,9 @@ loop over stdin lines ───────────────────�
   │                                                              (accept/decline/cancel); pairs with
   │                                                              unsolicited `elicitation_request` /
   │                                                              `elicitation_resolved` frames
+  ├─ (idle; a `bash` job ends) ─────────────────────► event{kind:"background", reason:"finished",
+  │     the session wakes: the notice becomes the               wake:true, text}, then a normal turn:
+  │     input of a synthetic `prompt`                            ack, events, response{command:"prompt"}
   ├─ {"type":"mcp_events_subscribe"|"mcp_events_unsubscribe"|"mcp_events_list", …} ► response; pairs
   │                                                              with unsolicited `mcp_event` /
   │                                                              `mcp_event_status` frames (see
@@ -1352,6 +1355,23 @@ afterward, so on-disk determinism is unaffected by which tool actually finished 
 exclusivity extends across the whole `serve` process via `write_locks: Arc<WriteLockRegistry>`, shared
 by every `build_agent` rebuild (`set_model`/`set_thinking`/`cycle_model`/`cycle_thinking_level`/
 `set_auto_compaction`/`set_auto_retry`) — not just re-derived per `Agent`.
+
+**Intended `bash` jobs outlive the run in `serve`.** The session's job table lives on its `ExecCell`
+(`EndPolicy::KeepRunning`), so ending a turn leaves intended jobs (`cmd &`) running and a `set_model`
+rebuild keeps them; yielded ones (a foreground command that went quiet) are stopped as the prompt ends
+(`BashJobs::end_turn`, on the blocking pool), reported in a `bash_jobs_stopped` frame before the
+terminal `prompt` response.
+When one ends while the session is idle, the idle loop's last `select!` arm (`bash_job_notice_due`)
+fires: it waits `BASH_JOBS_WAKE_SETTLE` (200 ms, so jobs that end together fold into one turn), takes
+the notices, emits a `background` event with `wake: true`, and feeds `{"type":"prompt", message:
+<notice>, "bash_jobs_wake": true}` through the ordinary `prompt` path — persisted, streamed, retried like
+any turn. The wait is level-triggered (a `watch` generation marked seen before the table is checked),
+so a job that ends while the session is busy is never missed. A client prompt that races it wins (the
+arm is last in a biased `select!`): its run delivers the notice at its first tool results or its stop,
+and the arm then finds nothing to take, so no second turn runs. A transcript switch (`new_session`,
+`switch_session`, `fork`, …) stops the jobs — they belong to the old history — and the session's own
+end (stdin EOF, the daemon's reaper, a closed socket) kills them with its cell. Jobs do not survive a
+restart; `bash_job` on an id from before one says so.
 
 ---
 
@@ -1582,6 +1602,20 @@ split is what each tool actually produces:
 | `grep`/`find`        | bad regex / bad glob                                                                                                                 | the `spawn_blocking` task itself panics (walk failures are swallowed per-entry)                                                                                                                                              |
 | `bash`               | missing `command`                                                                                                                    | spawn failure, or timeout (`timed_out`)                                                                                                                                                                                      |
 | `fork`/`sync`/`logs` | missing `app` (fork only)                                                                                                            | `beyond` spawn failure, timeout, or non-zero exit                                                                                                                                                                            |
+
+### Background work — told, not polled
+
+A tool whose work outlives its call exposes it as an `agent_core::Background` through
+`Tool::background` (`bash` and `bash_job` both return their job table; the loop dedupes by pointer).
+The loop asks it three things, at turn boundaries only: **notices** (`take_notices`, each delivered
+once) fold into the next tool-results turn after any steer, like the step-budget wrap-up; at a
+**would-stop**, pending notices go first, as a user turn, and the run continues — failing that, a
+one-time **reminder** (`stop_reminder`) lists work still running that no earlier reminder covered, so
+ending with it is the model's informed choice; and every compaction summary appends the **carry**
+(`carry`) as a `<background-jobs>` block. All three ride existing paths (no new message type), are
+reported as `AgentEvent::Background { reason, text, wake }`, and begin with a harness tag
+(`agent_core::background::NOTE_PREFIXES`) so compaction's carried user requests skip them. The `bash`
+side is under "`bash` jobs" below.
 
 ### File tools — direct, synchronous, in-process
 
@@ -2388,36 +2422,46 @@ and `serve`'s own `bash`/`abort_bash` RPC commands reuse `RealRunner` directly, 
   legitimate full suites finish in under 17 s with gaps of at most 4 s between outputs, but a clean
   release build of this repo goes **204 s without output**. So silence is grounds to _ask_ the model,
   never to kill.
-  - Every call runs as a `Job` on its own task (`exec_detachable`); `attach` races the job's exit, its
-    output (throttled progress), its idle deadline and the call's own cancellation (biased toward
-    output, so a chunk landing just before exit still gets its live update).
+  - Every call runs as a `Job` on its own task (`exec_detachable`); `attach` waits on the job's
+    shared state (output, its shell leaving processes behind, its end — one `Notify` for all three),
+    its yield deadline and the call's own cancellation. New output gets its live update even when the
+    command ended right behind it.
+  - **A call always returns.** Besides the silence window, the call that starts a command returns by
+    `OUTPUT_CEILING` (10 min) however much it prints — a server logging requests used to hold its call
+    until the 30-minute timeout — and a `bash_job` wait returns by `WAIT_CEILING` (5 min). Both sit
+    above the 3 min 44 s release build of this repo, so a build that prints as it goes still finishes
+    in the call that started it, and the one wait after a silent build's first yield covers the rest.
+    The yield text names the reason: "No output for N s" or "Still printing after N s".
   - **`bash_job`** (`{job, kill?}`, `JOB_TOOL`) is registered over the same `Bash` instance and its job
     table, and follows `bash` through every tool filter (`filter_allows`). Waiting reports the output
-    since the last report: the final result, or another "still running". `kill` stops the job's
-    process group and waits for it to die. These are not optional fields on `bash` because gpt-6-luna
-    fills every property of a schema (`"job": 0` on every call in a live probe).
+    since the last report: the final result (at once, for a job that already ended), or another "still
+    running". `kill` stops every process the job started and waits for them. These are not optional
+    fields on `bash` because gpt-6-luna fills every property of a schema (`"job": 0` on every call in a
+    live probe).
   - **The window grows per report** (`idle_window`, `IDLE_GROWTH` = 4): 60 s for the call that started
-    the command, then 240 s, then 960 s for each wait. With a fixed 60 s window a legitimately silent
-    100 s build was reported twice (4 turns against 2) and a 204 s one would be reported 3–4 times.
+    the command, then 240 s, then 960 s for each wait (each wait capped at `WAIT_CEILING`). With a fixed
+    60 s window a legitimately silent 100 s build was reported twice (4 turns against 2) and a 204 s
+    one would be reported 3–4 times.
   - **Remote worlds yield when their output is live.** A runner promises live output by reporting a
     `Kill` through `run_streaming_tracked` (see "Streaming (v1.2) and killing remote commands"):
     `RealRunner`, `HttpExecRunner` once its endpoint has passed the v1.2 probe, and `TemplateRunner`
-    all do, and from then on a remote job yields, streams progress and is killed exactly as a local
-    one. A v1.1 endpoint streams nothing, so its silence says nothing about the command; there the
-    call still waits for exit (`idle_window` is `None` while `remote && !live`), and `bash`'s
-    description names that exception rather than promising a job that never comes. `track` wakes
-    the waiting call, which computed its idle deadline before the output was known to be live.
+    all do, and from then on a remote job yields, streams progress, is noticed when it ends, is evicted
+    and is carried through compaction exactly as a local one. A v1.1 endpoint streams nothing, so its
+    silence says nothing about the command; there the call still waits for exit (`idle_window` is
+    `None` while `remote && !live`), and `bash`'s description names that exception rather than
+    promising a job that never comes. `track` wakes the waiting call, which computed its idle deadline
+    before the output was known to be live. Adoption (below) is this host's alone: on a remote stream
+    the endpoint owns the process group and ends the stream when the shell exits.
   - **`serve`'s host `bash` command waits for exit** (`ToolConfig::bash_waits_for_exit`,
-    `Bash::with_idle_yield(None)`): it has no `bash_job` to come back with.
-  - A `Job` owns its task and its process group. Dropping it kills the command: a call whose future
-    is dropped, a cancelled call, or a dropped tool (a registry rebuild) leaves nothing behind. At
-    most `MAX_PARKED_JOBS` (4) stay parked; parking another kills the oldest, because live probes
-    showed models moving on without waiting on or killing a job. `kill_live_jobs` runs in
+    `Bash::with_idle_yield(None)`): it has no `bash_job` to come back with. What its command leaves
+    running is still adopted into the session's table, so the model sees it.
+  - A `Job` owns its task and its processes. Dropping it kills the command: a call whose future is
+    dropped, a cancelled call, or a dropped table leaves nothing behind. `kill_live_jobs` runs in
     `finish_process_cleanup` before every `process::exit`, which runs no destructors. How to stop the
     command reaches `bash` through `CommandRunner::run_streaming_tracked` as a `tools::exec::Kill`:
-    a local process group, or a runner's blocking hook (close a v1.2 stream, or kill through a
-    template's transport). `bash_job` kill, `Job`'s `Drop` and `kill_live_jobs` all call
-    `Kill::kill`, so local and remote jobs die by the same three paths.
+    this host's job processes (`Kill::Procs`, below), or a runner's blocking hook (close a v1.2
+    stream, or kill through a template's transport). `bash_job` kill, `Job`'s `Drop` and
+    `kill_live_jobs` all call `Kill::kill`, so local and remote jobs die by the same three paths.
   - Evidence (seeded-hang sqlparse, an injected infinite loop; Haiku and Luna): hang wall time
     fell from a median 2,096 s to 480 s on Haiku (−77%, 6/6 fixed in both arms) and from 1,952 s to
     396 s on Luna (−80%; 11/12 fixed against 6/6, the miss a run that killed the hang and then spent
@@ -2431,6 +2475,94 @@ and `serve`'s own `bash`/`abort_bash` RPC commands reuse `RealRunner` directly, 
     and superseded) and `--bash-timeout-guidance` (advise sizing `timeout_ms`; a "probably stuck"
     hint), which left hang wall time unchanged (Haiku 2,416 → 1,946 s median, Luna 1,952 → 1,907 s,
     within noise) and lost a Luna pass.
+- **`bash` jobs: the model is told, never made to poll (`tools/bash_jobs.rs`)**. In 10,779 eval
+  `bash` calls models never backgrounded anything themselves, every yield on a code task was a real
+  hang, and in 27 of 85 yields the model kept working while the job ran — two parked infinite loops
+  were never waited on or killed. The field's recurring failures (Claude Code, Codex, opencode,
+  Gemini CLI, OpenHands, read from source) are making the model poll, `cmd &` leaving an invisible
+  orphan, relaunching a job compaction made it forget, and servers outliving the session. So the job
+  table (`BashJobs`) is an `agent_core::Background` (see "Background work" under Core Mechanism):
+  - **Finish notice.** A parked job that ends becomes, at the loop's next tool-results turn (or at a
+    would-stop, before the run may end), one text: `[job N exited with code C after S s:`cmd`]` (or
+    "was killed by SIGx", "timed out after S s and was stopped", or "ended … (the processes its
+    command left running have exited)"), the last `NOTICE_TAIL_LINES` (20) lines since the last
+    report, and `bash_job {"job": N} returns the full output.` A job whose shell exits while parked
+    but leaves processes running gets one notice saying so, and becomes adopted. A job reported by an
+    attached `bash_job` wait is never parked when it ends, so it gets no notice. An ended job stays in
+    the table, output unread, until `bash_job` reads it — at most `MAX_ENDED_JOBS` (8), the oldest
+    dropped first, and the next notice says which were dropped. The yield text says "You will be told
+    when it exits, so do not poll it or sleep".
+  - **Kinds decide lifetime and caps (`JobKind`).** `Yielded` (the command went quiet or hit the
+    ceiling: foreground work the model expected to finish) never outlives the turn —
+    `BashJobs::end_turn` stops it when the run ends, however it ends, in `run` and `serve` alike, so
+    an idle session never accumulates hung loops — and is evicted, oldest first, past
+    `MAX_YIELDED_JOBS` (4). `Adopted` (the command left processes running: the model asked for this)
+    lives until it exits, is killed, or its owner ends; it is never evicted, and one past
+    `MAX_INTENDED_JOBS` (8) is stopped at once, the result listing the running jobs to stop first. A
+    yielded job whose shell exits leaving processes running becomes adopted. `run_in_background` (P2)
+    adds one intended variant here.
+  - **The end of a run.** At a would-stop with jobs running that no earlier reminder listed, the model
+    gets one `[background jobs]` reminder (id, command, age, why it is a job) and may wait, kill, or end
+    again; each job is reminded once, so ending again ends. The reminder says what ending does, per
+    kind: yielded jobs are stopped; intended ones follow the host's `EndPolicy` — `run` stops them
+    with the process (`BashJobs::stop_all` after the last turn), `serve` leaves them running and wakes
+    the idle session when one ends (see the `serve` data flow). Every stopped job is reported with its
+    `kind`: in `run` as one `bash_jobs_stopped` line in `--json` (before any structured output) and on
+    stderr; in `serve` as a `bash_jobs_stopped` frame before the prompt's terminal response. A
+    subagent's jobs end with its registry. The deadline that stops a yielded job is the turn's end;
+    `timeout_ms` still kills any job, and every yield deadline (idle window, ceilings) is computed in
+    `Bash::yield_deadline`/`yield_reason`, so turning `timeout_ms` into "return and keep running" is
+    a change there and in `run_tracked`'s timeout.
+  - **One table per owner.** `ToolConfig::bash_jobs` hands `bash` the host's table: `run`'s, or the
+    `serve` session's (kept on its `ExecCell`, so a `set_model` rebuild keeps the jobs). `None` (a
+    subagent) is a table of the registry's own.
+  - **Compaction carries the table** (`Background::carry`): running and ended-unread jobs (id,
+    command, state, age) as a `<background-jobs>` block on every summary, so a compacted model does not
+    start a job again. Rendered from the live table, not persisted in `CompactionProvenance`: after a
+    restart the jobs are gone, and a persisted copy would describe them as running.
+- **What a command leaves running is adopted, never leaked (`tools/bash_proc.rs`)**. `cmd &`, a
+  daemon, `nohup`: when the shell exits with processes it started still alive, the call returns its
+  output plus "The command exited but left a process (`…`) running; it is tracked as job N:
+  bash_job {"job": N, "kill": true} stops it", and the job keeps streaming their output (if they hold
+  the pipe) until they exit. Previously `GroupKillGuard` was disarmed when the shell exited, so such a
+  process was untracked and outlived the agent. The requirement is that nothing a command starts
+  outlives the agent untracked, including `setsid`, `nohup … &`, `timeout` (its own process group)
+  and double forks; the mechanism was picked on what each candidate does in the places the agent runs:
+  - **Process-group liveness** (`kill(-pgid, 0)`) misses exactly the processes most likely to outlive
+    the agent: `setsid`, a daemon's double fork and `timeout` all leave the group.
+  - **A cgroup v2 per job** (`cgroup.kill`, `cgroup.events`) is the strongest, but needs a delegated,
+    writable cgroup. Measured on the dev box (Debian 13, kernel 6.12): the agent runs in
+    `/user.slice/user-1000.slice/session-c12.scope`, owned by root and mode 755 — no subgroup can be
+    made. GitHub-hosted runners put the job in a root-owned system service's cgroup, and the agent's
+    container image (`Dockerfile.agent`, ECS) mounts `/sys/fs/cgroup` read-only by default. It would be
+    a mechanism that works almost nowhere the agent runs.
+  - **`PR_SET_CHILD_SUBREAPER` plus descendant tracking** keeps orphans in the agent's tree, but the
+    agent must then reap every orphan's exit status without stealing tokio's (a `waitpid(-1)` races
+    the runtime's own child reaping), it reparents the orphans of every child the agent has (MCP
+    servers included), and it still cannot say which job an orphan came from.
+  - **Chosen: an environment tag** (`TAG_ENV` = `AI_AGENT_JOB_TAG`). Every job's shell starts with a
+    unique tag (agent pid, start time, sequence; appended to any inherited tag, so an agent run inside
+    another agent's job is still stopped by the outer one). An environment survives `fork`/`exec`,
+    `setsid`, `nohup`, `timeout` and double forks, and `/proc/<pid>/environ` (the environment a process
+    started with) is readable for our own uid without privilege — on a dev box, in CI, in a container
+    and in a Firecracker guest alike. A job's processes are the live (non-zombie) ones that carry the
+    tag **or** are still in its process group, which also covers one that cleared its environment.
+    A full scan of `/proc` is cheap: 1,145 processes, 68 of them ours, read in 7 ms by an unoptimized
+    Python probe on the dev box. It runs only when a shell exits, on a kill, and on each wake of an
+    adopted job's wait.
+  - **Waiting and killing.** After the shell exits, the pipes get the same 100 ms quiet grace as
+    before, then the scan; with survivors, `on_orphans` tells `bash` at once and the runner keeps
+    draining while it waits on a pidfd per survivor (readable when it exits; rescanned when all have,
+    in case one forked) — no polling where pidfds exist. A kill (`ProcGroup::kill`) signals the group,
+    then sweeps the scan until it comes back empty, each pid SIGKILLed through a pidfd opened _before_
+    re-checking that it still carries the tag, so a reused pid is never hit. The job's timeout covers
+    the whole wait. No name-based kill anywhere (`pkill -f` matching the harness is a known failure
+    elsewhere).
+  - **What escapes:** a process that both clears its environment (`env -i`) and leaves the group, and
+    one whose environment we cannot read and that left the group (another uid, setuid, or a process
+    that made itself non-dumpable, e.g. `ssh-agent`). A `SIGKILL` of the agent itself runs no exit
+    path. Another unix falls back to the process group alone (liveness polled every 250 ms), which
+    misses `setsid` and `timeout`.
 - **`fork`/`sync`/`logs`**: each builds a `beyond <subcommand> [args…]` argv (e.g.
   `["fork", app, "--name", name]`) and runs it through the same runner with a fixed 120 s timeout.
   Non-zero exit becomes `ToolError::Execution` (unlike `bash`, which reports a non-zero exit as text
