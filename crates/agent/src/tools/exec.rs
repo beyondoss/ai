@@ -87,9 +87,39 @@ pub fn signal_name(signal: i32) -> Option<&'static str> {
 /// `Send + Sync` because stdout and stderr are drained on separate concurrent tasks.
 pub type ChunkSink<'a> = &'a (dyn Fn(&[u8]) + Send + Sync);
 
-/// Told the spawned command's process-group id (its pid: the command leads its own group) once it
-/// starts — see [`CommandRunner::run_streaming_tracked`].
-pub type SpawnSink<'a> = &'a (dyn Fn(u32) + Send + Sync);
+/// Told how to stop the command once it has started and its output is streaming live — see
+/// [`CommandRunner::run_streaming_tracked`].
+pub type SpawnSink<'a> = &'a (dyn Fn(Kill) + Send + Sync);
+
+/// How to stop a command that a tracked run started, wherever it runs.
+///
+/// One shape for every place a command can live, so the code that keeps commands running past their
+/// call (`bash`'s jobs) kills a local process group, a remote stream and a command inside a container
+/// the same way, from the same three places: a `bash_job` kill, a dropped job, and the exit path.
+#[derive(Clone)]
+pub enum Kill {
+    /// A process group on this host, led by the command (its pid is the group id).
+    Group(u32),
+    /// The runner's own way to stop the command: close the exec stream (protocol v1.2), or run a kill
+    /// inside the container a template transport reaches. Blocking, and returns once the runner has
+    /// done everything it can — see [`Kill::kill`].
+    Hook(std::sync::Arc<dyn Fn() + Send + Sync>),
+}
+
+impl Kill {
+    /// Stop the command. **Blocking**: called from a dedicated OS thread (a dropped job, the exit
+    /// path) or `spawn_blocking` (a `bash_job` kill), never on a runtime worker, so a hook may wait
+    /// for its runner to confirm.
+    pub fn kill(&self) {
+        match self {
+            #[cfg(unix)]
+            Kill::Group(pgid) => kill_process_group(*pgid),
+            #[cfg(not(unix))]
+            Kill::Group(_) => {}
+            Kill::Hook(hook) => hook(),
+        }
+    }
+}
 
 /// Runs an external command. Implemented by [`RealRunner`] (production) and by test doubles that
 /// capture the invocation.
@@ -123,12 +153,16 @@ pub trait CommandRunner: Send + Sync {
         self.run(program, args, cwd, timeout).await
     }
 
-    /// Like [`run_streaming`](CommandRunner::run_streaming), but also reports the spawned command's
-    /// process-group id to `on_spawn` the moment it starts — for a caller that keeps the command
-    /// running past its own return (`bash`'s detached jobs) and so must be able to kill the group
-    /// itself, including from the exit path where no future is left to drop. Defaults to plain
-    /// `run_streaming`, never calling `on_spawn`: a runner with no local process (a remote endpoint)
-    /// has no group this host could signal.
+    /// Like [`run_streaming`](CommandRunner::run_streaming), but also reports to `on_spawn`, the
+    /// moment the command starts, how to stop it ([`Kill`]) — for a caller that keeps the command
+    /// running past its own return (`bash`'s detached jobs) and so must be able to kill it itself,
+    /// including from the exit path where no future is left to drop.
+    ///
+    /// **Calling `on_spawn` is a promise that the output is live**: every byte reaches `on_chunk` as
+    /// the command produces it, so silence on the sink means the command is silent. `bash` measures
+    /// its idle yield on that promise. Defaults to plain `run_streaming`, never calling `on_spawn`: a
+    /// runner that cannot see output as it happens (a v1.1 request/response endpoint) has nothing to
+    /// measure silence with and nothing to kill.
     async fn run_streaming_tracked(
         &self,
         program: &str,
@@ -233,7 +267,7 @@ impl RealRunner {
         // either one reaches the whole process group.
         let mut guard = GroupKillGuard { pid: child.id() };
         if let (Some(report), Some(pid)) = (on_spawn, child.id()) {
-            report(pid);
+            report(Kill::Group(pid));
         }
         // Streaming (`bash`'s live path) hands every chunk straight to `on_chunk`'s sink, then ignores
         // the `stdout`/`stderr`/`truncated` fields entirely (see the `Ok` arm's comment and `bash.rs`).

@@ -22,7 +22,7 @@ use async_trait::async_trait;
 use regex::Regex;
 use serde_json::{Value, json};
 
-use super::exec::{CommandRunner, ExecResult, RealRunner};
+use super::exec::{CommandRunner, ExecResult, Kill, RealRunner};
 use super::fs::local::LocalFs;
 use super::fs::{FsBackend, PathWorld};
 use super::output::{OutputAccumulator, OutputSnapshot, TruncatedBy, format_output};
@@ -164,7 +164,9 @@ fn describe(default_timeout_ms: u64, idle_yield: Option<Duration>) -> String {
         text.push_str(&format!(
             " A command still running after {} s without new output returns early with its output \
              so far and keeps running in the background as a numbered job: call `bash_job` with that \
-             number to wait for more of its output, or with `kill: true` to stop it.",
+             number to wait for more of its output, or with `kill: true` to stop it. (A remote \
+             sandbox that cannot stream output as it happens is the exception: there the call \
+             waits for the command to finish.)",
             idle.as_secs()
         ));
     }
@@ -426,7 +428,7 @@ impl Bash {
             let shared = shared.clone();
             tokio::spawn(async move {
                 let sink = |bytes: &[u8]| shared.append(bytes);
-                let spawned = |pgid: u32| shared.track(pgid);
+                let spawned = |kill: Kill| shared.track(kill);
                 let result = runner
                     .run_streaming_tracked(&shell, &args, cwd.as_deref(), dur, &sink, &spawned)
                     .await;
@@ -534,10 +536,11 @@ impl Bash {
     /// window, a silent 100 s build was reported twice and a 204 s one would be reported 3–4 times.
     ///
     /// `None` (never yield) when the command runs somewhere this host sees no output from as it
-    /// happens: a request/response exec endpoint streams nothing, so its silence says nothing about
-    /// the command.
+    /// happens: a v1.1 request/response exec endpoint streams nothing, so its silence says nothing
+    /// about the command. A remote runner whose output is live (exec protocol v1.2, a template
+    /// transport) says so by reporting a [`Kill`], and from then on yields exactly as local does.
     fn idle_window(&self, job: &Job) -> Option<Duration> {
-        if job.shared.remote {
+        if job.shared.remote && !job.shared.live.load(Ordering::Relaxed) {
             return None;
         }
         let scale = IDLE_GROWTH.saturating_pow(job.reports);
@@ -650,12 +653,10 @@ impl Bash {
         if input.get("kill").and_then(Value::as_bool) != Some(true) {
             return self.attach(job, progress).await;
         }
-        // Kill the group and wait for it, as the runner's own timeout path does, so a caller that
+        // Kill it and wait for the kill, as the runner's own timeout path does, so a caller that
         // checks side effects right after sees the command gone.
-        #[cfg(unix)]
-        if let Some(pgid) = job.shared.untrack() {
-            let _ =
-                tokio::task::spawn_blocking(move || super::exec::kill_process_group(pgid)).await;
+        if let Some(kill) = job.shared.untrack() {
+            let _ = tokio::task::spawn_blocking(move || kill.kill()).await;
         }
         job.handle.abort();
         let _ = tokio::time::timeout(Duration::from_secs(5), &mut job.handle).await;
@@ -702,8 +703,8 @@ impl Drop for Job {
         // `abort` only drops the runner's future when the runtime next polls the task, which a
         // process on its way out may never do — kill the group directly too.
         #[cfg(unix)]
-        if let Some(pgid) = self.shared.untrack() {
-            super::exec::spawn_tracked_cleanup(move || super::exec::kill_process_group(pgid));
+        if let Some(kill) = self.shared.untrack() {
+            super::exec::spawn_tracked_cleanup(move || kill.kill());
         }
     }
 }
@@ -713,9 +714,14 @@ struct JobShared {
     out: Mutex<JobOutput>,
     /// Woken on every chunk, so the waiting call can stream progress and re-arm its idle deadline.
     notify: tokio::sync::Notify,
-    /// The command's process group while it runs — what [`Job`]'s `Drop`, a kill, and
-    /// [`kill_live_jobs`] signal.
-    pgid: Mutex<Option<u32>>,
+    /// How to stop the command while it runs — what [`Job`]'s `Drop`, a kill, and
+    /// [`kill_live_jobs`] use.
+    kill: Mutex<Option<Kill>>,
+    /// This job's key in [`LIVE_JOBS`].
+    key: u64,
+    /// The runner reported a [`Kill`], which promises the output is live — see
+    /// [`Bash::idle_window`].
+    live: std::sync::atomic::AtomicBool,
     /// Where the command runs (no spill file when remote) — what each fresh per-report accumulator
     /// is built from.
     remote: bool,
@@ -738,7 +744,9 @@ impl JobShared {
                 streamed: false,
             }),
             notify: tokio::sync::Notify::new(),
-            pgid: Mutex::new(None),
+            kill: Mutex::new(None),
+            key: NEXT_JOB_KEY.fetch_add(1, Ordering::Relaxed),
+            live: std::sync::atomic::AtomicBool::new(false),
             remote,
         }
     }
@@ -753,17 +761,21 @@ impl JobShared {
         self.notify.notify_one();
     }
 
-    fn track(&self, pgid: u32) {
-        *lock(&self.pgid) = Some(pgid);
-        lock(&LIVE_JOB_GROUPS).push(pgid);
+    fn track(&self, kill: Kill) {
+        *lock(&self.kill) = Some(kill.clone());
+        lock(&LIVE_JOBS).push((self.key, kill));
+        self.live.store(true, Ordering::Relaxed);
+        // The waiting call computed its idle deadline before the output was known to be live; wake
+        // it to recompute.
+        self.notify.notify_one();
     }
 
-    /// Forget the process group (it exited, or the caller is about to kill it), returning it if it
-    /// was still recorded.
-    fn untrack(&self) -> Option<u32> {
-        let pgid = lock(&self.pgid).take()?;
-        lock(&LIVE_JOB_GROUPS).retain(|&g| g != pgid);
-        Some(pgid)
+    /// Forget how to kill the command (it exited, or the caller is about to kill it), returning the
+    /// kill if it was still recorded.
+    fn untrack(&self) -> Option<Kill> {
+        let kill = lock(&self.kill).take()?;
+        lock(&LIVE_JOBS).retain(|(k, _)| *k != self.key);
+        Some(kill)
     }
 
     /// The output since the last report, finished and snapshotted; the next report starts empty.
@@ -776,8 +788,9 @@ impl JobShared {
     }
 }
 
-/// Process groups of every detached-path command still running, for [`kill_live_jobs`].
-static LIVE_JOB_GROUPS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+/// How to stop every detached-path command still running, by job key, for [`kill_live_jobs`].
+static LIVE_JOBS: Mutex<Vec<(u64, Kill)>> = Mutex::new(Vec::new());
+static NEXT_JOB_KEY: AtomicU64 = AtomicU64::new(0);
 
 /// Kill every command still running on the detached path. The exit path calls this before
 /// `std::process::exit`, which runs no destructors: a job parked in a table would otherwise outlive
@@ -785,8 +798,8 @@ static LIVE_JOB_GROUPS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
 /// `wait_for_pending_group_kills` that follows waits for them.
 pub fn kill_live_jobs() {
     #[cfg(unix)]
-    for pgid in std::mem::take(&mut *lock(&LIVE_JOB_GROUPS)) {
-        super::exec::spawn_tracked_cleanup(move || super::exec::kill_process_group(pgid));
+    for (_, kill) in std::mem::take(&mut *lock(&LIVE_JOBS)) {
+        super::exec::spawn_tracked_cleanup(move || kill.kill());
     }
 }
 

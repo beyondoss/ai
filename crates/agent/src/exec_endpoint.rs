@@ -45,12 +45,96 @@
 //! honest partial `ExecResult` to return (not even the exit code, which may come after the output),
 //! and presenting whatever fit as the command's output would be a confident wrong answer. The error
 //! says the command *did run*, so the caller narrows its output instead of blindly repeating a
-//! command that may not be idempotent.
+//! command that may not be idempotent. The cap applies to v1.1 objects only; a v1.2 stream is read
+//! a frame at a time and never buffered whole.
+//!
+//! ## Streaming (v1.2)
+//!
+//! A tool that behaves differently depending on where it runs is a broken API. Over v1.1, `bash`
+//! cannot see a remote command's output until it exits, so it cannot tell a silent build from a hung
+//! one (the idle yield never fires: a hung command burns its whole timeout), cannot show progress,
+//! and cannot kill a command it has given up on. v1.2 streams the output and makes **the connection
+//! the command's lifetime**, so the endpoint stays stateless — no job ids, no poll or kill routes.
+//!
+//! The key words MUST, MUST NOT, SHOULD and MAY are used as in RFC 2119.
+//!
+//! **Request.** The v1.1 request plus `"stream": true`:
+//!
+//! ```jsonc
+//! { "command": "sh", "args": ["-c", "cargo build"], "cwd": "/work", "timeout_ms": 1800000, "stream": true }
+//! ```
+//!
+//! **Response.** `200` with `Content-Type: application/x-ndjson`, a body of frames, one JSON object
+//! per line, each terminated by `\n` (chunked transfer on HTTP/1.1, DATA frames on HTTP/2; no
+//! `Content-Length`). A frame carries exactly one of:
+//!
+//! | frame | meaning |
+//! |---|---|
+//! | `{"stdout": "<base64>"}` | bytes the command wrote to stdout |
+//! | `{"stderr": "<base64>"}` | bytes the command wrote to stderr |
+//! | `{}` | heartbeat: the connection is alive; never output |
+//! | `{"exit_code": N}` | **final**: the command exited with code N |
+//! | `{"signal": S}` | **final**: the command was killed by signal S (9 for SIGKILL) |
+//! | `{"timed_out": true}` | **final**: the endpoint killed the command at `timeout_ms` |
+//! | `{"error": "<message>"}` | **final**: the endpoint failed after answering 200 (lost the sandbox) |
+//!
+//! - Output is **standard base64 with padding** (RFC 4648 §4), so arbitrary bytes — invalid UTF-8,
+//!   NULs, terminal escapes — survive. An output frame MUST NOT be empty and MUST carry at most
+//!   64 KiB of decoded bytes ([`stream::MAX_FRAME_PAYLOAD`]); split anything longer.
+//! - **Exactly one final frame, last.** After it the endpoint MUST end the body. A body that ends
+//!   without one is a broken stream, never a success. Failures *before* answering are non-2xx
+//!   statuses exactly as in v1.1; a command that cannot be spawned is an ordinary result (`stderr`
+//!   frame, then `{"exit_code": 127}`), as a shell reports it.
+//! - **Ordering.** Frames of one stream are in the order the bytes were read; the relative order of
+//!   stdout and stderr is best-effort, as between two local pipes. The final frame comes after all
+//!   output read from both pipes. Once the command exits, the endpoint SHOULD stop waiting for pipes
+//!   held open by a detached descendant after a short grace (the client uses 100 ms) rather than
+//!   until they close.
+//! - **Flushing.** Each frame MUST reach the connection without buffering: the endpoint MAY coalesce
+//!   output read within 100 ms into one frame, and MUST NOT hold any longer. Anything between the
+//!   endpoint and the client must not buffer either (send `Cache-Control: no-store`, and e.g.
+//!   `X-Accel-Buffering: no` behind nginx) — the probe below refuses an endpoint whose frames arrive
+//!   all at once.
+//! - **Heartbeat.** When no frame has been written for [`stream::HEARTBEAT_INTERVAL`] (5 s), the
+//!   endpoint MUST write `{}`. It keeps a silent command's connection alive through proxies (whose
+//!   idle timeouts start around 60 s), and it bounds how long a vanished client can go unnoticed. A
+//!   client MUST NOT treat a heartbeat as output — `bash` measures a command's silence on output
+//!   frames only — and this client treats 30 s with no frame at all as a dead connection.
+//! - **Unknown fields are ignored**, and a frame with no known field is a heartbeat, so a later
+//!   version can add fields (a sequence number, timings) without breaking this client.
+//! - **Timeouts.** `timeout_ms` is the endpoint's to enforce: at the deadline it MUST kill the
+//!   command's whole process group and send `{"timed_out": true}`. The client's own deadline is
+//!   `timeout_ms` + 30 s for the whole exchange, so the endpoint's verdict normally wins.
+//!
+//! **Disconnect kills — normative.** Every streamed command MUST run in its own process group (or an
+//! equivalent the endpoint can kill as a unit, such as a cgroup). **If the connection closes before
+//! the final frame, the endpoint MUST kill that whole group** — SIGKILL, grandchildren included —
+//! within two heartbeat intervals (10 s), and SHOULD do so at once by watching the connection for
+//! EOF or `RST_STREAM` rather than waiting for a heartbeat write to fail. This is how the agent stops
+//! a command: `bash_job` kill, a cancelled call, a dropped job and the agent's own exit all close the
+//! stream (see [`Kill`]), and nothing else is ever sent.
+//!
+//! **The probe.** Streaming is adopted only after the endpoint proves it, once per runner, on the
+//! first streaming call ([`HttpExecRunner::streams`]): `sh -c 'printf a; sleep 0.3; printf b'` with
+//! `"stream": true` must come back as `application/x-ndjson` with at least two output frames, `ab`,
+//! `{"exit_code": 0}`, and the first output frame at least 100 ms before the final one. A v1.1
+//! endpoint answers with one JSON object (it ignores the unknown field); a buffering endpoint or proxy
+//! sends one frame, or every frame at once. Either way the runner stays on v1.1 for good, and `bash`
+//! keeps v1.1's behavior exactly: no yield, no live progress, and its description says so. A probe
+//! that could not reach the endpoint is not an answer and is retried on the next call. Only `bash`
+//! streams: the filesystem backend's commands stay v1.1, whose single object they need anyway.
+//!
+//! **Conformance.** [`conformance::verify`] checks an endpoint against all of the above — framing,
+//! the probe, exit/signal/timeout frames, heartbeats, the 64 KiB frame cap, and kill on disconnect
+//! measured against a grandchild's marker file — and `tests/exec_conformance.rs` runs it against any
+//! URL. `tests/fixtures/exec/v1.2-frames.json` holds the decoding vectors.
 //!
 //! For targets that have no HTTP surface at all (`ssh`, `docker exec`, `kubectl exec`, any CLI), see
-//! [`TemplateRunner`], which is the same idea expressed as an argv template.
+//! [`TemplateRunner`], which is the same idea expressed as an argv template. Its transport is a local
+//! process, so its output streams natively; killing it is the hard part — see `far_kill`.
 
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -58,8 +142,15 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
 use crate::tools::exec::{
-    ChunkSink, CommandRunner, ExecResult, STREAM_HEAD, STREAM_TAIL, drain_capped, feed_stdin,
+    ChunkSink, CommandRunner, ExecResult, Kill, STREAM_HEAD, STREAM_TAIL, SpawnSink, drain_capped,
+    feed_stdin,
 };
+
+pub mod conformance;
+mod far_kill;
+pub mod stream;
+
+use stream::{FRAME_SILENCE_LIMIT, Frame, FrameReader, NDJSON};
 
 /// What the agent sends.
 #[derive(Debug, Serialize)]
@@ -72,6 +163,9 @@ struct ExecRequest<'a> {
     /// v1.1: bytes for the command's stdin, standard base64. Absent means no stdin — v1 behavior.
     #[serde(skip_serializing_if = "Option::is_none")]
     stdin_base64: Option<String>,
+    /// v1.2: answer with a stream of frames instead of one object. Absent means v1.1.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    stream: bool,
 }
 
 /// What the agent expects back. Extra fields are ignored, so an endpoint may return more.
@@ -102,6 +196,10 @@ pub struct HttpExecRunner {
     client: reqwest::Client,
     headers: Vec<(String, String)>,
     max_response_bytes: usize,
+    /// Whether the endpoint has proved it streams (v1.2) — probed once, on the first streaming call,
+    /// and cached. A probe that could not reach the endpoint is not cached: that is an outage, not
+    /// an answer.
+    streams: tokio::sync::OnceCell<bool>,
 }
 
 impl HttpExecRunner {
@@ -126,6 +224,7 @@ impl HttpExecRunner {
             },
             headers: Vec::new(),
             max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
+            streams: tokio::sync::OnceCell::new(),
         })
     }
 
@@ -159,28 +258,32 @@ impl HttpExecRunner {
         &self.url
     }
 
-    /// One request, one response: the whole protocol.
-    async fn post(
+    /// Send one request and return the response once its status is known to be a success. `stream`
+    /// asks for v1.2 frames; whether they came is the response's `Content-Type` to say.
+    async fn send(
         &self,
         program: &str,
         args: &[String],
         cwd: Option<&str>,
         timeout: Duration,
         stdin: Option<&[u8]>,
-    ) -> std::io::Result<ExecResponse> {
+        stream: bool,
+    ) -> std::io::Result<reqwest::Response> {
         let body = ExecRequest {
             command: program,
             args,
             cwd,
             timeout_ms: timeout.as_millis().min(u64::MAX as u128) as u64,
             stdin_base64: stdin.map(|b| base64::engine::general_purpose::STANDARD.encode(b)),
+            stream,
         };
         let mut req = self.client.post(&self.url).json(&body);
         for (name, value) in &self.headers {
             req = req.header(name.as_str(), value.as_str());
         }
         // A little past the command's own budget, so the endpoint gets the chance to enforce and
-        // report the timeout itself — its message is more useful than a bare client-side abort.
+        // report the timeout itself — its message is more useful than a bare client-side abort. It
+        // bounds the whole exchange, a stream's body included.
         let resp = req
             .timeout(timeout.saturating_add(Duration::from_secs(30)))
             .send()
@@ -195,26 +298,37 @@ impl HttpExecRunner {
                     std::io::Error::other(format!("exec endpoint {} unreachable: {e}", self.url))
                 }
             })?;
-
         let status = resp.status();
-        let (body, over_cap) = self.read_capped(resp).await?;
-        let excerpt = || {
-            String::from_utf8_lossy(&body)
-                .trim()
-                .chars()
-                .take(400)
-                .collect::<String>()
-        };
         if !status.is_success() {
             // The endpoint refused the *request* — a bad URL, auth, a dead sandbox. Distinct from the
             // command running and exiting non-zero, which is an ordinary result.
+            let (body, _) = self.read_capped(resp).await?;
             return Err(std::io::Error::other(format!(
                 "exec endpoint {} returned {}: {}",
                 self.url,
                 status.as_u16(),
-                excerpt()
+                excerpt(&body)
             )));
         }
+        Ok(resp)
+    }
+
+    /// One request, one response: the whole v1.1 protocol.
+    async fn post(
+        &self,
+        program: &str,
+        args: &[String],
+        cwd: Option<&str>,
+        timeout: Duration,
+        stdin: Option<&[u8]>,
+    ) -> std::io::Result<ExecResponse> {
+        let resp = self.send(program, args, cwd, timeout, stdin, false).await?;
+        self.envelope(resp).await
+    }
+
+    /// Read and parse a v1.1 response body: one JSON object, capped.
+    async fn envelope(&self, resp: reqwest::Response) -> std::io::Result<ExecResponse> {
+        let (body, over_cap) = self.read_capped(resp).await?;
         if over_cap {
             return Err(std::io::Error::other(format!(
                 "exec endpoint {}: the response exceeded the {}-byte cap and was discarded — the \
@@ -227,7 +341,7 @@ impl HttpExecRunner {
             std::io::Error::other(format!(
                 "exec endpoint {} returned unparseable JSON ({e}): {}",
                 self.url,
-                excerpt()
+                excerpt(&body)
             ))
         })
     }
@@ -296,11 +410,215 @@ impl CommandRunner for HttpExecRunner {
         })
     }
 
-    // No `run_streaming` override, deliberately. One request, one response: there is nothing to
-    // stream, so the default — which never calls the sink — is the honest answer, and `bash` then
-    // builds its output from the final `stdout` *and* `stderr`. An override that fed the sink stdout
-    // alone told `bash` the output had streamed, and every remote command that printed to stdout lost
-    // its stderr.
+    /// v1.2 when the endpoint has proved it streams; otherwise v1.1, which never calls the sink.
+    ///
+    /// The sink gets *every* byte of *both* streams or none: a v1.1 answer (or a v1.2 endpoint that
+    /// answers this request with one object anyway) goes back as `stdout`/`stderr` for `bash` to
+    /// assemble. An earlier override fed the sink stdout alone, told `bash` the output had streamed,
+    /// and every remote command that printed to stdout lost its stderr.
+    async fn run_streaming(
+        &self,
+        program: &str,
+        args: &[String],
+        cwd: Option<&str>,
+        timeout: Duration,
+        on_chunk: ChunkSink<'_>,
+    ) -> std::io::Result<ExecResult> {
+        self.run_stream(program, args, cwd, timeout, on_chunk, None)
+            .await
+    }
+
+    /// As [`Self::run_streaming`], reporting a [`Kill`] once the stream is open — which is also the
+    /// promise that the output is live. Killing it closes the stream; the endpoint MUST then kill the
+    /// command's process group (see the module doc).
+    async fn run_streaming_tracked(
+        &self,
+        program: &str,
+        args: &[String],
+        cwd: Option<&str>,
+        timeout: Duration,
+        on_chunk: ChunkSink<'_>,
+        on_spawn: SpawnSink<'_>,
+    ) -> std::io::Result<ExecResult> {
+        self.run_stream(program, args, cwd, timeout, on_chunk, Some(on_spawn))
+            .await
+    }
+}
+
+/// The start of a body, for an error message.
+fn excerpt(body: &[u8]) -> String {
+    String::from_utf8_lossy(body)
+        .trim()
+        .chars()
+        .take(400)
+        .collect()
+}
+
+/// How long a [`Kill`] of a stream waits for the runner to confirm it has let go of the connection.
+/// The runner's future runs on the async runtime, which a process on its way out may no longer poll;
+/// past this the exit itself closes the socket, which the endpoint sees the same way.
+const STOP_WAIT: Duration = Duration::from_secs(2);
+
+/// The shared state between a stream's runner future and the [`Kill`] handed out for it.
+#[derive(Default)]
+struct StreamStop {
+    /// Asked to stop: the runner drops the response, which closes the connection.
+    requested: tokio::sync::Notify,
+    /// Set once the runner future has ended (by any path, a drop included) and the response is gone.
+    released: std::sync::Mutex<bool>,
+    released_cv: std::sync::Condvar,
+}
+
+impl StreamStop {
+    /// Blocking: ask the runner to drop the stream and wait (bounded) until it has.
+    fn stop(&self) {
+        self.requested.notify_one();
+        let released = self.released.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = self
+            .released_cv
+            .wait_timeout_while(released, STOP_WAIT, |r| !*r);
+    }
+}
+
+/// Marks the stream released when the runner future ends — dropped by an abort, or returning. Must
+/// be declared before the response in the future's scope, so it drops *after* the response does.
+struct Released(Arc<StreamStop>);
+
+impl Drop for Released {
+    fn drop(&mut self) {
+        *self.0.released.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        self.0.released_cv.notify_all();
+    }
+}
+
+impl HttpExecRunner {
+    /// Whether this endpoint streams (v1.2), probing it the first time. See the module doc's "The
+    /// probe".
+    pub async fn streams(&self) -> bool {
+        self.streams
+            .get_or_try_init(|| async {
+                let resp = self
+                    .send(
+                        "sh",
+                        &["-c".to_string(), stream::PROBE_SCRIPT.to_string()],
+                        None,
+                        Duration::from_secs(10),
+                        None,
+                        true,
+                    )
+                    .await?;
+                if !is_ndjson(&resp) {
+                    return Ok::<bool, std::io::Error>(false);
+                }
+                let seen = stream::observe_probe(resp)
+                    .await
+                    .map_err(std::io::Error::other)?;
+                let streams = seen.streams();
+                if !streams {
+                    tracing::info!(url = %self.url, why = %seen.explain(), "exec endpoint does not stream; `bash` waits for each command to exit");
+                }
+                Ok(streams)
+            })
+            .await
+            .copied()
+            .unwrap_or(false)
+    }
+
+    /// The v1.2 exchange. Falls back to v1.1 when the endpoint has not proved it streams, or when it
+    /// answers this request with one JSON object after all (a fleet mid-rollout).
+    async fn run_stream(
+        &self,
+        program: &str,
+        args: &[String],
+        cwd: Option<&str>,
+        timeout: Duration,
+        on_chunk: ChunkSink<'_>,
+        on_spawn: Option<SpawnSink<'_>>,
+    ) -> std::io::Result<ExecResult> {
+        if !self.streams().await {
+            return self.run(program, args, cwd, timeout).await;
+        }
+        let stop = Arc::new(StreamStop::default());
+        // Declared before the response: dropped after it, so "released" is only ever set once the
+        // connection has been let go.
+        let _released = Released(stop.clone());
+        let resp = self.send(program, args, cwd, timeout, None, true).await?;
+        if !is_ndjson(&resp) {
+            let parsed = self.envelope(resp).await?;
+            return Ok(ExecResult {
+                code: Some(parsed.exit_code),
+                stdout: parsed.stdout,
+                stderr: parsed.stderr,
+                ..Default::default()
+            });
+        }
+        if let Some(report) = on_spawn {
+            let stop = stop.clone();
+            report(Kill::Hook(Arc::new(move || stop.stop())));
+        }
+        let mut frames = FrameReader::new(resp);
+        let broken = |e: String| {
+            std::io::Error::other(format!(
+                "exec endpoint {}: {e} (the command may have been killed)",
+                self.url
+            ))
+        };
+        loop {
+            let next = tokio::select! {
+                biased;
+                () = stop.requested.notified() => {
+                    return Err(std::io::Error::other("stopped: the exec stream was closed"));
+                }
+                next = frames.next(FRAME_SILENCE_LIMIT) => next,
+            };
+            match next.map_err(broken)? {
+                Some(Frame::Stdout(b) | Frame::Stderr(b)) => on_chunk(&b),
+                Some(Frame::Heartbeat) => {}
+                Some(Frame::Exit(code)) => {
+                    frames.finish().await;
+                    return Ok(ExecResult {
+                        code: Some(code),
+                        ..Default::default()
+                    });
+                }
+                Some(Frame::Signal(signal)) => {
+                    frames.finish().await;
+                    return Ok(ExecResult {
+                        signal: Some(signal),
+                        ..Default::default()
+                    });
+                }
+                Some(Frame::TimedOut) => {
+                    frames.finish().await;
+                    return Ok(ExecResult {
+                        timed_out: true,
+                        stderr: "command exceeded its timeout".into(),
+                        ..Default::default()
+                    });
+                }
+                Some(Frame::Error(e)) => {
+                    return Err(broken(format!("the endpoint failed mid-command: {e}")));
+                }
+                None => {
+                    return Err(broken(
+                        "the stream ended before the command's final frame".to_string(),
+                    ));
+                }
+            }
+        }
+    }
+}
+
+/// Whether a response is a v1.2 stream rather than a v1.1 object.
+fn is_ndjson(resp: &reqwest::Response) -> bool {
+    resp.headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| {
+            v.split(';')
+                .next()
+                .is_some_and(|m| m.trim().eq_ignore_ascii_case(NDJSON))
+        })
 }
 
 /// A [`CommandRunner`] that runs each command through a caller-supplied **argv template**, for targets
@@ -340,16 +658,7 @@ impl TemplateRunner {
     }
 
     fn expand(&self, program: &str, args: &[String]) -> Vec<String> {
-        let mut out = Vec::with_capacity(self.template.len() + args.len());
-        for part in &self.template {
-            if part == "{}" {
-                out.push(program.to_string());
-                out.extend(args.iter().cloned());
-            } else {
-                out.push(part.clone());
-            }
-        }
-        out
+        expand(&self.template, program, args)
     }
 }
 
@@ -362,7 +671,45 @@ impl CommandRunner for TemplateRunner {
         cwd: Option<&str>,
         timeout: Duration,
     ) -> std::io::Result<ExecResult> {
-        self.exec(program, args, cwd, timeout, None).await
+        self.exec(program, args, cwd, timeout, None, None, None)
+            .await
+    }
+
+    /// The transport is a local process, so its output streams for free: every chunk the far side
+    /// writes arrives on the transport's pipes as it happens.
+    async fn run_streaming(
+        &self,
+        program: &str,
+        args: &[String],
+        cwd: Option<&str>,
+        timeout: Duration,
+        on_chunk: ChunkSink<'_>,
+    ) -> std::io::Result<ExecResult> {
+        self.exec(program, args, cwd, timeout, Some(on_chunk), None, None)
+            .await
+    }
+
+    /// As [`Self::run_streaming`], reporting a [`Kill`] that stops the command **on the far side**,
+    /// not just the local transport — see `far_kill`.
+    async fn run_streaming_tracked(
+        &self,
+        program: &str,
+        args: &[String],
+        cwd: Option<&str>,
+        timeout: Duration,
+        on_chunk: ChunkSink<'_>,
+        on_spawn: SpawnSink<'_>,
+    ) -> std::io::Result<ExecResult> {
+        self.exec(
+            program,
+            args,
+            cwd,
+            timeout,
+            Some(on_chunk),
+            None,
+            Some(on_spawn),
+        )
+        .await
     }
 
     /// Piped into the *transport* process. Whether it reaches the far side is the transport's
@@ -377,35 +724,111 @@ impl CommandRunner for TemplateRunner {
         timeout: Duration,
         stdin: &[u8],
     ) -> std::io::Result<ExecResult> {
-        self.exec(program, args, cwd, timeout, Some(stdin)).await
+        self.exec(program, args, cwd, timeout, None, Some(stdin), None)
+            .await
     }
 }
 
+/// How long the far-side kill may take before it is abandoned: one more round trip through the
+/// transport, which for `docker exec` is a fraction of a second.
+const FAR_KILL_LIMIT: Duration = Duration::from_secs(10);
+
+/// Stops a template command wherever it is: on the far side through the transport (once its
+/// marker has arrived), then the local transport's own process group. Blocking.
+#[derive(Clone)]
+struct TemplateKill {
+    template: Arc<Vec<String>>,
+    far: far_kill::FarIdCell,
+    local_pgid: Option<u32>,
+}
+
+impl TemplateKill {
+    fn kill(&self) {
+        let far = *self.far.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(id) = far {
+            let (program, args) = far_kill::far_kill_argv(id);
+            far_kill::run_bounded(&expand(&self.template, &program, &args), FAR_KILL_LIMIT);
+        }
+        #[cfg(unix)]
+        if let Some(pgid) = self.local_pgid {
+            crate::tools::exec::kill_process_group(pgid);
+        }
+    }
+}
+
+/// Runs a [`TemplateKill`] if the command's future is dropped before the command exits — a
+/// cancelled call, an aborted job. Disarmed once the transport has exited on its own.
+struct TemplateKillGuard(Option<TemplateKill>);
+
+impl Drop for TemplateKillGuard {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(kill) = self.0.take() {
+            crate::tools::exec::spawn_tracked_cleanup(move || kill.kill());
+        }
+    }
+}
+
+/// `{}` replaced by the command and its arguments, as argv entries.
+fn expand(template: &[String], program: &str, args: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(template.len() + args.len());
+    for part in template {
+        if part == "{}" {
+            out.push(program.to_string());
+            out.extend(args.iter().cloned());
+        } else {
+            out.push(part.clone());
+        }
+    }
+    out
+}
+
 impl TemplateRunner {
+    #[allow(clippy::too_many_arguments)]
     async fn exec(
         &self,
         program: &str,
         args: &[String],
         cwd: Option<&str>,
         timeout: Duration,
+        on_chunk: Option<ChunkSink<'_>>,
         stdin: Option<&[u8]>,
+        on_spawn: Option<SpawnSink<'_>>,
     ) -> std::io::Result<ExecResult> {
         // `cwd` is expressed by wrapping the command, not by setting the *local* process's directory —
         // the directory belongs to the far side. Positional parameters to a fixed script, never
         // substituted text.
-        let (program, args): (String, Vec<String>) = match cwd {
-            Some(dir) => {
-                let mut v = vec![
-                    "-c".to_string(),
-                    r#"cd "$1" || exit 1; shift; exec "$@""#.to_string(),
-                    "sh".to_string(),
-                    dir.to_string(),
-                    program.to_string(),
-                ];
-                v.extend(args.iter().cloned());
-                ("sh".to_string(), v)
+        //
+        // Everything but a stdin-carrying call runs under `far_kill::WRAPPER`, which makes the
+        // command killable on the far side (killing the transport does not reach it — see
+        // `far_kill`). A stdin call cannot: the wrapper backgrounds the command, and a background
+        // job's stdin is `/dev/null`.
+        let killable = stdin.is_none();
+        let (program, args): (String, Vec<String>) = if killable {
+            let mut v = vec![
+                "-c".to_string(),
+                far_kill::WRAPPER.to_string(),
+                "sh".to_string(),
+                cwd.unwrap_or("").to_string(),
+                program.to_string(),
+            ];
+            v.extend(args.iter().cloned());
+            ("sh".to_string(), v)
+        } else {
+            match cwd {
+                Some(dir) => {
+                    let mut v = vec![
+                        "-c".to_string(),
+                        r#"cd "$1" || exit 1; shift; exec "$@""#.to_string(),
+                        "sh".to_string(),
+                        dir.to_string(),
+                        program.to_string(),
+                    ];
+                    v.extend(args.iter().cloned());
+                    ("sh".to_string(), v)
+                }
+                None => (program.to_string(), args.to_vec()),
             }
-            None => (program.to_string(), args.to_vec()),
         };
         let argv = self.expand(&program, &args);
 
@@ -419,21 +842,36 @@ impl TemplateRunner {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        // Its own group, so the local half of a kill reaches whatever helpers the transport forks.
+        #[cfg(unix)]
+        cmd.process_group(0);
         let mut child = cmd.spawn()?;
+        let far = far_kill::FarIdCell::default();
+        let kill = TemplateKill {
+            template: Arc::new(self.template.clone()),
+            far: far.clone(),
+            local_pgid: child.id(),
+        };
+        let mut guard = TemplateKillGuard(Some(kill.clone()));
+        if let Some(report) = on_spawn {
+            let kill = kill.clone();
+            report(Kill::Hook(Arc::new(move || kill.kill())));
+        }
         let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
+        let stderr = child
+            .stderr
+            .take()
+            .map(|e| far_kill::MarkerStrip::new(e, far.clone()));
         // Fed concurrently with the drains, never before them — see `feed_stdin`.
         let feed = feed_stdin(child.stdin.take(), stdin);
-        // `wait_with_output` used to collect both pipes here, which buffers *everything* the far side
-        // prints into this process — a `cat` of a large file on the target, or a build's log, sized
-        // the replica's memory rather than the command. Worse, it then reported `truncated: false`
-        // unconditionally, so a caller had no way to know output had been lost when it was.
-        //
         // `drain_capped` is the same streaming head+tail accumulator the local runner uses: memory
         // is bounded at `STREAM_HEAD + STREAM_TAIL` per stream regardless of how much arrives, and
-        // it says honestly whether a middle was dropped. Not `HttpExecRunner::read_capped` — that
-        // *discards* an over-cap body and errors, which is right for a response envelope that must
-        // parse as a whole, and wrong here: a long-running command's output is still the answer.
+        // it says honestly whether a middle was dropped (`wait_with_output`, used here once, buffered
+        // everything and reported `truncated: false` regardless). When streaming, every chunk goes to
+        // the sink and nothing is captured, exactly as `RealRunner` does. Not
+        // `HttpExecRunner::read_capped` — that *discards* an over-cap body and errors, which is right
+        // for a response envelope that must parse as a whole, and wrong here: a long-running
+        // command's output is still the answer.
         //
         // Both pipes are drained *concurrently* with the wait. A child that fills one pipe's OS
         // buffer while we read only the other deadlocks, and an unread pipe stalls its exit.
@@ -446,13 +884,26 @@ impl TemplateRunner {
         let collect = async {
             tokio::join!(
                 wait,
-                drain_capped(stdout, STREAM_HEAD, STREAM_TAIL, None, exited_rx.clone()),
-                drain_capped(stderr, STREAM_HEAD, STREAM_TAIL, None, exited_rx.clone()),
+                drain_capped(
+                    stdout,
+                    STREAM_HEAD,
+                    STREAM_TAIL,
+                    on_chunk,
+                    exited_rx.clone()
+                ),
+                drain_capped(
+                    stderr,
+                    STREAM_HEAD,
+                    STREAM_TAIL,
+                    on_chunk,
+                    exited_rx.clone()
+                ),
                 feed,
             )
         };
         match tokio::time::timeout(timeout, collect).await {
             Ok((status, (stdout, out_truncated), (stderr, err_truncated), fed)) => {
+                guard.0 = None;
                 let status = status?;
                 fed?;
                 Ok(ExecResult {
@@ -467,14 +918,21 @@ impl TemplateRunner {
                     truncated: out_truncated || err_truncated,
                 })
             }
-            Err(_) => Ok(ExecResult {
-                code: None,
-                signal: None,
-                stdout: String::new(),
-                stderr: format!("exec template timed out after {timeout:?}"),
-                timed_out: true,
-                truncated: false,
-            }),
+            Err(_) => {
+                // Reaping the transport is not enough: the far command outlives it. Kill both and
+                // wait for it, so a caller that re-checks side effects sees the command gone.
+                if let Some(kill) = guard.0.take() {
+                    let _ = tokio::task::spawn_blocking(move || kill.kill()).await;
+                }
+                Ok(ExecResult {
+                    code: None,
+                    signal: None,
+                    stdout: String::new(),
+                    stderr: format!("exec template timed out after {timeout:?}"),
+                    timed_out: true,
+                    truncated: false,
+                })
+            }
         }
     }
 }
@@ -569,12 +1027,15 @@ mod tests {
     #[tokio::test]
     #[cfg(unix)]
     async fn a_template_runner_caps_its_output_and_says_when_it_truncated() {
-        let r = TemplateRunner::parse("sh -c {}").unwrap();
+        let r = TemplateRunner::parse("env {}").unwrap();
         let bytes = 2 * (STREAM_HEAD + STREAM_TAIL);
         let out = r
             .run(
-                &format!("head -c {bytes} /dev/zero | tr '\\0' 'a'"),
-                &[],
+                "sh",
+                &[
+                    "-c".into(),
+                    format!("head -c {bytes} /dev/zero | tr '\\0' 'a'"),
+                ],
                 None,
                 Duration::from_secs(30),
             )
@@ -594,11 +1055,14 @@ mod tests {
     #[tokio::test]
     #[cfg(unix)]
     async fn a_template_runner_leaves_output_under_the_cap_alone() {
-        let r = TemplateRunner::parse("sh -c {}").unwrap();
+        let r = TemplateRunner::parse("env {}").unwrap();
         let out = r
             .run(
-                "printf 'hello\\n'; printf 'oops\\n' >&2",
-                &[],
+                "sh",
+                &[
+                    "-c".into(),
+                    "printf 'hello\\n'; printf 'oops\\n' >&2".into(),
+                ],
                 None,
                 Duration::from_secs(10),
             )
@@ -805,6 +1269,32 @@ impl CommandRunner for CellRunner {
             None => {
                 crate::tools::exec::RealRunner
                     .run_streaming(program, args, cwd, timeout, on_chunk)
+                    .await
+            }
+        }
+    }
+
+    /// Forwarded, not left to the default: without it a `bash` job behind a cell — every `serve`
+    /// session's — reported no [`Kill`], so the exit path could not reach it and a remote job never
+    /// yielded.
+    async fn run_streaming_tracked(
+        &self,
+        program: &str,
+        args: &[String],
+        cwd: Option<&str>,
+        timeout: Duration,
+        on_chunk: ChunkSink<'_>,
+        on_spawn: SpawnSink<'_>,
+    ) -> std::io::Result<ExecResult> {
+        match self.0.resolve().map_err(std::io::Error::other)? {
+            Some(t) => {
+                t.runner()
+                    .run_streaming_tracked(program, args, cwd, timeout, on_chunk, on_spawn)
+                    .await
+            }
+            None => {
+                crate::tools::exec::RealRunner
+                    .run_streaming_tracked(program, args, cwd, timeout, on_chunk, on_spawn)
                     .await
             }
         }

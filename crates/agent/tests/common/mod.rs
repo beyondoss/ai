@@ -40,6 +40,8 @@ pub mod mcp_events_fixture;
 pub mod mcp_fixture;
 /// A real OAuth-protected MCP server with mid-session controls, and the `mcp-login` steps.
 pub mod mcp_oauth_fixture;
+/// `bash` + `bash_job` over a remote runner, for the streaming exec suites.
+pub mod remote_bash;
 /// A running `serve --service` replica, for the service-mode suites.
 pub mod service;
 /// The MCP Skills (SEP-2640) suites' isolated `$HOME` + skills-fixture harness.

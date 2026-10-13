@@ -1972,11 +1972,12 @@ place that pairs them:
 `kubectl exec`, any CLI) via an argv template whose `{}` expands to _separate argv entries_ — never
 into a shell string, so a model-supplied path cannot be reparsed as syntax on the far side.
 
-Neither runner streams: each returns the whole result at once, so both inherit
-`CommandRunner::run_streaming`'s default, which never calls the chunk sink, and `bash` builds its
-output from the final `stdout` and `stderr`. A runner that calls the sink at all claims to have
-delivered every byte of both streams through it — `HttpExecRunner` once fed it stdout alone, and
-every remote command that printed to stdout lost its stderr.
+Both stream to `bash` when they can (next section): `HttpExecRunner` over protocol v1.2, once its
+endpoint has proved it streams, and `TemplateRunner` always, since its transport is a local process
+whose pipes carry the far side's output as it happens. A runner that calls the sink at all claims to
+have delivered every byte of both streams through it — `HttpExecRunner` once fed it stdout alone,
+and every remote command that printed to stdout lost its stderr — so over v1.1 `HttpExecRunner`
+never calls it, and `bash` builds its output from the final `stdout` and `stderr`.
 
 Both are **bounded**, by different mechanisms, because they are bounding different things.
 `HttpExecRunner` caps the response body and treats an over-cap body as an error (below): a response
@@ -1991,6 +1992,72 @@ everything, and then reported `truncated: false` regardless.)
 `tests/exec_endpoint.rs` drives all of this against a ~30-line mock provider — the same shim someone
 would write in front of a real one. If standing up a fake provider took more than that, the protocol
 would be too big.
+
+#### Streaming (v1.2) and killing remote commands
+
+Over v1.1 a remote `bash` could not see output until the command exited, so it could not yield a
+hung command (#243's hang handling never fired remotely: a hung remote command burned its whole
+30-minute timeout), could not show progress, and could not kill a job. A tool that behaves
+differently depending on where it runs is a broken API, so v1.2 closes all three. The normative
+wire spec is `exec_endpoint`'s module doc; in short:
+
+- **Request** v1.1 + `"stream": true`. **Response** `application/x-ndjson`, one frame per line:
+  `{"stdout": b64}` / `{"stderr": b64}` (≤ 64 KiB decoded each), heartbeat `{}` after 5 s with no
+  other frame, and exactly one final frame, last: `{"exit_code"}` / `{"signal"}` /
+  `{"timed_out": true}` / `{"error"}`. Unknown fields are ignored. `timeout_ms` is the endpoint's to
+  enforce (kill the group, send `timed_out`); the client's deadline is `timeout_ms` + 30 s for the
+  whole exchange, plus 30 s with no frame at all as a dead connection.
+- **The connection is the command's lifetime.** If the client disconnects before the final frame,
+  the endpoint MUST kill the command's whole process group, within 10 s and preferably at once. That
+  is the only kill the agent ever sends, so the endpoint stays stateless: no job ids, no poll or kill
+  routes.
+- **Adopted only on proof.** `HttpExecRunner::streams` probes once per runner, on the first streaming
+  call (lazily, so every construction site — `run`, `serve`, service mode, `set_exec_endpoint` — gets
+  it without a change): `printf a; sleep 0.3; printf b` must arrive as two or more output frames, the
+  first ≥ 100 ms before the final one. A v1.1 endpoint (one JSON object back) or a buffering one (one
+  frame, or all frames at once) stays on v1.1 for the runner's life; a probe that could not reach the
+  endpoint is not cached. A v1.2 endpoint that answers one request with a JSON object anyway (a fleet
+  mid-rollout) is handled per response, by `Content-Type`. Only `bash` streams;
+  `run`/`run_with_stdin` (the filesystem backend) stay v1.1.
+- **Memory.** `FrameReader` holds at most one partial line (≤ 1 MiB); output goes straight to the
+  sink, where `bash`'s accumulator keeps a bounded tail. The spill file stays off remotely.
+
+**Killing.** `run_streaming_tracked` reports a `tools::exec::Kill` once the stream is open. For HTTP
+it is a hook that signals the runner future to drop the response (closing the connection) and then
+blocks, up to 2 s, until that future has ended — so `bash_job` kill returns once the stream is
+closed, and `kill_live_jobs` on the exit path closes it explicitly instead of relying on the process
+exit to close the socket (which also works, and is what the endpoint sees if the hook times out).
+The endpoint's kill itself cannot be confirmed per call — the connection that would carry the
+confirmation is the thing being closed — which is why it is a MUST that the conformance verifier
+measures.
+
+**Template mode** (`docker exec ctr {}`) streams natively, but **killing the transport does not kill
+the command.** Measured against a real `docker exec` into Alpine: SIGKILL and SIGTERM to the local
+client both left `sh -c 'sleep 123'` running in the container, as its own session leader. So every
+`TemplateRunner` command except a stdin-carrying one runs under `far_kill::WRAPPER`: the command is
+backgrounded under `setsid` (a background child of a non-interactive shell never leads a group, so
+`setsid` does not fork and the pid is the command's own), and that process writes
+`\x1eexec-pgid:<pid>\n` to stderr before `exec`ing the real command — always the first stderr bytes,
+stripped by `far_kill::MarkerStrip` before anyone sees them. A kill (the `Kill` hook, a dropped
+future, a timeout) runs `sh -c 'kill -KILL "$1"' sh -<pgid>` through the same template, then kills
+the local transport's group. The shell builtin, because slim images have no `/bin/kill`; no `--`,
+because busybox rejects it and then fails to signal the group (measured). Without `setsid` the
+marker says `exec-pid:` and only that process dies. A stdin call cannot use the wrapper (a
+background job's stdin is `/dev/null`), so on timeout only its transport is reaped.
+
+Tests: `exec_stream_frames.rs` (order, bytes, bounds, final frames, probe once, v1.1 and buffered
+fallbacks), `exec_stream_kill.rs` (drop and `Kill` close the stream; the mock sees the group die),
+`bash_remote_stream.rs` (yield despite heartbeats, `bash_job` wait/kill, live progress, cancel, tool
+drop, the v1.1 wait-for-exit fallback), `bash_remote_exit.rs` (`kill_live_jobs`, and SIGTERM to the
+real `run --exec-url` binary), `exec_template_kill.rs` (a stand-in transport that, like `docker
+exec`, does not propagate a kill — the first test proves that — then `bash_job` kill, timeout and
+cancel all reach the far side), and `exec_endpoint_live.rs`'s `a_killed_bash_job_dies_on_the_target`
+against CI's real Alpine container. `exec_conformance.rs` runs `exec_endpoint::conformance::verify`
+against the mocks (it must pass the conforming one and fail a buffering one and one that survives a
+disconnect) and against `AGENT_CONFORMANCE_EXEC_URL` for endpoint implementers; the decoding vectors
+are `tests/fixtures/exec/v1.2-frames.json`. The shared mock (`beyond-ai-test-support::exec_mock`)
+is a conforming v1.2 endpoint by default, so every service-mode suite now drives the streaming path;
+`MockOptions` selects v1.1, buffered, or no-kill-on-disconnect.
 
 #### Which endpoint a session gets
 
@@ -2069,7 +2136,9 @@ no honest partial `ExecResult` to hand back (the exit code may come after the ou
 off whatever fit as the command's output would be a confident wrong answer. The error says the
 command _ran_, so the model narrows its output (`| head`) rather than blindly re-running something
 that may not be idempotent. The cap bounds memory in a process that may serve many tenants, and it
-sits far above anything a tool consumes (`bash` keeps ~30 KB), so legitimate output never meets it.
+sits far above anything a tool consumes (`bash` keeps ~30 KB), so legitimate output never meets it. It
+applies to v1.1 objects only: a v1.2 stream is read a frame at a time, so a streaming `bash` with
+huge output behaves as it does locally — a bounded tail and a truncation marker, not an error.
 
 The endpoint must accept request bodies as large as the files the agent writes (≈4/3 of the file
 size with `stdin_base64`).
@@ -2097,16 +2166,17 @@ tenant's session.
 Every tool takes its world from the backend (`FsBackend::world()`), asked **per call** rather than
 captured, because `ExecCell` can be re-pointed by `set_exec_endpoint` with no registry rebuild.
 
-| Decision                                                                       | Local                                          | Remote                                                                                    |
-| ------------------------------------------------------------------------------ | ---------------------------------------------- | ----------------------------------------------------------------------------------------- |
-| `~` in a path (`read`/`write`/`edit`/`ls`/`grep`/`find`) and in `bash`'s `cwd` | this process's `$HOME`                         | the target's home, or left as `~` when it isn't known                                     |
-| a relative path with no tool root (`write_key`)                                | joined onto the process cwd                    | left relative — the replica's cwd is not the target's                                     |
-| `write`/`edit`'s same-file key                                                 | `canonicalize` (unifies symlink aliases)       | lexical only                                                                              |
-| `bash`'s `cwd` pre-check                                                       | `is_dir`, with pi's two messages               | none; the remote shell reports a bad `cwd`                                                |
-| `bash`'s shell                                                                 | `/bin/bash`, else `bash` on `$PATH`, else `sh` | `ToolConfig::remote_shell`, else `sh`                                                     |
-| `bash`'s oversized output                                                      | spilled to a temp file, `Full output: <path>`  | no file; the marker says to redirect into the sandbox and read that                       |
-| `rg --no-require-git` (`ShellFs`)                                              | `.git` in an ancestor, host `stat`s            | the same walk run **on the target**, cached per root                                      |
-| `format_path`'s "is the root a directory"                                      | —                                              | the caller's answer: `find`'s `stat`, or, for `grep`, whether its first hit _is_ the root |
+| Decision                                                                       | Local                                          | Remote                                                                                      |
+| ------------------------------------------------------------------------------ | ---------------------------------------------- | ------------------------------------------------------------------------------------------- |
+| `~` in a path (`read`/`write`/`edit`/`ls`/`grep`/`find`) and in `bash`'s `cwd` | this process's `$HOME`                         | the target's home, or left as `~` when it isn't known                                       |
+| a relative path with no tool root (`write_key`)                                | joined onto the process cwd                    | left relative — the replica's cwd is not the target's                                       |
+| `write`/`edit`'s same-file key                                                 | `canonicalize` (unifies symlink aliases)       | lexical only                                                                                |
+| `bash`'s `cwd` pre-check                                                       | `is_dir`, with pi's two messages               | none; the remote shell reports a bad `cwd`                                                  |
+| `bash`'s shell                                                                 | `/bin/bash`, else `bash` on `$PATH`, else `sh` | `ToolConfig::remote_shell`, else `sh`                                                       |
+| `bash`'s oversized output                                                      | spilled to a temp file, `Full output: <path>`  | no file; the marker says to redirect into the sandbox and read that                         |
+| `bash`'s idle yield, progress and jobs                                         | always                                         | when the runner's output is live (v1.2 stream, template); over v1.1 the call waits for exit |
+| `rg --no-require-git` (`ShellFs`)                                              | `.git` in an ancestor, host `stat`s            | the same walk run **on the target**, cached per root                                        |
+| `format_path`'s "is the root a directory"                                      | —                                              | the caller's answer: `find`'s `stat`, or, for `grep`, whether its first hit _is_ the root   |
 
 Two of those deserve their reasoning spelled out.
 
@@ -2329,16 +2399,25 @@ and `serve`'s own `bash`/`abort_bash` RPC commands reuse `RealRunner` directly, 
   - **The window grows per report** (`idle_window`, `IDLE_GROWTH` = 4): 60 s for the call that started
     the command, then 240 s, then 960 s for each wait. With a fixed 60 s window a legitimately silent
     100 s build was reported twice (4 turns against 2) and a 204 s one would be reported 3–4 times.
-  - **Never on a remote world**: a request/response exec endpoint streams nothing, so its silence says
-    nothing about the command; there every call waits for exit, as before.
+  - **Remote worlds yield when their output is live.** A runner promises live output by reporting a
+    `Kill` through `run_streaming_tracked` (see "Streaming (v1.2) and killing remote commands"):
+    `RealRunner`, `HttpExecRunner` once its endpoint has passed the v1.2 probe, and `TemplateRunner`
+    all do, and from then on a remote job yields, streams progress and is killed exactly as a local
+    one. A v1.1 endpoint streams nothing, so its silence says nothing about the command; there the
+    call still waits for exit (`idle_window` is `None` while `remote && !live`), and `bash`'s
+    description names that exception rather than promising a job that never comes. `track` wakes
+    the waiting call, which computed its idle deadline before the output was known to be live.
   - **`serve`'s host `bash` command waits for exit** (`ToolConfig::bash_waits_for_exit`,
     `Bash::with_idle_yield(None)`): it has no `bash_job` to come back with.
   - A `Job` owns its task and its process group. Dropping it kills the command: a call whose future
     is dropped, a cancelled call, or a dropped tool (a registry rebuild) leaves nothing behind. At
     most `MAX_PARKED_JOBS` (4) stay parked; parking another kills the oldest, because live probes
     showed models moving on without waiting on or killing a job. `kill_live_jobs` runs in
-    `finish_process_cleanup` before every `process::exit`, which runs no destructors. The spawned
-    pgid reaches `bash` through `CommandRunner::run_streaming_tracked`.
+    `finish_process_cleanup` before every `process::exit`, which runs no destructors. How to stop the
+    command reaches `bash` through `CommandRunner::run_streaming_tracked` as a `tools::exec::Kill`:
+    a local process group, or a runner's blocking hook (close a v1.2 stream, or kill through a
+    template's transport). `bash_job` kill, `Job`'s `Drop` and `kill_live_jobs` all call
+    `Kill::kill`, so local and remote jobs die by the same three paths.
   - Evidence (seeded-hang sqlparse, an injected infinite loop; Haiku and Luna): hang wall time
     fell from a median 2,096 s to 480 s on Haiku (−77%, 6/6 fixed in both arms) and from 1,952 s to
     396 s on Luna (−80%; 11/12 fixed against 6/6, the miss a run that killed the hang and then spent
