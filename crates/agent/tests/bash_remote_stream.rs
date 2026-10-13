@@ -86,7 +86,19 @@ async fn waiting_on_a_remote_job_returns_its_later_output_and_exit() {
     .unwrap();
     let n = job_number(&out).unwrap_or_else(|| panic!("no job in: {out}"));
     assert!(out.contains("first") && !out.contains("second"), "{out}");
-    let rest = call(&jobs, json!({ "job": n })).await.unwrap_err();
+    // Every wait gets one idle window of silence; the one that sees the exit reports it.
+    let mut waits = 0;
+    let rest = loop {
+        match call(&jobs, json!({ "job": n })).await {
+            Ok(still) if waits < 10 => {
+                assert!(still.contains("is still running"), "{still}");
+                assert!(!still.contains("first"), "{still}");
+                waits += 1;
+            }
+            Ok(still) => panic!("never exited: {still}"),
+            Err(rest) => break rest,
+        }
+    };
     assert!(rest.contains("second"), "{rest}");
     assert!(
         !rest.contains("first"),

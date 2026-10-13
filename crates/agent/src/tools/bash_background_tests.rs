@@ -84,15 +84,20 @@ async fn a_background_start_returns_after_the_settle_with_its_first_output() {
     );
     assert!(out.contains("serving on 8080"), "first output: {out}");
     assert!(
-        out.contains("Running in the background as job 1 (it is stopped when the run ends)."),
+        out.contains(
+            "Running in the background as job 1 (it is stopped for you when the run ends)."
+        ),
         "{out}"
     );
     assert!(
         out.contains("You will be told when it exits, so do not poll it or sleep."),
         "{out}"
     );
+    // Peek, wait (only for something that finishes), stop: each spelled out.
     assert!(
-        out.contains(r#"bash_job {"job": 1, "kill": true} stops it."#),
+        out.contains(
+            r#"To see what it has printed since, bash_job {"job": 1, "timeout_ms": 0}; to wait for it to finish (a build or a test run, not a server), bash_job {"job": 1}; to stop it, bash_job {"job": 1, "kill": true}."#
+        ),
         "{out}"
     );
     let carry = bash.jobs().carry().unwrap();
@@ -323,16 +328,19 @@ async fn the_reminder_says_what_ending_does_to_a_background_job_per_host() {
         "{run}"
     );
     assert!(
-        run.ends_with("If you end your turn now: jobs 1, 2 are stopped."),
+        run.contains(
+            "If you end your turn now, jobs 1, 2 are stopped for you (no need to kill them). If \
+             you still need a job's result"
+        ),
         "{run}"
     );
     bash.jobs().set_policy(EndPolicy::KeepRunning);
     ok(bash.run(background("sleep 73")).await);
     let serve = bash.jobs().stop_reminder().expect("a new job");
     assert!(
-        serve.ends_with(
-            "If you end your turn now: job 1 is stopped; jobs 2, 3 keep running, and you will be \
-             told when each exits."
+        serve.contains(
+            "If you end your turn now, job 1 is stopped for you (no need to kill it); jobs 2, 3 \
+             keep running and you will be told when each exits"
         ),
         "{serve}"
     );
@@ -358,7 +366,7 @@ async fn a_wait_on_a_background_job_that_yields_keeps_it_a_background_job() {
     let waited = ok(jobs.run(json!({ "job": 1 })).await);
     assert!(waited.contains("No output for"), "{waited}");
     assert!(
-        waited.contains("s so far; it is stopped when the run ends)"),
+        waited.contains("s so far; it is stopped for you when the run ends)"),
         "its lifetime is its kind's, not a yielded job's: {waited}"
     );
     // Still intended: the end of the turn keeps it.
@@ -435,4 +443,134 @@ async fn a_runner_that_cannot_track_jobs_refuses_background_without_running_it()
         !runner.0.load(std::sync::atomic::Ordering::Relaxed),
         "nothing ran"
     );
+}
+
+// `bash_job`'s `timeout_ms`: the same meaning as on `bash` (when this call returns; the job keeps
+// running), plus 0, a peek. The background A/B's waits on servers and watchers wanted the latest
+// output, not an exit, and each blocked for the whole silence window.
+
+#[tokio::test]
+async fn a_peek_returns_at_once_with_what_the_job_printed_since_the_last_report() {
+    let (bash, jobs) = tools(200, 30_000);
+    let out = ok(bash
+        .run(background(
+            "echo warming; sleep 0.3; echo ready on 8080; sleep 77",
+        ))
+        .await);
+    assert!(out.contains("warming"), "{out}");
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let started = Instant::now();
+    // Luna fills every field: `kill: false` rides along.
+    let peek = ok(jobs
+        .run(json!({ "job": 1, "kill": false, "timeout_ms": 0 }))
+        .await);
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "a peek does not wait: {:?}",
+        started.elapsed()
+    );
+    assert!(peek.starts_with("ready on 8080\n"), "{peek}");
+    assert!(!peek.contains("warming"), "already reported: {peek}");
+    // Nothing to explain about why it returned: that it still runs, and how to stop it.
+    assert!(peek.contains("\n\nJob 1 is still running ("), "{peek}");
+    assert!(
+        peek.ends_with(
+            "it is stopped for you when the run ends). You will be told when it exits, so do not \
+             poll it. bash_job {\"job\": 1, \"kill\": true} stops it."
+        ),
+        "{peek}"
+    );
+    // A second peek has nothing new; the job is still in the table, still background.
+    let again = ok(jobs.run(json!({ "job": 1, "timeout_ms": 0 })).await);
+    assert!(again.starts_with("Job 1 is still running"), "{again}");
+    assert!(bash.jobs().end_turn().is_empty(), "still an intended job");
+    ok(jobs.run(json!({ "job": 1, "kill": true })).await);
+}
+
+#[tokio::test]
+async fn timeout_ms_bounds_a_wait_on_a_job_that_never_exits() {
+    // A 30 s silence window: only the timeout can end this wait.
+    let tmp = tempfile::tempdir().unwrap();
+    let pidfile = tmp.path().join("pid");
+    let (bash, jobs) = tools(200, 30_000);
+    ok(bash
+        .run(background(&format!(
+            "sh -c 'echo $$ > {}; exec sleep 78'",
+            pidfile.display()
+        )))
+        .await);
+    let started = Instant::now();
+    let waited = ok(jobs.run(json!({ "job": 1, "timeout_ms": 400 })).await);
+    let took = started.elapsed();
+    assert!(
+        took >= Duration::from_millis(400) && took < Duration::from_secs(3),
+        "returned at the timeout: {took:?}"
+    );
+    assert!(
+        waited.starts_with("Returned after your timeout_ms of 400 ms. Job 1 is still running"),
+        "{waited}"
+    );
+    let pid = read_pid(&pidfile).await;
+    assert!(alive(pid), "a timeout never stops the job");
+    ok(jobs
+        .run(json!({ "job": 1, "kill": true, "timeout_ms": 0 }))
+        .await);
+    assert!(
+        wait_dead(pid).await,
+        "kill wins over a timeout_ms sent with it"
+    );
+}
+
+#[tokio::test]
+async fn a_wait_with_timeout_ms_still_returns_the_final_result_of_a_job_that_exits_first() {
+    let (bash, jobs) = tools(200, 30_000);
+    ok(bash
+        .run(background("echo up; sleep 0.6; echo built; exit 4"))
+        .await);
+    let started = Instant::now();
+    let err = jobs
+        .run(json!({ "job": 1, "timeout_ms": 20_000 }))
+        .await
+        .unwrap_err();
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "returned at the exit, not the timeout"
+    );
+    let ToolError::Execution(done) = err else {
+        panic!("a non-zero exit is an execution error: {err:?}")
+    };
+    assert!(done.contains("built"), "{done}");
+    assert!(done.contains("Command exited with code 4"), "{done}");
+    // A peek that reaches an ended job returns its final result too.
+    ok(bash.run(background("echo a; sleep 0.3; echo b")).await);
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let peek = ok(jobs.run(json!({ "job": 2, "timeout_ms": 0 })).await);
+    assert_eq!(peek, "b\n", "the final result, nothing about a job");
+}
+
+#[tokio::test]
+async fn a_bad_bash_job_timeout_ms_is_refused_before_the_job_is_touched() {
+    let (bash, jobs) = tools(200, 30_000);
+    ok(bash.run(background("sleep 79")).await);
+    for (bad, says) in [
+        (json!(-1), "must be a non-negative integer"),
+        (json!(1.5), "must be a non-negative integer"),
+        (json!("soon"), "must be a non-negative integer"),
+        (json!(2_147_483_648_u64), "must be at most 2147483647"),
+    ] {
+        let err = jobs
+            .run(json!({ "job": 1, "timeout_ms": bad }))
+            .await
+            .unwrap_err();
+        let ToolError::InvalidInput(msg) = err else {
+            panic!("a refusal the model must act on: {err:?}")
+        };
+        assert!(msg.contains(says), "{msg}");
+    }
+    let carry = bash.jobs().carry().unwrap();
+    assert!(
+        carry.contains("- job 1: `sleep 79` (running"),
+        "a refused call leaves the job running: {carry}"
+    );
+    ok(jobs.run(json!({ "job": 1, "kill": true })).await);
 }

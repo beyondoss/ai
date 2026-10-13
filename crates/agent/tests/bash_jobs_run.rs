@@ -147,7 +147,8 @@ fn ending_with_a_running_job_reminds_once_then_stops_it_and_records_which() {
     assert!(reminded.contains("[background jobs]"), "{reminded}");
     assert!(reminded.contains("- job 1: `setsid sh -c"), "{reminded}");
     assert!(
-        reminded.contains("If you end your turn now: job 1 is stopped."),
+        reminded
+            .contains("If you end your turn now, job 1 is stopped for you (no need to kill it)."),
         "{reminded}"
     );
     let reasons: Vec<&Value> = events

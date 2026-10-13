@@ -72,7 +72,38 @@ fn bash_yields_after_sixty_quiet_seconds_and_bash_job_rides_with_it() {
     crate::tools::apply_filter(&mut excluded, None, Some(&["bash".to_string()]), false);
     assert!(!has_job(&excluded));
     let (_, jobs) = detaching(60_000);
-    assert_eq!(jobs.input_schema()["required"], json!(["job"]));
+    let schema = jobs.input_schema();
+    assert_eq!(schema["required"], json!(["job"]));
+    // `timeout_ms` on both tools, in the same words, with this instance's defaults.
+    let job_timeout = schema["properties"]["timeout_ms"]["description"]
+        .as_str()
+        .unwrap();
+    assert!(
+        job_timeout.starts_with(
+            "How long to wait, in milliseconds, before returning with the output so far; 0 \
+             returns at once."
+        ),
+        "{job_timeout}"
+    );
+    assert!(
+        job_timeout.ends_with("after 60 s without output, or after 5 minutes."),
+        "{job_timeout}"
+    );
+    let bash_timeout = bash.input_schema()["properties"]["timeout_ms"]["description"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        bash_timeout.starts_with(
+            "How long to wait, in milliseconds, before returning with the output so far."
+        ) && bash_timeout.ends_with("after 60 s without output, or after 10 minutes."),
+        "{bash_timeout}"
+    );
+    let desc = jobs.description();
+    assert!(
+        desc.contains("never for a server or watcher to exit"),
+        "{desc}"
+    );
 }
 
 #[tokio::test]
@@ -159,19 +190,32 @@ async fn waiting_on_a_job_reports_only_the_new_output_and_its_exit() {
 }
 
 #[tokio::test]
-async fn each_wait_on_a_silent_job_allows_a_longer_silence() {
-    // A legitimately silent build: reported once after the first 0.5 s window, then one wait (a 2 s
-    // window) covers the rest. A fixed 0.5 s window would report it three more times.
+async fn every_wait_on_a_silent_job_gets_the_same_silence_window() {
+    // No growth: with exits pushed, a wait returning early costs a turn, and a grown window cost a
+    // 240 s wait on a watcher in the background A/B. (It used to be 0.5 s, then 2 s, here.)
     let (bash, jobs) = detaching(500);
-    let first = text(
-        bash.run(json!({ "command": "sleep 1.8; echo built" }))
-            .await,
+    let first = text(bash.run(json!({ "command": "sleep 30" })).await);
+    assert!(first.contains("No output for"), "{first}");
+    assert!(
+        first.contains(r#"if you need its result, wait for it with bash_job {"job": 1}."#),
+        "{first}"
     );
-    assert!(first.contains("job 1"), "{first}");
-    assert!(first.contains("after 2 s without new output"), "{first}");
-    let done = text(jobs.run(json!({ "job": 1 })).await);
-    assert!(done.contains("built"), "one wait covers the build: {done}");
-    assert!(!done.contains("still running"), "{done}");
+    for _ in 0..2 {
+        let started = Instant::now();
+        let waited = text(jobs.run(json!({ "job": 1 })).await);
+        let took = started.elapsed();
+        assert!(
+            took >= Duration::from_millis(500) && took < Duration::from_millis(1_500),
+            "one window, not a grown one: {took:?}"
+        );
+        // A wait's report is short: the model was told how to use the job when it started.
+        assert!(
+            waited.starts_with("No output for 0 s. Job 1 is still running ("),
+            "{waited}"
+        );
+        assert!(!waited.contains("pkill"), "{waited}");
+    }
+    text(jobs.run(json!({ "job": 1, "kill": true })).await);
 }
 
 #[tokio::test]

@@ -68,7 +68,7 @@ fn a_background_job_outlives_the_turn_and_its_exit_wakes_the_session() {
         );
         assert!(
             recorded[2]
-                .contains("If you end your turn now: job 1 keeps running, and you will be told"),
+                .contains("If you end your turn now, job 1 keeps running and you will be told"),
             "the serve reminder: {}",
             recorded[2]
         );
@@ -93,6 +93,69 @@ fn a_background_job_outlives_the_turn_and_its_exit_wakes_the_session() {
         "the notice is the turn's input"
     );
     drop(recorded);
+    close(child, stdin);
+}
+
+#[test]
+fn after_the_one_reminder_ending_again_applies_each_kinds_rule() {
+    // Reminded once per run: a job started after the reminder does not earn another, and the second
+    // stop ends the prompt — the yielded job stopped with the turn, the background one kept.
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+    let (base, bodies) = spawn_model_server(vec![
+        turn_tool_use(
+            "t1",
+            "bash",
+            &json!({ "command": "echo serving; sleep 96", "run_in_background": true }).to_string(),
+        ),
+        turn_text("started it"),
+        // The reminder's reply: a foreground command that outlives its timeout_ms (yielded).
+        turn_tool_use(
+            "t2",
+            "bash",
+            &json!({ "command": "echo checking; sleep 97", "timeout_ms": 300 }).to_string(),
+        ),
+        turn_text("done"),
+    ]);
+    let mut child = serve_cmd(BIN, &base, &session_file).spawn_guarded();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = common::child_frames(&mut child);
+
+    send(
+        &mut stdin,
+        json!({ "type": "prompt", "id": "p1", "message": "start it" }),
+    );
+    let frames = read_until_response(&mut stdout, "prompt");
+    assert_eq!(frames.last().unwrap()["success"], true);
+    {
+        let recorded = bodies.lock().unwrap();
+        assert_eq!(
+            recorded.len(),
+            4,
+            "one reminder; the second stop ends the prompt"
+        );
+        assert_eq!(
+            recorded[3]
+                .matches("You are ending your turn with jobs")
+                .count(),
+            1
+        );
+    }
+    let stopped = frames
+        .iter()
+        .find(|f| f["type"] == "bash_jobs_stopped")
+        .expect("the yielded job stops with the turn");
+    let jobs: Vec<(u64, &str)> = stopped["jobs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|j| (j["job"].as_u64().unwrap(), j["kind"].as_str().unwrap()))
+        .collect();
+    assert_eq!(
+        jobs,
+        vec![(2, "yielded")],
+        "the background job keeps running"
+    );
     close(child, stdin);
 }
 

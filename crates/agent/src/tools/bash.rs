@@ -40,6 +40,32 @@ use super::output::{OutputSnapshot, TruncatedBy, format_output};
 /// so beats silently accepting it.
 const MAX_TIMEOUT_MS: u64 = 2_147_483_647;
 
+/// The model's `timeout_ms`, the same field on `bash` and `bash_job`: how long the call waits before
+/// returning with the output so far. `None` when absent ("no timeout of your own": the call returns
+/// on exit, silence or its ceiling). A present one must be an integer from `min` to
+/// [`MAX_TIMEOUT_MS`]; a negative value or a fraction is the caller mistake it looks like, and saying
+/// so beats coercing it.
+fn parse_timeout_ms(input: &Value, min: u64) -> Result<Option<u64>, ToolError> {
+    let v = match input.get("timeout_ms") {
+        None | Some(Value::Null) => return Ok(None),
+        Some(v) => v,
+    };
+    match v.as_u64() {
+        Some(ms) if (min..=MAX_TIMEOUT_MS).contains(&ms) => Ok(Some(ms)),
+        Some(ms) if ms > MAX_TIMEOUT_MS => Err(ToolError::InvalidInput(format!(
+            "`timeout_ms` must be at most {MAX_TIMEOUT_MS}, got {ms}"
+        ))),
+        _ => Err(ToolError::InvalidInput(format!(
+            "`timeout_ms` must be {}, got {v}",
+            if min == 0 {
+                "a non-negative integer"
+            } else {
+                "a positive integer"
+            }
+        ))),
+    }
+}
+
 /// How long a `run_in_background` call waits before returning with the job number: long enough that
 /// a command which dies at once — a bad flag, a port in use, a missing script — reports its exit in
 /// this result instead of as a notice a turn later; it returns sooner when the command exits. Measured
@@ -104,10 +130,11 @@ pub const IDLE_YIELD: Duration = Duration::from_secs(60);
 /// test suite that prints as it goes still finishes inside the call that started it.
 pub const OUTPUT_CEILING: Duration = Duration::from_secs(600);
 
-/// The longest one `bash_job` wait lasts, quiet or not, before it reports the job still running.
-/// 5 minutes is above the 3 min 44 s a clean release build of this repo takes, so the one wait that
-/// follows a build's first yield (at 60 s of silence) covers the rest of it; it also caps the growing
-/// idle window (60 s, 240 s, then 960 s) so no wait blocks the model for a quarter of an hour.
+/// The longest one `bash_job` wait lasts, quiet or not, before it reports the job still running: a
+/// job that never goes quiet (a server logging requests) cannot hold a wait past it. 5 minutes is
+/// above the 3 min 44 s a clean release build of this repo takes, so a build that prints as it goes
+/// finishes inside one wait. Silence still ends a wait at [`IDLE_YIELD`], and the model's own
+/// `timeout_ms` sooner.
 pub const WAIT_CEILING: Duration = Duration::from_secs(300);
 
 pub struct Bash {
@@ -190,8 +217,9 @@ fn describe(idle_yield: Option<Duration>) -> String {
              so does a process a command leaves running (`cmd &`). Set `run_in_background: true` for \
              a command you don't need to wait on (a server, a watcher): the call returns at once with \
              a job number and you are notified when it exits; don't poll or sleep. You are told when \
-             every job exits, without asking. Call `bash_job` with the number to wait for it, or with \
-             `kill: true` to stop it. (A remote sandbox that cannot stream output as it happens is the \
+             every job exits, without asking. Use `bash_job` with the number to see what a job has \
+             printed, to wait for one whose result you need, or to stop one. (A remote sandbox that \
+             cannot stream output as it happens is the \
              exception: there the call waits for the command to exit, and `run_in_background` is \
              unavailable.)",
             idle.as_secs(),
@@ -399,26 +427,9 @@ impl Bash {
                 return Err(ToolError::InvalidInput(msg));
             }
         }
-        // A present `timeout_ms` must be a positive integer no larger than `MAX_TIMEOUT_MS` (pi's
-        // `resolveTimeoutMs` bounds): 0 would return before the command had a chance to print
-        // anything, and a negative value is the obvious caller mistake it looks like. Missing means
-        // "no timeout of your own": the call returns on exit, silence or the output ceiling.
-        let timeout_ms = match input.get("timeout_ms") {
-            None | Some(Value::Null) => None,
-            Some(v) => match v.as_u64() {
-                Some(ms) if ms > 0 && ms <= MAX_TIMEOUT_MS => Some(ms),
-                Some(ms) if ms > MAX_TIMEOUT_MS => {
-                    return Err(ToolError::InvalidInput(format!(
-                        "`timeout_ms` must be at most {MAX_TIMEOUT_MS}, got {ms}"
-                    )));
-                }
-                _ => {
-                    return Err(ToolError::InvalidInput(format!(
-                        "`timeout_ms` must be a positive integer, got {v}"
-                    )));
-                }
-            },
-        };
+        // A present `timeout_ms` must be a positive integer (pi's `resolveTimeoutMs` bounds): 0 would
+        // return before the command had a chance to print anything.
+        let timeout_ms = parse_timeout_ms(&input, 1)?;
         let start = match input.get("run_in_background") {
             None | Some(Value::Null) | Some(Value::Bool(false)) => Start::Foreground(timeout_ms),
             Some(Value::Bool(true)) => Start::Background,
@@ -529,7 +540,7 @@ impl Bash {
             shared: shared.clone(),
             handle,
             started: Instant::now(),
-            reports: 0,
+            reminded: false,
             command: truncate_command(command, COMMAND_CHARS),
         };
         let started = job.started;
@@ -629,11 +640,12 @@ impl Bash {
         }
     }
 
-    /// When this attach hands control back. A foreground attach yields after the idle window of
-    /// silence (measured from the later of the last output and this attach, so a re-attached job
-    /// always gets a full window), at its ceiling, or at the model's `timeout_ms`, whichever is
-    /// first — and never, when the command's silence says nothing (see [`Self::idle_window`]). A
-    /// background start returns at its settle.
+    /// When this attach hands control back. A foreground attach (the call that starts a command, or
+    /// a `bash_job` wait) yields after the idle window of silence (measured from the later of the
+    /// last output and this attach, so a re-attached job always gets a full window), at its
+    /// ceiling, or at the model's `timeout_ms` (0: at once), whichever is first — and never, when
+    /// the command's silence says nothing (see [`Self::idle_window`]). A background start returns
+    /// at its settle.
     fn yield_deadline(&self, job: &Job, attached: Instant, hold: Hold) -> Instant {
         let (ceiling, timeout_ms) = match hold {
             Hold::Settle(settle) => return attached + settle,
@@ -654,11 +666,13 @@ impl Bash {
         }
     }
 
-    /// The silence this attach allows before reporting: [`Self::idle_yield`] for the call that
-    /// started the command, then [`IDLE_GROWTH`] times longer for each report since. A hung command
-    /// is reported after one window and costs one longer wait before the model kills it; a
-    /// legitimately silent build is reported once, and the wait that follows covers it. With a fixed
-    /// window, a silent 100 s build was reported twice and a 204 s one would be reported 3–4 times.
+    /// The silence any attach allows before reporting: [`Self::idle_yield`], the same for the call
+    /// that started the command and for every wait after it. It used to grow ×4 per report (60 s,
+    /// 240 s, 960 s), so a silent build was reported once rather than every minute; that predates
+    /// finish notices. With the exit pushed to the model, an early return costs one model turn
+    /// (median 2.5 s on Luna), while a long window costs its whole length on a job that never exits
+    /// — in the background A/B the one grown window was a 240 s wait on a watcher. See "`bash` and
+    /// hung commands" in `ARCHITECTURE.md`.
     ///
     /// `None` (never yield) when the command runs somewhere this host sees no output from as it
     /// happens: a v1.1 request/response exec endpoint streams nothing, so its silence says nothing
@@ -668,8 +682,7 @@ impl Bash {
         if job.shared.remote && !job.shared.live.load(std::sync::atomic::Ordering::Relaxed) {
             return None;
         }
-        let scale = IDLE_GROWTH.saturating_pow(job.reports);
-        self.idle_yield.map(|d| d.saturating_mul(scale))
+        self.idle_yield
     }
 
     /// Why this attach should return now, if it should. The model's own `timeout_ms` is named first
@@ -697,37 +710,41 @@ impl Bash {
     }
 
     /// Park `job` in the table and tell the model what it has so far, why the call returned, and
-    /// how to come back to it.
+    /// how to come back to it. A job that already has a number is a `bash_job` wait returning: the
+    /// model was told how to use it when it started, so the report is short.
     async fn detach(&self, mut job: Job, reason: Yield) -> Result<ToolOutput, ToolError> {
         let why = match reason {
             Yield::Settled => return self.start_background(job).await,
-            Yield::Quiet(quiet) => format!("No output for {} s.", quiet.as_secs()),
+            Yield::Quiet(quiet) => format!("No output for {} s. ", quiet.as_secs()),
             Yield::Ceiling(waited) => format!(
-                "Still printing after {} s, so this call returned with the output so far.",
+                "Still printing after {} s, so this call returned with the output so far. ",
                 waited.as_secs()
             ),
-            Yield::Timeout(ms) => format!("Returned after your timeout_ms of {ms} ms."),
+            // A peek: nothing to explain.
+            Yield::Timeout(0) => String::new(),
+            Yield::Timeout(ms) => format!("Returned after your timeout_ms of {ms} ms. "),
         };
+        let reattached = job.id.is_some();
         let id = self.jobs.assign_id(&mut job);
         let snap = job.shared.take_segment();
         let text = clean(format_output(&snap, ""));
         let running = job.started.elapsed().as_secs();
-        job.reports = job.reports.saturating_add(1);
-        let wait = match self.idle_window(&job) {
-            Some(next) => format!(
-                " A wait returns when it exits, after {} s without new output, or after {} s.",
-                next.as_secs(),
-                self.wait_ceiling.as_secs()
-            ),
-            None => String::new(),
+        let lifetime = self.jobs.lifetime(job.kind);
+        let status = if reattached {
+            format!(
+                "{why}Job {id} is still running ({running} s so far; {lifetime}). You will be told \
+                 when it exits, so do not poll it. bash_job {{\"job\": {id}, \"kill\": true}} stops \
+                 it."
+            )
+        } else {
+            format!(
+                "{why}The command is still running as job {id} ({running} s so far; {lifetime}). \
+                 You will be told when it exits, so do not poll it or sleep: keep working, or, if \
+                 you need its result, wait for it with bash_job {{\"job\": {id}}}. bash_job \
+                 {{\"job\": {id}, \"kill\": true}} stops it (not `pkill`, which can match unrelated \
+                 processes)."
+            )
         };
-        let status = format!(
-            "{why} The command is still running as job {id} ({running} s so far; {}). You will be \
-             told when it exits, so do not poll it or sleep: keep working, or wait for it with \
-             bash_job {{\"job\": {id}}}.{wait} bash_job {{\"job\": {id}, \"kill\": true}} stops it \
-             (not `pkill`, which can match unrelated processes).",
-            self.jobs.lifetime(job.kind)
-        );
         let status = match self.jobs.park(job) {
             // Dropped at the end of this arm, outside the table lock; dropping kills it.
             Some((old, _evicted)) => format!(
@@ -749,10 +766,15 @@ impl Bash {
         match self.jobs.park_intended(job) {
             Ok(id) => Ok(append_status(
                 &text,
+                // Three uses, each spelled out: a server's or watcher's new output is a peek, not
+                // a wait (it never exits; waiting on one blocked for the whole silence window in
+                // the A/B), and only a command that finishes is worth waiting for.
                 &format!(
                     "Running in the background as job {id} ({lifetime}). You will be told when it \
-                     exits, so do not poll it or sleep. bash_job {{\"job\": {id}}} waits for it; \
-                     bash_job {{\"job\": {id}, \"kill\": true}} stops it."
+                     exits, so do not poll it or sleep. To see what it has printed since, bash_job \
+                     {{\"job\": {id}, \"timeout_ms\": 0}}; to wait for it to finish (a build or a \
+                     test run, not a server), bash_job {{\"job\": {id}}}; to stop it, bash_job \
+                     {{\"job\": {id}, \"kill\": true}}."
                 ),
             )
             .into()),
@@ -866,7 +888,8 @@ impl Bash {
     }
 
     /// `bash_job`'s body: `{"job": N}` waits on job N (or returns its result, if it already
-    /// ended), `{"job": N, "kill": true}` stops it.
+    /// ended) — for at most `timeout_ms`, if given (0: a peek) — and `{"job": N, "kill": true}`
+    /// stops it.
     async fn resume_job(
         &self,
         job: &Value,
@@ -879,6 +902,11 @@ impl Bash {
             .ok_or_else(|| {
                 ToolError::InvalidInput(format!("`job` must be a job number, got {job}"))
             })?;
+        // Checked before the job leaves the table: a bad input must not drop (and so kill) it.
+        // 0 is allowed here, unlike on `bash`: a peek at a job that is already running is the
+        // cheap way to see a server's latest output, where on `bash` 0 would return before the
+        // command could print anything.
+        let timeout_ms = parse_timeout_ms(input, 0)?;
         let Some(mut job) = self.jobs.take(id) else {
             return Err(ToolError::InvalidInput(format!(
                 "no job {id}: it was already reported, was stopped, or never existed (jobs do not \
@@ -888,7 +916,7 @@ impl Bash {
         if input.get("kill").and_then(Value::as_bool) != Some(true) || job.shared.ended() {
             let hold = Hold::Foreground {
                 ceiling: self.wait_ceiling,
-                timeout_ms: None,
+                timeout_ms,
             };
             return self.attach(job, progress, hold).await;
         }
@@ -968,11 +996,6 @@ impl Drop for FinishOnDrop {
         }
     }
 }
-
-/// How much longer each wait on a job may sit silent than the last report's window (see
-/// [`Bash::idle_window`]): 60 s, then 240 s, then 960 s (a wait is still capped at
-/// [`WAIT_CEILING`]).
-const IDLE_GROWTH: u32 = 4;
 
 pub use super::bash_jobs::kill_live_jobs;
 
@@ -1137,19 +1160,33 @@ impl Tool for BashJob {
         JOB_TOOL
     }
     fn description(&self) -> &str {
-        "Wait for or stop a job: a command `bash` left running in the background (its result or a \
-         notice said \"job N\"). Waiting returns the output printed since the last report: the final \
-         result once the command exits (at once, if it already has), or another report if it is \
-         still running. `kill: true` stops it and every process it started instead. You are told \
-         when a job exits without calling this, so only call it to wait when you have nothing else \
-         to do."
+        "Wait for, look at, or stop a job: a command `bash` left running (its result or a notice \
+         said \"job N\"). Returns what the job printed since the last report: its final result once \
+         it exits (at once, if it already has), or the output so far if it is still running when \
+         the call returns. `timeout_ms: 0` returns at once: how to see a server's or watcher's \
+         latest output. `kill: true` stops the job and every process it started. You are told when \
+         a job exits without calling this: wait only for a job whose result you need, never for a \
+         server or watcher to exit, and do not poll."
     }
     fn input_schema(&self) -> Value {
+        // `timeout_ms` means what it means on `bash` (and says so in the same words), plus 0: a
+        // peek. The defaults it names are this instance's.
         json!({
             "type": "object",
             "properties": {
                 "job": { "type": "integer", "description": "The job number from the `bash` result." },
-                "kill": { "type": "boolean", "description": "Stop the job instead of waiting for it." }
+                "kill": { "type": "boolean", "description": "Stop the job instead of waiting for it." },
+                "timeout_ms": {
+                    "type": "integer",
+                    "description": format!(
+                        "How long to wait, in milliseconds, before returning with the output so \
+                         far; 0 returns at once. The job is not stopped: it keeps running and you \
+                         are told when it exits. Without it, the call returns when the job exits, \
+                         after {} s without output, or after {} minutes.",
+                        self.bash.idle_yield.unwrap_or(IDLE_YIELD).as_secs(),
+                        self.bash.wait_ceiling.as_secs() / 60,
+                    )
+                }
             },
             "required": ["job"]
         })

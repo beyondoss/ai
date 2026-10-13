@@ -6,6 +6,8 @@ Every count comes from the event stream, so a run from before background jobs ex
 `run_in_background`, `timeout_ms` that kills, no notices) is measured the same way as one after:
 
 - `bash_calls`, `bash_job_calls` (`job_waits`, `job_kills`): tool calls.
+- `job_wait_s`: seconds spent inside `bash_job` calls that were not kills (waits and peeks): the
+  model blocked on a job.
 - `run_in_background`: bash calls with `run_in_background: true`.
 - `shell_background`: bash calls that background with the shell instead: a trailing `&`, `nohup`,
   `setsid`, `disown`, `tmux`/`screen -d`.
@@ -46,8 +48,8 @@ _NOTICE = re.compile(r"^\[job (\d+) ", re.M)
 _YIELD = re.compile(r"^No output for \d+ s\.|\bStill printing after \d+ s\b", re.M)
 _DIED = re.compile(r"Address already in use|Traceback \(most recent call last\)")
 
-FIELDS = ("bash_calls", "bash_job_calls", "job_waits", "job_kills", "run_in_background", "shell_background",
-          "timeout_ms_set", "timeout_ms_short", "timeout_returns", "timeout_kills", "idle_yields", "notices",
+FIELDS = ("bash_calls", "bash_job_calls", "job_waits", "job_wait_s", "job_kills", "run_in_background",
+          "shell_background", "timeout_ms_set", "timeout_ms_short", "timeout_returns", "timeout_kills", "idle_yields", "notices",
           "reminders", "sleep_polls", "launches", "duplicate_launches", "jobs_stopped_at_end")
 
 
@@ -93,6 +95,8 @@ def metrics(events: list[dict], launches: tuple[str, ...] = ()) -> dict:
                     out["job_kills"] += 1
                 else:
                     out["job_waits"] += 1
+                    if isinstance(start.get("t"), (int, float)) and isinstance(ev.get("t"), (int, float)):
+                        out["job_wait_s"] = round(out["job_wait_s"] + ev["t"] - start["t"], 3)
                 if isinstance(job, int) and (inp.get("kill") or "exited with code" in res or "was killed" in res):
                     ended(job)
                 continue

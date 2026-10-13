@@ -92,7 +92,7 @@ async fn a_chatty_command_yields_at_the_ceiling() {
     // A wait on it returns at its own ceiling too, still running.
     let again = ok(jobs.run(json!({ "job": 1 })).await);
     assert!(
-        again.contains("Still printing after") && again.contains("job 1"),
+        again.contains("Still printing after") && again.contains("Job 1 is still running"),
         "{again}"
     );
     let killed = ok(jobs.run(json!({ "job": 1, "kill": true })).await);
@@ -299,7 +299,14 @@ async fn a_parked_job_that_exits_is_noticed_once_with_its_tail() {
 async fn a_job_reported_by_an_attached_wait_gets_no_notice() {
     let (bash, jobs) = tools(300, 60_000, 60_000);
     ok(bash.run(json!({ "command": "sleep 1; echo done" })).await);
-    let done = ok(jobs.run(json!({ "job": 1 })).await);
+    // Each wait may go quiet for one 300 ms window; the one that sees the exit reports it.
+    let mut done = String::new();
+    for _ in 0..20 {
+        done = ok(jobs.run(json!({ "job": 1 })).await);
+        if !done.contains("still running") {
+            break;
+        }
+    }
     assert!(done.contains("done"), "{done}");
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(bash.jobs().take_notices().is_none(), "no duplicate");
@@ -308,7 +315,8 @@ async fn a_job_reported_by_an_attached_wait_gets_no_notice() {
 
 #[tokio::test]
 async fn the_stop_reminder_lists_running_jobs_once_and_says_what_ending_does_per_kind() {
-    let (bash, _jobs) = tools(200, 60_000, 60_000);
+    use super::super::bash_jobs::REMINDER_ASK;
+    let (bash, jobs) = tools(200, 60_000, 60_000);
     ok(bash.run(json!({ "command": "sleep 72" })).await);
     let reminder = bash.jobs().stop_reminder().expect("a running job");
     assert!(reminder.starts_with("[background jobs]"), "{reminder}");
@@ -321,10 +329,22 @@ async fn the_stop_reminder_lists_running_jobs_once_and_says_what_ending_does_per
         "says why it is a job: {reminder}"
     );
     assert!(
-        reminder.ends_with("If you end your turn now: job 1 is stopped."),
+        reminder.ends_with(&format!(
+            "If you end your turn now, job 1 is stopped for you (no need to kill it). \
+             {REMINDER_ASK}"
+        )),
         "{reminder}"
     );
+    // No unconditional "wait for one": read as an instruction, it sent models to wait out a
+    // server's silence.
+    assert!(!reminder.contains("Wait for one"), "{reminder}");
     assert!(bash.jobs().stop_reminder().is_none(), "once per job");
+    // A wait takes the job out of the table and parks it again: that is not news.
+    ok(jobs.run(json!({ "job": 1, "timeout_ms": 0 })).await);
+    assert!(
+        bash.jobs().stop_reminder().is_none(),
+        "a re-parked job was already reminded"
+    );
     // A new job is news: the next reminder lists both, each kind with its own fate.
     ok(bash.run(json!({ "command": "sleep 73 & echo bg" })).await);
     let again = bash.jobs().stop_reminder().expect("a new job");
@@ -334,7 +354,10 @@ async fn the_stop_reminder_lists_running_jobs_once_and_says_what_ending_does_per
     );
     assert!(again.contains("left running by its command"), "{again}");
     assert!(
-        again.ends_with("If you end your turn now: jobs 1, 2 are stopped."),
+        again.ends_with(&format!(
+            "If you end your turn now, jobs 1, 2 are stopped for you (no need to kill them). \
+             {REMINDER_ASK}"
+        )),
         "{again}"
     );
     bash.jobs()
@@ -342,10 +365,11 @@ async fn the_stop_reminder_lists_running_jobs_once_and_says_what_ending_does_per
     ok(bash.run(json!({ "command": "sleep 74 & echo bg" })).await);
     let serve = bash.jobs().stop_reminder().expect("a new job");
     assert!(
-        serve.ends_with(
-            "If you end your turn now: job 1 is stopped; jobs 2, 3 keep running, and you will be \
-             told when each exits."
-        ),
+        serve.ends_with(&format!(
+            "If you end your turn now, job 1 is stopped for you (no need to kill it); jobs 2, 3 \
+             keep running and you will be told when each exits (bash_job {{\"job\": N, \"kill\": \
+             true}} stops one you no longer need). {REMINDER_ASK}"
+        )),
         "{serve}"
     );
     bash.jobs().stop_all();

@@ -315,14 +315,16 @@ def _bg_leftovers(scratch: Path) -> tuple[str, bool, str]:
     return "bg: leftovers", ok, f"left behind: {got[0]}; after cleaning up: {got[1]}"
 
 
-def _ev(i: int, name: str, inp: dict, result: str) -> list[dict]:
-    return [dict(kind="tool_start", id=str(i), name=name, input=inp),
-            dict(kind="tool_end", id=str(i), name=name, result=result, is_error=False)]
+def _ev(i: int, name: str, inp: dict, result: str, secs: float | None = None) -> list[dict]:
+    t = {} if secs is None else dict(t=100.0)
+    end = {} if secs is None else dict(t=100.0 + secs)
+    return [dict(kind="tool_start", id=str(i), name=name, input=inp, **t),
+            dict(kind="tool_end", id=str(i), name=name, result=result, is_error=False, **end)]
 
 
 SYNTHETIC = [
     *_ev(1, "bash", {"command": "python app/server.py > /tmp/s.log 2>&1", "run_in_background": True},
-         "(no output yet)\n\nRunning in the background as job 1 (it is stopped when the run ends)."),
+         "(no output yet)\n\nRunning in the background as job 1 (it is stopped for you when the run ends)."),
     *_ev(2, "bash", {"command": "sleep 2; curl -s localhost:9/items", "timeout_ms": 5000}, "{}"),
     *_ev(3, "bash", {"command": "python app/server.py &"},
          "The command exited but left a process (`python app/server.py`) running; it is tracked as job 2"),
@@ -334,16 +336,16 @@ SYNTHETIC = [
     *_ev(7, "bash", {"command": "python -m pytest -x", "timeout_ms": 600000}, "Command timed out after 600 seconds"),
     *_ev(8, "bash_job", {"job": 2, "kill": True}, "Job 2 killed after 3 s."),
     *_ev(9, "bash", {"command": "python app/server.py > /tmp/s2.log 2>&1", "run_in_background": True},
-         "Running in the background as job 4 (it is stopped when the run ends)."),
+         "Running in the background as job 4 (it is stopped for you when the run ends)."),
     *_ev(10, "bash", {"command": "pkill -f server.py"}, ""),
     *_ev(11, "bash", {"command": "nohup python app/server.py > /tmp/s3.log 2>&1 &"}, ""),
     *_ev(12, "bash", {"command": "while ! curl -s localhost:9/health; do sleep 1; done"},
          "No output for 60 s. The command is still running as job 5 (60 s so far)."),
-    *_ev(13, "bash_job", {"job": 3}, "[40/40] compiled\nBUILD OK\n\nCommand exited with code 0"),
+    *_ev(13, "bash_job", {"job": 3}, "[40/40] compiled\nBUILD OK\n\nCommand exited with code 0", secs=85.0),
     dict(kind="background", reason="still_running", text="[background jobs] You are ending your turn with jobs still running"),
     dict(kind="bash_jobs_stopped", jobs=[{"job": 4}, {"job": 5}]),
 ]
-SYNTHETIC_WANT = dict(bash_calls=11, bash_job_calls=2, job_waits=1, job_kills=1, run_in_background=2, shell_background=2,
+SYNTHETIC_WANT = dict(bash_calls=11, bash_job_calls=2, job_waits=1, job_wait_s=85.0, job_kills=1, run_in_background=2, shell_background=2,
                       timeout_ms_set=3, timeout_ms_short=2, timeout_returns=1, timeout_kills=1, idle_yields=1, notices=1,
                       reminders=1, sleep_polls=3, launches=5, duplicate_launches=1, jobs_stopped_at_end=2)
 
