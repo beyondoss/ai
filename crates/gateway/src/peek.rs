@@ -1036,11 +1036,49 @@ pub fn remove_items(
     items: &[(usize, usize)],
     drop: impl Fn(usize) -> bool,
 ) -> bool {
-    let (Some(&(_, end)), Some(last)) = (items.last(), items.len().checked_sub(1)) else {
+    let mut cuts = Vec::new();
+    item_cuts(items, drop, &mut cuts);
+    splice_out(body, &cuts);
+    !cuts.is_empty()
+}
+
+/// Remove every member whose key decodes to `key` from each object element of the array whose `[`
+/// is at `open` (an Anthropic `tools` list's per-tool fields), with the separators that keep each
+/// object valid JSON, in one pass over the body. Every other byte is untouched. `true` when
+/// anything was removed; `false`, untouched, for malformed JSON.
+pub fn remove_element_members(body: &mut Vec<u8>, open: usize, key: &str) -> bool {
+    let Some(elements) = array_elements(body, open) else {
         return false;
     };
+    let mut cuts = Vec::new();
+    for (start, _) in elements {
+        if body.get(start) != Some(&b'{') {
+            continue;
+        }
+        let Some(members) = object_members(body, start) else {
+            return false;
+        };
+        let spans: Vec<(usize, usize)> = members.iter().map(Member::span).collect();
+        item_cuts(
+            &spans,
+            |k| members.get(k).is_some_and(|m| m.key_is(body, key)),
+            &mut cuts,
+        );
+    }
+    splice_out(body, &cuts);
+    !cuts.is_empty()
+}
+
+/// The spans [`remove_items`] cuts for one container's items, appended to `cuts` in order.
+fn item_cuts(
+    items: &[(usize, usize)],
+    drop: impl Fn(usize) -> bool,
+    cuts: &mut Vec<(usize, usize)>,
+) {
+    let (Some(&(_, end)), Some(last)) = (items.last(), items.len().checked_sub(1)) else {
+        return;
+    };
     let last_kept = (0..=last).rev().find(|&k| !drop(k));
-    let mut cuts: Vec<(usize, usize)> = Vec::new();
     for (k, &(start, _)) in items.iter().enumerate() {
         if !drop(k) {
             continue;
@@ -1063,8 +1101,6 @@ pub fn remove_items(
             }
         }
     }
-    splice_out(body, &cuts);
-    !cuts.is_empty()
 }
 
 /// Cut every `(start, end)` span (ascending, disjoint, in bounds) out of `body` in one pass: each

@@ -2336,6 +2336,10 @@ const MANAGED_FORWARD_HEADERS: [&str; 8] = [
     "anthropic-beta",
 ];
 
+/// The beta that turned on fine-grained tool input streaming before each tool's
+/// `eager_input_streaming` field replaced it; kept only for a candidate that takes the field.
+const FINE_GRAINED_TOOL_STREAMING_BETA: &str = "fine-grained-tool-streaming-2025-05-14";
+
 /// `anthropic-beta` tokens a managed request may send on the pool key. Each changes how a request
 /// is parsed or streamed, and none changes what Anthropic charges per token or runs server-side
 /// tools the gateway does not meter. Anything else is dropped: `context-1m-*` switches on premium
@@ -2348,7 +2352,7 @@ const MANAGED_ANTHROPIC_BETAS: [&str; 8] = [
     "claude-code-20250219",
     "prompt-caching-2024-07-31",
     "interleaved-thinking-2025-05-14",
-    "fine-grained-tool-streaming-2025-05-14",
+    FINE_GRAINED_TOOL_STREAMING_BETA,
     "context-management-2025-06-27",
     "token-efficient-tools-2025-02-19",
     "output-128k-2025-02-19",
@@ -2356,18 +2360,24 @@ const MANAGED_ANTHROPIC_BETAS: [&str; 8] = [
 ];
 
 /// Drop every client header a managed request may not forward ([`MANAGED_FORWARD_HEADERS`]), and
-/// every `anthropic-beta` token not in [`MANAGED_ANTHROPIC_BETAS`], less
+/// every `anthropic-beta` token not in [`MANAGED_ANTHROPIC_BETAS`], plus
 /// [`translate::FAST_MODE_BETA`] when `anthropic` (the attempt goes to direct Anthropic, the only
 /// provider with fast mode). Fast mode is a product Beyond sells at its price: the row records the
-/// speed asked and the speed served (`usage.speed`), so it is billed as served (D266). The header
-/// sweep allocates nothing (D92: it collected the names into a `Vec` on nearly every managed
-/// request); only an `anthropic-beta` value with a token to drop is rebuilt.
+/// speed asked and the speed served (`usage.speed`), so it is billed as served (D266). Without
+/// `eager_tool_streaming` (the attempt's candidate does not take fine-grained tool streaming,
+/// `providers::catalog::serves_eager_input_streaming`), [`FINE_GRAINED_TOOL_STREAMING_BETA`] is
+/// dropped too, as `request_body_filter` drops each tool's `eager_input_streaming` (D272). The
+/// header sweep allocates nothing (D92: it collected the names into a `Vec` on nearly every
+/// managed request); only an `anthropic-beta` value with a token to drop is rebuilt.
 fn retain_managed_client_headers(
     req: &mut pingora::http::RequestHeader,
     anthropic: bool,
+    eager_tool_streaming: bool,
 ) -> Result<()> {
     let allowed = |t: &str| {
-        MANAGED_ANTHROPIC_BETAS.contains(&t) || (anthropic && t == translate::FAST_MODE_BETA)
+        (MANAGED_ANTHROPIC_BETAS.contains(&t)
+            && (eager_tool_streaming || t != FINE_GRAINED_TOOL_STREAMING_BETA))
+            || (anthropic && t == translate::FAST_MODE_BETA)
     };
     remove_headers_where(req, |name| !MANAGED_FORWARD_HEADERS.contains(&name));
     let betas = req.headers.get_all("anthropic-beta");
@@ -5908,7 +5918,16 @@ impl ProxyHttp for AiProxy {
             //
             // The allowlist would drop these too; they are removed by name so this invariant does
             // not hang on the list's contents.
-            retain_managed_client_headers(upstream_request, rc.provider.name == "anthropic")?;
+            let eager_tool_streaming = rc
+                .auto
+                .as_ref()
+                .and_then(|a| a.candidate_at(a.candidate))
+                .is_none_or(providers::catalog::serves_eager_input_streaming);
+            retain_managed_client_headers(
+                upstream_request,
+                rc.provider.name == "anthropic",
+                eager_tool_streaming,
+            )?;
             upstream_request.remove_header("authorization");
             for header in STATIC_KEY_HEADERS {
                 upstream_request.remove_header(header);
@@ -6262,6 +6281,8 @@ impl ProxyHttp for AiProxy {
                         .map_or(providers::catalog::ToolThinking::Free, |c| {
                             providers::catalog::tool_thinking(c)
                         });
+                    let eager_tool_streaming =
+                        candidate.is_none_or(providers::catalog::serves_eager_input_streaming);
                     if let Some(t) = a.translate.as_mut()
                         && let Some(to) = serving
                     {
@@ -6334,6 +6355,13 @@ impl ProxyHttp for AiProxy {
                             && to != route::Endpoint::Responses
                             && translate::force_stream(&mut buf, false);
                         changed |= t.assemble;
+                    }
+                    // Fine-grained tool streaming only where the candidate takes it (D272): an
+                    // older Bedrock stack 400s the field, and a 400 is not failed over. Per
+                    // attempt, so direct Anthropic still gets the client's bytes (and its prompt
+                    // cache key) unchanged; `upstream_request_filter` drops the matching beta.
+                    if serving == Some(route::Endpoint::Messages) && !eager_tool_streaming {
+                        changed |= translate::strip_eager_input_streaming(&mut buf);
                     }
                     if changed {
                         scan = peek::scan_buffered(&buf);
@@ -8587,7 +8615,7 @@ mod tests {
                 ),
             ],
         );
-        retain_managed_client_headers(&mut req, true).unwrap();
+        retain_managed_client_headers(&mut req, true, true).unwrap();
         let mut names: Vec<&str> = req.headers.keys().map(|k| k.as_str()).collect();
         names.sort_unstable();
         assert_eq!(
@@ -8610,14 +8638,14 @@ mod tests {
             "/v1/messages",
             &[("anthropic-beta", "mcp-client-2025-04-04")],
         );
-        retain_managed_client_headers(&mut req, true).unwrap();
+        retain_managed_client_headers(&mut req, true, true).unwrap();
         assert!(req.headers.get("anthropic-beta").is_none());
         let mut req = req_with_headers("/v1/messages", &[]);
         req.append_header("anthropic-beta", "prompt-caching-2024-07-31")
             .unwrap();
         req.append_header("anthropic-beta", "code-execution-2025-05-22")
             .unwrap();
-        retain_managed_client_headers(&mut req, true).unwrap();
+        retain_managed_client_headers(&mut req, true, true).unwrap();
         assert_eq!(
             req.headers
                 .get_all("anthropic-beta")
@@ -10148,7 +10176,7 @@ mod mutation_gaps {
         let value = "prompt-caching-2024-07-31,  interleaved-thinking-2025-05-14";
         let mut req = pingora::http::RequestHeader::build("POST", b"/v1/messages", None).unwrap();
         req.insert_header("anthropic-beta", value).unwrap();
-        retain_managed_client_headers(&mut req, true).unwrap();
+        retain_managed_client_headers(&mut req, true, true).unwrap();
         assert_eq!(req.headers.get("anthropic-beta").unwrap(), value);
     }
 
@@ -10163,12 +10191,37 @@ mod mutation_gaps {
             let mut req =
                 pingora::http::RequestHeader::build("POST", b"/v1/messages", None).unwrap();
             req.insert_header("anthropic-beta", value).unwrap();
-            retain_managed_client_headers(&mut req, anthropic).unwrap();
+            retain_managed_client_headers(&mut req, anthropic, true).unwrap();
             req.headers
                 .get("anthropic-beta")
                 .map(|v| v.to_str().unwrap().to_owned())
         };
         assert_eq!(header(true).as_deref(), Some(value));
         assert_eq!(header(false).as_deref(), Some("prompt-caching-2024-07-31"));
+    }
+
+    /// The fine-grained-tool-streaming beta rides only to a candidate that takes fine-grained tool
+    /// streaming; for any other (an older Bedrock stack) it goes with each tool's
+    /// `eager_input_streaming` (D272). Alone on the line, the header goes entirely.
+    /// claim: SEC-6
+    /// defect: D272
+    #[test]
+    fn the_fine_grained_tool_streaming_beta_reaches_only_a_candidate_that_takes_it() {
+        let header = |value: &str, eager_tool_streaming| {
+            let mut req =
+                pingora::http::RequestHeader::build("POST", b"/v1/messages", None).unwrap();
+            req.insert_header("anthropic-beta", value).unwrap();
+            retain_managed_client_headers(&mut req, false, eager_tool_streaming).unwrap();
+            req.headers
+                .get("anthropic-beta")
+                .map(|v| v.to_str().unwrap().to_owned())
+        };
+        let both = "fine-grained-tool-streaming-2025-05-14,prompt-caching-2024-07-31";
+        assert_eq!(header(both, true).as_deref(), Some(both));
+        assert_eq!(
+            header(both, false).as_deref(),
+            Some("prompt-caching-2024-07-31")
+        );
+        assert_eq!(header(FINE_GRAINED_TOOL_STREAMING_BETA, false), None);
     }
 }

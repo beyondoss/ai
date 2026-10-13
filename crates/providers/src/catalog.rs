@@ -437,6 +437,27 @@ pub fn serves_fast_mode(c: &Candidate) -> bool {
         && FAST_MODE_MODELS.contains(&c.upstream_model)
 }
 
+/// Bedrock inference profiles known to accept a tool's `eager_input_streaming` (fine-grained tool
+/// input streaming). Only Bedrock's newer serving stack does: the claude-api skill's tool-use notes
+/// say Opus 4.7, 4.8 and 5, Fable 5 and Sonnet 4.6 and 5 take the field, while "older Bedrock
+/// deployments (Opus 4.5 / 4.6, Sonnet 4.0 / 4.5, Haiku 4.5) return 400 on the unknown field".
+/// Claude Code 2.1.295's model catalog agrees on every row here: it marks `eager_input_streaming`
+/// for Bedrock on Sonnet 4.6, 5 and 5.5, Opus 4.7, 4.8, 5 and 5.5 and Fable 5 and 5.1, and never on
+/// Haiku 4.5 or 5.5. An allowlist, not a refusal list: a profile nobody has shown to take the field
+/// does not get it, since a 400 is relayed rather than failed over.
+const BEDROCK_EAGER_INPUT_STREAMING: &[&str] = &["us.anthropic.claude-opus-4-8"];
+
+/// Whether a candidate accepts fine-grained tool input streaming: a tool's `eager_input_streaming`
+/// field, or the `fine-grained-tool-streaming-2025-05-14` beta that came before it. Direct
+/// Anthropic does on every model. A Bedrock candidate does only if listed in
+/// [`BEDROCK_EAGER_INPUT_STREAMING`]; for any other the gateway strips both from the request, which
+/// costs only the streaming granularity (the API buffers each tool parameter instead). A candidate
+/// on another wire never sees either: translation rebuilds each tool from its name, description and
+/// schema.
+pub fn serves_eager_input_streaming(c: &Candidate) -> bool {
+    c.provider != ProviderId::Bedrock || BEDROCK_EAGER_INPUT_STREAMING.contains(&c.upstream_model)
+}
+
 /// Candidates that refuse file (PDF) input on a row whose card advertises it. OpenRouter routes
 /// `x-ai/grok-build-0.1` to no file-capable endpoint: 404 "No endpoints found that support file
 /// input" (measured 2026-10-01; its `x-ai/grok-4.20`, `grok-4.3`, `grok-4.5` and `grok-4.6` read
@@ -3424,6 +3445,45 @@ mod tests {
                     "{name} third"
                 );
             }
+        }
+    }
+
+    /// Fine-grained tool input streaming is kept only where it is known to be accepted: on direct
+    /// Anthropic, and on the Bedrock profiles of [`BEDROCK_EAGER_INPUT_STREAMING`]. Haiku 4.5 is on
+    /// Bedrock's older serving stack, which 400s the field; neither Haiku is shown to take it.
+    #[test]
+    fn eager_input_streaming_is_kept_only_where_a_candidate_is_known_to_accept_it() {
+        let bedrock = |name: &str| {
+            for_model(name)
+                .and_then(|r| {
+                    r.candidates
+                        .iter()
+                        .find(|c| c.provider == ProviderId::Bedrock)
+                })
+                .map(serves_eager_input_streaming)
+        };
+        assert_eq!(bedrock("claude-haiku-4-5"), Some(false));
+        assert_eq!(bedrock("claude-haiku-5-5"), Some(false));
+        assert_eq!(bedrock("claude-opus-4-8"), Some(true));
+        for r in MODEL_ROUTES {
+            for c in r
+                .candidates
+                .iter()
+                .filter(|c| c.provider == ProviderId::Anthropic)
+            {
+                assert!(serves_eager_input_streaming(c), "{}", r.model);
+            }
+        }
+        // Every allowlisted profile is one the catalog actually serves: a stale entry would be a
+        // claim nothing checks.
+        for id in BEDROCK_EAGER_INPUT_STREAMING {
+            assert!(
+                MODEL_ROUTES
+                    .iter()
+                    .flat_map(|r| r.candidates)
+                    .any(|c| c.provider == ProviderId::Bedrock && c.upstream_model == *id),
+                "{id} is not a Bedrock candidate"
+            );
         }
     }
 

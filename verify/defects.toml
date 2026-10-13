@@ -2751,3 +2751,17 @@ state = "fixed"
 test = "service_tier_auto_is_the_standard_class"
 fix = "3a53615"
 note = "Fixed in the contract: a reported service_tier auto is the request default echoed back unresolved, so it is the standard class (providers::pricing::served_class and verify/pricing_reference.py alike; crates/providers/ARCHITECTURE.md's class table). Anthropic and Bedrock still refuse anything but standard. Golden vectors from the reference pricer: openrouter_service_tier_auto_reported, openrouter_service_tier_auto_dearest_endpoint, anthropic_service_tier_auto_refused. Live 2026-10-11: VERIFY_CATALOG_ROW 13/13 on both Muse rows."
+
+[[defect]]
+id = "D272"
+severity = "high"
+area = "Reliability"
+title = "A tool request failing over to Bedrock carried eager_input_streaming, which Bedrock's older stack 400s"
+impact = "Claude Code and this repo's agent mark every tool eager_input_streaming: true. A Messages body is relayed to a Bedrock candidate as bytes, so on claude-haiku-4-5 and claude-haiku-5-5 (whose Bedrock profiles are not known to take the field) an Anthropic 5xx would fail a tool request over onto a 400, which is relayed rather than failed over: an Anthropic outage became hard failures at the candidate meant to absorb it. The fine-grained-tool-streaming-2025-05-14 beta, on the managed allowlist, rode along the same way."
+confidence = "medium"
+evidence = "claude-api skill, shared/tool-use-concepts.md 'Eager input streaming': only Bedrock's newer serving stack accepts the field (Opus 4.7 / 4.8 / 5, Fable 5, Sonnet 4.6 / 5); older deployments (Opus 4.5 / 4.6, Sonnet 4.0 / 4.5, Haiku 4.5) return 400 on the unknown field. Claude Code 2.1.295's embedded model catalog sets eager_input_streaming.bedrock for Sonnet 4.6 / 5 / 5.5, Opus 4.7 / 4.8 / 5 / 5.5 and Fable 5 / 5.1, never for Haiku 4.5 or 5.5. The rows' live verification did not send tools. Not measured live: no Bedrock spend in October 2026."
+claims = ["CAT-6"]
+state = "fixed"
+test = "a_bedrock_failover_strips_eager_input_streaming_where_the_profile_does_not_take_it"
+fix = "234fc382"
+note = "providers::catalog::serves_eager_input_streaming is a per-candidate capability: direct Anthropic always, Bedrock only for the BEDROCK_EAGER_INPUT_STREAMING allowlist (us.anthropic.claude-opus-4-8), so a new Bedrock row starts without it. On any other candidate request_body_filter cuts each root tools element's eager_input_streaming out by span (translate::strip_eager_input_streaming) and retain_managed_client_headers drops the beta; the only cost is that Bedrock buffers each tool parameter. Per attempt on the replayed client body, so direct Anthropic gets the client's exact bytes and its prompt cache key never moves. The test fails over Anthropic 500 onto Bedrock for all three Bedrock rows (and a 100 KiB full-body request) and asserts both bodies and beta headers. Also held by strip_eager_input_streaming_cuts_only_the_tool_field, the_fine_grained_tool_streaming_beta_reaches_only_a_candidate_that_takes_it and eager_input_streaming_is_kept_only_where_a_candidate_is_known_to_accept_it. To widen the allowlist, verify one tool-bearing request with the field on the Bedrock profile."
