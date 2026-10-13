@@ -84,7 +84,6 @@ pub type TransportFactory =
 /// outlives every call site's locals.
 #[derive(Clone, Default)]
 pub struct ChildToolConfig {
-    pub bash_timeout_ms: Option<u64>,
     pub bash_shell_path: Option<String>,
     pub bash_command_prefix: Option<String>,
     /// The parent's probed remote shell (`bash` or `sh`), inherited so a child's `bash` asks the
@@ -1043,7 +1042,6 @@ impl Subagent {
             origin,
         );
         let mut registry = super::default_registry_with_config(&super::ToolConfig {
-            bash_timeout_ms: self.ctx.tool_cfg.bash_timeout_ms,
             bash_waits_for_exit: false,
             bash_shell_path: self.ctx.tool_cfg.bash_shell_path.as_deref(),
             bash_command_prefix: self.ctx.tool_cfg.bash_command_prefix.as_deref(),

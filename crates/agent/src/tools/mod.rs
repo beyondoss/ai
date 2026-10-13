@@ -534,8 +534,6 @@ impl TouchedFiles {
 /// caller the same "only name what you override" ergonomics the ladder existed to provide.
 #[derive(Default)]
 pub struct ToolConfig<'a> {
-    /// `bash`'s default timeout, applied when the model omits `timeout_ms` (`--bash-timeout-ms`).
-    pub bash_timeout_ms: Option<u64>,
     /// `bash` waits for every command to exit instead of leaving one quiet for
     /// [`bash::IDLE_YIELD`] running as a `bash_job` job. Only for a caller with no `bash_job` to come
     /// back with: `serve`'s host `bash` command.
@@ -658,20 +656,6 @@ pub fn default_registry() -> ToolRegistry {
     default_registry_with_config(&ToolConfig::new())
 }
 
-/// Like [`default_registry`], overriding `bash`'s default timeout and/or shell — the two knobs enough
-/// callers (tests, `serve_tools_bash.rs`) want on their own to be worth a shorthand over building a
-/// whole [`ToolConfig`].
-pub fn default_registry_with(
-    bash_timeout_ms: Option<u64>,
-    bash_shell_path: Option<&str>,
-) -> ToolRegistry {
-    default_registry_with_config(&ToolConfig {
-        bash_timeout_ms,
-        bash_shell_path,
-        ..ToolConfig::new()
-    })
-}
-
 /// Assemble the tool set described by `cfg`. The one real constructor; everything else here is a
 /// shorthand over it.
 pub fn default_registry_with_config(cfg: &ToolConfig<'_>) -> ToolRegistry {
@@ -704,13 +688,9 @@ pub fn default_registry_with_config(cfg: &ToolConfig<'_>) -> ToolRegistry {
     reg.register(Arc::new(grep_tool));
     reg.register(Arc::new(find_tool));
     // `bash` runs wherever the filesystem tools do — see `ToolConfig::command_runner`.
-    let mut bash = match (&cfg.command_runner, cfg.bash_timeout_ms) {
-        (Some(runner), Some(ms)) => {
-            bash::Bash::with_runner(runner.clone()).with_default_timeout_ms(ms)
-        }
-        (Some(runner), None) => bash::Bash::with_runner(runner.clone()),
-        (None, Some(ms)) => bash::Bash::real().with_default_timeout_ms(ms),
-        (None, None) => bash::Bash::real(),
+    let mut bash = match &cfg.command_runner {
+        Some(runner) => bash::Bash::with_runner(runner.clone()),
+        None => bash::Bash::real(),
     };
     bash = bash.with_root(root);
     // `bash` asks the filesystem backend which world it is in, rather than being told once, because
@@ -1411,19 +1391,6 @@ mod tests {
         assert!(reg.get("read").is_some());
         assert!(reg.get("grep").is_some());
         assert!(reg.get("web").is_none());
-    }
-
-    #[test]
-    fn default_registry_with_none_matches_default_registry() {
-        // `default_registry()` must genuinely delegate to `default_registry_with(None, None)`, not
-        // just happen to look similar — same tool set either way.
-        assert_eq!(
-            default_registry().len(),
-            default_registry_with(None, None).len()
-        );
-        for name in ["read", "write", "edit", "bash", "ls", "grep", "find"] {
-            assert!(default_registry_with(None, None).get(name).is_some());
-        }
     }
 
     /// A trivial stand-in for an [`mcp::McpTool`] — that type is crate-private and always backed by a

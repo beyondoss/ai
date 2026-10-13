@@ -267,7 +267,9 @@
 //!     that point doesn't leak backward into it), rebuilding the `Agent` if either differs from what's
 //!     currently active
 //!   - `{type:"bash", command, cwd?, timeout_ms?, exclude_from_context?}` run a shell command directly
-//!     — independent of the model's own tool-call loop — streaming `tool_progress`/`tool_end` events
+//!     — independent of the model's own tool-call loop; `timeout_ms` cancels it at that deadline
+//!     ("Command timed out after N seconds"), and without one it runs until it exits or `abort_bash`
+//!     — streaming `tool_progress`/`tool_end` events
 //!     exactly like a model-invoked `bash` call, then a terminal `response` whose `data` carries
 //!     `{result, is_error, exit_code, cancelled, truncated, full_output_path}` (Fix 7, pi-parity gap: the
 //!     last four previously only ever reached a client via the interim `tool_progress` event, or embedded
@@ -648,9 +650,6 @@ pub struct ServeConfig {
     /// --image-auto-resize false` had no effect on a `serve` process. Threaded to
     /// `tools::default_registry_with_prefix_and_image_auto_resize` in `build_tools`.
     pub image_auto_resize: bool,
-    /// Default `bash` command timeout when the model omits `timeout_ms`. `None` keeps the tool's
-    /// built-in default.
-    pub bash_timeout_ms: Option<u64>,
     /// Run `bash` commands through this shell instead of the auto-resolved one (`/bin/bash`, else
     /// `bash` on `$PATH`, else `sh`). Already validated to exist by the time it reaches here (see
     /// `--bash-shell-path` in `main.rs`) — `build_tools` trusts it rather than re-checking on every
@@ -8075,9 +8074,14 @@ pub(crate) async fn serve_session(
                 if let Some(cwd) = cmd.get("cwd").and_then(Value::as_str) {
                     input["cwd"] = json!(cwd);
                 }
-                if let Some(timeout_ms) = cmd.get("timeout_ms").and_then(Value::as_u64) {
-                    input["timeout_ms"] = json!(timeout_ms);
-                }
+                // The client's own bound on this command, enforced here as a cancel. Not handed to
+                // the tool: its `timeout_ms` only decides when a model's call returns (the command
+                // keeps running as a job), and this instance waits for exit — the client is the one
+                // waiting, and `abort_bash` or this deadline is how it gives up.
+                let deadline = cmd
+                    .get("timeout_ms")
+                    .and_then(Value::as_u64)
+                    .map(std::time::Duration::from_millis);
                 // Track L23 (pi-parity fix): this host command used to call `tool.run_streaming`
                 // directly, bypassing `--deny-tool`/`--deny-bash-pattern`/`--deny-path` entirely (only
                 // `--exclude-tools bash` — the `bash_tool` check above — actually gated it). Checked
@@ -8135,13 +8139,20 @@ pub(crate) async fn serve_session(
                 // reaching a client via a progress event that a client polling just for the final
                 // result never sees at all.
                 let mut last_bash_details: Option<Value> = None;
+                let mut deadline_hit = false;
                 let outcome = {
                     let run = tool.run_streaming(input, &progress);
                     tokio::pin!(run);
+                    let deadline_sleep = sleep_opt(deadline);
+                    tokio::pin!(deadline_sleep);
                     loop {
                         tokio::select! {
                             biased;
                             r = &mut run => break r,
+                            () = &mut deadline_sleep, if !deadline_hit => {
+                                deadline_hit = true;
+                                cancel.cancel();
+                            }
                             // `cancel.cancel()` alone (set by `abort_bash`/`abort` below, or by
                             // shutdown) doesn't, by itself, interrupt an in-flight `run` — but `bash`'s
                             // own `exec` races the same token internally (see `tools::bash`) and returns
@@ -8232,6 +8243,18 @@ pub(crate) async fn serve_session(
                 let (result_text, is_error) = match outcome {
                     Ok(output) => (output.text, false),
                     Err(e) => (e.to_string(), true),
+                };
+                // Cancelled by the client's deadline rather than an abort: say which.
+                let result_text = match deadline {
+                    Some(d) if deadline_hit && is_error => {
+                        match result_text.strip_suffix("Command cancelled") {
+                            Some(head) => {
+                                format!("{head}Command timed out after {} seconds", d.as_secs())
+                            }
+                            None => result_text,
+                        }
+                    }
+                    _ => result_text,
                 };
                 // Fix 7 (pi-parity gap): pi's own `BashResult{output, exitCode, cancelled, truncated,
                 // fullOutputPath}` (`bash-executor.ts`) alongside the text, not flattened into it — see
@@ -8801,7 +8824,6 @@ fn build_subagent_ctx(
         mcp_enabled: mcp_enabled.clone(),
         memory_mounts,
         tool_cfg: subagent::ChildToolConfig {
-            bash_timeout_ms: cfg.bash_timeout_ms,
             bash_shell_path: cfg.bash_shell_path.clone(),
             bash_command_prefix: cfg.bash_command_prefix.clone(),
             remote_shell: cfg
@@ -9242,7 +9264,6 @@ fn build_tools(
     let empty: &[String] = &[];
     let nested_exclude = cfg.exclude_tools.as_deref().unwrap_or(empty);
     let mut registry = tools::default_registry_with_config(&tools::ToolConfig {
-        bash_timeout_ms: cfg.bash_timeout_ms,
         bash_waits_for_exit,
         bash_shell_path: cfg.bash_shell_path.as_deref(),
         bash_command_prefix: cfg.bash_command_prefix.as_deref(),
@@ -10286,8 +10307,9 @@ fn bash_exit_code_from_status_line(result_text: &str, is_error: bool) -> Option<
 /// Whether the host `bash` RPC command's result represents a cancelled or timed-out run rather than an
 /// ordinary completion (Fix 7, pi-parity gap) — pi's own `BashResult.cancelled` conflates both under one
 /// signal (`executeBashWithOperations`'s `options?.signal?.aborted` fires for either). Recovered from
-/// `tools::bash`'s own status-line text (`append_status`'s `"Command cancelled"`/`"Command timed out
-/// after <N> seconds"`), or this RPC handler's own fallback synthetic `"cancelled"` error for a tool
+/// the status line: `tools::bash`'s `"Command cancelled"`, the `bash` handler's own `"Command timed
+/// out after <N> seconds"` (the client's `timeout_ms`, enforced as a cancel) or the runner's (an exec
+/// endpoint's deadline), or this RPC handler's own fallback synthetic `"cancelled"` error for a tool
 /// that isn't internally cancellation-aware (see the `bash` handler's own `select!` comment on why, in
 /// practice, `tools::bash` always wins that race first).
 fn bash_result_was_cancelled(result_text: &str, is_error: bool) -> bool {

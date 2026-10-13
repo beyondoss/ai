@@ -188,9 +188,11 @@ truncation marker as a local command.)
 
 Over v1.1, `bash` sees nothing until a command exits. It can't show progress, can't tell a silent
 build from a hung one, and can't stop a command it has given up on. Locally, a command that is
-silent for 60 s returns to the model as a numbered job that `bash_job` can wait on or kill. v1.2
+silent for 60 s (or outlasts the model's `timeout_ms`) returns to the model as a numbered job that
+`bash_job` can wait on or kill, and `run_in_background` starts a server or watcher as one. v1.2
 makes the same true remotely, and keeps your endpoint stateless: **the connection is the command's
-lifetime.**
+lifetime.** Over v1.1 the agent refuses `run_in_background` rather than start something it could
+never stop.
 
 When the request carries `"stream": true`, answer `200` with `Content-Type: application/x-ndjson`
 and one JSON frame per line:
@@ -206,7 +208,10 @@ and one JSON frame per line:
   nothing in front of you buffers the response.
 - End the body right after the final frame. Use `{"signal":9}` for a signal, `{"timed_out":true}`
   when you enforce `timeout_ms` (kill the whole process group first), and `{"error":"…"}` if you
-  fail after sending the 200.
+  fail after sending the 200. `bash` jobs have no deadline of their own, so a streamed `bash`
+  command carries `"timeout_ms": 2147483647` (`i32::MAX`, the most a Node `setTimeout` holds): the
+  connection ends it. Over v1.1, where nothing else could stop a hung command, `bash` sends 30
+  minutes.
 - **If the client disconnects before the final frame, you MUST kill the command's whole process
   group** (grandchildren too) within 10 s. Kill it at once if you can, by watching the connection.
   That is the only kill signal the agent sends: `bash_job` kill, a cancelled call and the agent's
