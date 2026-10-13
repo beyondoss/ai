@@ -3771,9 +3771,120 @@ fn close_incomplete_json(s: &str) -> Option<String> {
     Some(out)
 }
 
-/// The error result for a tool call whose streamed input isn't valid JSON (see [`Turn::not_run`]).
+/// Bytes of the input echoed before the point where parsing failed, in [`invalid_tool_input_error`].
+const INVALID_INPUT_BEFORE: usize = 60;
+/// Bytes of the input echoed from the point where parsing failed onward.
+const INVALID_INPUT_AFTER: usize = 40;
+
+/// The error result for a tool call whose streamed input isn't valid JSON (see [`Turn::not_run`]):
+/// what was wrong, where, and how to resend. Never the whole input: a broken `write` can be tens of
+/// kilobytes, and the model already has it in its own `tool_use` block. The excerpt is cut from the
+/// input after [`repair_json`] — the text the parse actually failed on — at most
+/// [`INVALID_INPUT_BEFORE`] bytes before the failure point and [`INVALID_INPUT_AFTER`] from it.
+///
+/// Haiku's one recorded failure shape gets its own hint: its XML tool syntax (`<parameter
+/// name="new_string">RAW</parameter>`) leaking into JSON as `"new_string">RAW`. The input is never
+/// repaired into a call that runs — a guessed `new_string` can be silently wrong — the model is told
+/// how to resend it instead.
 fn invalid_tool_input_error(raw: &str) -> String {
-    format!("tool call arguments were not valid JSON and could not be parsed: {raw}")
+    let text = repair_json(raw);
+    // `flush_block` only gets here when the re-escaped text failed to parse too, so this is that
+    // same failure; the fallback just keeps a mismatch from ever panicking.
+    let Err(e) = serde_json::from_str::<Value>(&text) else {
+        return "not run: the tool call's input is not valid JSON. Resend the whole call as one \
+                JSON object."
+            .to_string();
+    };
+    if e.is_eof() {
+        return format!(
+            "not run: the tool call's input is not valid JSON ({e}). It ends with `{}` before the \
+             JSON is complete. Resend the whole call as one complete JSON object.",
+            excerpt(&text, Excerpt::Tail(INVALID_INPUT_BEFORE)),
+        );
+    }
+    // serde_json's column points at the offending byte itself.
+    let at = byte_offset(&text, e.line(), e.column());
+    let (before, after) = text.split_at(at);
+    let hint = match xml_style_parameter(before, after) {
+        Some(key) => format!(
+            "\"{key}\"> is XML parameter syntax; JSON needs \"{key}\": \"…\", with quotes, \
+             backslashes and newlines inside the value escaped (\\\", \\\\, \\n). Resend the whole \
+             call as JSON."
+        ),
+        None => "Resend the whole call as one JSON object, with quotes, backslashes and newlines \
+                 inside string values escaped (\\\", \\\\, \\n)."
+            .to_string(),
+    };
+    format!(
+        "not run: the tool call's input is not valid JSON ({e}). Parsing failed after `{}`, at \
+         `{}`. {hint}",
+        excerpt(before, Excerpt::Tail(INVALID_INPUT_BEFORE)),
+        excerpt(after, Excerpt::Head(INVALID_INPUT_AFTER)),
+    )
+}
+
+/// The byte offset of serde_json's 1-based `line`/`column` (a column counts bytes) in `text`,
+/// clamped to the text and backed off to a char boundary. Line 0 (no position) is offset 0.
+fn byte_offset(text: &str, line: usize, column: usize) -> usize {
+    let line_start = text
+        .split_inclusive('\n')
+        .take(line.saturating_sub(1))
+        .map(str::len)
+        .sum::<usize>();
+    let mut at = (line_start + column.saturating_sub(1)).min(text.len());
+    while !text.is_char_boundary(at) {
+        at -= 1;
+    }
+    at
+}
+
+/// Which end of a string [`excerpt`] keeps, and at most how many bytes.
+enum Excerpt {
+    Head(usize),
+    Tail(usize),
+}
+
+/// A short, single-line piece of `text` for an error message: its first or last `n` bytes (on char
+/// boundaries), an ellipsis where it was cut, and raw newlines/tabs/CRs shown as `\n`/`\t`/`\r`.
+fn excerpt(text: &str, keep: Excerpt) -> String {
+    let piece = match keep {
+        Excerpt::Head(n) if text.len() > n => {
+            let mut end = n;
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            format!("{}…", &text[..end])
+        }
+        Excerpt::Tail(n) if text.len() > n => {
+            let mut start = text.len() - n;
+            while !text.is_char_boundary(start) {
+                start += 1;
+            }
+            format!("…{}", &text[start..])
+        }
+        _ => text.to_string(),
+    };
+    piece
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
+}
+
+/// The parameter name when parsing failed on XML-style parameter syntax: the text before the
+/// failure ends with a quoted name in key position (right after a `{` or `,`) and the failure is the
+/// `>` right after it, where JSON needs a `:`. `None` for any other failure.
+fn xml_style_parameter<'a>(before: &'a str, after: &str) -> Option<&'a str> {
+    if !after.starts_with('>') {
+        return None;
+    }
+    let key = before.strip_suffix('"')?;
+    let start = key.rfind('"')?;
+    let name = &key[start + 1..];
+    let in_key_position = key[..start].trim_end().ends_with(['{', ',']);
+    (in_key_position
+        && !name.is_empty()
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'))
+    .then_some(name)
 }
 
 /// The assembled result of one model turn.
@@ -8263,6 +8374,105 @@ data: {"type":"response.incomplete","response":{"status":"incomplete","incomplet
         assert!(
             serde_json::from_str::<Value>(&closed).is_err(),
             "must not fabricate a value for a truncated key: {closed:?}"
+        );
+    }
+
+    /// Haiku's recorded failure shape (longctx-eval `p46/7fbf843bae/marshmallow/claude-haiku-5-5/
+    /// model/a2/events.jsonl:395`, shortened): its XML parameter syntax leaking into JSON as
+    /// `"new_string">RAW`, the raw value carrying literal newlines, the keys after it proper JSON.
+    const XML_LEAK: &str = "{\"edits\": [{\"new_string\">        try:\n            value = \
+        getter_func(data)\n        except ValidationError as error:\n            return \
+        error.valid_data or missing\n        return value\", \"old_string\": \"        raise \
+        NotImplementedError(\\\"Schema._call_and_store\\\")\"}]}";
+
+    #[test]
+    fn an_xml_style_parameter_is_named_with_the_json_form_to_resend_it_in() {
+        // All 89 recorded Haiku edit failures (longctx-eval, 2026-10-11..13) are this shape, and all
+        // 89 get this hint; the one other recorded failure gets the generic one below.
+        assert_eq!(
+            invalid_tool_input_error(XML_LEAK),
+            "not run: the tool call's input is not valid JSON (expected `:` at line 1 column 25). \
+             Parsing failed after `{\"edits\": [{\"new_string\"`, at `>        try:\\n            \
+             value = getter…`. \"new_string\"> is XML parameter syntax; JSON needs \"new_string\": \
+             \"…\", with quotes, backslashes and newlines inside the value escaped (\\\", \\\\, \
+             \\n). Resend the whole call as JSON."
+        );
+        let old_string = invalid_tool_input_error(
+            "{\"edits\": [{\"old_string\">x = 1\n\", \"new_string\": \"x = 2\"}]}",
+        );
+        assert!(
+            old_string.contains("\"old_string\"> is XML parameter syntax"),
+            "{old_string}"
+        );
+    }
+
+    #[test]
+    fn a_quoted_value_before_a_stray_gt_is_not_called_xml_syntax() {
+        // Only a quoted name in *key* position (after `{` or `,`) followed by `>` is the leak.
+        let message = invalid_tool_input_error(r#"{"path": "a.txt" > 1}"#);
+        assert!(!message.contains("XML"), "{message}");
+        assert!(message.contains("Parsing failed after `{\"path\": \"a.txt\" `, at `> 1}`"));
+    }
+
+    #[test]
+    fn an_input_that_ends_early_is_told_it_was_incomplete() {
+        assert_eq!(
+            invalid_tool_input_error(r#"{"path":"a.txt","content":"hello wor"#),
+            "not run: the tool call's input is not valid JSON (EOF while parsing a string at line 1 \
+             column 36). It ends with `{\"path\":\"a.txt\",\"content\":\"hello wor` before the JSON \
+             is complete. Resend the whole call as one complete JSON object."
+        );
+    }
+
+    #[test]
+    fn any_other_parse_failure_shows_where_it_failed() {
+        // The one recorded non-leak failure: a Haiku `read` call (longctx-eval
+        // `ab/f0100041f6/toolz/claude-haiku-5-5/default/a2/events.jsonl:39`, shortened).
+        assert_eq!(
+            invalid_tool_input_error(r#"{"path": "toolz/_signatures.py", "offset": [640}"#),
+            "not run: the tool call's input is not valid JSON (expected `,` or `]` at line 1 column \
+             48). Parsing failed after `{\"path\": \"toolz/_signatures.py\", \"offset\": [640`, at \
+             `}`. Resend the whole call as one JSON object, with quotes, backslashes and newlines \
+             inside string values escaped (\\\", \\\\, \\n)."
+        );
+    }
+
+    #[test]
+    fn the_error_echoes_only_a_short_excerpt_of_a_huge_input() {
+        // A 60 KB leaked `write` — the old error echoed all of it. Multi-byte text on both sides of
+        // the failure point puts each excerpt cut inside a character, which must not panic.
+        let raw = format!(
+            "{{\"path\": \"{}\", \"content\">{}\"}}",
+            "é".repeat(20_000),
+            "ü\n".repeat(20_000)
+        );
+        let message = invalid_tool_input_error(&raw);
+        assert!(message.len() < 500, "{} bytes: {message}", message.len());
+        assert!(message.contains("\"content\"> is XML parameter syntax"));
+        assert!(message.contains("Parsing failed after `…éé"));
+        assert!(message.contains("at `>ü\\nü\\n"));
+    }
+
+    #[tokio::test]
+    async fn an_unparseable_call_is_answered_with_the_diagnosis_and_never_run() {
+        let (edit, ran) = Recorder::new("edit");
+        let mut tools = ToolRegistry::new();
+        tools.register(edit);
+        let (agent, _mock) = agent_with(
+            vec![
+                tool_turn(&[("tu_1", "edit", XML_LEAK)], StopReason::ToolUse),
+                turn::text("done"),
+            ],
+            tools,
+        );
+        let mut session = Session::new();
+        session.user("go");
+        agent.run(&mut session, |_| {}).await.unwrap();
+
+        assert!(ran.lock().unwrap().is_empty());
+        assert_eq!(
+            tool_results(&session.messages[2]),
+            [(invalid_tool_input_error(XML_LEAK), true)]
         );
     }
 
