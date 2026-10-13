@@ -208,9 +208,11 @@
 //!   - `{type:"set_auto_retry", enabled}` toggle transport-failure retry (on by default) — off surfaces
 //!     a normally-retried transient failure immediately, for debugging a flaky connection rather than
 //!     waiting through several silent attempts. Gates *two* layers as one user-facing concept: the
-//!     mid-stream retry inside a single model turn (`agent_core::Agent::with_auto_retry`), and, once
-//!     that's exhausted, automatically re-invoking the *whole* `prompt` run against the same session up
-//!     to 3 more times with backoff (2/4/8s) — pi's `agent-session.ts` auto-retry. Each whole-run retry
+//!     mid-stream retry inside a single model turn (`agent_core::Agent::with_auto_retry`; each of its
+//!     retries streams an `event` with `kind:"retry"`, and a rate limit is waited out there for up to
+//!     `--retry-rate-limit-secs`), and, once that's exhausted, automatically re-invoking the *whole*
+//!     `prompt` run against the same session up to 3 more times without progress, with backoff
+//!     (2/4/8s) — pi's `agent-session.ts` auto-retry. Each whole-run retry
 //!     attempt emits an unsolicited `auto_retry_start` frame (`{type:"auto_retry_start", id, command:"prompt",
 //!     attempt, max_attempts, delay_ms, error}`) before its backoff sleep. A sequence that made at
 //!     least one attempt ends with exactly one `auto_retry_end` frame (`{type:"auto_retry_end", id,
@@ -623,6 +625,9 @@ pub struct ServeConfig {
     /// third knob, `agent_core::client::GatewayClient::with_max_backoff`, previously had no CLI flag or
     /// persisted override at all.
     pub retry_max_backoff_ms: Option<std::time::Duration>,
+    /// How long one turn keeps retrying a rate limit or overload, in seconds (`--retry-rate-limit-secs`).
+    /// `None` keeps `agent_core::rate_limit::DEFAULT_BUDGET`.
+    pub retry_rate_limit_secs: Option<u64>,
     /// Idle-read timeout between response chunks on the gateway HTTP client. `None` keeps the client's
     /// built-in default. Task #38 (pi-parity fix): `run`'s identical `--idle-timeout-ms`/
     /// `AI_AGENT_IDLE_TIMEOUT_MS`/persisted `default_provider_timeout_ms` setting (see `main.rs::
@@ -4775,6 +4780,11 @@ pub(crate) async fn serve_session(
                 // below) — a client abort during backoff takes effect immediately, not just once the
                 // next attempt starts.
                 let mut retry_attempt: u32 = 0;
+                // Retries since the run last made progress — what `max_retries` and the backoff count.
+                // `retry_attempt` above keeps counting every retry of this prompt (lifecycle, the
+                // closing `auto_retry_end`); this one resets when a failed attempt still committed a
+                // step, so a long run that recovers from one blip doesn't carry it against the next.
+                let mut stalled_retries: u32 = 0;
                 // Whether the final post-attempt persist (below) failed to write to disk — surfaced in
                 // the terminal `prompt` response instead of being silently swallowed, since an agent run
                 // that appears to succeed while its transcript failed to persist is exactly the failure
@@ -4804,6 +4814,7 @@ pub(crate) async fn serve_session(
                 let own_injection = crate::tools::mcp_events::injection_batch(&cmd);
                 let mut steered_injections: Vec<u64> = Vec::new();
                 let result = 'retry: loop {
+                    let steps_at_start = session.steps;
                     refused.store(false, Ordering::Relaxed);
                     is_compacting.store(false, Ordering::Relaxed);
                     pending_deferred.clear();
@@ -5485,11 +5496,14 @@ pub(crate) async fn serve_session(
                     // below, and reused verbatim as the retry arm's own guard — the two must not be
                     // able to disagree, because the closing error record has to be dropped on the same
                     // side of the persist in memory as it is on disk.
+                    if session.steps > steps_at_start {
+                        stalled_retries = 0;
+                    }
                     let will_retry = matches!(&attempt_result, Err(e)
                         if current_auto_retry
                             && stdin_open
                             && !cancel.is_cancelled()
-                            && retry_attempt < run_retry_policy.max_retries
+                            && stalled_retries < run_retry_policy.max_retries
                             && crate::retry::is_retryable_whole_run(e));
 
                     // The failed attempt's closing error record (`run_events_steered` always pushes one
@@ -5534,10 +5548,11 @@ pub(crate) async fn serve_session(
                     match &attempt_result {
                         Err(e) if will_retry => {
                             retry_attempt += 1;
-                            let delay = run_retry_policy.backoff(retry_attempt);
+                            stalled_retries += 1;
+                            let delay = run_retry_policy.backoff(stalled_retries);
                             let _ = out_tx.send(auto_retry_frame(
                                 id.clone(),
-                                retry_attempt,
+                                stalled_retries,
                                 run_retry_policy.max_retries,
                                 delay.as_millis() as u64,
                                 &e.to_string(),
@@ -8863,6 +8878,7 @@ fn build_agent(
         .with_max_steps(cfg.max_steps)
         .with_compaction(compaction)
         .with_auto_retry(auto_retry)
+        .with_rate_limit_retry(crate::retry::rate_limit_policy(cfg.retry_rate_limit_secs))
         .with_sequential_tools(cfg.sequential_tools)
         // Pin this session to a warm prompt-cache node via its stable id.
         .with_cache_key(cache_key.to_string())

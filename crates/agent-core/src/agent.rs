@@ -132,6 +132,16 @@ pub enum AgentEvent {
         /// inferring them from `usage`.
         summary_source: SummarySource,
     },
+    /// A model request failed transiently and is re-sent after `delay_ms`. The retry starts the
+    /// turn's stream over — nothing from the failed attempt is kept or executed. `rate_limited`
+    /// marks the time-budgeted class (429/overload, see [`crate::rate_limit`]); `attempt` counts
+    /// within that class, from 1.
+    Retry {
+        attempt: u32,
+        delay_ms: u64,
+        rate_limited: bool,
+        message: String,
+    },
     /// The run is ending abnormally (transport failure after retries, malformed SSE, or the step
     /// ceiling). A terminal marker on the event stream so a streaming client sees *why* a run stopped
     /// rather than the stream just going silent; `run_events` still returns the same `Err`.
@@ -238,7 +248,8 @@ type ToolCallResult = (String, Vec<ImageSource>, bool, bool);
 /// truncated stream (dropped connection, gateway cut) or an in-band `overloaded_error` event. Distinct
 /// from `client.rs`'s retry, which only covers a failure *before* the first byte; once events start
 /// flowing that layer deliberately stops retrying (a mid-stream drop there would replay partial
-/// output), so this is the only place that can recover from this failure class today.
+/// output), so this is the only place that can recover from this failure class today. A rate limit or
+/// overload is not counted against this: it gets [`crate::rate_limit::RateLimitRetry`]'s time budget.
 const MAX_MID_STREAM_RETRIES: u32 = 3;
 /// Base of the exponential backoff between mid-stream retries (`BASE · 2^(attempt-1)`). Mirrors
 /// `client.rs`'s shape but kept separate — a different layer, a different failure class, no shared state.
@@ -327,6 +338,9 @@ pub struct Agent {
     /// operator debugging a flaky network hop can disable it via `with_auto_retry(false)` to see the
     /// raw failure on the very first hiccup rather than after `MAX_MID_STREAM_RETRIES` silent attempts.
     auto_retry: bool,
+    /// How long [`Self::run_turn`] keeps re-sending a rate-limited (or overloaded) turn — a time
+    /// budget, not [`MAX_MID_STREAM_RETRIES`]. See [`crate::rate_limit`].
+    rate_limit_retry: crate::rate_limit::RateLimitRetry,
     /// Force every tool-call group in a turn to run one at a time, regardless of
     /// [`MAX_CONCURRENT_TOOL_GROUPS`] — the same effect `exclusive_turn` already has for a single
     /// `bash`-like call, but host-selectable for a whole run. Defaults to `false` (concurrent, bounded).
@@ -410,6 +424,7 @@ impl Agent {
                 ..compaction
             },
             auto_retry: true,
+            rate_limit_retry: crate::rate_limit::RateLimitRetry::default(),
             sequential_tools: false,
             hooks: Arc::new(NoHooks),
             cache_key: None,
@@ -555,6 +570,13 @@ impl Agent {
     /// Enable or disable mid-stream retry (default: enabled) — see the `auto_retry` field's doc comment.
     pub fn with_auto_retry(mut self, enabled: bool) -> Self {
         self.auto_retry = enabled;
+        self
+    }
+
+    /// How patiently a turn waits out rate limits (default: [`crate::rate_limit::RateLimitRetry`]'s
+    /// 5-minute budget). Has no effect with `with_auto_retry(false)`.
+    pub fn with_rate_limit_retry(mut self, policy: crate::rate_limit::RateLimitRetry) -> Self {
+        self.rate_limit_retry = policy;
         self
     }
 
@@ -1003,7 +1025,7 @@ impl Agent {
             // an error so the terminal `Error` event can go out through `sink`.
             let mut partial_turn: Option<Turn> = None;
             let turn_result = {
-                let mut emit = |ev: StreamEvent| sink(AgentEvent::Stream(ev));
+                let mut emit = |ev: AgentEvent| sink(ev);
                 self.run_turn(req, &mut emit, &cancel, &mut partial_turn)
                     .await
             };
@@ -2198,37 +2220,70 @@ impl Agent {
     /// starts `run_turn_once` fresh, so a dead attempt's partial blocks never leak into a *later*,
     /// successful attempt's slot; only a final, non-retried (or retries-exhausted) failure leaves this
     /// set when this function returns.
+    ///
+    /// Two budgets: a rate limit or overload ([`crate::rate_limit::is_rate_limited`]) is re-sent until
+    /// `rate_limit_retry.budget` would be overrun, each wait the larger of the server's own hint and
+    /// an exponential backoff; every other retryable failure gets [`MAX_MID_STREAM_RETRIES`]. Each
+    /// retry is announced as an [`AgentEvent::Retry`] before its wait.
     async fn run_turn(
         &self,
         req: ModelRequest,
-        emit: &mut (dyn FnMut(StreamEvent) + Send),
+        emit: &mut (dyn FnMut(AgentEvent) + Send),
         cancel: &CancellationToken,
         partial_out: &mut Option<Turn>,
     ) -> Result<Turn> {
+        use crate::rate_limit::{BUDGET_EXHAUSTED, is_rate_limited, retry_hint};
         let mut attempt = 0u32;
+        // When this turn was first rate limited, and how many rate-limit retries it has made since.
+        let mut throttled: Option<(std::time::Instant, u32)> = None;
         loop {
-            match self
+            let e = match self
                 .run_turn_once(req.clone(), emit, cancel, partial_out)
                 .await
             {
                 Ok(turn) => return Ok(turn),
-                Err(e)
-                    if self.auto_retry
-                        && attempt < MAX_MID_STREAM_RETRIES
-                        && is_retryable_mid_stream(&e) =>
-                {
-                    attempt += 1;
-                    // Race the backoff sleep against cancellation too — left unraced, a tripped token
-                    // during this wait would sit idle for up to `MID_STREAM_MAX_BACKOFF` before the
-                    // next `run_turn_once` call even started racing it.
-                    let delay = futures_timer::Delay::new(mid_stream_backoff(attempt));
-                    let cancelled = cancel.cancelled();
-                    futures::pin_mut!(delay, cancelled);
-                    if let Either::Right(((), _)) = select(delay, cancelled).await {
-                        return Err(Error::Cancelled);
-                    }
-                }
+                Err(e) if self.auto_retry && is_retryable_mid_stream(&e) => e,
                 Err(e) => return Err(e),
+            };
+            let (n, delay, rate_limited) = if is_rate_limited(&e) {
+                let policy = &self.rate_limit_retry;
+                let (since, n) = throttled.get_or_insert((std::time::Instant::now(), 0));
+                let delay = policy.wait(*n + 1, retry_hint(&e.to_string()));
+                // Spent (or about to be): fail now rather than start a wait that overruns it.
+                let waited = since.elapsed();
+                if waited + delay > policy.budget {
+                    let Error::Transport(msg) = e else {
+                        return Err(e);
+                    };
+                    let waited = Duration::from_millis(waited.as_millis() as u64);
+                    return Err(Error::Transport(format!(
+                        "{BUDGET_EXHAUSTED}: still rate limited after {n} retries over {waited:?} \
+                         (budget {:?}); last error: {msg}",
+                        policy.budget,
+                    )));
+                }
+                *n += 1;
+                (*n, delay, true)
+            } else if attempt < MAX_MID_STREAM_RETRIES {
+                attempt += 1;
+                (attempt, mid_stream_backoff(attempt), false)
+            } else {
+                return Err(e);
+            };
+            emit(AgentEvent::Retry {
+                attempt: n,
+                delay_ms: u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+                rate_limited,
+                message: e.to_string(),
+            });
+            // Race the backoff sleep against cancellation too — left unraced, a tripped token during
+            // a wait of up to a minute would sit idle before the next `run_turn_once` even started
+            // racing it.
+            let delay = futures_timer::Delay::new(delay);
+            let cancelled = cancel.cancelled();
+            futures::pin_mut!(delay, cancelled);
+            if let Either::Right(((), _)) = select(delay, cancelled).await {
+                return Err(Error::Cancelled);
             }
         }
     }
@@ -2251,7 +2306,7 @@ impl Agent {
     async fn run_turn_once(
         &self,
         mut req: ModelRequest,
-        emit: &mut (dyn FnMut(StreamEvent) + Send),
+        emit: &mut (dyn FnMut(AgentEvent) + Send),
         cancel: &CancellationToken,
         partial_out: &mut Option<Turn>,
     ) -> Result<Turn> {
@@ -2300,7 +2355,7 @@ impl Agent {
                     // `apply` only borrows, so `ev` is still ours to move into `emit` afterward — no
                     // clone needed on this per-delta hot path (see `Accumulator::apply`'s doc comment).
                     acc.apply(&ev);
-                    emit(ev);
+                    emit(AgentEvent::Stream(ev));
                 }
                 Either::Left((None, _)) => break,
                 // Cancelled after some content had already streamed — `finish()` flushes whatever's
@@ -3466,7 +3521,9 @@ pub fn is_retryable_mid_stream(e: &Error) -> bool {
     let Error::Transport(msg) = e else {
         return false;
     };
-    if is_context_overflow(e) {
+    // A turn that already waited out its whole rate-limit budget: retrying it again (here or at the
+    // whole-run layer, which calls this) would restart that wait and break the budget's promise.
+    if is_context_overflow(e) || msg.contains(crate::rate_limit::BUDGET_EXHAUSTED) {
         return false;
     }
     // A quota/billing-exhausted 429 must not be retried even when its own message also happens to
@@ -5848,6 +5905,7 @@ mod tests {
                 AgentEvent::CompactionFailed { .. } => "compaction_failed",
                 AgentEvent::Error { .. } => "error",
                 AgentEvent::ModelSwitched { .. } => "model_switched",
+                AgentEvent::Retry { .. } => "retry",
                 AgentEvent::ToolsUpdated { .. } => "tools_updated",
             }
         }

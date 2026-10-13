@@ -933,9 +933,20 @@ The harness layers several capabilities over the bare tools + loop:
   begin with. `main.rs`'s
   one-shot `run`/`run --json` share the same [`retry`](src/retry.rs) policy (`run_turn`,
   unconditionally on — a scripted/cron invocation has no interactive toggle, and so no `abort_retry`
-  either — a bare sleep between attempts is correct there) rather than propagating a transient failure
-  straight out of the process; a retried attempt's streamed output follows a
-  `[transient error, retrying …]` stderr notice. `--retry-max-retries`/`--retry-base-delay-ms`
+  either; the wait between attempts races the run's cancel token, so Ctrl-C/SIGTERM ends it at once with
+  the closing error record kept) rather than propagating a transient failure straight out of the
+  process; a retried attempt's streamed output follows a `[transient error, retrying …]` stderr notice.
+  The ceiling counts retries **without progress**: both `run_turn` and `serve`'s loop reset it when a
+  failed attempt still committed a step (`session.steps` advanced), so a long run that recovered from
+  three blips doesn't die on the fourth — which is how a 165-step eval run lost its progress. (`serve`
+  keeps a separate cumulative `retry_attempt` for lifecycle and `auto_retry_end`; the `auto_retry_start`
+  frame's `attempt` is the stall count.) Rate limits are mostly not this layer's job: `agent_core`
+  waits them out inside the turn under a time budget (`--retry-rate-limit-secs` /
+  `AI_AGENT_RETRY_RATE_LIMIT_SECS`, default 300, `retry::rate_limit_policy`, see `agent_core`'s
+  `rate_limit.rs`), announcing each wait as an `AgentEvent::Retry` (`run` text mode prints
+  `[rate limited, retrying in Ns (attempt n): …]` to stderr; `--json` and `serve` stream the event). An
+  error that spent that budget leads with `rate_limit::BUDGET_EXHAUSTED`, which
+  `is_retryable_whole_run` refuses, so the run fails rather than restarting the wait. `--retry-max-retries`/`--retry-base-delay-ms`
   (`AI_AGENT_RETRY_MAX_RETRIES`/`AI_AGENT_RETRY_BASE_DELAY_MS`) now also configure this whole-run layer
   (`retry::RunRetryPolicy::from_overrides`, Task #50 pi-parity fix), not just `agent_core::client`'s
   pre-connect/mid-stream layer as before — the two flags previously had no effect at all on `run_turn`'s

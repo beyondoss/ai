@@ -1269,8 +1269,8 @@ async fn send_with_retry(
             Ok(resp) if resp.status().is_success() => return Ok(resp),
             Ok(resp) => {
                 let status = resp.status();
+                let hint = retry_after(&resp, max_backoff);
                 if is_retryable_status(status.as_u16()) && attempt < max_retries {
-                    let hint = retry_after(&resp, max_backoff);
                     // A 429 needs a quick body peek before committing to a retry: some providers use it
                     // for genuine rate limiting (worth retrying — the request will likely succeed once
                     // the window resets) and others for quota/billing exhaustion (retrying only delays
@@ -1330,8 +1330,15 @@ async fn send_with_retry(
                         truncate_error_body(detail.trim())
                     )));
                 }
+                // The server's wait hint dies with the response headers, so write it into the error:
+                // the turn-level rate-limit retry (`agent::run_turn`, `rate_limit::retry_hint`) reads
+                // it back from there.
+                let hint = match hint {
+                    Some(h) => format!(" (retry-after-ms: {})", h.as_millis()),
+                    None => String::new(),
+                };
                 return Err(Error::Transport(format!(
-                    "{who} returned {status}: {}",
+                    "{who} returned {status}{hint}: {}",
                     truncate_error_body(detail.trim())
                 )));
             }
