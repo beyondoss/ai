@@ -10,6 +10,11 @@ each binary's own per-model trigger). `--base-arg`/`--cand-arg` pass extra agent
 one commit can be A/B'd against itself with a mechanism toggled (the labels then carry the flags). MCP tasks get a third arm, the candidate with `--code-mode` (built with
 `--features code-mode`); the plain candidate arm is tool search, the default. Results go to
 `$LONGCTX_WORK/ab/<label>/…`; the report pairs each candidate arm against the base on task × attempt.
+
+The background tasks (`bg_tasks.py`, `--bg-tasks`) get a section of their own: per arm, what each run
+did with long-running processes (`bg_metrics.py`) and what it left running, and the pre-registered
+ship rule for background jobs (`SHIP_RULE`), which also checks the code tasks against an earlier
+baseline run (`--code-baseline`, a runs root such as `$LONGCTX_WORK/ab/<label>`).
 """
 
 from __future__ import annotations
@@ -22,6 +27,7 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
+import bg_tasks
 import mcp_tasks
 import prefix_tasks
 import run
@@ -79,9 +85,10 @@ def cmd_run(a) -> None:
     code = a.tasks.split(",") if a.tasks else list(TASKS)
     mcp = a.mcp_tasks.split(",") if a.mcp_tasks else list(mcp_tasks.MCP_TASKS)
     ctx = a.ctx_tasks.split(",") if a.ctx_tasks else list(prefix_tasks.PREFIX_TASKS)
+    bg = [] if a.bg_tasks == "none" else a.bg_tasks.split(",") if a.bg_tasks else list(bg_tasks.BG_TASKS)
     for label, sha, cm, extra, mcp_only in arms(a):
         binary = build(sha, cm)
-        names = mcp if mcp_only else code + ctx + mcp
+        names = mcp if mcp_only else code + ctx + mcp + bg
         if not names:
             continue
         argv = ["--bin", str(binary), "--models", a.models, "--arms", a.arm, "--tasks", ",".join(names),
@@ -129,7 +136,8 @@ def cmd_report(a) -> None:
     labels = arms(a)
     base_label = labels[0][0]
     base = load(base_label, a.arm)
-    family = lambda t: "mcp" if t in mcp_tasks.MCP_TASKS else "prefix" if t in prefix_tasks.PREFIX_TASKS else "code"
+    family = lambda t: ("mcp" if t in mcp_tasks.MCP_TASKS else "prefix" if t in prefix_tasks.PREFIX_TASKS
+                        else "bg" if t in bg_tasks.BG_TASKS else "code")
     print(f"Base {base_label}, candidate {labels[1][0]} (`-cm`: candidate with --code-mode, MCP tasks only).\n")
     print("| arm | model | family | n | pass (95% CI) | $/task | wall s/task | TTFT first / median s | turns | first-request tok | cache-read share | compactions | maskings | end reasons | tool errors hard / soft |")
     print("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
@@ -167,6 +175,107 @@ def cmd_report(a) -> None:
                   f"| {verdict_pass(b, c, dq)} | {du[0]:+.2f} ({du[1]:+.2f}, {du[2]:+.2f}) | {verdict_cost(du)} "
                   f"| {dw[0]:+.0f} ({dw[1]:+.0f}, {dw[2]:+.0f}) | {verdict_cost(dw)} | {dfp:+.0f} "
                   f"| {sum(1 for _, x, y in ps if x.get('cut_off', bool(x.get('killed'))) or y.get('cut_off', bool(y.get('killed'))))} |")
+    bg_report(labels[0][0], labels[1][0], data, family, a.code_baseline)
+
+
+# Fixed before any background-task run (2026-10-13) and not to be edited after one: what "ship"
+# means for background jobs (P0 + P2) against the build before them.
+SHIP_RULE = (
+    "1. the background tasks' pass rate does not drop (candidate ≥ base);",
+    "2. the median wall time of a background-task run falls (candidate < base);",
+    "3. the candidate leaves no process running at exit in any run (`processes_left` = 0; a run the harness cuts "
+    "off at its wall or cost cap is killed together with its sandbox, so it has no report and is not counted);",
+    "4. the four code tasks (marshmallow, sqlparse, tabulate, toolz) lose no passes against the baseline run "
+    "(`--code-baseline`): Σ over tasks of the candidate's pass rate × the baseline's run count ≥ the baseline's passes.",
+)
+CODE_GATE = ("marshmallow", "sqlparse", "tabulate", "toolz")
+
+BG_COLS = (("bash calls", "bash_calls"), ("run_in_background", "run_in_background"), ("shell `&`", "shell_background"),
+           ("timeout_ms set (≤10 s)", None), ("timeout returns", "timeout_returns"), ("timeout kills", "timeout_kills"),
+           ("idle yields", "idle_yields"), ("notices", "notices"), ("reminders", "reminders"), ("sleep-polls", "sleep_polls"),
+           ("launches", "launches"), ("duplicate launches", "duplicate_launches"), ("stopped at end", "jobs_stopped_at_end"))
+
+
+def bg_report(base_label: str, cand_label: str, data: dict, family, code_baseline: str) -> None:
+    """The background-task section: what each arm did with long-running processes, per task, and the ship rule."""
+    bg = {lab: [r for (t, _, _), r in rows.items() if family(t) == "bg"] for lab, rows in data.items()}
+    if not any(bg.values()):
+        return
+    print("\n## Background tasks\n")
+    print("Means per run (`bg_metrics.py` defines each); `left` counts processes still running when the agent exited "
+          "(total, and runs with any).\n")
+    print("| arm | n | pass | median wall s | turns | $/run | " + " | ".join(c for c, _ in BG_COLS) + " | left |")
+    print("|---|---|---|---|---|---|" + "---|" * len(BG_COLS) + "---|")
+    for lab, rs in bg.items():
+        if not rs:
+            continue
+        n = len(rs)
+        mean = lambda k: sum((r.get("bg") or {}).get(k, 0) for r in rs) / n
+        cols = [f"{mean('timeout_ms_set'):.1f} ({mean('timeout_ms_short'):.1f})" if k is None else f"{mean(k):.1f}"
+                for _, k in BG_COLS]
+        left = [r.get("processes_left") for r in rs]
+        print(f"| {lab} | {n} | {sum(r['passed'] for r in rs)}/{n} | {med([r['wall_s'] for r in rs]):.0f} "
+              f"| {sum(r['turns'] for r in rs) / n:.0f} | ${sum(r['usd'] for r in rs) / n:.3f} | " + " | ".join(cols)
+              + f" | {sum(x or 0 for x in left)} ({sum(1 for x in left if x)} runs) |")
+    print("\n| task | " + " | ".join(f"{lab}: pass · median wall s · left" for lab, rs in bg.items() if rs) + " |")
+    print("|---|" + "---|" * sum(1 for rs in bg.values() if rs))
+    for t in bg_tasks.BG_TASKS:
+        cells = []
+        for lab, rs in bg.items():
+            if not rs:
+                continue
+            tr = [r for r in rs if r["task"] == t]
+            cells.append(f"{sum(r['passed'] for r in tr)}/{len(tr)} · {med([r['wall_s'] for r in tr]):.0f} · "
+                         f"{sum(r.get('processes_left') or 0 for r in tr)}" if tr else "–")
+        print(f"| {t} | " + " | ".join(cells) + " |")
+    print("\n### Ship rule (pre-registered)\n")
+    print("Ship background jobs if all of:\n")
+    for line in SHIP_RULE:
+        print(f"{line}")
+    b, c = bg.get(base_label, []), bg.get(cand_label, [])
+    checks = []
+    if b and c:
+        pb, pc = sum(r["passed"] for r in b) / len(b), sum(r["passed"] for r in c) / len(c)
+        checks.append((pc >= pb, f"pass rate {pc:.0%} ({len(c)} runs) vs base {pb:.0%} ({len(b)} runs)"))
+        wb, wc = med([r["wall_s"] for r in b]), med([r["wall_s"] for r in c])
+        checks.append((wc < wb, f"median wall {wc:.0f} s vs base {wb:.0f} s"))
+    else:
+        checks += [(None, "no background runs for both arms"), (None, "no background runs for both arms")]
+    cand_all = list(data.get(cand_label, {}).values())
+    left = [r.get("processes_left") for r in cand_all if r.get("sandboxed")]
+    reported = [x for x in left if x is not None]
+    checks.append((not any(reported) if reported else None,
+                   f"{sum(1 for x in reported if x)} of {len(reported)} candidate runs left processes"
+                   + (f"; {left.count(None)} have no report (cut off by the harness, or run before reports existed)"
+                      if None in left else "")))
+    checks.append(code_gate(cand_all, family, code_baseline))
+    print()
+    for i, (ok, why) in enumerate(checks, 1):
+        print(f"- rule {i}: {'PASS' if ok else 'FAIL' if ok is False else 'NO DATA'} — {why}")
+    verdict = "SHIP" if all(ok for ok, _ in checks) else "DON'T SHIP" if any(ok is False for ok, _ in checks) else "INCOMPLETE"
+    print(f"\n**Verdict: {verdict}**")
+
+
+def code_gate(cand: list[dict], family, root: str) -> tuple[bool | None, str]:
+    """Rule 4: the candidate's code-task passes, scaled to the baseline's run counts, against the baseline's."""
+    if not root:
+        return None, "no --code-baseline given"
+    base = [json.loads(p.read_text()) for p in Path(root).glob("*/*/*/*/result.json")]
+    base = [r for r in base if r["task"] in CODE_GATE]
+    mine = [r for r in cand if r["task"] in CODE_GATE]
+    if not base or not mine:
+        return None, f"{len(base)} baseline and {len(mine)} candidate runs of {', '.join(CODE_GATE)}"
+    want = got = 0.0
+    parts = []
+    for t in CODE_GATE:
+        bt, ct = [r for r in base if r["task"] == t], [r for r in mine if r["task"] == t]
+        if not bt or not ct:
+            return None, f"{t}: {len(bt)} baseline, {len(ct)} candidate runs"
+        kb, kc = sum(r["passed"] for r in bt), sum(r["passed"] for r in ct)
+        want += kb
+        got += kc / len(ct) * len(bt)
+        parts.append(f"{t} {kc}/{len(ct)} vs {kb}/{len(bt)}")
+    return got >= want, f"{got:.1f} scaled passes vs baseline {want:.0f} ({'; '.join(parts)})"
 
 
 def main(argv: list[str]) -> None:
@@ -182,6 +291,9 @@ def main(argv: list[str]) -> None:
         p.add_argument("--tasks", default="", help="code tasks (default: all)")
         p.add_argument("--mcp-tasks", default="", help="MCP tasks (default: all)")
         p.add_argument("--ctx-tasks", default="", help="prompt-prefix tasks (default: all)")
+        p.add_argument("--bg-tasks", default="", help="background-process tasks (default: all; `none` for none)")
+        p.add_argument("--code-baseline", default="",
+                       help="runs root of an earlier code-task run that ship rule 4 compares the candidate against")
         p.add_argument("--attempts", type=int, default=1)
         p.add_argument("--jobs", type=int, default=6)
         p.add_argument("--cap-usd", type=float, default=12.0)

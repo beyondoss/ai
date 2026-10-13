@@ -1,6 +1,6 @@
 """The run's private filesystem view: where the agent works and where every test suite is graded.
 
-    python3 sandbox.py '<ops json>' <cwd> -- <cmd> [args…]
+    python3 sandbox.py '<ops json>' <cwd> [--leftovers=<host path>] -- <cmd> [args…]
 
 A user + mount + PID namespace (no root, no setuid helper) in which:
 
@@ -21,6 +21,10 @@ A user + mount + PID namespace (no root, no setuid helper) in which:
 The network is shared: the agent must reach its model provider. Fetching a pristine copy over the
 network is what the prompt forbids and `run._SUSPECT` flags.
 
+`--leftovers` makes the namespace's init, once the command exits and before the kernel kills what is
+left, write a JSON list of the processes still running (`survivors`): what the agent would have
+leaked onto a host with no sandbox around it.
+
 `ops` is an ordered list: `["tmpfs", path, writable]` mounts an empty tmpfs, `["bind", src, dst,
 writable]` binds a host path. Read-only tmpfs mounts are remounted read-only after every bind under
 them exists. The command runs as the caller's uid with no capabilities, so it can't undo a mount.
@@ -34,6 +38,7 @@ import os
 import signal
 import stat
 import sys
+import time
 
 WS = "/tmp/longctx/work"  # the workspace, as the agent and the grader see it
 ROOT = "/tmp/longctx"
@@ -62,9 +67,12 @@ def view(hide: list[str], ro: list[tuple[str, str]], after: list[str], rw: list[
     return ops
 
 
-def argv(ops: list, cwd: str, cmd: list[str]) -> list[str]:
-    """The command line that runs `cmd` in `cwd` inside the view `ops`."""
-    return [sys.executable, "-I", os.path.abspath(__file__), json.dumps(ops), cwd, "--", *cmd]
+def argv(ops: list, cwd: str, cmd: list[str], leftovers: str | None = None) -> list[str]:
+    """The command line that runs `cmd` in `cwd` inside the view `ops`. With `leftovers` (a host
+    path), the namespace's init writes there, once `cmd` exits and before it tears the namespace
+    down, a JSON list of the processes `cmd` left running (see `survivors`)."""
+    extra = [f"--leftovers={leftovers}"] if leftovers else []
+    return [sys.executable, "-I", os.path.abspath(__file__), json.dumps(ops), cwd, *extra, "--", *cmd]
 
 _NEWNS, _NEWUSER, _NEWPID = 0x00020000, 0x10000000, 0x20000000
 _RDONLY, _NOSUID, _NODEV, _NOEXEC = 1, 2, 4, 8
@@ -126,8 +134,51 @@ def _setup(ops: list) -> None:
     _mount("proc", "/proc", "proc", _NOSUID | _NODEV | _NOEXEC)
 
 
+LEFTOVER_GRACE = 1.0  # seconds a process the command signalled on its way out gets to exit
+
+
+def _proc(pid: str) -> dict | None:
+    """One live process of this namespace's `/proc`: pid, command line, whether it carries the
+    agent's job tag; None for a zombie or one already gone."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            if f.read().rsplit(")", 1)[1].split()[0] in ("Z", "X"):
+                return None
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            cmd = f.read().replace(b"\0", b" ").decode("utf-8", "replace").strip()
+        try:
+            with open(f"/proc/{pid}/environ", "rb") as f:
+                tagged = b"AI_AGENT_JOB_TAG=" in f.read()
+        except OSError:
+            tagged = None
+    except (OSError, IndexError):
+        return None
+    return dict(pid=int(pid), cmd=cmd[:300], job_tag=tagged)
+
+
+def survivors(grace: float = LEFTOVER_GRACE) -> list[dict]:
+    """What the command left running, from inside the namespace (PID 1's view): every live process
+    but init itself, after reaping orphans for up to `grace` seconds so a process the agent killed
+    on its way out is not counted. Identifies them by namespace membership, not by name, an
+    environment tag or a directory, so it means the same thing for every agent build."""
+    deadline = time.monotonic() + grace
+    while True:
+        try:
+            while os.waitpid(-1, os.WNOHANG)[0] > 0:
+                pass
+        except ChildProcessError:
+            pass
+        live = [p for pid in os.listdir("/proc") if pid.isdigit() and pid != "1" and (p := _proc(pid))]
+        if not live or time.monotonic() >= deadline:
+            return live
+        time.sleep(0.05)
+
+
 def main(argv: list[str]) -> int:
     ops, cwd = json.loads(argv[0]), argv[1]
+    report = None
+    if argv[2].startswith("--leftovers="):
+        report = argv.pop(2).split("=", 1)[1]
     assert argv[2] == "--", argv
     cmd = argv[3:]
     uid, gid = os.getuid(), os.getgid()
@@ -144,6 +195,8 @@ def main(argv: list[str]) -> int:
     # finished run leaves no test process behind. It dies with the outer process too.
     try:
         _libc.prctl(_PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0)
+        # Opened before the masks hide the host path; close-on-exec, so the command never holds it.
+        out = os.open(report, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_CLOEXEC, 0o644) if report else None
         _setup(ops)
         os.chdir(cwd)
         if _libc.prctl(_PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0:
@@ -161,6 +214,9 @@ def main(argv: list[str]) -> int:
     while True:  # reap orphans until the command itself exits
         pid, st = os.wait()
         if pid == child:
+            if out is not None:
+                os.write(out, json.dumps(survivors()).encode())
+                os.close(out)
             os._exit(os.waitstatus_to_exitcode(st) if os.WIFEXITED(st) else 128 + os.WTERMSIG(st))
 
 

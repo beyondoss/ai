@@ -1092,6 +1092,30 @@ The harness layers several capabilities over the bare tools + loop:
     carry `t` (seconds since start), each turn's text is logged as `assistant_text`, and the result
     keeps `final_text` and `started_at`.
 
+  Eight background-process tasks ([`eval/longctx/bg_tasks.py`](eval/longctx/bg_tasks.py)) measure
+  `bash` jobs, where the code tasks cannot (they have no server or watcher): generated stdlib repos
+  whose work needs a process kept running — a server bug reproduced with curl, an API plus its worker
+  over SQLite, a test watcher kept going, a 100 s build with other edits meanwhile, a dev server that
+  invites "start it with `timeout_ms: 1000`", a configured port held by a squatter the agent cannot see
+  or kill (it runs in the harness, outside the sandbox's PID namespace), an error only the server log
+  shows under a load script, and an obligation to leave nothing running. Each `check` starts the
+  agent's code afresh on ports of its own (never reads the transcript); every port is an flock-held
+  lease below the ephemeral range, so parallel runs and both A/B arms never collide. The sandbox's
+  init writes, once the agent exits and before the namespace dies, the processes still running
+  (`sandbox.survivors`, by namespace membership, so the same for every build): the result's
+  `processes_left`. Every sandboxed result also carries `bg` ([`bg_metrics.py`](eval/longctx/bg_metrics.py)):
+  `run_in_background` and shell `&` uses, `timeout_ms` set/short/returns/kills, idle yields, finish
+  notices, end-of-run reminders, sleep-polls, launches and duplicate launches, jobs stopped at end.
+  `ab.py report` prints them per arm and per task, and checks the pre-registered ship rule
+  (`ab.SHIP_RULE`: background pass rate holds, median wall falls, no process left in any candidate run,
+  the four code tasks lose no passes against `--code-baseline`). `validate.py --bg-only` sets all
+  eight up at once and checks that each untouched task fails and its reference solution passes, three
+  times each, plus ports, graders' processes, the real build's bundle, the leftover report and the
+  metrics on a synthetic log; [`mock_model.py`](eval/longctx/mock_model.py) drives the real agent
+  through every task's reference trajectory with a scripted Responses-API model on localhost (no
+  credential in its environment), starting processes with `run_in_background` where `bash` has it and
+  `nohup … &` where it does not.
+
   ```sh
   cargo test -p beyond-ai-agent --test code_mode_density
   cargo test -p beyond-ai-agent --features code-mode --test code_mode_eval -- --nocapture
