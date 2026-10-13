@@ -31,6 +31,7 @@ use serde_json::Value;
 
 use crate::message::{ContentBlock, Message, Role, StopReason};
 use crate::session::Session;
+use crate::token_size::{self, TokenFamily};
 use crate::transport::ModelRequest;
 
 /// Why a compaction fired — carried on [`crate::agent::AgentEvent::Compacted`] and folded into
@@ -234,7 +235,9 @@ pub struct CompactionConfig {
     /// Headroom left below the input budget: compaction fires once the prompt crosses
     /// `input_budget() - reserve_tokens`, leaving room for the next turn's growth + slack.
     pub reserve_tokens: u32,
-    /// Roughly how many tokens of recent conversation to keep verbatim after a compaction.
+    /// At most how many real prompt tokens of recent conversation a compaction keeps verbatim (see
+    /// [`find_cut`]). The default is per model family ([`TokenFamily::keep_recent_tokens`]): the
+    /// value that reproduces the tail the threshold sweep validated.
     pub keep_recent_tokens: u32,
     /// Output ceiling for the summarization call itself.
     pub summary_max_tokens: u32,
@@ -245,15 +248,16 @@ pub struct CompactionConfig {
     pub mask_tool_output: bool,
     /// Tool results in the last this-many turns (assistant messages) are never masked...
     pub mask_keep_turns: usize,
-    /// ...unless those turns hold more than this many tokens: then only the most recent this-many
-    /// tokens are kept. `None`: a quarter of the trigger ([`Self::mask_keep_tokens`]), so the window
-    /// scales with the model — on a 90K trigger the last ten turns can be most of the context, and a
+    /// ...unless those turns hold more than this many real tokens: then only the most recent
+    /// this-many tokens are kept. `None`: a quarter of the trigger, scaled to real tokens by the
+    /// family's measured ratio ([`Self::mask_keep_tokens`]), so the window scales with the model — on a 90K trigger the last ten turns can be most of the context, and a
     /// fixed turn count left nothing to mask.
     pub mask_keep_tokens: Option<u32>,
-    /// A masking pass is applied only when it frees at least this many tokens, or a tenth of the
-    /// trigger when that is less ([`Self::mask_min_free`]), so the bar scales with the model. Every pass rewrites
-    /// history and so invalidates the prompt cache from its first edit on; a pass must buy back enough
-    /// context to pay for that. Our `clear_at_least`.
+    /// A masking pass is applied only when it frees at least this many real tokens, or a tenth of
+    /// the trigger when that is less ([`Self::mask_min_free`]), so the bar scales with the model.
+    /// Every pass rewrites history and so invalidates the prompt cache from its first edit on; a pass
+    /// must buy back enough context to pay for that. Our `clear_at_least`. [`Self::for_model`]
+    /// scales the 25K default by the family's calibration ([`TokenFamily::scale_tool`]).
     pub mask_min_free_tokens: u32,
     /// Whether the summarization call is the live conversation plus a closing instruction (its
     /// prefix read from the prompt cache; see `Agent::conversation_summary_request`), falling back to
@@ -263,6 +267,16 @@ pub struct CompactionConfig {
     pub cached_summary: bool,
     /// Changes under evaluation, all off by default. See [`CompactionCandidates`].
     pub candidates: CompactionCandidates,
+    /// The model family whose calibrated estimate sizes what no anchor measured (see
+    /// [`crate::token_size`]), and whose measured ratios set the family defaults. [`Self::for_model`]
+    /// picks it from the model id; [`Default`] is [`TokenFamily::Other`], chars/4.
+    pub family: TokenFamily,
+    /// The prompt size past which the model's price per token jumps (Claude Haiku 5.5 bills 5× over
+    /// 100K; OpenAI's GPT-5.4+ 2× over 272K; xAI's Grok 2× from 200K), from the model's published
+    /// rate card ([`crate::models::price_tier`]). The cached summary request, which sends the whole
+    /// live conversation, falls back to the much smaller re-render rather than cross it. `None`: no
+    /// tier.
+    pub price_tier: Option<u32>,
 }
 
 /// Compaction changes under A/B evaluation, each off by default so the shipped behavior is what
@@ -338,17 +352,33 @@ impl CompactionConfig {
     /// absolute reserve and half the remaining budget already exceeds `keep_recent_tokens`. Only the
     /// genuinely small windows — the ones that were broken — see different numbers.
     pub fn for_window(context_window: u32) -> Self {
-        Self::for_limits(context_window, None, None)
+        Self::for_limits(context_window, None, None, TokenFamily::Other)
     }
 
-    /// [`Self::for_window`] for a model's capabilities: the window plus its input cap, so the trigger
-    /// lands below the point the vendor rejects input (OpenAI's GPT-5 family caps input at the window
-    /// less the max output — trigger at `window - reserve` there never fires before the 400 does).
-    pub fn for_model(caps: &crate::models::ModelCaps) -> Self {
-        Self::for_limits(caps.context_window, caps.input_limit, caps.compact_at)
+    /// [`Self::for_window`] for a model: its window plus its input cap, so the trigger lands below the
+    /// point the vendor rejects input (OpenAI's GPT-5 family caps input at the window less the max
+    /// output — trigger at `window - reserve` there never fires before the 400 does), its
+    /// `compact_at` cap, its [`TokenFamily`] (and that family's `keep_recent_tokens` and masking
+    /// defaults), and its price tier.
+    pub fn for_model(model: &str) -> Self {
+        let caps = crate::models::capabilities(model);
+        Self {
+            price_tier: crate::models::price_tier(model),
+            ..Self::for_limits(
+                caps.context_window,
+                caps.input_limit,
+                caps.compact_at,
+                TokenFamily::for_model(model),
+            )
+        }
     }
 
-    fn for_limits(context_window: u32, input_limit: Option<u32>, compact_at: Option<u32>) -> Self {
+    fn for_limits(
+        context_window: u32,
+        input_limit: Option<u32>,
+        compact_at: Option<u32>,
+        family: TokenFamily,
+    ) -> Self {
         let d = Self::default();
         let input_budget = input_limit.map_or(context_window, |l| l.min(context_window));
         // Never hand the reserve more than a quarter of the budget: at the absolute 16_384 a 32k model
@@ -359,11 +389,13 @@ impl CompactionConfig {
             input_limit,
             compact_at,
             reserve_tokens,
+            family,
+            mask_min_free_tokens: family.scale_tool(d.mask_min_free_tokens),
             ..d
         };
         // Half the trigger: a compaction lands the context at roughly 50% of the threshold, so there's
         // real room to work before the next one fires rather than re-triggering immediately.
-        let keep_recent_tokens = d.keep_recent_tokens.min(cfg.trigger_tokens() / 2);
+        let keep_recent_tokens = family.keep_recent_tokens().min(cfg.trigger_tokens() / 2);
         Self {
             keep_recent_tokens,
             ..cfg
@@ -376,17 +408,21 @@ impl CompactionConfig {
             .map_or(self.context_window, |l| l.min(self.context_window))
     }
 
-    /// The recent-transcript budget masking never touches: `mask_keep_tokens`, else a quarter of the
-    /// trigger.
+    /// The recent-transcript budget masking never touches, in real tokens: `mask_keep_tokens`, else
+    /// a quarter of the trigger scaled by the family's measured ratio ([`TokenFamily::scale_span`]:
+    /// the quarter was tuned on the chars/4 walk, which kept about 2× that on Claude).
     pub fn mask_keep_tokens(&self) -> u32 {
         self.mask_keep_tokens
-            .unwrap_or_else(|| self.trigger_tokens() / 4)
+            .unwrap_or_else(|| self.family.scale_span(self.trigger_tokens() / 4))
     }
 
-    /// The least a masking pass must free to be applied: `mask_min_free_tokens`, capped at a tenth of
-    /// the trigger (90K → 9K, 200K → 20K, 500K → the 25K default).
+    /// The least a masking pass must free to be applied, in real tokens: `mask_min_free_tokens`,
+    /// capped at a tenth of the trigger in chars/4 tokens of tool output, scaled to the family's
+    /// calibrated estimate ([`TokenFamily::scale_tool`]: 90K → 9K, 200K → 20K, 500K → the 25K
+    /// default on [`TokenFamily::Other`]; × 1.6 on Claude), so the same passes qualify as before.
     pub fn mask_min_free(&self) -> u32 {
-        self.mask_min_free_tokens.min(self.trigger_tokens() / 10)
+        self.mask_min_free_tokens
+            .min(self.family.scale_tool(self.trigger_tokens() / 10))
     }
 
     /// The prompt size past which [`should_compact`] fires:
@@ -425,6 +461,8 @@ impl Default for CompactionConfig {
             mask_min_free_tokens: 25_000,
             cached_summary: true,
             candidates: CompactionCandidates::default(),
+            family: TokenFamily::Other,
+            price_tier: None,
         }
     }
 }
@@ -580,99 +618,50 @@ const TOOL_RESULT_MAX_CHARS: usize = 2_000;
 /// actual user/assistant exchange.
 const THINKING_MAX_CHARS: usize = 1_000;
 
-/// Estimate a text's token count. The cheap, dependency-free char/4 heuristic — good enough for the
-/// trigger and the cut-point search, which only need to be in the right ballpark.
-pub fn estimate_tokens(text: &str) -> u32 {
-    (text.chars().count() / 4) as u32
-}
-
-/// Count `value`'s characters as its wire JSON would render, without materializing that JSON as a
-/// `String` first — `serde_json::Value`'s `Display` impl already writes through `fmt::Write` rather
-/// than building a buffer internally, so feeding it a counting-only sink (instead of collecting into a
-/// `String` via `to_string()`) skips the allocation entirely for what `estimate_message_tokens` only
-/// ever uses as a length, on a call already made once per tool-call block on every turn.
-fn count_value_chars(value: &Value) -> usize {
-    struct CharCount(usize);
-    impl std::fmt::Write for CharCount {
-        fn write_str(&mut self, s: &str) -> std::fmt::Result {
-            self.0 += s.chars().count();
-            Ok(())
-        }
-    }
-    let mut counter = CharCount(0);
-    // `Value`'s `Display` impl never fails to format, so a write error here would only ever indicate
-    // the sink itself (which never returns `Err`) — safe to discard.
-    let _ = std::fmt::Write::write_fmt(&mut counter, format_args!("{value}"));
-    counter.0
-}
-
-/// Estimate one message's token cost from its blocks. `pub(crate)`: also used by
-/// [`crate::branch_summary`] to window a branch's transcript by token budget.
-///
-/// Sums raw character counts across every block first, then applies one `ceil(chars / 4)` — matching
-/// pi's own `estimateTokens` (`estimate.ts`), which sums a whole message's chars before its single
-/// division. Flooring (or ceiling) *per block* and summing the results instead systematically
-/// under-counts a message built of several short blocks (e.g. a tool call's name and its JSON input,
-/// each too short alone to clear a whole token at chars/4 floor division, but not once combined).
-pub(crate) fn estimate_message_tokens(m: &Message) -> u32 {
-    let chars: usize = m
-        .content
-        .iter()
-        .map(|b| match b {
-            ContentBlock::Text { text, .. } => text.chars().count(),
-            ContentBlock::Thinking { text, .. } => text.chars().count(),
-            ContentBlock::RedactedThinking { data } => data.chars().count(),
-            ContentBlock::ToolUse { name, input, .. } => {
-                name.chars().count() + count_value_chars(input)
-            }
-            ContentBlock::ToolResult { content, .. } => content.chars().count(),
-            // Matches pi's flat `ESTIMATED_IMAGE_CHARS` (4800, chars/4 = 1200 tokens) for an image
-            // (Anthropic bills vision roughly there); the exact figure depends on resolution, but the
-            // trigger only needs the right ballpark, and folding it into the same char sum as every
-            // other block keeps the single ceiling division below the one true source of rounding.
-            ContentBlock::Image { .. } => 4_800,
-        })
-        .sum();
-    chars.div_ceil(4) as u32
-}
-
-/// Total estimated tokens across every message in `messages` — pi's own `estimateMessagesTokens`,
-/// summing [`estimate_message_tokens`] per message. Unlike [`trailing_tokens`] (a *delta* since the last
-/// real usage snapshot), this estimates the whole list from scratch — used right after
-/// [`apply_summary`] rebuilds the message list for a post-compaction estimate, a moment at which
-/// `trailing_tokens` would just report 0 (`apply_summary` resets its snapshot to point past the
-/// freshly-shrunk list's end, so there's no "since last snapshot" delta to speak of yet).
-pub(crate) fn estimate_messages_tokens(messages: &[Message]) -> u32 {
-    messages
-        .iter()
-        .map(estimate_message_tokens)
-        .fold(0u32, |acc, n| acc.saturating_add(n))
-}
-
 /// Estimated tokens in every message appended since [`Session::last_input_tokens`] was last set — the
 /// assistant turn that usage snapshot itself came from, plus anything since (tool results, further
 /// turns). `should_compact` adds this to `last_input_tokens` so the trigger reflects the prompt's
 /// *actual* current size rather than a size that's already stale by the time it's checked (the check
 /// runs at the top of the next loop iteration, after that turn's own messages were pushed).
 ///
-/// The very first trailing message — `messages[last_usage_message_count]`, when it's the assistant
-/// turn that snapshot was taken for (see [`Session::last_output_tokens`]'s doc comment) — uses the
-/// provider's own reported output size instead of the usual char/4 estimate: it's the one message
-/// here whose real size is already known exactly, not guessed. Guarded on `Role::Assistant` so this
-/// never misapplies to an ordinary user/tool-result message at that same index (e.g. before any turn
-/// has completed yet, when both fields are still their zero defaults).
-pub fn trailing_tokens(session: &Session) -> u32 {
+/// Each message is sized by the family's calibrated estimate ([`token_size::message_tokens`]): an
+/// assistant message by its recorded output tokens, which on Claude include the full thinking the
+/// prompt carries. On the eval runs this step was under-counted by a median 22–34% on Claude with
+/// chars/4, so a crossing fired one request late 20–22% of the time (weighted by step size); with the
+/// calibrated estimate, 0.6–2.1% late and 3.3–5.0% early (by at most about 1.2K at p1, against a 16K
+/// reserve). On GPT, where only about 30% of reasoning returns, 6.3% late / 9.1% early becomes
+/// 4.3% / 6.2% (Luna) and 10.5% / 1.0% becomes 3.3% / 3.0% (Sol).
+///
+/// The very first trailing message — `messages[last_usage_message_count]`, the assistant turn the
+/// snapshot was taken for — falls back to [`Session::last_output_tokens`] when it carries no usage of
+/// its own (a host hook stripped it), the one message whose size the snapshot itself reported.
+pub fn trailing_tokens(session: &Session, family: TokenFamily) -> u32 {
     let start = session.last_usage_message_count.min(session.messages.len());
     let mut total = 0u32;
     for (i, m) in session.messages[start..].iter().enumerate() {
-        let tokens = if i == 0 && m.role == Role::Assistant && session.last_output_tokens > 0 {
-            session.last_output_tokens
-        } else {
-            estimate_message_tokens(m)
+        let tokens = match (i, m.role, m.usage) {
+            (0, Role::Assistant, Some(u)) if u.output_tokens > 0 => family.assistant_tokens(&u),
+            (0, Role::Assistant, None) if session.last_output_tokens > 0 => {
+                session.last_output_tokens
+            }
+            _ => token_size::message_tokens(m, family),
         };
         total = total.saturating_add(tokens);
     }
     total
+}
+
+/// The live prompt size: the last real usage report ([`Session::last_input_tokens`]) plus
+/// [`trailing_tokens`], or — with no report since the history was last rewritten (right after a
+/// compaction) — the whole conversation's `sizes` ([`token_size::message_sizes`]).
+pub fn live_tokens(session: &Session, sizes: &[u32], family: TokenFamily) -> u32 {
+    if session.last_input_tokens > 0 {
+        session
+            .last_input_tokens
+            .saturating_add(trailing_tokens(session, family))
+    } else {
+        token_size::total(sizes)
+    }
 }
 
 /// Whether the live prompt has crossed the compaction threshold. Uses the *last turn's* input size
@@ -686,7 +675,7 @@ pub fn should_compact(session: &Session, cfg: &CompactionConfig) -> bool {
     session.last_input_tokens > 0
         && session
             .last_input_tokens
-            .saturating_add(trailing_tokens(session))
+            .saturating_add(trailing_tokens(session, cfg.family))
             > cfg.trigger_tokens()
 }
 
@@ -715,36 +704,30 @@ pub fn is_hard_overflow(
 ) -> bool {
     let live_prompt = session
         .last_input_tokens
-        .saturating_add(trailing_tokens(session));
+        .saturating_add(trailing_tokens(session, cfg.family));
     live_prompt >= cfg.input_budget()
         || (stop_reason == StopReason::MaxTokens
             && live_prompt.saturating_add(next_max_tokens) >= cfg.context_window)
 }
 
-/// Choose the first message index to keep verbatim. Walks back from the end accumulating estimated
-/// tokens until ~`keep_recent_tokens` is covered, then snaps to the nearest assistant message —
-/// **forward** (at or after that point) when one exists, so the kept suffix never retains *more*
-/// than the budget, only ever less. (An earlier version of this always snapped backward, which could
-/// pull in a whole extra message's worth of tokens ahead of the accumulation point — unbounded if
-/// that message happened to be a large tool result.)
+/// Choose the first message index to keep verbatim: the earliest assistant message whose suffix
+/// (`sizes[first_kept..]`, real tokens — see [`token_size::message_sizes`]) fits in
+/// `keep_recent_tokens`. The kept suffix never holds more than the budget, with one exception: when
+/// even the last turn alone holds more, that turn (from the last assistant message on) is kept whole
+/// — the in-flight tool call and its result stay verbatim, and [`plan_cut`] cuts past it when that
+/// would leave the prompt over the trigger.
 ///
-/// Forward-snapping can run off the end of the array when the accumulation point lands on the very
-/// last message and it isn't an assistant message (routinely true: `should_compact` is checked right
-/// after a tool-dispatch turn appends a `user` tool-result message, before the next assistant turn
-/// exists yet). Rather than decline to compact entirely in that case, this falls back to snapping
-/// backward instead — some valid boundary is required for the post-compaction alternation to hold,
-/// and retaining slightly more than the budget for one round beats not compacting at all.
+/// The boundary is always an assistant message, which is what keeps it safe against splitting a
+/// `tool_use`/`tool_result` pair *in this codebase's message model specifically*: roles strictly
+/// alternate (the loop never emits two consecutive same-role messages — Anthropic rejects that), so a
+/// pair always spans exactly `messages[k]` (assistant) / `messages[k+1]` (user). The post-compaction
+/// history is `[summary(user), assistant, user, …]` — valid alternation.
 ///
-/// Either direction is equally safe against splitting a `tool_use`/`tool_result` pair *in this
-/// codebase's message model specifically*: roles strictly alternate (the loop never emits two
-/// consecutive same-role messages — Anthropic rejects that), so a pair always spans exactly
-/// `messages[k]` (assistant) / `messages[k+1]` (user), and landing the boundary on the assistant
-/// message immediately before *or* immediately after a tool-result message never lands mid-pair. The
-/// post-compaction history is `[summary(user), assistant, user, …]` — valid alternation either way.
-///
-/// Returns `None` when there isn't a worthwhile prefix to summarize (too short, or no clean
-/// boundary at all) — the caller then leaves the conversation untouched.
-pub fn find_cut(messages: &[Message], keep_recent_tokens: u32) -> Option<usize> {
+/// Returns `None` when there isn't a worthwhile prefix to summarize (fewer than four messages, or no
+/// assistant boundary after the first message) — the caller then leaves the conversation untouched.
+/// `Some(1)` when everything after the first message fits: on a compacted session (the first message
+/// is the summary) there is nothing new to fold in.
+pub fn find_cut(messages: &[Message], sizes: &[u32], keep_recent_tokens: u32) -> Option<usize> {
     // Debug-only, not a runtime check on untrusted input: the tool_use/tool_result-pairing safety
     // argument above depends on `messages` strictly alternating roles. Nothing enforces that at the
     // type level — `Session::push` is a bare append — so this catches a violation at the one call
@@ -756,38 +739,81 @@ pub fn find_cut(messages: &[Message], keep_recent_tokens: u32) -> Option<usize> 
         "find_cut: messages must strictly alternate roles — a violation here means the \
          tool_use/tool_result-pairing safety argument this function relies on no longer holds"
     );
+    debug_assert_eq!(messages.len(), sizes.len());
     let n = messages.len();
     // Need at least a couple of turns to bother — a summary plus a kept suffix.
     if n < 4 {
         return None;
     }
-    let mut kept = 0u32;
-    let mut idx = n - 1;
-    while idx > 0 {
-        kept = kept.saturating_add(estimate_message_tokens(&messages[idx]));
-        if kept >= keep_recent_tokens {
+    let mut suffix = 0u32;
+    let (mut fits, mut last_turn) = (None, None);
+    for i in (1..n).rev() {
+        suffix = suffix.saturating_add(sizes[i]);
+        if messages[i].role != Role::Assistant {
+            continue;
+        }
+        last_turn.get_or_insert(i);
+        if suffix > keep_recent_tokens {
             break;
         }
-        idx -= 1;
+        fits = Some(i);
     }
-    let mut forward = idx;
-    while forward < n && messages[forward].role != Role::Assistant {
-        forward += 1;
+    fits.or(last_turn)
+}
+
+/// The cut a compaction makes: [`find_cut`]'s, unless that would leave the prompt over the trigger
+/// when the compaction has to get under it (`must_fit`: an automatic compaction, which fires only
+/// past the trigger, or an overflow). Then the earliest boundary after it that does get under —
+/// cutting into the kept tail, past a turn too big to keep, or, when even the last turn does not
+/// fit, past everything (`messages.len()`: the summary alone carries on).
+///
+/// "Gets under" is projected from the live prompt (`live`, [`live_tokens`]): what stays is
+/// `live − sizes[..cut]`, plus a new summary of at most [`CompactionConfig::summary_max_tokens`].
+/// On a compacted session a cut at 1 (just the old summary) is no progress and is passed over. When
+/// no cut gets under (the system prompt, tools and summary alone exceed the trigger), this keeps
+/// [`find_cut`]'s cut and logs it: compacting further would only repeat every turn.
+///
+/// This is what makes a compaction that declines itself while the prompt grows past the trigger
+/// impossible. Before anchors, a Haiku turn with 56K of hidden thinking sat in the kept tail estimated
+/// at 1–2K, so `find_cut` found nothing to cut and the prompt grew 89K → 111K over 13 requests,
+/// past Haiku's 100K price tier.
+pub fn plan_cut(
+    messages: &[Message],
+    sizes: &[u32],
+    cfg: &CompactionConfig,
+    live: u32,
+    must_fit: bool,
+) -> Option<usize> {
+    let cut = find_cut(messages, sizes, cfg.keep_recent_tokens);
+    // A lone user message has no turn to summarize.
+    if !must_fit || messages.len() < 3 {
+        return cut;
     }
-    let first_kept = if forward < n {
-        forward
-    } else {
-        let mut backward = idx;
-        while backward > 0 && messages[backward].role != Role::Assistant {
-            backward -= 1;
+    let target = cfg.trigger_tokens();
+    // On a compacted session a cut at 1 summarizes nothing but the summary: no progress.
+    let first = 1 + usize::from(previous_summary(&messages[..1]).is_some());
+    let mut before = token_size::total(&sizes[..first.min(messages.len())]);
+    for j in first..=messages.len() {
+        if j > first {
+            before = before.saturating_add(sizes[j - 1]);
         }
-        backward
-    };
-    // Leave a non-trivial prefix to summarize, and require a real assistant boundary.
-    if first_kept == 0 || first_kept >= n || messages[first_kept].role != Role::Assistant {
-        return None;
+        let boundary = j == messages.len() || messages[j].role == Role::Assistant;
+        let fits = live
+            .saturating_sub(before)
+            .saturating_add(cfg.summary_max_tokens)
+            <= target;
+        // The earliest boundary that gets under, but never one keeping more than `find_cut`'s.
+        if boundary && fits && cut.is_none_or(|c| j >= c) {
+            return Some(j);
+        }
     }
-    Some(first_kept)
+    tracing::warn!(
+        live,
+        target,
+        "compaction cannot bring the prompt under the trigger: the system prompt, tools and summary \
+         alone exceed it"
+    );
+    cut
 }
 
 /// [`find_cut`]'s boundary, plus — when the prefix being summarized ends mid-turn (see
@@ -804,7 +830,7 @@ pub struct CutPoint {
     pub turn_start: Option<usize>,
 }
 
-/// Backstop on how far back [`find_split_cut`]'s turn-start scan will look before giving up and
+/// Backstop on how far back [`split_turn_start`]'s turn-start scan will look before giving up and
 /// treating the whole scanned window as the in-progress turn's own prefix. Deliberately large and
 /// independent of `keep_recent_tokens` (which callers may set small, e.g. in tests, to force a
 /// specific cut point for the unrelated suffix-selection budget in [`find_cut`]) — a real turn almost
@@ -814,9 +840,22 @@ pub struct CutPoint {
 const MAX_SPLIT_TURN_SCAN_TOKENS: u32 = 200_000;
 
 /// [`find_cut`], plus the split-turn boundary described on [`CutPoint`].
-pub fn find_split_cut(messages: &[Message], keep_recent_tokens: u32) -> Option<CutPoint> {
-    let first_kept = find_cut(messages, keep_recent_tokens)?;
-    let turn_start = is_split_turn(&messages[..first_kept]).then(|| {
+pub fn find_split_cut(
+    messages: &[Message],
+    sizes: &[u32],
+    keep_recent_tokens: u32,
+) -> Option<CutPoint> {
+    let first_kept = find_cut(messages, sizes, keep_recent_tokens)?;
+    Some(CutPoint {
+        first_kept,
+        turn_start: split_turn_start(messages, sizes, first_kept),
+    })
+}
+
+/// Where the turn in progress at `first_kept` started, when `messages[..first_kept]` ends mid-turn
+/// (see [`CutPoint::turn_start`]); `None` on a clean boundary.
+pub fn split_turn_start(messages: &[Message], sizes: &[u32], first_kept: usize) -> Option<usize> {
+    is_split_turn(&messages[..first_kept]).then(|| {
         // Bounded by `MAX_SPLIT_TURN_SCAN_TOKENS`: stop once that much of the in-progress turn has
         // been scanned, even without a genuine turn-start yet, rather than walking the entire
         // (potentially session-spanning) prefix. `is_split_turn`'s gate is common — true after any
@@ -832,7 +871,7 @@ pub fn find_split_cut(messages: &[Message], keep_recent_tokens: u32) -> Option<C
             if is_turn_start(&messages[i]) {
                 break;
             }
-            scanned_tokens = scanned_tokens.saturating_add(estimate_message_tokens(&messages[i]));
+            scanned_tokens = scanned_tokens.saturating_add(sizes[i]);
             if scanned_tokens >= MAX_SPLIT_TURN_SCAN_TOKENS {
                 break;
             }
@@ -848,10 +887,6 @@ pub fn find_split_cut(messages: &[Message], keep_recent_tokens: u32) -> Option<C
             cut = 1;
         }
         cut
-    });
-    Some(CutPoint {
-        first_kept,
-        turn_start,
     })
 }
 
@@ -1572,6 +1607,8 @@ pub fn apply_summary(session: &mut Session, first_kept: usize, summary: &str, to
     )));
     new_messages.extend_from_slice(kept);
     session.messages = Arc::new(new_messages);
+    // The next request's growth over the last one would measure the rewrite, not a turn.
+    session.forget_anchor();
     // Request-only blocks on kept messages move with them; ones on summarized messages go with them.
     for b in &mut session.request_blocks {
         b.index = (b.index + 1).wrapping_sub(first_kept);
@@ -1623,7 +1660,10 @@ pub struct MaskPlan {
     pub edited: Vec<usize>,
     /// How many tool results were masked.
     pub masked: usize,
-    /// Estimated tokens freed (chars/4 of the elided output, plus 1,200 per dropped image).
+    /// Real prompt tokens freed: each elided output's calibrated estimate
+    /// ([`token_size::tool_content_tokens`], plus 1,200 per dropped image) less its placeholder's,
+    /// scaled by how far its message's measured size ([`token_size::message_sizes`]) exceeds that
+    /// message's estimate.
     pub freed: u32,
 }
 
@@ -1652,10 +1692,13 @@ pub struct MaskPlan {
 /// [`find_cut`] invariants hold across a pass by construction.
 pub fn mask_tool_results(
     messages: &[Message],
+    sizes: &[u32],
+    family: TokenFamily,
     keep_turns: usize,
     keep_tokens: u32,
     keep_paths: &[String],
 ) -> Option<MaskPlan> {
+    debug_assert_eq!(messages.len(), sizes.len());
     // The first message of the kept window: the `keep_turns`-th assistant message from the end.
     let turn_start = |turns: usize| {
         messages
@@ -1671,8 +1714,8 @@ pub fn mask_tool_results(
     let last_turn = turn_start(1)?;
     let token_start = || {
         let mut held = 0u32;
-        let i = messages.iter().rposition(|m| {
-            held = held.saturating_add(estimate_message_tokens(m));
+        let i = sizes.iter().rposition(|&n| {
+            held = held.saturating_add(n);
             held >= keep_tokens
         })?;
         Some(
@@ -1715,6 +1758,12 @@ pub fn mask_tool_results(
         if m.role != Role::User {
             continue;
         }
+        // How much bigger the prompt measured this message than its estimate (exactly 1 with no
+        // anchor): the calibrated estimate of each elided output is scaled by it, so content the
+        // estimate under-counts (dense JSON, an image's real cost) frees what it really held. Held
+        // within 2× either way: the measured size is a turn's, less its assistant message's estimate.
+        let estimate = token_size::message_tokens(m, family).max(1);
+        let measured = sizes[i].clamp(estimate / 2, estimate.saturating_mul(2));
         let mut changed = false;
         for b in &mut m.content {
             let ContentBlock::ToolResult {
@@ -1738,10 +1787,15 @@ pub fn mask_tool_results(
                 continue;
             }
             let placeholder = mask_placeholder(call, chars, images.len());
-            freed = freed
-                .saturating_add(chars.div_ceil(4) as u32)
+            let elided = token_size::tool_content_tokens(chars, family)
                 .saturating_add(1_200 * images.len() as u32)
-                .saturating_sub(placeholder.chars().count().div_ceil(4) as u32);
+                .saturating_sub(token_size::tool_content_tokens(
+                    placeholder.chars().count(),
+                    family,
+                ));
+            let elided = (u64::from(elided) * u64::from(measured) / u64::from(estimate))
+                .min(u64::from(u32::MAX)) as u32;
+            freed = freed.saturating_add(elided);
             *content = Arc::from(placeholder);
             images.clear();
             masked += 1;
@@ -1821,6 +1875,11 @@ pub fn summary_tokens_before(m: &Message) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// chars/4 sizes, the [`TokenFamily::Other`] estimate these tests were written against.
+    fn legacy_sizes(messages: &[Message]) -> Vec<u32> {
+        token_size::message_sizes(messages, TokenFamily::Other, None)
+    }
     use serde_json::json;
 
     #[test]
@@ -1868,7 +1927,7 @@ mod tests {
         // Without its provisional 240K `compact_at`, which would otherwise fire first.
         let cfg = CompactionConfig {
             compact_at: None,
-            ..CompactionConfig::for_model(&crate::models::capabilities("gpt-5.6-sol"))
+            ..CompactionConfig::for_model("gpt-5.6-sol")
         };
         assert_eq!(cfg.context_window, 1_050_000);
         assert_eq!(cfg.input_budget(), 922_000);
@@ -1881,7 +1940,10 @@ mod tests {
         // Same budgets as any large window: only the base the reserve comes off moved.
         let d = CompactionConfig::default();
         assert_eq!(cfg.reserve_tokens, d.reserve_tokens);
-        assert_eq!(cfg.keep_recent_tokens, d.keep_recent_tokens);
+        assert_eq!(
+            cfg.keep_recent_tokens,
+            TokenFamily::Gpt.keep_recent_tokens()
+        );
     }
 
     #[test]
@@ -1902,7 +1964,7 @@ mod tests {
             let caps = crate::models::capabilities(id);
             let limit = caps.input_limit.expect(id);
             assert!(limit < caps.context_window, "{id}");
-            let cfg = CompactionConfig::for_model(&caps);
+            let cfg = CompactionConfig::for_model(id);
             let mut s = Session::new();
             s.last_input_tokens = limit - 1;
             assert!(
@@ -1932,7 +1994,7 @@ mod tests {
             ("grok-4.6", 180_000),
             ("kimi-k3", 128_000),
         ] {
-            let cfg = CompactionConfig::for_model(&crate::models::capabilities(id));
+            let cfg = CompactionConfig::for_model(id);
             assert_eq!(cfg.trigger_tokens(), cap, "{id}");
             let mut s = Session::new();
             s.last_input_tokens = cap;
@@ -1949,7 +2011,13 @@ mod tests {
                 ..crate::models::capabilities(id)
             };
             assert_eq!(
-                CompactionConfig::for_model(&caps).trigger_tokens(),
+                CompactionConfig::for_limits(
+                    caps.context_window,
+                    caps.input_limit,
+                    caps.compact_at,
+                    TokenFamily::for_model(id)
+                )
+                .trigger_tokens(),
                 200_000,
                 "{id}"
             );
@@ -1958,13 +2026,13 @@ mod tests {
         let small = crate::models::capabilities("some-unknown-model");
         assert_eq!(small.context_window, 128_000);
         assert_eq!(
-            CompactionConfig::for_model(&small).trigger_tokens(),
+            CompactionConfig::for_model("some-unknown-model").trigger_tokens(),
             128_000 - 16_384
         );
         // `--compact-at 0` (no cap) still restores the full-window trigger.
         let cfg = CompactionConfig {
             compact_at: None,
-            ..CompactionConfig::for_model(&crate::models::capabilities("claude-opus-4-8"))
+            ..CompactionConfig::for_model("claude-opus-4-8")
         };
         assert_eq!(cfg.trigger_tokens(), 1_000_000 - 16_384);
     }
@@ -1990,7 +2058,13 @@ mod tests {
             ..crate::models::capabilities("claude-opus-5-5")
         };
         assert_eq!(
-            CompactionConfig::for_model(&caps).keep_recent_tokens,
+            CompactionConfig::for_limits(
+                caps.context_window,
+                caps.input_limit,
+                caps.compact_at,
+                TokenFamily::for_model("claude-opus-5-5")
+            )
+            .keep_recent_tokens,
             15_000
         );
     }
@@ -1999,7 +2073,7 @@ mod tests {
     fn a_max_tokens_stop_still_measures_prompt_plus_output_against_the_window() {
         // The input cap moves only the input-side checks: a max-tokens cut-off compares prompt +
         // next output against the whole window, which still holds both.
-        let cfg = CompactionConfig::for_model(&crate::models::capabilities("gpt-5.6"));
+        let cfg = CompactionConfig::for_model("gpt-5.6");
         let mut s = Session::new();
         s.last_input_tokens = 900_000;
         assert!(!is_hard_overflow(&s, &cfg, StopReason::MaxTokens, 128_000));
@@ -2038,10 +2112,10 @@ mod tests {
     }
 
     #[test]
-    fn estimate_message_tokens_ceils_once_over_the_whole_message_not_per_block() {
+    fn the_chars_4_estimate_ceils_once_over_the_whole_message_not_per_block() {
         // pi-parity gap (fixed): pi's `estimateTokens` (`estimate.ts`) sums a whole message's chars
-        // before its single `Math.ceil(chars / 4)`. Flooring (the old per-block behavior, via
-        // `estimate_tokens`'s chars/4) each block separately then summing systematically under-counts a
+        // before its single `Math.ceil(chars / 4)` — `TokenFamily::Other`'s estimate. Flooring (the old
+        // per-block behavior) each block separately then summing systematically under-counts a
         // message built of several short blocks — three 3-char text blocks (9 chars total, ceil(9/4) =
         // 3 tokens) each individually floor to 0 tokens alone (3/4 = 0), summing to 0 instead.
         let m = Message::assistant(vec![
@@ -2050,7 +2124,7 @@ mod tests {
             ContentBlock::text("ghi"),
         ]);
         assert_eq!(
-            estimate_message_tokens(&m),
+            token_size::message_tokens(&m, TokenFamily::Other),
             3,
             "9 total chars across 3 blocks must ceil-divide once as a whole (ceil(9/4) = 3), not \
              floor-divide per block and sum (0 + 0 + 0 = 0)"
@@ -2192,7 +2266,7 @@ mod tests {
         s.last_usage_message_count = s.messages.len(); // snapshot taken right before the reply
         s.last_output_tokens = 5_000;
         s.push(Message::assistant(vec![ContentBlock::text("ok")])); // ~0 tokens by char/4
-        assert_eq!(trailing_tokens(&s), 5_000);
+        assert_eq!(trailing_tokens(&s, TokenFamily::Other), 5_000);
     }
 
     #[test]
@@ -2206,7 +2280,7 @@ mod tests {
         s.last_output_tokens = 100;
         s.push(Message::assistant(vec![ContentBlock::text("ok")]));
         s.push(Message::user("x".repeat(400))); // ~100 estimated tokens
-        assert_eq!(trailing_tokens(&s), 200);
+        assert_eq!(trailing_tokens(&s, TokenFamily::Other), 200);
     }
 
     #[test]
@@ -2220,7 +2294,7 @@ mod tests {
         let mut s = Session::new();
         s.last_output_tokens = 5_000; // stale/default-adjacent value, must not leak in here
         s.push(Message::user("x".repeat(40))); // ~10 estimated tokens
-        assert_eq!(trailing_tokens(&s), 10);
+        assert_eq!(trailing_tokens(&s, TokenFamily::Other), 10);
     }
 
     #[test]
@@ -2325,7 +2399,7 @@ mod tests {
     fn find_cut_snaps_to_assistant_and_leaves_both_sides() {
         let messages = convo();
         // Keep a tiny budget so the cut lands late, then snaps to an assistant boundary.
-        let cut = find_cut(&messages, 1).expect("a cut");
+        let cut = find_cut(&messages, &legacy_sizes(&messages), 1).expect("a cut");
         assert_eq!(messages[cut].role, Role::Assistant);
         assert!(cut > 0 && cut < messages.len());
     }
@@ -2337,7 +2411,7 @@ mod tests {
         // the end, message 5 ("done", ~1 token) isn't enough alone, so the walk continues to message 4
         // ("edited", ~1 token) — cumulative 2, stop at idx=4, a *user* (tool_result) message.
         let messages = convo();
-        let cut = find_cut(&messages, 2).expect("a cut");
+        let cut = find_cut(&messages, &legacy_sizes(&messages), 2).expect("a cut");
         // Forward-snap lands on message 5 (the next assistant boundary *after* idx=4) — the
         // tool_use/tool_result pair at [3, 4] is fully summarized, not partially retained. A prior
         // backward-snapping implementation would have landed on message 3 instead, retaining both
@@ -2347,7 +2421,10 @@ mod tests {
         // The kept suffix (from `cut` onward) never exceeds the budget by more than the one boundary
         // message itself — unlike backward-snap, it can't additionally pull in an *earlier* sibling
         // message (here, message 3) ahead of the accumulation point.
-        let kept_tokens: u32 = messages[cut..].iter().map(estimate_message_tokens).sum();
+        let kept_tokens: u32 = messages[cut..]
+            .iter()
+            .map(|m| token_size::message_tokens(m, TokenFamily::Other))
+            .sum();
         assert!(kept_tokens <= 2, "kept {kept_tokens} tokens, budget was 2");
     }
 
@@ -2369,7 +2446,7 @@ mod tests {
                 "second done, another long enough response for the estimate to register",
             )]),
         ];
-        let cut = find_split_cut(&messages, 1).expect("a cut");
+        let cut = find_split_cut(&messages, &legacy_sizes(&messages), 1).expect("a cut");
         assert_eq!(cut.first_kept, 3);
         assert_eq!(
             cut.turn_start, None,
@@ -2404,7 +2481,7 @@ mod tests {
         // A tiny budget forces the cut to land as late as possible; the trailing tool_result-only
         // message at index 6 makes it snap (forward has nowhere to go, so it snaps backward) to the
         // assistant message at index 5 — a split-turn boundary.
-        let cut = find_split_cut(&messages, 1).expect("a cut");
+        let cut = find_split_cut(&messages, &legacy_sizes(&messages), 1).expect("a cut");
         assert_eq!(cut.first_kept, 5);
         assert_eq!(
             cut.turn_start,
@@ -2434,7 +2511,7 @@ mod tests {
             )]));
             messages.push(Message::tool_result(i.to_string(), big.clone(), false));
         }
-        let cut = find_split_cut(&messages, 1).expect("a cut");
+        let cut = find_split_cut(&messages, &legacy_sizes(&messages), 1).expect("a cut");
         let turn_start = cut
             .turn_start
             .expect("a trailing bare tool_result is a split-turn boundary");
@@ -2473,7 +2550,7 @@ mod tests {
             )]), // 3
             Message::tool_result("2", "edited", false),                       // 4
         ];
-        let cut = find_split_cut(&messages, 1).expect("a cut");
+        let cut = find_split_cut(&messages, &legacy_sizes(&messages), 1).expect("a cut");
         assert_eq!(cut.first_kept, 3);
         assert_eq!(
             cut.turn_start,
@@ -2512,7 +2589,7 @@ mod tests {
         messages.push(Message::assistant(vec![ContentBlock::text("done")]));
 
         for budget in [1u32, 3, 5, 8, 12, 20, 50] {
-            let Some(cut) = find_cut(&messages, budget) else {
+            let Some(cut) = find_cut(&messages, &legacy_sizes(&messages), budget) else {
                 continue;
             };
             assert_eq!(
@@ -2535,7 +2612,7 @@ mod tests {
 
     #[test]
     fn find_cut_declines_short_conversations() {
-        assert!(find_cut(&convo()[..3], 1).is_none());
+        assert!(find_cut(&convo()[..3], &legacy_sizes(&convo()[..3]), 1).is_none());
     }
 
     #[test]
@@ -2550,7 +2627,7 @@ mod tests {
             Message::assistant(vec![ContentBlock::text("three")]),
             Message::user("four"),
         ];
-        find_cut(&messages, 1);
+        find_cut(&messages, &legacy_sizes(&messages), 1);
     }
 
     #[test]
@@ -3423,7 +3500,15 @@ mod tests {
     #[test]
     fn masking_elides_results_older_than_the_kept_turns_and_nothing_else() {
         let history = tool_history(6, "read", 4_000);
-        let plan = mask_tool_results(&history, 2, u32::MAX, &[]).expect("something to mask");
+        let plan = mask_tool_results(
+            &history,
+            &legacy_sizes(&history),
+            TokenFamily::Other,
+            2,
+            u32::MAX,
+            &[],
+        )
+        .expect("something to mask");
         // Turns 0..4 masked (their results sit at 2, 4, 6, 8); the last two turns untouched.
         assert_eq!(plan.masked, 4);
         assert_eq!(plan.edited, vec![2, 4, 6, 8]);
@@ -3478,7 +3563,15 @@ mod tests {
                 ..Message::user("")
             });
         }
-        let plan = mask_tool_results(&history, 1, u32::MAX, &[]).unwrap();
+        let plan = mask_tool_results(
+            &history,
+            &legacy_sizes(&history),
+            TokenFamily::Other,
+            1,
+            u32::MAX,
+            &[],
+        )
+        .unwrap();
         let masked = &plan.messages;
         assert_eq!(masked.len(), history.len());
         assert!(masked.windows(2).all(|w| w[0].role != w[1].role));
@@ -3497,7 +3590,10 @@ mod tests {
         }
         assert!(result_content(&masked[2]).contains("bash(command=make)"));
         // The cut search still finds the same assistant boundary on the masked transcript.
-        assert_eq!(find_cut(masked, 1), find_cut(&history, 1));
+        assert_eq!(
+            find_cut(masked, &legacy_sizes(masked), 1),
+            find_cut(&history, &legacy_sizes(&history), 1)
+        );
     }
 
     #[test]
@@ -3534,7 +3630,15 @@ mod tests {
         // A short result (turn 3) costs about what its placeholder would.
         history[8] = Message::tool_result("c3", "short", false);
 
-        let plan = mask_tool_results(&history, 3, u32::MAX, &["src/f2.rs".to_string()]).unwrap();
+        let plan = mask_tool_results(
+            &history,
+            &legacy_sizes(&history),
+            TokenFamily::Other,
+            3,
+            u32::MAX,
+            &["src/f2.rs".to_string()],
+        )
+        .unwrap();
         let masked = |i: usize| result_content(&plan.messages[i]).starts_with(MASKED_PREFIX);
         assert!(masked(2), "an old error is masked");
         assert!(!masked(4), "src/f1.rs is being edited");
@@ -3547,7 +3651,14 @@ mod tests {
         assert!(masked(12));
         // Idempotent: a masked transcript has nothing left to mask.
         assert_eq!(
-            mask_tool_results(&plan.messages, 3, u32::MAX, &["src/f2.rs".to_string()]),
+            mask_tool_results(
+                &plan.messages,
+                &legacy_sizes(&plan.messages),
+                TokenFamily::Other,
+                3,
+                u32::MAX,
+                &["src/f2.rs".to_string()]
+            ),
             None
         );
     }
@@ -3564,7 +3675,15 @@ mod tests {
             }],
             ..history[2].clone()
         };
-        let plan = mask_tool_results(&history, 1, u32::MAX, &[]).unwrap();
+        let plan = mask_tool_results(
+            &history,
+            &legacy_sizes(&history),
+            TokenFamily::Other,
+            1,
+            u32::MAX,
+            &[],
+        )
+        .unwrap();
         assert_eq!(plan.masked, 1, "only the image result is worth masking");
         let ContentBlock::ToolResult {
             content, images, ..
@@ -3580,14 +3699,38 @@ mod tests {
     #[test]
     fn masking_needs_more_turns_than_it_keeps() {
         assert_eq!(
-            mask_tool_results(&tool_history(2, "read", 4_000), 2, u32::MAX, &[]),
+            mask_tool_results(
+                &tool_history(2, "read", 4_000),
+                &legacy_sizes(&tool_history(2, "read", 4_000)),
+                TokenFamily::Other,
+                2,
+                u32::MAX,
+                &[]
+            ),
             None
         );
         assert_eq!(
-            mask_tool_results(&tool_history(2, "read", 4_000), 3, u32::MAX, &[]),
+            mask_tool_results(
+                &tool_history(2, "read", 4_000),
+                &legacy_sizes(&tool_history(2, "read", 4_000)),
+                TokenFamily::Other,
+                3,
+                u32::MAX,
+                &[]
+            ),
             None
         );
-        assert!(mask_tool_results(&tool_history(3, "read", 4_000), 2, u32::MAX, &[]).is_some());
+        assert!(
+            mask_tool_results(
+                &tool_history(3, "read", 4_000),
+                &legacy_sizes(&tool_history(3, "read", 4_000)),
+                TokenFamily::Other,
+                2,
+                u32::MAX,
+                &[]
+            )
+            .is_some()
+        );
     }
 
     #[test]
@@ -3595,18 +3738,49 @@ mod tests {
         // Twelve turns of ~1K tokens: ten kept turns hold ~10K. With a 2,500-token budget only the
         // last two or three turns stay; everything older is masked.
         let history = tool_history(12, "read", 4_000);
-        let by_turns = mask_tool_results(&history, 10, u32::MAX, &[]).unwrap();
+        let by_turns = mask_tool_results(
+            &history,
+            &legacy_sizes(&history),
+            TokenFamily::Other,
+            10,
+            u32::MAX,
+            &[],
+        )
+        .unwrap();
         assert_eq!(by_turns.masked, 2);
-        let by_tokens = mask_tool_results(&history, 10, 2_500, &[]).unwrap();
+        let by_tokens = mask_tool_results(
+            &history,
+            &legacy_sizes(&history),
+            TokenFamily::Other,
+            10,
+            2_500,
+            &[],
+        )
+        .unwrap();
         assert!((9..=10).contains(&by_tokens.masked), "{}", by_tokens.masked);
         // The last turn is always kept, however small the budget.
-        let tiny = mask_tool_results(&history, 10, 1, &[]).unwrap();
+        let tiny = mask_tool_results(
+            &history,
+            &legacy_sizes(&history),
+            TokenFamily::Other,
+            10,
+            1,
+            &[],
+        )
+        .unwrap();
         assert_eq!(tiny.masked, 11);
         // A budget larger than the turns leaves the turn count in charge.
         assert_eq!(
-            mask_tool_results(&history, 10, 1_000_000, &[])
-                .unwrap()
-                .masked,
+            mask_tool_results(
+                &history,
+                &legacy_sizes(&history),
+                TokenFamily::Other,
+                10,
+                1_000_000,
+                &[]
+            )
+            .unwrap()
+            .masked,
             2
         );
     }
@@ -3939,5 +4113,221 @@ mod tests {
             )]),
         ];
         assert_eq!(extract_bash_writes(&messages), ["a.txt", "c.py"]);
+    }
+
+    /// A Haiku-5.5-shaped config: 90K trigger, 40.5K tail, 13,107-token summaries.
+    fn haiku() -> CompactionConfig {
+        CompactionConfig {
+            summary_max_tokens: 13_107,
+            ..CompactionConfig::for_model("claude-haiku-5-5")
+        }
+    }
+
+    /// `[summary or prompt, (assistant, tool result) × n]`, roles alternating.
+    fn turns(first_is_summary: bool, n: usize) -> Vec<Message> {
+        let mut out = vec![if first_is_summary {
+            Message::user(format!(
+                "{SUMMARY_MARKER}\n\nCompacted from 1 tokens\n\nearlier"
+            ))
+        } else {
+            Message::user("the task")
+        }];
+        for i in 0..n {
+            out.push(Message::assistant(vec![ContentBlock::tool_use(
+                format!("c{i}"),
+                "read",
+                json!({ "path": format!("src/f{i}.rs") }),
+            )]));
+            out.push(Message::tool_result(format!("c{i}"), "out", false));
+        }
+        out
+    }
+
+    #[test]
+    fn find_cut_keeps_the_longest_suffix_that_fits_and_never_more() {
+        let messages = turns(false, 3);
+        let sizes = [10, 5, 30, 5, 3, 2, 1];
+        // From 5: 3; from 3: 5 + 3 + 3 = 11; from 1: 5 + 30 + 11 = 46.
+        assert_eq!(find_cut(&messages, &sizes, 11), Some(3));
+        assert_eq!(find_cut(&messages, &sizes, 10), Some(5));
+        assert_eq!(find_cut(&messages, &sizes, 46), Some(1));
+        // Even the last turn holds more than the budget: it is kept whole.
+        assert_eq!(find_cut(&messages, &sizes, 2), Some(5));
+        // Too short to cut.
+        assert_eq!(find_cut(&messages[..3], &sizes[..3], 1), None);
+    }
+
+    #[test]
+    fn plan_cut_drops_a_turn_too_big_to_keep_and_keeps_one_that_fits() {
+        let cfg = haiku();
+        assert_eq!(cfg.trigger_tokens(), 90_000);
+        assert_eq!(cfg.keep_recent_tokens, 40_500);
+        let messages = turns(true, 2);
+        // The last turn carries 70K of hidden thinking: more than the tail budget on its own.
+        let sizes = [3_000, 2_000, 5_000, 70_000, 8_000];
+        let live = 3_400 + token_size::total(&sizes);
+        assert!(live > cfg.trigger_tokens());
+        assert_eq!(find_cut(&messages, &sizes, cfg.keep_recent_tokens), Some(3));
+        // Keeping it would leave 3.4K + 78K + a summary: over the trigger. Cut past it: the summary
+        // alone carries on, and the prompt lands far under.
+        assert_eq!(
+            plan_cut(&messages, &sizes, &cfg, live, true),
+            Some(messages.len())
+        );
+        // A manual compaction keeps the configured tail.
+        assert_eq!(plan_cut(&messages, &sizes, &cfg, live, false), Some(3));
+        // A 50K last turn fits under the trigger after the cut: it stays verbatim.
+        let sizes = [3_000, 2_000, 5_000, 50_000, 8_000];
+        let live = 3_400 + token_size::total(&sizes);
+        assert_eq!(plan_cut(&messages, &sizes, &cfg, live, true), Some(3));
+    }
+
+    /// The decline-and-grow failure, replayed on its own shape: after a compaction, a turn with
+    /// 56K of hidden thinking sits right after the summary. chars/4 sized its stored text at about
+    /// 1K, so the cut kept everything (`first_kept == 1`), `compact` declined, and the prompt grew
+    /// past the trigger for 13 requests. Real sizes see the turn, and the cut drops it.
+    #[test]
+    fn plan_cut_never_declines_while_the_prompt_is_over_the_trigger() {
+        let cfg = haiku();
+        let mut messages = turns(true, 6);
+        messages[1] = Message::assistant(vec![
+            ContentBlock::Thinking {
+                text: "a short summary of a long think".into(),
+                signature: "sig".into(),
+            },
+            ContentBlock::tool_use("c0", "read", json!({ "path": "src/f0.rs" })),
+        ])
+        .with_usage(crate::message::TokenUsage {
+            output_tokens: 56_460,
+            reasoning_tokens: 56_244,
+            ..Default::default()
+        });
+        let real = token_size::message_sizes(&messages, TokenFamily::Claude, None);
+        let legacy = legacy_sizes(&messages);
+        assert!(
+            real[1] >= 56_000 && legacy[1] < 100,
+            "{} vs {}",
+            real[1],
+            legacy[1]
+        );
+        // What chars/4 saw: everything after the summary fits the tail, so nothing to cut.
+        assert_eq!(find_cut(&messages, &legacy, 20_000), Some(1));
+        // Real sizes, live over the trigger: the huge turn goes into the summary.
+        let live = 3_400 + token_size::total(&real) + 30_000;
+        let cut = plan_cut(&messages, &real, &cfg, live, true).expect("a cut");
+        assert!(cut >= 3, "the cut must pass the 56K turn, got {cut}");
+        // Even when everything after the summary fits the tail (an oversized summary or tool set
+        // pushed the prompt over), a cut at 1 — the summary alone — is no progress: it goes deeper.
+        let small = vec![
+            60_000, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500,
+        ];
+        let live = 3_400 + token_size::total(&small);
+        assert_eq!(find_cut(&messages, &small, cfg.keep_recent_tokens), Some(1));
+        assert!(plan_cut(&messages, &small, &cfg, live, true).is_some_and(|c| c > 1));
+        // When nothing can get under (the system prompt and tools alone fill the trigger), the
+        // configured cut stands rather than summarizing everything every turn.
+        let live = 200_000;
+        assert_eq!(plan_cut(&messages, &small, &cfg, live, true), Some(1));
+    }
+
+    #[test]
+    fn family_defaults_reproduce_the_validated_budgets_in_real_tokens() {
+        let claude = CompactionConfig::for_model("claude-sonnet-5-5");
+        assert_eq!(claude.family, TokenFamily::Claude);
+        assert_eq!(claude.keep_recent_tokens, 40_500);
+        // Masking's window: a quarter of the 200K trigger, × 2.025.
+        assert_eq!(claude.mask_keep_tokens(), 101_250);
+        // Its bar: min(25K, a tenth of the trigger) in chars/4 tokens of tool output, × 1.6.
+        assert_eq!(claude.mask_min_free(), 32_000);
+        let gpt = CompactionConfig::for_model("gpt-6-luna");
+        assert_eq!(gpt.family, TokenFamily::Gpt);
+        assert_eq!(gpt.keep_recent_tokens, 22_000);
+        assert_eq!(gpt.price_tier, Some(272_000));
+        // An unmeasured family keeps the pre-calibration numbers.
+        let other = CompactionConfig::for_model("kimi-k3");
+        assert_eq!(other.family, TokenFamily::Other);
+        assert_eq!(other.keep_recent_tokens, 20_000);
+        assert_eq!(other.mask_min_free(), 12_800);
+        // Haiku's 100K price tier comes from its rate card, through any vendor prefix.
+        assert_eq!(haiku().price_tier, Some(100_000));
+        assert_eq!(
+            crate::models::price_tier("us.anthropic.claude-haiku-5-5-v1:0"),
+            Some(100_000)
+        );
+        assert_eq!(crate::models::price_tier("claude-sonnet-5-5"), None);
+        // xAI's tier applies *at* 200K: the last base-rate prompt is one below.
+        assert_eq!(crate::models::price_tier("grok-4.6"), Some(199_999));
+    }
+
+    #[test]
+    fn trailing_tokens_carry_only_the_reasoning_the_prompt_keeps() {
+        let mut s = Session::new();
+        s.user("go");
+        s.last_input_tokens = 1_000;
+        s.last_usage_message_count = 1;
+        s.push(
+            Message::assistant(vec![ContentBlock::text("x")]).with_usage(
+                crate::message::TokenUsage {
+                    output_tokens: 10_000,
+                    reasoning_tokens: 9_000,
+                    ..Default::default()
+                },
+            ),
+        );
+        s.push(Message::tool_result("t", "y".repeat(2_500), false));
+        // Claude carries every thinking token back; 2,500 chars of output at 2.5 + 80 framing.
+        assert_eq!(
+            trailing_tokens(&s, TokenFamily::Claude),
+            10_000 + 1_000 + 80
+        );
+        // GPT carries 30% of reasoning; 2,500 chars at 3.5.
+        assert_eq!(trailing_tokens(&s, TokenFamily::Gpt), 10_000 - 6_300 + 715);
+    }
+
+    #[test]
+    fn masking_frees_what_the_prompt_measured_not_what_chars_4_says() {
+        let mut history = tool_history(3, "read", 10_000);
+        // The second turn was measured: its tool output cost 6,000 real tokens, half again its
+        // calibrated estimate (4,000 + 80).
+        let measured = history[2].clone();
+        history[3].prior_turn_tokens = Some(6_000 + 200);
+        history[1] = history[1].clone().with_usage(crate::message::TokenUsage {
+            output_tokens: 200,
+            ..Default::default()
+        });
+        for m in history.iter_mut().filter(|m| m.role == Role::Assistant) {
+            m.model_id = Some("claude-haiku-5-5".into());
+        }
+        let sizes = token_size::message_sizes(&history, TokenFamily::Claude, None);
+        assert_eq!(sizes[2], 6_000);
+        let plan =
+            mask_tool_results(&history, &sizes, TokenFamily::Claude, 1, u32::MAX, &[]).unwrap();
+        assert_eq!(plan.masked, 2);
+        let placeholder = |i: usize| match &plan.messages[i].content[0] {
+            ContentBlock::ToolResult { content, .. } => content.chars().count(),
+            _ => unreachable!(),
+        };
+        let elided = |i: usize| {
+            token_size::tool_content_tokens(10_000, TokenFamily::Claude)
+                - token_size::tool_content_tokens(placeholder(i), TokenFamily::Claude)
+        };
+        // Message 2 frees its measured share (6,000 / 4,080 of its estimate); message 4, unmeasured,
+        // its estimate.
+        let scaled = (u64::from(elided(2)) * 6_000 / 4_080) as u32;
+        assert_eq!(plan.freed, scaled + elided(4));
+        assert_ne!(measured, plan.messages[2]);
+        // On chars/4 (`TokenFamily::Other`) with no measured turn, the pass frees what it always did.
+        history[3].prior_turn_tokens = None;
+        let legacy = mask_tool_results(
+            &history,
+            &legacy_sizes(&history),
+            TokenFamily::Other,
+            1,
+            u32::MAX,
+            &[],
+        )
+        .unwrap();
+        let old = |i: usize| (10_000usize.div_ceil(4) - placeholder(i).div_ceil(4)) as u32;
+        assert_eq!(legacy.freed, old(2) + old(4));
     }
 }

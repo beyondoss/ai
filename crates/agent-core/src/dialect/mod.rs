@@ -367,8 +367,8 @@ const MIN_CLAMPED_MAX_TOKENS: u32 = 1_024;
 const ABSOLUTE_MIN_MAX_TOKENS: u32 = 16;
 /// Held back below `context_window` on top of the estimated prompt size — matches pi's
 /// `clampMaxTokensToContext` margin (`packages/ai/src/api/simple-options.ts`). Token *estimates* (ours:
-/// chars/4, see [`crate::compaction::estimate_tokens`]) are approximate; this absorbs that slop so the
-/// clamp doesn't itself become the thing that pushes a request over the edge.
+/// the family-calibrated [`crate::token_size::message_tokens`]) are approximate; this absorbs that slop
+/// so the clamp doesn't itself become the thing that pushes a request over the edge.
 const CONTEXT_CLAMP_MARGIN: u32 = 4_096;
 
 /// Clamp `req.max_tokens` down so `estimated prompt tokens + max_tokens` doesn't already exceed the
@@ -387,15 +387,16 @@ const CONTEXT_CLAMP_MARGIN: u32 = 4_096;
 /// `req.thinking` is simply `None` for a model that doesn't use Anthropic's budget shape, so the floor
 /// term is harmlessly `0` there.
 pub(crate) fn clamp_max_tokens_to_context(req: &ModelRequest, caps: &ModelCaps) -> u32 {
+    let family = crate::token_size::TokenFamily::for_model(&req.model);
     let estimated_prompt: u32 = req
         .messages
         .iter()
-        .map(crate::compaction::estimate_message_tokens)
+        .map(|m| crate::token_size::message_tokens(m, family))
         .fold(0u32, |acc, n| acc.saturating_add(n))
         .saturating_add(
             req.system
                 .as_deref()
-                .map(crate::compaction::estimate_tokens)
+                .map(|s| crate::token_size::text_tokens(s, family))
                 .unwrap_or(0),
         );
     let available = caps

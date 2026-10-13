@@ -59,12 +59,9 @@ pub struct Session {
     pub last_usage_message_count: usize,
     /// Output tokens the provider reported for the turn `last_usage_message_count` was snapshotted at
     /// — i.e. the exact size of `messages[last_usage_message_count]` (that turn's own assistant
-    /// message), once appended. `compaction::trailing_tokens` uses this in place of its usual char/4
-    /// estimate for that one message specifically: it's the one message in the trailing window whose
-    /// real size is already known exactly, from the provider's own usage report, rather than needing
-    /// the heuristic every other trailing message must fall back on. Without this, the just-completed
-    /// turn's own output was still *counted* (the heuristic estimates it too, just less precisely) —
-    /// this is a precision fix for the proactive trigger's timing, not a data-loss one.
+    /// message), once appended. `compaction::trailing_tokens` falls back on this for that one message
+    /// when it carries no usage of its own (the message's own `usage` is the same figure, and is
+    /// what it reads first).
     #[serde(default)]
     pub last_output_tokens: u32,
     /// What compaction has recorded about this session so far — folded forward across every round
@@ -90,6 +87,25 @@ pub struct Session {
     /// replaces the list, whose own rewrite carries the masked content. Never serialized.
     #[serde(skip)]
     pub edited: Vec<usize>,
+    /// The last real prompt size [`Session::record_usage`] recorded, and the message boundary it
+    /// belongs to, for [`Session::push`] to turn into the next assistant message's
+    /// [`Message::prior_turn_tokens`]. Only valid while nothing has rewritten the history since:
+    /// compaction, masking and a cross-model scrub clear it ([`Session::forget_anchor`]). Never
+    /// serialized, so a reopened session measures its first turn afresh.
+    #[serde(skip)]
+    anchor: Option<Anchor>,
+}
+
+/// One request's real prompt size, keyed to the message boundary it saw — see [`Session::anchor`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Anchor {
+    /// `messages.len()` when the request was sent: the index its reply lands at.
+    index: usize,
+    /// [`TokenUsage::prompt_tokens`] of that request.
+    prompt: u32,
+    /// The prompt's growth since the previous request, when that one's reply landed exactly two
+    /// messages earlier: the real size of the turn in between.
+    prior_turn: Option<u32>,
 }
 
 /// One block attached for the model to a message of a [`Session`] — see
@@ -126,9 +142,6 @@ impl Session {
         Self::default()
     }
 
-    /// Append a message to the history. Copy-on-write via `Arc::make_mut`: in place when the history
-    /// is solely owned here (the steady state between turns), cloning only if a request still holds
-    /// the prior snapshot.
     /// Attach `text` to the newest message, if it is a user turn, as a block of its own for the
     /// model — never in the user's own text, never persisted (see [`Self::request_blocks`]). Returns
     /// whether it was attached.
@@ -171,8 +184,37 @@ impl Session {
         Arc::new(out)
     }
 
-    pub fn push(&mut self, message: Message) {
+    /// Append a message to the history. Copy-on-write via `Arc::make_mut`: in place when the history
+    /// is solely owned here (the steady state between turns), cloning only if a request still holds
+    /// the prior snapshot.
+    ///
+    /// An assistant message landing where the last [`record_usage`](Self::record_usage) said its
+    /// request's reply would gets that request's measured prior turn
+    /// ([`Message::prior_turn_tokens`]), when the turn's earlier assistant message came from the same
+    /// model.
+    pub fn push(&mut self, mut message: Message) {
+        if let Some(Anchor {
+            index,
+            prior_turn: Some(turn),
+            ..
+        }) = self.anchor
+            && index == self.messages.len()
+            && message.role == Role::Assistant
+            && message.prior_turn_tokens.is_none()
+            && index
+                .checked_sub(2)
+                .and_then(|i| self.messages.get(i))
+                .is_some_and(|m| m.role == Role::Assistant && m.model_id == message.model_id)
+        {
+            message.prior_turn_tokens = Some(turn);
+        }
         Arc::make_mut(&mut self.messages).push(message);
+    }
+
+    /// Drop the recorded prompt size, after something rewrote the history it measured (compaction,
+    /// masking, a scrub): the next request's growth over it would mean nothing.
+    pub fn forget_anchor(&mut self) {
+        self.anchor = None;
     }
 
     /// Seed (or continue) the conversation with a user text turn.
@@ -224,7 +266,16 @@ impl Session {
     /// foreign and scrubbed. `split_once('|')`-based truncation is a no-op for Anthropic-native tool-use
     /// ids (never contain `|`), so this is safe to run unconditionally regardless of dialect.
     pub fn scrub_cross_model_state(&mut self, new_model: &str) {
+        self.anchor = None;
         let messages = Arc::make_mut(&mut self.messages);
+        // A measured turn (`Message::prior_turn_tokens`) whose messages this rewrites no longer
+        // describes them: drop it wherever the turn's assistant message is foreign.
+        let foreign = |m: &Message| m.model_id.as_deref() != Some(new_model);
+        for i in 2..messages.len() {
+            if foreign(&messages[i]) || foreign(&messages[i - 2]) {
+                messages[i].prior_turn_tokens = None;
+            }
+        }
 
         // First pass: downgrade/drop thinking blocks and truncate foreign-model tool-call ids,
         // recording old -> new id for every `ToolUse` rewrite.
@@ -311,10 +362,7 @@ impl Session {
         // not `+`: these three fields come straight from parsed model-API usage data with no
         // upper-bound validation (a non-standard proxy could report anomalously large values), and
         // `overflow-checks = true` in the release profile turns a raw `u32` overflow into a panic.
-        let live_input = usage
-            .input_tokens
-            .saturating_add(usage.cache_read_tokens)
-            .saturating_add(usage.cache_write_tokens);
+        let live_input = usage.prompt_tokens();
         // A genuinely all-zero report means no real `Usage` event ever arrived this turn (the loop's
         // `Aborted`-turn path calls this unconditionally, before checking `stop_reason`, and a stream
         // cancelled before its `Usage` event carries `TokenUsage::default()`) — not a provider telling
@@ -323,12 +371,63 @@ impl Session {
         // actual last-known size through an aborted turn, rather than spuriously reporting "no context
         // at all" the instant a client cancels mid-stream. A message pushed since the last real
         // snapshot (including the very turn this call is for) is still accounted for — just via
-        // `compaction::trailing_tokens`'s char/4 estimate instead of this exact figure, the same
+        // `compaction::trailing_tokens`'s calibrated estimate instead of this exact figure, the same
         // fallback every message ahead of `last_usage_message_count` already uses.
         if live_input > 0 {
+            let index = self.messages.len();
             self.last_input_tokens = live_input;
-            self.last_usage_message_count = self.messages.len();
+            self.last_usage_message_count = index;
             self.last_output_tokens = usage.output_tokens;
+            // The anchor: this request's real prompt, and — when the previous request's reply landed
+            // two messages back and nothing rewrote the history since — the real size of the turn
+            // between them. A prompt that shrank without a rewrite (a smaller system prompt or tool
+            // set) measures nothing.
+            let prior_turn = self
+                .anchor
+                .filter(|a| a.index + 2 == index && live_input >= a.prompt)
+                .map(|a| live_input - a.prompt);
+            self.anchor = Some(Anchor {
+                index,
+                prompt: live_input,
+                prior_turn,
+            });
+        }
+    }
+
+    /// Rebuild the live-size snapshot ([`Session::last_input_tokens`] and its boundary) for a session
+    /// opened from disk, from the persisted messages: the most recent message carrying usage gives
+    /// the exact prompt size its request carried, as a still-running process would have it.
+    ///
+    /// Except when that usage predates the last compaction: the kept suffix keeps its messages'
+    /// usage, which measured the prompt *before* the summary replaced the prefix. A session reopened
+    /// between a compaction and the next reply would report the pre-compaction size. It is
+    /// recognized by the summary's own record of the size it compacted from
+    /// ([`crate::compaction::summary_tokens_before`]), which is that very usage's prompt size. Then,
+    /// and when no message carries usage at all, the size is the whole conversation's
+    /// [`crate::token_size::message_sizes`] — every measured turn exact, the rest estimated.
+    pub fn restore_usage_snapshot(&mut self, family: crate::token_size::TokenFamily) {
+        let last = self
+            .messages
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(i, m)| m.usage.filter(|u| u.prompt_tokens() > 0).map(|u| (i, u)));
+        let compacted_from = self
+            .messages
+            .first()
+            .and_then(crate::compaction::summary_tokens_before);
+        match last {
+            Some((i, usage)) if compacted_from != Some(usage.prompt_tokens()) => {
+                self.last_usage_message_count = i;
+                self.last_output_tokens = usage.output_tokens;
+                self.last_input_tokens = usage.prompt_tokens();
+            }
+            _ => {
+                let sizes = crate::token_size::message_sizes(&self.messages, family, None);
+                self.last_input_tokens = crate::token_size::total(&sizes);
+                self.last_usage_message_count = self.messages.len();
+                self.last_output_tokens = 0;
+            }
         }
     }
 }
@@ -655,5 +754,159 @@ mod tests {
             req.iter()
                 .all(|m| !m.content.contains(&ContentBlock::text("ctx-two")))
         );
+    }
+
+    fn prompt(n: u32) -> TokenUsage {
+        TokenUsage {
+            input_tokens: n / 10,
+            cache_read_tokens: n - n / 10,
+            output_tokens: 7,
+            ..Default::default()
+        }
+    }
+
+    fn reply(model: &str, usage: TokenUsage) -> Message {
+        Message::assistant(vec![ContentBlock::text("r")])
+            .with_model_id(model)
+            .with_usage(usage)
+    }
+
+    /// One loop turn the way `run_events_steered` records it: usage first, then the reply.
+    fn turn(s: &mut Session, model: &str, prompt_tokens: u32) {
+        s.record_usage(prompt(prompt_tokens));
+        s.push(reply(model, prompt(prompt_tokens)));
+        s.push(Message::tool_result("t", "out", false));
+    }
+
+    #[test]
+    fn each_reply_carries_the_real_size_of_the_turn_before_it() {
+        let mut s = Session::new();
+        s.user("go");
+        turn(&mut s, "m", 3_000);
+        turn(&mut s, "m", 7_500);
+        turn(&mut s, "m", 8_000);
+        // The first reply has no earlier request to measure against.
+        assert_eq!(s.messages[1].prior_turn_tokens, None);
+        // Each later one: its prompt less the previous prompt — the earlier reply plus its tool
+        // results, as the provider counted them.
+        assert_eq!(s.messages[3].prior_turn_tokens, Some(4_500));
+        assert_eq!(s.messages[5].prior_turn_tokens, Some(500));
+        // User messages never carry one.
+        assert!(
+            s.messages
+                .iter()
+                .filter(|m| m.role == Role::User)
+                .all(|m| m.prior_turn_tokens.is_none())
+        );
+    }
+
+    #[test]
+    fn a_rewrite_or_a_gap_between_two_requests_measures_nothing() {
+        let mut s = Session::new();
+        s.user("go");
+        turn(&mut s, "m", 3_000);
+        // A rewrite (compaction, masking, a scrub) between the two requests: the growth would be the
+        // rewrite's, not the turn's.
+        s.forget_anchor();
+        turn(&mut s, "m", 9_000);
+        assert_eq!(s.messages[3].prior_turn_tokens, None);
+        // An error turn in between: the previous measured reply is four messages back, not two.
+        s.push(Message::error("boom"));
+        s.user("again");
+        turn(&mut s, "m", 9_600);
+        assert_eq!(s.messages[7].prior_turn_tokens, None);
+        // Measuring resumes on the next clean pair.
+        turn(&mut s, "m", 9_900);
+        assert_eq!(s.messages[9].prior_turn_tokens, Some(300));
+        // A model switch between the two replies: different tokenizers, nothing comparable.
+        turn(&mut s, "other", 12_000);
+        assert_eq!(s.messages[11].prior_turn_tokens, None);
+        // A prompt that shrank with no rewrite (a smaller tool set) measures nothing either.
+        turn(&mut s, "other", 11_000);
+        assert_eq!(s.messages[13].prior_turn_tokens, None);
+        // A zero-usage report (a cancelled stream) leaves the last anchor alone.
+        s.record_usage(TokenUsage::default());
+        s.push(Message::assistant(vec![ContentBlock::text("")]));
+        assert_eq!(s.messages[15].prior_turn_tokens, None);
+    }
+
+    #[test]
+    fn a_measured_turn_persists_and_old_sessions_still_load() {
+        let mut s = Session::new();
+        s.user("go");
+        turn(&mut s, "m", 3_000);
+        turn(&mut s, "m", 4_000);
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains("\"prior_turn_tokens\":1000"), "{json}");
+        let back: Session = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.messages[3].prior_turn_tokens, Some(1_000));
+        // The anchor itself is not persisted: a reopened session measures its first turn afresh.
+        assert_eq!(back.anchor, None);
+        // A message persisted before the field existed reads as unmeasured.
+        let old: Message =
+            serde_json::from_str(r#"{"role":"assistant","content":[{"type":"text","text":"hi"}]}"#)
+                .unwrap();
+        assert_eq!(old.prior_turn_tokens, None);
+        // And an unmeasured message writes no field at all: byte-identical to before.
+        assert!(
+            !serde_json::to_string(&old)
+                .unwrap()
+                .contains("prior_turn_tokens")
+        );
+    }
+
+    #[test]
+    fn compaction_and_a_scrub_drop_the_anchor_and_the_turns_they_invalidate() {
+        let mut s = Session::new();
+        s.user("go");
+        turn(&mut s, "a", 3_000);
+        turn(&mut s, "a", 4_000);
+        crate::compaction::apply_summary(&mut s, 1, "summary", 4_000);
+        assert_eq!(s.anchor, None);
+        // The kept turn keeps its measurement: its content did not change.
+        assert_eq!(s.messages[3].prior_turn_tokens, Some(1_000));
+        // A scrub for another model rewrites that model's turns: their measurements go.
+        let mut t = Session::new();
+        t.user("go");
+        turn(&mut t, "a", 3_000);
+        turn(&mut t, "a", 4_000);
+        t.scrub_cross_model_state("b");
+        assert_eq!(t.anchor, None);
+        assert_eq!(t.messages[3].prior_turn_tokens, None);
+    }
+
+    #[test]
+    fn restore_uses_the_last_usage_unless_it_predates_the_last_compaction() {
+        let family = crate::token_size::TokenFamily::Claude;
+        let mut s = Session::new();
+        s.user("go");
+        turn(&mut s, "m", 3_000);
+        turn(&mut s, "m", 50_000);
+        // Reopened mid-run: the last reply's request size, exactly.
+        let mut reopened = Session {
+            messages: s.messages.clone(),
+            ..Session::new()
+        };
+        reopened.restore_usage_snapshot(family);
+        assert_eq!(reopened.last_input_tokens, 50_000);
+        assert_eq!(reopened.last_usage_message_count, 3);
+
+        // Compacted (from that very size), then reopened before the next reply: the kept reply's
+        // usage measured the prompt before the summary replaced its prefix. The summary records the
+        // size it compacted from, which identifies it.
+        crate::compaction::apply_summary(&mut s, 3, "the summary", 50_000);
+        let mut reopened = Session {
+            messages: s.messages.clone(),
+            ..Session::new()
+        };
+        reopened.restore_usage_snapshot(family);
+        assert!(
+            reopened.last_input_tokens < 50_000,
+            "a pre-compaction size must not survive the reopen: {}",
+            reopened.last_input_tokens
+        );
+        assert_eq!(reopened.last_usage_message_count, reopened.messages.len());
+        let sizes = crate::token_size::message_sizes(&reopened.messages, family, None);
+        assert_eq!(reopened.last_input_tokens, crate::token_size::total(&sizes));
     }
 }

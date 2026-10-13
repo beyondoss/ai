@@ -300,6 +300,24 @@ fn default_compact_at(m: &str) -> Option<u32> {
     }
 }
 
+/// The largest prompt `model` bills at its base rate, when its published rate card prices longer
+/// prompts higher: Claude Haiku 5.5 at 5× over 100K tokens, OpenAI's GPT-5.4 and later at 2× input
+/// over 272K, xAI's Grok at 2× from 200K. Read from the catalog's primary-vendor card
+/// (`providers::rates`, generated from the vendors' own price pages), so it follows the rates
+/// rather than a copy of them. `None` for a model with no such tier, or none in the catalog. A
+/// vendor slug (`anthropic/…`) and a Bedrock id (`us.anthropic.…-v1:0`) resolve to the catalog row.
+pub fn price_tier(model: &str) -> Option<u32> {
+    let m = model.to_ascii_lowercase();
+    let id = bedrock_claude_id(&m).unwrap_or_else(|| m.rsplit('/').next().unwrap_or(&m));
+    let tier = providers::rates::for_row(id)?.list.long_context?;
+    let last_base = if tier.inclusive {
+        tier.threshold.saturating_sub(1)
+    } else {
+        tier.threshold
+    };
+    Some(last_base.min(u64::from(u32::MAX)) as u32)
+}
+
 /// Adjust a native-OpenAI-family `ModelCaps` (o-series/gpt-4/gpt-5) for a vendor-slug id (e.g.
 /// OpenRouter's `"openai/gpt-5.2"`, matched via `family_id`). Every current OpenRouter entry serves
 /// these ids over Chat Completions (`api: "openai-completions"` in pi's own `openrouter.models.ts`),

@@ -2162,6 +2162,7 @@ mod tests {
                 aborted: false,
                 usage: None,
                 stop_reason: None,
+                prior_turn_tokens: None,
             }],
             64,
         );

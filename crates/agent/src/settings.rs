@@ -151,7 +151,8 @@ pub struct Settings {
     /// Used when neither `--compaction-keep-recent-tokens` nor
     /// `AI_AGENT_COMPACTION_KEEP_RECENT_TOKENS` is given — pi-parity fix (Round 3),
     /// [`Self::default_compaction_reserve_tokens`]'s identical relationship to
-    /// `CompactionConfig::default()`'s own built-in 20,000-token `keep_recent_tokens`.
+    /// the model family's built-in `keep_recent_tokens` (`agent_core::TokenFamily::keep_recent_tokens`,
+    /// in real tokens).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_compaction_keep_recent_tokens: Option<u32>,
     /// Used when neither `--retry-max-retries` nor `AI_AGENT_RETRY_MAX_RETRIES` is given — pi-parity fix

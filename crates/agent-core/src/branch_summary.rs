@@ -18,10 +18,10 @@
 use std::sync::Arc;
 
 use crate::compaction::{
-    SUMMARY_MARKER, SUMMARY_SYSTEM, estimate_message_tokens, extract_file_ops,
-    render_prefix_without_tool_results,
+    SUMMARY_MARKER, SUMMARY_SYSTEM, extract_file_ops, render_prefix_without_tool_results,
 };
 use crate::message::{ContentBlock, Message};
+use crate::token_size::{TokenFamily, content_tokens};
 use crate::transport::ModelRequest;
 
 /// The branch-summarization call's output budget — a small fixed constant, unlike compaction's own
@@ -82,11 +82,13 @@ fn is_nested_summary(m: &Message) -> bool {
 /// Losing a compaction/branch-summary's condensed recap of everything *behind* it is a much bigger
 /// loss of context per token than trimming a few more raw messages, so it's worth stretching for when
 /// there's still reasonable room.
-fn windowed_by_budget(messages: &[Message], budget_tokens: u32) -> &[Message] {
+fn windowed_by_budget(messages: &[Message], budget_tokens: u32, family: TokenFamily) -> &[Message] {
     let mut acc = 0u32;
     let mut start = messages.len();
     for (i, m) in messages.iter().enumerate().rev() {
-        let cost = estimate_message_tokens(m);
+        // The stored text's cost at the model family's rates: the rendered transcript shows it, not
+        // the hidden thinking a turn's recorded usage counts.
+        let cost = content_tokens(m, family);
         if start != messages.len() && acc.saturating_add(cost) > budget_tokens {
             if is_nested_summary(m) && acc < budget_tokens.saturating_mul(9) / 10 {
                 start = i;
@@ -129,7 +131,7 @@ pub fn branch_summary_request(
     replace_instructions: bool,
 ) -> ModelRequest {
     let (read, modified) = extract_file_ops(messages);
-    let windowed = windowed_by_budget(messages, input_token_budget);
+    let windowed = windowed_by_budget(messages, input_token_budget, TokenFamily::for_model(model));
 
     let mut prompt = String::new();
     if windowed.len() < messages.len() {
@@ -292,10 +294,10 @@ mod tests {
 
     #[test]
     fn windowed_by_budget_keeps_only_the_newest_tail_within_budget() {
-        // Each message here costs a few tokens (estimate_tokens is chars/4); a tiny budget should keep
+        // Each message here costs a few tokens (chars/4 on `TokenFamily::Other`); a tiny budget should keep
         // only the last one or two, never the whole branch.
         let messages = branch();
-        let windowed = windowed_by_budget(&messages, 1);
+        let windowed = windowed_by_budget(&messages, 1, TokenFamily::Other);
         assert!(
             windowed.len() < messages.len(),
             "must actually drop older messages"
@@ -310,7 +312,7 @@ mod tests {
     #[test]
     fn windowed_by_budget_never_drops_to_empty_on_one_oversized_message() {
         let messages = vec![Message::user("x".repeat(10_000))];
-        let windowed = windowed_by_budget(&messages, 1);
+        let windowed = windowed_by_budget(&messages, 1, TokenFamily::Other);
         assert_eq!(
             windowed.len(),
             1,
@@ -321,7 +323,7 @@ mod tests {
     #[test]
     fn windowed_by_budget_keeps_everything_when_the_whole_branch_fits() {
         let messages = branch();
-        let windowed = windowed_by_budget(&messages, 1_000_000);
+        let windowed = windowed_by_budget(&messages, 1_000_000, TokenFamily::Other);
         assert_eq!(windowed.len(), messages.len());
     }
 
@@ -335,7 +337,7 @@ mod tests {
             Message::user(format!("{SUMMARY_MARKER}\n\n{}", "x".repeat(400))),
             Message::user("abcd"),
         ];
-        let windowed = windowed_by_budget(&messages, 10);
+        let windowed = windowed_by_budget(&messages, 10, TokenFamily::Other);
         assert_eq!(
             windowed.len(),
             2,
@@ -348,7 +350,7 @@ mod tests {
         // Same shape as the privileged case, but the oversized old message carries no summary marker
         // — it's dropped like any other message that would blow the budget.
         let messages = vec![Message::user("y".repeat(400)), Message::user("abcd")];
-        let windowed = windowed_by_budget(&messages, 10);
+        let windowed = windowed_by_budget(&messages, 10, TokenFamily::Other);
         assert_eq!(
             windowed.len(),
             1,
@@ -366,7 +368,7 @@ mod tests {
             Message::user("a".repeat(20)), // 5 tokens
             Message::user("b".repeat(20)), // 5 tokens
         ];
-        let windowed = windowed_by_budget(&messages, 10);
+        let windowed = windowed_by_budget(&messages, 10, TokenFamily::Other);
         assert_eq!(
             windowed.len(),
             2,

@@ -1412,36 +1412,20 @@ impl SessionStore {
         // after that turn (the same `input + cache_read + cache_write` combination
         // `Session::record_usage`'s own `live_input` computes, and the same "snapshot taken right
         // before this message was pushed" positioning `trailing_tokens`'s own substitution relies on —
-        // see its doc comment) — a real figure, not the char/4 estimate below. Everything *after* that
+        // see its doc comment) — a real figure, not the estimate below. Everything *after* that
         // message (usually nothing) is still covered by `trailing_tokens`' own per-message estimate,
         // exactly like a live session's own turns since its last real usage snapshot.
         //
         // A session with no `usage`-carrying message at all (every message predates Round 1, or the
         // active path is entirely a compaction/branch-summary recap with none recorded) falls back to
-        // the previous whole-transcript char/4 estimate, unchanged: treat every persisted message as
-        // "trailing" (by calling `trailing_tokens` while `last_usage_message_count` is still its
-        // default 0) and then mark it all as already accounted for, so the very next real
-        // `trailing_tokens` call doesn't double-count it.
-        match session
-            .messages
-            .iter()
-            .enumerate()
-            .rev()
-            .find_map(|(i, m)| m.usage.map(|u| (i, u)))
-        {
-            Some((i, usage)) => {
-                session.last_usage_message_count = i;
-                session.last_output_tokens = usage.output_tokens;
-                session.last_input_tokens = usage
-                    .input_tokens
-                    .saturating_add(usage.cache_read_tokens)
-                    .saturating_add(usage.cache_write_tokens);
-            }
-            None => {
-                session.last_input_tokens = agent_core::compaction::trailing_tokens(&session);
-                session.last_usage_message_count = session.messages.len();
-            }
-        }
+        // a whole-transcript estimate, and marks it all as already accounted for, so the very next
+        // real `trailing_tokens` call doesn't double-count it.
+        //
+        // `Session::restore_usage_snapshot` does both, and also recognizes a usage that predates the
+        // last compaction (a reopen between a compaction and the next reply), which would otherwise
+        // report the pre-compaction size. Its estimate sizes every turn a persisted
+        // `Message::prior_turn_tokens` measured exactly.
+        session.restore_usage_snapshot(agent_core::TokenFamily::for_model(&meta.model));
         Ok((
             Self {
                 journal,
@@ -7452,7 +7436,7 @@ mod tests {
         // (substituting `last_output_tokens` for it) rather than double-counting it as trailing.
         assert_eq!(restored.last_usage_message_count, 1);
         assert_eq!(
-            agent_core::compaction::trailing_tokens(&restored),
+            agent_core::compaction::trailing_tokens(&restored, agent_core::TokenFamily::Claude),
             250,
             "the assistant message at the snapshot position must use last_output_tokens, not a fresh \
              char/4 estimate of its short reply text"
@@ -7947,8 +7931,19 @@ mod tests {
         store.append_new(&session.messages).unwrap();
 
         session.scrub_cross_model_state("claude-opus-5-5");
-        let plan =
-            agent_core::compaction::mask_tool_results(&session.messages, 1, u32::MAX, &[]).unwrap();
+        let plan = agent_core::compaction::mask_tool_results(
+            &session.messages,
+            &agent_core::token_size::message_sizes(
+                &session.messages,
+                agent_core::TokenFamily::Other,
+                None,
+            ),
+            agent_core::TokenFamily::Other,
+            1,
+            u32::MAX,
+            &[],
+        )
+        .unwrap();
         assert!(
             format!("{:?}", plan.messages[2]).contains("\"call_1\""),
             "scrubbed in memory"
