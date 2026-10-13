@@ -138,14 +138,14 @@ impl Drop for KillGuard {
 
 /// `RealRunner::run_streaming_tracked`: run `program args` as a tagged process-group leader, stream
 /// both pipes into `hooks.on_chunk`, and return once the shell **and everything it left running**
-/// have exited (or the timeout killed them). When the shell exits with processes still running,
-/// `hooks.on_orphans` hears so at once, with the shell's own result: the caller can return to the
-/// model while this keeps streaming and waiting.
+/// have exited. When the shell exits with processes still running, `hooks.on_orphans` hears so at
+/// once, with the shell's own result: the caller can return to the model while this keeps streaming
+/// and waiting. No deadline: the [`Kill`] reported to `hooks.on_spawn`, or dropping this future, is
+/// what stops the job early.
 pub(crate) async fn run_tracked(
     program: &str,
     args: &[String],
     cwd: Option<&str>,
-    timeout: Duration,
     hooks: &JobHooks<'_>,
 ) -> std::io::Result<ExecResult> {
     let tag = new_tag();
@@ -226,32 +226,13 @@ pub(crate) async fn run_tracked(
         }
         Ok::<_, std::io::Error>(shell)
     };
-    let run = async {
-        tokio::select! {
-            r = body => r,
-            () = drains => unreachable_pending(),
-        }
+    let result = tokio::select! {
+        r = body => r,
+        () = drains => unreachable_pending(),
     };
-    match tokio::time::timeout(timeout, run).await {
-        Ok(result) => {
-            // Everything exited on its own (or a spawn-side error): nothing left to kill.
-            guard.0 = None;
-            result
-        }
-        Err(_) => {
-            // Timed out: kill and wait for the kill here, so a caller re-checking side effects sees
-            // the processes gone (as `RealRunner::exec`'s timeout path does).
-            if let Some(group) = guard.0.take() {
-                let _ = tokio::task::spawn_blocking(move || group.kill()).await;
-            }
-            Ok(ExecResult {
-                code: None,
-                stderr: "command exceeded its timeout".into(),
-                timed_out: true,
-                ..Default::default()
-            })
-        }
-    }
+    // Everything exited on its own (or a spawn-side error): nothing left to kill.
+    guard.0 = None;
+    result
 }
 
 /// The `drains` arm of `run_tracked`'s `select!` never completes; this satisfies the type.
@@ -500,8 +481,8 @@ mod tests {
         assert!(!tag_value("x").is_empty());
     }
 
-    /// What `run_tracked` reports for `cmd`, run with a 10 s timeout: its result, and what the shell
-    /// left running (if anything) as `on_orphans` heard it.
+    /// What `run_tracked` reports for `cmd` (which must end within 10 s): its result, and what the
+    /// shell left running (if anything) as `on_orphans` heard it.
     async fn tracked(cmd: &str) -> (ExecResult, Option<String>, String) {
         let orphans = Mutex::new(None);
         let output = Mutex::new(String::new());
@@ -514,9 +495,13 @@ mod tests {
             on_orphans: &on_orphans,
         };
         let args = vec!["-c".to_string(), cmd.to_string()];
-        let result = run_tracked("/bin/sh", &args, None, Duration::from_secs(10), &hooks)
-            .await
-            .unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            run_tracked("/bin/sh", &args, None, &hooks),
+        )
+        .await
+        .expect("the command ends on its own")
+        .unwrap();
         let left = orphans.lock().unwrap().take();
         let out = output.lock().unwrap().clone();
         (result, left, out)
@@ -545,7 +530,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_timeout_stops_what_the_shell_left_running() {
+    async fn dropping_the_call_stops_what_the_shell_left_running() {
         let orphans = Mutex::new(None);
         let groups = Mutex::new(None);
         let on_chunk = |_b: &[u8]| {};
@@ -561,16 +546,31 @@ mod tests {
             on_orphans: &on_orphans,
         };
         let args = vec!["-c".to_string(), "setsid sleep 81 & echo x".to_string()];
-        let result = run_tracked("/bin/sh", &args, None, Duration::from_millis(800), &hooks)
-            .await
-            .unwrap();
-        assert!(result.timed_out);
-        assert!(orphans.lock().unwrap().is_some());
+        // No deadline of its own: it would wait on the sleep for 81 s. Dropping it is the kill.
+        let mut run = Box::pin(run_tracked("/bin/sh", &args, None, &hooks));
+        let reported = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                tokio::select! {
+                    _ = &mut run => panic!("ended while the setsid'd sleep runs"),
+                    () = tokio::time::sleep(Duration::from_millis(50)) => {}
+                }
+                if orphans.lock().unwrap().is_some() {
+                    return;
+                }
+            }
+        })
+        .await;
+        assert!(reported.is_ok(), "the shell's exit was reported");
         let group = groups.lock().unwrap().clone().unwrap();
-        assert!(
-            group.members().is_empty(),
-            "the timeout killed the setsid'd sleep"
-        );
+        assert!(!group.members().is_empty(), "the sleep is still running");
+        drop(run);
+        for _ in 0..100 {
+            if group.members().is_empty() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("dropping the call left the setsid'd sleep running");
     }
 
     #[test]

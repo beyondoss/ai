@@ -61,7 +61,7 @@
 //! **Request.** The v1.1 request plus `"stream": true`:
 //!
 //! ```jsonc
-//! { "command": "sh", "args": ["-c", "cargo build"], "cwd": "/work", "timeout_ms": 1800000, "stream": true }
+//! { "command": "sh", "args": ["-c", "cargo build"], "cwd": "/work", "timeout_ms": 2147483647, "stream": true }
 //! ```
 //!
 //! **Response.** `200` with `Content-Type: application/x-ndjson`, a body of frames, one JSON object
@@ -104,7 +104,13 @@
 //!   version can add fields (a sequence number, timings) without breaking this client.
 //! - **Timeouts.** `timeout_ms` is the endpoint's to enforce: at the deadline it MUST kill the
 //!   command's whole process group and send `{"timed_out": true}`. The client's own deadline is
-//!   `timeout_ms` + 30 s for the whole exchange, so the endpoint's verdict normally wins.
+//!   `timeout_ms` + 30 s for the whole exchange, so the endpoint's verdict normally wins. `bash`
+//!   jobs have no deadline — they end with the turn, the run or the session, or a `bash_job` kill,
+//!   all of which close the stream — so a streamed job sends [`STREAM_DEADLINE`] (`i32::MAX` ms,
+//!   ~24.8 days, the most a Node endpoint's `setTimeout` can hold): the connection is the lifetime,
+//!   and the deadline only bounds one that outlives every session. Over v1.1 nothing streams and
+//!   nothing can be killed, so a `bash` command there sends [`UNTRACKED_DEADLINE`] (30 minutes): the
+//!   only thing that ends a command that hangs.
 //!
 //! **Disconnect kills — normative.** Every streamed command MUST run in its own process group (or an
 //! equivalent the endpoint can kill as a unit, such as a cgroup). **If the connection closes before
@@ -143,7 +149,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::tools::exec::{
     ChunkSink, CommandRunner, ExecResult, JobHooks, Kill, STREAM_HEAD, STREAM_TAIL, SpawnSink,
-    drain_capped, feed_stdin,
+    UNTRACKED_DEADLINE, drain_capped, feed_stdin,
 };
 
 pub mod conformance;
@@ -177,6 +183,12 @@ struct ExecResponse {
     #[serde(default)]
     stderr: String,
 }
+
+/// The `timeout_ms` a streamed `bash` job sends: `i32::MAX` ms (~24.8 days), the longest deadline
+/// every endpoint can honor — Node's `setTimeout` fires at once for anything longer. A job's lifetime
+/// is the connection's (see "Disconnect kills"), so this only has to outlast any session; it is not a
+/// limit anyone should meet.
+pub const STREAM_DEADLINE: Duration = Duration::from_millis(i32::MAX as u64);
 
 /// The default response-body cap for [`HttpExecRunner`]: 16 MiB.
 ///
@@ -431,25 +443,38 @@ impl CommandRunner for HttpExecRunner {
     /// As [`Self::run_streaming`], reporting a [`Kill`] once the stream is open — which is also the
     /// promise that the output is live. Killing it closes the stream; the endpoint MUST then kill the
     /// command's process group (see the module doc).
+    ///
+    /// The job has no deadline of its own, but the wire needs a `timeout_ms`: a stream sends
+    /// [`STREAM_DEADLINE`], so the connection (closed by a kill, a dropped job or the agent's exit) is
+    /// what ends it; a v1.1 endpoint gets [`UNTRACKED_DEADLINE`], the only thing that can end a
+    /// command it cannot stream or stop. See the module doc's "Timeouts".
     async fn run_streaming_tracked(
         &self,
         program: &str,
         args: &[String],
         cwd: Option<&str>,
-        timeout: Duration,
         hooks: &JobHooks<'_>,
     ) -> std::io::Result<ExecResult> {
+        let deadline = if self.streams().await {
+            STREAM_DEADLINE
+        } else {
+            UNTRACKED_DEADLINE
+        };
         // No `on_orphans`: the endpoint owns the command's process group, and ends the stream (and
         // kills the group) when the shell exits.
         self.run_stream(
             program,
             args,
             cwd,
-            timeout,
+            deadline,
             hooks.on_chunk,
             Some(hooks.on_spawn),
         )
         .await
+    }
+
+    async fn tracks_jobs(&self) -> bool {
+        self.streams().await
     }
 }
 
@@ -679,7 +704,7 @@ impl CommandRunner for TemplateRunner {
         cwd: Option<&str>,
         timeout: Duration,
     ) -> std::io::Result<ExecResult> {
-        self.exec(program, args, cwd, timeout, None, None, None)
+        self.exec(program, args, cwd, Some(timeout), None, None, None)
             .await
     }
 
@@ -693,30 +718,41 @@ impl CommandRunner for TemplateRunner {
         timeout: Duration,
         on_chunk: ChunkSink<'_>,
     ) -> std::io::Result<ExecResult> {
-        self.exec(program, args, cwd, timeout, Some(on_chunk), None, None)
-            .await
+        self.exec(
+            program,
+            args,
+            cwd,
+            Some(timeout),
+            Some(on_chunk),
+            None,
+            None,
+        )
+        .await
     }
 
     /// As [`Self::run_streaming`], reporting a [`Kill`] that stops the command **on the far side**,
-    /// not just the local transport — see `far_kill`.
+    /// not just the local transport — see `far_kill`. No deadline: that kill is how it ends early.
     async fn run_streaming_tracked(
         &self,
         program: &str,
         args: &[String],
         cwd: Option<&str>,
-        timeout: Duration,
         hooks: &JobHooks<'_>,
     ) -> std::io::Result<ExecResult> {
         self.exec(
             program,
             args,
             cwd,
-            timeout,
+            None,
             Some(hooks.on_chunk),
             None,
             Some(hooks.on_spawn),
         )
         .await
+    }
+
+    async fn tracks_jobs(&self) -> bool {
+        true
     }
 
     /// Piped into the *transport* process. Whether it reaches the far side is the transport's
@@ -731,7 +767,7 @@ impl CommandRunner for TemplateRunner {
         timeout: Duration,
         stdin: &[u8],
     ) -> std::io::Result<ExecResult> {
-        self.exec(program, args, cwd, timeout, None, Some(stdin), None)
+        self.exec(program, args, cwd, Some(timeout), None, Some(stdin), None)
             .await
     }
 }
@@ -797,7 +833,7 @@ impl TemplateRunner {
         program: &str,
         args: &[String],
         cwd: Option<&str>,
-        timeout: Duration,
+        timeout: Option<Duration>,
         on_chunk: Option<ChunkSink<'_>>,
         stdin: Option<&[u8]>,
         on_spawn: Option<SpawnSink<'_>>,
@@ -908,8 +944,13 @@ impl TemplateRunner {
                 feed,
             )
         };
-        match tokio::time::timeout(timeout, collect).await {
-            Ok((status, (stdout, out_truncated), (stderr, err_truncated), fed)) => {
+        // `None`: a tracked job, whose kill is how it ends early.
+        let collected = match timeout {
+            Some(limit) => tokio::time::timeout(limit, collect).await.ok(),
+            None => Some(collect.await),
+        };
+        match collected {
+            Some((status, (stdout, out_truncated), (stderr, err_truncated), fed)) => {
                 guard.0 = None;
                 let status = status?;
                 fed?;
@@ -925,7 +966,7 @@ impl TemplateRunner {
                     truncated: out_truncated || err_truncated,
                 })
             }
-            Err(_) => {
+            None => {
                 // Reaping the transport is not enough: the far command outlives it. Kill both and
                 // wait for it, so a caller that re-checks side effects sees the command gone.
                 if let Some(kill) = guard.0.take() {
@@ -935,7 +976,10 @@ impl TemplateRunner {
                     code: None,
                     signal: None,
                     stdout: String::new(),
-                    stderr: format!("exec template timed out after {timeout:?}"),
+                    stderr: format!(
+                        "exec template timed out after {:?}",
+                        timeout.unwrap_or_default()
+                    ),
                     timed_out: true,
                     truncated: false,
                 })
@@ -1298,20 +1342,30 @@ impl CommandRunner for CellRunner {
         program: &str,
         args: &[String],
         cwd: Option<&str>,
-        timeout: Duration,
         hooks: &crate::tools::exec::JobHooks<'_>,
     ) -> std::io::Result<ExecResult> {
         match self.0.resolve().map_err(std::io::Error::other)? {
             Some(t) => {
                 t.runner()
-                    .run_streaming_tracked(program, args, cwd, timeout, hooks)
+                    .run_streaming_tracked(program, args, cwd, hooks)
                     .await
             }
             None => {
                 crate::tools::exec::RealRunner
-                    .run_streaming_tracked(program, args, cwd, timeout, hooks)
+                    .run_streaming_tracked(program, args, cwd, hooks)
                     .await
             }
+        }
+    }
+
+    /// Forwarded for the same reason: the target behind the cell decides whether `bash` can run a
+    /// command in the background. A strict cell with no target answers `false`; running anything
+    /// then fails with the cell's own refusal.
+    async fn tracks_jobs(&self) -> bool {
+        match self.0.resolve() {
+            Ok(Some(t)) => t.runner().tracks_jobs().await,
+            Ok(None) => true,
+            Err(_) => false,
         }
     }
 

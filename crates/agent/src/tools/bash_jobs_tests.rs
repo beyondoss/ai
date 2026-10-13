@@ -74,7 +74,7 @@ async fn notices_within(bash: &Bash, within: Duration) -> Option<String> {
 }
 
 #[tokio::test]
-async fn a_chatty_command_yields_at_the_ceiling_not_its_timeout() {
+async fn a_chatty_command_yields_at_the_ceiling() {
     let (bash, jobs) = tools(30_000, 800, 600);
     let started = Instant::now();
     let out = ok(bash
@@ -317,10 +317,11 @@ async fn the_stop_reminder_lists_running_jobs_once_and_says_what_ending_does_per
         "{reminder}"
     );
     assert!(
-        reminder.contains(
-            "If you end your turn now: Job 1 (a command that went quiet or kept printing) is \
-             stopped."
-        ),
+        reminder.contains("its call returned early)"),
+        "says why it is a job: {reminder}"
+    );
+    assert!(
+        reminder.ends_with("If you end your turn now: job 1 is stopped."),
         "{reminder}"
     );
     assert!(bash.jobs().stop_reminder().is_none(), "once per job");
@@ -333,7 +334,7 @@ async fn the_stop_reminder_lists_running_jobs_once_and_says_what_ending_does_per
     );
     assert!(again.contains("left running by its command"), "{again}");
     assert!(
-        again.contains("Job 2 (left running by its command) is stopped too."),
+        again.ends_with("If you end your turn now: jobs 1, 2 are stopped."),
         "{again}"
     );
     bash.jobs()
@@ -341,13 +342,12 @@ async fn the_stop_reminder_lists_running_jobs_once_and_says_what_ending_does_per
     ok(bash.run(json!({ "command": "sleep 74 & echo bg" })).await);
     let serve = bash.jobs().stop_reminder().expect("a new job");
     assert!(
-        serve.contains(
-            "Jobs 2, 3 (left running by their command) keep running, and you will be told when \
-             each exits."
+        serve.ends_with(
+            "If you end your turn now: job 1 is stopped; jobs 2, 3 keep running, and you will be \
+             told when each exits."
         ),
         "{serve}"
     );
-    assert!(serve.contains("Job 1 (a command"), "{serve}");
     bash.jobs().stop_all();
 }
 

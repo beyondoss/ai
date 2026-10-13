@@ -66,7 +66,7 @@ pub struct Read {
     /// entirely and ships the normalized (format-converted, if a BMP) bytes as-is regardless of size,
     /// matching pi's `processImage`, which never calls `resizeImage` in that case either. Set once at
     /// registry-construction time (see [`crate::tools::ToolConfig`]) rather than per-call — mirrors how
-    /// `bash`'s own tunables (`default_timeout_ms`, `shell_path`) are configured.
+    /// `bash`'s own tunables (`shell_path`, `command_prefix`) are configured.
     image_auto_resize: bool,
     /// Relative `path` arguments resolve against this. Empty = the process cwd. See
     /// [`super::resolve_against`].

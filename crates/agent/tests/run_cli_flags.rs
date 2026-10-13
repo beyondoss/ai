@@ -2881,8 +2881,9 @@ fn run_binary_without_block_images_a_read_tool_image_carries_no_non_vision_place
     );
 }
 
-/// Flags whose eval arms lost were deleted, not left as no-ops: each must fail startup before any
-/// request, so a stale eval arm cannot quietly run the control.
+/// Flags whose eval arms lost (or whose behavior was removed, like `--bash-timeout-ms`: nothing kills
+/// a `bash` command on a timer any more) were deleted, not left as no-ops: each must fail startup
+/// before any request, so a stale caller cannot quietly run without it.
 #[test]
 fn deleted_experiment_flags_fail_startup_as_unknown() {
     let (base, bodies) = spawn_model_server(vec![turn_text("ok")]);
@@ -2893,6 +2894,7 @@ fn deleted_experiment_flags_fail_startup_as_unknown() {
         &["--max-steps-notice", "5"],
         &["--max-steps-continue-nudge"],
         &["--bash-timeout-guidance"],
+        &["--bash-timeout-ms", "60000"],
         &["--bash-idle-yield-secs", "60"],
         &["--bash-yield-secs", "60"],
         &["--max-steps-wrap-up", "5"],

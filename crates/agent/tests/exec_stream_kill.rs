@@ -80,7 +80,6 @@ async fn a_tracked_runs_kill_closes_the_stream_and_returns_once_it_has() {
                     "sh",
                     &long_command("kill-me"),
                     None,
-                    Duration::from_secs(120),
                     &JobHooks {
                         on_chunk: &|_: &[u8]| {},
                         on_spawn: &on_spawn,
@@ -136,7 +135,6 @@ async fn a_v11_tracked_run_reports_no_kill() {
             "sh",
             &sh("printf hi"),
             None,
-            Duration::from_secs(10),
             &JobHooks {
                 on_chunk: &|_: &[u8]| {},
                 on_spawn: &move |_: Kill| *r.lock().unwrap() = true,

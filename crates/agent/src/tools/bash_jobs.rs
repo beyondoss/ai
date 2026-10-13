@@ -1,10 +1,12 @@
 //! `bash`'s job table: commands still running after their call returned, and commands that ended
 //! with nobody waiting on them, until the model has been told.
 //!
-//! A job outlives its call for one of two reasons ([`JobKind`]): its command went quiet or kept
-//! printing past the call's ceiling (**yielded**: unintended, so the oldest is evicted past
-//! [`MAX_YIELDED_JOBS`]), or its command exited but left processes running (**adopted**, `cmd &`:
-//! intended, never evicted; past [`MAX_INTENDED_JOBS`] a new one is refused).
+//! A job outlives its call for one of three reasons ([`JobKind`]): its call returned before it
+//! finished — it went quiet, kept printing past the call's ceiling, or outlasted the model's
+//! `timeout_ms` (**yielded**: unintended, so the oldest is evicted past [`MAX_YIELDED_JOBS`]); the
+//! model asked for it with `run_in_background` (**background**); or its command exited but left
+//! processes running (**adopted**, `cmd &`). Background and adopted jobs are intended: never evicted,
+//! and past [`MAX_INTENDED_JOBS`] a new one is refused.
 //!
 //! The table is a [`Background`]: a job that ends while parked becomes a finish notice the loop
 //! folds into the next turn ([`BashJobs::take_notices`]), a would-stop with jobs still running gets
@@ -30,7 +32,7 @@ use super::output::{OutputAccumulator, OutputSnapshot};
 
 /// Most yielded (unintended) jobs kept running; parking another kills the oldest of them.
 pub const MAX_YIELDED_JOBS: usize = 4;
-/// Most intended jobs (adopted now; started in the background later) running at once. One past it is
+/// Most intended jobs (started in the background, or adopted) running at once. One past it is
 /// refused, never made room for: the model meant every one of them.
 pub const MAX_INTENDED_JOBS: usize = 8;
 /// Most ended jobs whose output is kept for `bash_job` after their notice; the oldest goes first.
@@ -46,9 +48,12 @@ pub const COMMAND_CHARS: usize = 80;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JobKind {
-    /// Its command went quiet, or kept printing past the call's ceiling, and the call returned. The
-    /// model did not ask for this, so the cap may evict it.
+    /// Its call returned before it finished: it went quiet, kept printing past the call's ceiling,
+    /// or outlasted the model's `timeout_ms`. The model did not ask for a job, so the cap may evict
+    /// it, and it never outlives the turn.
     Yielded,
+    /// Started with `run_in_background`. The model asked for this; never evicted.
+    Background,
     /// Its command exited but left processes running (`cmd &`, a daemon). The model asked for this;
     /// never evicted.
     Adopted,
@@ -81,7 +86,6 @@ pub(crate) struct Job {
     pub shared: Arc<JobShared>,
     pub handle: tokio::task::JoinHandle<()>,
     pub started: Instant,
-    pub timeout_ms: u64,
     /// How many times the model has been told this job is still running; widens the idle window.
     pub reports: u32,
     /// The model's command, truncated for notices.
@@ -328,12 +332,33 @@ impl BashJobs {
             .get_or_insert_with(|| self.next.fetch_add(1, Ordering::Relaxed) + 1)
     }
 
-    /// Park a yielded job. Returns the yielded job evicted to stay within [`MAX_YIELDED_JOBS`], if
-    /// any (the caller drops it, killing it, outside the lock).
-    pub(crate) fn park_yielded(&self, job: Job) -> Option<(u64, Job)> {
+    /// What a job of `kind` lives until, as the model is told when its call returns.
+    pub(crate) fn lifetime(&self, kind: JobKind) -> &'static str {
+        match (kind, *lock(&self.policy)) {
+            (JobKind::Yielded, _) => "it is stopped when you end your turn",
+            (_, EndPolicy::StopAtEnd) => "it is stopped when the run ends",
+            (_, EndPolicy::KeepRunning) => "it keeps running after your turn ends",
+        }
+    }
+
+    /// The running intended jobs, listed for the model, when there are already
+    /// [`MAX_INTENDED_JOBS`] of them: a new one would be refused.
+    pub(crate) fn intended_full(&self) -> Option<String> {
+        let running = running_intended(&lock(&self.table));
+        (running.len() >= MAX_INTENDED_JOBS).then(|| running.join(", "))
+    }
+
+    /// Park a job whose call returned while it runs (any kind: an intended job a `bash_job` wait
+    /// returned from is parked again here). Returns the yielded job evicted to stay within
+    /// [`MAX_YIELDED_JOBS`], if any (the caller drops it, killing it, outside the lock).
+    pub(crate) fn park(&self, job: Job) -> Option<(u64, Job)> {
         let id = job.id?;
+        let mut parked = Parked::new(job);
+        // Processes its shell left running were already reported — by the adoption, a notice, or
+        // the background start — so a re-park must not announce them again.
+        parked.orphan_notified = parked.job.shared.orphans().is_some();
         let mut table = lock(&self.table);
-        table.insert(id, Parked::new(job));
+        table.insert(id, parked);
         let running_yielded: Vec<u64> = table
             .iter()
             .filter(|(_, p)| p.job.kind == JobKind::Yielded && !p.job.shared.ended())
@@ -351,17 +376,15 @@ impl BashJobs {
     /// jobs to report.
     pub(crate) fn park_intended(&self, mut job: Job) -> Result<u64, (Job, String)> {
         let mut table = lock(&self.table);
-        let running: Vec<String> = table
-            .iter()
-            .filter(|(_, p)| p.job.kind.intended() && !p.job.shared.ended())
-            .map(|(id, p)| format!("job {id} `{}`", p.job.command))
-            .collect();
+        let running = running_intended(&table);
         if running.len() >= MAX_INTENDED_JOBS {
             return Err((job, running.join(", ")));
         }
         let id = self.assign_id(&mut job);
         let mut parked = Parked::new(job);
-        // Its adoption was this call's own result; the next thing to tell the model is its end.
+        // Its adoption or start was this call's own result (a background command's shell may also
+        // have exited leaving processes, before it settled); the next thing to tell the model is
+        // its end.
         parked.orphan_notified = true;
         table.insert(id, parked);
         Ok(id)
@@ -381,9 +404,9 @@ impl BashJobs {
 
     /// The turn (a run) is over: stop the jobs that must not outlive it — the **yielded** ones, a
     /// foreground command the model expected to finish, which in an idle `serve` session would
-    /// otherwise be a hung loop spinning to its timeout. Intended jobs live on (until the end of a
-    /// `run`, or for as long as a `serve` session). The model was told so by the stop reminder.
-    /// Ended jobs stay, their output unread.
+    /// otherwise be a hung loop spinning forever. Intended jobs live on (until the end of a `run`,
+    /// or for as long as a `serve` session). The model was told so by the stop reminder. Ended jobs
+    /// stay, their output unread.
     pub fn end_turn(&self) -> Vec<StoppedJob> {
         // A yielded job whose shell has exited leaving processes running is adopted, notice
         // delivered or not.
@@ -442,11 +465,14 @@ impl BashJobs {
                 }
                 None => {
                     // The shell exited while parked, leaving processes running: the job is the
-                    // processes now, which the command meant to leave (`cmd &`).
+                    // processes now, which the command meant to leave (`cmd &`). A background job
+                    // was intended already, and stays one.
                     p.orphan_notified = true;
                     let (shell, left) = state.orphans.clone().unwrap_or_default();
                     drop(state);
-                    job.kind = JobKind::Adopted;
+                    if job.kind == JobKind::Yielded {
+                        job.kind = JobKind::Adopted;
+                    }
                     parts.push(orphan_notice(id, job, &shell, &left));
                     continue;
                 }
@@ -494,8 +520,9 @@ impl BashJobs {
         if running.iter().all(|(_, p)| p.reminded) {
             return None;
         }
+        let keep = *lock(&self.policy) == EndPolicy::KeepRunning;
         let mut lines = Vec::new();
-        let (mut yielded, mut intended) = (Vec::new(), Vec::new());
+        let (mut stopped, mut kept) = (Vec::new(), Vec::new());
         for (id, p) in running {
             p.reminded = true;
             lines.push(format!(
@@ -503,47 +530,37 @@ impl BashJobs {
                 p.job.command,
                 describe_running(&p.job)
             ));
-            if p.job.kind.intended() {
-                intended.push(id.to_string());
+            // A yielded job never outlives the turn; an intended one follows the host's policy.
+            if keep && p.job.kind.intended() {
+                kept.push(id.to_string());
             } else {
-                yielded.push(id.to_string());
+                stopped.push(id.to_string());
             }
         }
-        // What ending does, said per kind: a yielded job never outlives the turn; an intended one
-        // follows the host's policy.
-        let mut end = Vec::new();
-        if !yielded.is_empty() {
-            end.push(format!(
-                "{} {} (a command that went quiet or kept printing) {} stopped.",
-                plural(yielded.len(), "Job", "Jobs"),
-                yielded.join(", "),
-                plural(yielded.len(), "is", "are"),
+        let mut fates = Vec::new();
+        if !stopped.is_empty() {
+            fates.push(format!(
+                "{} {} {} stopped",
+                plural(stopped.len(), "job", "jobs"),
+                stopped.join(", "),
+                plural(stopped.len(), "is", "are"),
             ));
         }
-        if !intended.is_empty() {
-            let what = match *lock(&self.policy) {
-                EndPolicy::StopAtEnd => {
-                    format!("{} stopped too", plural(intended.len(), "is", "are"))
-                }
-                EndPolicy::KeepRunning => format!(
-                    "{} running, and you will be told when {} exits",
-                    plural(intended.len(), "keeps", "keep"),
-                    plural(intended.len(), "it", "each"),
-                ),
-            };
-            end.push(format!(
-                "{} {} (left running by {} command) {what}.",
-                plural(intended.len(), "Job", "Jobs"),
-                intended.join(", "),
-                plural(intended.len(), "its", "their"),
+        if !kept.is_empty() {
+            fates.push(format!(
+                "{} {} {} running, and you will be told when {} exits",
+                plural(kept.len(), "job", "jobs"),
+                kept.join(", "),
+                plural(kept.len(), "keeps", "keep"),
+                plural(kept.len(), "it", "each"),
             ));
         }
         Some(format!(
             "{REMINDER_PREFIX} You are ending your turn with jobs still running:\n{}\nWait for one \
              (bash_job {{\"job\": N}}), stop it (bash_job {{\"job\": N, \"kill\": true}}), or end your \
-             turn. If you end your turn now: {}",
+             turn. If you end your turn now: {}.",
             lines.join("\n"),
-            end.join(" ")
+            fates.join("; ")
         ))
     }
 
@@ -608,9 +625,19 @@ impl Background for BashJobs {
 fn describe_running(job: &Job) -> String {
     let secs = job.started.elapsed().as_secs();
     match job.kind {
-        JobKind::Yielded => format!("running {secs} s"),
+        JobKind::Yielded => format!("running {secs} s; its call returned early"),
+        JobKind::Background => format!("running {secs} s; started in the background"),
         JobKind::Adopted => format!("running {secs} s; left running by its command"),
     }
+}
+
+/// The running intended jobs, as "job N `cmd`".
+fn running_intended(table: &BTreeMap<u64, Parked>) -> Vec<String> {
+    table
+        .iter()
+        .filter(|(_, p)| p.job.kind.intended() && !p.job.shared.ended())
+        .map(|(id, p)| format!("job {id} `{}`", p.job.command))
+        .collect()
 }
 
 /// The first line of an ended job's notice.
@@ -619,9 +646,11 @@ fn ended_header(id: u64, job: &Job, end: &JobEnd, orphaned: bool) -> String {
     let cmd = &job.command;
     match &end.result {
         Err(e) => format!("{NOTICE_PREFIX}{id} failed after {secs} s: `{cmd}`: {e}]"),
-        Ok(r) if r.timed_out => {
-            format!("{NOTICE_PREFIX}{id} timed out after {secs} s and was stopped: `{cmd}`]")
-        }
+        // `bash` sets no deadline; this is an exec endpoint enforcing the one on the wire.
+        Ok(r) if r.timed_out => format!(
+            "{NOTICE_PREFIX}{id} timed out after {secs} s (the sandbox's exec endpoint stopped it): \
+             `{cmd}`]"
+        ),
         Ok(_) if orphaned => format!(
             "{NOTICE_PREFIX}{id} ended after {secs} s: `{cmd}` (the processes its command left \
              running have exited)]"

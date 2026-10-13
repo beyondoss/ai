@@ -22,12 +22,19 @@ pub(crate) const STREAM_TAIL: usize = 128 * 1024;
 /// How long a pipe may sit silent, once the direct child has exited, before we stop waiting on it.
 /// Without this, a detached grandchild that inherits the stdout/stderr fd (e.g. `cmd &` backgrounding
 /// something before the shell itself exits) keeps the pipe open with no EOF, and the read loop blocks
-/// on it until the *outer command timeout* (default 30 minutes — see `bash.rs::DEFAULT_TIMEOUT_MS`)
-/// finally fires and reaps the process group. Re-armed on every chunk read after exit, so an actively
+/// on it until the *outer command timeout* finally fires and reaps the process group. Re-armed on every chunk read after exit, so an actively
 /// writing descendant (e.g. a backgrounded `lint-staged` still flushing output) is never cut off early
 /// — only a genuinely quiet held-open handle releases us. Matches pi's `waitForChildProcess` fix for
 /// earendil-works/pi#5303 (`EXIT_STDIO_GRACE_MS = 100`).
 const POST_EXIT_IDLE_GRACE: Duration = Duration::from_millis(100);
+
+/// The hard deadline for a command run through [`CommandRunner::run_streaming_tracked`] by a runner
+/// that cannot track it (the default implementation; an exec endpoint on protocol v1.1). Such a runner
+/// streams nothing and reports no [`Kill`], so nothing else could ever stop a command that hangs, and
+/// the call waiting on it would wait forever. Not model-facing: `bash`'s `timeout_ms` only decides
+/// when a call returns. 30 minutes is well above the 3 min 44 s a clean release build of this repo
+/// takes. See "`bash` timeouts" in `ARCHITECTURE.md`.
+pub const UNTRACKED_DEADLINE: Duration = Duration::from_secs(30 * 60);
 
 /// The result of running a command.
 #[derive(Debug, Clone, Default)]
@@ -130,7 +137,7 @@ pub struct JobHooks<'a> {
     pub on_spawn: SpawnSink<'a>,
     /// The shell exited, but processes it started are still running (`cmd &`, a daemon): the
     /// shell's own result, and a short description of what is left. The call goes on — streaming
-    /// their output — until they have all exited, been killed, or hit the timeout. Only a runner
+    /// their output — until they have all exited or been killed. Only a runner
     /// that can see the command's processes calls it (this host's); on a remote stream the endpoint
     /// owns the process group, and the call simply ends when the shell does.
     pub on_orphans: &'a (dyn Fn(&ExecResult, String) + Send + Sync),
@@ -176,21 +183,33 @@ pub trait CommandRunner: Send + Sync {
     /// leaving some running, and keeps going until those exit too, so nothing the command started
     /// is left untracked.
     ///
+    /// **No deadline.** The command runs until it exits or its [`Kill`] stops it: the caller owns its
+    /// lifetime (`bash`'s jobs end with the turn, the run or the session). A remote runner still has
+    /// to put *some* deadline on the wire — see `HttpExecRunner`.
+    ///
     /// **Calling `on_spawn` is a promise that the output is live**: every byte reaches `on_chunk` as
     /// the command produces it, so silence on the sink means the command is silent. `bash` measures
-    /// its idle yield on that promise. Defaults to plain `run_streaming`, calling neither hook: a
-    /// runner that cannot see output as it happens (a v1.1 request/response endpoint) has nothing to
-    /// measure silence with and nothing to kill.
+    /// its idle yield on that promise. Defaults to plain `run_streaming` under
+    /// [`UNTRACKED_DEADLINE`], calling neither hook: a runner that cannot see output as it happens (a
+    /// v1.1 request/response endpoint) has nothing to measure silence with and nothing to kill, so a
+    /// deadline is the only thing that ends a command that hangs.
     async fn run_streaming_tracked(
         &self,
         program: &str,
         args: &[String],
         cwd: Option<&str>,
-        timeout: Duration,
         hooks: &JobHooks<'_>,
     ) -> std::io::Result<ExecResult> {
-        self.run_streaming(program, args, cwd, timeout, hooks.on_chunk)
+        self.run_streaming(program, args, cwd, UNTRACKED_DEADLINE, hooks.on_chunk)
             .await
+    }
+
+    /// Whether [`run_streaming_tracked`](CommandRunner::run_streaming_tracked) reports a [`Kill`]
+    /// (live output, and a way to stop the command) — what `bash` needs to run a command in the
+    /// background. Asked before the command starts, so a runner that cannot is refused without
+    /// running anything. Defaults to `false`, matching the default `run_streaming_tracked`.
+    async fn tracks_jobs(&self) -> bool {
+        false
     }
 
     /// Like [`run`](CommandRunner::run), but with `stdin` written to the command's standard input and
@@ -523,10 +542,13 @@ impl CommandRunner for RealRunner {
         program: &str,
         args: &[String],
         cwd: Option<&str>,
-        timeout: Duration,
         hooks: &JobHooks<'_>,
     ) -> std::io::Result<ExecResult> {
-        super::bash_proc::run_tracked(program, args, cwd, timeout, hooks).await
+        super::bash_proc::run_tracked(program, args, cwd, hooks).await
+    }
+
+    async fn tracks_jobs(&self) -> bool {
+        true
     }
 
     async fn run_with_stdin(

@@ -495,10 +495,6 @@ enum Command {
         /// default when not explicitly given (Task #4, pi-parity feature).
         #[usage(long, env = "AI_AGENT_NO_IMAGE_AUTO_RESIZE")]
         no_image_auto_resize: bool,
-        /// Default `bash` command timeout (ms) when the model omits `timeout_ms`. Defaults to 1,800,000
-        /// (30 minutes). `serve`'s identical flag.
-        #[usage(long, env = "AI_AGENT_BASH_TIMEOUT_MS")]
-        bash_timeout_ms: Option<u64>,
         /// Run `bash` commands through this shell instead of the auto-resolved one (`/bin/bash`, else
         /// `bash` on `$PATH`, else `sh`). Matches pi's own `shellPath` setting. `serve`'s identical flag.
         #[usage(long, env = "AI_AGENT_BASH_SHELL_PATH")]
@@ -1114,11 +1110,6 @@ enum Command {
         /// image auto-resize on, with no way to turn it off).
         #[usage(long, env = "AI_AGENT_NO_IMAGE_AUTO_RESIZE")]
         no_image_auto_resize: bool,
-        /// Default `bash` command timeout (ms) when the model omits `timeout_ms`. Defaults to 1,800,000
-        /// (30 minutes) — see `tools::bash`'s doc comment for why this deliberately deviates from the
-        /// reference agent's no-default.
-        #[usage(long, env = "AI_AGENT_BASH_TIMEOUT_MS")]
-        bash_timeout_ms: Option<u64>,
         /// Run `bash` commands through this shell instead of the auto-resolved one (`/bin/bash`, else
         /// `bash` on `$PATH`, else `sh`) — for a non-standard environment (Cygwin, a container without
         /// `/bin/bash` at the expected path, a hardened/audited shell wrapper) where auto-detection
@@ -2016,7 +2007,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             block_images,
             no_block_images,
             no_image_auto_resize,
-            bash_timeout_ms,
             bash_shell_path,
             bash_command_prefix,
             web_allow_private,
@@ -2098,7 +2088,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 block_images,
                 no_block_images,
                 no_image_auto_resize,
-                bash_timeout_ms,
                 bash_shell_path,
                 bash_command_prefix,
                 web_allow_private,
@@ -2206,7 +2195,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             block_images,
             no_block_images,
             no_image_auto_resize,
-            bash_timeout_ms,
             bash_shell_path,
             bash_command_prefix,
             web_allow_private,
@@ -2372,10 +2360,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or_else(|| {
                     // Shell-path override doesn't affect this registry's use (listing tool
                     // names/descriptions for the default system prompt) — `describe()` doesn't mention it.
-                    let mut reg = tools::default_registry_with_config(&tools::ToolConfig {
-                        bash_timeout_ms,
-                        ..tools::ToolConfig::new()
-                    });
+                    let mut reg = tools::default_registry_with_config(&tools::ToolConfig::new());
                     tools::apply_filter(
                         &mut reg,
                         tools.as_deref(),
@@ -2713,7 +2698,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 idle_timeout_ms,
                 block_images,
                 image_auto_resize,
-                bash_timeout_ms,
                 bash_shell_path,
                 bash_command_prefix,
                 web_allow_private,
@@ -4251,7 +4235,6 @@ async fn run_task(
     block_images: bool,
     no_block_images: bool,
     no_image_auto_resize: bool,
-    bash_timeout_ms: Option<u64>,
     bash_shell_path: Option<String>,
     bash_command_prefix: Option<String>,
     web_allow_private: bool,
@@ -4719,7 +4702,6 @@ async fn run_task(
     ));
     let mut registry = tools::default_registry_with_config(&tools::ToolConfig {
         bash_jobs: Some(bash_jobs.clone()),
-        bash_timeout_ms,
         bash_shell_path: bash_shell_path.as_deref(),
         bash_command_prefix: bash_command_prefix.as_deref(),
         web_allow_private,
@@ -5018,7 +5000,6 @@ async fn run_task(
             mcp_enabled: mcp_enabled.clone(),
             memory_mounts: mounts.clone(),
             tool_cfg: subagent::ChildToolConfig {
-                bash_timeout_ms,
                 bash_shell_path: bash_shell_path.clone(),
                 bash_command_prefix: bash_command_prefix.clone(),
                 // `run` never probes a target for its shell (only `serve --service` does), so a
