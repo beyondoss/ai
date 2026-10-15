@@ -40,24 +40,24 @@ For rate limits and pricing, see the [Serverless overview](/docs/serverless/over
 
 | Organization | Model name | API model string | Context length | Input pricing (per 1M tokens) | Cached input pricing (per 1M tokens) | Output pricing (per 1M tokens) | Quantization | Function calling | Structured outputs |
 | :- | :- | :- | :- | :- | :- | :- | :- | :- | :- |
-| Thinking Machines | Inkling | thinkingmachines/Inkling | 524288 | \$1.00 | \$0.17 | \$4.05 | NVFP4 | Yes | Yes |
-| Minimax | Minimax M3 | MiniMaxAI/MiniMax-M3 | 524288 | \$0.30 | \$0.06 | \$1.20 | FP4 | Yes | Yes |
-| Qwen | Qwen3.8-2.4T-A95B | Qwen/Qwen3.8-2.4T-A95B | - | \$2.00 | \$0.50 | \$6.00 | FP4 | Yes | Yes |
-| Qwen | Qwen3.7 Max | Qwen/Qwen3.7-Max | - | \$2.50 | \$0.50 | \$7.50 | - | Yes | Yes |
-| Qwen | Qwen3.6 Plus | Qwen/Qwen3.6-Plus | 1000000 | \$0.50 | - | \$3.00 | - | Yes | Yes |
-| Qwen | Qwen3.5 9B | Qwen/Qwen3.5-9B | 262144 | \$0.17 | - | \$0.25 | FP8 | Yes | Yes |
-| Moonshot | Kimi K3 | moonshotai/Kimi-K3 | 1048576 | \$2.70 | \$0.30 | \$13.50 | - | Yes | Yes |
-| Z.ai | GLM-5.3 | zai-org/GLM-5.3 | 1048575 | \$1.40 | \$0.26 | \$4.40 | FP4 | Yes | Yes |
-| Z.ai | GLM-5.3 Flash | zai-org/GLM-5.3-Flash | 1048575 | \$0.15 | \$0.03 | \$0.50 | FP8 | Yes | Yes |
-| Z.ai | GLM-5.2 | zai-org/GLM-5.2 | 1048575 | \$1.40 | \$0.26 | \$4.40 | FP4 | Yes | Yes |
-| OpenAI | GPT-OSS 120B | openai/gpt-oss-120b | 131072 | \$0.15 | - | \$0.60 | MXFP4 | Yes | Yes |
 | DeepSeek | DeepSeek V4 Pro 0813 | deepseek-ai/DeepSeek-V4-Pro-0813 | 1048576 | \$1.32 | \$0.13 | \$3.96 | NVFP4 | Yes | Yes |
-| Qwen | Qwen3.7 Plus | Qwen/Qwen3.7-Plus | 1000000 | \$0.32 | - | \$1.28 | - | Yes | Yes |
-| Prism ML | Ternary Bonsai 27B | Prism-ML/Ternary-Bonsai-27B | 262144 | Free | - | Free | - | Yes | Yes |
-| Meta | Muse Glimmer 30B | meta-models/Muse-Glimmer-30B | 131072 | \$0.35 | \$0.04 | \$1.50 | FP8 | Yes | Yes |
-| Qwen | Qwen3.8 Flash | Qwen/Qwen3.8-Flash | 1000000 | \$0.15 | - | \$0.47 | - | Yes | Yes |
 | DeepSeek | DeepSeek V4.1 Flash | deepseek-ai/DeepSeek-V4.1-Flash | 1000000 | \$0.30 | \$0.006 | \$1.20 | FP8 | Yes | Yes |
+| Meta | Muse Glimmer 30B | meta-models/Muse-Glimmer-30B | 131072 | \$0.35 | \$0.04 | \$1.50 | FP8 | Yes | Yes |
+| Minimax | Minimax M3 | MiniMaxAI/MiniMax-M3 | 524288 | \$0.30 | \$0.06 | \$1.20 | FP4 | Yes | Yes |
+| Moonshot | Kimi K3 | moonshotai/Kimi-K3 | 1048576 | \$3.00 | \$0.30 | \$15.00 | - | Yes | Yes |
+| OpenAI | GPT-OSS 120B | openai/gpt-oss-120b | 131072 | \$0.15 | - | \$0.60 | MXFP4 | Yes | Yes |
+| Prism ML | Ternary Bonsai 27B | Prism-ML/Ternary-Bonsai-27B | 262144 | Free | - | Free | - | Yes | Yes |
+| Qwen | Qwen3.5 9B | Qwen/Qwen3.5-9B | 262144 | \$0.17 | - | \$0.25 | FP8 | Yes | Yes |
+| Qwen | Qwen3.6 Plus | Qwen/Qwen3.6-Plus | 1000000 | \$0.50 | - | \$3.00 | - | Yes | Yes |
+| Qwen | Qwen3.7 Max | Qwen/Qwen3.7-Max | - | \$2.50 | \$0.50 | \$7.50 | - | Yes | Yes |
+| Qwen | Qwen3.7 Plus | Qwen/Qwen3.7-Plus | 1000000 | \$0.32 | - | \$1.28 | - | Yes | Yes |
+| Qwen | Qwen3.8 Flash | Qwen/Qwen3.8-Flash | 1000000 | \$0.15 | - | \$0.47 | - | Yes | Yes |
+| Qwen | Qwen3.8-2.4T-A95B | Qwen/Qwen3.8-2.4T-A95B | - | \$2.00 | \$0.50 | \$6.00 | FP4 | Yes | Yes |
+| Thinking Machines | Inkling | thinkingmachines/Inkling | 524288 | \$1.00 | \$0.17 | \$4.05 | NVFP4 | Yes | Yes |
 | Together AI | Tev1 4B Experimental | together/Tev1-4B-experimental | 32768 | \$0.042 | - | Free | - | - | - |
+| Z.ai | GLM-5.2 | zai-org/GLM-5.2 | 1048575 | \$1.40 | \$0.26 | \$4.40 | FP4 | Yes | Yes |
+| Z.ai | GLM-5.3 | zai-org/GLM-5.3 | 1048575 | \$1.40 | \$0.26 | \$4.40 | FP4 | Yes | Yes |
+| Z.ai | GLM-5.3 Flash | zai-org/GLM-5.3-Flash | 1048575 | \$0.15 | \$0.03 | \$0.50 | FP4 | Yes | Yes |
 
 **Chat model examples**
 
@@ -76,32 +76,32 @@ Use our [Images](/reference/post-images-generations) endpoint for image models. 
 
 | Organization | Model name | Model string for API | Unit | Price | Output per \$1 |
 | :- | :- | :- | :- | :- | :- |
-| Google | Flash Image 2.5 (Nano Banana) | google/flash-image-2.5 | `image` | \$0.039+ ([varies](/docs/serverless/overview#how-image-models-bill)) | 26 images |
-| Google | Gemini 3 Pro Image (Nano Banana Pro) | google/gemini-3-pro-image | `image` | \$0.134 at 1K or 2K ([varies](/docs/serverless/overview#how-image-models-bill)) | 7.5 images |
-| Black Forest Labs | Flux1.1 \[pro] | black-forest-labs/FLUX.1.1-pro | `megapixel` | \$0.04 | 25 megapixels |
-| Black Forest Labs | Flux.1 Kontext \[pro] | black-forest-labs/FLUX.1-kontext-pro | `megapixel` | \$0.04 | 25 megapixels |
 | Black Forest Labs | Flux.1 Kontext \[max] | black-forest-labs/FLUX.1-kontext-max | `megapixel` | \$0.08 | 12 megapixels |
-| Black Forest Labs | FLUX.2 \[pro] | black-forest-labs/FLUX.2-pro | `image` | \$0.03+ ([varies](/docs/serverless/overview#how-image-models-bill)) | 33 images |
+| Black Forest Labs | Flux.1 Kontext \[pro] | black-forest-labs/FLUX.1-kontext-pro | `megapixel` | \$0.04 | 25 megapixels |
+| Black Forest Labs | Flux1.1 \[pro] | black-forest-labs/FLUX.1.1-pro | `megapixel` | \$0.04 | 25 megapixels |
 | Black Forest Labs | FLUX.2 \[dev] | black-forest-labs/FLUX.2-dev | `image` | \$0.0154+ ([varies](/docs/serverless/overview#how-image-models-bill)) | 65 images |
 | Black Forest Labs | FLUX.2 \[flex] | black-forest-labs/FLUX.2-flex | `image` | \$0.03+ ([varies](/docs/serverless/overview#how-image-models-bill)) | 33 images |
+| Black Forest Labs | FLUX.2 \[max] | black-forest-labs/FLUX.2-max | `megapixel` | \$0.07 at 50 steps | 14 megapixels |
+| Black Forest Labs | FLUX.2 \[pro] | black-forest-labs/FLUX.2-pro | `image` | \$0.03+ ([varies](/docs/serverless/overview#how-image-models-bill)) | 33 images |
 | ByteDance | Seedream 3.0 | ByteDance-Seed/Seedream-3.0 | `image` | \$0.018+ ([varies](/docs/serverless/overview#how-image-models-bill)) | 56 images |
 | ByteDance | Seedream 4.0 | ByteDance-Seed/Seedream-4.0 | `image` | \$0.03+ ([varies](/docs/serverless/overview#how-image-models-bill)) | 33 images |
 | ByteDance | Seedream 5.0 Lite | ByteDance/Seedream-5.0-lite | `image` | \$0.035+ ([varies](/docs/serverless/overview#how-image-models-bill)) | 29 images |
-| Qwen | Qwen Image | Qwen/Qwen-Image | `image` | \$0.0058+ ([varies](/docs/serverless/overview#how-image-models-bill)) | 172 images |
-| RunDiffusion | Juggernaut Pro Flux | RunDiffusion/Juggernaut-pro-flux | `image` | \$0.0049+ ([varies](/docs/serverless/overview#how-image-models-bill)) | 204 images |
-| RunDiffusion | Juggernaut Lightning Flux | Rundiffusion/Juggernaut-Lightning-Flux | `image` | \$0.0017+ ([varies](/docs/serverless/overview#how-image-models-bill)) | 588 images |
-| Ideogram | Ideogram 3.0 | ideogram/ideogram-3.0 | `image` | \$0.06+ ([varies](/docs/serverless/overview#how-image-models-bill)) | 17 images |
-| Stability AI | SD XL | stabilityai/stable-diffusion-xl-base-1.0 | `image` | \$0.0019+ ([varies](/docs/serverless/overview#how-image-models-bill)) | 526 images |
-| Black Forest Labs | FLUX.2 \[max] | black-forest-labs/FLUX.2-max | `megapixel` | \$0.07 at 50 steps | 14 megapixels |
+| Google | Flash Image 2.5 (Nano Banana) | google/flash-image-2.5 | `image` | \$0.039+ ([varies](/docs/serverless/overview#how-image-models-bill)) | 26 images |
+| Google | Gemini 3 Pro Image (Nano Banana Pro) | google/gemini-3-pro-image | `image` | \$0.134 at 1K or 2K ([varies](/docs/serverless/overview#how-image-models-bill)) | 7.5 images |
 | Google | Gemini 3.1 Flash Image (Nano Banana 2) | google/flash-image-3.1 | `image` | \$0.04657 at 512×512 ([varies](/docs/serverless/overview#how-image-models-bill)) | 21 images |
+| Google | Gemini 3.1 Flash-Lite Image (Nano Banana 2 Lite) | google/flash-image-3.1-lite | `image` | \$0.069+ ([varies](/docs/serverless/overview#how-image-models-bill)) | 14 images |
+| Ideogram | Ideogram 3.0 | ideogram/ideogram-3.0 | `image` | \$0.06+ ([varies](/docs/serverless/overview#how-image-models-bill)) | 17 images |
+| Ideogram | Ideogram 4.0 | ideogram/ideogram-4.0 | `image` | \$0.06+ ([varies](/docs/serverless/overview#how-image-models-bill)) | 17 images |
 | OpenAI | GPT Image 1.5 | openai/gpt-image-1.5 | `image` | \$0.034+ ([varies](/docs/serverless/overview#how-image-models-bill)) | 29 images |
+| OpenAI | GPT Image 2 | openai/gpt-image-2 | `image` | \$0.053+ ([varies](/docs/serverless/overview#how-image-models-bill)) | 19 images |
+| Pruna AI | P-Image-Ideogram | prunaai/p-image-ideogram | `image` | \$0.00225+ ([varies](/docs/serverless/overview#how-image-models-bill)) | 444 images |
+| Qwen | Qwen Image | Qwen/Qwen-Image | `image` | \$0.0058+ ([varies](/docs/serverless/overview#how-image-models-bill)) | 172 images |
 | Qwen | Qwen Image 2.0 | Qwen/Qwen-Image-2.0 | `image` | \$0.035+ ([varies](/docs/serverless/overview#how-image-models-bill)) | 29 images |
 | Qwen | Qwen Image 2.0 Pro | Qwen/Qwen-Image-2.0-Pro | `image` | \$0.075+ ([varies](/docs/serverless/overview#how-image-models-bill)) | 13 images |
+| RunDiffusion | Juggernaut Lightning Flux | Rundiffusion/Juggernaut-Lightning-Flux | `image` | \$0.0017+ ([varies](/docs/serverless/overview#how-image-models-bill)) | 588 images |
+| RunDiffusion | Juggernaut Pro Flux | RunDiffusion/Juggernaut-pro-flux | `image` | \$0.0049+ ([varies](/docs/serverless/overview#how-image-models-bill)) | 204 images |
+| Stability AI | SD XL | stabilityai/stable-diffusion-xl-base-1.0 | `image` | \$0.0019+ ([varies](/docs/serverless/overview#how-image-models-bill)) | 526 images |
 | Wan-AI | Wan 2.6 Image | Wan-AI/Wan2.6-image | `image` | \$0.03+ ([varies](/docs/serverless/overview#how-image-models-bill)) | 33 images |
-| ideogram | Ideogram 4.0 | ideogram/ideogram-4.0 | `image` | \$0.06+ ([varies](/docs/serverless/overview#how-image-models-bill)) | 17 images |
-| OpenAI | GPT Image 2 | openai/gpt-image-2 | `image` | \$0.053+ ([varies](/docs/serverless/overview#how-image-models-bill)) | 19 images |
-| Google | Gemini 3.1 Flash-Lite Image (Nano Banana 2 Lite) | google/flash-image-3.1-lite | `image` | \$0.069+ ([varies](/docs/serverless/overview#how-image-models-bill)) | 14 images |
-| Pruna AI | P-Image-Ideogram | prunaai/p-image-ideogram | `image` | \$0.00225+ ([varies](/docs/serverless/overview#how-image-models-bill)) | 444 images |
 
 ### **Image model examples**
 
@@ -146,9 +146,9 @@ If you're not sure which vision model to use, start with **Qwen3.5 9B** (`Qwen/Q
 
 | Organization | Model name | API model string | Context length | Input pricing (per 1M tokens) | Output pricing (per 1M tokens) |
 | :- | :- | :- | :- | :- | :- |
-| Qwen | Qwen3.5 9B | Qwen/Qwen3.5-9B | 262144 | \$0.17 | \$0.25 |
 | Minimax | Minimax M3 | MiniMaxAI/MiniMax-M3 | 524288 | \$0.30 | \$1.20 |
-| Moonshot | Kimi K3 | moonshotai/Kimi-K3 | 1048576 | \$2.70 | \$13.50 |
+| Moonshot | Kimi K3 | moonshotai/Kimi-K3 | 1048576 | \$3.00 | \$15.00 |
+| Qwen | Qwen3.5 9B | Qwen/Qwen3.5-9B | 262144 | \$0.17 | \$0.25 |
 
 ### **Vision model examples**
 
@@ -160,31 +160,31 @@ If you're not sure which vision model to use, start with **Qwen3.5 9B** (`Qwen/Q
 
 | Organization | Model name | Model string for API | Price per video | Resolution / duration |
 | :- | :- | :- | :- | :- |
-| MiniMax | MiniMax 01 Director | minimax/video-01-director | \$0.28 | 720p / 5s |
-| MiniMax | MiniMax Hailuo 02 | minimax/hailuo-02 | \$0.49 | 768p / 10s |
-| ByteDance | Seedance 1.0 Pro | ByteDance/Seedance-1.0-pro | \$0.57 | 1080p / 5s |
-| PixVerse | PixVerse v5 | pixverse/pixverse-v5 | \$0.30 | 1080p / 5s |
-| Vidu | Vidu Q1 | vidu/vidu-q1 | \$0.22 | 1080p / 5s |
-| PixVerse | PixVerse v5.6 | pixverse/pixverse-v5.6 | \$0.1326 | - |
-| Wan-AI | Wan 2.7 T2V | Wan-AI/wan2.7-t2v | \$0.10 | - |
-| Vidu | Vidu Q3 | vidu/vidu-q3 | \$0.0975 | - |
-| Vidu | Vidu Q3 Turbo | vidu/vidu-q3-turbo | \$0.195 | - |
-| Wan-AI | Wan 2.7 I2V | Wan-AI/wan2.7-i2v | \$0.10 | - |
-| Wan-AI | Wan 2.7 R2V | Wan-AI/wan2.7-r2v | \$0.10 | - |
-| PixVerse | PixVerse v6 | pixverse/pixverse-v6 | \$0.09 | - |
-| Alibaba | HappyHorse 1.0 T2V | alibaba/happyhorse-1.0-t2v | \$0.24 | - |
-| ByteDance | Seedance 2.0 | ByteDance/Seedance-2.0 | \$0.16 | - |
 | Alibaba | HappyHorse 1.0 I2V | alibaba/happyhorse-1.0-i2v | \$0.24 | - |
 | Alibaba | HappyHorse 1.0 R2V | alibaba/happyhorse-1.0-r2v | \$0.24 | - |
-| Google | Veo 3.1 | google/veo-3.1 | \$0.08 | - |
-| Google | Veo 3.1 Lite | google/veo-3.1-lite | \$0.05 | - |
+| Alibaba | HappyHorse 1.0 T2V | alibaba/happyhorse-1.0-t2v | \$0.24 | - |
 | Alibaba | HappyHorse 1.1 I2V | alibaba/happyhorse-1.1-i2v | \$0.14 | - |
 | Alibaba | HappyHorse 1.1 R2V | alibaba/happyhorse-1.1-r2v | \$0.14 | - |
 | Alibaba | HappyHorse 1.1 T2V | alibaba/happyhorse-1.1-t2v | \$0.14 | - |
 | Black Forest Labs | FLUX 3 | black-forest-labs/FLUX-3 | \$0.17 | - |
-| ByteDance | Seedance 2.5 | ByteDance/Seedance-2.5 | \$0.115 | - |
 | ByteDance | Seedance 1.0 Lite | ByteDance/Seedance-1.0-lite | \$0.143 | 720p / 5s |
+| ByteDance | Seedance 1.0 Pro | ByteDance/Seedance-1.0-pro | \$0.57 | 1080p / 5s |
+| ByteDance | Seedance 2.0 | ByteDance/Seedance-2.0 | \$0.16 | - |
+| ByteDance | Seedance 2.5 | ByteDance/Seedance-2.5 | \$0.115 | - |
+| Google | Veo 3.1 | google/veo-3.1 | \$0.08 | - |
+| Google | Veo 3.1 Lite | google/veo-3.1-lite | \$0.05 | - |
+| MiniMax | MiniMax 01 Director | minimax/video-01-director | \$0.28 | 720p / 5s |
 | MiniMax | MiniMax H3 | MiniMaxAI/MiniMax-H3 | \$0.1391 | 2k / 1s |
+| MiniMax | MiniMax Hailuo 02 | minimax/hailuo-02 | \$0.49 | 768p / 10s |
+| PixVerse | PixVerse v5 | pixverse/pixverse-v5 | \$0.30 | 1080p / 5s |
+| PixVerse | PixVerse v5.6 | pixverse/pixverse-v5.6 | \$0.1326 | - |
+| PixVerse | PixVerse v6 | pixverse/pixverse-v6 | \$0.09 | - |
+| Vidu | Vidu Q1 | vidu/vidu-q1 | \$0.22 | 1080p / 5s |
+| Vidu | Vidu Q3 | vidu/vidu-q3 | \$0.0975 | - |
+| Vidu | Vidu Q3 Turbo | vidu/vidu-q3-turbo | \$0.195 | - |
+| Wan-AI | Wan 2.7 I2V | Wan-AI/wan2.7-i2v | \$0.10 | - |
+| Wan-AI | Wan 2.7 R2V | Wan-AI/wan2.7-r2v | \$0.10 | - |
+| Wan-AI | Wan 2.7 T2V | Wan-AI/wan2.7-t2v | \$0.10 | - |
 
 ## Audio models
 
@@ -193,15 +193,14 @@ Use our [Audio](/reference/audio-speech) endpoint for text-to-speech models. For
 | Organization | Modality | Model name | Model string for API | Pricing |
 | :- | :- | :- | :- | :- |
 | Canopy Labs | Text-to-Speech | Orpheus 3B | canopylabs/orpheus-3b-0.1-ft | \$15.00 per 1M chars |
-| Kokoro | Text-to-Speech | Kokoro | hexgrad/Kokoro-82M | \$4.00 per 1M chars |
-| Qwen | Text-to-Speech | Qwen3 TTS 12Hz 1.7B CustomVoice | Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice | \$4.00 per 1M chars |
-| Cartesia | Text-to-Speech | Cartesia Sonic 3 | cartesia/sonic-3 | \$65.00 per 1M chars |
-| Cartesia | Text-to-Speech | Cartesia Sonic 2 | cartesia/sonic-2 | \$65.00 per 1M chars |
 | Cartesia | Text-to-Speech | Cartesia Sonic | cartesia/sonic | \$65.00 per 1M chars |
-| OpenAI | Speech-to-Text | Whisper Large v3 | openai/whisper-large-v3 | \$0.0015 per audio min |
-| NVIDIA | Speech-to-Text | Parakeet TDT 0.6B v3 | nvidia/parakeet-tdt-0.6b-v3 | \$0.0015 per audio min |
+| Cartesia | Text-to-Speech | Cartesia Sonic 2 | cartesia/sonic-2 | \$65.00 per 1M chars |
+| Cartesia | Text-to-Speech | Cartesia Sonic 3 | cartesia/sonic-3 | \$65.00 per 1M chars |
+| Kokoro | Text-to-Speech | Kokoro | hexgrad/Kokoro-82M | \$4.00 per 1M chars |
 | NVIDIA | Speech-to-Text | NVIDIA Nemotron 3 ASR Streaming 0.6B | nvidia/nemotron-3-asr-streaming-0.6b | \$0.0015 per audio min |
 | NVIDIA | Speech-to-Text | NVIDIA Nemotron 3.5 ASR Streaming 0.6B | nvidia/nemotron-3.5-asr-streaming-0.6b | \$0.0015 per audio min |
+| NVIDIA | Speech-to-Text | Parakeet TDT 0.6B v3 | nvidia/parakeet-tdt-0.6b-v3 | \$0.0015 per audio min |
+| OpenAI | Speech-to-Text | Whisper Large v3 | openai/whisper-large-v3 | \$0.0015 per audio min |
 
 **Audio model examples**
 

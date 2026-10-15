@@ -15,14 +15,6 @@ Dedicated Container Inference
 Inference for custom models
 Together Link
 Run open models in your harness
-MiniMax M3
-Gemma 4 31B
-DeepSeek V4 Pro
-GLM-5.2
-kimi K2.7 Code
-gpt-oss-120B
-Model library
-Explore the top open-source models
 Explore Top Open-Source Models
 Chat
 Image
@@ -124,14 +116,6 @@ Dedicated Container Inference
 Inference for custom models
 Together Link
 Run open models in your harness
-MiniMax M3
-Gemma 4 31B
-DeepSeek V4 Pro
-GLM-5.2
-kimi K2.7 Code
-gpt-oss-120B
-Model library
-Explore the top open-source models
 Explore Top Open-Source Models
 Chat
 Image
@@ -257,16 +241,12 @@ $0.06 (cached)
 $1.20
 Kimi K3
 $3.00
-$0.27 (cached)
+$0.30 (cached)
 $15.00
 Qwen3.8-2.4T-A95B
 $2.00
 $0.25 (cached)
 $6.00
-Muse Glimmer 30B
-$0.35
-$0.04 (cached)
-$1.50
 DeepSeek V4 Pro 0813
 $1.32
 $0.13 (cached)
@@ -314,6 +294,10 @@ Qwen3.7-Max
 $1.50
 $0.30 (cached)
 $4.50
+Muse Glimmer 30B
+$0.35
+$0.04 (cached)
+$1.50
 gpt-oss-120B
 $0.15
 $0.60
@@ -356,25 +340,23 @@ Input
 output
 MiniMax M3
 $0.30
+$0.06 (cached)
 $1.20
 Kimi K3
-PROMO
-Promotion valid until October 11, 2026
 $3.00
-$2.70
+$0.30 (cached)
 $15.00
-$13.50
 Qwen3.8-2.4T-A95B
 $2.00
+$0.25 (cached)
 $6.00
-Muse Glimmer 30B
-$0.35
-$1.50
 GLM-5.3-Flash
 $0.15
+$0.03 (cached)
 $0.50
 DeepSeek V4.1 Flash
 $0.30
+$0.006 (cached)
 $1.20
 Gemma 4 31B
 $0.39
@@ -387,10 +369,15 @@ $0.00
 $0.00
 Inkling
 $1.00
+$0.17 (cached)
 $4.05
 Qwen3.8 Flash
 $0.15
 $0.47
+Muse Glimmer 30B
+$0.35
+$0.04 (cached)
+$1.50
 Qwen3.5 9B
 $0.17
 $0.25
@@ -520,12 +507,8 @@ NVIDIA Parakeet TDT 0.6B V3 Realtime
 $0.0035
 Cartesia Sonic-3
 $65.00
-Orpheus TTS
-$15
 Kokoro-82M TTS
 $4.00
-Cartesia Sonic-2
-$65.00
 Price per video
 Model
 Price

@@ -3755,13 +3755,13 @@
     "organization": "Moonshot AI",
     "pricing": {
       "base": 0,
-      "cached_input": 0.27,
+      "cached_input": 0.3,
       "finetune": 0,
       "hourly": 0,
       "image": 0,
       "image_pixel": 0,
-      "input": 2.7,
-      "output": 13.5,
+      "input": 3,
+      "output": 15,
       "transcribe": 0,
       "video": 0
     },

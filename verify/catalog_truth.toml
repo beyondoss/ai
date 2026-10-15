@@ -2251,13 +2251,6 @@ values = { "together.models" = "0.25", "together.docs" = "0.5" }
 follow = "together.models"
 reason = "The models API (the catalog Together bills from) and the pricing page both say $0.25; only the docs table says $0.50."
 
-[[conflict]]
-card = "together:moonshotai/Kimi-K3"
-field = "cache_read"
-values = { "together.models" = "0.27", "together.docs" = "0.3" }
-follow = "together.models"
-reason = "The models API and the pricing page say $0.27 (the promotion's cached rate, \"Promotion valid until 10/11/2026\"); the docs table pairs the promotional input and output with the list cached rate. Together bills the models API's rates, which the card follows; once the promotion ends both sources say $0.30 and this entry settles."
-
 [[superseded]]
 card = "anthropic:claude-sonnet-5-5"
 field = "cache_read"

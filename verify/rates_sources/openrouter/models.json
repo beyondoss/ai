@@ -298,90 +298,9 @@
       "id": "deepseek/deepseek-v4.1-flash",
       "name": "DeepSeek: DeepSeek V4.1 Flash",
       "pricing": {
-        "completion": "0.0000006",
-        "input_cache_read": "0.000000003",
-        "overrides": [
-          {
-            "completion": "0.0000006",
-            "input_cache_read": "0.000000003",
-            "prompt": "0.00000015",
-            "utc_days": [
-              "saturday",
-              "sunday"
-            ]
-          },
-          {
-            "completion": "0.0000006",
-            "input_cache_read": "0.000000003",
-            "prompt": "0.00000015",
-            "utc_days": [
-              "monday",
-              "tuesday",
-              "wednesday",
-              "thursday",
-              "friday"
-            ],
-            "utc_end": 100,
-            "utc_start": 0
-          },
-          {
-            "completion": "0.0000012",
-            "input_cache_read": "0.000000006",
-            "prompt": "0.0000003",
-            "utc_days": [
-              "monday",
-              "tuesday",
-              "wednesday",
-              "thursday",
-              "friday"
-            ],
-            "utc_end": 400,
-            "utc_start": 100
-          },
-          {
-            "completion": "0.0000006",
-            "input_cache_read": "0.000000003",
-            "prompt": "0.00000015",
-            "utc_days": [
-              "monday",
-              "tuesday",
-              "wednesday",
-              "thursday",
-              "friday"
-            ],
-            "utc_end": 600,
-            "utc_start": 400
-          },
-          {
-            "completion": "0.0000012",
-            "input_cache_read": "0.000000006",
-            "prompt": "0.0000003",
-            "utc_days": [
-              "monday",
-              "tuesday",
-              "wednesday",
-              "thursday",
-              "friday"
-            ],
-            "utc_end": 1000,
-            "utc_start": 600
-          },
-          {
-            "completion": "0.0000006",
-            "input_cache_read": "0.000000003",
-            "prompt": "0.00000015",
-            "utc_days": [
-              "monday",
-              "tuesday",
-              "wednesday",
-              "thursday",
-              "friday"
-            ],
-            "utc_end": 0,
-            "utc_start": 1000
-          }
-        ],
-        "prompt": "0.00000015"
+        "completion": "0.00000072",
+        "input_cache_read": "0.0000000054",
+        "prompt": "0.00000002376"
       }
     },
     {
@@ -399,9 +318,8 @@
       "id": "google/gemma-4-31b-it",
       "name": "Google: Gemma 4 31B",
       "pricing": {
-        "completion": "0.00000034",
-        "input_cache_read": "0.00000005",
-        "prompt": "0.00000009"
+        "completion": "0.0000004",
+        "prompt": "0.0000002"
       }
     },
     {
@@ -419,9 +337,9 @@
       "id": "meta-llama/llama-3.3-70b-instruct",
       "name": "Meta: Llama 3.3 70B Instruct",
       "pricing": {
-        "completion": "0.0000005",
-        "input_cache_read": "0.00000011",
-        "prompt": "0.00000022"
+        "completion": "0.00000079",
+        "input_cache_read": "0.000000295",
+        "prompt": "0.00000059"
       }
     },
     {
@@ -510,9 +428,9 @@
       "id": "moonshotai/kimi-k3",
       "name": "MoonshotAI: Kimi K3",
       "pricing": {
-        "completion": "0.00001",
-        "input_cache_read": "0.00000055",
-        "prompt": "0.00000073"
+        "completion": "0.000015",
+        "input_cache_read": "0.00000028",
+        "prompt": "0.00000045"
       }
     },
     {
@@ -784,19 +702,19 @@
       "id": "openai/gpt-5.6-sol",
       "name": "OpenAI: GPT-5.6 Sol",
       "pricing": {
-        "completion": "0.00001",
-        "input_cache_read": "0.0000002",
-        "input_cache_write": "0.0000025",
+        "completion": "0.00002",
+        "input_cache_read": "0.0000004",
+        "input_cache_write": "0.000005",
         "overrides": [
           {
-            "completion": "0.000015",
-            "input_cache_read": "0.0000004",
-            "input_cache_write": "0.000005",
+            "completion": "0.00003",
+            "input_cache_read": "0.0000008",
+            "input_cache_write": "0.00001",
             "min_prompt_tokens": 272000,
-            "prompt": "0.000004"
+            "prompt": "0.000008"
           }
         ],
-        "prompt": "0.000002",
+        "prompt": "0.000004",
         "web_search": "0.01"
       }
     },
@@ -805,19 +723,19 @@
       "id": "openai/gpt-5.6-sol-pro",
       "name": "OpenAI: GPT-5.6 Sol Pro",
       "pricing": {
-        "completion": "0.00001",
-        "input_cache_read": "0.0000002",
-        "input_cache_write": "0.0000025",
+        "completion": "0.00002",
+        "input_cache_read": "0.0000004",
+        "input_cache_write": "0.000005",
         "overrides": [
           {
-            "completion": "0.000015",
-            "input_cache_read": "0.0000004",
-            "input_cache_write": "0.000005",
+            "completion": "0.00003",
+            "input_cache_read": "0.0000008",
+            "input_cache_write": "0.00001",
             "min_prompt_tokens": 272000,
-            "prompt": "0.000004"
+            "prompt": "0.000008"
           }
         ],
-        "prompt": "0.000002",
+        "prompt": "0.000004",
         "web_search": "0.01"
       }
     },
@@ -1163,9 +1081,9 @@
       "id": "qwen/qwen3.8-27b",
       "name": "Qwen: Qwen3.8 27B",
       "pricing": {
-        "completion": "0.0000023",
-        "input_cache_read": "0.0000000198",
-        "prompt": "0.00000004"
+        "completion": "0.0000022",
+        "input_cache_read": "0.00000005",
+        "prompt": "0.00000024"
       }
     },
     {
@@ -1357,8 +1275,8 @@
       "name": "Z.ai: GLM 5.2",
       "pricing": {
         "completion": "0.000007",
-        "input_cache_read": "0.000000059",
-        "prompt": "0.00000006"
+        "input_cache_read": "0.000000019",
+        "prompt": "0.00000002"
       }
     },
     {
@@ -1367,7 +1285,7 @@
       "name": "Z.ai: GLM 5.3",
       "pricing": {
         "completion": "0.0000048",
-        "input_cache_read": "0.000000059",
+        "input_cache_read": "0.000000078",
         "prompt": "0.000000079"
       }
     },
@@ -1376,9 +1294,9 @@
       "id": "z-ai/glm-5.3-flash",
       "name": "Z.ai: GLM 5.3 Flash",
       "pricing": {
-        "completion": "0.0000012",
-        "input_cache_read": "0.0000000232",
-        "prompt": "0.0000000232"
+        "completion": "0.0000005",
+        "input_cache_read": "0.00000003",
+        "prompt": "0.00000015"
       }
     }
   ]

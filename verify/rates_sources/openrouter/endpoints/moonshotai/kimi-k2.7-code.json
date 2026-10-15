@@ -121,6 +121,19 @@
         "context_length": 262144,
         "max_prompt_tokens": null,
         "pricing": {
+          "completion": "0.000004",
+          "discount": 0,
+          "input_cache_read": "0.00000019",
+          "prompt": "0.00000095"
+        },
+        "provider_name": "Phala",
+        "quantization": "unknown",
+        "tag": "phala"
+      },
+      {
+        "context_length": 262144,
+        "max_prompt_tokens": null,
+        "pricing": {
           "completion": "0.0000038",
           "discount": 0,
           "input_cache_read": "0.00000017993",
