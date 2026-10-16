@@ -3421,6 +3421,26 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// What `run`'s session flags select — opened *before* anything model-keyed is resolved, so a resumed
+/// session's own model drives the credential, route and capabilities (see `run_task`).
+enum RunSession {
+    /// An existing session (`--session`, `--session-id`, `--continue`), or a `--fork` of one.
+    Existing(Box<(SessionStore, Session)>),
+    /// A brand-new session, created only once the invocation has passed every check — a session
+    /// created and then abandoned by a failed invocation is what the next `--continue` would resume.
+    Fresh(FreshSession),
+    /// `--no-session-persistence`.
+    Ephemeral,
+}
+
+/// Where a [`RunSession::Fresh`] session is created.
+enum FreshSession {
+    /// A literal `--session <path>` that doesn't exist yet (or is empty).
+    AtPath(PathBuf),
+    /// This project's repo.
+    InRepo(SessionRepo),
+}
+
 /// Split `run`'s positional `tasks` into file references (an `@`-prefixed argument, path with the
 /// prefix stripped) and plain message strings, each preserving its own relative order.
 fn partition_tasks(tasks: Vec<String>) -> (Vec<String>, Vec<String>) {
@@ -4478,6 +4498,141 @@ async fn run_task(
     // `reasoning_effort` further below.
     let (model, model_thinking_level) = serve::resolve_model_id(&model, serve::available_models())
         .map_err(|e| format!("--model {model:?}: {e}"))?;
+    // `--session`/`--continue` persist this run (and load prior history to continue it) exactly like
+    // `serve`'s own repo/file modes. pi-parity fix: neither given previously kept `run` in-memory-only —
+    // pi's own default (no flags at all, including one-shot print-mode) is a persisted, disk-backed
+    // session, matching `serve`'s own default repo-mode persistence; only an explicit
+    // `--no-session-persistence` now opts back out to the old ephemeral behavior (see the final `None`
+    // arm below).
+    let cwd_str = cwd.to_string_lossy().into_owned();
+    // `--session-dir` (matching `serve`'s own flag/env var exactly) redirects the repo root that
+    // `--continue` and `--fork` both use, in place of the default `~/.claude/sessions/<encoded-cwd>/`.
+    // Its parent becomes `--fork`'s cross-project search root too — the same convention `serve`'s own
+    // `list_all_sessions` already applies (`Persistence::list_all_with_progress`'s `repo.dir().parent()`)
+    // when `--session-dir` is set there, so both binaries scope a cross-project scan identically.
+    let (repo_dir, fork_search_root): (PathBuf, PathBuf) =
+        match session_dir.or_else(|| stored_settings.default_session_dir.clone()) {
+            Some(dir) => {
+                let dir = PathBuf::from(dir);
+                let search_root = dir
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| dir.clone());
+                (dir, search_root)
+            }
+            None => (default_session_dir(&cwd_str), sessions_root()),
+        };
+    // Select the session before anything model-keyed is resolved — the credential and route, the
+    // `models.json` headers, vision, the reasoning default and the context window all key off the
+    // model, and a resumed session's model is the one it is actually on. Existing sessions are opened
+    // here; a fresh one is only *selected* (created after every check passes, see `RunSession`).
+    let selected = if let Some(arg) = &fork {
+        // `--fork` wins over `--session`/`--continue`: a fork always starts a fresh child session,
+        // never reopens one in place, so there is no meaningful way to combine it with either.
+        let target = SessionRepo::open(&repo_dir)?;
+        let (store, session) = fork_by_arg(arg, &target, &cwd_str, &fork_search_root, usize::MAX)
+            .map_err(|e| format!("--fork {arg:?}: {e}"))?;
+        RunSession::Existing(Box::new((store, session)))
+    } else {
+        match session_path {
+            Some(arg) => {
+                let literal_path = PathBuf::from(&arg);
+                // Task #24 (pi-parity fix): `--session <arg>` accepts either a literal path or a bare
+                // session id, matching pi's own `resolveSessionPath` — previously this always treated
+                // `arg` as a literal filesystem path, so a bare id (no `/`, no leading `.`/`~`, no
+                // `.jsonl` suffix — almost certainly not an existing relative path) silently created an
+                // empty, wrongly-named session file instead of reopening the one actually meant. A
+                // path-like argument, or one that already exists as a literal file, is still used as-is
+                // below (creating a fresh session there when absent, exactly as `--session` always has);
+                // anything else is resolved as a session id against the current project's repo first,
+                // then cross-project (`open_session_by_id`, the identical two-tier search `--fork <id>`
+                // already does via `fork_by_arg`) and REOPENED in place — continuing that session, not
+                // forking a new one, since that's what `--session` (unlike `--fork`) has always meant.
+                if is_path_like(&arg) || literal_path.exists() {
+                    // A zero-byte file at `literal_path` (e.g. `touch`'d ahead of time, or left over
+                    // from a crash before the header write landed) has nothing to open — route it
+                    // through `create`, which now initializes an empty file in place rather than failing
+                    // (see its own doc comment).
+                    let has_content = literal_path.metadata().is_ok_and(|m| m.len() > 0);
+                    if has_content {
+                        // pi-parity fix (C-M6): bare `?` here propagated the raw `std::io::Error`
+                        // straight to `main`'s `Result`, which Rust's default `Termination` impl prints
+                        // via `{:?}` — a Debug dump of the error's internal shape (`Custom { kind:
+                        // InvalidData, error: "..." }`) with no file path at all, matching neither pi's
+                        // own clear `"Error: Session file is not a valid pi session: <path>"` nor this
+                        // project's own no-leaked-internals bar for user-facing errors. Wrapping in a
+                        // plain `String` message (still `Error: "..."` once printed, but a human-readable
+                        // sentence, not an internal struct shape) and naming the path fixes both: the
+                        // operator now sees *which* file and *why*, instead of guessing.
+                        let (store, session) =
+                            SessionStore::open(literal_path.clone()).map_err(|e| {
+                                format!(
+                                    "session file is not a valid session: {}: {e}",
+                                    literal_path.display()
+                                )
+                            })?;
+                        RunSession::Existing(Box::new((store, session)))
+                    } else {
+                        RunSession::Fresh(FreshSession::AtPath(literal_path))
+                    }
+                } else {
+                    let repo = SessionRepo::open(&repo_dir)?;
+                    let (store, session) = open_session_by_id(&arg, &repo, &fork_search_root)
+                        .map_err(|e| format!("--session {arg:?}: {e}"))?;
+                    RunSession::Existing(Box::new((store, session)))
+                }
+            }
+            // Pure in-memory. `--continue` still overrides `--no-session-persistence` (it always has:
+            // asking to continue a persisted session is a direct contradiction of not persisting, and
+            // the explicit verb wins), but `--session-id` does not — there it just names the ephemeral
+            // session for correlation, exactly as it does in `serve`'s own no-persistence branch.
+            None if no_session_persistence && !continue_session => RunSession::Ephemeral,
+            // The selection ladder, most specific first — the same one `serve` applies via
+            // `serve::SessionSelect`, so the flags mean identically the same thing in both binaries.
+            None => {
+                let repo = SessionRepo::open(&repo_dir)?;
+                let existing = match (session_id.as_deref(), continue_session) {
+                    // `--session-id` addresses one session outright: open it, or create it under
+                    // exactly that id. It outranks `--continue`, which only *describes* a session
+                    // ("whatever ran here last"). It used to be discarded outright whenever any session
+                    // already existed for this cwd, which collapsed every distinct id in a shared
+                    // directory onto one shared conversation.
+                    (Some(id), _) => repo.open_id_if_exists(id)?,
+                    (None, true) => repo.resume_latest(&cwd_str)?,
+                    // A bare `run` starts a genuinely new session — persisted, so nothing is lost, but
+                    // its own. It briefly reattached to this cwd's most recent session instead, which
+                    // meant two shells in one repo drove the same store: `append_new` is count-keyed,
+                    // so neither could observe the other's writes and the transcript interleaved into
+                    // nonsense. `--continue` is how you ask for the old behavior, and it is now the
+                    // only thing that reattaches implicitly.
+                    (None, false) => None,
+                };
+                match existing {
+                    Some((store, session)) => RunSession::Existing(Box::new((store, session))),
+                    None => RunSession::Fresh(FreshSession::InRepo(repo)),
+                }
+            }
+        }
+    };
+    // The model the resumed session is on at its active tip: the last recorded model change on that
+    // branch (`serve`'s `model_and_level_at_active`), else the session's creation model. It wins
+    // unless `--model` was given explicitly; a merely-stored default doesn't count.
+    let resumed_model = match &selected {
+        RunSession::Existing(opened) => Some(
+            opened
+                .0
+                .active_ids()
+                .last()
+                .and_then(|id| opened.0.model_at(id))
+                .unwrap_or(&opened.0.meta().model)
+                .to_string(),
+        ),
+        RunSession::Fresh(_) | RunSession::Ephemeral => None,
+    };
+    let (model, model_thinking_level) = match &resumed_model {
+        Some(resumed) if !model_explicit => (resumed.clone(), None),
+        _ => (model, model_thinking_level),
+    };
     // Task 3 (pi-parity fix, pass 19): the exact capability the model-issued `read` tool-call dispatch
     // path already ANDs into `_model_supports_vision` (see this block's own doc comment above) — computed
     // once here, now that `model` is fully resolved, and threaded down to `read_file_refs` below.
@@ -4848,13 +5003,6 @@ async fn run_task(
         );
     }
 
-    // `--session`/`--continue` persist this run (and load prior history to continue it) exactly like
-    // `serve`'s own repo/file modes. pi-parity fix: neither given previously kept `run` in-memory-only —
-    // pi's own default (no flags at all, including one-shot print-mode) is a persisted, disk-backed
-    // session, matching `serve`'s own default repo-mode persistence; only an explicit
-    // `--no-session-persistence` now opts back out to the old ephemeral behavior (see the final `None`
-    // arm below).
-    let cwd_str = cwd.to_string_lossy().into_owned();
     // `--session-id`, when given, applies only where a *new* `SessionMeta` is actually minted below —
     // reopening an existing `--session <path>` or resuming via `--continue` already has a fixed id from
     // disk. Matches pi's own `--session-id`: a known, predictable id for a script/test harness to
@@ -4871,23 +5019,6 @@ async fn run_task(
         meta.title = name.clone();
         meta
     };
-    // `--session-dir` (matching `serve`'s own flag/env var exactly) redirects the repo root that
-    // `--continue` and `--fork` both use, in place of the default `~/.claude/sessions/<encoded-cwd>/`.
-    // Its parent becomes `--fork`'s cross-project search root too — the same convention `serve`'s own
-    // `list_all_sessions` already applies (`Persistence::list_all_with_progress`'s `repo.dir().parent()`)
-    // when `--session-dir` is set there, so both binaries scope a cross-project scan identically.
-    let (repo_dir, fork_search_root): (PathBuf, PathBuf) =
-        match session_dir.or_else(|| stored_settings.default_session_dir.clone()) {
-            Some(dir) => {
-                let dir = PathBuf::from(dir);
-                let search_root = dir
-                    .parent()
-                    .map(Path::to_path_buf)
-                    .unwrap_or_else(|| dir.clone());
-                (dir, search_root)
-            }
-            None => (default_session_dir(&cwd_str), sessions_root()),
-        };
     // Persistent, cross-session memory. Resolved here (before the subagent context is built) so the same
     // backend `Arc` is shared with every child — the whole subagent tree reads/writes one durable store.
     // Registered *after* `apply_filter` (like `structured_output`/`subagent`) so a `--tools` allow-list
@@ -4928,91 +5059,21 @@ async fn run_task(
             exit_process(2);
         })
     });
-    let (mut store, mut session) = if let Some(arg) = &fork {
-        // `--fork` wins over `--session`/`--continue`: a fork always starts a fresh child session,
-        // never reopens one in place, so there is no meaningful way to combine it with either.
-        let target = SessionRepo::open(&repo_dir)?;
-        let (store, session) = fork_by_arg(arg, &target, &cwd_str, &fork_search_root, usize::MAX)
-            .map_err(|e| format!("--fork {arg:?}: {e}"))?;
-        (Some(store), session)
-    } else {
-        match session_path {
-            Some(arg) => {
-                let literal_path = PathBuf::from(&arg);
-                // Task #24 (pi-parity fix): `--session <arg>` accepts either a literal path or a bare
-                // session id, matching pi's own `resolveSessionPath` — previously this always treated
-                // `arg` as a literal filesystem path, so a bare id (no `/`, no leading `.`/`~`, no
-                // `.jsonl` suffix — almost certainly not an existing relative path) silently created an
-                // empty, wrongly-named session file instead of reopening the one actually meant. A
-                // path-like argument, or one that already exists as a literal file, is still used as-is
-                // below (creating a fresh session there when absent, exactly as `--session` always has);
-                // anything else is resolved as a session id against the current project's repo first,
-                // then cross-project (`open_session_by_id`, the identical two-tier search `--fork <id>`
-                // already does via `fork_by_arg`) and REOPENED in place — continuing that session, not
-                // forking a new one, since that's what `--session` (unlike `--fork`) has always meant.
-                if is_path_like(&arg) || literal_path.exists() {
-                    // A zero-byte file at `literal_path` (e.g. `touch`'d ahead of time, or left over
-                    // from a crash before the header write landed) has nothing to open — route it
-                    // through `create`, which now initializes an empty file in place rather than failing
-                    // (see its own doc comment).
-                    let has_content = literal_path.metadata().is_ok_and(|m| m.len() > 0);
-                    if has_content {
-                        // pi-parity fix (C-M6): bare `?` here propagated the raw `std::io::Error`
-                        // straight to `main`'s `Result`, which Rust's default `Termination` impl prints
-                        // via `{:?}` — a Debug dump of the error's internal shape (`Custom { kind:
-                        // InvalidData, error: "..." }`) with no file path at all, matching neither pi's
-                        // own clear `"Error: Session file is not a valid pi session: <path>"` nor this
-                        // project's own no-leaked-internals bar for user-facing errors. Wrapping in a
-                        // plain `String` message (still `Error: "..."` once printed, but a human-readable
-                        // sentence, not an internal struct shape) and naming the path fixes both: the
-                        // operator now sees *which* file and *why*, instead of guessing.
-                        let (store, session) =
-                            SessionStore::open(literal_path.clone()).map_err(|e| {
-                                format!(
-                                    "session file is not a valid session: {}: {e}",
-                                    literal_path.display()
-                                )
-                            })?;
-                        (Some(store), session)
-                    } else {
-                        let store = SessionStore::create(literal_path, fresh_meta())?;
-                        (Some(store), Session::new())
-                    }
-                } else {
-                    let repo = SessionRepo::open(&repo_dir)?;
-                    let (store, session) = open_session_by_id(&arg, &repo, &fork_search_root)
-                        .map_err(|e| format!("--session {arg:?}: {e}"))?;
-                    (Some(store), session)
-                }
-            }
-            // Pure in-memory. `--continue` still overrides `--no-session-persistence` (it always has:
-            // asking to continue a persisted session is a direct contradiction of not persisting, and
-            // the explicit verb wins), but `--session-id` does not — there it just names the ephemeral
-            // session for correlation, exactly as it does in `serve`'s own no-persistence branch.
-            None if no_session_persistence && !continue_session => (None, Session::new()),
-            // The selection ladder, most specific first — the same one `serve` applies via
-            // `serve::SessionSelect`, so the flags mean identically the same thing in both binaries.
-            None => {
-                let repo = SessionRepo::open(&repo_dir)?;
-                let (store, session) = match (session_id.as_deref(), continue_session) {
-                    // `--session-id` addresses one session outright: open it, or create it under
-                    // exactly that id. It outranks `--continue`, which only *describes* a session
-                    // ("whatever ran here last"). It used to be discarded outright whenever any session
-                    // already existed for this cwd, which collapsed every distinct id in a shared
-                    // directory onto one shared conversation.
-                    (Some(id), _) => repo.open_or_create_id(id, &cwd_str, &model)?,
-                    (None, true) => repo.resume_latest_or_create(&cwd_str, &model)?,
-                    // A bare `run` starts a genuinely new session — persisted, so nothing is lost, but
-                    // its own. It briefly reattached to this cwd's most recent session instead, which
-                    // meant two shells in one repo drove the same store: `append_new` is count-keyed,
-                    // so neither could observe the other's writes and the transcript interleaved into
-                    // nonsense. `--continue` is how you ask for the old behavior, and it is now the
-                    // only thing that reattaches implicitly.
-                    (None, false) => (repo.create(fresh_meta())?, Session::new()),
-                };
-                (Some(store), session)
-            }
+    // Materialize the selection made before anything model-keyed was resolved (see `selected` above):
+    // a fresh session is created only now, once every check that can fail this invocation has passed.
+    let (mut store, mut session) = match selected {
+        RunSession::Existing(opened) => {
+            let (store, session) = *opened;
+            (Some(store), session)
         }
+        RunSession::Fresh(FreshSession::AtPath(path)) => (
+            Some(SessionStore::create(path, fresh_meta())?),
+            Session::new(),
+        ),
+        RunSession::Fresh(FreshSession::InRepo(repo)) => {
+            (Some(repo.create(fresh_meta())?), Session::new())
+        }
+        RunSession::Ephemeral => (None, Session::new()),
     };
     // One writer per session: held for the whole run, taken before the store's first write. A
     // session another process is writing (`run -c` in a second terminal, a `serve` that has it open)
@@ -5023,6 +5084,14 @@ async fn run_task(
             .map_err(|e| format!("cannot use this session: {e}"))?,
         None => None,
     };
+    // (After the lock: this is a write.) An explicit `--model` that differs from the resumed session's own is a model change, recorded
+    // the way `serve`'s `set_model` records one, so the next `--continue` stays on it instead of
+    // reverting to the model the session was created with.
+    if let (Some(store), Some(resumed)) = (&mut store, &resumed_model)
+        && *resumed != model
+    {
+        store.record_model_change(&model)?;
+    }
 
     // Build the mount list: durable `/memories`, plus (unless `--no-session-memory`) a per-session
     // `/session` working-memory store — the compaction-surviving scratchpad. `run` is single-session, so
@@ -5238,22 +5307,13 @@ async fn run_task(
     {
         store.set_title(name)?;
     }
-    let meta = store
+    let mut meta = store
         .as_ref()
         .map(|s| s.meta().clone())
         .unwrap_or_else(fresh_meta);
-    // Prefer the session's own persisted model over the CLI-resolved default when reopening an
-    // existing `--session`/`--continue` session and the operator didn't explicitly pass `--model` —
-    // the same bug class `switch_session` had in `serve.rs` (see `Persistence::model_and_level_at_active`
-    // there): without this, reattaching to a session last driven on `gpt-5` without re-passing `--model`
-    // silently continued it on whatever `DEFAULT_MODEL` resolves to instead, no warning. For a
-    // genuinely fresh session `meta.model` already equals `model` (`fresh_meta` seeds it from the same
-    // value), so this is a no-op there.
-    let model = if model_explicit {
-        model
-    } else {
-        meta.model.clone()
-    };
+    // The model this run is on (the resumed session's active model, or an explicit `--model`), not the
+    // header's creation-time one: what the `session` header line, lifecycle and export report.
+    meta.model = model.clone();
     // A genuinely fresh session's `cwd` always equals the current one (just stamped by `fresh_meta`),
     // so this only fires for a reopened `--session`/`--continue` session — the recorded directory was
     // moved/deleted, or this process simply isn't running where the session was created (e.g. a

@@ -791,6 +791,17 @@ The harness layers several capabilities over the bare tools + loop:
   `switch_session` uses — supplies the reattached session's own last-recorded value, which already falls
   back to `cfg.model`/the CLI-resolved level itself when nothing was ever recorded (a genuinely fresh
   session, or pure in-memory mode), so this is a no-op there.
+- **`run` resumes on the session's model, over that model's route** — `run` selects its session
+  (`RunSession`) right after resolving `--model`, before anything model-keyed: the credential and
+  route (`resolve_gateway_credential_and_headers`, including a `models.json` `base_url`/`headers`),
+  vision, the reasoning default and the context window. Existing sessions are opened there; a fresh one
+  is only selected and is created once every check has passed (`SessionRepo::resume_latest` /
+  `open_id_if_exists` are the create-free halves of `resume_latest_or_create` / `open_or_create_id`).
+  Without an explicit `--model`, the model is the resumed session's active one: `model_at` its tip,
+  else its creation model, the same lookup as `model_and_level_at_active`. An explicit `--model` that
+  differs is recorded with `record_model_change`, so `a → --continue --model b → --continue` stays on
+  `b`. Before this, the credential was resolved for the CLI default and the session's model was sent
+  over it, and a switch was never recorded, so the next `--continue` reverted to the creation model.
 - **Reset to root** — `switch_branch`'s `before: bool` (mirroring `fork`'s identical flag) switches to
   `target_id`'s own _parent_ instead of `target_id` itself; when `target_id` is the very first message,
   its parent is the tree's own root (before any message), which is exactly "redo the first message in

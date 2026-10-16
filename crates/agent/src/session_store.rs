@@ -3370,16 +3370,32 @@ impl SessionRepo {
         cwd: &str,
         model: &str,
     ) -> std::io::Result<(SessionStore, Session)> {
+        match self.resume_latest(cwd)? {
+            Some(opened) => Ok(opened),
+            None => Ok((self.create(SessionMeta::new(cwd, model))?, Session::new())),
+        }
+    }
+
+    /// [`Self::resume_latest_or_create`]'s selection without the create: `None` when no session here
+    /// matches `cwd`. For a caller (`run`) that must read the resumed session's model before it
+    /// resolves anything model-keyed, and creates a fresh session only once the invocation has passed
+    /// every check.
+    pub fn resume_latest(&self, cwd: &str) -> std::io::Result<Option<(SessionStore, Session)>> {
         let matching: Vec<SessionMeta> =
             self.list()?.into_iter().filter(|m| m.cwd == cwd).collect();
         let latest = matching
             .iter()
             .find(|m| m.message_count > 0)
             .or_else(|| matching.first());
-        match latest {
-            Some(meta) => self.open_id(&meta.id),
-            None => Ok((self.create(SessionMeta::new(cwd, model))?, Session::new())),
-        }
+        latest.map(|meta| self.open_id(&meta.id)).transpose()
+    }
+
+    /// [`Self::open_or_create_id`]'s open half: the session named exactly `id`, or `None` if there is
+    /// none (no prefix match — see [`Self::find_path_exact`]).
+    pub fn open_id_if_exists(&self, id: &str) -> std::io::Result<Option<(SessionStore, Session)>> {
+        self.find_path_exact(id)?
+            .map(|path| self.open_path(path, id))
+            .transpose()
     }
 
     /// List every session across every project's own repo directory — each immediate subdirectory of
@@ -9476,6 +9492,27 @@ mod tests {
         let (store, _) = repo.resume_latest_or_create("/mine", "m").unwrap();
         assert_eq!(store.meta().id, empty.meta().id);
         assert_eq!(repo.list().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn the_create_free_halves_open_what_exists_and_create_nothing() {
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        assert!(repo.resume_latest("/mine").unwrap().is_none());
+        assert!(repo.open_id_if_exists("named-one").unwrap().is_none());
+        assert!(repo.list().unwrap().is_empty(), "neither created a session");
+
+        let named = repo
+            .create(SessionMeta::with_id("named-one", "/mine", "m"))
+            .unwrap();
+        let (store, _) = repo.open_id_if_exists("named-one").unwrap().unwrap();
+        assert_eq!(store.meta().id, named.meta().id);
+        assert!(
+            repo.open_id_if_exists("named").unwrap().is_none(),
+            "an id is matched exactly, never by prefix"
+        );
+        let (store, _) = repo.resume_latest("/mine").unwrap().unwrap();
+        assert_eq!(store.meta().id, "named-one");
     }
 
     #[test]
