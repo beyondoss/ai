@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -87,6 +88,14 @@ pub struct Session {
     /// replaces the list, whose own rewrite carries the masked content. Never serialized.
     #[serde(skip)]
     pub edited: Vec<usize>,
+    /// Where the transcript was cut back, or rewritten from, in place since this session was built
+    /// ([`Session::cut_back`], [`Session::rewriting_from`]) — for a persistence layer to rewind to
+    /// before it appends: one keyed on message count can't see a pop followed by a push (the count is
+    /// back where it was) and would keep the discarded message on disk while never writing its
+    /// replacement. Cleared when a compaction replaces the list (its own rewrite carries the current
+    /// one). Never serialized.
+    #[serde(skip)]
+    pub cuts: Cuts,
     /// The last real prompt size [`Session::record_usage`] recorded, and the message boundary it
     /// belongs to, for [`Session::push`] to turn into the next assistant message's
     /// [`Message::prior_turn_tokens`]. Only valid while nothing has rewritten the history since:
@@ -94,6 +103,46 @@ pub struct Session {
     /// serialized, so a reopened session measures its first turn afresh.
     #[serde(skip)]
     anchor: Option<Anchor>,
+}
+
+/// Process-wide source of [`Cuts`] ids: increasing across every session in the process, so a store
+/// that has applied cut `n` can tell any later cut — even one recorded on a session rebuilt since —
+/// from one it has already seen.
+static CUT_IDS: AtomicU64 = AtomicU64::new(0);
+
+/// The highest cut id issued in this process so far. A persistence layer opened now starts here:
+/// every cut that exists already happened to a transcript it never wrote.
+pub fn cut_watermark() -> u64 {
+    CUT_IDS.load(Ordering::Relaxed)
+}
+
+/// Where a [`Session`]'s transcript was cut back, or rewritten from, in place — see
+/// [`Session::cuts`]. Each cut is `(id, length)`: the messages before `length` are untouched, the
+/// rest changed or went away. Ids come from [`cut_watermark`]'s counter.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Cuts(Vec<(u64, usize)>);
+
+impl Cuts {
+    fn record(&mut self, len: usize) {
+        let id = CUT_IDS.fetch_add(1, Ordering::Relaxed) + 1;
+        self.0.push((id, len));
+    }
+
+    /// Over the cuts after id `seen`: the newest id, and the shortest length cut back to — how much
+    /// of what a store wrote since `seen` still stands. `None` when there are none.
+    pub fn since(&self, seen: u64) -> Option<(u64, usize)> {
+        self.0
+            .iter()
+            .filter(|(id, _)| *id > seen)
+            .fold(None, |acc, &(id, len)| match acc {
+                None => Some((id, len)),
+                Some((newest, floor)) => Some((newest.max(id), floor.min(len))),
+            })
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.0.clear();
+    }
 }
 
 /// One request's real prompt size, keyed to the message boundary it saw — see [`Session::anchor`].
@@ -246,7 +295,25 @@ impl Session {
             .last()
             .is_some_and(|m| m.error_message.is_some())
         {
-            Arc::make_mut(&mut self.messages).pop();
+            self.cut_back(self.messages.len() - 1);
+        }
+    }
+
+    /// Cut the transcript back to its first `len` messages, recording the cut in [`Self::cuts`] so a
+    /// persistence layer that already wrote what went away rewinds past it rather than keeping it.
+    /// Every in-place shrink goes through here. A no-op when there is nothing past `len`.
+    pub fn cut_back(&mut self, len: usize) {
+        if len < self.messages.len() {
+            Arc::make_mut(&mut self.messages).truncate(len);
+            self.cuts.record(len);
+        }
+    }
+
+    /// Record that the messages from `index` on are about to be rewritten in place — the count-keeping
+    /// counterpart of [`Self::cut_back`], for a persistence layer that already wrote the old ones.
+    pub fn rewriting_from(&mut self, index: usize) {
+        if index < self.messages.len() {
+            self.cuts.record(index);
         }
     }
 
@@ -442,6 +509,28 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every in-place shrink is recorded, with an id newer than anything before it; `since` reports
+    /// the newest id and the shortest length over the cuts a store hasn't seen.
+    #[test]
+    fn cuts_record_every_shrink_and_since_folds_the_unseen_ones() {
+        let mut s = Session::new();
+        for i in 0..4 {
+            s.user(format!("u{i}"));
+        }
+        let before = cut_watermark();
+        assert_eq!(s.cuts.since(before), None);
+        s.cut_back(3);
+        s.cut_back(9); // nothing past 9: not a cut
+        s.push(Message::error("boom"));
+        s.pop_error_record();
+        let (newest, floor) = s.cuts.since(before).unwrap();
+        assert_eq!(floor, 3);
+        assert!(newest > before);
+        assert_eq!(s.cuts.since(newest), None);
+        s.rewriting_from(1);
+        assert_eq!(s.cuts.since(newest).map(|(_, f)| f), Some(1));
+    }
 
     #[test]
     fn scrub_cross_model_state_downgrades_signed_thinking_to_text_and_drops_redacted() {

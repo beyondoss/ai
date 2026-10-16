@@ -313,8 +313,13 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
   `max_tokens` alone, with no tool calls — a silent truncation, not an error — is checked against
   `is_hard_overflow` too, right before the run would otherwise end and hand back the hard-truncated
   non-answer. If compacting frees real room, the truncated response is discarded (never shown to the
-  user) and the same turn is retried fresh; if there's nothing left to compact, the truncated answer is
-  reported as-is, unchanged from prior behavior. Anthropic writes `max_tokens`, OpenAI Chat Completions
+  user, and through `Session::cut_back`, so the cut is recorded in `Session::cuts` for a persistence
+  layer whose compaction checkpoint already wrote it to rewind past) and the same turn is retried
+  fresh; if there's nothing left to compact, the truncated answer is reported as-is, unchanged from
+  prior behavior. Every in-place shrink of the transcript (`pop_error_record` too) goes through
+  `cut_back`, and an in-place rewrite of an already-pushed message (folding next-turn messages into the
+  prompt) through `rewriting_from`; cut ids come from one process-wide counter (`cut_watermark`), and a
+  compaction clears the list. Anthropic writes `max_tokens`, OpenAI Chat Completions
   writes `max_tokens`/
   `max_completion_tokens` (per `ModelCaps::max_tokens_field`), and OpenAI Responses writes
   `max_output_tokens` — all three funnel through the one shared clamp rather than each reimplementing

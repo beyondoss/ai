@@ -58,7 +58,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use agent_core::compaction::{CompactionProvenance, CompactionReason};
-use agent_core::{ContentBlock, Message, Role, Session};
+use agent_core::{ContentBlock, Cuts, Message, Role, Session};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chacha20poly1305::aead::{AeadInPlace, KeyInit};
@@ -1049,6 +1049,10 @@ pub struct SessionStore {
     /// starts in step with what it reloads; handed back out by [`Self::compaction_provenance`] so a
     /// session rebuilt from this store (a branch switch) starts in step too.
     written: CompactionProvenance,
+    /// The newest `agent_core::Cuts` id this store has applied (or, at open/create, the process's
+    /// watermark then: every cut that exists already happened to a transcript it never wrote). See
+    /// [`Self::persist`].
+    cuts_seen: u64,
     /// Every known node (message), by id — spans the whole tree, not just the active path.
     nodes: HashMap<String, Node>,
     /// Ids of the messages on the currently active path, root-first, parallel to `Session.messages`.
@@ -1122,6 +1126,7 @@ impl SessionStore {
             meta,
             persisted: 0,
             written: CompactionProvenance::default(),
+            cuts_seen: agent_core::cut_watermark(),
             nodes: HashMap::new(),
             active: Vec::new(),
             branch_summary_details: HashMap::new(),
@@ -1551,6 +1556,7 @@ impl SessionStore {
                 meta,
                 persisted,
                 written: session.compaction.clone(),
+                cuts_seen: agent_core::cut_watermark(),
                 nodes,
                 active,
                 branch_summary_details,
@@ -1735,11 +1741,37 @@ impl SessionStore {
     /// not a compaction. That count is adopted and the turn appended as usual. Taking it for a
     /// compaction instead wrote a spurious compaction round — new ids for the whole transcript, the
     /// provenance replaced by the session's empty one.
+    ///
+    /// A transcript cut back in place since the last write (`cuts`, the session's
+    /// [`agent_core::Session::cuts`]) is rewound first: the active tip moves back (a `Leaf`) to the
+    /// last message the cut left standing, and the append goes on from there. The agent's
+    /// silent-truncation recovery pops a cut-off reply the compaction's own checkpoint already wrote,
+    /// then pushes the retry — the count is back where it was, so a count-keyed append wrote nothing,
+    /// and a reopen got the cut-off reply (or a tool result without its call) instead of the retry.
+    /// The cut, not a comparison of contents, is the signal: what is in memory legitimately differs
+    /// from disk in ways that must never be written back (a cross-model scrub). A list shorter than
+    /// what is on disk with no compaction behind it is a cut too, recorded or not.
     pub fn persist(
         &mut self,
         messages: &[Message],
         provenance: &CompactionProvenance,
         edited: &[usize],
+        cuts: &Cuts,
+    ) -> std::io::Result<()> {
+        let cut = cuts.since(self.cuts_seen);
+        self.persist_inner(messages, provenance, edited, cut.map(|(_, floor)| floor))?;
+        if let Some((newest, _)) = cut {
+            self.cuts_seen = newest;
+        }
+        Ok(())
+    }
+
+    fn persist_inner(
+        &mut self,
+        messages: &[Message],
+        provenance: &CompactionProvenance,
+        edited: &[usize],
+        cut: Option<usize>,
     ) -> std::io::Result<()> {
         if provenance.compactions != self.written.compactions {
             if self.first_differs(messages) {
@@ -1765,8 +1797,45 @@ impl SessionStore {
             );
             self.written.compactions = provenance.compactions;
         }
+        let shrunk = (messages.len() < self.persisted).then_some(messages.len());
+        if let Some(floor) = cut.into_iter().chain(shrunk).min()
+            && floor < self.persisted
+        {
+            self.rewind_to(floor)?;
+        }
         self.record_edits(messages, edited)?;
         self.append_new(messages)
+    }
+
+    /// Move the active tip back so only the first `keep` messages stay on it — a `Leaf` to the last
+    /// active-path entry before message `keep` (custom entries after the last kept message stay with
+    /// it), or to the root for `keep == 0`. The messages past it stay on disk as an abandoned branch.
+    fn rewind_to(&mut self, keep: usize) -> std::io::Result<()> {
+        let Some(first_dropped) = self
+            .active
+            .iter()
+            .enumerate()
+            .filter(|(_, id)| {
+                self.nodes
+                    .get(*id)
+                    .is_some_and(|n| n.as_message().is_some())
+            })
+            .nth(keep)
+            .map(|(i, _)| i)
+        else {
+            return Ok(());
+        };
+        tracing::debug!(session = %self.meta.id, keep, "rewinding past a cut before appending");
+        match first_dropped.checked_sub(1) {
+            Some(tip) => {
+                let tip = self.active[tip].clone();
+                self.switch_active(&tip)?;
+            }
+            None => {
+                self.switch_active_to_root()?;
+            }
+        }
+        Ok(())
     }
 
     /// Whether `messages` starts somewhere other than the stored active path: its first message is

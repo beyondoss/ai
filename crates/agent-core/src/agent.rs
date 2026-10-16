@@ -835,6 +835,9 @@ impl Agent {
                             .map(|source| ContentBlock::Image { source }),
                     );
                 }
+                // A prompt already on disk (one an earlier, cut-short run left there) is rewritten
+                // in place: tell the store, which would otherwise keep the unfolded one.
+                session.rewriting_from(session.messages.len() - 1);
                 // `fold_into_prompt` already established `last_mut()` is `Some`.
                 if let Some(last) = Arc::make_mut(&mut session.messages).last_mut() {
                     prefix.append(&mut last.content);
@@ -1312,8 +1315,10 @@ impl Agent {
                         Ok(outcome) if outcome.compacted() => {
                             // Compaction freed real room — discard the truncated response and retry the
                             // same turn fresh; keeping both would leave two consecutive assistant turns
-                            // once the retry's real response lands, a shape no dialect accepts.
-                            Arc::make_mut(&mut session.messages).pop();
+                            // once the retry's real response lands, a shape no dialect accepts. Through
+                            // `cut_back`: the compaction's own checkpoint already wrote the truncated
+                            // reply, and the store must rewind past it before writing the retry.
+                            session.cut_back(session.messages.len() - 1);
                             session.steps -= 1;
                             steps_this_call -= 1;
                             truncation_recovered = true;

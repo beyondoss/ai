@@ -62,11 +62,11 @@ fn a_session_rebuilt_without_the_stores_generation_appends_instead_of_compacting
         turn(&mut s, i);
     }
     store
-        .persist(&s.messages, &s.compaction, &s.edited)
+        .persist(&s.messages, &s.compaction, &s.edited, &s.cuts)
         .unwrap();
     compact(&mut s, 4);
     store
-        .persist(&s.messages, &s.compaction, &s.edited)
+        .persist(&s.messages, &s.compaction, &s.edited, &s.cuts)
         .unwrap();
     store.record_model_change("model-b").unwrap();
     let tip = store.active_ids().last().unwrap().clone();
@@ -79,7 +79,12 @@ fn a_session_rebuilt_without_the_stores_generation_appends_instead_of_compacting
     rebuilt.push(Message::user("new question"));
     let before = fs::read(&path).unwrap();
     store
-        .persist(&rebuilt.messages, &rebuilt.compaction, &rebuilt.edited)
+        .persist(
+            &rebuilt.messages,
+            &rebuilt.compaction,
+            &rebuilt.edited,
+            &rebuilt.cuts,
+        )
         .unwrap();
     assert!(fs::read(&path).unwrap().starts_with(&before));
     assert_eq!(compaction_records(&path), 1);
@@ -104,22 +109,32 @@ fn after_adopting_a_sessions_generation_the_next_real_compaction_is_written() {
         turn(&mut s, i);
     }
     store
-        .persist(&s.messages, &s.compaction, &s.edited)
+        .persist(&s.messages, &s.compaction, &s.edited, &s.cuts)
         .unwrap();
     compact(&mut s, 4);
     store
-        .persist(&s.messages, &s.compaction, &s.edited)
+        .persist(&s.messages, &s.compaction, &s.edited, &s.cuts)
         .unwrap();
 
     let mut rebuilt = Session::new();
     rebuilt.messages = s.messages.clone();
     turn(&mut rebuilt, 9);
     store
-        .persist(&rebuilt.messages, &rebuilt.compaction, &rebuilt.edited)
+        .persist(
+            &rebuilt.messages,
+            &rebuilt.compaction,
+            &rebuilt.edited,
+            &rebuilt.cuts,
+        )
         .unwrap();
     compact(&mut rebuilt, 3);
     store
-        .persist(&rebuilt.messages, &rebuilt.compaction, &rebuilt.edited)
+        .persist(
+            &rebuilt.messages,
+            &rebuilt.compaction,
+            &rebuilt.edited,
+            &rebuilt.cuts,
+        )
         .unwrap();
     assert_eq!(compaction_records(&path), 2);
     drop(store);
@@ -138,7 +153,7 @@ fn a_compaction_persisted_while_the_store_lagged_keeps_every_side_record() {
     let mut s = Session::new();
     turn(&mut s, 0);
     store
-        .persist(&s.messages, &s.compaction, &s.edited)
+        .persist(&s.messages, &s.compaction, &s.edited, &s.cuts)
         .unwrap();
     store.record_model_change("model-b").unwrap();
     store.set_title("my title").unwrap();
@@ -150,7 +165,7 @@ fn a_compaction_persisted_while_the_store_lagged_keeps_every_side_record() {
     compact(&mut s, 2);
     let before = fs::read(&path).unwrap();
     store
-        .persist(&s.messages, &s.compaction, &s.edited)
+        .persist(&s.messages, &s.compaction, &s.edited, &s.cuts)
         .unwrap();
     assert!(fs::read(&path).unwrap().starts_with(&before));
     drop(store);
@@ -174,13 +189,13 @@ fn a_compaction_whose_kept_suffix_is_partly_on_disk_writes_exactly_the_new_trans
     turn(&mut s, 0);
     s.push(Message::user("u1"));
     store
-        .persist(&s.messages, &s.compaction, &s.edited)
+        .persist(&s.messages, &s.compaction, &s.edited, &s.cuts)
         .unwrap();
     s.push(Message::assistant(vec![ContentBlock::text("a1")]));
     turn(&mut s, 2);
     compact(&mut s, 2);
     store
-        .persist(&s.messages, &s.compaction, &s.edited)
+        .persist(&s.messages, &s.compaction, &s.edited, &s.cuts)
         .unwrap();
     drop(store);
     let (_store, reopened) = SessionStore::open(path.clone()).unwrap();
