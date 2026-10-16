@@ -3450,6 +3450,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// The closing record for a resumed session's prompt that its run never answered (see
+/// [`agent_core::Session::close_unanswered_prompt`]).
+const INTERRUPTED_PROMPT: &str =
+    "interrupted: the previous run ended before answering this request";
+
 /// What `run`'s session flags select — opened *before* anything model-keyed is resolved, so a resumed
 /// session's own model drives the credential, route and capabilities (see `run_task`).
 enum RunSession {
@@ -5576,6 +5581,18 @@ async fn run_task(
     // once that write has actually landed.
     let broken_pipe = AtomicBool::new(false);
 
+    // A resumed session whose last run was killed outright (OOM, `kill -9`, a CI cancel) ends on that
+    // run's prompt, checkpointed before the model call and never answered. Close it the way a failed
+    // run closes its own, so this run's prompt doesn't make two consecutive `user` turns. Persisted
+    // with the new prompt by the first checkpoint. A `serve` host bash record is a `user` message that
+    // legitimately ends a session between prompts, not an interrupted one.
+    if !session
+        .messages
+        .last()
+        .is_some_and(serve::is_host_bash_record)
+    {
+        session.close_unanswered_prompt(INTERRUPTED_PROMPT);
+    }
     // A resumed session (`--session-id`, `--continue`) whose transcript still holds an MCP skill's
     // SKILL.md is acting on that skill: the code-execution gate is restored with it.
     mcp_enabled

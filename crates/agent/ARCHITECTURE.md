@@ -807,6 +807,14 @@ The harness layers several capabilities over the bare tools + loop:
   differs is recorded with `record_model_change`, so `a → --continue --model b → --continue` stays on
   `b`. Before this, the credential was resolved for the CLI default and the session's model was sent
   over it, and a switch was never recorded, so the next `--continue` reverted to the creation model.
+- **`run` closes a prompt a killed run never answered** — the prompt is checkpointed before the model
+  call, so a run killed outright (OOM, `kill -9`, a CI cancel) leaves a session whose tip is that `user`
+  message with no closing record: no `Err` path ran to write one. A resumed `run` calls
+  `Session::close_unanswered_prompt` before adding its own prompt, which appends the same synthetic
+  `Message::error` record a failed run leaves ("interrupted: the previous run ended before answering
+  this request"), so the request never carries `[user, user]`. A `serve` host bash record
+  (`serve::is_host_bash_record`) is a `user` message that legitimately ends a session between prompts,
+  so it is left alone.
 - **Reset to root** — `switch_branch`'s `before: bool` (mirroring `fork`'s identical flag) switches to
   `target_id`'s own _parent_ instead of `target_id` itself; when `target_id` is the very first message,
   its parent is the tree's own root (before any message), which is exactly "redo the first message in

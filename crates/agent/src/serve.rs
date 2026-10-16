@@ -9407,6 +9407,17 @@ const HOST_BASH_LABEL: &str = "[Host bash command, run outside the model's own t
 /// back to the old `"(error)\n"`-marker-only detection, no migration needed.
 const HOST_BASH_STATUS_LINE_PREFIX: &str = "[Host bash status] ";
 
+/// Whether `m` is a host bash record (`serve`'s `bash` RPC, either label): a `user` message that
+/// legitimately ends a session between prompts, so a resumed session ending on one was not
+/// interrupted mid-turn (see `run`'s use of [`agent_core::Session::close_unanswered_prompt`]).
+pub fn is_host_bash_record(m: &agent_core::Message) -> bool {
+    m.role == agent_core::Role::User
+        && m.content.iter().any(|c| {
+            matches!(c, agent_core::ContentBlock::Text { text, .. }
+                if text.starts_with(HOST_BASH_LABEL) || text.starts_with(HOST_BASH_EXCLUDED_LABEL))
+        })
+}
+
 /// Whether `m` is a [`HOST_BASH_EXCLUDED_LABEL`]-tagged message — see that constant's own doc comment.
 fn is_excluded_from_model_context(m: &agent_core::Message) -> bool {
     m.role == agent_core::Role::User
@@ -12634,6 +12645,15 @@ async fn write_frame(out: &mut tokio::io::Stdout, line: &[u8]) -> std::io::Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_host_bash_record_is_recognized_under_either_label() {
+        for label in [HOST_BASH_LABEL, HOST_BASH_EXCLUDED_LABEL] {
+            let m = agent_core::Message::user(format!("{label}\n$ ls\n\nout"));
+            assert!(is_host_bash_record(&m));
+        }
+        assert!(!is_host_bash_record(&agent_core::Message::user("a prompt")));
+    }
 
     /// A views sidecar of `n` views, oldest first, each opening `html_bytes` of HTML.
     fn views_sidecar(n: usize, html_bytes: usize) -> Vec<u8> {
