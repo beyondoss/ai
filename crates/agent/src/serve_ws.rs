@@ -315,8 +315,9 @@ struct SessionHandle {
     /// When the last connection detached (`attached` reached `0`), for the idle reaper's clock. `None`
     /// while any connection is attached, or on a fresh session — either way it isn't reap-eligible yet.
     last_detached_at: Option<Instant>,
-    /// `true` exactly while the session's [`serve_session`] loop is running a `prompt`. The reaper reads
-    /// it so a detached-but-mid-run background session is never reaped out from under an in-flight turn.
+    /// `true` exactly while the session's [`serve_session`] loop is running a `prompt`, a host `bash`
+    /// command or a manual `compact`. The reaper and the drain read it so a detached session is never
+    /// stopped out from under work a client started and walked away from.
     running: Arc<AtomicBool>,
     /// `true` while the session holds a live MCP Events subscription (and `--mcp-events-reapable`
     /// is off): a background trigger, so the idle reaper leaves the session alone.
@@ -1358,9 +1359,9 @@ impl Supervisor {
     ///    still owns keep working**, because those clients cannot be served anywhere else until this
     ///    replica releases the session's lock.
     /// 2. **Wait for in-flight runs**, bounded by `grace`. The wait is on each session's `running`
-    ///    flag — true exactly while a prompt is executing. It is deliberately **not** `is_reapable`,
-    ///    which additionally requires `attached == 0`: a client watching its own run keeps a socket
-    ///    attached throughout, so a drain gated on that would burn its entire grace every time and
+    ///    flag — true exactly while a prompt, host `bash` or `compact` is executing. It is
+    ///    deliberately **not** `is_reapable`, which additionally requires `attached == 0`: a client
+    ///    watching its own run keeps a socket attached throughout, so a drain gated on that would burn its entire grace every time and
     ///    then kill the run anyway.
     /// 3. **Then the ordinary shutdown**, which stops every session and waits for the tasks.
     ///
@@ -1370,9 +1371,9 @@ impl Supervisor {
         lock_ignoring_poison(&self.table).lifecycle = Lifecycle::Draining;
     }
 
-    /// Is any session still executing a prompt?
+    /// Is any session still executing a prompt (or a host `bash` or `compact`)?
     ///
-    /// Reads each session's `running` flag — true exactly while a prompt is executing. Deliberately
+    /// Reads each session's `running` flag — true exactly while one is executing. Deliberately
     /// **not** `is_reapable`, which additionally requires `attached == 0`: a client watching its own
     /// run holds a socket open throughout, so a drain gated on that would burn its whole grace every
     /// time and then cut the run anyway.
@@ -1505,8 +1506,8 @@ impl Supervisor {
 /// send and tears the socket down; a reconnect waits for the task to finish and respawns the id).
 ///
 /// Otherwise the session is alive, and the ordinary conditions apply: **detached** (`attached == 0`) for
-/// at least `timeout`, and not mid-`prompt` — a detached background run is exactly what this design
-/// exists to keep alive, so `running` is never reaped out from under an in-flight turn. Nor is a
+/// at least `timeout`, and not mid-`prompt` (or mid host `bash`/`compact`) — a detached background run
+/// is exactly what this design exists to keep alive, so `running` is never reaped out from under it. Nor is a
 /// session with a live MCP Events subscription (`keep_alive`): its triggers fire with no client
 /// attached, which is the point of them.
 fn is_reapable(h: &SessionHandle, timeout: Duration) -> bool {
