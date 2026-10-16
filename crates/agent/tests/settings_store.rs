@@ -1305,3 +1305,40 @@ fn serve_binary_stored_steering_mode_and_follow_up_mode_seed_a_fresh_processs_in
     drop(stdin);
     child.wait().unwrap();
 }
+
+#[test]
+fn one_wrongly_typed_field_is_reported_and_every_valid_field_still_applies() {
+    // A strict parse used to fail on the first bad field and fall back to all-unset, with only a
+    // `tracing::warn!` nobody sees: one typo silently discarded the stored model (and gateway, MCP
+    // servers, ...), so an unattended host quietly changed model and provider.
+    let home = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(home.path().join(".claude")).unwrap();
+    std::fs::write(
+        home.path().join(".claude/settings.json"),
+        r#"{"default_model": "claude-from-settings", "block_images": "yes"}"#,
+    )
+    .unwrap();
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let (base, bodies) = spawn_model_server(vec![turn_text("ok")]);
+    let output = Command::new(bin)
+        .args(["run", "hi", "--gateway-url", &base, "--key", "bai_v1.test"])
+        .args(["--no-session-persistence"])
+        .env("HOME", home.path())
+        .env_remove("AI_AGENT_CONFIG_DIR")
+        .env_remove("AI_AGENT_MODEL")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stderr: {stderr}");
+    assert!(
+        stderr.contains("settings.json") && stderr.contains("`block_images`"),
+        "the bad field is named on stderr: {stderr}"
+    );
+    let bodies = bodies.lock().unwrap();
+    assert_eq!(
+        common::body_json(&bodies[0])["model"],
+        "claude-from-settings",
+        "the valid field still applies"
+    );
+}
