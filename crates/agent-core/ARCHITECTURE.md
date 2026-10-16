@@ -87,7 +87,10 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
   `prepareNextTurn`/`nextTurnSnapshot` equivalent) retargets every subsequent turn of a run already in
   flight, applied at the same turn boundary a graceful stop is checked — never mid-turn, so the request
   already in flight when a switch is requested is unaffected. A `ModelSwitched` event fires when it's
-  applied. Deliberately narrower than pi's full snapshot: only the main conversational turns' own model/
+  applied, after the same cross-model scrub the run start applies (`needs_cross_model_scrub` →
+  `scrub_cross_model_state`, below): turns the previous model produced, this run's included, carry
+  thinking signatures and combined tool-call ids the new vendor rejects (Anthropic: 400 ``Invalid
+  `signature` in `thinking` block``). Deliberately narrower than pi's full snapshot: only the main conversational turns' own model/
   thinking budget are affected — `compact`/`compact_or_report`/`summarize_branch` keep using the `Agent`'s
   original, as-configured model, matching pi's own summarization path (no `nextTurnSnapshot` awareness
   there either). `serve`'s `switch_model` RPC command is the concrete surface for this; `set_model`/
