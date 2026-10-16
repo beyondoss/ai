@@ -1126,9 +1126,18 @@ fn message_item_id_phase(item: Option<&Value>) -> (Option<String>, Option<String
 /// decoder knows which indices are still open, for two purposes: (1) a stray `done`/delta for an index
 /// that was never opened is recognized as stale/duplicate and dropped, and (2) `finalize` can close out
 /// anything a malformed/truncated stream left open.
+///
+/// A `reasoning` or `message` item opens on its `output_item.added`, not on its first delta: a
+/// reasoning item with an empty summary (routine with `summary:"auto"`) streams no delta at all,
+/// yet its `output_item.done` carries the `encrypted_content` the next request must replay ahead
+/// of the function call it led to; a message's text can likewise arrive only in its `done`.
+/// `silent` holds the opened reasoning/message indices that have not streamed any text yet, so
+/// their `done` emits the item's text as one delta (clients that render deltas see it) before the
+/// usual resync.
 pub struct Decoder {
     started: bool,
     open_indices: Vec<usize>,
+    silent: Vec<usize>,
     saw_terminal: bool,
     failed: Option<String>,
     saw_tool_call: bool,
@@ -1141,6 +1150,7 @@ impl Default for Decoder {
         Self {
             started: false,
             open_indices: Vec::new(),
+            silent: Vec::new(),
             saw_terminal: false,
             failed: None,
             saw_tool_call: false,
@@ -1157,6 +1167,21 @@ impl Decoder {
             self.open_indices.push(index);
         }
         out.push(ev);
+    }
+
+    /// Note that `index` streamed some text, so its `done` need not emit the text itself. Free on
+    /// the per-token path once every opened item has streamed (`silent` is then empty).
+    fn streamed(&mut self, index: usize) {
+        if let Some(pos) = self.silent.iter().position(|&i| i == index) {
+            self.silent.swap_remove(pos);
+        }
+    }
+
+    /// Whether `index` was opened and never streamed text; clears the mark.
+    fn take_silent(&mut self, index: usize) -> bool {
+        let silent = self.silent.contains(&index);
+        self.streamed(index);
+        silent
     }
 
     /// Close `index`, if it's actually open — a `done` for an index never opened is a stale/duplicate
@@ -1191,6 +1216,7 @@ impl Decoder {
         for index in std::mem::take(&mut self.open_indices) {
             out.push(StreamEvent::ContentBlockStop { index });
         }
+        self.silent.clear();
 
         let response = data.get("response");
         let usage = response.and_then(|r| r.get("usage"));
@@ -1284,6 +1310,9 @@ impl StreamDecoder for Decoder {
     fn try_fast_path(&mut self, payload: &str) -> Option<Vec<StreamEvent>> {
         let parsed: FastDeltaEvent = serde_json::from_str(payload).ok()?;
         let index = parsed.output_index;
+        if !self.silent.is_empty() && !parsed.delta.is_empty() {
+            self.streamed(index);
+        }
         let ev = match parsed.kind {
             FastDeltaKind::OutputText | FastDeltaKind::Refusal => StreamEvent::TextDelta {
                 index,
@@ -1345,32 +1374,47 @@ impl StreamDecoder for Decoder {
                         StreamEvent::ToolUseStart { index, id, name },
                     );
                 }
-                // A message/reasoning item has no explicit "start" `StreamEvent` — it opens implicitly
-                // on its first delta, which `emit` handles lazily (marking it open on first mention).
-                // Nothing to emit here for those.
+                // A reasoning/message item opens here, with an empty delta: no `StreamEvent` means
+                // "start", and waiting for the first delta would never open an item that streams none
+                // (see the `Decoder` doc comment). Opening now also declares the block in its true
+                // position, ahead of any item announced after it.
+                let open = match item.and_then(|i| i.get("type")).and_then(Value::as_str) {
+                    Some("reasoning") => Some(StreamEvent::ThinkingDelta {
+                        index,
+                        text: String::new(),
+                    }),
+                    Some("message") => Some(StreamEvent::TextDelta {
+                        index,
+                        text: String::new(),
+                    }),
+                    _ => None,
+                };
+                if let Some(ev) = open
+                    && !self.open_indices.contains(&index)
+                {
+                    self.silent.push(index);
+                    self.emit(&mut out, index, ev);
+                }
             }
             "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
                 let Some(index) = usize_at(data, "output_index") else {
                     tracing::warn!(event = %kind, "responses event with no usable output_index; dropping");
                     return out;
                 };
-                self.emit(
-                    &mut out,
-                    index,
-                    StreamEvent::ThinkingDelta {
-                        index,
-                        text: str_at(Some(data), "delta").to_string(),
-                    },
-                );
+                let text = str_at(Some(data), "delta").to_string();
+                if !text.is_empty() {
+                    self.streamed(index);
+                }
+                self.emit(&mut out, index, StreamEvent::ThinkingDelta { index, text });
             }
             "response.reasoning_summary_part.done" => {
                 let Some(index) = usize_at(data, "output_index") else {
                     tracing::warn!(event = %kind, "responses event with no usable output_index; dropping");
                     return out;
                 };
-                // Only meaningful for an index that's already open (accrued some reasoning text) —
-                // otherwise there's nothing to add a paragraph break to.
-                if self.open_indices.contains(&index) {
+                // Only meaningful for an index that has accrued some reasoning text — otherwise
+                // there's nothing to add a paragraph break to.
+                if self.open_indices.contains(&index) && !self.silent.contains(&index) {
                     self.emit(
                         &mut out,
                         index,
@@ -1386,14 +1430,11 @@ impl StreamDecoder for Decoder {
                     tracing::warn!(event = %kind, "responses event with no usable output_index; dropping");
                     return out;
                 };
-                self.emit(
-                    &mut out,
-                    index,
-                    StreamEvent::TextDelta {
-                        index,
-                        text: str_at(Some(data), "delta").to_string(),
-                    },
-                );
+                let text = str_at(Some(data), "delta").to_string();
+                if !text.is_empty() {
+                    self.streamed(index);
+                }
+                self.emit(&mut out, index, StreamEvent::TextDelta { index, text });
             }
             "response.function_call_arguments.delta" => {
                 let Some(index) = usize_at(data, "output_index") else {
@@ -1437,8 +1478,18 @@ impl StreamDecoder for Decoder {
                 } else {
                     let item = data.get("item");
                     let item_type = item.and_then(|i| i.get("type")).and_then(Value::as_str);
+                    // An item that streamed no text gets its text here as one delta, ahead of the
+                    // resync, so a client rendering deltas sees it too.
+                    let silent = self.take_silent(index);
                     match item_type {
                         Some("reasoning") => {
+                            if silent && let Some(text) = reasoning_item_text(item) {
+                                self.emit(
+                                    &mut out,
+                                    index,
+                                    StreamEvent::ThinkingDelta { index, text },
+                                );
+                            }
                             // The whole item, JSON-stringified, is the block's replayable signature —
                             // see the module doc comment.
                             self.emit(
@@ -1482,6 +1533,16 @@ impl StreamDecoder for Decoder {
                         }
                         Some("message") => {
                             if let Some(text) = message_item_text(item) {
+                                if silent {
+                                    self.emit(
+                                        &mut out,
+                                        index,
+                                        StreamEvent::TextDelta {
+                                            index,
+                                            text: text.clone(),
+                                        },
+                                    );
+                                }
                                 let (id, phase) = message_item_id_phase(item);
                                 self.emit(
                                     &mut out,
@@ -2806,16 +2867,24 @@ data: {"type":"response.completed","response":{"status":"completed","usage":{"in
         let events = decode_sse(&mut dec, FIXTURE).unwrap();
 
         assert_eq!(events[0], StreamEvent::MessageStart);
-        // Reasoning: summary delta, then signature (full item JSON) + stop on `output_item.done`.
+        // The reasoning item opens on its `output_item.added`, not on its first delta.
         assert_eq!(
             events[1],
+            StreamEvent::ThinkingDelta {
+                index: 0,
+                text: String::new()
+            }
+        );
+        // Reasoning: summary delta, then signature (full item JSON) + stop on `output_item.done`.
+        assert_eq!(
+            events[2],
             StreamEvent::ThinkingDelta {
                 index: 0,
                 text: "Let me check.".into()
             }
         );
-        assert!(matches!(events[2], StreamEvent::SignatureDelta { .. }));
-        if let StreamEvent::SignatureDelta { signature, .. } = &events[2] {
+        assert!(matches!(events[3], StreamEvent::SignatureDelta { .. }));
+        if let StreamEvent::SignatureDelta { signature, .. } = &events[3] {
             let parsed: Value = serde_json::from_str(signature).unwrap();
             assert_eq!(parsed["type"], "reasoning");
             assert_eq!(parsed["id"], "rs_1");
@@ -2823,16 +2892,16 @@ data: {"type":"response.completed","response":{"status":"completed","usage":{"in
         // pi-parity fix: `output_item.done` also resyncs the block's visible thinking text from the
         // item's own authoritative `summary`, same as the text/tool-call resyncs below.
         assert_eq!(
-            events[3],
+            events[4],
             StreamEvent::ThinkingFinal {
                 index: 0,
                 text: "Let me check.".into()
             }
         );
-        assert_eq!(events[4], StreamEvent::ContentBlockStop { index: 0 });
+        assert_eq!(events[5], StreamEvent::ContentBlockStop { index: 0 });
         // Tool call.
         assert_eq!(
-            events[5],
+            events[6],
             StreamEvent::ToolUseStart {
                 index: 1,
                 id: "call_42|fc_1".into(),
@@ -2840,14 +2909,14 @@ data: {"type":"response.completed","response":{"status":"completed","usage":{"in
             }
         );
         assert_eq!(
-            events[6],
+            events[7],
             StreamEvent::InputJsonDelta {
                 index: 1,
                 partial_json: "{\"city\":".into()
             }
         );
         assert_eq!(
-            events[7],
+            events[8],
             StreamEvent::InputJsonDelta {
                 index: 1,
                 partial_json: "\"SF\"}".into()
@@ -2856,13 +2925,13 @@ data: {"type":"response.completed","response":{"status":"completed","usage":{"in
         // `output_item.done` resyncs to the provider's own authoritative arguments before closing —
         // see `message_item_text`'s sibling `Some("function_call")` resync arm.
         assert_eq!(
-            events[8],
+            events[9],
             StreamEvent::InputJsonFinal {
                 index: 1,
                 full_json: "{\"city\":\"SF\"}".into()
             }
         );
-        assert_eq!(events[9], StreamEvent::ContentBlockStop { index: 1 });
+        assert_eq!(events[10], StreamEvent::ContentBlockStop { index: 1 });
         // Terminal: usage + a ToolUse-upgraded stop reason (status was "completed", but a tool call
         // happened).
         let usage = events

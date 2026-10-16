@@ -4150,10 +4150,14 @@ impl Accumulator {
                     thought_signature,
                 })
             }
-            OpenBlock::Thinking(text, signature) => Some(ContentBlock::Thinking {
-                text: text.into(),
-                signature,
-            }),
+            // A thinking block that never accrued text or a signature (an OpenAI Responses reasoning
+            // item opened on its `output_item.added` whose stream was cut before its `done`) carries
+            // nothing to show or replay.
+            OpenBlock::Thinking(text, signature) => (!text.is_empty() || !signature.is_empty())
+                .then(|| ContentBlock::Thinking {
+                    text: text.into(),
+                    signature,
+                }),
             OpenBlock::Text(text, id, phase) => (!text.is_empty()).then(|| ContentBlock::Text {
                 text: text.into(),
                 id,
@@ -8314,6 +8318,106 @@ data: {"type":"response.incomplete","response":{"status":"incomplete","incomplet
                 "{wire}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_responses_reasoning_item_with_no_summary_is_replayed_ahead_of_its_function_call() {
+        // Recorded shapes from a `summary:"auto"` turn whose reasoning produced no summary: the
+        // reasoning item streams no delta at all, only `added` and a `done` carrying its
+        // `encrypted_content`. The next request must replay that item ahead of the function call
+        // it led to, or the model loses its reasoning (and its cache) between tool calls.
+        const TOOL_TURN: &str = r#"
+data: {"type":"response.created","response":{"id":"resp_1"}}
+
+data: {"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs_1","summary":[]}}
+
+data: {"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":"ENC-REASONING"}}
+
+data: {"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"read","arguments":""}}
+
+data: {"type":"response.function_call_arguments.delta","output_index":1,"delta":"{\"path\":\"a.txt\"}"}
+
+data: {"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"read","arguments":"{\"path\":\"a.txt\"}"}}
+
+data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":10,"output_tokens":20}}}
+"#;
+        // A message whose text arrives only in its `done`, with no `output_text.delta`.
+        const TEXT_TURN: &str = r#"
+data: {"type":"response.created","response":{"id":"resp_2"}}
+
+data: {"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_1","role":"assistant","content":[]}}
+
+data: {"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"output_text","text":"all done"}]}}
+
+data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":10,"output_tokens":5}}}
+"#;
+        let decode = |sse| {
+            let mut dec = crate::dialect::openai_responses::Decoder::default();
+            crate::dialect::decode_sse(&mut dec, sse).unwrap()
+        };
+        let text_events = decode(TEXT_TURN);
+        assert!(
+            text_events.contains(&StreamEvent::TextDelta {
+                index: 0,
+                text: "all done".into()
+            }),
+            "a client rendering deltas must see text that only arrived in `done`: {text_events:?}"
+        );
+        let (read, _) = Recorder::new("read");
+        let mut tools = ToolRegistry::new();
+        tools.register(read);
+        let mock = Arc::new(MockTransport::new(vec![decode(TOOL_TURN), text_events]));
+        let agent = Agent::new(mock.clone(), "gpt-5.4")
+            .with_tools(tools)
+            .with_max_steps(8);
+        let mut session = Session::new();
+        session.user("go");
+        agent.run(&mut session, |_| {}).await.unwrap();
+
+        let body = crate::dialect::openai_responses::build_body(&mock.requests()[1]);
+        let input = body["input"].as_array().unwrap();
+        let reasoning = input
+            .iter()
+            .position(|i| i["type"] == "reasoning")
+            .unwrap_or_else(|| panic!("the reasoning item must be replayed: {input:#?}"));
+        assert_eq!(input[reasoning]["encrypted_content"], "ENC-REASONING");
+        let call = input
+            .iter()
+            .position(|i| i["type"] == "function_call")
+            .expect("the function call is replayed");
+        assert_eq!(
+            reasoning + 1,
+            call,
+            "the reasoning item leads its call: {input:#?}"
+        );
+        assert_eq!(
+            session.messages.last().unwrap().content,
+            vec![ContentBlock::Text {
+                text: "all done".into(),
+                id: Some("msg_1".into()),
+                phase: None,
+            }],
+            "a message whose text arrives only in `done` is kept"
+        );
+    }
+
+    #[test]
+    fn a_thinking_block_opened_but_never_filled_is_dropped() {
+        // A Responses reasoning item opens on `output_item.added`; a stream cut before its `done`
+        // leaves a block with no text and no signature, which has nothing to show or replay.
+        let mut acc = Accumulator::default();
+        acc.apply(&StreamEvent::ThinkingDelta {
+            index: 0,
+            text: String::new(),
+        });
+        acc.apply(&StreamEvent::TextDelta {
+            index: 1,
+            text: "hi".into(),
+        });
+        acc.apply(&StreamEvent::MessageStop {
+            stop_reason: StopReason::EndTurn,
+        });
+        assert_eq!(acc.finish().blocks, vec![ContentBlock::text("hi")]);
     }
 
     #[test]
