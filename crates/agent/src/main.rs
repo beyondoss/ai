@@ -1800,16 +1800,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // out of `run` both pass through this guard's `Drop`: the same cleanup as `exit_process`.
     let _sweep = tools::mcp_stdio::ExitSweep;
     let runtime = build_runtime(is_service_mode())?;
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| runtime.block_on(run()))) {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        runtime.block_on(run_main())
+    })) {
         Ok(result) => result,
         // A panic out of `run` (the panic hook has already reported it). Dropping the runtime
         // here would wait for every blocking task — and `serve`'s stdin reader is one, parked on a
         // read that may never return — so the process would hang instead of exiting. Abandon the
-        // runtime's threads, sweep (the same cleanup as every exit), and go, with Rust's own
-        // panic status.
+        // runtime's threads, clean up exactly as every other exit does, and go, with Rust's own
+        // panic status. The whole cleanup, not just the MCP sweep: the unwind drops only what the
+        // main future owned, and a daemon's sessions (their own threads) still hold `bash` jobs
+        // that only `kill_live_jobs` reaches.
         Err(_) => {
             runtime.shutdown_background();
-            tools::mcp_stdio::sweep_before_exit();
+            finish_process_cleanup();
             std::process::exit(101);
         }
     }
@@ -1827,6 +1831,31 @@ async fn stop_jobs(
     tokio::task::spawn_blocking(move || how(&jobs))
         .await
         .unwrap_or_default()
+}
+
+/// [`run`] — raced, in debug builds and only when `BEYOND_AI_AGENT_TEST_PANIC_MAIN_ON` names a
+/// path, against that path appearing, which panics **in the main future**: how a test reaches the
+/// panic exit path while work (a daemon's sessions, on their own threads) is still running.
+async fn run_main() -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(debug_assertions)]
+    if let Some(path) = std::env::var_os("BEYOND_AI_AGENT_TEST_PANIC_MAIN_ON") {
+        let path = std::path::PathBuf::from(path);
+        let appeared = async {
+            while !path.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        };
+        return tokio::select! {
+            r = run() => r,
+            () = appeared => {
+                #[allow(clippy::panic)]
+                {
+                    panic!("test panic requested in the main future");
+                }
+            }
+        };
+    }
+    run().await
 }
 
 /// What every way out of the process does first: retire every stdio MCP server still running

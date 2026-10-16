@@ -5819,9 +5819,13 @@ mcp_events_subscribe (any session) ──► owned by that session
   future does not reach that guard by dropping the runtime — that would wait for every blocking
   task, and `serve`'s stdin reader is one, parked on a read that may never return, so the process
   hung. `main` catches the unwind instead, abandons the runtime's threads
-  (`Runtime::shutdown_background`), sweeps, and exits `101`
-  (`a_panic_inside_serve_exits_promptly_and_still_sweeps`, through a debug-build-only `__test_panic`
-  command). In a daemon a session is a task, not the main future, so its panic is **contained**:
+  (`Runtime::shutdown_background`), runs the same `finish_process_cleanup` as every other exit
+  (`kill_live_jobs`, then the sweep — not the sweep alone: the unwind drops only what the main future
+  owned, and whatever else still holds a `bash` job is reached only through the live-job registry),
+  and exits `101` (`a_panic_inside_serve_exits_promptly_and_still_sweeps`, through a
+  debug-build-only `__test_panic` command; `tests/bash_jobs_panic_exit.rs` for `bash` jobs, in
+  `serve` and in a multi-threaded daemon whose main future panics through the debug-build-only
+  `BEYOND_AI_AGENT_TEST_PANIC_MAIN_ON` seam). In a daemon a session is a task, not the main future, so its panic is **contained**:
   `serve_ws` catches the session future's unwind (in-flight runs and MCP calls are dropped, its
   events hub cancelled and its state written by their `Drop`s), sends its clients an `error` frame,
   ends the session, and keeps serving every other one — sound because sessions share only state
