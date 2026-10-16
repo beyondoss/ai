@@ -1243,10 +1243,20 @@ an `Arc<Mutex<Option<SessionStore>>>` since the hook only gets `&self` — that 
 writes to after each `run_turn` call returns) durably appends every mid-run checkpoint (after each tool
 round-trip) as it happens. **Every persist path, `run`'s and `serve`'s, goes through
 `SessionStore::persist`, keyed on the compaction generation as well as the message count**: the store
-remembers `Session::compaction.compactions` as of its last write (`compactions_written`, set from the
-session `open` returns), and a session ahead of it is written with `rewrite_compacted` first (its
-`tokens_before` read back off the summary by `agent_core::compaction::summary_tokens_before`), then
-masked results, then what is new. `Agent::compact` checkpoints right after its rewrite, so the
+remembers `Session::compaction` as of its last write (`written`, set from the session `open` returns),
+and a session whose generation differs is written with `rewrite_compacted` first (its `tokens_before`
+read back off the summary by `agent_core::compaction::summary_tokens_before`), then masked results, then
+what is new. The generation is a claim the store checks: a compaction always puts a fresh summary at
+`messages[0]` (the one message no in-memory-only rewrite — scrub, masking, MCP splice — touches), so a
+generation that moved while the first message is still the stored one is a session rebuilt without the
+store's provenance, and its count is adopted rather than taken for a compaction. `serve`'s
+`switch_branch` hands back a session carrying `SessionStore::compaction_provenance` for the same reason:
+it used to hand back `Session::new()`'s defaults, and the next persist read the reset generation as a
+compaction. `rewrite_compacted` never falls back to a full rewrite: the folded messages are the stored
+active path up to where the kept suffix (`messages[1..]`) begins, found by content, so a store that
+lagged the session (failed checkpoints) still writes an append-only round, appending kept messages it
+never had — the count-based fold read that as "nothing folded" and rewrote the file, dropping every
+model change, label, title and earlier compaction record (`tests/session_compaction_continuity.rs`). `Agent::compact` checkpoints right after its rewrite, so the
 compaction is on disk before anything else is appended. `append_new` alone is count-keyed and reads a
 compaction's shrink as "nothing new": `run` used to skip every message after a compaction until the list
 outgrew its old length, then chain the wrong tail onto the uncompacted history
