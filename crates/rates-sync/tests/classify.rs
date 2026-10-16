@@ -5,6 +5,7 @@
 
 use rates_sync::classify::{Class, Report, classify};
 use rates_sync::snapshot::{self, Entry, Store};
+use rates_sync::spec::Conflict;
 use rates_sync::{SOURCES, build, read_spec, repo_root, sources};
 use std::collections::BTreeMap;
 
@@ -21,7 +22,17 @@ fn committed() -> Store {
 
 /// Classify the committed store against a copy that `edit` changed.
 fn run(edit: impl FnOnce(&mut BTreeMap<String, String>, &mut BTreeMap<String, Entry>)) -> Report {
-    let spec = read_spec(&repo_root()).unwrap();
+    run_with(&[], edit)
+}
+
+/// [`run`], with `conflicts` recorded in the truth file on top of the committed ones. A case about
+/// a [[conflict]] brings its own, so it does not depend on which ones today's vendors need.
+fn run_with(
+    conflicts: &[Conflict],
+    edit: impl FnOnce(&mut BTreeMap<String, String>, &mut BTreeMap<String, Entry>),
+) -> Report {
+    let mut spec = read_spec(&repo_root()).unwrap();
+    spec.conflicts.extend_from_slice(conflicts);
     let old = committed();
     let (mut text, mut entries) = (old.text.clone(), old.entries.clone());
     edit(&mut text, &mut entries);
@@ -282,32 +293,41 @@ fn a_moved_long_threshold_is_broken() {
     broken(&r, "crosscheck", "[[prose]] anthropic.long_context says");
 }
 
-/// Pricing is pass-through, so the card follows a vendor's promotion and its end alike: Together's
-/// Kimi K3 promotion ($2.70 / $13.50 / cached $0.27) ending at list ($3 / $15 / $0.30) is a routine
-/// change within 2x. The cached-rate [[conflict]] it caused settles (both sources say $0.30) and
-/// `--apply` removes it, rather than the run breaking.
+/// Together's Kimi K3 cached rate while its promotion ran: the models API said $0.27, the docs
+/// table the list $0.30. Both now say $0.30.
+fn kimi_promo_conflict() -> Conflict {
+    Conflict {
+        card: "together:moonshotai/Kimi-K3".to_owned(),
+        field: "cache_read".to_owned(),
+        values: BTreeMap::from([
+            ("together.models".to_owned(), "0.27".to_owned()),
+            ("together.docs".to_owned(), "0.3".to_owned()),
+        ]),
+        follow: "together.models".to_owned(),
+        reason: "The promotion's cached rate.".to_owned(),
+    }
+}
+
+/// Set one Together model's rate in the models API snapshot.
+fn together_rate(text: &mut BTreeMap<String, String>, id: &str, field: &str, to: f64) {
+    let t = text.get_mut("together.models").unwrap();
+    let mut v: serde_json::Value = serde_json::from_str(t).unwrap();
+    let model = v
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|m| m["id"] == id)
+        .unwrap();
+    model["pricing"][field] = to.into();
+    *t = serde_json::to_string_pretty(&v).unwrap();
+}
+
+/// Pricing is pass-through, so the card follows a vendor's promotion and its end alike. A
+/// [[conflict]] a promotion caused (Together's Kimi K3 cached rate) settles once its sources agree
+/// again, rather than the run breaking, and `--apply` removes it.
 #[test]
-fn a_promotion_ending_is_routine() {
-    let r = run(|t, _| {
-        replace(
-            t,
-            "together.models",
-            "\"cached_input\": 0.27,",
-            "\"cached_input\": 0.3,",
-        );
-        replace(t, "together.models", "\"input\": 2.7,", "\"input\": 3,");
-        replace(t, "together.models", "\"output\": 13.5,", "\"output\": 15,");
-        let d = t.get_mut("together.docs").unwrap();
-        *d = d
-            .replace(
-                r"| moonshotai/Kimi-K3 | 1048576 | \$2.70 | \$0.30 | \$13.50 |",
-                r"| moonshotai/Kimi-K3 | 1048576 | \$3.00 | \$0.30 | \$15.00 |",
-            )
-            .replace(
-                r"| moonshotai/Kimi-K3 | 1048576 | \$2.70 | \$13.50 |",
-                r"| moonshotai/Kimi-K3 | 1048576 | \$3.00 | \$15.00 |",
-            );
-    });
+fn a_conflict_whose_sources_agree_again_settles() {
+    let r = run_with(&[kimi_promo_conflict()], |_, _| {});
     assert_eq!(r.class, Class::Routine, "{r:?}");
     assert_eq!(
         r.settled,
@@ -316,36 +336,27 @@ fn a_promotion_ending_is_routine() {
             "cache_read".to_owned()
         )]
     );
-    assert!(
-        r.changes
-            .iter()
-            .any(|c| c.item.contains("Kimi-K3") && c.new.as_deref() == Some("$3/MTok")),
-        "{r:?}"
-    );
+    assert!(r.changes.is_empty() && r.reasons.is_empty(), "{r:?}");
     let md = r.markdown(&[], &[]);
     assert!(md.contains("Settled `[[conflict]]`"), "{md}");
     // And the entry comes out of the truth file cleanly.
+    let entry = "[[conflict]]\ncard = \"together:moonshotai/Kimi-K3\"\nfield = \"cache_read\"\nvalues = { \"together.models\" = \"0.27\", \"together.docs\" = \"0.3\" }\nfollow = \"together.models\"\nreason = \"The promotion's cached rate.\"\n";
     let truth = std::fs::read_to_string(repo_root().join(rates_sync::TRUTH)).unwrap();
     let out = rates_sync::catalog_edit::remove_conflict(
-        &truth,
+        &format!("{truth}\n{entry}"),
         "together:moonshotai/Kimi-K3",
         "cache_read",
     )
     .unwrap();
-    assert!(!out.contains("card = \"together:moonshotai/Kimi-K3\"\nfield = \"cache_read\""));
+    assert_eq!(out.trim_end(), truth.trim_end());
 }
 
 /// A recorded [[conflict]] whose sources still disagree, on values it did not record, is stale:
 /// a human decides which to follow again.
 #[test]
 fn a_stale_conflict_is_broken() {
-    let r = run(|t, _| {
-        replace(
-            t,
-            "together.models",
-            "\"cached_input\": 0.27,",
-            "\"cached_input\": 0.26,",
-        );
+    let r = run_with(&[kimi_promo_conflict()], |t, _| {
+        together_rate(t, "moonshotai/Kimi-K3", "cached_input", 0.26);
     });
     broken(&r, "stale", "[[conflict]]");
 }
