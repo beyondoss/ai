@@ -2763,18 +2763,24 @@ impl Agent {
         // reflect every round so far, not just this one's new activity. `previous_summary` strips these
         // same blocks back off before the body is ever fed forward, so they never accumulate.
         //
-        // The background-jobs block is the exception that is not in `file_ops`: it is rendered from
-        // the tools' live state (see `crate::background`), because it describes processes, not
-        // history.
         let summary = format!(
-            "{summary}{}{}{}{}{}",
+            "{summary}{}{}{}{}",
             compaction::format_user_requests(&file_ops.user_requests),
             compaction::format_file_operations(&file_ops.read_files, &file_ops.modified_files),
             compaction::format_todo_list(file_ops.todos.as_ref()),
             compaction::format_memory_notes(&file_ops.memory_notes),
-            crate::background::format_carry(&crate::background::collect(&self.tools)),
         );
         compaction::apply_summary(session, first_kept, &summary, tokens_before);
+        // The background-jobs block is not in the summary text: it describes processes, not history,
+        // rendered from the tools' live state (see `crate::background`). A request-only block on the
+        // summary message carries it to the model for as long as this summary stands, and it is
+        // never persisted — a restarted or switched-back session would otherwise be told dead jobs
+        // are running.
+        if let Some(block) =
+            crate::background::format_carry(&crate::background::collect(&self.tools))
+        {
+            session.attach_request_block_at(0, block);
+        }
         session.compaction = file_ops;
         // The live prompt less the real size of what was summarized, plus the summary message: system
         // prompt, tools and the kept suffix stay as measured.
@@ -14435,6 +14441,71 @@ data: {"type":"response.incomplete","response":{"status":"incomplete","incomplet
         assert!(
             !summary.contains("<user-requests>"),
             "nothing carries requests by default"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_background_carry_rides_the_request_not_the_persisted_summary() {
+        struct Running;
+        impl crate::background::Background for Running {
+            fn take_notices(&self) -> Option<String> {
+                None
+            }
+            fn stop_reminder(&self) -> Option<String> {
+                None
+            }
+            fn carry(&self) -> Option<String> {
+                Some("- job 1: `npm run dev` (running)".into())
+            }
+        }
+        struct Server;
+        #[async_trait::async_trait]
+        impl Tool for Server {
+            fn name(&self) -> &str {
+                "server"
+            }
+            fn description(&self) -> &str {
+                "runs a server"
+            }
+            fn input_schema(&self) -> Value {
+                json!({ "type": "object", "properties": {} })
+            }
+            async fn run(
+                &self,
+                _input: Value,
+            ) -> std::result::Result<crate::ToolOutput, crate::error::ToolError> {
+                Ok("ok".into())
+            }
+            fn background(&self) -> Option<Arc<dyn crate::background::Background>> {
+                Some(Arc::new(Running))
+            }
+        }
+        let mock = Arc::new(MockTransport::new(vec![turn::text("## Goal\nthe state")]));
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(EchoTool));
+        tools.register(Arc::new(Server));
+        let agent = summary_agent(&mock, summary_config()).with_tools(tools);
+        let mut session = summarized_session(12);
+        compact_once(&agent, &mut session).await;
+        // What a host persists: the summary, without the jobs (after a restart they are gone).
+        let persisted = serde_json::to_string(&session).unwrap();
+        assert!(persisted.contains("the state"));
+        assert!(!persisted.contains("<background-jobs>"), "{persisted}");
+        // What the model is sent: the summary message, with the live table beside it.
+        let sent = session.request_messages();
+        let blocks: Vec<&str> = sent[0]
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Text { text, .. } => Some(text.as_ref()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(blocks.len(), 2, "{blocks:?}");
+        assert!(blocks[0].contains("the state"));
+        assert_eq!(
+            blocks[1],
+            "<background-jobs>\n- job 1: `npm run dev` (running)\n</background-jobs>"
         );
     }
 

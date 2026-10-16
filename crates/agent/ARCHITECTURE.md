@@ -1664,8 +1664,8 @@ once) fold into the next tool-results turn after any steer, like the step-budget
 **would-stop**, pending notices go first, as a user turn, and the run continues — failing that, a
 **reminder** (`stop_reminder`) lists work still running that no earlier reminder covered, so ending
 with it is the model's informed choice. The loop asks for it at most once per run (`stop_reminded`):
-work started or waited on after it does not earn a second, so ending again ends; and every compaction summary appends the **carry**
-(`carry`) as a `<background-jobs>` block. All three ride existing paths (no new message type), are
+work started or waited on after it does not earn a second, so ending again ends; and every compaction summary carries the **carry**
+(`carry`) as a `<background-jobs>` request-only block beside it, never persisted. All three ride existing paths (no new message type), are
 reported as `AgentEvent::Background { reason, text, wake }`, and begin with a harness tag
 (`agent_core::background::NOTE_PREFIXES`) so compaction's carried user requests skip them. The `bash`
 side is under "`bash` jobs" below.
@@ -2608,9 +2608,11 @@ and `serve`'s own `bash`/`abort_bash` RPC commands reuse `RealRunner` directly, 
     transcript switch (the processes are the client's, not a history's) and is stopped, unreported,
     when the session ends; ended entries are dropped at the next host command (`forget_ended`).
   - **Compaction carries the table** (`Background::carry`): running and ended-unread jobs (id,
-    command, state, age) as a `<background-jobs>` block on every summary, so a compacted model does not
-    start a job again. Rendered from the live table, not persisted in `CompactionProvenance`: after a
-    restart the jobs are gone, and a persisted copy would describe them as running.
+    command, state, age) as a `<background-jobs>` block beside every summary, so a compacted model
+    does not start a job again. Rendered from the live table and attached as a request-only block on
+    the summary message: never in the persisted summary, `CompactionProvenance` or the MCP App
+    context sidecar, because after a restart the jobs are gone and a persisted copy would describe
+    them as running (`tests/bash_jobs_serve_carry.rs`).
 - **`run_in_background` (`Start::Background`, `JobKind::Background`)**. A boolean on `bash`, not a
   tool of its own: in the background-shell probe (1,500 trials on Luna, Sol, Kimi K2.7 Code and Qwen
   3.8 Flash with the real system prompt and tools) it beat a separate start tool on every model, was

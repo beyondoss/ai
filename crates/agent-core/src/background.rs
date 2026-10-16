@@ -14,11 +14,12 @@
 //!   step-budget wrap-up ([`crate::step_budget`]), the loop asks at most once per run — work started
 //!   or waited on after it does not earn a second — so a model that ends again ends; and a source
 //!   never lists the same work twice, so a later run (a `serve` prompt) is reminded only of new work.
-//! - **Compaction carry** ([`Background::carry`]): the work in flight is appended to every
-//!   compaction summary as a `<background-jobs>` block, outside anything the summarizer can drop, so
+//! - **Compaction carry** ([`Background::carry`]): the work in flight at each compaction rides the
+//!   summary message as a `<background-jobs>` block, outside anything the summarizer can drop, so
 //!   a compacted model does not relaunch a job it forgot. Rendered from live state at each
-//!   compaction rather than folded into the persisted [`crate::CompactionProvenance`]: the work is
-//!   process state, and a persisted copy would describe dead jobs after a restart.
+//!   compaction and attached as a request-only block ([`crate::Session::attach_request_block_at`]),
+//!   never written into the summary text or the persisted [`crate::CompactionProvenance`]: the work
+//!   is process state, and a persisted copy would describe dead jobs after a restart.
 //!
 //! The texts are the source's own; the loop adds nothing to them. Each begins with one of
 //! [`NOTE_PREFIXES`], which is how compaction's carried user requests
@@ -49,6 +50,12 @@ pub fn is_note(text: &str) -> bool {
 pub const CARRY_OPEN: &str = "<background-jobs>";
 /// See [`CARRY_OPEN`].
 pub const CARRY_CLOSE: &str = "</background-jobs>";
+
+/// Whether a request block is a compaction's [`CARRY_OPEN`] block: process state, which a host that
+/// saves request blocks across a restart (`serve`'s MCP App context sidecar) must not save.
+pub fn is_carry_block(text: &str) -> bool {
+    text.starts_with(CARRY_OPEN)
+}
 
 /// What the loop asks a tool's background work. Every method is cheap and non-blocking: they run
 /// on the loop's own task at turn boundaries.
@@ -94,12 +101,10 @@ pub(crate) fn stop_reminder(sources: &[Arc<dyn Background>]) -> Option<String> {
     join(sources.iter().filter_map(|b| b.stop_reminder()))
 }
 
-/// The `<background-jobs>` block for a compaction summary, or `""`.
-pub(crate) fn format_carry(sources: &[Arc<dyn Background>]) -> String {
-    match join(sources.iter().filter_map(|b| b.carry())) {
-        Some(text) => format!("\n\n{CARRY_OPEN}\n{text}\n{CARRY_CLOSE}"),
-        None => String::new(),
-    }
+/// The `<background-jobs>` block for a compaction summary, or `None` when nothing is in flight.
+pub(crate) fn format_carry(sources: &[Arc<dyn Background>]) -> Option<String> {
+    join(sources.iter().filter_map(|b| b.carry()))
+        .map(|text| format!("{CARRY_OPEN}\n{text}\n{CARRY_CLOSE}"))
 }
 
 fn join(parts: impl Iterator<Item = String>) -> Option<String> {

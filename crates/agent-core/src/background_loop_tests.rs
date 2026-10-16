@@ -284,12 +284,16 @@ fn the_carry_block_renders_live_state_and_is_stripped_before_resummarizing() {
         .unwrap()
         .push("job 4 `npm run dev`".into());
     let sources: Vec<Arc<dyn Background>> = vec![script.clone()];
-    let block = crate::background::format_carry(&sources);
+    let block = crate::background::format_carry(&sources).unwrap();
     assert!(block.contains("<background-jobs>") && block.contains("npm run dev"));
-    let summary = format!("{}\n\nThe prose.{block}", crate::compaction::SUMMARY_MARKER);
+    // An echo the summarizer left in its prose (the host never writes the block into the text).
+    let summary = format!(
+        "{}\n\nThe prose.\n\n{block}",
+        crate::compaction::SUMMARY_MARKER
+    );
     let prefix = vec![crate::Message::user(summary)];
     let body = crate::compaction::previous_summary(&prefix).unwrap();
     assert_eq!(body, "The prose.");
     script.running.lock().unwrap().clear();
-    assert_eq!(crate::background::format_carry(&sources), "");
+    assert_eq!(crate::background::format_carry(&sources), None);
 }

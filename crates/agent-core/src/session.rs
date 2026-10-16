@@ -152,8 +152,15 @@ impl Session {
         if last.role != Role::User {
             return false;
         }
-        let index = self.messages.len() - 1;
-        let anchor = last.clone();
+        self.attach_request_block_at(self.messages.len() - 1, text)
+    }
+
+    /// [`Self::attach_request_block`] onto `messages[index]`, whatever its role. Returns whether
+    /// there is such a message.
+    pub fn attach_request_block_at(&mut self, index: usize, text: impl Into<Arc<str>>) -> bool {
+        let Some(anchor) = self.messages.get(index).cloned() else {
+            return false;
+        };
         // Drop blocks whose message is gone, so this list can't outgrow the history.
         let messages = &self.messages;
         self.request_blocks
