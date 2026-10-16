@@ -3762,22 +3762,25 @@ fn unwrap_turn_result(
 ) -> Result<agent_core::StopReason, Box<dyn std::error::Error>> {
     match result {
         Ok(reason) => Ok(reason),
-        Err(agent_core::Error::Cancelled) => {
-            eprintln!("[cancelled]");
-            let code = shutdown_cause
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .map(serve::Signal::exit_code)
-                .unwrap_or(1);
-            // A cancellation this recent may have just dropped a `GroupKillGuard` for an in-flight
-            // bash tool call — that guard's cleanup runs on a detached thread `process::exit` below
-            // won't wait for on its own, so an in-flight timed-out/backgrounded grandchild would be
-            // silently orphaned without this. Bounded, not indefinite: a hung `kill`/`ps` shell-out
-            // must not hang the whole process's own shutdown.
-            exit_process(code);
-        }
+        Err(agent_core::Error::Cancelled) => exit_cancelled(shutdown_cause),
         Err(e) => Err(e.into()),
     }
+}
+
+/// End a cancelled `run`: `[cancelled]` on stderr, and the triggering signal's POSIX code (else 1).
+fn exit_cancelled(shutdown_cause: &std::sync::Mutex<Option<serve::Signal>>) -> ! {
+    eprintln!("[cancelled]");
+    let code = shutdown_cause
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .map(serve::Signal::exit_code)
+        .unwrap_or(1);
+    // A cancellation this recent may have just dropped a `GroupKillGuard` for an in-flight
+    // bash tool call — that guard's cleanup runs on a detached thread `process::exit` below
+    // won't wait for on its own, so an in-flight timed-out/backgrounded grandchild would be
+    // silently orphaned without this. Bounded, not indefinite: a hung `kill`/`ps` shell-out
+    // must not hang the whole process's own shutdown.
+    exit_process(code);
 }
 
 /// [`run_turn_once`], wrapped with the same whole-run auto-retry `serve.rs`'s `"prompt"` command gets
@@ -4206,15 +4209,16 @@ async fn resume_mcp_tasks_for_run(
     journal: Option<&RunJournal>,
     session: &Session,
     catalog: &tools::mcp::McpCatalog,
-) -> (
+    cancel: &agent_core::CancellationToken,
+) -> agent_core::Result<(
     Vec<beyond_ai_agent::mcp_resume::Resolved>,
     std::collections::HashSet<String>,
-) {
+)> {
     use beyond_ai_agent::mcp_resume::{
         PLACEHOLDER_ENTRY_KIND, RESULT_ENTRY_KIND, Resolved, TASK_ENTRY_KIND,
     };
     let Some(journal) = journal else {
-        return Default::default();
+        return Ok(Default::default());
     };
     let (tasks, results, mut placeholders) = {
         let guard = journal.store.lock().unwrap_or_else(|e| e.into_inner());
@@ -4226,7 +4230,7 @@ async fn resume_mcp_tasks_for_run(
                     &store.active_journal(PLACEHOLDER_ENTRY_KIND),
                 ),
             ),
-            None => return Default::default(),
+            None => return Ok(Default::default()),
         }
     };
     let mut pending = beyond_ai_agent::mcp_resume::pending(
@@ -4244,10 +4248,14 @@ async fn resume_mcp_tasks_for_run(
             "[resuming MCP task {} ({}) left in flight by a previous run]",
             task.record.task_id, task.name
         );
-        let result = match catalog
-            .resume_task(task.record.clone(), &tools::mcp::host(), None)
-            .await
-        {
+        // A task still working can be polled for as long as it runs: Ctrl-C ends the wait (the
+        // task stays journaled for the next `--continue`) rather than being ignored until it lands.
+        let host = tools::mcp::host();
+        let resumed = tokio::select! {
+            r = catalog.resume_task(task.record.clone(), &host, None) => r,
+            () = cancel.cancelled() => return Err(agent_core::Error::Cancelled),
+        };
+        let result = match resumed {
             Ok(output) => Resolved {
                 tool_use_id: task.tool_use_id,
                 name: task.name,
@@ -4287,7 +4295,7 @@ async fn resume_mcp_tasks_for_run(
         journal.append(RESULT_ENTRY_KIND, data);
         resolved.push(result);
     }
-    (resolved, placeholders)
+    Ok((resolved, placeholders))
 }
 
 /// `run`'s checkpoint hook: [`persist_run`] against the run's shared store.
@@ -5570,6 +5578,13 @@ async fn run_task(
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()) = Some(sig);
             shutdown_cancel.cancel();
+            // The first signal asks the run to stop cooperatively. A wait that doesn't watch the
+            // token (an MCP server that never answers a skill fetch, say) would otherwise leave a
+            // second Ctrl-C doing nothing at all; a second signal means "stop now", with the usual
+            // exit cleanup (job group kills, the stdio-server sweep) and its own code.
+            let sig = shutdown.wait().await;
+            eprintln!("\n[second signal: exiting now]");
+            exit_process(sig.exit_code());
         }
     });
     // Set by `write_stdout_or_exit` on a broken stdout pipe (a downstream consumer that closed its
@@ -5601,7 +5616,12 @@ async fn run_task(
     let initial_message =
         expand_message(&initial_message, &skills, &prompt_templates, &mcp_skills).await;
     let (resumed, placeholders) =
-        resume_mcp_tasks_for_run(run_journal, &session, &mcp_catalog).await;
+        match resume_mcp_tasks_for_run(run_journal, &session, &mcp_catalog, &cancel).await {
+            Ok(resumed) => resumed,
+            // Cancelled (the only error): nothing of this run's turn exists yet, so there is
+            // nothing to persist; exit as a cancelled turn does, with the signal's code.
+            Err(_) => exit_cancelled(&shutdown_cause),
+        };
     if initial_images.is_empty() {
         session.user(initial_message);
     } else {

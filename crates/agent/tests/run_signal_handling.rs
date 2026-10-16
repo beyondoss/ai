@@ -172,3 +172,69 @@ fn sighup_during_a_bash_tool_call_kills_the_whole_process_group_too() {
         "backgrounded grandchild survived SIGHUP to `run` — process group not killed"
     );
 }
+
+/// A second signal ends a run whose first cancellation is stuck in a wait that doesn't watch it:
+/// here an MCP skill fetch (`/skill:docs:...` expands before the turn) from a server that takes a
+/// minute to answer. The one-shot handler used to make every signal after the first a no-op.
+#[test]
+fn a_second_signal_exits_a_run_whose_first_cancellation_is_stuck() {
+    let env = common::skills_env::Env::new(json!({ "MCP_SKILLS_FIXTURE_SLOW_READ_MS": "60000" }));
+    let (base, _bodies) = spawn_model_server(vec![common::turn_text("unused")]);
+    let mut child = run_cmd(common::skills_env::BIN)
+        .env("HOME", &env.home)
+        .env("BEYOND_AI_AGENT_MCP_IDLE_SECS", "0")
+        .args([
+            "run",
+            "/skill:docs:git-workflow",
+            "--approve-mcp-skills",
+            "--no-session-persistence",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+        ])
+        .current_dir(&env.cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn_guarded();
+    let started = Instant::now();
+    while !env.log().iter().any(|l| l.contains("git-workflow")) {
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the skill was never fetched: {:?}",
+            env.log()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let term = || {
+        let _ = std::process::Command::new("kill")
+            .args(["-TERM", &child.id().to_string()])
+            .status();
+    };
+    term();
+    std::thread::sleep(Duration::from_millis(300));
+    term();
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "a second signal did not end the run"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .ok();
+    assert_eq!(status.code(), Some(143), "stderr: {stderr}");
+    assert!(stderr.contains("second signal"), "stderr: {stderr}");
+}

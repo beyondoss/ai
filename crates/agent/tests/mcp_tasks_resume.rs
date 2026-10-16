@@ -773,6 +773,69 @@ fn run_continue_resumes_a_task_a_killed_run_left_in_flight() {
     );
 }
 
+/// Ctrl-C (here SIGTERM) during `run --continue`'s resume of a task that is still working ends the
+/// run promptly, with the signal's code. The resume used to ignore the cancellation entirely and keep
+/// polling until the task finished, however long that was.
+#[test]
+fn a_signal_during_run_continues_resume_ends_the_run() {
+    let env = Env::new();
+    let _server = env.http();
+    let (base, _bodies) =
+        spawn_model_server(vec![turn_tool_use("toolu_g", "mcp__t__gated_task", "{}")]);
+    let mut first = run_once(&env, &base, &["start the job"]);
+    wait_for("the task being polled", || {
+        !env.methods("tasks/get").is_empty()
+    });
+    let task = env.methods("tasks/get")[0]["params"]["taskId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    wait_for("run's journal entry", || {
+        jsonl_files(&env.home)
+            .iter()
+            .any(|text| text.contains(&task))
+    });
+    first.kill().unwrap();
+    first.wait().unwrap();
+
+    // The gate stays shut: the task keeps working, so the resume would poll it indefinitely.
+    let polls_before = env.methods("tasks/get").len();
+    let (base, bodies) = spawn_model_server(vec![turn_text("unused")]);
+    let mut second = run_once(&env, &base, &["--continue", "what happened?"]);
+    wait_for("the resume polling the task", || {
+        env.methods("tasks/get").len() > polls_before
+    });
+    let _ = std::process::Command::new("kill")
+        .args(["-TERM", &second.id().to_string()])
+        .status();
+    let started = std::time::Instant::now();
+    let status = loop {
+        if let Some(status) = second.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "run --continue ignored the signal while resuming a task"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(status.code(), Some(143));
+    assert!(
+        bodies
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|r| r.contains("You write short titles")),
+        "no turn started"
+    );
+    assert!(
+        jsonl_files(&env.home)
+            .iter()
+            .any(|text| text.contains(&task)),
+        "the task stays journaled for the next --continue"
+    );
+}
+
 /// A client cannot forge the host's task journal. `append_custom` with an `mcp_task` (or
 /// `mcp_task_result`) kind is refused; had it landed, the resumer would poll a task id of the
 /// client's choosing on the next start (the latest record for a call wins).
