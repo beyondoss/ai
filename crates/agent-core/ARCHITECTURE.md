@@ -530,10 +530,13 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
     again). Harness notes riding user turns (background notices and reminders, the step-budget
     wrap-up — `background::is_note`) are not the user's words and are skipped.
   - **Work still running** — the tools' `Background::carry`, as `<background-jobs>`, so a compacted
-    model does not start a job again that it forgot. The one block **not** in
-    `CompactionProvenance`: it is rendered from live state at each compaction, because it describes
-    processes, and a persisted copy would list dead jobs as running after a restart. Stripped and
-    re-rendered like the rest.
+    model does not start a job again that it forgot. The one block **not** in the summary text or
+    `CompactionProvenance`: it is rendered from live state at each compaction and attached to the
+    summary message as a request-only block (`Session::attach_request_block_at`), because it
+    describes processes, and a persisted copy would list dead jobs as running after a restart (it
+    once was, until a restart test caught it). A host that saves request blocks across restarts
+    skips it (`background::is_carry_block`; `serve`'s MCP App context sidecar). A copy the model
+    echoes is stripped like the rest.
 
   `compact` first strips any blocks the model echoed at the end of its own reply (`strip_echoed_carry`):
   the cached call sees the previous summary, blocks included, and a model that mirrors its shape ends

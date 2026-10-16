@@ -1021,6 +1021,9 @@ pub fn context_records(session: &agent_core::Session) -> String {
             agent_core::ContentBlock::Text { text, .. } => Some((b, text)),
             _ => None,
         })
+        // A compaction's `<background-jobs>` block rides the same channel but describes processes:
+        // saved, a restarted session would be told dead jobs are running.
+        .filter(|(_, text)| !agent_core::background::is_carry_block(text))
         .map_while(|(b, text)| {
             budget = budget.checked_sub(text.len())?;
             Some(json!({

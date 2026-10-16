@@ -177,7 +177,7 @@ fn a_compaction_carries_the_job_table_and_the_session_exit_stops_the_job() {
     let tmp = tempfile::tempdir().unwrap();
     let pidfile = tmp.path().join("pid");
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
-    let (base, _bodies) = spawn_model_server(vec![
+    let (base, bodies) = spawn_model_server(vec![
         bash_turn(
             "t1",
             &format!(
@@ -189,6 +189,9 @@ fn a_compaction_carries_the_job_table_and_the_session_exit_stops_the_job() {
         turn_text("ok"),
         // The summarization call `compact` makes; it never mentions the job.
         turn_text("## Goal\nStarted a server."),
+        turn_text("it is still up"),
+        // The post-compaction memory reminder continues the run once.
+        turn_text("still up"),
     ]);
     let mut child = serve_cmd(BIN, &base, &session_file)
         .args(["--compaction-keep-recent-tokens", "1"])
@@ -208,16 +211,30 @@ fn a_compaction_carries_the_job_table_and_the_session_exit_stops_the_job() {
     let resp = read_until_response(&mut stdout, "compact");
     let resp = resp.last().unwrap();
     assert_eq!(resp["data"]["compacted"], true, "{resp}");
-    let raw = std::fs::read_to_string(&session_file).unwrap();
+    // The table rides the summary in the next request, never in the persisted summary: after a
+    // restart those jobs are gone (see `bash_jobs_serve_carry.rs`).
+    send(
+        &mut stdin,
+        json!({ "type": "prompt", "message": "is it up?" }),
+    );
+    let frames = read_until_response(&mut stdout, "prompt");
+    assert_eq!(frames.last().unwrap()["success"], true, "{frames:?}");
+    let body = bodies.lock().unwrap().last().unwrap().clone();
     assert!(
-        raw.contains("<background-jobs>"),
+        body.contains("<background-jobs>"),
         "the summary carries the table"
     );
-    assert!(raw.contains("do not start these again"));
+    assert!(body.contains("do not start these again"));
     assert!(
-        raw.contains("- job 1: `nohup sh -c"),
+        body.contains("- job 1: `nohup sh -c"),
         "the running job is listed"
     );
+    let raw = std::fs::read_to_string(&session_file).unwrap();
+    assert!(
+        raw.contains("Started a server."),
+        "the summary is persisted"
+    );
+    assert!(!raw.contains("<background-jobs>"), "the table is not");
 
     let pid = read_pid(&pidfile);
     assert!(alive(pid));

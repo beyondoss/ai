@@ -19,10 +19,10 @@
 //! there for the same reason: they are the run's working state, and losing them silently degrades the
 //! model rather than failing loudly. Anything else added here should clear the same bar.
 //!
-//! One block rides the same tail without being persisted here: `<background-jobs>`, the work tools
-//! left running ([`crate::background`]). It is rendered from live state at every compaction, because
-//! a persisted copy would describe dead processes after a restart; it is stripped and re-rendered
-//! like the rest.
+//! One block rides beside the summary without being persisted at all: `<background-jobs>`, the work
+//! tools left running ([`crate::background`]). It is rendered from live state at every compaction and
+//! attached to the summary message as a request-only block, because a persisted copy would describe
+//! dead processes after a restart. A copy the summarizing model echoes is stripped like the rest.
 
 use std::sync::Arc;
 
