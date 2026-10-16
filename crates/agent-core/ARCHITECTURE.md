@@ -1448,7 +1448,13 @@ never requires touching the gateway. The Responses dialect reuses `ContentBlock:
 field for a reasoning item's _entire JSON-stringified content_ (not just a cryptographic signature the
 way Anthropic's is) — the only way to replay OpenAI's encrypted reasoning across turns without a new
 content-block variant; a signature that fails to parse as JSON (e.g. after `set_model` scrubbed a
-cross-provider thinking history) degrades to plain text instead of erroring.
+cross-provider thinking history) degrades to plain text instead of erroring. A reasoning or message
+item opens on its `output_item.added` (as an empty `ThinkingDelta`/`TextDelta`, declaring the block in
+its true position), never on its first delta: a reasoning item with an empty summary — routine with
+`summary:"auto"` — streams no delta at all, yet its `output_item.done` carries the `encrypted_content`
+the next request must replay ahead of the function call it led to. An item that streamed no text gets
+its text from `done` as one delta before the resync, so clients rendering deltas see it; a thinking
+block that ends with neither text nor signature (a stream cut before the item's `done`) is dropped.
 
 `ContentBlock::Text` similarly carries two OpenAI-Responses-only, otherwise-`None` fields: `id` (the
 wire message id) and `phase` (`"commentary"` vs `"final_answer"` — a channel label OpenAI's docs say
