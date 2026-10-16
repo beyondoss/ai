@@ -38,7 +38,7 @@
         },
         "provider_name": "BaseTen",
         "quantization": "fp8",
-        "tag": "baseten/fp8"
+        "tag": "baseten/fp8/us"
       },
       {
         "context_length": 1048576,
@@ -46,7 +46,7 @@
         "pricing": {
           "completion": "0.0000005",
           "discount": 0,
-          "input_cache_read": "0.00000005",
+          "input_cache_read": "0.000000029",
           "prompt": "0.00000015"
         },
         "provider_name": "CoreWeave",
@@ -96,10 +96,10 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.0000005",
+          "completion": "0.0000004375",
           "discount": 0,
           "input_cache_read": "0.00000003",
-          "prompt": "0.00000015"
+          "prompt": "0.00000013125"
         },
         "provider_name": "DigitalOcean",
         "quantization": "unknown",
@@ -164,7 +164,7 @@
           "completion": "0.00000055",
           "discount": 0,
           "input_cache_read": "0.000000099",
-          "prompt": "0.0000000696"
+          "prompt": "0.000000108"
         },
         "provider_name": "Inceptron",
         "quantization": "fp8",
@@ -174,14 +174,27 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.00000005",
+          "completion": "0.00000015",
           "discount": 0,
           "input_cache_read": "0.00000003",
-          "prompt": "0.00000007"
+          "prompt": "0.000000083"
         },
         "provider_name": "InferenceNet",
         "quantization": "fp4",
         "tag": "inference-net/fp4"
+      },
+      {
+        "context_length": 1048576,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.00000047",
+          "discount": 0,
+          "input_cache_read": "0.000000024",
+          "prompt": "0.00000014"
+        },
+        "provider_name": "Makora",
+        "quantization": "unknown",
+        "tag": "makora"
       },
       {
         "context_length": 1048576,
@@ -202,8 +215,8 @@
         "pricing": {
           "completion": "0.000001",
           "discount": 0,
-          "input_cache_read": "0.000000015",
-          "prompt": "0.000000029"
+          "input_cache_read": "0.000000028",
+          "prompt": "0.000000071"
         },
         "provider_name": "Morph",
         "quantization": "fp8",
@@ -213,14 +226,27 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.00000035",
-          "discount": 0.3,
-          "input_cache_read": "0.0000000245",
-          "prompt": "0.000000105"
+          "completion": "0.0000005",
+          "discount": 0,
+          "input_cache_read": "0.000000012",
+          "prompt": "0.00000008"
         },
         "provider_name": "Near AI",
         "quantization": "fp8",
         "tag": "near-ai/fp8"
+      },
+      {
+        "context_length": 1048576,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.0000006",
+          "discount": 0,
+          "input_cache_read": "0.00000005",
+          "prompt": "0.00000019"
+        },
+        "provider_name": "NextBit",
+        "quantization": "fp4",
+        "tag": "nextbit/fp4"
       },
       {
         "context_length": 1048576,
@@ -239,10 +265,10 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.0000012",
+          "completion": "0.0000009",
           "discount": 0,
-          "input_cache_read": "0.0000000232",
-          "prompt": "0.0000000232"
+          "input_cache_read": "0.00000001125",
+          "prompt": "0.000000036"
         },
         "provider_name": "OpenInference",
         "quantization": "fp4",
@@ -397,8 +423,8 @@
         "pricing": {
           "completion": "0.0000005",
           "discount": 0,
-          "input_cache_read": "0.000000012",
-          "prompt": "0.00000006"
+          "input_cache_read": "0.00000006",
+          "prompt": "0.00000012"
         },
         "provider_name": "Wafer",
         "quantization": "unknown",

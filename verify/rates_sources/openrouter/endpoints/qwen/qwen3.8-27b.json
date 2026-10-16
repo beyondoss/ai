@@ -86,8 +86,8 @@
         "pricing": {
           "completion": "0.0000022",
           "discount": 0,
-          "input_cache_read": "0.000000025",
-          "prompt": "0.00000005"
+          "input_cache_read": "0.0000000175",
+          "prompt": "0.000000035"
         },
         "provider_name": "Darkbloom",
         "quantization": "fp4",
@@ -148,10 +148,10 @@
         "context_length": 262144,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.0000047",
+          "completion": "0.0000025",
           "discount": 0,
-          "input_cache_read": "0.000000135",
-          "prompt": "0.0000007"
+          "input_cache_read": "0.00000009",
+          "prompt": "0.0000002"
         },
         "provider_name": "ModelRun",
         "quantization": "fp4",
@@ -226,10 +226,10 @@
         "context_length": 262144,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.00000135",
+          "completion": "0.0000005",
           "discount": 0,
-          "input_cache_read": "0.000000018",
-          "prompt": "0.00000004"
+          "input_cache_read": "0.000000009",
+          "prompt": "0.00000002"
         },
         "provider_name": "Tenstorrent",
         "quantization": "fp4",
@@ -253,7 +253,7 @@
         "pricing": {
           "completion": "0.0000023",
           "discount": 0,
-          "input_cache_read": "0.0000000198",
+          "input_cache_read": "0.000000039",
           "prompt": "0.00000004"
         },
         "provider_name": "Wafer",

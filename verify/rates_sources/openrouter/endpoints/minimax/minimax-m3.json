@@ -82,14 +82,14 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.000003",
+          "completion": "0.0000013",
           "discount": 0,
-          "input_cache_read": "0.00000015",
-          "prompt": "0.00000075"
+          "input_cache_read": "0.00000005",
+          "prompt": "0.0000003"
         },
         "provider_name": "ModelRun",
-        "quantization": "fp4",
-        "tag": "modelrun/fp4"
+        "quantization": "fp8",
+        "tag": "modelrun/fp8"
       },
       {
         "context_length": 1000000,

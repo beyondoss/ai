@@ -31,24 +31,25 @@ All prices are in USD. For per-model details, see the [models page](/developers/
 
 | Model | Cost |
 | --- | --- |
+| grok-imagine-image-2.0 | $0.04 / image |
 | grok-imagine-image | $0.02 / image |
 | grok-imagine-image-quality | $0.05 / image |
-| grok-imagine-image-2.0 | $0.04 / image |
-| grok-imagine-video | $0.050 / sec |
-| grok-imagine-video-1.5-lite | $0.020 / sec |
 | grok-imagine-video-1.5 | $0.080 / sec |
+| grok-imagine-video-1.5-lite | $0.020 / sec |
+| grok-imagine-video | $0.050 / sec |
 
 ### Voice Pricing
 
 | Mode | Cost |
 | --- | --- |
-| Speech to Speech (grok-voice-think-fast-2.0) | $0.08 / min ($4.80 / hr)<br />$0.004 / text input |
+| Speech to Speech (grok-voice-2.0) — Deprecated | $0.08 / min ($4.80 / hr)<br />$0.004 / text input |
+| Speech to Speech (grok-voice-3.0) | $0.08 / min ($4.80 / hr)<br />$0.004 / text input |
 | Speech to Text | $0.10 / hr (REST), $0.20 / hr (Streaming) |
 | Text to Speech | $15.00 / 1M chars |
 
 ## Tools Pricing
 
-Requests which make use of SpaceXAI provided [server-side tools](/developers/tools/overview) are priced based on two components: **token usage** and **server-side tool invocations**. Since the agent autonomously decides how many tools to call, costs scale with query complexity.
+Requests which make use of SpaceXSI provided [server-side tools](/developers/tools/overview) are priced based on two components: **token usage** and **server-side tool invocations**. Since the agent autonomously decides how many tools to call, costs scale with query complexity.
 
 ### Token Costs
 
@@ -155,7 +156,7 @@ For `grok-4.7` this is $2.20 / $0.55 / $6.60 per 1M tokens (input / cached input
 
 ## Files and Collections Pricing
 
-Files and collections stored on the SpaceXAI platform are billed based on the amount of storage used.
+Files and collections stored on the SpaceXSI platform are billed based on the amount of storage used.
 
 | Resource | Rate |
 |---|---:|

@@ -81,10 +81,10 @@
         "context_length": 262142,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.00000035",
+          "completion": "0.00000032",
           "discount": 0,
-          "input_cache_read": "0.000000049",
-          "prompt": "0.000000123"
+          "input_cache_read": "0.000000041",
+          "prompt": "0.00000011"
         },
         "provider_name": "Io Net",
         "quantization": "bf16",
@@ -94,10 +94,10 @@
         "context_length": 256000,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.00000032",
+          "completion": "0.00000028",
           "discount": 0,
-          "input_cache_read": "0.000000032",
-          "prompt": "0.00000008"
+          "input_cache_read": "0.00000005",
+          "prompt": "0.0000001"
         },
         "provider_name": "Makora",
         "quantization": "unknown",
