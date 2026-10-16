@@ -155,7 +155,9 @@
 //!     self-contained HTML file → `data: {path}`. `output_path` defaults to a timestamped
 //!     `session-<unix-seconds>.html` in the current directory; parent directories are created as
 //!     needed.
-//!   - `{type:"compact", custom_instructions?}` summarize the prefix now → `data: {compacted: bool,
+//!   - `{type:"compact", custom_instructions?}` summarize the prefix now (while it runs, `abort`
+//!     cancels it, `get_state`/`get_session_stats`/`get_messages` are answered, and anything else
+//!     is refused as busy) → `data: {compacted: bool,
 //!     reason?, summary?, tokens_before?, tokens_after?, first_kept_entry_id?}` — `reason` (Task #26
 //!     pi-parity fix) is `null` on a real compaction, else `"too_small"`/`"already_compacted"`
 //!     (`agent_core::CompactOutcome`), matching pi's own two distinct thrown errors instead of
@@ -4262,128 +4264,6 @@ pub(crate) async fn serve_session(
             }
         }};
     }
-    macro_rules! do_compact {
-        ($cmd:expr, $id:expr) => {{
-            // Manual compaction (no run in flight here). Streams a `compacted` event if it cuts.
-            // `custom_instructions`, when given, steers what the summary emphasizes.
-            let custom_instructions = $cmd.get("custom_instructions").and_then(Value::as_str);
-            // Busy for the reaper and drain until the response is sent (see `BusyGuard`).
-            let _busy = BusyGuard::mark(&running);
-            let tx = out_tx.clone();
-            let mut compacted_tokens_before: Option<u32> = None;
-            let mut compacted_summary: Option<String> = None;
-            let mut compacted_tokens_after: Option<u32> = None;
-            let mut compacted_first_kept: Option<usize> = None;
-            // A compaction ends in a checkpoint, which waits until it is on disk (see
-            // `ChannelCheckpoint`): persist checkpoints while it runs, as the prompt loop does. Scoped
-            // so the compaction's borrows (`session`, the `compacted_*` slots) end with it.
-            // The pre-compaction active path, for `first_kept_entry_id` below: the compaction's own
-            // checkpoint rewrites the store before the call returns.
-            let ids_before: Vec<String> = persistence
-                .store
-                .as_ref()
-                .map(|s| s.active_ids().to_vec())
-                .unwrap_or_default();
-            let result = {
-                let compaction_cancel = CancellationToken::new();
-                let mut on_event = |ev: AgentEvent| {
-                        if let AgentEvent::Compacted {
-                            tokens_before,
-                            summary,
-                            tokens_after,
-                            first_kept,
-                            ..
-                        } = &ev
-                        {
-                            compacted_tokens_before = Some(*tokens_before);
-                            compacted_summary = Some(summary.clone());
-                            compacted_tokens_after = Some(*tokens_after);
-                            compacted_first_kept = Some(*first_kept);
-                            // Same active nudge as the auto-compaction path in the `prompt` run observer:
-                            // a manual `compact` also folds specifics into a lossy summary, so steer the
-                            // model to read back its `/session` working memory on its next turn.
-                            if session_memory_active {
-                                steering.push_steer(agent_core::SteeringMessage::new(
-                                    crate::memory::COMPACTION_REMINDER.to_string(),
-                                    Vec::new(),
-                                ));
-                            }
-                        }
-                        if let Some(frame) = event_frame(ev) {
-                            let _ = tx.send(frame);
-                        }
-                };
-                let compaction = agent.compact(
-                    &mut session,
-                    agent_core::CompactionReason::Manual,
-                    &compaction_cancel,
-                    &mut on_event,
-                    custom_instructions,
-                );
-                tokio::pin!(compaction);
-                loop {
-                    tokio::select! {
-                        biased;
-                        Some((messages, provenance, edited, ack)) = checkpoint_rx.recv() => {
-                            let (p, r) = write_then_ack(
-                                persist_messages_blocking(persistence, messages, provenance, edited),
-                                ack,
-                            )
-                            .await;
-                            persistence = p;
-                            if let Err(e) = r {
-                                tracing::warn!(error = %e, "compaction checkpoint failed to persist");
-                            }
-                        }
-                        r = &mut compaction => break r,
-                    }
-                }
-            };
-            match result {
-                Ok(outcome) => {
-                    // The tree entry that begins the retained (post-compaction) portion of history —
-                    // resolved against the active path as it was before the compaction rewrote it.
-                    let first_kept_entry_id =
-                        compacted_first_kept.and_then(|first_kept| ids_before.get(first_kept).cloned());
-                    while checkpoint_rx.try_recv().is_ok() {}
-                    let (p, persist_result) =
-                        persist_blocking(persistence, session.clone())
-                            .await;
-                    persistence = p;
-                    match persist_result {
-                        Ok(()) => {
-                            let _ = out_tx.send(response(
-                                $id,
-                                "compact",
-                                true,
-                                Some(json!({
-                                    "compacted": outcome.compacted(),
-                                    "reason": outcome.reason(),
-                                    "summary": compacted_summary,
-                                    "tokens_before": compacted_tokens_before,
-                                    "tokens_after": compacted_tokens_after,
-                                    "first_kept_entry_id": first_kept_entry_id,
-                                })),
-                                None,
-                            ));
-                        }
-                        Err(e) => {
-                            let _ = out_tx.send(response(
-                                $id,
-                                "compact",
-                                false,
-                                None,
-                                Some(&format!("compacted but failed to persist: {e}")),
-                            ));
-                        }
-                    }
-                }
-                Err(e) => {
-                    let _ = out_tx.send(response($id, "compact", false, None, Some(&e.to_string())));
-                }
-            }
-        }};
-    }
 
     timing.print();
 
@@ -4456,6 +4336,234 @@ pub(crate) async fn serve_session(
     // tell its own slot from a successor's (see `PendingLoginGuard`). Only ever touched from this
     // single-threaded command loop, so a plain counter suffices.
     let mut login_generation: u64 = 0;
+    macro_rules! do_compact {
+        ($cmd:expr, $id:expr) => {{
+            // Manual compaction (no run in flight here). Streams a `compacted` event if it cuts.
+            // `custom_instructions`, when given, steers what the summary emphasizes.
+            //
+            // Evaluates to whether the session goes on: `false` once stdin closed or a shutdown
+            // signal arrived mid-compaction, for the caller to end the session loop.
+            //
+            // The summary is a model call (up to the stream idle timeout per call), so it runs inside
+            // a select that keeps the session answering, the same shape as the host-`bash` loop:
+            // `abort` cancels it, read-only commands are answered from a pre-compaction snapshot,
+            // anything else is refused as busy, and shutdown or EOF cancel it.
+            let custom_instructions = $cmd.get("custom_instructions").and_then(Value::as_str);
+            // Busy for the reaper and drain until the response is sent (see `BusyGuard`).
+            let _busy = BusyGuard::mark(&running);
+            let tx = out_tx.clone();
+            let mut compacted_tokens_before: Option<u32> = None;
+            let mut compacted_summary: Option<String> = None;
+            let mut compacted_tokens_after: Option<u32> = None;
+            let mut compacted_first_kept: Option<usize> = None;
+            // A compaction ends in a checkpoint, which waits until it is on disk (see
+            // `ChannelCheckpoint`): persist checkpoints while it runs, as the prompt loop does. Scoped
+            // so the compaction's borrows (`session`, the `compacted_*` slots) end with it.
+            // The pre-compaction active path, for `first_kept_entry_id` below: the compaction's own
+            // checkpoint rewrites the store before the call returns.
+            let ids_before: Vec<String> = persistence
+                .store
+                .as_ref()
+                .map(|s| s.active_ids().to_vec())
+                .unwrap_or_default();
+            // What the read-only commands answer while the compaction holds `&mut session`: the
+            // session as it stands until the compaction lands.
+            let stats_before = session_stats(&session, &compaction_config(&cfg, &current_model));
+            let message_count_before = session.messages.len();
+            let mut compact_open = true;
+            // An `abort` is acknowledged once the compaction has actually stopped, after its own
+            // response, as a mid-run abort is.
+            let mut compact_abort_acks: Vec<Option<String>> = Vec::new();
+            let result = {
+                let compaction_cancel = CancellationToken::new();
+                let mut on_event = |ev: AgentEvent| {
+                        if let AgentEvent::Compacted {
+                            tokens_before,
+                            summary,
+                            tokens_after,
+                            first_kept,
+                            ..
+                        } = &ev
+                        {
+                            compacted_tokens_before = Some(*tokens_before);
+                            compacted_summary = Some(summary.clone());
+                            compacted_tokens_after = Some(*tokens_after);
+                            compacted_first_kept = Some(*first_kept);
+                            // Same active nudge as the auto-compaction path in the `prompt` run observer:
+                            // a manual `compact` also folds specifics into a lossy summary, so steer the
+                            // model to read back its `/session` working memory on its next turn.
+                            if session_memory_active {
+                                steering.push_steer(agent_core::SteeringMessage::new(
+                                    crate::memory::COMPACTION_REMINDER.to_string(),
+                                    Vec::new(),
+                                ));
+                            }
+                        }
+                        if let Some(frame) = event_frame(ev) {
+                            let _ = tx.send(frame);
+                        }
+                };
+                let compaction = agent.compact(
+                    &mut session,
+                    agent_core::CompactionReason::Manual,
+                    &compaction_cancel,
+                    &mut on_event,
+                    custom_instructions,
+                );
+                tokio::pin!(compaction);
+                loop {
+                    tokio::select! {
+                        biased;
+                        Some((messages, provenance, edited, ack)) = checkpoint_rx.recv() => {
+                            let (p, r) = write_then_ack(
+                                persist_messages_blocking(persistence, messages, provenance, edited),
+                                ack,
+                            )
+                            .await;
+                            persistence = p;
+                            if let Err(e) = r {
+                                tracing::warn!(error = %e, "compaction checkpoint failed to persist");
+                            }
+                        }
+                        r = &mut compaction => break r,
+                        sig = shutdown.wait(), if compact_open => {
+                            shutdown_cause = Some(sig);
+                            compact_open = false;
+                            compaction_cancel.cancel();
+                        }
+                        maybe_line = input_rx.recv(), if compact_open => match maybe_line {
+                            Some(l) => {
+                                let l = l.trim();
+                                if l.is_empty() {
+                                    continue;
+                                }
+                                let c: Value = match serde_json::from_str(l) {
+                                    Ok(v) => v,
+                                    Err(e) => {
+                                        let _ = out_tx.send(response(None, "parse", false, None, Some(&format!("invalid JSON: {e}"))));
+                                        continue;
+                                    }
+                                };
+                                let cid = c.get("id").and_then(Value::as_str).map(str::to_string);
+                                match c.get("type").and_then(Value::as_str).unwrap_or("") {
+                                    "abort" => {
+                                        compaction_cancel.cancel();
+                                        compact_abort_acks.push(cid);
+                                    }
+                                    "get_state" => {
+                                        let branch = match &service {
+                                            Some(svc) => git_branch_in(&exec_cell, svc.workspace_root()).await,
+                                            None => git_branch(&cwd).await,
+                                        };
+                                        let mut data = stats_before.clone();
+                                        if let Value::Object(m) = &mut data {
+                                            insert_session_identity(m, &persistence, service.as_deref());
+                                            m.insert("model".into(), json!(current_model));
+                                            m.insert("message_count".into(), json!(message_count_before));
+                                            m.insert("title".into(), json!(persistence.meta.title));
+                                            m.insert(
+                                                "cwd_stale".into(),
+                                                json!(service.is_none() && cwd_is_stale(&persistence.meta.cwd, &cwd)),
+                                            );
+                                            m.insert("cwd".into(), json!(cwd.display().to_string()));
+                                            m.insert("git_branch".into(), json!(branch));
+                                            m.insert("is_streaming".into(), json!(false));
+                                            m.insert("is_compacting".into(), json!(true));
+                                            m.insert("pending_tool_ids".into(), json!(Vec::<String>::new()));
+                                            if let Value::Object(rt) = runtime_settings(current_level, current_auto_compaction, current_auto_retry, current_block_images, current_image_auto_resize, &steering) {
+                                                m.extend(rt);
+                                            }
+                                        }
+                                        let _ = out_tx.send(response(cid, "get_state", true, Some(data), None));
+                                    }
+                                    "get_session_stats" => {
+                                        let mut data = stats_before.clone();
+                                        if let Value::Object(m) = &mut data {
+                                            insert_session_identity(m, &persistence, service.as_deref());
+                                            m.insert("pending_tool_ids".into(), json!(Vec::<String>::new()));
+                                        }
+                                        let _ = out_tx.send(response(cid, "get_session_stats", true, Some(data), None));
+                                    }
+                                    // The fanout's snapshot is the transcript as it stood when the
+                                    // compaction began (published by the idle loop) — what the busy
+                                    // prompt loop answers from too.
+                                    "get_messages" => {
+                                        let (msgs, ids) = {
+                                            let f = lock_ignoring_poison(&out_conn);
+                                            f.history_snapshot()
+                                        };
+                                        match messages_payload(&msgs, &ids, c.get("since").and_then(Value::as_str)) {
+                                            Ok(data) => { let _ = out_tx.send(response(cid, "get_messages", true, Some(data), None)); }
+                                            Err(e) => { let _ = out_tx.send(response(cid, "get_messages", false, None, Some(&e))); }
+                                        }
+                                    }
+                                    "prompt" if crate::tools::mcp_events::is_injection(&c) => {
+                                        deferred_events.push_back(l.to_string());
+                                    }
+                                    events_cmd if events_cmd.starts_with("mcp_events_") => dispatch_events(cid, events_cmd, &c),
+                                    other => {
+                                        let _ = out_tx.send(response(cid, other, false, None, Some("busy: a compaction is running; only `abort` (which cancels it) and get_state/get_session_stats/get_messages are accepted")));
+                                    }
+                                }
+                            }
+                            None => {
+                                compact_open = false;
+                                compaction_cancel.cancel();
+                            }
+                        },
+                    }
+                }
+            };
+            match result {
+                Ok(outcome) => {
+                    // The tree entry that begins the retained (post-compaction) portion of history —
+                    // resolved against the active path as it was before the compaction rewrote it.
+                    let first_kept_entry_id =
+                        compacted_first_kept.and_then(|first_kept| ids_before.get(first_kept).cloned());
+                    while checkpoint_rx.try_recv().is_ok() {}
+                    let (p, persist_result) =
+                        persist_blocking(persistence, session.clone())
+                            .await;
+                    persistence = p;
+                    match persist_result {
+                        Ok(()) => {
+                            let _ = out_tx.send(response(
+                                $id,
+                                "compact",
+                                true,
+                                Some(json!({
+                                    "compacted": outcome.compacted(),
+                                    "reason": outcome.reason(),
+                                    "summary": compacted_summary,
+                                    "tokens_before": compacted_tokens_before,
+                                    "tokens_after": compacted_tokens_after,
+                                    "first_kept_entry_id": first_kept_entry_id,
+                                })),
+                                None,
+                            ));
+                        }
+                        Err(e) => {
+                            let _ = out_tx.send(response(
+                                $id,
+                                "compact",
+                                false,
+                                None,
+                                Some(&format!("compacted but failed to persist: {e}")),
+                            ));
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = out_tx.send(response($id, "compact", false, None, Some(&e.to_string())));
+                }
+            }
+            for ack in compact_abort_acks {
+                let _ = out_tx.send(response(ack, "abort", true, None, None));
+            }
+            compact_open
+        }};
+    }
+
     loop {
         // Idle: the transcript is whatever the last command left behind (including a run that just
         // finished). Publish it for the next connection to attach — see `sync_history!`. Also seeds the
@@ -5932,7 +6040,11 @@ pub(crate) async fn serve_session(
                         "switch_session" => do_switch_session!(dcmd, dcid),
                         "fork" => do_fork!(dcmd, dcid),
                         "clone" => do_clone!(dcmd, dcid),
-                        "compact" => do_compact!(dcmd, dcid),
+                        "compact" => {
+                            if !do_compact!(dcmd, dcid) {
+                                stdin_open = false;
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -6935,7 +7047,11 @@ pub(crate) async fn serve_session(
                     Some("missing `kind`")
                 )),
             },
-            "compact" => do_compact!(cmd, id),
+            "compact" => {
+                if !do_compact!(cmd, id) {
+                    break;
+                }
+            }
             "get_last_assistant_text" => {
                 let text = last_assistant_text(&session);
                 emit!(response(
