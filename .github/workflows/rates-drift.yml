@@ -151,7 +151,7 @@ jobs:
           # Routine drift (rate values only, each within 2x, every check passed) merges itself once
           # `Check` is green, by the owner's decision; review drift waits for a human.
           if [ "$CLASS" = routine ]; then
-            gh pr merge "$pr" --auto --squash --delete-branch
+            gh pr merge "$pr" --auto
           else
             gh pr merge "$pr" --disable-auto || true
           fi
