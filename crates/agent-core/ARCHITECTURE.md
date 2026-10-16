@@ -1055,6 +1055,9 @@ line) triggers the join-and-parse. See `dialect/mod.rs`'s `SseEventBuffer`/`push
 Anthropic emits an explicit `content_block_stop` per block; OpenAI doesn't, so its decoder synthesizes
 `ContentBlockStop` when a tool call's `id` arrives (closing the prior block) or `finish_reason` shows
 up, and defers `MessageStop` to `Decoder::finish()` so it lands after the trailing usage-only chunk.
+Its tool-call deltas route to an open call by wire `index`, then by `id`; a delta carrying a new `id`
+together with a `name` opens a new call even on an index already in use (a provider that numbers
+every parallel call 0), while a changed `id` on an argument-only fragment (Kimi) stays with its call.
 All three dialect decoders produce the identical `StreamEvent` sequence shape — the loop's
 `Accumulator` is dialect-blind. Anthropic's own wire already carries a real per-block `index` on
 `content_block_start`/`_delta`/`_stop`, read straight through rather than discarded (defensive, since

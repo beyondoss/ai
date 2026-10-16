@@ -1342,11 +1342,23 @@ impl StreamDecoder for Decoder {
                     .and_then(|f| f.get("arguments"))
                     .and_then(Value::as_str);
 
+                // A delta naming a function under a new id is a call's opening chunk. Matched to an
+                // open call by `index` alone, a second parallel call that reuses the first one's wire
+                // `index` (some providers number every call 0) merged into it: one call with both
+                // calls' arguments concatenated, the other gone. Kimi's id mutation is unaffected — its
+                // changed ids ride argument-only fragments, never with a `name`.
+                let opens_call = name.is_some_and(|n| !n.is_empty()) && id.is_some();
                 let existing = index
                     .and_then(|idx| {
+                        // The newest call on this index: once a reused index has opened a second
+                        // call, its argument fragments are that call's.
                         self.open_tools
                             .iter()
-                            .position(|t| t.wire_index == Some(idx))
+                            .rposition(|t| t.wire_index == Some(idx))
+                    })
+                    .filter(|&pos| {
+                        let open_id = &self.open_tools[pos].id;
+                        !(opens_call && !open_id.is_empty() && Some(open_id.as_str()) != id)
                     })
                     .or_else(|| id.and_then(|id| self.open_tools.iter().position(|t| t.id == id)))
                     .or_else(|| {
@@ -2745,6 +2757,55 @@ data: [DONE]
         assert_eq!(
             serde_json::from_str::<Value>(&args_for(1)).unwrap(),
             json!({ "y": 2 })
+        );
+    }
+
+    #[test]
+    fn a_second_parallel_call_reusing_the_wire_index_opens_its_own_call() {
+        // Two parallel calls both numbered `index: 0`: the second's opening chunk carries a new id
+        // and a name. It used to merge into the first — one `read` with `{"path":"a"}{"path":"b"}`
+        // and the `write` gone.
+        const REUSED_INDEX: &str = r#"
+data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"read","arguments":""}}]},"finish_reason":null}]}
+
+data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"path\":\"a\"}"}}]},"finish_reason":null}]}
+
+data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_b","type":"function","function":{"name":"write","arguments":""}}]},"finish_reason":null}]}
+
+data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"path\":\"b\"}"}}]},"finish_reason":"tool_calls"}]}
+
+data: [DONE]
+"#;
+        let mut dec = Decoder::default();
+        let events = decode_sse(&mut dec, REUSED_INDEX).unwrap();
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::MessageStart,
+                StreamEvent::ToolUseStart {
+                    index: 0,
+                    id: "call_a".into(),
+                    name: "read".into(),
+                },
+                StreamEvent::InputJsonDelta {
+                    index: 0,
+                    partial_json: "{\"path\":\"a\"}".into(),
+                },
+                StreamEvent::ToolUseStart {
+                    index: 1,
+                    id: "call_b".into(),
+                    name: "write".into(),
+                },
+                StreamEvent::InputJsonDelta {
+                    index: 1,
+                    partial_json: "{\"path\":\"b\"}".into(),
+                },
+                StreamEvent::ContentBlockStop { index: 0 },
+                StreamEvent::ContentBlockStop { index: 1 },
+                StreamEvent::MessageStop {
+                    stop_reason: StopReason::ToolUse,
+                },
+            ]
         );
     }
 
