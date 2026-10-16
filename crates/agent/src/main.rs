@@ -4267,7 +4267,12 @@ fn persist_run(run: &RunStore, session: &Session) -> std::io::Result<()> {
     let Some(store) = guard.as_mut() else {
         return Ok(());
     };
-    store.persist(&session.messages, &session.compaction, &session.edited)
+    store.persist(
+        &session.messages,
+        &session.compaction,
+        &session.edited,
+        &session.cuts,
+    )
 }
 
 /// Expand an explicit `/skill:name` invocation first (its own prefix, so it can't collide with a

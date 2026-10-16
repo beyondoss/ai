@@ -1642,6 +1642,8 @@ pub fn apply_summary(session: &mut Session, first_kept: usize, summary: &str, to
     session.last_output_tokens = 0;
     // The rewrite above carries any masked content into the new list; the old indices mean nothing now.
     session.edited.clear();
+    // Same for cuts: the compaction's own write carries the current list whole.
+    session.cuts.clear();
 }
 
 /// The text a masked tool result starts with — how [`mask_tool_results`] recognizes its own work and

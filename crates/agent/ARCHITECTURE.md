@@ -1272,7 +1272,20 @@ compaction. `rewrite_compacted` never falls back to a full rewrite: the folded m
 active path up to where the kept suffix (`messages[1..]`) begins, found by content, so a store that
 lagged the session (failed checkpoints) still writes an append-only round, appending kept messages it
 never had — the count-based fold read that as "nothing folded" and rewrote the file, dropping every
-model change, label, title and earlier compaction record (`tests/session_compaction_continuity.rs`). `Agent::compact` checkpoints right after its rewrite, so the
+model change, label, title and earlier compaction record (`tests/session_compaction_continuity.rs`).
+**A transcript cut back in place is rewound before the append.** Every in-place shrink goes through
+`agent_core::Session::cut_back` (and an in-place rewrite of the tail through `rewriting_from`), which
+records `(id, length)` in `Session::cuts`; `persist` takes the cuts newer than the last one it applied
+(`cuts_seen`, starting at `agent_core::cut_watermark()` when the store opens, so a cut on a transcript
+it never wrote is ignored), and when the shortest length is below what it wrote, moves the active tip
+back with a `Leaf` to the last entry that length keeps, then appends. A list shorter than what is on
+disk with no compaction behind it is rewound the same way, recorded or not. The silent-truncation
+recovery is why: the agent pops the cut-off reply that the compaction's own checkpoint already wrote,
+then pushes the retry, so the count comes back where it was and a count-keyed append wrote nothing — a
+reopen got the cut-off reply, or a retried tool call's `tool_result` with no `tool_use` before it.
+Content comparison is deliberately not the signal: the in-memory transcript legitimately differs from
+disk in ways that must never be written back (a cross-model scrub). `serve`'s checkpoint carries the
+cuts alongside the provenance and edits (`tests/session_retry_persist.rs`, through both binaries). `Agent::compact` checkpoints right after its rewrite, so the
 compaction is on disk before anything else is appended. `append_new` alone is count-keyed and reads a
 compaction's shrink as "nothing new": `run` used to skip every message after a compaction until the list
 outgrew its old length, then chain the wrong tail onto the uncompacted history
