@@ -2599,7 +2599,14 @@ and `serve`'s own `bash`/`abort_bash` RPC commands reuse `RealRunner` directly, 
     things that stop a job: there is no per-command kill deadline (see "`bash` timeouts").
   - **One table per owner.** `ToolConfig::bash_jobs` hands `bash` the host's table: `run`'s, or the
     `serve` session's (kept on its `ExecCell`, so a `set_model` rebuild keeps the jobs). `None` (a
-    subagent) is a table of the registry's own.
+    subagent) is a table of the registry's own. `serve`'s host `bash` command (the client's, not the
+    model's) gets a third: `host_bash_jobs`, a table of the session's that nothing takes notices from.
+    What a client's `cmd &` leaves running is parked there, so it never wakes the model (a paid turn
+    nobody asked for, quoting output the client may have excluded from context), never appears in a
+    notice, reminder or carry, and the result says "it runs until the session ends" instead of
+    `bash_job` instructions (an instance that never detaches has no `bash_job`). It survives a
+    transcript switch (the processes are the client's, not a history's) and is stopped, unreported,
+    when the session ends; ended entries are dropped at the next host command (`forget_ended`).
   - **Compaction carries the table** (`Background::carry`): running and ended-unread jobs (id,
     command, state, age) as a `<background-jobs>` block on every summary, so a compacted model does not
     start a job again. Rendered from the live table, not persisted in `CompactionProvenance`: after a

@@ -398,6 +398,21 @@ impl BashJobs {
         lock(&self.table).remove(&id).map(|p| p.job)
     }
 
+    /// Drop every ended job. For a table whose notices nobody takes (`serve`'s host `bash`): this
+    /// is the only retention it gets, so ended jobs do not pile up for the life of the session.
+    pub fn forget_ended(&self) {
+        let ended: Vec<Parked> = {
+            let mut table = lock(&self.table);
+            let ids: Vec<u64> = table
+                .iter()
+                .filter(|(_, p)| p.job.shared.ended())
+                .map(|(id, _)| *id)
+                .collect();
+            ids.iter().filter_map(|id| table.remove(id)).collect()
+        };
+        drop(ended);
+    }
+
     /// Stop every running job, oldest first, and say which. Ended jobs are dropped too: nobody will
     /// read them now. For the end of a `run` and a transcript switch in `serve`.
     pub fn stop_all(&self) -> Vec<StoppedJob> {
