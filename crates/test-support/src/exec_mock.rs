@@ -79,6 +79,11 @@ pub struct MockOptions {
     /// Kill the command's process group when the client disconnects mid-stream — the v1.2 MUST.
     /// `false` is the non-conforming endpoint the conformance verifier has to catch.
     pub kills_on_disconnect: bool,
+    /// When the shell exits leaving processes of its group running, send `{"shell_exit": N}` and
+    /// keep the stream open until the group is empty — the v1.2 MUST ("Leftover processes").
+    /// `false` is an endpoint predating that rule: the stream ends with the shell and the leftovers
+    /// run on, untracked.
+    pub tracks_leftovers: bool,
     /// `HOME` for every command; `None` inherits this process's.
     pub home: Option<PathBuf>,
 }
@@ -90,6 +95,7 @@ impl Default for MockOptions {
             protocol: Protocol::Streaming,
             heartbeat: Duration::from_secs(5),
             kills_on_disconnect: true,
+            tracks_leftovers: true,
             home: None,
         }
     }
@@ -508,12 +514,46 @@ async fn serve_stream(sock: tokio::net::TcpStream, req: Value, shared: Shared) {
         TimedOut,
         Gone,
     }
+    // Set once the shell has exited leaving processes of its group running: the stream goes on
+    // until they are gone.
+    let mut shell: Option<std::process::ExitStatus> = None;
+    let mut leftovers = tokio::time::interval(Duration::from_millis(50));
     let why = loop {
         tokio::select! {
-            status = child.wait() => match status {
+            status = child.wait(), if shell.is_none() => match status {
+                Ok(s) if shared.opts.tracks_leftovers && group_alive(pgid) => {
+                    use std::os::unix::process::ExitStatusExt as _;
+                    let code = s.code().unwrap_or_else(|| 128 + s.signal().unwrap_or(0));
+                    // What the shell printed goes first: forward output until the pipes have been
+                    // quiet for the 100 ms settle (at most a second: a chatty leftover never goes
+                    // quiet), then say it exited.
+                    let mut gone = false;
+                    let settle_by = tokio::time::Instant::now() + Duration::from_secs(1);
+                    while let Ok(Some(frame)) = tokio::time::timeout(
+                        Duration::from_millis(100)
+                            .min(settle_by.saturating_duration_since(tokio::time::Instant::now())),
+                        rx.recv(),
+                    )
+                    .await
+                    {
+                        if wr.write_all(&chunk(&frame)).await.is_err() {
+                            gone = true;
+                            break;
+                        }
+                    }
+                    if gone || wr.write_all(&chunk(&json!({ "shell_exit": code }))).await.is_err() {
+                        break Why::Gone;
+                    }
+                    shell = Some(s);
+                }
                 Ok(s) => break Why::Exited(s),
                 Err(_) => break Why::Gone,
             },
+            _ = leftovers.tick(), if shell.is_some() => {
+                if !group_alive(pgid) && let Some(s) = shell {
+                    break Why::Exited(s);
+                }
+            }
             Some(frame) = rx.recv() => {
                 if wr.write_all(&chunk(&frame)).await.is_err() {
                     break Why::Gone;

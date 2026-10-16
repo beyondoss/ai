@@ -115,6 +115,7 @@ pub const SIGNAL: &str = "signal";
 pub const TIMEOUT: &str = "timeout kills the process group";
 pub const HEARTBEAT: &str = "heartbeat during silence";
 pub const DISCONNECT: &str = "disconnect kills the process group";
+pub const LEFTOVERS: &str = "leftover processes keep the stream open";
 
 /// Run every check against the endpoint at `url`.
 pub async fn verify(url: &str, headers: &[(String, String)], expect: &Expectations) -> Report {
@@ -171,6 +172,7 @@ pub async fn verify(url: &str, headers: &[(String, String)], expect: &Expectatio
             TIMEOUT,
             HEARTBEAT,
             DISCONNECT,
+            LEFTOVERS,
         ] {
             checks.push(skip(name, "not a v1.2 endpoint"));
         }
@@ -181,9 +183,9 @@ pub async fn verify(url: &str, headers: &[(String, String)], expect: &Expectatio
     checks.push(v.frame_size().await);
     checks.push(v.exit().await);
     checks.push(v.signal().await);
-    // The three slow checks wait on timers, not on each other.
-    let (t, h, d) = tokio::join!(v.timeout(), v.heartbeat(), v.disconnect());
-    checks.extend([t, h, d]);
+    // The slow checks wait on timers, not on each other.
+    let (t, h, d, l) = tokio::join!(v.timeout(), v.heartbeat(), v.disconnect(), v.leftovers());
+    checks.extend([t, h, d, l]);
     Report { streams, checks }
 }
 
@@ -661,6 +663,114 @@ impl Verifier {
                  command, not its process group",
             ),
             Err(e) => fail(DISCONNECT, e),
+        }
+    }
+
+    /// "Leftover processes": a shell that exits while a process it started runs on gets
+    /// `{"shell_exit": N}`, the stream stays open until that process exits, and then ends with the
+    /// shell's final frame — and a disconnect in between kills the leftover, so it is a job the client
+    /// can stop like any other.
+    async fn leftovers(&self) -> Check {
+        let ex = match self
+            .run("(sleep 1) & exit 3", Duration::from_secs(30))
+            .await
+        {
+            Ok(ex) => ex,
+            Err(e) => return fail(LEFTOVERS, e),
+        };
+        let frames = ex.frames();
+        let end = frames.last().filter(|(_, f)| f.is_final());
+        let Some(&(shell_at, ref shell)) = frames
+            .iter()
+            .find(|(_, f)| matches!(f, Frame::ShellExit(_)))
+        else {
+            return fail(
+                LEFTOVERS,
+                format!(
+                    "the stream ended with the shell ({:?}) while a process it started ran on: the \
+                     endpoint must send `{{\"shell_exit\": N}}` and keep the stream open until the \
+                     process group is empty",
+                    end.map(|(_, f)| f)
+                ),
+            );
+        };
+        if shell != &Frame::ShellExit(3) {
+            return fail(LEFTOVERS, format!("expected `shell_exit` 3, got {shell:?}"));
+        }
+        match end {
+            Some((at, Frame::Exit(3)))
+                if at.saturating_sub(shell_at) >= Duration::from_millis(500) => {}
+            Some((at, f)) => {
+                return fail(
+                    LEFTOVERS,
+                    format!(
+                        "after `shell_exit` the stream must end with the shell's `{{\"exit_code\": 3}}` \
+                         once the leftover (a 1 s sleep) has exited; got {f:?} {} ms after it",
+                        at.saturating_sub(shell_at).as_millis()
+                    ),
+                );
+            }
+            None => return fail(LEFTOVERS, "no final frame"),
+        }
+
+        let marker = self.marker("leftover");
+        let grandchild = self.expect.kill_within + Duration::from_secs(2);
+        let check = self
+            .leftover_disconnect(
+                &format!("(sleep {}; touch {marker}) & exit 0", grandchild.as_secs()),
+                &marker,
+                grandchild,
+            )
+            .await;
+        let _ = self.sh(&format!("rm -f {marker}")).await;
+        check
+    }
+
+    async fn leftover_disconnect(&self, script: &str, marker: &str, grandchild: Duration) -> Check {
+        let started = Instant::now();
+        let resp = match self
+            .runner
+            .send(
+                "sh",
+                &Self::args(script),
+                None,
+                Duration::from_secs(120),
+                None,
+                true,
+            )
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => return fail(LEFTOVERS, e.to_string()),
+        };
+        let mut reader = FrameReader::new(resp);
+        loop {
+            match reader.next(self.silence()).await {
+                Ok(Some(Frame::ShellExit(_))) => break,
+                Ok(Some(f)) if f.is_final() => {
+                    return fail(LEFTOVERS, format!("ended with the shell: {f:?}"));
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => return fail(LEFTOVERS, "the body ended early"),
+                Err(e) => return fail(LEFTOVERS, e),
+            }
+        }
+        // Hang up while only the leftover runs.
+        drop(reader);
+        tokio::time::sleep((grandchild + Duration::from_secs(1)).saturating_sub(started.elapsed()))
+            .await;
+        match self.sh(&format!("test -e {marker}")).await {
+            Ok(r) if r.exit_code != 0 => pass(
+                LEFTOVERS,
+                "`shell_exit` sent, the stream held until the leftover exited, and a disconnect \
+                 killed it",
+            ),
+            Ok(_) => fail(
+                LEFTOVERS,
+                "a leftover process survived a disconnect after `shell_exit`: the endpoint must kill \
+                 the process group whenever the connection closes before the final frame",
+            ),
+            Err(e) => fail(LEFTOVERS, e),
         }
     }
 }

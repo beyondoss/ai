@@ -171,9 +171,9 @@ pub struct JobHooks<'a> {
     pub on_spawn: SpawnSink<'a>,
     /// The shell exited, but processes it started are still running (`cmd &`, a daemon): the
     /// shell's own result, and a short description of what is left. The call goes on — streaming
-    /// their output — until they have all exited or been killed. Only a runner
-    /// that can see the command's processes calls it (this host's); on a remote stream the endpoint
-    /// owns the process group, and the call simply ends when the shell does.
+    /// their output — until they have all exited or been killed. This host's runner scans for them;
+    /// a v1.2 endpoint says so with a `shell_exit` frame, and a template transport's wrapper with a
+    /// marker (both for the command's process group). A v1.1 endpoint cannot, and never calls it.
     pub on_orphans: &'a (dyn Fn(&ExecResult, String) + Send + Sync),
 }
 
@@ -212,10 +212,10 @@ pub trait CommandRunner: Send + Sync {
     /// Like [`run_streaming`](CommandRunner::run_streaming), for a caller that keeps the command
     /// running past its own return (`bash`'s jobs): reports to [`JobHooks::on_spawn`], the moment
     /// the command starts, how to stop it ([`Kill`]) — so it can be killed from a `bash_job` kill, a
-    /// dropped job, or the exit path where no future is left to drop. A runner that can see the
-    /// command's processes (this host's) also tells [`JobHooks::on_orphans`] when the shell exits
-    /// leaving some running, and keeps going until those exit too, so nothing the command started
-    /// is left untracked.
+    /// dropped job, or the exit path where no future is left to drop. A runner that can tell when
+    /// the shell exits leaving processes running (this host's, a v1.2 stream, a template transport)
+    /// also tells [`JobHooks::on_orphans`], and keeps going until those exit too, so nothing the
+    /// command started is left untracked.
     ///
     /// **No deadline.** The command runs until it exits or its [`Kill`] stops it: the caller owns its
     /// lifetime (`bash`'s jobs end with the turn, the run or the session). A remote runner still has

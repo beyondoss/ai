@@ -73,6 +73,7 @@
 //! | `{"stdout": "<base64>"}` | bytes the command wrote to stdout |
 //! | `{"stderr": "<base64>"}` | bytes the command wrote to stderr |
 //! | `{}` | heartbeat: the connection is alive; never output |
+//! | `{"shell_exit": N}` | the command exited with code N, but processes of its group run on — see "Leftover processes"; not final, never output |
 //! | `{"exit_code": N}` | **final**: the command exited with code N |
 //! | `{"signal": S}` | **final**: the command was killed by signal S (9 for SIGKILL) |
 //! | `{"timed_out": true}` | **final**: the endpoint killed the command at `timeout_ms` |
@@ -87,9 +88,9 @@
 //!   frame, then `{"exit_code": 127}`), as a shell reports it.
 //! - **Ordering.** Frames of one stream are in the order the bytes were read; the relative order of
 //!   stdout and stderr is best-effort, as between two local pipes. The final frame comes after all
-//!   output read from both pipes. Once the command exits, the endpoint SHOULD stop waiting for pipes
-//!   held open by a detached descendant after a short grace (the client uses 100 ms) rather than
-//!   until they close.
+//!   output read from both pipes. Once the command's process group is empty, the endpoint SHOULD
+//!   stop waiting for pipes held open by a descendant that left the group after a short grace (the
+//!   client uses 100 ms) rather than until they close.
 //! - **Flushing.** Each frame MUST reach the connection without buffering: the endpoint MAY coalesce
 //!   output read within 100 ms into one frame, and MUST NOT hold any longer. Anything between the
 //!   endpoint and the client must not buffer either (send `Cache-Control: no-store`, and e.g.
@@ -120,6 +121,34 @@
 //! a command: `bash_job` kill, a cancelled call, a dropped job and the agent's own exit all close the
 //! stream (see [`Kill`]), and nothing else is ever sent.
 //!
+//! **Leftover processes — normative.** A command often exits leaving processes it started running
+//! (`server &`, `nohup … &`, a daemon that stays in its group). Locally those become a job the agent
+//! tracks and stops with the session; remotely they must too, or `nohup server &` holds its port
+//! until the sandbox dies. So when the command's own process exits **while its process group still
+//! has a live (non-zombie) member**, the endpoint:
+//!
+//! - MUST send `{"shell_exit": N}` — N the command's exit code, `128 + S` if signal S killed it —
+//!   after the output read from both pipes up to that exit (the same short grace as before a final
+//!   frame);
+//! - MUST then keep the stream open — output, heartbeats, `timeout_ms` and disconnect-kills all
+//!   still apply — until the group has no live member, and only then send the final frame, which
+//!   carries the command's own result (`{"exit_code": N}`, or `{"signal": S}`).
+//!
+//! A group that is empty when the command exits gets the final frame directly; `shell_exit` is
+//! never sent for it. Zombies do not count: a sandbox whose pid 1 is not an init (`sleep infinity`)
+//! never reaps the orphans it inherits. A process that leaves the group (`setsid`) is not covered,
+//! unless the endpoint tracks a cgroup (it MAY). The client adopts the leftovers as a job at
+//! `shell_exit` (`on_orphans`), and closes the stream to stop them, like any job. A call that is not
+//! a job (nothing tracks it) returns at `shell_exit` and closes the stream, so the endpoint kills
+//! the leftovers. Compatible both ways: an endpoint predating this rule ends the stream with the
+//! shell (its leftovers run on, untracked), and a client predating it reads `shell_exit` as a
+//! heartbeat (an unknown field) and keeps the job until the group ends.
+//!
+//! **Over v1.1 leftovers are untracked.** One request, one response: the endpoint answers when the
+//! command exits, and nothing the agent can do afterwards reaches what it left running. A v1.1
+//! endpoint SHOULD kill the command's process group once it has answered; one that does not leaves
+//! `server &` running until the sandbox ends.
+//!
 //! **The probe.** Streaming is adopted only after the endpoint proves it, once per runner, on the
 //! first streaming call ([`HttpExecRunner::streams`]): `sh -c 'printf a; sleep 0.3; printf b'` with
 //! `"stream": true` must come back as `application/x-ndjson` with at least two output frames, `ab`,
@@ -131,8 +160,9 @@
 //! streams: the filesystem backend's commands stay v1.1, whose single object they need anyway.
 //!
 //! **Conformance.** [`conformance::verify`] checks an endpoint against all of the above — framing,
-//! the probe, exit/signal/timeout frames, heartbeats, the 64 KiB frame cap, and kill on disconnect
-//! measured against a grandchild's marker file — and `tests/exec_conformance.rs` runs it against any
+//! the probe, exit/signal/timeout frames, heartbeats, the 64 KiB frame cap, kill on disconnect
+//! measured against a grandchild's marker file, and leftover processes (`shell_exit`, the stream
+//! held until they exit, killed on a disconnect after it) — and `tests/exec_conformance.rs` runs it against any
 //! URL. `tests/fixtures/exec/v1.2-frames.json` holds the decoding vectors.
 //!
 //! For targets that have no HTTP surface at all (`ssh`, `docker exec`, `kubectl exec`, any CLI), see
@@ -189,6 +219,17 @@ struct ExecResponse {
 /// is the connection's (see "Disconnect kills"), so this only has to outlast any session; it is not a
 /// limit anyone should meet.
 pub const STREAM_DEADLINE: Duration = Duration::from_millis(i32::MAX as u64);
+
+/// What a remote command left running, as `on_orphans` describes it: the runner cannot list the far
+/// side's processes, only that its process group still has some.
+pub(crate) const REMOTE_LEFTOVERS: &str = "processes on the exec target";
+
+/// How long a template command's output may still be in flight once its shell-exit marker has
+/// arrived — the local runner's 100 ms (`bash_proc::SETTLE`).
+const SHELL_EXIT_SETTLE: Duration = Duration::from_millis(100);
+
+/// Where a runner reports a shell that exited leaving processes running — [`JobHooks::on_orphans`].
+type OrphanSink<'a> = &'a (dyn Fn(&ExecResult, String) + Send + Sync);
 
 /// The default response-body cap for [`HttpExecRunner`]: 16 MiB.
 ///
@@ -436,7 +477,7 @@ impl CommandRunner for HttpExecRunner {
         timeout: Duration,
         on_chunk: ChunkSink<'_>,
     ) -> std::io::Result<ExecResult> {
-        self.run_stream(program, args, cwd, timeout, on_chunk, None)
+        self.run_stream(program, args, cwd, timeout, on_chunk, None, None)
             .await
     }
 
@@ -460,8 +501,9 @@ impl CommandRunner for HttpExecRunner {
         } else {
             UNTRACKED_DEADLINE
         };
-        // No `on_orphans`: the endpoint owns the command's process group, and ends the stream (and
-        // kills the group) when the shell exits.
+        // The endpoint owns the command's process group: it says when the shell exits leaving some
+        // of it running (`shell_exit`), and keeps the stream — and so the job — open until the group
+        // is empty. See the module doc's "Leftover processes".
         self.run_stream(
             program,
             args,
@@ -469,6 +511,7 @@ impl CommandRunner for HttpExecRunner {
             deadline,
             hooks.on_chunk,
             Some(hooks.on_spawn),
+            Some(hooks.on_orphans),
         )
         .await
     }
@@ -559,6 +602,7 @@ impl HttpExecRunner {
 
     /// The v1.2 exchange. Falls back to v1.1 when the endpoint has not proved it streams, or when it
     /// answers this request with one JSON object after all (a fleet mid-rollout).
+    #[allow(clippy::too_many_arguments)]
     async fn run_stream(
         &self,
         program: &str,
@@ -567,6 +611,7 @@ impl HttpExecRunner {
         timeout: Duration,
         on_chunk: ChunkSink<'_>,
         on_spawn: Option<SpawnSink<'_>>,
+        on_orphans: Option<OrphanSink<'_>>,
     ) -> std::io::Result<ExecResult> {
         if !self.streams().await {
             return self.run(program, args, cwd, timeout).await;
@@ -607,6 +652,20 @@ impl HttpExecRunner {
             match next.map_err(broken)? {
                 Some(Frame::Stdout(b) | Frame::Stderr(b)) => on_chunk(&b),
                 Some(Frame::Heartbeat) => {}
+                Some(Frame::ShellExit(code)) => {
+                    let shell = ExecResult {
+                        code: Some(code),
+                        ..Default::default()
+                    };
+                    match on_orphans {
+                        // A job: its leftovers are adopted, and the stream stays open until they
+                        // have exited or a kill closes it.
+                        Some(sink) => sink(&shell, REMOTE_LEFTOVERS.to_string()),
+                        // A call that ends with its command: returning drops the stream, and the
+                        // endpoint kills what is left.
+                        None => return Ok(shell),
+                    }
+                }
                 Some(Frame::Exit(code)) => {
                     frames.finish().await;
                     return Ok(ExecResult {
@@ -704,7 +763,7 @@ impl CommandRunner for TemplateRunner {
         cwd: Option<&str>,
         timeout: Duration,
     ) -> std::io::Result<ExecResult> {
-        self.exec(program, args, cwd, Some(timeout), None, None, None)
+        self.exec(program, args, cwd, Some(timeout), None, None, None, None)
             .await
     }
 
@@ -726,12 +785,15 @@ impl CommandRunner for TemplateRunner {
             Some(on_chunk),
             None,
             None,
+            None,
         )
         .await
     }
 
     /// As [`Self::run_streaming`], reporting a [`Kill`] that stops the command **on the far side**,
     /// not just the local transport — see `far_kill`. No deadline: that kill is how it ends early.
+    /// What the command leaves running in its process group is reported to `on_orphans` and waited
+    /// for, as a local shell's leftovers are (see `far_kill::WRAPPER`).
     async fn run_streaming_tracked(
         &self,
         program: &str,
@@ -747,6 +809,7 @@ impl CommandRunner for TemplateRunner {
             Some(hooks.on_chunk),
             None,
             Some(hooks.on_spawn),
+            Some(hooks.on_orphans),
         )
         .await
     }
@@ -767,8 +830,17 @@ impl CommandRunner for TemplateRunner {
         timeout: Duration,
         stdin: &[u8],
     ) -> std::io::Result<ExecResult> {
-        self.exec(program, args, cwd, Some(timeout), None, Some(stdin), None)
-            .await
+        self.exec(
+            program,
+            args,
+            cwd,
+            Some(timeout),
+            None,
+            Some(stdin),
+            None,
+            None,
+        )
+        .await
     }
 }
 
@@ -837,6 +909,7 @@ impl TemplateRunner {
         on_chunk: Option<ChunkSink<'_>>,
         stdin: Option<&[u8]>,
         on_spawn: Option<SpawnSink<'_>>,
+        on_orphans: Option<OrphanSink<'_>>,
     ) -> std::io::Result<ExecResult> {
         // `cwd` is expressed by wrapping the command, not by setting the *local* process's directory —
         // the directory belongs to the far side. Positional parameters to a fixed script, never
@@ -848,10 +921,14 @@ impl TemplateRunner {
         // job's stdin is `/dev/null`.
         let killable = stdin.is_none();
         let (program, args): (String, Vec<String>) = if killable {
+            // A tracked job lingers on the far side while its leftovers run; any other call ends
+            // with its command, as before.
+            let linger = if on_orphans.is_some() { "1" } else { "0" };
             let mut v = vec![
                 "-c".to_string(),
                 far_kill::WRAPPER.to_string(),
                 "sh".to_string(),
+                linger.to_string(),
                 cwd.unwrap_or("").to_string(),
                 program.to_string(),
             ];
@@ -901,10 +978,17 @@ impl TemplateRunner {
             report(Kill::Hook(Arc::new(move || kill.kill())));
         }
         let stdout = child.stdout.take();
-        let stderr = child
-            .stderr
-            .take()
-            .map(|e| far_kill::MarkerStrip::new(e, far.clone()));
+        // The wrapper's shell-exit marker, heard on stderr: the command exited leaving processes of
+        // its group running.
+        let (shell_exit_tx, mut shell_exit_rx) = tokio::sync::watch::channel(None::<i32>);
+        let stderr = child.stderr.take().map(|e| {
+            let on_shell_exit = on_orphans.map(|_| -> far_kill::ShellExitSink<'_> {
+                Box::new(move |code| {
+                    let _ = shell_exit_tx.send(Some(code));
+                })
+            });
+            far_kill::MarkerStrip::new(e, far.clone(), on_shell_exit)
+        });
         // Fed concurrently with the drains, never before them — see `feed_stdin`.
         let feed = feed_stdin(child.stdin.take(), stdin);
         // `drain_capped` is the same streaming head+tail accumulator the local runner uses: memory
@@ -924,6 +1008,27 @@ impl TemplateRunner {
             let _ = exited_tx.send(true);
             status
         };
+        // Report the leftovers once the marker arrives, after the same 100 ms the local runner gives
+        // output already in flight on the other pipe (`bash_proc::SETTLE`), so what the shell
+        // printed lands in the call's result, not the job's.
+        let orphans = async {
+            let Some(sink) = on_orphans else {
+                return;
+            };
+            let mut exited = exited_rx.clone();
+            tokio::select! {
+                // Each guard is dropped inside its own arm: neither may live across the sleep.
+                code = async { shell_exit_rx.wait_for(Option::is_some).await.ok().and_then(|c| *c) } => {
+                    tokio::time::sleep(SHELL_EXIT_SETTLE).await;
+                    let shell = ExecResult {
+                        code,
+                        ..Default::default()
+                    };
+                    sink(&shell, REMOTE_LEFTOVERS.to_string());
+                }
+                () = async { let _ = exited.wait_for(|e| *e).await; } => {}
+            }
+        };
         let collect = async {
             tokio::join!(
                 wait,
@@ -942,6 +1047,7 @@ impl TemplateRunner {
                     exited_rx.clone()
                 ),
                 feed,
+                orphans,
             )
         };
         // `None`: a tracked job, whose kill is how it ends early.
@@ -950,7 +1056,7 @@ impl TemplateRunner {
             None => Some(collect.await),
         };
         match collected {
-            Some((status, (stdout, out_truncated), (stderr, err_truncated), fed)) => {
+            Some((status, (stdout, out_truncated), (stderr, err_truncated), fed, ())) => {
                 guard.0 = None;
                 let status = status?;
                 fed?;

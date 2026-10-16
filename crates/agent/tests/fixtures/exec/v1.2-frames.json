@@ -4,6 +4,7 @@
     "Each case is the body of one application/x-ndjson response, one string per line, without the trailing newline.",
     "expect.stdout_base64 / expect.stderr_base64 are the bytes a conforming client hands the caller, in order.",
     "expect.heartbeats counts frames that carry nothing: they keep the connection alive and are never output.",
+    "expect.shell_exits lists the shell_exit codes, in order: the shell exited but processes of its group kept running, so the stream stayed open. Never output, never final.",
     "expect.end is the final frame; null means the body ended without one, which a client MUST report as a broken stream.",
     "expect.invalid means a conforming client MUST reject the body."
   ],
@@ -41,6 +42,23 @@
         "stdout_base64": "/wAB",
         "stderr_base64": "",
         "heartbeats": 0,
+        "end": { "exit_code": 0 }
+      }
+    },
+    {
+      "name": "the shell exits leaving a process running; the stream ends when it does",
+      "lines": [
+        "{\"stdout\":\"c3RhcnRlZAo=\"}",
+        "{\"shell_exit\":0}",
+        "{}",
+        "{\"stdout\":\"bGF0ZQo=\"}",
+        "{\"exit_code\":0}"
+      ],
+      "expect": {
+        "stdout_base64": "c3RhcnRlZApsYXRlCg==",
+        "stderr_base64": "",
+        "heartbeats": 1,
+        "shell_exits": [0],
         "end": { "exit_code": 0 }
       }
     },

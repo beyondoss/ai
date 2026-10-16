@@ -347,3 +347,71 @@ async fn a_killed_bash_job_dies_on_the_target() {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
+
+/// What a command leaves running on the target (`nohup server &`) is adopted as a job and stopped
+/// with the session — as a local shell's leftovers are. Before, nothing tracked it: it ran (and held
+/// its port) until the sandbox died. Read from `/proc` for the same reason as above.
+#[tokio::test]
+async fn a_leftover_on_the_target_is_adopted_and_stopped_with_the_session() {
+    use common::remote_bash::{call, remote_bash};
+    use std::time::{Duration, Instant};
+    let Some(runner) = live_runner() else {
+        eprintln!("skipping: set AGENT_LIVE_EXEC_CMD or AGENT_LIVE_EXEC_URL to run live tests");
+        return;
+    };
+    let (bash, _jobs) = remote_bash(runner.clone(), Duration::from_secs(60));
+    let out = call(
+        bash.as_ref(),
+        json!({ "command": "nohup sleep 301 >/dev/null 2>&1 & echo \"pid $!\"" }),
+    )
+    .await
+    .unwrap_or_else(|e| e);
+    assert!(
+        out.contains("tracked as job"),
+        "the leftover must be adopted: {out}"
+    );
+    let pid = out
+        .lines()
+        .find_map(|l| l.strip_prefix("pid "))
+        .unwrap_or_else(|| panic!("no pid in: {out}"))
+        .trim()
+        .to_string();
+    let alive = format!(
+        "s=$(cut -d' ' -f3 \"/proc/{pid}/stat\" 2>/dev/null); [ -n \"$s\" ] && [ \"$s\" != Z ]"
+    );
+    let probe = |script: String| {
+        let runner = runner.clone();
+        async move {
+            runner
+                .run(
+                    "sh",
+                    &["-c".to_string(), script],
+                    None,
+                    Duration::from_secs(10),
+                )
+                .await
+                .unwrap()
+                .code
+        }
+    };
+    assert_eq!(
+        probe(alive.clone()).await,
+        Some(0),
+        "the leftover runs on the target"
+    );
+    let stopped = tokio::task::spawn_blocking({
+        let bash = bash.clone();
+        move || bash.jobs().stop_all()
+    })
+    .await
+    .unwrap();
+    assert_eq!(stopped.len(), 1, "{stopped:?}");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while probe(alive.clone()).await == Some(0) {
+        assert!(
+            Instant::now() < deadline,
+            "the leftover {pid} still runs on the target after the session's jobs were stopped"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
