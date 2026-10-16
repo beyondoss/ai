@@ -798,6 +798,7 @@ impl Agent {
             );
             session.scrub_cross_model_state(&self.model);
         }
+        self.attach_background_carry(session);
         // Clears any pending stop request when this call returns, by whatever path — normal
         // completion, an early `?`/`return Err`, cancellation, or a refusal — so a request this call
         // never got around to consuming can't leak into a later call that reuses `steering`.
@@ -2775,9 +2776,10 @@ impl Agent {
         // rendered from the tools' live state (see `crate::background`). A request-only block on the
         // summary message carries it to the model for as long as this summary stands, and it is
         // never persisted — a restarted or switched-back session would otherwise be told dead jobs
-        // are running.
+        // are running. With nothing running it says so, so the block a reopen attaches
+        // (`attach_background_carry`) matches the one this process sent and keeps the cache.
         if let Some(block) =
-            crate::background::format_carry(&crate::background::collect(&self.tools))
+            crate::background::carry_block(&crate::background::collect(&self.tools))
         {
             session.attach_request_block_at(0, block);
         }
@@ -2811,6 +2813,41 @@ impl Agent {
             summary_source,
         });
         Ok(CompactOutcome::Compacted)
+    }
+
+    /// Give a summarized session its `<background-jobs>` block when it has none — after every
+    /// reopen, since request blocks are never persisted. The summary's own prose can still say "the
+    /// server is running as job 1" (written by a summarizer that saw the job, or by one from before
+    /// it was told not to record job state), and the live table is what corrects it; without one,
+    /// the first request after a restart reads that claim unchallenged. A no-op while the block
+    /// compaction attached still rides the summary, so the cached prefix is not disturbed.
+    fn attach_background_carry(&self, session: &mut Session) {
+        let summarized = session.messages.first().is_some_and(|m| {
+            m.role == Role::User
+                && matches!(
+                    m.content.first(),
+                    Some(ContentBlock::Text { text, .. })
+                        if text.starts_with(compaction::SUMMARY_MARKER)
+                )
+        });
+        if !summarized {
+            return;
+        }
+        let first = &session.messages[0];
+        let carried = session.request_blocks.iter().any(|b| {
+            b.index == 0
+                && b.anchor == *first
+                && matches!(&b.block, ContentBlock::Text { text, .. }
+                    if crate::background::is_carry_block(text))
+        });
+        if carried {
+            return;
+        }
+        if let Some(block) =
+            crate::background::carry_block(&crate::background::collect(&self.tools))
+        {
+            session.attach_request_block_at(0, block);
+        }
     }
 
     /// A request carrying the live conversation the way every turn sends it: tools, deferred tools,
@@ -14643,6 +14680,150 @@ data: {"type":"response.completed","response":{"status":"completed","usage":{"in
             blocks[1],
             "<background-jobs>\n- job 1: `npm run dev` (running)\n</background-jobs>"
         );
+    }
+
+    /// A tool whose background table is whatever the test says is running.
+    struct JobTable(Arc<std::sync::Mutex<Option<String>>>);
+    impl crate::background::Background for JobTable {
+        fn take_notices(&self) -> Option<String> {
+            None
+        }
+        fn stop_reminder(&self) -> Option<String> {
+            None
+        }
+        fn carry(&self) -> Option<String> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+    struct JobTool(Arc<std::sync::Mutex<Option<String>>>);
+    #[async_trait::async_trait]
+    impl Tool for JobTool {
+        fn name(&self) -> &str {
+            "server"
+        }
+        fn description(&self) -> &str {
+            "runs a server"
+        }
+        fn input_schema(&self) -> Value {
+            json!({ "type": "object", "properties": {} })
+        }
+        async fn run(
+            &self,
+            _input: Value,
+        ) -> std::result::Result<crate::ToolOutput, crate::error::ToolError> {
+            Ok("ok".into())
+        }
+        fn background(&self) -> Option<Arc<dyn crate::background::Background>> {
+            Some(Arc::new(JobTable(self.0.clone())))
+        }
+    }
+
+    fn job_agent(mock: &Arc<MockTransport>, running: Option<&str>) -> Agent {
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(EchoTool));
+        tools.register(Arc::new(JobTool(Arc::new(std::sync::Mutex::new(
+            running.map(String::from),
+        )))));
+        summary_agent(mock, summary_config()).with_tools(tools)
+    }
+
+    fn carry_text(sent: &[Message]) -> Option<String> {
+        sent[0].content.iter().find_map(|b| match b {
+            ContentBlock::Text { text, .. } if crate::background::is_carry_block(text) => {
+                Some(text.to_string())
+            }
+            _ => None,
+        })
+    }
+
+    #[tokio::test]
+    async fn a_reopened_summary_is_told_no_jobs_are_running() {
+        // The summarizer saw a live job and wrote "running as job 1" into its own prose, which is
+        // persisted. After a restart the job is gone: the first request must say so beside the
+        // summary, and the summarizer must have been told not to record job state at all.
+        let mock = Arc::new(MockTransport::new(vec![turn::text(
+            "## Goal\nthe state: the dev server is running as job 1",
+        )]));
+        let agent = job_agent(&mock, Some("- job 1: `npm run dev` (running)"));
+        let mut session = summarized_session(12);
+        compact_once(&agent, &mut session).await;
+        let instruction = last_text(mock.requests()[0].messages.last().unwrap()).to_string();
+        assert!(
+            instruction.contains(compaction::LIVENESS_NOTE.trim()),
+            "the summarizer is told not to record job state: {instruction}"
+        );
+        // What a host persists: no carry, live or negative.
+        let persisted = serde_json::to_string(&session).unwrap();
+        assert!(!persisted.contains("<background-jobs>"), "{persisted}");
+
+        // A fresh process reopens it: nothing is running now.
+        let mut reopened: Session = serde_json::from_str(&persisted).unwrap();
+        reopened.user("is the server still up?");
+        let mock = Arc::new(MockTransport::new(vec![turn::text("no")]));
+        job_agent(&mock, None)
+            .run(&mut reopened, |_| {})
+            .await
+            .unwrap();
+        let first = &mock.requests()[0];
+        assert_eq!(
+            carry_text(&first.messages).as_deref(),
+            Some(
+                format!(
+                    "{}\n{}\n{}",
+                    crate::background::CARRY_OPEN,
+                    crate::background::NO_JOBS,
+                    crate::background::CARRY_CLOSE
+                )
+                .as_str()
+            ),
+            "the first request after a reopen corrects the summary's stale claim"
+        );
+        assert!(
+            !serde_json::to_string(&reopened)
+                .unwrap()
+                .contains("<background-jobs>"),
+            "still never persisted"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_carry_compaction_attached_is_not_replaced_by_a_later_run() {
+        // In the same process the block compaction attached keeps riding the summary, byte for
+        // byte, so the cached prefix is untouched; with nothing running it is the negative form, the
+        // same one a reopen attaches.
+        let mock = Arc::new(MockTransport::new(vec![
+            turn::text("## Goal\nthe state"),
+            turn::text("next"),
+        ]));
+        let agent = job_agent(&mock, None);
+        let mut session = summarized_session(12);
+        compact_once(&agent, &mut session).await;
+        let attached = carry_text(&session.request_messages()).unwrap();
+        assert!(attached.contains(crate::background::NO_JOBS), "{attached}");
+        session.user("go on");
+        agent.run(&mut session, |_| {}).await.unwrap();
+        let sent = &mock.requests()[1].messages;
+        assert_eq!(carry_text(sent).as_deref(), Some(attached.as_str()));
+        assert_eq!(
+            sent[0]
+                .content
+                .iter()
+                .filter(|b| matches!(b, ContentBlock::Text { text, .. }
+                    if crate::background::is_carry_block(text)))
+                .count(),
+            1,
+            "attached once"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_without_background_tools_gets_no_carry() {
+        let mock = Arc::new(MockTransport::new(vec![turn::text("ok")]));
+        let agent = summary_agent(&mock, summary_config());
+        let mut session = summarized_session(1);
+        session.user("hi");
+        agent.run(&mut session, |_| {}).await.unwrap();
+        assert_eq!(carry_text(&mock.requests()[0].messages), None);
     }
 
     #[tokio::test]

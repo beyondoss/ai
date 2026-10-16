@@ -536,7 +536,15 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
     describes processes, and a persisted copy would list dead jobs as running after a restart (it
     once was, until a restart test caught it). A host that saves request blocks across restarts
     skips it (`background::is_carry_block`; `serve`'s MCP App context sidecar). A copy the model
-    echoes is stripped like the rest.
+    echoes is stripped like the rest. With nothing running it says so (`background::NO_JOBS`), and
+    a run on a summarized session whose block is gone — every reopen, since request blocks are never
+    persisted — attaches it afresh (`Agent::attach_background_carry`, a no-op while compaction's
+    block still rides, so the cached prefix is undisturbed). That is what corrects a summary whose
+    own prose says "the server is running as job 1": the summarizer is told not to record job state
+    (`compaction::LIVENESS_NOTE`, on every summary instruction), but it still reads the bash results
+    that started the job. The summarizer's input keeps the block rather than stripping it: it sits
+    on message 0, so stripping it would turn the cached summary call's prefix into a full-price
+    re-read; the instruction tells it to ignore the block instead.
 
   `compact` first strips any blocks the model echoed at the end of its own reply (`strip_echoed_carry`):
   the cached call sees the previous summary, blocks included, and a model that mirrors its shape ends
