@@ -904,7 +904,12 @@ fn map_finish_reason(s: Option<&str>) -> StopReason {
         // both "stop" and "end" to `stopReason: "stop"`.
         Some("stop") | Some("end") => StopReason::EndTurn,
         Some("tool_calls") | Some("function_call") => StopReason::ToolUse,
-        Some("length") => StopReason::MaxTokens,
+        // `model_length` (Mistral: the model's own context window, not the request's `max_tokens`)
+        // and `max_tokens` (several OpenAI-compatible providers' spelling of `length`) are the same
+        // length stop: the reply was cut off. Read as `Other`, the loop's cut-off handling and
+        // silent-truncation recovery never ran, and a cut-off tool call was answered as malformed
+        // JSON instead of "resend smaller".
+        Some("length") | Some("model_length") | Some("max_tokens") => StopReason::MaxTokens,
         // A safety-filtered completion is not a clean stop — collapsing it into `Other` (which the
         // loop treats identically to `EndTurn`) would report a filtered response as if the turn
         // succeeded normally. `Refusal` is this crate's distinct terminal state for "the model didn't
@@ -914,10 +919,10 @@ fn map_finish_reason(s: Option<&str>) -> StopReason {
         // not a terminal answer, so it needs to reach `run_turn`'s retry classifier as an `Err`
         // instead of a successful (if unusable) `Turn`.
         Some("content_filter") => StopReason::Refusal,
-        // Never actually surfaced — `finish()` returns an `Err` before this value would be read — but
-        // still mapped explicitly (rather than falling into the `Some(other)` catch-all) so a
-        // `network_error` finish doesn't spuriously log as an "unrecognized finish_reason".
-        Some("network_error") => StopReason::Other,
+        // Never actually surfaced — `finish()` returns an `Err` before this value would be read (see
+        // `failed_finish`) — but still mapped explicitly (rather than falling into the `Some(other)`
+        // catch-all) so neither spuriously logs as an "unrecognized finish_reason".
+        Some("network_error") | Some("error") => StopReason::Other,
         Some(other) => {
             // A genuinely unrecognized value (a new finish_reason we don't know about yet) silently
             // collapsing into `Other` — which the loop treats identically to a normal `EndTurn` —
@@ -1005,11 +1010,13 @@ pub struct Decoder {
     saw_finish: bool,
     open: Open,
     stop_reason: StopReason,
-    /// Set when this stream's `finish_reason` was `"network_error"` — a transient transport fault
-    /// disguised as a normal completion, not a real answer. Checked in `finish()`, which returns an
-    /// `Err` instead of the usual `MessageStop` when set, so the turn reaches `run_turn`'s mid-stream
-    /// retry classifier instead of being reported as a successful (refused) turn with nothing to retry.
-    network_error: bool,
+    /// Set when this stream's `finish_reason` reported a failure rather than an answer: the error
+    /// `finish()` returns instead of the usual `MessageStop`, so the turn reaches `run_turn`'s
+    /// mid-stream retry classifier instead of being reported as a successful turn with nothing to
+    /// retry. `network_error` is a transient transport fault disguised as a normal completion;
+    /// `error` (OpenRouter and other routers) is the upstream provider failing mid-generation, which
+    /// was read as a clean end of turn.
+    failed_finish: Option<&'static str>,
     usage: TokenUsage,
     /// Which [`REASONING_FIELDS`] entry this stream's reasoning arrives on, once known — remembered
     /// as the `Thinking` block's `signature` so a later replay (`build_body`) sends it back under the
@@ -1040,7 +1047,7 @@ impl Default for Decoder {
             saw_finish: false,
             open: Open::None,
             stop_reason: StopReason::EndTurn,
-            network_error: false,
+            failed_finish: None,
             usage: TokenUsage::default(),
             reasoning_field: None,
             open_tools: Vec::new(),
@@ -1472,7 +1479,15 @@ impl StreamDecoder for Decoder {
         if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
             self.saw_finish = true;
             self.stop_reason = map_finish_reason(Some(reason));
-            self.network_error = reason == "network_error";
+            self.failed_finish = match reason {
+                "network_error" => Some("OpenAI finish_reason: network_error"),
+                // Worded so `is_retryable_mid_stream` recognizes it ("provider returned error",
+                // OpenRouter's own phrase for an upstream failure), like any in-band provider error.
+                "error" => {
+                    Some("OpenAI finish_reason: error (provider returned error mid-generation)")
+                }
+                _ => None,
+            };
             self.close_text_or_thinking(&mut out);
             self.close_tools(&mut out);
         }
@@ -1496,10 +1511,8 @@ impl StreamDecoder for Decoder {
         // spelling of it. Erroring here (instead of the usual `MessageStop`) routes it through
         // `run_turn`'s mid-stream retry classifier (`is_retryable_mid_stream` matches this message)
         // rather than reporting a "successful" turn the caller has no real answer for.
-        if self.network_error {
-            return Err(Error::Transport(
-                "OpenAI finish_reason: network_error".into(),
-            ));
+        if let Some(msg) = self.failed_finish {
+            return Err(Error::Transport(msg.into()));
         }
         Ok(vec![StreamEvent::MessageStop {
             stop_reason: self.stop_reason,
@@ -2579,6 +2592,46 @@ data: [DONE]
                 stop_reason: StopReason::Refusal
             })
         );
+    }
+
+    #[test]
+    fn an_error_finish_reason_is_a_retryable_transport_error_not_a_clean_end() {
+        // OpenRouter and other routers end a stream with `finish_reason:"error"` when the upstream
+        // provider fails mid-generation. Read as `Other` (a clean end), the partial reply was kept
+        // as the model's final answer.
+        const ERROR_FINISH: &str = r#"
+data: {"choices":[{"index":0,"delta":{"content":"partial an"},"finish_reason":null}]}
+
+data: {"choices":[{"index":0,"delta":{},"finish_reason":"error"}]}
+
+data: [DONE]
+"#;
+        let mut dec = Decoder::default();
+        let err = decode_sse(&mut dec, ERROR_FINISH).unwrap_err();
+        assert!(
+            crate::agent::is_retryable_mid_stream(&err),
+            "must be classified as mid-stream-retryable, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn model_length_and_max_tokens_finish_reasons_are_length_stops() {
+        for reason in ["length", "model_length", "max_tokens"] {
+            let sse = format!(
+                "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"cut of\"}},\"finish_reason\":null}}]}}\n\n\
+                 data: {{\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"{reason}\"}}]}}\n\n\
+                 data: [DONE]\n"
+            );
+            let mut dec = Decoder::default();
+            let events = decode_sse(&mut dec, &sse).unwrap();
+            assert_eq!(
+                events.last(),
+                Some(&StreamEvent::MessageStop {
+                    stop_reason: StopReason::MaxTokens
+                }),
+                "{reason}"
+            );
+        }
     }
 
     #[test]

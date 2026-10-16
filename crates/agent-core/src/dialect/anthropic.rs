@@ -1125,7 +1125,11 @@ fn map_stop_reason(s: Option<&str>) -> StopReason {
     match s {
         Some("end_turn") => StopReason::EndTurn,
         Some("tool_use") => StopReason::ToolUse,
-        Some("max_tokens") => StopReason::MaxTokens,
+        // `model_context_window_exceeded`: the reply ran into the context window before `max_tokens`
+        // (recent models return it instead of a 400 whenever prompt + `max_tokens` exceeds the
+        // window). It is a length stop all the same — read as `Other`, the loop's cut-off handling and
+        // silent-truncation recovery never ran.
+        Some("max_tokens") | Some("model_context_window_exceeded") => StopReason::MaxTokens,
         Some("stop_sequence") => StopReason::StopSequence,
         Some("refusal") => StopReason::Refusal,
         // `pause_turn` is Anthropic pausing a long-running turn it expects the client to *resubmit* to
@@ -3019,6 +3023,28 @@ data: {"type":"message_stop"}
         }));
         assert!(!events.contains(&StreamEvent::MessageStop {
             stop_reason: StopReason::EndTurn
+        }));
+    }
+
+    #[test]
+    fn model_context_window_exceeded_is_a_length_stop() {
+        // Recent models stop with `model_context_window_exceeded` when the reply runs into the
+        // context window before `max_tokens`. It must drive the same cut-off handling as
+        // `max_tokens`, not read as an unrecognized `Other`.
+        const WINDOW: &str = r#"
+event: message_start
+data: {"type":"message_start","message":{"id":"m","usage":{"input_tokens":5,"output_tokens":1}}}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"model_context_window_exceeded"},"usage":{"output_tokens":2}}
+
+event: message_stop
+data: {"type":"message_stop"}
+"#;
+        let mut dec = Decoder::default();
+        let events = decode_sse(&mut dec, WINDOW).unwrap();
+        assert!(events.contains(&StreamEvent::MessageStop {
+            stop_reason: StopReason::MaxTokens
         }));
     }
 

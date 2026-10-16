@@ -8264,11 +8264,30 @@ data: {"type":"response.function_call_arguments.delta","output_index":1,"delta":
 
 data: {"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":10,"output_tokens":4096}}}
 "#;
-        let wires: [(&str, Box<dyn crate::dialect::StreamDecoder>, &str); 3] = [
+        // Each wire's other spellings of a length stop: Anthropic's context-window stop, and Chat
+        // providers' `model_length`/`max_tokens`. They must drive the same cut-off handling.
+        let anthropic_window = ANTHROPIC.replace(
+            r#""stop_reason":"max_tokens""#,
+            r#""stop_reason":"model_context_window_exceeded""#,
+        );
+        let chat_model_length = CHAT_COMPLETIONS.replace(
+            r#""finish_reason":"length""#,
+            r#""finish_reason":"model_length""#,
+        );
+        let chat_max_tokens = CHAT_COMPLETIONS.replace(
+            r#""finish_reason":"length""#,
+            r#""finish_reason":"max_tokens""#,
+        );
+        let wires: [(&str, Box<dyn crate::dialect::StreamDecoder>, &str); 6] = [
             (
                 "anthropic",
                 Box::new(crate::dialect::anthropic::Decoder::default()),
                 ANTHROPIC,
+            ),
+            (
+                "anthropic context window",
+                Box::new(crate::dialect::anthropic::Decoder::default()),
+                &anthropic_window,
             ),
             (
                 "chat completions",
@@ -8276,11 +8295,24 @@ data: {"type":"response.incomplete","response":{"status":"incomplete","incomplet
                 CHAT_COMPLETIONS,
             ),
             (
+                "chat completions model_length",
+                Box::new(crate::dialect::openai::Decoder::default()),
+                &chat_model_length,
+            ),
+            (
+                "chat completions max_tokens",
+                Box::new(crate::dialect::openai::Decoder::default()),
+                &chat_max_tokens,
+            ),
+            (
                 "responses",
                 Box::new(crate::dialect::openai_responses::Decoder::default()),
                 RESPONSES,
             ),
         ];
+        assert_ne!(anthropic_window, ANTHROPIC);
+        assert_ne!(chat_model_length, CHAT_COMPLETIONS);
+        assert_ne!(chat_max_tokens, CHAT_COMPLETIONS);
         for (wire, mut decoder, sse) in wires {
             let events = crate::dialect::decode_sse(decoder.as_mut(), sse).unwrap();
             assert_eq!(
