@@ -2668,15 +2668,15 @@ fn resolve_startup_model_and_level(
 
 /// Depth of a session's inbound command queue, shared by all three transports.
 ///
-/// The counterpart to [`crate::serve_ws::OUT_CHANNEL_BOUND`] on the way *in*. The consumer is a single
+/// The counterpart to [`CONN_BACKLOG_MAX_BYTES`] on the way *in*. The consumer is a single
 /// session loop that runs one command to completion — and some commands are genuinely slow (a
 /// `list_sessions` walks the session directory) — so a client that pipelines faster than the loop drains
 /// will always be able to get ahead of it. Left unbounded, that queue is a client-driven allocation with
 /// no ceiling.
 ///
-/// Bounded, but explicitly **not** drop-on-full the way the outbound fanout and the `Pong` queue are:
-/// those carry frames whose loss is a cosmetic degradation, whereas a *dropped command* is a
-/// correctness bug — the client is left waiting on a response that will never come, with no signal that
+/// Bounded, but explicitly **not** shed-on-full the way the outbound side is (a connection that falls
+/// too far behind is closed, to reconnect and be caught up; a `Pong` is simply dropped): a *dropped
+/// command* is a correctness bug — the client is left waiting on a response that will never come, with no signal that
 /// anything went wrong. So a full queue makes the producer wait instead. On the WebSocket path that
 /// means the read loop stops pulling from the socket and TCP's own window carries the backpressure to
 /// the client; on HTTP POST the handler awaits the same send; on stdio it simply pauses the stdin
@@ -11351,8 +11351,8 @@ impl OutFrame {
     }
 }
 
-/// The set of connections currently attached to a session, each an unbounded sink the session's single
-/// writer task **broadcasts** every [`OutFrame`] to — so a phone and a TUI (or any N of the user's own
+/// The set of connections currently attached to a session, each a sink ([`OutSink`]) the session's
+/// single writer task **broadcasts** every [`OutFrame`] to — so a phone and a TUI (or any N of the user's own
 /// devices) on one session all render the same live stream, in the same order. Empty ⇒ detached, frames
 /// dropped by design; the session keeps running, and the next connection to attach is caught up from
 /// the committed history the fanout carries ([`OutFanout::add_with_catchup`] — see [`crate::serve_ws`]).
@@ -11361,27 +11361,135 @@ impl OutFrame {
 /// into channels, and — once per attach, never on the event path — across serializing the catch-up
 /// payload, which is precisely what makes "seed the history, then register the sink" atomic against a
 /// concurrent `broadcast`.
-/// One attached connection's output channel. A network transport (WebSocket/UDS) registers a
-/// **bounded** sink: a client whose socket has stalled under TCP backpressure (a locked phone, a dead
-/// tunnel) would otherwise let the still-running session buffer streamed frames without limit, growing
-/// memory until the OS TCP layer finally times the socket out. When the bounded channel fills,
-/// [`OutFanout::broadcast`] prunes the sink — a disconnect-on-full that drops the wedged connection and
-/// leaves it to reconnect and replay committed state via `get_messages {since}`. The in-process
-/// **stdio** transport is a single trusted local sink for the whole process life and stays
-/// **unbounded**: pruning it on a transient stdout stall would sever the only client.
+/// One attached connection's output channel. The in-process **stdio** transport is a single trusted
+/// local sink for the whole process life and stays **unbounded**: dropping it on a transient stdout
+/// stall would sever the only client. A network transport (WebSocket/UDS/HTTP POST) registers a
+/// [`ConnTx`] — buffered, but with a byte cap on its backlog, past which the connection is closed (see
+/// there).
 pub(crate) enum OutSink {
-    Bounded(mpsc::Sender<OutFrame>),
+    Bounded(ConnTx),
     Unbounded(mpsc::UnboundedSender<OutFrame>),
 }
 
 impl OutSink {
-    /// Non-blocking send. `Err` means the sink is dead (receiver gone) or — for a bounded sink — its
-    /// buffer is full (a stalled connection); [`OutFanout::broadcast`] prunes it either way.
+    /// Non-blocking send of a live frame. `Err` means the sink is dead: its receiver is gone, or — for
+    /// a [`ConnTx`] — its backlog passed the cap and the connection is being closed.
+    /// [`OutFanout::broadcast`] prunes it either way.
     fn try_send(&self, frame: OutFrame) -> Result<(), ()> {
         match self {
-            OutSink::Bounded(tx) => tx.try_send(frame).map_err(|_| ()),
+            OutSink::Bounded(tx) => tx.try_send(frame),
             OutSink::Unbounded(tx) => tx.send(frame).map_err(|_| ()),
         }
+    }
+
+    /// Queue a frame seeded on attach (the catch-up, the turn replay, kept views, the ending frame),
+    /// outside the backlog cap: see [`ConnTx::seed`].
+    fn seed(&self, frame: OutFrame) {
+        match self {
+            OutSink::Bounded(tx) => tx.seed(frame),
+            OutSink::Unbounded(tx) => {
+                let _ = tx.send(frame);
+            }
+        }
+    }
+}
+
+/// How many bytes of **live** output one network connection may have queued and not yet written to
+/// its socket before it is dropped (see [`ConnTx`]).
+///
+/// Sized from what a healthy client actually falls behind by. The daemon's runtime is single-threaded
+/// by default, so the session's writer moves everything one model read delivered — easily thousands of
+/// deltas — into the channel before the connection's send task runs at all; a 3000-delta burst is
+/// 252 KB queued at once (measured), against a client reading as fast as it can. 8 MiB is ~33× that,
+/// and it still bounds what a wedged connection can pin.
+pub(crate) const CONN_BACKLOG_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// A network connection's output channel: the session's broadcast on one end, the connection's send
+/// task (which writes the socket) on the other.
+///
+/// **Buffered by bytes, then dropped — and a dropped connection is closed.**
+///
+/// - *Why buffer, and why count bytes.* The bound exists so that a client whose socket has stalled (a
+///   locked phone, a dead tunnel) cannot make a still-running session buffer without limit. That is a
+///   memory bound, so it is counted in bytes. It used to be a 1024-frame channel, which measured the
+///   wrong thing: a single model read can carry more frames than that, and on the single-threaded
+///   runtime they all land before the socket writer gets a turn, so a client that never stopped
+///   reading was dropped mid-burst (`tests/serve_slow_client.rs`).
+/// - *Why not backpressure.* Nothing upstream can wait. The agent's event sink is synchronous, the
+///   session's one writer task feeds every attached connection (awaiting a slow one would stall the
+///   others), and approvals, elicitations and app frames are broadcast straight from synchronous code
+///   under the fanout's lock. A frame that does not fit cannot be delayed, only lost — and a lost frame
+///   is a silent hole in the client's stream, so the connection goes instead.
+/// - *Why the drop closes the socket.* Refusing a frame cancels [`dropped`](Self::dropped), which the
+///   connection's send and read loops both watch: the socket closes (`1013 Try Again Later`) and the
+///   client reconnects, to be caught up from history and the turn replay like any re-attach. Merely
+///   unregistering the sink used to leave the socket open — still pinging, still running the client's
+///   commands, never sending it another frame — so the client never knew to reconnect, and its
+///   session counted as attached and was never reaped.
+///
+/// Frames seeded on attach are queued outside the cap ([`seed`](Self::seed)): they are bounded
+/// already (by [`TURN_REPLAY_MAX_BYTES`] and the view budget), and refusing them would drop a client
+/// for reconnecting.
+#[derive(Clone)]
+pub(crate) struct ConnTx {
+    tx: mpsc::UnboundedSender<(OutFrame, usize)>,
+    backlog: Arc<std::sync::atomic::AtomicUsize>,
+    dropped: CancellationToken,
+}
+
+/// The receiving end of a [`ConnTx`], owned by the connection's send task.
+pub(crate) struct ConnRx {
+    rx: mpsc::UnboundedReceiver<(OutFrame, usize)>,
+    backlog: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// A network connection's output channel: see [`ConnTx`].
+pub(crate) fn conn_channel() -> (ConnTx, ConnRx) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let backlog = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    (
+        ConnTx {
+            tx,
+            backlog: backlog.clone(),
+            dropped: CancellationToken::new(),
+        },
+        ConnRx { rx, backlog },
+    )
+}
+
+impl ConnTx {
+    /// Queue a live frame, charged against [`CONN_BACKLOG_MAX_BYTES`]. A frame that does not fit is
+    /// refused and the connection dropped ([`Self::dropped`] fires); so is every frame after it.
+    pub(crate) fn try_send(&self, frame: OutFrame) -> Result<(), ()> {
+        if self.dropped.is_cancelled() {
+            return Err(());
+        }
+        let len = frame.approx_len();
+        let queued = self.backlog.fetch_add(len, Ordering::Relaxed);
+        if queued + len > CONN_BACKLOG_MAX_BYTES || self.tx.send((frame, len)).is_err() {
+            self.dropped.cancel();
+            return Err(());
+        }
+        Ok(())
+    }
+
+    /// Queue a frame outside the cap — for what [`OutFanout`] seeds a connection with on attach.
+    fn seed(&self, frame: OutFrame) {
+        let _ = self.tx.send((frame, 0));
+    }
+
+    /// Fires once this connection has been dropped for falling too far behind: its socket must close.
+    pub(crate) fn dropped(&self) -> CancellationToken {
+        self.dropped.clone()
+    }
+}
+
+impl ConnRx {
+    /// The next queued frame, or `None` once every [`ConnTx`] is gone.
+    pub(crate) async fn recv(&mut self) -> Option<OutFrame> {
+        let (frame, charged) = self.rx.recv().await?;
+        self.backlog.fetch_sub(charged, Ordering::Relaxed);
+        Some(frame)
     }
 }
 
@@ -11457,35 +11565,6 @@ struct AppViewFrames {
     bytes: usize,
 }
 
-/// Sends on capacity reserved up front, so they cannot be lost to a channel that later fills; for
-/// an unbounded sink (or if the reservation itself fails), a plain send.
-struct ReservedSends<'a> {
-    tx: &'a OutSink,
-    permits: Vec<mpsc::Permit<'a, OutFrame>>,
-}
-
-impl<'a> ReservedSends<'a> {
-    fn new(tx: &'a OutSink, n: usize) -> Self {
-        let permits = match tx {
-            OutSink::Bounded(sender) if n > 0 => sender
-                .try_reserve_many(n)
-                .map(Iterator::collect)
-                .unwrap_or_default(),
-            _ => Vec::new(),
-        };
-        Self { tx, permits }
-    }
-
-    fn send(&mut self, frame: OutFrame) {
-        match self.permits.pop() {
-            Some(permit) => permit.send(frame),
-            None => {
-                let _ = self.tx.try_send(frame);
-            }
-        }
-    }
-}
-
 fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
     !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
 }
@@ -11503,9 +11582,6 @@ fn app_replay_frame(raw: &Bytes) -> OutFrame {
 const APP_VIEWS_MAX: usize = 16;
 /// The byte budget for those views (a view's HTML is commonly a few hundred KiB, single-file bundled).
 const APP_VIEWS_MAX_BYTES: usize = 8 * 1024 * 1024;
-// The views are replayed right after the catch-up, into a connection's empty bounded channel, so
-// they always fit: a frame there cannot be lost to a full buffer.
-const _: () = assert!(crate::serve_ws::OUT_CHANNEL_BOUND > 1 + 2 * APP_VIEWS_MAX);
 // One view never exceeds the budget on its own (the agent refuses larger views outright).
 const _: () = assert!(crate::tools::mcp_apps::MAX_VIEW_BYTES < APP_VIEWS_MAX_BYTES);
 
@@ -11521,7 +11597,7 @@ impl OutFanout {
     /// Register a connection's sink; returns an id to [`remove`](Self::remove) it by on disconnect.
     pub(crate) fn add(&mut self, tx: OutSink) -> u64 {
         if let Some(ended) = &self.ended {
-            let _ = tx.try_send(ended.clone());
+            tx.seed(ended.clone());
         }
         let id = self.next_id;
         self.next_id += 1;
@@ -11575,7 +11651,7 @@ impl OutFanout {
         if (!self.history.is_empty() || self.recording)
             && let Ok(data) = messages_payload(&self.history, &self.history_ids, None)
         {
-            let _ = tx.try_send(OutFrame::Value(json!({
+            tx.seed(OutFrame::Value(json!({
                 "type": "catchup",
                 "data": data,
                 // The turn in flight, if any, follows as replayed frames — unless it outgrew the
@@ -11588,9 +11664,8 @@ impl OutFanout {
         // The session's open MCP App views, each in its place: a view opened by a tool call in the
         // turn being replayed goes right after that call's `tool_start`, so a renderer never sees a
         // view before the call it belongs to; a view from an earlier turn (whose `tool_start` is in
-        // the catch-up's history) goes first. Every view frame is sent on capacity reserved up front,
-        // while the channel is still all but empty (see the assertion beside `APP_VIEWS_MAX`), so a
-        // long turn recording overflowing the buffer can drop turn frames but never a view.
+        // the catch-up's history) goes first. Everything seeded here is queued outside the
+        // connection's backlog cap (`ConnTx::seed`), so none of it can be refused.
         let anchors: Vec<Option<usize>> = self
             .app_views
             .iter()
@@ -11605,20 +11680,14 @@ impl OutFanout {
                 })
             })
             .collect();
-        let view_frames: usize = self
-            .app_views
-            .iter()
-            .map(|v| 1 + usize::from(v.result.is_some()))
-            .sum();
-        let mut reserved = ReservedSends::new(&tx, view_frames);
-        let send_view = |view: &AppViewFrames, reserved: &mut ReservedSends<'_>| {
+        let send_view = |view: &AppViewFrames| {
             for frame in std::iter::once(&view.open).chain(view.result.as_ref()) {
-                reserved.send(app_replay_frame(frame));
+                tx.seed(app_replay_frame(frame));
             }
         };
         for (view, anchor) in self.app_views.iter().zip(&anchors) {
             if anchor.is_none() {
-                send_view(view, &mut reserved);
+                send_view(view);
             }
         }
         // Replay the in-flight turn *after* the catch-up and *before* the sink goes live: the base
@@ -11627,14 +11696,13 @@ impl OutFanout {
         // concurrent `broadcast` can neither interleave with the replay nor slip in between it and the
         // registration below.
         for (index, frame) in self.turn.iter().enumerate() {
-            let _ = tx.try_send(frame.clone());
+            tx.seed(frame.clone());
             for (view, anchor) in self.app_views.iter().zip(&anchors) {
                 if *anchor == Some(index) {
-                    send_view(view, &mut reserved);
+                    send_view(view);
                 }
             }
         }
-        drop(reserved);
         self.add(tx)
     }
 
@@ -11786,7 +11854,7 @@ impl OutFanout {
         for view in &self.app_views {
             for frame in std::iter::once(&view.open).chain(view.result.as_ref()) {
                 for (_, tx) in &self.sinks {
-                    let _ = tx.try_send(app_replay_frame(frame));
+                    tx.seed(app_replay_frame(frame));
                 }
             }
         }
@@ -12303,6 +12371,91 @@ mod tests {
             "{} bytes kept",
             snapshot.len()
         );
+    }
+
+    /// A live frame of `len` bytes, numbered so a receiver can check order.
+    fn sized_frame(i: usize, len: usize) -> OutFrame {
+        let mut line = format!("{i:08}").into_bytes();
+        line.resize(len, b'x');
+        OutFrame::Raw(Bytes::from(line))
+    }
+
+    fn frame_number(frame: &OutFrame) -> usize {
+        let OutFrame::Raw(line) = frame else {
+            panic!("not a raw frame")
+        };
+        std::str::from_utf8(&line[..8]).unwrap().parse().unwrap()
+    }
+
+    #[test]
+    fn a_connection_past_its_backlog_cap_is_dropped_and_told_to_close() {
+        let (tx, mut rx) = conn_channel();
+        let dropped = tx.dropped();
+        let mut fanout = OutFanout::default();
+        fanout.add(OutSink::Bounded(tx));
+        let frame_len = 64 * 1024;
+        let fits = CONN_BACKLOG_MAX_BYTES / frame_len;
+        for i in 0..fits {
+            fanout.broadcast(sized_frame(i, frame_len));
+        }
+        assert!(
+            !dropped.is_cancelled() && !fanout.is_empty(),
+            "dropped at the cap, not past it"
+        );
+        // One frame more than fits: the connection goes, and is told to close its socket — rather
+        // than being silently unregistered while it stays open.
+        fanout.broadcast(sized_frame(fits, frame_len));
+        assert!(dropped.is_cancelled());
+        assert!(fanout.is_empty());
+        // What it was sent is whole and in order, with nothing after the refused frame.
+        let mut got = Vec::new();
+        while let Ok((frame, _)) = rx.rx.try_recv() {
+            got.push(frame_number(&frame));
+        }
+        assert_eq!(got, (0..fits).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_connection_that_keeps_draining_is_never_dropped() {
+        // Many times the cap in total, but never more than a little of it queued at once.
+        let (tx, mut rx) = conn_channel();
+        let dropped = tx.dropped();
+        let mut fanout = OutFanout::default();
+        fanout.add(OutSink::Bounded(tx));
+        let frame_len = 64 * 1024;
+        let total = 4 * CONN_BACKLOG_MAX_BYTES / frame_len;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        for i in 0..total {
+            fanout.broadcast(sized_frame(i, frame_len));
+            if i % 16 == 15 {
+                for _ in 0..16 {
+                    rt.block_on(rx.recv()).unwrap();
+                }
+            }
+        }
+        assert!(!dropped.is_cancelled() && !fanout.is_empty());
+    }
+
+    #[test]
+    fn frames_seeded_on_attach_do_not_count_against_the_backlog_cap() {
+        // A reconnect is seeded with the turn replay and kept views — together more than the cap can
+        // be — and must not be dropped for it.
+        let mut fanout = OutFanout::default();
+        fanout.begin_turn();
+        let frame_len = 64 * 1024;
+        for i in 0..TURN_REPLAY_MAX_BYTES / frame_len {
+            fanout.broadcast(sized_frame(i, frame_len));
+        }
+        let (tx, _rx) = conn_channel();
+        let dropped = tx.dropped();
+        for i in 0..2 * CONN_BACKLOG_MAX_BYTES / frame_len {
+            OutSink::Bounded(tx.clone()).seed(sized_frame(i, frame_len));
+        }
+        fanout.add_with_catchup(OutSink::Bounded(tx));
+        fanout.broadcast(sized_frame(0, 256));
+        assert!(!dropped.is_cancelled() && !fanout.is_empty());
     }
 
     #[test]

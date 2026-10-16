@@ -102,13 +102,14 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Duration, MissedTickBehavior};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::handshake::server::create_response;
+use tokio_tungstenite::tungstenite::protocol::frame::{CloseFrame, coding::CloseCode};
 use tokio_tungstenite::tungstenite::protocol::{Role, WebSocketConfig};
 use tokio_tungstenite::tungstenite::{Message, Utf8Bytes};
 use tokio_util::sync::CancellationToken;
 
 use crate::serve::{
-    OutFanout, OutFrame, OutSink, ServeConfig, SharedOutConn, Signal, UpstreamHttp2, frame_to_line,
-    lock_ignoring_poison, serve_session,
+    OutFanout, OutFrame, OutSink, ServeConfig, SharedOutConn, Signal, UpstreamHttp2, conn_channel,
+    frame_to_line, lock_ignoring_poison, serve_session,
 };
 use crate::service::{Refusal, ServiceSession, Shards};
 use crate::session_store::{
@@ -155,14 +156,6 @@ const SESSION_LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 /// How often the server sends an unsolicited `Ping` so an idle mobile connection isn't reaped by
 /// NAT/proxies. Also the granularity at which a wholly-dead socket is noticed (the ping send fails).
 const PING_INTERVAL: Duration = Duration::from_secs(30);
-
-/// Depth of a single connection's outbound frame buffer. Bounds memory per attached socket: if a
-/// client's write half stalls under TCP backpressure without erroring, the session keeps broadcasting
-/// streamed frames into this channel — cap it so a wedged connection can't grow memory without limit
-/// (`OutFanout::broadcast` prunes the sink when it fills, dropping the dead connection). Sized to
-/// absorb a normal burst of streamed event frames while keeping the worst-case per-connection buffer
-/// to a few MB.
-pub(crate) const OUT_CHANNEL_BOUND: usize = 1024;
 
 /// Depth of a single connection's control-frame queue (the `Pong`s the read loop owes the client for
 /// its `Ping`s). Its drain is the send task, which stalls for as long as the socket's write half is
@@ -1145,7 +1138,11 @@ impl Supervisor {
 
         // Register this connection's send channel as one of the session's output sinks — the session
         // broadcasts every frame to all registered sinks. Keep the `sink_id` to remove it on disconnect.
-        let (conn_tx, mut conn_rx) = mpsc::channel::<OutFrame>(OUT_CHANNEL_BOUND);
+        let (conn_tx, mut conn_rx) = conn_channel();
+        // Fires when the session drops this connection for falling too far behind on its output
+        // (`serve::ConnTx`): both loops below watch it, and the socket closes so the client reconnects
+        // and is caught up. Without it the socket stayed open and silent forever.
+        let dropped = conn_tx.dropped();
         // A direct handle to *this* connection's send channel, for supervisor-level replies (the
         // `list_daemon_sessions` command below) that must go back to *this* socket only, not fan out to
         // the other attached connections. Feeds the same `conn_rx`/send task.
@@ -1168,46 +1165,69 @@ impl Supervisor {
         let (ctrl_tx, mut ctrl_rx) = mpsc::channel::<Message>(CTRL_CHANNEL_BOUND);
         // Stops this connection's send task at teardown (when its read loop ends on socket close). The
         // send task also stops on its own if `conn_rx` closes (this connection's sink removed + `reply_tx`
-        // dropped).
+        // dropped), or when the connection is `dropped`.
         let send_cancel = CancellationToken::new();
         let send_task_cancel = send_cancel.clone();
+        let send_task_dropped = dropped.clone();
         let mut send_task = tokio::spawn(async move {
-            let mut ping = tokio::time::interval(PING_INTERVAL);
-            ping.set_missed_tick_behavior(MissedTickBehavior::Skip);
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = send_task_cancel.cancelled() => break,
-                    // A closed `conn_rx` means we were superseded (out_conn rebound) or the session
-                    // ended — stop writing to this socket.
-                    // A closed `conn_rx` means this connection's sink was removed (teardown) — stop.
-                    frame = conn_rx.recv() => match frame {
-                        Some(frame) => if let Some(line) = frame_to_line(frame) {
-                            // `line` is already valid UTF-8 (built from a `String`); `try_from` only
-                            // re-validates — no copy — to hand the same `Bytes` to a text frame.
-                            match Utf8Bytes::try_from(line) {
-                                Ok(text) => if sink.send(Message::Text(text)).await.is_err() {
-                                    break;
-                                },
-                                Err(e) => eprintln!("serve: non-utf8 output frame skipped: {e}"),
-                            }
+            let writing = async {
+                let mut ping = tokio::time::interval(PING_INTERVAL);
+                ping.set_missed_tick_behavior(MissedTickBehavior::Skip);
+                loop {
+                    tokio::select! {
+                        biased;
+                        // A closed `conn_rx` means this connection's sink was removed (teardown) — stop.
+                        frame = conn_rx.recv() => match frame {
+                            Some(frame) => if let Some(line) = frame_to_line(frame) {
+                                // `line` is already valid UTF-8 (built from a `String`); `try_from` only
+                                // re-validates — no copy — to hand the same `Bytes` to a text frame.
+                                match Utf8Bytes::try_from(line) {
+                                    Ok(text) => if sink.send(Message::Text(text)).await.is_err() {
+                                        break;
+                                    },
+                                    Err(e) => eprintln!("serve: non-utf8 output frame skipped: {e}"),
+                                }
+                            },
+                            None => break,
                         },
-                        None => break,
-                    },
-                    ctrl = ctrl_rx.recv() => {
-                        if let Some(msg) = ctrl
-                            && sink.send(msg).await.is_err() {
+                        ctrl = ctrl_rx.recv() => {
+                            if let Some(msg) = ctrl
+                                && sink.send(msg).await.is_err() {
+                                    break;
+                                }
+                        },
+                        _ = ping.tick() => {
+                            if sink.send(Message::Ping(Vec::new().into())).await.is_err() {
                                 break;
                             }
-                    },
-                    _ = ping.tick() => {
-                        if sink.send(Message::Ping(Vec::new().into())).await.is_err() {
-                            break;
                         }
                     }
                 }
+            };
+            // Either token ends the writing at once — including mid-`send` to a socket whose client has
+            // stopped reading, where a send never completes. (They used to be checked only between
+            // sends, so a teardown waiting on this task could wait forever on such a client.)
+            tokio::select! {
+                biased;
+                () = send_task_cancel.cancelled() => {}
+                () = send_task_dropped.cancelled() => {}
+                () = writing => {}
             }
-            let _ = sink.close().await;
+            // Bounded for the same reason: a `Close` is queued behind whatever the client left unread.
+            let _ = tokio::time::timeout(CLOSE_HANDSHAKE_WAIT, async {
+                if send_task_dropped.is_cancelled() {
+                    let _ = sink
+                        .send(Message::Close(Some(CloseFrame {
+                            code: CloseCode::Again,
+                            reason:
+                                "fell too far behind the session's output; reconnect to catch up"
+                                    .into(),
+                        })))
+                        .await;
+                }
+                let _ = sink.close().await;
+            })
+            .await;
         });
 
         // Set when the read loop ends because the *session* went away rather than the client. It
@@ -1243,6 +1263,9 @@ impl Supervisor {
                     session_ended = true;
                     break;
                 }
+                // Dropped for falling too far behind: the send task is closing the socket. Stop
+                // taking commands whose answers this connection would never be sent.
+                () = dropped.cancelled() => break,
                 msg = stream.next() => {
                     let Some(msg) = msg else { break }; // socket closed
                     let msg = match msg {
@@ -1335,6 +1358,11 @@ impl Supervisor {
             })
             .await;
             joined
+        } else if dropped.is_cancelled() {
+            // The send task is already writing the `Close` (itself bounded); let it.
+            tokio::time::timeout(JOIN_GRACE, &mut send_task)
+                .await
+                .is_ok()
         } else {
             false
         };
@@ -2623,7 +2651,8 @@ where
         .pin(requested_id, service)
         .await
         .map_err(HttpError::from)?;
-    let (conn_tx, mut conn_rx) = mpsc::channel::<OutFrame>(OUT_CHANNEL_BOUND);
+    let (conn_tx, mut conn_rx) = conn_channel();
+    let dropped = conn_tx.dropped();
     // No catch-up: a POST is one command's reply, not a streaming attach. Seeding history here
     // would dump the transcript into a buffer the waiter has to skip, and could fill it before the
     // ack ever arrived.
@@ -2666,6 +2695,13 @@ where
                     {
                         return Ok((v["type"].as_str() == Some("ack"), frame));
                     }
+                }
+                // Every sender gone: the session ended, or dropped this request for falling too far
+                // behind its output (`serve::ConnTx`) — retryable, unlike the first.
+                None if dropped.is_cancelled() => {
+                    return Err(HttpError::Unavailable(
+                        "fell too far behind the session's output",
+                    ));
                 }
                 None => return Err(HttpError::BadRequest("session ended")),
             }

@@ -90,7 +90,10 @@ The harness layers several capabilities over the bare tools + loop:
   connections can attach to one session at once** (the user's own
   phone + TUI): the session's output is **broadcast** to every attached connection (`serve::OutFanout`,
   with a zero-copy fast path for the single-connection case) and input is shared (any device drives; the
-  others watch live). Query responses (`get_state`/`get_messages`) broadcast too, so clients correlate
+  others watch live). A connection that falls more than `CONN_BACKLOG_MAX_BYTES` (8 MiB) of live
+  output behind is closed (`1013`), to reconnect and be caught up — see
+  [Why a slow connection is closed](#why-a-slow-connection-is-closed-not-backpressured-or-silently-dropped).
+  Query responses (`get_state`/`get_messages`) broadcast too, so clients correlate
   `response`s by the `id` they sent; `list_daemon_sessions` is unicast to its requester.
   Auth is **not** this crate's concern by default: `serve_ws` binds loopback/internal only and trusts
   the front door (the edge) — it never parses a user token. The exception is `--service`, where every
@@ -3041,7 +3044,7 @@ never cached.
 **Reconnect replay.** `mcp_app_open`/`mcp_app_result` go through `OutFanout::broadcast_app`, which
 keeps each view's frames — as their final JSON text, so `OutFrame::approx_len` is exact and a replay is
 a copy — for the 16 newest views within 8 MiB, beside the session's attached-connection set, and
-replays them, marked `replay: true`, to every connection that attaches, inside the same critical section as the catch-up: a view opened by a call in the turn being replayed goes **right after that call's `tool_start`**, so a renderer never meets a view before its call; a view from an earlier turn (whose `tool_start` is in the catch-up's history) goes right after the `catchup`. Every view frame is sent on channel capacity **reserved before** the turn replay (`try_reserve_many`, while the channel is all but empty — a compile-time assertion keeps `OUT_CHANNEL_BOUND` above the most view frames there can be), so a turn recording that overflows the buffer can drop turn frames but never a view, and none is delivered twice. A client that reconnects after the run reopens the view
+replays them, marked `replay: true`, to every connection that attaches, inside the same critical section as the catch-up: a view opened by a call in the turn being replayed goes **right after that call's `tool_start`**, so a renderer never meets a view before its call; a view from an earlier turn (whose `tool_start` is in the catch-up's history) goes right after the `catchup`. Every seeded frame — catch-up, views, turn replay — is queued outside the connection's backlog cap (`ConnTx::seed`, see [Why a slow connection is closed](#why-a-slow-connection-is-closed-not-backpressured-or-silently-dropped)), so none can be refused and none is delivered twice. A client that reconnects after the run reopens the view
 and gets its result; one that attaches while the view's tool runs gets the open view replayed and its
 result live. View frames are deliberately not recorded into the turn replay, which is dropped when
 the run ends while the view lives on. No single view can exceed the budget (`MAX_VIEW_BYTES` is under
@@ -3434,6 +3437,37 @@ stops reading, stdout's write eventually fails and the writer tears down,
 surfacing the stall as a closed session rather than masking it with dropped frames or unbounded
 buffering. Every frame — events and responses — flows through this one task, so output is FIFO and
 never interleaves even though tool execution itself is concurrent.
+
+### Why a slow connection is closed, not backpressured or silently dropped
+
+Each network connection (WebSocket, UDS, HTTP POST) has its own outbound queue between the session's
+broadcast and the task that writes its socket (`serve::ConnTx`/`ConnRx`). That queue has to be bounded
+— a locked phone or a dead tunnel must not make a still-running session buffer without limit — and the
+bound is **bytes of live output not yet written** (`CONN_BACKLOG_MAX_BYTES`, 8 MiB), not frames.
+
+- **Bytes, because a frame count measures the wrong thing.** The queue used to be a 1024-frame
+  channel. The daemon's runtime is single-threaded by default, so the session's writer moves everything
+  one model read delivered into the queue before the socket writer gets a turn: a 3000-delta burst
+  measured 252 KB queued at once, and a client that never stopped reading was dropped after ~1000
+  frames. 8 MiB is ~33× that burst and still bounds what a wedged connection can pin.
+- **Not backpressure, because nothing upstream can wait.** The agent's event sink is synchronous; the
+  session's one writer task feeds every attached connection, so awaiting a slow one stalls the others;
+  and approval, elicitation and app frames are broadcast from synchronous code under the fanout's lock.
+  A frame that does not fit can only be lost, and a lost frame is a silent hole in the client's stream —
+  so the connection goes instead.
+- **Dropped means closed.** Refusing a frame cancels the connection's `dropped` token. Its send task
+  stops writing at once (even mid-send to a socket nobody reads), sends `Close` `1013 Try Again Later`
+  (bounded by `CLOSE_HANDSHAKE_WAIT`), and its read loop stops taking commands and unpins, so the idle
+  reaper's clock starts. The client reconnects and is caught up from history plus the turn replay; the
+  frames seeded on attach do not count against the cap (`ConnTx::seed`), so a reconnect is never
+  dropped for its own replay. An HTTP POST dropped this way answers `503`. Before, a dropped sink was
+  only unregistered: the connection's own reply handle kept the socket open, so the client kept getting
+  pings and its commands kept running, but it never received another frame, never reconnected, and its
+  session counted as attached forever.
+
+`tests/serve_slow_client.rs` pins both halves end to end: a reading client gets every frame of a
+3000-delta burst, and a client that stops reading during a 24 MiB turn sees its socket close and
+re-attaches.
 
 ### Why the stdout guard is a compile-time lint, not a runtime patch
 
