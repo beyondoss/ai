@@ -951,17 +951,39 @@ impl Bash {
         }
         // Kill it — every process it started, or its remote stream — and wait for the kill, so a
         // caller that checks side effects right after sees the command gone.
-        if let Some(kill) = job.shared.untrack() {
-            let _ = tokio::task::spawn_blocking(move || kill.kill()).await;
-        }
+        let survived = match job.shared.untrack() {
+            Some(kill) => tokio::task::spawn_blocking(move || kill.kill())
+                .await
+                .unwrap_or_default(),
+            None => None,
+        };
         job.handle.abort();
         let _ = tokio::time::timeout(Duration::from_secs(5), &mut job.handle).await;
         let snap = job.shared.take_segment();
         let running = job.started.elapsed().as_secs();
         drop(job);
         let text = clean(format_output(&snap, ""));
-        Ok(append_status(&text, &format!("Job {id} killed after {running} s.")).into())
+        match survived {
+            None => Ok(append_status(&text, &format!("Job {id} killed after {running} s.")).into()),
+            // Not "killed": they still run, and nothing tracks them any more.
+            Some(left) => Err(ToolError::Execution(append_status(
+                &text,
+                &format!(
+                    "Job {id} was sent SIGTERM and then SIGKILL after {running} s, but {}",
+                    survived_note(&left)
+                ),
+            ))),
+        }
     }
+}
+
+/// What to say about processes a kill could not stop.
+pub(crate) fn survived_note(left: &str) -> String {
+    format!(
+        "{left} could not be killed (permission denied: it runs as another user, e.g. under sudo) \
+         and is still running, no longer tracked as a job. Stop it with the privilege that started \
+         it."
+    )
 }
 
 /// How a `bash` call starts its command.
@@ -1369,6 +1391,10 @@ mod jobs_tests;
 #[cfg(all(test, target_os = "linux"))]
 #[path = "bash_background_tests.rs"]
 mod background_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "bash_kill_tests.rs"]
+mod kill_tests;
 
 #[cfg(test)]
 mod tests {

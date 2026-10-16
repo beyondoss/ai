@@ -116,15 +116,49 @@ pub enum Kill {
 }
 
 impl Kill {
-    /// Stop the command. **Blocking**: called from a dedicated OS thread (a dropped job, the exit
-    /// path) or `spawn_blocking` (a `bash_job` kill), never on a runtime worker, so a hook may wait
-    /// for its runner to confirm.
-    pub fn kill(&self) {
-        match self {
-            Kill::Procs(group) => group.kill(),
-            Kill::Hook(hook) => hook(),
+    /// Stop the command — see [`kill_all`], which this is for one. **Blocking**: called from a
+    /// dedicated OS thread (a dropped job, the exit path) or `spawn_blocking` (a `bash_job` kill),
+    /// never on a runtime worker, so a hook may wait for its runner to confirm. A description of
+    /// any process that survived it.
+    pub fn kill(&self) -> Option<String> {
+        kill_all(std::slice::from_ref(self)).pop().flatten()
+    }
+}
+
+/// Stop several commands at once, spending one SIGTERM grace for all of them: SIGTERM every local
+/// job's processes, run the remote hooks (which overlap the grace), wait out what is left of
+/// [`super::bash_proc::TERM_GRACE`] for the local processes to exit, then SIGKILL-sweep them. Per
+/// command, in order: a description of the processes still running after it — ones we may not
+/// signal, e.g. the root child of a `sudo` — or `None`. Blocking, as [`Kill::kill`].
+pub fn kill_all(kills: &[Kill]) -> Vec<Option<String>> {
+    use std::time::Instant;
+    let deadline = Instant::now() + super::bash_proc::TERM_GRACE;
+    let groups: Vec<&super::bash_proc::ProcGroup> = kills
+        .iter()
+        .filter_map(|k| match k {
+            Kill::Procs(g) => Some(g),
+            Kill::Hook(_) => None,
+        })
+        .collect();
+    for group in &groups {
+        group.terminate();
+    }
+    for kill in kills {
+        if let Kill::Hook(hook) = kill {
+            hook();
         }
     }
+    super::bash_proc::await_exit(&groups, deadline);
+    kills
+        .iter()
+        .map(|k| match k {
+            Kill::Procs(g) => {
+                let left = g.sweep();
+                (!left.is_empty()).then(|| super::bash_proc::describe(&left))
+            }
+            Kill::Hook(_) => None,
+        })
+        .collect()
 }
 
 /// What a caller that keeps a command running past its own return (`bash`'s jobs) hears from
