@@ -825,7 +825,24 @@ impl Bash {
         let shell_status = exit_status_line(shell, job.started.elapsed().as_secs());
         job.kind = JobKind::Adopted;
         let lifetime = self.jobs.lifetime(job.kind);
+        // An instance that never detaches has no `bash_job` beside it and nobody to tell when the
+        // processes exit: `serve`'s host `bash`, whose caller is a client, not the model.
         let note = match self.jobs.park_intended(job) {
+            Ok(_) if !self.detaches() => {
+                format!(
+                    "The command exited but left {left} running; it runs until the session ends."
+                )
+            }
+            Err((job, _)) if !self.detaches() => {
+                if let Some(group) = job.shared.untrack() {
+                    let _ = tokio::task::spawn_blocking(move || group.kill()).await;
+                }
+                drop(job);
+                format!(
+                    "The command exited but left {left} running. It was stopped: {MAX_INTENDED_JOBS} \
+                     commands' leftover processes are already running in this session."
+                )
+            }
             Ok(id) => format!(
                 "The command exited but left {left} running; it is tracked as job {id} \
                  ({lifetime}). You will be told when it exits. bash_job {{\"job\": {id}, \"kill\": \

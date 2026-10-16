@@ -2916,6 +2916,15 @@ pub(crate) async fn serve_session(
     let bash_jobs = exec_cell.bash_jobs().clone();
     bash_jobs.set_policy(crate::tools::bash_jobs::EndPolicy::KeepRunning);
     let mut bash_jobs_wake = bash_jobs.subscribe();
+    // What the host `bash` command (the client's own, not the model's) leaves running (`cmd &`).
+    // A table of its own, so those processes never reach the model: no finish notice, no wake (a
+    // paid turn the client never asked for, quoting output it may have excluded from context), no
+    // `<background-jobs>` carry. Nothing reads notices from it; they live until they exit or the
+    // session ends, and a transcript switch leaves them alone (they belong to the client, not to a
+    // history).
+    let host_bash_jobs = Arc::new(crate::tools::bash_jobs::BashJobs::new(
+        crate::tools::bash_jobs::EndPolicy::KeepRunning,
+    ));
     let mut bash_jobs_transcript = persistence.transcript();
     // Per-session MCP kit gate (which configured servers' tools are advertised). Defaults to all
     // enabled — matching prior behavior — and is cleared on session switch so tenants cannot inherit
@@ -3080,7 +3089,7 @@ pub(crate) async fn serve_session(
         &exec_cell,
         &mcp_enabled,
         &skills,
-        false,
+        None,
     );
     let has_read = startup_tools.get("read").is_some();
     let has_todo = startup_tools.get(crate::tools::todo::NAME).is_some();
@@ -3646,7 +3655,7 @@ pub(crate) async fn serve_session(
         &exec_cell,
         &mcp_enabled,
         &skills,
-        true,
+        Some(&host_bash_jobs),
     )
     .get("bash");
     // The same deny-list `build_agent` installs as an `AgentHooks` gate on the model's own tool calls —
@@ -6294,7 +6303,7 @@ pub(crate) async fn serve_session(
                     &exec_cell,
                     &mcp_enabled,
                     &skills,
-                    false,
+                    None,
                 )
                 .names()
                 .into_iter()
@@ -6825,7 +6834,7 @@ pub(crate) async fn serve_session(
                     &exec_cell,
                     &mcp_enabled,
                     &skills,
-                    false,
+                    None,
                 );
                 let mut tool_defs = registry.definitions();
                 tool_defs.extend(registry.deferred_definitions());
@@ -8227,6 +8236,9 @@ pub(crate) async fn serve_session(
                     ));
                     continue;
                 };
+                // Nobody reads the client's table for notices, so its ended jobs are dropped here
+                // rather than kept for a `bash_job` that cannot reach them.
+                host_bash_jobs.forget_ended();
                 let mut input = json!({ "command": command });
                 if let Some(cwd) = cmd.get("cwd").and_then(Value::as_str) {
                     input["cwd"] = json!(cwd);
@@ -8751,9 +8763,14 @@ pub(crate) async fn serve_session(
     // stall every other session).
     let stopped_jobs = {
         let jobs = bash_jobs.clone();
-        tokio::task::spawn_blocking(move || jobs.stop_all())
-            .await
-            .unwrap_or_default()
+        let host_jobs = host_bash_jobs.clone();
+        tokio::task::spawn_blocking(move || {
+            // The client's are stopped too, but not reported as the model's jobs.
+            host_jobs.stop_all();
+            jobs.stop_all()
+        })
+        .await
+        .unwrap_or_default()
     };
     if !stopped_jobs.is_empty() {
         // Best effort: the client may already be gone.
@@ -8979,7 +8996,7 @@ fn build_subagent_ctx(
         exec,
         &crate::tools::mcp::McpEnabledSet::new(),
         skills,
-        false,
+        None,
     );
     crate::tools::apply_filter(
         &mut probe,
@@ -9105,7 +9122,7 @@ fn build_agent(
         ..compaction_config(cfg, model)
     };
 
-    let mut registry = build_tools(cfg, image_auto_resize, exec, mcp_enabled, skills, false);
+    let mut registry = build_tools(cfg, image_auto_resize, exec, mcp_enabled, skills, None);
     // Registered here, not in `build_tools`, because this is where `write_locks` is in scope — the ctx
     // needs the same registry every child shares. Reused across rebuilds; the ctx's factory handles the
     // per-child model itself, so a `set_model` rebuild doesn't invalidate it.
@@ -9418,15 +9435,16 @@ fn tool_root(cfg: &ServeConfig) -> std::path::PathBuf {
         .unwrap_or_default()
 }
 
-/// `bash_waits_for_exit`: see [`tools::ToolConfig::bash_waits_for_exit`] — only the host `bash`
-/// command's own instance sets it.
+/// `host_bash_jobs`: `Some` only for the host `bash` command's own instance, which waits for every
+/// command to exit (see [`tools::ToolConfig::bash_waits_for_exit`]) and parks what a command leaves
+/// running in this table — the client's, not the model's (see `host_bash_jobs` in `serve_session`).
 fn build_tools(
     cfg: &ServeConfig,
     image_auto_resize: bool,
     exec: &crate::exec_endpoint::ExecCell,
     mcp_enabled: &crate::tools::mcp::McpEnabledSet,
     skills: &[crate::skills::Skill],
-    bash_waits_for_exit: bool,
+    host_bash_jobs: Option<&Arc<crate::tools::bash_jobs::BashJobs>>,
 ) -> agent_core::ToolRegistry {
     // Task #34 (pi-parity fix): previously always called the plain `default_registry_with_prefix`,
     // hardcoding `image_auto_resize: true` regardless of `cfg.image_auto_resize` — `run`'s identical
@@ -9443,7 +9461,7 @@ fn build_tools(
     let empty: &[String] = &[];
     let nested_exclude = cfg.exclude_tools.as_deref().unwrap_or(empty);
     let mut registry = tools::default_registry_with_config(&tools::ToolConfig {
-        bash_waits_for_exit,
+        bash_waits_for_exit: host_bash_jobs.is_some(),
         bash_shell_path: cfg.bash_shell_path.as_deref(),
         bash_command_prefix: cfg.bash_command_prefix.as_deref(),
         web_allow_private: cfg.web_allow_private,
@@ -9462,9 +9480,14 @@ fn build_tools(
         fs_backend: Some(exec.backend()),
         command_runner: Some(exec.runner()),
         skills,
-        // The session's, not this registry's: a rebuild (`set_model`) keeps the jobs, the host
-        // `bash` command adopts into the same table, and the idle session wakes on it.
-        bash_jobs: Some(exec.bash_jobs().clone()),
+        // The session's, not this registry's: a rebuild (`set_model`) keeps the jobs, and the idle
+        // session wakes on them. The host `bash` command's instance gets the client's table instead:
+        // what a client's command leaves running is not the model's to be told about.
+        bash_jobs: Some(
+            host_bash_jobs
+                .cloned()
+                .unwrap_or_else(|| exec.bash_jobs().clone()),
+        ),
         // In service mode a relative path the model writes belongs in the tenant's workspace, not
         // wherever this replica's process happens to have been started. Empty (= the process cwd)
         // for every other caller, which is the pre-service behavior.
