@@ -137,7 +137,12 @@ The harness layers several capabilities over the bare tools + loop:
   it a naming split the repo's own `find_path` (`_<id>.jsonl`) couldn't resolve, so daemon sessions were
   listable but not openable by id. Because the key is an address something routes on, `new_session`
   **keeps** it: the outgoing conversation is archived into a sibling session (`parent` = the slot) and the
-  slot is blanked in place, so a client's address never goes stale. Creating a genuinely new session is a
+  slot is blanked in place, so a client's address never goes stale. Blanking in place
+  (`SessionStore::reset_for_new_session`, also single-file mode's `new_session`) keeps nothing of the old
+  conversation: not its abandoned branches (a narrow `rewrite` carries off-path entries along; the reset
+  used to as well, so the "new" session's file and tree still held every branch of the old one), not its
+  title, and not its compaction/branch-summary counters — the reset is not a compaction and no longer
+  counts as one (`tests/session_new_session_reset.rs`). Creating a genuinely new session is a
   routing operation — connect with a new `?session_id=`. A third daemon facility, **shared upstream
   pooling** (`--upstream-http2 <off|auto|h2c>`, **auto by default**): instead of each session building
   its own `reqwest::Client` (so N sessions ≈ N connections to the gateway on the plaintext HTTP/1.1 hop),
