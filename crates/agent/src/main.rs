@@ -3705,9 +3705,11 @@ fn unwrap_turn_result(
 /// exhausted `agent_core`'s own within-turn retries) is re-invoked from scratch against the same
 /// session, up to `retry::MAX_RUN_RETRIES` times with backoff, rather than failing a whole `agent run`
 /// invocation (plausibly unattended — a cron job, a CI step) outright on a hiccup that `serve` would
-/// have quietly recovered from. A retried attempt's own streamed output (text/JSON events) follows
-/// directly after a `[retrying...]` stderr notice — nothing is erased, matching how `serve` demarcates
-/// attempts with an `auto_retry_start` frame rather than hiding the failed one.
+/// have quietly recovered from. In `--json` mode a retried attempt's events follow directly after a
+/// `[retrying...]` stderr notice — nothing is erased, matching how `serve` demarcates attempts with an
+/// `auto_retry_start` frame rather than hiding the failed one. In text mode, stdout must read as the
+/// answer: when it isn't a terminal, a failed attempt's buffered text is discarded (see
+/// [`TextOut`]); on a terminal, a visible separator follows the already-shown partial text.
 #[allow(clippy::too_many_arguments)]
 async fn run_turn(
     agent: &Agent,
@@ -3723,6 +3725,7 @@ async fn run_turn(
     heartbeat: std::time::Duration,
 ) -> agent_core::Result<agent_core::StopReason> {
     let mut attempt = 0u32;
+    let mut text = TextOut::new(std::io::stdout().is_terminal());
     loop {
         if let Some(life) = life {
             life.set_attempt(attempt);
@@ -3732,6 +3735,7 @@ async fn run_turn(
             agent,
             session,
             json,
+            &mut text,
             cancel,
             broken_pipe,
             steering,
@@ -3758,6 +3762,7 @@ async fn run_turn(
                     "\n[transient error, retrying {attempt}/{}: {e}]",
                     retry_policy.max_retries
                 );
+                text.discard_attempt(cancel, broken_pipe);
                 // Ctrl-C during the wait ends the run now, not after it — with the closing error
                 // record still in place, so the persisted transcript stays well-formed.
                 tokio::select! {
@@ -3769,10 +3774,74 @@ async fn run_turn(
                 // scratch, not a fresh prompt).
                 session.pop_error_record();
             }
-            _ => return result,
+            _ => {
+                // A final failure (or a cancel) keeps the partial text the session keeps too.
+                text.flush(cancel, broken_pipe);
+                return result;
+            }
         }
     }
 }
+
+/// Text-mode stdout for `run`: what a script capturing stdout reads must be the answer, not the answer
+/// glued onto the partial text of attempts that failed and were retried. When stdout is not a
+/// terminal, each step's output is held until the step completes (`AgentEvent::TurnEnd`) and a retried
+/// attempt's held output is dropped. On a terminal, output streams live (a person is watching) and a
+/// retry writes a visible separator instead, since what's on screen can't be taken back.
+struct TextOut {
+    live: bool,
+    pending: String,
+    /// Whether anything of the current attempt reached the terminal (gates the separator).
+    shown: bool,
+}
+
+impl TextOut {
+    fn new(live: bool) -> Self {
+        Self {
+            live,
+            pending: String::new(),
+            shown: false,
+        }
+    }
+
+    fn write(
+        &mut self,
+        text: &str,
+        cancel: &agent_core::CancellationToken,
+        broken_pipe: &AtomicBool,
+    ) {
+        if self.live {
+            self.shown |= !text.is_empty();
+            write_stdout_or_exit(text, cancel, broken_pipe);
+        } else {
+            self.pending.push_str(text);
+        }
+    }
+
+    /// The step completed: its output is final.
+    fn flush(&mut self, cancel: &agent_core::CancellationToken, broken_pipe: &AtomicBool) {
+        self.shown = false;
+        if !self.pending.is_empty() {
+            write_stdout_or_exit(&self.pending, cancel, broken_pipe);
+            self.pending.clear();
+        }
+    }
+
+    /// The in-flight attempt failed and is about to be re-sent: nothing it streamed is kept.
+    fn discard_attempt(
+        &mut self,
+        cancel: &agent_core::CancellationToken,
+        broken_pipe: &AtomicBool,
+    ) {
+        self.pending.clear();
+        if std::mem::take(&mut self.shown) {
+            write_stdout_or_exit(RETRY_SEPARATOR, cancel, broken_pipe);
+        }
+    }
+}
+
+/// Written to a terminal stdout after a failed attempt's partial text, before the retry streams.
+const RETRY_SEPARATOR: &str = "\n[attempt failed; the text above is discarded, retrying]\n";
 
 /// Stream one turn's assistant reply to stdout. In text mode (`json: false`): live text, a
 /// `[tool: name]` marker when the model calls one, then a trailing blank line once the turn ends. In
@@ -3838,6 +3907,7 @@ async fn run_turn_once(
     agent: &Agent,
     session: &mut Session,
     json: bool,
+    text_out: &mut TextOut,
     cancel: &agent_core::CancellationToken,
     broken_pipe: &AtomicBool,
     steering: &agent_core::Steering,
@@ -3934,6 +4004,9 @@ async fn run_turn_once(
                         life.observe(&ev);
                     }
                     session_steers(&ev);
+                    if let agent_core::AgentEvent::TurnEnd { .. } = &ev {
+                        text_out.flush(cancel, broken_pipe);
+                    }
                     if let agent_core::AgentEvent::Retry {
                         attempt,
                         delay_ms,
@@ -3951,27 +4024,24 @@ async fn run_turn_once(
                             "\n[{what}, retrying in {:.1}s (attempt {attempt}): {message}]",
                             *delay_ms as f64 / 1000.0
                         );
+                        text_out.discard_attempt(cancel, broken_pipe);
                     }
                     let agent_core::AgentEvent::Stream(ev) = &ev else {
                         return;
                     };
                     match ev {
                         StreamEvent::TextDelta { text, .. } => {
-                            write_stdout_or_exit(text, cancel, broken_pipe);
+                            text_out.write(text, cancel, broken_pipe);
                         }
                         StreamEvent::ToolUseStart { name, .. } => {
                             // No trailing newline: `InputJsonDelta` fragments print immediately after, live,
                             // on this same line — a growing preview of the call's arguments as they stream
                             // in, rather than the model appearing to hang until the whole call (and its
                             // result) land.
-                            write_stdout_or_exit(
-                                &format!("\n[tool: {name}] "),
-                                cancel,
-                                broken_pipe,
-                            );
+                            text_out.write(&format!("\n[tool: {name}] "), cancel, broken_pipe);
                         }
                         StreamEvent::InputJsonDelta { partial_json, .. } => {
-                            write_stdout_or_exit(partial_json, cancel, broken_pipe);
+                            text_out.write(partial_json, cancel, broken_pipe);
                         }
                         StreamEvent::MessageStop { stop_reason: r } => {
                             stop_reason = *r;
@@ -3984,7 +4054,8 @@ async fn run_turn_once(
             )
             .await;
         if r.is_ok() {
-            write_stdout_or_exit("\n", cancel, broken_pipe);
+            text_out.write("\n", cancel, broken_pipe);
+            text_out.flush(cancel, broken_pipe);
         }
         r
     };
