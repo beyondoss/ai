@@ -1385,6 +1385,14 @@ identical treatment: `serve()`'s own return type changed from bare `Result<(), _
 `Result<Option<Signal>, _>`, and `main.rs`'s `Command::Serve` arm exits with `shutdown_cause.map(
 Signal::exit_code).unwrap_or(0)` instead of an unconditional `exit(0)`.
 
+The first signal is a request; a **second signal** is an order. `run`'s signal task keeps waiting after
+it cancels, and a second SIGTERM/SIGHUP/Ctrl-C calls `exit_process` with that signal's code (the usual
+exit cleanup still runs: job group kills, the stdio-server sweep), with `[second signal: exiting now]`
+on stderr. The cooperative path covers everything that watches the token, including `--continue`'s MCP
+task resume (`resume_mcp_tasks_for_run` selects each `resume_task` against `cancel`, and a cancelled
+resume exits via `exit_cancelled` before any turn exists, leaving the task journaled); the second
+signal covers a wait that doesn't, such as a hung MCP skill fetch while `/skill:server:name` expands.
+
 ### `serve` — headless NDJSON control protocol
 
 ```
