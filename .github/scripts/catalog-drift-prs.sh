@@ -154,7 +154,7 @@ $(jq -r .markdown <<<"$f")"
     gh pr edit "$pr" --title "$title" --body-file "$body" --add-label catalog-auto
   fi
   gh workflow run ci.yml --ref "$branch"
-  gh pr merge "$pr" --auto --squash --delete-branch
+  gh pr merge "$pr" --auto
   echo "PR: $pr (CI dispatched on $branch)"
   echo "::endgroup::"
 done

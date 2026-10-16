@@ -67,7 +67,7 @@ while read -r pr branch auto; do
   git push -q --force-with-lease="refs/heads/$branch:$lease" "$remote" "HEAD:refs/heads/$branch"
   gh workflow run ci.yml --ref "$branch"
   if [ "$auto" = true ]; then
-    gh pr merge "$pr" --auto --squash --delete-branch
+    gh pr merge "$pr" --auto
   fi
   echo "#$pr ($branch): was $behind behind main; refreshed and CI dispatched"
 done <<<"$prs"
