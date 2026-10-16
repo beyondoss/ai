@@ -2024,13 +2024,10 @@ impl SessionStore {
     /// last message in the file" still resolves to the active tip with no `Leaf` marker needed, exactly
     /// like a plain flat file. See the module doc comment's compaction-vs-branching section.
     ///
-    /// Every existing caller — `fork`/`fork_from_path`/`fork_at_entry` (all rewriting a store they just
-    /// got back from [`SessionRepo::create`], so every id-keyed side index below starts empty anyway) and
-    /// `rewrite_compacted`'s degenerate same-length fallback (rewriting *this* store in place, where
-    /// `labels`/`model_changes`/`level_changes`/`title_changes`/`branch_summary_details`/`compactions`/
-    /// `events` must legitimately survive since it's still the same session) — wants exactly this
-    /// narrower reset. See [`Self::reset_for_new_session`] for the one caller that genuinely wants a
-    /// blank slate.
+    /// Every existing caller — `fork`/`fork_from_path`/`fork_at_entry`, all rewriting a store they just
+    /// got back from [`SessionRepo::create`], so every id-keyed side index below starts empty anyway —
+    /// wants exactly this narrower reset. See [`Self::reset_for_new_session`] for the one caller that
+    /// genuinely wants a blank slate.
     pub fn rewrite(&mut self, messages: &[Message]) -> std::io::Result<()> {
         self.rewrite_impl(messages, false)
     }
@@ -2047,30 +2044,49 @@ impl SessionStore {
     /// as if it were the new session's own change — reachable from a `switch_branch{before: true}` that
     /// resolves to root — silently misrouting every subsequent turn to the wrong provider; (2) `events`
     /// feeds `export_events`/`export_html` directly, so exporting the "new" session kept showing the old
-    /// session's `ModelChange`/`ThinkingLevelChange`/`Label`/`Custom` log. This clears all of that, so the
-    /// store afterward is indistinguishable — other than its file path/id — from one just returned by
-    /// [`SessionRepo::create`].
+    /// session's `ModelChange`/`ThinkingLevelChange`/`Label`/`Custom` log. This clears all of that —
+    /// and keeps no entry of the old conversation's tree (its abandoned branches used to survive into
+    /// the new one) and none of its header provenance (title, compaction and branch-summary counters;
+    /// the reset itself is not a compaction) — so the store afterward is indistinguishable, other than
+    /// its file path/id, from one just returned by [`SessionRepo::create`].
     pub fn reset_for_new_session(&mut self) -> std::io::Result<()> {
         self.rewrite_impl(&[], true)
     }
 
     fn rewrite_impl(&mut self, messages: &[Message], full_reset: bool) -> std::io::Result<()> {
-        // Compaction provenance: a rewrite that ends with *fewer* messages than were on disk dropped a
-        // prefix (the compaction case), so record it in the header before writing. A same-length rewrite
-        // (e.g. `set_title`) or a fresh fork (`persisted == 0`) drops nothing and records nothing.
-        let dropped = self.persisted.saturating_sub(messages.len());
-        if dropped > 0 {
-            self.meta.compactions = self.meta.compactions.saturating_add(1);
-            self.meta.dropped_messages = self.meta.dropped_messages.saturating_add(dropped as u64);
+        if full_reset {
+            // A new conversation, not a compacted one: nothing was folded into a summary, and the
+            // header's provenance and title described the conversation that is going away.
+            self.meta.title = None;
+            self.meta.compactions = 0;
+            self.meta.dropped_messages = 0;
+            self.meta.branch_summaries = 0;
+            self.meta.summarized_branch_messages = 0;
+        } else {
+            // Compaction provenance: a rewrite that ends with *fewer* messages than were on disk
+            // dropped a prefix (the compaction case), so record it in the header before writing. A
+            // same-length rewrite or a fresh fork (`persisted == 0`) drops nothing and records nothing.
+            let dropped = self.persisted.saturating_sub(messages.len());
+            if dropped > 0 {
+                self.meta.compactions = self.meta.compactions.saturating_add(1);
+                self.meta.dropped_messages =
+                    self.meta.dropped_messages.saturating_add(dropped as u64);
+            }
         }
 
+        // Every entry off the active path — another branch — rides along a narrow rewrite. A full
+        // reset keeps none of them: `/new` reusing this file used to carry every abandoned branch of
+        // the old conversation into the new one, still on disk and listed in its tree.
         let old_active: HashSet<&str> = self.active.iter().map(String::as_str).collect();
-        let preserved: Vec<(String, Node)> = self
-            .nodes
-            .iter()
-            .filter(|(id, _)| !old_active.contains(id.as_str()))
-            .map(|(id, node)| (id.clone(), node.clone()))
-            .collect();
+        let preserved: Vec<(String, Node)> = if full_reset {
+            Vec::new()
+        } else {
+            self.nodes
+                .iter()
+                .filter(|(id, _)| !old_active.contains(id.as_str()))
+                .map(|(id, node)| (id.clone(), node.clone()))
+                .collect()
+        };
 
         let mut new_nodes: Vec<(String, Node)> = Vec::with_capacity(messages.len());
         let mut new_active = Vec::with_capacity(messages.len());
