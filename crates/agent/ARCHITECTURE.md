@@ -481,8 +481,10 @@ The harness layers several capabilities over the bare tools + loop:
   `Session::edited` — O(edited), the original output left on disk under the edit, only a result's
   `content`/`images` taken from memory so a cross-model scrub's in-memory id rewrite is never
   persisted, idempotent so every persist passes the list without tracking it; `run`'s `persist_run`
-  writes edits at every checkpoint, `serve` at the end of the turn, and a crash before that reloads
-  the unmasked transcript, which is valid, only larger), every write is `fsync`ed for durability, a corrupt/torn line anywhere in the file (not just
+  and `serve`'s `ChannelCheckpoint` both write edits at every checkpoint as well as at the end of the
+  turn — each pass replaces `Session::edited`, so a run that masks twice keeps the first pass's edits
+  only until the second, and the checkpoints in between are where they reach disk; a crash before
+  that reloads the unmasked transcript, which is valid, only larger), every write is `fsync`ed for durability, a corrupt/torn line anywhere in the file (not just
   the last one) is skipped rather than aborting the whole read, and a header whose `version` is newer
   than the build understands is refused (migration hook). `rewrite`'s write-to-`.jsonl.tmp`-then-rename
   is safe either way a failure lands: a hard crash leaves the `.tmp` behind harmlessly (never read back

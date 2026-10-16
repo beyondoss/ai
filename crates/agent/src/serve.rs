@@ -1127,16 +1127,17 @@ async fn persist_blocking(
 }
 
 /// Like [`persist_blocking`], but for one incremental mid-run checkpoint (see [`ChannelCheckpoint`]):
-/// takes just the message snapshot a checkpoint carries rather than a whole `Session`, and always
-/// appends (never a compacted rewrite — see [`Persistence::persist_messages`]).
+/// takes just the snapshot a checkpoint carries rather than a whole `Session` (see
+/// [`Persistence::persist_messages`]).
 async fn persist_messages_blocking(
     mut persistence: Persistence,
     messages: Arc<Vec<agent_core::Message>>,
     provenance: agent_core::CompactionProvenance,
+    edited: Vec<usize>,
 ) -> (Persistence, std::io::Result<()>) {
     match tokio::task::spawn_blocking(move || {
         let r = simulated_checkpoint_write(&persistence.meta.id)
-            .and_then(|()| persistence.persist_messages(&messages, &provenance));
+            .and_then(|()| persistence.persist_messages(&messages, &provenance, &edited));
         (persistence, r)
     })
     .await
@@ -1186,10 +1187,17 @@ struct ChannelCheckpoint(mpsc::UnboundedSender<Checkpoint>);
 
 /// One mid-run checkpoint on its way to the session loop: the transcript snapshot, its compaction
 /// provenance (whose generation tells the store a compaction happened since its last write; see
-/// [`SessionStore::persist`]), and the acknowledgement the loop sends once it is on disk.
+/// [`SessionStore::persist`]), the messages the last masking pass rewrote in place
+/// (`Session::edited`), and the acknowledgement the loop sends once it is on disk.
+///
+/// The edits have to ride along: each masking pass *replaces* `Session::edited`, so a run that masks
+/// twice keeps the first pass's edits only until the second. The checkpoints in between are where
+/// they reach disk — as they do in `run` — and without them only the last pass survived the run, and
+/// every reopen re-sent the first pass's results unmasked, missing the prompt cache.
 type Checkpoint = (
     Arc<Vec<agent_core::Message>>,
     agent_core::CompactionProvenance,
+    Vec<usize>,
     tokio::sync::oneshot::Sender<Result<(), String>>,
 );
 
@@ -1210,7 +1218,12 @@ impl agent_core::CheckpointHook for ChannelCheckpoint {
         let (ack, persisted) = tokio::sync::oneshot::channel();
         if self
             .0
-            .send((session.messages.clone(), session.compaction.clone(), ack))
+            .send((
+                session.messages.clone(),
+                session.compaction.clone(),
+                session.edited.clone(),
+                ack,
+            ))
             .is_err()
         {
             return Err("the session loop is gone".into());
@@ -1567,15 +1580,17 @@ impl Persistence {
     /// compaction (`Agent::compact` takes one) writes the rewrite then and there, so a later
     /// checkpoint, once the list outgrows its old length, can never chain the post-compaction tail
     /// onto the uncompacted history — what a crash before the end of the turn used to leave behind.
+    /// `edited` is the masking pass's in-place rewrites (see [`Checkpoint`]).
     fn persist_messages(
         &mut self,
         messages: &[agent_core::Message],
         provenance: &agent_core::CompactionProvenance,
+        edited: &[usize],
     ) -> std::io::Result<()> {
         let Some(store) = &mut self.store else {
             return Ok(());
         };
-        let r = store.persist(messages, provenance, &[]);
+        let r = store.persist(messages, provenance, edited);
         if let Err(e) = &r {
             eprintln!("serve: failed to persist checkpoint: {e}");
         }
@@ -4309,9 +4324,9 @@ pub(crate) async fn serve_session(
                 loop {
                     tokio::select! {
                         biased;
-                        Some((messages, provenance, ack)) = checkpoint_rx.recv() => {
+                        Some((messages, provenance, edited, ack)) = checkpoint_rx.recv() => {
                             let (p, r) = write_then_ack(
-                                persist_messages_blocking(persistence, messages, provenance),
+                                persist_messages_blocking(persistence, messages, provenance, edited),
                                 ack,
                             )
                             .await;
@@ -5085,12 +5100,12 @@ pub(crate) async fn serve_session(
                                 // right after this loop, below, before it can leak into some later, unrelated
                                 // turn — see that drain's own comment for why "harmless, the final persist
                                 // is a superset" isn't quite true on its own.
-                                Some((messages, provenance, ack)) = checkpoint_rx.recv() => {
+                                Some((messages, provenance, edited, ack)) = checkpoint_rx.recv() => {
                                     // The agent is waiting on the acknowledgement before it dispatches
                                     // the next tool, and acts on a failure — the tool does not run (see
                                     // `ChannelCheckpoint`). Sent only once the write is done.
                                     let (p, r) = write_then_ack(
-                                        persist_messages_blocking(persistence, messages, provenance),
+                                        persist_messages_blocking(persistence, messages, provenance, edited),
                                         ack,
                                     )
                                     .await;
