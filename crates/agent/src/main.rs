@@ -1815,6 +1815,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
+/// Stop `run`'s jobs with `how` off the runtime thread. Each kill blocks until its processes are
+/// gone, and a remote job's kill waits for its stream's future to let the connection go — a future
+/// on this (current-thread) runtime, which a kill run inline would starve: every v1.2 job would cost
+/// its kill's full bound, and its stream would close only at the process exit.
+async fn stop_jobs(
+    jobs: &std::sync::Arc<tools::bash_jobs::BashJobs>,
+    how: fn(&tools::bash_jobs::BashJobs) -> Vec<tools::bash_jobs::StoppedJob>,
+) -> Vec<tools::bash_jobs::StoppedJob> {
+    let jobs = jobs.clone();
+    tokio::task::spawn_blocking(move || how(&jobs))
+        .await
+        .unwrap_or_default()
+}
+
 /// What every way out of the process does first: retire every stdio MCP server still running
 /// (close its stdin, give it its grace, sweep its process group) and wait for those sweeps and for
 /// any `bash` group kill still in flight — see `mcp_stdio::sweep_before_exit`.
@@ -5515,7 +5529,7 @@ async fn run_task(
     )
     .await;
     // A yielded job never outlives the turn that started it (the stop reminder said so).
-    let mut stopped_jobs = bash_jobs.end_turn();
+    let mut stopped_jobs = stop_jobs(&bash_jobs, tools::bash_jobs::BashJobs::end_turn).await;
     // Persist whatever's in `session` regardless of outcome: `run_events_cancellable` mutates
     // `session` in place as it streams, so a cancelled turn still leaves behind whatever
     // assistant/tool content had already landed — the same partial-content guarantee `serve` gives
@@ -5559,7 +5573,7 @@ async fn run_task(
             std::time::Duration::from_secs(lifecycle_heartbeat_secs),
         )
         .await;
-        stopped_jobs.extend(bash_jobs.end_turn());
+        stopped_jobs.extend(stop_jobs(&bash_jobs, tools::bash_jobs::BashJobs::end_turn).await);
         persist_run(&store, &session)?;
         if broken_pipe.load(Ordering::Relaxed) {
             emit_cli_lifecycle(life.as_ref(), &session, CliTerminal::Aborted, None).await;
@@ -5622,7 +5636,7 @@ async fn run_task(
     // `bash_jobs_stopped` line (before any structured output, which stays last), each job with its
     // `kind`.
     let mut stopped = stopped_jobs;
-    stopped.extend(bash_jobs.stop_all());
+    stopped.extend(stop_jobs(&bash_jobs, tools::bash_jobs::BashJobs::stop_all).await);
     if !stopped.is_empty() {
         if json {
             let line =
