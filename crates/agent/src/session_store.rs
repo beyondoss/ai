@@ -1042,12 +1042,14 @@ pub struct SessionStore {
     meta: SessionMeta,
     /// How many messages are already on disk (on the active path) — the append cursor.
     persisted: usize,
-    /// `Session::compaction.compactions` as of the last write: the compaction generation on disk.
-    /// A session ahead of it was compacted since, and [`Self::persist`] writes that rewrite before
-    /// anything else — the signal `persisted` (a message count) can't give, since a compaction's
-    /// shrink looks to it like nothing new. Set from the session `open` returns, so a legacy file
-    /// whose provenance never restored starts in step with what it reloads.
-    compactions_written: u32,
+    /// `Session::compaction` as of the last write: its `compactions` is the compaction generation on
+    /// disk. A session whose generation differs was compacted since (see [`Self::persist`] for how
+    /// that is confirmed), and `persist` writes that compaction before anything else — the signal
+    /// `persisted` (a message count) can't give, since a compaction's shrink looks to it like nothing
+    /// new. Set from the session `open` returns, so a legacy file whose provenance never restored
+    /// starts in step with what it reloads; handed back out by [`Self::compaction_provenance`] so a
+    /// session rebuilt from this store (a branch switch) starts in step too.
+    written: CompactionProvenance,
     /// Every known node (message), by id — spans the whole tree, not just the active path.
     nodes: HashMap<String, Node>,
     /// Ids of the messages on the currently active path, root-first, parallel to `Session.messages`.
@@ -1120,7 +1122,7 @@ impl SessionStore {
             log,
             meta,
             persisted: 0,
-            compactions_written: 0,
+            written: CompactionProvenance::default(),
             nodes: HashMap::new(),
             active: Vec::new(),
             branch_summary_details: HashMap::new(),
@@ -1544,7 +1546,7 @@ impl SessionStore {
                 log,
                 meta,
                 persisted,
-                compactions_written: session.compaction.compactions,
+                written: session.compaction.clone(),
                 nodes,
                 active,
                 branch_summary_details,
@@ -1722,29 +1724,70 @@ impl SessionStore {
     /// manual `compact`) goes through this, so none can append a post-compaction tail onto the
     /// uncompacted history: `append_new` alone is count-keyed and reads a compaction's shrink as
     /// "nothing new", then, once the list outgrows its old length, chains the wrong messages on.
+    ///
+    /// The generation is a claim, and it is checked: a compaction always puts a fresh summary at
+    /// `messages[0]`, so a generation that moved while the first message is still the one on disk is
+    /// a session built without this store's provenance (a branch switch that started from defaults),
+    /// not a compaction. That count is adopted and the turn appended as usual. Taking it for a
+    /// compaction instead wrote a spurious compaction round — new ids for the whole transcript, the
+    /// provenance replaced by the session's empty one.
     pub fn persist(
         &mut self,
         messages: &[Message],
         provenance: &CompactionProvenance,
         edited: &[usize],
     ) -> std::io::Result<()> {
-        if provenance.compactions != self.compactions_written {
-            let tokens_before = messages
-                .first()
-                .and_then(agent_core::compaction::summary_tokens_before)
-                .unwrap_or(0);
-            self.rewrite_compacted(
-                messages,
-                CompactionMeta {
-                    tokens_before,
-                    provenance: provenance.clone(),
-                },
-            )?;
-            self.compactions_written = provenance.compactions;
-            return Ok(());
+        if provenance.compactions != self.written.compactions {
+            if self.first_differs(messages) {
+                let tokens_before = messages
+                    .first()
+                    .and_then(agent_core::compaction::summary_tokens_before)
+                    .unwrap_or(0);
+                self.rewrite_compacted(
+                    messages,
+                    CompactionMeta {
+                        tokens_before,
+                        provenance: provenance.clone(),
+                    },
+                )?;
+                self.written = provenance.clone();
+                return Ok(());
+            }
+            tracing::warn!(
+                session = %self.meta.id,
+                session_generation = provenance.compactions,
+                stored_generation = self.written.compactions,
+                "a session's compaction count disagrees with the store but its history does not; adopting it"
+            );
+            self.written.compactions = provenance.compactions;
         }
         self.record_edits(messages, edited)?;
         self.append_new(messages)
+    }
+
+    /// Whether `messages` starts somewhere other than the stored active path: its first message is
+    /// not the first message on disk, or nothing is on disk yet. `messages[0]` is the one message no
+    /// in-memory-only rewrite touches (a cross-model scrub only changes assistant turns and
+    /// `prior_turn_tokens` from the third message on; a masking pass and an MCP splice only change
+    /// tool results, which never open a transcript), so a difference there is a compaction's.
+    fn first_differs(&self, messages: &[Message]) -> bool {
+        let stored = self
+            .active
+            .iter()
+            .find_map(|id| self.nodes.get(id).and_then(Node::as_message));
+        match (messages.first(), stored) {
+            (Some(m), Some(s)) => m != s,
+            (_, None) => true,
+            (None, Some(_)) => false,
+        }
+    }
+
+    /// The compaction provenance this store last wrote or restored, generation included — what a
+    /// [`Session`] rebuilt from this store's messages (a branch switch) must carry, so its next
+    /// [`persist`](Self::persist) reads as the continuation it is and the provenance survives the
+    /// next compaction.
+    pub fn compaction_provenance(&self) -> CompactionProvenance {
+        self.written.clone()
     }
 
     /// Write the tool results a masking pass rewrote in place since they were stored — at the message
@@ -2022,7 +2065,7 @@ impl SessionStore {
         self.active = new_active;
         self.persisted = messages.len();
         if full_reset {
-            self.compactions_written = 0;
+            self.written = CompactionProvenance::default();
             self.labels.clear();
             self.model_changes.clear();
             self.level_changes.clear();
@@ -2061,49 +2104,50 @@ impl SessionStore {
     /// `messages` is the new active-path list — by construction (this is only ever called from the
     /// compaction path, right after `agent_core::compaction::apply_summary`) always exactly one
     /// summary message followed by the kept suffix verbatim. That invariant is what lets this method
-    /// recover *which* original messages were folded purely from lengths, with no extra parameter:
-    /// `old_persisted - (messages.len() - 1)` is the net shrinkage (one summary message took every
-    /// folded message's place), so `+ 1` recovers the true folded count.
+    /// recover *which* stored messages were folded with no extra parameter: the stored active path up
+    /// to where the kept suffix begins. It is found by content, so a store that lagged the session
+    /// (kept messages not on disk yet) still writes an append-only round — never a full rewrite,
+    /// which would lose every side record.
     pub fn rewrite_compacted(
         &mut self,
         messages: &[Message],
         meta: CompactionMeta,
     ) -> std::io::Result<()> {
-        let dropped = self.persisted.saturating_sub(messages.len());
-        if dropped == 0 {
-            // Nothing was actually folded (a degenerate one-message-in-one-message-out round) — no
-            // `Entry::Compaction` provenance is meaningful, so fall back to a plain rewrite.
-            return self.rewrite(messages);
-        }
+        // Which stored messages the round folded: everything on the active path before the stored
+        // messages `messages[1..]` (the kept suffix) still begins with. Found by content, not by
+        // count, because the store can lag the session — checkpoints that failed (or never ran)
+        // before the compaction leave the kept suffix partly, or wholly, unwritten, and the old
+        // count-based `persisted - (messages.len() - 1)` then read as "nothing folded" and fell back
+        // to a full rewrite that dropped every side record (model changes, labels, titles, earlier
+        // compaction records) and re-minted every id. A kept message not on disk yet is simply
+        // appended after the ones that are.
+        let stored: Vec<(usize, &Message)> = self
+            .active
+            .iter()
+            .enumerate()
+            .filter_map(|(i, id)| self.nodes.get(id)?.as_message().map(|m| (i, m)))
+            .collect();
+        let kept = messages.get(1..).unwrap_or_default();
+        let overlap_from = (0..stored.len())
+            .find(|&i| {
+                let tail = &stored[i..];
+                tail.len() <= kept.len() && tail.iter().zip(kept).all(|((_, s), k)| *s == k)
+            })
+            .unwrap_or(stored.len());
+        let folded_messages = overlap_from;
+        // The fold boundary on `self.active`: just past the last folded message, so a custom entry
+        // (Track C-M2) among the folded messages is folded with them, and one after them rides along
+        // with the kept suffix.
+        let boundary = folded_messages
+            .checked_sub(1)
+            .map_or(0, |last| stored[last].0 + 1);
+        let folded_ids: Vec<String> = self.active[..boundary].to_vec();
         self.meta.compactions = self.meta.compactions.saturating_add(1);
-        self.meta.dropped_messages = self.meta.dropped_messages.saturating_add(dropped as u64);
-
-        // Walk from the front of `self.active` counting only *message*-bearing ids (a custom entry —
-        // Track C-M2 — can sit interspersed on the active path without contributing to `self.persisted`,
-        // so a plain positional slice by count would misalign once one exists); any custom id
-        // encountered along the way is folded together with the messages around it, since it sat
-        // structurally within the region compaction just summarized away. `target` message ids is
-        // `dropped + 1` (one summary message replaces every folded message — see this method's doc
-        // comment on why `+ 1`), capped so a pathological `dropped` can't run past the end of `active`.
-        // Walk from the front of `self.active` counting only *message*-bearing ids (a custom entry —
-        // Track C-M2 — can sit interspersed on the active path without contributing to `self.persisted`,
-        // so a plain positional slice by count would misalign once one exists); any custom id
-        // encountered along the way is folded together with the messages around it, since it sat
-        // structurally within the region compaction just summarized away. `target` message ids is
-        // `dropped + 1` (one summary message replaces every folded message — see this method's doc
-        // comment on why `+ 1`), capped so a pathological `dropped` can't run past the end of `active`.
-        let target = dropped.saturating_add(1);
-        let mut folded_ids: Vec<String> = Vec::new();
-        let mut folded_messages = 0usize;
-        for id in &self.active {
-            if folded_messages >= target {
-                break;
-            }
-            folded_ids.push(id.clone());
-            if self.nodes[id].as_message().is_some() {
-                folded_messages += 1;
-            }
-        }
+        // Net shrink, as before: the summary takes the folded messages' place.
+        self.meta.dropped_messages = self
+            .meta
+            .dropped_messages
+            .saturating_add(folded_messages.saturating_sub(1) as u64);
         // Everything on the active path past the fold point: the real kept messages (verbatim in
         // `messages[1..]`) and any custom entry (Track C-M2) interleaved among them. The fold loop
         // above only ever walks up to the fold boundary, so a custom entry positioned here was
@@ -2191,7 +2235,7 @@ impl SessionStore {
                     Some(m) if m == existing => Arc::clone(original),
                     Some(m) => Arc::new(NodeContent::Message(m.clone())),
                     None => unreachable!(
-                        "kept_suffix_ids and messages[1..] must have the same message count"
+                        "kept_suffix_ids holds the stored messages messages[1..] begins with"
                     ),
                 },
                 NodeContent::Custom { .. } => Arc::clone(original),
@@ -2206,6 +2250,19 @@ impl SessionStore {
                 },
             ));
             parent = Some(new_node_id);
+        }
+        // Kept messages the store never got (it lagged the session): new nodes, like an append.
+        for m in rest {
+            let id = new_id();
+            new_nodes.push((
+                id.clone(),
+                Node {
+                    parent_id: parent.clone(),
+                    content: Arc::new(NodeContent::Message(m.clone())),
+                    timestamp: now_secs(),
+                },
+            ));
+            parent = Some(id);
         }
         let new_active: Vec<String> = new_nodes.iter().map(|(id, _)| id.clone()).collect();
 
@@ -8746,11 +8803,11 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_compacted_falls_back_to_a_plain_rewrite_when_nothing_was_folded() {
-        // B-L6 pi-parity test gap (fixed): a degenerate "compaction" that doesn't actually shrink the
-        // active path (e.g. new message count matching the old one) has no folded prefix worth
-        // recording — `rewrite_compacted` must fall back to a plain `rewrite`, not write a
-        // meaningless `Entry::Compaction` record naming zero folded messages.
+    fn rewrite_compacted_never_falls_back_to_a_full_rewrite() {
+        // A round whose message count did not shrink (the store lagged the session, or a degenerate
+        // round) used to fall back to a full `rewrite`, which drops every side record and re-mints
+        // every id. It is an append-only round like any other: the stored messages it replaced are
+        // folded, and nothing already on disk is touched.
         let dir = tmpdir();
         let repo = SessionRepo::open(dir.path()).unwrap();
         let mut store = repo.create(SessionMeta::new("/w", "m")).unwrap();
@@ -8758,8 +8815,11 @@ mod tests {
         session.user("one");
         session.user("two");
         store.append_new(&session.messages).unwrap();
+        store.record_model_change("model-b").unwrap();
+        let before = fs::read(store.path()).unwrap();
+        let originals = store.active_ids().to_vec();
 
-        // Same length in as out — nothing folded.
+        // Same length in as out — neither stored message survives verbatim.
         let same_length = vec![
             Message::user("one (rewritten)"),
             Message::user("two (rewritten)"),
@@ -8774,33 +8834,24 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(
-            store.meta().compactions,
-            0,
-            "nothing was folded; must not count as a compaction"
-        );
-        assert_eq!(store.meta().dropped_messages, 0);
-        assert_eq!(store.active_ids().len(), 2);
-
+        let after = fs::read(store.path()).unwrap();
+        assert!(after.starts_with(&before), "existing bytes were rewritten");
+        assert_eq!(store.meta().compactions, 1);
         let (reopened, restored) = repo.open_id(&store.meta().id.clone()).unwrap();
         assert_eq!(restored.messages.len(), 2);
         let ContentBlock::Text { text, .. } = &restored.messages[0].content[0] else {
             panic!("expected text");
         };
         assert_eq!(text.as_ref(), "one (rewritten)");
-
-        // No `Entry::Compaction` record at all.
+        assert_eq!(reopened.model_at_root(), Some("model-b"));
         let raw = fs::read_to_string(reopened.path()).unwrap();
-        let compaction_entries = raw
+        let folded: Vec<Value> = raw
             .lines()
-            .filter(|l| !l.trim().is_empty())
             .filter_map(|l| serde_json::from_str::<Value>(l).ok())
             .filter(|v| v["type"] == json!("compaction"))
-            .count();
-        assert_eq!(
-            compaction_entries, 0,
-            "a no-op fold must not write a meaningless compaction provenance record: {raw}"
-        );
+            .map(|v| v["folded_ids"].clone())
+            .collect();
+        assert_eq!(folded, vec![json!(originals)], "{raw}");
     }
 
     #[test]

@@ -2369,6 +2369,11 @@ impl Persistence {
         self.meta = store.meta().clone();
         let mut session = Session::new();
         session.messages = Arc::new(messages);
+        // The store's compaction provenance, generation included: the switched session is a
+        // continuation of this store, not a fresh one. Starting from defaults reset the generation the
+        // store remembers, so the next persist read the turn as a compaction, and lost the provenance
+        // (read files, todos, user requests) the next real compaction carries forward.
+        session.compaction = store.compaction_provenance();
         Ok((session, resolved))
     }
 
@@ -13736,6 +13741,78 @@ mod tests {
             !prompt.contains("Additional focus:"),
             "replace_instructions:true must not use the append-style framing: {prompt}"
         );
+    }
+
+    /// A branch switch on a compacted session hands back a session carrying the store's compaction
+    /// provenance, so the next persist appends. It used to hand back `Session::new()`'s defaults; the
+    /// store read the reset generation as a compaction and rewrote the round — re-minting ids and
+    /// replacing the provenance with the switched session's empty one.
+    #[tokio::test]
+    async fn switch_branch_on_a_compacted_session_keeps_its_provenance_and_appends() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut persistence, mut session) =
+            Persistence::open_repo(dir.path(), "/w", "claude-test", SessionSelect::Latest).unwrap();
+        for i in 0..4 {
+            session.user(format!("u{i}"));
+            session.push(agent_core::Message::assistant(vec![
+                agent_core::ContentBlock::text(format!("a{i}")),
+            ]));
+        }
+        persistence.persist(&session).unwrap();
+        // A compaction as `Agent::compact` leaves it: a summary, the kept suffix, the provenance.
+        agent_core::compaction::apply_summary(&mut session, 4, "earlier work", 1000);
+        session.compaction.compactions = 1;
+        session.compaction.read_files = vec!["src/important.rs".into()];
+        persistence.persist(&session).unwrap();
+        let summary_id = {
+            let store = persistence.store.as_mut().unwrap();
+            store.record_model_change("model-b").unwrap();
+            store.active_ids()[0].clone()
+        };
+
+        let agent = Agent::new(
+            Arc::new(agent_core::MockTransport::new(vec![])),
+            "claude-test",
+        );
+        let (mut switched, _) = persistence
+            .switch_branch(
+                &agent,
+                &summary_id,
+                false,
+                false,
+                None,
+                false,
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(switched.compaction.compactions, 1);
+        assert_eq!(switched.compaction.read_files, ["src/important.rs"]);
+
+        let path = persistence.store.as_ref().unwrap().path().to_path_buf();
+        let before = std::fs::read(&path).unwrap();
+        switched.push(agent_core::Message::assistant(vec![
+            agent_core::ContentBlock::text("new branch reply"),
+        ]));
+        switched.user("new branch question");
+        persistence.persist(&switched).unwrap();
+        let after = std::fs::read(&path).unwrap();
+        assert!(
+            after.starts_with(&before),
+            "the persist rewrote the session"
+        );
+        let compaction_records = String::from_utf8_lossy(&after)
+            .lines()
+            .filter(|l| l.contains(r#""type":"compaction""#))
+            .count();
+        assert_eq!(
+            compaction_records, 1,
+            "a spurious compaction round was written"
+        );
+
+        let (_store, reopened) = SessionStore::open(path).unwrap();
+        assert_eq!(reopened.messages.len(), 3);
+        assert_eq!(reopened.compaction.read_files, ["src/important.rs"]);
     }
 
     #[test]
