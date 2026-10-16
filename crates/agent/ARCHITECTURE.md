@@ -1266,6 +1266,15 @@ Agent::run[_events] (agent_core loop; see agent-core/ARCHITECTURE.md for the loo
    │
    ▼ (model ends its turn without a tool_use, or hits an opted-in --max-steps ceiling)
 stdout: trailing newline (text mode only — `--json` has no extra trailing line, just the event stream)
+stderr: "[stopped at the --max-steps ceiling (N): …]" when the run reached its ceiling and ended on the
+        model's wrap-up answer (`AgentEvent::WrapUp` seen, `RUN_WRAPPED_UP`). Still exit 0, on evidence:
+        the wrap-up grant exists to turn a cut-off run into a usable answer (agent-core's "Wrap-up at
+        the step ceiling"), a run that can't stop within it already fails with `MaxSteps`, and the
+        eval harnesses read the `--json` events (longctx's `end_reason`) or treat a non-zero exit as
+        a warning only (harbor), so a new code would buy nothing a stderr line doesn't; `--json`
+        consumers already get the `wrap_up` event.
+--export:  written however the run ends: success, a failed turn, a cancel (before `exit_cancelled`)
+        or a closed stdout — a failed run's transcript is the one most worth reading.
 stderr: "[done in N step(s); X in / Y out tokens]"   (or the propagated Error::MaxSteps / Error::Transport)
         text mode only: last turn's StopReason::Refusal ──► stderr "[refused]", exit(1) — matching
         pi's own print-mode text-mode behavior; `--json` already carries `stop_reason` on every

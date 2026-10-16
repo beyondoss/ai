@@ -290,7 +290,8 @@ enum Command {
         key: Option<String>,
         /// Opt-in cap on model turns (default: unbounded). At the cap the model gets 5 more steps to
         /// stop cleanly (fix or revert an edit that no longer parses, run the tests once, summarize);
-        /// a run that uses those too ends with an error.
+        /// a run that stops within them exits 0 with a stderr line saying the task may be unfinished,
+        /// and a run that uses those too ends with an error.
         #[usage(long)]
         max_steps: Option<u32>,
         /// Per-turn output token ceiling. `serve`'s identical flag; defaults to the model's own
@@ -747,9 +748,10 @@ enum Command {
         /// working store is the compaction-surviving scratchpad; on by default when memory is enabled.
         #[usage(long)]
         no_session_memory: bool,
-        /// After the run completes, export the transcript as a self-contained HTML file at this path
-        /// (parent directories are created as needed) — the same rendering `serve`'s `export_html` RPC
-        /// command produces, for a one-shot run with no server involved.
+        /// When the run ends — completed, failed or cancelled — export the transcript as a
+        /// self-contained HTML file at this path (parent directories are created as needed) — the
+        /// same rendering `serve`'s `export_html` RPC command produces, for a one-shot run with no
+        /// server involved.
         #[usage(long)]
         export: Option<String>,
         /// Emit newline-delimited JSON to stdout instead of human-readable text: one leading session
@@ -4013,6 +4015,9 @@ async fn run_turn_once(
         if let Some(journal) = RUN_JOURNAL.get() {
             journal.observe(ev);
         }
+        if let agent_core::AgentEvent::WrapUp { .. } = ev {
+            RUN_WRAPPED_UP.store(true, Ordering::Relaxed);
+        }
         if !session_memory_active {
             return;
         }
@@ -4163,6 +4168,11 @@ async fn run_turn_once(
 /// `run --continue` (or by `serve`). Process-wide because `run` drives exactly one session per
 /// process; set once, when that session is persisted.
 static RUN_JOURNAL: std::sync::OnceLock<RunJournal> = std::sync::OnceLock::new();
+
+/// Set when this process's run reached its `--max-steps` ceiling and the model was granted its
+/// wrap-up steps (`AgentEvent::WrapUp`): the run then ends normally on the model's own wrap-up answer,
+/// and the end of `run_task` says so on stderr. Process-wide for the same reason as [`RUN_JOURNAL`].
+static RUN_WRAPPED_UP: AtomicBool = AtomicBool::new(false);
 
 struct RunJournal {
     store: Arc<std::sync::Mutex<Option<SessionStore>>>,
@@ -5635,6 +5645,44 @@ async fn run_task(
         let messages: &mut Vec<agent_core::Message> = Arc::make_mut(&mut session.messages);
         beyond_ai_agent::mcp_resume::splice(messages, &resumed, &placeholders);
     }
+    // `--export` renders the transcript however the run ends: a failed or cancelled run's transcript
+    // (everything up to the failure, its closing error record included) is the one most worth
+    // reading, and the export used to sit after the `?`s that end those runs.
+    let export_transcript = |session: &Session| {
+        let Some(export) = &export else {
+            return;
+        };
+        let (branches, events) = {
+            let guard = store.lock().unwrap_or_else(|e| e.into_inner());
+            match guard.as_ref() {
+                Some(s) => (s.abandoned_branches(), s.export_events().to_vec()),
+                None => (Vec::new(), Vec::new()),
+            }
+        };
+        // `export_html_full` (Task #44 integration): the running agent's actual system prompt/tool
+        // set, not the plainer `export_html_with_entries` this call site used before — so an exported
+        // transcript's own System Prompt/Available Tools sections reflect what this run really used.
+        // `session`'s own running token counters are right here too, so the stats section gets real
+        // usage numbers rather than omitting that line entirely.
+        match beyond_ai_agent::export::export_html_full(
+            &meta,
+            &session.messages,
+            &branches,
+            Some(beyond_ai_agent::export::UsageTotals {
+                input_tokens: session.input_tokens,
+                output_tokens: session.output_tokens,
+                cache_read_tokens: session.cache_read_tokens,
+                cache_write_tokens: session.cache_write_tokens,
+            }),
+            &events,
+            Some(&system_for_export),
+            Some(&tool_defs),
+            Some(export),
+        ) {
+            Ok(path) => eprintln!("[exported transcript to {}]", path.display()),
+            Err(e) => eprintln!("[failed to export transcript: {e}]"),
+        }
+    };
     let life = lifecycle.enabled().then(|| {
         beyond_ai_agent::lifecycle::Run::begin(
             std::sync::Arc::clone(&lifecycle),
@@ -5669,10 +5717,12 @@ async fn run_task(
     // only ever captured here.
     persist_run(&store, &session)?;
     if broken_pipe.load(Ordering::Relaxed) {
+        export_transcript(&session);
         emit_cli_lifecycle(life.as_ref(), &session, CliTerminal::Aborted, None).await;
         exit_process(0);
     }
     if let Err(e) = &turn_result {
+        export_transcript(&session);
         emit_cli_lifecycle(
             life.as_ref(),
             &session,
@@ -5707,10 +5757,12 @@ async fn run_task(
         stopped_jobs.extend(stop_jobs(&bash_jobs, tools::bash_jobs::BashJobs::end_turn).await);
         persist_run(&store, &session)?;
         if broken_pipe.load(Ordering::Relaxed) {
+            export_transcript(&session);
             emit_cli_lifecycle(life.as_ref(), &session, CliTerminal::Aborted, None).await;
             exit_process(0);
         }
         if let Err(e) = &turn_result {
+            export_transcript(&session);
             emit_cli_lifecycle(
                 life.as_ref(),
                 &session,
@@ -5728,38 +5780,7 @@ async fn run_task(
         stop_reason = unwrap_turn_result(turn_result, &shutdown_cause)?;
     }
 
-    if let Some(export) = export {
-        let (branches, events) = {
-            let guard = store.lock().unwrap_or_else(|e| e.into_inner());
-            match guard.as_ref() {
-                Some(s) => (s.abandoned_branches(), s.export_events().to_vec()),
-                None => (Vec::new(), Vec::new()),
-            }
-        };
-        // `export_html_full` (Task #44 integration): the running agent's actual system prompt/tool
-        // set, not the plainer `export_html_with_entries` this call site used before — so an exported
-        // transcript's own System Prompt/Available Tools sections reflect what this run really used.
-        // `session`'s own running token counters are right here too, so the stats section gets real
-        // usage numbers rather than omitting that line entirely.
-        match beyond_ai_agent::export::export_html_full(
-            &meta,
-            &session.messages,
-            &branches,
-            Some(beyond_ai_agent::export::UsageTotals {
-                input_tokens: session.input_tokens,
-                output_tokens: session.output_tokens,
-                cache_read_tokens: session.cache_read_tokens,
-                cache_write_tokens: session.cache_write_tokens,
-            }),
-            &events,
-            Some(&system_for_export),
-            Some(&tool_defs),
-            Some(&export),
-        ) {
-            Ok(path) => eprintln!("[exported transcript to {}]", path.display()),
-            Err(e) => eprintln!("[failed to export transcript: {e}]"),
-        }
-    }
+    export_transcript(&session);
 
     // The run is over, so are its jobs: the yielded ones stopped at the end of their turn (above),
     // the intended ones stop now. The model was told once, at its stop, which were still running
@@ -5792,6 +5813,18 @@ async fn run_task(
         );
     }
 
+    // A run that hit its `--max-steps` ceiling still ends normally (exit 0) on the model's own
+    // wrap-up answer — that answer is the point of the wrap-up grant, and a run that couldn't stop
+    // within it already fails with `MaxSteps`. But the task may well be unfinished, which text mode
+    // otherwise never says (`--json` streams the `wrap_up` event).
+    if RUN_WRAPPED_UP.load(Ordering::Relaxed)
+        && let Some(max) = max_steps
+    {
+        eprintln!(
+            "[stopped at the --max-steps ceiling ({max}): the reply above is the model's wrap-up, \
+             so the task may be unfinished; --continue (or a higher --max-steps) keeps going]"
+        );
+    }
     eprintln!(
         "[done in {} step(s); {} in / {} out tokens]",
         session.steps, session.input_tokens, session.output_tokens
