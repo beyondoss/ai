@@ -2695,9 +2695,17 @@ and `serve`'s own `bash`/`abort_bash` RPC commands reuse `RealRunner` directly, 
   - **Waiting and killing.** After the shell exits, the pipes get the same 100 ms quiet grace as
     before, then the scan; with survivors, `on_orphans` tells `bash` at once and the runner keeps
     draining while it waits on a pidfd per survivor (readable when it exits; rescanned when all have,
-    in case one forked) — no polling where pidfds exist. A kill (`ProcGroup::kill`) signals the group,
-    then sweeps the scan until it comes back empty, each pid SIGKILLed through a pidfd opened _before_
-    re-checking that it still carries the tag, so a reused pid is never hit. No deadline bounds the
+    in case one forked) — no polling where pidfds exist. A kill (`ProcGroup::kill`) sends SIGTERM to
+    the group and every scanned pid, waits up to `TERM_GRACE` (300 ms, returning as soon as the scan
+    is empty), then signals the group with SIGKILL and sweeps the scan until it comes back empty,
+    each pid signalled through a pidfd opened _before_ re-checking that it still carries the tag, so
+    a reused pid is never hit. TERM first because SIGKILL cannot be relayed: `sudo cmd` forwards a
+    TERM to its root child (gone ~40 ms later on the dev box), while a KILL takes `sudo` down alone
+    and leaves the child, which we may not signal, running. Stopping several jobs (`stop_all`,
+    `end_turn`) goes through `exec::kill_all`, which spends one grace for all of them. A process
+    that refuses the signal (`EPERM`: another uid) ends the sweep and is reported — in the
+    `bash_job` kill's result (an error, not "killed") and as `survived` on the job's
+    `bash_jobs_stopped` entry — instead of being claimed killed. No deadline bounds the
     wait: the job's `Kill`, or dropping the call, ends it. No name-based kill anywhere (`pkill -f` matching the harness is a known failure
     elsewhere).
   - **What escapes:** a process that both clears its environment (`env -i`) and leaves the group, and

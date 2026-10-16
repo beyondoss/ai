@@ -40,6 +40,16 @@ const SETTLE: Duration = Duration::from_millis(100);
 /// How often liveness is polled where a pidfd is not available (another unix, a kernel before 5.3).
 const POLL: Duration = Duration::from_millis(250);
 
+/// How long a stopped job's processes get to exit on SIGTERM before the SIGKILL sweep. SIGTERM
+/// first because SIGKILL cannot be relayed: `sudo cmd` forwards a TERM to its root child (gone 40
+/// ms after the TERM on the dev box, `sudo -n sleep`), but a KILL takes `sudo` down alone and leaves
+/// the child — which we may not signal — running. 300 ms is ~7x that, and is only spent in full on a
+/// process that ignores or traps TERM; a job whose processes all exit returns as soon as they have.
+pub const TERM_GRACE: Duration = Duration::from_millis(300);
+
+/// How often the grace re-checks whether the jobs' processes have exited.
+const GRACE_POLL: Duration = Duration::from_millis(10);
+
 /// One job's processes: its process group and its tag.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcGroup {
@@ -78,15 +88,42 @@ impl ProcGroup {
         imp::members(self)
     }
 
-    /// SIGKILL every process of the job and keep sweeping until none is left (a process that forked
-    /// mid-sweep is caught by the next pass). Blocking: callers run it on a blocking thread.
-    pub fn kill(&self) {
-        imp::kill(self);
+    /// Stop every process of the job: SIGTERM, up to [`TERM_GRACE`] for them to exit, then SIGKILL,
+    /// sweeping until none is left (a process that forked mid-sweep is caught by the next pass).
+    /// Returns the pids still running after it — processes we may not signal (`EPERM`: another
+    /// uid, e.g. the root child of a `sudo` that died before relaying). Blocking: callers run it on
+    /// a blocking thread. Several jobs at once: [`super::exec::kill_all`], which spends one grace.
+    pub fn kill(&self) -> Vec<u32> {
+        self.terminate();
+        let deadline = Instant::now() + TERM_GRACE;
+        await_exit(&[self], deadline);
+        self.sweep()
+    }
+
+    /// SIGTERM every process of the job, without waiting.
+    pub(crate) fn terminate(&self) {
+        imp::terminate(self);
+    }
+
+    /// The SIGKILL sweep alone; returns what survived it — see [`Self::kill`].
+    pub(crate) fn sweep(&self) -> Vec<u32> {
+        imp::kill(self)
     }
 
     /// Resolve once every process of the job has exited.
     pub async fn wait_gone(&self) {
         imp::wait_gone(self).await;
+    }
+}
+
+/// Block until every process of `groups` has exited or `deadline` passes. Blocking.
+pub(crate) fn await_exit(groups: &[&ProcGroup], deadline: Instant) {
+    while groups.iter().any(|g| !g.members().is_empty()) {
+        let now = Instant::now();
+        if now >= deadline {
+            return;
+        }
+        std::thread::sleep(GRACE_POLL.min(deadline - now));
     }
 }
 
@@ -131,7 +168,9 @@ impl Drop for KillGuard {
     fn drop(&mut self) {
         #[cfg(unix)]
         if let Some(group) = self.0.take() {
-            super::exec::spawn_tracked_cleanup(move || group.kill());
+            super::exec::spawn_tracked_cleanup(move || {
+                group.kill();
+            });
         }
     }
 }
@@ -334,47 +373,76 @@ mod imp {
         })
     }
 
-    pub(super) fn kill(group: &ProcGroup) {
+    pub(super) fn terminate(group: &ProcGroup) {
+        if let Some(pgid) = Pid::from_raw(group.pgid as i32) {
+            let _ = rustix::process::kill_process_group(pgid, Signal::TERM);
+        }
+        for pid in members(group) {
+            signal_verified(group, pid, Signal::TERM);
+        }
+    }
+
+    pub(super) fn kill(group: &ProcGroup) -> Vec<u32> {
         if let Some(pgid) = Pid::from_raw(group.pgid as i32) {
             let _ = rustix::process::kill_process_group(pgid, Signal::KILL);
         }
         for pass in 0..KILL_PASSES {
             let pids = members(group);
             if pids.is_empty() {
-                return;
+                return pids;
             }
-            for pid in pids {
-                kill_verified(group, pid);
+            // Every one left refused the signal: another pass cannot do better.
+            let mut denied = 0;
+            for &pid in &pids {
+                if signal_verified(group, pid, Signal::KILL) {
+                    denied += 1;
+                }
+            }
+            if denied == pids.len() {
+                tracing::warn!(
+                    pgid = group.pgid,
+                    ?pids,
+                    "bash job processes we may not signal survived the kill"
+                );
+                return pids;
             }
             // A SIGKILLed process is a zombie (skipped above) once the kernel has torn it down.
             std::thread::sleep(Duration::from_millis(if pass == 0 { 5 } else { 25 }));
         }
-        tracing::warn!(
-            pgid = group.pgid,
-            "bash job processes survived repeated kill passes"
-        );
+        let pids = members(group);
+        if !pids.is_empty() {
+            tracing::warn!(
+                pgid = group.pgid,
+                ?pids,
+                "bash job processes survived repeated kill passes"
+            );
+        }
+        pids
     }
 
-    /// SIGKILL `pid` if it still belongs to `group` — checked after opening a pidfd on it, and
-    /// signalled through that pidfd, so a pid reused by an unrelated process in between is never
-    /// hit.
-    fn kill_verified(group: &ProcGroup, pid: u32) {
+    /// Send `signal` to `pid` if it still belongs to `group` — checked after opening a pidfd on it,
+    /// and signalled through that pidfd, so a pid reused by an unrelated process in between is
+    /// never hit. Whether the kernel refused it (`EPERM`: a process of another uid).
+    fn signal_verified(group: &ProcGroup, pid: u32, signal: Signal) -> bool {
         let Some(p) = Pid::from_raw(pid as i32) else {
-            return;
+            return false;
         };
-        match rustix::process::pidfd_open(p, PidfdFlags::empty()) {
+        let sent = match rustix::process::pidfd_open(p, PidfdFlags::empty()) {
             Ok(fd) => {
-                if belongs(group, pid) {
-                    let _ = rustix::process::pidfd_send_signal(&fd, Signal::KILL);
+                if !belongs(group, pid) {
+                    return false;
                 }
+                rustix::process::pidfd_send_signal(&fd, signal)
             }
             // No pidfd (a kernel before 5.3): the check-then-kill gap is a few microseconds.
             Err(_) => {
-                if belongs(group, pid) {
-                    let _ = rustix::process::kill_process(p, Signal::KILL);
+                if !belongs(group, pid) {
+                    return false;
                 }
+                rustix::process::kill_process(p, signal)
             }
-        }
+        };
+        sent == Err(rustix::io::Errno::PERM)
     }
 
     pub(super) async fn wait_gone(group: &ProcGroup) {
@@ -439,8 +507,15 @@ mod imp {
         }
     }
 
-    pub(super) fn kill(group: &ProcGroup) {
+    pub(super) fn terminate(group: &ProcGroup) {
+        if let Some(p) = Pid::from_raw(group.pgid as i32) {
+            let _ = rustix::process::kill_process_group(p, rustix::process::Signal::TERM);
+        }
+    }
+
+    pub(super) fn kill(group: &ProcGroup) -> Vec<u32> {
         super::super::exec::kill_group_members(group.pgid);
+        Vec::new()
     }
 
     pub(super) async fn wait_gone(group: &ProcGroup) {
@@ -462,7 +537,11 @@ mod imp {
         Vec::new()
     }
 
-    pub(super) fn kill(_group: &ProcGroup) {}
+    pub(super) fn terminate(_group: &ProcGroup) {}
+
+    pub(super) fn kill(_group: &ProcGroup) -> Vec<u32> {
+        Vec::new()
+    }
 
     pub(super) async fn wait_gone(_group: &ProcGroup) {}
 

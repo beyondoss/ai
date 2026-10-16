@@ -5520,7 +5520,13 @@ async fn run_task(
         }
         let list: Vec<String> = stopped
             .iter()
-            .map(|j| format!("job {} `{}` ({} s)", j.job, j.command, j.running_secs))
+            .map(|j| match &j.survived {
+                None => format!("job {} `{}` ({} s)", j.job, j.command, j.running_secs),
+                Some(left) => format!(
+                    "job {} `{}` ({} s; {left} could not be killed and is still running)",
+                    j.job, j.command, j.running_secs
+                ),
+            })
             .collect();
         eprintln!(
             "[stopped {} background job(s) still running at the end of the run: {}]",

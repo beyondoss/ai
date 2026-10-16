@@ -103,7 +103,9 @@ impl Drop for Job {
         // process on its way out may never do — kill directly too.
         #[cfg(unix)]
         if let Some(group) = self.shared.untrack() {
-            super::exec::spawn_tracked_cleanup(move || group.kill());
+            super::exec::spawn_tracked_cleanup(move || {
+                group.kill();
+            });
         }
     }
 }
@@ -280,6 +282,10 @@ pub struct StoppedJob {
     pub command: String,
     pub kind: JobKind,
     pub running_secs: u64,
+    /// Processes of the job still running after the kill — ones we may not signal (another uid,
+    /// e.g. the root child of `sudo`). Absent when everything stopped.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub survived: Option<String>,
 }
 
 /// One session's jobs. Shared by every `bash`/`bash_job` built over it (a registry rebuild keeps
@@ -449,20 +455,29 @@ impl BashJobs {
                 .collect()
         };
         let mut stopped = Vec::new();
-        for (id, p) in taken {
+        let mut kills = Vec::new();
+        for (id, p) in &taken {
             if !p.job.shared.ended() {
                 stopped.push(StoppedJob {
-                    job: id,
+                    job: *id,
                     command: p.job.command.clone(),
                     kind: p.job.kind,
                     running_secs: p.job.started.elapsed().as_secs(),
+                    survived: None,
                 });
             }
             if let Some(kill) = p.job.shared.untrack() {
-                kill.kill();
+                kills.push((*id, kill));
             }
-            drop(p);
         }
+        // All at once, so stopping N jobs spends one SIGTERM grace, not N.
+        let all: Vec<Kill> = kills.iter().map(|(_, k)| k.clone()).collect();
+        for ((id, _), left) in kills.iter().zip(super::exec::kill_all(&all)) {
+            if let Some(s) = stopped.iter_mut().find(|s| s.job == *id) {
+                s.survived = left;
+            }
+        }
+        drop(taken);
         stopped
     }
 
@@ -725,7 +740,9 @@ static NEXT_JOB_KEY: AtomicU64 = AtomicU64::new(0);
 pub fn kill_live_jobs() {
     #[cfg(unix)]
     for (_, kill) in std::mem::take(&mut *lock(&LIVE_JOBS)) {
-        super::exec::spawn_tracked_cleanup(move || kill.kill());
+        super::exec::spawn_tracked_cleanup(move || {
+            kill.kill();
+        });
     }
 }
 
