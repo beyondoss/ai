@@ -485,7 +485,17 @@ The harness layers several capabilities over the bare tools + loop:
   turn — each pass replaces `Session::edited`, so a run that masks twice keeps the first pass's edits
   only until the second, and the checkpoints in between are where they reach disk; a crash before
   that reloads the unmasked transcript, which is valid, only larger), every write is `fsync`ed for durability, a corrupt/torn line anywhere in the file (not just
-  the last one) is skipped rather than aborting the whole read, and a header whose `version` is newer
+  the last one) is skipped rather than aborting the whole read — and costs only itself: an entry whose
+  parent was the bad line re-chains to the tip in effect when it was read (`rechain_orphans`, after the
+  whole scan, since a full rewrite writes off-path nodes in no particular order), a `Leaf` naming an
+  unreadable entry is ignored, and a message holding a content block or stop reason from a newer build
+  is read as a degraded copy (the block becomes a text block naming its type, the stop reason `Other`;
+  the original line stays on disk) rather than dropped. A torn tail is cut back to the last newline by
+  every writable single-file open (`trim_torn_tail`; read-only opens never touch the file), and a
+  single-file append that fails part-way (`ENOSPC`, `EFBIG`, a failed sync) is `set_len` back to its
+  starting length, with a newline written first if the file somehow still ends mid-line — so the next
+  turn is never glued onto a fragment, which used to take every message chained after it (8 → 1) off
+  the active path on reopen (`tests/session_file_integrity.rs`). A header whose `version` is newer
   than the build understands is refused (migration hook). `rewrite`'s write-to-`.jsonl.tmp`-then-rename
   is safe either way a failure lands: a hard crash leaves the `.tmp` behind harmlessly (never read back
   as a session; the next `rewrite` reuses the same deterministic path anyway), while a genuine

@@ -3,10 +3,14 @@
 //! Each session is one newline-delimited JSON file: a header line carrying [`SessionMeta`] (stable id,
 //! cwd, model, timestamps, optional title and `parent` lineage), then one line per conversation
 //! message. A turn **appends** its new messages — O(new), not O(transcript) — and a torn final line
-//! (a crash mid-append) is dropped on load, so at most the last entry is lost. More generally, any
-//! single line that fails to deserialize — not only the last one — is skipped rather than truncating
-//! the scan: reading resumes with whatever comes after it, since a fully-read line's boundaries are
-//! already known regardless of whether its *contents* parse.
+//! (a crash mid-append) is dropped on load and cut off the file by the next writable open, so at most
+//! the last entry is lost and the next append never lands glued onto the fragment; an append that
+//! fails part-way is rolled back to the length it started from. More generally, any single line that
+//! fails to deserialize — not only the last one — is skipped rather than truncating the scan, and an
+//! entry whose parent was such a line re-chains to the entry before the gap (`rechain_orphans`), so
+//! the damage costs only the unreadable entries, never the history before them. A message holding a
+//! content block or stop reason from a newer build is read as a degraded copy rather than skipped
+//! (`degrade_unknown_variants`).
 //!
 //! **Tree-shaped history.** Every message entry carries an `id` and a `parent_id`, so a session's
 //! history is a tree, not just a line — the "active path" (what `Session.messages` holds) is the
@@ -951,6 +955,69 @@ fn path_from_root(nodes: &HashMap<String, Node>, tip: Option<&str>) -> Vec<Strin
     rev
 }
 
+/// Re-chain every node whose `parent_id` names a node the tree never got — its line was torn,
+/// unreadable, or of a kind this build does not know — onto the tip in effect when the orphan was read
+/// (`tip_at_read`). Appends always chain off the active tip, so that is the orphan's nearest readable
+/// ancestor: the gap costs exactly the unreadable entries, never the history before them. Without this
+/// [`path_from_root`] stops at the gap, and everything before it falls off the active path.
+///
+/// Runs after the whole scan, not per line: a full rewrite writes off-path nodes in no particular
+/// order, so a parent can legitimately come after its child in the file. Only the in-memory index is
+/// re-chained; the file is left as written, and every open derives the same tree from it.
+fn rechain_orphans(
+    nodes: &mut HashMap<String, Node>,
+    tip_at_read: &HashMap<String, Option<String>>,
+) {
+    let orphans: Vec<String> = nodes
+        .iter()
+        .filter(|(_, node)| {
+            node.parent_id
+                .as_ref()
+                .is_some_and(|p| !nodes.contains_key(p))
+        })
+        .map(|(id, _)| id.clone())
+        .collect();
+    for id in orphans {
+        let adopted = tip_at_read
+            .get(&id)
+            .cloned()
+            .flatten()
+            .filter(|t| *t != id && nodes.contains_key(t));
+        tracing::warn!(id = %id, adopted = ?adopted, "re-chaining a session entry whose parent is unreadable");
+        if let Some(node) = nodes.get_mut(&id) {
+            node.parent_id = adopted;
+        }
+    }
+}
+
+/// Cut a single-file session back to its last complete line — a torn tail left by a crash, an OOM
+/// kill or a full disk mid-append. A file with no newline at all (a torn header) is left alone; the
+/// open that called this has already refused it.
+fn trim_torn_tail(path: &Path) -> std::io::Result<()> {
+    use std::io::{Seek, SeekFrom};
+    let mut f = OpenOptions::new().read(true).write(true).open(path)?;
+    let len = f.metadata()?.len();
+    let mut end = len;
+    let mut chunk = vec![0u8; 64 * 1024];
+    while end > 0 {
+        let start = end.saturating_sub(chunk.len() as u64);
+        let n = usize::try_from(end - start).unwrap_or(chunk.len());
+        f.seek(SeekFrom::Start(start))?;
+        f.read_exact(&mut chunk[..n])?;
+        if let Some(pos) = chunk[..n].iter().rposition(|&b| b == b'\n') {
+            let keep = start + pos as u64 + 1;
+            if keep < len {
+                tracing::warn!(path = %path.display(), cut = len - keep, "cutting a torn session tail");
+                f.set_len(keep)?;
+                f.sync_all()?;
+            }
+            return Ok(());
+        }
+        end = start;
+    }
+    Ok(())
+}
+
 /// A handle to one session's append log.
 ///
 /// Not `Sync`-guarded internally, and deliberately so: every mutating method takes `&mut self`, and
@@ -1067,7 +1134,8 @@ impl SessionStore {
     }
 
     /// Open an existing session file, returning the store and the restored [`Session`] (the active
-    /// path's messages). A torn final line (crash mid-append) is skipped; a header is required.
+    /// path's messages). A torn final line (crash mid-append) is skipped, and cut off the file since
+    /// this open may write; a header is required.
     pub fn open(path: PathBuf) -> std::io::Result<(Self, Session)> {
         Self::open_with(path, None, &Layout::File, false)
     }
@@ -1118,6 +1186,14 @@ impl SessionStore {
         // own all-empty default.
         let mut compaction_provenance: Option<CompactionProvenance> = None;
         let mut events: Vec<ExportEvent> = Vec::new();
+        // The active tip at the moment each tree node was read, by node id: where a node whose parent
+        // never made it into the tree (an unreadable line) is re-chained once the scan is done — see
+        // `rechain_orphans`.
+        let mut tip_at_read: HashMap<String, Option<String>> = HashMap::new();
+        // Whether the last line read was a whole, readable entry, and whether the scan stopped on a
+        // read error rather than at the end — what decides `trim_torn_tail` below.
+        let mut last_line_ok = true;
+        let mut read_failed = false;
 
         let mut reader = log.lines()?;
         let mut raw = Vec::new();
@@ -1135,8 +1211,12 @@ impl SessionStore {
                 // not this session's, and a partial view would be silently overwritten by the next
                 // write. Every other read failure keeps whatever was valid so far.
                 Err(e) if is_seal_failure(&e) => return Err(e),
-                Err(_) => break,
+                Err(_) => {
+                    read_failed = true;
+                    break;
+                }
             };
+            last_line_ok = false;
             if oversized {
                 tracing::warn!(path = %path.display(), "skipping oversized session entry line");
                 continue;
@@ -1149,7 +1229,18 @@ impl SessionStore {
             if line.is_empty() {
                 continue;
             }
-            match parse_entry_lenient(&path, line) {
+            let parsed = parse_entry_lenient(&path, line);
+            last_line_ok = parsed.is_ok();
+            // Every tree node remembers the tip it was read under (see `tip_at_read`).
+            if let Ok(
+                Entry::Message { id: Some(id), .. }
+                | Entry::BranchSummary { id, .. }
+                | Entry::Custom { id, .. },
+            ) = &parsed
+            {
+                tip_at_read.insert(id.clone(), tip.clone());
+            }
+            match parsed {
                 Ok(Entry::Session(m)) => meta = Some(m),
                 Ok(Entry::Message {
                     id,
@@ -1185,7 +1276,13 @@ impl SessionStore {
                     );
                     tip = Some(id);
                 }
-                Ok(Entry::Leaf { target_id, .. }) => tip = target_id,
+                // A target the tree never got (its line was unreadable) is ignored rather than
+                // followed: a tip naming no node would materialize as an empty session.
+                Ok(Entry::Leaf { target_id, .. }) => {
+                    if target_id.as_ref().is_none_or(|t| nodes.contains_key(t)) {
+                        tip = target_id;
+                    }
+                }
                 // A branch summary *does* become the new tip — it's a child of the branch point being
                 // returned to (see `switch_active_with_summary`), materialized into a real message so
                 // the recap actually reaches the model on the next turn, not just sitting on disk.
@@ -1373,7 +1470,22 @@ impl SessionStore {
         })?;
         // Validate (and, in a future format, upgrade) the header before trusting the rest of the file.
         let meta = migrate(meta, &path)?;
+        // A writable open owns the tail: a torn final line (a crash, OOM or full disk mid-append) is
+        // cut off now, so the next append starts on a line of its own instead of being glued onto
+        // the fragment and lost with it. Only when the scan reached the end — a read error leaves
+        // lines unread that the cut would take with it. The segmented layout never needs this: its
+        // reads are bounded and a writer only ever appends to a segment it created.
+        if !read_failed
+            && !last_line_ok
+            && let Log::File {
+                path,
+                read_only: false,
+            } = &log
+        {
+            trim_torn_tail(path)?;
+        }
 
+        rechain_orphans(&mut nodes, &tip_at_read);
         let active = path_from_root(&nodes, tip.as_deref());
         // A custom entry (`NodeContent::Custom`) contributes nothing here — it's a real, positioned
         // node in `active`'s chain (see `Entry::Custom`'s doc comment), but not a message, so
@@ -1556,8 +1668,8 @@ impl SessionStore {
     /// advanced — a caller that retries the same batch after the error would then re-append `0..k`,
     /// duplicating history. Serializing to a buffer first means a mid-batch failure never touches the
     /// file at all; the one `write_all` against the open file is then all-or-nothing at this layer
-    /// (and even a partial short write only leaves a torn trailing line, which `open`'s load path
-    /// already drops per the module's crash-recovery contract).
+    /// (a partial short write is rolled back by `Log::append`, and one a crash leaves behind is a torn
+    /// trailing line `open` drops and cuts, per the module's crash-recovery contract).
     pub fn append_new(&mut self, messages: &[Message]) -> std::io::Result<()> {
         if messages.len() <= self.persisted {
             return Ok(());
@@ -4812,7 +4924,60 @@ fn parse_entry_lenient(path: &Path, line: &str) -> Result<Entry, serde_json::Err
             "recovered session entry line with null/missing content by treating it as empty"
         );
     })
+    .or_else(|| degrade_unknown_variants(line))
+    .inspect(|_| {
+        tracing::warn!(
+            path = %path.display(),
+            "read a session message holding content this build does not know as a degraded copy"
+        );
+    })
     .ok_or(original_err)
+}
+
+/// A message (or message edit) written by a newer build, holding a content block or stop reason this
+/// build has no variant for, read as a degraded copy instead of being dropped: each unknown block
+/// becomes a text block naming its type, an unknown stop reason becomes [`StopReason::Other`]. The
+/// message keeps its id, parent and place in the tree, so nothing that chains off it is lost, and
+/// the original line stays on disk untouched for the newer build to read in full (only a full
+/// rewrite by this build — a `/new`, a fork — would write the degraded copy back).
+///
+/// `None` for anything else: an unknown entry `type`, a missing role, JSON that does not parse.
+fn degrade_unknown_variants(line: &str) -> Option<Entry> {
+    use agent_core::StopReason;
+    let mut value = serde_json::from_str::<serde_json::Value>(line).ok()?;
+    let obj = value.as_object_mut()?;
+    match obj.get("type").and_then(serde_json::Value::as_str) {
+        Some("message" | "message_edit") => {}
+        _ => return None,
+    }
+    let mut changed = false;
+    if let Some(serde_json::Value::Array(blocks)) = obj.get_mut("content") {
+        for block in blocks.iter_mut() {
+            if serde_json::from_value::<ContentBlock>(block.clone()).is_ok() {
+                continue;
+            }
+            let kind = block
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            *block = serde_json::to_value(ContentBlock::text(format!(
+                "[content this version cannot read: {kind}]"
+            )))
+            .ok()?;
+            changed = true;
+        }
+    }
+    if let Some(reason) = obj.get_mut("stop_reason")
+        && !reason.is_null()
+        && serde_json::from_value::<StopReason>(reason.clone()).is_err()
+    {
+        *reason = serde_json::to_value(StopReason::Other).ok()?;
+        changed = true;
+    }
+    if !changed {
+        return None;
+    }
+    serde_json::from_value::<Entry>(value).ok()
 }
 
 /// Ceiling on one session-file line (one JSON entry) while loading. A legitimate entry — even one
@@ -5830,14 +5995,40 @@ impl Log {
         self.guard_writable()?;
         match self {
             Log::File { path, .. } => {
-                let mut f = OpenOptions::new().append(true).open(path)?;
+                use std::io::{Seek, SeekFrom};
+                let mut f = OpenOptions::new().read(true).append(true).open(&*path)?;
                 keep_private(&f)?;
-                f.write_all(bytes)?;
-                // `flush` only pushes past our buffer into the OS; `sync_all` forces the bytes to
-                // disk, which is what the module's crash-safety claim actually requires. The parent
-                // dir is unchanged on an append (same inode, same dentry), so no directory fsync.
-                f.flush()?;
-                f.sync_all()
+                let pre = f.metadata()?.len();
+                // Never glue an entry onto a line that did not end: a tail left unterminated since
+                // the open (a rollback below that itself failed) gets its newline first, so this
+                // entry reads back as its own line whatever the fragment before it is.
+                let mut last = [b'\n'];
+                if pre > 0 {
+                    f.seek(SeekFrom::Start(pre - 1))?;
+                    f.read_exact(&mut last)?;
+                }
+                let written = (|| -> std::io::Result<()> {
+                    if last[0] != b'\n' {
+                        f.write_all(b"\n")?;
+                    }
+                    f.write_all(bytes)?;
+                    // `flush` only pushes past our buffer into the OS; `sync_all` forces the bytes
+                    // to disk, which is what the module's crash-safety claim actually requires. The
+                    // parent dir is unchanged on an append (same inode, same dentry), so no
+                    // directory fsync.
+                    f.flush()?;
+                    f.sync_all()
+                })();
+                if written.is_err() {
+                    // A failed append (a full disk, a file-size limit, a failed sync) may have left
+                    // part of its bytes behind. The caller's state did not advance, so put the file
+                    // back exactly as long as it was: the retry, or the next turn, must never land
+                    // after half a line.
+                    if let Err(e) = f.set_len(pre).and_then(|()| f.sync_all()) {
+                        tracing::warn!(path = %path.display(), error = %e, "could not roll back a failed session append");
+                    }
+                }
+                written
             }
             Log::Segmented(s) => s.append(bytes),
         }
