@@ -4960,6 +4960,15 @@ async fn run_task(
             }
         }
     };
+    // One writer per session: held for the whole run, taken before the store's first write. A
+    // session another process is writing (`run -c` in a second terminal, a `serve` that has it open)
+    // is refused with the file named, not shared — two writers each chain their turns onto their own
+    // stale tip. See `session_store::lock_session_writer`.
+    let _session_lock = match &store {
+        Some(store) => beyond_ai_agent::session_store::lock_session_writer(store.path())
+            .map_err(|e| format!("cannot use this session: {e}"))?,
+        None => None,
+    };
 
     // Persistent, cross-session memory. Resolved here (before the subagent context is built) so the same
     // backend `Arc` is shared with every child — the whole subagent tree reads/writes one durable store.

@@ -1025,12 +1025,11 @@ fn trim_torn_tail(path: &Path) -> std::io::Result<()> {
 /// value, never behind an `Arc`. Rust's borrow checker already makes a concurrent `append_new`/`rewrite`
 /// race on one `SessionStore` unrepresentable *within a process* — there is no code path that could
 /// call two mutating methods on the same store at once, so an in-process lock would guard against a
-/// scenario that can't happen. What this does *not* cover is two separate **processes** opening the
-/// same session file (e.g. an operator accidentally pointing two `serve --session-file` invocations at
-/// one path) — nothing here takes an OS-level advisory lock, so that remains a real, if currently
-/// unreachable, hazard: no feature today opens one session file from more than one process. If that
-/// ever changes (a future multi-process feature), add a `flock`-based lock in `open`/`create` then —
-/// not before, per this project's minimum-effective-abstraction standard.
+/// scenario that can't happen. Two separate **processes** writing one single-file session (`run -c`
+/// in two terminals, `run` against a session a `serve` has open) are kept apart by the writer lock
+/// [`lock_session_writer`], which every writing binary takes right after opening and holds with the
+/// store; the store itself takes no lock, so a read-only consumer (listing, export, a fork source) is
+/// never blocked. The segmented layout is fenced by epoch instead (see "Ownership: the epoch fence").
 pub struct SessionStore {
     /// Where this session's entries actually live — one file, or a directory of epoch segments. The
     /// tree logic below never looks inside it: every read goes through `log.lines()` and every write
@@ -1473,18 +1472,23 @@ impl SessionStore {
         // Validate (and, in a future format, upgrade) the header before trusting the rest of the file.
         let meta = migrate(meta, &path)?;
         // A writable open owns the tail: a torn final line (a crash, OOM or full disk mid-append) is
-        // cut off now, so the next append starts on a line of its own instead of being glued onto
-        // the fragment and lost with it. Only when the scan reached the end — a read error leaves
-        // lines unread that the cut would take with it. The segmented layout never needs this: its
-        // reads are bounded and a writer only ever appends to a segment it created.
+        // cut off before this store's first write, so that write starts on a line of its own instead
+        // of being glued onto the fragment and lost with it. Only when the scan reached the end — a
+        // read error leaves lines unread that the cut would take with it. Deferred to the first
+        // write rather than done here, because an open is not yet ownership: a caller takes the
+        // session lock after opening (`lock_session_writer`) and refuses if another process holds
+        // it, and that process's in-flight append looks exactly like a torn tail. The segmented
+        // layout never needs this: its reads are bounded and a writer only ever appends to a segment
+        // it created.
         if !read_failed
             && !last_line_ok
             && let Log::File {
                 path,
                 read_only: false,
-            } = &log
+                torn_at,
+            } = &mut log
         {
-            trim_torn_tail(path)?;
+            *torn_at = Some(fs::metadata(&*path)?.len());
         }
 
         rechain_orphans(&mut nodes, &tip_at_read);
@@ -5815,7 +5819,13 @@ fn segment_has_trailer(file: &mut File, start: u64, end: u64) -> std::io::Result
 /// Where a [`SessionStore`]'s entries live. Replaces the bare `PathBuf` the store used to hold, so
 /// every write goes through one place and the tree logic above never learns which layout it is on.
 enum Log {
-    File { path: PathBuf, read_only: bool },
+    File {
+        path: PathBuf,
+        read_only: bool,
+        /// The file's length when the open found its last line torn: the first write cuts that
+        /// line off (`trim_torn_tail`) if the file is still exactly this long, then clears it.
+        torn_at: Option<u64>,
+    },
     Segmented(Box<SegLog>),
 }
 
@@ -5919,6 +5929,7 @@ impl Log {
                 Ok(Log::File {
                     path,
                     read_only: false,
+                    torn_at: None,
                 })
             }
             Layout::Segmented { codec } => Ok(Log::Segmented(Box::new(SegLog::create(
@@ -5991,7 +6002,11 @@ impl Log {
         } else {
             // A missing file must surface as `NotFound` here, exactly as `File::open` used to.
             drop(File::open(&path)?);
-            Ok(Log::File { path, read_only })
+            Ok(Log::File {
+                path,
+                read_only,
+                torn_at: None,
+            })
         }
     }
 
@@ -6051,8 +6066,16 @@ impl Log {
     fn append(&mut self, bytes: &[u8]) -> std::io::Result<()> {
         self.guard_writable()?;
         match self {
-            Log::File { path, .. } => {
+            Log::File { path, torn_at, .. } => {
                 use std::io::{Seek, SeekFrom};
+                // The torn tail the open found, cut now that this store is writing (see `open_with`).
+                // Only if the file is still exactly as the open saw it: anything appended since is
+                // someone else's, and the newline below keeps this entry clear of it regardless.
+                if let Some(len) = torn_at.take()
+                    && fs::metadata(&*path)?.len() == len
+                {
+                    trim_torn_tail(path)?;
+                }
                 let mut f = OpenOptions::new().read(true).append(true).open(&*path)?;
                 keep_private(&f)?;
                 let pre = f.metadata()?.len();
@@ -6095,7 +6118,9 @@ impl Log {
     fn replace_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
         self.guard_writable()?;
         match self {
-            Log::File { path, .. } => {
+            Log::File { path, torn_at, .. } => {
+                // The whole file is replaced, torn tail and all.
+                *torn_at = None;
                 let tmp = path.with_extension("jsonl.tmp");
                 let mut f = create_private(&tmp)?;
                 let write = (|| -> std::io::Result<()> {
@@ -6808,6 +6833,32 @@ pub fn acquire_session_lock(session_path: &Path) -> std::io::Result<Option<Sessi
     } else {
         crate::file_lock::Target::File(session_path)
     })
+}
+
+/// The single-writer lock a process holds on a single-file session for as long as it may write it —
+/// `run`, and `serve` outside service mode, take it right after opening (before any write; see
+/// `Log::File::torn_at`) and keep it with the store. A second process asking for a session already
+/// held is **refused**, with an error naming the file ([`std::io::ErrorKind::WouldBlock`]), rather
+/// than opened read-only: a turn on a read-only session can't be saved, and the operator asked for one
+/// that is. Two writers can't share a single-file session at all — `append_new` is count-keyed, so
+/// neither sees the other's turns and each chains its next one onto its own stale tip.
+///
+/// `Ok(None)` for the segmented layout: its writers are fenced by epoch, and service mode takes the
+/// session lock itself (`serve_ws`), which a second acquire in the same process would be refused.
+pub fn lock_session_writer(session_path: &Path) -> std::io::Result<Option<SessionLock>> {
+    if session_path.is_dir() {
+        return Ok(None);
+    }
+    match acquire_session_lock(session_path)? {
+        Some(lock) => Ok(Some(lock)),
+        None => Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            format!(
+                "session {} is open in another agent process; wait for it to finish, or fork it",
+                session_path.display()
+            ),
+        )),
+    }
 }
 
 #[cfg(test)]

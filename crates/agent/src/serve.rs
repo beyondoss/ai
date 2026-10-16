@@ -1334,6 +1334,15 @@ impl<'a> SessionSelect<'a> {
 struct Persistence {
     repo: Option<SessionRepo>,
     store: Option<SessionStore>,
+    /// The writer lock on `store`'s session (see [`crate::session_store::lock_session_writer`]):
+    /// taken before the store's first write, replaced with every store swap, so no other process can
+    /// write the session this one is writing. `None` with no store, and for the segmented layout.
+    lock: Option<crate::session_store::SessionLock>,
+    /// Whether this process takes writer locks at all: stdio `serve` does, as `run` does. A daemon
+    /// session (`ServeConfig::supervised`) does not — its sessions share one process, where the
+    /// supervisor's id table already keeps one task per session, and service mode locks in
+    /// `serve_ws` itself.
+    writer_lock: bool,
     meta: SessionMeta,
     /// Set when the caller *named* this session ([`ServeConfig::session_id`]), which makes the id a
     /// routing key rather than an incidental label — the daemon reconnects `?session_id=<id>` to it, and
@@ -1409,13 +1418,22 @@ impl Persistence {
                 &cfg.model,
                 SessionSelect::from_cfg(cfg),
                 service.repo_options_for(service.session_id()),
+                false,
             );
         }
+        let writer_lock = !cfg.supervised;
         let cwd = crate::session_store::canonical_cwd(&std::env::current_dir().unwrap_or_default())
             .to_string_lossy()
             .into_owned();
         if let Some(dir) = &cfg.session_dir {
-            return Self::open_repo(dir, &cwd, &cfg.model, SessionSelect::from_cfg(cfg));
+            return Self::open_repo_with(
+                dir,
+                &cwd,
+                &cfg.model,
+                SessionSelect::from_cfg(cfg),
+                crate::session_store::RepoOptions::default(),
+                writer_lock,
+            );
         }
         if let Some(path) = &cfg.session_file {
             let path = std::path::PathBuf::from(path);
@@ -1430,11 +1448,18 @@ impl Persistence {
                 let store = SessionStore::create(path, meta)?;
                 (store, Session::new())
             };
+            let lock = if writer_lock {
+                crate::session_store::lock_session_writer(store.path())?
+            } else {
+                None
+            };
             let meta = store.meta().clone();
             return Ok((
                 Self {
                     repo: None,
                     store: Some(store),
+                    lock,
+                    writer_lock,
                     meta,
                     // Recorded for consistency, but single-file mode never consults it: the operator
                     // named the *file*, and `new_session`'s file-mode arm already resets in place, so
@@ -1450,6 +1475,8 @@ impl Persistence {
                 Self {
                     repo: None,
                     store: None,
+                    lock: None,
+                    writer_lock,
                     meta: fresh_meta(&cwd, &cfg.model, cfg.session_id.as_deref()),
                     pinned_id: cfg.session_id.clone(),
                     transcript: 0,
@@ -1460,11 +1487,13 @@ impl Persistence {
         // Neither flag was given and persistence wasn't explicitly opted out: default to a per-cwd
         // repo directory rather than silently running in-memory-only, so an operator who simply
         // forgot the flag doesn't lose all history on the next restart with no indication why.
-        Self::open_repo(
+        Self::open_repo_with(
             crate::session_store::default_session_dir(&cwd),
             &cwd,
             &cfg.model,
             SessionSelect::from_cfg(cfg),
+            crate::session_store::RepoOptions::default(),
+            writer_lock,
         )
     }
 
@@ -1476,6 +1505,10 @@ impl Persistence {
     /// A supervised `serve` that wants to pick its conversation back up across restarts should pin
     /// `--session-id`: that's deterministic and idempotent, whereas `--continue`'s "most recent for this
     /// cwd" silently depends on what else has touched the directory since.
+    ///
+    /// The tests' shorthand for [`Self::open_repo_with`] with the default layout and writer locks
+    /// taken, as stdio `serve` takes them; [`Self::open`] calls that directly.
+    #[cfg(test)]
     fn open_repo(
         dir: impl Into<std::path::PathBuf>,
         cwd: &str,
@@ -1488,17 +1521,20 @@ impl Persistence {
             model,
             select,
             crate::session_store::RepoOptions::default(),
+            true,
         )
     }
 
     /// [`Self::open_repo`] with an explicit on-disk shape — the service-mode entry point, where the
-    /// repo is segmented, sealed per tenant, and mints derived ids onto the session's own shard.
+    /// repo is segmented, sealed per tenant, and mints derived ids onto the session's own shard — and
+    /// whether to take writer locks (see [`Self::writer_lock`]).
     fn open_repo_with(
         dir: impl Into<std::path::PathBuf>,
         cwd: &str,
         model: &str,
         select: SessionSelect<'_>,
         opts: crate::session_store::RepoOptions,
+        writer_lock: bool,
     ) -> std::io::Result<(Self, Session)> {
         let repo = SessionRepo::open_with(dir, opts)?;
         let (store, session) = match select {
@@ -1506,9 +1542,16 @@ impl Persistence {
             SessionSelect::Latest => repo.resume_latest_or_create(cwd, model)?,
             SessionSelect::Fresh => (repo.create(SessionMeta::new(cwd, model))?, Session::new()),
         };
+        let lock = if writer_lock {
+            crate::session_store::lock_session_writer(store.path())?
+        } else {
+            None
+        };
         let meta = store.meta().clone();
         Ok((
             Self {
+                lock,
+                writer_lock,
                 repo: Some(repo),
                 // Only an explicitly addressed session is pinned. `Latest`/`Fresh` produce an id the
                 // caller never asked for, so nothing is routing on it and `new_session` may mint freely.
@@ -1653,11 +1696,8 @@ impl Persistence {
             }
             let mut meta = SessionMeta::new(&cwd, model);
             meta.parent = Some(parent_session.unwrap_or(&self.meta.id).to_string());
-            match repo.create(meta) {
-                Ok(store) => {
-                    self.meta = store.meta().clone();
-                    self.store = Some(store);
-                }
+            match repo.create(meta).and_then(|store| self.install(store)) {
+                Ok(()) => {}
                 Err(e) => {
                     eprintln!("serve: failed to create session: {e}");
                     return Err(e);
@@ -1714,10 +1754,30 @@ impl Persistence {
     fn switch(&mut self, id: &str) -> std::io::Result<Session> {
         let repo = self.repo.as_ref().ok_or_else(not_in_repo_mode)?;
         let (store, session) = repo.open_id(id)?;
-        self.meta = store.meta().clone();
-        self.store = Some(store);
+        self.install(store)?;
         self.transcript += 1;
         Ok(session)
+    }
+
+    /// Make `store` the active session, taking its writer lock first (and releasing the old one): a
+    /// session another process holds is refused, and nothing here changes. The same session reopened
+    /// keeps the lock already held — a second acquire in this process would be refused.
+    fn install(&mut self, store: SessionStore) -> std::io::Result<()> {
+        let same = self
+            .store
+            .as_ref()
+            .is_some_and(|s| s.path() == store.path());
+        let lock = if same {
+            self.lock.take()
+        } else if self.writer_lock {
+            crate::session_store::lock_session_writer(store.path())?
+        } else {
+            None
+        };
+        self.meta = store.meta().clone();
+        self.store = Some(store);
+        self.lock = lock;
+        Ok(())
     }
 
     /// Fork the current session into a new session and switch to it (repo mode). `entry_id`, when
@@ -1751,8 +1811,7 @@ impl Persistence {
             Some(entry_id) => repo.fork_at_entry(&id, entry_id, before)?,
             None => repo.fork(&id, upto)?,
         };
-        self.meta = store.meta().clone();
-        self.store = Some(store);
+        self.install(store)?;
         self.transcript += 1;
         Ok((session, restored_model, restored_level))
     }
@@ -13606,6 +13665,8 @@ mod tests {
             transcript: 0,
             repo: None,
             store: None,
+            lock: None,
+            writer_lock: false,
             meta: SessionMeta::new("/w", "claude-test"),
         };
         let agent = Agent::new(
@@ -13743,6 +13804,40 @@ mod tests {
         );
     }
 
+    /// `switch_session` onto a session another writer holds is refused, and the current session —
+    /// and the lock on it — stays exactly as it was.
+    #[test]
+    fn switch_refuses_a_session_another_writer_holds_and_keeps_the_current_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut persistence, _session) =
+            Persistence::open_repo(dir.path(), "/w", "claude-test", SessionSelect::Fresh).unwrap();
+        let current = persistence.session_id().to_owned();
+        let other = persistence
+            .repo
+            .as_ref()
+            .unwrap()
+            .create(SessionMeta::new("/w", "claude-test"))
+            .unwrap();
+        let held = crate::session_store::lock_session_writer(other.path()).unwrap();
+        let other_id = other.meta().id.clone();
+
+        let err = persistence.switch(&other_id).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock, "{err}");
+        assert_eq!(persistence.session_id(), current);
+        let current_path = persistence.store.as_ref().unwrap().path().to_path_buf();
+        assert!(
+            crate::session_store::acquire_session_lock(&current_path)
+                .unwrap()
+                .is_none(),
+            "the current session's lock was let go"
+        );
+
+        // Released, the same switch goes through.
+        drop(held);
+        persistence.switch(&other_id).unwrap();
+        assert_eq!(persistence.session_id(), other_id);
+    }
+
     /// A branch switch on a compacted session hands back a session carrying the store's compaction
     /// provenance, so the next persist appends. It used to hand back `Session::new()`'s defaults; the
     /// store read the reset generation as a compaction and rewrote the round — re-minting ids and
@@ -13826,6 +13921,8 @@ mod tests {
             transcript: 0,
             repo: None,
             store: None,
+            lock: None,
+            writer_lock: false,
             meta: SessionMeta::new("/w", "claude-test"),
         };
         let err = persistence
@@ -13854,6 +13951,8 @@ mod tests {
             transcript: 0,
             repo: None,
             store: None,
+            lock: None,
+            writer_lock: false,
             meta: SessionMeta::new("/w", "claude-test"),
         };
         let err = persistence
@@ -13932,6 +14031,8 @@ mod tests {
             transcript: 0,
             repo: None,
             store: None,
+            lock: None,
+            writer_lock: false,
             meta: SessionMeta::new("/w", "claude-test"),
         };
         let err = persistence
@@ -13955,6 +14056,8 @@ mod tests {
             transcript: 0,
             repo: None,
             store: None,
+            lock: None,
+            writer_lock: false,
             meta: SessionMeta::new("/w", "claude-test"),
         };
 

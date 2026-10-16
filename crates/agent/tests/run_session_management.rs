@@ -734,12 +734,7 @@ fn run_continue_with_name_titles_a_genuinely_fresh_session() {
         .expect("one project subdirectory")
         .unwrap()
         .path();
-    let session_file = std::fs::read_dir(&project_subdir)
-        .expect("project subdirectory must exist")
-        .next()
-        .expect("one session file")
-        .unwrap()
-        .path();
+    let session_file = first_session_file(&project_subdir);
     let content = std::fs::read_to_string(&session_file).unwrap();
     assert!(
         content.contains("My Session"),
@@ -817,12 +812,7 @@ fn run_continue_with_name_does_not_rename_an_existing_session_for_this_cwd() {
         .expect("one project subdirectory")
         .unwrap()
         .path();
-    let session_file = std::fs::read_dir(&project_subdir)
-        .expect("project subdirectory must exist")
-        .next()
-        .expect("one session file")
-        .unwrap()
-        .path();
+    let session_file = first_session_file(&project_subdir);
     let content = std::fs::read_to_string(&session_file).unwrap();
     assert!(
         content.contains("Original Name"),
@@ -961,6 +951,26 @@ fn run_session_id_addresses_one_session_rather_than_whatever_matched_the_cwd() {
     assert!(ids.contains(&"task-a".to_string()) && ids.contains(&"task-b".to_string()));
 }
 
+/// The session files in a session directory, in name order — leaving out the writer lock files a
+/// writing process keeps beside each one (`session_store::lock_session_writer`).
+fn session_files(dir: impl AsRef<std::path::Path>) -> Vec<std::path::PathBuf> {
+    let mut files: Vec<_> = std::fs::read_dir(dir)
+        .expect("session directory")
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("jsonl"))
+        .collect();
+    files.sort();
+    files
+}
+
+/// The one session file in a session directory.
+fn first_session_file(dir: impl AsRef<std::path::Path>) -> std::path::PathBuf {
+    session_files(dir)
+        .into_iter()
+        .next()
+        .expect("a session file")
+}
+
 /// Reads a session `.jsonl` file's header line and returns its `id` field.
 fn session_id_of(path: &std::path::Path) -> String {
     let content = std::fs::read_to_string(path).unwrap();
@@ -1045,12 +1055,7 @@ fn run_fork_by_path_copies_a_session_file_into_a_new_session_and_continues_from_
         .expect("one project subdirectory")
         .unwrap()
         .path();
-    let forked_path = std::fs::read_dir(&project_subdir)
-        .expect("project subdirectory must exist")
-        .next()
-        .expect("one forked session file")
-        .unwrap()
-        .path();
+    let forked_path = first_session_file(&project_subdir);
     let forked_content: String = std::fs::read_to_string(&forked_path).unwrap();
     let header: serde_json::Value =
         serde_json::from_str(forked_content.lines().next().unwrap()).unwrap();
@@ -1118,12 +1123,7 @@ fn run_fork_by_id_finds_a_session_in_a_different_projects_own_directory() {
         .unwrap()
         .unwrap()
         .path();
-    let source_path = std::fs::read_dir(&project_a_subdir)
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
+    let source_path = first_session_file(&project_a_subdir);
     let source_id = session_id_of(&source_path);
 
     let (base2, bodies2) = spawn_model_server(vec![turn_text("second answer")]);
@@ -1174,12 +1174,7 @@ fn run_fork_by_id_finds_a_session_in_a_different_projects_own_directory() {
         .iter()
         .find(|p| p != &&project_a_subdir)
         .expect("a second, distinct project subdirectory for project B");
-    let forked_path = std::fs::read_dir(project_b_subdir)
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
+    let forked_path = first_session_file(project_b_subdir);
     let header: serde_json::Value = serde_json::from_str(
         std::fs::read_to_string(&forked_path)
             .unwrap()
@@ -1261,12 +1256,7 @@ fn run_session_flag_with_a_bare_id_reopens_the_session_in_place_same_project() {
         "first run failed.\nstderr: {}",
         String::from_utf8_lossy(&output1.stderr)
     );
-    let session_path = std::fs::read_dir(repo_dir.path())
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
+    let session_path = first_session_file(repo_dir.path());
     let id = session_id_of(&session_path);
 
     let (base2, bodies2) = spawn_model_server(vec![turn_text("second answer")]);
@@ -1303,10 +1293,7 @@ fn run_session_flag_with_a_bare_id_reopens_the_session_in_place_same_project() {
     );
 
     // Reopened in place, not forked: still exactly one file in the repo, and it's the very same one.
-    let entries: Vec<_> = std::fs::read_dir(repo_dir.path())
-        .unwrap()
-        .map(|e| e.unwrap().path())
-        .collect();
+    let entries = session_files(repo_dir.path());
     assert_eq!(
         entries.len(),
         1,
@@ -1351,12 +1338,7 @@ fn run_session_flag_with_a_bare_id_reopens_a_session_found_in_a_different_projec
         "first run failed.\nstderr: {}",
         String::from_utf8_lossy(&output1.stderr)
     );
-    let session_path = std::fs::read_dir(&repo_a)
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
+    let session_path = first_session_file(&repo_a);
     let id = session_id_of(&session_path);
 
     // `--session-dir repo_b` scopes this run's cross-project search to `repo_b`'s own parent
@@ -1400,10 +1382,7 @@ fn run_session_flag_with_a_bare_id_reopens_a_session_found_in_a_different_projec
         0,
         "must reopen the source session in place under repo_a, not fork a copy into repo_b"
     );
-    let entries_a: Vec<_> = std::fs::read_dir(&repo_a)
-        .unwrap()
-        .map(|e| e.unwrap().path())
-        .collect();
+    let entries_a = session_files(&repo_a);
     assert_eq!(
         entries_a.len(),
         1,
@@ -1612,12 +1591,7 @@ fn run_binary_fork_with_session_dir_scopes_cross_project_search_to_its_parent() 
         "seeding run into repo-a failed.\nstderr: {}",
         String::from_utf8_lossy(&output1.stderr)
     );
-    let source_path = std::fs::read_dir(&repo_a)
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
+    let source_path = first_session_file(&repo_a);
     let source_id = session_id_of(&source_path);
 
     // `--fork <id> --session-dir repo-b` must find the session seeded into the *sibling* repo-a via
