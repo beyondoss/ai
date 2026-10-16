@@ -77,6 +77,11 @@
 //! and trust the front door (the edge, in another repo) to have validated the client before forwarding
 //! the upgrade. This module never sees or parses a user token.
 //!
+//! What it does refuse on the TCP listener is a request a **web browser** could have been made to
+//! send — a foreign `Origin`, a DNS-rebinding `Host`, a non-JSON POST — since "anything on
+//! `127.0.0.1`" includes every page the user has open. See `browser_guard` for the rules and why the
+//! Unix socket and service mode are exempt.
+//!
 //! `serve --service` is the exception, and the reason is multi-tenancy rather than a change of heart:
 //! one replica serving many tenants cannot infer from a loopback socket *whose* session a connection
 //! is for. So every connection carries a [session grant](crate::grant) in `x-beyond-grant`, verified
@@ -114,6 +119,8 @@ use crate::service::{Refusal, ServiceSession, Shards};
 use crate::session_store::{
     Layout, SessionLock, acquire_session_lock, is_valid_session_id, new_id,
 };
+
+mod browser_guard;
 
 /// The fixed URL path a WebSocket upgrade must target. The front door maps a service subdomain to this
 /// path on the loopback listener; any other path is rejected at the handshake.
@@ -2058,7 +2065,7 @@ pub async fn serve_ws(
             Some(stream) = accept_tcp(&tcp_listener) => {
                 let supervisor = supervisor.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_connection(&supervisor, stream).await {
+                    if let Err(e) = handle_connection(&supervisor, stream, Transport::Tcp).await {
                         eprintln!("serve: websocket connection error: {e}");
                     }
                 });
@@ -2066,7 +2073,7 @@ pub async fn serve_ws(
             Some(stream) = accept_uds_arm(&uds_listener) => {
                 let supervisor = supervisor.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_connection(&supervisor, stream).await {
+                    if let Err(e) = handle_connection(&supervisor, stream, Transport::Unix).await {
                         eprintln!("serve: unix socket connection error: {e}");
                     }
                 });
@@ -2097,6 +2104,14 @@ async fn accept_uds_arm(_listener: &Option<()>) -> Option<TcpStream> {
     std::future::pending().await
 }
 
+/// Which listener a connection arrived on. Only TCP is reachable from a web browser, so only TCP gets
+/// the [`browser_guard`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Transport {
+    Tcp,
+    Unix,
+}
+
 /// Read one HTTP/1.1 request and either attach it as a WebSocket or run it as a one-shot POST
 /// command. Generic over the underlying byte stream so the same path serves both TCP and Unix-domain
 /// sockets. We parse the request-line ourselves rather than handing every connection to tungstenite:
@@ -2105,6 +2120,7 @@ async fn accept_uds_arm(_listener: &Option<()>) -> Option<TcpStream> {
 async fn handle_connection<S>(
     supervisor: &Arc<Supervisor>,
     mut stream: S,
+    transport: Transport,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -2160,6 +2176,21 @@ where
 
     if head.path != WS_PATH {
         refuse(&mut stream, &head, &leftover, HttpError::NotFound).await;
+        return Ok(());
+    }
+
+    // The loopback daemon authenticates no caller, so a web page must not be able to be one: a
+    // foreign `Origin`, a rebinding `Host`, or a non-JSON POST is refused before anything else is read.
+    // Unix sockets and service mode are exempt for the reasons `browser_guard` gives.
+    if transport == Transport::Tcp
+        && supervisor.service.is_none()
+        && let Err(why) = browser_guard::check(&head.headers, head.method == "POST")
+    {
+        let err = match why {
+            browser_guard::Refused::NotJson => HttpError::UnsupportedMediaType(why.message()),
+            _ => HttpError::Forbidden(why.message()),
+        };
+        refuse(&mut stream, &head, &leftover, err).await;
         return Ok(());
     }
 
@@ -2758,8 +2789,11 @@ enum HttpError {
     Unavailable(&'static str),
     /// Service mode: no session grant, or one that doesn't verify.
     Unauthorized(&'static str),
-    /// Service mode: the grant verifies but isn't for this session or this tenant.
+    /// Service mode: the grant verifies but isn't for this session or this tenant. Outside service
+    /// mode: a TCP request a web page could have sent (see [`browser_guard`]).
     Forbidden(&'static str),
+    /// A TCP POST outside service mode that isn't `Content-Type: application/json`.
+    UnsupportedMediaType(&'static str),
     /// Service mode: the grant is well-formed, but this replica doesn't mount its shard. The client
     /// should be routed elsewhere rather than retried here.
     Misdirected(&'static str),
@@ -2785,6 +2819,7 @@ impl std::fmt::Display for HttpError {
             | HttpError::Unavailable(m)
             | HttpError::Unauthorized(m)
             | HttpError::Forbidden(m)
+            | HttpError::UnsupportedMediaType(m)
             | HttpError::Misdirected(m) => write!(f, "{m}"),
             HttpError::NotFound => write!(f, "not found: expected {WS_PATH}"),
             HttpError::MethodNotAllowed => write!(f, "method not allowed"),
@@ -2809,6 +2844,7 @@ impl HttpError {
             HttpError::Unavailable(_) => (503, "Service Unavailable"),
             HttpError::Unauthorized(_) => (401, "Unauthorized"),
             HttpError::Forbidden(_) => (403, "Forbidden"),
+            HttpError::UnsupportedMediaType(_) => (415, "Unsupported Media Type"),
             HttpError::Misdirected(_) => (421, "Misdirected Request"),
             HttpError::Incomplete | HttpError::BadRequest(_) | HttpError::Io => {
                 (400, "Bad Request")

@@ -791,8 +791,10 @@ enum Command {
         /// command (a `prompt` returns 202 on ack so the caller does not have to hold the socket
         /// for the run). A session outlives a dropped connection so a reconnecting client re-attaches
         /// to a still-running run. Bind loopback/internal only: the agent authenticates no caller — it
-        /// trusts the front door. Pair with `--session-dir` so sessions survive a process restart.
-        /// Absent ⇒ stdio.
+        /// trusts the front door. Outside `--service` it refuses what a web page could send: a
+        /// non-loopback `Origin` or a `Host` that is not localhost/an IP (403), and a POST that is not
+        /// `Content-Type: application/json` (415). Pair with `--session-dir` so sessions survive a
+        /// process restart. Absent ⇒ stdio.
         #[usage(long, env = "AI_AGENT_LISTEN")]
         listen: Option<std::net::SocketAddr>,
         /// Also (or instead) offer the control protocol over a Unix-domain socket at this path — a

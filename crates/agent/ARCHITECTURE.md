@@ -94,7 +94,19 @@ The harness layers several capabilities over the bare tools + loop:
   `response`s by the `id` they sent; `list_daemon_sessions` is unicast to its requester.
   Auth is **not** this crate's concern by default: `serve_ws` binds loopback/internal only and trusts
   the front door (the edge) — it never parses a user token. The exception is `--service`, where every
-  connection presents a verified session grant instead (see "Service mode"). See serve.rs's module doc for the full command/frame
+  connection presents a verified session grant instead (see "Service mode"). What it does refuse,
+  on **TCP outside service mode**, is a request a web page could have sent (`serve_ws::browser_guard`):
+  a present `Origin` that is not loopback (`localhost`, `*.localhost`, `127.0.0.0/8`, `::1`) → 403,
+  covering cross-site WebSocket upgrades (browsers apply no CORS to them); a present `Host` that is
+  neither a loopback name nor an IP literal → 403 (DNS rebinding — a rebound page is same-origin, so
+  only `Host` gives it away); and a POST that is not `Content-Type: application/json` → 415 (a
+  `text/plain` or typeless "simple" request needs no CORS preflight, and the daemon answers none).
+  Absent headers pass — browsers always send them, so their absence means curl or another non-browser
+  client. The UDS is not guarded (no browser can open one, and a front door splicing authenticated
+  browser traffic onto it forwards the browser's own `Origin`/`Host`), nor is service mode (its grant
+  rides in a custom header that a browser never attaches ambiently and cannot add cross-origin without
+  a preflight, so a forged request is already a 401; and its `Host` is whatever the load balancer
+  routed). See serve.rs's module doc for the full command/frame
   reference and the reconnect flow. Two supervisor-level daemon facilities sit above the per-session
   protocol: **`list_daemon_sessions`** — intercepted in the read loop (never forwarded to a session)
   and answered by unioning the live `session id → running session` map with an on-disk scan of
