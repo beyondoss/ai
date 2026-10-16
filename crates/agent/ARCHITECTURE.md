@@ -2457,8 +2457,11 @@ and `serve`'s own `bash`/`abort_bash` RPC commands reuse `RealRunner` directly, 
   carries the signal alongside the code (`exec::exit_signal`, Unix-only) and `bash` reports it as a failure
   naming the signal. Previously that `None` shared an arm with `Some(0)` and an OOM-killed build, a SIGSEGV,
   or a SIGTERM'd server all reported **success** to the model — silently, with `(no output)` standing in for
-  the output the command never got to produce. A cancellation kills the job like a `bash_job` kill
-  (dropping the `Job`), so a backgrounded grandchild process can't outlive it. Cancellation is
+  the output the command never got to produce. A cancellation kills the call's own fresh command like
+  a `bash_job` kill (dropping the `Job`), so a backgrounded grandchild process can't outlive it. A job
+  that already has a number is different: cancelling a `bash_job` wait on it (an `abort`, or a
+  command that ends the run) parks it again and returns "Wait cancelled; job N is still running.",
+  because the model was told how long that job lives and a cancelled wait must not end it. Cancellation is
   cooperative, not just an external `Drop`: `attach` races the running job against the call's own
   `ToolProgress::cancelled()` (the same `CancellationToken` a caller like `serve`'s `abort_bash` trips),
   and on a trip flushes whatever the always-current `OutputAccumulator` already captured before
