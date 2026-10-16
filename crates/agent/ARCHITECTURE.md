@@ -4044,9 +4044,17 @@ sealed one never does, which is how a reader tells them apart with no state.
 There is no lease and no clock. A writer owns a session because it created a file nobody else could
 have created.
 
-- **Create** — `create_dir_all(<id>)` (idempotent, so the lock can live there), then O_EXCL
-  `000001.jsonl` at mode 0600, `fsync` of the file, its directory and the parent. A directory with
-  no segments is not a session.
+- **Create** — `create_dir_all(<id>)` (idempotent, so the lock can live there), then
+  `000001.jsonl` at mode 0600, created **whole** (`create_whole`): the complete base goes to a hidden
+  temp file beside it, `fsync`ed, then `link`ed into place — `link` refuses an existing name, so it
+  is still the exclusive-create fence, but the name never exists with less than its header — then
+  `fsync` of its directory and the parent. A directory with no segments is not a session. The
+  single-file layout creates its `.jsonl` the same way. A crash between an O_EXCL create and the
+  header write used to leave an empty first file that bricked the id for good — not openable (no
+  header) and not creatable (it exists); `open_or_create_id` now treats such a file, left by an older
+  build, as absent: one that is empty, or has no newline and only the start of a header line
+  (`is_headerless`), is renamed aside, judged again (and put back if a creator raced it), then removed
+  and the id created (`tests/session_create_recovery.rs`).
 - **Open** — record the newest epoch `N` and the offset `L` the replay consumed. Nothing is created
   until the first write.
 - **First write** — if `len(N) ≠ L`, `Superseded`. Otherwise O_EXCL-create `N+1` with the seals so
