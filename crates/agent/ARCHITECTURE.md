@@ -114,7 +114,9 @@ The harness layers several capabilities over the bare tools + loop:
   `false`); and the **idle reaper** (`--session-idle-timeout <secs>`, default 3600, `0` disables) — a
   background ticker that stops sessions whose loop has already ended (a closed input: stopped on sight)
   plus those with no attached connection, idle past the timeout, and not mid-run (a per-session
-  `running` flag `serve_session` flips around a `prompt`). Stopping is the same transition graceful
+  `running` flag `serve_session` sets around a `prompt`, a host `bash` command and a manual `compact`
+  — so a client that starts a long one and detaches, or an HTTP POST past its reply timeout, does
+  not lose it; the drain waits on the same flag). Stopping is the same transition graceful
   shutdown makes per entry: the retained input is dropped so the session persists and exits, and the
   entry stays in the map, `Stopping`, until the task itself has gone (see
   [the daemon session state machine](#state-machine--daemon-session-slot-starting--live--stopping)) —
@@ -4877,7 +4879,9 @@ Three things had to be right, and each was wrong in an earlier draft:
 - **The closed check belongs on the spawn path, not at the top of `try_pin`.** Checking before the map
   lookup refuses reconnects to exactly the sessions the drain is protecting. It now sits after the
   lookup, next to the `--max-live-sessions` check, where every other new-session gate lives.
-- **The wait is on each session's `running` flag, not `is_reapable`.** That helper also requires
+- **The wait is on each session's `running` flag, not `is_reapable`.** The flag covers a host `bash`
+  command and a manual `compact` as well as a `prompt`: a detached client's command is in flight
+  work too, and stopping its session cancels it. `is_reapable` also requires
   `attached == 0`, which is never true while a client watches its own run — a drain gated on it burns
   its whole grace every time and then cuts the run anyway.
 - **The accept loop keeps running.** Draining inline and returning from the signal arm leaves nothing

@@ -4231,6 +4231,8 @@ pub(crate) async fn serve_session(
             // Manual compaction (no run in flight here). Streams a `compacted` event if it cuts.
             // `custom_instructions`, when given, steers what the summary emphasizes.
             let custom_instructions = $cmd.get("custom_instructions").and_then(Value::as_str);
+            // Busy for the reaper and drain until the response is sent (see `BusyGuard`).
+            let _busy = BusyGuard::mark(&running);
             let tx = out_tx.clone();
             let mut compacted_tokens_before: Option<u32> = None;
             let mut compacted_summary: Option<String> = None;
@@ -8109,6 +8111,9 @@ pub(crate) async fn serve_session(
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
                 let command = command.to_string();
+                // Busy for the reaper and drain until the result is persisted and answered (see
+                // `BusyGuard`): a detached client's command finishes rather than being cancelled.
+                let _busy = BusyGuard::mark(&running);
                 host_bash_seq += 1;
                 let call_id = format!("host-bash-{host_bash_seq}");
                 if let Some(frame) = event_frame(AgentEvent::ToolStart {
@@ -10693,6 +10698,28 @@ impl crate::approval::ApprovalGate for ServeApprovalGate {
         // Every other attached client is still showing this question. Tell them it's answered.
         self.broadcast(approval_resolved_frame(&request_id, outcome));
         outcome
+    }
+}
+
+/// Marks a session busy — its `running` flag, which the daemon's idle reaper and drain read — for as
+/// long as a host `bash` command or a manual `compact` is in flight, and clears it on drop.
+///
+/// A `prompt` manages the flag itself (it spans retries and keeps `agent_runs_in_flight` in step).
+/// These two commands are not runs, so the gauge is untouched, but their work is just as lost if
+/// the session is reaped or drained out from under them: a client that starts a long host `bash`
+/// and detaches, or an HTTP POST past its reply timeout, has nothing else keeping the session alive.
+/// `None` when the flag was already set, so an enclosing owner's clear is the one that counts.
+struct BusyGuard<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl<'a> BusyGuard<'a> {
+    fn mark(flag: &'a std::sync::atomic::AtomicBool) -> Option<Self> {
+        (!flag.swap(true, Ordering::Relaxed)).then_some(Self(flag))
+    }
+}
+
+impl Drop for BusyGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Relaxed);
     }
 }
 
