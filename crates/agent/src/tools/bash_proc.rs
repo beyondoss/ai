@@ -8,7 +8,8 @@
 //! `fork`/`exec`, `setsid`, `nohup`, `timeout` and double forks alike, and `/proc/<pid>/environ` (the
 //! environment a process was *started* with) is readable for our own uid without privilege. A job's
 //! processes are the live ones that carry its tag **or** are still in its process group (which also
-//! covers a process that cleared its environment but stayed in the group). See "`bash` jobs: what a
+//! covers a process that cleared its environment but stayed in the group) — the group only while its
+//! number is still ours, see [`ProcGroup`]. See "`bash` jobs: what a
 //! command leaves running" in `ARCHITECTURE.md` for the alternatives measured and rejected (cgroup v2
 //! per job, a child subreaper).
 //!
@@ -51,12 +52,25 @@ pub const TERM_GRACE: Duration = Duration::from_millis(300);
 const GRACE_POLL: Duration = Duration::from_millis(10);
 
 /// One job's processes: its process group and its tag.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// **The group number is ours only while our group lives.** Once the shell is reaped and every
+/// process left in its group has exited (`setsid` leftovers do not count: they left), the kernel
+/// may hand the number to an unrelated process, which can lead a group of its own with it. So
+/// processes are matched by group, and the group signalled as a unit, only while that cannot have
+/// happened: a group signal only while the shell itself still holds the number (alive or a zombie),
+/// and group membership only until the group is seen empty after the shell's reap, or the number is
+/// seen held by another process ([`crate::tools::exec::GroupId::recycled`]) — after which only the
+/// tag counts, each kill verified through a pidfd.
+#[derive(Debug, Clone)]
 pub struct ProcGroup {
     /// The shell's pid, which leads its own group (`process_group(0)`).
     pub pgid: u32,
     /// This job's tag — see [`TAG_ENV`].
     pub tag: String,
+    /// The shell's identity, to tell our group's number from a recycled one.
+    leader: super::exec::GroupId,
+    /// Latched once the group can no longer be ours: matched by tag only from then on.
+    group_gone: std::sync::Arc<AtomicBool>,
 }
 
 /// A tag no other job of any process on this host shares: this process's pid, its start time, and a
@@ -83,6 +97,43 @@ fn tag_value(tag: &str) -> String {
 }
 
 impl ProcGroup {
+    /// The group `leader` leads (call it while `leader` is unreaped, right after spawning it), with
+    /// its tag.
+    pub fn new(leader: u32, tag: String) -> Self {
+        Self {
+            pgid: leader,
+            tag,
+            leader: super::exec::GroupId::leader(leader),
+            group_gone: std::sync::Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Whether a process in group `pgid` is still one of ours — see the type's doc. Latches `false`.
+    fn by_group(&self) -> bool {
+        if self.pgid == 0 || self.group_gone.load(Ordering::Acquire) {
+            return false;
+        }
+        if self.leader.recycled() {
+            self.group_gone.store(true, Ordering::Release);
+            return false;
+        }
+        true
+    }
+
+    /// A scan found no live process in group `pgid`: once the shell no longer holds the number
+    /// either, the group is gone for good — it can only ever be someone else's from here on.
+    fn saw_group_empty(&self) {
+        if !self.leader.leader_holds() {
+            self.group_gone.store(true, Ordering::Release);
+        }
+    }
+
+    /// Whether signalling group `pgid` as a unit can reach only this job: the shell still holds the
+    /// number.
+    fn may_signal_group(&self) -> bool {
+        self.pgid != 0 && self.leader.leader_holds()
+    }
+
     /// The pids of this job's live processes (zombies excluded), never this process itself.
     pub fn members(&self) -> Vec<u32> {
         imp::members(self)
@@ -203,7 +254,7 @@ pub(crate) async fn run_tracked(
     }
     let mut child = cmd.spawn()?;
     let pgid = child.id().unwrap_or(0);
-    let group = ProcGroup { pgid, tag };
+    let group = ProcGroup::new(pgid, tag);
     let mut guard = KillGuard(Some(group.clone()));
     (hooks.on_spawn)(Kill::Procs(group.clone()));
 
@@ -317,6 +368,8 @@ mod imp {
         let Ok(dir) = std::fs::read_dir("/proc") else {
             return Vec::new();
         };
+        let by_group = group.by_group();
+        let mut in_group = false;
         let mut out = Vec::new();
         for entry in dir.flatten() {
             let Some(pid) = entry
@@ -326,36 +379,57 @@ mod imp {
             else {
                 continue;
             };
-            if pid != me && belongs(group, pid) {
-                out.push(pid);
+            if pid == me {
+                continue;
             }
+            match classify(group, pid, by_group) {
+                Some(Member::Group) => {
+                    in_group = true;
+                    out.push(pid);
+                }
+                Some(Member::Tag) => out.push(pid),
+                None => {}
+            }
+        }
+        if by_group && !in_group {
+            group.saw_group_empty();
         }
         out.sort_unstable();
         out
     }
 
-    /// Whether `pid` is a live (non-zombie) process of `group`: in its process group, or carrying
-    /// its tag.
+    /// Why a process is one of a job's.
+    enum Member {
+        /// In its process group (while that is still ours).
+        Group,
+        /// Carrying its tag.
+        Tag,
+    }
+
+    /// Whether `pid` is a live (non-zombie) process of `group`: in its process group (while that
+    /// number is still ours — see [`ProcGroup`]), or carrying its tag.
     fn belongs(group: &ProcGroup, pid: u32) -> bool {
+        classify(group, pid, group.by_group()).is_some()
+    }
+
+    fn classify(group: &ProcGroup, pid: u32, by_group: bool) -> Option<Member> {
         let Ok(stat) = std::fs::read(format!("/proc/{pid}/stat")) else {
-            return false;
+            return None;
         };
         // `pid (comm) state ppid pgrp …`; `comm` may hold spaces or parens, so read after the last
         // `)`.
-        let Some(close) = stat.iter().rposition(|&b| b == b')') else {
-            return false;
-        };
+        let close = stat.iter().rposition(|&b| b == b')')?;
         let rest = String::from_utf8_lossy(&stat[close + 1..]);
         let mut fields = rest.split_whitespace();
         let state = fields.next().unwrap_or("");
         if state == "Z" || state == "X" {
-            return false;
+            return None;
         }
         let pgrp = fields.nth(1).and_then(|s| s.parse::<u32>().ok());
-        if pgrp == Some(group.pgid) && group.pgid != 0 {
-            return true;
+        if by_group && pgrp == Some(group.pgid) {
+            return Some(Member::Group);
         }
-        has_tag(pid, &group.tag)
+        has_tag(pid, &group.tag).then_some(Member::Tag)
     }
 
     fn has_tag(pid: u32, tag: &str) -> bool {
@@ -374,7 +448,9 @@ mod imp {
     }
 
     pub(super) fn terminate(group: &ProcGroup) {
-        if let Some(pgid) = Pid::from_raw(group.pgid as i32) {
+        if group.may_signal_group()
+            && let Some(pgid) = Pid::from_raw(group.pgid as i32)
+        {
             let _ = rustix::process::kill_process_group(pgid, Signal::TERM);
         }
         for pid in members(group) {
@@ -383,7 +459,9 @@ mod imp {
     }
 
     pub(super) fn kill(group: &ProcGroup) -> Vec<u32> {
-        if let Some(pgid) = Pid::from_raw(group.pgid as i32) {
+        if group.may_signal_group()
+            && let Some(pgid) = Pid::from_raw(group.pgid as i32)
+        {
             let _ = rustix::process::kill_process_group(pgid, Signal::KILL);
         }
         for pass in 0..KILL_PASSES {
@@ -514,7 +592,7 @@ mod imp {
     }
 
     pub(super) fn kill(group: &ProcGroup) -> Vec<u32> {
-        super::super::exec::kill_group_members(group.pgid);
+        super::super::exec::kill_group_members(group.leader);
         Vec::new()
     }
 
@@ -650,6 +728,136 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         panic!("dropping the call left the setsid'd sleep running");
+    }
+
+    /// Set (to anything) only for the copy of this binary [`a_recycled_group_number_is_never_claimed`]
+    /// runs inside a fresh pid namespace.
+    const IN_PID_NS: &str = "BASH_PROC_TEST_IN_PID_NS";
+
+    /// A job's group number, recycled for an unrelated group after the shell is reaped and its
+    /// `setsid` leftover has left the group: the stranger must never read as one of the job's
+    /// processes, and a kill of the job must never reach it. Pids are only predictable in a pid
+    /// namespace of our own (`ns_last_pid`), so this runs the real check
+    /// ([`recycled_group_inner`]) in a copy of this test binary under `unshare -Urpf --mount-proc`,
+    /// and skips where that is unavailable (no `unshare`, unprivileged user namespaces off).
+    #[test]
+    fn a_recycled_group_number_is_never_claimed() {
+        let Ok(exe) = std::env::current_exe() else {
+            return;
+        };
+        let usable = std::process::Command::new("unshare")
+            .args(["-Urpf", "--mount-proc", "true"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if !usable {
+            eprintln!("skipped: `unshare -Urpf --mount-proc` is unavailable here");
+            return;
+        }
+        let out = std::process::Command::new("unshare")
+            .args(["-Urpf", "--mount-proc"])
+            .arg(&exe)
+            .args([
+                "--exact",
+                "tools::bash_proc::tests::recycled_group_inner",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(IN_PID_NS, "1")
+            .output()
+            .unwrap();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            out.status.success() && text.contains("1 passed"),
+            "in the pid namespace:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "run by a_recycled_group_number_is_never_claimed, inside a pid namespace"]
+    async fn recycled_group_inner() {
+        if std::env::var_os(IN_PID_NS).is_none() {
+            return;
+        }
+        let groups = Mutex::new(None);
+        let orphans = Mutex::new(None);
+        let output = Mutex::new(String::new());
+        let on_chunk = |b: &[u8]| output.lock().unwrap().push_str(&String::from_utf8_lossy(b));
+        let on_spawn = |k: Kill| {
+            if let Kill::Procs(g) = k {
+                *groups.lock().unwrap() = Some(g);
+            }
+        };
+        let on_orphans = |_r: &ExecResult, s: String| *orphans.lock().unwrap() = Some(s);
+        let hooks = JobHooks {
+            on_chunk: &on_chunk,
+            on_spawn: &on_spawn,
+            on_orphans: &on_orphans,
+        };
+        // The leftover leaves the group (`setsid`), so the group empties when the shell exits.
+        let args = vec![
+            "-c".to_string(),
+            "setsid sleep 97 >/dev/null 2>&1 &".to_string(),
+        ];
+        let mut run = Box::pin(run_tracked("/bin/sh", &args, None, &hooks));
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while orphans.lock().unwrap().is_none() {
+                tokio::select! {
+                    _ = &mut run => panic!("ended while the setsid'd sleep runs"),
+                    () = tokio::time::sleep(Duration::from_millis(20)) => {}
+                }
+            }
+        })
+        .await
+        .expect("the shell's exit was reported");
+        let group = groups.lock().unwrap().clone().unwrap();
+        let leftover = group.members();
+        assert_eq!(leftover.len(), 1, "{leftover:?}");
+
+        // Hand the shell's old pid — the group's number — to a stranger leading its own group.
+        let mut victim = None;
+        for _ in 0..50 {
+            std::fs::write("/proc/sys/kernel/ns_last_pid", (group.pgid - 1).to_string()).unwrap();
+            let mut cmd = std::process::Command::new("sleep");
+            std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+            let mut child = cmd.arg("98").spawn().unwrap();
+            if child.id() == group.pgid {
+                victim = Some(child);
+                break;
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let mut victim = victim.expect("the group's number was recycled");
+
+        let members = group.members();
+        assert!(
+            !members.contains(&group.pgid),
+            "the stranger holding the recycled number reads as the job's: {members:?}"
+        );
+        let survived = group.kill();
+        assert!(survived.is_empty(), "{survived:?}");
+        // The same window in the other group killers (`exec`'s `GroupKillGuard`, the MCP sweep
+        // after a reap, a template transport's local group): never once the number is recycled.
+        crate::tools::exec::kill_process_group(group.leader);
+        crate::tools::exec::kill_group_members(group.leader);
+        std::thread::sleep(Duration::from_millis(200));
+        let victim_alive = victim.try_wait().unwrap().is_none();
+        let _ = victim.kill();
+        let _ = victim.wait();
+        assert!(victim_alive, "the job's kill reached the stranger's group");
+        assert!(
+            !std::path::Path::new(&format!("/proc/{}", leftover[0])).exists()
+                || group.members().is_empty(),
+            "the job's own leftover was killed"
+        );
+        let _ = tokio::time::timeout(Duration::from_secs(5), run).await;
     }
 
     #[test]

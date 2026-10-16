@@ -332,7 +332,9 @@ impl RealRunner {
         // otherwise leak a backgrounded grandchild as an orphan. `disarm`ed below once the child has
         // actually exited on its own; still armed on both the timeout branch and an external drop, so
         // either one reaches the whole process group.
-        let mut guard = GroupKillGuard { pid: child.id() };
+        let mut guard = GroupKillGuard {
+            group: child.id().map(GroupId::leader),
+        };
         // Streaming (`bash`'s live path) hands every chunk straight to `on_chunk`'s sink, then ignores
         // the `stdout`/`stderr`/`truncated` fields entirely (see the `Ok` arm's comment and `bash.rs`).
         // So when streaming we skip the ≤256 KiB head/tail `Capture` *and* the final `from_utf8_lossy`
@@ -415,8 +417,8 @@ impl RealRunner {
                 // firing it and hoping it lands before a caller re-checks side effects. Disarms the
                 // guard (via `take`) first so its own `Drop` doesn't *also* fire a redundant kill.
                 #[cfg(unix)]
-                if let Some(pid) = guard.pid.take() {
-                    let _ = tokio::task::spawn_blocking(move || kill_process_group(pid)).await;
+                if let Some(group) = guard.group.take() {
+                    let _ = tokio::task::spawn_blocking(move || kill_process_group(group)).await;
                 }
                 drop(guard);
                 Ok(ExecResult {
@@ -458,12 +460,12 @@ pub(crate) async fn feed_stdin(
 /// through this stack frame the same way, so arming the kill here (rather than only in the timeout
 /// branch) covers both.
 struct GroupKillGuard {
-    pid: Option<u32>,
+    group: Option<GroupId>,
 }
 
 impl GroupKillGuard {
     fn disarm(&mut self) {
-        self.pid = None;
+        self.group = None;
     }
 }
 
@@ -478,7 +480,7 @@ static PENDING_GROUP_KILLS: std::sync::Mutex<Vec<std::sync::mpsc::Receiver<()>>>
 impl Drop for GroupKillGuard {
     fn drop(&mut self) {
         #[cfg(unix)]
-        if let Some(pid) = self.pid.take() {
+        if let Some(group) = self.group.take() {
             // `Drop` can't `.await`, so this can't be made fully synchronous with the caller — but a
             // real OS thread (not a `tokio::spawn`ed task) is scheduled by the kernel directly, rather
             // than depending on the ambient tokio runtime finding a moment to poll it. That matters
@@ -492,7 +494,7 @@ impl Drop for GroupKillGuard {
             // (SIGTERM/SIGINT/SIGHUP) can reach `std::process::exit` moments after this guard drops,
             // and `process::exit` tears down every thread immediately with no chance for this one to
             // finish — see `wait_for_pending_group_kills`, which such a caller must call first.
-            spawn_tracked_cleanup(move || kill_process_group(pid));
+            spawn_tracked_cleanup(move || kill_process_group(group));
         }
     }
 }
@@ -743,21 +745,94 @@ impl Capture {
 ///
 /// Also used by [`crate::tools::mcp`] to sweep a reaped MCP server's group, for the same reason `bash`
 /// needs it: the process that was killed is not necessarily the process holding the memory.
+///
+/// Never once the group's number has been recycled: see [`GroupId`].
 #[cfg(unix)]
-pub(crate) fn kill_process_group(pgid: u32) {
-    kill_group(pgid, true);
+pub(crate) fn kill_process_group(group: GroupId) {
+    kill_group(group, true);
 }
 
 /// [`kill_process_group`] without its kill-by-pid fallback: only processes that are *in* group
 /// `pgid` are signalled. For a caller whose group leader has already been reaped — its pid is free
 /// to be reused by an unrelated process, which a fallback `kill -KILL <pid>` would then hit.
 #[cfg(unix)]
-pub(crate) fn kill_group_members(pgid: u32) {
-    kill_group(pgid, false);
+pub(crate) fn kill_group_members(group: GroupId) {
+    kill_group(group, false);
+}
+
+/// A process group, as the process that leads it was started: its number, and the leader's start
+/// time — which tells our group's number apart from the same number recycled for someone else's.
+///
+/// A group id is its leader's pid, and the kernel hands a pid out again only once nothing uses it —
+/// no process, and no group or session — so while our leader is unreaped (alive or a zombie), or
+/// any member of our group lives, the number is ours. Once the group is empty it is free: a later
+/// process may get that pid and lead a group of its own with it, and a `kill -<pgid>` aimed at ours
+/// would then hit the stranger's. [`Self::recycled`] is that case: a live process holds the pid
+/// but is not our leader (another start time).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GroupId {
+    pub pgid: u32,
+    /// The leader's start time (`/proc/<pid>/stat` field 22), read while it was ours; `None` where
+    /// `/proc` is unavailable, which leaves the old behavior (no recycling check).
+    start: Option<u64>,
+}
+
+impl GroupId {
+    /// The group `leader` leads, read now — call it while `leader` is still unreaped (right after
+    /// spawning it).
+    pub(crate) fn leader(leader: u32) -> Self {
+        Self {
+            pgid: leader,
+            start: start_time(leader),
+        }
+    }
+
+    /// Whether our leader still holds the number (alive or a zombie): a group signal can reach only
+    /// our group.
+    pub(crate) fn leader_holds(&self) -> bool {
+        self.start.is_some() && start_time(self.pgid) == self.start
+    }
+
+    /// Whether the number now belongs to someone else: a live process has the pid and it is not our
+    /// leader. Our group is then necessarily empty (the kernel would not have reused the number
+    /// otherwise), so there is nothing of ours left to signal by group.
+    pub(crate) fn recycled(&self) -> bool {
+        match (self.start, start_time(self.pgid)) {
+            (Some(ours), Some(now)) => ours != now,
+            _ => false,
+        }
+    }
+}
+
+/// A process's start time in clock ticks since boot (`/proc/<pid>/stat` field 22), or `None` if it
+/// does not exist (or this is not Linux). With the pid, it names one process for all time.
+pub(crate) fn start_time(pid: u32) -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let stat = std::fs::read(format!("/proc/{pid}/stat")).ok()?;
+        // `pid (comm) state …`: `comm` may hold spaces or parens, so count from after the last `)`.
+        let close = stat.iter().rposition(|&b| b == b')')?;
+        let rest = std::str::from_utf8(&stat[close + 1..]).ok()?;
+        // Field 3 (`state`) is the first after `)`, so field 22 is the 20th.
+        rest.split_whitespace().nth(19)?.parse().ok()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        None
+    }
 }
 
 #[cfg(unix)]
-fn kill_group(pgid: u32, pid_fallback: bool) {
+fn kill_group(group: GroupId, pid_fallback: bool) {
+    let pgid = group.pgid;
+    if group.recycled() {
+        // Our group is gone and its number is a stranger's now: signalling it would kill them.
+        return;
+    }
+    // The pid is the leader's only while the leader holds it; once reaped, a fallback could hit
+    // whoever got the pid next.
+    let pid_fallback = pid_fallback && group.leader_holds();
     let group_result = std::process::Command::new("kill")
         .arg("-KILL")
         // `--` first, so the exit status means what the code below assumes. Without it procps-ng
@@ -797,7 +872,9 @@ fn kill_group(pgid: u32, pid_fallback: bool) {
     // second catches anything that was itself mid-fork (and so invisible to `ps`) during the first.
     sweep_kill_remaining_group_members(pgid);
     std::thread::sleep(Duration::from_millis(50));
-    sweep_kill_remaining_group_members(pgid);
+    if !group.recycled() {
+        sweep_kill_remaining_group_members(pgid);
+    }
 }
 
 /// Enumerate every process currently reporting `pgid` via `ps -eo pid=,pgid=` and SIGKILL each one
@@ -1059,7 +1136,7 @@ mod tests {
 
         tokio::time::timeout(
             Duration::from_secs(5),
-            tokio::task::spawn_blocking(move || kill_process_group(pid)),
+            tokio::task::spawn_blocking(move || kill_process_group(GroupId::leader(pid))),
         )
         .await
         .expect("kill_process_group must not hang when there's nothing left to kill")
