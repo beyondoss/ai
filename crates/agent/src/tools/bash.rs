@@ -561,8 +561,8 @@ impl Bash {
 
     /// Wait on `job` until it ends (its final result), its shell exits leaving processes running
     /// (adopt them as a job, if the call was a foreground one), `hold` says to hand control back
-    /// (park it and report the output since the last report), or the call is cancelled (kill it and
-    /// return what it printed, tagged "Command cancelled").
+    /// (park it and report the output since the last report), or the call is cancelled (kill a fresh
+    /// command and return what it printed, tagged "Command cancelled"; park a numbered job again).
     async fn attach(
         &self,
         job: Job,
@@ -625,12 +625,24 @@ impl Bash {
                 }
                 Woke::Cancelled => {
                     let snap = job.shared.take_segment();
-                    // Dropping the job kills its processes (see `Job`'s `Drop`).
-                    drop(job);
                     if let Some(p) = progress {
                         emit_update(p, &snap);
                     }
                     let text = clean(format_output(&snap, ""));
+                    // A job with a number is a `bash_job` wait being cancelled (an abort, or a
+                    // command that ends the run): the model was told how long that job lives, and
+                    // cancelling a wait on it must not end it. It goes back in the table; only a
+                    // call's own fresh command dies with the call.
+                    if let Some(id) = job.id {
+                        // An evicted yielded job is dropped (killed) here, outside the table lock.
+                        let _evicted = self.jobs.park(job);
+                        return Err(ToolError::Execution(append_status(
+                            &text,
+                            &format!("Wait cancelled; job {id} is still running."),
+                        )));
+                    }
+                    // Dropping the job kills its processes (see `Job`'s `Drop`).
+                    drop(job);
                     return Err(ToolError::Execution(append_status(
                         &text,
                         "Command cancelled",
