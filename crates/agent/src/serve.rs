@@ -1327,6 +1327,9 @@ struct Persistence {
     /// holds never goes stale underneath it. `None` leaves `new_session` free to mint (repo mode's
     /// natural behavior).
     pinned_id: Option<String>,
+    /// Bumped by every command that replaces the active transcript (`new_session`, `switch`,
+    /// `fork`) — see [`Self::transcript`].
+    transcript: u64,
 }
 
 /// The latency a network-backed session directory adds to [`Persistence::open`], simulated: sleeps
@@ -1422,6 +1425,7 @@ impl Persistence {
                     // named the *file*, and `new_session`'s file-mode arm already resets in place, so
                     // the id can't move regardless of whether one was pinned.
                     pinned_id: cfg.session_id.clone(),
+                    transcript: 0,
                 },
                 session,
             ));
@@ -1433,6 +1437,7 @@ impl Persistence {
                     store: None,
                     meta: fresh_meta(&cwd, &cfg.model, cfg.session_id.as_deref()),
                     pinned_id: cfg.session_id.clone(),
+                    transcript: 0,
                 },
                 Session::new(),
             ));
@@ -1498,6 +1503,7 @@ impl Persistence {
                 },
                 store: Some(store),
                 meta,
+                transcript: 0,
             },
             session,
         ))
@@ -1505,6 +1511,14 @@ impl Persistence {
 
     fn session_id(&self) -> &str {
         &self.meta.id
+    }
+
+    /// Which transcript is active: changes whenever a command replaces it, including the ones that
+    /// keep the session id (`new_session` on a pinned session, which every daemon session is, and in
+    /// single-file mode). What the active transcript's own state — its `bash` jobs — is keyed on;
+    /// the id alone cannot tell a blanked session from the one it replaced.
+    fn transcript(&self) -> u64 {
+        self.transcript
     }
 
     /// The active session's on-disk JSONL path — pi's `sessionFile` — or `None` when persistence is
@@ -1614,7 +1628,11 @@ impl Persistence {
         let cwd = Self::cwd();
         if let Some(repo) = &self.repo {
             if let Some(pinned) = self.pinned_id.clone() {
-                return self.blank_pinned_session(&pinned);
+                let blanked = self.blank_pinned_session(&pinned);
+                if blanked.is_ok() {
+                    self.transcript += 1;
+                }
+                return blanked;
             }
             let mut meta = SessionMeta::new(&cwd, model);
             meta.parent = Some(parent_session.unwrap_or(&self.meta.id).to_string());
@@ -1636,6 +1654,7 @@ impl Persistence {
         } else {
             self.meta = SessionMeta::new(&cwd, model);
         }
+        self.transcript += 1;
         Ok(Session::new())
     }
 
@@ -1680,6 +1699,7 @@ impl Persistence {
         let (store, session) = repo.open_id(id)?;
         self.meta = store.meta().clone();
         self.store = Some(store);
+        self.transcript += 1;
         Ok(session)
     }
 
@@ -1716,6 +1736,7 @@ impl Persistence {
         };
         self.meta = store.meta().clone();
         self.store = Some(store);
+        self.transcript += 1;
         Ok((session, restored_model, restored_level))
     }
 
@@ -2878,7 +2899,7 @@ pub(crate) async fn serve_session(
     let bash_jobs = exec_cell.bash_jobs().clone();
     bash_jobs.set_policy(crate::tools::bash_jobs::EndPolicy::KeepRunning);
     let mut bash_jobs_wake = bash_jobs.subscribe();
-    let mut bash_jobs_session = persistence.session_id().to_string();
+    let mut bash_jobs_transcript = persistence.transcript();
     // Per-session MCP kit gate (which configured servers' tools are advertised). Defaults to all
     // enabled — matching prior behavior — and is cleared on session switch so tenants cannot inherit
     // each other's enablement the way they must not inherit each other's exec endpoint.
@@ -4433,10 +4454,12 @@ pub(crate) async fn serve_session(
         }
         // The transcript changed (`new_session`, `switch_session`, `fork`, …): the jobs the old one
         // started belong to its history, not the new one's, so they stop here rather than wake the
-        // new transcript with notices about commands it never ran.
-        if bash_jobs_session != persistence.session_id() {
+        // new transcript with notices about commands it never ran. Keyed on the transcript, not the
+        // session id: a pinned session (every daemon session) and a `--session-file` session keep
+        // their id across `new_session`.
+        if bash_jobs_transcript != persistence.transcript() {
             bash_jobs.stop_all();
-            bash_jobs_session = persistence.session_id().to_string();
+            bash_jobs_transcript = persistence.transcript();
         }
         // Checked here because every write path — a run's persist, a mid-run checkpoint, a title, a
         // label, a compaction rewrite — comes back through this loop before the next command is read.
@@ -13241,6 +13264,7 @@ mod tests {
         // cleanly, doesn't crash."
         let mut persistence = Persistence {
             pinned_id: None,
+            transcript: 0,
             repo: None,
             store: None,
             meta: SessionMeta::new("/w", "claude-test"),
@@ -13388,6 +13412,7 @@ mod tests {
         // `switch_branch` above.
         let mut persistence = Persistence {
             pinned_id: None,
+            transcript: 0,
             repo: None,
             store: None,
             meta: SessionMeta::new("/w", "claude-test"),
@@ -13415,6 +13440,7 @@ mod tests {
         // a repo directory to consult.
         let persistence = Persistence {
             pinned_id: None,
+            transcript: 0,
             repo: None,
             store: None,
             meta: SessionMeta::new("/w", "claude-test"),
@@ -13492,6 +13518,7 @@ mod tests {
         // "no tree, nothing to append to" contract as `set_label`/`get_label` above.
         let mut persistence = Persistence {
             pinned_id: None,
+            transcript: 0,
             repo: None,
             store: None,
             meta: SessionMeta::new("/w", "claude-test"),
@@ -13514,6 +13541,7 @@ mod tests {
         // `None`; only `--session-dir` sets it).
         let mut persistence = Persistence {
             pinned_id: None,
+            transcript: 0,
             repo: None,
             store: None,
             meta: SessionMeta::new("/w", "claude-test"),
