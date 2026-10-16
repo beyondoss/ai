@@ -176,8 +176,8 @@ fn seed(dir: &std::path::Path, id: &str) {
 }
 
 /// A detached client's `compact` outlives the idle timeout: the summary call (stalled past it)
-/// completes and the compaction lands on disk. (While a `compact` blocks the session loop, a reap
-/// cannot reach it anyway; once the loop answers EOF mid-compaction, this is what keeps it alive.)
+/// completes and the compaction lands on disk. A compaction cancels on EOF, so a reap — which closes
+/// the session's input — would cut it short without the busy flag.
 #[tokio::test]
 async fn reaper_spares_a_detached_compact() {
     const SID: &str = "compactreap01";

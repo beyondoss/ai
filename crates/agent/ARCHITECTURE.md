@@ -3539,12 +3539,14 @@ its first summarization call) and cleared on literally the next event of any kin
 propagated error), and its own summarization call passes a discarding inner sink, so nothing else can
 possibly arrive between `CompactionStart` and whatever naturally follows it (`Compacted` on success, the
 next turn's `TurnStart` otherwise). Clearing on "anything else" is therefore exact, not a conservative
-guess, and never leaves the flag stuck `true` past the compaction attempt that set it. Manual `compact`
-and branch summarization (`switch_branch`'s `summarize?`) don't participate in this flag at all — both
-only ever run from the idle main loop, which processes one stdin command to completion before reading
-the next, so no concurrent `get_state` could ever observe them in flight regardless; tracking a flag
-neither the client nor this process's own control flow could ever race would be a private detail with
-no external correctness. `session_file` is a plain accessor (`Persistence::session_file`) — repo and
+guess, and never leaves the flag stuck `true` past the compaction attempt that set it. A manual
+`compact` runs its summary call inside a select, the same shape as the host-`bash` loop, so the session
+keeps answering while it waits (up to the stream idle timeout per call): `abort` cancels it (the
+compaction ends unapplied and `abort` is acknowledged after the `compact` response), shutdown and stdin
+EOF cancel it, `get_state` (`is_compacting: true`, `message_count` as it stands until the compaction
+lands), `get_session_stats` and `get_messages` are answered from a pre-compaction snapshot, MCP Events
+injections are deferred, and every other command is refused as busy. Branch summarization
+(`switch_branch`'s `summarize?`) still runs inline from the idle loop. `session_file` is a plain accessor (`Persistence::session_file`) — repo and
 single-file modes both populate `Persistence.store`, so one method covers either without needing to
 distinguish them, and it's `None` only for true in-memory (`--no-session-persistence`) runs.
 
@@ -5583,7 +5585,8 @@ mcp_events_subscribe (any session) ──► owned by that session
   the loop runs something that cannot take a prompt — a host `bash`, a branch summary, a whole-run
   retry backoff — goes to `deferred_events` and is replayed the moment the loop is idle. A mid-run
   follow-up injection runs right after the run; a steer the lane refuses is deferred too. Inline
-  commands such as `compact` never read the channel, so an injection waits behind them.
+  commands that never read the channel wait an injection behind them; a manual `compact` reads it,
+  and defers an injection like a host `bash` does.
 - **Commands never block.** `mcp_events_*` commands are spawned tasks (`McpEventsCommands`), from
   the idle loop and every busy loop alike. Subscribe/unsubscribe take a lock **per subscription
   key**, so a slow server's discovery or verification challenge holds neither the session nor
