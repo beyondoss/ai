@@ -1441,7 +1441,8 @@ any turn. The wait is level-triggered (a `watch` generation marked seen before t
 so a job that ends while the session is busy is never missed. A client prompt that races it wins (the
 arm is last in a biased `select!`): its run delivers the notice at its first tool results or its stop,
 and the arm then finds nothing to take, so no second turn runs. A transcript switch (`new_session`,
-`switch_session`, `fork`, …) stops the jobs — they belong to the old history. The check is keyed on
+`switch_session`, `fork`, …) stops the jobs — they belong to the old history — on the blocking pool,
+reported in a `bash_jobs_stopped` frame. The check is keyed on
 `Persistence::transcript`, a counter every transcript-replacing command bumps, not on the session id:
 a pinned session (every daemon session) and a `--session-file` session keep their id across
 `new_session`, and the blank transcript must not wake about a job it never ran. The session's own
@@ -2645,7 +2646,11 @@ and `serve`'s own `bash`/`abort_bash` RPC commands reuse `RealRunner` directly, 
     with the process (`BashJobs::stop_all` after the last turn), `serve` leaves them running and wakes
     the idle session when one ends (see the `serve` data flow). Every stopped job is reported with its
     `kind`: in `run` as one `bash_jobs_stopped` line in `--json` (before any structured output) and on
-    stderr; in `serve` as a `bash_jobs_stopped` frame before the prompt's terminal response. A
+    stderr; in `serve` as a `bash_jobs_stopped` frame before the prompt's terminal response. Every
+    stop (`end_turn`, `stop_all`, in `run` and `serve` alike) runs on the blocking pool, never the
+    runtime thread: a v1.2 job's kill waits for its stream's future (on that runtime) to let the
+    connection go, so a stop run inline starved it — each remote job cost the kill's full 2 s bound,
+    and its stream closed only at the process exit (`tests/bash_jobs_stop_remote.rs`). A
     subagent's jobs end with its registry. These ends, a `bash_job` kill, and the caps are the only
     things that stop a job: there is no per-command kill deadline (see "`bash` timeouts").
   - **One table per owner.** `ToolConfig::bash_jobs` hands `bash` the host's table: `run`'s, or the

@@ -4596,9 +4596,26 @@ pub(crate) async fn serve_session(
         // new transcript with notices about commands it never ran. Keyed on the transcript, not the
         // session id: a pinned session (every daemon session) and a `--session-file` session keep
         // their id across `new_session`.
+        //
+        // Off the runtime thread, as at the end of a turn and of the session: each kill blocks until
+        // its processes are gone, and a remote job's kill waits for its stream's future — which runs
+        // on this runtime — to let the connection go, so stopping it here would stall that future
+        // (and every other session on a daemon's current-thread runtime) for the kill's full bound.
+        // Said to the client, like every other stop.
         if bash_jobs_transcript != persistence.transcript() {
-            bash_jobs.stop_all();
             bash_jobs_transcript = persistence.transcript();
+            let stopped_jobs = {
+                let jobs = bash_jobs.clone();
+                tokio::task::spawn_blocking(move || jobs.stop_all())
+                    .await
+                    .unwrap_or_default()
+            };
+            if !stopped_jobs.is_empty() {
+                emit!(OutFrame::Value(json!({
+                    "type": "bash_jobs_stopped",
+                    "jobs": stopped_jobs,
+                })));
+            }
         }
         // Checked here because every write path — a run's persist, a mid-run checkpoint, a title, a
         // label, a compaction rewrite — comes back through this loop before the next command is read.
