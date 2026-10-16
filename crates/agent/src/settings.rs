@@ -678,8 +678,9 @@ impl SettingsStore {
 /// Read and parse the store file at `path`, tolerating a missing or unparsable file (all-unset) — shared
 /// by [`SettingsStore::open`] and [`SettingsStore::mutate_locked`], which both need "current on-disk
 /// state, gracefully defaulted." A missing file is the ordinary case (no settings configured yet) and
-/// stays silent; an existing-but-unparsable file (corrupted, hand-edited into invalid JSON, or written
-/// by a newer binary with a field this one doesn't understand) `warn!`s before defaulting — mirrors
+/// stays silent; a wrongly typed field is dropped alone and the rest kept (see [`parse_lenient`]), and
+/// an existing-but-unparsable file (corrupted, hand-edited into invalid JSON) defaults. Either is
+/// reported on stderr (once per process) as well as `warn!`ed — mirrors
 /// [`ModelOverrides::open`]'s identical "skip and warn, don't silently lose data" convention, which this
 /// function used to be the one exception to: silently resetting to all-unset with no diagnostic at all.
 /// That silence was especially costly here, since [`SettingsStore::mutate_locked`] re-reads through
@@ -699,16 +700,68 @@ fn read_store_file(path: &Path) -> Settings {
             return Settings::default();
         }
     };
-    match serde_json::from_str(&contents) {
-        Ok(settings) => settings,
+    let (settings, problems) = parse_lenient(&contents);
+    for problem in problems {
+        tracing::warn!(path = %path.display(), "settings file: {problem}");
+        warn_once(format!("warning: {}: {problem}", path.display()));
+    }
+    settings
+}
+
+/// Parse a settings file field by field: one wrongly typed value (`"block_images": "yes"`) drops only
+/// that field, not the whole file. A strict parse used to fail on the first bad field and fall back to
+/// all-unset, so a single typo silently discarded the default model, gateway, MCP servers and
+/// everything else — an unattended host quietly changed model and provider. Returns the settings that
+/// did parse, plus one message per field (or whole file) that didn't. Unknown keys are ignored, as
+/// they always were (`~/.claude/settings.json` is shared with other tools).
+fn parse_lenient(contents: &str) -> (Settings, Vec<String>) {
+    let value: serde_json::Value = match serde_json::from_str(contents) {
+        Ok(v) => v,
         Err(e) => {
-            tracing::warn!(
-                path = %path.display(),
-                error = %e,
-                "settings file is not valid JSON, treating it as empty"
+            return (
+                Settings::default(),
+                vec![format!(
+                    "not valid JSON ({e}); ignoring every setting in it"
+                )],
             );
-            Settings::default()
         }
+    };
+    let serde_json::Value::Object(fields) = value else {
+        return (
+            Settings::default(),
+            vec!["not a JSON object; ignoring every setting in it".to_string()],
+        );
+    };
+    let mut kept = serde_json::Map::with_capacity(fields.len());
+    let mut problems = Vec::new();
+    for (key, value) in fields {
+        // Probe each field alone (deserializing from a borrowed `&Value`), so a good one moves on into
+        // `kept` uncopied.
+        let probe = serde_json::Value::Object(serde_json::Map::from_iter([(key, value)]));
+        let result = Settings::deserialize(&probe);
+        let serde_json::Value::Object(one) = probe else {
+            continue;
+        };
+        match result {
+            Ok(_) => kept.extend(one),
+            Err(e) => {
+                let key = one.keys().next().map(String::as_str).unwrap_or_default();
+                problems.push(format!("ignoring `{key}`: {e}"));
+            }
+        }
+    }
+    let settings = serde_json::from_value(serde_json::Value::Object(kept)).unwrap_or_default();
+    (settings, problems)
+}
+
+/// Print a settings warning to stderr once per process: `run` and `serve` both re-read settings, and a
+/// typo should be reported, not repeated on every read.
+fn warn_once(message: String) {
+    static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !seen.contains(&message) {
+        eprintln!("{message}");
+        seen.push(message);
     }
 }
 
@@ -1494,6 +1547,43 @@ mod tests {
             "a corrupt settings file must be logged, not silently swallowed: {:?}",
             capture.messages()
         );
+    }
+
+    #[test]
+    fn one_wrongly_typed_field_drops_only_that_field() {
+        let (settings, problems) = parse_lenient(
+            r#"{
+                "default_model": "claude-keep",
+                "block_images": "yes",
+                "default_gateway_url": "http://gw.example",
+                "default_retry_max_retries": -1,
+                "permissions": {"allow": []}
+            }"#,
+        );
+        assert_eq!(settings.default_model.as_deref(), Some("claude-keep"));
+        assert_eq!(
+            settings.default_gateway_url.as_deref(),
+            Some("http://gw.example")
+        );
+        assert_eq!(settings.block_images, None);
+        assert_eq!(settings.default_retry_max_retries, None);
+        assert_eq!(problems.len(), 2, "{problems:?}");
+        assert!(problems.iter().any(|p| p.contains("`block_images`")));
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("`default_retry_max_retries`"))
+        );
+    }
+
+    #[test]
+    fn a_valid_file_parses_with_no_problems_and_garbage_reports_one() {
+        let (settings, problems) = parse_lenient(r#"{"default_model":"m","block_images":true}"#);
+        assert!(problems.is_empty());
+        assert_eq!(settings.block_images, Some(true));
+        let (settings, problems) = parse_lenient("[1,2]");
+        assert_eq!(settings, Settings::default());
+        assert_eq!(problems.len(), 1);
     }
 
     #[test]

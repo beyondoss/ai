@@ -274,7 +274,10 @@ The harness layers several capabilities over the bare tools + loop:
   hostile untrusted checkout could otherwise redirect `default_gateway_url`/`default_model` (or any
   other field) to something attacker-controlled just by shipping the file; a missing or malformed
   project `settings.json` degrades to global-only the same way a missing/malformed global one degrades
-  to all-defaults-unset, never an error. Read-only: there's no CLI mutation surface for the project
+  to all-defaults-unset, never an error. Both tiers parse field by field (`settings::parse_lenient`): a
+  wrongly typed field (`"block_images": "yes"`) drops only itself and is named once on stderr, and
+  every valid field still applies. A strict parse used to discard the whole file on one typo, with
+  only a `tracing::warn!`, so an unattended host silently lost its stored model and gateway. Read-only: there's no CLI mutation surface for the project
   tier (unlike the global one, no `agent settings --project` flag) — a project's `settings.json` is
   hand-edited, matching `models.json`'s own convention. Threaded into `run_task`/`Command::Serve` in
   place of the bare `SettingsStore::open_default()` both used before this feature; `.claude/settings.json`
