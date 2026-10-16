@@ -2660,7 +2660,8 @@ and `serve`'s own `bash`/`abort_bash` RPC commands reuse `RealRunner` directly, 
     does not start a job again. Rendered from the live table and attached as a request-only block on
     the summary message: never in the persisted summary, `CompactionProvenance` or the MCP App
     context sidecar, because after a restart the jobs are gone and a persisted copy would describe
-    them as running (`tests/bash_jobs_serve_carry.rs`).
+    them as running. A reopened summarized session's first request instead says no jobs are running,
+    which also corrects a summary whose prose claims one is (`tests/bash_jobs_serve_carry.rs`).
 - **`run_in_background` (`Start::Background`, `JobKind::Background`)**. A boolean on `bash`, not a
   tool of its own: in the background-shell probe (1,500 trials on Luna, Sol, Kimi K2.7 Code and Qwen
   3.8 Flash with the real system prompt and tools) it beat a separate start tool on every model, was

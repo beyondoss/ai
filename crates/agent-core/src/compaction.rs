@@ -22,7 +22,9 @@
 //! One block rides beside the summary without being persisted at all: `<background-jobs>`, the work
 //! tools left running ([`crate::background`]). It is rendered from live state at every compaction and
 //! attached to the summary message as a request-only block, because a persisted copy would describe
-//! dead processes after a restart. A copy the summarizing model echoes is stripped like the rest.
+//! dead processes after a restart; a reopened session gets it afresh on its first run, saying no jobs
+//! are running when none are. A copy the summarizing model echoes is stripped like the rest, and the
+//! summarizer is told not to record job state in its prose ([`LIVENESS_NOTE`]).
 
 use std::sync::Arc;
 
@@ -587,6 +589,15 @@ doing and what it last showed]\n\n### Blocked\n- [Issues preventing progress, if
 Decisions\n- **[Decision]** (user | assistant): [Brief rationale]\n\n## Next Steps\n1. [Ordered list of \
 what should happen next]\n\n## Critical Context\n- [Data, examples and references needed to continue: \
 exact values, commands and their key outputs, file:line references]\n- [Or \"(none)\"]";
+
+/// Appended to every summary instruction. Which jobs are running is process state: the host
+/// supplies it beside the summary from live state ([`crate::background`]), and a claim the summary
+/// records ("the dev server is running as job 1") is persisted and outlives the process, so after a
+/// restart the model skips restarting a server it believes is up.
+pub const LIVENESS_NOTE: &str = "\n\nDo not record whether any process or background job is \
+running, or its job number: which jobs are running is supplied separately, from live state, and a \
+recorded claim goes stale. Record what a process is for and how it was started (the command, port, \
+working directory), not that it is up. Ignore any <background-jobs> block above for the same reason.";
 
 /// Appended to a re-render's instruction when it carries the kept suffix
 /// ([`CompactionCandidates::sees_tail`]).
@@ -1384,6 +1395,7 @@ pub fn summary_request_with(
     if !tail.is_empty() {
         prompt.push_str(TAIL_NOTE);
     }
+    prompt.push_str(LIVENESS_NOTE);
     if let Some(custom) = custom_instructions {
         prompt.push_str("\n\nAdditional focus: ");
         prompt.push_str(custom);
@@ -1483,6 +1495,7 @@ pub fn conversation_summary_instruction(
             }
         }
     }
+    out.push_str(LIVENESS_NOTE);
     if state && previous_summary(messages).is_some() {
         out.push_str(STATE_FOLD_IN);
     } else if previous_summary(messages).is_some() {
@@ -3870,7 +3883,7 @@ mod tests {
             SummaryFraming::Compact,
         );
         assert!(state.contains(&format!(
-            "{STATE_INTRO}{STATE_RULES}{STATE_FORMAT}{STATE_FOLD_IN}"
+            "{STATE_INTRO}{STATE_RULES}{STATE_FORMAT}{LIVENESS_NOTE}{STATE_FOLD_IN}"
         )));
     }
 
@@ -4018,18 +4031,22 @@ mod tests {
             }
         };
         let fresh = text(&split, &[]);
-        assert!(fresh.ends_with(&format!("{STATE_INTRO}{STATE_RULES}{STATE_FORMAT}")));
+        assert!(fresh.ends_with(&format!(
+            "{STATE_INTRO}{STATE_RULES}{STATE_FORMAT}{LIVENESS_NOTE}"
+        )));
         assert!(!fresh.contains(SPLIT_TURN_INSTRUCTION) && !fresh.contains("<recent-context>"));
         // With a previous summary: the rewrite-not-append opener.
         let mut later = vec![Message::user(format!("{SUMMARY_MARKER}\n\n## Goal\nold"))];
         later.extend_from_slice(&split[1..]);
         let update = text(&later, &[]);
-        assert!(update.ends_with(&format!("{STATE_UPDATE_INTRO}{STATE_RULES}{STATE_FORMAT}")));
+        assert!(update.ends_with(&format!(
+            "{STATE_UPDATE_INTRO}{STATE_RULES}{STATE_FORMAT}{LIVENESS_NOTE}"
+        )));
         // A tail: rendered after the transcript, read-only, with the note saying so.
         let tail = vec![Message::assistant(vec![ContentBlock::text("now testing")])];
         let with_tail = text(&split, &tail);
         assert!(with_tail.contains("<recent-context>\nAssistant: now testing\n</recent-context>"));
-        assert!(with_tail.ends_with(TAIL_NOTE));
+        assert!(with_tail.ends_with(&format!("{TAIL_NOTE}{LIVENESS_NOTE}")));
     }
 
     #[test]
@@ -4046,7 +4063,7 @@ mod tests {
             SummaryFraming::Handoff,
         );
         assert!(text.starts_with(&format!(
-            "<system-reminder>{HANDOFF_FRAMING}{STATE_RULES}{STATE_FORMAT}{STATE_FOLD_IN}"
+            "<system-reminder>{HANDOFF_FRAMING}{STATE_RULES}{STATE_FORMAT}{LIVENESS_NOTE}{STATE_FOLD_IN}"
         )));
         assert!(!text.contains(SUMMARY_INSTRUCTION) && !text.contains("Fold it in: PRESERVE"));
     }
