@@ -5000,6 +5000,15 @@ async fn run_task(
             }
         }
     };
+    // One writer per session: held for the whole run, taken before the store's first write. A
+    // session another process is writing (`run -c` in a second terminal, a `serve` that has it open)
+    // is refused with the file named, not shared — two writers each chain their turns onto their own
+    // stale tip. See `session_store::lock_session_writer`.
+    let _session_lock = match &store {
+        Some(store) => beyond_ai_agent::session_store::lock_session_writer(store.path())
+            .map_err(|e| format!("cannot use this session: {e}"))?,
+        None => None,
+    };
 
     // Build the mount list: durable `/memories`, plus (unless `--no-session-memory`) a per-session
     // `/session` working-memory store — the compaction-surviving scratchpad. `run` is single-session, so

@@ -490,12 +490,22 @@ The harness layers several capabilities over the bare tools + loop:
   whole scan, since a full rewrite writes off-path nodes in no particular order), a `Leaf` naming an
   unreadable entry is ignored, and a message holding a content block or stop reason from a newer build
   is read as a degraded copy (the block becomes a text block naming its type, the stop reason `Other`;
-  the original line stays on disk) rather than dropped. A torn tail is cut back to the last newline by
-  every writable single-file open (`trim_torn_tail`; read-only opens never touch the file), and a
-  single-file append that fails part-way (`ENOSPC`, `EFBIG`, a failed sync) is `set_len` back to its
-  starting length, with a newline written first if the file somehow still ends mid-line — so the next
-  turn is never glued onto a fragment, which used to take every message chained after it (8 → 1) off
-  the active path on reopen (`tests/session_file_integrity.rs`). A header whose `version` is newer
+  the original line stays on disk) rather than dropped. A torn tail a writable single-file open found
+  is cut back to the last newline by that store's first write (`trim_torn_tail`, only if the file is
+  still the length the open saw; read-only opens never touch the file) — the first write, not the
+  open, because an open is not yet ownership: the caller takes the writer lock after opening, and a
+  holder's append in flight looks exactly like a torn tail. A single-file append that fails part-way
+  (`ENOSPC`, `EFBIG`, a failed sync) is `set_len` back to its starting length, with a newline written
+  first if the file somehow still ends mid-line — so the next turn is never glued onto a fragment,
+  which used to take every message chained after it (8 → 1) off the active path on reopen
+  (`tests/session_file_integrity.rs`). **One writer per single-file session**: `run` and `serve`
+  outside service mode take `session_store::lock_session_writer` right after opening and hold it with
+  the store (`serve`'s `Persistence::install` swaps it with every `switch`/`fork`/`new_session`); a
+  session another process holds is **refused** with the file named, not opened read-only — a turn on a
+  read-only session could not be saved, and the operator asked for one that is. Two writers used to
+  share one file silently, each chaining its turns onto its own stale tip. The store itself takes no
+  lock, so listing, export and fork sources are never blocked; the segmented layout is fenced by epoch
+  and service mode locks it in `serve_ws` (`tests/session_writer_lock.rs`). A header whose `version` is newer
   than the build understands is refused (migration hook). `rewrite`'s write-to-`.jsonl.tmp`-then-rename
   is safe either way a failure lands: a hard crash leaves the `.tmp` behind harmlessly (never read back
   as a session; the next `rewrite` reuses the same deterministic path anyway), while a genuine

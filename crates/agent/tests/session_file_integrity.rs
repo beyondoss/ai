@@ -90,7 +90,7 @@ fn a_turn_after_a_torn_tail_reopens_with_the_whole_history() {
 /// The cut belongs to a writer: a read-only open (a preview, an export, a fork source) leaves the file
 /// exactly as it found it.
 #[test]
-fn only_a_writable_open_cuts_a_torn_tail() {
+fn only_a_writers_first_write_cuts_a_torn_tail() {
     let dir = TempDir::new().unwrap();
     let (path, _) = session_with(&dir, 1);
     append_raw(&path, r#"{"type":"mess"#);
@@ -100,11 +100,22 @@ fn only_a_writable_open_cuts_a_torn_tail() {
     assert_eq!(s.messages.len(), 2);
     assert_eq!(fs::read(&path).unwrap(), before);
 
-    let (_rw, s) = SessionStore::open(path.clone()).unwrap();
+    // An open alone is not ownership yet (the caller takes the writer lock after it, and the tail
+    // may be another process's append in flight): the file is untouched until the first write.
+    let (mut rw, mut s) = SessionStore::open(path.clone()).unwrap();
     assert_eq!(s.messages.len(), 2);
-    let after = fs::read(&path).unwrap();
-    assert!(after.ends_with(b"\n"));
-    assert_eq!(after.len(), before.len() - r#"{"type":"mess"#.len());
+    assert_eq!(fs::read(&path).unwrap(), before);
+    s.push(Message::user("u1"));
+    rw.append_new(&s.messages).unwrap();
+    let after = String::from_utf8(fs::read(&path).unwrap()).unwrap();
+    assert!(
+        after
+            .lines()
+            .all(|l| serde_json::from_str::<serde_json::Value>(l).is_ok()),
+        "the torn line is still on disk: {after}"
+    );
+    let (_store, reopened) = SessionStore::open(path).unwrap();
+    assert_eq!(texts(&reopened.messages), ["u0", "a0", "u1"]);
 }
 
 /// A complete final entry that only lost its newline is a readable entry, not a torn one: it stays,
