@@ -279,6 +279,24 @@ impl Session {
         self
     }
 
+    /// Close a prompt that was never answered with a synthetic [`Message::error`] record, the same
+    /// closing record a failed run leaves (see [`Self::pop_error_record`]). Returns whether one was
+    /// added.
+    ///
+    /// The prompt is checkpointed before the model call, so a process killed outright (OOM, `kill -9`,
+    /// a CI cancel) leaves a session whose tip is that `user` message, with no closing record — no
+    /// `Err` path ever ran. A host resuming such a session calls this before adding its own prompt, so
+    /// the conversation doesn't send two consecutive `user` turns: the model sees that the earlier
+    /// request was interrupted rather than two prompts merged into one turn.
+    pub fn close_unanswered_prompt(&mut self, why: impl Into<String>) -> bool {
+        if self.messages.last().is_some_and(|m| m.role == Role::User) {
+            self.push(Message::error(why));
+            true
+        } else {
+            false
+        }
+    }
+
     /// Remove the trailing message if (and only if) it's a synthetic [`Message::error`] record —
     /// called by a whole-run auto-retry layer right before re-invoking the same run on the same
     /// session. `run_events_steered` persists this record on every `Err`-ending run (so a client's own
@@ -508,6 +526,19 @@ impl Session {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn close_unanswered_prompt_closes_only_a_user_tip() {
+        let mut session = Session::new();
+        assert!(!session.close_unanswered_prompt("x"), "nothing to close");
+        session.user("first");
+        assert!(session.close_unanswered_prompt("interrupted"));
+        let tip = session.messages.last().unwrap();
+        assert_eq!(tip.role, Role::Assistant);
+        assert_eq!(tip.error_message.as_deref(), Some("interrupted"));
+        assert!(!session.close_unanswered_prompt("again"), "already closed");
+        assert_eq!(session.messages.len(), 2);
+    }
+
     use super::*;
 
     /// Every in-place shrink is recorded, with an id newer than anything before it; `since` reports
