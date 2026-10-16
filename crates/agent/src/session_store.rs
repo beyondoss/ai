@@ -3299,12 +3299,23 @@ impl SessionRepo {
     /// interleave their transcripts into it, and since [`SessionStore::append_new`] is count-keyed
     /// neither process can even observe the other's writes. Callers wanting a brand-new session call
     /// [`Self::create`]; callers wanting a *named* one call [`Self::open_or_create_id`].
+    ///
+    /// A header-only session (no messages yet) is passed over for an older one that has a conversation:
+    /// an invocation that failed after creating its session (a bad flag, an unreadable schema) must
+    /// not make the next `--continue` resume nothing while the real conversation sits one entry down.
+    /// Only when every match is empty is the newest empty one reused, rather than minting yet another.
     pub fn resume_latest_or_create(
         &self,
         cwd: &str,
         model: &str,
     ) -> std::io::Result<(SessionStore, Session)> {
-        match self.list()?.into_iter().find(|m| m.cwd == cwd) {
+        let matching: Vec<SessionMeta> =
+            self.list()?.into_iter().filter(|m| m.cwd == cwd).collect();
+        let latest = matching
+            .iter()
+            .find(|m| m.message_count > 0)
+            .or_else(|| matching.first());
+        match latest {
             Some(meta) => self.open_id(&meta.id),
             None => Ok((self.create(SessionMeta::new(cwd, model))?, Session::new())),
         }
@@ -9327,6 +9338,42 @@ mod tests {
         let (store, session) = repo.resume_latest_or_create("/mine", "m").unwrap();
         assert_eq!(store.meta().id, mine.meta().id);
         assert_eq!(session.messages.len(), 1);
+    }
+
+    #[test]
+    fn resume_latest_or_create_passes_over_a_newer_header_only_session() {
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let mut real = repo.create(SessionMeta::new("/mine", "m")).unwrap();
+        let mut s = Session::new();
+        s.user("the real conversation");
+        real.append_new(&s.messages).unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        fs::File::options()
+            .write(true)
+            .open(real.path())
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        // A later invocation created its session, then failed before writing anything.
+        let empty = repo.create(SessionMeta::new("/mine", "m")).unwrap();
+        assert_eq!(
+            repo.list().unwrap()[0].id,
+            empty.meta().id,
+            "the empty one is newer"
+        );
+
+        let (store, session) = repo.resume_latest_or_create("/mine", "m").unwrap();
+        assert_eq!(store.meta().id, real.meta().id);
+        assert_eq!(session.messages.len(), 1);
+
+        // With only empty sessions, the newest one is reused rather than minting another.
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let empty = repo.create(SessionMeta::new("/mine", "m")).unwrap();
+        let (store, _) = repo.resume_latest_or_create("/mine", "m").unwrap();
+        assert_eq!(store.meta().id, empty.meta().id);
+        assert_eq!(repo.list().unwrap().len(), 1);
     }
 
     #[test]
