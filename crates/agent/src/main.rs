@@ -274,8 +274,10 @@ enum Command {
         /// The task prompt for the agent. Multiple messages run as separate, sequential turns (the
         /// second is sent only after the first fully completes). An argument starting with `@` is a
         /// file reference instead of a message: its contents are read and wrapped in a
-        /// `<file name="...">` block prepended to the *first* message (stdin, if piped, comes before
-        /// that). At least one of a message, `@file`, or piped stdin is required.
+        /// `<file name="...">` block prepended to the *first* message. Stdin is read only when no
+        /// message is given (`cmd | agent run`, `agent run @prompt.md < input`) or the first message
+        /// is `-`, and comes before the `@file` blocks; with a message, an open stdin is never waited
+        /// on. At least one of a message, `@file`, or stdin is required.
         tasks: Vec<String>,
         /// Model id (default `claude-opus-4-8`, or `AI_AGENT_MODEL`).
         #[usage(long, env = "AI_AGENT_MODEL")]
@@ -3626,6 +3628,16 @@ fn read_stdin_if_piped() -> Option<String> {
     }
 }
 
+/// Stdin's full contents for an explicit `-` message — read even from a terminal (type, then EOF), since
+/// the operator asked for it; trimmed and blank-checked like [`read_stdin_if_piped`].
+fn read_stdin_explicit() -> Option<String> {
+    let mut buf = String::new();
+    match std::io::stdin().lock().read_to_string(&mut buf) {
+        Ok(_) => trim_piped_stdin(&buf),
+        Err(_) => None,
+    }
+}
+
 /// [`read_stdin_if_piped`]'s trim/blank-check logic, split out so it's unit-testable without a real
 /// piped stdin — Task #37 (pi-parity fix): matches pi's own `readPipedStdin`'s `data.trim() ||
 /// undefined`. `None` for an empty or whitespace-only buffer (e.g. just a trailing newline from an
@@ -4464,7 +4476,19 @@ async fn run_task(
     // (see `read_file_refs`) contributes no text of its own but still counts as "something", so an
     // invocation like `run @screenshot.png` with no other text still proceeds.
     let (file_refs, mut messages) = partition_tasks(tasks);
-    let stdin_content = read_stdin_if_piped();
+    // Stdin is read only when asked for: no message argument (`some-cmd | agent run`, or
+    // `agent run @prompt.md < diff`), or an explicit `-`. Reading it unconditionally made
+    // `run "task"` wait for an EOF that never comes under `ssh host agent run …` without `-t`,
+    // `docker exec -i`, or any parent holding a pipe open, and made `while read …; do agent run …`
+    // swallow the rest of the loop's input as its prompt.
+    let stdin_content = match messages.first().map(String::as_str) {
+        Some("-") => {
+            messages.remove(0);
+            read_stdin_explicit()
+        }
+        Some(_) => None,
+        None => read_stdin_if_piped(),
+    };
     let file_refs = read_file_refs(
         &file_refs,
         &cwd,
