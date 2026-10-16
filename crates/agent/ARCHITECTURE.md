@@ -2772,6 +2772,18 @@ and `serve`'s own `bash`/`abort_bash` RPC commands reuse `RealRunner` directly, 
     started with) is readable for our own uid without privilege — on a dev box, in CI, in a container
     and in a Firecracker guest alike. A job's processes are the live (non-zombie) ones that carry the
     tag **or** are still in its process group, which also covers one that cleared its environment.
+    **The group number is ours only while the group lives**: once the shell is reaped and the group
+    empty (a `setsid` leftover has left it), the kernel may hand the number to an unrelated process,
+    which can lead a group with it — and a job that matched or signalled "group `pgid`" would claim and
+    SIGKILL a stranger (reproduced by recycling the pid inside `unshare -Urpf --mount-proc`). So the
+    shell's start time is recorded at spawn (`exec::GroupId`): the group is signalled as a unit only
+    while the shell itself holds the number (alive or a zombie), and group membership counts only
+    until a scan finds the group empty after the reap or the number held by another process
+    (`GroupId::recycled`) — then the tag alone, each kill pidfd-verified. `exec`'s `GroupKillGuard`,
+    the MCP sweep after a reap and a template transport's local group kill skip a recycled number the
+    same way, and kill by pid only while the leader holds it
+    (`bash_proc::tests::a_recycled_group_number_is_never_claimed`, which skips where `unshare` is
+    unavailable).
     A full scan of `/proc` is cheap: 1,145 processes, 68 of them ours, read in 7 ms by an unoptimized
     Python probe on the dev box. It runs only when a shell exits, on a kill, and on each wake of an
     adopted job's wait.

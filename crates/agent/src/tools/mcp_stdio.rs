@@ -30,7 +30,9 @@ pub const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(3
 /// synchronous caller (a `Drop`, a thread on the way out of the process) can close stdin and poll
 /// for the exit itself, with no runtime needing to run anything.
 pub struct ServerProcess {
-    pgid: Option<u32>,
+    /// Its process group, with the leader's identity: the sweep after a reap must not signal the
+    /// number once it has been recycled (see [`crate::tools::exec::GroupId`]).
+    group: Option<crate::tools::exec::GroupId>,
     child: std::sync::Mutex<tokio::process::Child>,
     stdin: std::sync::Mutex<Option<tokio::process::ChildStdin>>,
     retired: std::sync::atomic::AtomicBool,
@@ -47,7 +49,7 @@ fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 impl ServerProcess {
     /// Its process-group id (its pid: it leads its group).
     pub(crate) fn pgid(&self) -> Option<u32> {
-        self.pgid
+        self.group.map(|g| g.pgid)
     }
 
     /// Whether the server has exited — a non-blocking wait on the child this process owns, so it
@@ -88,10 +90,11 @@ pub(crate) fn retire(server: &std::sync::Arc<ServerProcess>) {
                 // Not reaped, so the pid is still this server's: killing it by pid is safe.
                 let _ = lock(&server.child).start_kill();
             }
-            if let Some(pgid) = server.pgid {
+            if let Some(group) = server.group {
                 // The rest of the group — by group only: once the leader is reaped its pid may be
-                // reused, so there is no kill-by-pid fallback here.
-                crate::tools::exec::kill_group_members(pgid);
+                // reused, so there is no kill-by-pid fallback here, and no group kill at all once
+                // the number has been recycled.
+                crate::tools::exec::kill_group_members(group);
             }
             if !reaped {
                 for _ in 0..40 {
@@ -134,8 +137,8 @@ pub fn sweep_before_exit() {
                 // Not reaped, so the pid is still this server's.
                 let _ = lock(&server.child).start_kill();
             }
-            if let Some(pgid) = server.pgid {
-                crate::tools::exec::kill_group_members(pgid);
+            if let Some(group) = server.group {
+                crate::tools::exec::kill_group_members(group);
             }
         }
     }
@@ -766,7 +769,7 @@ pub(crate) fn stdio_transport(
         .stderr(std::process::Stdio::inherit())
         .kill_on_drop(true);
     let mut child = cmd.spawn()?;
-    let pgid = child.id();
+    let group = child.id().map(crate::tools::exec::GroupId::leader);
     let stdout = child
         .stdout
         .take()
@@ -776,7 +779,7 @@ pub(crate) fn stdio_transport(
         .take()
         .ok_or_else(|| std::io::Error::other("no stdin"))?;
     let server = std::sync::Arc::new(ServerProcess {
-        pgid,
+        group,
         child: std::sync::Mutex::new(child),
         stdin: std::sync::Mutex::new(Some(stdin)),
         retired: std::sync::atomic::AtomicBool::new(false),
@@ -1179,11 +1182,12 @@ mod tests {
             .spawn()
             .unwrap();
         let pid = bystander.id();
-        crate::tools::exec::kill_group_members(pid);
+        let group = crate::tools::exec::GroupId::leader(pid);
+        crate::tools::exec::kill_group_members(group);
         std::thread::sleep(std::time::Duration::from_millis(200));
         let survived = bystander.try_wait().unwrap().is_none();
         // The hazard is real: with the fallback, the same call kills it.
-        crate::tools::exec::kill_process_group(pid);
+        crate::tools::exec::kill_process_group(group);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let mut killed = false;
         while std::time::Instant::now() < deadline {

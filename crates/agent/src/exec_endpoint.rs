@@ -854,7 +854,7 @@ const FAR_KILL_LIMIT: Duration = Duration::from_secs(10);
 struct TemplateKill {
     template: Arc<Vec<String>>,
     far: far_kill::FarIdCell,
-    local_pgid: Option<u32>,
+    local_group: Option<crate::tools::exec::GroupId>,
 }
 
 impl TemplateKill {
@@ -865,8 +865,8 @@ impl TemplateKill {
             far_kill::run_bounded(&expand(&self.template, &program, &args), FAR_KILL_LIMIT);
         }
         #[cfg(unix)]
-        if let Some(pgid) = self.local_pgid {
-            crate::tools::exec::kill_process_group(pgid);
+        if let Some(group) = self.local_group {
+            crate::tools::exec::kill_process_group(group);
         }
     }
 }
@@ -970,7 +970,7 @@ impl TemplateRunner {
         let kill = TemplateKill {
             template: Arc::new(self.template.clone()),
             far: far.clone(),
-            local_pgid: child.id(),
+            local_group: child.id().map(crate::tools::exec::GroupId::leader),
         };
         let mut guard = TemplateKillGuard(Some(kill.clone()));
         if let Some(report) = on_spawn {
