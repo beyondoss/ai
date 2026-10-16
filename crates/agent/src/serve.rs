@@ -2873,7 +2873,8 @@ pub(crate) async fn serve_session(
     };
     // `bash` jobs outlive the run that started them here: ending a turn leaves them running, and the
     // idle loop below starts a turn when one ends (see the `bash_jobs_wake` arm). They end with the
-    // session (its cell drops), and a transcript switch stops them (they belong to its history).
+    // session (stopped explicitly when this function returns), and a transcript switch stops them
+    // (they belong to its history).
     let bash_jobs = exec_cell.bash_jobs().clone();
     bash_jobs.set_policy(crate::tools::bash_jobs::EndPolicy::KeepRunning);
     let mut bash_jobs_wake = bash_jobs.subscribe();
@@ -8583,6 +8584,24 @@ pub(crate) async fn serve_session(
                 emit!(response(id, other, false, None, Some("unknown command")));
             }
         }
+    }
+    // The session is over, however it ended (EOF, a reap, a supersede, shutdown): its `bash` jobs
+    // stop with it. Explicit rather than left to the table's drop: in a daemon the process lives
+    // on, and nothing else would ever reach these jobs again. Off the runtime thread, because each
+    // kill blocks until its processes are gone (on the daemon's current-thread runtime that would
+    // stall every other session).
+    let stopped_jobs = {
+        let jobs = bash_jobs.clone();
+        tokio::task::spawn_blocking(move || jobs.stop_all())
+            .await
+            .unwrap_or_default()
+    };
+    if !stopped_jobs.is_empty() {
+        // Best effort: the client may already be gone.
+        let _ = out_tx.send(OutFrame::Value(json!({
+            "type": "bash_jobs_stopped",
+            "jobs": stopped_jobs,
+        })));
     }
     // Unsubscribe (webhook) / cancel (push) every MCP Events subscription before the session goes:
     // best effort and bounded, so a dead server cannot hold the teardown.

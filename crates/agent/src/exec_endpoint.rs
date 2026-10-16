@@ -1219,15 +1219,44 @@ impl ExecTarget {
 /// fall back to.
 #[derive(Clone, Default)]
 pub struct ExecCell {
+    route: CellRoute,
+    /// The session's `bash` jobs. Here because they share the cell's lifetime and reach: one per
+    /// session, handed to every registry rebuild (`build_tools` takes the cell), so a `set_model`
+    /// keeps them running.
+    ///
+    /// Deliberately *not* in [`CellRoute`], the part [`Self::runner`] and [`Self::backend`] clone:
+    /// every running job's task holds the runner, so a runner that held the table would make a
+    /// cycle (task → runner → table → job → task), and a session that ended without stopping its
+    /// jobs would leak them, unreachable, for the life of the process.
+    bash_jobs: std::sync::Arc<crate::tools::bash_jobs::BashJobs>,
+}
+
+/// Where an [`ExecCell`] dispatches: the part its runner and filesystem backend share.
+#[derive(Clone, Default)]
+struct CellRoute {
     target: std::sync::Arc<std::sync::RwLock<Option<ExecTarget>>>,
     /// Fail closed: an empty cell errors instead of running on this host. Service mode
     /// (`serve --service`) sets it, because there the host is the *replica* — a tenant's `bash`
     /// landing on it is not a stale-config bug but a breach. Fixed at construction.
     strict: bool,
-    /// The session's `bash` jobs. Here because they share the cell's lifetime and reach: one per
-    /// session, handed to every registry rebuild (`build_tools` takes the cell), so a `set_model`
-    /// keeps them running.
-    bash_jobs: std::sync::Arc<crate::tools::bash_jobs::BashJobs>,
+}
+
+impl CellRoute {
+    fn get(&self) -> Option<ExecTarget> {
+        self.target
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// The target to dispatch to, or — in strict mode with an empty cell — the refusal.
+    fn resolve(&self) -> Result<Option<ExecTarget>, &'static str> {
+        match (self.get(), self.strict) {
+            (Some(t), _) => Ok(Some(t)),
+            (None, false) => Ok(None),
+            (None, true) => Err(NO_TARGET),
+        }
+    }
 }
 
 /// What a strict cell answers when nothing is configured. Static text: it reaches the model as a
@@ -1245,7 +1274,10 @@ impl ExecCell {
     /// stale-config bug but a breach.
     pub fn strict() -> Self {
         Self {
-            strict: true,
+            route: CellRoute {
+                strict: true,
+                ..CellRoute::default()
+            },
             ..Self::default()
         }
     }
@@ -1259,39 +1291,27 @@ impl ExecCell {
     pub fn set(&self, target: Option<ExecTarget>) {
         // Recover a poisoned lock rather than panicking: the cell holds a single value with no
         // invariant a panicked writer could leave half-updated, and the workspace forbids `unwrap`.
-        *self.target.write().unwrap_or_else(|e| e.into_inner()) = target;
+        *self.route.target.write().unwrap_or_else(|e| e.into_inner()) = target;
     }
 
     pub fn get(&self) -> Option<ExecTarget> {
-        self.target
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
-    }
-
-    /// The target to dispatch to, or — in strict mode with an empty cell — the refusal.
-    fn resolve(&self) -> Result<Option<ExecTarget>, &'static str> {
-        match (self.get(), self.strict) {
-            (Some(t), _) => Ok(Some(t)),
-            (None, false) => Ok(None),
-            (None, true) => Err(NO_TARGET),
-        }
+        self.route.get()
     }
 
     /// A [`CommandRunner`] that always dispatches to whatever this cell currently holds.
     pub fn runner(&self) -> std::sync::Arc<dyn CommandRunner> {
-        std::sync::Arc::new(CellRunner(self.clone()))
+        std::sync::Arc::new(CellRunner(self.route.clone()))
     }
 
     /// An [`FsBackend`](crate::tools::fs::FsBackend) that always dispatches to whatever this cell
     /// currently holds.
     pub fn backend(&self) -> std::sync::Arc<dyn crate::tools::fs::FsBackend> {
-        std::sync::Arc::new(CellFs(self.clone()))
+        std::sync::Arc::new(CellFs(self.route.clone()))
     }
 }
 
 /// Dispatches each command to the cell's current target, or this host when it is empty.
-struct CellRunner(ExecCell);
+struct CellRunner(CellRoute);
 
 #[async_trait]
 impl CommandRunner for CellRunner {
@@ -1393,7 +1413,7 @@ impl CommandRunner for CellRunner {
 }
 
 /// The filesystem half of the same indirection.
-struct CellFs(ExecCell);
+struct CellFs(CellRoute);
 
 impl CellFs {
     fn inner(

@@ -1396,8 +1396,12 @@ so a job that ends while the session is busy is never missed. A client prompt th
 arm is last in a biased `select!`): its run delivers the notice at its first tool results or its stop,
 and the arm then finds nothing to take, so no second turn runs. A transcript switch (`new_session`,
 `switch_session`, `fork`, …) stops the jobs — they belong to the old history — and the session's own
-end (stdin EOF, the daemon's reaper, a closed socket) kills them with its cell. Jobs do not survive a
-restart; `bash_job` on an id from before one says so.
+end (stdin EOF, the daemon's reaper, a closed socket, a supersede) stops them explicitly
+(`BashJobs::stop_all` on the blocking pool as `serve_session` returns, reported in a
+`bash_jobs_stopped` frame), so in a daemon, whose process lives on, nothing outlives its session. The
+table is kept out of what the cell's runner and backend clone (`CellRoute`): every running job's task
+holds the runner, and a runner that held the table would be a cycle that kept an ended session's jobs
+alive, unreachable. Jobs do not survive a restart; `bash_job` on an id from before one says so.
 
 ---
 
