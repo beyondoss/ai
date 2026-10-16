@@ -4874,6 +4874,46 @@ async fn run_task(
             }
             None => (default_session_dir(&cwd_str), sessions_root()),
         };
+    // Persistent, cross-session memory. Resolved here (before the subagent context is built) so the same
+    // backend `Arc` is shared with every child — the whole subagent tree reads/writes one durable store.
+    // Registered *after* `apply_filter` (like `structured_output`/`subagent`) so a `--tools` allow-list
+    // can't strip the agent's memory; `--no-memory`/`--no-tools` opt out. A bad backend fails fast before
+    // a model call is billed, and before a session is created (see below). The `MEMORY.md` index is
+    // injected into the system prompt below.
+    let memory_backend: Option<Arc<dyn beyond_ai_agent::memory::MemoryBackend>> =
+        if no_memory || no_tools {
+            None
+        } else {
+            let dsn = memory.or_else(|| stored_settings.default_memory_backend.clone());
+            Some(
+                beyond_ai_agent::memory::open(dsn.as_deref(), &cwd).unwrap_or_else(|e| {
+                    eprintln!("{e}");
+                    exit_process(2);
+                }),
+            )
+        };
+
+    // Every check that can fail this invocation runs before the session is opened: a session created
+    // and then abandoned by a failed invocation is what the next `--continue` would otherwise resume.
+    // `--output-schema` is loaded here for that reason, and registered further down.
+    let compaction_candidates =
+        agent_core::CompactionCandidates::from_names(&compaction_candidates.unwrap_or_default())?;
+    let output_slot = tools::structured_output::OutputSlot::new();
+    let structured_output_tool = output_schema.as_ref().map(|arg| {
+        let schema = tools::structured_output::load_schema(arg).unwrap_or_else(|e| {
+            eprintln!("{e}");
+            exit_process(2);
+        });
+        tools::structured_output::StructuredOutput::new(
+            schema,
+            output_description,
+            output_slot.clone(),
+        )
+        .unwrap_or_else(|e| {
+            eprintln!("{e}");
+            exit_process(2);
+        })
+    });
     let (mut store, mut session) = if let Some(arg) = &fork {
         // `--fork` wins over `--session`/`--continue`: a fork always starts a fresh child session,
         // never reopens one in place, so there is no meaningful way to combine it with either.
@@ -4961,23 +5001,6 @@ async fn run_task(
         }
     };
 
-    // Persistent, cross-session memory. Resolved here (before the subagent context is built) so the same
-    // backend `Arc` is shared with every child — the whole subagent tree reads/writes one durable store.
-    // Registered *after* `apply_filter` (like `structured_output`/`subagent`) so a `--tools` allow-list
-    // can't strip the agent's memory; `--no-memory`/`--no-tools` opt out. A bad backend fails fast before
-    // a model call is billed. The `MEMORY.md` index is injected into the system prompt below.
-    let memory_backend: Option<Arc<dyn beyond_ai_agent::memory::MemoryBackend>> =
-        if no_memory || no_tools {
-            None
-        } else {
-            let dsn = memory.or_else(|| stored_settings.default_memory_backend.clone());
-            Some(
-                beyond_ai_agent::memory::open(dsn.as_deref(), &cwd).unwrap_or_else(|e| {
-                    eprintln!("{e}");
-                    exit_process(2);
-                }),
-            )
-        };
     // Build the mount list: durable `/memories`, plus (unless `--no-session-memory`) a per-session
     // `/session` working-memory store — the compaction-surviving scratchpad. `run` is single-session, so
     // the session dir is fixed for the whole process: the `<...>.memory/` sibling of a persisted session
@@ -5031,22 +5054,9 @@ async fn run_task(
     //
     // Fail fast on a bad schema, before a single model call is billed — the same discipline
     // `ToolPolicy::validate_deny_path_patterns` uses for a malformed `--deny-path` glob.
-    let output_slot = tools::structured_output::OutputSlot::new();
-    let wants_structured_output = output_schema.is_some();
-    if let Some(arg) = &output_schema {
-        let schema = tools::structured_output::load_schema(arg).unwrap_or_else(|e| {
-            eprintln!("{e}");
-            exit_process(2);
-        });
-        let tool = tools::structured_output::StructuredOutput::new(
-            schema,
-            output_description,
-            output_slot.clone(),
-        )
-        .unwrap_or_else(|e| {
-            eprintln!("{e}");
-            exit_process(2);
-        });
+    // (The schema itself was loaded and checked before the session was opened — see above.)
+    let wants_structured_output = structured_output_tool.is_some();
+    if let Some(tool) = structured_output_tool {
         registry.register(Arc::new(tool));
     }
 
@@ -5311,9 +5321,7 @@ async fn run_task(
             tool_masking_keep_tokens,
             tool_masking_min_tokens,
             no_cached_summary,
-            candidates: agent_core::CompactionCandidates::from_names(
-                &compaction_candidates.unwrap_or_default(),
-            )?,
+            candidates: compaction_candidates,
         },
     );
     if no_compaction {

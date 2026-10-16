@@ -515,7 +515,10 @@ The harness layers several capabilities over the bare tools + loop:
      `find_path`, since resolving `abc` onto an existing `abcdef` would both return the wrong session and
      suppress creating the one asked for. Idempotent: same id, same conversation, every time.
   2. `--continue` reattaches to this cwd's most recent session (`resume_latest_or_create`), else creates
-     one. The only implicit reattach there is.
+     one. The only implicit reattach there is. A header-only session (no messages) is passed over for an
+     older one with a conversation, so an invocation that died after creating its session never hijacks
+     the next `--continue`; `run` also runs every check that can fail an invocation (`--output-schema`,
+     `--memory`, `--compaction-candidates`) before it opens a session at all.
   3. Otherwise a **fresh** session, persisted but its own.
 
   The precedence is the point. `--session-id` used to be consulted only in `resume_or_create`'s no-match
