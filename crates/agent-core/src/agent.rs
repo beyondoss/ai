@@ -1384,13 +1384,22 @@ impl Agent {
                 // already arrived; failing that, work still running is listed — once per run — so
                 // ending with it is the model's informed choice. Either continues the run as a user
                 // turn.
-                let background = crate::background::collect(&self.tools);
-                let mut background_note = crate::background::take_notices(&background)
-                    .map(|t| (crate::BackgroundReason::Finished, t));
-                if background_note.is_none() && injected.is_empty() && !stop_reminded {
-                    background_note = crate::background::stop_reminder(&background)
-                        .map(|t| (crate::BackgroundReason::StillRunning, t));
-                    stop_reminded = background_note.is_some();
+                //
+                // Not once the step limit (or the wrap-up's extended one) is reached: the run cannot
+                // take the step either would start, so continuing turned a clean final answer into a
+                // `MaxSteps` failure. The run ends here instead; notices stay unconsumed, for the next
+                // run (a `serve` prompt) or the next stop.
+                let at_step_limit = budget.limit.is_some_and(|limit| steps_this_call >= limit);
+                let mut background_note = None;
+                if !at_step_limit {
+                    let background = crate::background::collect(&self.tools);
+                    background_note = crate::background::take_notices(&background)
+                        .map(|t| (crate::BackgroundReason::Finished, t));
+                    if background_note.is_none() && injected.is_empty() && !stop_reminded {
+                        background_note = crate::background::stop_reminder(&background)
+                            .map(|t| (crate::BackgroundReason::StillRunning, t));
+                        stop_reminded = background_note.is_some();
+                    }
                 }
                 if injected.is_empty() && background_note.is_none() {
                     sink(AgentEvent::AgentEnd {

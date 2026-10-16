@@ -960,7 +960,10 @@ into the tool-results turn after any steer, as the wrap-up does. At a would-stop
 delivered first — pushed as a user turn after any drained follow-ups, checkpointed, and the run
 continues — so a run never ends without a result that already arrived; with none, `stop_reminder`
 lists work still running that no earlier reminder covered, once per piece of work, so a model that
-ends again ends. A pending stop request still wins over both. Each delivery is reported as
+ends again ends. A pending stop request still wins over both, and so does the step limit: once
+the run has used its steps (or the wrap-up's extended ones), neither is delivered — the step they
+would start is one the run cannot take, and a clean final answer used to become a `MaxSteps`
+failure. The run ends `Ok`; notices stay unconsumed for the next run. Each delivery is reported as
 `AgentEvent::Background { reason: finished | still_running, text, wake }` (`wake` is for a host that
 starts a turn itself to deliver a notice). Every text starts with one of `background::NOTE_PREFIXES`
 (`[job `, `[background jobs]`, `[step budget]`), which `merge_user_requests` skips: a run of harness
