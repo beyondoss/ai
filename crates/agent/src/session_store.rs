@@ -3423,13 +3423,52 @@ impl SessionRepo {
         cwd: &str,
         model: &str,
     ) -> std::io::Result<(SessionStore, Session)> {
-        match self.find_path_exact(id)? {
-            Some(path) => self.open_path(path, id),
-            None => Ok((
+        let create = || -> std::io::Result<(SessionStore, Session)> {
+            Ok((
                 self.create(SessionMeta::with_id(id.to_string(), cwd, model))?,
                 Session::new(),
-            )),
+            ))
+        };
+        let Some(path) = self.find_path_exact(id)? else {
+            return create();
+        };
+        match self.open_path(path.clone(), id) {
+            Ok(opened) => Ok(opened),
+            // A create that crashed before its header landed (under a build that did not create
+            // files whole) left a file that is neither openable nor creatable over: this id was
+            // bricked for good. Nothing was ever written to it, so it is treated as absent.
+            Err(e) => match self.headerless_first_file(&path, id) {
+                Some((first, expected)) if clear_headerless(&first, &expected)? => create(),
+                _ => Err(e),
+            },
         }
+    }
+
+    /// The first file of the session at `path` — the `.jsonl` itself, or a segmented session's
+    /// `000001.jsonl` when it is the only segment — and the bytes its first line begins with, if that
+    /// file is headerless ([`is_headerless`]).
+    fn headerless_first_file(&self, path: &Path, id: &str) -> Option<(PathBuf, Vec<u8>)> {
+        let (first, expected) = if self.segmented() {
+            let segments = scan_segments(path).ok()?;
+            let [only] = segments.as_slice() else {
+                return None;
+            };
+            (
+                only.path.clone(),
+                SegmentHeader::line(1, &BTreeMap::new(), true).ok()?,
+            )
+        } else {
+            let mut header = Vec::new();
+            write_line(
+                &mut header,
+                &Entry::Session(SessionMeta::with_id(id, "", "")),
+            )
+            .ok()?;
+            (path.to_path_buf(), header)
+        };
+        // Only the stable start of that first line: the rest carries per-session values.
+        let expected = expected[..expected.len().min(16)].to_vec();
+        is_headerless(&first, &expected).then_some((first, expected))
     }
 
     /// Reopen the most recent session whose recorded `cwd` matches, or create a fresh one — "my last
@@ -5285,6 +5324,80 @@ fn create_private(path: &Path) -> std::io::Result<File> {
     opts.open(path)
 }
 
+/// Create `path` holding exactly `bytes`, all at once: they go to a private temp file beside it
+/// first, which is then hard-linked into place. `link` refuses a name that exists, so this is the same
+/// exclusive-create fence `create_new` is — two creators racing for one id, exactly one wins — but the
+/// name never exists holding less than all of `bytes`, so a crash mid-create leaves no half-made
+/// session behind (at most a hidden temp file, which nothing reads). `replace_empty` initializes a
+/// zero-byte file already at `path` (`touch`ed ahead of time) instead of refusing it.
+fn create_whole(path: &Path, bytes: &[u8], replace_empty: bool) -> std::io::Result<()> {
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("session");
+    let tmp = path.with_file_name(format!(".{name}.{}.creating", new_id()));
+    let placed = (|| -> std::io::Result<()> {
+        let mut f = create_private(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        match fs::hard_link(&tmp, path) {
+            Err(e)
+                if e.kind() == std::io::ErrorKind::AlreadyExists
+                    && replace_empty
+                    && fs::metadata(path).is_ok_and(|m| m.len() == 0) =>
+            {
+                fs::rename(&tmp, path)
+            }
+            other => other,
+        }
+    })();
+    // Gone already after a rename; a link leaves it as a second name to drop.
+    let _ = fs::remove_file(&tmp);
+    placed?;
+    fsync_dir(path)
+}
+
+/// Whether the session file (or first segment) at `path` holds nothing but the start of its first
+/// line — a crash between creating it and writing it, under a build that did not create files whole
+/// ([`create_whole`]): empty, or no newline yet and its bytes a prefix of what that first line
+/// begins with (`expected`). Nothing else counts, so a file holding anything real is never taken for
+/// one.
+fn is_headerless(path: &Path, expected: &[u8]) -> bool {
+    let Ok(bytes) = fs::read(path) else {
+        return false;
+    };
+    if bytes.contains(&b'\n') {
+        return false;
+    }
+    let n = bytes.len().min(expected.len());
+    bytes[..n] == expected[..n]
+}
+
+/// Move a headerless first file ([`is_headerless`]) out of the way so its id can be created again.
+/// Renamed aside before it is judged, so a creator that put a whole file there in the meantime is
+/// never deleted: what was moved is checked again, and put back if it turns out to be real. `true`
+/// when the name is free.
+fn clear_headerless(path: &Path, expected: &[u8]) -> std::io::Result<bool> {
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("session");
+    let aside = path.with_file_name(format!(".{name}.{}.headerless", new_id()));
+    fs::rename(path, &aside)?;
+    if is_headerless(&aside, expected) {
+        tracing::warn!(path = %path.display(), "re-creating a session whose create never wrote its header");
+        fs::remove_file(&aside)?;
+        return Ok(true);
+    }
+    match fs::hard_link(&aside, path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e),
+    }
+    fs::remove_file(&aside)?;
+    Ok(false)
+}
+
 /// Replace `path` with `bytes` the way a transcript rewrite does: a `0600` temp file beside it
 /// ([`create_private`]), `fsync`ed, renamed over `path`, then the directory `fsync`ed — so a reader
 /// (or a crash) sees the old content or the new, never a torn file, and never a group/world-readable
@@ -6053,46 +6166,14 @@ impl Log {
         }
     }
 
-    /// The single-file create, unchanged: `create_new` with mode 0600, initializing a zero-byte file
-    /// in place rather than failing, then fsync of the file and its directory.
+    /// The single-file create: the header written whole ([`create_whole`], mode 0600, the file and
+    /// its directory fsynced), a zero-byte file already at `path` (`touch`ed ahead of time) initialized
+    /// rather than refused.
     fn create_file(path: &Path, first_line: &[u8]) -> std::io::Result<()> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let open = |truncate_existing: bool| -> std::io::Result<File> {
-            let mut opts = OpenOptions::new();
-            opts.write(true);
-            if truncate_existing {
-                opts.truncate(true);
-            } else {
-                opts.create_new(true);
-            }
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                opts.mode(0o600);
-            }
-            opts.open(path)
-        };
-        let mut f = match open(false) {
-            Ok(f) => f,
-            // The atomic fast path failed because *something* is already there — only initialize in
-            // place if it's genuinely empty; otherwise propagate the original error rather than risk
-            // clobbering real data on a race.
-            Err(e)
-                if e.kind() == std::io::ErrorKind::AlreadyExists
-                    && fs::metadata(path).is_ok_and(|m| m.len() == 0) =>
-            {
-                open(true)?
-            }
-            Err(e) => return Err(e),
-        };
-        f.write_all(first_line)?;
-        // Durability: get the header bytes (and the new file's directory entry) onto stable storage
-        // before returning, so a crash right after `create` can't lose the session entirely.
-        f.flush()?;
-        f.sync_all()?;
-        fsync_dir(path)
+        create_whole(path, first_line, true)
     }
 
     /// Open an existing session for reading, and (unless `read_only`) for writing.
@@ -6288,23 +6369,15 @@ impl SegLog {
             ));
         }
         let path = dir.join(segment_name(1));
-        let mut opts = OpenOptions::new();
-        opts.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        let mut f = opts.open(&path)?;
         let mut buf = SegmentHeader::line(1, &BTreeMap::new(), true)?;
         append_sealed(&mut buf, codec.as_deref(), id, first_line)?;
         buf.extend_from_slice(BASE_TRAILER);
         buf.push(b'\n');
-        f.write_all(&buf)?;
-        f.flush()?;
-        f.sync_all()?;
-        // The file, its directory, and the repo directory the new session directory appeared in.
-        fsync_dir(&path)?;
+        // Still the fence — `link` refuses an existing name exactly as `create_new` did — but the
+        // segment appears whole: a crash between creating it and writing it used to leave an empty
+        // `000001.jsonl` that made the id neither openable (no header) nor creatable (it exists).
+        create_whole(&path, &buf, false)?;
+        // The repo directory the new session directory appeared in.
         fsync_dir(&dir)?;
         Ok(Self {
             dir,
