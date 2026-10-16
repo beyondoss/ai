@@ -1194,8 +1194,12 @@ Session::new() + user(expanded task)
 Agent::run[_events] (agent_core loop; see agent-core/ARCHITECTURE.md for the loop itself)
    │  each step, text mode (default) — Agent::run, StreamEvent only:
    │   ├─ POST one model turn → gateway → provider ──── network/4xx/5xx ──► Error::Transport, exit ≠0
-   │   ├─ StreamEvent::TextDelta   ───────────────────────────────────────► stdout (printed live)
+   │   ├─ StreamEvent::TextDelta   ───────────────────────────────────────► stdout (via TextOut)
    │   ├─ StreamEvent::ToolUseStart ──────────────────────────────────────► stdout "\n[tool: name]"
+   │   ├─ TextOut: stdout not a TTY → a step's output is held until its TurnEnd, and a retried
+   │   │   attempt's (AgentEvent::Retry, or a whole-run retry) is dropped, so a captured stdout is
+   │   │   the answer, never PARTIAL-PARTIAL-ANSWER; stdout a TTY → printed live, and a retry writes
+   │   │   "[attempt failed; the text above is discarded, retrying]" after the shown partial
    │   └─ assistant turn carries tool_use blocks → ToolRegistry.get(name)
    │        │
    │        ├─ found    → tool.run(input) → Ok(text) / Err(ToolError) ──► tool_result (is_error?)
