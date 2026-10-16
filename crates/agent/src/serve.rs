@@ -5455,7 +5455,7 @@ pub(crate) async fn serve_session(
                                                     let f = lock_ignoring_poison(&out_conn);
                                                     f.history_snapshot()
                                                 };
-                                                match messages_payload(&msgs, &ids, cmd.get("since").and_then(Value::as_str)) {
+                                                match messages_payload(&msgs, &ids, c.get("since").and_then(Value::as_str)) {
                                                     Ok(data) => { let _ = out_tx.send(response(cid, "get_messages", true, Some(data), None)); }
                                                     Err(e) => { let _ = out_tx.send(response(cid, "get_messages", false, None, Some(&e))); }
                                                 }

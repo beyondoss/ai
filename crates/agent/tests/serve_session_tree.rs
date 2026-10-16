@@ -2671,3 +2671,64 @@ fn serve_append_custom_refuses_the_kinds_the_agent_writes_itself() {
     drop(stdin);
     child.wait().unwrap();
 }
+
+#[test]
+fn serve_get_messages_since_is_honoured_while_a_prompt_is_running() {
+    // The busy prompt loop answered `get_messages` with the `since` of the *running prompt's*
+    // command (which never has one), so a mid-run `get_messages {since}` returned the whole
+    // transcript instead of only what followed the given id.
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+    let base = spawn_model_server_with_stalled_response(
+        vec![turn_text("first answer"), turn_text("second answer")],
+        std::time::Duration::from_secs(10),
+        vec![turn_text("third answer")],
+    );
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = common::child_frames(&mut child);
+
+    for m in ["first", "second"] {
+        writeln!(stdin, "{}", json!({ "type": "prompt", "message": m })).unwrap();
+        stdin.flush().unwrap();
+        read_until_response(&mut stdout, "prompt");
+    }
+    writeln!(stdin, "{}", json!({ "type": "get_messages" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "get_messages");
+    let all = frames.last().unwrap()["data"]["messages"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(all.len(), 4, "{all:#?}");
+    let first_answer_id = all[1]["id"].as_str().unwrap().to_string();
+
+    // Third prompt: its model call stalls, so the next command lands in the busy loop.
+    writeln!(stdin, "{}", json!({ "type": "prompt", "message": "third" })).unwrap();
+    stdin.flush().unwrap();
+    common::read_until_event(&mut stdout, |_| true);
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "get_messages", "since": first_answer_id })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "get_messages");
+    let resp = frames.last().unwrap();
+    assert_eq!(resp["success"], true, "{resp:#?}");
+    let since = resp["data"]["messages"].as_array().unwrap();
+    assert_eq!(
+        since.len(),
+        2,
+        "mid-run `since` must return only the second turn: {since:#?}"
+    );
+    assert!(since[1].to_string().contains("second answer"), "{since:#?}");
+
+    writeln!(stdin, "{}", json!({ "type": "abort" })).unwrap();
+    stdin.flush().unwrap();
+    drop(stdin);
+    child.wait().unwrap();
+}
