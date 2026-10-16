@@ -297,3 +297,52 @@ fn the_carry_block_renders_live_state_and_is_stripped_before_resummarizing() {
     script.running.lock().unwrap().clear();
     assert_eq!(crate::background::format_carry(&sources), None);
 }
+
+#[tokio::test]
+async fn a_final_answer_on_the_last_step_with_a_job_running_ends_ok() {
+    // Turn 1 starts a job (step 1); turn 2 is the final answer, on step 2 of 2. The stop reminder
+    // would start a third step the limit forbids, so it is skipped: the run succeeded.
+    let script = Arc::new(Script::default());
+    let turns = vec![
+        turn::tool_call("s", "start", "{}"),
+        turn::text("all done"),
+        turn::text("unreachable"),
+    ];
+    let agent = agent(&script, false, turns).with_max_steps(2);
+    let mut session = Session::new();
+    session.user("go");
+    let mut fired = Vec::new();
+    let res = agent
+        .run_events(&mut session, |ev| {
+            if let AgentEvent::Background { reason, .. } = ev {
+                fired.push(reason);
+            }
+        })
+        .await;
+    assert!(res.is_ok(), "a final answer must not fail the run: {res:?}");
+    assert!(fired.is_empty(), "{fired:?}");
+    assert_eq!(session.messages.last().unwrap().role, Role::Assistant);
+    // The reminder was not spent: a later run (a `serve` prompt) is still told of the job.
+    assert!(script.stop_reminder().is_some());
+}
+
+#[tokio::test]
+async fn a_pending_notice_at_the_step_limit_waits_for_the_next_run() {
+    let script = Arc::new(Script::default());
+    script
+        .notices
+        .lock()
+        .unwrap()
+        .push("[job 2 exited with code 0 after 9 s: `cargo test`]".into());
+    let turns = vec![turn::text("all done"), turn::text("unreachable")];
+    let agent = agent(&script, false, turns).with_max_steps(1);
+    let mut session = Session::new();
+    session.user("go");
+    let res = agent.run_events(&mut session, |_| {}).await;
+    assert!(res.is_ok(), "{res:?}");
+    assert_eq!(session.messages.len(), 2, "no notice turn was added");
+    assert!(
+        script.take_notices().is_some(),
+        "the notice is left for the next run, not consumed"
+    );
+}
