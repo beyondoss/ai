@@ -955,6 +955,17 @@ impl Agent {
             // next request is built, never mid-turn.
             if let Some(switch) = steering.take_model_switch() {
                 current_model = switch.model.clone();
+                // The same cross-model scrub the run start applies (see there): turns the previous
+                // model produced — this run's included — carry thinking signatures and combined
+                // tool-call ids bound to it, and the new model's provider rejects them (Anthropic:
+                // 400 ``Invalid `signature` in `thinking` block``).
+                if session.needs_cross_model_scrub(&current_model) {
+                    tracing::debug!(
+                        model = %current_model,
+                        "mid-run model switch: scrubbing thinking blocks and foreign tool-call ids"
+                    );
+                    session.scrub_cross_model_state(&current_model);
+                }
                 // Applied first, against the model this same switch just selected, so a level
                 // translates correctly even when the switch changes both at once: `Some(Off)`
                 // explicitly disables thinking/reasoning, `Some(level)` sets a new depth via the same
@@ -8501,6 +8512,113 @@ data: {"type":"response.completed","response":{"status":"completed","usage":{"in
             stop_reason: StopReason::EndTurn,
         });
         assert_eq!(acc.finish().blocks, vec![ContentBlock::text("hi")]);
+    }
+
+    #[tokio::test]
+    async fn a_model_switch_before_the_first_turn_scrubs_the_old_models_signed_thinking() {
+        let mock = Arc::new(MockTransport::new(vec![turn::text("hi from claude")]));
+        let agent = Agent::new(mock.clone(), "gpt-5.4");
+        let mut session = Session::new();
+        session.user("first");
+        session.push(
+            Message::assistant(vec![
+                ContentBlock::Thinking {
+                    text: "reasoned".into(),
+                    signature: "OPENAI-ENCRYPTED".into(),
+                },
+                ContentBlock::text("answer from gpt"),
+            ])
+            .with_model_id("gpt-5.4"),
+        );
+        session.user("second");
+        let steering = Steering::new();
+        steering.request_model_switch("claude-opus-4-8", None);
+        agent
+            .run_events_steered(&mut session, |_| {}, CancellationToken::new(), steering)
+            .await
+            .unwrap();
+        let req = &mock.requests()[0];
+        assert_eq!(req.model, "claude-opus-4-8");
+        let body = crate::dialect::anthropic::build_body(req, false).to_string();
+        assert!(
+            !body.contains("OPENAI-ENCRYPTED"),
+            "a foreign model's signed thinking must not reach Anthropic: {body}"
+        );
+        assert!(body.contains("reasoned"), "its text survives as context");
+    }
+
+    #[tokio::test]
+    async fn a_model_switch_between_turns_scrubs_what_this_run_produced() {
+        // The switch lands while turn 1's tool runs; turn 1 itself (this run, the old model) carries
+        // the signature and a combined Responses tool-call id.
+        struct Switcher(Steering);
+        #[async_trait]
+        impl Tool for Switcher {
+            fn name(&self) -> &str {
+                "switch"
+            }
+            fn description(&self) -> &str {
+                "requests a model switch"
+            }
+            fn input_schema(&self) -> Value {
+                json!({ "type": "object" })
+            }
+            async fn run(
+                &self,
+                _input: Value,
+            ) -> std::result::Result<crate::ToolOutput, crate::error::ToolError> {
+                self.0.request_model_switch("claude-opus-4-8", None);
+                Ok("switched".into())
+            }
+        }
+        let steering = Steering::new();
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(Switcher(steering.clone())));
+        let first = vec![
+            StreamEvent::MessageStart,
+            StreamEvent::ThinkingDelta {
+                index: 0,
+                text: "reasoned".into(),
+            },
+            StreamEvent::SignatureDelta {
+                index: 0,
+                signature: "OPENAI-ENCRYPTED".into(),
+            },
+            StreamEvent::ContentBlockStop { index: 0 },
+            StreamEvent::ToolUseStart {
+                index: 1,
+                id: "call_1|fc_1".into(),
+                name: "switch".into(),
+            },
+            StreamEvent::InputJsonDelta {
+                index: 1,
+                partial_json: "{}".into(),
+            },
+            StreamEvent::ContentBlockStop { index: 1 },
+            StreamEvent::MessageStop {
+                stop_reason: StopReason::ToolUse,
+            },
+        ];
+        let mock = Arc::new(MockTransport::new(vec![first, turn::text("done")]));
+        let agent = Agent::new(mock.clone(), "gpt-5.4").with_tools(tools);
+        let mut session = Session::new();
+        session.user("go");
+        agent
+            .run_events_steered(&mut session, |_| {}, CancellationToken::new(), steering)
+            .await
+            .unwrap();
+        let req = &mock.requests()[1];
+        assert_eq!(req.model, "claude-opus-4-8");
+        let body = crate::dialect::anthropic::build_body(req, false).to_string();
+        assert!(!body.contains("OPENAI-ENCRYPTED"), "{body}");
+        assert!(
+            !body.contains("fc_1"),
+            "the Responses item id is dropped: {body}"
+        );
+        assert!(
+            body.contains("call_1"),
+            "the call keeps its pairing: {body}"
+        );
     }
 
     #[test]
