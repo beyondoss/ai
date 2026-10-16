@@ -64,7 +64,7 @@ async fn a_conforming_endpoint_passes_every_check() {
         "{}",
         report.render()
     );
-    assert_eq!(report.checks.len(), 10);
+    assert_eq!(report.checks.len(), 11);
 }
 
 #[tokio::test]
@@ -113,6 +113,32 @@ async fn a_buffering_endpoint_fails_incremental_delivery_and_heartbeats() {
 }
 
 #[tokio::test]
+async fn an_endpoint_that_ends_the_stream_with_the_shell_fails_the_leftover_check() {
+    let (opts, expect) = quick();
+    let report = verify_mock(
+        MockOptions {
+            tracks_leftovers: false,
+            ..opts
+        },
+        &expect,
+    )
+    .await;
+    let check = report.check(conformance::LEFTOVERS).unwrap();
+    assert_eq!(check.verdict, Verdict::Fail, "{}", report.render());
+    assert!(check.detail.contains("shell_exit"), "{}", check.detail);
+    assert_eq!(
+        report
+            .checks
+            .iter()
+            .filter(|c| c.verdict == Verdict::Fail)
+            .count(),
+        1,
+        "{}",
+        report.render()
+    );
+}
+
+#[tokio::test]
 async fn an_endpoint_that_survives_a_disconnect_fails_the_kill_check() {
     let (opts, expect) = quick();
     let report = verify_mock(
@@ -126,14 +152,17 @@ async fn an_endpoint_that_survives_a_disconnect_fails_the_kill_check() {
     let check = report.check(conformance::DISCONNECT).unwrap();
     assert_eq!(check.verdict, Verdict::Fail, "{}", report.render());
     assert!(check.detail.contains("still running"), "{}", check.detail);
-    // Everything else about it is fine: the failure is pinned on the one requirement it breaks.
+    // Everything else about it is fine: the failures are pinned on the one requirement it breaks —
+    // kill on disconnect, which the leftover check measures a second time, after `shell_exit`.
+    let failed: Vec<&str> = report
+        .checks
+        .iter()
+        .filter(|c| c.verdict == Verdict::Fail)
+        .map(|c| c.name)
+        .collect();
     assert_eq!(
-        report
-            .checks
-            .iter()
-            .filter(|c| c.verdict == Verdict::Fail)
-            .count(),
-        1,
+        failed,
+        vec![conformance::DISCONNECT, conformance::LEFTOVERS],
         "{}",
         report.render()
     );

@@ -201,6 +201,7 @@ and one JSON frame per line:
 {"stdout":"aGVsbG8K"}   // output bytes, standard base64, at most 64 KiB decoded per frame
 {"stderr":"b29wcwo="}
 {}                      // heartbeat: send one after 5 s with no other frame
+{"shell_exit":0}        // the command exited, but processes of its group still run (not final)
 {"exit_code":0}         // final, exactly one of: exit_code | signal | timed_out | error
 ```
 
@@ -216,14 +217,21 @@ and one JSON frame per line:
   group** (grandchildren too) within 10 s. Kill it at once if you can, by watching the connection.
   That is the only kill signal the agent sends: `bash_job` kill, a cancelled call and the agent's
   own exit all just close the stream.
+- **If the command exits while its process group still has a live process** (`nohup server &`),
+  you MUST send `{"shell_exit": N}` and keep the stream open until the group is empty, then send
+  the command's own final frame. The agent tracks those processes as a job, exactly as it does a
+  local shell's, and stops them by closing the stream. Zombies don't count.
 - Keep answering requests without `stream` exactly as v1.1 does. The filesystem tools use them.
+  Over v1.1 nothing can track what a command leaves running; kill its process group once you have
+  answered.
 
 The agent adopts streaming only after a probe at the first `bash` call proves it works: it runs
 `printf a; sleep 0.3; printf b` and needs two frames, the first arriving well before the end. A v1.1
 endpoint, or one whose frames arrive all at once, keeps v1.1 behavior: the call waits for the
 command to exit, and `bash`'s description says so. The full spec is the module doc of
 `crates/agent/src/exec_endpoint.rs`. To check your endpoint against it (framing, heartbeats,
-timeouts, and kill-on-disconnect measured with a grandchild's marker file), run:
+timeouts, leftover processes, and kill-on-disconnect measured with a grandchild's marker file),
+run:
 
 ```sh
 AGENT_CONFORMANCE_EXEC_URL=https://exec.internal/run \

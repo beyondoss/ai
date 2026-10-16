@@ -2125,6 +2125,15 @@ wire spec is `exec_endpoint`'s module doc; in short:
   the endpoint MUST kill the command's whole process group, within 10 s and preferably at once. That
   is the only kill the agent ever sends, so the endpoint stays stateless: no job ids, no poll or kill
   routes.
+- **Leftovers are the job's.** When the command exits while its group still has a live
+  (non-zombie) member (`nohup server &`), the endpoint MUST send `{"shell_exit": N}` (not final),
+  keep the stream open until the group is empty, then send the command's own final frame. The
+  runner calls `on_orphans` at `shell_exit`, so `bash` adopts the leftovers as a job, exactly as it
+  does a local shell's, and a kill (closing the stream) reaches them. Before, the stream ended with
+  the shell and a far-side `nohup server &` held its port until the sandbox died (reproduced with a
+  real `docker exec`). Compatible both ways: an older endpoint just ends at the shell's exit; an
+  older client reads `shell_exit` as a heartbeat. Over v1.1 leftovers stay untracked (one request,
+  one response); the spec says a v1.1 endpoint SHOULD kill the group once it has answered.
 - **Adopted only on proof.** `HttpExecRunner::streams` probes once per runner, on the first streaming
   call (lazily, so every construction site — `run`, `serve`, service mode, `set_exec_endpoint` — gets
   it without a change): `printf a; sleep 0.3; printf b` must arrive as two or more output frames, the
@@ -2159,6 +2168,17 @@ because busybox rejects it and then fails to signal the group (measured). Withou
 marker says `exec-pid:` and only that process dies. A stdin call cannot use the wrapper (a
 background job's stdin is `/dev/null`), so on timeout only its transport is reaped.
 
+**Template leftovers.** A tracked job's wrapper (`<linger>` = 1) does not return at `wait $!`: if
+the command's group still has a live member it writes `\x1eexec-shell-exit:<status>\n` to stderr
+and polls the group every 500 ms (`kill -0 -<pgid>`, then `/proc` with builtins only, so a zombie
+under a non-reaping pid 1 is not "alive" — CI's Alpine target is exactly that) until it is empty,
+then exits with the command's status. `MarkerStrip` strips the marker wherever it lands and the
+runner calls `on_orphans` 100 ms later (output in flight on stdout lands first), so `bash` adopts the
+leftovers as a job, and the far kill of the group stops them. This also ends the old asymmetry where
+a leftover holding stdout kept the transport attached with nothing said: the call yielded on the
+idle window as a _yielded_ job, which the end of the turn killed. Other calls (`<linger>` = 0) end
+with the command, as before.
+
 Tests: `exec_stream_frames.rs` (order, bytes, bounds, final frames, probe once, v1.1 and buffered
 fallbacks), `exec_stream_kill.rs` (drop and `Kill` close the stream; the mock sees the group die),
 `bash_remote_stream.rs` (yield despite heartbeats, `bash_job` wait/kill, live progress, cancel, tool
@@ -2166,13 +2186,17 @@ drop, the v1.1 wait-for-exit fallback), `bash_background_remote.rs` (`run_in_bac
 `timeout_ms` over v1.2 and v1.1, and the deadlines each puts on the wire), `bash_remote_exit.rs` (`kill_live_jobs`, and SIGTERM to the
 real `run --exec-url` binary), `exec_template_kill.rs` (a stand-in transport that, like `docker
 exec`, does not propagate a kill — the first test proves that — then `bash_job` kill, timeout and
-cancel all reach the far side), and `exec_endpoint_live.rs`'s `a_killed_bash_job_dies_on_the_target`
-against CI's real Alpine container. `exec_conformance.rs` runs `exec_endpoint::conformance::verify`
-against the mocks (it must pass the conforming one and fail a buffering one and one that survives a
-disconnect) and against `AGENT_CONFORMANCE_EXEC_URL` for endpoint implementers; the decoding vectors
+cancel all reach the far side), `bash_remote_leftovers.rs` (`nohup … &` over the v1.2 mock and the
+template stand-in is adopted at the shell's exit and gone after `stop_all`; a stdout-holding
+leftover is adopted, not yielded; a leftover that exits ends its job; an endpoint without
+`shell_exit` still works), and `exec_endpoint_live.rs`'s `a_killed_bash_job_dies_on_the_target` and
+`a_leftover_on_the_target_is_adopted_and_stopped_with_the_session` against CI's real Alpine
+container. `exec_conformance.rs` runs `exec_endpoint::conformance::verify`
+against the mocks (it must pass the conforming one and fail a buffering one, one that survives a
+disconnect, and one that ends the stream with the shell) and against `AGENT_CONFORMANCE_EXEC_URL` for endpoint implementers; the decoding vectors
 are `tests/fixtures/exec/v1.2-frames.json`. The shared mock (`beyond-ai-test-support::exec_mock`)
 is a conforming v1.2 endpoint by default, so every service-mode suite now drives the streaming path;
-`MockOptions` selects v1.1, buffered, or no-kill-on-disconnect.
+`MockOptions` selects v1.1, buffered, no-kill-on-disconnect, or no-`shell_exit`.
 
 #### Which endpoint a session gets
 

@@ -44,6 +44,10 @@ pub enum Frame {
     /// A keepalive (`{}`, or any frame with no field this version knows). Not output: it says the
     /// connection is alive, never that the command printed anything.
     Heartbeat,
+    /// Not final: the command's own process (the shell) exited with this code, but processes of its
+    /// group are still running. The stream stays open until they have all exited, then ends with the
+    /// shell's final frame. See "Leftover processes" in the parent module's doc.
+    ShellExit(i32),
     /// Final: the command exited with this code.
     Exit(i32),
     /// Final: the command was killed by this signal.
@@ -70,6 +74,7 @@ impl Frame {
 struct WireFrame {
     stdout: Option<String>,
     stderr: Option<String>,
+    shell_exit: Option<i32>,
     exit_code: Option<i32>,
     signal: Option<i32>,
     #[serde(default)]
@@ -103,6 +108,9 @@ pub fn decode_line(line: &[u8]) -> Result<Vec<Frame>, String> {
     }
     if let Some(s) = &wire.stderr {
         frames.push(Frame::Stderr(b64("stderr", s)?));
+    }
+    if let Some(code) = wire.shell_exit {
+        frames.push(Frame::ShellExit(code));
     }
     if let Some(e) = wire.error {
         frames.push(Frame::Error(e));
@@ -318,6 +326,7 @@ mod tests {
             let mut stdout = Vec::new();
             let mut stderr = Vec::new();
             let mut heartbeats = 0;
+            let mut shell_exits = Vec::new();
             let mut end = None;
             let mut error = None;
             for line in case["lines"].as_array().unwrap() {
@@ -333,6 +342,7 @@ mod tests {
                                 Frame::Stdout(b) => stdout.extend(b),
                                 Frame::Stderr(b) => stderr.extend(b),
                                 Frame::Heartbeat => heartbeats += 1,
+                                Frame::ShellExit(c) => shell_exits.push(serde_json::json!(c)),
                                 other => end = Some(other),
                             }
                         }
@@ -351,6 +361,12 @@ mod tests {
                 heartbeats,
                 want["heartbeats"].as_u64().unwrap_or(0) as usize,
                 "{name}: heartbeats"
+            );
+            let no_shell_exits = Vec::new();
+            assert_eq!(
+                &shell_exits,
+                want["shell_exits"].as_array().unwrap_or(&no_shell_exits),
+                "{name}: shell exits"
             );
             let want_end = match &want["end"] {
                 v if v["exit_code"].is_i64() => {
