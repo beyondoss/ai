@@ -4747,6 +4747,15 @@ server is unknowable, and re-sending a `tools/call` could do its work twice. The
 `tests/mcp_redial.rs` (tool, then resource, after `kill -9`) and `tests/mcp_events_redial.rs` (a
 poll subscription resubscribes on the fresh process).
 
+Every dial — first connect or redial, stdio or HTTP — is bounded (`connect_one_client`,
+`handshake_timeout`). Servers connect concurrently but startup waits for all of them, so one that
+starts and never answers `initialize` used to hold `run`/`serve` startup, and every other server's
+tools, forever; on a redial it would hold the connection's lock, and every call to that server. A
+grant connector gets 20 s; an operator's own server 60 s (a first `npx -y …` downloads the package),
+or `BEYOND_AI_AGENT_MCP_HANDSHAKE_SECS`. On timeout the dial is dropped (a stdio child retired with
+its transport) and handled like any failed connect: a warning, the server dormant, the rest loaded
+(`tests/mcp_handshake_timeout.rs`).
+
 ### Per-session MCP
 
 Outside service mode, MCP is a **process** fact: `main.rs` connects every server in the operator's
