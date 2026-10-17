@@ -130,7 +130,7 @@ pub async fn daemon_opts(
 ) -> Daemon {
     let dir = tempfile::tempdir().unwrap();
     let sock = dir.path().join("serve.sock");
-    let child = Command::new(env!("CARGO_BIN_EXE_beyond-ai-agent"))
+    let child = crate::common::agent_cmd()
         .args([
             "serve",
             "--listen-uds",

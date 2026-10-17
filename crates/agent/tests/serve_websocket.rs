@@ -21,7 +21,7 @@ use serde_json::json;
 /// per-session files under `session_dir`. In `--listen` mode stdio is unused, so null it.
 fn serve_ws_child(base: &str, session_dir: &str) -> (ChildGuard, u16) {
     spawn_listening(
-        Command::new(env!("CARGO_BIN_EXE_beyond-ai-agent"))
+        crate::common::agent_cmd()
             .args([
                 "serve",
                 "--gateway-url",

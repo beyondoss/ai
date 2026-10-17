@@ -21,7 +21,7 @@ use serde_json::{Value, json};
 /// A `serve` child bound to `--session-dir`, plus whatever extra selection flags a test wants
 /// (`--session-id <id>`, `--continue`).
 fn serve_selecting(bin: &str, base: &str, session_dir: &str, extra: &[&str]) -> Command {
-    let mut c = Command::new(bin);
+    let mut c = crate::common::isolated_cmd(bin);
     c.args([
         "serve",
         "--gateway-url",

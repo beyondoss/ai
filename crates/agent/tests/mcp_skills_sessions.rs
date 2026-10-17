@@ -9,7 +9,7 @@
 
 mod common;
 
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use common::skills_env::{BIN, Env, bash, last_message_text, read_skill, system_text};
 use common::{
@@ -24,7 +24,7 @@ const GUIDE: &str = "skill://git-workflow/references/GUIDE.md";
 fn daemon(env: &Env, base: &str) -> (ChildGuard, u16) {
     let sessions = env.dir.path().join("sessions");
     spawn_listening(
-        Command::new(BIN)
+        crate::common::agent_cmd()
             .args([
                 "serve",
                 "--gateway-url",

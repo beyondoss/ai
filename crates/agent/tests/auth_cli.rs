@@ -6,7 +6,7 @@
 //! reporting against a hand-seeded `auth.json` fixture.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use std::process::Command;
+mod common;
 
 fn write_auth_json(home: &std::path::Path, body: &str) {
     let dir = home.join(".beyond");
@@ -17,9 +17,8 @@ fn write_auth_json(home: &std::path::Path, body: &str) {
 #[test]
 fn auth_status_with_no_file_reports_every_provider_logged_out() {
     let home = tempfile::tempdir().unwrap();
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
 
-    let output = Command::new(bin)
+    let output = crate::common::agent_cmd()
         .arg("auth-status")
         .env("HOME", home.path())
         .output()
@@ -34,9 +33,8 @@ fn auth_status_with_no_file_reports_every_provider_logged_out() {
 #[test]
 fn auth_status_for_an_unknown_provider_is_an_error() {
     let home = tempfile::tempdir().unwrap();
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
 
-    let output = Command::new(bin)
+    let output = crate::common::agent_cmd()
         .args(["auth-status", "not-a-real-provider"])
         .env("HOME", home.path())
         .output()
@@ -49,9 +47,8 @@ fn auth_status_for_an_unknown_provider_is_an_error() {
 #[test]
 fn login_for_an_unknown_provider_is_an_error() {
     let home = tempfile::tempdir().unwrap();
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
 
-    let output = Command::new(bin)
+    let output = crate::common::agent_cmd()
         .args(["login", "not-a-real-provider"])
         .env("HOME", home.path())
         .output()
@@ -64,9 +61,8 @@ fn login_for_an_unknown_provider_is_an_error() {
 #[test]
 fn logout_of_a_never_logged_in_provider_is_idempotent() {
     let home = tempfile::tempdir().unwrap();
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
 
-    let output = Command::new(bin)
+    let output = crate::common::agent_cmd()
         .args(["logout", "anthropic"])
         .env("HOME", home.path())
         .output()
@@ -86,9 +82,8 @@ fn auth_status_reports_logged_in_for_a_non_expired_stored_credential() {
             r#"{{"anthropic":{{"type":"oauth","access":"tok","refresh":"ref","expires":{far_future_ms}}}}}"#
         ),
     );
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
 
-    let output = Command::new(bin)
+    let output = crate::common::agent_cmd()
         .args(["auth-status", "anthropic"])
         .env("HOME", home.path())
         .output()
@@ -106,9 +101,8 @@ fn auth_status_reports_needs_reauth_when_the_last_refresh_failed() {
         r#"{"anthropic":{"type":"oauth","access":"tok","refresh":"ref","expires":1,
             "last_refresh_error":"network unreachable"}}"#,
     );
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
 
-    let output = Command::new(bin)
+    let output = crate::common::agent_cmd()
         .args(["auth-status", "anthropic"])
         .env("HOME", home.path())
         .output()
@@ -125,9 +119,8 @@ fn logout_removes_a_stored_credential_and_reports_it_was_present() {
         home.path(),
         r#"{"anthropic":{"type":"oauth","access":"tok","refresh":"ref","expires":4000000000000}}"#,
     );
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
 
-    let output = Command::new(bin)
+    let output = crate::common::agent_cmd()
         .args(["logout", "anthropic"])
         .env("HOME", home.path())
         .output()
@@ -137,7 +130,7 @@ fn logout_removes_a_stored_credential_and_reports_it_was_present() {
     assert!(stdout.starts_with("logged out:"), "{stdout}");
 
     // A second logout is now a no-op idempotent success, not an error.
-    let second = Command::new(bin)
+    let second = crate::common::agent_cmd()
         .args(["logout", "anthropic"])
         .env("HOME", home.path())
         .output()
@@ -156,9 +149,8 @@ fn ai_agent_config_dir_env_var_redirects_the_auth_store_off_of_home() {
         config_dir.path(),
         r#"{"anthropic":{"type":"oauth","access":"tok","refresh":"ref","expires":4000000000000}}"#,
     );
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
 
-    let output = Command::new(bin)
+    let output = crate::common::agent_cmd()
         .args(["auth-status", "anthropic"])
         .env("HOME", home.path())
         .env("AI_AGENT_CONFIG_DIR", config_dir.path().join(".beyond"))

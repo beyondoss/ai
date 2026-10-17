@@ -15,8 +15,8 @@ use std::time::Duration;
 
 use common::service::Service;
 use common::{
-    BIN, SpawnGuarded, spawn_model_server, turn_text, ws_connect_with_headers,
-    ws_read_until_response, ws_send,
+    SpawnGuarded, spawn_model_server, turn_text, ws_connect_with_headers, ws_read_until_response,
+    ws_send,
 };
 use serde_json::{Value, json};
 
@@ -60,7 +60,7 @@ fn keys() -> Keys {
 /// The minimal valid `--service` command line, for a test to spoil one piece of.
 /// Every use is a startup that must fail; were one to succeed, port 0 is still the kernel's to pick.
 fn service_cmd(k: &Keys) -> Command {
-    let mut c = Command::new(BIN);
+    let mut c = crate::common::agent_cmd();
     c.args([
         "serve",
         "--service",
@@ -103,7 +103,7 @@ fn service_mode_demands_a_verifier_a_shard_and_a_listener() {
     let shard = ["--shard".to_string(), format!("a={}", k.shard.display())];
 
     let run = |extra: Vec<&[String]>| {
-        let mut c = Command::new(BIN);
+        let mut c = crate::common::agent_cmd();
         c.args(&base);
         for group in extra {
             c.args(group);

@@ -15,7 +15,7 @@ mod common;
 
 use std::io::{BufReader, Write};
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use common::mcp_oauth_fixture::{
     get_following_redirects, read_printed_url, spawn_oauth_protected_mcp_fixture,
@@ -38,7 +38,7 @@ fn mcp_login_completes_the_real_oauth_flow_and_the_token_authenticates_a_real_to
         json!([{ "name": "protected", "transport": "http", "url": url, "headers": {} }]),
     );
 
-    let mut login = Command::new(env!("CARGO_BIN_EXE_beyond-ai-agent"))
+    let mut login = crate::common::agent_cmd()
         .args(["mcp-login", "protected"])
         .env("HOME", home.path())
         .stdout(Stdio::piped())
@@ -116,7 +116,7 @@ fn mcp_login_completes_the_real_oauth_flow_and_the_token_authenticates_a_real_to
 fn mcp_login_an_unknown_server_name_fails_clearly() {
     let home = tempfile::tempdir().unwrap();
     write_global_settings(home.path(), json!([]));
-    let output = Command::new(env!("CARGO_BIN_EXE_beyond-ai-agent"))
+    let output = crate::common::agent_cmd()
         .args(["mcp-login", "does-not-exist"])
         .env("HOME", home.path())
         .output()
@@ -136,7 +136,7 @@ fn mcp_login_a_stdio_server_is_rejected_with_a_clear_error() {
         home.path(),
         json!([{ "name": "local", "transport": "stdio", "command": "true", "args": [], "env": {} }]),
     );
-    let output = Command::new(env!("CARGO_BIN_EXE_beyond-ai-agent"))
+    let output = crate::common::agent_cmd()
         .args(["mcp-login", "local"])
         .env("HOME", home.path())
         .output()
@@ -158,7 +158,7 @@ fn mcp_logout_removes_a_stored_credential_and_is_idempotent() {
         json!([{ "name": "protected", "transport": "http", "url": url, "headers": {} }]),
     );
 
-    let mut login = Command::new(env!("CARGO_BIN_EXE_beyond-ai-agent"))
+    let mut login = crate::common::agent_cmd()
         .args(["mcp-login", "protected"])
         .env("HOME", home.path())
         .stdout(Stdio::piped())
@@ -171,7 +171,7 @@ fn mcp_logout_removes_a_stored_credential_and_is_idempotent() {
     assert!(output.status.success());
 
     let logout = |home: &Path| -> String {
-        let output = Command::new(env!("CARGO_BIN_EXE_beyond-ai-agent"))
+        let output = crate::common::agent_cmd()
             .args(["mcp-logout", "protected"])
             .env("HOME", home)
             .output()
@@ -233,7 +233,7 @@ fn mcp_get_access_token_transparently_refreshes_an_expired_token_on_the_next_con
         json!([{ "name": "protected", "transport": "http", "url": url, "headers": {} }]),
     );
 
-    let mut login = Command::new(env!("CARGO_BIN_EXE_beyond-ai-agent"))
+    let mut login = crate::common::agent_cmd()
         .args(["mcp-login", "protected"])
         .env("HOME", home.path())
         .stdout(Stdio::piped())
@@ -304,7 +304,7 @@ fn mcp_login_established_credential_is_honored_by_serve_too_not_just_run() {
         json!([{ "name": "protected", "transport": "http", "url": url, "headers": {} }]),
     );
 
-    let mut login = Command::new(env!("CARGO_BIN_EXE_beyond-ai-agent"))
+    let mut login = crate::common::agent_cmd()
         .args(["mcp-login", "protected"])
         .env("HOME", home.path())
         .stdout(Stdio::piped())

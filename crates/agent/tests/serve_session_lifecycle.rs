@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 /// Neither `--session-file` nor `--session-dir` — exercises `Persistence::open`'s default directory
 /// (`~/.beyond/sessions/<encoded-cwd>/`) rather than in-memory-only.
 fn serve_default_persistence_cmd(bin: &str, base: &str) -> Command {
-    let mut c = Command::new(bin);
+    let mut c = crate::common::isolated_cmd(bin);
     c.args([
         "serve",
         "--gateway-url",
@@ -1548,8 +1548,7 @@ fn serve_rejects_a_path_traversal_session_id_and_persists_nothing() {
     let session_file = dir.path().join("s.jsonl");
     let (base, _bodies) = spawn_model_server(vec![]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
-    let output = Command::new(bin)
+    let output = crate::common::agent_cmd()
         .args([
             "serve",
             "--gateway-url",

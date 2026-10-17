@@ -10,7 +10,7 @@
 mod common;
 
 use std::io::Write;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use agent_core::compaction::MASKED_PREFIX;
 use agent_core::{ContentBlock, Message, Session};
@@ -66,7 +66,7 @@ fn masked(m: &Message) -> bool {
 }
 
 fn serve(base: &str, session_file: &str) -> std::process::Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_beyond-ai-agent"));
+    let mut cmd = crate::common::agent_cmd();
     cmd.args([
         "serve",
         "--gateway-url",
