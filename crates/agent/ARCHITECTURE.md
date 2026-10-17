@@ -6600,8 +6600,9 @@ built-in default.
   clears it: a startup argument is meant to be meaningful.
 - **`--no-session-persistence`** (run, serve): in `run`, an explicit `--session`, `--fork` or
   `--continue` still persists, since asking to continue a session contradicts not persisting and the
-  explicit verb wins; `--session-id` only names the in-memory session. In `serve`, `--session-dir`,
-  `--session-file` and a stored `settings --session-dir` default take precedence over it.
+  explicit verb wins; `--session-id` only names the in-memory session. In `serve`, an explicit `--session-dir`
+  or `--session-file` takes precedence over it, but a stored `settings --session-dir` default does
+  not: in both binaries `--no-session-persistence` beats the stored default and nothing is written.
 
 ### Output
 

@@ -296,6 +296,77 @@ fn serve_binary_stored_session_dir_default_does_not_override_an_explicit_session
 }
 
 #[test]
+fn serve_no_session_persistence_wins_over_a_stored_session_dir() {
+    // `run` already lets `--no-session-persistence` beat a stored `default_session_dir`; `serve` must
+    // too, or an operator who asked for nothing on disk still gets a transcript there.
+    let home = tempfile::tempdir().unwrap();
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let stored_dir = home.path().join("stored-repo-dir");
+    let set = Command::new(bin)
+        .args(["settings", "--session-dir", stored_dir.to_str().unwrap()])
+        .env("HOME", home.path())
+        .env_remove("AI_AGENT_CONFIG_DIR")
+        .output()
+        .unwrap();
+    assert!(set.status.success());
+
+    let cwd = tempfile::tempdir().unwrap();
+    let (base, bodies) = spawn_model_server(vec![turn_text("ok")]);
+    let mut child = Command::new(bin)
+        .args([
+            "serve",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--no-session-persistence",
+        ])
+        .env("HOME", home.path())
+        .env_remove("AI_AGENT_CONFIG_DIR")
+        .env_remove("AI_AGENT_SESSION_DIR")
+        .current_dir(cwd.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn_guarded();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = common::child_frames(&mut child);
+    writeln!(stdin, "{}", json!({ "type": "prompt", "message": "hi" })).unwrap();
+    stdin.flush().unwrap();
+    common::read_until_response(&mut stdout, "prompt");
+    drop(stdin);
+    child.wait().unwrap();
+    assert!(
+        !bodies.lock().unwrap().is_empty(),
+        "the prompt reached the model"
+    );
+
+    assert!(
+        !stored_dir.exists(),
+        "--no-session-persistence must win over the stored default_session_dir"
+    );
+    fn jsonl_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                jsonl_files(&path, out);
+            } else if path.extension().is_some_and(|e| e == "jsonl") {
+                out.push(path);
+            }
+        }
+    }
+    let mut written = Vec::new();
+    jsonl_files(home.path(), &mut written);
+    jsonl_files(cwd.path(), &mut written);
+    assert!(
+        written.is_empty(),
+        "no session file may be written: {written:?}"
+    );
+}
+
+#[test]
 fn settings_file_never_exists_under_the_isolated_test_home() {
     // Sanity check underlying every other hermetic test in this suite: no settings file exists under
     // `ISOLATED_HOME`, so `run`/`serve`'s stored-default lookup is always a harmless no-op there,
