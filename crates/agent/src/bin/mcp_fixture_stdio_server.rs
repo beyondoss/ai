@@ -23,7 +23,8 @@
 //! Legacy `initialize` still works for Auto fallback.
 //!
 //! Env: `MCP_FIXTURE_STARTUP_BARRIER` (`<dir>:<n>`: serve nothing until `n` fixtures have started; see
-//! `main`), `MCP_FIXTURE_STARTUP_BARRIER_SECS`, `MCP_FIXTURE_ORPHAN_PIDFILE` (unchanged).
+//! `main`), `MCP_FIXTURE_STARTUP_BARRIER_SECS`, `MCP_FIXTURE_ORPHAN_PIDFILE` (unchanged),
+//! `MCP_FIXTURE_ODD_NAMES` (see [`odd_names`]).
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -357,19 +358,32 @@ fn handle(method: &str, params: Value) -> Result<Value, (i64, String)> {
         "tasks/get" => tasks_get(params),
         "tasks/cancel" => tasks_cancel(params),
         "tasks/update" => tasks_update(params),
-        "resources/list" => Ok(json!({
-            "resources": [{
+        "resources/list" => {
+            let mut resources = vec![json!({
                 "uri": RESOURCE_URI,
                 "name": "doc",
                 "description": "A fixture text resource.",
                 "mimeType": "text/plain",
-            }]
-        })),
+            })];
+            if odd_names() {
+                resources.push(json!({
+                    "uri": ODD_RESOURCE_URI,
+                    "name": "README.md",
+                    "mimeType": "text/plain",
+                }));
+            }
+            Ok(json!({ "resources": resources }))
+        }
         "resources/read" => {
             let uri = params
                 .get("uri")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
+            if uri == ODD_RESOURCE_URI && odd_names() {
+                return Ok(json!({
+                    "contents": [{ "uri": uri, "mimeType": "text/plain", "text": "readme-body" }]
+                }));
+            }
             if uri != RESOURCE_URI {
                 return Err((-32002, format!("unknown resource `{uri}`")));
             }
@@ -381,8 +395,8 @@ fn handle(method: &str, params: Value) -> Result<Value, (i64, String)> {
                 }]
             }))
         }
-        "prompts/list" => Ok(json!({
-            "prompts": [{
+        "prompts/list" => {
+            let mut prompts = vec![json!({
                 "name": "greet",
                 "description": "A fixture prompt that greets `who`.",
                 "arguments": [{
@@ -390,13 +404,25 @@ fn handle(method: &str, params: Value) -> Result<Value, (i64, String)> {
                     "description": "Who to greet",
                     "required": true,
                 }]
-            }]
-        })),
+            })];
+            if odd_names() {
+                prompts.push(json!({ "name": "complex prompt" }));
+            }
+            Ok(json!({ "prompts": prompts }))
+        }
         "prompts/get" => {
             let name = params
                 .get("name")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
+            if name == "complex prompt" && odd_names() {
+                return Ok(json!({
+                    "messages": [{
+                        "role": "user",
+                        "content": { "type": "text", "text": "complex-prompt-body" }
+                    }]
+                }));
+            }
             if name != "greet" {
                 return Err((-32602, format!("unknown prompt `{name}`")));
             }
@@ -435,7 +461,7 @@ fn handle(method: &str, params: Value) -> Result<Value, (i64, String)> {
 }
 
 fn tool_defs() -> Value {
-    json!([
+    let mut defs = json!([
         {
             "name": "echo",
             "description": "Echoes back its `text` argument.",
@@ -521,8 +547,31 @@ fn tool_defs() -> Value {
             "description": "SEP-2663 task that needs in-task elicitation via tasks/update.",
             "inputSchema": { "type": "object", "properties": {} },
         },
-    ])
+    ]);
+    if odd_names() {
+        let Value::Array(defs) = &mut defs else {
+            unreachable!()
+        };
+        // Both normalise to `get_file`: the first listed keeps the name.
+        for name in ["get.file", "get file"] {
+            defs.push(json!({
+                "name": name,
+                "description": "Answers with the name it was called by.",
+                "inputSchema": { "type": "object", "properties": {} },
+            }));
+        }
+    }
+    defs
 }
+
+/// `MCP_FIXTURE_ODD_NAMES`: also list names real servers use that no provider accepts as a tool name
+/// — a tool `get.file` (and `get file`, which normalises alike), a resource `README.md`, a prompt
+/// `complex prompt`.
+fn odd_names() -> bool {
+    std::env::var_os("MCP_FIXTURE_ODD_NAMES").is_some()
+}
+
+const ODD_RESOURCE_URI: &str = "fixture://readme";
 
 /// SEP-2322 MRTR: first call returns `input_required`; retry with `inputResponses` completes.
 fn call_ask_user_mrtr(params: &Value) -> Value {
@@ -588,6 +637,7 @@ fn call_tool(params: Value) -> Value {
             text_result(&(a + b).to_string(), false)
         }
         "ping" => text_result("pong", false),
+        "get.file" | "get file" if odd_names() => text_result(&format!("called-as={name}"), false),
         "fail" => text_result("intentional failure from fixture server", true),
         "echo_env" => {
             let var = arguments

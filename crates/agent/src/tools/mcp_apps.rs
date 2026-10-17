@@ -178,6 +178,9 @@ impl ToolUi {
 pub struct AppServer {
     handle: McpServerHandle,
     tools: HashMap<String, ToolUi>,
+    /// Each tool's registered name → its remote name. A registered name is normalised
+    /// (`tools::mcp::registered_name`), so the remote one is never parsed back out of it.
+    remote_names: HashMap<String, String>,
     /// Resource sizes the server advertised in `resources/list`, by URI.
     sizes: HashMap<String, u64>,
 }
@@ -188,9 +191,19 @@ impl AppServer {
         tools: impl IntoIterator<Item = (String, ToolUi)>,
         sizes: impl IntoIterator<Item = (String, u64)>,
     ) -> Arc<Self> {
+        let tools: Vec<(String, ToolUi)> = tools.into_iter().collect();
+        let mut remote_names = HashMap::with_capacity(tools.len());
+        for (remote, _) in &tools {
+            // In listing order, first wins — as it does for the registered tools themselves.
+            remote_names
+                .entry(crate::tools::mcp::registered_name(handle.name(), remote))
+                .or_insert_with(|| remote.clone());
+        }
+        let tools = tools.into_iter().collect();
         Arc::new(Self {
             handle,
-            tools: tools.into_iter().collect(),
+            tools,
+            remote_names,
             sizes: sizes.into_iter().collect(),
         })
     }
@@ -533,10 +546,11 @@ impl AppsView {
         let mut servers = BTreeMap::new();
         for (name, up) in self.pool.up() {
             for tool in &up.tools {
-                let remote = tool
-                    .name()
-                    .strip_prefix(&format!("mcp__{name}__"))
-                    .unwrap_or_default();
+                // A resource, prompt or skill tool is no remote tool of the server's.
+                let Some(remote) = up.apps.remote_names.get(tool.name()) else {
+                    wrapped.push(tool.clone());
+                    continue;
+                };
                 match up.apps.tools.get(remote) {
                     Some(ui) if !ui.model_visible() => {}
                     Some(ToolUi {
