@@ -1,7 +1,7 @@
 //! Egress safety for the `web` tool — the layer ax (a local human-run CLI) never needs and we cannot
 //! do without (we fetch URLs the *model* chose, from a server).
 //!
-//! Because the `web` tool is read-only and therefore never approval-gated, **this is the sole boundary
+//! Because a plain `web` fetch is never approval-gated, **this is the sole boundary
 //! between the model and an internal fetch.** Its correctness is load-bearing, so it is deliberately
 //! explicit — every blocked range is an auditable octet/segment check, not a call to a std helper whose
 //! semantics might drift (and one of the ones we'd want, `Ipv6Addr::is_unicast_link_local`, is still
@@ -112,8 +112,16 @@ impl EgressPolicy {
 /// Classify a blocked address, or `None` if it is a routable public address. Every arm is an explicit
 /// range so the policy can be read and audited without chasing std's stability guarantees.
 ///
-/// IPv4-mapped and IPv4-compatible IPv6 addresses are unwrapped and re-checked as their embedded v4 —
-/// `http://[::ffff:169.254.169.254]/` must not sneak a metadata fetch past the v4 checks.
+/// The table follows the IANA IPv4 and IPv6 Special-Purpose Address Registries: every block that is
+/// not globally reachable is refused. IPv6 forms that *embed* an IPv4 address — IPv4-mapped
+/// (`::ffff:a.b.c.d`), IPv4-compatible (`::a.b.c.d`), NAT64 well-known prefix (`64:ff9b::a.b.c.d`,
+/// RFC 6052) and 6to4 (`2002:aabb:ccdd::`, RFC 3056) — are unwrapped and re-checked as their embedded
+/// v4, so `http://[64:ff9b::a9fe:a9fe]/` can't sneak a metadata fetch past the v4 checks through a
+/// DNS64/NAT64 gateway. A public embedded v4 still passes: that is how an IPv6-only host reaches the
+/// v4 internet.
+///
+/// This one classifier is shared by the `web` tool and MCP's HTTP egress (`tools::mcp::McpEgress`),
+/// both through [`EgressPolicy::addr_permitted`].
 pub fn blocked_class(addr: IpAddr) -> Option<&'static str> {
     match addr {
         IpAddr::V4(v4) => blocked_v4(v4),
@@ -121,6 +129,16 @@ pub fn blocked_class(addr: IpAddr) -> Option<&'static str> {
             // `::ffff:a.b.c.d` — check as its embedded v4.
             if let Some(v4) = v6.to_ipv4_mapped() {
                 return blocked_v4(v4);
+            }
+            let seg = v6.segments();
+            // 64:ff9b::/96 — NAT64 well-known prefix (RFC 6052): the low 32 bits are the v4 the
+            // translator will connect to.
+            if seg[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
+                return blocked_v4(embedded_v4(seg[6], seg[7]));
+            }
+            // 2002::/16 — 6to4 (RFC 3056): bits 16..48 are the v4 of the relay-reachable site.
+            if seg[0] == 0x2002 {
+                return blocked_v4(embedded_v4(seg[1], seg[2]));
             }
             // v6-native ranges *first*: `::1`/`::` must be classified here, before the v4-compatible
             // fallback below — `Ipv6Addr::to_ipv4()` maps `::1` to the *public-looking* `0.0.0.1` and
@@ -138,10 +156,20 @@ pub fn blocked_class(addr: IpAddr) -> Option<&'static str> {
     }
 }
 
+fn embedded_v4(hi: u16, lo: u16) -> Ipv4Addr {
+    let [a, b] = hi.to_be_bytes();
+    let [c, d] = lo.to_be_bytes();
+    Ipv4Addr::new(a, b, c, d)
+}
+
 fn blocked_v4(ip: Ipv4Addr) -> Option<&'static str> {
-    let [a, b, ..] = ip.octets();
+    let [a, b, c, _] = ip.octets();
     if ip.is_unspecified() {
         return Some("unspecified (0.0.0.0)");
+    }
+    // 0.0.0.0/8 — "this network" (RFC 791). Linux routes `0.x.y.z` to the local host.
+    if a == 0 {
+        return Some("this-network (0.0.0.0/8)");
     }
     if ip.is_loopback() {
         return Some("loopback");
@@ -161,6 +189,30 @@ fn blocked_v4(ip: Ipv4Addr) -> Option<&'static str> {
     if a == 100 && (64..=127).contains(&b) {
         return Some("carrier-grade NAT (RFC 6598)");
     }
+    // 192.0.0.0/24 — IETF protocol assignments (RFC 6890): DS-Lite B4/AFTR, NAT64 discovery, …
+    if (a, b, c) == (192, 0, 0) {
+        return Some("IETF protocol assignment (192.0.0.0/24)");
+    }
+    // 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24 — documentation (RFC 5737).
+    if (a, b, c) == (192, 0, 2) || (a, b, c) == (198, 51, 100) || (a, b, c) == (203, 0, 113) {
+        return Some("documentation (RFC 5737)");
+    }
+    // 192.88.99.0/24 — deprecated 6to4 relay anycast (RFC 7526).
+    if (a, b, c) == (192, 88, 99) {
+        return Some("6to4 relay anycast (192.88.99.0/24)");
+    }
+    // 198.18.0.0/15 — benchmarking (RFC 2544).
+    if a == 198 && (b == 18 || b == 19) {
+        return Some("benchmarking (198.18.0.0/15)");
+    }
+    // 224.0.0.0/4 — multicast.
+    if (224..=239).contains(&a) {
+        return Some("multicast (224.0.0.0/4)");
+    }
+    // 240.0.0.0/4 — reserved (RFC 1112); 255.255.255.255 was caught above.
+    if a >= 240 {
+        return Some("reserved (240.0.0.0/4)");
+    }
     None
 }
 
@@ -179,6 +231,36 @@ fn blocked_v6(ip: Ipv6Addr) -> Option<&'static str> {
     // fe80::/10 — link-local unicast.
     if (seg0 & 0xffc0) == 0xfe80 {
         return Some("link-local (fe80::/10)");
+    }
+    // fec0::/10 — deprecated site-local (RFC 3879); still routed internally on old networks.
+    if (seg0 & 0xffc0) == 0xfec0 {
+        return Some("site-local (fec0::/10)");
+    }
+    // ff00::/8 — multicast.
+    if (seg0 & 0xff00) == 0xff00 {
+        return Some("multicast (ff00::/8)");
+    }
+    let seg = ip.segments();
+    // 64:ff9b:1::/48 — local-use NAT64 (RFC 8215): a site's own translator, internal by definition.
+    if seg[..3] == [0x64, 0xff9b, 0x1] {
+        return Some("local-use NAT64 (64:ff9b:1::/48)");
+    }
+    // 100::/64 — discard-only (RFC 6666).
+    if seg[..4] == [0x100, 0, 0, 0] {
+        return Some("discard-only (100::/64)");
+    }
+    // 2001::/23 — IETF protocol assignments, including Teredo 2001::/32 (a tunnel whose far end is
+    // an obfuscated IPv4 we can't vet), benchmarking 2001:2::/48 and ORCHID.
+    if seg0 == 0x2001 && seg[1] < 0x200 {
+        return Some("IETF protocol assignment / Teredo (2001::/23)");
+    }
+    // 2001:db8::/32 and 3fff::/20 — documentation (RFC 3849, RFC 9637).
+    if (seg0 == 0x2001 && seg[1] == 0xdb8) || (seg0 == 0x3fff && seg[1] < 0x1000) {
+        return Some("documentation (2001:db8::/32, 3fff::/20)");
+    }
+    // 5f00::/16 — SRv6 segment identifiers (RFC 9602), not globally reachable.
+    if seg0 == 0x5f00 {
+        return Some("SRv6 SID (5f00::/16)");
     }
     None
 }
@@ -295,6 +377,141 @@ mod tests {
         assert!(blocked_class(ip("::ffff:10.0.0.1")).is_some());
         // A mapped *public* v4 still passes.
         assert_eq!(blocked_class(ip("::ffff:8.8.8.8")), None);
+    }
+
+    /// Every IANA special-purpose block that is not globally reachable, one representative address
+    /// (or more, at the edges) per row.
+    #[test]
+    fn every_special_purpose_v4_range_is_blocked() {
+        let cases = [
+            ("0.0.0.1", "this-network"),
+            ("0.255.255.255", "this-network"),
+            ("192.0.0.1", "IETF protocol"),
+            ("192.0.0.170", "IETF protocol"), // NAT64 discovery
+            ("192.0.2.1", "documentation"),
+            ("198.51.100.7", "documentation"),
+            ("203.0.113.9", "documentation"),
+            ("192.88.99.1", "6to4 relay"),
+            ("198.18.0.1", "benchmarking"),
+            ("198.19.255.255", "benchmarking"),
+            ("224.0.0.1", "multicast"),
+            ("239.255.255.250", "multicast"), // SSDP
+            ("240.0.0.1", "reserved"),
+            ("254.1.2.3", "reserved"),
+            ("100.127.255.255", "carrier-grade NAT"),
+        ];
+        for (s, needle) in cases {
+            let class = blocked_class(ip(s)).unwrap_or_else(|| panic!("{s} must be blocked"));
+            assert!(
+                class.contains(needle),
+                "{s}: got {class:?}, wanted {needle:?}"
+            );
+        }
+        // The neighbors are public.
+        for s in [
+            "1.0.0.1",
+            "100.128.0.1",
+            "192.0.1.1",
+            "192.0.3.1",
+            "198.17.255.255",
+            "198.20.0.1",
+            "223.255.255.254",
+        ] {
+            assert_eq!(blocked_class(ip(s)), None, "{s} is public");
+        }
+    }
+
+    #[test]
+    fn nat64_embeds_are_checked_as_their_v4() {
+        // 64:ff9b::/96 — a DNS64/NAT64 gateway connects to the embedded v4, so an internal one is
+        // an internal fetch.
+        for s in [
+            "64:ff9b::a9fe:a9fe", // 169.254.169.254
+            "64:ff9b::7f00:1",    // 127.0.0.1
+            "64:ff9b::a00:1",     // 10.0.0.1
+            "64:ff9b::1",         // 0.0.0.1
+            "64:ff9b::c0a8:101",  // 192.168.1.1
+        ] {
+            assert!(blocked_class(ip(s)).is_some(), "{s} must be blocked");
+        }
+        assert!(
+            blocked_class(ip("64:ff9b::a9fe:a9fe"))
+                .unwrap()
+                .contains("link-local"),
+            "the class is the embedded v4's"
+        );
+        // A public v4 through NAT64 is how an IPv6-only host reaches the v4 internet.
+        assert_eq!(blocked_class(ip("64:ff9b::808:808")), None); // 8.8.8.8
+        // 64:ff9b:1::/48 — local-use NAT64: internal whatever it embeds.
+        for s in ["64:ff9b:1::808:808", "64:ff9b:1:ffff::1"] {
+            assert!(
+                blocked_class(ip(s)).unwrap().contains("local-use NAT64"),
+                "{s}"
+            );
+        }
+    }
+
+    #[test]
+    fn six_to_four_embeds_are_checked_as_their_v4() {
+        assert!(blocked_class(ip("2002:a9fe:a9fe::1")).is_some()); // 169.254.169.254
+        assert!(blocked_class(ip("2002:7f00:1::")).is_some()); // 127.0.0.1
+        assert!(blocked_class(ip("2002:c0a8:101::1")).is_some()); // 192.168.1.1
+        assert_eq!(blocked_class(ip("2002:808:808::1")), None); // 8.8.8.8
+    }
+
+    #[test]
+    fn every_special_purpose_v6_range_is_blocked() {
+        let cases = [
+            ("fec0::1", "site-local"),
+            ("feff::1", "site-local"),
+            ("ff02::1", "multicast"),
+            ("ff05::2", "multicast"),
+            ("100::1", "discard-only"),
+            ("2001::1", "Teredo"),
+            ("2001:0:4136:e378:8000:63bf:3fff:fdd2", "Teredo"),
+            ("2001:2::1", "IETF protocol"), // benchmarking
+            ("2001:1ff:ffff::1", "IETF protocol"),
+            ("2001:db8::1", "documentation"),
+            ("3fff::1", "documentation"),
+            ("3fff:fff::1", "documentation"),
+            ("5f00::1", "SRv6"),
+            ("fdff:ffff::1", "unique-local"),
+            ("febf::1", "link-local"),
+        ];
+        for (s, needle) in cases {
+            let class = blocked_class(ip(s)).unwrap_or_else(|| panic!("{s} must be blocked"));
+            assert!(
+                class.contains(needle),
+                "{s}: got {class:?}, wanted {needle:?}"
+            );
+        }
+        // The neighbors are public.
+        for s in [
+            "2001:200::1", // the first real RIR allocation after the /23
+            "2001:4860:4860::8888",
+            "2001:db9::1",
+            "3ffe:ffff::1",
+            "3fff:1000::1",
+            "4000::1",
+            "5f01::1",
+            "fe00::1",
+            "101::1",
+        ] {
+            assert_eq!(blocked_class(ip(s)), None, "{s} is public");
+        }
+    }
+
+    #[test]
+    fn mcp_egress_uses_this_classifier() {
+        // MCP's HTTP egress builds on `EgressPolicy::addr_permitted`, which is this table.
+        let p = EgressPolicy::default();
+        for s in ["64:ff9b::a9fe:a9fe", "0.1.2.3", "198.18.0.1", "ff02::1"] {
+            assert!(p.addr_permitted("h", ip(s)).is_err(), "{s}");
+        }
+        assert!(
+            validate_url(&url("http://[64:ff9b::7f00:1]/"), &p).is_err(),
+            "a literal NAT64 loopback URL is refused without DNS"
+        );
     }
 
     fn url(s: &str) -> reqwest::Url {

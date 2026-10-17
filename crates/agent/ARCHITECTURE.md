@@ -3178,9 +3178,17 @@ server fetching URLs the _model_ chose. Because a plain fetch is read-only (in `
   before any DNS; redirects are followed manually (`Policy::none()`, capped at 5) so each hop is
   re-validated, which also blocks an `http → file:` scheme downgrade.
 
-Every blocked range is an explicit octet/segment check rather than a std helper (loopback, RFC-1918,
-link-local incl. `169.254.169.254`, CGNAT, v6 ULA/link-local, and — a real bypass — IPv4-mapped v6 like
-`::ffff:169.254.169.254`, unwrapped and re-checked as its embedded v4). `--web-allow-private` and
+Every blocked range is an explicit octet/segment check rather than a std helper, following the IANA
+IPv4/IPv6 Special-Purpose Address Registries: every block that isn't globally reachable is refused —
+v4 `0.0.0.0/8`, loopback, RFC-1918, link-local incl. `169.254.169.254`, CGNAT `100.64/10`,
+`192.0.0.0/24`, documentation, `192.88.99/24`, benchmarking `198.18/15`, multicast and `240/4`; v6
+loopback/unspecified, ULA `fc00::/7`, link-local, deprecated site-local `fec0::/10`, multicast,
+local-use NAT64 `64:ff9b:1::/48`, discard-only `100::/64`, `2001::/23` (incl. Teredo), documentation
+(`2001:db8::/32`, `3fff::/20`) and SRv6 `5f00::/16`. IPv6 forms that embed an IPv4 — mapped
+`::ffff:a.b.c.d`, compatible `::a.b.c.d`, NAT64 `64:ff9b::/96` and 6to4 `2002::/16` — are unwrapped
+and re-checked as their embedded v4 (`[64:ff9b::a9fe:a9fe]` is the metadata endpoint through a
+DNS64/NAT64 gateway); a public embedded v4 passes, as an IPv6-only host needs. MCP's HTTP egress
+(`McpEgress`) uses the same `EgressPolicy`, so the same table. `--web-allow-private` and
 `--web-allow-host <host>` open it back up; the allowlist is also what makes a loopback test fixture
 reachable. The tool owns its own `reqwest::Client` (the gateway's `shared_http` is h2-pinned with a
 10-minute timeout, the wrong shape), and subagents inherit the parent's egress policy via
