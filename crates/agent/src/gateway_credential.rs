@@ -721,9 +721,10 @@ fn resolve_with(
     if env.direct() {
         return Err(match providers::for_model_id(model) {
             Some(spec) => format!(
-                "no credential for model {model:?}: set {} (or run `agent login`, or set AI_PROVIDER \
+                "no credential for model {model:?}: set {} (or run `{} login`, or set AI_PROVIDER \
                  + AI_API_KEY, or point AI_BASE_URL at an OpenAI-compatible endpoint)",
-                spec.env_var.unwrap_or("a provider key")
+                spec.env_var.unwrap_or("a provider key"),
+                crate::PROGRAM
             ),
             None => format!(
                 "no provider recognizes model {model:?}: set AI_PROVIDER (e.g. AI_PROVIDER=openrouter) \
@@ -733,8 +734,9 @@ fn resolve_with(
         });
     }
     Err(format!(
-        "no gateway key: pass --key or set AI_AGENT_KEY (a bai_v1… virtual key), or run `agent login \
-         <provider>` to use a subscription for model {model:?}"
+        "no gateway key: pass --key or set AI_AGENT_KEY (a bai_v1… virtual key), or run `{} login \
+         <provider>` to use a subscription for model {model:?}",
+        crate::PROGRAM
     ))
 }
 

@@ -1453,6 +1453,12 @@ come from a path say which one: `SessionRepo::open_with` and the single-file cre
 help writes `{DEFAULT_MODEL}`, and `render_help` fills in the `DEFAULT_MODEL` constant whenever help
 is printed, so the help can't name a different default from the one the code uses.
 
+**Hints name the real command.** The binary is `beyond-ai-agent`, and every error, warning or
+hint that tells a user what to run formats `beyond_ai_agent::PROGRAM` (the package name) in:
+`run`beyond-ai-agent login anthropic``, never a hard-coded `agent login`. Help text writes
+`{PROGRAM}`, which `render_help` fills in. `program_name_tests.rs` scans the crate's string literals
+for a command line spelled with another name, and a `main.rs` test checks every rendered help page.
+
 The first signal is a request; a **second signal** is an order. `run`'s signal task keeps waiting after
 it cancels, and a second SIGTERM/SIGHUP/Ctrl-C calls `exit_process` with that signal's code (the usual
 exit cleanup still runs: job group kills, the stdio-server sweep), with `[second signal: exiting now]`

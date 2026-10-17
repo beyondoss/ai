@@ -226,8 +226,10 @@ impl ServerAuth {
             Err(e) if e.definitive => {
                 let message = format!(
                     "mcp server `{0}` rejected its OAuth token and it could not be refreshed ({1}); \
-                     run `agent mcp-login {0}` again",
-                    self.server, e.reason
+                     run `{2} mcp-login {0}` again",
+                    self.server,
+                    e.reason,
+                    crate::PROGRAM
                 );
                 tracing::warn!(server = %self.server, error = %e.reason, "MCP OAuth refresh rejected");
                 state.failed = Some(Failed {
@@ -280,7 +282,8 @@ async fn stored_token(name: &str, url: &str) -> Option<String> {
             tracing::warn!(
                 server = %name,
                 error = %e,
-                "stored MCP OAuth login could not be refreshed; run `agent mcp-login {name}` again"
+                "stored MCP OAuth login could not be refreshed; run `{} mcp-login {name}` again",
+                crate::PROGRAM
             );
             None
         }
@@ -549,7 +552,7 @@ impl<C: StreamableHttpClient<Error = reqwest::Error>> OAuthHttp<C> {
                             Err(StreamableHttpError::UnexpectedServerResponse(
                                 format!(
                                     "{}; the server refused the refreshed login for `{1}` too: run \
-                                     `agent mcp-login {1}` again",
+                                     `{2} mcp-login {1}` again",
                                     match &e {
                                         StreamableHttpError::UnexpectedServerResponse(m) => {
                                             m.to_string()
@@ -569,6 +572,7 @@ impl<C: StreamableHttpClient<Error = reqwest::Error>> OAuthHttp<C> {
                                         _ => "HTTP 401 Unauthorized".to_owned(),
                                     },
                                     auth.server,
+                                    crate::PROGRAM,
                                 )
                                 .into(),
                             ))
@@ -799,7 +803,10 @@ mod tests {
         Arc::get_mut(&mut auth).unwrap().first_backoff = Duration::from_millis(10);
         for _ in 0..3 {
             let e = auth.after_rejection(Some("old")).await.unwrap_err();
-            assert!(e.contains("agent mcp-login fake"), "{e}");
+            assert!(
+                e.contains(&format!("`{} mcp-login fake`", crate::PROGRAM)),
+                "{e}"
+            );
             // Even past any backoff, a rejected refresh token is not tried again.
             tokio::time::sleep(Duration::from_millis(30)).await;
         }
@@ -915,7 +922,7 @@ mod tests {
         // A redial that reloads the *same* token: the refusal still stands, no new refresh.
         auth.reload().await;
         let e = auth.after_rejection(Some("old")).await.unwrap_err();
-        assert!(e.contains("agent mcp-login"), "{e}");
+        assert!(e.contains(&format!("`{} mcp-login", crate::PROGRAM)), "{e}");
         assert_eq!(
             refreshes.load(Ordering::SeqCst),
             1,

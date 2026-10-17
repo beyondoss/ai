@@ -3071,11 +3071,11 @@ pub(crate) async fn serve_session(
         eprintln!(
             "warning: {} has a project-local SYSTEM.md/APPEND_SYSTEM.md, skills, prompt templates, or a \
              settings.json on disk, but the project isn't trusted, so they were skipped — pass \
-             --trust-project or run `agent trust {}` to enable them (a project's own settings.json \
-             additionally requires a *persisted* `agent trust`, not just a one-off --trust-project — see \
-             `settings::effective_settings_for_cwd`'s doc comment)",
+             --trust-project or run `{program} trust {}` to enable them (a project's own settings.json \
+             additionally requires a *persisted* `{program} trust`, not just a one-off --trust-project)",
             cwd.display(),
-            cwd.display()
+            cwd.display(),
+            program = crate::PROGRAM
         );
     }
 
@@ -7401,11 +7401,13 @@ pub(crate) async fn serve_session(
                         eprintln!(
                             "warning: {} has a project-local SYSTEM.md/APPEND_SYSTEM.md, skills, \
                              prompt templates, or a settings.json on disk, but the project isn't \
-                             trusted, so they were skipped — pass --trust-project or run `agent trust \
-                             {}` to enable them (a project's own settings.json additionally requires a \
-                             *persisted* `agent trust`, not just a one-off --trust-project)",
+                             trusted, so they were skipped — pass --trust-project or run `{program} \
+                             trust {}` to enable them (a project's own settings.json additionally \
+                             requires a *persisted* `{program} trust`, not just a one-off \
+                             --trust-project)",
                             cwd.display(),
-                            cwd.display()
+                            cwd.display(),
+                            program = crate::PROGRAM
                         );
                     }
                 }
