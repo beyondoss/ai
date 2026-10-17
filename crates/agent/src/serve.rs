@@ -2890,6 +2890,8 @@ pub(crate) async fn serve_session(
     // [`open_persistence_blocking`].
     let (mut cfg, opened) = open_persistence_blocking(cfg).await;
     let (mut persistence, mut session) = opened?;
+    // A previous process killed mid-turn left this session ending on its unanswered prompt.
+    close_interrupted_prompt(&mut session);
 
     // The session whose title has already been attempted, so the attempt happens **at most once**
     // rather than once per turn until it succeeds. `title.is_none()` alone cannot express that: a
@@ -4045,6 +4047,7 @@ pub(crate) async fn serve_session(
                 Some(target) => match persistence.switch(target) {
                     Ok(s) => {
                         session = s;
+                        close_interrupted_prompt(&mut session);
                         repoint_session_memory!();
                         reset_exec_endpoint!();
                         reset_mcp_enabled!();
@@ -9440,9 +9443,28 @@ const HOST_BASH_LABEL: &str = "[Host bash command, run outside the model's own t
 /// back to the old `"(error)\n"`-marker-only detection, no migration needed.
 const HOST_BASH_STATUS_LINE_PREFIX: &str = "[Host bash status] ";
 
+/// The closing record for a reopened session's prompt that its run never answered (see
+/// [`close_interrupted_prompt`]).
+pub const INTERRUPTED_PROMPT: &str =
+    "interrupted: the previous run ended before answering this request";
+
+/// Close the prompt a killed process left unanswered, as a session is reopened — by `run`, and by
+/// `serve` on open and on `switch_session`. A process killed outright (OOM, `kill -9`, a deploy's
+/// SIGKILL) leaves the session ending on its prompt (checkpointed before the model call) or on a
+/// tool-results turn, with no closing record: no `Err` path ever ran. Left open, the next prompt
+/// stacks a second `user` turn and the model is never told the first was cut off. A host bash record
+/// is the exception: a `user` message that legitimately ends a session between prompts. Returns
+/// whether a record was added; it is persisted with the next write.
+pub fn close_interrupted_prompt(session: &mut agent_core::Session) -> bool {
+    if session.messages.last().is_some_and(is_host_bash_record) {
+        return false;
+    }
+    session.close_unanswered_prompt(INTERRUPTED_PROMPT)
+}
+
 /// Whether `m` is a host bash record (`serve`'s `bash` RPC, either label): a `user` message that
-/// legitimately ends a session between prompts, so a resumed session ending on one was not
-/// interrupted mid-turn (see `run`'s use of [`agent_core::Session::close_unanswered_prompt`]).
+/// legitimately ends a session between prompts, so a reopened session ending on one was not
+/// interrupted mid-turn (see [`close_interrupted_prompt`]).
 pub fn is_host_bash_record(m: &agent_core::Message) -> bool {
     m.role == agent_core::Role::User
         && m.content.iter().any(|c| {
@@ -12699,6 +12721,27 @@ mod tests {
             assert!(is_host_bash_record(&m));
         }
         assert!(!is_host_bash_record(&agent_core::Message::user("a prompt")));
+    }
+
+    #[test]
+    fn reopening_closes_an_unanswered_prompt_but_not_a_host_bash_record() {
+        let mut session = agent_core::Session::new();
+        session.user("cut off mid-turn");
+        assert!(close_interrupted_prompt(&mut session));
+        assert_eq!(
+            session.messages.last().unwrap().error_message.as_deref(),
+            Some(INTERRUPTED_PROMPT)
+        );
+        assert!(!close_interrupted_prompt(&mut session), "already closed");
+
+        let mut session = agent_core::Session::new();
+        session.push(agent_core::Message::user(format!(
+            "{HOST_BASH_LABEL}\n$ ls\n\nout"
+        )));
+        assert!(
+            !close_interrupted_prompt(&mut session),
+            "a host bash record legitimately ends a session"
+        );
     }
 
     /// A views sidecar of `n` views, oldest first, each opening `html_bytes` of HTML.
