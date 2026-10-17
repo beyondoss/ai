@@ -2218,7 +2218,11 @@ priority = "P1"
 group = "Translation detail"
 text = "max_tokens defaults and clamps never truncate or 400"
 layer = "both"
-touches = ["crates/gateway/src/translate.rs", "crates/gateway/src/proxy.rs", "crates/gateway/src/peek.rs"]
+touches = [
+  "crates/gateway/src/translate.rs",
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/peek.rs",
+]
 defects = ["D59", "D63", "D85", "D275"]
 
 [[claim]]
