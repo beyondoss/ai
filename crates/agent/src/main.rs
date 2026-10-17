@@ -2208,7 +2208,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             // a tenant needs. A tenant's connectors come from its grant, per session (a later PR);
             // until then it has none rather than the replica's.
             let (mcp_tools, mcp_catalog) = if service {
-                (Vec::new(), tools::mcp::McpCatalog::default())
+                (
+                    tools::mcp::McpTools::default(),
+                    tools::mcp::McpCatalog::default(),
+                )
             } else {
                 let (mcp_tools, mcp_catalog, mcp_warnings) = tools::mcp::connect_all(
                     stored_settings.mcp_servers.as_deref().unwrap_or(&[]),
@@ -4526,7 +4529,7 @@ async fn run_task(
     // just above. `stored_settings.mcp_servers` is already trust-gated (a project's own
     // `.beyond/settings.json` — where a project-tier `mcp_servers` entry would live — only merges in at
     // all when `effective_settings_for_cwd` found `cwd` trusted; the global tier always applies).
-    let (mcp_tools, mcp_catalog, mcp_warnings) = tools::mcp::connect_all(
+    let (mcp_live, mcp_catalog, mcp_warnings) = tools::mcp::connect_all(
         stored_settings.mcp_servers.as_deref().unwrap_or(&[]),
         tools::mcp::idle_reap_after_from_env(),
         mcp_manifest_dir().as_ref(),
@@ -4550,7 +4553,10 @@ async fn run_task(
         .set_listing_suppressed(no_skills);
     let mcp_skills = tools::mcp_skills::McpSkills::new(&mcp_catalog, mcp_enabled.clone());
     // Skill-loading tools rebound to this run's skill state (see `filter_by_enabled`).
-    let mcp_tools = tools::mcp::filter_by_enabled(&mcp_tools, &mcp_enabled);
+    // The generation the registry below is built from: a server that re-lists its tools after this
+    // reaches the run through its tool source (installed on `steering` below).
+    let mcp_built_at = mcp_live.generation();
+    let mcp_tools = tools::mcp::filter_by_enabled(&mcp_live.snapshot(), &mcp_enabled);
     for diagnostic in mcp_skills.diagnostics(&skills) {
         eprintln!("warning: {diagnostic}");
     }
@@ -4626,6 +4632,20 @@ async fn run_task(
         tools_exclude.as_deref(),
         no_tools,
     );
+    // A server that changes its tools during the run (`notifications/tools/list_changed`, or a start
+    // that lists something new) has them offered from the next turn.
+    steering.set_tool_source(Some(tools::mcp::tool_source(
+        mcp_live.clone(),
+        mcp_enabled.clone(),
+        mcp_built_at,
+        tools::McpFilter {
+            loading: mcp_loading,
+            tools: tools_allow.clone(),
+            exclude: tools_exclude.clone(),
+            no_tools,
+            code_mode,
+        },
+    )));
     #[cfg(feature = "code-mode")]
     if code_mode {
         let nested =
@@ -4831,7 +4851,7 @@ async fn run_task(
             agents: Arc::new(agent_defs.clone()),
             skills: Arc::new(skills.clone()),
             write_locks: write_locks.clone(),
-            mcp_tools: mcp_tools.clone(),
+            mcp_tools: mcp_live.clone(),
             // `run` has no `set_mcp_enabled` command, so the gate never moves: every configured
             // server stays enabled for the life of the process, which is what the default means.
             // Shared, so a child sees (and is gated by) the skills this run loaded.

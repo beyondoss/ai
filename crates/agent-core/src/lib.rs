@@ -70,7 +70,9 @@ pub use models::{
     thinking_for_level,
 };
 pub use session::{Cuts, RequestBlock, Session, cut_watermark};
-pub use steering::{ModelSwitch, QueueMode, Steering, SteeringMessage, TurnContextSource};
+pub use steering::{
+    ModelSwitch, QueueMode, Steering, SteeringMessage, ToolSource, TurnContextSource,
+};
 pub use tls::ensure_provider;
 pub use token_size::TokenFamily;
 pub use tool::{Tool, ToolOutput, ToolProgress, ToolRegistry, ToolUpdate};
