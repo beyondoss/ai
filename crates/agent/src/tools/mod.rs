@@ -14,6 +14,7 @@ pub mod bash_proc;
 pub mod bash_sandbox;
 pub mod code_mode;
 pub mod edit;
+pub mod encoding;
 pub mod exec;
 pub(crate) mod fence_tables;
 pub mod find;

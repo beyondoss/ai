@@ -77,7 +77,8 @@ impl Tool for Edit {
          (each `old_string` must match exactly once), or a single old_string/new_string. With \
          `replace_all`, a single edit replaces every occurrence. An entry's own `path` sends it to \
          another file. Each file applies on its own (all of its edits or none); the result lists \
-         which files were edited and which FAILED, so resend only the failed ones."
+         which files were edited and which FAILED, so resend only the failed ones. A UTF-16 file \
+         keeps its encoding."
     }
     fn input_schema(&self) -> Value {
         json!({
@@ -443,13 +444,34 @@ impl Edit {
         // session's event pump and abort/steer loop. See `tests/tool_reactor_stall.rs`.
         // So is validating the bytes as UTF-8 — a pass over every byte of the file.
         let plan_path = path.clone();
+        //
+        // A UTF-16 file (the same classifier `read` uses) is decoded, edited as text, and encoded back
+        // in its own byte order — a BOM decodes to a leading U+FEFF, which `plan_edits` already keeps,
+        // so it round-trips too. Without this, `edit` refused every UTF-16 file as "not valid UTF-8".
         let (text, result) = match tokio::task::spawn_blocking(move || {
-            let Ok(raw) = String::from_utf8(raw_bytes) else {
-                let err =
-                    ToolError::Execution(format!("read {plan_path}: file is not valid UTF-8"));
-                return (None, Err(PlanError::from(err)));
+            let utf16 = match super::encoding::sniff(&raw_bytes) {
+                super::encoding::Encoding::Utf16 { big_endian } => Some(big_endian),
+                _ => None,
             };
-            let result = plan_edits(&plan_path, &raw, &edits, replace_all, total_edits);
+            let decoded = match utf16 {
+                Some(be) => super::encoding::decode_utf16(&raw_bytes, be).ok_or_else(|| {
+                    let label = super::encoding::utf16_label(be);
+                    format!("read {plan_path}: file is not valid {label}")
+                }),
+                None => String::from_utf8(raw_bytes)
+                    .map_err(|_| format!("read {plan_path}: file is not valid UTF-8")),
+            };
+            let raw = match decoded {
+                Ok(raw) => raw,
+                Err(msg) => return (None, Err(PlanError::from(ToolError::Execution(msg)))),
+            };
+            let mut result = plan_edits(&plan_path, &raw, &edits, replace_all, total_edits);
+            if let (Some(be), Ok((bytes, _))) = (utf16, &mut result) {
+                // `plan_edits` builds its output from a `String`, so this is always valid UTF-8.
+                if let Ok(text) = std::str::from_utf8(bytes) {
+                    *bytes = super::encoding::encode_utf16(text, be);
+                }
+            }
             // A file that will be written is searched in its new bytes (see `explain_failures`).
             ((keep_text && result.is_err()).then_some(raw), result)
         })

@@ -3,6 +3,7 @@
 use std::fmt::Write as _;
 use std::io::{BufRead, BufReader};
 
+use super::encoding::{self, Encoding};
 use super::fs::local::LocalFs;
 use super::fs::{FileKind, FsBackend};
 use std::sync::OnceLock;
@@ -300,7 +301,8 @@ impl Tool for Read {
                  can see; a model without vision support gets a text note instead. For text files, \
                  output is line-numbered and truncated to at most {DEFAULT_LIMIT} lines or {}, \
                  whichever is hit first. Use `offset`/`limit` to continue reading a large file from \
-                 where a truncated call left off.",
+                 where a truncated call left off. A binary file is reported by size, not \
+                 decoded; a UTF-16 file is decoded.",
                 super::output::format_size(MAX_OUTPUT_BYTES as u64)
             )
         })
@@ -385,9 +387,17 @@ impl Read {
         //
         // An *animated* PNG is deliberately excluded from image handling entirely, extension fallback
         // included — see `Sniff::AnimatedPng`'s doc comment — so it falls all the way through to the
-        // ordinary text path below, the same route a corrupt/non-image file named `.png` takes.
+        // non-image path below (where its NULs make it a binary file), the same route a
+        // corrupt/non-image file named `.png` takes.
+        //
+        // One prefix read serves both sniffs: the image signature here, and the binary/UTF-16 one
+        // below — so a binary file is answered from these bytes without ever reading the rest.
         let sniff_buf = backend
-            .read_bytes(std::path::Path::new(&path), 0, SNIFF_LEN)
+            .read_bytes(
+                std::path::Path::new(&path),
+                0,
+                SNIFF_LEN.max(encoding::SNIFF_LEN),
+            )
             .await
             .unwrap_or_default();
         let sniff = sniff_image_format(&sniff_buf);
@@ -442,6 +452,16 @@ impl Read {
             }
         }
 
+        // Not text: a NUL in the first 8 KB that UTF-16 does not explain. Decoding a `.dylib`, a
+        // SQLite database or a PDF line by line returned kilobytes of replacement characters and
+        // NULs — even with a small `limit`, since one "line" of a binary can be thousands of bytes.
+        // Images were handled above (they contain NULs too), so this only sees what is left.
+        let encoding = encoding::sniff(&sniff_buf);
+        if encoding == Encoding::Binary {
+            let len = meta.as_ref().map_or(sniff_buf.len() as u64, |m| m.len);
+            return Ok(format!("binary file, {len} bytes — not shown").into());
+        }
+
         let offset = input
             .get("offset")
             .and_then(Value::as_u64)
@@ -468,12 +488,49 @@ impl Read {
             .read_bytes(std::path::Path::new(&path), 0, MAX_READ_BYTES)
             .await?;
         let path_for_task = path.clone();
-        tokio::task::spawn_blocking(move || {
-            read_text_windowed(&path_for_task, &bytes, offset, limit)
+        tokio::task::spawn_blocking(move || match encoding {
+            Encoding::Utf16 { big_endian } => {
+                read_utf16(&path_for_task, &bytes, big_endian, offset, limit)
+            }
+            _ => read_text_windowed(&path_for_task, &bytes, offset, limit),
         })
         .await
         .map_err(|e| ToolError::Execution(format!("read task failed: {e}")))?
     }
+}
+
+/// A UTF-16 file, decoded and then windowed exactly like any other text. Without this it read as
+/// `h e l l o` — every other byte a NUL. A trailing note names the encoding, because `edit` and
+/// `write` keep it and the model should know the bytes on disk are not the UTF-8 it sees.
+fn read_utf16(
+    path: &str,
+    bytes: &[u8],
+    big_endian: bool,
+    offset: usize,
+    limit: usize,
+) -> Result<ToolOutput, ToolError> {
+    let label = encoding::utf16_label(big_endian);
+    let (text, note) = match encoding::decode_utf16(bytes, big_endian) {
+        Some(text) => (
+            text,
+            format!("[{label} file, shown decoded; `edit` and `write` keep its encoding]"),
+        ),
+        // An odd length or an unpaired surrogate: still show it, but say `edit` will refuse it.
+        None => (
+            char::decode_utf16(bytes.chunks_exact(2).map(|p| encoding::unit(p, big_endian)))
+                .map(|r| r.unwrap_or(char::REPLACEMENT_CHARACTER))
+                .collect(),
+            format!(
+                "[{label} file that is not valid {label}; shown with replacement characters, and \
+                 `edit` will refuse it]"
+            ),
+        ),
+    };
+    let body = text.strip_prefix('\u{feff}').unwrap_or(&text);
+    let mut out = read_text_windowed(path, body.as_bytes(), offset, limit)?;
+    out.text.push_str(&note);
+    out.text.push('\n');
+    Ok(out)
 }
 
 /// The blocking text read: open `path`, stream it line-by-line into a bounded `offset`/`limit` window,
@@ -630,8 +687,8 @@ enum Sniff {
     /// Deliberately its own variant, not folded into `Unknown`: sending a single static frame of an
     /// animated image to a vision model as if it were the whole picture is misleading (matching pi's
     /// `detectSupportedImageMimeType`, which returns `null` for an animated PNG so `read.ts` never
-    /// attempts to decode/serve it as an image at all — it goes straight to the ordinary text path,
-    /// the raw PNG bytes included, same as any other non-image file would). The `image` crate *can*
+    /// attempts to decode/serve it as an image at all — it goes straight to the non-image path,
+    /// reported as a binary file by size like any other non-image binary). The `image` crate *can*
     /// decode an APNG's default/first frame as an ordinary static PNG, so without this distinction the
     /// extension-based fallback (see `Read::run`) would silently ship that one frame as if it were the
     /// complete image — this variant exists specifically so the caller can refuse that fallback too,
