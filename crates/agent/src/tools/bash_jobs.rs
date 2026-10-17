@@ -47,6 +47,15 @@ pub const COMMAND_CHARS: usize = 80;
 pub(crate) const REMINDER_ASK: &str = "If you still need a job's result, wait for it with bash_job \
                                        {\"job\": N}; otherwise just end your turn.";
 
+/// The session custom-entry kind each local job's processes are journaled under — its process group,
+/// the group leader's start time and its environment tag ([`super::bash_proc::TAG_ENV`]) — so a
+/// process reopening the session after this one was killed outright (SIGKILL, OOM: no exit path ran
+/// to stop them) can find what survived and stop it ([`BashJobs::stop_survivors`]).
+pub const PROCS_ENTRY_KIND: &str = "bash_job_procs";
+
+/// Where a [`BashJobs`] journals a job's processes as it spawns them: the host's session store.
+pub type ProcRecorder = Arc<dyn Fn(serde_json::Value) + Send + Sync>;
+
 /// Why a job outlived its call — which also decides how long it may live: a yielded job never
 /// outlives the turn ([`BashJobs::end_turn`]); an intended one lives until it exits, is killed, or
 /// its owner ends.
@@ -147,6 +156,8 @@ pub(crate) struct JobShared {
     state: Mutex<JobState>,
     /// The table to tell when the job ends or is orphaned, so a waiting host can wake.
     table: Weak<BashJobs>,
+    /// The model's command, truncated — what a journaled record names it by.
+    command: OnceLock<String>,
 }
 
 #[derive(Default)]
@@ -185,7 +196,13 @@ impl JobShared {
             released: AtomicBool::new(false),
             state: Mutex::new(JobState::default()),
             table: Arc::downgrade(table),
+            command: OnceLock::new(),
         }
+    }
+
+    /// The model's command, truncated, for the journaled record of its processes.
+    pub fn set_command(&self, command: String) {
+        let _ = self.command.set(command);
     }
 
     /// A job the sandbox runs, read from `offset` of its output.
@@ -257,6 +274,9 @@ impl JobShared {
     }
 
     pub fn track(&self, kill: Kill) {
+        if let (Kill::Procs(group), Some(table)) = (&kill, self.table.upgrade()) {
+            table.record_procs(group, None, self.command.get().map(String::as_str));
+        }
         *lock(&self.kill) = Some(kill.clone());
         if !self.released() {
             lock(&LIVE_JOBS).push((self.key, kill));
@@ -364,6 +384,25 @@ pub struct StoppedJob {
     pub survived: Option<String>,
 }
 
+/// A job a killed process left running, as [`BashJobs::stop_survivors`] found it on reopen.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SurvivorFate {
+    /// Its job number, if it had one (a foreground command still attached when the process died
+    /// had none).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub job: Option<u64>,
+    pub command: String,
+    /// What is still running after the stop — processes we may not signal. `None`: all stopped.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub survived: Option<String>,
+}
+
+/// What [`BashJobs::stop_survivors`] found, until the reopen note reports it.
+#[derive(Default)]
+struct Survivors {
+    found: Vec<SurvivorFate>,
+}
+
 /// One session's jobs. Shared by every `bash`/`bash_job` built over it (a registry rebuild keeps
 /// them), and dropped — killing every job — with the last of them.
 pub struct BashJobs {
@@ -383,6 +422,10 @@ pub struct BashJobs {
     /// Sandbox jobs whose end the model has been told: their directories go once that report is
     /// persisted ([`Self::collect_garbage`]).
     garbage: Mutex<Vec<SandboxLink>>,
+    /// Where each local job's processes are journaled ([`PROCS_ENTRY_KIND`]).
+    recorder: Mutex<Option<ProcRecorder>>,
+    /// What [`Self::stop_survivors`] found of the jobs a killed process left, for the reopen note.
+    survivors: Mutex<Survivors>,
 }
 
 impl Default for BashJobs {
@@ -401,7 +444,100 @@ impl BashJobs {
             policy: Mutex::new(policy),
             scope: Mutex::new(None),
             garbage: Mutex::new(Vec::new()),
+            recorder: Mutex::new(None),
+            survivors: Mutex::new(Survivors::default()),
         }
+    }
+
+    /// Journal each local job's processes through `recorder` from now on (`None`: stop). Set by the
+    /// host that persists the session, with the session it persists to.
+    pub fn set_recorder(&self, recorder: Option<ProcRecorder>) {
+        *lock(&self.recorder) = recorder;
+    }
+
+    fn record_procs(
+        &self,
+        group: &super::bash_proc::ProcGroup,
+        job: Option<u64>,
+        command: Option<&str>,
+    ) {
+        let Some(recorder) = lock(&self.recorder).clone() else {
+            return;
+        };
+        let mut data = serde_json::json!({
+            "tag": group.tag,
+            "pgid": group.pgid,
+            "start": group.leader_start(),
+        });
+        if let Some(job) = job {
+            data["job"] = job.into();
+        }
+        if let Some(command) = command {
+            data["command"] = command.into();
+        }
+        recorder(data);
+    }
+
+    /// Stop the local jobs a killed process left running: `records` are this session's journaled
+    /// [`PROCS_ENTRY_KIND`] entries. A SIGKILL or an OOM kill runs no exit path, so a job's
+    /// processes outlive the process that started them; the next process to open the session finds
+    /// each by its tag (and its group, while the recorded leader still holds the number — see
+    /// [`super::bash_proc::ProcGroup`]) and stops it, SIGTERM then SIGKILL, as any other stop.
+    /// What it found is kept for the reopen note ([`Background::resume`]), and returned. A record
+    /// whose tag no live process carries is gone: its group number alone proves nothing. Never a
+    /// tag this process carries itself (it runs inside that job). Sandbox jobs are never here: the
+    /// sandbox owns them, and they are reattached instead. **Blocking.**
+    pub fn stop_survivors(&self, records: &[serde_json::Value]) -> Vec<SurvivorFate> {
+        let own = super::bash_proc::own_tags();
+        /// One job's records merged by tag: (pgid, leader start, job number, command).
+        type Recorded = (u32, Option<u64>, Option<u64>, Option<String>);
+        let mut by_tag: BTreeMap<String, Recorded> = BTreeMap::new();
+        for r in records {
+            let (Some(tag), Some(pgid)) = (
+                r.get("tag").and_then(serde_json::Value::as_str),
+                r.get("pgid")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|p| u32::try_from(p).ok()),
+            ) else {
+                continue;
+            };
+            if own.iter().any(|t| t == tag) {
+                continue;
+            }
+            let entry = by_tag
+                .entry(tag.to_string())
+                .or_insert((pgid, None, None, None));
+            entry.1 = entry
+                .1
+                .or(r.get("start").and_then(serde_json::Value::as_u64));
+            entry.2 = entry.2.or(r.get("job").and_then(serde_json::Value::as_u64));
+            if entry.3.is_none() {
+                entry.3 = r
+                    .get("command")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string);
+            }
+        }
+        let mut found = Vec::new();
+        for (tag, (pgid, start, job, command)) in by_tag {
+            let group = super::bash_proc::ProcGroup::recorded(pgid, start, tag);
+            if group.tag_alive() {
+                found.push((job, command.unwrap_or_default(), Kill::Procs(group)));
+            }
+        }
+        let kills: Vec<Kill> = found.iter().map(|(_, _, k)| k.clone()).collect();
+        let left = super::exec::kill_all(&kills);
+        let fates: Vec<SurvivorFate> = found
+            .into_iter()
+            .zip(left)
+            .map(|((job, command, _), survived)| SurvivorFate {
+                job,
+                command,
+                survived,
+            })
+            .collect();
+        lock(&self.survivors).found.extend(fates.iter().cloned());
+        fates
     }
 
     /// Run this session's remote jobs in the sandbox, under `scope` — see
@@ -484,8 +620,16 @@ impl BashJobs {
     }
 
     pub(crate) fn assign_id(&self, job: &mut Job) -> u64 {
-        *job.id
-            .get_or_insert_with(|| self.next.fetch_add(1, Ordering::Relaxed) + 1)
+        if let Some(id) = job.id {
+            return id;
+        }
+        let id = self.next.fetch_add(1, Ordering::Relaxed) + 1;
+        job.id = Some(id);
+        // Its processes were journaled at spawn; now their record names the job too.
+        if let Some(Kill::Procs(group)) = lock(&job.shared.kill).as_ref() {
+            self.record_procs(group, Some(id), Some(&job.command));
+        }
+        id
     }
 
     /// What a job of `kind` lives until, as the model is told when its call returns. `sandbox`:
@@ -575,6 +719,7 @@ impl BashJobs {
     /// read them now. For the end of a `run` and a transcript switch in `serve`.
     pub fn stop_all(&self) -> Vec<StoppedJob> {
         self.resumed.store(false, Ordering::Relaxed);
+        lock(&self.survivors).found.clear();
         self.stop(|_| true)
     }
 
@@ -825,39 +970,87 @@ impl Background for BashJobs {
         // A job the sandbox kept running (reattached when the session opened) is in the table:
         // still running, or ended with its notice on the way. Only the rest were stopped.
         let table = lock(&self.table);
-        let mut running = Vec::new();
-        let mut stopped = Vec::new();
+        let mut found = std::mem::take(&mut lock(&self.survivors).found);
+        let mut note = Reopened::default();
         for (id, left) in read.running {
             match table.get(&id) {
                 Some(p) if p.job.shared.ended() => {}
-                Some(p) => running.push((id, p.job.command.clone())),
-                None => stopped.push((id, left.command)),
+                Some(p) => note.running.push((id, p.job.command.clone())),
+                None => match found.iter().position(|f| f.job == Some(id)) {
+                    Some(i) => {
+                        let mut fate = found.remove(i);
+                        fate.command = left.command;
+                        note.push_found(fate);
+                    }
+                    None => note.gone.push((id, left.command)),
+                },
             }
         }
         drop(table);
-        reopen_note(&running, &stopped, self.next.load(Ordering::Relaxed) + 1)
+        // The rest ran when the process died but the transcript does not show them running: a
+        // foreground command still attached, or a yielded job a later prompt would have stopped.
+        for fate in found {
+            note.push_found(fate);
+        }
+        reopen_note(&note, self.next.load(Ordering::Relaxed) + 1)
     }
 }
 
-/// The note a reopened session's first run gets about the jobs its transcript left running
-/// ([`Background::resume`]): each was stopped when the session last closed — its process exited,
-/// or `serve` ended or switched away from the session — so it is gone, and `bash_job` no longer
-/// knows its id. `None` when the transcript left nothing running. The one place the note is
-/// written, so a host whose jobs can outlive a session has one function to add "still running"
-/// entries to.
-fn reopen_note(running: &[(u64, String)], stopped: &[(u64, String)], next: u64) -> Option<String> {
-    if running.is_empty() && stopped.is_empty() {
+/// What a reopened session's first run is told about the jobs its last process left: kept running by
+/// the sandbox, stopped now (a killed process left them running), still running because they could
+/// not be stopped, or no longer running.
+#[derive(Default)]
+struct Reopened {
+    running: Vec<(u64, String)>,
+    stopped_now: Vec<SurvivorFate>,
+    unstoppable: Vec<SurvivorFate>,
+    gone: Vec<(u64, String)>,
+}
+
+impl Reopened {
+    fn push_found(&mut self, fate: SurvivorFate) {
+        if fate.survived.is_some() {
+            self.unstoppable.push(fate);
+        } else {
+            self.stopped_now.push(fate);
+        }
+    }
+}
+
+/// How a found job is named in the note: by its number, or as the command it was.
+fn found_line(f: &SurvivorFate, state: &str) -> String {
+    match f.job {
+        Some(id) => format!("- job {id}: `{}` ({state})", f.command),
+        None => format!(
+            "- `{}` (a command still running when it closed; {state})",
+            f.command
+        ),
+    }
+}
+
+/// The note a reopened session's first run gets about the jobs its last process left
+/// ([`Background::resume`]). Each entry says what is true now: kept running in the sandbox (still a
+/// job `bash_job` knows), stopped just now (the process that ran it was killed before it could stop
+/// it), still running because it could not be stopped, or no longer running (stopped when the session
+/// closed, or exited). `None` when there is nothing to say. The one place the note is written.
+fn reopen_note(r: &Reopened, next: u64) -> Option<String> {
+    if r.running.is_empty()
+        && r.stopped_now.is_empty()
+        && r.unstoppable.is_empty()
+        && r.gone.is_empty()
+    {
         return None;
     }
     let mut parts = vec![format!(
         "{REMINDER_PREFIX} This session was closed since it last ran."
     )];
-    if !running.is_empty() {
-        let lines: Vec<String> = running
+    if !r.running.is_empty() {
+        let lines: Vec<String> = r
+            .running
             .iter()
             .map(|(id, command)| format!("- job {id}: `{command}` (still running)"))
             .collect();
-        let (it, each) = if running.len() == 1 {
+        let (it, each) = if r.running.len() == 1 {
             ("it", "it exits")
         } else {
             ("them", "each exits")
@@ -870,22 +1063,55 @@ fn reopen_note(running: &[(u64, String)], stopped: &[(u64, String)], next: u64) 
             lines.join("\n")
         ));
     }
-    if !stopped.is_empty() {
-        let lines: Vec<String> = stopped
+    if !r.stopped_now.is_empty() {
+        let lines: Vec<String> = r
+            .stopped_now
             .iter()
-            .map(|(id, command)| format!("- job {id}: `{command}` (stopped)"))
+            .map(|f| found_line(f, "stopped now"))
             .collect();
-        let (them, are) = if stopped.len() == 1 {
-            ("it", "is")
-        } else {
-            ("them", "are")
-        };
         parts.push(format!(
-            "The jobs it left running were stopped with it:\n{}\nNone of {them} {are} running now, \
-             and bash_job no longer knows {them}: do not wait on or kill {them}; start again what you \
-             still need.",
+            "The process that ran {} was killed before it could stop {}, so {} still running when \
+             the session reopened, and {} stopped now:\n{}",
+            plural(r.stopped_now.len(), "this", "these"),
+            plural(r.stopped_now.len(), "it", "them"),
+            plural(r.stopped_now.len(), "it was", "they were"),
+            plural(r.stopped_now.len(), "was", "were"),
             lines.join("\n")
         ));
+    }
+    if !r.unstoppable.is_empty() {
+        let lines: Vec<String> = r
+            .unstoppable
+            .iter()
+            .map(|f| {
+                let left = f.survived.as_deref().unwrap_or_default();
+                found_line(f, &format!("could not be stopped: {left} still running"))
+            })
+            .collect();
+        parts.push(format!(
+            "These were left running by a process that was killed, and could not be stopped (they \
+             belong to another user):\n{}",
+            lines.join("\n")
+        ));
+    }
+    if !r.gone.is_empty() {
+        let lines: Vec<String> = r
+            .gone
+            .iter()
+            .map(|(id, command)| format!("- job {id}: `{command}` (not running)"))
+            .collect();
+        parts.push(format!(
+            "These jobs it left running are no longer running (stopped when the session closed, or \
+             exited):\n{}",
+            lines.join("\n")
+        ));
+    }
+    if !r.stopped_now.is_empty() || !r.unstoppable.is_empty() || !r.gone.is_empty() {
+        parts.push(
+            "bash_job no longer knows any of those: do not wait on or kill them; start again what \
+             you still need."
+                .to_string(),
+        );
     }
     parts.push(format!("New jobs are numbered from {next}."));
     Some(parts.join(" "))

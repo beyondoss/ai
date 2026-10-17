@@ -4211,7 +4211,7 @@ impl RunJournal {
         if let Some(store) = guard.as_mut()
             && let Err(e) = store.append_journal(kind, data)
         {
-            eprintln!("run: failed to journal an MCP task: {e}");
+            eprintln!("run: failed to journal a session entry ({kind}): {e}");
         }
     }
 }
@@ -5465,6 +5465,27 @@ async fn run_task(
     ));
     if let Some(runner) = &exec_runner {
         tools::bash_sandbox::reattach(&bash_jobs, runner.clone()).await;
+    }
+    // Local jobs a killed earlier run left running (a SIGKILL runs no exit path to stop them) are
+    // found by their journaled tags and stopped now; the reopen note says which. And this run's own
+    // jobs are journaled as they spawn, for whoever opens the session after it.
+    if let Some(journal) = run_journal {
+        let records = journal
+            .store
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|s| s.active_journal(tools::bash_jobs::PROCS_ENTRY_KIND))
+            .unwrap_or_default();
+        if !records.is_empty() {
+            let jobs = bash_jobs.clone();
+            let _ = tokio::task::spawn_blocking(move || jobs.stop_survivors(&records)).await;
+        }
+        bash_jobs.set_recorder(Some(std::sync::Arc::new(|data| {
+            if let Some(journal) = RUN_JOURNAL.get() {
+                journal.append(tools::bash_jobs::PROCS_ENTRY_KIND, data);
+            }
+        })));
     }
     // `serve`'s own resolution (`build_agent`): the model's window, input limit and compaction cap,
     // then the `--context-window`/`--compact-at`/reserve/keep-recent overrides.

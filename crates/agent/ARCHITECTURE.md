@@ -2888,7 +2888,7 @@ separate host `bash` instance (`build_tools` with `bash_waits_for_exit`) over th
     not read), and the jobs it shows still running at its end (a `bash` result that parked one,
     minus finish notices, `bash_job` results that are not "still running", evictions, and yielded
     jobs a later prompt's turn-end stopped) are listed in one `[background jobs]` note (`reopen_note`,
-    the one place it is written) — "were stopped with it … New jobs are numbered from N" — attached
+    the one place it is written) — "no longer running … New jobs are numbered from N" — attached
     as a request-only block to the run's prompt: in every request of the process (a stable cached
     prefix), never persisted, never saved by the MCP App context sidecar
     (`background::is_process_state`), so each later reopen re-reads the transcript and says it
@@ -2899,6 +2899,25 @@ separate host `bash` instance (`build_tools` with `bash_waits_for_exit`) over th
     gone: it is in the table again by the first run, and the note lists it as "(still running)"
     under its old number, separately from the ones that were stopped; one that ended meanwhile is
     left to its finish notice.
+  - **A killed process's survivors (`BashJobs::stop_survivors`).** A SIGKILL or an OOM kill runs no
+    exit path, so the local jobs that process ran — background, and a foreground command still
+    attached — outlive it. Each local job's processes are journaled in the session as they spawn:
+    a sealed `bash_job_procs` custom entry (`PROCS_ENTRY_KIND`, one of `HOST_CUSTOM_KINDS`, so a
+    client cannot plant one) holding its process group, the leader's start time and its tag, and
+    again with its job number once parked (`BashJobs::set_recorder`: `run` appends through its
+    `RunJournal`; `serve` sends through its journal channel, stamped with the session). The next
+    process to open the session (`run` before its first turn; `serve` at start and on every
+    transcript change) reads them back and stops the survivors before the first run: a record counts
+    only if a live process carries its tag (a group number alone proves nothing), and is then
+    stopped as any job is — tag and group, the group only while the recorded leader still holds
+    the number (`exec::GroupId`'s recycled-pgid guard), SIGTERM, the grace, then SIGKILL
+    (`exec::kill_all`). Never a tag the reopening process itself carries. The reopen note then says
+    what is true per job: "stopped now", "could not be stopped" (naming what is left, processes of
+    another uid), or "not running" (stopped when the session closed, or exited); a foreground
+    command is named by its command. Sandbox jobs are never journaled here: the sandbox owns them
+    and they are reattached (next item). Tests: `tools/bash_jobs_reopen_tests.rs`,
+    `tests/bash_jobs_reopen_after_kill.rs` (SIGKILL a `run` and a `serve` with a background and a
+    foreground `sleep`, reopen, both are stopped and the note says so).
   - **Remote jobs belong to the sandbox (`tools::bash_sandbox`).** A session's table has a job
     scope (`BashJobs::set_scope`: `serve` and `run` set `JobScope::for_session(tenant, session)`;
     a subagent's table and `serve`'s host table have none and keep the stream-owned lifetime). With

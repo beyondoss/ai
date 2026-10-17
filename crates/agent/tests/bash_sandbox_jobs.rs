@@ -534,7 +534,7 @@ async fn the_reopen_note_says_a_job_the_sandbox_kept_is_still_running() {
             note.contains("- job 1: `npm run dev; sleep 300` (still running)"),
             "{note}"
         );
-        assert!(!note.contains("(stopped)"), "{note}");
+        assert!(!note.contains("(not running)"), "{note}");
         assert!(note.contains("New jobs are numbered from 2."), "{note}");
         sb.wipe().await;
     }

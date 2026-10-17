@@ -350,6 +350,8 @@ pub fn search_sessions(sessions: Vec<SessionMeta>, query: Option<&str>) -> Vec<S
 
 /// Custom-entry kinds the agent writes itself, and acts on when a session is replayed: an MCP task to
 /// resume, a resumed task's result and a "result pending" placeholder's mark (`crate::mcp_resume`),
+/// a local `bash` job's processes to stop if a killed process left them running
+/// (`crate::tools::bash_jobs::PROCS_ENTRY_KIND`),
 /// and `mcp_skill_approval`, which is no
 /// longer written (an approval read back from disk is one a model with file-write tools could have
 /// planted, so approvals are never persisted) but stays reserved so no client can make an older
@@ -360,6 +362,7 @@ pub const HOST_CUSTOM_KINDS: &[&str] = &[
     crate::mcp_resume::RESULT_ENTRY_KIND,
     crate::mcp_resume::PLACEHOLDER_ENTRY_KIND,
     "mcp_skill_approval",
+    crate::tools::bash_jobs::PROCS_ENTRY_KIND,
 ];
 
 /// Whether `kind` is one of [`HOST_CUSTOM_KINDS`].

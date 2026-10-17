@@ -19,7 +19,7 @@ use common::{
 use serde_json::{Value, json};
 
 const BIN: &str = env!("CARGO_BIN_EXE_beyond-ai-agent");
-const NOTE: &str = "were stopped with it";
+const NOTE: &str = "are no longer running";
 
 fn send(stdin: &mut ChildStdin, cmd: Value) {
     writeln!(stdin, "{cmd}").unwrap();
@@ -71,7 +71,7 @@ fn a_restarted_serve_session_is_told_its_jobs_stopped_and_numbers_past_them() {
         "is the server still up?",
     );
     assert!(
-        bodies[0].contains("- job 1: `echo up; sleep 90` (stopped)"),
+        bodies[0].contains("- job 1: `echo up; sleep 90` (not running)"),
         "the first request after the restart says job 1 stopped: {}",
         bodies[0]
     );
@@ -125,7 +125,7 @@ fn run_continue_is_told_the_last_runs_jobs_stopped() {
     run(&base, &["is the server still up?", "--continue"]);
     let bodies = bodies.lock().unwrap();
     assert!(
-        bodies[0].contains("- job 1: `echo up; sleep 90` (stopped)"),
+        bodies[0].contains("- job 1: `echo up; sleep 90` (not running)"),
         "{}",
         bodies[0]
     );

@@ -3247,6 +3247,7 @@ pub(crate) async fn serve_session(
     if reattached != Default::default() {
         tracing::info!(session = %persistence.session_id(), ?reattached, "reattached the session's sandbox jobs");
     }
+    stop_survivors(&bash_jobs, &persistence).await;
 
     // Slash-command prompt templates (`/name args`), discoverable skills, agent definitions and this
     // project's own instruction files — for `get_commands`, for expanding a `/name`/`/skill:name`
@@ -3770,6 +3771,9 @@ pub(crate) async fn serve_session(
     // run's event sink and from the background resumer, results from the resumer. Drained by the
     // idle loop, the busy loop and at run end; `data.sessionId` must match the session persisted to.
     let (mcp_task_tx, mut mcp_task_rx) = mpsc::unbounded_channel::<(String, Value)>();
+    // Each local `bash` job's processes are journaled through the same channel, stamped with the
+    // session they belong to (re-pointed on a transcript change below).
+    bash_jobs.set_recorder(Some(procs_recorder(&mcp_task_tx, persistence.session_id())));
     macro_rules! journal_mcp {
         ($kind:expr, $data:expr) => {{
             let data: Value = $data;
@@ -4812,6 +4816,8 @@ pub(crate) async fn serve_session(
                 persistence.session_id(),
             )));
             crate::tools::bash_sandbox::reattach(&bash_jobs, exec_cell.runner()).await;
+            stop_survivors(&bash_jobs, &persistence).await;
+            bash_jobs.set_recorder(Some(procs_recorder(&mcp_task_tx, persistence.session_id())));
             if !stopped_jobs.is_empty() {
                 emit!(OutFrame::Value(json!({
                     "type": "bash_jobs_stopped",
@@ -12766,6 +12772,38 @@ fn ack(id: Option<String>, command: &str) -> OutFrame {
 /// together (a `make -j` fan-out, a server and its watcher) then fold into one turn rather than one
 /// turn each.
 const BASH_JOBS_WAKE_SETTLE: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Stop the local `bash` jobs a killed process left running on the session `persistence` just
+/// opened — see [`crate::tools::bash_jobs::BashJobs::stop_survivors`]. Off the runtime thread: each
+/// stop blocks until its processes are gone.
+async fn stop_survivors(jobs: &Arc<crate::tools::bash_jobs::BashJobs>, persistence: &Persistence) {
+    let records = persistence.active_journal(crate::tools::bash_jobs::PROCS_ENTRY_KIND);
+    if records.is_empty() {
+        return;
+    }
+    let session = persistence.session_id().to_string();
+    let jobs = jobs.clone();
+    let fates = tokio::task::spawn_blocking(move || jobs.stop_survivors(&records))
+        .await
+        .unwrap_or_default();
+    if !fates.is_empty() {
+        tracing::info!(%session, ?fates, "stopped bash jobs a killed process left running");
+    }
+}
+
+/// Where a session's `bash` jobs journal their processes: the session loop's journal channel,
+/// stamped with `session` (the loop drops an entry for any other session).
+fn procs_recorder(
+    tx: &mpsc::UnboundedSender<(String, Value)>,
+    session: &str,
+) -> crate::tools::bash_jobs::ProcRecorder {
+    let tx = tx.clone();
+    let session = session.to_string();
+    Arc::new(move |mut data: Value| {
+        data["sessionId"] = Value::String(session.clone());
+        let _ = tx.send((crate::tools::bash_jobs::PROCS_ENTRY_KIND.to_string(), data));
+    })
+}
 
 /// Resolves once a parked `bash` job's finish notice is due, after [`BASH_JOBS_WAKE_SETTLE`].
 /// Level-triggered: the state is re-checked every time this future is created and after every

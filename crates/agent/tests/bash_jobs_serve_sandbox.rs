@@ -159,7 +159,7 @@ async fn a_background_job_outlives_its_serve_process_and_the_next_one_reports_it
         second[0]
     );
     assert!(
-        !second[0].contains("(stopped)"),
+        !second[0].contains("(not running)"),
         "nothing was stopped: {}",
         second[0]
     );
@@ -229,7 +229,7 @@ async fn a_job_that_ended_while_no_process_served_the_session_is_noticed_once() 
     );
     assert!(last.contains("built-while-away"), "{last}");
     assert!(
-        !last.contains("(stopped)"),
+        !last.contains("(not running)"),
         "an ended job is not reported stopped: {last}"
     );
 }

@@ -505,6 +505,7 @@ impl Bash {
         )>,
     ) -> Result<ToolOutput, ToolError> {
         let shared = Arc::new(JobShared::new(world.is_remote(), &self.jobs));
+        shared.set_command(truncate_command(command, COMMAND_CHARS));
         // A sandbox job when the sandbox can host it: held when its start can stream, kept from the
         // start otherwise — which only a background job needs; a foreground command over an endpoint
         // that cannot stream waits for its exit as before.
