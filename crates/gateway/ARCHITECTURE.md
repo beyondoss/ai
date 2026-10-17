@@ -1278,10 +1278,12 @@ What the parent does for every attempt, so a relayed request behaves like any ot
   attempt (one that recorded a `RelayRetry`) still feeds the breaker but writes no
   `ai.usage` or `ai.payload` row.
 - **One tenant slot, taken before the read.** `tenant_max_in_flight` is checked before the body is
-  read in full (`SlotGuard`), so it bounds the bodies held in memory, not only requests in flight: a
-  tenant at its cap gets its 429 before uploading. The parent holds the slot across every attempt;
-  attempts neither take nor release one. A client that stalls during that read gives it back at
-  `client_read_timeout_secs`, HTTP/2 included (D265).
+  read in full, so it bounds the bodies held in memory, not only requests in flight: a tenant at its
+  cap gets its 429 before uploading. The slot is a move-only guard (`concurrency::TenantSlot`, taken
+  only with an `Identity`) that the request context holds and that releases it when dropped, so
+  every way a request ends gives it back exactly once. The parent holds the slot across every
+  attempt; attempts neither take nor release one. A client that stalls during that read gives it
+  back at `client_read_timeout_secs`, HTTP/2 included (D265).
 - **Abandoned attempts wind down first.** The next attempt starts after the abandoned one finishes
   (bounded at 2s), since it still holds that candidate's breaker permit and a half-open breaker has
   one.

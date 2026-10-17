@@ -67,6 +67,7 @@
 use crate::cache;
 use crate::capture::CaptureBufs;
 use crate::circuit_breaker::{Answered, CircuitBreaker, Permit};
+use crate::concurrency::TenantSlot;
 use crate::drain::{self, Drain};
 use crate::key::{self, Identity};
 use crate::metrics::{DrainEnd, KeyCooled, Rejection};
@@ -277,8 +278,8 @@ struct Held {
     in_flight: bool,
     /// Counted on `ai_active_streams`.
     active_stream: bool,
-    /// Holds one of this tenant's `tenant_max_in_flight` slots.
-    tenant: Option<u64>,
+    /// One of this tenant's `tenant_max_in_flight` slots, when the request holds one.
+    tenant: Option<TenantSlot<'static>>,
     /// Bytes this request holds in the process body budget (`max_buffered_body_bytes`).
     body_bytes: usize,
     /// A `FullBody` re-run: its parent reserved the budget for both copies of the body.
@@ -377,11 +378,7 @@ impl Held {
     }
 
     fn release_tenant(&mut self) {
-        if let Some(tenant) = self.tenant.take()
-            && let Some(slots) = self.state.tenant_slots.as_ref()
-        {
-            slots.release(tenant);
-        }
+        self.tenant = None;
     }
 }
 
@@ -1977,22 +1974,13 @@ impl AiProxy {
         Box::pin(Self::reject(session, request_id, status, typ, msg)).await
     }
 
-    /// Take this tenant's concurrency slot before reading a body in full. `Ok(None)` when no cap is
-    /// configured; `Err` when the tenant is at its cap.
-    fn take_slot_before_read(
-        &self,
-        tenant_id: u64,
-    ) -> std::result::Result<Option<SlotGuard<'_>>, ()> {
-        let Some(slots) = self.state.tenant_slots.as_ref() else {
-            return Ok(None);
-        };
-        if !slots.try_acquire(tenant_id) {
-            return Err(());
+    /// This tenant's concurrency slot. `Ok(None)` when no cap is configured; `Err` when the tenant
+    /// is at its cap.
+    fn take_slot(&self, id: &Identity) -> std::result::Result<Option<TenantSlot<'static>>, ()> {
+        match self.state.tenant_slots.as_ref() {
+            None => Ok(None),
+            Some(slots) => slots.take(id).map(Some).ok_or(()),
         }
-        Ok(Some(SlotGuard {
-            slots: Some(slots),
-            tenant: tenant_id,
-        }))
     }
 
     async fn reject_tenant_busy(&self, session: &mut Session, request_id: &str) -> Result<bool> {
@@ -3035,29 +3023,6 @@ async fn peek_body_model(
         over_cap: over_cap && !done,
         over_budget,
     })
-}
-
-/// A tenant concurrency slot taken before the gateway reads a request body in full, so
-/// `tenant_max_in_flight` bounds the bodies held in memory and not only the requests in flight.
-/// Released on drop (every early return), or handed to the request context with [`Self::hand_over`]
-/// once the request is admitted, after which `logging` releases it.
-struct SlotGuard<'a> {
-    slots: Option<&'a crate::concurrency::TenantSlots>,
-    tenant: u64,
-}
-
-impl SlotGuard<'_> {
-    fn hand_over(mut self) {
-        self.slots = None;
-    }
-}
-
-impl Drop for SlotGuard<'_> {
-    fn drop(&mut self) {
-        if let Some(slots) = self.slots {
-            slots.release(self.tenant);
-        }
-    }
 }
 
 /// Whether the client asked for `100 Continue` before it sends the body. curl does for any body
@@ -4671,8 +4636,9 @@ impl ProxyHttp for AiProxy {
         let responses = route::is_responses_path(session.req_header().uri.path());
         let large = declared_len.is_none_or(past_replay_buffer);
         let mut peeked = false;
-        // Taken before any full read (see `SlotGuard`), handed to the request context below.
-        let mut early_slot: Option<SlotGuard<'_>> = None;
+        // The tenant slot, taken before any full read so `tenant_max_in_flight` bounds the bodies held
+        // in memory and not only the requests in flight; moved into the request context below.
+        let mut early_slot: Option<TenantSlot<'static>> = None;
         if let Some(id) = identity
             && model_route.is_none()
             && resolve_from_body
@@ -4692,7 +4658,7 @@ impl ProxyHttp for AiProxy {
                 }
                 CatalogHeader::Absent => {
                     if full_body.is_none() {
-                        match self.take_slot_before_read(id.tenant_id) {
+                        match self.take_slot(&id) {
                             Ok(guard) => early_slot = guard,
                             Err(()) => return self.reject_tenant_busy(session, &request_id).await,
                         }
@@ -4771,7 +4737,7 @@ impl ProxyHttp for AiProxy {
                 || route::walk_reads_body(route)
                 || route::walk_reads_tools(route, session.req_header().uri.path()))
         {
-            match self.take_slot_before_read(id.tenant_id) {
+            match self.take_slot(&id) {
                 Ok(guard) => early_slot = guard,
                 Err(()) => return self.reject_tenant_busy(session, &request_id).await,
             }
@@ -5472,18 +5438,14 @@ impl ProxyHttp for AiProxy {
         // `concurrency`). After the cache (a hit costs no provider spend) and before the breaker,
         // so a refused request never holds a half-open probe permit.
         let parent_holds_slot = full_body.as_ref().is_some_and(|fb| fb.slot_held);
-        let tenant_slot = match (self.state.tenant_slots.as_ref(), identity) {
+        let slot = match (early_slot, identity) {
             // A `FullBody` attempt whose parent holds the slot: neither take nor release one.
-            _ if parent_holds_slot => false,
-            // Taken before the body was read; `logging` releases it from here on.
-            _ if early_slot.is_some() => {
-                if let Some(guard) = early_slot.take() {
-                    guard.hand_over();
-                }
-                true
-            }
-            (Some(slots), Some(id)) => {
-                if !slots.try_acquire(id.tenant_id) {
+            _ if parent_holds_slot => None,
+            // Taken before the body was read.
+            (Some(slot), _) => Some(slot),
+            (None, Some(id)) => match self.take_slot(&id) {
+                Ok(slot) => slot,
+                Err(()) => {
                     self.state
                         .metrics
                         .rejection(Rejection::TenantConcurrency)
@@ -5497,9 +5459,8 @@ impl ProxyHttp for AiProxy {
                     )
                     .await;
                 }
-                true
-            }
-            _ => false,
+            },
+            (None, None) => None,
         };
 
         // Circuit breaker (per provider, all traffic — a down provider is down regardless of whose
@@ -5519,12 +5480,8 @@ impl ProxyHttp for AiProxy {
             _ => Ok(None),
         };
         if let Err(breaker) = breaker_permit {
-            if tenant_slot
-                && let Some(slots) = self.state.tenant_slots.as_ref()
-                && let Some(id) = identity
-            {
-                slots.release(id.tenant_id);
-            }
+            // Given back before the refusal is written: a slow client must not hold it.
+            drop(slot);
             self.state.metrics.rejection(Rejection::CircuitOpen).inc();
             let retry_after = Some(breaker.retry_after_secs());
             return Box::pin(Self::reject_retry_after(
@@ -5542,9 +5499,7 @@ impl ProxyHttp for AiProxy {
         let permit = breaker_permit.ok().flatten();
         // Past any key cooling off from a 401 (D71); a catalog walk picks per candidate.
         let pool_key = provider.first_key();
-        if tenant_slot {
-            ctx.held.tenant = identity.map(|id| id.tenant_id);
-        }
+        ctx.held.tenant = slot;
 
         ctx.rc = Some(RequestCtx {
             billing: Billing::of(identity),

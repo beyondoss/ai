@@ -15,6 +15,7 @@
 //! State is exact, not a sketch: two tenants must never share a ceiling. Sparse — a tenant with
 //! nothing in flight has no entry — and sharded so tenants on different shards never contend.
 
+use crate::key::Identity;
 use rustc_hash::FxHashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
@@ -111,9 +112,19 @@ impl TenantSlots {
         })
     }
 
+    /// One of `id`'s slots, held until the returned guard drops. `None` when the tenant is at its
+    /// ceiling and nothing was claimed.
+    pub fn take(&self, id: &Identity) -> Option<TenantSlot<'_>> {
+        self.try_acquire(id.tenant_id).then_some(TenantSlot {
+            slots: self,
+            tenant: id.tenant_id,
+        })
+    }
+
     /// Claim a slot for `tenant`. `false` means the tenant is at its ceiling and nothing was
-    /// claimed. Every `true` must be paired with exactly one [`Self::release`].
-    pub fn try_acquire(&self, tenant: u64) -> bool {
+    /// claimed. Every `true` must be paired with exactly one [`Self::release`]: [`TenantSlot`] is
+    /// what pairs them.
+    fn try_acquire(&self, tenant: u64) -> bool {
         let mut shard = self.shard(tenant);
         let n = shard.entry(tenant).or_insert(0);
         if *n >= self.limit {
@@ -123,7 +134,7 @@ impl TenantSlots {
         true
     }
 
-    pub fn release(&self, tenant: u64) {
+    fn release(&self, tenant: u64) {
         let mut shard = self.shard(tenant);
         if let Some(n) = shard.get_mut(&tenant) {
             *n = n.saturating_sub(1);
@@ -150,6 +161,22 @@ impl TenantSlots {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         }
+    }
+}
+
+/// One of a tenant's `tenant_max_in_flight` slots: taken by [`TenantSlots::take`] and given back
+/// when dropped, so whichever way a request ends (an early refusal, `logging`, a drain that frees
+/// it early, a panic unwinding the context) it is released exactly once. Move-only; whoever holds
+/// it owns the slot.
+#[must_use = "a slot dropped at once is released at once"]
+pub struct TenantSlot<'a> {
+    slots: &'a TenantSlots,
+    tenant: u64,
+}
+
+impl Drop for TenantSlot<'_> {
+    fn drop(&mut self) {
+        self.slots.release(self.tenant);
     }
 }
 
