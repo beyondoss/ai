@@ -2328,6 +2328,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             if let Err(e) = ToolPolicy::validate_deny_path_patterns(&deny_path) {
                 return Err(e.into());
             }
+            tools::selection::check_tool_flags(
+                tools.as_deref(),
+                exclude_tools.as_deref(),
+                &deny_tool,
+                no_tools,
+            )?;
+            beyond_ai_agent::skills::check_paths("--skill", &extra_skill_paths)?;
+            beyond_ai_agent::skills::check_paths(
+                "--prompt-template",
+                &extra_prompt_template_paths,
+            )?;
             // Same filesystem-path-injection concern as `run`'s identical check (`--session-id` becomes
             // part of a persisted session's filename) — see `is_valid_session_id`'s doc comment.
             if let Some(id) = &session_id
@@ -4479,6 +4490,14 @@ async fn run_task(
     if let Err(e) = ToolPolicy::validate_deny_path_patterns(&deny_path) {
         return Err(e.into());
     }
+    tools::selection::check_tool_flags(
+        tools_allow.as_deref(),
+        tools_exclude.as_deref(),
+        &deny_tool,
+        no_tools,
+    )?;
+    beyond_ai_agent::skills::check_paths("--skill", &extra_skill_paths)?;
+    beyond_ai_agent::skills::check_paths("--prompt-template", &extra_prompt_template_paths)?;
     // `--session-id` is embedded directly into a filename (`SessionMeta::with_id` →
     // `SessionRepo::path_for`'s `{created_at}_{id}.jsonl`) with no other sanitization — an id like
     // `../../../tmp/pwned/evil` would write (and `mkdir -p`, since `SessionStore::create` does that

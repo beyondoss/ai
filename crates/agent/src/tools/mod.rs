@@ -36,6 +36,7 @@ pub(crate) mod mcp_wire;
 pub mod memory;
 pub mod output;
 pub mod read;
+pub mod selection;
 pub mod structured_output;
 pub mod subagent;
 pub mod todo;
@@ -876,9 +877,9 @@ pub fn default_registry_with_config(cfg: &ToolConfig<'_>) -> ToolRegistry {
 /// otherwise has no way to run with less than the full default tool set. `no_tools` wins outright
 /// (checked first); otherwise `tools` (if given) narrows to exactly those names, and `exclude` (if
 /// given) drops names from whatever remains — so `tools` + `exclude` can combine to carve one tool out
-/// of an allow-list, though picking just one of the three is the common case. Unknown names in either
-/// list are silently ignored (there's nothing to remove/keep that isn't already there), matching
-/// `ToolRegistry::retain`'s set semantics rather than erroring on a typo.
+/// of an allow-list, though picking just one of the three is the common case. Names match exactly;
+/// `run`/`serve` refuse an unknown one at startup ([`selection::check_tool_flags`]), so by the time a
+/// list reaches here every name is a built-in or an `mcp__` name.
 ///
 /// With no `--tools` allow-list, [`OPTIONAL_BUILTINS`] (`web`) is dropped so a bare invocation does
 /// not advertise `web`. Pass `--tools web` to opt it in; it stays constructed in [`default_registry`]
