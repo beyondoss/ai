@@ -177,7 +177,25 @@ pub fn expand_tilde(path: &str, home: Option<&str>) -> String {
 ///
 /// Shared by `write` and `edit`: both replace whole files and must not leave a corrupt intermediate
 /// state that a later read (or `serve` reattach) would observe.
+///
+/// **Not synced to disk**: a crash leaves the old file or the new one, but a power loss can still
+/// lose the write. That is the right trade for the model's file edits, which an `fsync` would make
+/// cost milliseconds each (about 9 ms on macOS) for no benefit. State that must survive a power loss
+/// uses [`write_atomic_durable`].
 pub(crate) fn write_atomic(path: &str, content: &[u8]) -> std::io::Result<()> {
+    write_atomic_with(path, content, false)
+}
+
+/// [`write_atomic`], and durable: the temp file is `fsync`ed before the rename and the directory
+/// after it, so a power loss leaves the old file or the new one, never a path naming an empty or
+/// partial file. A filesystem may commit the rename (metadata) ahead of the data, which without the
+/// first sync is exactly how `auth.json` or `settings.json` comes back empty. For the settings, trust,
+/// auth and MCP-auth stores — small, rarely written, and costly to lose.
+pub(crate) fn write_atomic_durable(path: &str, content: &[u8]) -> std::io::Result<()> {
+    write_atomic_with(path, content, true)
+}
+
+fn write_atomic_with(path: &str, content: &[u8], durable: bool) -> std::io::Result<()> {
     use std::io::Write as _;
 
     let p = std::path::Path::new(path);
@@ -210,20 +228,95 @@ pub(crate) fn write_atomic(path: &str, content: &[u8]) -> std::io::Result<()> {
 
     let tmp = p.with_file_name(format!(".{}.tmp.{}", name.to_string_lossy(), temp_suffix()));
     let mut f = opts.open(&tmp)?;
-    if let Err(e) = f.write_all(content) {
+    // Durable: the bytes are on disk before the rename can be (see `write_atomic_durable`).
+    let written = f.write_all(content).and_then(|()| {
+        if !durable {
+            return Ok(());
+        }
+        durability_step(p, DurabilityStep::SyncTemp);
+        f.sync_all()
+    });
+    if let Err(e) = written {
         drop(f);
         let _ = std::fs::remove_file(&tmp); // don't leave the temp behind on a mid-write failure
         return Err(e);
     }
     drop(f);
 
+    durability_step(p, DurabilityStep::Rename);
     match std::fs::rename(&tmp, p) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            if durable {
+                sync_parent_dir(p);
+            }
+            Ok(())
+        }
         Err(e) => {
             let _ = std::fs::remove_file(&tmp); // don't leave the temp behind on failure
             Err(e)
         }
     }
+}
+
+/// Make a rename in `path`'s directory durable: until the directory itself is synced, a power loss
+/// can bring back the entry as it was before. Best effort, because the rename has already happened —
+/// the new content is in place and readable, and reporting the write failed would be wrong. Some
+/// filesystems refuse `fsync` on a directory, and off unix a directory cannot be opened to sync.
+fn sync_parent_dir(path: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        let dir = match path.parent() {
+            Some(d) if !d.as_os_str().is_empty() => d,
+            _ => std::path::Path::new("."),
+        };
+        durability_step(path, DurabilityStep::SyncDir);
+        if let Ok(d) = std::fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
+/// The durability-relevant steps of [`write_atomic_durable`] (and of [`write_atomic`]), recorded in
+/// order under test, with the path written, so their order can be asserted without tracing syscalls.
+/// Process-wide rather than per-thread: the file tools write on the blocking pool.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DurabilityStep {
+    SyncTemp,
+    Rename,
+    SyncDir,
+}
+
+#[cfg(test)]
+static DURABILITY_STEPS: std::sync::Mutex<Vec<(std::path::PathBuf, DurabilityStep)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[inline]
+fn durability_step(path: &std::path::Path, step: DurabilityStep) {
+    #[cfg(test)]
+    DURABILITY_STEPS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((path.to_path_buf(), step));
+    #[cfg(not(test))]
+    let _ = (path, step);
+}
+
+/// Take the steps recorded for writes to `path` (other tests' writes are left alone).
+#[cfg(test)]
+fn take_durability_steps(path: &std::path::Path) -> Vec<DurabilityStep> {
+    let mut all = DURABILITY_STEPS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut mine = Vec::new();
+    all.retain(|(p, step)| {
+        if p == path {
+            mine.push(*step);
+            false
+        } else {
+            true
+        }
+    });
+    mine
 }
 
 /// Resolve `path` to its real target when it's a symlink, so [`write_atomic`] writes through it
@@ -947,6 +1040,60 @@ mod tests {
         assert_eq!(
             normalize_path("file:///home/jared/~weird@name.txt"),
             "/home/jared/~weird@name.txt"
+        );
+    }
+
+    /// The durable write syncs the new content before the rename publishes it, and the directory
+    /// after: a power loss can leave the old file or the new one, never a path naming an empty or
+    /// partial file. A failed rename syncs no directory.
+    #[test]
+    fn write_atomic_durable_syncs_the_temp_before_the_rename_and_the_directory_after() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("auth.json");
+        let steps = || take_durability_steps(&target);
+        write_atomic_durable(target.to_str().unwrap(), b"{}").unwrap();
+        #[cfg(unix)]
+        let expected = [
+            DurabilityStep::SyncTemp,
+            DurabilityStep::Rename,
+            DurabilityStep::SyncDir,
+        ];
+        #[cfg(not(unix))]
+        let expected = [DurabilityStep::SyncTemp, DurabilityStep::Rename];
+        assert_eq!(steps(), expected);
+        assert_eq!(std::fs::read(&target).unwrap(), b"{}");
+
+        let blocked = dir.path().join("a-directory");
+        std::fs::create_dir(&blocked).unwrap();
+        assert!(write_atomic_durable(blocked.to_str().unwrap(), b"x").is_err());
+        assert_eq!(
+            take_durability_steps(&blocked),
+            [DurabilityStep::SyncTemp, DurabilityStep::Rename],
+            "a rename that failed published nothing to sync"
+        );
+    }
+
+    /// The `write` and `edit` tools never pay for an `fsync`: their path (`LocalFs` → `write_atomic`)
+    /// renames without syncing anything.
+    #[tokio::test]
+    async fn the_write_and_edit_tools_do_not_fsync() {
+        use crate::tools::fs::FsBackend as _;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("main.rs");
+        let fs = crate::tools::fs::local::LocalFs::new();
+        fs.write_bytes(&target, b"fn main() {}".to_vec())
+            .await
+            .unwrap();
+        let mtime = std::fs::metadata(&target).unwrap().modified().unwrap();
+        assert!(
+            fs.write_if_unchanged(&target, b"fn main() { }".to_vec(), Some(mtime))
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            take_durability_steps(&target),
+            [DurabilityStep::Rename, DurabilityStep::Rename],
+            "a tool write renamed into place and synced nothing"
         );
     }
 

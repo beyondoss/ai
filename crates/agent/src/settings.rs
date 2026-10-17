@@ -15,7 +15,6 @@
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
@@ -658,7 +657,7 @@ impl SettingsStore {
         self.mutate_locked(move |s| s.follow_up_mode = mode)
     }
 
-    /// Acquire the cross-process lock (see [`FileLock`]), re-read the store's *current* on-disk state —
+    /// Acquire the cross-process lock (see [`crate::file_lock::lock_store_file`]), re-read the store's *current* on-disk state —
     /// not `self`'s possibly-stale in-memory copy, which another process may have moved past since this
     /// handle's `open()` or its own last mutation — apply `mutate` to that fresh state, and persist it.
     /// `self` is updated to match afterward, so this handle's own `get()` stays consistent with what's
@@ -666,7 +665,7 @@ impl SettingsStore {
     /// `agent settings` invocations changing different fields concurrently must not let whichever writes
     /// last silently clobber the other's change.
     fn mutate_locked(&mut self, mutate: impl FnOnce(&mut Settings)) -> std::io::Result<()> {
-        let _lock = FileLock::acquire(&self.path)?;
+        let _lock = crate::file_lock::lock_store_file(&self.path)?;
         let mut settings = read_store_file(&self.path);
         mutate(&mut settings);
         write_store_file(&self.path, &settings)?;
@@ -773,86 +772,7 @@ fn write_store_file(path: &Path, settings: &Settings) -> std::io::Result<()> {
     let path_str = path
         .to_str()
         .ok_or_else(|| std::io::Error::other(format!("non-UTF-8 path: {}", path.display())))?;
-    crate::tools::write_atomic(path_str, body.as_bytes())
-}
-
-/// How long [`FileLock::acquire`] retries before giving up.
-const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
-/// How long between retries while waiting for another process's lock.
-const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(20);
-/// A lock file older than this is assumed abandoned (its owner crashed without cleaning up, rather than
-/// genuinely being mid-operation for this long — a settings read/parse/write is a handful of
-/// milliseconds) and is forcibly reclaimed instead of blocking every future `agent settings` indefinitely.
-const STALE_LOCK_AGE: Duration = Duration::from_secs(10);
-
-/// A cross-process advisory lock via atomic lockfile creation — the same pattern
-/// `trust_store.rs::FileLock` already uses for its own on-disk store, duplicated here rather than shared:
-/// each store is small and self-contained, and the two have no other reason to depend on each other.
-/// Released by deleting the lock file on `Drop`, so a panicked or early-returning holder still releases
-/// it.
-struct FileLock {
-    path: PathBuf,
-}
-
-impl FileLock {
-    fn acquire(store_path: &Path) -> std::io::Result<Self> {
-        let lock_path = lock_path_for(store_path);
-        if let Some(parent) = lock_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let deadline = Instant::now() + LOCK_TIMEOUT;
-        loop {
-            match fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&lock_path)
-            {
-                Ok(_) => return Ok(Self { path: lock_path }),
-                Err(e) if e.kind() == ErrorKind::AlreadyExists => {
-                    if is_stale(&lock_path) {
-                        // Best-effort: another process reclaiming it at the same instant just means our
-                        // own retry loop's next `create_new` fails normally and we wait it out.
-                        let _ = fs::remove_file(&lock_path);
-                        continue;
-                    }
-                    if Instant::now() >= deadline {
-                        return Err(std::io::Error::new(
-                            ErrorKind::TimedOut,
-                            format!(
-                                "timed out waiting for settings store lock at {}",
-                                lock_path.display()
-                            ),
-                        ));
-                    }
-                    std::thread::sleep(LOCK_RETRY_INTERVAL);
-                }
-                Err(e) => return Err(e),
-            }
-        }
-    }
-}
-
-impl Drop for FileLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
-}
-
-fn is_stale(lock_path: &Path) -> bool {
-    fs::metadata(lock_path)
-        .and_then(|m| m.modified())
-        .and_then(|modified| {
-            SystemTime::now()
-                .duration_since(modified)
-                .map_err(std::io::Error::other)
-        })
-        .is_ok_and(|age| age > STALE_LOCK_AGE)
-}
-
-fn lock_path_for(store_path: &Path) -> PathBuf {
-    let mut os = store_path.as_os_str().to_owned();
-    os.push(".lock");
-    PathBuf::from(os)
+    crate::tools::write_atomic_durable(path_str, body.as_bytes())
 }
 
 /// The root config directory both this store and `trust_store.rs`'s persist under — `~/.claude` unless
@@ -1750,21 +1670,52 @@ mod tests {
         assert!(path.exists());
     }
 
+    /// What a writer that crashed while holding the lock leaves behind — the old protocol's
+    /// `<file>.lock`, fresh, and an unheld lock file of the current one — does not block the next
+    /// write. (The old lock made every write fail with `TimedOut` until that file aged out.)
     #[test]
-    fn a_stale_lock_file_is_reclaimed_rather_than_blocking_forever() {
+    fn a_lock_left_by_a_crashed_writer_does_not_block_the_next_write() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
-        let lock_path = lock_path_for(&path);
-        fs::write(&lock_path, b"").unwrap();
-        let stale = SystemTime::now() - (STALE_LOCK_AGE + Duration::from_secs(1));
-        fs::File::open(&lock_path)
-            .unwrap()
-            .set_modified(stale)
-            .unwrap();
+        fs::write(dir.path().join("settings.json.lock"), b"").unwrap();
+        fs::write(dir.path().join("settings.json.beyond-lock"), b"").unwrap();
 
+        let started = std::time::Instant::now();
         let mut store = SettingsStore::open(path);
         store.set_default_model(Some("m".to_string())).unwrap();
         assert_eq!(store.get().default_model.as_deref(), Some("m"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    /// A live holder's lock makes the next writer wait, and that writer then goes through on fresh
+    /// state: writes are serialized, not refused and not interleaved.
+    #[test]
+    fn a_held_lock_makes_the_next_writer_wait_then_go_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let held = crate::file_lock::lock_store_file(&path).unwrap();
+        let writer = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                SettingsStore::open(path).set_default_model(Some("waited".to_string()))
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(!writer.is_finished(), "wrote while the lock was held");
+        // What the holder writes under its lock is kept: the waiter re-reads after taking it.
+        write_store_file(
+            &path,
+            &Settings {
+                default_session_dir: Some("/held".to_string()),
+                ..Settings::default()
+            },
+        )
+        .unwrap();
+        drop(held);
+        writer.join().unwrap().unwrap();
+        let after = SettingsStore::open(path);
+        assert_eq!(after.get().default_model.as_deref(), Some("waited"));
+        assert_eq!(after.get().default_session_dir.as_deref(), Some("/held"));
     }
 
     #[test]
