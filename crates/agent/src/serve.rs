@@ -562,7 +562,7 @@ pub struct ServeConfig {
     pub continue_session: bool,
     /// Skip persistence entirely, even though neither `session_file` nor `session_dir` was set —
     /// without this, `Persistence::open` defaults to a per-cwd directory under
-    /// `~/.claude/sessions/<encoded-cwd>/` rather than silently running in-memory-only (an operator
+    /// `~/.beyond/sessions/<encoded-cwd>/` rather than silently running in-memory-only (an operator
     /// who simply forgot the flag would otherwise lose all history on restart with no indication why).
     /// An explicit opt-out for the cases that genuinely want pure in-memory operation (e.g. a
     /// short-lived test harness).

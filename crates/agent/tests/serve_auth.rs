@@ -28,7 +28,7 @@ fn serve_cmd_with_real_home(bin: &str, session_file: &str, home: &std::path::Pat
 }
 
 fn write_auth_json(home: &std::path::Path, body: &str) {
-    let dir = home.join(".claude");
+    let dir = home.join(".beyond");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("auth.json"), body).unwrap();
 }

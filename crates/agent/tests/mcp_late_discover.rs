@@ -22,7 +22,7 @@ use serde_json::{Value, json};
 /// Run once with `server` configured; assert it connected and `tool` is advertised.
 fn assert_connects(server: Value, tool: &str) {
     let home = tempfile::tempdir().unwrap();
-    let dir = home.path().join(".claude");
+    let dir = home.path().join(".beyond");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
         dir.join("settings.json"),

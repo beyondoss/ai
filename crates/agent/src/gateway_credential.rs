@@ -301,7 +301,7 @@ pub fn resolve_gateway_credential_and_headers(
 /// credentials and `models.json` — passed in rather than read from disk.
 ///
 /// The whole precedence ladder lives here, and this is the seam every test drives it through. Reading
-/// `~/.claude/*` inside the resolver would make the ladder testable only on a machine with the right
+/// `~/.beyond/*` inside the resolver would make the ladder testable only on a machine with the right
 /// files (and untestable in parallel, since the alternative is mutating `$HOME`) — so the two file reads
 /// stay in the thin wrapper above, and the logic below is a pure function of its arguments. Same
 /// convention `ProviderEnv` follows for process env.
@@ -1184,7 +1184,7 @@ fn direct_route_path(dialect: agent_core::dialect::Dialect, base_url: &str) -> &
 /// per-override at all — its `path` is a fixed `&'static str` constant, not an interpolated owned
 /// string) rather than `path`, so this composes within `agent_core::client`'s existing types without
 /// needing a change there. Factored out from `resolve_gateway_credential` so both this and
-/// [`direct_route_path`] are unit-testable directly, without touching the real `~/.claude/models.json`
+/// [`direct_route_path`] are unit-testable directly, without touching the real `~/.beyond/models.json`
 /// file `ModelOverrides::open_default` reads from.
 ///
 /// Fix #33 (pi-parity audit): the deployment-segment insertion above is skipped for

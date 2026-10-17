@@ -122,7 +122,7 @@ A session id is an **address**, and it's the only thing that names a session out
 `serve` take the same three:
 
 ```sh
-beyond-ai-agent run "..."                      # a new session, persisted under ~/.claude/sessions/<cwd>/
+beyond-ai-agent run "..."                      # a new session, persisted under ~/.beyond/sessions/<cwd>/
 beyond-ai-agent run --continue "..."           # reattach to this directory's most recent session
 beyond-ai-agent run --session-id build-42 "…"  # open session build-42, or create it — same session every time
 ```
@@ -135,6 +135,19 @@ multi-tenant, and what the daemon's `?session_id=` routing is built on.
 
 A bare launch starts its own session rather than reattaching, so two shells (or two servers) working in
 one directory don't silently drive the same transcript. Use `--continue` when you want the old one.
+
+### Where the agent keeps its state
+
+Everything the agent writes about itself lives in `~/.beyond` (or `$AI_AGENT_CONFIG_DIR`): settings,
+logins (`auth.json`, `mcp_auth.json`), trust grants, `models.json`, memory, the MCP tool cache and
+sessions. A project's own settings go in `<project>/.beyond/settings.json`.
+
+`~/.claude` belongs to Claude Code. The agent reads its skills, agents, prompt templates and
+`CLAUDE.md` from there, and a project's `.claude/settings.json` for the keys the agent knows, but it
+never writes anything under `~/.claude`.
+
+Upgrading from a release that kept state in `~/.claude`: nothing is migrated. Run `login` and `trust`
+again and re-apply any `settings`; sessions under `~/.claude/sessions` are no longer listed.
 
 ### Running the tools against a remote exec endpoint
 

@@ -118,17 +118,22 @@ pub fn invocation_key(config: &McpServerConfig) -> String {
 /// Passed in rather than read from `HOME` at the point of use. Two reasons, and the second is the
 /// one that bit: an ambient `HOME` makes this untestable (setting an env var in-process is `unsafe`
 /// in edition 2024, which this crate forbids), and — worse — a test run would write into the
-/// developer's own `~/.claude`, so one test's discovery silently changed the next test's behavior.
+/// developer's own state directory, so one test's discovery silently changed the next test's behavior.
 /// That actually happened: a reaping test started passing for the wrong reason because a previous
 /// run had left a manifest behind.
 #[derive(Debug, Clone)]
 pub struct ManifestDir(PathBuf, &'static str);
 
 impl ManifestDir {
-    /// The real location, under the agent's own state directory. It describes the *machine's*
-    /// configured servers, so it belongs beside the other agent state rather than in a session.
+    /// The real location, under the agent's own state directory (`~/.beyond`, or
+    /// `$AI_AGENT_CONFIG_DIR`). It describes the *machine's* configured servers, so it belongs beside
+    /// the other agent state rather than in a session. `None` when there is neither a `HOME` nor an
+    /// override to put it under.
     pub fn from_home() -> Option<Self> {
-        std::env::var_os("HOME").map(|h| Self(PathBuf::from(h).join(".claude"), FILE))
+        if std::env::var_os("AI_AGENT_CONFIG_DIR").is_none() && std::env::var_os("HOME").is_none() {
+            return None;
+        }
+        Some(Self(crate::settings::config_dir_root(), FILE))
     }
 
     /// An explicit directory — what tests use, and what an embedder can point wherever it likes.

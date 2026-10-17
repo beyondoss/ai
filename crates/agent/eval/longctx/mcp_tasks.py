@@ -63,7 +63,7 @@ def prewarm(cache: Path) -> None:
 
 
 def settings(workdir: Path, cache: Path) -> dict:
-    """`$HOME/.claude/settings.json` for a run: the three servers, sharing one npm/browser cache."""
+    """`$HOME/.beyond/settings.json` for a run: the three servers, sharing one npm/browser cache."""
     env = cache_env(cache)
     servers = []
     for name, args in SERVERS.items():

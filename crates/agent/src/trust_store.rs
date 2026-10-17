@@ -27,7 +27,8 @@ use crate::path_utils::resolved_path as resolved_key_path;
 /// Whether `cwd` has anything project trust actually gates: a `SYSTEM.md`/`APPEND_SYSTEM.md`
 /// override, project-local skills (`.claude/skills`, or an `.agents/skills` at any ancestor level up
 /// to the enclosing git-repo root), project-local prompt templates (`.claude/prompts`), or a
-/// project-level settings tier (`.claude/settings.json` — Round 3, pi-parity feature: see
+/// project-level settings tier (`.beyond/settings.json`, or `.claude/settings.json` read for
+/// compatibility — see
 /// `settings::effective_settings_for_cwd`) — see `resources.rs`/`skills.rs`/`prompts.rs`/`settings.rs`
 /// for where each of these is actually read. When none exist, there's nothing an untrusted checkout
 /// could do differently by being trusted, so a caller can treat the directory as trusted without ever
@@ -42,6 +43,7 @@ pub fn has_trust_gated_resources(cwd: &Path) -> bool {
         || cwd.join(".claude/skills").is_dir()
         || cwd.join(".claude/prompts").is_dir()
         || cwd.join(".claude/settings.json").is_file()
+        || cwd.join(".beyond/settings.json").is_file()
         // pi-parity fix (Task #45): the operator's own `~/.agents/skills` (pi's documented,
         // always-trusted personal-skills convention) must not itself count as a project-controlled,
         // trust-gated resource — `collect_ancestor_agents_skill_dirs` alone has no notion of "this
@@ -83,7 +85,7 @@ struct StoreFile {
 }
 
 impl TrustStore {
-    /// Open the default trust store (`~/.claude/trusted-projects.json`). A missing or unparsable file
+    /// Open the default trust store (`~/.beyond/trusted-projects.json`). A missing or unparsable file
     /// is treated as an empty allowlist — nothing is trusted until explicitly recorded.
     pub fn open_default() -> Self {
         Self::open(default_path())
@@ -264,10 +266,8 @@ fn canonical_key(path: &Path) -> String {
     resolved_key_path(path).display().to_string()
 }
 
-/// pi-parity fix: previously hardcoded `home.join(".claude/...")` directly, with no way to redirect it
-/// short of overriding `$HOME` itself (which also moves every other HOME-relative thing). Shares
-/// `settings.rs::config_dir_root`'s `AI_AGENT_CONFIG_DIR`-aware resolution rather than duplicating it —
-/// both stores' config directory must agree on the same root.
+/// `~/.beyond/trusted-projects.json` (or under `$AI_AGENT_CONFIG_DIR`) — the agent's own state directory,
+/// shared with `settings.rs` via `config_dir_root` so both stores agree on the same root.
 fn default_path() -> PathBuf {
     crate::settings::config_dir_root().join("trusted-projects.json")
 }
@@ -290,6 +290,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir_all(dir.path().join(".claude")).unwrap();
         fs::write(dir.path().join(".claude/SYSTEM.md"), "custom identity").unwrap();
+        assert!(has_trust_gated_resources(dir.path()));
+    }
+
+    #[test]
+    fn has_trust_gated_resources_is_true_for_a_dot_beyond_settings_json() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".beyond")).unwrap();
+        fs::write(
+            dir.path().join(".beyond/settings.json"),
+            r#"{"default_model":"m"}"#,
+        )
+        .unwrap();
         assert!(has_trust_gated_resources(dir.path()));
     }
 
@@ -457,8 +469,8 @@ mod tests {
         let project = dir.path().join("project");
         fs::create_dir_all(&project).unwrap();
         // A nested store path whose parent directory doesn't exist yet — matches the real
-        // `~/.claude/trusted-projects.json` layout on a fresh `~/.claude`.
-        let store_path = dir.path().join("nested/.claude/trusted-projects.json");
+        // `~/.beyond/trusted-projects.json` layout on a fresh `~/.beyond`.
+        let store_path = dir.path().join("nested/.beyond/trusted-projects.json");
 
         let mut store = TrustStore::open(store_path.clone());
         store.trust(&project).unwrap();

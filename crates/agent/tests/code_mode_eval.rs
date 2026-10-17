@@ -40,7 +40,7 @@ fn stdio_server_config(name: &str) -> Value {
 }
 
 fn write_global_settings(home: &Path, servers: &[Value]) {
-    let claude_dir = home.join(".claude");
+    let claude_dir = home.join(".beyond");
     std::fs::create_dir_all(&claude_dir).unwrap();
     std::fs::write(
         claude_dir.join("settings.json"),

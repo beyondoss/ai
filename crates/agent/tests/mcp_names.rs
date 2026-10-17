@@ -23,7 +23,7 @@ fn server(name: &str) -> Value {
 
 fn run(servers: Value, responses: Vec<String>) -> (String, Vec<String>) {
     let home = tempfile::tempdir().unwrap();
-    let claude = home.path().join(".claude");
+    let claude = home.path().join(".beyond");
     std::fs::create_dir_all(&claude).unwrap();
     std::fs::write(
         claude.join("settings.json"),

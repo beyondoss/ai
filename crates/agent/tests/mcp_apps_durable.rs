@@ -386,9 +386,9 @@ async fn an_unadvertised_oversized_view_is_refused_over_http_without_reading_its
     let fixture = spawn_http_apps_fixture();
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path().join("home");
-    std::fs::create_dir_all(home.join(".claude")).unwrap();
+    std::fs::create_dir_all(home.join(".beyond")).unwrap();
     std::fs::write(
-        home.join(".claude/settings.json"),
+        home.join(".beyond/settings.json"),
         json!({ "mcp_servers": [{ "name": "wx", "transport": "http", "url": fixture.url, "headers": {} }] })
             .to_string(),
     )

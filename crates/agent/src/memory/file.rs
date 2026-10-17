@@ -1,6 +1,6 @@
 //! [`FileBackend`] — the default memory store: local `*.md` files under a per-project directory.
 //!
-//! Layout: `~/.claude/projects/<encoded-cwd>/memory/`, reusing [`crate::settings::config_dir_root`]
+//! Layout: `~/.beyond/projects/<encoded-cwd>/memory/`, reusing [`crate::settings::config_dir_root`]
 //! (honors `AI_AGENT_CONFIG_DIR`) and [`crate::session_store::encode_cwd`] so a repo's memory sits
 //! beside — and is scoped exactly like — its sessions. All worktrees of one repo share it.
 //!
@@ -87,7 +87,7 @@ pub struct FileBackend {
 }
 
 impl FileBackend {
-    /// The store for the project rooted at `cwd`: `~/.claude/projects/<encoded-cwd>/memory/`.
+    /// The store for the project rooted at `cwd`: `~/.beyond/projects/<encoded-cwd>/memory/`.
     pub fn for_project(cwd: &Path) -> Self {
         let canonical = crate::session_store::canonical_cwd(cwd);
         let encoded = crate::session_store::encode_cwd(&canonical.to_string_lossy());

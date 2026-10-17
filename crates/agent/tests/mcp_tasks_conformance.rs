@@ -39,9 +39,9 @@ impl Env {
         for (k, v) in extra_env.as_object().unwrap() {
             env[k] = v.clone();
         }
-        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        std::fs::create_dir_all(home.join(".beyond")).unwrap();
         std::fs::write(
-            home.join(".claude/settings.json"),
+            home.join(".beyond/settings.json"),
             json!({ "mcp_servers": [{
                 "name": "t",
                 "transport": "stdio",

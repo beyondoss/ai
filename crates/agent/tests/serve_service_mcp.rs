@@ -179,9 +179,9 @@ async fn a_connector_named_like_an_operator_login_gets_no_bearer_token() {
 
     // A replica whose operator has logged into an MCP server called `linear`.
     let host_home = tempfile::tempdir().unwrap();
-    std::fs::create_dir_all(host_home.path().join(".claude")).unwrap();
+    std::fs::create_dir_all(host_home.path().join(".beyond")).unwrap();
     std::fs::write(
-        host_home.path().join(".claude/mcp_auth.json"),
+        host_home.path().join(".beyond/mcp_auth.json"),
         json!({
             "linear": {
                 "client_id": "operator-client-id",

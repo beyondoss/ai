@@ -106,7 +106,7 @@ fn serve_gates_skills_and_prompts_on_project_trust() {
     // An untrusted project's `.claude/skills`/`.claude/prompts` are attacker-controlled instructions:
     // they must not be advertised via `get_commands`, nor invocable via `/skill:name`/`/name`, until
     // the directory is trusted. Isolate HOME so this doesn't see (or pollute) the real developer's
-    // `~/.claude/skills`/`~/.claude/trusted-projects.json`.
+    // `~/.claude/skills`/`~/.beyond/trusted-projects.json`.
     let home = tempfile::tempdir().unwrap();
     let dir = tempfile::tempdir().unwrap();
     let skill_dir = dir.path().join(".claude/skills/foo");

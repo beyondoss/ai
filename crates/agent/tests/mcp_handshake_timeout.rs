@@ -32,7 +32,7 @@ fn silent_http() -> String {
 #[test]
 fn a_silent_server_times_out_and_the_others_still_load() {
     let home = tempfile::tempdir().unwrap();
-    let claude = home.path().join(".claude");
+    let claude = home.path().join(".beyond");
     std::fs::create_dir_all(&claude).unwrap();
     let servers = json!([
         { "name": "silent-stdio", "transport": "stdio", "command": FIXTURE,

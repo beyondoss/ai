@@ -39,7 +39,7 @@ impl Env {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
         let cwd = dir.path().join("work");
-        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        std::fs::create_dir_all(home.join(".beyond")).unwrap();
         std::fs::create_dir_all(&cwd).unwrap();
         let log = dir.path().join("fixture.log");
         let env = Self {
@@ -59,7 +59,7 @@ impl Env {
             server_env[k] = v.clone();
         }
         std::fs::write(
-            self.home.join(".claude/settings.json"),
+            self.home.join(".beyond/settings.json"),
             serde_json::to_string_pretty(&json!({ "mcp_servers": [{
                 "name": "docs",
                 "transport": "stdio",
@@ -176,7 +176,7 @@ impl Env {
     /// Configure a second server, `other`, beside `docs` — the same fixture under another label.
     pub fn configure_two(&self) {
         std::fs::write(
-            self.home.join(".claude/settings.json"),
+            self.home.join(".beyond/settings.json"),
             serde_json::to_string_pretty(&json!({ "mcp_servers": [
                 { "name": "docs", "transport": "stdio", "command": FIXTURE, "args": [],
                   "env": { "MCP_SKILLS_FIXTURE_LOG": self.log } },

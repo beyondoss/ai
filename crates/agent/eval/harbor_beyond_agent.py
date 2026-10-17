@@ -223,8 +223,8 @@ class BeyondAiAgent(BaseInstalledAgent):
                 local.write_text(json.dumps(settings, indent=2) + "\n")
                 await environment.upload_file(local, remote_settings)
             mcp_setup = (
-                f"mkdir -p \"$HOME/.claude\" && "
-                f"cp {shlex.quote(remote_settings)} \"$HOME/.claude/settings.json\"; "
+                f"mkdir -p \"$HOME/.beyond\" && "
+                f"cp {shlex.quote(remote_settings)} \"$HOME/.beyond/settings.json\"; "
             )
         cmd = (
             f"mkdir -p {shlex.quote(logs)}; "

@@ -104,7 +104,7 @@ fn one_run_mounts_both_roots_and_writes_to_each() {
     );
 
     // Durable lands under HOME's per-project dir; session lands in the `<...>.memory/` sibling.
-    let projects = home.path().join(".claude/projects");
+    let projects = home.path().join(".beyond/projects");
     let durable_dir = std::fs::read_dir(&projects)
         .unwrap()
         .next()

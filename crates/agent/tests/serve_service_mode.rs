@@ -362,7 +362,7 @@ async fn a_settings_toggle_stays_session_local() {
     assert_eq!(frames.last().unwrap()["data"]["auto_compaction"], false);
 
     // Nothing was written under the replica's own HOME.
-    let settings = host_home.path().join(".claude");
+    let settings = host_home.path().join(".beyond");
     assert!(
         !settings.exists(),
         "service mode must not write the replica's settings: {}",

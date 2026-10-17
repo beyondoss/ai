@@ -27,7 +27,7 @@ impl Env {
     pub fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
-        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        std::fs::create_dir_all(home.join(".beyond")).unwrap();
         let log = dir.path().join("wire.jsonl");
         let gate = dir.path().join("gate");
         let state = dir.path().join("fixture-state");
@@ -42,7 +42,7 @@ impl Env {
 
     pub fn settings(&self, servers: Value) {
         std::fs::write(
-            self.home.join(".claude/settings.json"),
+            self.home.join(".beyond/settings.json"),
             json!({ "mcp_servers": servers }).to_string(),
         )
         .unwrap();
