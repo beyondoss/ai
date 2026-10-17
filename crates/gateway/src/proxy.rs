@@ -86,6 +86,7 @@ use pingora_core::protocols::http::subrequest::server::SubrequestHandle;
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_proxy::subrequest::{BodyMode, Ctx as SubrequestCtx};
 use pingora_proxy::{FailToProxy, ProxyHttp, ProxyWarnLogContext, Session};
+use providers::catalog::strip_snapshot_date;
 use std::borrow::Cow;
 use std::fmt::Write as _;
 use std::sync::Arc;
@@ -2637,21 +2638,6 @@ fn price_model(billed: &str, requested: &str) -> Option<&'static str> {
 /// requested model would leave its billing row without a `price_model`.
 fn price_row(m: &str) -> Option<&'static route::ModelRoute> {
     route::model_route(m).or_else(|| strip_snapshot_date(m).and_then(route::model_route))
-}
-
-/// `m` without a trailing `-YYYY-MM-DD` (OpenAI) or `-YYYYMMDD` (Anthropic) snapshot date.
-fn strip_snapshot_date(m: &str) -> Option<&str> {
-    let digits = |s: &str, n: usize| s.len() == n && s.bytes().all(|b| b.is_ascii_digit());
-    let (head, last) = m.rsplit_once('-')?;
-    if digits(last, 8) {
-        return Some(head);
-    }
-    if !digits(last, 2) {
-        return None;
-    }
-    let (head, month) = head.rsplit_once('-')?;
-    let (head, year) = head.rsplit_once('-')?;
-    (digits(month, 2) && digits(year, 4)).then_some(head)
 }
 
 /// Set OpenRouter's attribution headers when (and only when) `provider_name` is `"openrouter"`
@@ -9881,6 +9867,16 @@ mod mutation_gaps {
     fn a_model_id_with_a_space_is_kept() {
         assert_eq!(sanitize_model("my model".to_owned()), "my model");
         assert_eq!(sanitize_model("bad\u{1f}model".to_owned()), "unknown");
+    }
+
+    /// A dated snapshot prices as its base model, in either spelling the vendors use.
+    /// claim: BIL-13, BIL-24
+    /// defect: D278
+    #[test]
+    fn a_dated_snapshot_prices_as_its_base_model() {
+        for id in ["gpt-4o-mini-2024-07-18", "gpt-4o-mini-20240718"] {
+            assert_eq!(price_row(id).map(|r| r.model), Some("gpt-4o-mini"), "{id}");
+        }
     }
 
     /// Only an eight-digit or `YYYY-MM-DD` suffix is a snapshot date; an all-digit suffix of

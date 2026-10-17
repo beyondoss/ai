@@ -1305,8 +1305,9 @@ touches = [
   "crates/gateway/src/proxy.rs",
   "crates/gateway/src/peek.rs",
   "crates/gateway/src/main.rs",
+  "crates/gateway/src/unpriced.rs",
 ]
-defects = ["D24"]
+defects = ["D24", "D278"]
 
 [[claim]]
 id = "BIL-11"

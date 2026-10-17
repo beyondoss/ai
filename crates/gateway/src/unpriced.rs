@@ -19,6 +19,7 @@
 //! `type`), so a prompt that mentions a tool cannot trip it.
 
 use crate::peek;
+use providers::catalog::strip_snapshot_date;
 
 /// What [`inspect`] found in a managed request body.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -127,20 +128,11 @@ fn plugins(body: &[u8], open: usize) -> Option<&'static str> {
     (!free).then_some(OPENROUTER_WEB)
 }
 
-/// `model` without a vendor prefix (`openai/`) or a dated snapshot suffix.
+/// `model` without a vendor prefix (`openai/`) or a dated snapshot suffix, as the price lookup
+/// strips it (`proxy::price_row`), so the gate and the price name the same model.
 fn base_model(model: &str) -> &str {
     let m = model.rsplit_once('/').map_or(model, |(_, m)| m);
-    let digits = |s: &str, n: usize| s.len() == n && s.bytes().all(|b| b.is_ascii_digit());
-    if let Some((head, day)) = m.rsplit_once('-')
-        && digits(day, 2)
-        && let Some((head, month)) = head.rsplit_once('-')
-        && digits(month, 2)
-        && let Some((head, year)) = head.rsplit_once('-')
-        && digits(year, 4)
-    {
-        return head;
-    }
-    m
+    strip_snapshot_date(m).unwrap_or(m)
 }
 
 #[cfg(test)]
@@ -333,6 +325,26 @@ mod tests {
         );
         let i = inspect(br#"{"tools":[{"type":"web_search"}]}"#, "gpt-5", false);
         assert!(!i.web_search_preview);
+    }
+
+    /// Both snapshot spellings name the base model to this gate, as they do to the price lookup.
+    /// claim: BIL-10
+    /// defect: D278
+    #[test]
+    fn a_dated_snapshot_names_its_base_model_to_the_refusal() {
+        let web_search = br#"{"tools":[{"type":"web_search"}]}"#;
+        for (model, base) in [
+            ("gpt-4o-mini-2024-07-18", "gpt-4o-mini"),
+            ("gpt-4o-mini-20240718", "gpt-4o-mini"),
+            ("openai/gpt-4.1-mini-20250414", "gpt-4.1-mini"),
+        ] {
+            assert_eq!(base_model(model), base, "{model}");
+            assert_eq!(
+                inspect(web_search, model, false).refused,
+                Some(MINI_WEB_SEARCH),
+                "{model}"
+            );
+        }
     }
 
     #[test]

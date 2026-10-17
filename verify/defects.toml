@@ -2835,3 +2835,17 @@ state = "fixed"
 test = "a_spaced_message_delta_type_member_finishes_a_stream"
 fix = ""
 note = "Fixed in usage.rs: both checks read a member by its key and the value that follows, skipping JSON whitespace around the colon (member_value_starts). The `event: message_delta` line stays a marker, as each_message_delta_marker_alone_finishes_a_stream requires an event line whose data is empty, so the parse-based check the audit suggested would not be equivalent. A quote inside generated text is escaped in the bytes, so the key cannot match there (forged-text tests unchanged). Also held by a_spaced_error_member_is_an_error_event."
+
+[[defect]]
+id = "D278"
+severity = "med"
+area = "Billing"
+title = "A compact-dated gpt-4o-mini snapshot escapes the mini web_search refusal"
+impact = "The price lookup strips both dated snapshot forms (-YYYY-MM-DD and -YYYYMMDD), but the unpriced gate's base_model stripped only the dashed one. So gpt-4o-mini-20240718 with a web_search tool was not refused as the mini web search that bills a fixed content block the gateway cannot meter, and it ran unpriced."
+confidence = "high"
+evidence = "unpriced.rs base_model matched only -YYYY-MM-DD; proxy.rs strip_snapshot_date matched both. Reproduced on 4513e6f by a_dated_snapshot_names_its_base_model_to_the_refusal (base_model(\"gpt-4o-mini-20240718\") returned the id unchanged)."
+claims = ["BIL-10"]
+state = "fixed"
+test = "a_dated_snapshot_names_its_base_model_to_the_refusal"
+fix = ""
+note = "Fixed by one shared stripper: providers::catalog::strip_snapshot_date, used by the price lookup (proxy::price_row) and by unpriced::base_model, which now strips the vendor prefix and then the shared snapshot date. Also held by a_dated_snapshot_prices_as_its_base_model (proxy) for the price side, which already worked, so the two callers cannot drift apart again."
