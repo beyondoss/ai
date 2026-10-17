@@ -432,6 +432,7 @@ dependencies = [
  "jsonschema",
  "libc",
  "listenfd",
+ "memchr",
  "mimalloc",
  "nix",
  "percent-encoding",
