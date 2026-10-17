@@ -224,9 +224,13 @@ impl Ending {
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(CLOSE_DEADLINE);
         if let Some(policy) = &self.egress {
-            builder = builder.dns_resolver(crate::tools::web::ssrf::SsrfResolver::new(
-                (**policy).clone(),
-            ));
+            // Like the connector's own client (`McpEgress`): no ambient proxy, which would carry
+            // the request past the resolver's SSRF check.
+            builder = builder
+                .no_proxy()
+                .dns_resolver(crate::tools::web::ssrf::SsrfResolver::new(
+                    (**policy).clone(),
+                ));
         }
         builder.build().map_err(|e| e.to_string())
     }
