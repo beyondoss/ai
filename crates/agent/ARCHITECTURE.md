@@ -2022,6 +2022,15 @@ bullet does not fire and `bash` is registered, the rule is its own bullet
 `.gitignore`, `hidden(false)` includes dotfiles) and, like every `LocalFs` operation, run their walk
 inside `tokio::task::spawn_blocking`; their cost scales with the size of the tree, not a single syscall.
 
+**`.git` is never walked.** Including dotfiles includes `.git`, which no `.gitignore` names — so before
+this rule, a search of any repository root filled with `packed-refs`, reflogs and worktree `HEAD`s. Both walks prune any entry named `.git` below the root (`filter_entry`, so the
+subtree is never read) — the directory, and the `.git` _file_ a worktree or submodule checkout has. The
+root itself is exempt: `path: "repo/.git"` (or a file inside it) searches what was asked for.
+`ShellFs` matches it on every rung: `rg --glob '!.git'` (placed after the caller's glob, since the last
+matching glob wins), GNU `grep --exclude-dir=.git` unless the root _is_ a `.git`, and a host-side
+`fs::is_under_git_dir` filter on every returned path so busybox `grep` and `find` (which have no such
+flag) cannot leak one either.
+
 They diverge on parallelism, and the divergence is **measured, not assumed**:
 
 | Tool   | Walk strategy                                       | 5,000-file benchmark (`benches/search.rs`)                                                                             |

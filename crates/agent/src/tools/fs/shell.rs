@@ -293,13 +293,16 @@ impl FsBackend for ShellFs {
             }
         }
 
-        let hits = if engine == SearchEngine::BusyboxGrep {
+        let mut hits = if engine == SearchEngine::BusyboxGrep {
             // No `-Z`, so records are `path:line:text` with no unambiguous path terminator, and no
             // `--include`, so the glob is applied here instead.
             parse_colon_records(&result.stdout, q)
         } else {
             parse_records(&result.stdout)
         };
+        // The engine was asked to skip `.git` where it can; this is the guarantee for the rungs that
+        // can't (busybox `grep`, and a `.git` *file* GNU `--exclude-dir` does not cover).
+        hits.retain(|h| !super::is_under_git_dir(&q.root, &h.path));
         // `ExecResult` keeps only the first and last 128 KiB of each stream and drops the middle. On a
         // large result set that silently removes records from the middle of the output — so the flag
         // must reach the outcome, or this backend would report a confidently incomplete result as
@@ -521,6 +524,8 @@ impl FsBackend for ShellFs {
                     "--files".to_string(),
                     "--null".to_string(),
                     "--hidden".to_string(),
+                    "--glob".to_string(),
+                    format!("!{}", super::GIT_DIR),
                 ];
                 // The target's answer, not this host's — see `ShellFs::root_in_git_repo`.
                 if !self.root_in_git_repo(&q.root).await {
@@ -612,7 +617,7 @@ impl FsBackend for ShellFs {
                             hit_hard_cap = true;
                             break;
                         }
-                        if p == q.root {
+                        if p == q.root || super::is_under_git_dir(&q.root, &p) {
                             continue;
                         }
                         let candidate = if q.basename_only {
@@ -679,7 +684,9 @@ impl FsBackend for ShellFs {
                 hit_hard_cap = true;
                 break;
             }
-            if p == q.root {
+            // `.git` is skipped by `rg --glob !.git` on pass 1, but not by `find` (pass 2, and the
+            // POSIX rungs) — one host-side rule covers every rung identically.
+            if p == q.root || super::is_under_git_dir(&q.root, &p) {
                 continue;
             }
             let candidate = if q.basename_only {
@@ -1170,6 +1177,8 @@ fn incomplete_note(result: &ExecResult) -> Option<String> {
 fn rg_args(q: &SearchQuery, in_git_repo: bool) -> Vec<String> {
     let mut args = vec![
         "--null".to_string(),
+        // Like `grep -H`: a single-file root otherwise prints no path, and the record parser needs one.
+        "--with-filename".to_string(),
         "--line-number".to_string(),
         "--no-heading".to_string(),
         "--color=never".to_string(),
@@ -1192,6 +1201,10 @@ fn rg_args(q: &SearchQuery, in_git_repo: bool) -> Vec<String> {
             pattern.clone()
         });
     }
+    // After the caller's glob on purpose: ripgrep gives the *last* matching glob precedence. Never
+    // applied to the root itself, so an explicit search of `repo/.git` still searches it.
+    args.push("--glob".to_string());
+    args.push(format!("!{}", super::GIT_DIR));
     push_context(&mut args, q);
     // `-e` and `--` so a pattern or path beginning with `-` is never read as a flag.
     args.push("-e".to_string());
@@ -1210,7 +1223,9 @@ fn rg_args(q: &SearchQuery, in_git_repo: bool) -> Vec<String> {
 /// Rust's regex dialect: `\d`, `\b`, and non-greedy quantifiers are GNU extensions at best and absent
 /// at worst. **This rung does not honor `.gitignore`.**
 fn posix_grep_args(q: &SearchQuery, gnu: bool) -> Vec<String> {
-    let mut args = vec!["-r".to_string(), "-n".to_string()];
+    // `-H`: name the file even when the root *is* a single file — without it `grep` prints bare
+    // `line:text` records, which neither parser can attribute, so a file-path search came back empty.
+    let mut args = vec!["-r".to_string(), "-n".to_string(), "-H".to_string()];
     if gnu {
         // Busybox has neither: `-Z` (NUL after the filename) nor `-I` (skip binary files), and
         // rejects `--color` outright.
@@ -1235,6 +1250,12 @@ fn posix_grep_args(q: &SearchQuery, gnu: bool) -> Vec<String> {
         } else {
             format!("--include={pattern}")
         });
+    }
+    // GNU `--exclude-dir` also skips a *command-line* directory whose name matches, so it is left off
+    // when the root is itself a `.git` — the caller asked for that tree. The host-side
+    // `is_under_git_dir` filter covers what this flag cannot (busybox, a worktree's `.git` file).
+    if gnu && q.root.file_name().is_none_or(|n| n != super::GIT_DIR) {
+        args.push(format!("--exclude-dir={}", super::GIT_DIR));
     }
     push_context(&mut args, q);
     args.push("-e".to_string());
@@ -1421,6 +1442,45 @@ mod tests {
         let args = rg_args(&q, false);
         let g = args.iter().position(|a| a == "--glob").unwrap();
         assert_eq!(args[g + 1], "!*.test.rs");
+    }
+
+    #[test]
+    fn rg_skips_git_metadata_with_a_glob_that_outranks_the_callers() {
+        // Ripgrep gives the *last* matching glob precedence, so `!.git` must follow a caller's own.
+        let mut q = query("x", PathBuf::from("."), 100);
+        q.glob = Some(("*".into(), false));
+        let args = rg_args(&q, false);
+        let globs: Vec<_> = args
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| *a == "--glob")
+            .map(|(i, _)| args[i + 1].as_str())
+            .collect();
+        assert_eq!(globs, ["*", "!.git"]);
+    }
+
+    #[test]
+    fn gnu_grep_excludes_git_unless_the_root_is_git_itself() {
+        let q = query("x", PathBuf::from("/repo"), 100);
+        assert!(
+            posix_grep_args(&q, true)
+                .iter()
+                .any(|a| a == "--exclude-dir=.git")
+        );
+        // GNU `--exclude-dir` would skip the command-line directory itself.
+        let q = query("x", PathBuf::from("/repo/.git"), 100);
+        assert!(
+            !posix_grep_args(&q, true)
+                .iter()
+                .any(|a| a.starts_with("--exclude-dir"))
+        );
+        // Busybox has no such flag; the host-side filter covers it.
+        let q = query("x", PathBuf::from("/repo"), 100);
+        assert!(
+            !posix_grep_args(&q, false)
+                .iter()
+                .any(|a| a.starts_with("--exclude-dir"))
+        );
     }
 
     #[test]

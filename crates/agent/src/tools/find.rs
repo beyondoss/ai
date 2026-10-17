@@ -69,7 +69,7 @@ impl Tool for Find {
         DESC.get_or_init(|| {
             format!(
                 "Find files by glob pattern (e.g. \"*.rs\", \"src/**/*.test.ts\"), honoring \
-                 .gitignore. A pattern without \"/\" matches the file name; with \"/\" it matches the \
+                 .gitignore and skipping .git (pass a path inside it to search it). A pattern without \"/\" matches the file name; with \"/\" it matches the \
                  full path. Results are sorted by path and truncated to at most {DEFAULT_LIMIT} paths \
                  or {}, whichever is hit first; when truncated, the lexicographically-smallest paths \
                  are reported.",

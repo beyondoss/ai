@@ -73,8 +73,8 @@ impl Tool for Grep {
         static DESC: OnceLock<String> = OnceLock::new();
         DESC.get_or_init(|| {
             format!(
-                "Search file contents by regular expression, honoring .gitignore. Optionally restrict \
-                 to a `path`, a `glob` (e.g. \"*.rs\"), case-insensitive with `ignore_case`. Results \
+                "Search file contents by regular expression, honoring .gitignore and skipping .git \
+                 (pass a path inside it to search it). Optionally restrict to a `path`, a `glob` (e.g. \"*.rs\"), case-insensitive with `ignore_case`. Results \
                  are sorted by path and truncated to at most {DEFAULT_LIMIT} matches or {}, whichever \
                  is hit first, with individual lines truncated to {MAX_LINE} characters; when \
                  truncated, the lexicographically-smallest matches are reported.",
