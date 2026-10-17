@@ -1804,7 +1804,7 @@ touches = [
   "crates/gateway/src/main.rs",
   "crates/gateway/src/config.rs",
 ]
-defects = ["D52"]
+defects = ["D52", "D280"]
 
 [[claim]]
 id = "REL-16"

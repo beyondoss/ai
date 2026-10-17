@@ -562,12 +562,35 @@ impl AiConfig {
         let mut cfg: AiConfig = fig
             .extract()
             .map_err(|e| GatewayError::Config(e.to_string()))?;
+        // Before the env fold, which matches names against these tables (`pool_key_env_provider`).
+        cfg.normalize_provider_names()?;
         // One pass over the environment for both secret prefixes, and via `vars_os` because
         // `std::env::vars()` *panics* on a variable that isn't valid UTF-8 — a hostile or merely odd
         // environment should not be able to kill the boot before it starts.
         cfg.merge_secret_env(env_pairs());
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// Provider names are lowercase everywhere: the env fold lowercases `AI_POOL_KEY_<NAME>`, so a
+    /// TOML `MiniMax` has to meet its key as `minimax`. Lowercased here, once, for every table keyed
+    /// by provider name. A name outside `[a-z0-9_-]`, or two names that are one once lowercased, is a
+    /// boot failure, not a provider that silently has no key.
+    fn normalize_provider_names(&mut self) -> Result<()> {
+        self.pool_keys = lowercase_names("pool_keys", std::mem::take(&mut self.pool_keys))?;
+        self.provider_authorities = lowercase_names(
+            "provider_authorities",
+            std::mem::take(&mut self.provider_authorities),
+        )?;
+        self.provider_dialects = lowercase_names(
+            "provider_dialects",
+            std::mem::take(&mut self.provider_dialects),
+        )?;
+        self.provider_auth_schemes = lowercase_names(
+            "provider_auth_schemes",
+            std::mem::take(&mut self.provider_auth_schemes),
+        )?;
+        Ok(())
     }
 
     /// Reject nonsensical values that would otherwise fail silently at runtime. A `0` connect/read
@@ -721,6 +744,30 @@ impl AiConfig {
         }
         Ok(ring)
     }
+}
+
+/// `names` with every key lowercased, for the table `table` (named in the error). See
+/// [`AiConfig::normalize_provider_names`].
+fn lowercase_names<V>(table: &str, names: HashMap<String, V>) -> Result<HashMap<String, V>> {
+    let mut out = HashMap::with_capacity(names.len());
+    for (name, value) in names {
+        let lower = name.to_ascii_lowercase();
+        let valid = !lower.is_empty()
+            && lower
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_');
+        if !valid {
+            return Err(GatewayError::Config(format!(
+                "[{table}] provider name {name:?} must be letters, digits, '-' or '_'"
+            )));
+        }
+        if out.insert(lower.clone(), value).is_some() {
+            return Err(GatewayError::Config(format!(
+                "[{table}] provider name {name:?} is {lower:?} once lowercased, which another name already is"
+            )));
+        }
+    }
+    Ok(out)
 }
 
 /// Environment variables as `(String, String)`, skipping any that aren't valid UTF-8.
@@ -1075,6 +1122,45 @@ mod tests {
         assert_eq!(cfg.config_bucket, "from-file");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A TOML provider name in any case meets its env key: `MiniMax` in `[provider_authorities]` and
+    /// `[pool_keys]`, and `AI_POOL_KEY_MINIMAX` in the env, all address the provider `minimax`.
+    /// claim: REL-15
+    /// defect: D280
+    #[test]
+    fn provider_names_are_lowercased_at_the_config_boundary() {
+        let mut c = AiConfig {
+            provider_authorities: HashMap::from([(
+                "MiniMax".to_string(),
+                "api.minimax.io:443".to_string(),
+            )]),
+            pool_keys: HashMap::from([("MiniMax".to_string(), "from-file".into())]),
+            ..Default::default()
+        };
+        c.normalize_provider_names().unwrap();
+        c.merge_secret_env([("AI_POOL_KEY_MINIMAX".to_string(), "mm-key".to_string())].into_iter());
+        assert!(c.provider_authorities.contains_key("minimax"));
+        assert_eq!(c.pool_keys.len(), 1, "{:?}", c.pool_keys.keys());
+        assert_eq!(c.pool_keys["minimax"][0].expose(), "mm-key");
+    }
+
+    /// A name outside the charset, or two names that are one once lowercased, does not load.
+    #[test]
+    fn a_provider_name_outside_the_charset_or_repeated_in_case_is_refused() {
+        let mut bad = AiConfig {
+            provider_dialects: HashMap::from([("my vendor".to_string(), "openai".to_string())]),
+            ..Default::default()
+        };
+        assert!(bad.normalize_provider_names().is_err());
+        let mut twice = AiConfig {
+            pool_keys: HashMap::from([
+                ("MiniMax".to_string(), "a".into()),
+                ("minimax".to_string(), "b".into()),
+            ]),
+            ..Default::default()
+        };
+        assert!(twice.normalize_provider_names().is_err());
     }
 
     #[test]

@@ -68,6 +68,40 @@ async fn env_pool_key_reaches_a_hyphenated_provider() {
     );
 }
 
+/// A config-added provider written `MiniMax` in the TOML is served at `/MiniMax/…` (the name it was
+/// written with) and at `/minimax/…`: names are lowercase in the table, and a config-added provider's
+/// path segment matches case-insensitively. Both reach the provider's own pool key.
+/// claim: REL-15
+/// defect: D280
+#[tokio::test]
+async fn a_mixed_case_config_provider_routes_at_its_name_in_any_case() {
+    let (pubkey, sk) = test_keypair(3);
+    let mock = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::builder(unused_nats_port(), &mock.authority(), &b64(&pubkey))
+        .providers(&["openai", "MiniMax"])
+        .pool_key("MiniMax", "sk-minimax")
+        .start()
+        .await;
+    for segment in ["MiniMax", "minimax"] {
+        let resp = test_client()
+            .post(format!("{}/{segment}/v1/chat/completions", gw.url()))
+            .header("authorization", format!("Bearer {}", vkey(&sk)))
+            .header("content-type", "application/json")
+            .body(BODY)
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status().as_u16();
+        let text = resp.text().await.unwrap_or_default();
+        assert_eq!(status, 200, "/{segment}/…: {text}");
+    }
+    assert_eq!(
+        mock.captured().and_then(|c| c.authorization).as_deref(),
+        Some("Bearer sk-minimax"),
+        "the provider's own pool key went upstream"
+    );
+}
+
 /// Control for D52: the same env path works for a provider name without a hyphen.
 /// claim: REL-15
 /// defect: D52

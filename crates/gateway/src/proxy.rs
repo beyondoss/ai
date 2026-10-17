@@ -4045,7 +4045,16 @@ impl ProxyHttp for AiProxy {
                 Some(q) => format!("{p}?{q}"),
                 None => p.to_string(),
             };
-            if let Some(p) = self.state.provider(first) {
+            // A config-added provider written with capitals (`MiniMax`) is served at its name, and at
+            // `/minimax/…`: the table is lowercase, since config names are lowercased at load. A
+            // built-in name is exact (`/OpenAI/…` is no route). The retry runs on a miss only.
+            let provider = self.state.provider(first).or_else(|| {
+                let lower = first.to_ascii_lowercase();
+                (lower != first && providers::by_name(&lower).is_none())
+                    .then(|| self.state.provider(&lower))
+                    .flatten()
+            });
+            if let Some(p) = provider {
                 // Provider-prefixed: strip the leading `/{first}` segment, forward the remainder.
                 // `first` is non-empty here (an empty first segment matches no provider), so this
                 // always differs from the inbound path and always needs the URI rewritten.

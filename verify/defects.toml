@@ -2863,3 +2863,17 @@ state = "fixed"
 test = "an_unlisted_tool_type_is_refused"
 fix = ""
 note = "Decided by the owner: an allowlist by family. unpriced::allowed_tool accepts the client-run families (function, custom, namespace, apply_patch, local_shell, bash, text_editor, computer, memory) and the server families the usage meter counts (web_search, web_fetch, file_search, tool_search, x_search, mcp, computer), dated versions included. Every existing specific refusal (containers, image generation, browser_search, OpenRouter web, mini web_search, code_execution, advisor) is checked first with its message; any other type, or a tool with no string type, is refused with UNLISTED_TOOL. every_kind_the_meter_counts_is_allowed_or_named keeps the list and the meter together. Also held by every_unpriced_feature_is_refused and priced_features_and_lookalikes_pass, unchanged."
+
+[[defect]]
+id = "D280"
+severity = "med"
+area = "Config"
+title = "A provider written with capitals in the TOML silently loses its env pool key"
+impact = "The env fold lowercases AI_POOL_KEY_<NAME>, but TOML provider names kept their case. A config that writes [provider_authorities] MiniMax with AI_POOL_KEY_MINIMAX gave the provider no key, so every managed request to it returned 503 with a healthy-looking boot."
+confidence = "high"
+evidence = "config.rs merge_secret_env stored the env key as `minimax`; the TOML table kept `MiniMax`, and build_providers looks the key up by the provider's name. Reproduced on 4513e6f by provider_names_are_lowercased_at_the_config_boundary (the authority stayed under MiniMax, and the env key sat under minimax with no provider to match)."
+claims = ["REL-15"]
+state = "fixed"
+test = "provider_names_are_lowercased_at_the_config_boundary"
+fix = ""
+note = "Fixed at the config boundary: AiConfig::normalize_provider_names lowercases the keys of pool_keys, provider_authorities, provider_dialects and provider_auth_schemes right after the TOML/flat extract and before the env fold, so the env fold's name matching sees the same names. A name outside [a-z0-9_-], or two names equal once lowercased, is a boot failure. Also held by a_provider_name_outside_the_charset_or_repeated_in_case_is_refused. The typed ProviderName newtype is left to PR 1."
