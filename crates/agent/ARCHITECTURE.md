@@ -2112,6 +2112,14 @@ single-threaded baseline. This isn't a gap: pi's own `grep.ts` shells out to a r
 codebases already get for free, so a tunable here would add a parameter surface (and a way for the
 model to accidentally pin a search to one thread) with no real workload it actually helps.
 
+**Result paths are printed so `read` can open them as printed** (`output::format_path`): relative to
+the tool's working directory — the same base `read`/`edit`/`write` resolve a relative path against —
+or absolute when a hit lies outside it; a single-file search prints that file the same way. They used
+to be relative to the _search_ root (a single file as its bare name), so `grep path="sub"` printed
+`inner/b.txt` and `read inner/b.txt` failed. That dropped pi's "relative to search directory" contract
+on purpose: a path that saves a few tokens but cannot be opened costs a failed call. With no tool root,
+the base is the process cwd locally; remotely, paths print as the search produced them.
+
 `find` also disambiguates what it's matching against based on the pattern: a pattern with no `/`
 (e.g. `*.rs`) matches against the basename only; a pattern containing `/` matches the full path, with
 a `**/` prefix implicitly added unless the pattern already starts with `**/` or `/` — so
@@ -2572,17 +2580,17 @@ tenant's session.
 Every tool takes its world from the backend (`FsBackend::world()`), asked **per call** rather than
 captured, because `ExecCell` can be re-pointed by `set_exec_endpoint` with no registry rebuild.
 
-| Decision                                                                       | Local                                          | Remote                                                                                      |
-| ------------------------------------------------------------------------------ | ---------------------------------------------- | ------------------------------------------------------------------------------------------- |
-| `~` in a path (`read`/`write`/`edit`/`ls`/`grep`/`find`) and in `bash`'s `cwd` | this process's `$HOME`                         | the target's home, or left as `~` when it isn't known                                       |
-| a relative path with no tool root (`write_key`)                                | joined onto the process cwd                    | left relative — the replica's cwd is not the target's                                       |
-| `write`/`edit`'s same-file key                                                 | `canonicalize` (unifies symlink aliases)       | lexical only                                                                                |
-| `bash`'s `cwd` pre-check                                                       | `is_dir`, with pi's two messages               | none; the remote shell reports a bad `cwd`                                                  |
-| `bash`'s shell                                                                 | `/bin/bash`, else `bash` on `$PATH`, else `sh` | `ToolConfig::remote_shell`, else `sh`                                                       |
-| `bash`'s oversized output                                                      | spilled to a temp file, `Full output: <path>`  | no file; the marker says to redirect into the sandbox and read that                         |
-| `bash`'s idle yield, progress and jobs                                         | always                                         | when the runner's output is live (v1.2 stream, template); over v1.1 the call waits for exit |
-| `rg --no-require-git` (`ShellFs`)                                              | `.git` in an ancestor, host `stat`s            | the same walk run **on the target**, cached per root                                        |
-| `format_path`'s "is the root a directory"                                      | —                                              | the caller's answer: `find`'s `stat`, or, for `grep`, whether its first hit _is_ the root   |
+| Decision                                                                       | Local                                            | Remote                                                                                      |
+| ------------------------------------------------------------------------------ | ------------------------------------------------ | ------------------------------------------------------------------------------------------- |
+| `~` in a path (`read`/`write`/`edit`/`ls`/`grep`/`find`) and in `bash`'s `cwd` | this process's `$HOME`                           | the target's home, or left as `~` when it isn't known                                       |
+| a relative path with no tool root (`write_key`)                                | joined onto the process cwd                      | left relative — the replica's cwd is not the target's                                       |
+| `write`/`edit`'s same-file key                                                 | `canonicalize` (unifies symlink aliases)         | lexical only                                                                                |
+| `bash`'s `cwd` pre-check                                                       | `is_dir`, with pi's two messages                 | none; the remote shell reports a bad `cwd`                                                  |
+| `bash`'s shell                                                                 | `/bin/bash`, else `bash` on `$PATH`, else `sh`   | `ToolConfig::remote_shell`, else `sh`                                                       |
+| `bash`'s oversized output                                                      | spilled to a temp file, `Full output: <path>`    | no file; the marker says to redirect into the sandbox and read that                         |
+| `bash`'s idle yield, progress and jobs                                         | always                                           | when the runner's output is live (v1.2 stream, template); over v1.1 the call waits for exit |
+| `rg --no-require-git` (`ShellFs`)                                              | `.git` in an ancestor, host `stat`s              | the same walk run **on the target**, cached per root                                        |
+| `grep`/`find` result paths with no tool root (`output::display_base`)          | relative to the process cwd, absolute outside it | as the search produced them — relative if typed relative                                    |
 
 Two of those deserve their reasoning spelled out.
 
@@ -4913,7 +4921,8 @@ are allowed now.
 Paths resolve against the sandbox root in the backend's world (`tools::resolve_against_in`,
 `fs::PathWorld`). The host-only checks are dropped in the remote world: `bash`'s `is_dir` on its
 `cwd` and its shell probe (it uses the probed `remote_shell`, else `sh`), `root_is_inside_git_repo`
-(only `LocalFs` asks it), and `format_path`'s host `is_dir` (callers pass `root_is_dir` in). Oversized
+(only `LocalFs` asks it), and `display_base`'s process cwd (with no tool root, result paths print as
+the search produced them). Oversized
 `bash` output gets no host spill file (`OutputAccumulator::without_spill`).
 
 ### Sandbox discovery

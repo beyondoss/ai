@@ -72,7 +72,8 @@ impl Tool for Find {
                  .gitignore and skipping .git (pass a path inside it to search it). A pattern without \"/\" matches the file name; with \"/\" it matches the \
                  full path. Results are sorted by path and truncated to at most {DEFAULT_LIMIT} paths \
                  or {}, whichever is hit first; when truncated, the lexicographically-smallest paths \
-                 are reported.",
+                 are reported. Paths are relative to the working directory (absolute outside it), \
+                 so `read` opens them as printed.",
                 super::output::format_size(super::output::MAX_LISTING_BYTES as u64)
             )
         })
@@ -136,11 +137,6 @@ impl Tool for Find {
                 root.display()
             )));
         }
-        // The same `stat` also answers `format_path`'s "is the root a directory", which used to be a
-        // second, host-only `is_dir` — a question about the wrong machine whenever the walk is remote.
-        // A `None` here is a path that doesn't exist, which is exactly what `is_dir` reported as
-        // `false`, so the rendering is unchanged locally.
-        let root_is_dir = matches!(&root_meta, Some(m) if m.kind == FileKind::Dir);
         let outcome = self
             .backend
             .glob(&GlobQuery {
@@ -169,8 +165,8 @@ impl Tool for Find {
         }
         // Write straight into `out` instead of allocating a `format!` temp String per path — same fix
         // as `read`/`ls`/`grep`'s formatting loops. `writeln!` into a `String` can't fail, so the
-        // `Result` is discarded. Paths are reported relative to the search root (matching pi), not the
-        // full path straight from the walk entry — see `format_path`'s doc comment. A directory match
+        // `Result` is discarded. Paths are reported relative to the tool's working directory, so `read`
+        // opens them as printed — see `format_path`'s doc comment. A directory match
         // gets a trailing "/" (matching real `fd`'s own default, which pi's `find` tool relies on
         // as-is) — since `find` deliberately matches both files and directories, the model otherwise
         // has no way to tell "src/components" is a directory vs. an extension-less file without an
@@ -181,8 +177,9 @@ impl Tool for Find {
                 .saturating_mul(64)
                 .min(super::output::MAX_LISTING_BYTES),
         );
+        let base = super::output::display_base(&self.root, &self.backend.world());
         for (path, is_dir) in &paths {
-            let rendered = format_path(path, &root, root_is_dir);
+            let rendered = format_path(path, base.as_deref());
             if *is_dir {
                 let _ = writeln!(out, "{rendered}/");
             } else {
@@ -301,23 +298,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn output_paths_are_relative_to_the_search_root_not_absolute() {
-        // Same fix as grep's: the prior behavior reported the full path straight from the walk entry
-        // (often absolute), costing the model extra tokens for a prefix it already knows and diverging
-        // from pi's documented "relative to search directory" contract.
+    async fn output_paths_are_relative_to_the_tool_root_so_read_can_open_them() {
+        // Same fix as grep's: `find path="src"` used to print `main.rs`, relative to the search root,
+        // which `read` resolves against the tool root and cannot find.
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("src")).unwrap();
-        std::fs::write(dir.path().join("src/main.rs"), "").unwrap();
+        std::fs::create_dir_all(dir.path().join("src/bin")).unwrap();
+        std::fs::write(dir.path().join("src/bin/main.rs"), "").unwrap();
 
-        let out = Find::default()
+        let find = Find::new(dir.path());
+        let out = find
+            .run(json!({ "pattern": "*.rs", "path": "src" }))
+            .await
+            .unwrap()
+            .text;
+        assert_eq!(out.trim_end(), "src/bin/main.rs", "got: {out}");
+
+        let out = find
             .run(json!({ "pattern": "*.rs", "path": dir.path().to_str().unwrap() }))
             .await
             .unwrap()
             .text;
-        assert_eq!(out.trim_end(), "src/main.rs", "got: {out}");
-        assert!(
-            !out.contains(dir.path().to_str().unwrap()),
-            "the search root's own absolute prefix must not appear in the output: {out}"
+        assert_eq!(out.trim_end(), "src/bin/main.rs", "got: {out}");
+
+        // Outside the tool root: absolute.
+        let other = tempfile::tempdir().unwrap();
+        std::fs::write(other.path().join("x.rs"), "").unwrap();
+        let out = find
+            .run(json!({ "pattern": "*.rs", "path": other.path().to_str().unwrap() }))
+            .await
+            .unwrap()
+            .text;
+        assert_eq!(
+            out.trim_end(),
+            other.path().join("x.rs").to_str().unwrap(),
+            "got: {out}"
         );
     }
 
@@ -364,7 +378,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("somedir")).unwrap();
         std::fs::write(dir.path().join("somefile.txt"), "").unwrap();
-        let out = Find::default()
+        let out = Find::new(dir.path())
             .run(json!({ "pattern": "some*", "path": dir.path().to_str().unwrap() }))
             .await
             .unwrap()
@@ -589,7 +603,7 @@ mod tests {
         std::fs::write(dir.path().join(".secret/hidden.txt"), "hidden").unwrap();
         std::fs::write(dir.path().join("visible.txt"), "visible").unwrap();
 
-        let out = Find::default()
+        let out = Find::new(dir.path())
             .run(json!({ "pattern": "**/*.txt", "path": dir.path().to_str().unwrap() }))
             .await
             .unwrap()
@@ -621,7 +635,7 @@ mod tests {
         std::fs::write(dir.path().join("b/kept.txt"), "").unwrap();
         std::fs::write(dir.path().join("root.txt"), "").unwrap();
 
-        let out = Find::default()
+        let out = Find::new(dir.path())
             .run(json!({ "pattern": "**/*.txt", "path": dir.path().to_str().unwrap() }))
             .await
             .unwrap()
@@ -659,7 +673,7 @@ mod tests {
         std::fs::write(dir.path().join("b/kept.txt"), "").unwrap();
         std::fs::write(dir.path().join("root.txt"), "").unwrap();
 
-        let out = Find::default()
+        let out = Find::new(dir.path())
             .run(json!({ "pattern": "**/*.txt", "path": dir.path().to_str().unwrap() }))
             .await
             .unwrap()
@@ -776,7 +790,7 @@ mod tests {
     #[tokio::test]
     async fn regression_3302_nested_src_glob_matches_the_nested_spec_file() {
         let dir = regression_3302_tree();
-        let out = Find::default()
+        let out = Find::new(dir.path())
             .run(json!({ "pattern": "src/**/*.spec.ts", "path": dir.path().to_str().unwrap() }))
             .await
             .unwrap()

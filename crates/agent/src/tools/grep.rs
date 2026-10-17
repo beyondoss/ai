@@ -78,7 +78,8 @@ impl Tool for Grep {
                  are sorted by path and truncated to at most {DEFAULT_LIMIT} matches or {}, whichever \
                  is hit first, with individual lines truncated to {MAX_LINE} characters (centered \
                  on the match when it is further in); when \
-                 truncated, the lexicographically-smallest matches are reported.",
+                 truncated, the lexicographically-smallest matches are reported. Paths are relative \
+                 to the working directory (absolute outside it), so `read` opens them as printed.",
                 super::output::format_size(super::output::MAX_LISTING_BYTES as u64)
             )
         })
@@ -197,15 +198,8 @@ impl Tool for Grep {
         );
         let mut lines_truncated = false;
         let mut lines_windowed = false;
-        // Whether the search root is a directory, decided from the hits themselves rather than with a
-        // host `is_dir` that would be answering about the wrong filesystem for a remote backend — and
-        // without the round trip a backend `stat` would cost (`grep` is deliberately one operation per
-        // call; see `tests/fs_backend_cost.rs`). It is exact, not an approximation: a hit's path can
-        // equal the root only when the root is the single file being searched, and every hit of such a
-        // search has that path. `matches` is non-empty here — the empty case returned above.
-        let root_is_dir = matches
-            .first()
-            .is_none_or(|h| h.path.as_ref() != root.as_path());
+        // Paths print relative to the tool's working directory, so `read` opens them as printed.
+        let base = super::output::display_base(&self.root, &self.backend.world());
         for hit in &matches {
             let (path, line, text, is_match) = (&hit.path, hit.line, &hit.text, hit.is_match);
             // Write straight into `out` instead of allocating a `format!` temp String per line — same
@@ -218,7 +212,7 @@ impl Tool for Grep {
             } else if super::fs::is_windowed(text) {
                 lines_windowed = true;
             }
-            let display_path = format_path(path, &root, root_is_dir);
+            let display_path = format_path(path, base.as_deref());
             let _ = if is_match {
                 writeln!(out, "{display_path}:{line}: {text}")
             } else {
@@ -297,50 +291,73 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn output_paths_are_relative_to_the_search_root_not_absolute() {
-        // A prior bug reported the full path straight from the walk entry (often absolute, since the
-        // search root itself usually is) — costing the model extra tokens per line for a prefix it
-        // already knows, and diverging from pi's documented "relative to search directory" contract.
-        // Exact-match (not `.contains`) so a leftover root prefix can't slip through undetected.
+    async fn output_paths_are_relative_to_the_tool_root_so_read_can_open_them() {
+        // Paths used to be relative to the *search* root: `grep path="sub"` printed `inner/b.txt`,
+        // which `read` resolves against the tool root and cannot find. Exact lines, so a leftover
+        // prefix (or a missing one) can't slip through.
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.txt"), "needle\n").unwrap();
-        std::fs::create_dir(dir.path().join("sub")).unwrap();
-        std::fs::write(dir.path().join("sub").join("b.txt"), "needle\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("sub/inner")).unwrap();
+        std::fs::write(dir.path().join("sub/inner/b.txt"), "needle\n").unwrap();
 
-        let out = Grep::default()
+        let grep = Grep::new(dir.path());
+        let out = grep
+            .run(json!({ "pattern": "needle", "path": "sub" }))
+            .await
+            .unwrap()
+            .text;
+        assert_eq!(out.trim_end(), "sub/inner/b.txt:1: needle", "got: {out}");
+        let read = super::super::read::Read::new(dir.path())
+            .run(json!({ "path": "sub/inner/b.txt" }))
+            .await
+            .unwrap()
+            .text;
+        assert!(
+            read.contains("needle"),
+            "read must open the printed path: {read}"
+        );
+
+        // The whole tree, by absolute path: still relative to the tool root, never the root prefix.
+        let out = grep
             .run(json!({ "pattern": "needle", "path": dir.path().to_str().unwrap() }))
             .await
             .unwrap()
             .text;
         let lines: Vec<&str> = out.lines().collect();
-        assert!(
-            lines.contains(&"a.txt:1: needle"),
-            "expected a root-relative bare filename, got: {out}"
-        );
-        assert!(
-            lines.contains(&"sub/b.txt:1: needle"),
-            "expected a root-relative nested path, got: {out}"
-        );
-        assert!(
-            !out.contains(dir.path().to_str().unwrap()),
-            "the search root's own absolute prefix must not appear in the output: {out}"
+        assert_eq!(
+            lines,
+            ["a.txt:1: needle", "sub/inner/b.txt:1: needle"],
+            "got: {out}"
         );
     }
 
     #[tokio::test]
-    async fn searching_a_single_file_reports_just_its_basename() {
-        // Mirrors pi: when `path` names a single file (not a directory), there's nothing meaningful to
-        // show beyond its own name — the "relative to root" and "the file itself" cases coincide.
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("a.txt");
+    async fn a_hit_outside_the_tool_root_is_printed_absolute() {
+        let root = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let file = elsewhere.path().join("x.txt");
         std::fs::write(&file, "needle\n").unwrap();
-
-        let out = Grep::default()
-            .run(json!({ "pattern": "needle", "path": file.to_str().unwrap() }))
+        let out = Grep::new(root.path())
+            .run(json!({ "pattern": "needle", "path": elsewhere.path().to_str().unwrap() }))
             .await
             .unwrap()
             .text;
-        assert_eq!(out.trim_end(), "a.txt:1: needle", "got: {out}");
+        assert_eq!(out.trim_end(), format!("{}:1: needle", file.display()));
+    }
+
+    #[tokio::test]
+    async fn searching_a_single_file_prints_it_relative_to_the_tool_root() {
+        // Was the bare basename, which `read` could not open from anywhere but the file's directory.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("sub/a.txt"), "needle\n").unwrap();
+
+        let out = Grep::new(dir.path())
+            .run(json!({ "pattern": "needle", "path": "sub/a.txt" }))
+            .await
+            .unwrap()
+            .text;
+        assert_eq!(out.trim_end(), "sub/a.txt:1: needle", "got: {out}");
     }
 
     #[tokio::test]
