@@ -3815,6 +3815,10 @@ mod tests {
             "http://10.1.2.3/mcp",
             "http://127.0.0.1:9/mcp",
             "http://[::1]:9/mcp",
+            // The same classifier as `web`: NAT64-embedded metadata, "this network", local-use NAT64.
+            "http://[64:ff9b::a9fe:a9fe]/mcp",
+            "http://0.1.2.3/mcp",
+            "http://[64:ff9b:1::808:808]/mcp",
         ] {
             let err = egress.check(url).unwrap_err();
             assert!(err.contains("refusing to dial"), "{url}: {err}");
