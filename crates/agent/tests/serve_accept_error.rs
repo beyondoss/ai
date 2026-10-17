@@ -12,7 +12,7 @@
 mod common;
 
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use common::{ChildGuard, ISOLATED_HOME, spawn_listening_logged, spawn_model_server};
@@ -32,7 +32,7 @@ fn serve_daemon(
     uds: Option<&Path>,
 ) -> (ChildGuard, u16, std::path::PathBuf) {
     let log = dir.join("serve.log");
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_beyond-ai-agent"));
+    let mut cmd = crate::common::agent_cmd();
     cmd.args([
         "serve",
         "--gateway-url",

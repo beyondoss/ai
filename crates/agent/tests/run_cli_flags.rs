@@ -4,7 +4,7 @@
 mod common;
 
 use std::io::Write;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::Duration;
 
 use common::{
@@ -341,7 +341,7 @@ fn export_subcommand_renders_an_existing_session_file_with_no_gateway_or_key() {
     // all, proving the export subcommand is pure offline rendering of what's on disk, unlike `run
     // --export` (which only exports after a live model run completes).
     let export_path = dir.path().join("transcript.html");
-    let output = Command::new(bin)
+    let output = crate::common::agent_cmd()
         .args([
             "export",
             session_file.to_str().unwrap(),
@@ -435,7 +435,7 @@ fn export_subcommand_usage_totals_match_run_exports_for_the_same_session() {
     );
 
     let standalone_export_path = dir.path().join("standalone-export.html");
-    let output = Command::new(bin)
+    let output = crate::common::agent_cmd()
         .args([
             "export",
             session_file.to_str().unwrap(),

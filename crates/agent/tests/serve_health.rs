@@ -9,11 +9,11 @@
 mod common;
 
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use common::service::{Options, Service};
 use common::{
-    BIN, ISOLATED_HOME, spawn_listening, spawn_model_server, turn_text, ws_connect_with_headers,
+    ISOLATED_HOME, spawn_listening, spawn_model_server, turn_text, ws_connect_with_headers,
     ws_read_until_response, ws_send,
 };
 use serde_json::{Value, json};
@@ -320,7 +320,7 @@ async fn health_exists_on_a_non_service_daemon() {
     let (base, _requests) = spawn_model_server(vec![]);
     let dir = tempfile::tempdir().unwrap();
     let (_child, port) = spawn_listening(
-        Command::new(BIN)
+        crate::common::agent_cmd()
             .args([
                 "serve",
                 "--gateway-url",

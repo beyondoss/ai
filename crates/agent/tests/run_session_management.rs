@@ -3,7 +3,7 @@
 
 mod common;
 
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use common::{run_cmd, spawn_model_server, turn_text};
 use serde_json::json;
@@ -85,10 +85,9 @@ fn run_binary_persists_but_does_not_resume_by_default_with_no_session_flags_give
     //      that reattaches implicitly (covered by the `--continue` tests above).
     let home_dir = tempfile::tempdir().unwrap();
     let project_dir = tempfile::tempdir().unwrap();
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
 
     let (base1, bodies1) = spawn_model_server(vec![turn_text("first answer")]);
-    let output1 = Command::new(bin)
+    let output1 = crate::common::agent_cmd()
         .env("HOME", home_dir.path())
         .args([
             "run",
@@ -116,7 +115,7 @@ fn run_binary_persists_but_does_not_resume_by_default_with_no_session_flags_give
     );
 
     let (base2, bodies2) = spawn_model_server(vec![turn_text("second answer")]);
-    let output2 = Command::new(bin)
+    let output2 = crate::common::agent_cmd()
         .env("HOME", home_dir.path())
         .args([
             "run",
@@ -171,10 +170,9 @@ fn run_binary_no_session_persistence_flag_opts_out_of_the_default_persistence() 
     // in-memory-only behavior — no file on disk at all, and a second invocation has no history to see.
     let home_dir = tempfile::tempdir().unwrap();
     let project_dir = tempfile::tempdir().unwrap();
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
 
     let (base1, bodies1) = spawn_model_server(vec![turn_text("first answer")]);
-    let output1 = Command::new(bin)
+    let output1 = crate::common::agent_cmd()
         .env("HOME", home_dir.path())
         .args([
             "run",
@@ -203,7 +201,7 @@ fn run_binary_no_session_persistence_flag_opts_out_of_the_default_persistence() 
     );
 
     let (base2, bodies2) = spawn_model_server(vec![turn_text("second answer")]);
-    let output2 = Command::new(bin)
+    let output2 = crate::common::agent_cmd()
         .env("HOME", home_dir.path())
         .args([
             "run",
@@ -699,8 +697,7 @@ fn run_continue_with_name_titles_a_genuinely_fresh_session() {
 
     let (base, _bodies) = spawn_model_server(vec![turn_text("ok")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
-    let output = Command::new(bin)
+    let output = crate::common::agent_cmd()
         .env("HOME", home_dir.path())
         .args([
             "run",
@@ -753,10 +750,9 @@ fn run_continue_with_name_does_not_rename_an_existing_session_for_this_cwd() {
     // deliberate, already-decided divergence, not an oversight).
     let home_dir = tempfile::tempdir().unwrap();
     let project_dir = tempfile::tempdir().unwrap();
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
 
     let (base1, _bodies1) = spawn_model_server(vec![turn_text("first")]);
-    let output1 = Command::new(bin)
+    let output1 = crate::common::agent_cmd()
         .env("HOME", home_dir.path())
         .args([
             "run",
@@ -782,7 +778,7 @@ fn run_continue_with_name_does_not_rename_an_existing_session_for_this_cwd() {
     );
 
     let (base2, _bodies2) = spawn_model_server(vec![turn_text("second")]);
-    let output2 = Command::new(bin)
+    let output2 = crate::common::agent_cmd()
         .env("HOME", home_dir.path())
         .args([
             "run",
@@ -884,10 +880,9 @@ fn run_session_id_addresses_one_session_rather_than_whatever_matched_the_cwd() {
     // caller minting one id per task got a stranger's conversation instead of its own.
     let home_dir = tempfile::tempdir().unwrap();
     let project_dir = tempfile::tempdir().unwrap();
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
 
     let go = |base: &str, args: &[&str], msg: &str| {
-        let mut cmd = Command::new(bin);
+        let mut cmd = crate::common::agent_cmd();
         cmd.env("HOME", home_dir.path())
             .args(["run", msg, "--gateway-url", base, "--key", "bai_v1.test"])
             .args(["--model", "claude-test"])
@@ -1017,7 +1012,7 @@ fn run_fork_by_path_copies_a_session_file_into_a_new_session_and_continues_from_
     let target_home = tempfile::tempdir().unwrap();
     let target_project = tempfile::tempdir().unwrap();
     let (base2, bodies2) = spawn_model_server(vec![turn_text("second answer")]);
-    let output2 = Command::new(bin)
+    let output2 = crate::common::agent_cmd()
         .env("HOME", target_home.path())
         .args([
             "run",
@@ -1092,10 +1087,9 @@ fn run_fork_by_id_finds_a_session_in_a_different_projects_own_directory() {
     let home_dir = tempfile::tempdir().unwrap();
     let project_a = tempfile::tempdir().unwrap();
     let project_b = tempfile::tempdir().unwrap();
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
 
     let (base1, _bodies1) = spawn_model_server(vec![turn_text("first answer")]);
-    let output1 = Command::new(bin)
+    let output1 = crate::common::agent_cmd()
         .env("HOME", home_dir.path())
         .args([
             "run",
@@ -1128,7 +1122,7 @@ fn run_fork_by_id_finds_a_session_in_a_different_projects_own_directory() {
     let source_id = session_id_of(&source_path);
 
     let (base2, bodies2) = spawn_model_server(vec![turn_text("second answer")]);
-    let output2 = Command::new(bin)
+    let output2 = crate::common::agent_cmd()
         .env("HOME", home_dir.path())
         .args([
             "run",
@@ -1192,9 +1186,8 @@ fn run_fork_with_an_unknown_id_fails_clearly_instead_of_silently_starting_fresh(
     let home_dir = tempfile::tempdir().unwrap();
     let project_dir = tempfile::tempdir().unwrap();
     let (base, _bodies) = spawn_model_server(vec![]);
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
 
-    let output = Command::new(bin)
+    let output = crate::common::agent_cmd()
         .env("HOME", home_dir.path())
         .args([
             "run",

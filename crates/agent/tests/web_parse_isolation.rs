@@ -21,12 +21,12 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+mod common;
+
 use std::io::Write as _;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use serde_json::{Value, json};
-
-const AGENT: &str = env!("CARGO_BIN_EXE_beyond-ai-agent");
 
 const PAGE: &str = r#"<html><head><title>Doc</title></head><body>
 <h1>Hi</h1><p>Some <b>bold</b> prose.</p>
@@ -35,7 +35,7 @@ const PAGE: &str = r#"<html><head><title>Doc</title></head><body>
 
 /// Drive the child directly: write one request, read one response, return it with the exit status.
 fn parse(mode: &str, input: Value, html: &str) -> (Value, std::process::ExitStatus) {
-    let mut child = Command::new(AGENT)
+    let mut child = crate::common::agent_cmd()
         .arg("__web-parse")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

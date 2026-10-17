@@ -12,7 +12,7 @@
 mod common;
 
 use std::io::Write;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use common::{
     SpawnGuarded, read_until_response, spawn_model_server, turn_text, turn_text_responses,
@@ -71,8 +71,7 @@ fn set_model_across_oauth_providers_rederives_credential_and_routing() {
         turn_text_responses("second"),
     ]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
-    let mut child = Command::new(bin)
+    let mut child = crate::common::agent_cmd()
         .args([
             "serve",
             "--gateway-url",

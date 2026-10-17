@@ -787,7 +787,7 @@ pub fn read_printed_url(stderr: &mut BufReader<std::process::ChildStderr>) -> St
 /// Run `agent mcp-login <server>` with `$HOME` = `home` through the whole real flow (the browser
 /// step simulated by following the printed URL's redirects to the callback), asserting success.
 pub fn mcp_login(home: &Path, server: &str) {
-    let mut login = Command::new(super::BIN)
+    let mut login = crate::common::agent_cmd()
         .args(["mcp-login", server])
         .env("HOME", home)
         .stdout(Stdio::piped())

@@ -63,6 +63,35 @@ pub const DEV_TOKEN: &str = "bai_v1.1.AQAAAAAAAAABAAAAAAAAAA.WrWcPbklu91PS-4WuR6
 /// this afterward via its own `.env("HOME", ...)`, which simply wins — `Command::env` is last-write.
 pub const ISOLATED_HOME: &str = "/nonexistent-beyond-ai-agent-test-home";
 
+/// The agent binary as a [`Command`] that cannot touch the developer's real state: the only way a
+/// test spawns it (`tests/home_isolation.rs` rejects a bare `Command::new` of the binary).
+///
+/// `HOME` is [`ISOLATED_HOME`], and the variables that move state elsewhere (`AI_AGENT_CONFIG_DIR`,
+/// `AI_AGENT_SESSION_DIR`, `AI_AGENT_SESSION_FILE`, `AI_AGENT_MEMORY_URL`) are removed, so a test
+/// that forgets to give the child a home of its own fails to persist — loudly, at the write —
+/// instead of leaving a session under the developer's `~/.beyond/sessions` on every run. A test
+/// that wants a real home sets `.env("HOME", tmp)` afterwards, which wins (`Command::env` is
+/// last-write).
+pub fn agent_cmd() -> Command {
+    isolated_cmd(BIN)
+}
+
+/// [`agent_cmd`] for an explicit path to the agent binary — what the `run_cmd`/`serve_cmd` helpers
+/// build on, since they take the path as a parameter.
+pub fn isolated_cmd(program: &str) -> Command {
+    let mut c = Command::new(program);
+    c.env("HOME", ISOLATED_HOME);
+    for key in [
+        "AI_AGENT_CONFIG_DIR",
+        "AI_AGENT_SESSION_DIR",
+        "AI_AGENT_SESSION_FILE",
+        "AI_AGENT_MEMORY_URL",
+    ] {
+        c.env_remove(key);
+    }
+    c
+}
+
 /// A spawned child process that is killed and reaped when it goes out of scope — **including when the
 /// enclosing test panics**.
 ///
@@ -725,7 +754,7 @@ fn isolate_provider_env(cmd: &mut Command) {
 
 /// A `serve` child bound to a single session file, talking to the mock gateway at `base`.
 pub fn serve_cmd(bin: &str, base: &str, session_file: &str) -> Command {
-    let mut c = Command::new(bin);
+    let mut c = isolated_cmd(bin);
     isolate_provider_env(&mut c);
     c.args([
         "serve",
@@ -748,7 +777,7 @@ pub fn serve_cmd(bin: &str, base: &str, session_file: &str) -> Command {
 /// Like `serve_cmd`, but bound to a session *directory* (`--session-dir`) rather than a single file —
 /// exercises the multi-session-per-process repo mode (`list_sessions`, `switch`, fork).
 pub fn serve_dir_cmd(bin: &str, base: &str, session_dir: &str) -> Command {
-    let mut c = Command::new(bin);
+    let mut c = isolated_cmd(bin);
     isolate_provider_env(&mut c);
     c.args([
         "serve",
@@ -772,7 +801,7 @@ pub fn serve_dir_cmd(bin: &str, base: &str, session_dir: &str) -> Command {
 /// [`ISOLATED_HOME`]. A test that wants real HOME-relative behavior overrides it via its own
 /// `.env("HOME", ...)`, which simply wins (`Command::env` is last-write).
 pub fn run_cmd(bin: &str) -> Command {
-    let mut c = Command::new(bin);
+    let mut c = isolated_cmd(bin);
     isolate_provider_env(&mut c);
     c.env("HOME", ISOLATED_HOME);
     c
@@ -854,7 +883,7 @@ pub fn serve_service_cmd(
     seal_key: &std::path::Path,
     shards: &[(&str, &std::path::Path)],
 ) -> Command {
-    let mut c = Command::new(bin);
+    let mut c = isolated_cmd(bin);
     isolate_provider_env(&mut c);
     c.args([
         "serve",

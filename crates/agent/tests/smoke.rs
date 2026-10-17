@@ -163,7 +163,8 @@ fn serve_child_with_gateway_url(
         "6".into(),
     ];
     args.extend(extra.iter().map(|s| s.to_string()));
-    Command::new(env!("CARGO_BIN_EXE_beyond-ai-agent"))
+    crate::common::agent_cmd()
+        .env("HOME", cwd)
         .args(&args)
         .current_dir(cwd)
         .stdin(Stdio::piped())
@@ -178,7 +179,8 @@ fn serve_child_with_gateway_url(
 fn run_oneshot(provider: &Provider, cwd: &Path, prompt: &str) -> Output {
     let key = env_key(provider.env).expect("provider key present");
     let (gw_port, mut gateway) = boot_gateway(cwd, provider.pool, &key);
-    let output = Command::new(env!("CARGO_BIN_EXE_beyond-ai-agent"))
+    let output = crate::common::agent_cmd()
+        .env("HOME", cwd)
         .args([
             "run",
             prompt,
@@ -255,11 +257,10 @@ fn smoke_memory_persists_and_recalls_across_sessions() {
     let work = tempfile::tempdir().unwrap();
     let (gw_port, mut gateway) = boot_gateway(work.path(), "anthropic", &key);
     let gw = format!("http://127.0.0.1:{gw_port}");
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let fact = "zig build test";
 
     let run = |prompt: &str| {
-        Command::new(bin)
+        crate::common::agent_cmd()
             .args([
                 "run",
                 prompt,
@@ -872,7 +873,8 @@ fn smoke_max_steps_halts_a_live_run() {
         std::fs::write(dir.path().join("marker.txt"), "PINEAPPLE-7493\n").unwrap();
         let (gw_port, mut gateway) = boot_gateway(dir.path(), p.pool, &key);
 
-        let output = Command::new(env!("CARGO_BIN_EXE_beyond-ai-agent"))
+        let output = crate::common::agent_cmd()
+        .env("HOME", dir.path())
             .args([
                 "run",
                 "Use the read tool to read marker.txt in the current directory, then reply with ONLY the token it contains.",
@@ -1720,7 +1722,8 @@ fn smoke_invalid_model_id_fails_fast_not_retried_live() {
         };
 
         let started = std::time::Instant::now();
-        let output = Command::new(env!("CARGO_BIN_EXE_beyond-ai-agent"))
+        let output = crate::common::agent_cmd()
+            .env("HOME", dir.path())
             .args([
                 "run",
                 "say hello",
@@ -2090,7 +2093,8 @@ fn smoke_whole_run_auto_retry_recovers_from_a_real_dropped_connection_live() {
 /// it. Mirrors [`serve_child`] but for the `serve_ws` path.
 fn serve_ws_child(gw_port: u16, cwd: &Path, model: &str, session_dir: &Path) -> (ChildGuard, u16) {
     spawn_listening(
-        Command::new(env!("CARGO_BIN_EXE_beyond-ai-agent"))
+        crate::common::agent_cmd()
+            .env("HOME", cwd)
             .args([
                 "serve",
                 "--gateway-url",
@@ -2280,7 +2284,8 @@ fn serve_uds_child(
     session_dir: &Path,
     sock: &Path,
 ) -> ChildGuard {
-    Command::new(env!("CARGO_BIN_EXE_beyond-ai-agent"))
+    crate::common::agent_cmd()
+        .env("HOME", cwd)
         .args([
             "serve",
             "--listen-uds",
@@ -2391,7 +2396,8 @@ async fn smoke_h2c_shared_pool_live() {
         let session_dir = dir.path().join("sessions");
         // serve with the shared h2c client. The gateway (this branch) accepts downstream h2c.
         let (mut child, ws_port) = spawn_listening(
-            Command::new(env!("CARGO_BIN_EXE_beyond-ai-agent"))
+            crate::common::agent_cmd()
+                .env("HOME", dir.path())
                 .args([
                     "serve",
                     "--upstream-http2",
@@ -2571,7 +2577,8 @@ fn smoke_subagent_worktree_merge_back() {
     }
 
     let (gw_port, mut gateway) = boot_gateway(repo, "anthropic", &key);
-    let output = Command::new(env!("CARGO_BIN_EXE_beyond-ai-agent"))
+    let output = crate::common::agent_cmd()
+        .env("HOME", repo)
         .args([
             "run",
             "Delegate to the `writer` subagent: have it append a second line reading exactly \
