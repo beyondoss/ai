@@ -3523,7 +3523,11 @@ Anthropic prompt cache and contend the Codex WebSocket pool, which is keyed on i
 checkpoint hook** (`Agent::new`'s `NoCheckpoint` default) so their turns don't leak into the parent's
 session store. The transport is built per child via a **factory closure** (`TransportFactory`), not by
 cloning the parent's — credentials/routing are model-keyed, so a child naming its own `model:` must
-re-resolve.
+re-resolve. A child with no `model:` inherits the parent's **current** model through
+`SubagentCtx::parent`, a shared `ParentCell` read at each dispatch. `serve` builds its ctx once per
+session and keeps it across every rebuild, so a copied startup model went stale on the first
+`set_model`/`cycle_model`/resume/branch; `build_agent` — which every one of those reaches — now writes
+the cell with the model it is building for.
 
 Child `AgentEvent`s are folded into `ToolProgress::emit` as a **coalesced, throttled** status snapshot
 (≥100 ms between emits; raw token deltas are never forwarded) — `serve`'s outbound channel is unbounded,

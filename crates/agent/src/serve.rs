@@ -3625,7 +3625,8 @@ pub(crate) async fn serve_session(
     // exclusivity (same-path `edit`/`write` calls) survives a `set_model`/`set_thinking` rebuild.
     let write_locks = Arc::new(agent_core::WriteLockRegistry::new());
     // The subagent context, built once and reused across every rebuild — its transport factory closes
-    // over `cfg` and re-resolves per child model, so nothing here changes when the *parent's* model does.
+    // over `cfg` and re-resolves per child model. The one parent-dependent piece, the model a child
+    // inherits, is a live cell that `build_agent` rewrites on every rebuild (see `ParentLoop`).
     // `None` when no agent definitions were discovered: no delegable agents, no `subagent` tool.
     // `mut` because `reload` rebuilds it when trust or the on-disk definitions change and then rebuilds
     // the agent, so a mid-session-added agent becomes delegable immediately.
@@ -9181,7 +9182,9 @@ fn build_subagent_ctx(
         // `PromptOptions::disk_overrides`) — otherwise delegating would be a way around it.
         disk_overrides: !cfg.service_mode,
         prompt_guidelines: Vec::new(),
-        parent_model: parent_model.to_string(),
+        parent: subagent::ParentCell::new(subagent::ParentLoop {
+            model: parent_model.to_string(),
+        }),
         parent_cache_key: parent_model.to_string(),
         parent_tools,
         deny_tool: cfg.deny_tool.clone(),
@@ -9260,6 +9263,12 @@ fn build_agent(
     // needs the same registry every child shares. Reused across rebuilds; the ctx's factory handles the
     // per-child model itself, so a `set_model` rebuild doesn't invalidate it.
     if let Some(ctx) = subagent_ctx {
+        // Every model switch, resume and branch lands here, so this is the one place that keeps the
+        // long-lived ctx's view of the parent current: a child dispatched after `set_model` inherits
+        // the model the parent is on *now*, not the one the session started with.
+        ctx.parent.set(crate::tools::subagent::ParentLoop {
+            model: model.to_string(),
+        });
         registry.register(Arc::new(crate::tools::subagent::Subagent::new(ctx.clone())));
     }
     // After `build_tools`'s `--tools`/`--exclude-tools` filter, like `subagent` above: an allow-list

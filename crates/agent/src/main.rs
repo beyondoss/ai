@@ -5286,7 +5286,9 @@ async fn run_task(
             project_trusted,
             disk_overrides: true,
             prompt_guidelines: prompt_guidelines.clone(),
-            parent_model: model.clone(),
+            parent: subagent::ParentCell::new(subagent::ParentLoop {
+                model: model.clone(),
+            }),
             parent_cache_key: model.clone(),
             parent_tools,
             deny_tool: deny_tool.clone(),
