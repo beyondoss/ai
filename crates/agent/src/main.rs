@@ -2356,6 +2356,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             .into(),
                     );
                 }
+                // The session epoch fence trusts the NFS client's caches to expire within one
+                // lease; a mount that keeps them longer (`nocto`, a large `acdirmax`/`actimeo`)
+                // could lose acknowledged writes, so it is refused before anything is served.
+                beyond_ai_agent::shard_mount::check_shards(&shards)?;
                 if listen.is_none() && listen_uds.is_none() && !systemd_activated {
                     return Err(
                         "--service requires --listen, --listen-uds, or systemd socket activation: \

@@ -33,6 +33,7 @@ pub mod serve_ws;
 pub mod service;
 pub mod session_store;
 pub mod settings;
+pub mod shard_mount;
 pub mod skills;
 #[cfg(test)]
 pub(crate) mod test_support;

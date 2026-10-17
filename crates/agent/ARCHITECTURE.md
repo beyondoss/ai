@@ -4125,6 +4125,25 @@ have created.
   which the format has no room for today. Measured with a partitioned owner against a real NFSv4
   lease: the successor took over at 102 s, and before this check the old owner then committed a turn,
   answered `success`, and that turn was absent from the transcript the successor replayed.
+- **Deployment invariant: the shard's NFS mount (`shard_mount`).** The re-check is a lookup of the
+  next epoch's name, and an NFS client may answer a lookup from cache: a negative dentry is trusted
+  until the directory's cached attributes expire, up to `acdirmax` (with the default
+  `lookupcache=all`). The fence holds anyway because a successor can only take a session from a
+  partitioned owner after the owner's NFSv4 lease expires — at least one lease after the owner's
+  last contact, which is no earlier than any attribute it cached — so once the owner can reach the
+  server again, every cache that could hide the successor's segment is already older than a lease.
+  That needs `acdirmax` (and `acdirmin`; `actimeo` sets both) shorter than the lease, and
+  close-to-open consistency so a successor's open of the predecessor reads its real length.
+  `serve --service` checks this at startup: it reads `/proc/self/mountinfo` and finds the mount each
+  `--shard` path lives on (resolved through symlinks, deepest and latest mount wins). It refuses to
+  start, naming the shard and the option, when an `nfs`/`nfs4` mount has `nocto`, or has
+  `lookupcache=all` with a directory attribute timeout of 80 s or more (the assumed 90 s lease less
+  a 10 s margin). `lookupcache=none`/`pos` never caches negative lookups, so `acdirmax` is not
+  limited there. A shard that is not on NFS passes, and if `mountinfo` cannot be read startup fails
+  (fail closed). The kernel prints only non-default timeouts; its defaults (30 s/60 s) are what
+  ECS/Fargate mounts EFS with, so the shipped deployment passes. The lease belongs to the server and
+  no client interface exposes it, so 90 s (EFS's, and Linux `nfsd`'s default) is assumed: a server
+  set to a shorter lease needs a correspondingly smaller `acdirmax`, which this check cannot see.
 - **An append that fails** seals the segment at its last good offset and rolls on the next write, so
   one `ENOSPC` can't brick a session with an unbounded torn line mid-segment.
 

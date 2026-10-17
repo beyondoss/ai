@@ -6692,10 +6692,14 @@ impl SegLog {
     ///
     /// **What it does not close.** A successor that reads this segment's length and creates its own
     /// epoch *after* this check has passed still seals away a line this owner has acknowledged. The
-    /// window shrinks from unbounded to one round trip, and on a network filesystem it is further
-    /// bounded below by the client's own attribute cache — a negative lookup for the successor's
-    /// name can be served locally for up to `acdirmin`. Closing it completely needs a fencing token
-    /// carried in the write itself, which the storage format has no room for today.
+    /// window shrinks from unbounded to one round trip. On a network filesystem the `exists()` below
+    /// can also be answered from the client's cache: a negative lookup for the successor's name (a
+    /// cached negative dentry) is trusted until the directory's cached attributes expire, which
+    /// takes up to `acdirmax` (with the default `lookupcache=all`). That is safe only while
+    /// `acdirmax` is shorter than the NFSv4 lease a successor must outwait before it can take the
+    /// session from a partitioned owner — service mode refuses to start on a mount where it is not,
+    /// or with `nocto` ([`crate::shard_mount`]). Closing the round-trip window completely needs a
+    /// fencing token carried in the write itself, which the storage format has no room for today.
     fn guard_not_superseded(&mut self) -> std::io::Result<()> {
         let Some(epoch) = self.target else {
             return Ok(());
