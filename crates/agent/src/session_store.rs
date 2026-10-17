@@ -604,10 +604,10 @@ pub struct CompactionMeta {
     /// Estimated input tokens at the moment this compaction fired (before the reset) — the same value
     /// carried on `agent_core::AgentEvent::Compacted`.
     pub tokens_before: u32,
-    /// `Session.compaction` right after this round's own `merge_file_ops` fold — persisted onto the new
-    /// `Entry::Compaction` record's `read_files`/`modified_files`/`last_reason` (see that variant's own
-    /// doc comment) so a later `SessionStore::open` can restore it instead of silently starting over
-    /// from empty.
+    /// `Session.compaction` right after this round's own `merge_provenance` fold — persisted onto
+    /// the new `Entry::Compaction` record's `read_files`/`modified_files`/`last_reason` (see that
+    /// variant's own doc comment) so a later `SessionStore::open` can restore it instead of
+    /// silently starting over from empty.
     pub provenance: CompactionProvenance,
 }
 
@@ -1373,13 +1373,14 @@ impl SessionStore {
                     user_requests,
                     ..
                 }) => {
-                    // Each record already carries every earlier round's file-provenance folded in (via
-                    // `merge_file_ops`, before it was even written — see `CompactionMeta::provenance`'s
-                    // doc comment), so it's a complete, self-contained snapshot: the *last* one in file
-                    // order (this loop runs in file order, so a later assignment here simply overwrites
-                    // an earlier one) is all `Session.compaction` needs, restored below once `meta` (for
-                    // its `compactions` counter) is available. Fixes a bug where this provenance was
-                    // purely in-memory and silently reset to empty on every reopen past a compaction.
+                    // Each record already carries every earlier round's file-provenance folded in
+                    // (via `merge_provenance`, before it was even written — see
+                    // `CompactionMeta::provenance`'s doc comment), so it's a complete,
+                    // self-contained snapshot: the *last* one in file order (this loop runs in file
+                    // order, so a later assignment here simply overwrites an earlier one) is all
+                    // `Session.compaction` needs, restored below once `meta` (for its `compactions`
+                    // counter) is available. Fixes a bug where this provenance was purely in-memory
+                    // and silently reset to empty on every reopen past a compaction.
                     compaction_provenance = Some(CompactionProvenance {
                         read_files,
                         modified_files,
@@ -1667,7 +1668,7 @@ impl SessionStore {
 
     /// The message at tree entry `id`, anywhere in the whole tree (on or off the active path) —
     /// `None` for an unknown id or one naming a non-message node ([`Entry::Custom`]). Used by `fork`'s
-    /// own response (`serve.rs`'s `Persistence::fork_source_text`) to echo the forked-from message's
+    /// own response (`serve.rs`'s `fork_text`) to echo the forked-from message's
     /// text back to the caller without a second `get_fork_messages`-style round trip.
     pub fn message_at(&self, id: &str) -> Option<&Message> {
         self.nodes.get(id).and_then(Node::as_message)
@@ -8592,15 +8593,16 @@ mod tests {
     fn rewrite_compacted_persists_file_provenance_and_it_survives_a_reopen() {
         // Fix 2 (pi-parity remediation, Round 2): `agent_core::Session.compaction`
         // (`CompactionProvenance`'s `read_files`/`modified_files`/`last_reason`, folded forward
-        // turn-to-turn by `agent_core::compaction::merge_file_ops`) was purely in-memory — the on-disk
-        // `Entry::Compaction` record had no field to carry it at all, and `SessionStore::open` never
-        // restored it. So a `serve` restart or session reattach after even one compaction round
-        // silently forgot every file that round already knew about: the *next* compaction's
-        // `<read-files>`/`<modified-files>` tags would quietly omit everything from before the
-        // restart. Reproduced here exactly as that would happen: seed `Session.compaction` as if a
-        // live compaction round just fired, persist it via `rewrite_compacted`, then reopen the
-        // session fresh (a brand-new `SessionStore::open`/`repo.open_id` call, not the same in-memory
-        // `store`) and assert the provenance is back.
+        // turn-to-turn by `agent_core::compaction::merge_provenance`) was purely in-memory — the
+        // on-disk `Entry::Compaction` record had no field to carry it at all, and
+        // `SessionStore::open` never restored it. So a `serve` restart or session reattach after
+        // even one compaction round silently forgot every file that round already knew about: the
+        // *next* compaction's `<read-files>`/`<modified-files>` tags would quietly omit everything
+        // from before the restart. Reproduced here exactly as that would happen: seed
+        // `Session.compaction` as if a live compaction round just fired, persist it via
+        // `rewrite_compacted`, then reopen the session fresh (a brand-new
+        // `SessionStore::open`/`repo.open_id` call, not the same in-memory `store`) and assert the
+        // provenance is back.
         let dir = tmpdir();
         let repo = SessionRepo::open(dir.path()).unwrap();
         let mut store = repo.create(SessionMeta::new("/w", "m")).unwrap();
@@ -8749,7 +8751,7 @@ mod tests {
     fn rewrite_compacted_folds_file_provenance_forward_across_two_rounds_and_both_survive_a_reopen()
     {
         // The forward-folding half of Fix 2: a *second* compaction round's own `CompactionMeta
-        // .provenance` (what `agent_core::compaction::merge_file_ops` already folds forward in
+        // .provenance` (what `agent_core::compaction::merge_provenance` already folds forward in
         // memory) must still be a complete snapshot on its own — `SessionStore::open` only ever reads
         // the *last* `Entry::Compaction` record, trusting that it already carries every earlier
         // round's files, exactly like `Session.compaction` already does turn-to-turn in memory.
@@ -8787,8 +8789,8 @@ mod tests {
             .unwrap();
 
         // Round 2 folds round 1's `a.rs` forward with its own new activity, matching what
-        // `merge_file_ops` would actually do — the persisted record must reflect that already-folded
-        // union, not just round 2's own new files.
+        // `merge_provenance` would actually do — the persisted record must reflect that
+        // already-folded union, not just round 2's own new files.
         let round2 = CompactionProvenance {
             read_files: vec!["a.rs".to_string(), "b.rs".to_string()],
             modified_files: vec!["c.rs".to_string()],

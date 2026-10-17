@@ -60,7 +60,7 @@ pub fn backoff(attempt: u32) -> std::time::Duration {
 /// mapped onto `[0.8, 1.2]`. Salt gives cross-process variance (two fleet processes at the same attempt
 /// number don't jitter identically); the counter gives cross-call variance (the *same* attempt number,
 /// computed twice in one process, doesn't jitter identically either — see
-/// `backoff_jitter_varies_across_calls` below).
+/// `backoff_jitter_varies_across_calls_but_stays_in_range` below).
 fn jitter(d: std::time::Duration, attempt: u32) -> std::time::Duration {
     use std::collections::hash_map::{DefaultHasher, RandomState};
     use std::hash::{BuildHasher, Hash, Hasher};

@@ -109,7 +109,7 @@ const CACHE_STATUS_HEADER: &str = "x-beyond-cache-status";
 /// OpenRouter's dashboard-attribution headers (https://openrouter.ai/docs/quickstart): purely
 /// cosmetic on OpenRouter's side (their own cost/usage categorization), no effect on the request
 /// or response. Static — this doesn't need to be configurable, just present. Only OpenRouter is in
-/// `KNOWN_PROVIDERS` among the providers pi attributes to (NVIDIA NIM, Cloudflare, Vercel AI
+/// `known_providers()` among the providers pi attributes to (NVIDIA NIM, Cloudflare, Vercel AI
 /// Gateway aren't routed providers here), so this is the one case worth porting. Header names match
 /// pi's current OpenRouter-specific set (`packages/coding-agent/src/core/provider-attribution.ts`):
 /// `HTTP-Referer`, `X-OpenRouter-Title` (NOT the generic `X-Title` pi used for the now-removed Vercel
@@ -1677,16 +1677,17 @@ impl AiProxy {
         row: Option<&route::ModelRoute>,
     ) -> HttpPeer {
         let mut peer = HttpPeer::new(addr, self.state.config.upstream_tls, provider.host.clone());
-        // Prefer HTTP/2 to the provider (config `upstream_http2`, default on), fall back to HTTP/1.1.
-        // Every provider in `KNOWN_PROVIDERS` negotiates `h2` over TLS (verified by handshake), and H2
-        // multiplexes many concurrent requests/streams over one connection — fewer sockets and TLS
-        // handshakes from our egress IPs (which also eases the egress-reputation pressure `ratelimit`
-        // guards). `H2H1` is strictly ≥ `H1` on compatibility: ALPN negotiates down to H1 for any host
-        // that doesn't offer h2, and a plaintext upstream (the mock, `upstream_tls=false`) has no ALPN
-        // at all and stays H1. The negotiated protocol is then visible per-request as
-        // `upstream_request.version` (see `upstream_request_filter`), which is what lets the
-        // body-injection path frame correctly. The knob lets an operator force all-H1 without a code
-        // redeploy, and lets the e2e bench compare the two head-to-head.
+        // Prefer HTTP/2 to the provider (config `upstream_http2`, default on), fall back to
+        // HTTP/1.1. Every provider in `known_providers()` negotiates `h2` over TLS (verified by
+        // handshake), and H2 multiplexes many concurrent requests/streams over one connection —
+        // fewer sockets and TLS handshakes from our egress IPs (which also eases the
+        // egress-reputation pressure `ratelimit` guards). `H2H1` is strictly ≥ `H1` on
+        // compatibility: ALPN negotiates down to H1 for any host that doesn't offer h2, and a
+        // plaintext upstream (the mock, `upstream_tls=false`) has no ALPN at all and stays H1. The
+        // negotiated protocol is then visible per-request as `upstream_request.version` (see
+        // `upstream_request_filter`), which is what lets the body-injection path frame correctly.
+        // The knob lets an operator force all-H1 without a code redeploy, and lets the e2e bench
+        // compare the two head-to-head.
         peer.options.alpn = if self.state.config.upstream_http2 {
             ALPN::H2H1
         } else {

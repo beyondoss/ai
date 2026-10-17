@@ -499,12 +499,13 @@ fn serve_list_sessions_streams_progress_frames_correlated_to_the_request_id() {
     let response = frames.last().unwrap();
     assert_eq!(response["success"], true);
     // Track L28 (pi-parity fix): `list_sessions` now filters to this process's own cwd (matching
-    // `resume_or_create`'s identical filter at startup — see `Persistence::list_with_progress`'s doc
-    // comment), so the returned count is no longer `total` itself once other cwds are mixed into the
-    // same directory: `total`/`scanned` still reflect the raw, unfiltered file scan (the same
-    // scan-vs-filtered-result split `list_sessions`'s own `query` parameter already has), but the 6
-    // seeded here all carry a fake `/w{i}` cwd that matches none of them — only the server's own real
-    // startup session (this cwd) survives the filter.
+    // `resume_latest_or_create`'s identical filter at startup — see
+    // `Persistence::list_with_progress`'s doc comment), so the returned count is no longer `total`
+    // itself once other cwds are mixed into the same directory: `total`/`scanned` still reflect the
+    // raw, unfiltered file scan (the same scan-vs-filtered-result split `list_sessions`'s own
+    // `query` parameter already has), but the 6 seeded here all carry a fake `/w{i}` cwd that
+    // matches none of them — only the server's own real startup session (this cwd) survives the
+    // filter.
     assert_eq!(
         response["data"]["sessions"].as_array().unwrap().len(),
         1,

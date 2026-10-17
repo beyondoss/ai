@@ -1,7 +1,7 @@
 //! The agent's coding tools — pi's tool set, ported.
 //!
 //! Each tool implements [`agent_core::Tool`]; [`default_registry`] assembles the set the agent
-//! advertises to the model. The Beyond platform tools (fork/sync/logs) register here too once added.
+//! advertises to the model.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -536,42 +536,23 @@ fn join_against(root: &Path, normalized: String) -> String {
     root.join(&normalized).display().to_string()
 }
 
-/// Reject any resolved path that isn't a regular file or a directory, *before* a caller ever opens it —
-/// shared by `read` (image-sniffing/content), `write` (the overwrite-open path, via [`is_writable`]),
-/// and `edit` (`read_with_mtime`'s initial open). Originally lived only in `read.rs`; hoisted here once
-/// the same hang class was found in `write`/`edit` too (pi-parity pass 20) — each of those blocks on a
-/// syscall no timeout/kill-on-drop can preempt, exactly like `read`'s own pre-fix bug below, so one
-/// shared gate closes all three rather than three independently-maintained copies.
+/// The refusal `read`, `write` and `edit` return for a path that is neither a regular file nor a
+/// directory (a FIFO, socket or device), decided from the [`FileKind`](fs::FileKind) the backend's
+/// `stat` already reported, before anything opens the path. Asking the host's `std::fs::metadata`
+/// instead would answer about the wrong machine for a remote path.
 ///
-/// That gap is a real hang, not just a theoretical one: opening a FIFO for reading blocks until a
-/// writer shows up on the other end (a bare `mkfifo` with no writer wedges the very first read), opening
-/// one for *writing* (`write`'s overwrite path, `OpenOptions::write(true)`) equally blocks until a
-/// *reader* shows up, and a character device like `/dev/zero` opens and reads immediately but never
-/// signals EOF or contains a newline byte — a line-scanning read loop spins forever waiting for either.
-/// None of this has a timeout or kill-on-drop the way `bash`'s child processes do, so any one of them
-/// wedges the whole tool call — and, since dispatch awaits each call in turn, the entire turn — forever;
-/// worse, because it's a blocking syscall inline in the future's own `poll()` rather than behind an
-/// `await` point, dropping/cancelling the enclosing future can't recover it either — only killing the
-/// whole process can, which in `serve` pins a tokio worker thread shared by other concurrent sessions.
+/// The gate exists because opening one of these is a real hang: a FIFO opened for reading blocks
+/// until a writer shows up (and for writing, until a reader does), and a character device like
+/// `/dev/zero` opens and reads immediately but never signals EOF or contains a newline byte, so a
+/// line-scanning read loop spins forever. None of this has a timeout or kill-on-drop the way
+/// `bash`'s child processes do, and because it is a blocking syscall inside the future's own
+/// `poll()`, cancelling the enclosing future cannot recover it — in `serve` it pins a tokio worker
+/// thread shared by other sessions. There is no legitimate use for reading or writing one through
+/// these tools, so all of them are refused with one clear error. A directory needs no gate: opening
+/// one already fails cleanly a moment later.
 ///
-/// There's no legitimate use for reading/writing a FIFO/socket/device through these tools (a named
-/// pipe's "content" isn't a stable, replayable value the way a regular file's bytes are, and images are
-/// never any of these), so this simply refuses all of them with one clear error rather than trying to
-/// special-case any as safe. A directory is let through unmolested — opening one for reading or writing
-/// already fails cleanly a moment later (an `EISDIR`-style OS error) — so it needs no separate gate here.
-///
-/// Uses `std::fs::metadata` (follows symlinks) rather than `symlink_metadata`, so a symlink pointing
-/// *at* a FIFO/device is caught too, not just a bare one. A path whose metadata can't be read at all
-/// (most commonly: doesn't exist) is let through here — that already has its own clear "missing
-/// file"/"not writable" error at the real open call below, and duplicating it here under a different
-/// wording would just be a second, inconsistent failure mode for the same cause.
-///
-/// `tool` names the caller in the error message (`"read"`/`"write"`/`"edit"`) so the model sees which
-/// tool actually refused the path, not a generic one-size-fits-all wording.
-/// The same refusal, phrased identically, for a caller that already has the path's
-/// [`FileKind`](fs::FileKind) from a backend `stat` and must not pay a second, host-only
-/// `std::fs::metadata` to rediscover it — which for a remote path would be answering the question
-/// about the wrong machine.
+/// `tool` names the caller in the message (`"read"`/`"write"`/`"edit"`) so the model sees which
+/// tool refused the path.
 pub(crate) fn non_regular_file_error(path: &str, tool: &str) -> ToolError {
     ToolError::Execution(format!(
         "{path} is not a regular file (it's a FIFO, socket, or device); `{tool}` can only operate on \
@@ -762,9 +743,10 @@ impl<'a> ToolConfig<'a> {
 /// TB polyglot run burned most of its `$` fetching pages. `grep`/`find`/`ls`/`todo` stay advertised.
 pub const OPTIONAL_BUILTINS: &[&str] = &["web"];
 
-/// The constructed tool set: Pi's seven coding tools (read, write, edit, bash, ls, grep, find), the
-/// `todo` task list, and `web`. Advertised default is those eight minus `web`; `web` stays registered
-/// so `--tools web` can opt it in. No vendor-specific platform tools, no root (process cwd).
+/// The constructed tool set: Pi's seven coding tools (read, write, edit, bash, ls, grep, find),
+/// `bash_job` (whenever `bash` can leave a command running), the `todo` task list, and `web`. The
+/// advertised default is all of them minus `web`, which stays registered so `--tools web` can opt
+/// it in. No vendor-specific platform tools, no root (process cwd).
 pub fn default_registry() -> ToolRegistry {
     default_registry_with_config(&ToolConfig::new())
 }
@@ -1576,9 +1558,9 @@ mod tests {
     }
 
     /// A trivial stand-in for an [`mcp::McpTool`] — that type is crate-private and always backed by a
-    /// live connection, so tests exercising `default_registry_with_prefix_image_auto_resize_and_mcp_tools`
-    /// (which only cares that *some* `Arc<dyn Tool>` merges in under its own name) use this instead of
-    /// standing up a real MCP server.
+    /// live connection, so tests exercising `ToolConfig::mcp_tools` (which only care that *some*
+    /// `Arc<dyn Tool>` merges in under its own name) use this instead of standing up a real MCP
+    /// server.
     struct FakeMcpTool(&'static str);
     #[async_trait::async_trait]
     impl Tool for FakeMcpTool {
@@ -1987,8 +1969,8 @@ mod tests {
     }
 
     /// `LocalFs::stat` is what every tool's "is this safe to open" branch reads, so its classification
-    /// of the three ordinary cases is pinned here — the coverage `reject_non_regular_file`'s own tests
-    /// used to provide before the check moved behind the backend.
+    /// of the three ordinary cases is pinned here — the FIFO gate decides on that
+    /// classification.
     fn stat_kind(path: &std::path::Path) -> Option<fs::FileKind> {
         tokio::runtime::Builder::new_current_thread()
             .build()

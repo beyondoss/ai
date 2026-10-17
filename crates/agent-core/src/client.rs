@@ -119,19 +119,20 @@ impl Drop for ApiKey {
 /// How a [`DirectRouting`]-carrying credential's request must reach its upstream when the default
 /// `{GatewayClient::base_url}{dialect.endpoint_path()}` composition is wrong for this provider.
 ///
-/// Both GitHub Copilot and OpenAI Codex OAuth logins hand back a bearer token that's useless against
-/// the gateway's *default* provider (bare `/v1/…` always means "whichever provider the gateway's
-/// dialect default points at" — Anthropic or OpenAI direct, never Copilot/Codex): the gateway's
-/// `route.rs` `KNOWN_PROVIDERS` table is a set of **static** `(name, authority, dialect, auth)` rows,
-/// which fits Codex fine (`chatgpt.com` is a fixed host) but cannot express Copilot's endpoint at
-/// all — GitHub hands back a *different* proxy host per account/enterprise, embedded in the access
-/// token itself (`proxy-ep=…`), not knowable at gateway-boot time. So the two providers need two
-/// different fixes, both applied client-side rather than in the gateway's routing table:
+/// Both GitHub Copilot and OpenAI Codex OAuth logins hand back a bearer token that's useless
+/// against the gateway's *default* provider (bare `/v1/…` always means "whichever provider the
+/// gateway's dialect default points at" — Anthropic or OpenAI direct, never Copilot/Codex): the
+/// gateway's provider table (`providers::gateway_providers()`) is a set of **static** `(name,
+/// authority, dialect, auth)` rows, which fits Codex fine (`chatgpt.com` is a fixed host) but
+/// cannot express Copilot's endpoint at all — GitHub hands back a *different* proxy host per
+/// account/enterprise, embedded in the access token itself (`proxy-ep=…`), not knowable at
+/// gateway-boot time. So the two providers need two different fixes, both applied client-side
+/// rather than in the gateway's routing table:
 #[derive(Debug, Clone)]
 pub enum RouteOverride {
     /// Still relayed through the gateway (`GatewayClient::base_url` unchanged) under a
-    /// `route::KNOWN_PROVIDERS` row's name as the first path segment (e.g. `"/openai-codex"`), with
-    /// `path` appended in place of the dialect's own default endpoint path — Codex's real path
+    /// `route::known_providers()` row's name as the first path segment (e.g. `"/openai-codex"`),
+    /// with `path` appended in place of the dialect's own default endpoint path — Codex's real path
     /// (`/backend-api/codex/responses`) differs from the OpenAI-Responses dialect's usual
     /// `/v1/responses`. Fits because Codex's host (`chatgpt.com`) is genuinely static.
     Prefixed {
@@ -1727,7 +1728,7 @@ fn parse_retry_after(raw: &str, max_backoff: Duration) -> Option<Duration> {
 /// attempt inputs, not the hasher itself) and mapped onto `[0.8, 1.2]`. Salt gives cross-process
 /// variance (two fleet processes at the same attempt number don't jitter identically); the counter
 /// gives cross-call variance (the *same* attempt number, computed twice in one process, doesn't
-/// jitter identically either — see `backoff_jitter_varies_across_calls` below).
+/// jitter identically either — see `backoff_jitter_varies_across_calls_but_stays_in_range` below).
 ///
 /// `pub(crate)`: also reused by `agent::mid_stream_backoff`, this crate's other inner retry layer.
 pub(crate) fn jitter(d: Duration, attempt: u32) -> Duration {
@@ -3391,7 +3392,7 @@ mod tests {
     }
 
     /// A Claude-family model routed through a Copilot credential is `is_anthropic` but not
-    /// `is_oauth` (see `has_direct_override`'s doc comment in `stream()`): it must still get
+    /// `is_oauth` (see `routed_to_anthropic_natively` in `stream()`): it must still get
     /// `anthropic-dangerous-direct-browser-access` (pi sends that header in every Anthropic auth
     /// branch, Copilot included — Task 3, pi-parity), but none of Anthropic's own OAuth-only identity
     /// headers, which would misrepresent this as a direct-to-Anthropic Claude Code request instead of

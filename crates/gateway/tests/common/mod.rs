@@ -1161,7 +1161,7 @@ impl GatewayBuilder {
         self
     }
 
-    /// Point the gateway at the **real** provider hosts over TLS (the `route::KNOWN_PROVIDERS`
+    /// Point the gateway at the **real** provider hosts over TLS (the `route::known_providers()`
     /// defaults), instead of the plaintext mock. Used by the live smoke tests (`tests/smoke.rs`):
     /// no authority overrides, no pool keys, no signing keys — smoke traffic is BYO (the caller's
     /// real provider token, passed through), so none of that is needed.

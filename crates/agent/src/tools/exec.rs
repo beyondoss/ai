@@ -1,8 +1,10 @@
 //! A command-execution seam.
 //!
-//! `bash` runs real commands through [`RealRunner`]; the Beyond tools (fork/sync/logs, M8) run the
-//! `beyond` CLI through the same trait, so their tests inject a [`CommandRunner`] that records the
-//! argv instead of shelling out. This is the boundary that keeps shell-driven tools testable.
+//! `bash` runs real commands through [`RealRunner`]; the shell filesystem backend (`ShellFs`),
+//! worktree `git` and the sandbox-job scripts run theirs through the same trait, and an exec
+//! endpoint is just another [`CommandRunner`]. Tests inject one that records the argv instead of
+//! shelling out. This is the boundary that keeps shell-driven tools testable and lets them run
+//! somewhere other than this host.
 
 use std::process::Stdio;
 use std::time::Duration;
@@ -390,7 +392,8 @@ impl RealRunner {
         // the `stdout`/`stderr`/`truncated` fields entirely (see the `Ok` arm's comment and `bash.rs`).
         // So when streaming we skip the ≤256 KiB head/tail `Capture` *and* the final `from_utf8_lossy`
         // allocations below — they'd only be produced to be discarded. The non-streaming `run` path
-        // (the `beyond` CLI tools) keeps full capture, since it *does* read these fields.
+        // (`ShellFs`'s commands, worktree `git`) keeps full capture, since it *does* read these
+        // fields.
         let streaming = on_chunk.is_some() || on_stderr.is_some();
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
@@ -429,15 +432,14 @@ impl RealRunner {
             (status, out, err, fed)
         };
         match tokio::time::timeout(timeout, collect).await {
-            // Lossy on purpose, not by oversight: `bash` (this crate's primary consumer) never reads
-            // these two fields for real output — its `run_streaming` sink appends every chunk to its
-            // `OutputAccumulator` as raw bytes as they arrive (see `bash.rs`'s `sink` closure), and
-            // only falls back to `stdout`/`stderr` here when nothing streamed (a test double, a remote
-            // runner). The live path this struct actually feeds for `bash` never goes through
-            // `from_utf8_lossy`. The Beyond platform tools (`fork`/`sync`/`logs`, `beyond.rs`) *do*
-            // consume these fields directly as their whole output — but that's the `beyond` CLI's own
-            // stdout/stderr, expected to be human-readable text, not arbitrary binary data the way a
-            // `bash`-run command's output can be.
+            // Lossy on purpose, not by oversight: `bash` (this crate's primary consumer) never
+            // reads these two fields for real output — its `run_streaming` sink appends every chunk
+            // to its `OutputAccumulator` as raw bytes as they arrive (see `bash.rs`'s `sink`
+            // closure), and only falls back to `stdout`/`stderr` here when nothing streamed (a test
+            // double, a remote runner). The live path this struct actually feeds for `bash` never
+            // goes through `from_utf8_lossy`. The non-streaming callers that *do* read these fields
+            // (`ShellFs`, worktree `git`) run commands whose output is text, or base64-encode bytes
+            // that may not be (a worktree patch; see `worktree.rs`).
             Ok((status, (stdout, out_trunc), (stderr, err_trunc), fed)) => {
                 guard.disarm();
                 let status = status?;

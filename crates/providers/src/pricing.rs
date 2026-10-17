@@ -12,13 +12,15 @@
 //!
 //! # The model in one paragraph
 //!
-//! A row names a catalog model (`price_model`) and the provider that served it. The **price** is
-//! the row's customer card ([`RowRates::customer`]: the primary vendor's published rates, whose
-//! standard tier is exactly the catalog's [`crate::ListPrice`]) applied to the usage under that
-//! vendor's own rules (long-context tier, fast mode, data residency, off-peak hours, server-tool
-//! fees). The **cost** is the serving candidate's card applied the same way. On OpenRouter it is
-//! the cost OpenRouter reported, plus its credit fee. Anything the tables cannot price exactly is
-//! an [`Unpriced`] error, never a zero.
+//! A row names a catalog model (`price_model`) and the provider that served it. The **cost** is
+//! the serving candidate's card applied to the usage under that vendor's own rules (long-context
+//! tier, fast mode, data residency, off-peak hours, server-tool fees): the primary vendor's
+//! published card ([`RowRates::list`], whose standard tier is exactly the catalog's
+//! [`crate::ListPrice`]) when that vendor serves the row, else the candidate's own. Where the
+//! vendor reports its own figure (OpenRouter, xAI), that figure is the cost; on OpenRouter, plus
+//! its credit fee. The **price** is pass-through: exactly the cost. A response-cache hit costs,
+//! and is priced at, zero. Anything the tables cannot price exactly is an [`Unpriced`] error,
+//! never a zero.
 
 use crate::rates::{self, CostCard, OrEndpoint, RowRates};
 use crate::{ProviderId, WireFormat};
@@ -609,7 +611,7 @@ pub enum Unpriced {
     /// it, 1-hour writes where none are sold, fast mode above 272K where unpublished).
     NoRate,
     /// A server tool was used that the card has no per-call fee for, or OpenRouter reports a
-    /// metered tool or plugin cost (which no customer card prices).
+    /// metered tool or plugin cost (which no card prices).
     NoToolFee,
     /// `server_tools` names a kind the pricer does not know, or a count that is not a number.
     UnknownTool,

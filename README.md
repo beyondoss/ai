@@ -368,7 +368,7 @@ docker run --rm -p 8080:8080 \
   beyond-ai-agent \
   --listen 0.0.0.0:8080 \
   --gateway-url https://gateway.internal \
-  --grant-key k1=/etc/beyond/grant/k1.pub \
+  --grant-key "1=$(cat /etc/beyond/grant/k1.pub)" \
   --seal-key /etc/beyond/grant/seal.key \
   --shard a07-s1=/mnt/efs/a07-s1 \
   --shard a07-s2=/mnt/efs/a07-s2

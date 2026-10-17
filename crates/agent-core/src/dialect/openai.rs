@@ -1847,12 +1847,13 @@ mod tests {
         // Together: a nested `reasoning: {"enabled": bool}` sent unconditionally, regardless of
         // whether a level is requested.
         //
-        // pi-parity pass 20 Task 1: "qwen/qwen3.6-plus" (this test's id previously) turned out to be
-        // OpenRouter's own identical vendor-slug spelling too, with a real, much smaller max_output that
-        // now wins the collision (`models.rs`'s `capabilities_impl`, OpenRouter-specific Qwen overrides)
-        // — it now resolves to `OpenAiReasoningFormat::OpenRouter`, not `Together`, so it no longer
-        // exercises this shape. "qwen/qwen3.5-9b" is a genuinely Together-only id (no such collision)
-        // that still does.
+        // pi-parity pass 20 Task 1: "qwen/qwen3.6-plus" (this test's id previously) turned out to
+        // be OpenRouter's own identical vendor-slug spelling too, with a real, much smaller
+        // max_output that now wins the collision (`models.rs`'s `capabilities_impl_lc`,
+        // OpenRouter-specific Qwen overrides) — it now resolves to
+        // `OpenAiReasoningFormat::OpenRouter`, not `Together`, so it no longer exercises this
+        // shape. "qwen/qwen3.5-9b" is a genuinely Together-only id (no such collision) that still
+        // does.
         let idle = build_body(&ModelRequest::new(
             "qwen/qwen3.5-9b",
             vec![Message::user("hi")],

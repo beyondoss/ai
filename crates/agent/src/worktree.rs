@@ -1220,8 +1220,9 @@ async fn three_way_in(
     Ok(ApplyOutcome::Conflicted { files })
 }
 
-/// Raw `std::process::Output` from a git command fed `stdin` — [`git_with_stdin`] discards it, but
-/// `git apply --3way` needs its exit status and stderr inspected rather than turned into an `Err`.
+/// Raw `std::process::Output` from a git command fed `stdin` — [`git_stdout_with_stdin`] discards
+/// it, but `git apply --3way` needs its exit status and stderr inspected rather than turned into an
+/// `Err`.
 async fn command_output_with_stdin(
     dir: &Path,
     args: &[&str],

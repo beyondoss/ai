@@ -3163,7 +3163,7 @@ impl McpCatalog {
     ///   reaps a client somebody holds), so an open push stream pins its server while it is open.
     /// - **streamable HTTP**: the URL, credential headers and negotiated protocol version, for
     ///   direct stateless requests — rmcp's typed result union would drop a custom result that
-    ///   carries `_meta` (see `mcp_events::rescue_line`), and over HTTP there is no byte stream of
+    ///   carries `_meta` (see `mcp_stdio::rescue`), and over HTTP there is no byte stream of
     ///   ours to repair it on.
     pub(crate) async fn events_peer(&self, server: &str) -> Result<EventsPeer, String> {
         let entry = self

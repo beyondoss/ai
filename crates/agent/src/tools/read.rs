@@ -3011,7 +3011,7 @@ mod tests {
         // or content — a bare FIFO with no writer on the other end blocks `File::open`'s read forever,
         // wedging this tool call (and, since dispatch awaits each call in turn, the whole turn) with no
         // timeout to save it, unlike `bash` (30-minute timeout, kill-on-drop). `tokio::time::timeout`
-        // here is a *test* safety net, not the fix itself: if `reject_non_regular_file` ever regresses,
+        // here is a *test* safety net, not the fix itself: if the FIFO gate ever regresses,
         // this test fails fast in seconds instead of hanging CI indefinitely.
         let dir = tempfile::tempdir().unwrap();
         let fifo_path = dir.path().join("a.fifo");

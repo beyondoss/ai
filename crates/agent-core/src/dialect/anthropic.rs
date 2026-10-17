@@ -697,9 +697,9 @@ fn canonicalize_tool_names(tools: &mut Value) {
 /// rather than "a field Anthropic rejects gets sent", which only shows up as a live 400.
 ///
 /// `cache_control` is absent on purpose: it is *added* by a later pass, after this one runs.
-/// `tool_result.images` is present even though Anthropic has no such key — a later pass consumes it into
-/// the real `content` array shape and removes it (see `attach_tool_result_images`), so it has to survive
-/// this one.
+/// `tool_result.images` is present even though Anthropic has no such key — a later pass consumes it
+/// into the real `content` array shape and removes it (see `encode_tool_result_images`), so it has
+/// to survive this one.
 const ANTHROPIC_BLOCK_KEYS: &[(&str, &[&str])] = &[
     ("text", &["type", "text"]),
     ("thinking", &["type", "thinking", "signature"]),
