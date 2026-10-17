@@ -159,13 +159,26 @@ impl FrameReader {
             if let Some(f) = self.pending.pop_front() {
                 return Ok(Some(f));
             }
+            match self.next_line(silence).await? {
+                Some(line) => {
+                    let frames = decode_line(&line)?;
+                    self.pending.extend(frames);
+                }
+                None => return Ok(None),
+            }
+        }
+    }
+
+    /// The next line of the body (without its `\n`), or `None` at the end — for a decoder of its
+    /// own (the v1.3 job streams, `jobs_native`). Errors as [`Self::next`].
+    pub(crate) async fn next_line(&mut self, silence: Duration) -> Result<Option<Vec<u8>>, String> {
+        loop {
             if let Some(nl) = self.buf[self.scanned..].iter().position(|&b| b == b'\n') {
                 let end = self.scanned + nl;
-                let frames = decode_line(&self.buf[..end])?;
+                let line = self.buf[..end].to_vec();
                 self.buf.drain(..=end);
                 self.scanned = 0;
-                self.pending.extend(frames);
-                continue;
+                return Ok(Some(line));
             }
             self.scanned = self.buf.len();
             if self.buf.len() > MAX_LINE {

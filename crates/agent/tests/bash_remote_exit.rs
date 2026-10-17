@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use beyond_ai_agent::exec_endpoint::HttpExecRunner;
-use common::exec_mock::{ExecMock, StreamEnd, wait_group_gone};
+use common::exec_mock::{ExecMock, MockOptions, StreamEnd, wait_group_gone};
 use common::remote_bash::{call, job_number, remote_bash};
 use common::{SpawnGuarded, run_cmd, spawn_model_server, turn_tool_use};
 use serde_json::json;
@@ -57,7 +57,15 @@ async fn the_exit_path_reaches_a_parked_remote_job() {
 fn sigterm_to_run_kills_the_remote_command_group() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let dir = tempfile::tempdir().unwrap();
-    let mock = rt.block_on(ExecMock::start(dir.path(), true));
+    // A v1.2-only sandbox: this is about the stream a command lives in (a v1.3 sandbox kills an
+    // unkept job the same way when its stream closes, which `sandbox_jobs.rs` covers).
+    let mock = rt.block_on(ExecMock::start_with(
+        dir.path(),
+        MockOptions {
+            jobs: false,
+            ..MockOptions::default()
+        },
+    ));
 
     let turn = turn_tool_use(
         "toolu_1",

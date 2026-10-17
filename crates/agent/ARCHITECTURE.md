@@ -2320,11 +2320,34 @@ second for the groups to empty; what is still alive (a process the sandbox user 
 reported per job. A job whose `end` exists is never signalled again, so a recycled group number is
 not a target. Not covered, exactly as over v1.2: a process that leaves the job's session.
 
+A removing `kill` and `wipe` delete a job's directory only once its supervisor has recorded the end
+(bounded at 3 s), so the supervisor never writes into a directory being deleted — `rm -rf` racing
+it failed with "Directory not empty".
+
+**Native (v1.3).** The same contract can be the endpoint's own: the module doc's "Sandbox jobs
+(v1.3)" specifies it as an optional, probed capability — every operation is a v1.1 request plus a
+`"job"` object (`probe`, `start` held or kept, `attach` from an offset, `read`, `keep`, `seen`,
+`kill`, `list`, `remove`, `wipe`), and a job stream is a v1.2 stream plus `started` and `gap`
+frames. `HttpExecRunner::sandbox_jobs` hands out `jobs_native::HttpJobs`, which probes once
+(`offers_jobs`, cached like `streams`) and sends each operation to `NativeJobs` or `ShellJobs`.
+The probe is a real command (`printf exec-v1.2`) that a v1.2 endpoint simply runs, so adoption is
+compatible both ways. Native jobs are what a vendor adapter (E2B background commands, Daytona session
+commands — mapped in the spec) or the platform's own guest implements; the baseline stays what
+every other endpoint gets. `exec_mock` implements v1.3 natively by default (`MockOptions::jobs`;
+`jobs: false` is a v1.2-only endpoint for the baseline path), and `conformance::verify` adds six
+checks when the probe says yes: the capability, a held job's live output and end, a dropped hold
+killing an unkept job (measured on the far side), a kept job surviving its hold and reading back by
+`read` and `attach` from an offset (closing the attach must not kill), `kill` reaching a
+`SIGTERM`-ignoring job and removing it, and `list`/`wipe` staying in their scope. The decoding
+vectors are `tests/fixtures/exec/v1.3-jobs.json` (`tests/exec_jobs_vectors.rs`).
+
 Tests: `tests/sandbox_jobs.rs` runs every operation over this host's `sh`, the v1.2 mock, the v1.1
-mock and a template transport whose far side lives in its own session (held streaming, a hold
-dropped before and after `keep`, leftovers, polling, a `SIGTERM`-ignoring kill, the cap's gap,
-`wipe` scoped to one session, `remove` refusing a running job); `exec_endpoint_live.rs` repeats the
-lifecycle inside CI's busybox container.
+mock, a template transport whose far side lives in its own session, and the v1.3 mock natively
+(held streaming, a hold dropped before and after `keep`, leftovers, polling, a `SIGTERM`-ignoring
+kill, the cap's gap, `wipe` scoped to one session, `remove` refusing a running job);
+`exec_endpoint_live.rs` repeats the lifecycle inside CI's busybox container; `exec_conformance.rs`
+passes the v1.3 mock with every check, the v1.2-only mock with the job checks skipped, and fails a
+mock whose dropped hold leaves the job running on exactly the hold check.
 
 #### Which endpoint a session gets
 

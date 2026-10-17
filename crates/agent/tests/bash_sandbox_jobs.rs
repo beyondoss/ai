@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use agent_core::{Background, ContentBlock, Message};
-use beyond_ai_agent::exec_endpoint::jobs::{JobScope, SandboxJobs, ShellJobs};
+use beyond_ai_agent::exec_endpoint::jobs::JobScope;
 use beyond_ai_agent::exec_endpoint::{HttpExecRunner, TemplateRunner};
 use beyond_ai_agent::tools::bash::{Bash, BashJob};
 use beyond_ai_agent::tools::bash_jobs::{BashJobs, EndPolicy};
@@ -27,18 +27,26 @@ use serde_json::json;
 
 #[derive(Clone, Copy, Debug)]
 enum Transport {
+    /// A v1.2-only endpoint: jobs run on plain exec commands.
     Stream,
+    /// The v1.3 endpoint: it runs the jobs itself.
+    Native,
     V11,
     Template,
 }
 
-const ALL: [Transport; 3] = [Transport::Stream, Transport::V11, Transport::Template];
+const ALL: [Transport; 4] = [
+    Transport::Stream,
+    Transport::V11,
+    Transport::Template,
+    Transport::Native,
+];
 
 /// A sandbox, and the scope one session's jobs live under in it.
 struct Sandbox {
     runner: Arc<dyn CommandRunner>,
     scope: JobScope,
-    dir: tempfile::TempDir,
+    _dir: tempfile::TempDir,
     _mock: Option<ExecMock>,
 }
 
@@ -46,7 +54,7 @@ impl Sandbox {
     async fn new(t: Transport) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let (runner, mock): (Arc<dyn CommandRunner>, _) = match t {
-            Transport::Stream | Transport::V11 => {
+            Transport::Stream | Transport::V11 | Transport::Native => {
                 let mock = ExecMock::start_with(
                     dir.path(),
                     MockOptions {
@@ -56,6 +64,7 @@ impl Sandbox {
                             Protocol::Streaming
                         },
                         heartbeat: Duration::from_millis(500),
+                        jobs: matches!(t, Transport::Native),
                         ..MockOptions::default()
                     },
                 )
@@ -83,7 +92,7 @@ impl Sandbox {
         Self {
             runner,
             scope,
-            dir,
+            _dir: dir,
             _mock: mock,
         }
     }
@@ -106,15 +115,27 @@ impl Sandbox {
         Replica { jobs, bash, job }
     }
 
-    fn job_dirs(&self) -> usize {
-        std::fs::read_dir(self.dir.path().join("jobs/session"))
-            .map(|d| d.count())
-            .unwrap_or(0)
+    /// How many jobs the sandbox still has for the session.
+    async fn jobs_left(&self) -> usize {
+        self.runner
+            .clone()
+            .sandbox_jobs()
+            .unwrap()
+            .list(&self.scope)
+            .await
+            .unwrap()
+            .len()
     }
 
     /// Kill whatever a failed assertion left behind.
     async fn wipe(&self) {
-        let _ = ShellJobs::new(self.runner.clone()).wipe(&self.scope).await;
+        let _ = self
+            .runner
+            .clone()
+            .sandbox_jobs()
+            .unwrap()
+            .wipe(&self.scope)
+            .await;
     }
 }
 
@@ -226,13 +247,17 @@ async fn a_background_job_outlives_its_replica_and_the_next_one_takes_it_over() 
         })
         .await
         .unwrap();
-        assert_eq!(sb.job_dirs(), 0, "{t:?}: killed jobs leave no directory");
+        assert_eq!(
+            sb.jobs_left().await,
+            0,
+            "{t:?}: killed jobs leave no directory"
+        );
     }
 }
 
 #[tokio::test]
 async fn a_foreground_command_dies_with_its_replica() {
-    for t in [Transport::Stream, Transport::Template] {
+    for t in [Transport::Stream, Transport::Template, Transport::Native] {
         let sb = Sandbox::new(t).await;
         let a = sb.replica(EndPolicy::KeepRunning);
         let out = call(
@@ -253,13 +278,17 @@ async fn a_foreground_command_dies_with_its_replica() {
             reattach(&b.jobs, sb.runner.clone()).await,
             Reattached::default()
         );
-        assert_eq!(sb.job_dirs(), 0, "{t:?}: the stale directory is gone");
+        assert_eq!(
+            sb.jobs_left().await,
+            0,
+            "{t:?}: the stale directory is gone"
+        );
     }
 }
 
 #[tokio::test]
 async fn an_adopted_leftover_outlives_its_replica() {
-    for t in [Transport::Stream, Transport::Template] {
+    for t in [Transport::Stream, Transport::Template, Transport::Native] {
         let sb = Sandbox::new(t).await;
         let a = sb.replica(EndPolicy::KeepRunning);
         let out = call(
@@ -323,7 +352,7 @@ async fn a_job_that_ends_while_detached_is_noticed_once_on_the_next_attach() {
         );
         // Its directory goes once the report is persisted (the host collects then).
         b.jobs.collect_garbage().await;
-        assert_eq!(sb.job_dirs(), 0, "{t:?}");
+        assert_eq!(sb.jobs_left().await, 0, "{t:?}");
         b.vanish();
         // So the replica after that has nothing to say about it.
         let c = sb.replica(EndPolicy::KeepRunning);
@@ -337,58 +366,62 @@ async fn a_job_that_ends_while_detached_is_noticed_once_on_the_next_attach() {
 
 #[tokio::test]
 async fn a_replica_that_dies_before_persisting_a_notice_leaves_it_for_the_next() {
-    let sb = Sandbox::new(Transport::Stream).await;
-    let a = sb.replica(EndPolicy::KeepRunning);
-    call(
-        a.bash.as_ref(),
-        // Past the start's settle, so it ends as a job.
-        json!({ "command": "sleep 2.5; echo done", "run_in_background": true }),
-    )
-    .await
-    .unwrap();
-    // Noticed by this replica, which dies before its run is persisted (no garbage collection).
-    assert!(
-        notice(&a.jobs)
-            .await
-            .starts_with("[job 1 exited with code 0")
-    );
-    a.vanish();
-    let b = sb.replica(EndPolicy::KeepRunning);
-    assert_eq!(reattach(&b.jobs, sb.runner.clone()).await.ended, vec![1]);
-    assert!(
-        notice(&b.jobs)
-            .await
-            .starts_with("[job 1 exited with code 0")
-    );
-    b.jobs.collect_garbage().await;
-    assert_eq!(sb.job_dirs(), 0);
+    for t in [Transport::Stream, Transport::Native] {
+        let sb = Sandbox::new(t).await;
+        let a = sb.replica(EndPolicy::KeepRunning);
+        call(
+            a.bash.as_ref(),
+            // Past the start's settle, so it ends as a job.
+            json!({ "command": "sleep 2.5; echo done", "run_in_background": true }),
+        )
+        .await
+        .unwrap();
+        // Noticed by this replica, which dies before its run is persisted (no garbage collection).
+        assert!(
+            notice(&a.jobs)
+                .await
+                .starts_with("[job 1 exited with code 0")
+        );
+        a.vanish();
+        let b = sb.replica(EndPolicy::KeepRunning);
+        assert_eq!(reattach(&b.jobs, sb.runner.clone()).await.ended, vec![1]);
+        assert!(
+            notice(&b.jobs)
+                .await
+                .starts_with("[job 1 exited with code 0")
+        );
+        b.jobs.collect_garbage().await;
+        assert_eq!(sb.jobs_left().await, 0);
+    }
 }
 
 #[tokio::test]
 async fn a_run_stops_what_an_earlier_run_of_its_session_left_in_the_sandbox() {
-    let sb = Sandbox::new(Transport::Stream).await;
-    let a = sb.replica(EndPolicy::StopAtEnd);
-    let out = call(
-        a.bash.as_ref(),
-        json!({ "command": "echo \"pid $$\"; sleep 300", "run_in_background": true }),
-    )
-    .await
-    .unwrap();
-    assert!(
-        out.contains("it is stopped for you when the run ends"),
-        "{out}"
-    );
-    let pid = printed_pid(&out);
-    // Killed before it could stop its jobs: no exit path, nothing dropped.
-    std::mem::forget(a);
-    let b = sb.replica(EndPolicy::StopAtEnd);
-    let found = reattach(&b.jobs, sb.runner.clone()).await;
-    assert_eq!(found.stopped, vec![1], "{found:?}");
-    assert!(
-        wait_dead(pid).await,
-        "a run's reopen stops the old run's jobs"
-    );
-    assert_eq!(sb.job_dirs(), 0);
+    for t in [Transport::Stream, Transport::Native] {
+        let sb = Sandbox::new(t).await;
+        let a = sb.replica(EndPolicy::StopAtEnd);
+        let out = call(
+            a.bash.as_ref(),
+            json!({ "command": "echo \"pid $$\"; sleep 300", "run_in_background": true }),
+        )
+        .await
+        .unwrap();
+        assert!(
+            out.contains("it is stopped for you when the run ends"),
+            "{out}"
+        );
+        let pid = printed_pid(&out);
+        // Killed before it could stop its jobs: no exit path, nothing dropped.
+        std::mem::forget(a);
+        let b = sb.replica(EndPolicy::StopAtEnd);
+        let found = reattach(&b.jobs, sb.runner.clone()).await;
+        assert_eq!(found.stopped, vec![1], "{found:?}");
+        assert!(
+            wait_dead(pid).await,
+            "a run's reopen stops the old run's jobs"
+        );
+        assert_eq!(sb.jobs_left().await, 0);
+    }
 }
 
 #[tokio::test]
@@ -397,7 +430,7 @@ async fn a_v11_sandbox_can_now_run_a_job_in_the_background() {
     let a = sb.replica(EndPolicy::KeepRunning);
     let out = call(
         a.bash.as_ref(),
-        json!({ "command": "echo up; sleep 1; echo later", "run_in_background": true }),
+        json!({ "command": "echo up; sleep 3; echo later", "run_in_background": true }),
     )
     .await
     .unwrap();
@@ -414,89 +447,95 @@ async fn a_v11_sandbox_can_now_run_a_job_in_the_background() {
 
 #[tokio::test]
 async fn ending_the_transcript_stops_kept_jobs_and_wipes_the_scope() {
-    let sb = Sandbox::new(Transport::Stream).await;
-    let a = sb.replica(EndPolicy::KeepRunning);
-    let out = call(
-        a.bash.as_ref(),
-        json!({ "command": "echo \"pid $$\"; sleep 300", "run_in_background": true }),
-    )
-    .await
-    .unwrap();
-    let pid = printed_pid(&out);
-    let stopped = tokio::task::spawn_blocking({
-        let jobs = a.jobs.clone();
-        move || jobs.stop_all()
-    })
-    .await
-    .unwrap();
-    assert_eq!(stopped.len(), 1);
-    assert!(wait_dead(pid).await, "an explicit end kills a kept job");
-    assert_eq!(sb.job_dirs(), 0);
+    for t in [Transport::Stream, Transport::Native] {
+        let sb = Sandbox::new(t).await;
+        let a = sb.replica(EndPolicy::KeepRunning);
+        let out = call(
+            a.bash.as_ref(),
+            json!({ "command": "echo \"pid $$\"; sleep 300", "run_in_background": true }),
+        )
+        .await
+        .unwrap();
+        let pid = printed_pid(&out);
+        let stopped = tokio::task::spawn_blocking({
+            let jobs = a.jobs.clone();
+            move || jobs.stop_all()
+        })
+        .await
+        .unwrap();
+        assert_eq!(stopped.len(), 1);
+        assert!(wait_dead(pid).await, "an explicit end kills a kept job");
+        assert_eq!(sb.jobs_left().await, 0);
+    }
 }
 
 #[tokio::test]
 async fn release_lets_go_of_kept_jobs_and_stops_the_rest() {
-    let sb = Sandbox::new(Transport::Stream).await;
-    let a = sb.replica(EndPolicy::KeepRunning);
-    let kept = call(
-        a.bash.as_ref(),
-        json!({ "command": "echo \"pid $$\"; sleep 300", "run_in_background": true }),
-    )
-    .await
-    .unwrap();
-    let yielded = call(
-        a.bash.as_ref(),
-        json!({ "command": "echo \"pid $$\"; sleep 301", "timeout_ms": 300 }),
-    )
-    .await
-    .unwrap();
-    let stopped = tokio::task::spawn_blocking({
-        let jobs = a.jobs.clone();
-        move || jobs.release()
-    })
-    .await
-    .unwrap();
-    assert_eq!(stopped.len(), 1, "only the yielded one: {stopped:?}");
-    assert_eq!(stopped[0].job, 2);
-    assert!(wait_dead(printed_pid(&yielded)).await);
-    assert!(alive(printed_pid(&kept)), "the kept one runs on");
-    sb.wipe().await;
-    assert!(wait_dead(printed_pid(&kept)).await);
+    for t in [Transport::Stream, Transport::Native] {
+        let sb = Sandbox::new(t).await;
+        let a = sb.replica(EndPolicy::KeepRunning);
+        let kept = call(
+            a.bash.as_ref(),
+            json!({ "command": "echo \"pid $$\"; sleep 300", "run_in_background": true }),
+        )
+        .await
+        .unwrap();
+        let yielded = call(
+            a.bash.as_ref(),
+            json!({ "command": "echo \"pid $$\"; sleep 301", "timeout_ms": 300 }),
+        )
+        .await
+        .unwrap();
+        let stopped = tokio::task::spawn_blocking({
+            let jobs = a.jobs.clone();
+            move || jobs.release()
+        })
+        .await
+        .unwrap();
+        assert_eq!(stopped.len(), 1, "only the yielded one: {stopped:?}");
+        assert_eq!(stopped[0].job, 2);
+        assert!(wait_dead(printed_pid(&yielded)).await);
+        assert!(alive(printed_pid(&kept)), "the kept one runs on");
+        sb.wipe().await;
+        assert!(wait_dead(printed_pid(&kept)).await);
+    }
 }
 
 #[tokio::test]
 async fn the_reopen_note_says_a_job_the_sandbox_kept_is_still_running() {
-    let sb = Sandbox::new(Transport::Stream).await;
-    let a = sb.replica(EndPolicy::KeepRunning);
-    let started = call(
-        a.bash.as_ref(),
-        json!({ "command": "npm run dev; sleep 300", "run_in_background": true }),
-    )
-    .await
-    .unwrap();
-    a.vanish();
-    let transcript = vec![
-        Message::user("start the dev server"),
-        Message::assistant(vec![ContentBlock::tool_use(
-            "a",
-            "bash",
+    for t in [Transport::Stream, Transport::Native] {
+        let sb = Sandbox::new(t).await;
+        let a = sb.replica(EndPolicy::KeepRunning);
+        let started = call(
+            a.bash.as_ref(),
             json!({ "command": "npm run dev; sleep 300", "run_in_background": true }),
-        )]),
-        Message::tool_results(vec![ContentBlock::ToolResult {
-            tool_use_id: "a".into(),
-            content: started.into(),
-            is_error: false,
-            images: Vec::new(),
-        }]),
-    ];
-    let b = sb.replica(EndPolicy::KeepRunning);
-    reattach(&b.jobs, sb.runner.clone()).await;
-    let note = b.jobs.resume(&transcript).unwrap();
-    assert!(
-        note.contains("- job 1: `npm run dev; sleep 300` (still running)"),
-        "{note}"
-    );
-    assert!(!note.contains("(stopped)"), "{note}");
-    assert!(note.contains("New jobs are numbered from 2."), "{note}");
-    sb.wipe().await;
+        )
+        .await
+        .unwrap();
+        a.vanish();
+        let transcript = vec![
+            Message::user("start the dev server"),
+            Message::assistant(vec![ContentBlock::tool_use(
+                "a",
+                "bash",
+                json!({ "command": "npm run dev; sleep 300", "run_in_background": true }),
+            )]),
+            Message::tool_results(vec![ContentBlock::ToolResult {
+                tool_use_id: "a".into(),
+                content: started.into(),
+                is_error: false,
+                images: Vec::new(),
+            }]),
+        ];
+        let b = sb.replica(EndPolicy::KeepRunning);
+        reattach(&b.jobs, sb.runner.clone()).await;
+        let note = b.jobs.resume(&transcript).unwrap();
+        assert!(
+            note.contains("- job 1: `npm run dev; sleep 300` (still running)"),
+            "{note}"
+        );
+        assert!(!note.contains("(stopped)"), "{note}");
+        assert!(note.contains("New jobs are numbered from 2."), "{note}");
+        sb.wipe().await;
+    }
 }

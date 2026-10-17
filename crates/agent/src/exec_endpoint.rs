@@ -165,6 +165,89 @@
 //! held until they exit, killed on a disconnect after it) — and `tests/exec_conformance.rs` runs it against any
 //! URL. `tests/fixtures/exec/v1.2-frames.json` holds the decoding vectors.
 //!
+//! ## Sandbox jobs (v1.3)
+//!
+//! A stream is the right owner for a command someone is waiting on and the wrong one for a job: a
+//! replica that is reaped, redeployed or failed over closes every stream it holds. So a `bash` job
+//! the model meant to keep (`run_in_background`, an adopted `cmd &`) is owned by the **sandbox**: it
+//! runs until it exits, is killed, or its session ends, and any replica serving the session can
+//! list it, read its output from an offset, and kill it. Every endpoint gets this without doing
+//! anything: the agent builds it from plain exec commands ([`jobs::ShellJobs`], "the baseline" — a
+//! directory per job under `/tmp/beyond-jobs/`, a `setsid` supervisor, a relay that writes the
+//! output as offset-named chunks; see [`jobs`]). v1.3 is the same contract offered **natively**, for
+//! an endpoint that would rather keep jobs its own way (a vendor's background commands, the
+//! platform's own guest). [`jobs_native`] is the client.
+//!
+//! **Adoption.** Optional and probed, like stdin and streaming: the first job operation sends a
+//! valid v1.1 request — `sh -c 'printf exec-v1.2'` — carrying `"job": {"op": "probe"}`. An endpoint
+//! without the capability ignores the unknown field and runs the command; one with it MUST answer
+//! `{"jobs": "v1.3"}`. A probe that could not reach the endpoint is retried later. A v1.3 endpoint
+//! MUST also be a conforming v1.2 endpoint.
+//!
+//! **Requests.** Every job operation is a v1.1 request (the same URL, headers and envelope) plus a
+//! `"job"` object naming `op` and `scope`. A **scope** is an opaque name for one session's jobs
+//! (the agent sends a digest of tenant and session); an operation MUST only ever see the jobs of
+//! its own scope. A job **id** is chosen by the agent (lowercase hex, at most 32 characters) and is
+//! unique within its scope. A **status** is a job's exit code, or 128 + N for signal N. Except for
+//! `start`, the request's `command` is `true` with no arguments: harmless if run. Unknown fields are
+//! ignored. A refusal before answering (an unknown job for `attach`, a bad request) is a non-2xx
+//! status, as in v1.1.
+//!
+//! | op | `job` fields | answer |
+//! |---|---|---|
+//! | `probe` | | `{"jobs": "v1.3"}` |
+//! | `start` | `id`, `hold`, `label` — the command is the request's `command`/`args`/`cwd` | `hold: true` (with `"stream": true`): a job stream; `hold: false`: `{"started": pgid}` |
+//! | `attach` | `id`, `offset` (with `"stream": true`) | a job stream from `offset` |
+//! | `read` | `id`, `offset`, `max` | `{"state", "code", "offset", "end", "data"}` |
+//! | `keep` | `id`, `num`, `kind`, `seen` | `{}` |
+//! | `seen` | `id`, `offset` | `{}` |
+//! | `kill` | `ids`, `remove`, `grace_ms` | `{"survivors": [{"id", "pids": [..]}]}` |
+//! | `list` | | `{"jobs": [{"id", "state", "code", "kept", "num", "kind", "seen", "started", "ended", "label"}]}` |
+//! | `remove` | `ids` | `{}` |
+//! | `wipe` | `grace_ms` | `{"survivors": [{"pids": [..]}]}` |
+//!
+//! - **A job** runs in a process group (or cgroup) of its own, its stdin empty, its stdout and stderr
+//!   one combined **output**, of which the endpoint MUST keep at least the last 8 MiB, addressed by
+//!   byte offset from the job's first byte. Offsets never move: dropping old output leaves a gap.
+//! - **States** (`read`, `list`): `running`; `exited` — the shell exited with status `code` but
+//!   processes of its group run on; `ended` — the group is empty, `code` the shell's status and
+//!   `ended` its epoch second; `lost` — the endpoint no longer knows how it ended; `gone` — no such
+//!   job. `started` is the job's epoch second, `label` what `start` sent.
+//! - **Held.** A job started with `hold: true` lives as long as its stream unless it is **kept**: if
+//!   the connection closes before the job's final frame and no `keep` arrived, the endpoint MUST kill
+//!   its whole group, exactly as v1.2's "Disconnect kills". `keep` hands it to the endpoint for good
+//!   (recording `num`, `kind` and `seen` for `list`); after it a closed stream kills nothing. A job
+//!   started with `hold: false` is kept from the start. Closing an `attach` never kills.
+//! - **A job stream** is a v1.2 stream (`application/x-ndjson`, heartbeats, frame size, flushing,
+//!   unknown fields) with two more frames: `{"started": pgid}` first on a held start, and
+//!   `{"gap": n}` when `n` bytes of output from the requested offset are no longer kept. Output
+//!   frames (`stdout`; `stderr` is accepted too) carry the combined output in order. `{"shell_exit":
+//!   N}` follows the output read up to the shell's exit when the shell exits leaving its group alive,
+//!   once per stream. The final frame — after all output up to the job's end — is the job's status:
+//!   `{"exit_code": N}` (or `{"signal": S}`), or `{"error"}`. An `attach` of an ended job streams
+//!   what is left from `offset` and the final frame at once.
+//! - **`read`** returns up to `max` bytes from `offset` (or from the oldest byte kept, reported in
+//!   `offset`, when that is later) as `data` in base64, and `end`, the offset of the next byte.
+//! - **`kill`** sends `SIGTERM` to each named job's group, waits up to `grace_ms` for it to empty,
+//!   sends `SIGKILL`, waits up to a second more, and reports the live members of any group still not
+//!   empty. It MUST NOT signal a group whose job has ended (its number may be reused). With `remove`,
+//!   it then deletes each job whose group is empty. `remove` deletes ended jobs and never a running
+//!   one; `wipe` kills every job of the scope and deletes them all.
+//!
+//! Mapping a vendor's own primitives is the adapter's business; two that fit: **E2B** background
+//! commands (`commands.run(cmd, background=True, timeout=0)` returns a handle whose `pid`
+//! `commands.connect(pid)` reattaches to; `commands.list()`, `kill()`) — its streamed output reaches
+//! only the process that started the command, so an adapter redirects it to a file to serve
+//! `attach`/`read` from offsets; **Daytona** session commands (`execute_session_command` with
+//! `run_async`, `get_session_command` for the exit code, `get_session_command_logs` to stream logs;
+//! its docs name no kill for one command, so an adapter kills the process group itself).
+//!
+//! [`conformance::verify`] checks the capability when the probe says it is offered: a held job's
+//! live output and end, a dropped hold killing an unkept job (measured on the far side), a kept job
+//! surviving its hold and reading back from an offset (read and attach), `kill` reaching a job that
+//! ignores `SIGTERM`, and `list`/`wipe` staying inside their scope. `tests/fixtures/exec/v1.3-jobs.json`
+//! holds the decoding vectors.
+//!
 //! For targets that have no HTTP surface at all (`ssh`, `docker exec`, `kubectl exec`, any CLI), see
 //! [`TemplateRunner`], which is the same idea expressed as an argv template. Its transport is a local
 //! process, so its output streams natively; killing it is the hard part — see `far_kill`.
@@ -185,6 +268,7 @@ use crate::tools::exec::{
 pub mod conformance;
 mod far_kill;
 pub mod jobs;
+pub mod jobs_native;
 pub mod stream;
 
 use stream::{FRAME_SILENCE_LIMIT, Frame, FrameReader, NDJSON};
@@ -203,6 +287,9 @@ struct ExecRequest<'a> {
     /// v1.2: answer with a stream of frames instead of one object. Absent means v1.1.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     stream: bool,
+    /// v1.3: a job operation (see "Sandbox jobs (v1.3)"). Absent means the command is run as ever.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    job: Option<&'a serde_json::Value>,
 }
 
 /// What the agent expects back. Extra fields are ignored, so an endpoint may return more.
@@ -256,6 +343,8 @@ pub struct HttpExecRunner {
     streams: tokio::sync::OnceCell<bool>,
     /// Whether the sandbox can run jobs of its own ([`jobs::ShellJobs`]) — probed once, the same way.
     jobs_probe: Arc<tokio::sync::OnceCell<bool>>,
+    /// Whether the endpoint offers jobs natively (v1.3, [`jobs_native`]) — probed once, the same way.
+    native_jobs: tokio::sync::OnceCell<bool>,
 }
 
 impl HttpExecRunner {
@@ -282,6 +371,7 @@ impl HttpExecRunner {
             max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
             streams: tokio::sync::OnceCell::new(),
             jobs_probe: Arc::default(),
+            native_jobs: tokio::sync::OnceCell::new(),
         })
     }
 
@@ -326,6 +416,22 @@ impl HttpExecRunner {
         stdin: Option<&[u8]>,
         stream: bool,
     ) -> std::io::Result<reqwest::Response> {
+        self.send_job(program, args, cwd, timeout, stdin, stream, None)
+            .await
+    }
+
+    /// [`Self::send`], carrying a v1.3 job operation.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn send_job(
+        &self,
+        program: &str,
+        args: &[String],
+        cwd: Option<&str>,
+        timeout: Duration,
+        stdin: Option<&[u8]>,
+        stream: bool,
+        job: Option<&serde_json::Value>,
+    ) -> std::io::Result<reqwest::Response> {
         let body = ExecRequest {
             command: program,
             args,
@@ -333,6 +439,7 @@ impl HttpExecRunner {
             timeout_ms: timeout.as_millis().min(u64::MAX as u128) as u64,
             stdin_base64: stdin.map(|b| base64::engine::general_purpose::STANDARD.encode(b)),
             stream,
+            job,
         };
         let mut req = self.client.post(&self.url).json(&body);
         for (name, value) in &self.headers {
@@ -405,7 +512,10 @@ impl HttpExecRunner {
 
     /// Read the body incrementally, stopping at the cap instead of buffering whatever the endpoint
     /// sends. `true` means the cap was hit and the bytes returned are only a prefix.
-    async fn read_capped(&self, mut resp: reqwest::Response) -> std::io::Result<(Vec<u8>, bool)> {
+    pub(crate) async fn read_capped(
+        &self,
+        mut resp: reqwest::Response,
+    ) -> std::io::Result<(Vec<u8>, bool)> {
         let cap = self.max_response_bytes;
         // A declared length over the cap fails before a byte of it is read.
         let declared = resp.content_length().unwrap_or(0);
@@ -597,9 +707,28 @@ impl CommandRunner for HttpExecRunner {
         self.streams().await
     }
 
+    /// Native (v1.3) when the endpoint offers it, the baseline over plain exec commands otherwise.
     fn sandbox_jobs(self: Arc<Self>) -> Option<Arc<dyn jobs::SandboxJobs>> {
-        let probe = self.jobs_probe.clone();
-        Some(Arc::new(jobs::ShellJobs::with_probe(self, probe)))
+        let shell = jobs::ShellJobs::with_probe(self.clone(), self.jobs_probe.clone());
+        Some(Arc::new(jobs_native::HttpJobs::new(self, shell)))
+    }
+}
+
+impl HttpExecRunner {
+    /// Whether the endpoint offers sandbox jobs natively (v1.3), probing it the first time. See the
+    /// module doc's "Sandbox jobs (v1.3)".
+    pub async fn offers_jobs(&self) -> bool {
+        self.native_jobs
+            .get_or_try_init(|| async {
+                let native = jobs_native::probe(self).await?;
+                if native {
+                    tracing::info!(url = %self.url, "exec endpoint offers sandbox jobs (v1.3)");
+                }
+                Ok::<bool, std::io::Error>(native)
+            })
+            .await
+            .copied()
+            .unwrap_or(false)
     }
 }
 

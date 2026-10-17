@@ -28,21 +28,29 @@ enum Transport {
     V11,
     /// A template whose far side runs in its own session (`docker exec`'s shape).
     Template,
+    /// The v1.3 mock: the endpoint runs the jobs itself, and the agent uses its native operations.
+    Native,
 }
 
-const HOLDING: [Transport; 3] = [Transport::Local, Transport::Stream, Transport::Template];
-const ALL: [Transport; 4] = [
+const HOLDING: [Transport; 4] = [
+    Transport::Local,
+    Transport::Stream,
+    Transport::Template,
+    Transport::Native,
+];
+const ALL: [Transport; 5] = [
     Transport::Local,
     Transport::Stream,
     Transport::V11,
     Transport::Template,
+    Transport::Native,
 ];
 
 /// A sandbox over `t`, its jobs rooted in a fresh directory.
 struct Sandbox {
     jobs: Arc<dyn SandboxJobs>,
     scope: JobScope,
-    dir: tempfile::TempDir,
+    _dir: tempfile::TempDir,
     _mock: Option<ExecMock>,
 }
 
@@ -55,7 +63,7 @@ impl Sandbox {
         let dir = tempfile::tempdir().unwrap();
         let (runner, mock): (Arc<dyn CommandRunner>, _) = match t {
             Transport::Local => (Arc::new(RealRunner), None),
-            Transport::Stream | Transport::V11 => {
+            Transport::Stream | Transport::V11 | Transport::Native => {
                 let mock = ExecMock::start_with(
                     dir.path(),
                     MockOptions {
@@ -65,6 +73,9 @@ impl Sandbox {
                             Protocol::Streaming
                         },
                         heartbeat: Duration::from_millis(500),
+                        // Only the v1.3 mock runs jobs itself; the others take the baseline.
+                        jobs: matches!(t, Transport::Native),
+                        job_output_cap: cap.map_or(8 * 1024 * 1024, |c| c as usize),
                         ..MockOptions::default()
                     },
                 )
@@ -88,29 +99,27 @@ impl Sandbox {
                 None,
             ),
         };
-        let mut shell = ShellJobs::new(runner);
-        if let Some(cap) = cap {
-            shell = shell.with_output_cap(cap);
-        }
+        let jobs: Arc<dyn SandboxJobs> = if matches!(t, Transport::Native) {
+            runner.sandbox_jobs().unwrap()
+        } else {
+            let mut shell = ShellJobs::new(runner);
+            if let Some(cap) = cap {
+                shell = shell.with_output_cap(cap);
+            }
+            Arc::new(shell)
+        };
         let scope = JobScope::under(dir.path().join("jobs").to_str().unwrap(), "scope");
         Self {
-            jobs: Arc::new(shell),
+            jobs,
             scope,
-            dir,
+            _dir: dir,
             _mock: mock,
         }
     }
 
-    fn job_dir(&self, id: &JobId) -> std::path::PathBuf {
-        self.dir.path().join("jobs/scope").join(id.as_str())
-    }
-
-    fn pgid(&self, id: &JobId) -> u32 {
-        std::fs::read_to_string(self.job_dir(id).join("pgid"))
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap()
+    /// The sandbox no longer has the job.
+    async fn gone(&self, id: &JobId) -> bool {
+        self.jobs.read(&self.scope, id, 0, 0).await.unwrap().status == JobStatus::Gone
     }
 
     async fn read_all(&self, id: &JobId, from: u64) -> (JobStatus, Vec<u8>, u64) {
@@ -256,16 +265,18 @@ async fn a_kept_job_outlives_its_hold_and_is_read_back_from_an_offset() {
         let heard = Mutex::new(Heard::default());
         let events = recorder(&heard);
         let spec = sh("echo one; sleep 1; echo two; sleep 60");
-        let run = sb.jobs.run_held(&sb.scope, &id, &spec, &events);
+        let mut run = Box::pin(sb.jobs.run_held(&sb.scope, &id, &spec, &events));
+        // Boxed, not stack-pinned: dropping it below must really close the hold.
         tokio::select! {
-            r = run => panic!("ended early: {r:?}"),
+            r = &mut run => panic!("ended early: {r:?}"),
             () = wait_for("output", || heard.lock().unwrap().output == b"one\n") => {}
         }
+        // Kept while the hold is still up — as `bash` keeps a job before it lets go of anything.
         sb.jobs
             .keep(&sb.scope, &id, 7, "background", 4)
             .await
             .unwrap();
-        // ...and the hold is dropped as the select ends.
+        drop(run);
         let pgid = heard.lock().unwrap().started.unwrap();
         tokio::time::sleep(Duration::from_millis(1500)).await;
         assert!(group_alive(pgid), "{t:?}: a kept job died with its hold");
@@ -291,7 +302,7 @@ async fn a_kept_job_outlives_its_hold_and_is_read_back_from_an_offset() {
             .unwrap();
         assert!(survivors.is_empty(), "{t:?}: {survivors:?}");
         assert!(!group_alive(pgid), "{t:?}");
-        assert!(!sb.job_dir(&id).exists(), "{t:?}: killed and removed");
+        assert!(sb.gone(&id).await, "{t:?}: killed and removed");
         assert_eq!(
             sb.jobs.read(&sb.scope, &id, 0, 10).await.unwrap().status,
             JobStatus::Gone
@@ -335,7 +346,7 @@ async fn a_job_started_kept_is_followed_by_polling() {
             .start_kept(&sb.scope, &id, &sh("echo a; sleep 0.6; echo b; exit 5"))
             .await
             .unwrap();
-        assert_eq!(pgid, sb.pgid(&id), "{t:?}");
+        assert!(pgid > 1, "{t:?}");
         let listed = sb.jobs.list(&sb.scope).await.unwrap();
         assert!(listed[0].kept && listed[0].num.is_none(), "{t:?}");
         let heard = Mutex::new(Heard::default());
@@ -386,7 +397,7 @@ async fn kill_stops_a_job_that_ignores_sigterm_and_removes_it() {
             .unwrap();
         assert!(survivors.is_empty(), "{t:?}: {survivors:?}");
         assert!(!group_alive(pgid), "{t:?}");
-        assert!(!sb.job_dir(&id).exists(), "{t:?}");
+        assert!(sb.gone(&id).await, "{t:?}");
         // Idempotent: killing it again is not an error.
         assert!(
             sb.jobs
@@ -400,44 +411,46 @@ async fn kill_stops_a_job_that_ignores_sigterm_and_removes_it() {
 
 #[tokio::test]
 async fn output_past_the_cap_is_deleted_and_read_back_as_a_gap_of_known_size() {
-    let sb = Sandbox::with_cap(Transport::Local, Some(64 * 1024)).await;
-    let id = JobId::fresh();
-    // 3 MiB at once, then quiet: three full 1 MiB chunks and a partial one.
-    sb.jobs
-        .start_kept(
-            &sb.scope,
-            &id,
-            &sh("head -c 3500000 /dev/zero | tr '\\0' a; echo; sleep 60"),
-        )
-        .await
-        .unwrap();
-    // The keeper prunes every four seconds.
-    let deadline = Instant::now() + Duration::from_secs(15);
-    let first = loop {
-        let c = sb.jobs.read(&sb.scope, &id, 0, 16).await.unwrap();
-        if c.offset > 0 {
-            break c;
+    for t in [Transport::Local, Transport::Native] {
+        let sb = Sandbox::with_cap(t, Some(64 * 1024)).await;
+        let id = JobId::fresh();
+        // 3 MiB at once, then quiet: three full 1 MiB chunks and a partial one (baseline).
+        sb.jobs
+            .start_kept(
+                &sb.scope,
+                &id,
+                &sh("head -c 3500000 /dev/zero | tr '\\0' a; echo; sleep 60"),
+            )
+            .await
+            .unwrap();
+        // The baseline's keeper prunes every four seconds.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let first = loop {
+            let c = sb.jobs.read(&sb.scope, &id, 0, 16).await.unwrap();
+            if c.offset > 0 && c.end == 3_500_001 {
+                break c;
+            }
+            assert!(Instant::now() < deadline, "{t:?}: nothing was pruned");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        };
+        // What is kept is at least the cap, and the reader is told where it starts.
+        assert!(first.offset >= 1024 * 1024, "{t:?}: {}", first.offset);
+        assert!(first.end - first.offset >= 64 * 1024, "{t:?}");
+        assert_eq!(first.data, b"aaaaaaaaaaaaaaaa", "{t:?}");
+        let heard = Mutex::new(Heard::default());
+        let events = recorder(&heard);
+        let follow = sb.jobs.follow(&sb.scope, &id, 0, &events);
+        tokio::select! {
+            r = follow => panic!("{t:?}: ended early: {r:?}"),
+            () = wait_for("the tail", || heard.lock().unwrap().output.ends_with(b"a\n")) => {}
         }
-        assert!(Instant::now() < deadline, "nothing was pruned");
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    };
-    assert_eq!(first.end, 3_500_001);
-    // What is kept starts at a chunk boundary, and the reader is told where.
-    assert!(first.offset >= 1024 * 1024, "{}", first.offset);
-    assert_eq!(first.data, b"aaaaaaaaaaaaaaaa");
-    let heard = Mutex::new(Heard::default());
-    let events = recorder(&heard);
-    let follow = sb.jobs.follow(&sb.scope, &id, 0, &events);
-    tokio::select! {
-        r = follow => panic!("ended early: {r:?}"),
-        () = wait_for("the tail", || heard.lock().unwrap().output.ends_with(b"a\n")) => {}
+        {
+            let h = heard.lock().unwrap();
+            assert_eq!(h.gaps, first.offset, "{t:?}");
+            assert_eq!(h.gaps + h.output.len() as u64, 3_500_001, "{t:?}");
+        }
+        sb.jobs.wipe(&sb.scope).await.unwrap();
     }
-    {
-        let h = heard.lock().unwrap();
-        assert_eq!(h.gaps, first.offset);
-        assert_eq!(h.gaps + h.output.len() as u64, 3_500_001);
-    }
-    sb.jobs.wipe(&sb.scope).await.unwrap();
 }
 
 #[tokio::test]

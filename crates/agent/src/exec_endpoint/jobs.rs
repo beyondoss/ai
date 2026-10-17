@@ -728,7 +728,7 @@ fn one_word(kind: &str) -> String {
 }
 
 /// `"12,34"` (the pids `kill` could not stop) as the model is told.
-fn describe_survivors(pids: &str) -> String {
+pub(crate) fn describe_survivors(pids: &str) -> String {
     let pids: Vec<&str> = pids.split(',').filter(|p| !p.is_empty()).collect();
     match pids.as_slice() {
         [] => "a process in the sandbox".to_string(),
@@ -887,7 +887,9 @@ fn parse_marker(line: &[u8]) -> Option<Marker> {
 ///   bytes from `offset` (or from the oldest byte kept, when that is later), within one chunk.
 /// - `list` — one line per job: `<id> <state> <code> <num> <kind> <seen> <started> <ended> <label>`.
 /// - `keep <id> <num> <kind> <seen>`, `seen <id> <offset>`.
-/// - `kill <grace-ms> <remove> <id…>` — `survived <id> <pid,pid>` for each job not stopped.
+/// - `kill <grace-ms> <remove> <id…>` — `survived <id> <pid,pid>` for each job not stopped. A
+///   removed job's directory goes once its supervisor has recorded the end (at most 3 s), so it
+///   writes nothing into a directory being deleted.
 /// - `rm <id…>` — deletes each job whose group is empty.
 /// - `wipe <grace-ms>` — kills every job in the scope and deletes it.
 pub const JOB_SCRIPT: &str = r#"umask 077
@@ -929,6 +931,15 @@ state() {
   elif [ -e "$j/sup" ]; then read -r _s <"$j/sup"; alive "$_s" || st=lost
   else st=lost
   fi
+}
+gone() {
+  _i=0
+  while [ ! -e "$j/end" ] && [ -e "$j/sup" ] && [ $_i -lt 60 ]; do
+    read -r _s <"$j/sup"; alive "$_s" || break
+    sleep 0.05 2>/dev/null || sleep 1; _i=$((_i + 1))
+  done
+  rm -rf "$j" 2>/dev/null || { sleep 0.1 2>/dev/null; rm -rf "$j" 2>/dev/null; }
+  return 0
 }
 stop() {
   for g in $gs; do kill -TERM -"$g" 2>/dev/null; done
@@ -1034,7 +1045,7 @@ kill)
     g=
     [ -e "$j/pgid" ] && [ ! -e "$j/end" ] && read -r g <"$j/pgid"
     if [ -n "$g" ] && live; then members; echo "survived $id $M"
-    elif [ "$rmf" = 1 ]; then rm -rf "$j"
+    elif [ "$rmf" = 1 ]; then gone
     fi
   done
   ;;
@@ -1055,7 +1066,9 @@ wipe)
   done
   stop "$1"
   for g in $gs; do live && { members; echo "survived - $M"; }; done
-  rm -rf "$S"
+  for j in "$S"/*; do [ -d "$j" ] && gone; done
+  rm -rf "$S" 2>/dev/null
+  true
   ;;
 *)
   echo "unknown op $op" >&2
