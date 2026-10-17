@@ -687,8 +687,9 @@ touches = [
   "crates/gateway/src/capture.rs",
   "crates/gateway/src/admin.rs",
   "crates/gateway/src/doctor.rs",
+  "crates/gateway/src/metrics.rs",
 ]
-defects = []
+defects = ["D284"]
 
 # --- Real agents doing real work ---------------------------------------------------------------
 [[claim]]

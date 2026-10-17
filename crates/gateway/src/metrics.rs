@@ -29,7 +29,8 @@ pub enum Rejection {
     DenyUnknown,
     /// Provider's circuit breaker is open.
     CircuitOpen,
-    /// Streamed request body crossed `MAX_REQUEST_BODY`.
+    /// The request body crossed `MAX_REQUEST_BODY`: declared by `Content-Length` up front, or
+    /// streamed past it.
     BodyTooLarge,
     /// Per-credential rate ceiling.
     RateLimit,
@@ -100,12 +101,23 @@ pub enum Rejection {
     /// A catalog-walk output limit that is not a whole number (a string, a fraction, a negative):
     /// no span to cap it by, so the body is refused. 400 before any upstream.
     OutputLimit,
+    /// `/{name}/…` names no provider the gateway routes to. 404 before any upstream.
+    UnknownProvider,
+    /// A request presented no credential at all (neither `Authorization` nor `x-api-key`), on any
+    /// route. 401.
+    MissingKey,
+    /// The request presents a BYO key for one provider in one header and another in a second one.
+    /// 400, since neither key can be chosen. Before any upstream.
+    AmbiguousCredential,
+    /// A `/{name}/…` route whose provider has no pool key configured: nothing to send on a managed
+    /// key. 503 before any upstream.
+    NoPoolKey,
 }
 
 impl Rejection {
     /// Every variant, in `as_index` order. The array in `Metrics` is built from this, so adding a
     /// variant without adding it here fails the exhaustive `match` in `as_index`.
-    pub(crate) const ALL: [Rejection; 26] = [
+    pub(crate) const ALL: [Rejection; 30] = [
         Rejection::Auth,
         Rejection::DenySpend,
         Rejection::DenyFraud,
@@ -132,6 +144,10 @@ impl Rejection {
         Rejection::RequestDeadline,
         Rejection::UnpricedFeature,
         Rejection::OutputLimit,
+        Rejection::UnknownProvider,
+        Rejection::MissingKey,
+        Rejection::AmbiguousCredential,
+        Rejection::NoPoolKey,
     ];
 
     /// The `reason=` label value. `RateLimit` keeps the original `"rate_limit"` string so existing
@@ -164,6 +180,10 @@ impl Rejection {
             Rejection::RequestDeadline => "request_deadline",
             Rejection::UnpricedFeature => "unpriced_feature",
             Rejection::OutputLimit => "output_limit",
+            Rejection::UnknownProvider => "unknown_provider",
+            Rejection::MissingKey => "missing_key",
+            Rejection::AmbiguousCredential => "ambiguous_credential",
+            Rejection::NoPoolKey => "no_pool_key",
         }
     }
 
@@ -195,6 +215,10 @@ impl Rejection {
             Rejection::RequestDeadline => 23,
             Rejection::UnpricedFeature => 24,
             Rejection::OutputLimit => 25,
+            Rejection::UnknownProvider => 26,
+            Rejection::MissingKey => 27,
+            Rejection::AmbiguousCredential => 28,
+            Rejection::NoPoolKey => 29,
         }
     }
 }

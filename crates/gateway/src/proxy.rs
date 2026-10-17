@@ -4204,6 +4204,10 @@ impl ProxyHttp for AiProxy {
                 return Self::reject_catalog_miss(session, &request_id, name.as_deref()).await;
             }
             Routed::UnknownProvider => {
+                self.state
+                    .metrics
+                    .rejection(Rejection::UnknownProvider)
+                    .inc();
                 return Self::reject_boxed(
                     session,
                     &request_id,
@@ -4214,6 +4218,10 @@ impl ProxyHttp for AiProxy {
                 .await;
             }
             Routed::AmbiguousCredential => {
+                self.state
+                    .metrics
+                    .rejection(Rejection::AmbiguousCredential)
+                    .inc();
                 // Rare and never a flood path, so not in `REJECT_BODIES`.
                 return Self::reject_message_boxed(
                     session,
@@ -4235,6 +4243,7 @@ impl ProxyHttp for AiProxy {
             managed: managed_key,
         }) = extract_virtual_key(session.req_header())
         else {
+            self.state.metrics.rejection(Rejection::MissingKey).inc();
             return Self::reject_boxed(
                 session,
                 &request_id,
@@ -4278,6 +4287,7 @@ impl ProxyHttp for AiProxy {
         if let Some(len) = declared_len
             && len > MAX_REQUEST_BODY
         {
+            self.state.metrics.rejection(Rejection::BodyTooLarge).inc();
             return Self::reject_boxed(
                 session,
                 &request_id,
@@ -4382,6 +4392,7 @@ impl ProxyHttp for AiProxy {
                 && !resolve_from_body
                 && !provider.as_ref().is_some_and(|p| p.has_pool_key())
             {
+                self.state.metrics.rejection(Rejection::NoPoolKey).inc();
                 return Self::reject_boxed(
                     session,
                     &request_id,

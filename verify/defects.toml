@@ -2919,3 +2919,17 @@ state = "fixed"
 test = "an_ipv6_authority_keeps_its_brackets_in_the_host_header_and_not_in_sni"
 fix = ""
 note = "Fixed in route.rs: the host is http::uri::Authority::host(), which keeps the brackets of an IPv6 literal, so the Host header carries them (RFC 9110). Provider::sni() strips them for the TLS server name, which proxy's peer uses. A string that is no authority keeps the old first-colon fallback."
+
+[[defect]]
+id = "D284"
+severity = "low"
+area = "Observability"
+title = "Four refusals in request_filter were not counted on ai_rejections_total"
+impact = "An unknown provider segment (404), a request with no credential (401), a known provider with no pool key (503), and a declared body past the cap (413) were refused before the upstream but incremented no Rejection counter, so a flood of them was invisible on the dashboard, against ARCHITECTURE's statement that every rejection is counted."
+confidence = "high"
+evidence = "proxy.rs request_filter returned these four refusals with no metrics call. Reproduced on 4513e6f by every_refusal_before_the_upstream_is_counted, which needs the four counted (the reasons were absent from the scrape)."
+claims = ["O3"]
+state = "fixed"
+test = "every_refusal_before_the_upstream_is_counted"
+fix = ""
+note = "Fixed in proxy.rs request_filter and metrics.rs: the 404 counts Rejection::UnknownProvider and the 401 Rejection::MissingKey (both new, labels unknown_provider and missing_key); the declared-length 413 counts the existing BodyTooLarge (the same refusal as the peek path's reject_too_large) and the no-pool-key 503 counts the existing NoCandidate (none of the candidates has a pool key). The integration test is in tests/claims_reliability.rs and compiles here; it runs on Linux."
