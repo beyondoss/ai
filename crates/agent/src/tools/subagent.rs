@@ -1120,7 +1120,15 @@ impl Subagent {
         // succeeded (or conflicted cleanly). The shared `WriteLockRegistry` (the same one every child's file writes
         // key on) serializes them on a sentinel key that no real path can collide with.
         let _merge_guard = self.ctx.write_locks.lock("\0subagent-merge-back").await;
-        match worktree::apply_patch(wt.git(), repo_root, &delta, &policy.denied_paths()).await {
+        // The child's policy anchors relative `--deny-path` patterns (`secrets/*`) at its worktree;
+        // the patch lands in the main tree, so re-anchor them there — where the child's own view of
+        // them maps to — and at the parent's root, where the parent itself would apply them. Both:
+        // they differ only when the parent runs in a subdirectory, and a deny-list errs wide.
+        let mut denied = policy.denied_paths_at(repo_root);
+        if self.ctx.cwd != repo_root {
+            denied.extend(policy.denied_paths_at(&self.ctx.cwd));
+        }
+        match worktree::apply_patch(wt.git(), repo_root, &delta, &denied).await {
             Ok(ApplyOutcome::Clean) => {
                 let _ = wt.remove().await;
             }

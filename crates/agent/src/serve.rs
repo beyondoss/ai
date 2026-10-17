@@ -753,7 +753,8 @@ pub struct ServeConfig {
     /// Block a `bash` call whenever its command contains this substring, case-insensitively. Combines
     /// with `deny_tool` under the same policy hook.
     pub deny_bash_pattern: Vec<String>,
-    /// Block a `write`/`edit` call whenever its `path` argument matches this glob. Combines with
+    /// Block a `write`/`edit` call whenever its `path` argument matches this glob, with gitignore
+    /// semantics anchored to the tool root (see `policy::anchored_globs`). Combines with
     /// `deny_tool`/`deny_bash_pattern` under the same policy hook.
     pub deny_path: Vec<String>,
     /// Which tools require a human's approval before they run (`--approve off|writes|all|tools:a,b`). The
