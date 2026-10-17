@@ -279,7 +279,7 @@ enum Command {
         /// is `-`, and comes before the `@file` blocks; with a message, an open stdin is never waited
         /// on. At least one of a message, `@file`, or stdin is required.
         tasks: Vec<String>,
-        /// Model id (default `claude-opus-4-8`, or `AI_AGENT_MODEL`).
+        /// Model id. Defaults to the stored `settings --model`, else {DEFAULT_MODEL}.
         #[usage(long, env = "AI_AGENT_MODEL")]
         model: Option<String>,
         /// Gateway base URL (default `http://ai.internal`, or `AI_GATEWAY_URL`).
@@ -774,7 +774,7 @@ enum Command {
     },
     /// Run the headless agent server: a newline-delimited JSON control protocol over stdio.
     Serve {
-        /// Model id (default `claude-opus-4-8`, or `AI_AGENT_MODEL`).
+        /// Model id. Defaults to the stored `settings --model`, else {DEFAULT_MODEL}.
         #[usage(long, env = "AI_AGENT_MODEL")]
         model: Option<String>,
         /// Gateway base URL (default `http://ai.internal`, or `AI_GATEWAY_URL`).
@@ -1736,6 +1736,17 @@ fn expand_short_aliases(args: Vec<String>) -> Vec<String> {
 /// message (an argument starting with `-` is consumed as a flag by clap, not a positional, unless
 /// explicitly escaped with `--`). `args` here is already run through [`expand_short_aliases`], so the
 /// argv-position/substring checks below see the expanded (long-flag) form too.
+/// Written in help text where the built-in default model belongs, and replaced with
+/// [`DEFAULT_MODEL`] when the help is rendered, so the two can't drift apart.
+const DEFAULT_MODEL_PLACEHOLDER: &str = "{DEFAULT_MODEL}";
+
+/// A command's rendered `--help`/`-h` page, with [`DEFAULT_MODEL_PLACEHOLDER`] filled in.
+fn render_help(cmd: &'static usage::Command, long: bool) -> String {
+    Cli::render_help(cmd, long)
+        .unwrap_or_default()
+        .replace(DEFAULT_MODEL_PLACEHOLDER, DEFAULT_MODEL)
+}
+
 fn cli() -> Cli {
     let args = expand_short_aliases(std::env::args().collect());
     let run_json_help = args.get(1).map(String::as_str) == Some("run")
@@ -1746,7 +1757,7 @@ fn cli() -> Cli {
     match Cli::try_parse_from(&argv_refs) {
         Ok(cli) => cli,
         Err(usage::Error::Help { cmd, long }) => {
-            let text = Cli::render_help(cmd, long).unwrap_or_default();
+            let text = render_help(cmd, long);
             if run_json_help {
                 eprint!("{text}");
             } else {
@@ -1787,7 +1798,7 @@ fn mcp_manifest_dir() -> Option<tools::mcp_manifest::ManifestDir> {
 /// allowlist has no reason to permit, which would either widen the filter or kill the process on
 /// teardown. Intercepting argv here means the child is one thread that has opened nothing. See
 /// `tools::web::isolate`.
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> std::process::ExitCode {
     if std::env::args_os()
         .nth(1)
         .is_some_and(|a| a == tools::web::isolate::SUBCOMMAND)
@@ -1805,11 +1816,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The ordinary way out (`run` finishing, every subcommand that returns) and a panic unwinding
     // out of `run` both pass through this guard's `Drop`: the same cleanup as `exit_process`.
     let _sweep = tools::mcp_stdio::ExitSweep;
-    let runtime = build_runtime(is_service_mode())?;
+    let runtime = match build_runtime(is_service_mode()) {
+        Ok(runtime) => runtime,
+        Err(e) => return report_error(e.as_ref()),
+    };
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         runtime.block_on(run_main())
     })) {
-        Ok(result) => result,
+        Ok(Ok(())) => std::process::ExitCode::SUCCESS,
+        Ok(Err(e)) => report_error(e.as_ref()),
         // A panic out of `run` (the panic hook has already reported it). Dropping the runtime
         // here would wait for every blocking task — and `serve`'s stdin reader is one, parked on a
         // read that may never return — so the process would hang instead of exiting. Abandon the
@@ -1823,6 +1838,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(101);
         }
     }
+}
+
+/// Print a failed run's error to stderr as one plain line, `error: <message>`, and exit 1. Rust's
+/// default for an `Err` out of `main` is the error's `Debug` form (`Error: Os { code: 13, kind:
+/// PermissionDenied, .. }`, `Transport("…")` with every quote escaped), which reads as a crash dump.
+/// A source chain is appended unless the message already says it.
+fn report_error(e: &(dyn std::error::Error + 'static)) -> std::process::ExitCode {
+    eprintln!("error: {}", render_error(e));
+    std::process::ExitCode::FAILURE
+}
+
+fn render_error(e: &(dyn std::error::Error + 'static)) -> String {
+    let mut msg = e.to_string();
+    let mut source = e.source();
+    while let Some(cause) = source {
+        let cause_msg = cause.to_string();
+        if !msg.contains(&cause_msg) {
+            msg.push_str(": ");
+            msg.push_str(&cause_msg);
+        }
+        source = cause.source();
+    }
+    msg
 }
 
 /// Raise the soft `RLIMIT_NOFILE` to the hard limit. A `serve` daemon holds one descriptor per
@@ -6206,6 +6244,50 @@ mod tests {
                 "{sub} --reasoning-effort help must reference --thinking: {sub_help}"
             );
         }
+    }
+
+    #[test]
+    fn help_names_the_real_default_model() {
+        for sub in ["run", "serve"] {
+            let cmd = Cli::command()
+                .subcommands
+                .iter()
+                .copied()
+                .find(|c| c.name == sub)
+                .unwrap_or_else(|| panic!("no {sub} subcommand"));
+            for long in [false, true] {
+                let help = render_help(cmd, long);
+                let normalized: String = help.split_whitespace().collect::<Vec<_>>().join(" ");
+                assert!(
+                    normalized.contains(&format!("else {DEFAULT_MODEL}")),
+                    "{sub} --model help must name {DEFAULT_MODEL}: {help}"
+                );
+                assert!(!help.contains(DEFAULT_MODEL_PLACEHOLDER), "{help}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_error_renders_as_its_message_and_its_causes() {
+        #[derive(Debug)]
+        struct Outer(std::io::Error);
+        impl std::fmt::Display for Outer {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("cannot open session")
+            }
+        }
+        impl std::error::Error for Outer {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+        let e = Outer(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "denied",
+        ));
+        assert_eq!(render_error(&e), "cannot open session: denied");
+        let plain: Box<dyn std::error::Error> = "--fork x: no such session".into();
+        assert_eq!(render_error(plain.as_ref()), "--fork x: no such session");
     }
 
     /// In-process argv parse cost only (no process start, no help rendering). Printed under
