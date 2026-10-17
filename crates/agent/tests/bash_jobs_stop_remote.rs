@@ -1,8 +1,9 @@
-//! Stopping remote `bash` jobs never runs on the runtime thread. A v1.2 job's kill asks its stream's
-//! future — on that runtime — to let the connection go, and waits (up to 2 s) until it has; run
-//! inline on `run`'s or `serve`'s current-thread runtime, the future could never run, so every job
-//! cost the kill's full bound and its stream closed only when the process exited. A transcript switch
-//! in `serve` also stopped the jobs without telling the client.
+//! Stopping remote `bash` jobs never runs on the runtime thread. A remote job's kill runs on that
+//! runtime — the sandbox's `kill` operation, or (a stream-owned job) its stream's future letting the
+//! connection go — and the stop waits for it; run inline on `run`'s or `serve`'s current-thread
+//! runtime, it could never run, so every job cost the kill's full bound and its stream closed only
+//! when the process exited. A transcript switch in `serve` also stopped the jobs without telling the
+//! client.
 #![cfg(target_os = "linux")]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -34,6 +35,38 @@ fn send(stdin: &mut ChildStdin, cmd: Value) {
     stdin.flush().unwrap();
 }
 
+/// Whether a live (non-zombie) process runs exactly `cmd`.
+fn running(cmd: &str) -> bool {
+    std::fs::read_dir("/proc").unwrap().flatten().any(|e| {
+        let Some(pid) = e.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else {
+            return false;
+        };
+        let line: Vec<String> = std::fs::read(format!("/proc/{pid}/cmdline"))
+            .unwrap_or_default()
+            .split(|&b| b == 0)
+            .filter(|s| !s.is_empty())
+            .map(|s| String::from_utf8_lossy(s).into_owned())
+            .collect();
+        let zombie = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .unwrap_or_default()
+            .rsplit_once(')')
+            .is_some_and(|(_, r)| r.trim_start().starts_with('Z'));
+        line.join(" ") == cmd && !zombie
+    })
+}
+
+/// The job's stream ended — the endpoint killed it on a disconnect (a stream-owned job), or it
+/// finished because the sandbox's kill ended the job it was holding.
+fn stream_ended(end: Option<(StreamEnd, Instant)>) -> bool {
+    matches!(
+        end,
+        Some((
+            StreamEnd::Finished | StreamEnd::Disconnected { killed: true },
+            _
+        ))
+    )
+}
+
 /// `new_session` in `serve` stops the old transcript's remote job at once — its stream closed, the
 /// endpoint killing it — and says so in a `bash_jobs_stopped` frame.
 #[test]
@@ -42,7 +75,7 @@ fn a_transcript_switch_stops_remote_jobs_promptly_and_says_so() {
     let dir = tempfile::tempdir().unwrap();
     let mock = rt.block_on(ExecMock::start(dir.path(), true));
     let (base, _bodies) = spawn_model_server(vec![
-        background("t1", "echo switch-tag; sleep 60"),
+        background("t1", "echo switch-tag; sleep 60.21"),
         turn_text("started it"),
         turn_text("ok, it can run"),
     ]);
@@ -76,10 +109,14 @@ fn a_transcript_switch_stops_remote_jobs_promptly_and_says_so() {
         }
     };
     assert_eq!(stopped["jobs"][0]["job"], 1, "{stopped}");
-    assert_eq!(
-        rt.block_on(mock.wait_for_end(s.pgid, Duration::from_secs(5))),
-        Some(StreamEnd::Disconnected { killed: true })
-    );
+    rt.block_on(mock.wait_for_end(s.pgid, Duration::from_secs(5)));
+    let record = mock
+        .streams()
+        .into_iter()
+        .find(|r| r.pgid == s.pgid)
+        .unwrap();
+    assert!(stream_ended(record.end), "{record:?}");
+    assert!(!running("sleep 60.21"), "the job itself is gone");
     let (_, ended) = mock
         .streams()
         .into_iter()
@@ -103,8 +140,8 @@ fn the_end_of_a_run_stops_remote_jobs_without_waiting_out_each_kill() {
     let dir = tempfile::tempdir().unwrap();
     let mock = rt.block_on(ExecMock::start(dir.path(), true));
     let (base, bodies) = spawn_model_server(vec![
-        background("t1", "echo end-a; sleep 60"),
-        background("t2", "echo end-b; sleep 60"),
+        background("t1", "echo end-a; sleep 60.22"),
+        background("t2", "echo end-b; sleep 60.23"),
         turn_text("started them"),
         // The one stop reminder's reply: the last model call.
         turn_text("they can stop"),
@@ -152,11 +189,12 @@ fn the_end_of_a_run_stops_remote_jobs_without_waiting_out_each_kill() {
         .collect();
     assert_eq!(jobs.len(), 2, "{jobs:?}");
     for s in &jobs {
-        assert!(
-            matches!(s.end, Some((StreamEnd::Disconnected { killed: true }, _))),
-            "{s:?}"
-        );
+        assert!(stream_ended(s.end), "{s:?}");
     }
+    assert!(
+        !running("sleep 60.22") && !running("sleep 60.23"),
+        "the jobs are gone"
+    );
     // Inline, each v1.2 kill waited out its 2 s bound: two jobs took over 4 s.
     assert!(
         took < Duration::from_millis(2500),

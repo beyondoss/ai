@@ -20,15 +20,17 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::Instant;
 
 use agent_core::Background;
 use agent_core::background::{NOTICE_PREFIX, REMINDER_PREFIX};
 use tokio::sync::watch;
 
+use super::bash_sandbox::SandboxLink;
 use super::exec::{ExecResult, Kill};
 use super::output::{OutputAccumulator, OutputSnapshot};
+use crate::exec_endpoint::jobs::JobScope;
 
 /// Most yielded (unintended) jobs kept running; parking another kills the oldest of them.
 pub const MAX_YIELDED_JOBS: usize = 4;
@@ -99,6 +101,11 @@ pub(crate) struct Job {
 impl Drop for Job {
     fn drop(&mut self) {
         self.handle.abort();
+        // A job the sandbox owns outlives this process's interest in it: dropping it lets go of
+        // its stream (the abort above), and nothing more.
+        if self.shared.released() {
+            return;
+        }
         // `abort` only drops the runner's future when the runtime next polls the task, which a
         // process on its way out may never do — kill directly too.
         #[cfg(unix)]
@@ -132,6 +139,11 @@ pub(crate) struct JobShared {
     pub live: AtomicBool,
     /// Where the command runs (no spill file when remote).
     pub remote: bool,
+    /// Set when the sandbox runs it ([`crate::exec_endpoint::jobs`]): where to reach it.
+    sandbox: OnceLock<SandboxLink>,
+    /// The sandbox owns it now (it was kept), and this host's policy lets it outlive the session:
+    /// dropping the job, or this process exiting, must not kill it.
+    released: AtomicBool,
     state: Mutex<JobState>,
     /// The table to tell when the job ends or is orphaned, so a waiting host can wake.
     table: Weak<BashJobs>,
@@ -147,6 +159,9 @@ struct JobState {
 pub(crate) struct JobOutput {
     /// Output since the last report to the model.
     pub acc: OutputAccumulator,
+    /// How many bytes of output the command has produced in all (from where this job started
+    /// reading it): the sandbox's offset of the next byte, for a sandbox job.
+    pub offset: u64,
     pub last_output: Instant,
     /// Whether any chunk came through the sink at all — see `Bash::finish_job`'s fallback.
     pub streamed: bool,
@@ -157,6 +172,7 @@ impl JobShared {
         Self {
             out: Mutex::new(JobOutput {
                 acc: accumulator(!remote),
+                offset: 0,
                 last_output: Instant::now(),
                 streamed: false,
             }),
@@ -165,11 +181,66 @@ impl JobShared {
             key: NEXT_JOB_KEY.fetch_add(1, Ordering::Relaxed),
             live: AtomicBool::new(false),
             remote,
+            sandbox: OnceLock::new(),
+            released: AtomicBool::new(false),
             state: Mutex::new(JobState::default()),
             table: Arc::downgrade(table),
         }
     }
 
+    /// A job the sandbox runs, read from `offset` of its output.
+    pub fn in_sandbox(link: SandboxLink, offset: u64, table: &Arc<BashJobs>) -> Self {
+        let shared = Self::new(true, table);
+        let _ = shared.sandbox.set(link);
+        lock(&shared.out).offset = offset;
+        shared
+    }
+
+    /// Where the sandbox runs it, if it does.
+    pub fn sandbox(&self) -> Option<&SandboxLink> {
+        self.sandbox.get()
+    }
+
+    /// Run by the sandbox from now on — set once, before the job runs.
+    pub fn set_sandbox(&self, link: SandboxLink) {
+        let _ = self.sandbox.set(link);
+    }
+
+    /// The offset of the next byte of output.
+    pub fn offset(&self) -> u64 {
+        lock(&self.out).offset
+    }
+
+    /// `n` bytes of output the sandbox no longer had when they were read: counted, and marked.
+    pub fn append_gap(&self, n: u64) {
+        {
+            let mut out = lock(&self.out);
+            out.offset += n;
+            out.acc.append(
+                format!(
+                    "\n[{} of output not kept by the sandbox]\n",
+                    super::output::format_size(n)
+                )
+                .as_bytes(),
+            );
+            out.last_output = Instant::now();
+            out.streamed = true;
+        }
+        self.notify.notify_one();
+    }
+
+    /// Whether dropping the job leaves it running ([`Self::release`]).
+    pub fn released(&self) -> bool {
+        self.released.load(Ordering::Relaxed)
+    }
+
+    /// The sandbox owns it and this host lets it outlive the session: neither dropping the job nor
+    /// this process's exit kills it. Only an explicit kill does, which is why the kill stays
+    /// recorded.
+    pub fn release(&self) {
+        self.released.store(true, Ordering::Relaxed);
+        lock(&LIVE_JOBS).retain(|(k, _)| *k != self.key);
+    }
     pub fn out(&self) -> MutexGuard<'_, JobOutput> {
         lock(&self.out)
     }
@@ -177,6 +248,7 @@ impl JobShared {
     pub fn append(&self, bytes: &[u8]) {
         {
             let mut out = lock(&self.out);
+            out.offset += bytes.len() as u64;
             out.acc.append(bytes);
             out.last_output = Instant::now();
             out.streamed = true;
@@ -186,7 +258,9 @@ impl JobShared {
 
     pub fn track(&self, kill: Kill) {
         *lock(&self.kill) = Some(kill.clone());
-        lock(&LIVE_JOBS).push((self.key, kill));
+        if !self.released() {
+            lock(&LIVE_JOBS).push((self.key, kill));
+        }
         self.live.store(true, Ordering::Relaxed);
         // The waiting call computed its idle deadline before the output was known to be live; wake
         // it to recompute.
@@ -212,10 +286,12 @@ impl JobShared {
 
     /// The runner's task is done: record how, and wake whoever is waiting.
     pub fn finish(&self, result: Result<ExecResult, String>) {
-        lock(&self.state).end = Some(JobEnd {
-            result,
-            at: Instant::now(),
-        });
+        self.finish_at(result, Instant::now());
+    }
+
+    /// As [`Self::finish`], for a job that ended at `at` — earlier, while nobody was following it.
+    pub fn finish_at(&self, result: Result<ExecResult, String>, at: Instant) {
+        lock(&self.state).end = Some(JobEnd { result, at });
         self.notify.notify_one();
         if let Some(t) = self.table.upgrade() {
             t.changed();
@@ -300,6 +376,13 @@ pub struct BashJobs {
     /// Bumped whenever a parked job ends or is orphaned: what [`Self::subscribe`] hands out.
     wake: watch::Sender<u64>,
     policy: Mutex<EndPolicy>,
+    /// Where this session's jobs live in a sandbox. `None`: commands that run remotely keep the
+    /// stream-owned lifetime (a table with no session behind it — a subagent's, `serve`'s host
+    /// `bash`).
+    scope: Mutex<Option<JobScope>>,
+    /// Sandbox jobs whose end the model has been told: their directories go once that report is
+    /// persisted ([`Self::collect_garbage`]).
+    garbage: Mutex<Vec<SandboxLink>>,
 }
 
 impl Default for BashJobs {
@@ -316,9 +399,63 @@ impl BashJobs {
             table: Mutex::new(BTreeMap::new()),
             wake: watch::Sender::new(0),
             policy: Mutex::new(policy),
+            scope: Mutex::new(None),
+            garbage: Mutex::new(Vec::new()),
         }
     }
 
+    /// Run this session's remote jobs in the sandbox, under `scope` — see
+    /// [`crate::exec_endpoint::jobs`]. Set by the host that knows the session.
+    pub fn set_scope(&self, scope: Option<JobScope>) {
+        *lock(&self.scope) = scope;
+    }
+
+    pub fn scope(&self) -> Option<JobScope> {
+        lock(&self.scope).clone()
+    }
+
+    pub(crate) fn policy(&self) -> EndPolicy {
+        *lock(&self.policy)
+    }
+
+    /// The highest id handed out, raised to `id` if lower: a reattached job keeps its number.
+    pub(crate) fn see_id(&self, id: u64) {
+        self.next.fetch_max(id, Ordering::Relaxed);
+    }
+
+    /// The model has been told how this sandbox job ended: delete its directory once that is
+    /// persisted.
+    pub(crate) fn discard_later(&self, link: &SandboxLink) {
+        lock(&self.garbage).push(link.clone());
+    }
+
+    /// Delete the directories of sandbox jobs whose end has been reported. A host calls it where
+    /// the reports are known to be persisted (`serve`: the top of its loop; `run`: its end), so a
+    /// replica that dies before then leaves them for the next one to report again.
+    pub async fn collect_garbage(&self) {
+        let garbage = std::mem::take(&mut *lock(&self.garbage));
+        super::bash_sandbox::remove_all(garbage).await;
+    }
+
+    /// Park a job read back from the sandbox under its own number. `notified` when its end was
+    /// already reported; its shell's exit (if any) always was.
+    pub(crate) fn insert_reattached(&self, id: u64, job: Job) {
+        self.see_id(id);
+        let mut parked = Parked::new(job);
+        parked.orphan_notified = true;
+        lock(&self.table).insert(id, parked);
+    }
+
+    /// The session is over without being ended (a reap, a deploy, a shutdown): stop the jobs this
+    /// process owns — this host's, and a sandbox's that were never handed over — and let go of the
+    /// ones the sandbox owns, which run on for the next replica to reattach. Says which it stopped.
+    pub fn release(&self) -> Vec<StoppedJob> {
+        let stopped = self.stop(|p| !p.job.shared.released());
+        // What is left the sandbox owns: dropping a job only lets go of its stream.
+        let kept = std::mem::take(&mut *lock(&self.table));
+        drop(kept);
+        stopped
+    }
     /// What ending a run does to the jobs, as the stop reminder will say. Set once by the host that
     /// owns the table (`serve`: [`EndPolicy::KeepRunning`]).
     pub fn set_policy(&self, policy: EndPolicy) {
@@ -351,12 +488,16 @@ impl BashJobs {
             .get_or_insert_with(|| self.next.fetch_add(1, Ordering::Relaxed) + 1)
     }
 
-    /// What a job of `kind` lives until, as the model is told when its call returns.
-    pub(crate) fn lifetime(&self, kind: JobKind) -> &'static str {
-        match (kind, *lock(&self.policy)) {
-            (JobKind::Yielded, _) => "it is stopped when you end your turn",
-            (_, EndPolicy::StopAtEnd) => "it is stopped for you when the run ends",
-            (_, EndPolicy::KeepRunning) => "it keeps running after your turn ends",
+    /// What a job of `kind` lives until, as the model is told when its call returns. `sandbox`:
+    /// the sandbox runs it, so it outlives this session's replica too.
+    pub(crate) fn lifetime(&self, kind: JobKind, sandbox: bool) -> &'static str {
+        match (kind, *lock(&self.policy), sandbox) {
+            (JobKind::Yielded, _, _) => "it is stopped when you end your turn",
+            (_, EndPolicy::StopAtEnd, _) => "it is stopped for you when the run ends",
+            (_, EndPolicy::KeepRunning, true) => {
+                "it keeps running in the sandbox until it exits, you stop it, or the session ends"
+            }
+            (_, EndPolicy::KeepRunning, false) => "it keeps running after your turn ends",
         }
     }
 
@@ -494,6 +635,7 @@ impl BashJobs {
     }
 
     fn notices(&self) -> Option<String> {
+        let policy = self.policy();
         let mut table = lock(&self.table);
         let mut parts = Vec::new();
         for (&id, p) in table.iter_mut() {
@@ -505,6 +647,9 @@ impl BashJobs {
             let header = match &state.end {
                 Some(end) => {
                     p.notified = true;
+                    if let Some(link) = job.shared.sandbox() {
+                        self.discard_later(link);
+                    }
                     ended_header(id, job, end, state.orphans.is_some())
                 }
                 None => {
@@ -516,6 +661,9 @@ impl BashJobs {
                     drop(state);
                     if job.kind == JobKind::Yielded {
                         job.kind = JobKind::Adopted;
+                        // Intended now: the sandbox takes it over, as it does an adoption the
+                        // call itself saw.
+                        super::bash_sandbox::spawn_keep(job.shared.clone(), id, job.kind, policy);
                     }
                     parts.push(orphan_notice(id, job, &shell, &left));
                     continue;
@@ -674,12 +822,20 @@ impl Background for BashJobs {
         let read = read_transcript(messages);
         // Never back: after a transcript switch this table keeps counting past its own jobs too.
         self.next.fetch_max(read.max_id, Ordering::Relaxed);
-        let stopped: Vec<(u64, String)> = read
-            .running
-            .into_iter()
-            .map(|(id, left)| (id, left.command))
-            .collect();
-        reopen_note(&stopped, self.next.load(Ordering::Relaxed) + 1)
+        // A job the sandbox kept running (reattached when the session opened) is in the table:
+        // still running, or ended with its notice on the way. Only the rest were stopped.
+        let table = lock(&self.table);
+        let mut running = Vec::new();
+        let mut stopped = Vec::new();
+        for (id, left) in read.running {
+            match table.get(&id) {
+                Some(p) if p.job.shared.ended() => {}
+                Some(p) => running.push((id, p.job.command.clone())),
+                None => stopped.push((id, left.command)),
+            }
+        }
+        drop(table);
+        reopen_note(&running, &stopped, self.next.load(Ordering::Relaxed) + 1)
     }
 }
 
@@ -689,26 +845,50 @@ impl Background for BashJobs {
 /// knows its id. `None` when the transcript left nothing running. The one place the note is
 /// written, so a host whose jobs can outlive a session has one function to add "still running"
 /// entries to.
-fn reopen_note(stopped: &[(u64, String)], next: u64) -> Option<String> {
-    if stopped.is_empty() {
+fn reopen_note(running: &[(u64, String)], stopped: &[(u64, String)], next: u64) -> Option<String> {
+    if running.is_empty() && stopped.is_empty() {
         return None;
     }
-    let lines: Vec<String> = stopped
-        .iter()
-        .map(|(id, command)| format!("- job {id}: `{command}` (stopped)"))
-        .collect();
-    let (them, are) = if stopped.len() == 1 {
-        ("it", "is")
-    } else {
-        ("them", "are")
-    };
-    Some(format!(
-        "{REMINDER_PREFIX} This session was closed since it last ran, and the jobs it left running \
-         were stopped with it:\n{}\nNone of {them} {are} running now, and bash_job no longer knows \
-         {them}: do not wait on or kill {them}; start again what you still need. New jobs are \
-         numbered from {next}.",
-        lines.join("\n")
-    ))
+    let mut parts = vec![format!(
+        "{REMINDER_PREFIX} This session was closed since it last ran."
+    )];
+    if !running.is_empty() {
+        let lines: Vec<String> = running
+            .iter()
+            .map(|(id, command)| format!("- job {id}: `{command}` (still running)"))
+            .collect();
+        let (it, each) = if running.len() == 1 {
+            ("it", "it exits")
+        } else {
+            ("them", "each exits")
+        };
+        parts.push(format!(
+            "These jobs kept running in the sandbox, and are still job numbers bash_job knows:\n{}\n\
+             Do not start them again. You will be told when {each}; bash_job {{\"job\": N, \
+             \"timeout_ms\": 0}} shows what one has printed since, and bash_job {{\"job\": N, \
+             \"kill\": true}} stops one you no longer need — or leave {it} running.",
+            lines.join("\n")
+        ));
+    }
+    if !stopped.is_empty() {
+        let lines: Vec<String> = stopped
+            .iter()
+            .map(|(id, command)| format!("- job {id}: `{command}` (stopped)"))
+            .collect();
+        let (them, are) = if stopped.len() == 1 {
+            ("it", "is")
+        } else {
+            ("them", "are")
+        };
+        parts.push(format!(
+            "The jobs it left running were stopped with it:\n{}\nNone of {them} {are} running now, \
+             and bash_job no longer knows {them}: do not wait on or kill {them}; start again what you \
+             still need.",
+            lines.join("\n")
+        ));
+    }
+    parts.push(format!("New jobs are numbered from {next}."));
+    Some(parts.join(" "))
 }
 
 /// A job a transcript shows running when it ends, for [`reopen_note`].

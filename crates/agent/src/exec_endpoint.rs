@@ -714,7 +714,10 @@ impl HttpExecRunner {
         }
         if let Some(report) = on_spawn {
             let stop = stop.clone();
-            report(Kill::Hook(Arc::new(move || stop.stop())));
+            report(Kill::Hook(Arc::new(move || {
+                stop.stop();
+                None
+            })));
         }
         let mut frames = FrameReader::new(resp);
         let broken = |e: String| {
@@ -1109,7 +1112,10 @@ impl TemplateRunner {
         let mut guard = TemplateKillGuard(Some(kill.clone()));
         if let Some(report) = on_spawn {
             let kill = kill.clone();
-            report(Kill::Hook(Arc::new(move || kill.kill())));
+            report(Kill::Hook(Arc::new(move || {
+                kill.kill();
+                None
+            })));
         }
         let stdout = child.stdout.take();
         // The wrapper's shell-exit marker, heard on stderr: the command exited leaving processes of

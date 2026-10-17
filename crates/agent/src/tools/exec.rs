@@ -109,10 +109,11 @@ pub enum Kill {
     /// including the ones that left the group (`setsid`, `timeout`, a double fork). See
     /// [`super::bash_proc`].
     Procs(super::bash_proc::ProcGroup),
-    /// The runner's own way to stop the command: close the exec stream (protocol v1.2), or run a kill
-    /// inside the container a template transport reaches. Blocking, and returns once the runner has
-    /// done everything it can — see [`Kill::kill`].
-    Hook(std::sync::Arc<dyn Fn() + Send + Sync>),
+    /// The runner's own way to stop the command: close the exec stream (protocol v1.2), run a kill
+    /// inside the container a template transport reaches, or kill a sandbox-owned job
+    /// ([`crate::exec_endpoint::jobs`]). Blocking, and returns once the runner has done everything
+    /// it can — see [`Kill::kill`] — with a description of what survived, when it can tell.
+    Hook(std::sync::Arc<dyn Fn() -> Option<String> + Send + Sync>),
 }
 
 impl Kill {
@@ -143,20 +144,31 @@ pub fn kill_all(kills: &[Kill]) -> Vec<Option<String>> {
     for group in &groups {
         group.terminate();
     }
-    for kill in kills {
-        if let Kill::Hook(hook) = kill {
-            hook();
-        }
-    }
+    // Side by side: each may be a round trip with a grace of its own (a sandbox job's kill), and N
+    // of them must cost one, not N.
+    let hooked: Vec<Option<String>> = std::thread::scope(|scope| {
+        let running: Vec<_> = kills
+            .iter()
+            .map(|k| match k {
+                Kill::Hook(hook) => Some(scope.spawn(|| hook())),
+                Kill::Procs(_) => None,
+            })
+            .collect();
+        running
+            .into_iter()
+            .map(|h| h.and_then(|h| h.join().ok().flatten()))
+            .collect()
+    });
     super::bash_proc::await_exit(&groups, deadline);
     kills
         .iter()
-        .map(|k| match k {
+        .zip(hooked)
+        .map(|(k, hooked)| match k {
             Kill::Procs(g) => {
                 let left = g.sweep();
                 (!left.is_empty()).then(|| super::bash_proc::describe(&left))
             }
-            Kill::Hook(_) => None,
+            Kill::Hook(_) => hooked,
         })
         .collect()
 }

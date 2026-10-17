@@ -5452,6 +5452,15 @@ async fn run_task(
                 session_id: meta.id.clone(),
             })
         });
+    // Remote jobs run in the sandbox under this session's scope. A run stops its jobs when it ends,
+    // so whatever an earlier run of this session left there (it was killed before it could stop
+    // them) is stopped now — the reopen note says so.
+    bash_jobs.set_scope(Some(
+        beyond_ai_agent::exec_endpoint::jobs::JobScope::for_session(None, &meta.id),
+    ));
+    if let Some(runner) = &exec_runner {
+        tools::bash_sandbox::reattach(&bash_jobs, runner.clone()).await;
+    }
     // `serve`'s own resolution (`build_agent`): the model's window, input limit and compaction cap,
     // then the `--context-window`/`--compact-at`/reserve/keep-recent overrides.
     let mut compaction = beyond_ai_agent::serve::resolve_compaction(
@@ -5794,6 +5803,8 @@ async fn run_task(
     // `kind`.
     let mut stopped = stopped_jobs;
     stopped.extend(stop_jobs(&bash_jobs, tools::bash_jobs::BashJobs::stop_all).await);
+    // The reports of jobs that ended are persisted with the run: their sandbox directories can go.
+    bash_jobs.collect_garbage().await;
     if !stopped.is_empty() {
         if json {
             let line =

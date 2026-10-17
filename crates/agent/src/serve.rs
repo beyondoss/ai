@@ -3130,6 +3130,18 @@ pub(crate) async fn serve_session(
             }
         }
     }
+    // The jobs this session's sandbox kept running while no replica served it — a reap, a deploy,
+    // a failover — are its jobs again, under their old numbers: still running, or ended with their
+    // notices due (which wake the idle loop below). What nobody kept is stopped. See
+    // `tools::bash_sandbox`.
+    bash_jobs.set_scope(Some(crate::exec_endpoint::jobs::JobScope::for_session(
+        service.as_ref().map(|svc| svc.tenant()),
+        persistence.session_id(),
+    )));
+    let reattached = crate::tools::bash_sandbox::reattach(&bash_jobs, exec_cell.runner()).await;
+    if reattached != Default::default() {
+        tracing::info!(session = %persistence.session_id(), ?reattached, "reattached the session's sandbox jobs");
+    }
 
     // Slash-command prompt templates (`/name args`), discoverable skills, agent definitions and this
     // project's own instruction files — for `get_commands`, for expanding a `/name`/`/skill:name`
@@ -4655,6 +4667,10 @@ pub(crate) async fn serve_session(
         // very first snapshot, from the history `Persistence::open` restored off disk, so a client
         // attaching to a resumed session is caught up before it has issued a single command.
         sync_history!();
+        // Every report a run made is persisted by here: the sandbox directories of the jobs whose
+        // end it reported can go. A replica that died before this point leaves them for the next
+        // one to report again — once, since that one's report is persisted before it deletes them.
+        bash_jobs.collect_garbage().await;
         // A command just switched sessions (`switch_session`, `new_session`, `fork`, `clone`): the
         // old session's resumer stops (it must not emit into this session's clients, and never
         // cancels its tasks, which stay journaled) and the new session's pending tasks resume now,
@@ -4681,6 +4697,16 @@ pub(crate) async fn serve_session(
                     .await
                     .unwrap_or_default()
             };
+            // The old transcript is ended, so nothing of it may live on in the sandbox — not even
+            // a job this table no longer knew. The new one may have jobs a replica left running.
+            if let Some(old) = bash_jobs.scope() {
+                crate::tools::bash_sandbox::wipe(exec_cell.runner(), &old).await;
+            }
+            bash_jobs.set_scope(Some(crate::exec_endpoint::jobs::JobScope::for_session(
+                service.as_ref().map(|svc| svc.tenant()),
+                persistence.session_id(),
+            )));
+            crate::tools::bash_sandbox::reattach(&bash_jobs, exec_cell.runner()).await;
             if !stopped_jobs.is_empty() {
                 emit!(OutFrame::Value(json!({
                     "type": "bash_jobs_stopped",
@@ -6759,7 +6785,19 @@ pub(crate) async fn serve_session(
             // session id is a successful no-op.
             "delete_session" => match cmd.get("session_id").and_then(Value::as_str) {
                 Some(target) => match persistence.delete(service.as_deref(), target) {
-                    Ok(()) => emit!(response(id, "delete_session", true, None, None)),
+                    Ok(()) => {
+                        // A deleted session is ended: its jobs in this sandbox stop. (In another
+                        // sandbox they end with it — tearing that down is its owner's business.)
+                        crate::tools::bash_sandbox::wipe(
+                            exec_cell.runner(),
+                            &crate::exec_endpoint::jobs::JobScope::for_session(
+                                service.as_ref().map(|svc| svc.tenant()),
+                                target,
+                            ),
+                        )
+                        .await;
+                        emit!(response(id, "delete_session", true, None, None))
+                    }
                     Err(e) => emit!(response(
                         id,
                         "delete_session",
@@ -8860,7 +8898,9 @@ pub(crate) async fn serve_session(
         tokio::task::spawn_blocking(move || {
             // The client's are stopped too, but not reported as the model's jobs.
             host_jobs.stop_all();
-            jobs.stop_all()
+            // Not ended, only closed: the jobs the sandbox owns run on for the next replica to
+            // reattach. Everything this process owns stops.
+            jobs.release()
         })
         .await
         .unwrap_or_default()

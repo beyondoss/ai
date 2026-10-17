@@ -241,6 +241,8 @@ pub struct JobInfo {
     pub seen: u64,
     /// Epoch seconds.
     pub started: u64,
+    /// Epoch seconds when it ended; 0 while it runs.
+    pub ended: u64,
     pub label: String,
 }
 
@@ -773,15 +775,16 @@ fn parse_read(out: &str) -> std::io::Result<ReadChunk> {
     })
 }
 
-/// One `list` line: `<id> <state> <code> <num|-> <kind|-> <seen> <started> <label…>`.
+/// One `list` line: `<id> <state> <code> <num|-> <kind|-> <seen> <started> <ended> <label…>`.
 fn parse_list_line(line: &str) -> Option<JobInfo> {
-    let mut f = line.splitn(8, ' ');
+    let mut f = line.splitn(9, ' ');
     let id = JobId::parse(f.next()?)?;
     let status = JobStatus::parse(f.next()?, f.next()?)?;
     let num = f.next()?;
     let kind = f.next()?;
     let seen = f.next()?.parse().unwrap_or(0);
     let started = f.next()?.parse().unwrap_or(0);
+    let ended = f.next()?.parse().unwrap_or(0);
     let label = f.next().unwrap_or("").to_string();
     Some(JobInfo {
         id,
@@ -792,6 +795,7 @@ fn parse_list_line(line: &str) -> Option<JobInfo> {
         kind: (kind != "-").then(|| kind.to_string()),
         seen,
         started,
+        ended,
         label,
     })
 }
@@ -881,7 +885,7 @@ fn parse_marker(line: &[u8]) -> Option<Marker> {
 ///   to stdout. Not live: the job starts kept, and its group is printed once it runs.
 /// - `read <id> <offset> <max>` — `<state> <code> <offset> <end>`, then the base64 of up to `max`
 ///   bytes from `offset` (or from the oldest byte kept, when that is later), within one chunk.
-/// - `list` — one line per job: `<id> <state> <code> <num> <kind> <seen> <started> <label>`.
+/// - `list` — one line per job: `<id> <state> <code> <num> <kind> <seen> <started> <ended> <label>`.
 /// - `keep <id> <num> <kind> <seen>`, `seen <id> <offset>`.
 /// - `kill <grace-ms> <remove> <id…>` — `survived <id> <pid,pid>` for each job not stopped.
 /// - `rm <id…>` — deletes each job whose group is empty.
@@ -920,7 +924,7 @@ alive() {
 num() { _n=${1##*.}; _n=${_n#"${_n%%[!0]*}"}; N=${_n:-0}; }
 state() {
   st=running c=-
-  if [ -e "$j/end" ]; then st=ended; read -r c <"$j/end"
+  if [ -e "$j/end" ]; then st=ended; read -r c _e <"$j/end"
   elif [ -e "$j/exit" ]; then st=exited; read -r c <"$j/exit"
   elif [ -e "$j/sup" ]; then read -r _s <"$j/sup"; alive "$_s" || st=lost
   else st=lost
@@ -993,12 +997,13 @@ list)
   for j in "$S"/*; do
     [ -d "$j" ] || continue
     state
-    k=- kd=- sn=0 t=0 lb=
+    k=- kd=- sn=0 t=0 ed=0 lb=
+    [ -e "$j/end" ] && read -r _c ed <"$j/end"
     [ -e "$j/keep" ] && read -r k kd <"$j/keep"
     [ -e "$j/seen" ] && read -r sn <"$j/seen"
     [ -e "$j/started" ] && read -r t <"$j/started"
     [ -e "$j/cmd" ] && read -r lb <"$j/cmd"
-    printf '%s %s %s %s %s %s %s %s\n' "${j##*/}" "$st" "$c" "$k" "$kd" "$sn" "$t" "$lb"
+    printf '%s %s %s %s %s %s %s %s %s\n' "${j##*/}" "$st" "$c" "$k" "$kd" "$sn" "$t" "${ed:-0}" "$lb"
   done
   ;;
 keep)
@@ -1144,7 +1149,7 @@ fi
 k=$!
 wait $rp $tp
 kill $k 2>/dev/null
-printf '%s\n' "$s" >"$j/end.t" && mv -f "$j/end.t" "$j/end"
+printf '%s %s\n' "$s" "$(date +%s)" >"$j/end.t" && mv -f "$j/end.t" "$j/end"
 say "end:$s"
 exit "$s""#;
 
@@ -1215,7 +1220,7 @@ mod tests {
     #[test]
     fn a_list_line_parses() {
         let j =
-            parse_list_line("0123456789abcdef running - 3 background 17 1700000000 npm run dev")
+            parse_list_line("0123456789abcdef running - 3 background 17 1700000000 0 npm run dev")
                 .unwrap();
         assert_eq!(j.status, JobStatus::Running);
         assert!(j.kept);
@@ -1223,14 +1228,19 @@ mod tests {
         assert_eq!(j.kind.as_deref(), Some("background"));
         assert_eq!((j.seen, j.started), (17, 1_700_000_000));
         assert_eq!(j.label, "npm run dev");
-        let held = parse_list_line("00ff exited 1 - - 0 5 ").unwrap();
+        let held = parse_list_line("00ff exited 1 - - 0 5 0 ").unwrap();
         assert!(!held.kept);
         assert_eq!(held.status, JobStatus::ShellExited(1));
         assert_eq!(held.num, None);
         // Started kept, before its number was recorded.
-        let kept = parse_list_line("00ff running - - background 0 5 x").unwrap();
+        let kept = parse_list_line("00ff running - - background 0 5 0 x").unwrap();
+        let ended = parse_list_line("00ff ended 2 4 adopted 9 5 8 x y").unwrap();
+        assert_eq!(
+            (ended.status, ended.ended, ended.label.as_str()),
+            (JobStatus::Ended(2), 8, "x y")
+        );
         assert!(kept.kept && kept.num.is_none());
-        assert!(parse_list_line("../x running - - - 0 0 x").is_none());
+        assert!(parse_list_line("../x running - - - 0 0 0 x").is_none());
     }
 
     #[test]
