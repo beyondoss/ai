@@ -764,7 +764,11 @@ async fn a_child_tool_call_goes_through_the_parents_approval_gate() {
         "the child's `bash` call must have been gated"
     );
     assert_eq!(seen[0].tool, "bash");
-    assert_eq!(seen[0].scope_key, format!("cmd:{command}"));
+    assert!(
+        seen[0].scope_key.ends_with(&format!("\ncmd:{command}")),
+        "{}",
+        seen[0].scope_key
+    );
     assert!(!marker.exists(), "a denied child call must not have run");
 }
 

