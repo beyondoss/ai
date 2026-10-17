@@ -1950,7 +1950,12 @@ as `write("/home/…/f")` would.
   content unless it's a single-edit call with `replace_all: true` — uniqueness is the only safety
   check; there is no diff/dry-run, the file is rewritten on success. Writability is checked before any of
   that match/diff work runs — a read-only file fails fast rather than after paying for fuzzy-matching's
-  NFKC normalization (pi's own `access(path, W_OK)` pre-check). Matching tries an **exact** hit
+  NFKC normalization (pi's own `access(path, W_OK)` pre-check). So is size: matching needs the whole
+  file in memory and the file is rewritten from what was read, so a file over 64 MiB
+  (`MAX_EDIT_BYTES`) is refused before it is read, with an error naming its size and the limit and
+  pointing at `bash`/`sed`, on every backend. The read asks for one byte more than the limit, so a
+  file that grew past it after the size check is refused too. Editing a prefix would write the
+  prefix back and drop the rest of the file. Matching tries an **exact** hit
   first, then a normalized **fuzzy fallback** (NFKC + folding smart quotes/dash family/unicode spaces +
   per-line trailing-whitespace), with hits mapped back to original byte offsets — so a model's
   `old_string` carrying a curly quote, em-dash, nbsp, or stray trailing space still lands instead of
@@ -2257,7 +2262,11 @@ classifies them as binary). `tests/fs_backend_cost.rs` counts backend operations
 (`grep` 1, `ls`/`find` 2, `read`/`write`/`edit` 3) so the latency of any future remote backend can be
 estimated from a measured multiplier rather than a guess. Those are backend operations, not commands:
 over `ShellFs` a `write_bytes` is one command when the target delivers stdin, and one per 48 KiB when
-it does not (see the exec protocol below).
+it does not (see the exec protocol below). A `read_bytes` is one `dd | base64` command per 96 KiB:
+that base64s to exactly the 128 KiB head a runner's capture keeps whole. A larger window cannot be
+one command, because the capture keeps a stream's head and tail and drops the middle, and base64 of a
+glued head and tail still decodes, into bytes the file never held. A capture still reported as
+truncated is a read error, never a short read.
 
 ### Running the tools against a remote exec endpoint
 

@@ -22,8 +22,24 @@ use super::fs::local::LocalFs;
 use super::fs::{FileKind, FsBackend};
 
 /// Ceiling on the file size `edit` will load. Matching requires the whole file in memory, so this
-/// bounds that; a file beyond it fails to match rather than exhausting memory.
+/// bounds that. A file beyond it is refused before anything is read (see [`too_big_to_edit`]): `edit`
+/// rewrites the whole file from what it read, so editing a prefix would write the prefix back and
+/// silently drop the rest.
 const MAX_EDIT_BYTES: usize = 64 * 1024 * 1024;
+
+/// The refusal for a file over [`MAX_EDIT_BYTES`], naming both numbers and the way out. `len` is
+/// `None` when the file grew past the limit between the `stat` and the read, so only a lower bound is
+/// known.
+fn too_big_to_edit(path: &str, len: Option<u64>) -> ToolError {
+    let size = match len {
+        Some(n) => format!("{n} bytes"),
+        None => format!("more than {MAX_EDIT_BYTES} bytes"),
+    };
+    ToolError::Execution(format!(
+        "{path} is {size}, over edit's limit of {MAX_EDIT_BYTES} bytes (64 MiB); nothing was \
+         changed. Edit a file this large with bash instead (e.g. `sed -i`)"
+    ))
+}
 
 pub struct Edit {
     /// Relative `path` arguments resolve against this. Empty = the process cwd. See
@@ -432,8 +448,20 @@ impl Edit {
                 return FilePlan::failed(path, shown, err);
             }
         }
+        // Size before the read: `edit` writes back exactly what it read, so a file over the ceiling
+        // must be refused, never read as a prefix and rewritten without its tail.
+        if let Some(m) = meta.as_ref().filter(|m| m.len > MAX_EDIT_BYTES as u64) {
+            let err = too_big_to_edit(&path, Some(m.len));
+            return FilePlan::failed(path, shown, err);
+        }
         let mtime = meta.as_ref().and_then(|m| m.mtime);
-        let raw_bytes = match self.backend.read_bytes(p, 0, MAX_EDIT_BYTES).await {
+        // One byte past the ceiling, so a file that grew past it after the `stat` shows up as an
+        // over-long read here rather than as a clean prefix.
+        let raw_bytes = match self.backend.read_bytes(p, 0, MAX_EDIT_BYTES + 1).await {
+            Ok(b) if b.len() > MAX_EDIT_BYTES => {
+                let err = too_big_to_edit(&path, None);
+                return FilePlan::failed(path, shown, err);
+            }
             Ok(b) => b,
             Err(e) => return FilePlan::failed(path, shown, ToolError::from(e)),
         };
