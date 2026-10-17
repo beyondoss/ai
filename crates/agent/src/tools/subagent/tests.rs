@@ -128,7 +128,9 @@ fn ctx_with(
         project_trusted: true,
         disk_overrides: true,
         prompt_guidelines: Vec::new(),
-        parent_model: "parent-model".to_string(),
+        parent: ParentCell::new(ParentLoop {
+            model: "parent-model".to_string(),
+        }),
         parent_cache_key: "parent-key".to_string(),
         parent_tools: vec!["read".to_string(), "grep".to_string()],
         deny_tool: Vec::new(),
@@ -719,7 +721,9 @@ fn ctx_with_gate_call(
         project_trusted: true,
         disk_overrides: true,
         prompt_guidelines: Vec::new(),
-        parent_model: "parent-model".to_string(),
+        parent: ParentCell::new(ParentLoop {
+            model: "parent-model".to_string(),
+        }),
         parent_cache_key: "parent-key".to_string(),
         parent_tools: vec![tool.to_string()],
         deny_tool: Vec::new(),

@@ -114,6 +114,45 @@ pub struct ChildToolConfig {
     pub exclude_tools: Vec<String>,
 }
 
+/// What a child inherits from its parent's *current* loop, as opposed to what was true when the
+/// [`SubagentCtx`] was built.
+///
+/// A `serve` session builds its ctx once and keeps it across every `set_model`/`cycle_model`/resume/
+/// branch rebuild. A plain `String` copied in at build time therefore froze the startup model: switch
+/// the parent to another model and every delegated child still ran on the first one. The parent writes
+/// this whenever it rebuilds its own agent, and each dispatch reads it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ParentLoop {
+    /// The model a child inherits when its definition names none.
+    pub model: String,
+}
+
+/// The shared, live [`ParentLoop`]. Cloning shares the cell.
+#[derive(Clone, Debug, Default)]
+pub struct ParentCell(Arc<std::sync::RwLock<ParentLoop>>);
+
+impl ParentCell {
+    pub fn new(parent: ParentLoop) -> Self {
+        Self(Arc::new(std::sync::RwLock::new(parent)))
+    }
+
+    /// A snapshot for one dispatch. A poisoned lock still holds a whole value — every write replaces
+    /// it in one assignment — so it is read through rather than propagated.
+    pub fn get(&self) -> ParentLoop {
+        self.0
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub fn set(&self, parent: ParentLoop) {
+        *self
+            .0
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = parent;
+    }
+}
+
 /// Everything a [`Subagent`] needs to build and run a child. Shared by `Arc` across every depth level,
 /// so a nested `Subagent` costs one pointer clone plus a `u32`.
 pub struct SubagentCtx {
@@ -159,8 +198,9 @@ pub struct SubagentCtx {
     /// session's children are as fail-closed about the replica's filesystem as it is.
     pub disk_overrides: bool,
     pub prompt_guidelines: Vec<String>,
-    /// The model a child inherits when its definition names none.
-    pub parent_model: String,
+    /// The parent's live loop settings — the model a child inherits when its definition names none.
+    /// Read per dispatch, never cached: see [`ParentLoop`].
+    pub parent: ParentCell,
     /// The parent's own cache key, prefixed onto each child's so a `serve` session's children are
     /// traceable to it.
     pub parent_cache_key: String,
@@ -860,11 +900,10 @@ impl Subagent {
                 &owned_memory_sections
             }
         };
-        let system = self.build_child_system_prompt(def, &registry, &root, memory_sections, shared);
-        let model = def
-            .model
-            .clone()
-            .unwrap_or_else(|| self.ctx.parent_model.clone());
+        let parent = self.ctx.parent.get();
+        let model = def.model.clone().unwrap_or(parent.model);
+        let system =
+            self.build_child_system_prompt(def, &registry, &root, memory_sections, shared, &model);
         let transport = (self.ctx.factory)(&model)?;
 
         let mut agent = Agent::new(transport, model)
@@ -1105,6 +1144,8 @@ impl Subagent {
         root: &Path,
         memory_sections: &[(crate::memory::MountKind, String)],
         shared: Option<&SharedChildSetup>,
+        // The child's resolved model, for its context window.
+        model: &str,
     ) -> String {
         let default_base =
             crate::resources::default_system_prompt(registry, &self.ctx.prompt_guidelines);
@@ -1163,10 +1204,7 @@ impl Subagent {
                 // already reflects; kept honest here so the two can't disagree.
                 include_context_files: self.ctx.include_context_files,
                 skills: &listed_skills,
-                context_window: agent_core::capabilities(
-                    def.model.as_deref().unwrap_or(&self.ctx.parent_model),
-                )
-                .context_window,
+                context_window: agent_core::capabilities(model).context_window,
                 has_read: registry.get("read").is_some(),
                 has_todo: registry.get(crate::tools::todo::NAME).is_some(),
                 has_structured_output: registry
