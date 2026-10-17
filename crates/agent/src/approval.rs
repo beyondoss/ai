@@ -310,6 +310,10 @@ pub struct ApprovalRuntime {
     pub gate: Arc<dyn ApprovalGate>,
     pub gated: GatedSet,
     pub memory: Arc<SessionMemory>,
+    /// Held from the memory re-check through the question and the remembering of its answer, so
+    /// a call that waited behind another question sees the decision that question produced (see
+    /// [`ask_gate`]). Shared by `Arc` with every subagent child, like `memory`.
+    asking: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl ApprovalRuntime {
@@ -318,6 +322,7 @@ impl ApprovalRuntime {
             gate,
             gated,
             memory: Arc::new(SessionMemory::new()),
+            asking: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 }
@@ -449,6 +454,13 @@ pub async fn gated_before_tool_call(
 /// and fail-closed — for a caller that has no `Session` to hand the static policy (an MCP App's
 /// `tools/call`, which checks `--deny-tool` itself first). One gate, one memory: an "always allow"
 /// given to the model's call of a tool answers the app's call of it too, and vice versa.
+///
+/// The memory is checked twice: once without waiting, and again once this call holds the
+/// runtime's `asking` lock. Same-key calls dispatched together all miss the first check; without
+/// the second, every one queued behind the first question is asked again, though the user already
+/// answered "for this session". The lock spans the question and the remembering of its answer, so
+/// whoever takes it next sees that answer. It asks one question at a time, which `serve`'s gate does
+/// anyway.
 pub async fn ask_gate(
     runtime: &ApprovalRuntime,
     origin: &ApprovalOrigin,
@@ -461,14 +473,19 @@ pub async fn ask_gate(
         return None;
     }
     let mem_key = memory_key(name, &key);
-    match runtime.memory.lookup(&mem_key) {
-        Some(true) => return None,
-        Some(false) => {
-            return Some(format!(
-                "'{name}' was denied for the rest of this session by an earlier decision"
-            ));
+    if let Some(remembered) = remembered(runtime, &mem_key, name) {
+        return remembered;
+    }
+    // An abort while queued behind another question must not wait for it.
+    let _asking = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
+            return Some(format!("'{name}' was denied: the run was cancelled"));
         }
-        None => {}
+        guard = runtime.asking.lock() => guard,
+    };
+    if let Some(remembered) = remembered(runtime, &mem_key, name) {
+        return remembered;
     }
 
     let request = ApprovalRequest {
@@ -498,6 +515,17 @@ pub async fn ask_gate(
         Err(ApprovalError::Cancelled) => {
             Some(format!("'{name}' was denied: the run was cancelled"))
         }
+    }
+}
+
+/// A remembered "session" decision for `mem_key`, as [`ask_gate`]'s answer: `Some(None)` allows,
+/// `Some(Some(reason))` denies, `None` means nothing is remembered and the user must be asked.
+fn remembered(runtime: &ApprovalRuntime, mem_key: &str, name: &str) -> Option<Option<String>> {
+    match runtime.memory.lookup(mem_key)? {
+        true => Some(None),
+        false => Some(Some(format!(
+            "'{name}' was denied for the rest of this session by an earlier decision"
+        ))),
     }
 }
 
@@ -1146,6 +1174,71 @@ mod tests {
             gate.0.lock().unwrap_or_else(|e| e.into_inner()).clone(),
             Some(origin)
         );
+    }
+
+    /// A gate shaped like `serve`'s: one question at a time (a width-1 lock), each held open until
+    /// the test releases it. `asked_signal` fires when a question is put to the user.
+    struct QueuedGate {
+        answer: ApprovalDecision,
+        serialize: tokio::sync::Mutex<()>,
+        asked: AtomicUsize,
+        asked_signal: tokio::sync::Notify,
+        release: tokio::sync::Semaphore,
+    }
+
+    #[async_trait]
+    impl ApprovalGate for QueuedGate {
+        async fn request(
+            &self,
+            _req: ApprovalRequest,
+            _cancel: &CancellationToken,
+        ) -> Result<ApprovalDecision, ApprovalError> {
+            let _one_at_a_time = self.serialize.lock().await;
+            self.asked.fetch_add(1, Ordering::Relaxed);
+            self.asked_signal.notify_one();
+            let _answered = self.release.acquire().await.expect("never closed");
+            Ok(self.answer)
+        }
+    }
+
+    /// Two same-key calls dispatched together both miss the session memory; the second queues
+    /// behind the first's question. A "session" answer to the first must answer the second too,
+    /// rather than asking the user the same thing again.
+    #[tokio::test]
+    async fn a_call_queued_behind_a_session_answer_for_its_key_is_not_asked_again() {
+        for allow in [true, false] {
+            let gate = Arc::new(QueuedGate {
+                answer: ApprovalDecision {
+                    allow,
+                    scope: ApprovalScope::Session,
+                },
+                serialize: tokio::sync::Mutex::new(()),
+                asked: AtomicUsize::new(0),
+                asked_signal: tokio::sync::Notify::new(),
+                release: tokio::sync::Semaphore::new(0),
+            });
+            let rt = ApprovalRuntime::new(gate.clone(), GatedSet::All);
+            let policy = ToolPolicy::new();
+            let input = json!({ "command": "cargo test" });
+            // `join!` polls all three on one task: both calls are past their memory lookup and
+            // parked (one asking, one queued) before the answer is released.
+            let answer = async {
+                gate.asked_signal.notified().await;
+                gate.release.add_permits(1);
+            };
+            let (first, second, ()) = tokio::join!(
+                check(&policy, Some(&rt), "bash", input.clone()),
+                check(&policy, Some(&rt), "bash", input.clone()),
+                answer
+            );
+            assert_eq!(
+                gate.asked.load(Ordering::Relaxed),
+                1,
+                "allow={allow}: one question for two same-key calls"
+            );
+            assert_eq!(first.is_none(), allow, "{first:?}");
+            assert_eq!(second.is_none(), allow, "{second:?}");
+        }
     }
 
     #[test]

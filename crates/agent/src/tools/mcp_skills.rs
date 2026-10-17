@@ -1111,6 +1111,9 @@ pub struct SkillSession {
     preapproved: AtomicBool,
     /// `--no-skills`: MCP-served skills are not listed, offered or expanded either.
     listing_suppressed: AtomicBool,
+    /// Held from the remembered-decision re-check through the question and the remembering of its
+    /// answer, so a call queued behind a same-key question sees its answer (see [`Self::decide`]).
+    asking: tokio::sync::Mutex<()>,
 }
 
 /// A skill the session is acting on.
@@ -1363,7 +1366,15 @@ impl SkillSession {
         if self.preapproved.load(Ordering::Relaxed) {
             return Ok(true);
         }
-        if remember && let Some(remembered) = lock(&self.state).decisions.get(&key).copied() {
+        let recall = || lock(&self.state).decisions.get(&key).copied();
+        if remember && let Some(remembered) = recall() {
+            return Ok(remembered);
+        }
+        // Same-key calls dispatched together all miss the check above; re-check once this call's
+        // turn to ask comes, so a "session" answer given while it waited answers it too (the same
+        // shape as `approval::ask_gate`). An abort drops this future, and the wait with it.
+        let _asking = self.asking.lock().await;
+        if remember && let Some(remembered) = recall() {
             return Ok(remembered);
         }
         let gate = lock(&self.gate).clone();
@@ -2373,6 +2384,58 @@ mod tests {
                 .is_none()
         );
         assert_eq!(gate.1.load(Ordering::Relaxed), 2);
+    }
+
+    /// Two same-key code-execution calls dispatched together, through a gate that asks one question
+    /// at a time (as `serve`'s does): the second queues behind the first, and the first's "session"
+    /// answer must answer it rather than prompting again.
+    #[tokio::test]
+    async fn a_call_queued_behind_a_session_answer_for_its_key_is_not_asked_again() {
+        use crate::approval::ApprovalDecision;
+        struct Queued {
+            serialize: tokio::sync::Mutex<()>,
+            asked: std::sync::atomic::AtomicUsize,
+            asked_signal: tokio::sync::Notify,
+            release: tokio::sync::Semaphore,
+        }
+        #[async_trait]
+        impl ApprovalGate for Queued {
+            async fn request(
+                &self,
+                _req: ApprovalRequest,
+                _cancel: &CancellationToken,
+            ) -> Result<ApprovalDecision, ApprovalError> {
+                let _one_at_a_time = self.serialize.lock().await;
+                self.asked.fetch_add(1, Ordering::Relaxed);
+                self.asked_signal.notify_one();
+                let _answered = self.release.acquire().await.expect("never closed");
+                Ok(ApprovalDecision {
+                    allow: true,
+                    scope: ApprovalScope::Session,
+                })
+            }
+        }
+        let gate = Arc::new(Queued {
+            serialize: tokio::sync::Mutex::new(()),
+            asked: Default::default(),
+            asked_signal: tokio::sync::Notify::new(),
+            release: tokio::sync::Semaphore::new(0),
+        });
+        let session = session_with_active_skill();
+        session.set_gate(gate.clone());
+        let input = json!({ "command": "make" });
+        let (main, cancel) = (ApprovalOrigin::Main, CancellationToken::new());
+        let answer = async {
+            gate.asked_signal.notified().await;
+            gate.release.add_permits(1);
+        };
+        let (first, second, ()) = tokio::join!(
+            session.gate_tool_call("bash", &input, &main, &cancel),
+            session.gate_tool_call("bash", &input, &main, &cancel),
+            answer
+        );
+        assert!(first.is_none() && second.is_none(), "{first:?} {second:?}");
+        assert_eq!(gate.asked.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
