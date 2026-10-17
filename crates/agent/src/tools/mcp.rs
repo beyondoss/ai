@@ -21,6 +21,11 @@
 //! already-connected tools; see `serve.rs::ServeConfig::mcp_tools`). A server that fails to connect is
 //! skipped with a warning rather than failing the whole agent's startup (fail-soft).
 //!
+//! **Tool-list changes.** What a server lists is re-read when it says it changed
+//! (`notifications/tools/list_changed`) and whenever its process actually starts, and a difference
+//! replaces its tools in the live [`McpTools`] set and in the cached manifest — see [`Relist`] and
+//! [`tool_source`].
+//!
 //! **Progress.** `tools/call` requests carry an MCP `progressToken` (rmcp injects one on every
 //! request). When the server emits `notifications/progress`, [`McpTool::run_streaming`] forwards each
 //! update into the harness [`ToolProgress`] sink — the same `AgentEvent::ToolProgress` path bash/todo
@@ -169,6 +174,9 @@ struct Dial {
     apps: bool,
     /// The connection's skills-listing invalidation flag, handed to every handler it dials.
     skills_changed: Arc<std::sync::atomic::AtomicU64>,
+    /// Where a fresh `tools/list` from this server lands — see [`Relist`]. Shared by every handler
+    /// the connection dials, so a redial's notifications reach the same place.
+    relist: Relist,
 }
 
 impl Default for Dial {
@@ -178,6 +186,7 @@ impl Default for Dial {
             http: None,
             apps: false,
             skills_changed: Arc::default(),
+            relist: Relist::default(),
         }
     }
 }
@@ -265,6 +274,8 @@ pub(crate) struct McpHandler {
     /// Raised by a list-changed notification; the server's SEP-2640 skills listing reads it as
     /// "re-list on next need" (see `mcp_skills::ServerSkills::refresh_if_due`).
     skills_changed: Arc<std::sync::atomic::AtomicU64>,
+    /// What a `notifications/tools/list_changed` re-lists into — see [`Dial::relist`].
+    relist: Relist,
 }
 
 /// One request in flight on a connection, and the session (host) it belongs to.
@@ -287,6 +298,7 @@ impl McpHandler {
             skills_changed: Arc::default(),
             apps: false,
             views: Arc::default(),
+            relist: Relist::default(),
         }
     }
 
@@ -294,6 +306,7 @@ impl McpHandler {
         Self {
             apps: dial.apps,
             skills_changed: dial.skills_changed.clone(),
+            relist: dial.relist.clone(),
             ..Self::new(server_name, dial.host.clone())
         }
     }
@@ -461,6 +474,12 @@ impl ClientHandler for McpHandler {
         tracing::debug!(server = %self.server_name, "resources/list_changed handled: view cache cleared");
     }
 
+    // The server's tools changed: list them again and advertise what exists now. rmcp runs this on
+    // a task of its own, so the `tools/list` round trip holds up nothing else on the connection.
+    async fn on_tool_list_changed(&self, context: NotificationContext<RoleClient>) {
+        self.relist.run(&context.peer).await;
+    }
+
     async fn on_progress(
         &self,
         params: ProgressNotificationParam,
@@ -550,6 +569,296 @@ fn progress_details(params: &ProgressNotificationParam) -> Value {
 
 /// A connected MCP server's live client handle. Shared (via `Arc`) by every tool the server produced.
 pub(crate) type McpClient = RunningService<RoleClient, McpHandler>;
+
+/// The MCP tools on offer, kept current as servers change what they list.
+///
+/// Connecting produces one of these rather than a fixed `Vec`: a server may add or drop tools while
+/// the agent runs (a `notifications/tools/list_changed`, or a start that lists something the cached
+/// manifest did not — see [`Relist`]), and every registry built from it must be able to see that.
+/// Clones share one set. A registry builder takes a [`snapshot`](Self::snapshot); a running loop
+/// learns of a change through [`tool_source`], which compares [`generation`](Self::generation)s.
+#[derive(Clone, Default)]
+pub struct McpTools(Arc<LiveTools>);
+
+#[derive(Default)]
+struct LiveTools {
+    tools: std::sync::RwLock<Arc<[Arc<dyn Tool>]>>,
+    /// Bumped on every change that alters what is offered, never on a re-listing that matched.
+    generation: std::sync::atomic::AtomicU64,
+}
+
+impl McpTools {
+    pub fn new(tools: Vec<Arc<dyn Tool>>) -> Self {
+        Self(Arc::new(LiveTools {
+            tools: std::sync::RwLock::new(tools.into()),
+            generation: std::sync::atomic::AtomicU64::new(0),
+        }))
+    }
+
+    /// The tools on offer right now.
+    pub fn snapshot(&self) -> Arc<[Arc<dyn Tool>]> {
+        self.0
+            .tools
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Changes so far; equal generations mean an identical tool set.
+    pub fn generation(&self) -> u64 {
+        self.0.generation.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Swap the tools named in `retired` for `added`, as one change.
+    fn replace(&self, retired: &HashSet<String>, added: Vec<Arc<dyn Tool>>) {
+        let mut guard = self
+            .0
+            .tools
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let next: Vec<Arc<dyn Tool>> = guard
+            .iter()
+            .filter(|t| !retired.contains(t.name()))
+            .cloned()
+            .chain(added)
+            .collect();
+        let previous = std::mem::replace(&mut *guard, next.into());
+        // Bumped under the write lock: a reader that sees the new generation sees the new tools.
+        self.0
+            .generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        drop(guard);
+        // The retired tools' connection may go with them; not under the lock.
+        drop(previous);
+    }
+}
+
+impl From<Vec<Arc<dyn Tool>>> for McpTools {
+    fn from(tools: Vec<Arc<dyn Tool>>) -> Self {
+        Self::new(tools)
+    }
+}
+
+/// How a run that is already under way gets a server's changed tools: an
+/// [`agent_core::ToolSource`] that, at each turn boundary, swaps the MCP tools in the run's registry
+/// for what `live` offers now — through the same `enabled` gate, loading mode and filter a fresh
+/// registry build applies — whenever `live` has moved past `built_at` (the generation the run's
+/// registry was built from). A turn with no change costs one atomic load.
+///
+/// Prompt caching: tool definitions are sorted, so the revised set is as stable as the old one, but
+/// it is a different prefix, and the first request after a change misses the cache once. A
+/// re-listing that matched bumps nothing and so costs nothing.
+///
+/// Code Mode is left to the next registry build: its MCP tools live inside `execute`.
+pub fn tool_source(
+    live: McpTools,
+    enabled: McpEnabledSet,
+    built_at: u64,
+    filter: crate::tools::McpFilter,
+) -> agent_core::ToolSource {
+    let seen = std::sync::atomic::AtomicU64::new(built_at);
+    Arc::new(move |current: &agent_core::ToolRegistry| {
+        if filter.code_mode {
+            return None;
+        }
+        let now = live.generation();
+        if seen.swap(now, std::sync::atomic::Ordering::AcqRel) == now {
+            return None;
+        }
+        let tools = filter_by_enabled(&live.snapshot(), &enabled);
+        Some(crate::tools::rebase_mcp(current, &tools, &filter))
+    })
+}
+
+/// One server's share of a [`McpTools`] set, and how to bring it up to date: list the server's tools
+/// again, and if the answer differs from what is advertised, swap that server's tools in the live
+/// set and rewrite its cached manifest.
+///
+/// Run on `notifications/tools/list_changed`, and after every real start of the server's process
+/// (see [`McpConnection::client`]) — which is what keeps a manifest-born boot honest. Only a
+/// connection made for a [`McpTools`] set is bound ([`Relist::bind`]); any other (an MCP Apps dial,
+/// whose tools carry view metadata of their own) ignores both.
+#[derive(Clone, Default)]
+struct Relist(Arc<RelistState>);
+
+#[derive(Default)]
+struct RelistState {
+    target: std::sync::Mutex<Option<RelistTarget>>,
+    /// Held for a whole re-listing, so two in a row apply in order and a finished call can wait for
+    /// one under way ([`Relist::settled`]).
+    running: tokio::sync::Mutex<()>,
+}
+
+struct RelistTarget {
+    /// Weak both ways: the live set holds the tools, the tools hold the connection, and the
+    /// connection holds this — a strong edge back would keep a dropped server running.
+    live: std::sync::Weak<LiveTools>,
+    conn: std::sync::Weak<McpConnection>,
+    manifest: Option<crate::tools::mcp_manifest::ManifestDir>,
+    /// The server's `tools/list` as last seen — what is advertised for it now.
+    listed: Vec<crate::tools::mcp_manifest::CachedTool>,
+    /// The registered names its tools hold in the live set.
+    names: HashSet<String>,
+    /// Names its resources, prompts and skill tool hold, which a tool cannot take from them.
+    reserved: HashSet<String>,
+}
+
+/// How long one re-listing may take before it is abandoned (and the advertised tools kept).
+const RELIST_TIMEOUT: Duration = Duration::from_secs(10);
+
+impl Relist {
+    /// Bind this server's re-listings to its connection and what it was advertised with: `listed`
+    /// is the `tools/list` behind `tools` (all of the server's tools), of which `names` are the
+    /// listed tools' own.
+    fn bind(
+        &self,
+        conn: &Arc<McpConnection>,
+        manifest: Option<&crate::tools::mcp_manifest::ManifestDir>,
+        listed: Vec<crate::tools::mcp_manifest::CachedTool>,
+        tools: &[Arc<dyn Tool>],
+        names: HashSet<String>,
+    ) {
+        let reserved = tools
+            .iter()
+            .map(|t| t.name().to_string())
+            .filter(|n| !names.contains(n))
+            .collect();
+        if let Ok(mut target) = self.0.target.lock() {
+            *target = Some(RelistTarget {
+                live: std::sync::Weak::new(),
+                conn: Arc::downgrade(conn),
+                manifest: manifest.cloned(),
+                listed,
+                names,
+                reserved,
+            });
+        }
+    }
+
+    /// Point a bound server at the set its tools went into.
+    fn set_live(&self, live: &McpTools) {
+        if let Ok(mut target) = self.0.target.lock()
+            && let Some(target) = target.as_mut()
+        {
+            target.live = Arc::downgrade(&live.0);
+        }
+    }
+
+    /// Wait for a re-listing under way, if any, to land.
+    async fn settled(&self) {
+        drop(self.0.running.lock().await);
+    }
+
+    /// List the server's tools through `peer` and apply the answer. Fail-soft: a server that cannot
+    /// answer keeps the tools it was advertising.
+    async fn run(&self, peer: &Peer<RoleClient>) {
+        let _one_at_a_time = self.0.running.lock().await;
+        if !self.0.target.lock().is_ok_and(|t| t.is_some()) {
+            return;
+        }
+        let listed = match tokio::time::timeout(RELIST_TIMEOUT, peer.list_all_tools()).await {
+            Ok(Ok(tools)) => tools,
+            Ok(Err(e)) => {
+                tracing::debug!(error = %e, "MCP tools/list re-listing failed; keeping the advertised tools");
+                return;
+            }
+            Err(_) => {
+                tracing::debug!(
+                    "MCP tools/list re-listing timed out; keeping the advertised tools"
+                );
+                return;
+            }
+        };
+        let fresh: Vec<crate::tools::mcp_manifest::CachedTool> =
+            listed.iter().map(cached_tool).collect();
+        let (conn, live, manifest, retired, added) = {
+            let Ok(mut guard) = self.0.target.lock() else {
+                return;
+            };
+            let Some(target) = guard.as_mut() else {
+                return;
+            };
+            if target.listed == fresh {
+                return;
+            }
+            let Some(conn) = target.conn.upgrade() else {
+                return;
+            };
+            let mut names = RegisteredNames {
+                server: &conn.config.name,
+                taken: target.reserved.clone(),
+            };
+            let added: Vec<Arc<dyn Tool>> = fresh
+                .iter()
+                .filter_map(|t| mcp_tool(&conn, t.clone(), &mut names))
+                .collect();
+            let names: HashSet<String> = added.iter().map(|t| t.name().to_string()).collect();
+            let retired = std::mem::replace(&mut target.names, names);
+            target.listed = fresh.clone();
+            (
+                conn.clone(),
+                target.live.upgrade().map(McpTools),
+                target.manifest.clone(),
+                retired,
+                added,
+            )
+        };
+        tracing::info!(
+            server = %conn.config.name,
+            tools = added.len(),
+            "MCP server's tool list changed; advertising the new list from the next request"
+        );
+        if let Some(live) = live {
+            live.replace(&retired, added);
+        }
+        if let Some(dir) = manifest {
+            crate::tools::mcp_manifest::store_tools(&dir, &conn.config, fresh).await;
+        }
+    }
+}
+
+/// A `tools/list` entry as the manifest records it — and as a re-listing is compared.
+fn cached_tool(t: &rmcp::model::Tool) -> crate::tools::mcp_manifest::CachedTool {
+    crate::tools::mcp_manifest::CachedTool {
+        remote_name: t.name.to_string(),
+        description: t.description.as_deref().unwrap_or_default().to_string(),
+        input_schema: t.schema_as_json_value(),
+        // Both flavors: a server may send `_meta.ui` whether or not it was negotiated (the official
+        // SDK's `registerAppTool` always does), and an app-only tool must stay hidden from the model
+        // either way.
+        ui: crate::tools::mcp_apps::ToolUi::from_meta(t.meta.as_deref()),
+    }
+}
+
+/// The model-facing tool for one listed entry, or `None` when it is not the model's (an app-only
+/// tool) or its registered name is already taken.
+fn mcp_tool(
+    conn: &Arc<McpConnection>,
+    t: crate::tools::mcp_manifest::CachedTool,
+    names: &mut RegisteredNames<'_>,
+) -> Option<Arc<dyn Tool>> {
+    if t.ui.as_ref().is_some_and(|ui| !ui.model_visible()) {
+        return None;
+    }
+    let server = &conn.config.name;
+    let name = names.claim(registered_name(server, &t.remote_name), &t.remote_name)?;
+    let description = if t.description.is_empty() {
+        format!(
+            "MCP tool `{}` from server `{server}` (no description provided)",
+            t.remote_name
+        )
+    } else {
+        t.description
+    };
+    Some(Arc::new(McpTool {
+        name,
+        description,
+        input_schema: t.input_schema,
+        remote_name: t.remote_name,
+        server_name: server.clone(),
+        conn: conn.clone(),
+    }))
+}
 
 /// Session-scoped gate over which configured MCP servers' tools are advertised to the model.
 ///
@@ -1073,6 +1382,12 @@ impl McpConnection {
             client: client.clone(),
             proc,
         });
+        // A started process is the authority on what it offers, whatever the cached manifest or the
+        // previous process said: an upgrade between two starts adds tools no notification announces.
+        // Off the caller's path — the call that dialed goes ahead on the client it asked for.
+        let relist = self.dial.relist.clone();
+        let peer = client.peer().clone();
+        tokio::spawn(async move { relist.run(&peer).await });
         Ok(client)
     }
 
@@ -1210,8 +1525,11 @@ impl McpTool {
             arguments,
             progress,
         )
-        .await?;
-        tool_output_from_result(&self.server_name, &self.remote_name, result)
+        .await;
+        // A call that made its server change its tools (an `enable_toolset`) is answered once the
+        // re-listing it set off has landed, so the model's next request already offers them.
+        self.conn.dial.relist.settled().await;
+        tool_output_from_result(&self.server_name, &self.remote_name, result?)
     }
 }
 
@@ -2136,7 +2454,7 @@ pub async fn connect_all(
     configs: &[McpServerConfig],
     idle_reap_after: Duration,
     manifest_dir: Option<&crate::tools::mcp_manifest::ManifestDir>,
-) -> (Vec<Arc<dyn Tool>>, McpCatalog, Vec<String>) {
+) -> (McpTools, McpCatalog, Vec<String>) {
     let jobs: Vec<(McpServerConfig, Dial)> = configs
         .iter()
         .map(|config| (config.clone(), Dial::default()))
@@ -2209,7 +2527,7 @@ pub async fn connect_granted(
     egress: &McpEgress,
     host: Arc<McpHost>,
     idle_reap_after: Duration,
-) -> (Vec<Arc<dyn Tool>>, McpCatalog, Vec<String>) {
+) -> (McpTools, McpCatalog, Vec<String>) {
     let (jobs, refused, mut warnings) =
         granted_jobs(connectors, secrets, egress, host, false, None);
     warnings.extend(
@@ -2293,6 +2611,7 @@ fn granted_jobs(
                 }),
                 apps,
                 skills_changed: Arc::default(),
+                relist: Relist::default(),
             },
         ));
     }
@@ -2306,7 +2625,7 @@ async fn connect_many(
     jobs: &[(McpServerConfig, Dial)],
     idle_reap_after: Duration,
     manifest_dir: Option<&crate::tools::mcp_manifest::ManifestDir>,
-) -> (Vec<Arc<dyn Tool>>, McpCatalog, Vec<String>) {
+) -> (McpTools, McpCatalog, Vec<String>) {
     let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
     let mut catalogs = Vec::new();
     let mut warnings = Vec::new();
@@ -2342,6 +2661,11 @@ async fn connect_many(
     let catalog = McpCatalog::new(catalogs);
     if let Ok(mut u) = catalog.unconnected.lock() {
         *u = unconnected;
+    }
+    let tools = McpTools::new(tools);
+    // From here a server's re-listing lands in the set the agent's registries are built from.
+    for (_, dial) in jobs {
+        dial.relist.set_live(&tools);
     }
     (tools, catalog, warnings)
 }
@@ -2464,24 +2788,14 @@ fn tools_from_manifest(
         )
     });
     let mut names = RegisteredNames::new(&config.name, manifest.skills.is_some());
+    // Kept for the first real start to compare its own listing against (see [`Relist`]).
+    let listed = (!dial.apps).then(|| manifest.tools.clone());
     let mut tools: Vec<Arc<dyn Tool>> = manifest
         .tools
         .into_iter()
-        .filter(|t| t.ui.as_ref().is_none_or(|ui| ui.model_visible()))
-        .filter_map(|t| {
-            Some(Arc::new(McpTool {
-                name: names.claim(
-                    registered_name(&config.name, &t.remote_name),
-                    &t.remote_name,
-                )?,
-                description: t.description,
-                input_schema: t.input_schema,
-                remote_name: t.remote_name,
-                server_name: config.name.clone(),
-                conn: conn.clone(),
-            }) as Arc<dyn Tool>)
-        })
+        .filter_map(|t| mcp_tool(&conn, t, &mut names))
         .collect();
+    let tool_names: HashSet<String> = tools.iter().map(|t| t.name().to_string()).collect();
 
     let mut resource_infos = Vec::with_capacity(manifest.resources.len());
     for resource in manifest.resources {
@@ -2543,6 +2857,10 @@ fn tools_from_manifest(
             Some(manifest_dir),
         )
     });
+    if let Some(listed) = listed {
+        dial.relist
+            .bind(&conn, Some(manifest_dir), listed, &tools, tool_names);
+    }
     let catalog = McpServerCatalog {
         name: config.name.clone(),
         conn: Arc::downgrade(&conn),
@@ -3377,22 +3695,13 @@ async fn tools_from_client(
     if let (Some(dir), true) = (manifest_dir, private_listing) {
         crate::tools::mcp_manifest::forget(dir, config).await;
     }
+    let listed: Vec<crate::tools::mcp_manifest::CachedTool> =
+        remote_tools.iter().map(cached_tool).collect();
     if let (Some(dir), false) = (manifest_dir, private_listing) {
         crate::tools::mcp_manifest::store(
             dir,
             config,
-            remote_tools
-                .iter()
-                .map(|t| crate::tools::mcp_manifest::CachedTool {
-                    remote_name: t.name.to_string(),
-                    description: t.description.as_deref().unwrap_or_default().to_string(),
-                    input_schema: t.schema_as_json_value(),
-                    // Both flavors: a server may send `_meta.ui` whether or not it was negotiated
-                    // (the official SDK's `registerAppTool` always does), and an app-only tool
-                    // must stay hidden from the model either way.
-                    ui: crate::tools::mcp_apps::ToolUi::from_meta(t.meta.as_deref()),
-                })
-                .collect(),
+            listed.clone(),
             remote_resources
                 .iter()
                 .map(|r| crate::tools::mcp_manifest::CachedResource {
@@ -3445,40 +3754,14 @@ async fn tools_from_client(
         )
     });
     let mut names = RegisteredNames::new(&config.name, skill_listing.is_some());
-    let mut tools: Vec<Arc<dyn Tool>> = remote_tools
-        .into_iter()
-        // Spec: "Host MUST NOT include tools in the agent's tool list when their visibility does not
-        // include `model`" — whichever flavor of connection listed them.
-        .filter(|t| {
-            crate::tools::mcp_apps::ToolUi::from_meta(t.meta.as_deref())
-                .is_none_or(|ui| ui.model_visible())
-        })
-        .filter_map(|remote_tool| {
-            let name = names.claim(
-                registered_name(&config.name, &remote_tool.name),
-                &remote_tool.name,
-            )?;
-            let description = remote_tool
-                .description
-                .as_deref()
-                .filter(|d| !d.is_empty())
-                .map(str::to_string)
-                .unwrap_or_else(|| {
-                    format!(
-                        "MCP tool `{}` from server `{}` (no description provided)",
-                        remote_tool.name, config.name
-                    )
-                });
-            Some(Arc::new(McpTool {
-                name,
-                description,
-                input_schema: remote_tool.schema_as_json_value(),
-                remote_name: remote_tool.name.into_owned(),
-                server_name: config.name.clone(),
-                conn: conn.clone(),
-            }) as Arc<dyn Tool>)
-        })
+    // Spec: "Host MUST NOT include tools in the agent's tool list when their visibility does not
+    // include `model`" — whichever flavor of connection listed them ([`mcp_tool`] drops them).
+    let mut tools: Vec<Arc<dyn Tool>> = listed
+        .iter()
+        .cloned()
+        .filter_map(|t| mcp_tool(&conn, t, &mut names))
         .collect();
+    let tool_names: HashSet<String> = tools.iter().map(|t| t.name().to_string()).collect();
 
     let mut resource_infos = Vec::new();
     for resource in &remote_resources {
@@ -3550,6 +3833,10 @@ async fn tools_from_client(
     let skills = skill_listing.map(|listing| {
         crate::tools::mcp_skills::attach(&config.name, &conn, listing, &mut tools, manifest_dir)
     });
+    if !dial.apps {
+        dial.relist
+            .bind(&conn, manifest_dir, listed, &tools, tool_names);
+    }
     Ok((
         tools,
         McpServerCatalog {

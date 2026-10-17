@@ -63,6 +63,12 @@ async fn within(limit: Duration, mut f: impl FnMut() -> bool) -> bool {
     f()
 }
 
+/// The tools a connect produced, owned outright: the live set they came in is consumed, so dropping
+/// the result is what drops the server's connection.
+fn owned(live: mcp::McpTools) -> Vec<std::sync::Arc<dyn agent_core::Tool>> {
+    live.snapshot().to_vec()
+}
+
 /// `base` made unique to this test process, so concurrent runs of this suite (or of the whole
 /// test tree) never count one another's fixture processes.
 fn unique_tag(base: &str) -> String {
@@ -93,6 +99,7 @@ async fn an_idle_server_is_reaped_and_reconnects_on_the_next_call() {
     // A one-second window: the production default is minutes, which no test can wait out.
     let (tools, _catalog, warnings) =
         mcp::connect_all(&[fixture_config(tag)], Duration::from_secs(1), None).await;
+    let tools = owned(tools);
     assert!(
         warnings.is_empty(),
         "fixture failed to connect: {warnings:?}"
@@ -182,6 +189,7 @@ async fn a_cached_manifest_advertises_tools_without_starting_the_server() {
         Some(&manifest),
     )
     .await;
+    let tools = owned(tools);
     assert!(
         warnings.is_empty(),
         "fixture failed to connect: {warnings:?}"
@@ -206,6 +214,7 @@ async fn a_cached_manifest_advertises_tools_without_starting_the_server() {
         Some(&manifest),
     )
     .await;
+    let cached = owned(cached);
     assert!(warnings.is_empty(), "cached start warned: {warnings:?}");
     let from_cache: Vec<String> = cached.iter().map(|t| t.name().to_string()).collect();
     assert_eq!(
@@ -268,6 +277,7 @@ async fn reaping_sweeps_a_grandchild_the_server_forked_away() {
 
     let (tools, _catalog, warnings) =
         mcp::connect_all(&[config], Duration::from_secs(1), None).await;
+    let tools = owned(tools);
     assert!(
         warnings.is_empty(),
         "fixture failed to connect: {warnings:?}"
