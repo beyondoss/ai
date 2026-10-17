@@ -19,8 +19,21 @@
 //! against it, so the patch contains **only what the child changed**. Diffing against the original HEAD
 //! would replay the parent's own uncommitted work back onto the parent — applying it twice.
 //!
+//! The baseline's id is recorded at creation and the delta is taken against *it*, not against `HEAD`:
+//! a child with `bash` may `git commit`, which moves `HEAD`, and a delta from the moved `HEAD` would
+//! be empty.
+//!
 //! The baseline commit is unreachable from any ref and lives only in the shared object database, so it
 //! costs no branch, no tag, and is collected by `git gc` once the worktree is gone.
+//!
+//! # Merge-back never touches the user's index
+//!
+//! [`apply_patch`] lands the delta in the parent's **working tree** only. A plain `git apply` first;
+//! when hunks no longer apply as-is, a three-way merge against a private temporary index
+//! (`GIT_INDEX_FILE`) holding just the touched paths as the working tree has them. `git apply --3way`
+//! against the user's own index was wrong three ways: it refused every file edited but not staged
+//! (which is every file our `edit` tool touches), refused a file not yet added, and on success staged
+//! the child's work as if the user had run `git add`.
 //!
 //! # Cleanup
 //!
@@ -321,8 +334,65 @@ impl Git {
         }
     }
 
-    /// Run a shell command in the sandbox. Only for the two things git cannot express: removing a
-    /// directory tree, and listing one.
+    /// [`run_stdin_full`](Self::run_stdin_full) with `GIT_INDEX_FILE` pointed at `index` — the
+    /// merge-back's private index, so a three-way apply never reads or writes the user's own.
+    async fn run_with_index(
+        &self,
+        dir: &Path,
+        index: &str,
+        args: &[&str],
+        stdin: &[u8],
+    ) -> Result<(bool, Vec<u8>, String), String> {
+        match self {
+            Self::Local => {
+                let mut cmd = Command::new("git");
+                cmd.arg("-C")
+                    .arg(dir)
+                    .args(args)
+                    .env("GIT_INDEX_FILE", index);
+                let out = output_with_stdin(cmd, &format!("git {}", args.join(" ")), stdin).await?;
+                let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+                Ok((out.status.success(), out.stdout, stderr))
+            }
+            Self::Remote { runner, .. } => {
+                // The exec endpoint takes no environment, so a fixed script sets it; the index path
+                // and git's arguments travel as positional parameters, never spliced into the script.
+                let mut owned = vec![
+                    "-c".to_string(),
+                    r#"GIT_INDEX_FILE=$1; export GIT_INDEX_FILE; shift; exec git "$@""#.to_string(),
+                    "sh".to_string(),
+                    index.to_string(),
+                ];
+                owned.extend(args.iter().map(|a| (*a).to_string()));
+                let res = runner
+                    .run_with_stdin(
+                        "sh",
+                        &owned,
+                        Some(&dir.display().to_string()),
+                        REMOTE_GIT_TIMEOUT,
+                        stdin,
+                    )
+                    .await
+                    .map_err(|e| format!("git {}: {e}", args.join(" ")))?;
+                Ok((res.code == Some(0), res.stdout.into_bytes(), res.stderr))
+            }
+        }
+    }
+
+    /// Delete one file, tolerating its absence — the merge-back's temporary index.
+    async fn remove_file(&self, dir: &Path, path: &str) {
+        match self {
+            Self::Local => {
+                let _ = std::fs::remove_file(path);
+            }
+            Self::Remote { .. } => {
+                let _ = self.sh(dir, &format!("rm -f {}", shell_quote(path))).await;
+            }
+        }
+    }
+
+    /// Run a shell command in the sandbox. Only for what git cannot express: removing a directory
+    /// tree or a file, and listing one.
     async fn sh(&self, dir: &Path, script: &str) -> Result<String, String> {
         match self {
             Self::Local => Err("sh is only used on the remote path".to_string()),
@@ -688,6 +758,11 @@ pub struct Worktree {
     /// Where this worktree's `git` runs. Carried so every later operation on it — the delta, the
     /// removal — lands on the same filesystem the checkout is actually on.
     git: Git,
+    /// The seeded baseline commit, recorded once at creation. [`child_delta`](Self::child_delta)
+    /// diffs against this, never against `HEAD`: a child that runs `git commit` moves its HEAD, and
+    /// a delta measured from the moved HEAD would be empty — its work silently dropped and the
+    /// checkout auto-removed as "unchanged".
+    baseline: String,
 }
 
 impl Worktree {
@@ -725,29 +800,40 @@ impl Worktree {
         )
         .await?;
 
-        let wt = Self {
+        let mut wt = Self {
             path,
             repo_root: repo_root.to_path_buf(),
             detached: false,
             git: git.clone(),
+            baseline: String::new(),
         };
         // From here on, any failure must not leak the checkout we just made.
-        if let Err(e) = wt.seed_from_parent().await {
-            wt.git.remove_worktree(&wt.repo_root, &wt.path).await;
-            return Err(e);
+        match wt.seed_from_parent().await {
+            Ok(baseline) => wt.baseline = baseline,
+            Err(e) => {
+                wt.detached = true;
+                wt.git.remove_worktree(&wt.repo_root, &wt.path).await;
+                return Err(e);
+            }
         }
         Ok(wt)
     }
 
     /// Copy the parent's uncommitted state into this worktree and commit it as the baseline
-    /// [`child_delta`](Self::child_delta) diffs against. See the module doc for why this exists.
-    async fn seed_from_parent(&self) -> Result<(), String> {
+    /// [`child_delta`](Self::child_delta) diffs against, returning that commit's id. See the module
+    /// doc for why this exists.
+    async fn seed_from_parent(&self) -> Result<String, String> {
         // Tracked modifications, staged and unstaged alike (`diff HEAD`, not `diff`). `--binary` so a
         // changed image or fixture survives the round trip instead of becoming a "binary files differ"
-        // stub that `git apply` then refuses.
+        // stub that `git apply` then refuses. `--no-optional-locks` because this runs in the *user's*
+        // repository: a porcelain `diff` otherwise refreshes and rewrites their index as a side
+        // effect, and nothing here may write it.
         let patch = self
             .git
-            .run_bytes(&self.repo_root, &["diff", "--binary", "HEAD"])
+            .run_bytes(
+                &self.repo_root,
+                &["--no-optional-locks", "diff", "--binary", "HEAD"],
+            )
             .await?;
         if !patch.is_empty() {
             self.git
@@ -762,7 +848,13 @@ impl Worktree {
             .git
             .run_bytes(
                 &self.repo_root,
-                &["ls-files", "--others", "--exclude-standard", "-z"],
+                &[
+                    "--no-optional-locks",
+                    "ls-files",
+                    "--others",
+                    "--exclude-standard",
+                    "-z",
+                ],
             )
             .await?;
         let files = listed
@@ -805,7 +897,12 @@ impl Worktree {
                 )
                 .await?;
         }
-        Ok(())
+        Ok(self
+            .git
+            .run_text(&self.path, &["rev-parse", "HEAD"])
+            .await?
+            .trim()
+            .to_string())
     }
 
     /// This worktree's checkout directory — what the child's tools are rooted at.
@@ -819,10 +916,24 @@ impl Worktree {
     /// `add -A` first, so files the child *created* appear in the diff (`git diff` alone never shows an
     /// untracked file). Diffed against the baseline commit, so the parent's own uncommitted work — which
     /// is already present in the parent — is excluded rather than replayed onto it.
+    ///
+    /// Against the **recorded** baseline, not `HEAD`: a child that commits its work has moved `HEAD`
+    /// onto that commit, and `diff --cached HEAD` would then report nothing. Baseline-to-index covers
+    /// committed and uncommitted work alike. `--no-renames` keeps every touched path explicit in the
+    /// patch, whatever the user's `diff.renames` says, so the merge-back sees each one by name.
     pub async fn child_delta(&self) -> Result<Vec<u8>, String> {
         self.git.run_text(&self.path, &["add", "-A"]).await?;
         self.git
-            .run_bytes(&self.path, &["diff", "--cached", "--binary", "HEAD"])
+            .run_bytes(
+                &self.path,
+                &[
+                    "diff",
+                    "--cached",
+                    "--binary",
+                    "--no-renames",
+                    &self.baseline,
+                ],
+            )
             .await
     }
 
@@ -977,12 +1088,79 @@ pub async fn apply_patch(
         }
     }
 
-    // `--3way` falls back to a three-way merge when a hunk doesn't apply cleanly, leaving ordinary
-    // conflict markers rather than refusing. Both blobs are in the shared object database (the child's
-    // worktree writes there), so the merge base is always available.
-    let (ok, _stdout, stderr) = git
-        .run_stdin_full(
+    // The parent's working tree only — never its index. `--3way` would imply `--index`, which refuses
+    // any file whose working copy differs from the index ("does not match index": every file the user
+    // has edited and not staged, which is every file our own `edit` tool has touched) or is absent
+    // from it ("does not exist in index": a file the user just created), and on success stages the
+    // child's changes into the user's index as if they had run `git add`. A plain apply is
+    // all-or-nothing and touches the working tree alone.
+    let (ok, _stdout, plain_err) = git
+        .run_stdin_full(repo_root, &["apply", "--whitespace=nowarn", "-"], patch)
+        .await?;
+    if ok {
+        return Ok(ApplyOutcome::Clean);
+    }
+    three_way(git, repo_root, patch).await.map_err(|e| {
+        format!(
+            "could not apply subagent changes: {}\n{e}",
+            plain_err.trim()
+        )
+    })
+}
+
+/// The fallback when the child's hunks no longer apply as-is: a three-way merge that leaves ordinary
+/// conflict markers rather than refusing, run against a **private, temporary index** so the user's
+/// own is never read for it or written by it.
+///
+/// `git apply --3way` needs an index whose entries match the working tree for every path it touches.
+/// So the temporary index holds exactly those paths, recorded from the parent's working tree as it is
+/// right now (`update-index --add --remove`: present files added, absent ones left out) — which is the
+/// "ours" side of the merge. The patch's preimage blobs, the merge base, are in the shared object
+/// database: the child's worktree wrote them there.
+async fn three_way(git: &Git, repo_root: &Path, patch: &[u8]) -> Result<ApplyOutcome, String> {
+    let paths = patch_paths(git, repo_root, patch).await?;
+    let git_dir = git
+        .run_text(repo_root, &["rev-parse", "--absolute-git-dir"])
+        .await?;
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let index = Path::new(git_dir.trim()).join(format!(
+        "beyond-agent-merge-{}-{}.index",
+        git.owner(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let index = index.display().to_string();
+    let result = three_way_in(git, repo_root, &index, &paths, patch).await;
+    git.remove_file(repo_root, &index).await;
+    result
+}
+
+async fn three_way_in(
+    git: &Git,
+    repo_root: &Path,
+    index: &str,
+    paths: &[String],
+    patch: &[u8],
+) -> Result<ApplyOutcome, String> {
+    let mut list = Vec::new();
+    for p in paths {
+        list.extend_from_slice(p.as_bytes());
+        list.push(0);
+    }
+    let (ok, _, stderr) = git
+        .run_with_index(
             repo_root,
+            index,
+            &["update-index", "--add", "--remove", "-z", "--stdin"],
+            &list,
+        )
+        .await?;
+    if !ok {
+        return Err(stderr.trim().to_string());
+    }
+    let (ok, _stdout, stderr) = git
+        .run_with_index(
+            repo_root,
+            index,
             &["apply", "--3way", "--whitespace=nowarn", "-"],
             patch,
         )
@@ -999,10 +1177,7 @@ pub async fn apply_patch(
         .map(|p| p.trim().to_string())
         .collect();
     if files.is_empty() {
-        return Err(format!(
-            "could not apply subagent changes: {}",
-            stderr.trim()
-        ));
+        return Err(stderr.trim().to_string());
     }
     Ok(ApplyOutcome::Conflicted { files })
 }
@@ -1717,6 +1892,227 @@ mod tests {
             std::fs::read_to_string(repo.path().join("new.txt")).unwrap(),
             "brand new\n"
         );
+    }
+
+    /// The user's index file, byte for byte: the merge-back must neither stage the child's work nor
+    /// refresh, rewrite or unstage anything the user had.
+    fn index_bytes(repo: &Path) -> Vec<u8> {
+        std::fs::read(repo.join(".git/index")).unwrap()
+    }
+
+    /// Eight numbered lines, committed, so a child and the parent can edit far-apart lines.
+    async fn eight_line_repo() -> tempfile::TempDir {
+        let repo = repo().await;
+        std::fs::write(
+            repo.path().join("tracked.txt"),
+            "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\n",
+        )
+        .unwrap();
+        Git::Local
+            .run_text(repo.path(), &["commit", "--quiet", "-am", "eight"])
+            .await
+            .unwrap();
+        repo
+    }
+
+    #[tokio::test]
+    async fn merge_back_lands_in_a_file_the_parent_edited_but_never_staged() {
+        // Our own `edit` tool never stages, so a parent that has touched a file and then delegates
+        // work on that same file is the ordinary case. `git apply --3way` (which implies `--index`)
+        // refused it outright: "does not match index".
+        let repo = eight_line_repo().await;
+        std::fs::write(
+            repo.path().join("tracked.txt"),
+            "PARENT\nl2\nl3\nl4\nl5\nl6\nl7\nl8\n",
+        )
+        .unwrap();
+        let root = preflight(&Git::Local, repo.path()).await.unwrap();
+        let wt = Worktree::create(&Git::Local, &root, "worker-0")
+            .await
+            .unwrap();
+        std::fs::write(
+            wt.path().join("tracked.txt"),
+            "PARENT\nl2\nl3\nl4\nl5\nl6\nl7\nCHILD\n",
+        )
+        .unwrap();
+        let patch = wt.child_delta().await.unwrap();
+        let before = index_bytes(repo.path());
+
+        assert_eq!(
+            apply_patch(&Git::Local, &root, &patch, &[]).await.unwrap(),
+            ApplyOutcome::Clean
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("tracked.txt")).unwrap(),
+            "PARENT\nl2\nl3\nl4\nl5\nl6\nl7\nCHILD\n"
+        );
+        assert_eq!(
+            index_bytes(repo.path()),
+            before,
+            "the user's index must be untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_back_lands_in_a_file_the_parent_has_not_added_yet() {
+        // Seeding copies an untracked file into the worktree's baseline commit, so the child's edit
+        // arrives as a modification of a path the parent's index has never heard of — which `--3way`
+        // refused: "does not exist in index".
+        let repo = repo().await;
+        std::fs::write(repo.path().join("fresh.rs"), "fn main() { bug(); }\n").unwrap();
+        let root = preflight(&Git::Local, repo.path()).await.unwrap();
+        let wt = Worktree::create(&Git::Local, &root, "worker-0")
+            .await
+            .unwrap();
+        std::fs::write(wt.path().join("fresh.rs"), "fn main() { fixed(); }\n").unwrap();
+        let patch = wt.child_delta().await.unwrap();
+        let before = index_bytes(repo.path());
+
+        assert_eq!(
+            apply_patch(&Git::Local, &root, &patch, &[]).await.unwrap(),
+            ApplyOutcome::Clean
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("fresh.rs")).unwrap(),
+            "fn main() { fixed(); }\n"
+        );
+        assert_eq!(
+            index_bytes(repo.path()),
+            before,
+            "fresh.rs must stay untracked"
+        );
+    }
+
+    #[tokio::test]
+    async fn child_delta_includes_work_the_child_committed() {
+        // A child with `bash` may well `git commit`. That moves its HEAD, and a delta diffed against
+        // HEAD came back empty — the work silently dropped and the worktree auto-removed.
+        let repo = repo().await;
+        std::fs::write(repo.path().join("wip.txt"), "parent wip\n").unwrap();
+        let root = preflight(&Git::Local, repo.path()).await.unwrap();
+        let wt = Worktree::create(&Git::Local, &root, "worker-0")
+            .await
+            .unwrap();
+        std::fs::write(wt.path().join("committed.txt"), "committed by the child\n").unwrap();
+        Git::Local
+            .run_text(wt.path(), &["add", "-A"])
+            .await
+            .unwrap();
+        Git::Local
+            .run_text(wt.path(), &["commit", "--quiet", "-m", "child work"])
+            .await
+            .unwrap();
+        std::fs::write(wt.path().join("loose.txt"), "and one left uncommitted\n").unwrap();
+
+        let patch = String::from_utf8(wt.child_delta().await.unwrap()).unwrap();
+        assert!(patch.contains("committed by the child"), "{patch}");
+        assert!(patch.contains("and one left uncommitted"), "{patch}");
+        assert!(
+            !patch.contains("parent wip"),
+            "the parent's own work must not replay: {patch}"
+        );
+
+        assert_eq!(
+            apply_patch(&Git::Local, &root, patch.as_bytes(), &[])
+                .await
+                .unwrap(),
+            ApplyOutcome::Clean
+        );
+        assert!(repo.path().join("committed.txt").exists());
+        assert!(repo.path().join("loose.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn a_three_way_merge_never_touches_the_users_index() {
+        // The fallback path: the parent rewrote the very line the child did. The merge leaves markers
+        // in the working tree, and the user's index — including a change they had staged elsewhere —
+        // comes through byte for byte.
+        let repo = eight_line_repo().await;
+        std::fs::write(repo.path().join("staged.txt"), "the user staged this\n").unwrap();
+        Git::Local
+            .run_text(repo.path(), &["add", "staged.txt"])
+            .await
+            .unwrap();
+        let root = preflight(&Git::Local, repo.path()).await.unwrap();
+        let wt = Worktree::create(&Git::Local, &root, "worker-0")
+            .await
+            .unwrap();
+        std::fs::write(
+            wt.path().join("tracked.txt"),
+            "l1\nl2\nl3\nl4\nl5\nl6\nl7\nCHILD\n",
+        )
+        .unwrap();
+        let patch = wt.child_delta().await.unwrap();
+        // The parent edits the same line after the child was spawned, and never stages it.
+        std::fs::write(
+            repo.path().join("tracked.txt"),
+            "l1\nl2\nl3\nl4\nl5\nl6\nl7\nPARENT\n",
+        )
+        .unwrap();
+        let before = index_bytes(repo.path());
+
+        let outcome = apply_patch(&Git::Local, &root, &patch, &[]).await.unwrap();
+        assert_eq!(
+            outcome,
+            ApplyOutcome::Conflicted {
+                files: vec!["tracked.txt".to_string()]
+            }
+        );
+        let merged = std::fs::read_to_string(repo.path().join("tracked.txt")).unwrap();
+        assert!(
+            merged.contains("<<<<<<<") && merged.contains("CHILD") && merged.contains("PARENT"),
+            "{merged}"
+        );
+        assert_eq!(
+            index_bytes(repo.path()),
+            before,
+            "the user's index must be untouched"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(repo.path().join(".git"))
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("beyond-agent-merge-")
+            })
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "the temporary index must be removed: {leftovers:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_remote_path_merges_into_a_dirty_parent_without_touching_its_index() {
+        // The same fallback through the remote arm, whose temporary index is set by a fixed `sh`
+        // script rather than a process environment.
+        let git = remote_git();
+        let repo = eight_line_repo().await;
+        let root = preflight(&git, repo.path()).await.unwrap();
+        let wt = Worktree::create(&git, &root, "remote-child").await.unwrap();
+        std::fs::write(
+            wt.path().join("tracked.txt"),
+            "l1\nl2\nl3\nl4\nl5\nl6\nl7\nCHILD\n",
+        )
+        .unwrap();
+        let patch = wt.child_delta().await.unwrap();
+        std::fs::write(
+            repo.path().join("tracked.txt"),
+            "l1\nl2\nl3\nl4\nl5\nl6\nl7\nPARENT\n",
+        )
+        .unwrap();
+        let before = index_bytes(repo.path());
+
+        let outcome = apply_patch(&git, &root, &patch, &[]).await.unwrap();
+        assert_eq!(
+            outcome,
+            ApplyOutcome::Conflicted {
+                files: vec!["tracked.txt".to_string()]
+            }
+        );
+        assert_eq!(index_bytes(repo.path()), before);
+        wt.remove().await.unwrap();
     }
 
     #[tokio::test]

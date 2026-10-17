@@ -995,9 +995,9 @@ impl Subagent {
             return;
         }
         // Serialize the actual apply. `child_delta` above is per-worktree and safe to run concurrently,
-        // but `git apply` mutates the shared repo's working tree and index — two children applying at
-        // once would collide on `index.lock`, failing a merge that would otherwise have succeeded (or
-        // conflicted cleanly). The shared `WriteLockRegistry` (the same one every child's file writes
+        // but `git apply` mutates the shared repo's working tree — two children applying at once
+        // would interleave writes to the same files, failing a merge that would otherwise have
+        // succeeded (or conflicted cleanly). The shared `WriteLockRegistry` (the same one every child's file writes
         // key on) serializes them on a sentinel key that no real path can collide with.
         let _merge_guard = self.ctx.write_locks.lock("\0subagent-merge-back").await;
         match worktree::apply_patch(wt.git(), repo_root, &delta, policy.denied_paths()).await {
