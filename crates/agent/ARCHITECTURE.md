@@ -2120,6 +2120,16 @@ to be relative to the _search_ root (a single file as its bare name), so `grep p
 on purpose: a path that saves a few tokens but cannot be opened costs a failed call. With no tool root,
 the base is the process cwd locally; remotely, paths print as the search produced them.
 
+**A `$` anchor matches CRLF lines.** Lines split on `\n`, so every line of a CRLF file ends in `\r`,
+which sat between the text and `$`: `end$` matched only LF lines. `LocalFs` compiles with
+`multi_line(true)` + `crlf(true)` (then `line_terminator(\n)` again, since `crlf` resets it) — what
+`rg --crlf` does, and `ShellFs`'s `rg` rung passes `--crlf`. GNU and busybox `grep` have no CRLF mode,
+so the POSIX rungs rewrite each end-of-branch `$` (end of pattern, or before `|`/`)`; never an escaped
+`\$` or one inside a bracket expression) to `<CR>?$` with a literal carriage return
+(`shell::crlf_tolerant_ere`); a post-filter could not work, since the lines `grep` misses never come
+back. `literal` searches are untouched. `fs_backend_parity` checks all three backends agree byte for
+byte on a CRLF file.
+
 `find` also disambiguates what it's matching against based on the pattern: a pattern with no `/`
 (e.g. `*.rs`) matches against the basename only; a pattern containing `/` matches the full path, with
 a `**/` prefix implicitly added unless the pattern already starts with `**/` or `/` — so

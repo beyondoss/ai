@@ -350,8 +350,16 @@ fn compile_matcher(q: &SearchQuery) -> Result<RegexMatcher, FsError> {
     } else {
         q.pattern.as_str()
     };
+    // CRLF-tolerant line anchors, as `rg --crlf` has them: `multi_line` makes `^`/`$` line anchors
+    // (the only kind a line-at-a-time search can mean anyway) and `crlf` lets those anchors treat a
+    // `\r` before the `\n` as part of the line ending — so `end$` finds `end` on a CRLF line. Without
+    // it the trailing `\r` sat between the text and the anchor, and every CRLF line failed every `$`
+    // pattern. `crlf` also sets the line terminator to CRLF, so the plain `\n` terminator the
+    // searcher uses is set again *after* it — the order grep-regex documents for exactly this.
     RegexMatcherBuilder::new()
         .case_insensitive(q.ignore_case)
+        .multi_line(true)
+        .crlf(true)
         .line_terminator(Some(b'\n'))
         .build(effective)
         .map_err(|e| FsError::InvalidQuery(format!("bad regex: {e}")))
