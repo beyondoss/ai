@@ -28,7 +28,7 @@ use async_trait::async_trait;
 
 use super::{
     DirEntry, FileKind, FsBackend, FsError, GlobOutcome, GlobQuery, Hit, MAX_CONTEXT, Meta,
-    PathWorld, SearchOutcome, SearchQuery, clip, finalize, trim_eol,
+    PathWorld, SearchOutcome, SearchQuery, finalize, trim_eol,
 };
 use crate::tools::exec::{CommandRunner, ExecResult};
 
@@ -303,6 +303,10 @@ impl FsBackend for ShellFs {
         // The engine was asked to skip `.git` where it can; this is the guarantee for the rungs that
         // can't (busybox `grep`, and a `.git` *file* GNU `--exclude-dir` does not cover).
         hits.retain(|h| !super::is_under_git_dir(&q.root, &h.path));
+        // A long match line is cut to the window around its match, the same way `LocalFs` cuts it.
+        // (A line longer than the runner's 128 KiB capture arrives already cut, which is flagged as
+        // truncation below.)
+        super::clip_hits(&mut hits, &super::MatchFinder::new(q));
         // `ExecResult` keeps only the first and last 128 KiB of each stream and drops the middle. On a
         // large result set that silently removes records from the middle of the output — so the flag
         // must reach the outcome, or this backend would report a confidently incomplete result as
@@ -858,7 +862,7 @@ fn parse_colon_records(stdout: &str, q: &SearchQuery) -> Vec<Hit> {
         hits.push(Hit {
             path: Arc::from(Path::new(path)),
             line: line_no,
-            text: clip(&trim_eol(text)),
+            text: trim_eol(text).into_owned(),
             is_match,
         });
     }
@@ -1345,7 +1349,8 @@ fn parse_body(path: &str, rest: &str) -> Option<Hit> {
         path: Arc::from(Path::new(path)),
         line,
         // The same normalization `LocalFs`'s sink applies, from the same functions — see `super`.
-        text: clip(&trim_eol(text)),
+        // Clipped by `search` once parsed (`clip_hits`), where the query is in hand to find the match.
+        text: trim_eol(text).into_owned(),
         is_match,
     })
 }
