@@ -741,6 +741,48 @@ async fn grep_and_find_print_paths_read_can_open_on_every_backend() {
 }
 
 #[tokio::test]
+async fn an_end_anchor_matches_crlf_lines_identically_on_every_backend() {
+    // Every line of a CRLF file ends in `\r`, which sat between the text and `$`: `end$` matched
+    // only the LF line. The POSIX rung runs the system `grep` (GNU here), which has no CRLF mode.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("win.txt"),
+        "alpha end\r\nbeta\r\ncost $5\r\ngamma end\n",
+    )
+    .unwrap();
+    let root = dir.path().to_str().unwrap();
+    let cases = [
+        ("end$", vec!["alpha end", "gamma end"]),
+        ("(beta|nothing)$", vec!["beta"]),
+        ("^beta$", vec!["beta"]),
+        // An escaped `$` is a literal, never an anchor.
+        ("\\$5$", vec!["cost $5"]),
+    ];
+    for (pattern, want) in cases {
+        let mut outs = Vec::new();
+        for (name, backend) in all_backends().await {
+            let out = run_tool(
+                Some(backend),
+                "grep",
+                json!({ "pattern": pattern, "path": root }),
+            )
+            .await;
+            for w in &want {
+                assert!(
+                    out.contains(&format!(": {w}\n")),
+                    "{name} {pattern:?}: {out:?}"
+                );
+            }
+            assert_eq!(match_lines(&out), want.len(), "{name} {pattern:?}: {out:?}");
+            outs.push((name, out));
+        }
+        for (name, out) in &outs[1..] {
+            assert_eq!(&outs[0].1, out, "{pattern:?}: local vs {name} disagreed");
+        }
+    }
+}
+
+#[tokio::test]
 async fn grep_and_find_skip_git_metadata_on_every_backend() {
     let dir = git_fixture();
     let root = dir.path().to_str().unwrap();

@@ -1187,6 +1187,8 @@ fn rg_args(q: &SearchQuery, in_git_repo: bool) -> Vec<String> {
         "--no-heading".to_string(),
         "--color=never".to_string(),
         "--hidden".to_string(),
+        // `$` matches before `\r\n` too — the same `crlf(true)` `LocalFs` compiles with.
+        "--crlf".to_string(),
     ];
     if !in_git_repo {
         args.push("--no-require-git".to_string());
@@ -1263,10 +1265,73 @@ fn posix_grep_args(q: &SearchQuery, gnu: bool) -> Vec<String> {
     }
     push_context(&mut args, q);
     args.push("-e".to_string());
-    args.push(q.pattern.clone());
+    args.push(if q.literal {
+        q.pattern.clone()
+    } else {
+        crlf_tolerant_ere(&q.pattern).into_owned()
+    });
     args.push("--".to_string());
     args.push(q.root.to_string_lossy().into_owned());
     args
+}
+
+/// Make an ERE's end-of-line anchors tolerate a CRLF line ending — the POSIX rungs' stand-in for
+/// `rg --crlf`, which GNU and busybox `grep` have no equivalent of.
+///
+/// Both split lines on `\n` alone, so on a CRLF file every line ends in `\r` and `foo$` matches
+/// nothing. Each `$` that is an anchor at the end of a branch (end of pattern, or before `|` or `)`)
+/// becomes `\r?$`, with a literal carriage-return byte, which both dialects accept. A `$` that is
+/// escaped or inside a bracket expression is a literal and stays. Post-filtering cannot do this: the
+/// lines `grep` failed to match never reach us.
+fn crlf_tolerant_ere(pattern: &str) -> std::borrow::Cow<'_, str> {
+    if !pattern.contains('$') {
+        return std::borrow::Cow::Borrowed(pattern);
+    }
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut out = String::with_capacity(pattern.len() + 4);
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        match c {
+            '\\' => {
+                out.push(c);
+                if let Some(&next) = chars.get(i + 1) {
+                    out.push(next);
+                    i += 1;
+                }
+            }
+            '[' => {
+                // A bracket expression: `]` right after `[` or `[^` is literal, and `[:class:]`,
+                // `[=x=]`, `[.x.]` nest. Copied verbatim through its closing `]`.
+                let start = i;
+                i += 1;
+                if chars.get(i) == Some(&'^') {
+                    i += 1;
+                }
+                if chars.get(i) == Some(&']') {
+                    i += 1;
+                }
+                while i < chars.len() && chars[i] != ']' {
+                    if chars[i] == '['
+                        && let Some(&d @ (':' | '=' | '.')) = chars.get(i + 1)
+                    {
+                        i += 2;
+                        while i + 1 < chars.len() && !(chars[i] == d && chars[i + 1] == ']') {
+                            i += 1;
+                        }
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                let end = i.min(chars.len() - 1);
+                out.extend(&chars[start..=end]);
+            }
+            '$' if matches!(chars.get(i + 1), None | Some('|') | Some(')')) => out.push_str("\r?$"),
+            _ => out.push(c),
+        }
+        i += 1;
+    }
+    std::borrow::Cow::Owned(out)
 }
 
 /// `-B`/`-A` context flags, clamped the same way the query itself is. Shared because both engines
@@ -1503,6 +1568,29 @@ mod tests {
                 .iter()
                 .any(|a| a == "--include=*.rs")
         );
+    }
+
+    #[test]
+    fn end_anchors_tolerate_a_crlf_line_ending_for_posix_grep() {
+        assert_eq!(crlf_tolerant_ere("end$"), "end\r?$");
+        assert_eq!(crlf_tolerant_ere("(one$|two$)"), "(one\r?$|two\r?$)");
+        assert_eq!(crlf_tolerant_ere("a$|b"), "a\r?$|b");
+        // Literals stay literal: escaped, or inside a bracket expression (incl. `]` first, classes).
+        assert_eq!(crlf_tolerant_ere("cost\\$"), "cost\\$");
+        assert_eq!(crlf_tolerant_ere("[$]"), "[$]");
+        assert_eq!(crlf_tolerant_ere("[]$]x$"), "[]$]x\r?$");
+        assert_eq!(crlf_tolerant_ere("[[:space:]$]$"), "[[:space:]$]\r?$");
+        // No anchor at all borrows.
+        assert!(matches!(
+            crlf_tolerant_ere("plain"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        // A literal search is not rewritten, and rg gets `--crlf` instead.
+        let mut q = query("end$", PathBuf::from("."), 10);
+        assert!(posix_grep_args(&q, true).iter().any(|a| a == "end\r?$"));
+        q.literal = true;
+        assert!(posix_grep_args(&q, true).iter().any(|a| a == "end$"));
+        assert!(rg_args(&q, false).iter().any(|a| a == "--crlf"));
     }
 
     #[test]
