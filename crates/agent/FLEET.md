@@ -237,6 +237,13 @@ re-checked at runtime against a live replica that has actually served a session.
 3. Watch `agent_sessions_live` on the draining replica fall to zero rather than a clock.
 4. Adding a shard to a slice needs a rolling restart of that slice's replicas so they mount it.
    Opening a new slice does not touch the existing ones at all.
+5. A deploy does not stop anyone's background jobs. A `bash` job the model meant to keep (a dev
+   server, a watcher) belongs to the session's sandbox, not to the replica: the replica that picks
+   the session up next reports it still running under its number and reads its output on from
+   where the model left off, and a job that finished in between is reported once. Only an explicit
+   end (a delete, a new conversation in the session) or the sandbox's own end stops them. The
+   simulator proves it on both substrates and both kinds of sandbox (`sandbox-job-survives-its-replica`
+   after a hard kill, `sandbox-job-exit-noticed-once` across a drain).
 
 ## How it scales
 

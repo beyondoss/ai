@@ -2882,7 +2882,12 @@ and `serve`'s own `bash`/`abort_bash` RPC commands reuse `RealRunner` directly, 
     that dies before persisting; `StopAtEnd`; `release`; the reopen note) and
     `tests/bash_jobs_serve_sandbox.rs` (a real `serve` process ends, the job runs on, the next one
     reports it still running, peeks its new output, and kills it; a job that ended between processes
-    is noticed once).
+    is noticed once). Across real replicas, `crates/fleet-sim` grades it on the local-directory and
+    NFS substrates, over a v1.3 sandbox and a v1.2-only one: `sandbox-job-survives-its-replica` (a
+    dev server started on one replica, that replica killed outright, the session reopened on the
+    other: still running, its output read on from the seen offset, killed from there) and
+    `sandbox-job-exit-noticed-once` (a build that finishes while its replica drains away is noticed
+    exactly once on the next).
 - **`run_in_background` (`Start::Background`, `JobKind::Background`)**. A boolean on `bash`, not a
   tool of its own: in the background-shell probe (1,500 trials on Luna, Sol, Kimi K2.7 Code and Qwen
   3.8 Flash with the real system prompt and tools) it beat a separate start tool on every model, was
