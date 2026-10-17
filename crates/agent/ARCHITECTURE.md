@@ -1906,7 +1906,14 @@ as `write("/home/…/f")` would.
   omitted-limit case already doesn't,
   appends a bracketed `[showing lines A-B; use offset=N to continue]` marker (the same
   `output::marker` bracket convention every truncating tool now shares) if more lines remain. It streams
-  line-by-line and caps each line at `MAX_LINE_BYTES` (4000) — bytes past the cap are drained but not
+  the file through the window 1 MiB at a time (`read_bytes` at successive offsets into a `LineWindow`;
+  a UTF-16 file decodes chunk by chunk through `Utf16Stream`), so any offset in a file of any size is
+  reachable and memory stays at one chunk plus the output. It used to load a 64 MiB prefix, so a valid
+  offset past it was reported as "beyond end of file" with the prefix's line count. Past the window the
+  rest of the file is read only to count lines, for at most 64 MiB (`MAX_COUNT_BYTES`); a file still
+  going after that reports its size and the lines counted so far as a lower bound
+  (`[showing lines A-B; the file is N bytes and its first M hold L lines; use offset=…]`), never a
+  made-up total. Each line is capped at `MAX_LINE_BYTES` (4000) — bytes past the cap are drained but not
   stored, so one pathological single line (a minified bundle) can't balloon memory; a capped line gets
   a `"… [line truncated]"` marker — a **mid-line** clip, deliberately not pi's own `truncateHead`
   (`truncate.ts`), which "never returns partial lines": there, a line that alone exceeds the byte budget

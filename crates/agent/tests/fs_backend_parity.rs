@@ -1205,3 +1205,42 @@ async fn edit_keeps_every_byte_of_a_file_larger_than_one_command_output_on_every
         );
     }
 }
+
+#[tokio::test]
+async fn read_windows_a_file_past_64_mib_at_any_offset_on_both_backends() {
+    // 750,000 lines of 100 bytes: 75 MB, past the 64 MiB `read` used to load, which ends inside line
+    // 671,089. Reading at line 700,000 reported "offset 700000 is beyond end of file (671089 lines
+    // total)" for a line that exists.
+    const LINES: usize = 750_000;
+    let mut text = String::with_capacity(LINES * 100);
+    for i in 1..=LINES {
+        let start = text.len();
+        text.push_str(&format!("line {i:07} "));
+        text.extend(std::iter::repeat_n('.', 99 - (text.len() - start)));
+        text.push('\n');
+    }
+    assert!(text.len() > 64 * 1024 * 1024);
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("huge.log");
+    std::fs::write(&p, &text).unwrap();
+    drop(text);
+
+    // The two shell rungs differ only in how they search; their reads are the same commands, and
+    // 75 MB through one of them is enough.
+    for (name, backend) in [("local", local_backend()), ("shell", shell_posix_backend())] {
+        let out = run_tool(
+            Some(backend),
+            "read",
+            json!({ "path": p.to_str().unwrap(), "offset": 700_000, "limit": 2 }),
+        )
+        .await;
+        assert!(
+            out.starts_with("700000\tline 0700000 .") && out.contains("\n700001\tline 0700001 ."),
+            "{name}: the window is the lines at the offset: {out}"
+        );
+        assert!(
+            out.contains("showing lines 700000-700001 of 750000 total; use offset=700002"),
+            "{name}: the total is the whole file's: {out}"
+        );
+    }
+}

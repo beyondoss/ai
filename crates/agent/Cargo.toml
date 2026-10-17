@@ -121,6 +121,9 @@ globset = "0.4"
 grep-regex = "0.1"
 grep-searcher = "0.1"
 ignore = "0.4"
+# `read`'s streaming line window: finds each line's end, and counts the lines past the window, a
+# chunk at a time. Already in the build graph (ripgrep's crates pull it).
+memchr = "2"
 regex = "1"
 
 # Unicode by rule. `unicode-normalization`: `edit`'s fuzzy fallback matcher (NFKC folding, so a

@@ -1,7 +1,6 @@
 //! `read` — read a file, optionally a line range, with line numbers.
 
 use std::fmt::Write as _;
-use std::io::{BufRead, BufReader};
 
 use super::encoding::{self, Encoding};
 use super::fs::local::LocalFs;
@@ -239,45 +238,6 @@ async fn resolve_read_path(
     (path.to_string(), None)
 }
 
-/// Read one line into `buf` (without the trailing newline), keeping at most `cap` bytes; bytes beyond
-/// `cap` are consumed from the stream but discarded, so a single huge line can't balloon memory.
-/// Returns `(bytes_consumed, truncated)`; `bytes_consumed == 0` means EOF.
-fn read_line_capped(
-    reader: &mut impl BufRead,
-    buf: &mut Vec<u8>,
-    cap: usize,
-) -> std::io::Result<(usize, bool)> {
-    buf.clear();
-    let mut consumed = 0usize;
-    let mut truncated = false;
-    loop {
-        let available = reader.fill_buf()?;
-        if available.is_empty() {
-            break; // EOF
-        }
-        match available.iter().position(|&b| b == b'\n') {
-            Some(pos) => {
-                let want = pos; // bytes before the newline
-                let take = want.min(cap.saturating_sub(buf.len()));
-                buf.extend_from_slice(&available[..take]);
-                truncated |= take < want;
-                reader.consume(pos + 1);
-                consumed += pos + 1;
-                break;
-            }
-            None => {
-                let want = available.len();
-                let take = want.min(cap.saturating_sub(buf.len()));
-                buf.extend_from_slice(&available[..take]);
-                truncated |= take < want;
-                reader.consume(want);
-                consumed += want;
-            }
-        }
-    }
-    Ok((consumed, truncated))
-}
-
 #[async_trait]
 impl Tool for Read {
     fn name(&self) -> &str {
@@ -479,106 +439,269 @@ impl Read {
             .unwrap_or(DEFAULT_LIMIT)
             .max(1);
 
-        // The whole text read — open, the streaming line loop, and the post-truncation total-line
-        // drain — is blocking file I/O plus a potentially long line-by-line scan of a large/slow
-        // file. Run it off the async runtime's worker (same pattern as the image path above and
-        // `grep`/`find`/`edit`) so a serve_ws shared-runtime worker isn't pinned for
-        // the read's whole duration.
-        let bytes = backend
-            .read_bytes(std::path::Path::new(&path), 0, MAX_READ_BYTES)
-            .await?;
-        let path_for_task = path.clone();
-        tokio::task::spawn_blocking(move || match encoding {
-            Encoding::Utf16 { big_endian } => {
-                read_utf16(&path_for_task, &bytes, big_endian, offset, limit)
+        // The text is streamed through the window a chunk at a time, so any offset in a file of any
+        // size can be reached while memory stays at one chunk plus the output. Each chunk's line scan
+        // runs on a blocking worker (same pattern as the image path above and `grep`/`find`/`edit`),
+        // so a long scan never pins a `serve_ws` shared-runtime worker.
+        let file = std::path::Path::new(&path);
+        let mut window = LineWindow::new(offset, limit);
+        let mut utf16 = match encoding {
+            Encoding::Utf16 { big_endian } => Some(Utf16Stream::new(big_endian)),
+            _ => None,
+        };
+        let mut pos = 0u64;
+        let counted_all = loop {
+            let chunk = backend.read_bytes(file, pos, READ_CHUNK).await?;
+            pos += chunk.len() as u64;
+            let eof = chunk.len() < READ_CHUNK;
+            (window, utf16) = tokio::task::spawn_blocking(move || {
+                match utf16.as_mut() {
+                    Some(d) => {
+                        let mut text = d.push(&chunk);
+                        if eof {
+                            d.finish(&mut text);
+                        }
+                        window.feed(text.as_bytes());
+                    }
+                    None => window.feed(&chunk),
+                }
+                (window, utf16)
+            })
+            .await
+            .map_err(|e| ToolError::Execution(format!("read task failed: {e}")))?;
+            if eof {
+                break true;
             }
-            _ => read_text_windowed(&path_for_task, &bytes, offset, limit),
-        })
-        .await
-        .map_err(|e| ToolError::Execution(format!("read task failed: {e}")))?
+            // Past the window, the rest of the file is read only to count its lines. That count is
+            // bounded: past `MAX_COUNT_BYTES` the total is reported as what it is, a lower bound.
+            if window.counted_bytes >= MAX_COUNT_BYTES {
+                break false;
+            }
+        };
+        let file_len = meta.as_ref().map_or(pos, |m| m.len.max(pos));
+        let mut out = window.finish((!counted_all).then_some((pos, file_len)))?;
+        if let Some(d) = utf16 {
+            out.text.push_str(&d.note());
+            out.text.push('\n');
+        }
+        Ok(out)
     }
 }
 
-/// A UTF-16 file, decoded and then windowed exactly like any other text. Without this it read as
-/// `h e l l o` — every other byte a NUL. A trailing note names the encoding, because `edit` and
-/// `write` keep it and the model should know the bytes on disk are not the UTF-8 it sees.
-fn read_utf16(
-    path: &str,
-    bytes: &[u8],
+/// Bytes per backend read while streaming a text file through [`LineWindow`].
+const READ_CHUNK: usize = 1024 * 1024;
+
+/// How far past the end of the window `read` reads to count a file's total lines. Bounds the cost of
+/// a read near the top of a multi-gigabyte file; the lines in a file that big are reported as a lower
+/// bound, with the file's size.
+const MAX_COUNT_BYTES: u64 = 64 * 1024 * 1024;
+
+/// UTF-16 decoded a chunk at a time into UTF-8 for [`LineWindow`]. A code unit or surrogate pair split
+/// across two chunks is carried to the next. A leading BOM is dropped, and a file that is not valid
+/// UTF-16 (an odd byte count, an unpaired surrogate) is shown with replacement characters and noted.
+/// Without this, a UTF-16 file read as `h e l l o`, every other byte a NUL.
+struct Utf16Stream {
     big_endian: bool,
-    offset: usize,
-    limit: usize,
-) -> Result<ToolOutput, ToolError> {
-    let label = encoding::utf16_label(big_endian);
-    let (text, note) = match encoding::decode_utf16(bytes, big_endian) {
-        Some(text) => (
-            text,
-            format!("[{label} file, shown decoded; `edit` and `write` keep its encoding]"),
-        ),
-        // An odd length or an unpaired surrogate: still show it, but say `edit` will refuse it.
-        None => (
-            char::decode_utf16(bytes.chunks_exact(2).map(|p| encoding::unit(p, big_endian)))
-                .map(|r| r.unwrap_or(char::REPLACEMENT_CHARACTER))
-                .collect(),
+    odd: Option<u8>,
+    high: Option<u16>,
+    started: bool,
+    valid: bool,
+}
+
+impl Utf16Stream {
+    fn new(big_endian: bool) -> Self {
+        Self {
+            big_endian,
+            odd: None,
+            high: None,
+            started: false,
+            valid: true,
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8]) -> String {
+        let mut out = String::with_capacity(bytes.len() / 2 + 4);
+        let mut rest = bytes;
+        if let Some(b) = self.odd.take() {
+            match rest.split_first() {
+                Some((&next, tail)) => {
+                    self.unit(encoding::unit(&[b, next], self.big_endian), &mut out);
+                    rest = tail;
+                }
+                None => self.odd = Some(b),
+            }
+        }
+        let pairs = rest.chunks_exact(2);
+        if let [b] = pairs.remainder() {
+            self.odd = Some(*b);
+        }
+        for pair in pairs {
+            self.unit(encoding::unit(pair, self.big_endian), &mut out);
+        }
+        out
+    }
+
+    /// End of file: a dangling high surrogate or a lone last byte makes the file invalid UTF-16.
+    fn finish(&mut self, out: &mut String) {
+        if self.high.take().is_some() {
+            self.bad(out);
+        }
+        if self.odd.take().is_some() {
+            self.valid = false;
+        }
+    }
+
+    fn unit(&mut self, u: u16, out: &mut String) {
+        match u {
+            0xD800..=0xDBFF => {
+                if self.high.replace(u).is_some() {
+                    self.bad(out);
+                }
+            }
+            0xDC00..=0xDFFF => match self.high.take() {
+                Some(h) => {
+                    let c = 0x10000 + ((u32::from(h) - 0xD800) << 10) + (u32::from(u) - 0xDC00);
+                    self.emit(
+                        char::from_u32(c).unwrap_or(char::REPLACEMENT_CHARACTER),
+                        out,
+                    );
+                }
+                None => self.bad(out),
+            },
+            _ => {
+                if self.high.take().is_some() {
+                    self.bad(out);
+                }
+                self.emit(
+                    char::from_u32(u32::from(u)).unwrap_or(char::REPLACEMENT_CHARACTER),
+                    out,
+                );
+            }
+        }
+    }
+
+    fn bad(&mut self, out: &mut String) {
+        self.valid = false;
+        self.emit(char::REPLACEMENT_CHARACTER, out);
+    }
+
+    fn emit(&mut self, c: char, out: &mut String) {
+        if !std::mem::replace(&mut self.started, true) && c == '\u{feff}' {
+            return;
+        }
+        out.push(c);
+    }
+
+    /// The trailing note naming the encoding, because `edit` and `write` keep it and the model should
+    /// know the bytes on disk are not the UTF-8 it sees.
+    fn note(&self) -> String {
+        let label = encoding::utf16_label(self.big_endian);
+        if self.valid {
+            format!("[{label} file, shown decoded; `edit` and `write` keep its encoding]")
+        } else {
             format!(
                 "[{label} file that is not valid {label}; shown with replacement characters, and \
                  `edit` will refuse it]"
-            ),
-        ),
-    };
-    let body = text.strip_prefix('\u{feff}').unwrap_or(&text);
-    let mut out = read_text_windowed(path, body.as_bytes(), offset, limit)?;
-    out.text.push_str(&note);
-    out.text.push('\n');
-    Ok(out)
+            )
+        }
+    }
 }
 
-/// The blocking text read: open `path`, stream it line-by-line into a bounded `offset`/`limit` window,
-/// and, on truncation, drain the rest to count the file's true total line count. Runs on a
-/// `spawn_blocking` worker (see the call site in [`Read::run`]) since it is synchronous file I/O plus a
-/// potentially long scan of a large/slow file — it must not run inline on an async worker thread.
-fn read_text_windowed(
-    path: &str,
-    bytes: &[u8],
+/// `read`'s `offset`/`limit` window over a file fed to it a chunk at a time, so neither the file's
+/// size nor the offset bounds what can be shown: memory is one line (capped at [`MAX_LINE_BYTES`])
+/// plus the bounded output.
+///
+/// A line is what the old whole-buffer scan counted: bytes up to a `\n`, the `\n` itself dropped, and
+/// an unterminated last line counted too. Lines before the offset are skipped without being stored.
+/// Once the window is full, the rest of the file is only counted, with `memchr`, so the truncation
+/// notice can give the true total.
+struct LineWindow {
     offset: usize,
     limit: usize,
-) -> Result<ToolOutput, ToolError> {
-    // The line loop below still streams — it holds at most one line plus the bounded output window —
-    // but it now streams over bytes already fetched rather than straight off a file handle. That is
-    // what the backend seam costs here: the caller reads up to `MAX_READ_BYTES` first, so a file
-    // larger than that has its line count reported for the prefix rather than the whole file. `read`
-    // truncates its own output far below that ceiling anyway, so a file big enough to hit it is
-    // already being reported as truncated.
-    let mut reader = BufReader::new(std::io::Cursor::new(bytes));
+    out: String,
+    /// Lines completed so far.
+    lineno: usize,
+    shown: usize,
+    /// Set once the window is full: the first line not shown, which is the offset to continue from.
+    continue_at: Option<usize>,
+    /// Bytes fed after the window filled, read only to count lines.
+    counted_bytes: u64,
+    has_invalid_utf8: bool,
+    /// The current line's kept bytes, and whether bytes past [`MAX_LINE_BYTES`] were dropped from it.
+    line: Vec<u8>,
+    line_clipped: bool,
+    /// Whether the current line has any bytes yet; at end of file, such a line still counts.
+    partial: bool,
+}
 
-    // A rough per-line estimate (line-number prefix + a typical source line), capped by the same byte
-    // ceiling the loop below enforces anyway — avoids paying for several `String` grow-and-copy steps
-    // on a large `limit` without ever over-allocating past what the output could actually reach.
-    let mut out = String::with_capacity((limit.saturating_mul(48)).min(MAX_OUTPUT_BYTES));
-    let mut lineno = 0usize;
-    let mut shown = 0usize;
-    let mut truncated = false;
-    let mut has_invalid_utf8 = false;
-    let mut line: Vec<u8> = Vec::new();
-    loop {
-        let (n, line_clipped) = read_line_capped(&mut reader, &mut line, MAX_LINE_BYTES)
-            .map_err(|e| ToolError::Execution(format!("read {path}: {e}")))?;
-        if n == 0 {
-            break; // EOF
+impl LineWindow {
+    fn new(offset: usize, limit: usize) -> Self {
+        Self {
+            offset,
+            limit,
+            // A rough per-line estimate (line-number prefix + a typical source line), capped by the
+            // output budget, so a large `limit` doesn't pay for several grow-and-copy steps.
+            out: String::with_capacity((limit.saturating_mul(48)).min(MAX_OUTPUT_BYTES)),
+            lineno: 0,
+            shown: 0,
+            continue_at: None,
+            counted_bytes: 0,
+            has_invalid_utf8: false,
+            line: Vec::new(),
+            line_clipped: false,
+            partial: false,
         }
-        lineno += 1;
-        if lineno < offset {
-            continue; // skipped lines are still drained, so memory stays bounded
+    }
+
+    fn feed(&mut self, mut bytes: &[u8]) {
+        while !bytes.is_empty() {
+            if self.continue_at.is_some() {
+                self.counted_bytes += bytes.len() as u64;
+                self.lineno += memchr::memchr_iter(b'\n', bytes).count();
+                self.partial = bytes.last() != Some(&b'\n');
+                return;
+            }
+            let (segment, ends_line) = match memchr::memchr(b'\n', bytes) {
+                Some(at) => (&bytes[..at], true),
+                None => (bytes, false),
+            };
+            bytes = &bytes[segment.len() + usize::from(ends_line)..];
+            self.partial |= !segment.is_empty();
+            // A line before the offset is never shown, so none of it is kept.
+            if self.lineno + 1 >= self.offset {
+                let room = MAX_LINE_BYTES.saturating_sub(self.line.len());
+                let take = segment.len().min(room);
+                self.line.extend_from_slice(&segment[..take]);
+                self.line_clipped |= take < segment.len();
+            }
+            if ends_line {
+                self.end_line();
+            }
         }
-        // Stop before showing this line if we've hit the line limit or the byte budget; either way
-        // `lineno` is the first *un*shown line, so it's exactly the offset to continue from.
-        if shown >= limit || out.len() >= MAX_OUTPUT_BYTES {
-            truncated = true;
-            break;
+    }
+
+    fn end_line(&mut self) {
+        self.lineno += 1;
+        self.partial = false;
+        if self.lineno < self.offset {
+            return;
         }
-        // `read_line_capped` already stripped the trailing `\n`; strip a `\r` too. A capped line may
-        // end mid-codepoint, so decode lossily rather than erroring on the split byte.
-        let kept = line.strip_suffix(b"\r").unwrap_or(&line);
+        // Stop before showing this line if the line limit or the byte budget is hit; either way
+        // `lineno` is the first *un*shown line, so it is exactly the offset to continue from.
+        if self.shown >= self.limit || self.out.len() >= MAX_OUTPUT_BYTES {
+            self.continue_at = Some(self.lineno);
+        } else {
+            self.render();
+        }
+        self.line.clear();
+        self.line_clipped = false;
+    }
+
+    fn render(&mut self) {
+        let lineno = self.lineno;
+        // The trailing `\n` is already gone; strip a `\r` too. A capped line may end mid-codepoint,
+        // so decode lossily rather than erroring on the split byte.
+        let kept = self.line.strip_suffix(b"\r").unwrap_or(&self.line);
         let text = match std::str::from_utf8(kept) {
             Ok(s) => std::borrow::Cow::Borrowed(s),
             Err(e) => {
@@ -588,81 +711,89 @@ fn read_text_windowed(
                 // sequence's worth), or the line wasn't clipped at all so there's no cap-related
                 // excuse. `edit` requires strictly valid UTF-8 and will refuse a file flagged here, so
                 // the model needs to know *why* if it later can't edit it.
-                let split_by_our_clip = line_clipped && kept.len() - e.valid_up_to() <= 3;
+                let split_by_our_clip = self.line_clipped && kept.len() - e.valid_up_to() <= 3;
                 if !split_by_our_clip {
-                    has_invalid_utf8 = true;
+                    self.has_invalid_utf8 = true;
                 }
                 String::from_utf8_lossy(kept)
             }
         };
-        // Write straight into `out` instead of allocating a `format!` temp String per line — a
-        // windowed read of a large file did one heap allocation for every line shown. `writeln!` into a
-        // `String` can't fail, so the `Result` is discarded.
-        let _ = if line_clipped {
-            writeln!(out, "{lineno:>6}\t{text}… [line truncated]")
+        // Written straight into `out` rather than through a `format!` temp per line. `writeln!` into
+        // a `String` can't fail, so the `Result` is discarded.
+        let _ = if self.line_clipped {
+            writeln!(self.out, "{lineno:>6}\t{text}… [line truncated]")
         } else {
-            writeln!(out, "{lineno:>6}\t{text}")
+            writeln!(self.out, "{lineno:>6}\t{text}")
         };
-        shown += 1;
+        self.shown += 1;
     }
 
-    if lineno == 0 {
-        return Ok("(empty file)".into());
-    }
-    // An offset past the last line returns nothing useful — say so explicitly rather than handing back
-    // a blank result the model can't interpret.
-    //
-    // `lineno` (and every "N lines total" this tool reports) counts real content lines only, via
-    // `read_line_capped`'s own line-at-a-time scan — a file ending `"a\nb\nc\n"` reports 3, the same as
-    // `"a\nb\nc"` with no trailing newline. This is a deliberate divergence from pi's own `read.ts`,
-    // which counts `textContent.split("\n").length`: in JS, `"a\nb\nc\n".split("\n")` yields 4 elements
-    // (a trailing empty string for the newline), so pi reports one *more* line than the file actually
-    // has whenever it ends with a newline, but the correct count when it doesn't — an inconsistency,
-    // not a convention worth matching. Every other line-oriented tool here (`grep`, editors, `wc -l`)
-    // already treats "N lines" as "N newline-terminated-or-final content lines," so keeping that same,
-    // trailing-newline-independent count is the more correct and more consistent choice, not a parity
-    // gap.
-    if offset > lineno {
-        return Err(ToolError::InvalidInput(format!(
-            "offset {offset} is beyond end of file ({lineno} lines total)"
-        )));
-    }
-    if truncated {
-        let last = offset + shown - 1;
-        // `lineno` right now is the first not-yet-shown line — already consumed from the reader (so
-        // it's exactly the right `offset` to continue from), but not counted towards `shown` or written
-        // to `out`. Save it before the drain below overwrites `lineno` with the file's true total.
-        let continue_offset = lineno;
-        // pi's own truncation message (`read.ts`) includes the file's true total line count ("Showing
-        // lines X-Y of {totalFileLines}"); without it the model has no idea how much more content is
-        // left. We stream and stop at the truncation point by design (see this function's own doc
-        // comment on `MAX_LINE_BYTES`/streaming), so getting that total means reading the rest of the
-        // file here — but only a cheap, bounded byte scan via `read_line_capped`, the same streaming
-        // line counter already used above: no line is stored or decoded, only counted, and reusing it
-        // keeps this total consistent with `lineno`'s own "real content lines" convention (see the
-        // comment above on `offset > lineno`) rather than a raw `\n` byte count that would double-count
-        // that same trailing-newline edge case.
-        loop {
-            let (n, _clipped) = read_line_capped(&mut reader, &mut line, MAX_LINE_BYTES)
-                .map_err(|e| ToolError::Execution(format!("read {path}: {e}")))?;
-            if n == 0 {
-                break; // EOF
+    /// The rendered window. `stopped` is `Some((bytes_read, file_len))` when counting stopped at
+    /// [`MAX_COUNT_BYTES`] before the end of the file, so the total is only a lower bound.
+    fn finish(mut self, stopped: Option<(u64, u64)>) -> Result<ToolOutput, ToolError> {
+        if self.partial && stopped.is_none() {
+            if self.continue_at.is_some() {
+                self.lineno += 1;
+            } else {
+                self.end_line();
             }
-            lineno += 1;
         }
-        out.push_str(&super::output::marker(format_args!(
-            "showing lines {offset}-{last} of {lineno} total; use offset={continue_offset} to continue"
-        )));
-        out.push('\n');
+        let Self {
+            offset,
+            mut out,
+            lineno,
+            shown,
+            continue_at,
+            has_invalid_utf8,
+            ..
+        } = self;
+        if lineno == 0 {
+            return Ok("(empty file)".into());
+        }
+        // An offset past the last line returns nothing useful — say so explicitly rather than handing
+        // back a blank result the model can't interpret. Only reachable once the whole file was read:
+        // counting stops early only after the window is full.
+        //
+        // `lineno` (and every "N lines total" this tool reports) counts real content lines only — a
+        // file ending `"a\nb\nc\n"` reports 3, the same as `"a\nb\nc"` with no trailing newline. This
+        // is a deliberate divergence from pi's own `read.ts`, which counts
+        // `textContent.split("\n").length`: in JS, `"a\nb\nc\n".split("\n")` yields 4 elements (a
+        // trailing empty string for the newline), so pi reports one *more* line than the file actually
+        // has whenever it ends with a newline, but the correct count when it doesn't — an
+        // inconsistency, not a convention worth matching. Every other line-oriented tool here (`grep`,
+        // editors, `wc -l`) already treats "N lines" as "N newline-terminated-or-final content lines".
+        if offset > lineno {
+            return Err(ToolError::InvalidInput(format!(
+                "offset {offset} is beyond end of file ({lineno} lines total)"
+            )));
+        }
+        if let Some(continue_offset) = continue_at {
+            let last = offset + shown - 1;
+            // pi's own truncation message (`read.ts`) includes the file's true total line count
+            // ("Showing lines X-Y of {totalFileLines}"); without it the model has no idea how much
+            // more content is left.
+            let marker = match stopped {
+                None => super::output::marker(format_args!(
+                    "showing lines {offset}-{last} of {lineno} total; use offset={continue_offset} \
+                     to continue"
+                )),
+                Some((read, len)) => super::output::marker(format_args!(
+                    "showing lines {offset}-{last}; the file is {len} bytes and its first {read} \
+                     hold {lineno} lines; use offset={continue_offset} to continue"
+                )),
+            };
+            out.push_str(&marker);
+            out.push('\n');
+        }
+        if has_invalid_utf8 {
+            out.push_str(
+                "… (this file contains bytes that are not valid UTF-8; the text above used lossy \
+                 replacement (\u{FFFD}) for them, so it may not match the file's real bytes, and \
+                 `edit` will refuse to touch this file until that's fixed)\n",
+            );
+        }
+        Ok(out.into())
     }
-    if has_invalid_utf8 {
-        out.push_str(
-            "… (this file contains bytes that are not valid UTF-8; the text above used lossy \
-             replacement (\u{FFFD}) for them, so it may not match the file's real bytes, and `edit` \
-             will refuse to touch this file until that's fixed)\n",
-        );
-    }
-    Ok(out.into())
 }
 
 /// How many leading bytes are read once for magic-byte sniffing and, for a PNG specifically, an
@@ -674,9 +805,8 @@ fn read_text_windowed(
 /// [`is_animated_png`] enough room to actually reach it in practice, matching pi's own budget exactly.
 const SNIFF_LEN: usize = 4100;
 
-/// Ceiling on how many bytes `read` will pull for one call — the whole file for an image, or the
-/// window plus the line-count drain for text. Bounds memory for a pathological input; `read`'s own
-/// output caps bite long before this does.
+/// Ceiling on how many bytes `read` loads for an image, which is decoded whole. Text is streamed
+/// instead (see [`LineWindow`]), so this does not bound which lines of a text file can be read.
 const MAX_READ_BYTES: usize = 64 * 1024 * 1024;
 
 /// The result of sniffing a file's leading bytes.
@@ -1199,6 +1329,80 @@ mod tests {
         let mut f = tempfile::NamedTempFile::new().unwrap();
         f.write_all(contents.as_bytes()).unwrap();
         f
+    }
+
+    /// `bytes` through a [`LineWindow`] in pieces of `split` bytes (`0`: one piece).
+    fn window_in_pieces(bytes: &[u8], split: usize, offset: usize, limit: usize) -> String {
+        let mut w = LineWindow::new(offset, limit);
+        if split == 0 {
+            w.feed(bytes);
+        } else {
+            bytes.chunks(split).for_each(|c| w.feed(c));
+        }
+        match w.finish(None) {
+            Ok(o) => o.text,
+            Err(e) => format!("error: {e}"),
+        }
+    }
+
+    #[test]
+    fn where_the_chunks_split_never_changes_the_window() {
+        // A chunk can end anywhere: mid-line, between `\r` and `\n`, inside a multi-byte character, or
+        // inside a line long enough to be clipped. None of that may show in the output.
+        let long = "é".repeat(MAX_LINE_BYTES);
+        let mut bytes = format!("one\r\n\ntwo\n{long}\nthree\r\n").into_bytes();
+        bytes.extend_from_slice(b"caf\xe9\nlast, unterminated");
+        for (offset, limit) in [(1, 2000), (1, 1), (2, 3), (5, 2), (7, 1), (8, 1)] {
+            let whole = window_in_pieces(&bytes, 0, offset, limit);
+            for split in 1..=9 {
+                assert_eq!(
+                    window_in_pieces(&bytes, split, offset, limit),
+                    whole,
+                    "offset={offset} limit={limit} split={split}"
+                );
+            }
+        }
+        assert!(window_in_pieces(&bytes, 3, 7, 1).contains("7\tlast, unterminated"));
+        assert!(window_in_pieces(&bytes, 3, 8, 1).contains("beyond end of file (7 lines total)"));
+    }
+
+    #[test]
+    fn utf16_decodes_the_same_however_the_chunks_split_it() {
+        for big_endian in [false, true] {
+            let text = "\u{feff}héllo 😀\r\nwörld\n";
+            let bytes = encoding::encode_utf16(text, big_endian);
+            for split in 1..=5 {
+                let mut d = Utf16Stream::new(big_endian);
+                let mut got: String = bytes.chunks(split).map(|c| d.push(c)).collect();
+                d.finish(&mut got);
+                assert_eq!(got, &text[3..], "big_endian={big_endian} split={split}");
+                assert!(d.valid);
+            }
+            // A lone high surrogate, then an odd trailing byte: shown, and flagged.
+            let mut bad = encoding::encode_utf16("a", big_endian);
+            bad.extend_from_slice(&if big_endian {
+                [0xD8, 0x3D]
+            } else {
+                [0x3D, 0xD8]
+            });
+            bad.push(b'x');
+            let mut d = Utf16Stream::new(big_endian);
+            let mut got = d.push(&bad);
+            d.finish(&mut got);
+            assert_eq!(got, "a\u{FFFD}");
+            assert!(!d.valid && d.note().contains("not valid"));
+        }
+    }
+
+    #[test]
+    fn a_line_total_cut_short_by_the_count_budget_is_reported_as_a_lower_bound() {
+        let mut w = LineWindow::new(1, 2);
+        w.feed(b"a\nb\nc\nd\npartial");
+        let out = w.finish(Some((15, 1 << 40))).unwrap().text;
+        assert!(
+            out.contains("showing lines 1-2; the file is 1099511627776 bytes and its first 15 hold 4 lines; use offset=3"),
+            "{out}"
+        );
     }
 
     fn skill_at(dir: &std::path::Path, name: &str) -> crate::skills::Skill {
@@ -3034,7 +3238,7 @@ mod tests {
     #[tokio::test]
     async fn a_character_device_is_rejected_immediately_instead_of_hanging_the_tool_call_forever() {
         // `/dev/zero` streams infinite zero bytes and contains no newline byte at all — `read`'s
-        // line-scanning loop (`read_line_capped`) would spin forever waiting for a `\n` or an EOF that
+        // line-scanning loop (`LineWindow`) would spin forever waiting for a `\n` or an EOF that
         // never comes. Same regression class as the FIFO case above, guarded the same way.
         if !std::path::Path::new("/dev/zero").exists() {
             return; // this environment has no /dev/zero (unusual, but not worth failing the suite over)
