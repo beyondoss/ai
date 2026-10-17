@@ -3390,16 +3390,24 @@ other.
 - **Seeding.** `git worktree add HEAD` checks out HEAD, not the developer's uncommitted work, so
   `Worktree::create` copies the parent's tracked modifications and untracked-but-not-ignored files into
   the worktree and commits them as a throwaway baseline. `child_delta` diffs against that baseline, so
-  the patch is _only_ what the child changed — the parent's own WIP isn't replayed onto it.
+  the patch is _only_ what the child changed — the parent's own WIP isn't replayed onto it. The
+  baseline's id is recorded at creation and the delta is `diff --cached <baseline>`, not `HEAD`: a
+  child that `git commit`s moves `HEAD`, and a delta from there was empty — work dropped, checkout
+  auto-removed. The seed's reads of the parent run `--no-optional-locks` so they never rewrite its index.
   The untracked copy is one batch, never a call per file: one blocking task locally, and in a sandbox
   one fixed `sh` script per argv-sized chunk of paths. Per-file backend calls were four sandbox round
   trips each, so seeding cost grew with the untracked count times the exec latency (`benches/worktree_seed.rs`).
 - **Merge-back.** On child success, `apply_patch` re-checks every path in the diff against the parent's
   `--deny-path` globs (mapped back to the main tree) — `git apply` is not a tool call and never reaches
-  `ToolPolicy`, so this is the only place that check can live — then applies with `git apply --3way`. A
-  clean apply removes the worktree; a conflict leaves markers in the main tree, preserves the worktree,
-  and names it in the tool result for the parent (or the user) to resolve; a policy refusal rejects the
-  whole patch (all-or-nothing).
+  `ToolPolicy`, so this is the only place that check can live — then applies to the parent's **working
+  tree only**: a plain `git apply` first, and when hunks no longer apply as-is, `git apply --3way` against
+  a private temporary index (`GIT_INDEX_FILE` under the git dir, removed afterwards) seeded by
+  `update-index --add --remove` with just the touched paths as the working tree has them. The user's
+  index is never read for the merge or written by it. (`--3way` on the user's index implied `--index`:
+  it refused files edited but not staged — every file our `edit` tool touches — and files not yet added,
+  and on success staged the child's work.) A clean apply removes the worktree; a conflict leaves
+  markers in the main tree, preserves the worktree, and names it in the tool result for the parent (or
+  the user) to resolve; a policy refusal rejects the whole patch (all-or-nothing).
 - **Cleanup.** `Drop` removes a worktree best-effort, but a `process::exit`/SIGKILL runs no destructors,
   so worktrees live under `$XDG_CACHE_HOME/beyond-agent/worktrees/<repo-id>/<pid>-<label>` (on disk, not
   tmpfs — a checkout in RAM would exhaust it) and a startup `sweep` reaps any whose owning PID is gone.
