@@ -642,11 +642,15 @@ mod circuit_breaker {
     /// cache line stays Shared across every worker instead of ping-ponging Modified once per
     /// response. It must therefore cost about the same as `allow_closed`; if it ever measures like a
     /// CAS, the early return has been lost.
+    ///
+    /// A permit is spent by the call, so each iteration gets a fresh one from `with_inputs`, which
+    /// runs outside the timed region: only `record_success_for` is measured.
     #[divan::bench]
     fn record_success_healthy(bencher: Bencher) {
         let cb = breaker();
-        let permit = cb.allow().expect("closed");
-        bencher.bench(|| black_box(&cb).record_success_for(permit));
+        bencher
+            .with_inputs(|| cb.allow().expect("closed"))
+            .bench_local_values(|permit| black_box(&cb).record_success_for(permit));
     }
 }
 

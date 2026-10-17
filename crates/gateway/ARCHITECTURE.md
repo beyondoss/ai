@@ -215,7 +215,7 @@ Client (stock OpenAI/Anthropic SDK)
      Cache hit: same row with `cache_hit` and the stored tokens; no parse, no upstream latency
      Capturing: emit ai.payload (both bodies, truncation + completeness flags), correlated by
        request_id → bounded queue, DROPPED on overflow so a stalled sink can't backpressure
-     Resolve the circuit-breaker permit, only if one is still owed (breaker_pending): 5xx / upstream
+     Resolve the circuit-breaker permit, only if the leg still owes one: 5xx / upstream
        failure → failure; no head and no provider outcome (client abort, stalled upload)
        → permit released (`CircuitBreaker::release`), never a success
      Decrement requests_in_flight gauge; release the tenant slot
@@ -358,8 +358,9 @@ A `200` whose body is an error object (OpenRouter's error-in-200: a root `error`
 candidate's breaker (`settle_health`, at most 1 KiB read): the head already resolved the permit as a
 success, so `settle_health` records the failure the body showed. Without that a host that keeps
 answering errors in 200s would never be routed around, since the pin does not learn from failures.
-The verdict is recorded against the permit the head resolved, never unscoped: a probe that another
-request owns by the time the body is read is not reopened by it (D286).
+The verdict is recorded against the permit the head resolved (`record_success_for` hands it back as
+an `Answered`, spendable once on `record_late_failure`): a probe that another request owns by the
+time the body is read is not reopened by it (D286).
 
 A managed request may also permute that list with headers, still on the same wire, without adding a
 provider the row does not already name (`ProviderSpec::name` on that row). Parsed in `control.rs`,
@@ -2666,9 +2667,10 @@ the rate guardrails (which protect against abusive _inbound_ load):
   (D256), a reclaimed probe that later ended with no outcome released a permit it no longer held,
   so `half_open_permits = 1` ran two probes and the count could drift upward; its late answer also
   closed or reopened the breaker under the live probe. `release` still saturates at
-  `half_open_permits`. Outside HALF_OPEN a permit's outcome counts as any other. An outcome with no
-  permit (`record_success` / `record_failure`, the error found in a 200 body after its head resolved
-  the permit) is never stale.
+  `half_open_permits`. Outside HALF_OPEN a permit's outcome counts as any other. There is no outcome
+  without a permit: a `Permit` is `#[must_use]`, neither `Copy` nor `Clone`, made only by `allow()`,
+  and consumed by `record_success_for`, `record_failure_for` or `release`, so the compiler rules out
+  an attempt resolved twice or never claimed.
 - **A `429` is NOT a failure.** It means the provider is healthy and throttling _that credential_ — a
   velocity/spend signal the rate limiter, the same-provider key walk, and the client's `Retry-After`
   backoff own. Tripping on it would convert a self-healing throttle into a self-inflicted outage. The
@@ -2700,21 +2702,24 @@ the rate guardrails (which protect against abusive _inbound_ load):
   used. One breaker per provider, built at boot, shared lock-free across callers.
 - `circuit_breaker_threshold = 0` disables it.
 
-**The permit ledger.** `RequestCtx::breaker_pending` holds the `Permit` **iff** exactly one
-`allow()` is outstanding against whatever `provider` currently points at. `response_filter` (a
-response head arrived) and `logging` (no head ever did) resolve only when it is set, and `take()` it
-— so one `allow()` yields exactly one `record_*_for` or `release`, and a scarce half-open probe
-permit can neither leak nor be resolved twice.
+**The permit ledger.** A request's `Leg` (`proxy.rs`) is one candidate's share of it: the provider,
+the pool key it sends, its address cursor and refused-stream resend, and the `Permit` it owes, held
+**iff** exactly one `allow()` is outstanding against that provider. `response_filter` (a response
+head arrived) and `logging` (no head ever did) resolve it through the leg, which takes the permit —
+so one `allow()` yields exactly one outcome or release, and a scarce half-open probe permit can
+neither leak nor be resolved twice. A candidate switch builds a new leg, so no key index or permit
+of provider A's reaches provider B; a leg dropped with its permit still out (a panic unwinding the
+request) releases it.
 
 For a provider-routed request that is the old behaviour restated: `allow()` is the last thing in
 `request_filter` (after every other rejection, so a permit corresponds to a real upstream attempt),
-and `breaker_pending` is the permit it returned (`None` when the provider has no breaker).
+and the leg owes the permit it returned (none when the provider has no breaker).
 
 For a **model-routed** request the ledger is owned by `upstream_peer`, which gates each candidate as
 it is chosen and records the outgoing candidate's failure when it moves on. Three reasons it lives
 there and not in `fail_to_connect`:
 
-- `upstream_peer` is the only hook that changes `rc.provider`, which is what makes recording the
+- `upstream_peer` is the only hook that changes `rc.leg`, which is what makes recording the
   wrong candidate structurally impossible.
 - It is the only hook that runs on _every_ attempt. Pingora's default `error_while_proxy` marks a
   reused-connection failure retryable on its own, without consulting `fail_to_connect` at all.

@@ -66,7 +66,7 @@
 
 use crate::cache;
 use crate::capture::CaptureBufs;
-use crate::circuit_breaker::Permit;
+use crate::circuit_breaker::{Answered, CircuitBreaker, Permit};
 use crate::drain::{self, Drain};
 use crate::key::{self, Identity};
 use crate::metrics::{DrainEnd, KeyCooled, Rejection};
@@ -406,12 +406,8 @@ impl Drop for Ctx {
         self.held.release_body();
         // `logging` closes a drain with how it ended; only a panic past it lands here.
         self.held.close_drain(DrainEnd::Error);
-        if let Some(rc) = self.rc.as_mut()
-            && let Some(permit) = rc.breaker_pending.take()
-            && let Some(b) = rc.provider.breaker.as_ref()
-        {
-            b.release(permit);
-        }
+        // An unresolved breaker permit is given back by its `Leg` as the context goes.
+        drop(self.rc.take());
         LIVE_REQUESTS.fetch_sub(1, Ordering::AcqRel);
     }
 }
@@ -422,9 +418,8 @@ pub struct RequestCtx {
     /// Who pays: a verified Beyond identity, or the caller's own provider key.
     billing: Billing,
     dialect: Dialect,
-    /// The resolved upstream provider (authority/host + precomputed managed auth value), shared from
-    /// the boot-time registry — a cheap `Arc` clone, nothing re-allocated per request.
-    provider: Arc<Provider>,
+    /// The provider this attempt goes to, the pool key it sends, and the breaker permit it owes.
+    leg: Leg,
     /// The path (+ query) to send upstream, when it differs from the inbound one: the client path
     /// with the `/{provider}` segment stripped. Forwarded **verbatim** — the gateway does no
     /// per-provider path rewriting. Applied as the upstream URI in `upstream_request_filter`.
@@ -486,13 +481,6 @@ pub struct RequestCtx {
     /// [`crate::deadline::NONE`] when the ceiling is off. A `FullBody` attempt carries its
     /// parent's, so a re-run does not restart the clock.
     deadline: u64,
-    /// Connect-retry counter (see `fail_to_connect`).
-    attempt: u8,
-    /// Index into `provider.pool_auth` of the key used on this attempt. Starts on
-    /// `Provider::first_key` (past keys cooling off from a 401). Advanced on a managed 429 or
-    /// 401 when another unused key remains. Reset to the new provider's first key when
-    /// `provider` changes — never send provider A's key to provider B.
-    pool_key: u8,
     /// The previous attempt was a same-provider key walk. `upstream_peer` must not treat that as a
     /// candidate/breaker failure (a 429 is a healthy throttle) and must not pick a new vendor.
     same_provider_retry: bool,
@@ -500,28 +488,10 @@ pub struct RequestCtx {
     /// response and re-running. It still feeds the breaker; it writes no `ai.usage`
     /// or `ai.payload` row (the attempt that serves does).
     relay_abandoned: bool,
-    /// This attempt is the one resend a refused H2 stream gets on its candidate (D72, D91). A
-    /// second refusal there is a provider failure: fail over, or end the request. Cleared when the
-    /// walk moves to a new candidate.
-    refused_resent: bool,
     /// This attempt's upstream read timeout is the time left before `deadline` (shorter than the
     /// silence bound, see `cap_read_at_deadline`), so a read timeout on it is the deadline passing,
     /// not the provider going quiet.
     read_capped: bool,
-    /// The permit an `allow()` on `provider`'s breaker handed out, while it is outstanding and
-    /// still owes exactly one `record_*_for` or `release`. Resolving with the permit (not just
-    /// "the breaker") is what lets a half-open breaker ignore an attempt whose probe permit it has
-    /// since reclaimed (D256).
-    ///
-    /// The ledger that keeps breaker accounting honest once a request can attempt more than one
-    /// provider. Invariant: `breaker_pending` is `Some` **iff** there is exactly one unresolved
-    /// `allow()` against whatever `provider` currently points at. `logging` records only when it is
-    /// set, so an attempt can never be recorded twice, and a candidate switch resolves the outgoing
-    /// candidate before claiming the next one.
-    ///
-    /// On the `/{provider}/…` path this is the permit `request_filter`'s one `allow()` returned
-    /// (`None` when the provider has no breaker).
-    breaker_pending: Option<Permit>,
     /// Model-routing state — `Some` for `/auto` and for a managed bare `/v1` catalog walk. `None`
     /// keeps every provider-routed request on exactly the code it ran before model routing existed.
     /// See [`ModelRouting`] for why it is boxed rather than inline.
@@ -627,6 +597,77 @@ impl Billing {
             Billing::Managed(m) => Some(m.taps.get_or_insert_with(Box::default)),
             Billing::Byo => None,
         }
+    }
+}
+
+/// One candidate's share of a request: the provider it goes to, the pool key it sends, its connect
+/// bookkeeping, and the breaker permit it owes. A candidate switch builds a new leg, so nothing of
+/// provider A's (its key index, its address cursor, its refused-stream resend, its permit) can
+/// reach provider B.
+///
+/// The permit is the breaker ledger: `Some` iff one `allow()` against `provider` is unresolved.
+/// Every resolution takes it, so an attempt can never be recorded twice; resolving with the permit
+/// (not just "the breaker") lets a half-open breaker ignore an attempt whose probe it has since
+/// reclaimed (D256). A leg dropped with its permit still out (a panic unwinding the request) gives
+/// it back without an outcome, so a half-open breaker's only probe permit is never stranded.
+struct Leg {
+    /// The resolved upstream provider, shared from the boot-time registry: a cheap `Arc` clone,
+    /// nothing re-allocated per request.
+    provider: Arc<Provider>,
+    /// From `allow()` on `provider`'s breaker. `None` once resolved, and when it has no breaker.
+    permit: Option<Permit>,
+    /// Index into `provider.pool_auth` of the key this attempt sends. Starts on
+    /// `Provider::first_key` (past keys cooling off from a 401) unless a `FullBody` re-run resumes
+    /// a key walk; advanced on a managed 429 or 401 when another unused key remains.
+    pool_key: u8,
+    /// Connect-retry counter, and on a catalog walk the index of the candidate's resolved address
+    /// this attempt dials (see `fail_to_connect`).
+    attempt: u8,
+    /// This attempt is the one resend a refused H2 stream gets on its candidate (D72, D91). A
+    /// second refusal there is a provider failure: fail over, or end the request.
+    refused_resent: bool,
+}
+
+impl Leg {
+    fn new(provider: Arc<Provider>, permit: Option<Permit>, pool_key: u8) -> Self {
+        Self {
+            provider,
+            permit,
+            pool_key,
+            attempt: 0,
+            refused_resent: false,
+        }
+    }
+
+    /// The permit, with the breaker it is owed to.
+    fn owed(&mut self) -> Option<(&CircuitBreaker, Permit)> {
+        let permit = self.permit.take()?;
+        Some((self.provider.breaker.as_ref()?, permit))
+    }
+
+    /// The provider answered. The [`Answered`] is for a success its body may still overturn.
+    fn succeed(&mut self) -> Option<Answered> {
+        self.owed().map(|(b, p)| b.record_success_for(p))
+    }
+
+    /// The provider failed this attempt.
+    fn fail(&mut self) {
+        if let Some((b, p)) = self.owed() {
+            b.record_failure_for(p);
+        }
+    }
+
+    /// The attempt ended with no provider outcome (the client left, or the gateway's own doing).
+    fn release(&mut self) {
+        if let Some((b, p)) = self.owed() {
+            b.release(p);
+        }
+    }
+}
+
+impl Drop for Leg {
+    fn drop(&mut self) {
+        self.release();
     }
 }
 
@@ -798,7 +839,11 @@ fn drains_on_cancel(rc: &RequestCtx, status: u16) -> bool {
     rc.managed()
         && rc.streaming
         && (200..300).contains(&status)
-        && rc.provider.id.is_some_and(|id| MAY_CONTINUE.contains(&id))
+        && rc
+            .leg
+            .provider
+            .id
+            .is_some_and(|id| MAY_CONTINUE.contains(&id))
 }
 
 /// The upstream response header carrying the vendor's request id, in the order they are tried.
@@ -1321,9 +1366,9 @@ struct PendingHealth {
     /// The body's first bytes, up to [`HEALTH_PREFIX_CAP`].
     prefix: Vec<u8>,
     /// The breaker permit the head resolved as a success. The body's verdict is recorded against it,
-    /// never unscoped: a permit is copied, so a later failure cannot reopen a probe that another
-    /// request owns by then.
-    permit: Option<Permit>,
+    /// in its own generation, so a later failure cannot reopen a probe that another request owns by
+    /// then.
+    permit: Option<Answered>,
 }
 
 impl PendingHealth {
@@ -2297,11 +2342,11 @@ impl AiProxy {
     fn abandon_402(&self, rc: &RequestCtx, by_status: Option<bool>, status: u16) {
         let cool = match by_status {
             Some(true) => true,
-            Some(false) => rc.provider.strike_unread_402(rc.pool_key),
+            Some(false) => rc.leg.provider.strike_unread_402(rc.leg.pool_key),
             None => false,
         };
         if cool {
-            self.cool_unfunded_key(&rc.request_id, &rc.provider, rc.pool_key, status);
+            self.cool_unfunded_key(&rc.request_id, &rc.leg.provider, rc.leg.pool_key, status);
         }
     }
 
@@ -2321,18 +2366,17 @@ impl AiProxy {
             None if end_of_stream || pending.prefix.len() >= HEALTH_PREFIX_CAP => false,
             None => return,
         };
-        let permit = pending.permit;
-        a.health = None;
+        let permit = a.health.take().and_then(|h| h.permit);
         // The head resolved this attempt's breaker permit as a success (see `response_filter`):
         // only the body shows the provider is broken. Count it as the failure it is, so a host that
         // keeps answering errors in 200s opens its breaker and every walk, session pins included,
         // skips it. The windowed rule trips once failures reach the threshold and match the
         // successes, which one success plus one failure per such answer does.
         if verdict
-            && let Some(b) = rc.provider.breaker.as_ref()
+            && let Some(b) = rc.leg.provider.breaker.as_ref()
             && let Some(permit) = permit
         {
-            b.record_failure_for(permit);
+            b.record_late_failure(permit);
         }
     }
 
@@ -5362,7 +5406,7 @@ impl ProxyHttp for AiProxy {
                 ctx.rc = Some(RequestCtx {
                     billing: Billing::of(identity),
                     dialect,
-                    provider,
+                    leg: Leg::new(provider, None, 0),
                     forward_path,
                     control,
                     model: String::new(),
@@ -5380,13 +5424,9 @@ impl ProxyHttp for AiProxy {
                     upstream_status: Some(hit.status),
                     start,
                     deadline,
-                    attempt: 0,
-                    pool_key: 0,
                     same_provider_retry: false,
                     relay_abandoned: false,
-                    refused_resent: false,
                     read_capped: false,
-                    breaker_pending: None,
                     auto: model_route.map(|route| {
                         Box::new(ModelRouting {
                             route,
@@ -5497,10 +5537,9 @@ impl ProxyHttp for AiProxy {
             ))
             .await;
         }
-        // A permit is now outstanding against this provider (see `RequestCtx::breaker_pending`).
-        // The model-routed path starts owing nothing and takes on its first permit in
-        // `upstream_peer`.
-        let breaker_pending = breaker_permit.ok().flatten();
+        // The leg owes this permit until an outcome or a release resolves it (see `Leg`). A
+        // model-routed request owes none here: it claims each candidate's in `upstream_peer`.
+        let permit = breaker_permit.ok().flatten();
         // Past any key cooling off from a 401 (D71); a catalog walk picks per candidate.
         let pool_key = provider.first_key();
         if tenant_slot {
@@ -5510,7 +5549,7 @@ impl ProxyHttp for AiProxy {
         ctx.rc = Some(RequestCtx {
             billing: Billing::of(identity),
             dialect,
-            provider,
+            leg: Leg::new(provider, permit, pool_key),
             forward_path,
             control,
             model: String::new(),
@@ -5537,13 +5576,9 @@ impl ProxyHttp for AiProxy {
             upstream_status: None,
             start,
             deadline,
-            attempt: 0,
-            pool_key,
             same_provider_retry: false,
             relay_abandoned: false,
-            refused_resent: false,
             read_capped: false,
-            breaker_pending,
             auto: model_route.map(|route| {
                 Box::new(ModelRouting {
                     route,
@@ -5627,13 +5662,17 @@ impl ProxyHttp for AiProxy {
             if let Some(a) = rc.auto.as_mut() {
                 a.attempt_start = Instant::now();
             }
-            let addr = match self.state.resolve(&rc.provider.authority, rc.attempt).await {
+            let addr = match self
+                .state
+                .resolve(&rc.leg.provider.authority, rc.leg.attempt)
+                .await
+            {
                 Ok((a, _)) => a,
                 Err(e) => {
                     warn!(
                         request_id = %rc.request_id,
-                        provider = rc.provider.name.as_str(),
-                        authority = rc.provider.authority.as_str(),
+                        provider = rc.leg.provider.name.as_str(),
+                        authority = rc.leg.provider.authority.as_str(),
                         error = %e,
                         "upstream dns resolution failed",
                     );
@@ -5645,13 +5684,13 @@ impl ProxyHttp for AiProxy {
                 }
             };
             rc.upstream_phase = UpstreamPhase::Attempted;
-            let peer = self.build_peer(addr, &rc.provider, rc.auto.as_ref().map(|a| a.route));
+            let peer = self.build_peer(addr, &rc.leg.provider, rc.auto.as_ref().map(|a| a.route));
             return self.cap_read_at_deadline(rc, peer);
         }
 
         // Model-routed: this hook owns the candidate walk *and* the breaker ledger.
         //
-        // It is the only place `rc.provider` changes, which is what makes double-recording
+        // It is the only place `rc.leg.provider` changes, which is what makes double-recording
         // structurally impossible — and it is the only hook that runs on every attempt, including
         // the ones pingora starts without consulting `fail_to_connect` (its default
         // `error_while_proxy` marks a reused-connection failure retryable on its own). A design that
@@ -5660,11 +5699,7 @@ impl ProxyHttp for AiProxy {
             // Reaching here with a permit outstanding means the previous attempt failed before any
             // response arrived, so the candidate we were on earned the failure. Resolve it before
             // touching anything else; `logging` then only ever sees the final candidate's permit.
-            if let Some(permit) = rc.breaker_pending.take()
-                && let Some(b) = &rc.provider.breaker
-            {
-                b.record_failure_for(permit);
-            }
+            rc.leg.fail();
 
             loop {
                 // Read the cursor out of the boxed state; `rc` stays mutably borrowable below.
@@ -5716,32 +5751,34 @@ impl ProxyHttp for AiProxy {
                 // transition happens *inside* `allow()`, so a `state()`-based pre-check would report
                 // `Open` past the reset timeout, skip a candidate that `allow()` would have admitted
                 // as a probe, and leave the breaker with no way to ever close.
-                let permit = p.breaker.as_ref().map(|b| (b, b.allow()));
-                if let Some((b, Err(_))) = permit {
-                    self.state.metrics.rejection(Rejection::CircuitOpen).inc();
-                    if let Some(a) = rc.auto.as_mut() {
-                        let secs = u16::try_from(b.retry_after_secs()).unwrap_or(u16::MAX);
-                        a.open_retry_after = Some(a.open_retry_after.map_or(secs, |s| s.min(secs)));
-                    }
-                    rc.advance_candidate(i);
-                    continue;
-                }
-                // A permit (if this breaker has one to give) is now outstanding against `p`.
-                rc.breaker_pending = permit.and_then(|(_, r)| r.ok());
-                // New vendor ⇒ that vendor's first key not cooling off (D71). Never carry provider
-                // A's index (or secret) onto provider B. A re-run of a large body resumes the key
-                // walk an earlier attempt started on this candidate (see `FullBody`); one with no
-                // walk starts past the cooling keys like any other request (D83).
-                rc.pool_key = full_body_ctx(session)
+                let permit = match p.breaker.as_ref() {
+                    None => None,
+                    Some(b) => match b.allow() {
+                        Ok(permit) => Some(permit),
+                        Err(_) => {
+                            self.state.metrics.rejection(Rejection::CircuitOpen).inc();
+                            if let Some(a) = rc.auto.as_mut() {
+                                let secs = u16::try_from(b.retry_after_secs()).unwrap_or(u16::MAX);
+                                a.open_retry_after =
+                                    Some(a.open_retry_after.map_or(secs, |s| s.min(secs)));
+                            }
+                            rc.advance_candidate(i);
+                            continue;
+                        }
+                    },
+                };
+                // New vendor ⇒ that vendor's first key not cooling off (D71). A re-run of a large
+                // body resumes the key walk an earlier attempt started on this candidate (see
+                // `FullBody`); one with no walk starts past the cooling keys like any other request
+                // (D83). A new leg starts at the candidate's first address, with its own
+                // refused-stream resend, owing the permit (if this breaker has one to give).
+                let pool_key = full_body_ctx(session)
                     .zip(rc.auto.as_ref().and_then(|a| a.walk.catalog_index(i)))
                     .and_then(|(fb, orig)| fb.keys.get(usize::from(orig)).copied())
                     .filter(|&k| k != NO_KEY_WALK)
                     .unwrap_or_else(|| p.first_key());
-                rc.provider = p.clone();
+                rc.leg = Leg::new(p.clone(), permit, pool_key);
                 apply_serving_candidate(rc);
-                // A new candidate starts at its first address, with its own refused-stream resend.
-                rc.attempt = 0;
-                rc.refused_resent = false;
                 if let Some(a) = rc.auto.as_mut() {
                     a.attempted = true;
                 }
@@ -5778,11 +5815,7 @@ impl ProxyHttp for AiProxy {
                             error = %e,
                             "upstream dns resolution failed; trying the next candidate",
                         );
-                        if let Some(b) = &p.breaker
-                            && let Some(permit) = rc.breaker_pending.take()
-                        {
-                            b.record_failure_for(permit);
-                        }
+                        rc.leg.fail();
                         rc.advance_candidate(i);
                         continue;
                     }
@@ -5795,7 +5828,11 @@ impl ProxyHttp for AiProxy {
         // e2e harness flips `upstream_tls=false` for a plaintext mock).
         // Each connect retry (`fail_to_connect`) takes the next resolved address, so a name whose
         // first address is dead (`localhost` → `::1` first) still connects.
-        let addr = match self.state.resolve(&rc.provider.authority, rc.attempt).await {
+        let addr = match self
+            .state
+            .resolve(&rc.leg.provider.authority, rc.leg.attempt)
+            .await
+        {
             Ok((a, _)) => a,
             Err(e) => {
                 // DNS failures are rare and usually mean a misconfigured `provider_authorities`
@@ -5804,8 +5841,8 @@ impl ProxyHttp for AiProxy {
                 // `error_because` chains `e` as the cause so it shows in the Pingora error log.
                 warn!(
                     request_id = %rc.request_id,
-                    provider = rc.provider.name.as_str(),
-                    authority = rc.provider.authority.as_str(),
+                    provider = rc.leg.provider.name.as_str(),
+                    authority = rc.leg.provider.authority.as_str(),
                     error = %e,
                     "upstream dns resolution failed",
                 );
@@ -5817,7 +5854,7 @@ impl ProxyHttp for AiProxy {
             }
         };
         rc.upstream_phase = UpstreamPhase::Attempted;
-        let peer = self.build_peer(addr, &rc.provider, rc.auto.as_ref().map(|a| a.route));
+        let peer = self.build_peer(addr, &rc.leg.provider, rc.auto.as_ref().map(|a| a.route));
         self.cap_read_at_deadline(rc, peer)
     }
 
@@ -5864,7 +5901,7 @@ impl ProxyHttp for AiProxy {
         let status = upstream_response.status.as_u16();
         // A 2xx says this key's account pays: forget its unread OpenRouter 402s (D261).
         if rc.managed() && (200..300).contains(&status) {
-            rc.provider.key_served(rc.pool_key);
+            rc.leg.provider.key_served(rc.leg.pool_key);
         }
 
         // Managed 401: this pool key is revoked (D71). Never the caller's fault. Cool it off so
@@ -5873,7 +5910,7 @@ impl ProxyHttp for AiProxy {
         let key_auth = rc.managed() && is_pool_key_failure(status);
         if key_auth {
             self.state.metrics.key_cooled(KeyCooled::Revoked);
-            rc.provider.mark_key_bad(rc.pool_key);
+            rc.leg.provider.mark_key_bad(rc.leg.pool_key);
         }
 
         // Managed 429 or 401: walk the next unused key on *this* provider. Not a vendor failover
@@ -5882,20 +5919,20 @@ impl ProxyHttp for AiProxy {
         // the credential before it processed anything, so resending the body under the next key
         // is as safe as after a 429.
         if rc.managed() && (status == 429 || key_auth) {
-            let next = usize::from(rc.pool_key).saturating_add(1);
-            if next < rc.provider.pool_auth.len()
+            let next = usize::from(rc.leg.pool_key).saturating_add(1);
+            if next < rc.leg.provider.pool_auth.len()
                 && let Ok(next) = u8::try_from(next)
             {
                 if body_replayable(session) {
                     self.state.metrics.key_walks_total.inc();
                     warn!(
                         request_id = %rc.request_id,
-                        provider = rc.provider.name.as_str(),
-                        key = rc.pool_key,
+                        provider = rc.leg.provider.name.as_str(),
+                        key = rc.leg.pool_key,
                         status,
                         "upstream returned {status}; trying the next pool key",
                     );
-                    rc.pool_key = next;
+                    rc.leg.pool_key = next;
                     rc.same_provider_retry = true;
                     let mut e =
                         pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(status));
@@ -5912,8 +5949,8 @@ impl ProxyHttp for AiProxy {
                     self.state.metrics.key_walks_total.inc();
                     warn!(
                         request_id = %rc.request_id,
-                        provider = rc.provider.name.as_str(),
-                        key = rc.pool_key,
+                        provider = rc.leg.provider.name.as_str(),
+                        key = rc.leg.pool_key,
                         status,
                         "upstream returned {status}; re-running the full body on the next pool key",
                     );
@@ -5925,7 +5962,7 @@ impl ProxyHttp for AiProxy {
                 }
                 warn!(
                     request_id = %rc.request_id,
-                    provider = rc.provider.name.as_str(),
+                    provider = rc.leg.provider.name.as_str(),
                     status,
                     body_done = session.as_mut().is_body_done(),
                     "upstream returned {status} but the request body is not provably replayable; not walking keys",
@@ -5990,7 +6027,7 @@ impl ProxyHttp for AiProxy {
             self.state.metrics.candidate_failovers_total.inc();
             warn!(
                 request_id = %rc.request_id,
-                provider = rc.provider.name.as_str(),
+                provider = rc.leg.provider.name.as_str(),
                 candidate = at,
                 status,
                 "upstream returned {status}; re-running the full body on the next candidate",
@@ -6006,7 +6043,7 @@ impl ProxyHttp for AiProxy {
             self.state.metrics.failover_unreplayable_total.inc();
             warn!(
                 request_id = %rc.request_id,
-                provider = rc.provider.name.as_str(),
+                provider = rc.leg.provider.name.as_str(),
                 status,
                 body_done = session.as_mut().is_body_done(),
                 "upstream failed but the request body is not provably replayable; relaying the error",
@@ -6017,20 +6054,18 @@ impl ProxyHttp for AiProxy {
         self.state.metrics.candidate_failovers_total.inc();
         warn!(
             request_id = %rc.request_id,
-            provider = rc.provider.name.as_str(),
+            provider = rc.leg.provider.name.as_str(),
             candidate = at,
             status,
             "upstream returned {status}; trying the next candidate",
         );
         // The outgoing candidate's breaker failure is recorded by `upstream_peer`'s prologue, which
-        // still sees `breaker_pending` set. A 5xx is a failure by the breaker's own definition, so
-        // that is the right outcome — and recording it here as well would double-count. A key
-        // failure is not one: resolve its permit as the success it is (the provider answered).
-        if key_failure
-            && let Some(permit) = rc.breaker_pending.take()
-            && let Some(b) = rc.provider.breaker.as_ref()
-        {
-            b.record_success_for(permit);
+        // still sees the leg's permit outstanding. A 5xx is a failure by the breaker's own
+        // definition, so that is the right outcome — and recording it here as well would
+        // double-count. A key failure is not one: resolve its permit as the success it is (the
+        // provider answered).
+        if key_failure {
+            rc.leg.succeed();
         }
         self.abandon_402(rc, unfunded_402, status);
         rc.advance_candidate(at);
@@ -6077,7 +6112,7 @@ impl ProxyHttp for AiProxy {
                 .is_none_or(providers::catalog::serves_eager_input_streaming);
             retain_managed_client_headers(
                 upstream_request,
-                rc.provider.id == Some(ProviderId::Anthropic),
+                rc.leg.provider.id == Some(ProviderId::Anthropic),
                 eager_tool_streaming,
             )?;
             upstream_request.remove_header("authorization");
@@ -6092,17 +6127,17 @@ impl ProxyHttp for AiProxy {
             // `Accept-Encoding` at all, HTTP allows any coding. Managed only; a BYO response is never
             // parsed for billing.
             upstream_request.insert_header("accept-encoding", "identity")?;
-            if let Some(auth) = rc.provider.pool_auth.get(usize::from(rc.pool_key)) {
+            if let Some(auth) = rc.leg.provider.pool_auth.get(usize::from(rc.leg.pool_key)) {
                 // Clone the boot-built `HeaderValue` (a refcount bump) rather than re-validating and
                 // re-copying the key out of a `&str` on every managed request. The `&str` path is
                 // kept as a fallback for a key that isn't a legal header value, which could never
                 // have worked anyway — see `PoolAuth`.
                 match &auth.header {
                     Some(hv) => {
-                        upstream_request.insert_header(rc.provider.auth.header(), hv.clone())?
+                        upstream_request.insert_header(rc.leg.provider.auth.header(), hv.clone())?
                     }
                     None => upstream_request
-                        .insert_header(rc.provider.auth.header(), auth.value.expose())?,
+                        .insert_header(rc.leg.provider.auth.header(), auth.value.expose())?,
                 }
             }
         }
@@ -6117,14 +6152,14 @@ impl ProxyHttp for AiProxy {
         strip_beyond_headers(upstream_request);
 
         // Point Host at the upstream. Same precomputed-value trick as the pool key above.
-        match &rc.provider.host_header {
+        match &rc.leg.provider.host_header {
             Some(hv) => upstream_request.insert_header("host", hv.clone())?,
-            None => upstream_request.insert_header("host", rc.provider.host.as_str())?,
+            None => upstream_request.insert_header("host", rc.leg.provider.host.as_str())?,
         }
 
         // Dashboard-attribution headers (OpenRouter, managed traffic only — Task #22, see
         // `apply_provider_attribution`).
-        apply_provider_attribution(upstream_request, rc.provider.id, rc.managed())?;
+        apply_provider_attribution(upstream_request, rc.leg.provider.id, rc.managed())?;
 
         // A stock OpenAI SDK does not send `anthropic-version`. Anthropic (and Bedrock Messages)
         // require it; inject the current version when we translated Chat Completions or Responses
@@ -6624,10 +6659,24 @@ impl ProxyHttp for AiProxy {
             // Per-provider response counter, bucketed by status class — the signal that a provider
             // is degrading (429/5xx) before it shows up only as latency or a missing usage event.
             let status = upstream_response.status.as_u16();
-            rc.provider
+            rc.leg
+                .provider
                 .metrics
                 .ttft_seconds
                 .observe(rc.attempt_start().elapsed().as_secs_f64());
+            rc.leg.provider.metrics.record_response(status);
+            rc.upstream_status = Some(status);
+            // Resolve the breaker permit here, at the head, not at the end of the body: the head
+            // is the provider's answer (a 5xx is broken, anything else is reachable), and a
+            // half-open probe resolved only at end of stream let one long or stalled stream 503
+            // the provider for everyone until it ended. `logging` resolves only the attempts that
+            // never got a head.
+            let answered = if status >= 500 {
+                rc.leg.fail();
+                None
+            } else {
+                rc.leg.succeed()
+            };
             // A 2xx is not yet known to be healthy: a provider can answer 200 with an error body
             // (OpenRouter's error-in-200, an SSE stream whose first event is an error), so its
             // breaker verdict waits for the body's first bytes (`response_body_filter`).
@@ -6636,24 +6685,8 @@ impl ProxyHttp for AiProxy {
             {
                 a.health = Some(PendingHealth {
                     prefix: Vec::new(),
-                    permit: rc.breaker_pending,
+                    permit: answered,
                 });
-            }
-            rc.provider.metrics.record_response(status);
-            rc.upstream_status = Some(status);
-            // Resolve the breaker permit here, at the head, not at the end of the body: the head
-            // is the provider's answer (a 5xx is broken, anything else is reachable), and a
-            // half-open probe resolved only at end of stream let one long or stalled stream 503
-            // the provider for everyone until it ended. `logging` resolves only the attempts that
-            // never got a head.
-            if let Some(permit) = rc.breaker_pending.take()
-                && let Some(b) = rc.provider.breaker.as_ref()
-            {
-                if status >= 500 {
-                    b.record_failure_for(permit);
-                } else {
-                    b.record_success_for(permit);
-                }
             }
 
             // Derive streaming from the response, not the request: SSE ⇒ use the streaming usage
@@ -6708,9 +6741,10 @@ impl ProxyHttp for AiProxy {
             rc.redact = None;
             if rc.managed()
                 && let Some(finder) = rc
+                    .leg
                     .provider
                     .pool_auth
-                    .get(usize::from(rc.pool_key))
+                    .get(usize::from(rc.leg.pool_key))
                     .map(route::PoolAuth::finder)
                     .filter(|f| !f.needle().is_empty())
             {
@@ -6742,9 +6776,10 @@ impl ProxyHttp for AiProxy {
                     }
                 }
                 let keyed = rc
+                    .leg
                     .provider
                     .pool_auth
-                    .get(usize::from(rc.pool_key))
+                    .get(usize::from(rc.leg.pool_key))
                     .is_some_and(|a| !a.finder().needle().is_empty());
                 if whole || keyed {
                     rc.redact = Some(Box::new(Redact {
@@ -6759,7 +6794,7 @@ impl ProxyHttp for AiProxy {
             // and land on this request's log line. `insert_header` only fails on an invalid value;
             // our id is `[0-9a-f-]`, always valid — but surface a failure rather than silently drop.
             upstream_response.insert_header(REQUEST_ID_HEADER, rc.request_id.as_str())?;
-            if let Some(hv) = rc.provider.name_header.as_ref() {
+            if let Some(hv) = rc.leg.provider.name_header.as_ref() {
                 upstream_response.insert_header(PROVIDER_HEADER, hv.clone())?;
             }
             if let Some(c) = rc.auto.as_ref().and_then(|a| a.candidate_at(a.candidate)) {
@@ -6856,9 +6891,10 @@ impl ProxyHttp for AiProxy {
         // holds the pool key (D66).
         if let Some(r) = rc.redact.as_mut() {
             let keys = rc
+                .leg
                 .provider
                 .pool_auth
-                .get(usize::from(rc.pool_key))
+                .get(usize::from(rc.leg.pool_key))
                 .map_or(&[][..], route::PoolAuth::finders);
             *body = r.feed(keys, body.take(), end_of_stream);
         }
@@ -7124,18 +7160,18 @@ impl ProxyHttp for AiProxy {
         // that one counts. Each drain resend needs a live connection that served before, and
         // pingora's retry limit bounds them all.
         let drained = refused && client_reused && upstream_goaway(&e);
-        let resend_refused = refused && (drained || !rc.refused_resent);
+        let resend_refused = refused && (drained || !rc.leg.refused_resent);
         if resend_refused {
             warn!(
                 request_id = %rc.request_id,
-                provider = rc.provider.name.as_str(),
+                provider = rc.leg.provider.name.as_str(),
                 error = %e,
                 "upstream refused the stream unprocessed (GOAWAY / REFUSED_STREAM); resending once",
             );
         } else if refused {
             warn!(
                 request_id = %rc.request_id,
-                provider = rc.provider.name.as_str(),
+                provider = rc.leg.provider.name.as_str(),
                 error = %e,
                 "upstream refused the stream again; treating it as a provider failure",
             );
@@ -7161,11 +7197,8 @@ impl ProxyHttp for AiProxy {
                 // A same-candidate retry is the connection's fault (or a stream refused before
                 // any processing), not the provider's: give the permit back without an outcome,
                 // as a small body keeps it for its own same-candidate retry.
-                if retry == Some(RelayRetry::Reset(orig))
-                    && let Some(permit) = rc.breaker_pending.take()
-                    && let Some(b) = rc.provider.breaker.as_ref()
-                {
-                    b.release(permit);
+                if retry == Some(RelayRetry::Reset(orig)) {
+                    rc.leg.release();
                 }
                 if let Some(retry) = retry {
                     rc.relay_abandoned = fb.record(retry);
@@ -7183,7 +7216,7 @@ impl ProxyHttp for AiProxy {
             // candidate again on a fresh one, keeping its breaker permit (it was the connection,
             // not the provider).
             Some(_) if resend_refused || (client_reused && !refused) => {
-                rc.refused_resent |= refused && !drained;
+                rc.leg.refused_resent |= refused && !drained;
                 rc.same_provider_retry = true;
                 e.set_retry(true);
             }
@@ -7197,7 +7230,7 @@ impl ProxyHttp for AiProxy {
             // again, the error stands (`logging` records it against the breaker). Otherwise
             // pingora's rule: a reused connection is retried once.
             None if resend_refused => {
-                rc.refused_resent |= !drained;
+                rc.leg.refused_resent |= !drained;
                 e.set_retry(true);
             }
             None if refused => e.set_retry(false),
@@ -7343,15 +7376,15 @@ impl ProxyHttp for AiProxy {
                 // This candidate resolved to more than one address and an untried one remains:
                 // try it before giving up on the candidate. Same provider, same breaker permit
                 // (one address refusing is not the provider failing).
-                if rc.attempt.saturating_add(1) < addrs {
-                    rc.attempt += 1;
+                if rc.leg.attempt.saturating_add(1) < addrs {
+                    rc.leg.attempt += 1;
                     rc.same_provider_retry = true;
-                    rc.provider.metrics.connect_retries_total.inc();
+                    rc.leg.provider.metrics.connect_retries_total.inc();
                     warn!(
                         request_id = %rc.request_id,
-                        provider = rc.provider.name.as_str(),
+                        provider = rc.leg.provider.name.as_str(),
                         candidate = at,
-                        address = rc.attempt,
+                        address = rc.leg.attempt,
                         error = %e,
                         "upstream connect failed; trying the candidate's next address",
                     );
@@ -7363,10 +7396,10 @@ impl ProxyHttp for AiProxy {
                 // next candidate, since `logging` would then also resolve the still-pending permit —
                 // which would trip the breaker at half its configured threshold on the last
                 // candidate, exactly where everything lands once the primaries are sick.
-                rc.provider.metrics.connect_retries_total.inc();
+                rc.leg.provider.metrics.connect_retries_total.inc();
                 warn!(
                     request_id = %rc.request_id,
-                    provider = rc.provider.name.as_str(),
+                    provider = rc.leg.provider.name.as_str(),
                     candidate = at,
                     error = %e,
                     "upstream connect failed; trying the next candidate",
@@ -7382,17 +7415,17 @@ impl ProxyHttp for AiProxy {
                 return e;
             }
             // Retry transient connect failures a couple of times (Pingora re-invokes upstream_peer).
-            if rc.attempt < MAX_CONNECT_RETRIES {
-                rc.attempt += 1;
+            if rc.leg.attempt < MAX_CONNECT_RETRIES {
+                rc.leg.attempt += 1;
                 // Surface the retry. Without this, a partially-down provider TCP layer (or an
                 // egress-IP ban — connect is where that first bites) shows up only as extra latency
                 // on `upstream_latency_seconds`, indistinguishable from a slow model. The counter is
                 // the dashboard signal; the `warn!` carries the request_id to grep.
-                rc.provider.metrics.connect_retries_total.inc();
+                rc.leg.provider.metrics.connect_retries_total.inc();
                 warn!(
                     request_id = %rc.request_id,
-                    provider = rc.provider.name.as_str(),
-                    attempt = rc.attempt,
+                    provider = rc.leg.provider.name.as_str(),
+                    attempt = rc.leg.attempt,
                     error = %e,
                     "upstream connect failed; retrying",
                 );
@@ -7438,7 +7471,7 @@ impl ProxyHttp for AiProxy {
                 request_id = %rc.request_id,
                 tenant_id = rc.billing.identity().map_or(0, |id| id.tenant_id),
                 vpc_id = rc.billing.identity().map_or(0, |id| id.vpc_id),
-                provider = rc.provider.name.as_str(),
+                provider = rc.leg.provider.name.as_str(),
                 error = %e,
                 "upstream request errored",
             );
@@ -7446,26 +7479,26 @@ impl ProxyHttp for AiProxy {
 
         // Resolve the outstanding circuit-breaker permit, if this request still owes one.
         //
-        // `breaker_pending` is the ledger (see `RequestCtx::breaker_pending`): it holds the permit
-        // from when it is claimed until it is taken to resolve it, so exactly one `record_*_for`
-        // lands per `allow()`. On the model-routed path a candidate switch resolves the outgoing
-        // candidate in `upstream_peer` and takes the permit there, which is what stops this from double-recording
-        // against whichever candidate happened to be current at the end.
+        // The leg is the ledger (see `Leg`): it holds the permit from when it is claimed until it
+        // is taken to resolve it, so exactly one outcome lands per `allow()`. On the model-routed
+        // path a candidate switch resolves the outgoing candidate's leg in `upstream_peer`, which
+        // is what stops this from double-recording against whichever candidate happened to be
+        // current at the end.
         //
         // Failure = the provider is *broken*: a 5xx response, or no response at all paired with an
         // upstream error (connect/read failure). Success = the provider *answered* — 2xx/3xx, and
         // deliberately **4xx/429 too**: a 429 is a healthy provider throttling our pool key, which the
         // rate limiter and the client's `Retry-After` own, NOT a reason to cut all traffic to it.
-        if let Some(breaker) = rc.provider.breaker.as_ref()
-            && let Some(permit) = rc.breaker_pending.take()
-        {
+        if rc.leg.permit.is_some() {
             match rc.upstream_status {
                 // Defensive only, so its mutants are equivalent (excluded in .cargo/mutants.toml):
                 // `response_filter` sets `upstream_status` and takes the permit in the same step,
                 // and nothing else sets it on a request that holds a permit (a cache hit never
                 // claims one), so a pending permit here always comes with `None`.
-                Some(s) if s >= 500 => breaker.record_failure_for(permit),
-                Some(_) => breaker.record_success_for(permit),
+                Some(s) if s >= 500 => rc.leg.fail(),
+                Some(_) => {
+                    rc.leg.succeed();
+                }
                 // No response head arrived. Blame the provider only when the failure actually came
                 // *from* upstream. Pingora tags a client-side abort `ErrorSource::Downstream` (the
                 // `into_down()` at proxy_h1.rs's downstream read/write sites), and a user hitting
@@ -7480,14 +7513,14 @@ impl ProxyHttp for AiProxy {
                 // on *our* bytes, so its read timeout or reset says the client stalled, not that
                 // the provider is sick. A connect failure moved no body byte, so it still counts.
                 None if is_upstream_failure(e) && !client_still_uploading(session, rc) => {
-                    breaker.record_failure_for(permit);
+                    rc.leg.fail();
                 }
                 // Client went away, its upload stalled, or the request ended with no error at all:
                 // no provider outcome. Give the permit back without one (D86). A success here closed
                 // a half-open breaker on a probe that never heard from the provider, letting every
                 // caller flood one that may still be broken; `release` returns the probe permit so
                 // the next request probes instead.
-                None => breaker.release(permit),
+                None => rc.leg.release(),
             }
         }
 
@@ -7542,7 +7575,7 @@ impl ProxyHttp for AiProxy {
             // This request already answered; it does not walk.
             if managed && rc.upstream_status == Some(403) && body_names_the_key(tail) {
                 self.state.metrics.key_cooled(KeyCooled::KeyNamed403);
-                rc.provider.mark_key_bad(rc.pool_key);
+                rc.leg.provider.mark_key_bad(rc.leg.pool_key);
             }
             // A relayed managed error that says the account is out of credit or quota (Anthropic's
             // credit-balance 400, OpenAI's insufficient_quota 429: read from the body by `Redact`)
@@ -7553,7 +7586,7 @@ impl ProxyHttp for AiProxy {
             // the parent's drop, and a walk's 402 was already judged at the head (D258).
             if managed && !rc.relay_abandoned && rc.redact.as_ref().is_some_and(|r| r.unfunded) {
                 let status = rc.upstream_status.unwrap_or(0);
-                self.cool_unfunded_key(&rc.request_id, &rc.provider, rc.pool_key, status);
+                self.cool_unfunded_key(&rc.request_id, &rc.leg.provider, rc.leg.pool_key, status);
             }
             // Extract usage facts (shape depends on dialect + streaming). Every case reads the tail;
             // Anthropic streaming *additionally* reads the head, because that's where `message_start`
@@ -7664,7 +7697,7 @@ impl ProxyHttp for AiProxy {
             warn!(
                 request_id = %rc.request_id,
                 tenant_id = id.tenant_id,
-                provider = rc.provider.name.as_str(),
+                provider = rc.leg.provider.name.as_str(),
                 dialect = ?rc.dialect,
                 stream = rc.streaming,
                 status = s,
@@ -7714,7 +7747,8 @@ impl ProxyHttp for AiProxy {
         // request and could never be reconciled against each other.
         let elapsed = rc.start.elapsed();
         if cache_hit.is_none() {
-            rc.provider
+            rc.leg
+                .provider
                 .metrics
                 .upstream_latency_seconds
                 .observe(elapsed.as_secs_f64());
@@ -7797,13 +7831,12 @@ impl ProxyHttp for AiProxy {
             // The catalog row to price this row at. A model-routed row already names it; a
             // provider-routed one resolves it from what the provider echoed or the client asked for.
             let price_model = routed_model.or_else(|| price_model(billed_model, requested_model));
-            // Absent when no provider was called (every candidate's breaker open): `rc.provider`
+            // Absent when no provider was called (every candidate's breaker open): `rc.leg.provider`
             // is then just the walk's seed, and naming it would bill a call that never happened.
             let usage_provider = match cache_hit.as_ref() {
                 Some(h) => Some(h.provider.as_ref()),
-                None => {
-                    (rc.upstream_phase != UpstreamPhase::None).then_some(rc.provider.name.as_str())
-                }
+                None => (rc.upstream_phase != UpstreamPhase::None)
+                    .then_some(rc.leg.provider.name.as_str()),
             };
             let outcome = outcome(rc, e, cache_hit.is_some(), client_left);
             let usage_stream = cache_hit
@@ -7821,7 +7854,7 @@ impl ProxyHttp for AiProxy {
                 })
                 .filter(|m| !m.is_empty())
                 .map(|m| sanitize_model(m.to_owned()));
-            let upstream_host = called.then_some(rc.provider.host.as_str());
+            let upstream_host = called.then_some(rc.leg.provider.host.as_str());
             let upstream_path = called.then(|| {
                 let p = rc
                     .forward_path
@@ -8007,7 +8040,7 @@ impl ProxyHttp for AiProxy {
                     target: "ai.payload",
                     request_id = %rc.request_id,
                     tenant_id = id.tenant_id,
-                    provider = rc.provider.name.as_str(),
+                    provider = rc.leg.provider.name.as_str(),
                     model = billed_model,
                     stream = rc.streaming,
                     status = rc.upstream_status,
@@ -8051,7 +8084,7 @@ impl ProxyHttp for AiProxy {
                         billed_model: billed_model.to_owned().into_boxed_str(),
                         requested_model: requested_model.to_owned().into_boxed_str(),
                         routed_model,
-                        provider: rc.provider.name.clone().into_boxed_str(),
+                        provider: rc.leg.provider.name.clone().into_boxed_str(),
                         streaming: rc.streaming,
                     },
                 );
@@ -8159,7 +8192,7 @@ mod tests {
         RequestCtx {
             billing: Billing::of(Some(Identity::unverified_for_test(42, 7, None))),
             dialect: Dialect::OpenAi,
-            provider: Arc::new(provider),
+            leg: Leg::new(Arc::new(provider), None, 0),
             forward_path: None,
             model: String::new(),
             model_scanner: peek::ModelScanner::new(),
@@ -8174,13 +8207,9 @@ mod tests {
             req_buf: Vec::new(),
             start: Instant::now(),
             deadline: crate::deadline::NONE,
-            attempt: 0,
-            pool_key: 0,
             same_provider_retry: false,
             relay_abandoned: false,
-            refused_resent: false,
             read_capped: false,
-            breaker_pending: None,
             auto: None,
             control: None,
             request_id: RequestId::new(),
@@ -8324,7 +8353,7 @@ mod tests {
         );
         // This request was admitted while the breaker was closed, and its head was a 200.
         let admitted = breaker.allow().expect("a closed breaker admits");
-        breaker.record_success_for(admitted);
+        let admitted = breaker.record_success_for(admitted);
         // Another request trips the breaker; after the reset timeout its probe owns the breaker.
         let trip = breaker.allow().expect("a closed breaker admits");
         breaker.record_failure_for(trip);
@@ -8332,7 +8361,7 @@ mod tests {
         let _probe = breaker.allow().expect("the reset timeout admits one probe");
 
         let mut rc = test_ctx(true);
-        rc.provider = Arc::new(Provider::resolve(
+        rc.leg.provider = Arc::new(Provider::resolve(
             "openai",
             "api.openai.com:443".to_string(),
             Dialect::OpenAi,
@@ -8374,7 +8403,7 @@ mod tests {
 
         assert!(
             matches!(
-                rc.provider.breaker.as_ref().unwrap().state(),
+                rc.leg.provider.breaker.as_ref().unwrap().state(),
                 crate::circuit_breaker::CircuitState::HalfOpen { .. }
             ),
             "a late body verdict reopened a breaker owned by another request's probe"
