@@ -4474,6 +4474,9 @@ pub(crate) async fn serve_session(
             let mut compact_abort_acks: Vec<Option<String>> = Vec::new();
             let result = {
                 let compaction_cancel = CancellationToken::new();
+                // No usage reaches a compaction's sink, so no pressure point applies.
+                let manual_steers =
+                    crate::memory::SessionSteers::new(session_memory_active, u32::MAX);
                 let mut on_event = |ev: AgentEvent| {
                         if let AgentEvent::Compacted {
                             tokens_before,
@@ -4487,16 +4490,11 @@ pub(crate) async fn serve_session(
                             compacted_summary = Some(summary.clone());
                             compacted_tokens_after = Some(*tokens_after);
                             compacted_first_kept = Some(*first_kept);
-                            // Same active nudge as the auto-compaction path in the `prompt` run observer:
-                            // a manual `compact` also folds specifics into a lossy summary, so steer the
-                            // model to read back its `/session` working memory on its next turn.
-                            if session_memory_active {
-                                steering.push_steer(agent_core::SteeringMessage::new(
-                                    crate::memory::COMPACTION_REMINDER.to_string(),
-                                    Vec::new(),
-                                ));
-                            }
                         }
+                        // The shared steer observer, as in the `prompt` run: a manual `compact` also
+                        // folds specifics into a lossy summary, so the model is steered to read back its
+                        // `/session` working memory on its next turn.
+                        manual_steers.observe(&ev, &steering);
                         if let Some(frame) = event_frame(ev) {
                             let _ = tx.send(frame);
                         }
@@ -5053,13 +5051,14 @@ pub(crate) async fn serve_session(
                 // run from the idle main loop, which processes one command to completion before reading
                 // the next — no concurrent `get_state` could ever observe them in flight anyway.
                 let is_compacting = Arc::new(std::sync::atomic::AtomicBool::new(false));
-                // Whether the pre-compaction pressure nudge is still eligible to fire this fill cycle.
-                // Disarmed the first time the live prompt crosses `compaction_pressure_point`, so the model
-                // is warned to checkpoint to `/session` at most once per cycle; re-armed on each
-                // `Compacted` (the context just dropped, so a later re-fill should warn again). Declared
-                // here (per prompt-run, fresh-armed) so it survives the per-retry-attempt observer rebuild
-                // below. See `crate::memory::PRESSURE_NUDGE`.
-                let pressure_armed = Arc::new(std::sync::atomic::AtomicBool::new(true));
+                // The `/session` steers (pressure nudge, compaction reminder) — the observer `run`
+                // shares, see `crate::memory::SessionSteers`. Declared here (per prompt-run) so its
+                // once-per-fill-cycle nudge state survives the per-retry-attempt observer rebuild below;
+                // the pressure point is re-pointed per attempt (a `set_model` changes the trigger).
+                let session_steers = Arc::new(crate::memory::SessionSteers::new(
+                    session_memory_active,
+                    u32::MAX,
+                ));
 
                 // Start recording this run's frames for mid-turn replay (see `OutFanout::turn`). Here,
                 // outside the auto-retry loop below, so one recording spans the whole `prompt`: a client
@@ -5148,13 +5147,13 @@ pub(crate) async fn serve_session(
                     // A clone for the observer to push the compaction reminder + pressure nudge through —
                     // consumed by this attempt's `move` closure, so re-cloned per attempt.
                     let steer_on_compact = steering.clone();
-                    let pressure_armed_sink = pressure_armed.clone();
+                    let session_steers_sink = session_steers.clone();
                     // The live-prompt size at which to warn of an approaching compaction, against the
                     // *current* model (a `set_model` mid-session changes it): the same trigger
                     // `build_agent` hands this session's `Agent`.
-                    let pressure_point = crate::memory::compaction_pressure_point(
+                    session_steers.set_pressure_point(crate::memory::compaction_pressure_point(
                         compaction_config(&cfg, &current_model).trigger_tokens(),
-                    );
+                    ));
 
                     // Mark this session busy for the reaper's benefit (daemon mode). Already set at
                     // the ack above; re-asserted here so a retry attempt is still protected if anything
@@ -5190,21 +5189,9 @@ pub(crate) async fn serve_session(
                                 matches!(ev, AgentEvent::CompactionStart { .. }),
                                 Ordering::Relaxed,
                             );
-                            if let AgentEvent::Compacted { .. } = ev {
-                                // The context just dropped — re-arm the pressure nudge for the next
-                                // fill cycle.
-                                pressure_armed_sink.store(true, Ordering::Relaxed);
-                                // Actively nudge the model to read back its `/session` working memory
-                                // now that the raw transcript is a lossy summary. Rides the next
-                                // post-compaction request as a mid-run steer. Once per compaction (the
-                                // event fires once); skipped when no session mount is active.
-                                if session_memory_active {
-                                    steer_on_compact.push_steer(agent_core::SteeringMessage::new(
-                                        crate::memory::COMPACTION_REMINDER.to_string(),
-                                        Vec::new(),
-                                    ));
-                                }
-                            }
+                            // The `/session` steers: the nudge before a compaction, the recall
+                            // reminder after one.
+                            session_steers_sink.observe(&ev, &steer_on_compact);
                             if let AgentEvent::TurnEnd { stop_reason, step } = &ev {
                                 refused_sink
                                     .store(*stop_reason == StopReason::Refusal, Ordering::Relaxed);
@@ -5218,22 +5205,6 @@ pub(crate) async fn serve_session(
                             }
                             if let AgentEvent::Stream(StreamEvent::Usage(usage)) = &ev {
                                 live_stats_sink.record_usage(usage);
-                                // Pre-compaction pressure: the first time this fill cycle's live prompt
-                                // crosses the pressure point, warn the model to checkpoint to
-                                // `/session` while it still has full detail — before the cut, not after
-                                // (that's `COMPACTION_REMINDER`'s job). `swap` only runs when actually
-                                // over the point, so below it the flag stays armed; disarmed on fire,
-                                // re-armed on `Compacted`. Skipped without a session mount (nowhere to
-                                // checkpoint).
-                                if session_memory_active
-                                    && crate::memory::live_prompt_tokens(usage) > pressure_point
-                                    && pressure_armed_sink.swap(false, Ordering::Relaxed)
-                                {
-                                    steer_on_compact.push_steer(agent_core::SteeringMessage::new(
-                                        crate::memory::PRESSURE_NUDGE.to_string(),
-                                        Vec::new(),
-                                    ));
-                                }
                             }
                             // B-L1: mirrors the same events into `pending_tool_ids`, so `get_state`
                             // can answer "which calls are still running" mid-turn — see that

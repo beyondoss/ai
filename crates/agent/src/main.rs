@@ -3851,6 +3851,10 @@ async fn run_turn(
 ) -> agent_core::Result<agent_core::StopReason> {
     let mut attempt = 0u32;
     let mut text = TextOut::new(std::io::stdout().is_terminal());
+    // One observer for the whole prompt, retries included: a whole-run retry is the same fill cycle,
+    // so the pressure nudge must not re-arm across it (`serve` holds its observer the same way).
+    let session_steers =
+        beyond_ai_agent::memory::SessionSteers::new(session_memory_active, pressure_point);
     loop {
         if let Some(life) = life {
             life.set_attempt(attempt);
@@ -3864,8 +3868,7 @@ async fn run_turn(
             cancel,
             broken_pipe,
             steering,
-            session_memory_active,
-            pressure_point,
+            &session_steers,
             life,
             heartbeat,
         )
@@ -4036,21 +4039,12 @@ async fn run_turn_once(
     cancel: &agent_core::CancellationToken,
     broken_pipe: &AtomicBool,
     steering: &agent_core::Steering,
-    // Whether a `/session` working-memory mount is active — gates both the pre-compaction pressure nudge
-    // and the post-compaction recall reminder, mirroring `serve`'s own observer. See
-    // `beyond_ai_agent::memory`.
-    session_memory_active: bool,
-    // The live-prompt size at which to warn of an approaching compaction
-    // (`memory::compaction_pressure_point`), fixed for the run (`run`'s model can't change mid-run).
-    pressure_point: u32,
+    // The `/session` steers (pressure nudge, compaction reminder) — the observer `serve` shares. See
+    // `beyond_ai_agent::memory::SessionSteers`.
+    session_steers: &beyond_ai_agent::memory::SessionSteers,
     life: Option<&std::sync::Arc<beyond_ai_agent::lifecycle::Run>>,
     heartbeat_every: std::time::Duration,
 ) -> agent_core::Result<agent_core::StopReason> {
-    // Two `/session` steers, mirroring `serve`'s observer: a *pre*-compaction pressure nudge (checkpoint
-    // now, while detail is intact) fired at most once per fill cycle, and a *post*-compaction recall
-    // reminder (read it back) fired on the cut. `pressure_armed` disarms on the pressure fire and re-arms
-    // on `Compacted`. Both are no-ops without a session mount.
-    let pressure_armed = std::sync::atomic::AtomicBool::new(true);
     let session_steers = |ev: &agent_core::AgentEvent| {
         if let Some(journal) = RUN_JOURNAL.get() {
             journal.observe(ev);
@@ -4058,29 +4052,7 @@ async fn run_turn_once(
         if let agent_core::AgentEvent::WrapUp { .. } = ev {
             RUN_WRAPPED_UP.store(true, Ordering::Relaxed);
         }
-        if !session_memory_active {
-            return;
-        }
-        match ev {
-            agent_core::AgentEvent::Compacted { .. } => {
-                pressure_armed.store(true, std::sync::atomic::Ordering::Relaxed);
-                steering.push_steer(agent_core::SteeringMessage::new(
-                    beyond_ai_agent::memory::COMPACTION_REMINDER.to_string(),
-                    Vec::new(),
-                ));
-            }
-            agent_core::AgentEvent::Stream(agent_core::StreamEvent::Usage(usage)) => {
-                if beyond_ai_agent::memory::live_prompt_tokens(usage) > pressure_point
-                    && pressure_armed.swap(false, std::sync::atomic::Ordering::Relaxed)
-                {
-                    steering.push_steer(agent_core::SteeringMessage::new(
-                        beyond_ai_agent::memory::PRESSURE_NUDGE.to_string(),
-                        Vec::new(),
-                    ));
-                }
-            }
-            _ => {}
-        }
+        session_steers.observe(ev, steering);
     };
     let mut stop_reason = agent_core::StopReason::default();
     let life_obs = life.cloned();
