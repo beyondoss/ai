@@ -157,3 +157,118 @@ async fn openai_in_stream_rate_limits_are_waited_out_honouring_the_hint_in_the_b
         .count();
     assert_eq!(assistants, 1);
 }
+
+fn status_response(status_line: &str, headers: &str, body: &str) -> String {
+    format!(
+        "HTTP/1.1 {status_line}\r\n{headers}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+/// A provider that never stops rate limiting, behind a client configured the way `run`/`serve`
+/// configure it (3 pre-first-byte retries). The turn's budget is the only clock: it starts at the first
+/// 429, the run ends within the budget plus one wait, and every re-send is announced as a `Retry`.
+/// Before, the client first spent its own 3 silent retries (each honouring `Retry-After`) on every
+/// attempt, so the run took several times its budget and most re-sends were invisible.
+#[tokio::test]
+async fn an_endless_429_ends_within_the_budget_and_every_retry_is_visible() {
+    let body = r#"{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}"#;
+    let limited = status_response("429 Too Many Requests", "retry-after-ms: 400\r\n", body);
+    let (base, connections) = serve(vec![limited; 20]);
+    let client = GatewayClient::new(base, "bai_v1.test")
+        .unwrap()
+        .with_retry(3, Duration::from_millis(1));
+    let budget = Duration::from_millis(1000);
+    let wait = Duration::from_millis(400);
+    let agent =
+        Agent::new(Arc::new(client), "claude-opus-4-8").with_rate_limit_retry(RateLimitRetry {
+            budget,
+            base_backoff: Duration::from_millis(1),
+            max_wait: Duration::from_secs(5),
+        });
+
+    let started = Instant::now();
+    let (result, retries, _) = run(&agent).await;
+    let elapsed = started.elapsed();
+    let err = result
+        .expect_err("an endless rate limit fails the run")
+        .to_string();
+    assert!(
+        err.contains(agent_core::rate_limit::BUDGET_EXHAUSTED),
+        "{err}"
+    );
+    let sent = connections.load(Ordering::SeqCst);
+    assert_eq!(
+        retries.len() + 1,
+        sent,
+        "every re-send is announced: {retries:?}, {sent} requests"
+    );
+    assert!(
+        retries.iter().all(|&(_, d, r)| r && d >= 400),
+        "{retries:?}"
+    );
+    assert!(
+        elapsed <= budget + wait + Duration::from_millis(300),
+        "took {elapsed:?}, budget {budget:?} + one {wait:?} wait"
+    );
+}
+
+/// A bare 529 (no `overloaded_error` body) is an overload: the loop's budgeted retry handles it,
+/// visibly, rather than the client retrying it in silence.
+#[tokio::test]
+async fn a_bare_529_is_retried_visibly_as_a_rate_limit() {
+    let (base, connections) = serve(vec![
+        status_response("529 Site Overloaded", "", ""),
+        sse(ANTHROPIC_OK),
+    ]);
+    let client = GatewayClient::new(base, "bai_v1.test")
+        .unwrap()
+        .with_retry(3, Duration::from_millis(1));
+    let agent = Agent::new(Arc::new(client), "claude-opus-4-8").with_rate_limit_retry(fast());
+
+    let (result, retries, session) = run(&agent).await;
+    result.expect("the run completes after the overload");
+    assert_eq!(connections.load(Ordering::SeqCst), 2);
+    assert!(last_text(&session).contains("made it"));
+    assert_eq!(retries.len(), 1, "{retries:?}");
+    assert!(retries[0].2, "a 529 is the rate-limited class: {retries:?}");
+}
+
+/// The client's own pre-first-byte retry of a 5xx still happens (cheap and bounded), but each one now
+/// reaches the event stream.
+#[tokio::test]
+async fn the_clients_own_5xx_retries_are_announced() {
+    let (base, connections) = serve(vec![
+        status_response("503 Service Unavailable", "", ""),
+        status_response("502 Bad Gateway", "", ""),
+        sse(ANTHROPIC_OK),
+    ]);
+    let client = GatewayClient::new(base, "bai_v1.test")
+        .unwrap()
+        .with_retry(3, Duration::from_millis(1));
+    let agent = Agent::new(Arc::new(client), "claude-opus-4-8").with_rate_limit_retry(fast());
+
+    let mut session = Session::new();
+    session.user("hi");
+    let mut retries = Vec::new();
+    agent
+        .run_events(&mut session, |ev| {
+            if let AgentEvent::Retry {
+                attempt,
+                rate_limited,
+                message,
+                ..
+            } = ev
+            {
+                retries.push((attempt, rate_limited, message));
+            }
+        })
+        .await
+        .expect("the run completes after the 5xx");
+    assert_eq!(connections.load(Ordering::SeqCst), 3);
+    assert_eq!(retries.len(), 2, "{retries:?}");
+    assert_eq!((retries[0].0, retries[1].0), (1, 2));
+    assert!(retries.iter().all(|r| !r.1), "{retries:?}");
+    assert!(retries[0].2.contains("503"), "{retries:?}");
+    assert!(retries[1].2.contains("502"), "{retries:?}");
+}

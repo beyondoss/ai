@@ -2461,8 +2461,11 @@ impl Agent {
         }
         let cancelled = cancel.cancelled();
         futures::pin_mut!(cancelled);
+        // Retries the transport makes on its own before the first byte (a 5xx, a refused
+        // connection) arrive here as each wait starts, and are shown like the loop's own.
+        let (retry_tx, mut retry_rx) = futures::channel::mpsc::unbounded();
         let mut stream = {
-            let stream_fut = self.transport.stream(req);
+            let stream_fut = self.transport.stream_reporting_retries(req, retry_tx);
             futures::pin_mut!(stream_fut);
             match select(stream_fut, cancelled.as_mut()).await {
                 Either::Left((res, _)) => res?,
@@ -2476,8 +2479,29 @@ impl Agent {
         loop {
             let next = stream.next();
             futures::pin_mut!(next);
-            match select(next, cancelled.as_mut()).await {
-                Either::Left((Some(Err(e)), _)) => {
+            // `Some(item)` from the stream, `None` on cancellation. `select` polls left first, so a
+            // ready stream item always wins over a retry notice.
+            let next = loop {
+                match select(select(next.as_mut(), retry_rx.next()), cancelled.as_mut()).await {
+                    Either::Left((Either::Left((item, _)), _)) => break Some(item),
+                    Either::Left((Either::Right((Some(r), _)), _)) => emit(AgentEvent::Retry {
+                        attempt: r.attempt,
+                        delay_ms: u64::try_from(r.delay.as_millis()).unwrap_or(u64::MAX),
+                        rate_limited: false,
+                        message: r.message,
+                    }),
+                    // The transport dropped its reporter: wait on the stream alone.
+                    Either::Left((Either::Right((None, _)), _)) => {
+                        match select(next.as_mut(), cancelled.as_mut()).await {
+                            Either::Left((item, _)) => break Some(item),
+                            Either::Right(((), _)) => break None,
+                        }
+                    }
+                    Either::Right(((), _)) => break None,
+                }
+            };
+            match next {
+                Some(Some(Err(e))) => {
                     // A mid-stream transport/decode failure — unlike cancellation just below, this
                     // isn't a synthetic `Ok(Turn)` (the retry-classification functions need the real
                     // `Err` to decide whether `run_turn` retries), but whatever content had already
@@ -2486,20 +2510,20 @@ impl Agent {
                     *partial_out = Some(acc.finish());
                     return Err(e);
                 }
-                Either::Left((Some(Ok(ev)), _)) => {
+                Some(Some(Ok(ev))) => {
                     // `apply` only borrows, so `ev` is still ours to move into `emit` afterward — no
                     // clone needed on this per-delta hot path (see `Accumulator::apply`'s doc comment).
                     acc.apply(&ev);
                     emit(AgentEvent::Stream(ev));
                 }
-                Either::Left((None, _)) => break,
+                Some(None) => break,
                 // Cancelled after some content had already streamed — `finish()` flushes whatever's
                 // still open in `acc` (pi-parity: matches `abort.test.ts`'s "aborted mid-stream keeps
                 // partial content" contract). Returned as `Ok` with a synthetic `Aborted` stop reason,
                 // not `Err`, so `run_events_steered` still gets to persist it exactly like any other
                 // turn before that caller re-raises the cancellation — see its `StopReason::Aborted`
                 // arm for why the external `Err(Error::Cancelled)` contract is preserved either way.
-                Either::Right(((), _)) => {
+                None => {
                     let mut turn = acc.finish();
                     turn.stop_reason = StopReason::Aborted;
                     return Ok(turn);
@@ -3785,6 +3809,7 @@ pub fn is_retryable_mid_stream(e: &Error) -> bool {
     }
     let m = msg.to_ascii_lowercase();
     m.contains("stream ended before")
+        || crate::rate_limit::is_rate_limited(e)
         || m.contains("overloaded")
         || msg.contains(MID_STREAM_NETWORK_ERROR)
         || MID_STREAM_RETRYABLE_ERROR_TYPES
