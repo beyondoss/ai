@@ -114,7 +114,11 @@ async fn a_kill_sends_sigterm_first() {
     )
     .await;
     let killed = jobs.run(json!({ "job": 1, "kill": true })).await.unwrap();
-    assert!(killed.text.contains("Job 1 killed"), "{}", killed.text);
+    assert!(
+        killed.text.contains("Job 1 (`") && killed.text.contains(") killed after"),
+        "{}",
+        killed.text
+    );
     assert_eq!(
         std::fs::read_to_string(&mark).unwrap_or_default(),
         "term\n",
@@ -128,7 +132,11 @@ async fn a_process_that_ignores_sigterm_is_still_killed() {
     background(&bash, "trap '' TERM; exec sleep 62.31").await;
     let pids = wait_for("sleep 62.31").await;
     let killed = jobs.run(json!({ "job": 1, "kill": true })).await.unwrap();
-    assert!(killed.text.contains("Job 1 killed"), "{}", killed.text);
+    assert!(
+        killed.text.contains("Job 1 (`") && killed.text.contains(") killed after"),
+        "{}",
+        killed.text
+    );
     for pid in pids {
         assert!(wait_dead(pid).await, "the sweep's SIGKILL got it");
     }
@@ -147,7 +155,11 @@ async fn killing_a_sudo_job_stops_its_root_child() {
     background(&bash, "sudo -n sleep 62.32").await;
     let pids = wait_for("sleep 62.32").await;
     let killed = jobs.run(json!({ "job": 1, "kill": true })).await.unwrap();
-    assert!(killed.text.contains("Job 1 killed"), "{}", killed.text);
+    assert!(
+        killed.text.contains("Job 1 (`") && killed.text.contains(") killed after"),
+        "{}",
+        killed.text
+    );
     for pid in pids {
         assert!(wait_dead(pid).await, "the root child outlived the kill");
     }

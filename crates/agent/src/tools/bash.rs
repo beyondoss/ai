@@ -961,15 +961,22 @@ impl Bash {
         let _ = tokio::time::timeout(Duration::from_secs(5), &mut job.handle).await;
         let snap = job.shared.take_segment();
         let running = job.started.elapsed().as_secs();
+        // Named, so a kill is never ambiguous about which process it hit.
+        let command = std::mem::take(&mut job.command);
         drop(job);
         let text = clean(format_output(&snap, ""));
         match survived {
-            None => Ok(append_status(&text, &format!("Job {id} killed after {running} s.")).into()),
+            None => Ok(append_status(
+                &text,
+                &format!("Job {id} (`{command}`) killed after {running} s."),
+            )
+            .into()),
             // Not "killed": they still run, and nothing tracks them any more.
             Some(left) => Err(ToolError::Execution(append_status(
                 &text,
                 &format!(
-                    "Job {id} was sent SIGTERM and then SIGKILL after {running} s, but {}",
+                    "Job {id} (`{command}`) was sent SIGTERM and then SIGKILL after {running} s, \
+                     but {}",
                     survived_note(&left)
                 ),
             ))),
@@ -1395,6 +1402,10 @@ mod background_tests;
 #[cfg(all(test, target_os = "linux"))]
 #[path = "bash_kill_tests.rs"]
 mod kill_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "bash_jobs_reopen_tests.rs"]
+mod reopen_tests;
 
 #[cfg(test)]
 mod tests {

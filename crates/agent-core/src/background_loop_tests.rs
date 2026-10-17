@@ -21,6 +21,8 @@ struct Script {
     notices: Mutex<Vec<String>>,
     running: Mutex<Vec<String>>,
     reminded: Mutex<usize>,
+    /// The note the first `resume` returns (taken).
+    resume_note: Mutex<Option<String>>,
 }
 
 impl Background for Script {
@@ -43,6 +45,9 @@ impl Background for Script {
     fn carry(&self) -> Option<String> {
         let running = self.running.lock().unwrap();
         (!running.is_empty()).then(|| format!("running: {}", running.join(", ")))
+    }
+    fn resume(&self, _messages: &[crate::Message]) -> Option<String> {
+        self.resume_note.lock().unwrap().take()
     }
 }
 
@@ -344,5 +349,33 @@ async fn a_pending_notice_at_the_step_limit_waits_for_the_next_run() {
     assert!(
         script.take_notices().is_some(),
         "the notice is left for the next run, not consumed"
+    );
+}
+
+#[tokio::test]
+async fn a_resume_note_rides_every_request_of_the_process_but_is_never_persisted() {
+    let script = Arc::new(Script::default());
+    *script.resume_note.lock().unwrap() = Some("[background jobs] job 1 was stopped".into());
+    let turns = vec![turn::tool_call("a", "twin", "{}"), turn::text("done")];
+    let transport = Arc::new(MockTransport::new(turns));
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(Twin(script.clone())));
+    let agent = Agent::new(transport.clone(), "claude-opus-4-8").with_tools(tools);
+    let (session, _) = run(&agent).await;
+    let requests = transport.requests();
+    assert_eq!(requests.len(), 2);
+    for req in &requests {
+        let prompt = &req.messages[0];
+        assert!(
+            prompt.content.iter().any(|b| matches!(b,
+                ContentBlock::Text { text, .. } if text.contains("job 1 was stopped"))),
+            "on the prompt, in every request (a byte-stable prefix): {prompt:?}"
+        );
+    }
+    assert!(
+        !user_texts(&session)
+            .iter()
+            .any(|(_, t)| t.contains("job 1 was stopped")),
+        "request-only: not in the transcript"
     );
 }

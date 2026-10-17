@@ -1,7 +1,7 @@
 //! Work a tool leaves running past its own call, reported to the model without it asking.
 //!
 //! A tool that hands work to the background (`bash`'s jobs, in the `agent` crate) exposes a
-//! [`Background`] through [`crate::Tool::background`]. The loop then does three things with it, so
+//! [`Background`] through [`crate::Tool::background`]. The loop then does four things with it, so
 //! the model never has to poll and never ends a run blind:
 //!
 //! - **Finish notices** ([`Background::take_notices`]) join the next tool-results turn as trailing
@@ -65,6 +65,13 @@ pub fn is_carry_block(text: &str) -> bool {
     text.starts_with(CARRY_OPEN)
 }
 
+/// Whether a request block describes processes — a compaction's [`CARRY_OPEN`] block, or a
+/// [`Background::resume`] note (a [`REMINDER_PREFIX`] text, which otherwise only ever rides a
+/// persisted user turn) — so a host that saves request blocks across a restart must not save it.
+pub fn is_process_state(text: &str) -> bool {
+    is_carry_block(text) || text.starts_with(REMINDER_PREFIX)
+}
+
 /// What the loop asks a tool's background work. Every method is cheap and non-blocking: they run
 /// on the loop's own task at turn boundaries.
 pub trait Background: Send + Sync {
@@ -80,6 +87,17 @@ pub trait Background: Send + Sync {
     /// The work in flight right now (running, or ended with its result unread), for a compaction
     /// summary. `None` when there is none.
     fn carry(&self) -> Option<String>;
+
+    /// A run is starting on `messages`. A source whose live state does not cover this transcript yet
+    /// — a fresh one on a reopened session, or one a transcript switch reset — reads it, once: it
+    /// numbers new work past every id the transcript already used, so one id never names two pieces
+    /// of work in a conversation, and returns a note (starting with [`REMINDER_PREFIX`]) listing the
+    /// work the transcript left running, which is gone now. `None` otherwise, and on every later
+    /// call until the source is reset. The loop attaches the note to the run's prompt as a
+    /// request-only block: a later reopen reads the same transcript and says it again.
+    fn resume(&self, _messages: &[crate::Message]) -> Option<String> {
+        None
+    }
 }
 
 /// Every distinct [`Background`] the tools of a registry expose, in a stable order.
@@ -107,6 +125,14 @@ pub(crate) fn take_notices(sources: &[Arc<dyn Background>]) -> Option<String> {
 /// [`Background::stop_reminder`] over several sources, joined.
 pub(crate) fn stop_reminder(sources: &[Arc<dyn Background>]) -> Option<String> {
     join(sources.iter().filter_map(|b| b.stop_reminder()))
+}
+
+/// [`Background::resume`] over several sources, joined.
+pub(crate) fn resume(
+    sources: &[Arc<dyn Background>],
+    messages: &[crate::Message],
+) -> Option<String> {
+    join(sources.iter().filter_map(|b| b.resume(messages)))
 }
 
 /// The `<background-jobs>` block for a compaction summary, or `None` when nothing is in flight.

@@ -109,7 +109,10 @@ async fn bash_job_kill_reaches_the_far_side() {
     assert!(group_alive(far));
 
     let killed = kill_job(&jobs, n).await.unwrap();
-    assert!(killed.contains(&format!("Job {n} killed")), "{killed}");
+    assert!(
+        killed.contains(&format!("Job {n} (`")) && killed.contains(") killed after"),
+        "{killed}"
+    );
     let gone = wait_group_gone(far, Duration::from_secs(5)).await;
     if !gone {
         kill_group(far);
