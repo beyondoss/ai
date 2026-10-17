@@ -143,7 +143,10 @@ async fn a_quiet_command_returns_early_and_keeps_running_until_killed() {
     assert!(alive(&pid), "the command must keep running after the yield");
 
     let killed = text(jobs.run(json!({ "job": 1, "kill": true })).await);
-    assert!(killed.contains("Job 1 killed"), "{killed}");
+    assert!(
+        killed.contains("Job 1 (`") && killed.contains(") killed after"),
+        "{killed}"
+    );
     assert!(wait_dead(&pid).await, "kill must stop the command");
 
     let gone = jobs.run(json!({ "job": 1 })).await.unwrap_err();

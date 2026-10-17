@@ -65,7 +65,10 @@ async fn a_silent_remote_command_yields_as_a_job_and_bash_job_kill_kills_its_gro
     );
 
     let killed = kill_job(&jobs, n).await.unwrap();
-    assert!(killed.contains(&format!("Job {n} killed")), "{killed}");
+    assert!(
+        killed.contains(&format!("Job {n} (`")) && killed.contains(") killed after"),
+        "{killed}"
+    );
     assert_eq!(
         mock.wait_for_end(s.pgid, Duration::from_secs(5)).await,
         Some(StreamEnd::Disconnected { killed: true }),

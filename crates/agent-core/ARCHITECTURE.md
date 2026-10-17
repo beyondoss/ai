@@ -547,7 +547,10 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
     echoes is stripped like the rest. With nothing running it says so (`background::NO_JOBS`), and
     a run on a summarized session whose block is gone — every reopen, since request blocks are never
     persisted — attaches it afresh (`Agent::attach_background_carry`, a no-op while compaction's
-    block still rides, so the cached prefix is undisturbed). That is what corrects a summary whose
+    block still rides, so the cached prefix is undisturbed). The same call first asks each source to
+    `Background::resume` — the first run it sees on a transcript, summarized or not — and attaches
+    any note (the work that transcript left running, stopped since) to the run's prompt, also
+    request-only; hosts that save request blocks skip both (`background::is_process_state`). That is what corrects a summary whose
     own prose says "the server is running as job 1": the summarizer is told not to record job state
     (`compaction::LIVENESS_NOTE`, on every summary instruction), but it still reads the bash results
     that started the job. The summarizer's input keeps the block rather than stripping it: it sits

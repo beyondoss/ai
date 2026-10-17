@@ -1518,7 +1518,10 @@ end (stdin EOF, the daemon's reaper, a closed socket, a supersede) stops them ex
 `bash_jobs_stopped` frame), so in a daemon, whose process lives on, nothing outlives its session. The
 table is kept out of what the cell's runner and backend clone (`CellRoute`): every running job's task
 holds the runner, and a runner that held the table would be a cycle that kept an ended session's jobs
-alive, unreachable. Jobs do not survive a restart; `bash_job` on an id from before one says so.
+alive, unreachable. Jobs do not survive a restart (or a reap, a deploy, a transcript switch); the
+first run after one is told which jobs the transcript left running were stopped, and new jobs are
+numbered past every id it used (see "Reopen" under "`bash` jobs"). `bash_job` on an id from before
+one says it no longer exists.
 
 ---
 
@@ -1760,7 +1763,9 @@ once) fold into the next tool-results turn after any steer, like the step-budget
 **reminder** (`stop_reminder`) lists work still running that no earlier reminder covered, so ending
 with it is the model's informed choice. The loop asks for it at most once per run (`stop_reminded`):
 work started or waited on after it does not earn a second, so ending again ends; and every compaction summary carries the **carry**
-(`carry`) as a `<background-jobs>` request-only block beside it, never persisted. All three ride existing paths (no new message type), are
+(`carry`) as a `<background-jobs>` request-only block beside it, never persisted; and the first run
+a source sees on a transcript (a reopen) gets its **resume** note (`resume`) on the prompt, also
+request-only, saying which work the transcript left running is gone. All four ride existing paths (no new message type), are
 reported as `AgentEvent::Background { reason, text, wake }`, and begin with a harness tag
 (`agent_core::background::NOTE_PREFIXES`) so compaction's carried user requests skip them. The `bash`
 side is under "`bash` jobs" below.
@@ -2737,6 +2742,25 @@ and `serve`'s own `bash`/`abort_bash` RPC commands reuse `RealRunner` directly, 
     context sidecar, because after a restart the jobs are gone and a persisted copy would describe
     them as running. A reopened summarized session's first request instead says no jobs are running,
     which also corrects a summary whose prose claims one is (`tests/bash_jobs_serve_carry.rs`).
+  - **Reopen (`Background::resume`).** A table reads the transcript of the first run it serves —
+    once, and again after `stop_all` (a `serve` transcript switch) resets it — because a reopened
+    session's jobs are gone: `serve`'s session end (service-mode reap after detach, every deploy,
+    the daemon's idle reaper, a restart) and `run`'s exit stop them. It used to restart ids at 1 and
+    tell the model nothing, so a reopened model took a dead dev server for live, and a new job got
+    id 1 again — `bash_job {"job": 1, "kill": true}` killed the wrong process. Now the counter is
+    seeded past the highest id the transcript mentions (`bash`/`bash_job` calls and results, notices,
+    a summary's prose, assistant text — an over-count only skips numbers; other tools' results are
+    not read), and the jobs it shows still running at its end (a `bash` result that parked one,
+    minus finish notices, `bash_job` results that are not "still running", evictions, and yielded
+    jobs a later prompt's turn-end stopped) are listed in one `[background jobs]` note (`reopen_note`,
+    the one place it is written) — "were stopped with it … New jobs are numbered from N" — attached
+    as a request-only block to the run's prompt: in every request of the process (a stable cached
+    prefix), never persisted, never saved by the MCP App context sidecar
+    (`background::is_process_state`), so each later reopen re-reads the transcript and says it
+    again. Summarized or not; a summarized session also still gets its `<background-jobs>` block. A
+    kill result names the command it killed (``Job 3 (`npm run dev`) killed after 4 s.``). Tests:
+    `tools/bash_jobs_reopen_tests.rs` (the reader, seeding, a kill), `tests/bash_jobs_reopen.rs`
+    (a `serve` restart and `run --continue`).
 - **`run_in_background` (`Start::Background`, `JobKind::Background`)**. A boolean on `bash`, not a
   tool of its own: in the background-shell probe (1,500 trials on Luna, Sol, Kimi K2.7 Code and Qwen
   3.8 Flash with the real system prompt and tools) it beat a separate start tool on every model, was

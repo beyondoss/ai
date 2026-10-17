@@ -2846,7 +2846,19 @@ impl Agent {
     /// it was told not to record job state), and the live table is what corrects it; without one,
     /// the first request after a restart reads that claim unchallenged. A no-op while the block
     /// compaction attached still rides the summary, so the cached prefix is not disturbed.
+    ///
+    /// First, any source reading this transcript for the first time ([`crate::Background::resume`]) gets
+    /// its note on the run's prompt: the work a reopened session — summarized or not — left running
+    /// is gone, and the model is told so once per process rather than finding out from a kill that
+    /// hits a new job under the old id.
     fn attach_background_carry(&self, session: &mut Session) {
+        let sources = crate::background::collect(&self.tools);
+        if sources.is_empty() {
+            return;
+        }
+        if let Some(note) = crate::background::resume(&sources, &session.messages) {
+            session.attach_request_block(note);
+        }
         let summarized = session.messages.first().is_some_and(|m| {
             m.role == Role::User
                 && matches!(
@@ -2868,9 +2880,7 @@ impl Agent {
         if carried {
             return;
         }
-        if let Some(block) =
-            crate::background::carry_block(&crate::background::collect(&self.tools))
-        {
+        if let Some(block) = crate::background::carry_block(&sources) {
             session.attach_request_block_at(0, block);
         }
     }

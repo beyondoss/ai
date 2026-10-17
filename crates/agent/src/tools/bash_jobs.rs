@@ -292,6 +292,10 @@ pub struct StoppedJob {
 /// them), and dropped — killing every job — with the last of them.
 pub struct BashJobs {
     next: AtomicU64,
+    /// The transcript the next run is on has been read ([`Background::resume`]): its ids are
+    /// counted and what it left running was reported. Cleared by [`Self::stop_all`], which ends a
+    /// transcript's jobs, so the next run reads the one it is on.
+    resumed: AtomicBool,
     table: Mutex<BTreeMap<u64, Parked>>,
     /// Bumped whenever a parked job ends or is orphaned: what [`Self::subscribe`] hands out.
     wake: watch::Sender<u64>,
@@ -308,6 +312,7 @@ impl BashJobs {
     pub fn new(policy: EndPolicy) -> Self {
         Self {
             next: AtomicU64::new(0),
+            resumed: AtomicBool::new(false),
             table: Mutex::new(BTreeMap::new()),
             wake: watch::Sender::new(0),
             policy: Mutex::new(policy),
@@ -333,6 +338,12 @@ impl BashJobs {
     /// Whether a finish notice is waiting to be delivered.
     pub fn has_notice(&self) -> bool {
         lock(&self.table).values().any(Parked::notice_due)
+    }
+
+    /// The highest id handed out (or seeded from a reopened transcript).
+    #[cfg(test)]
+    pub(crate) fn last_id(&self) -> u64 {
+        self.next.load(Ordering::Relaxed)
     }
 
     pub(crate) fn assign_id(&self, job: &mut Job) -> u64 {
@@ -422,6 +433,7 @@ impl BashJobs {
     /// Stop every running job, oldest first, and say which. Ended jobs are dropped too: nobody will
     /// read them now. For the end of a `run` and a transcript switch in `serve`.
     pub fn stop_all(&self) -> Vec<StoppedJob> {
+        self.resumed.store(false, Ordering::Relaxed);
         self.stop(|_| true)
     }
 
@@ -653,6 +665,245 @@ impl Background for BashJobs {
 
     fn carry(&self) -> Option<String> {
         self.table_text()
+    }
+
+    fn resume(&self, messages: &[agent_core::Message]) -> Option<String> {
+        if self.resumed.swap(true, Ordering::Relaxed) {
+            return None;
+        }
+        let read = read_transcript(messages);
+        // Never back: after a transcript switch this table keeps counting past its own jobs too.
+        self.next.fetch_max(read.max_id, Ordering::Relaxed);
+        let stopped: Vec<(u64, String)> = read
+            .running
+            .into_iter()
+            .map(|(id, left)| (id, left.command))
+            .collect();
+        reopen_note(&stopped, self.next.load(Ordering::Relaxed) + 1)
+    }
+}
+
+/// The note a reopened session's first run gets about the jobs its transcript left running
+/// ([`Background::resume`]): each was stopped when the session last closed — its process exited,
+/// or `serve` ended or switched away from the session — so it is gone, and `bash_job` no longer
+/// knows its id. `None` when the transcript left nothing running. The one place the note is
+/// written, so a host whose jobs can outlive a session has one function to add "still running"
+/// entries to.
+fn reopen_note(stopped: &[(u64, String)], next: u64) -> Option<String> {
+    if stopped.is_empty() {
+        return None;
+    }
+    let lines: Vec<String> = stopped
+        .iter()
+        .map(|(id, command)| format!("- job {id}: `{command}` (stopped)"))
+        .collect();
+    let (them, are) = if stopped.len() == 1 {
+        ("it", "is")
+    } else {
+        ("them", "are")
+    };
+    Some(format!(
+        "{REMINDER_PREFIX} This session was closed since it last ran, and the jobs it left running \
+         were stopped with it:\n{}\nNone of {them} {are} running now, and bash_job no longer knows \
+         {them}: do not wait on or kill {them}; start again what you still need. New jobs are \
+         numbered from {next}.",
+        lines.join("\n")
+    ))
+}
+
+/// A job a transcript shows running when it ends, for [`reopen_note`].
+struct LeftRunning {
+    command: String,
+    /// Background or adopted: it outlives the run. A yielded one is stopped at the next prompt.
+    intended: bool,
+}
+
+/// What a reopened transcript says about `bash` jobs: the highest id it used, and the jobs still
+/// running as it ends.
+#[derive(Default)]
+struct TranscriptJobs {
+    max_id: u64,
+    running: BTreeMap<u64, LeftRunning>,
+}
+
+/// Read `bash` jobs out of a transcript, in order: a `bash` result that parks a job starts it; a
+/// finish notice, a `bash_job` result that is not "still running", or an eviction ends it; and a
+/// new prompt ends the yielded ones (their turn stopped them). The highest id comes from everywhere
+/// an id can appear — `bash`/`bash_job` calls and results, notices, a summary's prose, assistant
+/// text — so an over-count only skips numbers, never repeats one. Other tools' results (a file
+/// that happens to say "job 9") are not read.
+fn read_transcript(messages: &[agent_core::Message]) -> TranscriptJobs {
+    use agent_core::{ContentBlock, Role};
+    let mut calls: std::collections::HashMap<&str, (&str, &serde_json::Value)> =
+        std::collections::HashMap::new();
+    let mut out = TranscriptJobs::default();
+    for m in messages {
+        let prompt = m.role == Role::User
+            && !m
+                .content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::ToolResult { .. }))
+            && m.content.iter().any(|b| {
+                matches!(b, ContentBlock::Text { text, .. }
+                    if !agent_core::background::is_note(text))
+            });
+        if prompt {
+            out.running.retain(|_, j| j.intended);
+        }
+        for b in &m.content {
+            match b {
+                ContentBlock::ToolUse {
+                    id, name, input, ..
+                } => {
+                    calls.insert(id, (name, input));
+                    if name == super::bash::JOB_TOOL
+                        && let Some(n) = input.get("job").and_then(job_number)
+                    {
+                        out.see(n);
+                    }
+                }
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    ..
+                } => {
+                    let Some(&(name, input)) = calls.get(tool_use_id.as_str()) else {
+                        continue;
+                    };
+                    if name == "bash" {
+                        out.see_text(content);
+                        out.bash_result(content, input);
+                    } else if name == super::bash::JOB_TOOL {
+                        out.see_text(content);
+                        if let Some(n) = input.get("job").and_then(job_number) {
+                            out.bash_job_result(n, content);
+                        }
+                    }
+                }
+                ContentBlock::Text { text, .. } => {
+                    out.see_text(text);
+                    if m.role == Role::User {
+                        out.notices(text);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
+/// A `bash_job` input's `job`, read as `bash_job` reads it.
+fn job_number(v: &serde_json::Value) -> Option<u64> {
+    v.as_u64()
+        .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+}
+
+/// The id `s` starts with, and what follows it.
+fn leading_id(s: &str) -> Option<(u64, &str)> {
+    let end = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    let id = s[..end].parse().ok()?;
+    Some((id, &s[end..]))
+}
+
+impl TranscriptJobs {
+    fn see(&mut self, id: u64) {
+        self.max_id = self.max_id.max(id);
+    }
+
+    /// Every `job N` and `"job": N` in `text`, in any case.
+    fn see_text(&mut self, text: &str) {
+        let bytes = text.as_bytes();
+        let mut i = 0;
+        while let Some(at) = bytes[i..]
+            .windows(3)
+            .position(|w| w.eq_ignore_ascii_case(b"job"))
+        {
+            let start = i + at;
+            i = start + 3;
+            if start > 0 && bytes[start - 1].is_ascii_alphanumeric() {
+                continue;
+            }
+            // `job` is ASCII, so `i` is a char boundary.
+            let rest = text[i..]
+                .trim_start_matches('"')
+                .trim_start_matches(':')
+                .trim_start_matches(' ');
+            if let Some((id, _)) = leading_id(rest) {
+                self.see(id);
+            }
+        }
+    }
+
+    /// A `bash` result: the job it parked, and one a yield evicted.
+    fn bash_result(&mut self, content: &str, input: &serde_json::Value) {
+        let command = input
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let command = super::bash_proc::truncate_command(command, COMMAND_CHARS);
+        for (marker, intended) in [
+            ("Running in the background as job ", true),
+            ("it is tracked as job ", true),
+            ("The command is still running as job ", false),
+        ] {
+            if let Some((id, _)) = content
+                .find(marker)
+                .and_then(|at| leading_id(&content[at + marker.len()..]))
+            {
+                self.running.insert(
+                    id,
+                    LeftRunning {
+                        command: command.clone(),
+                        intended,
+                    },
+                );
+            }
+        }
+        if let Some((id, rest)) = content
+            .find(" Job ")
+            .and_then(|at| leading_id(&content[at + 5..]))
+            && rest.starts_with(" was stopped:")
+        {
+            self.running.remove(&id);
+        }
+    }
+
+    /// A `bash_job` result for job `id`: still running (a wait that returned early, or one whose
+    /// command left processes that are the job now), or done with — ended, killed, or unknown.
+    fn bash_job_result(&mut self, id: u64, content: &str) {
+        if content
+            .to_ascii_lowercase()
+            .contains(&format!("job {id} is still running"))
+        {
+            return;
+        }
+        if content.contains(&format!("it is tracked as job {id} ")) {
+            if let Some(j) = self.running.get_mut(&id) {
+                j.intended = true;
+            }
+            return;
+        }
+        self.running.remove(&id);
+    }
+
+    /// Finish notices in a user turn's text: `[job N's command … left … running` makes a yielded
+    /// job adopted; any other `[job N …]` ended it.
+    fn notices(&mut self, text: &str) {
+        let mut rest = text;
+        while let Some(at) = rest.find(NOTICE_PREFIX) {
+            rest = &rest[at + NOTICE_PREFIX.len()..];
+            let Some((id, after)) = leading_id(rest) else {
+                continue;
+            };
+            if after.starts_with("'s command") {
+                if let Some(j) = self.running.get_mut(&id) {
+                    j.intended = true;
+                }
+            } else {
+                self.running.remove(&id);
+            }
+        }
     }
 }
 

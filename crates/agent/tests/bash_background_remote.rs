@@ -75,7 +75,10 @@ async fn a_v12_background_start_returns_a_job_whose_stream_is_its_lifetime() {
     assert_eq!(STREAM_DEADLINE.as_millis(), i32::MAX as u128);
     let n = job_number(&out).unwrap();
     let killed = kill_job(&jobs, n).await.unwrap();
-    assert!(killed.contains(&format!("Job {n} killed")), "{killed}");
+    assert!(
+        killed.contains(&format!("Job {n} (`")) && killed.contains(") killed after"),
+        "{killed}"
+    );
     assert_eq!(
         mock.wait_for_end(s.pgid, Duration::from_secs(5)).await,
         Some(StreamEnd::Disconnected { killed: true })

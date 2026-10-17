@@ -1035,9 +1035,10 @@ pub fn context_records(session: &agent_core::Session) -> String {
             agent_core::ContentBlock::Text { text, .. } => Some((b, text)),
             _ => None,
         })
-        // A compaction's `<background-jobs>` block rides the same channel but describes processes:
-        // saved, a restarted session would be told dead jobs are running.
-        .filter(|(_, text)| !agent_core::background::is_carry_block(text))
+        // A compaction's `<background-jobs>` block and a reopen's stopped-jobs note ride the same
+        // channel but describe processes: saved, a restarted session would be told dead jobs are
+        // running, or re-told of a stop as if it were new.
+        .filter(|(_, text)| !agent_core::background::is_process_state(text))
         .map_while(|(b, text)| {
             budget = budget.checked_sub(text.len())?;
             Some(json!({

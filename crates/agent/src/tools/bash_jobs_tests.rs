@@ -96,7 +96,10 @@ async fn a_chatty_command_yields_at_the_ceiling() {
         "{again}"
     );
     let killed = ok(jobs.run(json!({ "job": 1, "kill": true })).await);
-    assert!(killed.contains("Job 1 killed"), "{killed}");
+    assert!(
+        killed.contains("Job 1 (`") && killed.contains(") killed after"),
+        "{killed}"
+    );
 }
 
 #[tokio::test]
@@ -169,7 +172,10 @@ async fn a_backgrounded_process_with_its_output_redirected_is_adopted_too() {
     let pid = read_pid(&pidfile).await;
     assert!(alive(pid));
     let killed = ok(jobs.run(json!({ "job": 1, "kill": true })).await);
-    assert!(killed.contains("Job 1 killed"), "{killed}");
+    assert!(
+        killed.contains("Job 1 (`") && killed.contains(") killed after"),
+        "{killed}"
+    );
     assert!(wait_dead(pid).await, "kill stops it");
 }
 
