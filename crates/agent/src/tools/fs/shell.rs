@@ -42,6 +42,10 @@ const STDIN_PROBE: &str = "stdin-probe";
 /// of Linux's 128 KiB cap on a single argv string (`MAX_ARG_STRLEN`), leaving the whole argv far under
 /// the kernel's total `ARG_MAX` as well.
 const WRITE_CHUNK: usize = 48 * 1024;
+/// Raw bytes per `read_bytes` command: 96 KiB, which base64s to exactly 128 KiB — the head a runner's
+/// capture keeps whole ([`crate::tools::exec`]'s `STREAM_HEAD`), so a chunk is never cut.
+const READ_CHUNK: usize = 96 * 1024;
+const _: () = assert!(READ_CHUNK.div_ceil(3) * 4 <= crate::tools::exec::STREAM_HEAD);
 
 /// What the target actually has, probed once at attach.
 ///
@@ -334,25 +338,50 @@ impl FsBackend for ShellFs {
         Ok(parse_stat(&result.stdout))
     }
 
+    /// One command per [`READ_CHUNK`] bytes, so every command's output fits the runner's capture
+    /// whole. A window bigger than that cannot be one command: the capture keeps the head and tail of
+    /// a stream and drops the middle, and base64 of a glued head and tail still decodes, into a file
+    /// that never existed. A short chunk is end-of-file and ends the loop.
     async fn read_bytes(&self, path: &Path, offset: u64, max: usize) -> Result<Vec<u8>, FsError> {
-        let args = sh_script(
-            READ_WINDOW_SCRIPT,
-            &[
-                path.to_string_lossy().into_owned(),
-                offset.to_string(),
-                max.to_string(),
-            ],
-        );
-        let result = self.exec("sh", &args).await?;
-        if result.code != Some(0) {
-            return Err(FsError::Backend(format!(
-                "read {}: {}",
-                path.display(),
-                first_line_or(&result.stderr, "command failed")
-            )));
+        let target = path.to_string_lossy().into_owned();
+        let mut out = Vec::new();
+        loop {
+            let want = (max - out.len()).min(READ_CHUNK);
+            let args = sh_script(
+                READ_WINDOW_SCRIPT,
+                &[
+                    target.clone(),
+                    (offset + out.len() as u64).to_string(),
+                    want.to_string(),
+                ],
+            );
+            let result = self.exec("sh", &args).await?;
+            if result.code != Some(0) {
+                return Err(FsError::Backend(format!(
+                    "read {}: {}",
+                    path.display(),
+                    first_line_or(&result.stderr, "command failed")
+                )));
+            }
+            // The backstop for a runner whose capture is smaller than the chunk: refuse a cut-short
+            // read rather than return it as the file.
+            if result.truncated {
+                return Err(FsError::Backend(format!(
+                    "read {}: the command's output was cut short",
+                    path.display()
+                )));
+            }
+            let chunk = decode_base64(result.stdout.trim())
+                .map_err(|e| FsError::Backend(format!("read {}: {e}", path.display())))?;
+            let short = chunk.len() < want;
+            if out.is_empty() && (short || want == max) {
+                return Ok(chunk); // the common case: the whole window in one command, no copy
+            }
+            out.extend_from_slice(&chunk);
+            if short || out.len() >= max {
+                return Ok(out);
+            }
         }
-        decode_base64(result.stdout.trim())
-            .map_err(|e| FsError::Backend(format!("read {}: {e}", path.display())))
     }
 
     /// Write-temp-then-`mv`, the same shape [`crate::tools::write_atomic`] uses locally, so a reader or

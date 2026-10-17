@@ -1136,3 +1136,72 @@ async fn a_truncated_result_agrees_on_count_and_notice_if_not_on_membership() {
         );
     }
 }
+
+/// One KiB past `edit`'s 64 MiB ceiling.
+const PAST_EDIT_CAP: usize = 64 * 1024 * 1024 + 1024;
+
+#[tokio::test]
+async fn edit_refuses_a_file_over_its_size_limit_and_leaves_it_untouched_on_every_backend() {
+    // Matchable text up front, a marker at the very end, zeros between. Before the size check, `edit`
+    // read only the first 64 MiB, applied the edit to that prefix, wrote the prefix back, and reported
+    // success: the tail, marker included, was gone.
+    let mut bytes = vec![0u8; PAST_EDIT_CAP];
+    let head = b"needle at the top\n";
+    bytes[..head.len()].copy_from_slice(head);
+    let tail = b"\nthe tail must survive\n";
+    let at = bytes.len() - tail.len();
+    bytes[at..].copy_from_slice(tail);
+
+    for (name, backend) in all_backends().await {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("huge.log");
+        std::fs::write(&p, &bytes).unwrap();
+        let err = run_tool_err(
+            Some(backend),
+            "edit",
+            json!({ "path": p.to_str().unwrap(), "old_string": "needle", "new_string": "pin" }),
+        )
+        .await;
+        assert!(
+            err.contains(&PAST_EDIT_CAP.to_string()) && err.contains("67108864"),
+            "{name}: the refusal names the size and the limit: {err}"
+        );
+        assert!(err.contains("bash"), "{name}: and says what to use: {err}");
+        assert!(
+            std::fs::read(&p).unwrap() == bytes,
+            "{name}: a refused edit must leave the file byte-identical"
+        );
+    }
+}
+
+#[tokio::test]
+async fn edit_keeps_every_byte_of_a_file_larger_than_one_command_output_on_every_backend() {
+    // 1 MiB: well past what one command's captured stdout holds (128 KiB head + 128 KiB tail). A
+    // single-command read kept the head and the tail, glued them together, and `edit` wrote that back.
+    let mut text = String::from("needle at the top\n");
+    let mut i = 0u32;
+    while text.len() < 1024 * 1024 {
+        text.push_str(&format!("line {i:08} of a file bigger than one capture\n"));
+        i += 1;
+    }
+    let expected = text.replacen("needle", "pin", 1);
+
+    for (name, backend) in all_backends().await {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("big.txt");
+        std::fs::write(&p, &text).unwrap();
+        run_tool(
+            Some(backend),
+            "edit",
+            json!({ "path": p.to_str().unwrap(), "old_string": "needle", "new_string": "pin" }),
+        )
+        .await;
+        let after = std::fs::read_to_string(&p).unwrap();
+        assert!(
+            after == expected,
+            "{name}: edit changed more than the match ({} bytes before, {} after)",
+            text.len(),
+            after.len()
+        );
+    }
+}
