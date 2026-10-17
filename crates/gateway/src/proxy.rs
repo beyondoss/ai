@@ -4651,11 +4651,12 @@ impl ProxyHttp for AiProxy {
         // Two root `model` keys (D34), refused before connecting wherever the body is already in
         // hand, with a JSON 400 and the request id (D94). A body streamed through is still refused
         // in `request_body_filter`, after the request headers went upstream.
-        if model_route.is_some()
-            && body_complete
-                .as_deref()
-                .is_some_and(|b| peek::scan_buffered(b).duplicate_model)
-        {
+        // One walk of the body serves both checks below.
+        let scan = body_complete
+            .as_deref()
+            .filter(|_| model_route.is_some())
+            .map(peek::scan_buffered);
+        if scan.as_ref().is_some_and(|s| s.duplicate_model) {
             self.state
                 .metrics
                 .rejection(Rejection::DuplicateModel)
@@ -4667,6 +4668,22 @@ impl ProxyHttp for AiProxy {
                 "invalid_request_error",
                 "the request body has more than one root \"model\" key; send exactly one"
                     .to_owned(),
+            )
+            .await;
+        }
+
+        // An output limit that is not a whole number on a row with a published cap: refused here, with
+        // a JSON 400, when the body is in hand (see `request_body_filter` for the streamed case).
+        if model_route.is_some_and(|r| r.card.output_cap().is_some())
+            && scan.as_ref().is_some_and(|s| s.inexact_limit)
+        {
+            self.state.metrics.rejection(Rejection::OutputLimit).inc();
+            return Self::reject_message_boxed(
+                session,
+                &request_id,
+                400,
+                "invalid_request_error",
+                "an output limit must be a whole number of tokens".to_owned(),
             )
             .await;
         }
@@ -6198,6 +6215,22 @@ impl ProxyHttp for AiProxy {
                     return Err(pingora_core::Error::explain(
                         pingora_core::ErrorType::HTTPStatus(400),
                         "duplicate root model key",
+                    )
+                    .into_down());
+                }
+                // An output limit that is not a whole number (a string, a fraction, a negative) has no
+                // span, so the clamp below cannot hold it to the row's maximum. Refused before a byte
+                // goes upstream, where the provider would otherwise be the one to read it.
+                if scan.inexact_limit
+                    && rc
+                        .auto
+                        .as_ref()
+                        .is_some_and(|a| a.route.card.output_cap().is_some())
+                {
+                    self.state.metrics.rejection(Rejection::OutputLimit).inc();
+                    return Err(gateway_error(
+                        400,
+                        "an output limit must be a whole number of tokens",
                     )
                     .into_down());
                 }

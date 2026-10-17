@@ -668,6 +668,10 @@ pub struct BufferedScan {
     /// (first occurrence of each): the span a catalog walk caps at the serving model's maximum.
     /// A value that is not a plain non-negative integer is not recorded.
     pub limit_spans: [Option<(usize, usize)>; 3],
+    /// A root output limit is present with a value that is no plain integer and not `null`: a
+    /// string, a fraction, an exponent, a negative, an object. It has no span, so a clamp cannot
+    /// cap it, and a catalog walk refuses the body rather than send it on.
+    pub inexact_limit: bool,
     /// Offset of each root-level output limit key's opening quote, indexed like
     /// [`OUTPUT_LIMIT_KEYS`] (first occurrence of each, whatever its value): where a walk onto
     /// native OpenAI Chat Completions renames `max_tokens`.
@@ -724,6 +728,7 @@ pub fn scan_buffered(body: &[u8]) -> BufferedScan {
             model_span: None,
             duplicate_model: false,
             limit_spans: [None; 3],
+            inexact_limit: false,
             limit_keys: [None; 3],
             stream_options_ambiguous: false,
         };
@@ -756,6 +761,9 @@ pub fn scan_buffered(body: &[u8]) -> BufferedScan {
     // The output limit whose value comes next, as an index into `OUTPUT_LIMIT_KEYS`.
     let mut limit_key: Option<usize> = None;
     let mut limit_spans: [Option<(usize, usize)>; 3] = [None; 3];
+    let mut inexact_limit = false;
+    // The byte after a limit key's colon is still to come.
+    let mut limit_value_next = false;
     let mut limit_keys: [Option<usize>; 3] = [None; 3];
 
     let mut j = i;
@@ -813,9 +821,22 @@ pub fn scan_buffered(body: &[u8]) -> BufferedScan {
                             || (key.contains(&b'\\')
                                 && escaped_key_is(&body[key_start - 1..=j], "model"));
                         model_keys += u32::from(last_key_is_model);
-                        limit_key = OUTPUT_LIMIT_KEYS.iter().position(|k| *k == key);
+                        // A key spelled with escapes names the limit it decodes to (`"max\u005ftokens"`).
+                        let quoted = &body[key_start - 1..=j];
+                        limit_key = OUTPUT_LIMIT_KEYS.iter().position(|k| {
+                            *k == key
+                                || (key.contains(&b'\\')
+                                    && std::str::from_utf8(k)
+                                        .is_ok_and(|want| escaped_key_is(quoted, want)))
+                        });
                         if let Some(k) = limit_key {
+                            // A second root spelling of the same limit: a parser keeps one of them, and
+                            // only the first is spanned, so it cannot be capped reliably. Refused.
+                            if limit_keys[k].is_some() {
+                                inexact_limit = true;
+                            }
                             limit_keys[k].get_or_insert(key_start - 1);
+                            limit_value_next = true;
                         }
                     }
                 } else if capturing_model {
@@ -838,6 +859,15 @@ pub fn scan_buffered(body: &[u8]) -> BufferedScan {
             continue;
         }
         let b = body[j];
+        // The first byte of a limit's value decides it: a digit starts a plain integer, the literal
+        // `null` is no value, and whitespace or the colon before the value is skipped. Anything else
+        // (an `n` that is not `null`, a string, a fraction) is inexact.
+        if limit_value_next && !(b.is_ascii_whitespace() || b == b':') {
+            limit_value_next = false;
+            if !(b.is_ascii_digit() || body[j..].starts_with(b"null")) {
+                inexact_limit = true;
+            }
+        }
         match b {
             b'"' => {
                 capturing_key = false;
@@ -875,10 +905,18 @@ pub fn scan_buffered(body: &[u8]) -> BufferedScan {
                     .iter()
                     .position(|c| !c.is_ascii_digit())
                     .map_or(n, |rel| j + rel);
-                if let Some(k) = limit_key.take()
-                    && limit_spans[k].is_none()
-                {
-                    limit_spans[k] = Some((j, end));
+                // A plain integer ends its member: `,` or `}`, past any whitespace. A fraction or an
+                // exponent ends in `.`, `e` or `E` instead, and is no integer.
+                let ends_member = body[end..]
+                    .iter()
+                    .find(|c| !c.is_ascii_whitespace())
+                    .is_some_and(|c| matches!(c, b',' | b'}'));
+                if let Some(k) = limit_key.take() {
+                    if !ends_member {
+                        inexact_limit = true;
+                    } else if limit_spans[k].is_none() {
+                        limit_spans[k] = Some((j, end));
+                    }
                 }
                 j = end;
                 continue;
@@ -916,6 +954,7 @@ pub fn scan_buffered(body: &[u8]) -> BufferedScan {
         model_span,
         duplicate_model: model_keys > 1,
         limit_spans,
+        inexact_limit,
         limit_keys,
         stream_options_ambiguous,
     }
@@ -1733,6 +1772,108 @@ mod tests {
         let body = br#"{"model":"openai\/gpt-5"}"#;
         assert_eq!(scan(body).as_deref(), Some("openai/gpt-5"));
         assert_eq!(scan_buffered(body).model.as_deref(), Some("openai/gpt-5"));
+    }
+
+    /// claim: TRN-5
+    /// defect: D275
+    #[test]
+    fn a_fractional_output_limit_has_no_span() {
+        let body = br#"{"max_tokens":1.5,"model":"m"}"#;
+        let scan = scan_buffered(body);
+        assert_eq!(scan.limit_spans[0], None);
+        assert!(scan.inexact_limit);
+    }
+
+    /// claim: TRN-5
+    /// defect: D275
+    #[test]
+    fn an_exponent_output_limit_has_no_span() {
+        let body = br#"{"max_tokens":1e5,"model":"m"}"#;
+        let scan = scan_buffered(body);
+        assert_eq!(scan.limit_spans[0], None);
+        assert!(scan.inexact_limit);
+    }
+
+    /// A limit key spelled with escapes is the limit it decodes to, so it is spanned and capped.
+    /// claim: TRN-5
+    /// defect: D275
+    #[test]
+    fn an_escaped_output_limit_key_is_spanned() {
+        let bs = '\\';
+        let body = format!(r#"{{"max{bs}u005ftokens":99999,"model":"m"}}"#);
+        let oracle: serde_json::Value = serde_json::from_slice(body.as_bytes()).unwrap();
+        assert_eq!(oracle["max_tokens"], 99999);
+        let scan = scan_buffered(body.as_bytes());
+        let (a, b) = scan.limit_spans[0].expect("the escaped key is max_tokens");
+        assert_eq!(&body.as_bytes()[a..b], b"99999");
+        assert!(!scan.inexact_limit);
+    }
+
+    /// A second root spelling of one limit cannot be capped reliably (a parser keeps one of them), so
+    /// it is inexact, whatever its values.
+    /// claim: TRN-5
+    /// defect: D275
+    #[test]
+    fn a_duplicate_output_limit_key_is_inexact() {
+        let scan = scan_buffered(br#"{"max_tokens":8,"max_tokens":99999,"model":"m"}"#);
+        assert!(scan.inexact_limit);
+        let other = scan_buffered(br#"{"max_tokens":8,"max_completion_tokens":9,"model":"m"}"#);
+        assert!(
+            !other.inexact_limit,
+            "two different limits are not a duplicate"
+        );
+    }
+
+    /// Any first byte that is not a digit, `null` or whitespace makes the limit inexact: a leading
+    /// `+` or `.` is no integer either.
+    /// claim: TRN-5
+    /// defect: D275
+    #[test]
+    fn a_limit_starting_with_plus_or_dot_is_inexact() {
+        for body in [
+            r#"{"max_tokens":+5,"model":"m"}"#,
+            r#"{"max_tokens":.5,"model":"m"}"#,
+        ] {
+            assert!(scan_buffered(body.as_bytes()).inexact_limit, "{body}");
+        }
+        assert!(!scan_buffered(br#"{"max_tokens": null ,"model":"m"}"#).inexact_limit);
+        // An `n` that is not the literal `null` is no null: inexact.
+        for body in [
+            r#"{"max_tokens":nope,"model":"m"}"#,
+            r#"{"max_tokens":nul,"model":"m"}"#,
+        ] {
+            assert!(scan_buffered(body.as_bytes()).inexact_limit, "{body}");
+        }
+    }
+
+    /// claim: TRN-5
+    /// defect: D275
+    #[test]
+    fn only_a_non_integer_output_limit_is_inexact() {
+        let flagged = |body: &str| scan_buffered(body.as_bytes()).inexact_limit;
+        assert!(flagged(r#"{"max_tokens":"100","model":"m"}"#), "a string");
+        assert!(flagged(r#"{"max_tokens":-1,"model":"m"}"#), "a negative");
+        assert!(flagged(r#"{"max_tokens":true,"model":"m"}"#), "a bool");
+        assert!(
+            flagged(r#"{"max_tokens":{"n":1},"model":"m"}"#),
+            "an object"
+        );
+        assert!(
+            flagged(r#"{"max_tokens":1 .5,"model":"m"}"#),
+            "a fraction past whitespace"
+        );
+        assert!(
+            !flagged(r#"{"max_tokens":null,"model":"m"}"#),
+            "null is no value"
+        );
+        assert!(
+            !flagged(r#"{"max_tokens" : 64000 ,"model":"m"}"#),
+            "a plain integer"
+        );
+        assert!(
+            !flagged(r#"{"messages":[{"max_tokens":"x"}],"max_tokens":8}"#),
+            "a nested one"
+        );
     }
 
     fn scan(body: &[u8]) -> Option<String> {

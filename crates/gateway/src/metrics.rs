@@ -97,12 +97,15 @@ pub enum Rejection {
     /// meter (a container, the image generation tool, an OpenRouter plugin, Anthropic Priority
     /// Tier: `unpriced::feature`). 400 before any upstream, so nothing runs unpriced.
     UnpricedFeature,
+    /// A catalog-walk output limit that is not a whole number (a string, a fraction, a negative):
+    /// no span to cap it by, so the body is refused. 400 before any upstream.
+    OutputLimit,
 }
 
 impl Rejection {
     /// Every variant, in `as_index` order. The array in `Metrics` is built from this, so adding a
     /// variant without adding it here fails the exhaustive `match` in `as_index`.
-    pub(crate) const ALL: [Rejection; 25] = [
+    pub(crate) const ALL: [Rejection; 26] = [
         Rejection::Auth,
         Rejection::DenySpend,
         Rejection::DenyFraud,
@@ -128,6 +131,7 @@ impl Rejection {
         Rejection::TranslateTooLarge,
         Rejection::RequestDeadline,
         Rejection::UnpricedFeature,
+        Rejection::OutputLimit,
     ];
 
     /// The `reason=` label value. `RateLimit` keeps the original `"rate_limit"` string so existing
@@ -159,6 +163,7 @@ impl Rejection {
             Rejection::TranslateTooLarge => "translate_too_large",
             Rejection::RequestDeadline => "request_deadline",
             Rejection::UnpricedFeature => "unpriced_feature",
+            Rejection::OutputLimit => "output_limit",
         }
     }
 
@@ -189,6 +194,7 @@ impl Rejection {
             Rejection::TranslateTooLarge => 22,
             Rejection::RequestDeadline => 23,
             Rejection::UnpricedFeature => 24,
+            Rejection::OutputLimit => 25,
         }
     }
 }

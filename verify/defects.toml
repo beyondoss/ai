@@ -2793,3 +2793,17 @@ state = "fixed"
 test = "a_unicode_escape_in_a_model_value_is_decoded"
 fix = ""
 note = "Fixed in peek.rs: a string's escapes are captured with it (the backslash too), and capture_text decodes the capture as serde_json does, at the value's close in ModelScanner and in scan_buffered. A capture at the cap that holds an escape decodes to None (unknown), since its last escape may be cut. Kept request knobs (service_tier, provider, ...) decode the same way. Capture stays bounded by MAX_CAPTURE and an unescaped value costs nothing new. Also held by a_newline_escape_in_a_model_value_is_decoded, a_slash_escape_in_a_model_value_is_decoded and props_peek's model-value property, now without its escaped-value exclusion."
+
+[[defect]]
+id = "D275"
+severity = "med"
+area = "Translation"
+title = "An output limit written as a fraction or an exponent escapes the row's cap"
+impact = "The catalog walk caps a root output limit by its span, and the span was the leading digit run. 1e5 spanned `1`, which is under any cap, so a value over the row's published maximum went upstream uncapped, to the provider's own 400 the cap exists to prevent. 99999.5 spanned `99999`, and the splice produced 16384.5, a fraction the provider refuses."
+confidence = "high"
+evidence = "peek.rs scan_buffered recorded (j, end) for the digits before any `.` or `e`. Reproduced on 4513e6f by a_fractional_output_limit_has_no_span and an_exponent_output_limit_has_no_span (the limit's span was Some(1))."
+claims = ["TRN-5"]
+state = "fixed"
+test = "an_exponent_output_limit_has_no_span"
+fix = ""
+note = "Fixed in peek.rs: a root limit's digits are a span only when the member ends after them (`,` or `}`, past whitespace). Any other value that is present and not null is flagged as inexact_limit: strings, bools, objects, arrays, negatives, fractions, exponents. A catalog walk on a row with a published cap refuses a flagged body with a 400 before the upstream (proxy request_body_filter, Rejection::OutputLimit, reason output_limit), so a limit is never sent on uncapped. A row with no published cap has nothing to hold it to and forwards it as before. Also held by a_non_integer_output_limit_is_refused_before_the_upstream (catalog_body.rs, compile-only here) and only_a_non_integer_output_limit_is_inexact."

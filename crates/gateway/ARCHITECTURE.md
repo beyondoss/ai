@@ -980,7 +980,10 @@ default). Tools, text, and usage still
 round-trip. Anthropic requires `max_tokens`; a missing OpenAI value becomes 4096. On every catalog
 walk, translated or not, a root `max_tokens` / `max_completion_tokens` / `max_output_tokens` above
 the row's **published** max output (`ModelCard::output_cap`) is capped to it (never raised; spans
-found by the same `peek::scan_buffered` walk that finds `model`, spliced in place). Claude Code sends
+found by the same `peek::scan_buffered` walk that finds `model`, spliced in place). A limit that is
+no whole number (a string, a fraction, an exponent, a negative) has no span to cap, so on such a row
+the walk refuses the body with a 400 (`ai_rejections_total{reason="output_limit"}`) before any byte
+goes upstream; `null` is no value and is left to the existing null handling. Claude Code sends
 32000 or 64000, which gpt-4o-class rows (16384) answered with a 400. A row whose vendor publishes no
 max output (Grok, Kimi, MiniMax, …) lists the `UNPUBLISHED_MAX_OUTPUT` placeholder and is not
 capped: cutting 64000 to a figure that is not the vendor's would end answers early with
@@ -3555,7 +3558,7 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
 | Metric                                | Type      | Labels               | What It Measures                                                                                                                                                                                                           |
 | ------------------------------------- | --------- | -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `ai_requests_total`                   | Counter   | —                    | Every client request received, rejected ones included (a `FullBody` re-run is not counted again)                                                                                                                           |
-| `ai_rejections_total`                 | Counter   | `reason`             | Rejected requests by cause (auth, deny_spend, quota, allowance_unavailable, deny_fraud, rate_limit, tenant_concurrency, managed_endpoint, duplicate_model, modality, request_deadline, unpriced_feature, etc.)             |
+| `ai_rejections_total`                 | Counter   | `reason`             | Rejected requests by cause (auth, deny_spend, quota, allowance_unavailable, deny_fraud, rate_limit, tenant_concurrency, managed_endpoint, duplicate_model, modality, request_deadline, unpriced_feature, output_limit, etc.)             |
 | `ai_upstream_responses_total`         | Counter   | `provider`, `status` | Upstream responses by provider and status class                                                                                                                                                                            |
 | `ai_connect_retries_total`            | Counter   | `provider`           | Upstream connect retries by provider (on a catalog walk, labelled with the candidate left behind)                                                                                                                          |
 | `ai_tokens_total`                     | Counter   | `kind`               | input / output / cache_read / cache_write token counts                                                                                                                                                                     |
