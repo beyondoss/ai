@@ -2812,16 +2812,64 @@ and `serve`'s own `bash`/`abort_bash` RPC commands reuse `RealRunner` directly, 
     again. Summarized or not; a summarized session also still gets its `<background-jobs>` block. A
     kill result names the command it killed (``Job 3 (`npm run dev`) killed after 4 s.``). Tests:
     `tools/bash_jobs_reopen_tests.rs` (the reader, seeding, a kill), `tests/bash_jobs_reopen.rs`
-    (a `serve` restart and `run --continue`).
+    (a `serve` restart and `run --continue`). A remote job the sandbox kept (next item) is not
+    gone: it is in the table again by the first run, and the note lists it as "(still running)"
+    under its old number, separately from the ones that were stopped; one that ended meanwhile is
+    left to its finish notice.
+  - **Remote jobs belong to the sandbox (`tools::bash_sandbox`).** A session's table has a job
+    scope (`BashJobs::set_scope`: `serve` and `run` set `JobScope::for_session(tenant, session)`;
+    a subagent's table and `serve`'s host table have none and keep the stream-owned lifetime). With
+    one, and a sandbox that passes the job probe, every remote command runs as a sandbox job
+    (`exec_endpoint::jobs`, see "Sandbox jobs"): held, so a foreground command still dies with its
+    call, its turn or its replica — the endpoint kills the held start's stream on disconnect and the
+    keeper kills the job within half a second. When the command becomes an intended job — parked by
+    a background start's settle, or adopted at its shell's exit, including a parked yielded job
+    whose shell exits (`notices` keeps it from there) — the table **keeps** it under its job number
+    and kind with the offset of the output already shown (`bash_sandbox::keep`); under
+    `EndPolicy::KeepRunning` the job is then **released**: dropping it (a reap, a deploy, a crash,
+    the session's end) only lets go of its stream, and the exit path's `kill_live_jobs` skips it.
+    Only a kill (`bash_job`, the `Kill` hook running the sandbox's `kill`, which also deletes the
+    directory), an explicit end, or the sandbox's own end stops it. Each later report of its output
+    records `seen` in the sandbox. Ends: `serve`'s session end calls `BashJobs::release` (stop
+    what this process owns, let go of what the sandbox owns); a transcript switch (`new_session`,
+    `switch_session`, a switching fork) and `delete_session` are explicit ends — `stop_all`, then
+    `bash_sandbox::wipe` of the old (or deleted) session's scope, so nothing of it outlives the
+    switch even if the table had lost track; `run` (`StopAtEnd`) kills kept jobs at its end as
+    before. The lifetime text says so: "it keeps running in the sandbox until it exits, you stop it,
+    or the session ends". Over v1.1 nothing can be held, so a background job starts kept and is
+    followed by polling: `run_in_background` now works there, and a foreground command still waits
+    for its exit. A kept job whose held stream breaks (a network blip) is followed by polling from
+    where the stream left off instead of being reported failed.
+  - **Reattach (`bash_sandbox::reattach`).** Where a session opens (`serve_session` after its exec
+    target is set, again after a transcript switch; `run` before its first turn) the table lists the
+    scope. A kept job with a number is the session's: under `KeepRunning` it is parked again under
+    that number (the id counter is raised past it), released, followed from its `seen` offset — so
+    a peek or its notice shows only what is new — with its shell's exit already reported; one that
+    ended meanwhile gets an ordinary finish notice timed by the sandbox's `end` epoch (which, in
+    `serve`, wakes the idle session like any other end). Under `StopAtEnd` it is killed, as the run
+    that started it would have. Everything else — a held job whose replica died, a kept start whose
+    number was never recorded because the call that started it was lost — belongs to a turn that is
+    over and is killed. **Delivered once:** a reported end (a notice, or a `bash_job` result) queues
+    the job's directory for deletion, and the host deletes them where the reports are known to be
+    persisted (`BashJobs::collect_garbage`: the top of `serve`'s loop, the end of `run`), so a replica
+    that dies after noticing but before persisting leaves the job for the next replica to notice
+    again, and one that persisted never repeats it. Tests: `tests/bash_sandbox_jobs.rs` (a background
+    job, an adoption and a yielded command across a dropped table and a reattach, over the v1.2 mock,
+    the v1.1 mock and a template transport; the ended-while-detached notice exactly once; a replica
+    that dies before persisting; `StopAtEnd`; `release`; the reopen note) and
+    `tests/bash_jobs_serve_sandbox.rs` (a real `serve` process ends, the job runs on, the next one
+    reports it still running, peeks its new output, and kills it; a job that ended between processes
+    is noticed once).
 - **`run_in_background` (`Start::Background`, `JobKind::Background`)**. A boolean on `bash`, not a
   tool of its own: in the background-shell probe (1,500 trials on Luna, Sol, Kimi K2.7 Code and Qwen
   3.8 Flash with the real system prompt and tools) it beat a separate start tool on every model, was
   never set wrongly on 400+ short commands (Luna and Sol send `false` on every call), and backgrounded
   server starts 88% (Luna, Sol), 73% (Kimi, plus 13% its own `docker -d`) and 50% (Qwen) of the time.
   The description sentence and the field text are the measured wording. A background call is refused
-  before anything runs when the runner cannot track a job (`CommandRunner::tracks_jobs`: false for a
-  v1.1 endpoint, which can neither stream nor stop a command) or when `MAX_INTENDED_JOBS` are already
-  running. Otherwise the command starts as a job and the call waits `BACKGROUND_SETTLE` (1.5 s), or
+  before anything runs when it could not outlive its call — the runner cannot track a job
+  (`CommandRunner::tracks_jobs`: false for a v1.1 endpoint, which can neither stream nor stop a
+  command) and there is no sandbox to own it (a v1.1 sandbox with a job scope runs it as a kept
+  sandbox job) — or when `MAX_INTENDED_JOBS` are already running. Otherwise the command starts as a job and the call waits `BACKGROUND_SETTLE` (1.5 s), or
   less if it exits: a command that dies at once reports its exit in this result, not as a notice a
   turn later. Measured time-to-exit of failed starts on the dev box (three runs each): a bad flag or
   missing command 1–3 ms, Python and Node servers on a port in use 24–90 ms, `npm run`/`npm start` with

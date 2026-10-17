@@ -218,10 +218,8 @@ fn describe(idle_yield: Option<Duration>) -> String {
              a command you don't need to wait on (a server, a watcher): the call returns at once with \
              a job number and you are notified when it exits; don't poll or sleep. You are told when \
              every job exits, without asking. Use `bash_job` with the number to see what a job has \
-             printed, to wait for one whose result you need, or to stop one. (A remote sandbox that \
-             cannot stream output as it happens is the \
-             exception: there the call waits for the command to exit, and `run_in_background` is \
-             unavailable.)",
+             printed, to wait for one whose result you need, or to stop one. (Where a remote sandbox \
+             cannot stream output as it happens, a call waits for its command to exit.)",
             idle.as_secs(),
             OUTPUT_CEILING.as_secs() / 60,
         ));
@@ -439,9 +437,16 @@ impl Bash {
                 )));
             }
         };
+        // Off this host, a session's commands run as jobs of the sandbox when it can host them
+        // (see `bash_sandbox`): that is what lets an intended job outlive this replica.
+        let sandbox = if world.is_remote() {
+            super::bash_sandbox::store_for(&self.jobs, &self.runner).await
+        } else {
+            None
+        };
         if start == Start::Background {
             // Refused before anything runs: starting a server only to stop it helps nobody.
-            if !self.runner.tracks_jobs().await {
+            if sandbox.is_none() && !self.runner.tracks_jobs().await {
                 return Err(ToolError::InvalidInput(
                     "`run_in_background` is unavailable here: this sandbox's exec endpoint (protocol \
                      v1.1) cannot stream a command's output or stop it, so nothing can keep running \
@@ -466,7 +471,7 @@ impl Bash {
             None => command.to_string(),
         };
         let args = vec!["-c".to_string(), resolved_command];
-        self.exec_detachable(args, cwd, &world, progress, command, start)
+        self.exec_detachable(args, cwd, &world, progress, command, start, sandbox)
             .await
     }
 
@@ -485,6 +490,7 @@ impl Bash {
     ///
     /// No deadline kills the command: a job lives until it exits, is killed, or its kind's owner ends
     /// it (the turn for a yielded job; the run or the session for an intended one).
+    #[allow(clippy::too_many_arguments)]
     async fn exec_detachable(
         &self,
         args: Vec<String>,
@@ -493,8 +499,31 @@ impl Bash {
         progress: Option<&ToolProgress>,
         command: &str,
         start: Start,
+        sandbox: Option<(
+            Arc<dyn crate::exec_endpoint::jobs::SandboxJobs>,
+            crate::exec_endpoint::jobs::JobScope,
+        )>,
     ) -> Result<ToolOutput, ToolError> {
         let shared = Arc::new(JobShared::new(world.is_remote(), &self.jobs));
+        // A sandbox job when the sandbox can host it: held when its start can stream, kept from the
+        // start otherwise — which only a background job needs; a foreground command over an endpoint
+        // that cannot stream waits for its exit as before.
+        let sandbox = match sandbox {
+            Some((store, scope)) => {
+                let held = store.holds().await;
+                (held || start == Start::Background).then(|| {
+                    let link = super::bash_sandbox::SandboxLink::new(
+                        store,
+                        scope,
+                        crate::exec_endpoint::jobs::JobId::fresh(),
+                        !held,
+                    );
+                    shared.set_sandbox(link.clone());
+                    (link, held)
+                })
+            }
+            None => None,
+        };
         if let Some(p) = progress {
             p.emit("", None);
         }
@@ -503,6 +532,7 @@ impl Bash {
             let shell = self.shell(world).to_string();
             let cwd = cwd.map(str::to_string);
             let shared = shared.clone();
+            let label = truncate_command(command, COMMAND_CHARS);
             tokio::spawn(async move {
                 // Records an end even if this task is aborted or panics, so a waiting call never
                 // waits on a task that is gone.
@@ -515,13 +545,25 @@ impl Bash {
                     on_spawn: &on_spawn,
                     on_orphans: &on_orphans,
                 };
-                let result = runner
-                    .run_streaming_tracked(&shell, &args, cwd.as_deref(), &hooks)
-                    .await;
+                let result = match sandbox {
+                    Some((link, held)) => {
+                        let spec = crate::exec_endpoint::jobs::JobSpec {
+                            program: shell,
+                            args,
+                            cwd,
+                            label,
+                        };
+                        super::bash_sandbox::run(&shared, &link, &spec, held).await
+                    }
+                    None => runner
+                        .run_streaming_tracked(&shell, &args, cwd.as_deref(), &hooks)
+                        .await
+                        .map_err(|e| format!("spawn failed: {e}")),
+                };
                 // Exited: nothing left for anyone to kill.
                 shared.untrack();
                 finished.0 = None;
-                shared.finish(result.map_err(|e| format!("spawn failed: {e}")));
+                shared.finish(result);
             })
         };
         let (kind, hold) = match start {
@@ -741,7 +783,10 @@ impl Bash {
         let snap = job.shared.take_segment();
         let text = clean(format_output(&snap, ""));
         let running = job.started.elapsed().as_secs();
-        let lifetime = self.jobs.lifetime(job.kind);
+        let lifetime = self.jobs.lifetime(job.kind, job.shared.sandbox().is_some());
+        // What the model has seen of a job the sandbox owns: where a replica that reattaches it
+        // picks up.
+        super::bash_sandbox::spawn_seen(&job.shared);
         let status = if reattached {
             format!(
                 "{why}Job {id} is still running ({running} s so far; {lifetime}). You will be told \
@@ -774,7 +819,8 @@ impl Bash {
     async fn start_background(&self, job: Job) -> Result<ToolOutput, ToolError> {
         let snap = job.shared.take_segment();
         let text = clean(format_output(&snap, "(no output yet)"));
-        let lifetime = self.jobs.lifetime(job.kind);
+        let shared = job.shared.clone();
+        let lifetime = self.jobs.lifetime(job.kind, shared.sandbox().is_some());
         match self.jobs.park_intended(job) {
             Ok(id) => Ok(append_status(
                 &text,
@@ -786,7 +832,8 @@ impl Bash {
                      exits, so do not poll it or sleep. To see what it has printed since, bash_job \
                      {{\"job\": {id}, \"timeout_ms\": 0}}; to wait for it to finish (a build or a \
                      test run, not a server), bash_job {{\"job\": {id}}}; to stop it, bash_job \
-                     {{\"job\": {id}, \"kill\": true}}."
+                     {{\"job\": {id}, \"kill\": true}}.{}",
+                    self.hand_over(&shared, id, JobKind::Background).await
                 ),
             )
             .into()),
@@ -824,7 +871,8 @@ impl Bash {
         let text = clean(format_output(&snap, ""));
         let shell_status = exit_status_line(shell, job.started.elapsed().as_secs());
         job.kind = JobKind::Adopted;
-        let lifetime = self.jobs.lifetime(job.kind);
+        let shared = job.shared.clone();
+        let lifetime = self.jobs.lifetime(job.kind, shared.sandbox().is_some());
         // An instance that never detaches has no `bash_job` beside it and nobody to tell when the
         // processes exit: `serve`'s host `bash`, whose caller is a client, not the model.
         let note = match self.jobs.park_intended(job) {
@@ -846,7 +894,8 @@ impl Bash {
             Ok(id) => format!(
                 "The command exited but left {left} running; it is tracked as job {id} \
                  ({lifetime}). You will be told when it exits. bash_job {{\"job\": {id}, \"kill\": \
-                 true}} stops it."
+                 true}} stops it.{}",
+                self.hand_over(&shared, id, JobKind::Adopted).await
             ),
             Err((job, running)) => {
                 if let Some(group) = job.shared.untrack() {
@@ -872,6 +921,20 @@ impl Bash {
         }
     }
 
+    /// Hand a parked intended job to the sandbox, if the sandbox runs it ([`super::bash_sandbox::keep`]).
+    /// Empty when it did, or nothing needed doing; otherwise the note the model needs, since the job
+    /// then lives only as long as this replica's stream.
+    async fn hand_over(&self, shared: &JobShared, id: u64, kind: JobKind) -> String {
+        match super::bash_sandbox::keep(shared, id, kind, self.jobs.policy()).await {
+            Ok(()) => String::new(),
+            Err(e) => {
+                tracing::warn!(job = id, error = %e, "the sandbox could not take over a job");
+                " (The sandbox could not take it over, so it stops if this session closes.)"
+                    .to_string()
+            }
+        }
+    }
+
     /// A job has ended: its final result over the output produced since the last report.
     fn finish_job(
         &self,
@@ -879,6 +942,10 @@ impl Bash {
         end: JobEnd,
         progress: Option<&ToolProgress>,
     ) -> Result<ToolOutput, ToolError> {
+        // Reported now: its directory in the sandbox can go once this is persisted.
+        if let Some(link) = job.shared.sandbox() {
+            self.jobs.discard_later(link);
+        }
         let result = end.result.map_err(ToolError::Execution)?;
         let snap = {
             let mut out = job.shared.out();
@@ -1678,8 +1745,11 @@ mod tests {
             desc.contains("after its `timeout_ms` returns early"),
             "{desc}"
         );
+        // Over v1.1 a background job is the sandbox's (it starts kept and is polled); only a
+        // foreground call still has to wait for its command.
         assert!(
-            desc.contains("`run_in_background` is unavailable"),
+            desc.contains("a call waits for its command to exit")
+                && !desc.contains("`run_in_background` is unavailable"),
             "the v1.1 exception: {desc}"
         );
         assert!(

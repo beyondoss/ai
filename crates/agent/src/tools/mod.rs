@@ -11,6 +11,7 @@ use agent_core::{Tool, ToolError, ToolRegistry};
 pub mod bash;
 pub mod bash_jobs;
 pub mod bash_proc;
+pub mod bash_sandbox;
 pub mod code_mode;
 pub mod edit;
 pub mod exec;
