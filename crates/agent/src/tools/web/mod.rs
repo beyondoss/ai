@@ -128,6 +128,10 @@ fn build_client(timeout: Duration, policy: EgressPolicy) -> Result<reqwest::Clie
         .connect_timeout(Duration::from_secs(10))
         .timeout(timeout)
         .redirect(reqwest::redirect::Policy::none())
+        // The resolver is the SSRF guard, and a proxy would skip it: the client would dial the proxy
+        // and hand it the hostname, so `localhost` (or a name resolving inward) would be resolved and
+        // fetched by the proxy on our behalf. An ambient `HTTP(S)_PROXY`/`ALL_PROXY` is ignored.
+        .no_proxy()
         .dns_resolver(SsrfResolver::new(policy))
         .build()
         .map_err(|e| e.to_string())

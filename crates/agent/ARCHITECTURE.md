@@ -2992,7 +2992,10 @@ between the model and an internal fetch. So it **fails closed**: if the hardened
 - **A validating `reqwest::dns::Resolve`.** reqwest connects to exactly what the resolver returns, so
   checking every resolved `SocketAddr` validates the _actual_ connection IP — on the initial request and
   on every redirect hop — closing the resolve-then-reconnect (DNS-rebinding) TOCTOU gap a bare hostname
-  check leaves open.
+  check leaves open. Only if the client resolves the target at all: through a proxy it dials the proxy
+  and hands over the hostname, so an ambient `HTTP(S)_PROXY`/`ALL_PROXY` would have the proxy fetch
+  `localhost` for us. The client is built with `no_proxy()`, as are the grant-connector clients
+  (`McpEgress` and the exit `DELETE`) — `tests/egress_proxy_env.rs`.
 - **`validate_url` on every hop.** Non-http(s) schemes and literal-IP internal targets are refused
   before any DNS; redirects are followed manually (`Policy::none()`, capped at 5) so each hop is
   re-validated, which also blocks an `http → file:` scheme downgrade.
@@ -4723,7 +4726,8 @@ assumption would otherwise cross a tenant boundary:
 once by `main.rs`: its own client, not the gateway's h2c pool (a tenant's connector is not the
 gateway), carrying the `web` tool's SSRF layers for the same reason the `web` tool has them — the URL
 is not this process's to choose. `validate_url` rejects a non-`http(s)` scheme or a literal internal
-IP before any DNS; `SsrfResolver` validates every address the client actually connects to; redirects
+IP before any DNS; `SsrfResolver` validates every address the client actually connects to (and the
+client ignores ambient proxies, which would resolve the target in its place); redirects
 are refused outright, since reqwest resolves a redirect target itself and a redirect to a literal IP
 would never reach the resolver. So a connector cannot name the instance metadata service, a storage
 mount target, or a peer replica. `--mcp-allow-private` opens the blocklist for a dev replica whose

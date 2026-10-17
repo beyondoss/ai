@@ -2783,6 +2783,10 @@ impl McpEgress {
             .connect_timeout(Duration::from_secs(10))
             .pool_idle_timeout(Duration::from_secs(90))
             .redirect(reqwest::redirect::Policy::none())
+            // The resolver below is the SSRF guard, and a proxy would skip it: the client dials the
+            // proxy and hands it the hostname, so `localhost` would be resolved — and fetched — by
+            // the proxy. An ambient `HTTP(S)_PROXY`/`ALL_PROXY` is ignored here on purpose.
+            .no_proxy()
             .dns_resolver(crate::tools::web::ssrf::SsrfResolver::new(policy.clone()))
             .build()
             .map_err(|e| format!("failed to build the MCP connector client: {e}"))?;
