@@ -14,6 +14,7 @@
 //! | Groq `browser_search` (and `code_interpreter`)                   | no published fee                                          |
 //! | OpenRouter `plugins` (web, file-parser), `:online` models, `web_search_options`, `openrouter:web_search` | engine and result count unreported |
 //! | Messages `service_tier: "priority"`                              | Anthropic Priority Tier is contract-priced                |
+//! | any other tool type                                              | not one the gateway meters (see [`allowed_tool`])         |
 //!
 //! Read structurally from the client's body (root members only, and each `tools` element's own
 //! `type`), so a prompt that mentions a tool cannot trip it.
@@ -42,6 +43,7 @@ pub const CODE_EXECUTION: &str = "a managed key cannot use Anthropic code execut
 pub const ADVISOR: &str = "a managed key cannot use the advisor tool: the advisor's tokens are billed outside the usage the gateway meters; use your own provider key";
 pub const GROQ_TOOLS: &str = "a managed key cannot use Groq's browser_search tool: it has no published price; use your own provider key";
 pub const OPENROUTER_WEB: &str = "a managed key cannot use OpenRouter web search or plugins (plugins, :online models, web_search_options, openrouter:web_search): their engine and results are billed outside the usage the gateway meters; use your own provider key";
+pub const UNLISTED_TOOL: &str = "a managed key cannot use a tool the gateway does not meter: its usage could be billed outside what the gateway can price; use your own provider key";
 pub const PRIORITY_TIER: &str = "a managed key cannot use Anthropic Priority Tier (service_tier: priority): it is priced by contract; omit service_tier or use your own provider key";
 
 /// Inspect a managed request's body. `model` is the model it names (the catalog row or the
@@ -86,11 +88,17 @@ fn tools(body: &[u8], open: usize, model: &str, preview: &mut bool) -> Option<&'
     }
     let mini = matches!(base_model(model), "gpt-4o-mini" | "gpt-4.1-mini");
     for (start, _) in peek::array_elements(body, open)? {
-        let Some(Some(t)) = peek::last_member(body, start, "type") else {
+        // Not an object: no tool the gateway can meter.
+        let Some(member) = peek::last_member(body, start, "type") else {
+            return Some(UNLISTED_TOOL);
+        };
+        // No `type` at all is Anthropic's client tool (`name`, `input_schema`): the client runs it,
+        // so no provider charge, and there is nothing to meter.
+        let Some(member) = member else {
             continue;
         };
-        let Some(ty) = peek::str_value(body, t.value) else {
-            continue;
+        let Some(ty) = peek::str_value(body, member.value) else {
+            return Some(UNLISTED_TOOL);
         };
         let ty = ty.as_ref();
         if ty.starts_with("web_search_preview") {
@@ -104,13 +112,59 @@ fn tools(body: &[u8], open: usize, model: &str, preview: &mut bool) -> Option<&'
             t if t.starts_with("web_search") && mini => Some(MINI_WEB_SEARCH),
             t if t.starts_with("code_execution") => Some(CODE_EXECUTION),
             t if t.starts_with("advisor") => Some(ADVISOR),
-            _ => None,
+            t if allowed_tool(t) => None,
+            _ => Some(UNLISTED_TOOL),
         };
         if refused.is_some() {
             return refused;
         }
     }
     None
+}
+
+/// Whether a tool type is one the gateway meters or one the client itself runs. An allowlist, so a
+/// new tool type is refused until it is known here: a denylist let an unknown billed tool through.
+///
+/// A family matches its exact name, or its name followed by `_` and a version or variant
+/// (`web_search_20250305`, `web_search_preview`, `computer_use_preview`, `text_editor_20250728`).
+/// `bashful_x` is not `bash`. Names listed as exact-only (`file_search`, `tool_search`, `x_search`,
+/// `function`, ...) take no suffix, so Anthropic's hosted `tool_search_tool_*` is refused.
+/// A tool with no `type` (Anthropic's `{name, input_schema}` client tool) is passed by the caller.
+///
+/// Client-run tools carry no provider charge: the client executes them and the provider bills the
+/// tokens they travel in. The rest are server tools the provider runs and the gateway counts in
+/// [`ServerTools`]. The refusals above are checked first, so a family listed here that is also
+/// refused there (`shell`, `code_execution`) stays refused.
+fn allowed_tool(ty: &str) -> bool {
+    // One spelling each: the function-call shapes and the server tools with no version suffix.
+    const EXACT: [&str; 8] = [
+        "function",
+        "custom",
+        "namespace",
+        "apply_patch",
+        "local_shell",
+        "file_search",
+        "tool_search",
+        "x_search",
+    ];
+    // Client-run tools (bash, text_editor, computer, memory) and metered server tools (web_search,
+    // web_fetch, mcp), each by its name with or without a `_` suffix.
+    const VERSIONED: [&str; 7] = [
+        "bash",
+        "text_editor",
+        "computer",
+        "memory",
+        "web_search",
+        "web_fetch",
+        "mcp",
+    ];
+    EXACT.contains(&ty)
+        || VERSIONED.iter().any(|family| {
+            ty == *family
+                || ty
+                    .strip_prefix(family)
+                    .is_some_and(|rest| rest.starts_with('_'))
+        })
 }
 
 /// A refusal when a `plugins` array (at `open`) names a plugin outside [`FREE_PLUGINS`].
@@ -306,6 +360,79 @@ mod tests {
         ];
         for (body, model, messages) in cases {
             assert_eq!(refused(body, model, messages), None, "{body} on {model}");
+        }
+    }
+
+    /// A tool type the gateway does not know is refused, not passed for want of a listing.
+    /// claim: BIL-10
+    /// defect: D279
+    #[test]
+    fn an_unlisted_tool_type_is_refused() {
+        for body in [
+            r#"{"tools":[{"type":"some_new_billed_tool"}],"messages":[]}"#,
+            r#"{"tools":[{"type":7}],"messages":[]}"#,
+            r#"{"tools":[{"type":"document_search"}],"messages":[]}"#,
+        ] {
+            assert_eq!(refused(body, "gpt-5", false), Some(UNLISTED_TOOL), "{body}");
+        }
+    }
+
+    /// Anthropic's client tools carry no `type`: they are the client's to run, so they pass.
+    #[test]
+    fn a_client_tool_with_no_type_passes() {
+        let body =
+            br#"{"tools":[{"name":"get_weather","input_schema":{"type":"object"}}],"messages":[]}"#;
+        assert_eq!(inspect(body, "claude-opus-4-8", true).refused, None);
+    }
+
+    /// Every kind the meter counts is either a tool type a client can send (allowed or refused by
+    /// name), or one no request names as a tool, so the two lists cannot drift. xAI's document
+    /// search is counted but has no published fee, so it is refused as unlisted, by name.
+    #[test]
+    fn every_kind_the_meter_counts_is_allowed_or_named() {
+        // Response-side counts only (X posts and users, sources, OpenRouter's total): no request
+        // names them as a tool, so there is nothing to check for them.
+        const NOT_A_REQUEST_TOOL: [&str; 4] = ["x_posts", "x_users", "sources", "tool_calls"];
+        for (kind, _) in crate::usage::ServerTools::default().entries() {
+            if NOT_A_REQUEST_TOOL.contains(&kind) {
+                continue;
+            }
+            let body = format!(r#"{{"tools":[{{"type":"{kind}"}}],"messages":[]}}"#);
+            let got = refused(&body, "gpt-5", false);
+            if kind == "document_search" {
+                // Counted, but no published fee: refused by name as unlisted.
+                assert_eq!(got, Some(UNLISTED_TOOL), "{kind}");
+            } else {
+                assert_ne!(got, Some(UNLISTED_TOOL), "{kind}");
+            }
+        }
+    }
+
+    /// A family matches its whole name, or the name and a `_` suffix. `bashful_x` is not `bash`, and
+    /// the hosted `tool_search_tool_*` is not `tool_search`.
+    #[test]
+    fn a_family_matches_its_name_and_a_version_suffix_only() {
+        for ty in [
+            "bashful_x",
+            "file_searchx",
+            "tool_search_tool_regex_20251119",
+            "web_searches",
+        ] {
+            let body = format!(r#"{{"tools":[{{"type":"{ty}"}}],"messages":[]}}"#);
+            assert_eq!(refused(&body, "gpt-5", false), Some(UNLISTED_TOOL), "{ty}");
+        }
+        for ty in [
+            "bash_20250124",
+            "text_editor_20250728",
+            "computer_use_preview",
+            "web_search_20250305",
+            "web_search_preview",
+            "web_fetch_20260209",
+            "file_search",
+            "tool_search",
+        ] {
+            let body = format!(r#"{{"tools":[{{"type":"{ty}"}}],"messages":[]}}"#);
+            assert_ne!(refused(&body, "gpt-5", false), Some(UNLISTED_TOOL), "{ty}");
         }
     }
 

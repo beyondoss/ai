@@ -3227,7 +3227,18 @@ to serve.
 - Priced features only on a managed billable call, catalog walk or `/{provider}` (D268): a tool,
   plugin or tier a provider bills outside the usage a row can meter (a container, the image
   generation tool, an OpenRouter plugin or `:online` model, Anthropic Priority Tier; the list is in
-  "The `ai.usage` row") → 400 before the provider has the body. BYO keys are not checked.
+  "The `ai.usage` row") → 400 before the provider has the body. BYO keys are not checked. The tool
+  list is an allowlist (`unpriced::allowed_tool`). A family matches its exact name, or its name and a
+  `_` suffix (`web_search_20250305`, `web_search_preview`, `computer_use_preview`,
+  `text_editor_20250728`); `bashful_x` is not `bash`. Client-run families: `function`, `custom`,
+  `namespace`, `apply_patch`, `local_shell`, `bash`, `text_editor`, `computer`, `memory`. Metered
+  server families (the usage meter counts them): `web_search`, `web_fetch`, `mcp`, `file_search`,
+  `tool_search`, `x_search`; the last four take no suffix. Anthropic's hosted
+  `tool_search_tool_*` is refused: the gateway neither meters it nor carries its result blocks. A
+  tool with no `type` (Anthropic's `{name, input_schema}` client tool) passes; a non-string `type`,
+  or any other type, is refused with a 400 (`UNLISTED_TOOL`), so a new billed tool fails closed until
+  it is listed. Breaking change (PR 0): an unlisted type that was passed before is now refused, for
+  example other `openrouter:*` types and dated `tool_search_tool_*`.
 - Request body size ≤ `MAX_REQUEST_BODY` (declared `Content-Length` + streaming running total)
 - One root `model` key on a catalog walk. The walk routes on one and rewrites one, while most JSON
   parsers take the _last_, so `{"model":"cheap",…,"model":"gpt-5.5-pro"}` would route as the cheap
