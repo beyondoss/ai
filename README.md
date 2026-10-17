@@ -475,6 +475,11 @@ mise run test:smoke          # live providers — needs API keys in env, bills r
 mise run bench               # unit micro-benchmarks + end-to-end throughput
 ```
 
+CI runs on Linux only — the only platform this project ships or supports (see the header of
+`.github/workflows/ci.yml` for why there is no macOS lane). Its nextest profile retries a failed test
+once; a test that passes only on the retry is reported as a flaky-test warning and counted in the job
+summary, so a green run never silently means a flaky one.
+
 ## Architecture
 
 [crates/gateway/ARCHITECTURE.md](crates/gateway/ARCHITECTURE.md) — request flow, module map, key invariants.
