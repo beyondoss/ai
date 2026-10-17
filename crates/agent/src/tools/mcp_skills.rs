@@ -1597,11 +1597,13 @@ impl agent_core::AgentHooks for RunHooks {
 }
 
 /// What a "session" answer about a code-execution call is remembered against: the verbatim command
-/// for `bash`, and for anything else (`execute`'s `code`) a digest of the whole input — never just the
-/// tool's name, which would let one approved program stand for every other.
+/// for `bash` together with the `cwd` it names (the same command means something else in another
+/// directory), and for anything else (`execute`'s `code`) a digest of the whole input — never just
+/// the tool's name, which would let one approved program stand for every other.
 fn call_identity(input: &Value) -> String {
     if let Some(command) = input.get("command").and_then(Value::as_str) {
-        return format!("cmd:{command}");
+        let cwd = input.get("cwd").and_then(Value::as_str).unwrap_or("");
+        return format!("cwd:{cwd:?}\ncmd:{command}");
     }
     fn canonical(v: &Value) -> Value {
         match v {
