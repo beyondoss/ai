@@ -101,6 +101,12 @@ impl ProviderId {
     /// How many variants there are — the width of an id-keyed array.
     pub const COUNT: usize = Self::ALL.len();
 
+    /// Whether a managed pool key can serve this provider. The ChatGPT backend takes only a client's
+    /// own OAuth bearer (see [`Self::OpenAiCodex`]), so no pool key is ever attached to it.
+    pub fn takes_pool_key(self) -> bool {
+        !matches!(self, Self::OpenAiCodex)
+    }
+
     /// A dense index in `0..COUNT`, for array-keyed lookup.
     ///
     /// The exhaustive `match` is the point: adding a variant fails to compile here rather than

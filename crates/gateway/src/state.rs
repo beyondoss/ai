@@ -260,9 +260,11 @@ fn build_providers(config: &AiConfig, metrics: &Metrics) -> Result<HashMap<Strin
             .get(spec.name)
             .cloned()
             .unwrap_or_else(|| spec.authority.to_string());
+        // A row that takes no pool key ignores one configured for it, so it cannot reach managed traffic.
         let pool_keys: Vec<&str> = config
             .pool_keys
             .get(spec.name)
+            .filter(|_| spec.id.takes_pool_key())
             .map(|k| k.iter().map(|s| s.expose()).collect())
             .unwrap_or_default();
         providers.insert(
@@ -723,6 +725,26 @@ pub(crate) fn test_metrics() -> Arc<Metrics> {
 mod tests {
     use super::*;
     use crate::route::AuthScheme;
+
+    /// `openai-codex` takes only a client's own ChatGPT bearer, so a pool key configured for it never
+    /// reaches the provider.
+    /// claim: SEC-5
+    /// defect: D281
+    #[test]
+    fn openai_codex_never_takes_a_pool_key() {
+        let config = AiConfig {
+            pool_keys: std::collections::HashMap::from([(
+                "openai-codex".to_string(),
+                "sk-codex".into(),
+            )]),
+            ..Default::default()
+        };
+        let providers = build_providers(&config, &test_metrics()).unwrap();
+        assert!(
+            !providers["openai-codex"].has_pool_key(),
+            "openai-codex accepted a pool key"
+        );
+    }
 
     /// Provider lookup runs before the model-routed segment is even considered, so registering a
     /// provider named `auto` from config would silently disable model routing. Boot must refuse.

@@ -2877,3 +2877,17 @@ state = "fixed"
 test = "provider_names_are_lowercased_at_the_config_boundary"
 fix = ""
 note = "Fixed at the config boundary: AiConfig::normalize_provider_names lowercases the keys of pool_keys, provider_authorities, provider_dialects and provider_auth_schemes right after the TOML/flat extract and before the env fold, so the env fold's name matching sees the same names. A name outside [a-z0-9_-], or two names equal once lowercased, is a boot failure. Also held by a_provider_name_outside_the_charset_or_repeated_in_case_is_refused. The typed ProviderName newtype is left to PR 1."
+
+[[defect]]
+id = "D281"
+severity = "med"
+area = "Security"
+title = "A pool key configured for openai-codex is attached to it"
+impact = "openai-codex is served only with a client's own ChatGPT bearer, and providers/src/lib.rs says it takes no pool key. build_providers attached any AI_POOL_KEY_OPENAI_CODEX or [pool_keys] openai-codex to the row, so a managed request to /openai-codex/ would have been served on a pool key the row was never meant to hold."
+confidence = "high"
+evidence = "state.rs build_providers read config.pool_keys for every known row, codex included. Reproduced on 4513e6f by openai_codex_never_takes_a_pool_key (has_pool_key was true)."
+claims = ["SEC-5"]
+state = "fixed"
+test = "openai_codex_never_takes_a_pool_key"
+fix = ""
+note = "Fixed by data on the provider id: ProviderId::takes_pool_key is false for OpenAiCodex, and build_providers only passes a configured pool key to a row that takes one. The env fold (config.rs) and its test are unchanged: the key is still read, and it is then not attached."
