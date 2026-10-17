@@ -59,7 +59,8 @@ impl Tool for Write {
         "write"
     }
     fn description(&self) -> &str {
-        "Create or overwrite a file with the given contents. Parent directories are created."
+        "Create or overwrite a file with the given contents. Parent directories are created. \
+         Overwriting a UTF-16 file keeps its encoding."
     }
     fn input_schema(&self) -> Value {
         json!({
@@ -107,12 +108,30 @@ impl Tool for Write {
         // A missing path reports no metadata at all and is simply created below, matching
         // `is_writable`'s own `NotFound => true`.
         let p = std::path::Path::new(path.as_str());
+        // Overwriting a UTF-16 file keeps it UTF-16 (same byte order, and its BOM if it had one).
+        // `read` shows such a file decoded, so a read-then-write round trip would otherwise
+        // transcode it to UTF-8 silently, and the Windows consumers that produce UTF-16 (registry
+        // exports, Windows PowerShell 5.1 scripts) misread BOM-less UTF-8. Costs one prefix read,
+        // and only when the file already exists.
+        let mut utf16: Option<(bool, bool)> = None;
         if let Some(meta) = self.backend.stat(p).await? {
             if meta.kind == FileKind::Other {
                 return Err(super::non_regular_file_error(path, "write"));
             }
             if !meta.writable {
                 return Err(ToolError::Execution(format!("{path} is not writable")));
+            }
+            if meta.kind == FileKind::File && meta.len >= 2 {
+                let head = self
+                    .backend
+                    .read_bytes(p, 0, super::encoding::SNIFF_LEN)
+                    .await?;
+                if let super::encoding::Encoding::Utf16 { big_endian } =
+                    super::encoding::sniff(&head)
+                {
+                    let had_bom = matches!(head.as_slice(), [0xFF, 0xFE, ..] | [0xFE, 0xFF, ..]);
+                    utf16 = Some((big_endian, had_bom));
+                }
             }
         }
         if let Some(parent) = p.parent()
@@ -123,10 +142,27 @@ impl Tool for Write {
         // Atomic temp-file + rename: an overwrite killed mid-write must not leave a half-written
         // file — the same guarantee `edit` makes (and which `serve` reattach depends on for the
         // session file). `create_dir_all` above ensures the sibling temp's directory exists.
-        let len = content.len();
-        self.backend.write_bytes(p, content.into_bytes()).await?;
+        let (bytes, kept) = match utf16 {
+            Some((big_endian, had_bom)) => {
+                // `read` strips the BOM from what it shows, so content written back from it
+                // usually lacks one; restore it rather than dropping it.
+                let text = if had_bom && !content.starts_with('\u{feff}') {
+                    format!("\u{feff}{content}")
+                } else {
+                    content
+                };
+                let label = super::encoding::utf16_label(big_endian);
+                (
+                    super::encoding::encode_utf16(&text, big_endian),
+                    format!(" (kept the file's {label} encoding)"),
+                )
+            }
+            None => (content.into_bytes(), String::new()),
+        };
+        let len = bytes.len();
+        self.backend.write_bytes(p, bytes).await?;
         self.touched.record(path);
-        Ok(format!("wrote {len} bytes to {path}").into())
+        Ok(format!("wrote {len} bytes to {path}{kept}").into())
     }
 }
 
