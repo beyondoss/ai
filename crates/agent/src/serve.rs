@@ -9188,15 +9188,14 @@ fn build_subagent_ctx(
         // `PromptOptions::disk_overrides`) — otherwise delegating would be a way around it.
         disk_overrides: !cfg.service_mode,
         prompt_guidelines: Vec::new(),
-        parent: subagent::ParentCell::new(subagent::ParentLoop {
-            model: parent_model.to_string(),
-        }),
+        // `build_agent` writes the parent's model and loop settings here on every (re)build, the first
+        // one included, before any child can be dispatched.
+        parent: subagent::ParentCell::default(),
         parent_cache_key: parent_model.to_string(),
         parent_tools,
         deny_tool: cfg.deny_tool.clone(),
         deny_bash_pattern: cfg.deny_bash_pattern.clone(),
         deny_path: cfg.deny_path.clone(),
-        child_max_steps: None,
         max_depth: subagent::DEFAULT_MAX_DEPTH,
         approval: approval.cloned(),
     })
@@ -9268,12 +9267,26 @@ fn build_agent(
     // Registered here, not in `build_tools`, because this is where `write_locks` is in scope — the ctx
     // needs the same registry every child shares. Reused across rebuilds; the ctx's factory handles the
     // per-child model itself, so a `set_model` rebuild doesn't invalidate it.
+    // `level` (the portable ladder) supplies the default thinking/reasoning-effort pair for whichever
+    // mechanism `model`'s capabilities actually call for; `thinking`, when present, is an explicit raw
+    // budget override that wins over the level's own derived budget (but never touches reasoning
+    // effort, which always comes from `level` — see `current_thinking`'s doc comment in `serve`).
+    let (level_thinking, reasoning_effort) =
+        agent_core::thinking_for_level(&agent_core::capabilities(model), level);
+    let thinking = thinking.or(level_thinking);
     if let Some(ctx) = subagent_ctx {
-        // Every model switch, resume and branch lands here, so this is the one place that keeps the
-        // long-lived ctx's view of the parent current: a child dispatched after `set_model` inherits
-        // the model the parent is on *now*, not the one the session started with.
+        // Every model switch, thinking/compaction/image toggle, resume and branch lands here, so this
+        // is the one place that keeps the long-lived ctx's view of the parent current: a child
+        // dispatched after `set_model` inherits the model — and loop settings — the parent has *now*.
         ctx.parent.set(crate::tools::subagent::ParentLoop {
             model: model.to_string(),
+            max_steps: cfg.max_steps,
+            compaction: cfg.compaction,
+            compaction_enabled: auto_compaction,
+            thinking,
+            reasoning_effort,
+            block_images,
+            rate_limit: crate::retry::rate_limit_policy(cfg.retry_rate_limit_secs),
         });
         registry.register(Arc::new(crate::tools::subagent::Subagent::new(ctx.clone())));
     }
@@ -9315,13 +9328,7 @@ fn build_agent(
     if let Some(reserve) = cfg.branch_summary_reserve_tokens {
         agent = agent.with_branch_summary_reserve_tokens(reserve);
     }
-    // `level` (the portable ladder) supplies the default thinking/reasoning-effort pair for whichever
-    // mechanism `model`'s capabilities actually call for; `thinking`, when present, is an explicit raw
-    // budget override that wins over the level's own derived budget (but never touches reasoning
-    // effort, which always comes from `level` — see `current_thinking`'s doc comment in `serve`).
-    let (level_thinking, reasoning_effort) =
-        agent_core::thinking_for_level(&agent_core::capabilities(model), level);
-    if let Some(budget) = thinking.or(level_thinking) {
+    if let Some(budget) = thinking {
         agent = agent.with_thinking(budget);
     }
     if let Some(effort) = reasoning_effort {

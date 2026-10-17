@@ -130,13 +130,13 @@ fn ctx_with(
         prompt_guidelines: Vec::new(),
         parent: ParentCell::new(ParentLoop {
             model: "parent-model".to_string(),
+            ..ParentLoop::default()
         }),
         parent_cache_key: "parent-key".to_string(),
         parent_tools: vec!["read".to_string(), "grep".to_string()],
         deny_tool: Vec::new(),
         deny_bash_pattern: Vec::new(),
         deny_path: Vec::new(),
-        child_max_steps: None,
         max_depth: DEFAULT_MAX_DEPTH,
         approval: None,
     });
@@ -723,13 +723,13 @@ fn ctx_with_gate_call(
         prompt_guidelines: Vec::new(),
         parent: ParentCell::new(ParentLoop {
             model: "parent-model".to_string(),
+            ..ParentLoop::default()
         }),
         parent_cache_key: "parent-key".to_string(),
         parent_tools: vec![tool.to_string()],
         deny_tool: Vec::new(),
         deny_bash_pattern: Vec::new(),
         deny_path,
-        child_max_steps: None,
         max_depth: DEFAULT_MAX_DEPTH,
         approval: Some(crate::approval::ApprovalRuntime::new(
             gate,

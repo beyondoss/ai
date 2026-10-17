@@ -121,10 +121,32 @@ pub struct ChildToolConfig {
 /// branch rebuild. A plain `String` copied in at build time therefore froze the startup model: switch
 /// the parent to another model and every delegated child still ran on the first one. The parent writes
 /// this whenever it rebuilds its own agent, and each dispatch reads it.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+///
+/// The rest is the parent's loop configuration. A child used to run on `Agent::new`'s defaults —
+/// unbounded steps, the default compaction, no thinking, the default rate-limit patience — whatever
+/// the parent was launched with: a `--max-steps 20` parent could spawn a child that ran for hours, and
+/// `--no-compaction` or `--block-images` stopped at the delegation boundary.
+#[derive(Clone, Debug, Default)]
 pub struct ParentLoop {
     /// The model a child inherits when its definition names none.
     pub model: String,
+    /// The parent's `--max-steps`: each child's own turn budget (`None`: unbounded, like the parent).
+    pub max_steps: Option<u32>,
+    /// The parent's compaction flags, resolved against the *child's* model, so an explicit
+    /// `--context-window` carries over while an unset one takes the child model's own window.
+    pub compaction: crate::serve::CompactionFlags,
+    /// Whether the parent auto-compacts (`--no-compaction`, `set_auto_compaction`).
+    pub compaction_enabled: bool,
+    /// The parent's effective thinking budget for its own model. Applied only to a child that
+    /// inherits that model: a raw budget sized for one model's output limit means nothing for another.
+    pub thinking: Option<u32>,
+    /// The parent's reasoning effort. Portable across models, so it reaches every child; one on a
+    /// budget-shaped model of its own gets the budget that effort maps to there.
+    pub reasoning_effort: Option<agent_core::ReasoningEffort>,
+    /// `--block-images` / `set_block_images`.
+    pub block_images: bool,
+    /// How patiently a turn waits out rate limits (`--retry-rate-limit-secs`).
+    pub rate_limit: agent_core::rate_limit::RateLimitRetry,
 }
 
 /// The shared, live [`ParentLoop`]. Cloning shares the cell.
@@ -211,9 +233,6 @@ pub struct SubagentCtx {
     pub deny_tool: Vec<String>,
     pub deny_bash_pattern: Vec<String>,
     pub deny_path: Vec<String>,
-    /// Opt-in cap on each child's model turns. `None` (the default) runs children unbounded, same as
-    /// the parent — see `agent_core::Agent::with_max_steps` for why unbounded is the default.
-    pub child_max_steps: Option<u32>,
     pub max_depth: u32,
     /// The parent's interactive approval gate, if it has one. Shared, not rebuilt: a child queues behind
     /// the same one-question-at-a-time lock its siblings do (eight parallel children must not raise eight
@@ -901,21 +920,51 @@ impl Subagent {
             }
         };
         let parent = self.ctx.parent.get();
-        let model = def.model.clone().unwrap_or(parent.model);
+        let inherits_model = def.model.is_none();
+        let model = def.model.clone().unwrap_or_else(|| parent.model.clone());
         let system =
             self.build_child_system_prompt(def, &registry, &root, memory_sections, shared, &model);
         let transport = (self.ctx.factory)(&model)?;
 
+        // The parent's loop configuration, not `Agent::new`'s defaults (see `ParentLoop`).
+        let mut compaction = crate::serve::resolve_compaction(&model, &parent.compaction);
+        compaction.enabled = parent.compaction_enabled;
+        let caps = agent_core::capabilities(&model);
         let mut agent = Agent::new(transport, model)
             .with_tools(registry)
             .with_system(system)
-            .with_max_steps(self.ctx.child_max_steps)
+            .with_max_steps(parent.max_steps)
+            .with_compaction(compaction)
+            .with_rate_limit_retry(parent.rate_limit)
+            .with_block_images(parent.block_images)
             // The parent's registry. Without this, `Agent::new` hands the child a private one and two
             // children editing the same path do not serialize.
             .with_write_locks(self.ctx.write_locks.clone())
             // A distinct key per child. Sharing the parent's would both poison the Anthropic prompt
             // cache and contend for one pooled Codex WebSocket connection, which is keyed on it.
             .with_cache_key(format!("{}:sub:{spawn_id}", self.ctx.parent_cache_key));
+
+        if inherits_model {
+            if let Some(budget) = parent.thinking {
+                agent = agent.with_thinking(budget);
+            }
+            if let Some(effort) = parent.reasoning_effort {
+                agent = agent.with_reasoning_effort(effort);
+            }
+        } else if let Some(effort) = parent.reasoning_effort {
+            agent = agent.with_reasoning_effort(effort);
+            if matches!(
+                caps.thinking,
+                agent_core::models::ThinkingShape::Budget
+                    | agent_core::models::ThinkingShape::Adaptive
+            ) {
+                agent = agent.with_thinking(agent_core::models::budget_for_effort_with_override(
+                    effort,
+                    caps.max_output,
+                    None,
+                ));
+            }
+        }
 
         // MANDATORY. `Agent::new` installs `NoHooks`; without this the child ignores every
         // `--deny-tool`/`--deny-bash-pattern`/`--deny-path` the parent was launched with, and `subagent`
@@ -973,8 +1022,26 @@ impl Subagent {
 
         // Read before `merge_back` below, so a worktree conflict note rides `outcome.note` rather than
         // being appended to what is now a machine-parseable JSON payload.
-        let mut outcome = match result {
-            Ok(()) => match &spec.output_schema {
+        // A run can end `Ok` without the child having finished: its model refused, or its last reply
+        // hit the output limit with nothing left to recover. Neither is a result, and a worktree
+        // child's half-done edits must be kept for inspection, not merged as if they were.
+        let unfinished = session
+            .messages
+            .last()
+            .filter(|m| m.role == agent_core::Role::Assistant)
+            .and_then(|m| match m.stop_reason {
+                Some(agent_core::StopReason::Refusal) => Some("the agent's model refused to continue"),
+                Some(agent_core::StopReason::MaxTokens) => Some(
+                    "the agent's last reply was cut off at the output-token limit, so its work may be unfinished",
+                ),
+                _ => None,
+            });
+        let mut outcome = match (result, unfinished) {
+            (Ok(()), Some(why)) => ChildOutcome::failed(
+                spec,
+                format!("{why}: {}", nonempty(last_assistant_text(&session))),
+            ),
+            (Ok(()), None) => match &spec.output_schema {
                 // The parent asked for a typed answer; the child's prose is not it. A child that ended
                 // without calling `structured_output` did not do what it was told, and reporting that as
                 // success would hand the parent a paragraph where it expected an object.
@@ -1004,7 +1071,7 @@ impl Subagent {
                     structured: false,
                 },
             },
-            Err(e) => ChildOutcome::failed(spec, format!("agent run failed: {e}")),
+            (Err(e), _) => ChildOutcome::failed(spec, format!("agent run failed: {e}")),
         };
 
         if let Some((wt, repo_root)) = worktree {

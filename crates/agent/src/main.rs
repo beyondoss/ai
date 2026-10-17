@@ -5220,6 +5220,9 @@ async fn run_task(
     let write_locks = Arc::new(agent_core::WriteLockRegistry::new());
     beyond_ai_agent::worktree::sweep(&cwd); // reap any worktree orphaned by a previous crash
     let agent_defs = beyond_ai_agent::agents::discover(&cwd, project_trusted);
+    // What a child inherits of this run's loop configuration — written once the parent's agent is
+    // built (see `ParentLoop`), read by each dispatch.
+    let parent_loop = beyond_ai_agent::tools::subagent::ParentCell::default();
     if !agent_defs.is_empty() {
         use beyond_ai_agent::tools::subagent;
         // `parent_tools` is what a child with no `tools:` of its own inherits — the parent's effective
@@ -5286,15 +5289,13 @@ async fn run_task(
             project_trusted,
             disk_overrides: true,
             prompt_guidelines: prompt_guidelines.clone(),
-            parent: subagent::ParentCell::new(subagent::ParentLoop {
-                model: model.clone(),
-            }),
+            // Filled in once the parent's own agent is configured, below.
+            parent: parent_loop.clone(),
             parent_cache_key: model.clone(),
             parent_tools,
             deny_tool: deny_tool.clone(),
             deny_bash_pattern: deny_bash_pattern.clone(),
             deny_path: deny_path.clone(),
-            child_max_steps: None,
             max_depth: subagent::DEFAULT_MAX_DEPTH,
             // `run` has no client to ask, so it has no interactive gate — only the static `--deny-*`
             // lists, which `ChildHooks` still installs. See `crate::approval`'s module doc.
@@ -5465,24 +5466,23 @@ async fn run_task(
     }
     // `serve`'s own resolution (`build_agent`): the model's window, input limit and compaction cap,
     // then the `--context-window`/`--compact-at`/reserve/keep-recent overrides.
-    let mut compaction = beyond_ai_agent::serve::resolve_compaction(
-        &model,
-        &beyond_ai_agent::serve::CompactionFlags {
-            context_window,
-            compact_at,
-            reserve_tokens: compaction_reserve_tokens,
-            keep_recent_tokens: compaction_keep_recent_tokens,
-            no_tool_masking,
-            tool_masking_keep_turns,
-            tool_masking_keep_tokens,
-            tool_masking_min_tokens,
-            no_cached_summary,
-            candidates: compaction_candidates,
-        },
-    );
+    let compaction_flags = beyond_ai_agent::serve::CompactionFlags {
+        context_window,
+        compact_at,
+        reserve_tokens: compaction_reserve_tokens,
+        keep_recent_tokens: compaction_keep_recent_tokens,
+        no_tool_masking,
+        tool_masking_keep_turns,
+        tool_masking_keep_tokens,
+        tool_masking_min_tokens,
+        no_cached_summary,
+        candidates: compaction_candidates,
+    };
+    let mut compaction = beyond_ai_agent::serve::resolve_compaction(&model, &compaction_flags);
     if no_compaction {
         compaction.enabled = false;
     }
+    let compaction_enabled = compaction.enabled;
     // The live-prompt size at which to warn the model that a compaction is approaching (see
     // `run_turn_once`), derived from the same trigger the agent will compact at.
     let pressure_point =
@@ -5516,6 +5516,7 @@ async fn run_task(
     }
     // Unlike `serve`, `run` has no thinking-level cycling — these are applied as-is, with no per-model
     // default derivation when omitted (matching `run`'s prior behavior of not setting either at all).
+    let mut effective_thinking = thinking;
     if let Some(budget) = thinking {
         agent = agent.with_thinking(budget);
     }
@@ -5542,6 +5543,7 @@ async fn run_task(
                     caps.max_output,
                     overrides.as_ref(),
                 );
+                effective_thinking = Some(budget);
                 agent = agent.with_thinking(budget);
             }
         }
@@ -5557,6 +5559,16 @@ async fn run_task(
     if block_images {
         agent = agent.with_block_images(true);
     }
+    parent_loop.set(beyond_ai_agent::tools::subagent::ParentLoop {
+        model: model.clone(),
+        max_steps,
+        compaction: compaction_flags,
+        compaction_enabled,
+        thinking: effective_thinking,
+        reasoning_effort,
+        block_images,
+        rate_limit: beyond_ai_agent::retry::rate_limit_policy(retry_rate_limit_secs),
+    });
     // Always installed: besides the deny-lists, the hooks carry the SEP-2640 code-execution gate,
     // which must hold even when no deny-list was given.
     let policy = ToolPolicy::from_lists(&deny_tool, &deny_bash_pattern, &deny_path);
