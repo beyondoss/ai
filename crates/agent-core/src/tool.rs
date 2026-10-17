@@ -31,6 +31,13 @@ pub enum ToolUpdate {
         /// there's nothing extra to report (e.g. the initial empty update).
         details: Option<Value>,
     },
+    /// Tokens a tool spent on model calls of its own — a subagent's child run. Folded into the
+    /// run's cumulative totals and surfaced as [`AgentEvent::ToolUsage`](crate::AgentEvent::ToolUsage).
+    Usage {
+        id: String,
+        name: String,
+        usage: crate::message::TokenUsage,
+    },
     /// A tool call's final result, sent the instant its own future resolves.
     End {
         id: String,
@@ -128,6 +135,19 @@ impl ToolProgress {
             name: self.name.clone(),
             snapshot: snapshot.into(),
             details,
+        });
+    }
+
+    /// Report tokens this call spent on model requests of its own (a subagent's child run), one
+    /// request's usage at a time. The loop adds them to the session's cumulative totals — what a run's
+    /// summary, `get_session_stats` and an export report — so delegating work never hides its cost.
+    /// Never the live context size: the child's prompt is not the parent's. Best-effort like
+    /// [`emit`](Self::emit): dropped once the run has finished.
+    pub fn report_usage(&self, usage: crate::message::TokenUsage) {
+        let _ = self.tx.unbounded_send(ToolUpdate::Usage {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            usage,
         });
     }
 

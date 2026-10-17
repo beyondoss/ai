@@ -3529,6 +3529,11 @@ session and keeps it across every rebuild, so a copied startup model went stale 
 `set_model`/`cycle_model`/resume/branch; `build_agent` — which every one of those reaches — now writes
 the cell with the model it is building for.
 
+Every model request a child makes, and every request its own children make, is reported up through
+`ToolProgress::report_usage`, so the parent's totals are the whole tree's: `run`'s `[done in …]` line,
+`serve`'s live stats and `get_session_stats` (whose message-derived totals add `Message::delegated_usage`),
+and an export. Per request rather than once at the end, so a failed or cancelled child's spend counts.
+
 Child `AgentEvent`s are folded into `ToolProgress::emit` as a **coalesced, throttled** status snapshot
 (≥100 ms between emits; raw token deltas are never forwarded) — `serve`'s outbound channel is unbounded,
 and eight streaming children would otherwise flood it.

@@ -5210,6 +5210,12 @@ pub(crate) async fn serve_session(
                                     .store(*stop_reason == StopReason::Refusal, Ordering::Relaxed);
                                 live_stats_sink.set_steps(*step);
                             }
+                            // A subagent's requests count toward this session's totals (the loop
+                            // already folds them into the `Session`); mirrored here so mid-run
+                            // stats agree with what the session will say once the run ends.
+                            if let AgentEvent::ToolUsage { usage, .. } = &ev {
+                                live_stats_sink.record_delegated_usage(usage);
+                            }
                             if let AgentEvent::Stream(StreamEvent::Usage(usage)) = &ev {
                                 live_stats_sink.record_usage(usage);
                                 // Pre-compaction pressure: the first time this fill cycle's live prompt
@@ -10483,7 +10489,14 @@ fn message_usage_totals(session: &Session) -> MessageUsageTotals {
         cache_write_1h_tokens: 0,
         reasoning_tokens: 0,
     };
-    for usage in session.messages.iter().filter_map(|m| m.usage) {
+    // A subagent's spend rides the tool-results message that carried its result (see
+    // `Message::delegated_usage`): delegated work is part of what this session cost.
+    for usage in session
+        .messages
+        .iter()
+        .flat_map(|m| [m.usage, m.delegated_usage])
+        .flatten()
+    {
         totals.input_tokens += u64::from(usage.input_tokens);
         totals.output_tokens += u64::from(usage.output_tokens);
         totals.cache_read_tokens += u64::from(usage.cache_read_tokens);
@@ -10773,6 +10786,17 @@ impl LiveStats {
     /// Fold one turn's usage into the running totals — the same arithmetic as
     /// [`Session::record_usage`], applied to atomics instead of plain fields.
     fn record_usage(&self, usage: &agent_core::TokenUsage) {
+        self.record_delegated_usage(usage);
+        let last = usage
+            .input_tokens
+            .saturating_add(usage.cache_read_tokens)
+            .saturating_add(usage.cache_write_tokens);
+        self.last_input_tokens.store(last, Ordering::Relaxed);
+    }
+
+    /// Fold a subagent's request into the running totals only — [`Session::record_delegated_usage`]'s
+    /// arithmetic. Never the live context size: the child's prompt is not this session's.
+    fn record_delegated_usage(&self, usage: &agent_core::TokenUsage) {
         self.input_tokens
             .fetch_add(usage.input_tokens.into(), Ordering::Relaxed);
         self.output_tokens
@@ -10785,11 +10809,6 @@ impl LiveStats {
             .fetch_add(usage.cache_write_1h_tokens.into(), Ordering::Relaxed);
         self.reasoning_tokens
             .fetch_add(usage.reasoning_tokens.into(), Ordering::Relaxed);
-        let last = usage
-            .input_tokens
-            .saturating_add(usage.cache_read_tokens)
-            .saturating_add(usage.cache_write_tokens);
-        self.last_input_tokens.store(last, Ordering::Relaxed);
     }
 
     fn set_steps(&self, step: u32) {
@@ -13079,6 +13098,7 @@ mod tests {
             usage: None,
             stop_reason: None,
             prior_turn_tokens: None,
+            delegated_usage: None,
         });
         session.push(agent_core::Message::assistant(vec![
             agent_core::ContentBlock::text("done reading both files"),
@@ -13119,6 +13139,7 @@ mod tests {
             usage: None,
             stop_reason: None,
             prior_turn_tokens: None,
+            delegated_usage: None,
         });
 
         let stats = session_stats(&session, &test_compaction("claude-opus-4-8"));

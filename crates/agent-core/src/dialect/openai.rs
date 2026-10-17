@@ -2188,6 +2188,7 @@ mod tests {
                 usage: None,
                 stop_reason: None,
                 prior_turn_tokens: None,
+                delegated_usage: None,
             }],
             64,
         );

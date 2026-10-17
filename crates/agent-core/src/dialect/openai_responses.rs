@@ -2356,6 +2356,7 @@ data: {"type":"response.completed","response":{"status":"completed","usage":{"in
                 usage: None,
                 stop_reason: None,
                 prior_turn_tokens: None,
+                delegated_usage: None,
             }],
             64,
         );
@@ -2552,6 +2553,7 @@ data: {"type":"response.completed","response":{"status":"completed","usage":{"in
             usage: None,
             stop_reason: None,
             prior_turn_tokens: None,
+            delegated_usage: None,
         };
 
         let native_body = build_body(&ModelRequest::new(

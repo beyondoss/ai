@@ -57,6 +57,15 @@ pub enum AgentEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         details: Option<Value>,
     },
+    /// Tokens a still-running tool spent on model calls of its own (a subagent's child run; see
+    /// [`ToolProgress::report_usage`](crate::ToolProgress::report_usage)). Already folded into the
+    /// session's cumulative totals by the loop; a host keeping its own running totals adds it too.
+    /// Never a live context size.
+    ToolUsage {
+        id: String,
+        name: String,
+        usage: TokenUsage,
+    },
     /// A tool finished (or errored); `result` is what's fed back to the model.
     ToolEnd {
         id: String,
@@ -1611,6 +1620,10 @@ impl Agent {
             // borrow's lifetime never actually overlaps a mutation.
             let session_ref: &Session = session;
             let cancel_ref = &cancel;
+            // Tokens the batch's tools spent on model calls of their own (subagents), folded into the
+            // session's totals below — on the cancelled path too, since they were spent either way.
+            let delegated = std::sync::Mutex::new(TokenUsage::default());
+            let delegated_ref = &delegated;
 
             let (results, cancelled_mid_dispatch): (Vec<Option<ToolCallResult>>, bool) =
                 if sequential_execution_requested {
@@ -1621,6 +1634,7 @@ impl Agent {
                         cancel_ref,
                         &mut sink,
                         &current_tools,
+                        delegated_ref,
                     )
                     .await
                 } else {
@@ -1962,7 +1976,7 @@ impl Agent {
                                 futures::select_biased! {
                                     prog = prog_rx.next() => {
                                         if let Some(u) = prog {
-                                            emit_tool_update(&mut sink, u);
+                                            emit_tool_update(&mut sink, u, delegated_ref);
                                         }
                                     }
                                     group = group_stream.next() => match group {
@@ -1973,7 +1987,7 @@ impl Agent {
                             }
                             // Flush any updates buffered between the final poll and group completion.
                             while let Ok(u) = prog_rx.try_recv() {
-                                emit_tool_update(&mut sink, u);
+                                emit_tool_update(&mut sink, u, delegated_ref);
                             }
                         };
                         let cancelled = cancel.cancelled();
@@ -1995,13 +2009,17 @@ impl Agent {
                     }
                     (results, cancelled_mid_dispatch)
                 };
+            let delegated = delegated
+                .into_inner()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            session.record_delegated_usage(delegated);
             if cancelled_mid_dispatch {
                 // Cancelled mid-gate or mid-dispatch: the assistant message (with its `ToolUse`
                 // blocks) is already committed above, but the tool-results message below never will
                 // be. Left as-is, the session would end on an orphaned `tool_use` with no matching
                 // `tool_result` — a shape both Anthropic and OpenAI reject on resume. Repair it before
                 // propagating the cancellation.
-                repair_cancelled_dispatch(session, &calls, results);
+                repair_cancelled_dispatch(session, &calls, results, delegated);
                 steering.clear_run_scoped();
                 return Err(Error::Cancelled);
             }
@@ -2049,7 +2067,10 @@ impl Agent {
             if let Some((_, text)) = &budget_note {
                 result_blocks.push(ContentBlock::text(text.clone()));
             }
-            session.push(Message::tool_results(result_blocks));
+            session.push(with_delegated_usage(
+                Message::tool_results(result_blocks),
+                delegated,
+            ));
             // Host-held context (an MCP App's `ui/update-model-context`) rides this same turn, as a
             // request-only block of its own — see `Steering::set_turn_context` and
             // `Session::attach_request_block`.
@@ -2148,6 +2169,9 @@ impl Agent {
     /// double it. Progress streaming (`Tool::run_streaming`) is still fully supported: a still-running
     /// call's updates race against its own completion and cancellation via `select_biased!`, the same
     /// pattern the default path's `drain` loop uses.
+    // One past the lint's limit with `delegated`: every argument is the default path's own local
+    // state for the same batch, and bundling them would only be a second place they live.
+    #[allow(clippy::too_many_arguments)]
     async fn run_tool_calls_interleaved(
         &self,
         session: &Session,
@@ -2156,6 +2180,7 @@ impl Agent {
         cancel: &CancellationToken,
         sink: &mut (dyn FnMut(AgentEvent) + Send),
         tools: &ToolRegistry,
+        delegated: &std::sync::Mutex<TokenUsage>,
     ) -> (Vec<Option<ToolCallResult>>, bool) {
         let mut results: Vec<Option<ToolCallResult>> = vec![None; calls.len()];
         let mut cancelled_mid_dispatch = false;
@@ -2279,7 +2304,7 @@ impl Agent {
                 futures::select_biased! {
                     prog = prog_rx.next() => {
                         if let Some(u) = prog {
-                            emit_tool_update(sink, u);
+                            emit_tool_update(sink, u, delegated);
                         }
                     }
                     outcome = &mut run_fut => break Some(outcome),
@@ -2287,7 +2312,7 @@ impl Agent {
                 }
             };
             while let Ok(u) = prog_rx.try_recv() {
-                emit_tool_update(sink, u);
+                emit_tool_update(sink, u, delegated);
             }
             let Some((text, images, is_error, terminate)) = outcome else {
                 cancelled_mid_dispatch = true;
@@ -3234,6 +3259,15 @@ impl Agent {
 ///
 /// `turn.stop_reason == StopReason::Aborted` never reaches here — see [`Agent::run_utility_turn`],
 /// every caller's actual entry point.
+/// Persist a batch's delegated spend on its tool-results message (see [`Message::delegated_usage`]),
+/// so the session's message-derived totals include it after a reopen.
+fn with_delegated_usage(mut message: Message, delegated: TokenUsage) -> Message {
+    if delegated != TokenUsage::default() {
+        message.delegated_usage = Some(delegated);
+    }
+    message
+}
+
 fn add_usage(total: &mut TokenUsage, u: &TokenUsage) {
     total.input_tokens = total.input_tokens.saturating_add(u.input_tokens);
     total.output_tokens = total.output_tokens.saturating_add(u.output_tokens);
@@ -3277,8 +3311,24 @@ fn turn_text(turn: &Turn) -> String {
 /// Turn one [`ToolUpdate`](crate::tool::ToolUpdate) from the per-turn progress channel into the
 /// matching [`AgentEvent`] and emit it — shared by the live-arriving path and the final flush of
 /// whatever was still buffered when the group stream finished.
-fn emit_tool_update(sink: &mut (dyn FnMut(AgentEvent) + Send), update: crate::tool::ToolUpdate) {
+///
+/// A [`ToolUpdate::Usage`](crate::tool::ToolUpdate::Usage) is also added to `delegated`, which the
+/// dispatch folds into the session's cumulative totals once the batch is done (or cancelled).
+fn emit_tool_update(
+    sink: &mut (dyn FnMut(AgentEvent) + Send),
+    update: crate::tool::ToolUpdate,
+    delegated: &std::sync::Mutex<TokenUsage>,
+) {
     match update {
+        crate::tool::ToolUpdate::Usage { id, name, usage } => {
+            add_usage(
+                &mut delegated
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                &usage,
+            );
+            sink(AgentEvent::ToolUsage { id, name, usage });
+        }
         crate::tool::ToolUpdate::Progress {
             id,
             name,
@@ -3501,6 +3551,8 @@ fn repair_cancelled_dispatch(
     session: &mut Session,
     calls: &[(String, String, Value)],
     results: Vec<Option<ToolCallResult>>,
+    // What the batch's tools spent on model calls of their own before the cancel — spent either way.
+    delegated: TokenUsage,
 ) {
     let blocks = calls
         .iter()
@@ -3515,7 +3567,10 @@ fn repair_cancelled_dispatch(
             }
         })
         .collect();
-    session.push(Message::tool_results(blocks));
+    session.push(with_delegated_usage(
+        Message::tool_results(blocks),
+        delegated,
+    ));
 }
 
 /// Substrings seen in a *throttling* rejection that would otherwise false-positive against
@@ -4331,6 +4386,123 @@ mod tests {
                 .map(|s| s.into())
                 .ok_or_else(|| crate::error::ToolError::InvalidInput("missing text".into()))
         }
+    }
+
+    /// A tool that spends model tokens of its own — a stand-in for `subagent` — reporting two
+    /// requests' usage and then failing, as a child that gave up would.
+    struct SpendTool;
+    #[async_trait]
+    impl Tool for SpendTool {
+        fn name(&self) -> &str {
+            "spend"
+        }
+        fn description(&self) -> &str {
+            "delegates"
+        }
+        fn input_schema(&self) -> Value {
+            json!({ "type": "object" })
+        }
+        async fn run(
+            &self,
+            _input: Value,
+        ) -> std::result::Result<crate::tool::ToolOutput, crate::error::ToolError> {
+            unreachable!("run_streaming is overridden")
+        }
+        async fn run_streaming(
+            &self,
+            _input: Value,
+            progress: &crate::tool::ToolProgress,
+        ) -> std::result::Result<crate::tool::ToolOutput, crate::error::ToolError> {
+            for _ in 0..2 {
+                progress.report_usage(TokenUsage {
+                    input_tokens: 100,
+                    output_tokens: 7,
+                    cache_read_tokens: 3,
+                    ..TokenUsage::default()
+                });
+            }
+            Err(crate::error::ToolError::Execution("child failed".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_tools_own_model_spend_counts_toward_the_session_totals_but_not_its_context() {
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(SpendTool));
+        let (agent, _mock) = agent_with(
+            vec![turn::tool_call("tu_1", "spend", "{}"), turn::text("done")],
+            tools,
+        );
+        let mut session = Session::new();
+        session.user("hi");
+        let mut events = Vec::new();
+        agent
+            .run_events(&mut session, |ev| events.push(ev))
+            .await
+            .unwrap();
+
+        let own: u64 = session
+            .messages
+            .iter()
+            .filter_map(|m| m.usage)
+            .map(|u| u64::from(u.input_tokens))
+            .sum();
+        assert_eq!(
+            session.input_tokens,
+            own + 200,
+            "a failed tool's spend still counts"
+        );
+        assert_eq!(
+            session.cache_read_tokens,
+            session
+                .messages
+                .iter()
+                .filter_map(|m| m.usage)
+                .map(|u| u64::from(u.cache_read_tokens))
+                .sum::<u64>()
+                + 6
+        );
+        let reported: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::ToolUsage { id, usage, .. } => Some((id.clone(), *usage)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reported.len(), 2);
+        assert!(reported.iter().all(|(id, _)| id == "tu_1"));
+        // Persisted on the batch's tool-results message, so a reopened session still counts it.
+        let results = session
+            .messages
+            .iter()
+            .find(|m| {
+                m.content
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::ToolResult { .. }))
+            })
+            .unwrap();
+        assert_eq!(
+            results.delegated_usage,
+            Some(TokenUsage {
+                input_tokens: 200,
+                output_tokens: 14,
+                cache_read_tokens: 6,
+                ..TokenUsage::default()
+            })
+        );
+        // The child's prompt is not this conversation's: the live size stays this session's own.
+        assert!(
+            session.last_input_tokens < 200,
+            "the live context size must not absorb a child's requests: {}",
+            session.last_input_tokens
+        );
+        assert!(
+            session.messages.iter().all(|m| m.delegated_usage.is_none()
+                || m.content
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::ToolResult { .. }))),
+            "only a tool-results message carries delegated usage"
+        );
     }
 
     fn agent_with(
@@ -6243,6 +6415,7 @@ mod tests {
                 AgentEvent::Stream(_) => "stream",
                 AgentEvent::ToolStart { .. } => "tool_start",
                 AgentEvent::ToolProgress { .. } => "tool_progress",
+                AgentEvent::ToolUsage { .. } => "tool_usage",
                 AgentEvent::ToolEnd { .. } => "tool_end",
                 AgentEvent::TurnEnd { .. } => "turn_end",
                 AgentEvent::Steered { .. } => "steered",

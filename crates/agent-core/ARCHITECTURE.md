@@ -679,6 +679,13 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
   can attach images the multimodal model sees (a screenshot, `read` on an image), and `terminate` ends
   the run when _every_ call in the batch agrees. `ContentBlock::ToolResult` and both dialects carry the
   images through to the wire.
+- **Delegated spend** — `ToolProgress::report_usage` is the progress channel's other use: a tool that makes model
+  requests of its own (`subagent`'s child runs) reports each request's `TokenUsage`. The dispatch sinks
+  it as `AgentEvent::ToolUsage`, adds the batch's sum to the session's cumulative counters
+  (`Session::record_delegated_usage`: never `last_input_tokens`, since the child's prompt is not this
+  conversation's), and persists it as `Message::delegated_usage` on the batch's tool-results message,
+  so a reopened session's message-derived totals still include it. A cancelled dispatch keeps what was
+  spent.
 - **Streaming tool progress** — a tool may override `Tool::run_streaming(input, &ToolProgress)` to
   `emit` incremental output while it runs (pi's `tool_execution_update`); the dispatch forwards each
   chunk as `AgentEvent::ToolProgress` the instant it arrives (not batched after the group joins), and
@@ -1083,7 +1090,7 @@ longer has to _assume_ strict sequential delivery to stay correct if that ever c
 | `Error`                          | A loop/transport failure → `run`/`run_events` returns `Err`, the in-flight turn is discarded                                                                                                           | `Cancelled` is a user abort, not a fault; malformed tool args are recoverable, not an error                                      |
 | `StreamEvent`                    | The normalized unit all three dialect decoders emit; every block-scoped variant carries an `index`, what `Accumulator` folds (text/thinking/tool/usage) — more than one index can be concurrently open | Not the wire format — it's the post-translation internal shape                                                                   |
 | `ContentBlock`                   | One piece of a `Message` (`Text`/`Thinking`/`RedactedThinking`/`ToolUse`/`ToolResult`/`Image`)                                                                                                         | Not a streaming unit — it's the assembled, turn-final form                                                                       |
-| `AgentEvent`                     | The full observation surface (`AgentStart`/`TurnStart`/`Stream`/`ToolStart`/`ToolEnd`/`TurnEnd`/`Steered`/`CompactionStart`/`Compacted`/`Retry`/`AgentEnd`/`Error`)                                    | Not exposed by `Agent::run` — that filters to `Stream` only                                                                      |
+| `AgentEvent`                     | The full observation surface (`AgentStart`/`TurnStart`/`Stream`/`ToolStart`/`ToolUsage`/`ToolEnd`/`TurnEnd`/`Steered`/`CompactionStart`/`Compacted`/`Retry`/`AgentEnd`/`Error`)                        | Not exposed by `Agent::run` — that filters to `Stream` only                                                                      |
 | `max_steps`                      | Opt-in loop-iteration ceiling (`None`/unbounded by default); one step = one model turn (tool dispatch doesn't increment it again)                                                                      | Not a token or wall-clock budget; not set unless a caller opts in                                                                |
 
 ## Core Mechanism

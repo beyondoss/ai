@@ -440,14 +440,21 @@ impl Session {
             })
     }
 
-    /// Fold a turn's token usage into the running totals and record the live context size.
-    pub fn record_usage(&mut self, usage: TokenUsage) {
+    /// Fold tokens a tool spent on model calls of its own — a subagent's child run — into the running
+    /// totals. Only the cumulative counters: the live context size describes *this* conversation's
+    /// prompt, which a child's requests are not.
+    pub fn record_delegated_usage(&mut self, usage: TokenUsage) {
         self.input_tokens += u64::from(usage.input_tokens);
         self.output_tokens += u64::from(usage.output_tokens);
         self.cache_read_tokens += u64::from(usage.cache_read_tokens);
         self.cache_write_tokens += u64::from(usage.cache_write_tokens);
         self.cache_write_1h_tokens += u64::from(usage.cache_write_1h_tokens);
         self.reasoning_tokens += u64::from(usage.reasoning_tokens);
+    }
+
+    /// Fold a turn's token usage into the running totals and record the live context size.
+    pub fn record_usage(&mut self, usage: TokenUsage) {
+        self.record_delegated_usage(usage);
         // The whole prompt the model just saw = uncached input + everything served from / written to
         // cache. This is the current context size (the cumulative sums above can't express it) and is
         // what the compaction trigger compares against the model's context window. `saturating_add`,
