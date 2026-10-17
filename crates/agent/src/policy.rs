@@ -28,8 +28,13 @@ pub struct ToolPolicy {
     /// Lowercased once at construction time so `before_tool_call` never re-lowercases the pattern list
     /// on every single call — only the (much shorter-lived) command string gets lowercased per call.
     denied_bash_patterns: Vec<String>,
-    /// Compiled once at construction (same reasoning as `denied_bash_patterns`'s one-time lowercasing)
-    /// rather than re-parsing the same glob source on every `write`/`edit` call. See [`DenyRule`].
+    /// The `--deny-path` patterns as written. Kept because a relative pattern's meaning depends on
+    /// [`ToolPolicy::root`] and the world, which builders set *after* the patterns (`from_lists`
+    /// then `with_root`/`in_world`); each of those recompiles [`ToolPolicy::denied_paths`] from here.
+    deny_path_patterns: Vec<String>,
+    /// Compiled from `deny_path_patterns` against the current root and world (same reasoning as
+    /// `denied_bash_patterns`'s one-time lowercasing) rather than re-parsing the same glob source on
+    /// every `write`/`edit` call. See [`DenyRule`] and [`anchored_globs`].
     denied_paths: Vec<DenyRule>,
     /// The same root the gated agent's filesystem tools resolve relative paths against (see
     /// [`crate::tools::resolve_against`]). Empty = the process cwd, which is every non-subagent case.
@@ -37,7 +42,8 @@ pub struct ToolPolicy {
     /// This must track the tools' root or the policy checks a *different path than the one that gets
     /// written*: a subagent under `isolation: worktree` resolves `edit path=notes.md` to
     /// `<worktree>/notes.md`, so a policy still keying on `<process cwd>/notes.md` would compare the
-    /// wrong string. Relative globs (`**/secrets.env`) then behave identically inside a worktree.
+    /// wrong string. It is also what an anchored `--deny-path` (`secrets/*`) is anchored to — see
+    /// [`anchored_globs`] — so relative patterns behave identically inside a worktree.
     ///
     /// An **absolute** deny glob (`/home/me/repo/secrets.env`) still cannot match a worktree path, and
     /// this field does not change that. What closes that hole is the merge-back step, which re-checks
@@ -60,29 +66,31 @@ pub struct ToolPolicy {
     remote: bool,
 }
 
-/// One compiled `--deny-path` glob.
+/// One compiled glob derived from a `--deny-path` pattern (see [`anchored_globs`]).
+///
+/// An absolute glob whose fixed prefix runs through a symlink (macOS's `/tmp -> /private/tmp`) gets
+/// a second rule with that prefix resolved, because targets are keyed on their resolved path and
+/// would otherwise never match the pattern as typed. Those twins are derived from this host's
+/// filesystem, so a remote policy never compiles them.
 #[derive(Debug, Clone)]
 struct DenyRule {
     exact: GlobMatcher,
     /// The same glob matched ignoring case — used when the target sits on a case-insensitive volume,
     /// where `SECRETS/x` *is* `secrets/x` and a case-sensitive match would be a bypass.
     folded: GlobMatcher,
-    /// Derived from this host's filesystem: an absolute pattern whose fixed prefix runs through a
-    /// symlink (macOS's `/tmp -> /private/tmp`) gets a second rule with that prefix resolved, because
-    /// targets are keyed on their resolved path and would otherwise never match the pattern as
-    /// typed. Meaningless for a remote filesystem, so [`ToolPolicy::with_remote`] drops these.
-    host_derived: bool,
+    /// The `--deny-path` pattern as the operator wrote it, for the denial message.
+    source: String,
 }
 
 impl DenyRule {
-    fn compile(pattern: &str, host_derived: bool) -> Result<Self, globset::Error> {
+    fn compile(glob: &str, source: &str) -> Result<Self, globset::Error> {
         Ok(Self {
-            exact: Glob::new(pattern)?.compile_matcher(),
-            folded: GlobBuilder::new(pattern)
+            exact: Glob::new(glob)?.compile_matcher(),
+            folded: GlobBuilder::new(glob)
                 .case_insensitive(true)
                 .build()?
                 .compile_matcher(),
-            host_derived,
+            source: source.to_string(),
         })
     }
 
@@ -93,6 +101,45 @@ impl DenyRule {
             self.exact.is_match(target)
         }
     }
+}
+
+/// The globs one `--deny-path` pattern compiles to, with gitignore semantics:
+///
+/// - **No `/`** other than a trailing one (`.env`, `*.pem`): the name at any depth — `**/.env`.
+/// - **A `/` inside** (`secrets/*`, `./config/prod.yml`): anchored to `root`, the policy's root.
+/// - **Absolute** (`/etc/**`): as written.
+/// - **Starting with `*`** (`**/secrets/**`, `*/x`): as written. globset's `*` crosses `/`, so these
+///   already match at any depth, and anchoring would only narrow a deny-list.
+/// - Every pattern also covers everything beneath a directory it names (`<glob>/**`), as gitignore
+///   excluding a directory excludes its contents. So a **trailing `/`** (`secrets/`) means the
+///   directory and everything beneath it; it is accepted and otherwise changes nothing.
+///
+/// `root` is `None` only for a remote policy with no root, whose targets stay relative too
+/// ([`crate::tools::lexical_write_target`]); an anchored pattern then stays relative to match them.
+fn anchored_globs(pattern: &str, root: Option<&std::path::Path>) -> Vec<String> {
+    let trimmed = pattern.trim_end_matches('/');
+    let base = if trimmed.is_empty() {
+        // `/`: the filesystem root, i.e. everything.
+        String::from("/")
+    } else if trimmed.starts_with('/') || trimmed.starts_with('*') {
+        trimmed.to_string()
+    } else if !trimmed.contains('/') {
+        format!("**/{trimmed}")
+    } else {
+        let rel = trimmed.trim_start_matches("./");
+        match root {
+            Some(root) => {
+                let root = globset::escape(&root.to_string_lossy());
+                format!("{}/{rel}", root.trim_end_matches('/'))
+            }
+            None => rel.to_string(),
+        }
+    };
+    if base == "**" || base.ends_with("/**") {
+        return vec![base];
+    }
+    let beneath = format!("{}/**", base.trim_end_matches('/'));
+    vec![base, beneath]
 }
 
 /// An absolute deny pattern with its fixed (glob-free) leading components resolved against this
@@ -166,6 +213,7 @@ impl ToolPolicy {
     /// with.
     pub fn with_root(mut self, root: impl Into<std::path::PathBuf>) -> Self {
         self.root = root.into();
+        self.denied_paths = self.compile_deny_paths(&self.root);
         self
     }
 
@@ -174,8 +222,8 @@ impl ToolPolicy {
     /// the deny-list evaluates a host-resolved spelling of a path that isn't on this host.
     pub fn with_remote(mut self, home: Option<String>) -> Self {
         self.remote = true;
-        self.denied_paths.retain(|rule| !rule.host_derived);
         self.remote_home = home;
+        self.denied_paths = self.compile_deny_paths(&self.root);
         self
     }
 
@@ -203,10 +251,57 @@ impl ToolPolicy {
         }
     }
 
-    /// The compiled deny-path globs, for the merge-back re-check described on [`ToolPolicy::root`] —
-    /// each as written, plus any host-resolved twin (see `host_resolved_pattern`).
+    /// The compiled deny-path globs — each pattern anchored at this policy's root (see
+    /// [`anchored_globs`]), plus any host-resolved twin (see `host_resolved_pattern`).
     pub fn denied_paths(&self) -> Vec<GlobMatcher> {
         self.denied_paths.iter().map(|r| r.exact.clone()).collect()
+    }
+
+    /// [`denied_paths`](Self::denied_paths) with every anchored pattern anchored at `root` instead,
+    /// for the merge-back re-check described on [`ToolPolicy::root`]: a worktree child's policy is
+    /// rooted at its worktree, but its patch lands in the main tree, where `secrets/*` must mean
+    /// `<main tree>/secrets/*`.
+    pub fn denied_paths_at(&self, root: &std::path::Path) -> Vec<GlobMatcher> {
+        self.compile_deny_paths(root)
+            .into_iter()
+            .map(|r| r.exact)
+            .collect()
+    }
+
+    /// Compile every `--deny-path` pattern against `root` in this policy's world.
+    fn compile_deny_paths(&self, root: &std::path::Path) -> Vec<DenyRule> {
+        // An empty root is the process cwd: a true answer on this host, a fabricated one anywhere
+        // else (the same rule `lexical_write_target` applies to the targets themselves).
+        let cwd;
+        let anchor = if !root.as_os_str().is_empty() {
+            Some(root)
+        } else if self.remote {
+            None
+        } else {
+            cwd = std::env::current_dir().unwrap_or_default();
+            Some(cwd.as_path())
+        };
+        let mut rules = Vec::new();
+        for pattern in &self.deny_path_patterns {
+            for glob in anchored_globs(pattern, anchor) {
+                match DenyRule::compile(&glob, pattern) {
+                    Ok(rule) => rules.push(rule),
+                    Err(e) => {
+                        eprintln!("policy: ignoring invalid --deny-path glob {pattern:?}: {e}");
+                        continue;
+                    }
+                }
+                // Targets key on their resolved path on this host, so a pattern whose literal
+                // prefix runs through a symlink gets a resolved twin. Meaningless remotely.
+                if !self.remote
+                    && let Some(resolved) = host_resolved_pattern(&glob)
+                    && let Ok(rule) = DenyRule::compile(&resolved, pattern)
+                {
+                    rules.push(rule);
+                }
+            }
+        }
+        rules
     }
 
     /// The filesystem root this policy resolves relative paths against — see [`ToolPolicy::root`].
@@ -243,21 +338,17 @@ impl ToolPolicy {
     /// isn't. Callers building a policy from user-supplied input must call
     /// [`Self::validate_deny_path_patterns`] first and fail the whole process on `Err`, exactly as
     /// `main.rs` does for both `run` and `serve` before ever reaching this builder.
+    ///
+    /// A relative pattern follows gitignore semantics, anchored to the policy's root — see
+    /// [`anchored_globs`].
     pub fn deny_path(mut self, pattern: impl AsRef<str>) -> Self {
         let pattern = pattern.as_ref();
-        match DenyRule::compile(pattern, false) {
-            Ok(rule) => self.denied_paths.push(rule),
-            Err(e) => {
-                eprintln!("policy: ignoring invalid --deny-path glob {pattern:?}: {e}");
-                return self;
-            }
+        if let Err(e) = Glob::new(pattern) {
+            eprintln!("policy: ignoring invalid --deny-path glob {pattern:?}: {e}");
+            return self;
         }
-        if !self.remote
-            && let Some(resolved) = host_resolved_pattern(pattern)
-            && let Ok(rule) = DenyRule::compile(&resolved, true)
-        {
-            self.denied_paths.push(rule);
-        }
+        self.deny_path_patterns.push(pattern.to_string());
+        self.denied_paths = self.compile_deny_paths(&self.root);
         self
     }
 
@@ -347,7 +438,7 @@ impl ToolPolicy {
             .find(|r| r.matches(&target, ci) || r.matches(&typed, ci))?;
         Some(format!(
             "path '{target}' is denied by policy (matches {:?})",
-            rule.exact.glob().glob()
+            rule.source
         ))
     }
 }
@@ -650,6 +741,7 @@ mod tests {
             .with_remote(None)
             .denied_paths();
         assert_eq!(remote.len(), 1);
+        assert_eq!(remote[0].glob().glob(), pattern);
     }
 
     #[tokio::test]
@@ -673,11 +765,157 @@ mod tests {
 
     #[test]
     fn a_deny_rule_matches_case_insensitively_only_when_the_volume_does() {
-        let rule = DenyRule::compile("**/Secrets/**", false).unwrap();
+        let rule = DenyRule::compile("**/Secrets/**", "Secrets/").unwrap();
         assert!(rule.matches("/repo/secrets/new2.env", true));
         assert!(rule.matches("/repo/SECRETS/new2.env", true));
         assert!(!rule.matches("/repo/secrets/new2.env", false));
         assert!(rule.matches("/repo/Secrets/new2.env", false));
+    }
+
+    /// Whether a `write` to `path` (as the model would name it) is denied.
+    async fn denies(policy: &ToolPolicy, path: &str) -> bool {
+        policy
+            .before_tool_call(
+                "write",
+                &json!({"path": path, "content": "x"}),
+                &agent_core::Session::new(),
+                &CancellationToken::new(),
+            )
+            .await
+            .is_some()
+    }
+
+    fn rooted(patterns: &[&str], root: &std::path::Path) -> ToolPolicy {
+        let patterns: Vec<String> = patterns.iter().map(|p| p.to_string()).collect();
+        ToolPolicy::from_lists(&[], &[], &patterns).with_root(root)
+    }
+
+    #[tokio::test]
+    async fn a_bare_name_matches_that_name_at_any_depth() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = rooted(&[".env"], dir.path());
+        assert!(denies(&policy, ".env").await);
+        assert!(denies(&policy, "app/config/.env").await);
+        let abs = dir.path().join("sub/.env");
+        assert!(denies(&policy, abs.to_str().unwrap()).await);
+        assert!(!denies(&policy, ".env.example").await);
+        assert!(!denies(&policy, "app/my.env").await);
+    }
+
+    #[tokio::test]
+    async fn a_bare_name_also_covers_everything_beneath_a_directory_of_that_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = rooted(&["secrets"], dir.path());
+        assert!(denies(&policy, "secrets").await);
+        assert!(denies(&policy, "secrets/token").await);
+        assert!(denies(&policy, "deep/secrets/a/b").await);
+        assert!(!denies(&policy, "secretsx/token").await);
+    }
+
+    #[tokio::test]
+    async fn a_pattern_with_a_slash_is_anchored_to_the_policy_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = rooted(&["secrets/*"], dir.path());
+        assert!(denies(&policy, "secrets/token").await);
+        assert!(denies(&policy, "./secrets/token").await);
+        let abs = dir.path().join("secrets/token");
+        assert!(denies(&policy, abs.to_str().unwrap()).await);
+        assert!(
+            !denies(&policy, "nested/secrets/token").await,
+            "an anchored pattern matches only under the root"
+        );
+        // A leading `./` anchors the same way.
+        let policy = rooted(&["./config/prod.yml"], dir.path());
+        assert!(denies(&policy, "config/prod.yml").await);
+        assert!(!denies(&policy, "x/config/prod.yml").await);
+    }
+
+    #[tokio::test]
+    async fn a_trailing_slash_means_the_directory_and_everything_beneath_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = rooted(&["secrets/"], dir.path());
+        assert!(denies(&policy, "secrets/token").await);
+        assert!(denies(&policy, "secrets/a/b/c").await);
+        assert!(
+            denies(&policy, "deep/secrets/token").await,
+            "no slash but the trailing one: any depth"
+        );
+        assert!(!denies(&policy, "secrets.txt").await);
+        let policy = rooted(&["config/keys/"], dir.path());
+        assert!(denies(&policy, "config/keys/a/b").await);
+        assert!(!denies(&policy, "x/config/keys/a").await);
+    }
+
+    #[tokio::test]
+    async fn an_absolute_pattern_stays_absolute_and_globs_starting_with_a_star_match_anywhere() {
+        let dir = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let abs = format!("{}/locked/*", other.path().display());
+        let policy = rooted(&[&abs, "**/vault/**", "*.pem"], dir.path());
+        assert!(denies(&policy, other.path().join("locked/a").to_str().unwrap()).await);
+        assert!(!denies(&policy, "locked/a").await);
+        assert!(denies(&policy, other.path().join("x/vault/y").to_str().unwrap()).await);
+        assert!(denies(&policy, "deep/key.pem").await);
+    }
+
+    #[tokio::test]
+    async fn a_root_set_after_the_patterns_still_anchors_them() {
+        // `from_lists` runs before `with_root` at every construction site.
+        let dir = tempfile::tempdir().unwrap();
+        let policy = ToolPolicy::from_lists(&[], &[], &["secrets/*".into()]).with_root(dir.path());
+        assert!(denies(&policy, "secrets/a").await);
+        // And a pattern added after the root is anchored to it too.
+        let policy = ToolPolicy::new().with_root(dir.path()).deny_path("keys/*");
+        assert!(denies(&policy, "keys/a").await);
+    }
+
+    #[tokio::test]
+    async fn an_unrooted_policy_anchors_to_the_process_cwd() {
+        let policy = ToolPolicy::from_lists(&[], &[], &["no-such-dir-xyz/*".into(), ".env".into()]);
+        assert!(denies(&policy, "no-such-dir-xyz/a").await);
+        assert!(denies(&policy, "no-such-dir-abc/.env").await);
+        assert!(!denies(&policy, "elsewhere/no-such-dir-xyz/a").await);
+    }
+
+    #[tokio::test]
+    async fn a_remote_policy_anchors_lexically_to_its_root() {
+        let policy = ToolPolicy::from_lists(&[], &[], &["secrets/*".into(), ".env".into()])
+            .with_root("/workspace")
+            .with_remote(Some("/home/agent".into()));
+        assert!(denies(&policy, "secrets/a").await);
+        assert!(denies(&policy, "/workspace/secrets/a").await);
+        assert!(denies(&policy, "/workspace/app/.env").await);
+        assert!(!denies(&policy, "/elsewhere/secrets/a").await);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn an_anchored_pattern_fires_through_a_symlinked_root() {
+        // The root is spelled through a symlink; targets key on the resolved path. The anchored
+        // pattern gets a resolved twin just as an absolute one does.
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().canonicalize().unwrap().join("real");
+        std::fs::create_dir_all(real.join("secrets")).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let policy = rooted(&["secrets/*"], &link);
+        assert!(denies(&policy, "secrets/a").await);
+        assert!(denies(&policy, real.join("secrets/b").to_str().unwrap()).await);
+    }
+
+    #[test]
+    fn the_merge_back_matchers_anchor_relative_patterns_at_the_tree_they_are_given() {
+        // A worktree child's policy is rooted at its worktree; merge-back re-checks the patch in
+        // the main tree, so the anchored patterns must be re-anchored there.
+        let wt = tempfile::tempdir().unwrap();
+        let main = tempfile::tempdir().unwrap();
+        let policy = rooted(&["secrets/*", ".env"], wt.path());
+        let matchers = policy.denied_paths_at(main.path());
+        let hit = |p: &str| matchers.iter().any(|m| m.is_match(p));
+        assert!(hit(&main.path().join("secrets/a").display().to_string()));
+        assert!(hit(&main.path().join("app/.env").display().to_string()));
+        assert!(hit("app/.env"));
+        assert!(!hit(&main.path().join("x/secrets/a").display().to_string()));
     }
 
     #[test]

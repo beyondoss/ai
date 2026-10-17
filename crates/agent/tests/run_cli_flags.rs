@@ -1839,6 +1839,66 @@ fn run_binary_deny_path_flag_blocks_a_write_to_the_matching_path_end_to_end() {
 }
 
 #[test]
+fn run_binary_relative_deny_path_patterns_block_relative_writes_end_to_end() {
+    // `--help`'s own example: `.env` denies a `.env` at any depth, and `config/secrets/*` is
+    // anchored to the working directory. Both used to compile as anchored globs that no absolute
+    // target could ever match, so the writes went through.
+    let dir = tempfile::tempdir().unwrap();
+    let write = |id: &str, path: &str| {
+        turn_tool_use(
+            id,
+            "write",
+            &json!({ "path": path, "content": "TOKEN=abc" }).to_string(),
+        )
+    };
+    let (base, bodies) = spawn_model_server(vec![
+        write("toolu_1", ".env"),
+        write("toolu_2", "app/.env"),
+        write("toolu_3", "config/secrets/key"),
+        turn_text("done"),
+    ]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let output = run_cmd(bin)
+        .args([
+            "run",
+            "write the secrets",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--deny-path",
+            ".env,config/secrets/*",
+            "--max-steps",
+            "6",
+            "--no-session-persistence",
+        ])
+        .current_dir(dir.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+
+    assert!(
+        output.status.success(),
+        "binary failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for path in [".env", "app/.env", "config/secrets/key"] {
+        assert!(
+            !dir.path().join(path).exists(),
+            "{path} was written despite --deny-path"
+        );
+    }
+    let bodies = bodies.lock().unwrap();
+    for body in &bodies[1..4] {
+        assert!(body.contains("denied by policy"), "{body}");
+    }
+}
+
+#[test]
 fn run_binary_ai_agent_exclude_tools_env_var_restricts_the_registry() {
     // Pi-parity audit: `Run`'s `tools`/`exclude_tools` clap fields carried no `env = ...` attribute at
     // all, unlike every other shared flag and unlike `serve`'s identical flags — a deployment

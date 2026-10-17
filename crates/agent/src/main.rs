@@ -610,9 +610,12 @@ enum Command {
         #[usage(long, env = "AI_AGENT_DENY_BASH_PATTERN", delimiter = ',')]
         deny_bash_pattern: Vec<String>,
         /// Block a `write`/`edit` call whenever its `path` argument matches this glob (comma-separated,
-        /// repeatable) — e.g. `--deny-path '.env,**/secrets/**'`. Same glob engine as `grep`'s
-        /// `--glob`/`find`'s pattern matching (`globset::Glob`). Combines with `--deny-tool`/
-        /// `--deny-bash-pattern` under the same policy hook.
+        /// repeatable) — e.g. `--deny-path '.env,config/secrets/'`. Gitignore semantics: a pattern
+        /// with no `/` (`.env`, `*.pem`) matches that name at any depth; one with a `/` inside
+        /// (`config/secrets/*`) is anchored to the working directory; an absolute one stays absolute;
+        /// a trailing `/` means the directory and everything beneath it (as does any pattern naming a
+        /// directory). Same glob engine as `grep`'s `--glob` (`globset::Glob`). Combines with
+        /// `--deny-tool`/`--deny-bash-pattern` under the same policy hook.
         #[usage(long, env = "AI_AGENT_DENY_PATH", delimiter = ',')]
         deny_path: Vec<String>,
         /// Disable *standard-root* skills discovery/loading (`~/.claude/skills`, `<cwd>/.claude/skills`)
@@ -1216,7 +1219,9 @@ enum Command {
         #[usage(long, env = "AI_AGENT_DENY_BASH_PATTERN", delimiter = ',')]
         deny_bash_pattern: Vec<String>,
         /// Block a `write`/`edit` call whenever its `path` argument matches this glob (comma-separated,
-        /// repeatable). `run`'s identical flag.
+        /// repeatable), with gitignore semantics: `.env` matches at any depth, `config/secrets/*` is
+        /// anchored to the working directory, a trailing `/` covers the whole directory. `run`'s
+        /// identical flag.
         #[usage(long, env = "AI_AGENT_DENY_PATH", delimiter = ',')]
         deny_path: Vec<String>,
         /// Require a human to approve a tool call before it runs: `off` (default), `writes`
