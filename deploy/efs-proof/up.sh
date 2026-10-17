@@ -230,13 +230,16 @@ REPLICA_ROLE="arn:aws:iam::$ACCOUNT:role/fleetsimReplicaTaskRole"
 VOLUME="[{\"name\":\"efs\",\"efsVolumeConfiguration\":{\"fileSystemId\":\"$FS\",\"transitEncryption\":\"ENABLED\",\"authorizationConfig\":{\"accessPointId\":\"$AP\",\"iam\":\"DISABLED\"}}}]"
 LOGS='{"logDriver":"awslogs","options":{"awslogs-group":"/fleetsim","awslogs-region":"'"$REGION"'","awslogs-stream-prefix":"fleetsim"}}'
 
+# The driver makes both shard directories as it starts. `s1` the replicas would make anyway; `s2` is
+# the shard no replica mounts, which the misdirection scenario needs to exist — and only something
+# that mounts the filesystem can make a directory on it. Without it every scenario fails at attach.
 register_driver() {
   cat <<JSON > /tmp/fleetsim-td-driver.json
 {"family":"fleetsim-driver","networkMode":"awsvpc","requiresCompatibilities":["FARGATE"],
  "cpu":"2048","memory":"8192","executionRoleArn":"$EXEC_ROLE","taskRoleArn":"$DRIVER_ROLE",
  "volumes":$VOLUME,
  "containerDefinitions":[{"name":"driver","image":"$ECR/fleetsim-driver:latest","essential":true,
-   "entryPoint":["/bin/bash","-c"],"command":["mkdir -p /mnt/efs && sleep infinity"],
+   "entryPoint":["/bin/bash","-c"],"command":["mkdir -p /mnt/efs/s1 /mnt/efs/s2 && sleep infinity"],
    "linuxParameters":{"initProcessEnabled":true},
    "mountPoints":[{"sourceVolume":"efs","containerPath":"/mnt/efs","readOnly":false}],
    "environment":[{"name":"AWS_REGION","value":"$REGION"},{"name":"FLEETSIM_CLUSTER","value":"$CLUSTER"},
@@ -309,9 +312,18 @@ wait_running() {
 register_driver >/dev/null
 say "driver"
 DRIVER=$(aws ecs list-tasks --cluster "$CLUSTER" --family fleetsim-driver --desired-status RUNNING --query 'taskArns[0]')
+# Retried, because the first task on a fresh filesystem can die before it starts: a new mount
+# target's DNS name takes a while to resolve (AWS says up to 90 s), and until it does the task stops
+# in `ResourceInitializationError: Failed to resolve "fs-….efs.…"` — the same words a VPC without
+# `enableDnsHostnames` produces, so it reads as a configuration error and is only a wait.
 if [ "$DRIVER" = "None" ] || [ -z "$DRIVER" ]; then
-  DRIVER=$(run_task fleetsim-driver "$DRIVER_SUBNET" key=role,value=driver)
-  wait_running "$DRIVER"
+  for attempt in 1 2 3; do
+    DRIVER=$(run_task fleetsim-driver "$DRIVER_SUBNET" key=role,value=driver)
+    wait_running "$DRIVER" && break
+    [ "$attempt" = 3 ] && exit 1
+    echo "driver did not start (attempt $attempt); retrying in 60 s" >&2
+    sleep 60
+  done
 fi
 DRIVER_IP=$(aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$DRIVER" \
   --query 'tasks[0].attachments[0].details[?name==`privateIPv4Address`].value|[0]')

@@ -1,0 +1,42 @@
+Session locks on EFS since #144: two lock files per live session, and the per-mount lock quota
+main f902044e · 2026-10-17 UTC · us-west-2 · Fargate, EFS Elastic, NFSv4.1 via the ECS EFS volume
+
+1. Live, on a replica mid-soak (00:47:09, r2, via ECS Exec into the agent container)
+
+   agent=9 fds=124
+   locks_total=60
+        30 FLOCK ADVISORY      <- legacy flock on <session>/lock (kept for mixed rollout)
+        30 OFDLCK ADVISORY     <- authoritative OFD lock on <session>/.beyond-lock
+
+   30 live sessions -> 60 locks on the NFS client, i.e. 2 per live session, as #144 intends.
+   An idle replica (r1, just restarted, 0 live sessions) held 11 fds and 0 locks, so a live
+   session costs ~3 descriptors (newest segment + 2 lock files), plus its socket while attached.
+
+2. Ceiling, on one EFS mount from one process (the driver task; same volume config as a replica)
+
+   perl lockprobe.pl /mnt/efs/lockprobe both 40000   (ulimit -n 65535, Fargate's hard limit)
+   per "session": mkdir s<i>; open s<i>/.beyond-lock + fcntl(F_OFD_SETLK, F_WRLCK, whole file);
+                  open s<i>/lock + flock(LOCK_EX|LOCK_NB); hold everything
+
+   01:07:43 start
+   ok 2048 sessions, 4096 locks
+   ok 4096 sessions, 8192 locks
+   ok 8192 sessions, 16384 locks
+   ok 16384 sessions, 32768 locks
+   ok 20480 sessions, 40960 locks      <- what the --max-live-sessions default of 20,000 needs
+   ok 30720 sessions, 61440 locks
+   open 32767: Too many open files     <- RLIMIT_NOFILE (65,535), not EFS
+   01:26:39 exit (most of the last ~4 min is releasing 65,532 locks over NFS on exit)
+
+   65,532 locks held at once on one mount (32,766 OFD + 32,766 flock, on 65,532 files), and EFS
+   refused none. AWS's documented quota is 65,536 locks per mount per connection, so the probe
+   ran out of descriptors 4 locks short of it: on Fargate the two ceilings coincide.
+
+What it means
+   - The lock quota is not what binds. The 20,000 default needs 40,000 locks: 61% of the quota.
+   - The old 8,192-locks / 256-file-process-pairs-per-mount quota that older AWS docs give would
+     have capped a replica at 128 live sessions under two locks per session. It does not apply
+     today: 32,766 two-lock sessions were held on one mount.
+   - Descriptors are the tighter budget. At ~3 per live session the 20,000 default is ~60,000
+     descriptors, ~92% of Fargate's 65,535 nofile limit before any attached socket. Retiring
+     the legacy flock (the plan in file_lock.rs) takes that back to ~2 per session.

@@ -59,8 +59,13 @@ if [ -n "$vpc" ] && [ "$vpc" != "None" ]; then
   for acl in $(aws ec2 describe-network-acls --filters "$TAG" --query 'NetworkAcls[].NetworkAclId'); do
     aws ec2 delete-network-acl --network-acl-id "$acl" 2>/dev/null && echo "deleted $acl"
   done
-  for sg in $(aws ec2 describe-security-groups --filters "$TAG" --query 'SecurityGroups[].GroupId'); do
-    aws ec2 delete-security-group --group-id "$sg" 2>/dev/null && echo "deleted $sg"
+  # Two passes: the EFS group admits the tasks group *by reference*, and a group that another still
+  # references cannot be deleted. Which one the listing returns first is up to EC2 — the 2026-10-16
+  # run got tasks-first, and the gate below caught it and the VPC it held.
+  for _ in 1 2; do
+    for sg in $(aws ec2 describe-security-groups --filters "$TAG" --query 'SecurityGroups[].GroupId'); do
+      aws ec2 delete-security-group --group-id "$sg" --query 'Return' >/dev/null 2>&1 && echo "deleted $sg"
+    done
   done
   for igw in $(aws ec2 describe-internet-gateways --filters "$TAG" --query 'InternetGateways[].InternetGatewayId'); do
     aws ec2 detach-internet-gateway --internet-gateway-id "$igw" --vpc-id "$vpc" 2>/dev/null

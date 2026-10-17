@@ -159,11 +159,11 @@ Start from what a running session actually costs a replica. A turn takes **~37 m
 instantly) against **seconds** of model streaming. A running session is idle from the replica's point
 of view something like 99% of the time, and that ratio is the whole reason this shape works.
 
-|                                                | Guidance                                                                          | Bound by                                                                                             |
-| ---------------------------------------------- | --------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
-| **Running** (turn in flight)                   | **~270 per vCPU**, assuming a turn every ~10 s                                    | CPU; memory lands in the same place (270 × 4 MiB replay cap ≈ 1.1 GB)                                |
-| **Live** (attached or recently detached, idle) | **~3,700 per 4 GB**; the `--max-live-sessions` default of **20,000** wants ~16 GB | Memory at 4 GB; descriptors at the default (2 per session, inside the filesystem's per-client limit) |
-| **Stored**                                     | No practical ceiling — ~933 bytes/turn, so a 200-turn session is ~190 KB          | Not capacity. See the caveat below                                                                   |
+|                                                | Guidance                                                                          | Bound by                                                                                                                                          |
+| ---------------------------------------------- | --------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Running** (turn in flight)                   | **~270 per vCPU**, assuming a turn every ~10 s                                    | CPU; memory lands in the same place (270 × 4 MiB replay cap ≈ 1.1 GB)                                                                             |
+| **Live** (attached or recently detached, idle) | **~3,700 per 4 GB**; the `--max-live-sessions` default of **20,000** wants ~16 GB | Memory at 4 GB; descriptors at the default (~3 per live session, so ~60k against Fargate's 65,535; its 2 locks are inside EFS's 65,536 per mount) |
+| **Stored**                                     | No practical ceiling — ~933 bytes/turn, so a 200-turn session is ~190 KB          | Not capacity. See the caveat below                                                                                                                |
 
 **Caveats, because these will get planned against.** The 270 figure assumes those Fargate tasks were
 CPU-saturated, which _was not measured_ — no CPU metric on the tasks. The soak also absorbed 13
