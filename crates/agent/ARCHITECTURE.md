@@ -1444,6 +1444,15 @@ identical treatment: `serve()`'s own return type changed from bare `Result<(), _
 `Result<Option<Signal>, _>`, and `main.rs`'s `Command::Serve` arm exits with `shutdown_cause.map(
 Signal::exit_code).unwrap_or(0)` instead of an unconditional `exit(0)`.
 
+**A failed command prints one plain line.** `main` no longer returns its error to Rust's runtime,
+which prints the `Debug` form (`Error: Os { code: 13, kind: PermissionDenied, .. }`,
+`Transport("…")` with escaped quotes). `report_error` prints `error: <Display>` with the source chain
+appended (unless the message already includes it) and exits 1, for every subcommand. Errors that
+come from a path say which one: `SessionRepo::open_with` and the single-file create wrap the
+`io::Error` as `cannot create session directory <path>: <os message>`, keeping its kind. The `--model`
+help writes `{DEFAULT_MODEL}`, and `render_help` fills in the `DEFAULT_MODEL` constant whenever help
+is printed, so the help can't name a different default from the one the code uses.
+
 The first signal is a request; a **second signal** is an order. `run`'s signal task keeps waiting after
 it cancels, and a second SIGTERM/SIGHUP/Ctrl-C calls `exit_process` with that signal's code (the usual
 exit cleanup still runs: job group kills, the stdio-server sweep), with `[second signal: exiting now]`

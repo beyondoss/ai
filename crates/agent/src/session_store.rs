@@ -3355,6 +3355,13 @@ pub struct SessionRepo {
     opts: RepoOptions,
 }
 
+/// `e`, with what was being done and to which path in front of the OS's message — an
+/// `io::Error` alone says "Permission denied (os error 13)" and nothing about where. Keeps the kind,
+/// so callers that branch on it still can.
+fn at_path(action: &str, path: &Path, e: std::io::Error) -> std::io::Error {
+    std::io::Error::new(e.kind(), format!("{action} {}: {e}", path.display()))
+}
+
 impl SessionRepo {
     /// Open (creating if needed) a repository rooted at `dir`, in the single-file layout with no id
     /// prefix — what every local invocation uses.
@@ -3365,7 +3372,8 @@ impl SessionRepo {
     /// [`open`](Self::open) with an explicit [`Layout`] and id prefix — the service-mode entry point.
     pub fn open_with(dir: impl Into<PathBuf>, opts: RepoOptions) -> std::io::Result<Self> {
         let dir = dir.into();
-        fs::create_dir_all(&dir)?;
+        fs::create_dir_all(&dir)
+            .map_err(|e| at_path("cannot create session directory", &dir, e))?;
         Ok(Self { dir, opts })
     }
 
@@ -6174,7 +6182,8 @@ impl Log {
     /// rather than refused.
     fn create_file(path: &Path, first_line: &[u8]) -> std::io::Result<()> {
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+            fs::create_dir_all(parent)
+                .map_err(|e| at_path("cannot create session directory", parent, e))?;
         }
         create_whole(path, first_line, true)
     }
