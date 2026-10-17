@@ -911,3 +911,53 @@ async fn a_childs_approved_multi_file_edit_lands_only_the_files_that_apply() {
         "beta\n"
     );
 }
+
+fn outcome(text: &str, ok: bool, note: Option<&str>, structured: bool) -> ChildOutcome {
+    ChildOutcome {
+        agent: "writer".to_string(),
+        task: "t".to_string(),
+        text: text.to_string(),
+        ok,
+        note: note.map(str::to_string),
+        structured,
+    }
+}
+
+#[test]
+fn a_structured_result_with_a_note_is_still_one_valid_json_value() {
+    // A merge conflict note on a child that returned typed data used to be appended after the
+    // payload — `{"done":true}\n\n[changes merged WITH CONFLICTS …]` — which no JSON parser accepts.
+    let rendered = render_outcome(outcome(
+        r#"{"done":true}"#,
+        true,
+        Some("changes merged WITH CONFLICTS in: a.txt"),
+        true,
+    ));
+    let v: serde_json::Value = serde_json::from_str(&rendered).expect(&rendered);
+    assert_eq!(v["output"], json!({"done": true}));
+    assert_eq!(v["note"], "changes merged WITH CONFLICTS in: a.txt");
+}
+
+#[test]
+fn a_structured_result_without_a_note_is_returned_exactly() {
+    assert_eq!(
+        render_outcome(outcome(r#"{"done":true}"#, true, None, true)),
+        r#"{"done":true}"#
+    );
+}
+
+#[test]
+fn a_failed_result_keeps_its_note() {
+    // The preserved checkout is the only copy of a failed child's work.
+    let rendered = render_outcome(outcome(
+        "agent run failed: boom",
+        false,
+        Some("worktree preserved at /x/kept-1-writer-0-0"),
+        false,
+    ));
+    assert!(rendered.contains("agent run failed: boom"), "{rendered}");
+    assert!(
+        rendered.contains("worktree preserved at /x/kept-1-writer-0-0"),
+        "{rendered}"
+    );
+}
