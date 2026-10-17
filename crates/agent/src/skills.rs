@@ -172,6 +172,35 @@ pub fn discover_extra_only(extra_roots: &[String]) -> (Vec<Skill>, Vec<Collision
     discover_with_diagnostics_impl(Path::new(""), false, extra_roots, false)
 }
 
+/// Refuse a `--skill`/`--prompt-template` path that is neither a directory nor a `.md` file, before
+/// anything runs. Discovery itself only reports such a path as a diagnostic, which a one-shot `run`
+/// never shows: `--skill /nope/skill` used to go straight to the model call without the skill. Pattern
+/// entries (`!pattern`, `+pattern`, a glob) are not paths and are left to discovery. Only the paths
+/// given on this invocation are checked; a stale stored default stays a diagnostic.
+pub fn check_paths(flag: &str, entries: &[String]) -> Result<(), String> {
+    let home = home_dir();
+    for entry in entries {
+        let crate::settings::PathEntry::Root(raw) = crate::settings::classify_path_entry(entry)
+        else {
+            continue;
+        };
+        let path = PathBuf::from(crate::tools::expand_tilde(
+            raw,
+            home.as_deref().and_then(|p| p.to_str()),
+        ));
+        let is_md = path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("md");
+        if !(path.is_dir() || is_md) {
+            let why = if path.exists() {
+                "is not a directory or a .md file"
+            } else {
+                "does not exist"
+            };
+            return Err(format!("{flag} {raw}: {why}"));
+        }
+    }
+    Ok(())
+}
+
 /// How many `SKILL.md` manifests one backend-side root may contribute. A root holding more than this
 /// is not a skills directory, and every manifest past it costs a round trip to read.
 const MAX_REMOTE_SKILLS_PER_ROOT: usize = 200;
@@ -1886,6 +1915,25 @@ mod tests {
             !collisions.iter().any(|c| c.to_string().contains("shared")),
             "must not report a phantom self-collision: {collisions:?}"
         );
+    }
+
+    #[test]
+    fn check_paths_refuses_a_missing_or_non_md_path_and_skips_patterns() {
+        let dir = tempfile::tempdir().unwrap();
+        let md = dir.path().join("one.md");
+        let txt = dir.path().join("one.txt");
+        fs::write(&md, "x").unwrap();
+        fs::write(&txt, "x").unwrap();
+        let ok = [
+            dir.path().display().to_string(),
+            md.display().to_string(),
+            "!private-*".to_string(),
+        ];
+        check_paths("--skill", &ok).unwrap();
+        let err = check_paths("--skill", &["/nope/skill".to_string()]).unwrap_err();
+        assert_eq!(err, "--skill /nope/skill: does not exist");
+        let err = check_paths("--prompt-template", &[txt.display().to_string()]).unwrap_err();
+        assert!(err.ends_with("is not a directory or a .md file"), "{err}");
     }
 
     #[test]
