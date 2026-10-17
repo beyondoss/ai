@@ -415,3 +415,128 @@ async fn a_leftover_on_the_target_is_adopted_and_stopped_with_the_session() {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
+
+/// Wait (bounded) until `cond` holds.
+async fn until(what: &str, cond: impl Fn() -> bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !cond() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {what}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// Sandbox-owned jobs (`exec_endpoint::jobs`) inside the real target — busybox in CI: a held job
+/// streams and dies with its hold, a kept one outlives it and is read back from an offset, a kill
+/// stops it and removes its directory, and a job started kept is polled to its end. The baseline's
+/// whole job is to work on exactly this image.
+#[tokio::test]
+async fn a_sandbox_job_lives_in_the_target_and_outlives_its_hold_once_kept() {
+    use beyond_ai_agent::exec_endpoint::jobs::{JobEvent, JobId, JobScope, JobSpec, JobStatus};
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    let Some(runner) = live_runner() else {
+        eprintln!("skipping: set AGENT_LIVE_EXEC_CMD or AGENT_LIVE_EXEC_URL to run live tests");
+        return;
+    };
+    let jobs = runner
+        .clone()
+        .sandbox_jobs()
+        .expect("a remote target has sandbox jobs");
+    assert!(
+        jobs.available().await,
+        "the target lacks a tool the job scripts need"
+    );
+    let scope = JobScope::for_session(Some("live"), JobId::fresh().as_str());
+    let group_alive = |pgid: u32| {
+        let runner = runner.clone();
+        async move {
+            runner
+                .run(
+                    "sh",
+                    &["-c".into(), format!("kill -0 -{pgid} 2>/dev/null")],
+                    None,
+                    Duration::from_secs(10),
+                )
+                .await
+                .unwrap()
+                .code
+                == Some(0)
+        }
+    };
+    let spec = |cmd: &str| JobSpec {
+        program: "sh".into(),
+        args: vec!["-c".into(), cmd.into()],
+        cwd: None,
+        label: cmd.into(),
+    };
+    let started = Mutex::new(None::<u32>);
+    let output = Mutex::new(Vec::<u8>::new());
+    let events = |e: JobEvent<'_>| match e {
+        JobEvent::Started(g) => *started.lock().unwrap() = Some(g),
+        JobEvent::Output(b) => output.lock().unwrap().extend_from_slice(b),
+        _ => {}
+    };
+
+    // Held, then dropped: it dies.
+    let held = JobId::fresh();
+    let s = spec("echo held-up; sleep 300");
+    tokio::select! {
+        r = jobs.run_held(&scope, &held, &s, &events) => panic!("ended early: {r:?}"),
+        () = until("held output", || output.lock().unwrap().ends_with(b"held-up\n")) => {}
+    }
+    let pgid = started.lock().unwrap().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while group_alive(pgid).await {
+        assert!(
+            Instant::now() < deadline,
+            "the held job outlived its hold on the target"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // Kept, then dropped: it lives, and reads back from where the model left off.
+    output.lock().unwrap().clear();
+    let kept = JobId::fresh();
+    let s = spec("echo one; sleep 1; echo two; sleep 300");
+    tokio::select! {
+        r = jobs.run_held(&scope, &kept, &s, &events) => panic!("ended early: {r:?}"),
+        () = until("kept output", || output.lock().unwrap().as_slice() == b"one\n") => {}
+    }
+    jobs.keep(&scope, &kept, 1, "background", 4).await.unwrap();
+    let pgid = started.lock().unwrap().unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(
+        group_alive(pgid).await,
+        "a kept job died with its hold on the target"
+    );
+    let listed = jobs.list(&scope).await.unwrap();
+    let j = listed.iter().find(|j| j.id == kept).unwrap();
+    assert_eq!((j.num, j.seen, j.status), (Some(1), 4, JobStatus::Running));
+    let c = jobs.read(&scope, &kept, j.seen, 1024).await.unwrap();
+    assert_eq!(c.data, b"two\n");
+    assert!(
+        jobs.kill(&scope, std::slice::from_ref(&kept), true)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(!group_alive(pgid).await);
+    assert_eq!(
+        jobs.read(&scope, &kept, 0, 1).await.unwrap().status,
+        JobStatus::Gone
+    );
+
+    // Started kept (no hold) and polled to its end.
+    let polled = JobId::fresh();
+    jobs.start_kept(&scope, &polled, &spec("echo a; sleep 0.5; echo b; exit 6"))
+        .await
+        .unwrap();
+    output.lock().unwrap().clear();
+    assert_eq!(jobs.follow(&scope, &polled, 0, &events).await.unwrap(), 6);
+    assert_eq!(output.lock().unwrap().as_slice(), b"a\nb\n");
+    jobs.wipe(&scope).await.unwrap();
+    assert!(jobs.list(&scope).await.unwrap().is_empty());
+}

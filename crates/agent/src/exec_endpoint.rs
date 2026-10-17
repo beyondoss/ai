@@ -184,6 +184,7 @@ use crate::tools::exec::{
 
 pub mod conformance;
 mod far_kill;
+pub mod jobs;
 pub mod stream;
 
 use stream::{FRAME_SILENCE_LIMIT, Frame, FrameReader, NDJSON};
@@ -253,6 +254,8 @@ pub struct HttpExecRunner {
     /// and cached. A probe that could not reach the endpoint is not cached: that is an outage, not
     /// an answer.
     streams: tokio::sync::OnceCell<bool>,
+    /// Whether the sandbox can run jobs of its own ([`jobs::ShellJobs`]) — probed once, the same way.
+    jobs_probe: Arc<tokio::sync::OnceCell<bool>>,
 }
 
 impl HttpExecRunner {
@@ -278,6 +281,7 @@ impl HttpExecRunner {
             headers: Vec::new(),
             max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
             streams: tokio::sync::OnceCell::new(),
+            jobs_probe: Arc::default(),
         })
     }
 
@@ -519,6 +523,84 @@ impl CommandRunner for HttpExecRunner {
     async fn tracks_jobs(&self) -> bool {
         self.streams().await
     }
+
+    /// v1.2 only: stdout frames to `on_stdout`, stderr frames to `on_stderr`, until the final frame.
+    /// Dropping the future drops the response, which closes the connection — and the endpoint kills
+    /// the command's group ("Disconnect kills").
+    async fn run_attached(
+        &self,
+        program: &str,
+        args: &[String],
+        cwd: Option<&str>,
+        on_stdout: ChunkSink<'_>,
+        on_stderr: ChunkSink<'_>,
+    ) -> std::io::Result<ExecResult> {
+        if !self.streams().await {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "this exec endpoint does not stream (protocol v1.1)",
+            ));
+        }
+        let resp = self
+            .send(program, args, cwd, STREAM_DEADLINE, None, true)
+            .await?;
+        if !is_ndjson(&resp) {
+            // One object after all (a fleet mid-rollout): everything arrives at once, at the end.
+            let parsed = self.envelope(resp).await?;
+            on_stdout(parsed.stdout.as_bytes());
+            on_stderr(parsed.stderr.as_bytes());
+            return Ok(ExecResult {
+                code: Some(parsed.exit_code),
+                ..Default::default()
+            });
+        }
+        let mut frames = FrameReader::new(resp);
+        let broken = |e: String| std::io::Error::other(format!("exec endpoint {}: {e}", self.url));
+        loop {
+            match frames.next(FRAME_SILENCE_LIMIT).await.map_err(broken)? {
+                Some(Frame::Stdout(b)) => on_stdout(&b),
+                Some(Frame::Stderr(b)) => on_stderr(&b),
+                Some(Frame::Heartbeat | Frame::ShellExit(_)) => {}
+                Some(Frame::Exit(code)) => {
+                    frames.finish().await;
+                    return Ok(ExecResult {
+                        code: Some(code),
+                        ..Default::default()
+                    });
+                }
+                Some(Frame::Signal(signal)) => {
+                    frames.finish().await;
+                    return Ok(ExecResult {
+                        signal: Some(signal),
+                        ..Default::default()
+                    });
+                }
+                Some(Frame::TimedOut) => {
+                    return Ok(ExecResult {
+                        timed_out: true,
+                        ..Default::default()
+                    });
+                }
+                Some(Frame::Error(e)) => {
+                    return Err(broken(format!("the endpoint failed mid-command: {e}")));
+                }
+                None => {
+                    return Err(broken(
+                        "the stream ended before the command's final frame".to_string(),
+                    ));
+                }
+            }
+        }
+    }
+
+    async fn attaches(&self) -> bool {
+        self.streams().await
+    }
+
+    fn sandbox_jobs(self: Arc<Self>) -> Option<Arc<dyn jobs::SandboxJobs>> {
+        let probe = self.jobs_probe.clone();
+        Some(Arc::new(jobs::ShellJobs::with_probe(self, probe)))
+    }
 }
 
 /// The start of a body, for an error message.
@@ -726,6 +808,8 @@ fn is_ndjson(resp: &reqwest::Response) -> bool {
 /// every model-supplied path an injection vector.
 pub struct TemplateRunner {
     template: Vec<String>,
+    /// Whether the far side can run jobs of its own ([`jobs::ShellJobs`]) — probed once.
+    jobs_probe: Arc<tokio::sync::OnceCell<bool>>,
 }
 
 impl TemplateRunner {
@@ -741,7 +825,10 @@ impl TemplateRunner {
         if template.first().is_none_or(|p| p == "{}") {
             return Err("exec template must start with a program to run".to_string());
         }
-        Ok(Self { template })
+        Ok(Self {
+            template,
+            jobs_probe: Arc::default(),
+        })
     }
 
     /// Parse a whitespace-separated template, the shape a CLI flag carries.
@@ -763,8 +850,18 @@ impl CommandRunner for TemplateRunner {
         cwd: Option<&str>,
         timeout: Duration,
     ) -> std::io::Result<ExecResult> {
-        self.exec(program, args, cwd, Some(timeout), None, None, None, None)
-            .await
+        self.exec(
+            program,
+            args,
+            cwd,
+            Some(timeout),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
     }
 
     /// The transport is a local process, so its output streams for free: every chunk the far side
@@ -783,6 +880,7 @@ impl CommandRunner for TemplateRunner {
             cwd,
             Some(timeout),
             Some(on_chunk),
+            None,
             None,
             None,
             None,
@@ -808,6 +906,7 @@ impl CommandRunner for TemplateRunner {
             None,
             Some(hooks.on_chunk),
             None,
+            None,
             Some(hooks.on_spawn),
             Some(hooks.on_orphans),
         )
@@ -816,6 +915,39 @@ impl CommandRunner for TemplateRunner {
 
     async fn tracks_jobs(&self) -> bool {
         true
+    }
+
+    /// The transport's two pipes, kept apart. No deadline; dropping the future kills the far side
+    /// (`TemplateKillGuard`), so the held start dies with it — as a v1.2 stream's does.
+    async fn run_attached(
+        &self,
+        program: &str,
+        args: &[String],
+        cwd: Option<&str>,
+        on_stdout: ChunkSink<'_>,
+        on_stderr: ChunkSink<'_>,
+    ) -> std::io::Result<ExecResult> {
+        self.exec(
+            program,
+            args,
+            cwd,
+            None,
+            Some(on_stdout),
+            Some(on_stderr),
+            None,
+            None,
+            None,
+        )
+        .await
+    }
+
+    async fn attaches(&self) -> bool {
+        true
+    }
+
+    fn sandbox_jobs(self: Arc<Self>) -> Option<Arc<dyn jobs::SandboxJobs>> {
+        let probe = self.jobs_probe.clone();
+        Some(Arc::new(jobs::ShellJobs::with_probe(self, probe)))
     }
 
     /// Piped into the *transport* process. Whether it reaches the far side is the transport's
@@ -835,6 +967,7 @@ impl CommandRunner for TemplateRunner {
             args,
             cwd,
             Some(timeout),
+            None,
             None,
             Some(stdin),
             None,
@@ -907,6 +1040,7 @@ impl TemplateRunner {
         cwd: Option<&str>,
         timeout: Option<Duration>,
         on_chunk: Option<ChunkSink<'_>>,
+        on_stderr: Option<ChunkSink<'_>>,
         stdin: Option<&[u8]>,
         on_spawn: Option<SpawnSink<'_>>,
         on_orphans: Option<OrphanSink<'_>>,
@@ -1043,7 +1177,7 @@ impl TemplateRunner {
                     stderr,
                     STREAM_HEAD,
                     STREAM_TAIL,
-                    on_chunk,
+                    on_stderr.or(on_chunk),
                     exited_rx.clone()
                 ),
                 feed,
@@ -1493,6 +1627,42 @@ impl CommandRunner for CellRunner {
             Ok(None) => true,
             Err(_) => false,
         }
+    }
+
+    async fn run_attached(
+        &self,
+        program: &str,
+        args: &[String],
+        cwd: Option<&str>,
+        on_stdout: ChunkSink<'_>,
+        on_stderr: ChunkSink<'_>,
+    ) -> std::io::Result<ExecResult> {
+        match self.0.resolve().map_err(std::io::Error::other)? {
+            Some(t) => {
+                t.runner()
+                    .run_attached(program, args, cwd, on_stdout, on_stderr)
+                    .await
+            }
+            None => {
+                crate::tools::exec::RealRunner
+                    .run_attached(program, args, cwd, on_stdout, on_stderr)
+                    .await
+            }
+        }
+    }
+
+    async fn attaches(&self) -> bool {
+        match self.0.resolve() {
+            Ok(Some(t)) => t.runner().attaches().await,
+            Ok(None) => true,
+            Err(_) => false,
+        }
+    }
+
+    /// The jobs of the sandbox the cell points at **now**. A job keeps the store it started with,
+    /// so a later re-point never sends its kill to another machine.
+    fn sandbox_jobs(self: Arc<Self>) -> Option<Arc<dyn jobs::SandboxJobs>> {
+        self.0.resolve().ok().flatten()?.runner().sandbox_jobs()
     }
 
     async fn run_with_stdin(
