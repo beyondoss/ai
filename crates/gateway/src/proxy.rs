@@ -1677,7 +1677,11 @@ impl AiProxy {
         provider: &Provider,
         row: Option<&route::ModelRoute>,
     ) -> HttpPeer {
-        let mut peer = HttpPeer::new(addr, self.state.config.upstream_tls, provider.host.clone());
+        let mut peer = HttpPeer::new(
+            addr,
+            self.state.config.upstream_tls,
+            provider.sni().to_string(),
+        );
         // Prefer HTTP/2 to the provider (config `upstream_http2`, default on), fall back to HTTP/1.1.
         // Every provider in `KNOWN_PROVIDERS` negotiates `h2` over TLS (verified by handshake), and H2
         // multiplexes many concurrent requests/streams over one connection — fewer sockets and TLS

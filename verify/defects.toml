@@ -2905,3 +2905,17 @@ state = "fixed"
 test = "a_name_that_matches_no_provider_is_flagged_as_unknown"
 fix = ""
 note = "Decided by the owner: the header stays well formed and malformed is unchanged (the existing unknown-name test still asserts !malformed). Control::unknown_provider is set only when a name in order, only or split matches no ProviderSpec (providers::by_name). It is counted on the new ai_control_unknown_provider_total in proxy request_filter, beside the malformed count. A real provider merely off the row is not flagged: a_real_provider_off_the_row_is_not_flagged."
+
+[[defect]]
+id = "D283"
+severity = "med"
+area = "Routing"
+title = "A provider configured with an IPv6 literal authority gets the host [2001 for SNI and Host"
+impact = "Provider::resolve took the host as the text before the first colon, so [2001:db8::1]:443 became the host [2001. A provider configured with an IPv6 literal upstream sent that as its Host header and SNI, so its TLS handshake and routing failed on every request."
+confidence = "high"
+evidence = "route.rs Provider::resolve split the authority on ':'. Reproduced on 4513e6f by an_ipv6_authority_keeps_its_brackets_in_the_host_header_and_not_in_sni (host was \"[2001\")."
+claims = ["R1"]
+state = "fixed"
+test = "an_ipv6_authority_keeps_its_brackets_in_the_host_header_and_not_in_sni"
+fix = ""
+note = "Fixed in route.rs: the host is http::uri::Authority::host(), which keeps the brackets of an IPv6 literal, so the Host header carries them (RFC 9110). Provider::sni() strips them for the TLS server name, which proxy's peer uses. A string that is no authority keeps the old first-colon fallback."

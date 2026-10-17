@@ -766,6 +766,15 @@ pub struct Provider {
 }
 
 impl Provider {
+    /// The TLS server name: `host` without the brackets an IPv6 literal carries in a URI. The
+    /// `Host` header keeps them (RFC 9110), but a server name is a bare name or address.
+    pub fn sni(&self) -> &str {
+        self.host
+            .strip_prefix('[')
+            .and_then(|h| h.strip_suffix(']'))
+            .unwrap_or(&self.host)
+    }
+
     /// Whether at least one pool key is configured — the 503 gate for managed traffic.
     pub fn has_pool_key(&self) -> bool {
         !self.pool_auth.is_empty()
@@ -842,11 +851,16 @@ impl Provider {
         metrics: ProviderMetrics,
         breaker: Option<CircuitBreaker>,
     ) -> Self {
-        let host = authority
-            .split(':')
-            .next()
-            .unwrap_or(&authority)
-            .to_string();
+        // The authority minus its port, bracket-aware: `[2001:db8::1]:443` is host `[2001:db8::1]`.
+        // A string that is no authority falls back to the text before the first colon.
+        let host = match authority.parse::<http::uri::Authority>() {
+            Ok(a) => a.host().to_string(),
+            Err(_) => authority
+                .split(':')
+                .next()
+                .unwrap_or(&authority)
+                .to_string(),
+        };
         let pool_auth = pool_keys
             .iter()
             .map(|k| {
@@ -1203,6 +1217,37 @@ mod tests {
     fn dialect_defaults() {
         assert_eq!(dialect_default(Dialect::OpenAi), "openai");
         assert_eq!(dialect_default(Dialect::Anthropic), "anthropic");
+    }
+
+    /// An IPv6 literal authority keeps its brackets as the `Host` header, and its SNI is the bare
+    /// address. Splitting on the first colon read `[2001:db8::1]:443` as the host `[2001`.
+    /// claim: R1
+    /// defect: D283
+    #[test]
+    fn an_ipv6_authority_keeps_its_brackets_in_the_host_header_and_not_in_sni() {
+        let p = Provider::resolve(
+            "x",
+            "[2001:db8::1]:443".to_string(),
+            Dialect::OpenAi,
+            AuthScheme::Bearer,
+            &[],
+            ProviderMetrics::disconnected(),
+            None,
+        );
+        assert_eq!(p.host, "[2001:db8::1]");
+        assert_eq!(p.sni(), "2001:db8::1");
+        assert_eq!(p.host_header.as_ref().unwrap(), "[2001:db8::1]");
+        let named = Provider::resolve(
+            "x",
+            "llm.internal:8443".to_string(),
+            Dialect::OpenAi,
+            AuthScheme::Bearer,
+            &[],
+            ProviderMetrics::disconnected(),
+            None,
+        );
+        assert_eq!(named.host, "llm.internal");
+        assert_eq!(named.sni(), "llm.internal");
     }
 
     /// claim: SEC-4
