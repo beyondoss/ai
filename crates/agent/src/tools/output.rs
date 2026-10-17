@@ -170,31 +170,43 @@ pub fn cap_listing_bytes(out: &mut String, guidance: &str) -> bool {
     true
 }
 
-/// Format `path` (as yielded by walking `root`) the way pi's `grep.ts`/`find.ts` do: relative to `root`
-/// when `root` is a directory, or just the basename when `root` names a single file (the two would
-/// otherwise coincide, showing nothing meaningful beyond the name itself). Shared by `grep`/`find` —
-/// reporting the full (possibly deeply-nested, possibly absolute) path root-first costs the model extra
-/// tokens per line for a prefix it already knows (it's whatever `path` it just asked to search), and
-/// diverges from pi's documented "relative to search directory" contract.
+/// Render a `grep`/`find` result path so that `read` can open it as printed: relative to the tool's
+/// working directory — the base `read`, `edit` and `write` resolve a relative path against — or
+/// absolute when the hit lies outside it.
 ///
-/// `root_is_dir` is **passed in** rather than read off the filesystem here, because this function is
-/// pure rendering and the answer belongs to whichever machine the search ran on: a `root.is_dir()`
-/// here asks the host about a path that may only exist inside a sandbox, and would quietly re-render
-/// every hit as a bare basename the moment the answer came back `false`. Both callers already know it
-/// for free — `find` from the `stat` it must do anyway, `grep` from whether its first hit *is* the
-/// root — so nobody pays a syscall or a round trip for it either.
+/// Paths used to be printed relative to the *search* root (and a single-file search as its bare
+/// name), so `grep path="sub"` printed `inner/b.txt`, and `read inner/b.txt` then failed: the path was
+/// relative to a directory no other tool knew about. `base` is [`display_base`]'s answer; a hit that
+/// is already relative (an empty tool root, where relative paths mean the process cwd) prints as
+/// walked, minus a leading `./`.
 pub fn format_path<'a>(
     path: &'a std::path::Path,
-    root: &std::path::Path,
-    root_is_dir: bool,
+    base: Option<&std::path::Path>,
 ) -> std::borrow::Cow<'a, str> {
-    if !root_is_dir {
-        return match path.file_name() {
-            Some(name) => name.to_string_lossy(),
-            None => path.to_string_lossy(),
-        };
+    if let Some(rel) = base.and_then(|b| path.strip_prefix(b).ok())
+        && !rel.as_os_str().is_empty()
+    {
+        return rel.to_string_lossy();
     }
-    path.strip_prefix(root).unwrap_or(path).to_string_lossy()
+    path.strip_prefix(".").unwrap_or(path).to_string_lossy()
+}
+
+/// The directory [`format_path`] prints paths relative to: the tool's root when it has one, else —
+/// on this host — the process cwd, which is what an empty root resolves against. A remote backend
+/// with no root has no cwd this process can name, so its paths print as the search produced them
+/// (relative when the model typed a relative path, absolute otherwise), which is still exactly what
+/// `read` resolves on that same backend. Asked once per call, never per path.
+pub fn display_base(
+    root: &std::path::Path,
+    world: &super::fs::PathWorld,
+) -> Option<std::path::PathBuf> {
+    if !root.as_os_str().is_empty() {
+        return Some(root.to_path_buf());
+    }
+    match world {
+        super::fs::PathWorld::Local => std::env::current_dir().ok(),
+        super::fs::PathWorld::Remote { .. } => None,
+    }
 }
 
 /// A unique-enough 16-hex-char (8-byte) token for temp-file names. It only needs to avoid collisions

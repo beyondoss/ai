@@ -709,6 +709,38 @@ async fn a_match_deep_in_a_long_line_is_windowed_identically_on_every_backend() 
 }
 
 #[tokio::test]
+async fn grep_and_find_print_paths_read_can_open_on_every_backend() {
+    // Relative to the tool root, not the search root: `path: "sub"` must print `sub/inner/b.txt`,
+    // and `read` (same root, same backend) must open exactly that.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("sub/inner")).unwrap();
+    std::fs::write(dir.path().join("sub/inner/b.txt"), "NEEDLE\n").unwrap();
+    for (name, backend) in all_backends().await {
+        let reg = default_registry_with_config(&ToolConfig {
+            fs_backend: Some(backend),
+            root: dir.path().to_path_buf(),
+            ..ToolConfig::new()
+        });
+        let run = |tool: &'static str, input: Value| {
+            let t = tool_of(&reg, tool);
+            async move { t.run(input).await.unwrap().text }
+        };
+        let grep = run("grep", json!({ "pattern": "NEEDLE", "path": "sub" })).await;
+        assert_eq!(grep.trim_end(), "sub/inner/b.txt:1: NEEDLE", "{name}");
+        let single = run(
+            "grep",
+            json!({ "pattern": "NEEDLE", "path": "sub/inner/b.txt" }),
+        )
+        .await;
+        assert_eq!(single.trim_end(), "sub/inner/b.txt:1: NEEDLE", "{name}");
+        let find = run("find", json!({ "pattern": "*.txt", "path": "sub" })).await;
+        assert_eq!(find.trim_end(), "sub/inner/b.txt", "{name}");
+        let read = run("read", json!({ "path": "sub/inner/b.txt" })).await;
+        assert!(read.contains("NEEDLE"), "{name}: {read}");
+    }
+}
+
+#[tokio::test]
 async fn grep_and_find_skip_git_metadata_on_every_backend() {
     let dir = git_fixture();
     let root = dir.path().to_str().unwrap();

@@ -310,11 +310,12 @@ async fn the_git_repo_answer_is_asked_once_per_root_not_once_per_search() {
 /// a cosmetic difference — the model uses these paths to `read` and `edit`.
 #[tokio::test]
 async fn grep_renders_hits_relative_to_a_root_that_exists_only_on_the_target() {
+    // Relative to the tool root — the base `read` resolves against — which here exists only there.
     let runner = Recorder::new(|program, _| match program {
         "rg" => ok("/sbx/proj/sub/a.rs\u{0}12:hit here\n"),
         _ => ok(""),
     });
-    let (reg, _backend) = registry_over(runner, "");
+    let (reg, _backend) = registry_over(runner, "/sbx/proj");
     let out = reg
         .get("grep")
         .unwrap()
@@ -333,23 +334,40 @@ async fn grep_renders_hits_relative_to_a_root_that_exists_only_on_the_target() {
 }
 
 #[tokio::test]
-async fn grep_on_a_single_target_file_still_renders_just_the_basename() {
-    // The other half of the same decision: when the root *is* the file being searched, stripping it
-    // would leave an empty string, so the basename is what the caller sees. Derived from the hits
-    // rather than from a host `stat`, and this pins that the derivation agrees.
+async fn grep_on_a_single_target_file_renders_it_relative_to_the_tool_root() {
+    // A single-file search prints the file the way `read` would open it, not as a bare basename.
     let runner = Recorder::new(|program, _| match program {
-        "rg" => ok("/sbx/proj/a.rs\u{0}3:only file\n"),
+        "rg" => ok("/sbx/proj/src/a.rs\u{0}3:only file\n"),
+        _ => ok(""),
+    });
+    let (reg, _backend) = registry_over(runner, "/sbx/proj");
+    let out = reg
+        .get("grep")
+        .unwrap()
+        .run(json!({ "pattern": "only", "path": "src/a.rs" }))
+        .await
+        .expect("grep succeeds")
+        .text;
+    assert!(out.starts_with("src/a.rs:3: "), "got:\n{out}");
+}
+
+#[tokio::test]
+async fn with_no_tool_root_remote_hits_print_as_the_search_produced_them() {
+    // No cwd this process can name on the target, so nothing is stripped: an absolute search prints
+    // absolute paths, which `read` on the same backend opens as-is.
+    let runner = Recorder::new(|program, _| match program {
+        "rg" => ok("/sbx/proj/sub/a.rs\u{0}12:hit here\n"),
         _ => ok(""),
     });
     let (reg, _backend) = registry_over(runner, "");
     let out = reg
         .get("grep")
         .unwrap()
-        .run(json!({ "pattern": "only", "path": "/sbx/proj/a.rs" }))
+        .run(json!({ "pattern": "hit", "path": "/sbx/proj" }))
         .await
         .expect("grep succeeds")
         .text;
-    assert!(out.starts_with("a.rs:3: "), "got:\n{out}");
+    assert!(out.starts_with("/sbx/proj/sub/a.rs:12: "), "got:\n{out}");
 }
 
 #[tokio::test]
@@ -360,7 +378,7 @@ async fn find_renders_matches_relative_to_a_root_that_exists_only_on_the_target(
         "rg" => ok("/sbx/proj/sub/a.rs\u{0}"),
         _ => ok(""),
     });
-    let (reg, _backend) = registry_over(runner, "");
+    let (reg, _backend) = registry_over(runner, "/sbx/proj");
     let out = reg
         .get("find")
         .unwrap()
