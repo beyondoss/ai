@@ -16,18 +16,30 @@ the model server and exec double that the replicas dial back into.
 
 ## What it answered
 
-|                                          | Homelab            | EFS            |
-| ---------------------------------------- | ------------------ | -------------- |
-| Full session takeover after a partition  | 102 s              | **88.4 s**     |
-| Takeover after a hard kill               | 81–89 s            | **73.1 s**     |
-| `/readyz` while the mount hangs          | bounded at 1.003 s | **1.0028 s**   |
-| Probe threads leaked over 20 such probes | 0                  | **0**          |
-| ESTALE during consolidation              | 0                  | **0**          |
-| Turns/s per session                      | 3.18               | **2.69 (85%)** |
+|                                          | Homelab            | EFS, 2026-09-22 | EFS, 2026-10-16 |
+| ---------------------------------------- | ------------------ | --------------- | --------------- |
+| Full session takeover after a partition  | 102 s              | **88.4 s**      | **88.4 s**      |
+| Takeover after a hard kill               | 81–89 s            | **73.1 s**      | **66.6 s**      |
+| `/readyz` while the mount hangs          | bounded at 1.003 s | **1.0028 s**    | **1.0026 s**    |
+| Probe threads leaked over 20 such probes | 0                  | **0**           | **0**           |
+| ESTALE during consolidation              | 0                  | **0**           | **0**           |
+| Turns/s per session                      | 3.18               | **2.69 (85%)**  | **2.64 (83%)**  |
 
 `9 passed · 0 failed · 0 skipped`, and a half-hour soak of 30 sessions over 5 tenants committing
 **145,244 turns** through 13 rolling deploys and 7 hard kills with **0 placements refused** and no
-acknowledged write lost. Full output in `results/`.
+acknowledged write lost. Full output in `results/2026-09-22/`.
+
+**Re-run on main `f902044e` (2026-10-16)**, for the two storage primitives that had changed since and
+never run on EFS: the epoch-1 fence is now a temp file `link()`ed into place (#297) rather than an
+`O_EXCL` create, and a session lock is an OFD lock on `.beyond-lock` plus the legacy `flock` on
+`lock` (#144). Again `9 passed · 0 failed · 0 skipped`; the soak committed **142,755 turns** through
+12 deploys and 7 hard kills, **0 placements refused**, every acknowledged write present in all 30
+sessions. The partitioned takeover reproduced to the tenth of a second; the hard-kill one depends on
+where in the lease the kill lands. A replica with 30 live sessions held exactly 60 locks (30 OFD, 30
+`flock`), and one EFS mount held **65,532 locks at once with none refused** — it ran out of
+descriptors (Fargate's 65,535) first, right at AWS's documented 65,536-locks-per-mount quota. The
+lock quota does not bind at the `--max-live-sessions` default (40,000 locks); descriptors are the
+tighter budget. Output, including the lock probe, in `results/2026-10-16/`.
 
 **The headline is that EFS recovers a lease faster than a stock Linux NFS server**, not slower. The
 102 s partitioned takeover was the number gating the Fargate-vs-EC2 decision, and it is not a reason

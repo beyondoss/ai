@@ -862,8 +862,9 @@ enum Command {
         #[usage(long, env = "AI_AGENT_SHARD", delimiter = ',')]
         shard: Vec<String>,
         /// Service mode: refuse a new session once this many are live on this replica (503, with a
-        /// `Retry-After`). Two open file descriptors per live session — its newest segment and its
-        /// lock — keeps the default comfortably inside a network filesystem's per-instance limits.
+        /// `Retry-After`). A live session holds three open file descriptors — its newest segment and
+        /// its two lock files — and two locks, so the default is ~60,000 descriptors (inside a
+        /// 65,535 `nofile` limit, not by much) and 40,000 locks (inside EFS's 65,536 per mount).
         /// `0` turns the cap off.
         #[usage(long, env = "AI_AGENT_MAX_LIVE_SESSIONS", default = "20000")]
         max_live_sessions: usize,

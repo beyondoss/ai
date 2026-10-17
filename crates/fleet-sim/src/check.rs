@@ -110,7 +110,10 @@ pub fn one_writer_per_session(session_dir: &Path) -> Finding {
     // Epoch 1 is kept forever, so the run to check is whatever sits above it.
     let tail: &[(u64, PathBuf)] = if segs[0].0 == 1 { &segs[1..] } else { &segs };
     let Some((oldest, oldest_path)) = tail.first() else {
-        return Finding::ok("C1", "one segment, the O_EXCL create that says it exists");
+        return Finding::ok(
+            "C1",
+            "one segment, the link() into place that says it exists",
+        );
     };
     let newest = tail.last().map_or(*oldest, |(e, _)| *e);
     if newest - oldest + 1 != tail.len() as u64 {

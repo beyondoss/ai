@@ -1,0 +1,143 @@
+main f902044e · 2026-10-17 00:33:48 → 01:06:15 UTC (1800 s of load, then the checker)
+driver=10.77.3.12 r1=10.77.0.10:8080 r2=10.77.1.11:8080 r3=10.77.2.7:8080
+
+attached: 1 shard(s), 3 replica(s), faults via "/usr/local/bin/fault.sh"
+soak · substrate Attached · 1800s · seed 7 · 30 session(s) over 5 tenant(s) × 1 shard(s) · 3 replicas
+
+142755 turns committed · 0 placements refused · 12 deploy(s) · 7 hard kill(s) · 7/30 session(s) needed the ring walk
+
+PASS soak (seed 7)
+  · C10            329 file(s) on this shard, none containing any of 10 thing(s) a client said
+  · C1             one segment, the O_EXCL create that says it exists
+  · C10            s1.alpha is on its own shard, under its own tenant
+  · C1             8 epoch(s), contiguous from 1, one file each
+  · C10            s1.soak-25 is on its own shard, under its own tenant
+  · C1             8 epoch(s), contiguous from 1, one file each
+  · C10            s1.soak-5 is on its own shard, under its own tenant
+  · C1             one segment, the O_EXCL create that says it exists
+  · C10            s1.first is on its own shard, under its own tenant
+  · C1             8 epoch(s), contiguous from 1, one file each
+  · C10            s1.soak-10 is on its own shard, under its own tenant
+  · C1             one segment, the O_EXCL create that says it exists
+  · C10            s1.draining is on its own shard, under its own tenant
+  · C1             8 epoch(s), contiguous from 1, one file each
+  · C10            s1.soak-0 is on its own shard, under its own tenant
+  · C1             2 epoch(s), contiguous from 1, one file each
+  · C10            s1.takeover is on its own shard, under its own tenant
+  · C1             8 epoch(s), contiguous from 1, one file each
+  · C10            s1.soak-15 is on its own shard, under its own tenant
+  · C1             one segment, the O_EXCL create that says it exists
+  · C10            s1.mine is on its own shard, under its own tenant
+  · C1             2 epoch(s), contiguous from 1, one file each
+  · C10            s1.fenced is on its own shard, under its own tenant
+  · C1             8 epoch(s), contiguous from 1, one file each
+  · C10            s1.soak-20 is on its own shard, under its own tenant
+  · C1             8 epoch(s), contiguous from 1, one file each
+  · C10            s1.soak-21 is on its own shard, under its own tenant
+  · C1             8 epoch(s), contiguous from 1, one file each
+  · C10            s1.soak-16 is on its own shard, under its own tenant
+  · C1             8 epoch(s), contiguous from 1, one file each
+  · C10            s1.soak-1 is on its own shard, under its own tenant
+  · C1             8 epoch(s), contiguous from 1, one file each
+  · C10            s1.soak-26 is on its own shard, under its own tenant
+  · C1             8 epoch(s), contiguous from 1, one file each
+  · C10            s1.soak-6 is on its own shard, under its own tenant
+  · C1             8 epoch(s), contiguous from 1, one file each
+  · C10            s1.soak-11 is on its own shard, under its own tenant
+  · C1             8 epoch(s), contiguous from 1, one file each
+  · C10            s1.soak-12 is on its own shard, under its own tenant
+  · C1             8 epoch(s), contiguous from 1, one file each
+  · C10            s1.soak-7 is on its own shard, under its own tenant
+  · C1             8 epoch(s), contiguous from 1, one file each
+  · C10            s1.soak-27 is on its own shard, under its own tenant
+  · C1             8 epoch(s), contiguous from 1, one file each
+  · C10            s1.soak-22 is on its own shard, under its own tenant
+  · C1             8 epoch(s), contiguous from 1, one file each
+  · C10            s1.soak-17 is on its own shard, under its own tenant
+  · C1             8 epoch(s), contiguous from 1, one file each
+  · C10            s1.soak-2 is on its own shard, under its own tenant
+  · C1             8 epoch(s), contiguous from 1, one file each
+  · C10            s1.soak-3 is on its own shard, under its own tenant
+  · C1             8 epoch(s), contiguous from 1, one file each
+  · C10            s1.soak-23 is on its own shard, under its own tenant
+  · C1             8 epoch(s), contiguous from 1, one file each
+  · C10            s1.soak-18 is on its own shard, under its own tenant
+  · C1             8 epoch(s), contiguous from 1, one file each
+  · C10            s1.soak-13 is on its own shard, under its own tenant
+  · C1             8 epoch(s), contiguous from 1, one file each
+  · C10            s1.soak-8 is on its own shard, under its own tenant
+  · C1             8 epoch(s), contiguous from 1, one file each
+  · C10            s1.soak-28 is on its own shard, under its own tenant
+  · C1             8 epoch(s), contiguous from 1, one file each
+  · C10            s1.soak-29 is on its own shard, under its own tenant
+  · C1             8 epoch(s), contiguous from 1, one file each
+  · C10            s1.soak-14 is on its own shard, under its own tenant
+  · C1             8 epoch(s), contiguous from 1, one file each
+  · C10            s1.soak-9 is on its own shard, under its own tenant
+  · C1             8 epoch(s), contiguous from 1, one file each
+  · C10            s1.soak-4 is on its own shard, under its own tenant
+  · C1             8 epoch(s), contiguous from 1, one file each
+  · C10            s1.soak-24 is on its own shard, under its own tenant
+  · C1             8 epoch(s), contiguous from 1, one file each
+  · C10            s1.soak-19 is on its own shard, under its own tenant
+  · reachable      s1.soak-0 moved, and the ring walk found it — its hash target answers 503 until the idle reaper frees the lock, so a hash-only edge would have had an outage here
+  · no-lost-write  5102 acknowledged message(s) all present after replay
+  · reachable      s1.soak-1 moved, and the ring walk found it — its hash target answers 503 until the idle reaper frees the lock, so a hash-only edge would have had an outage here
+  · no-lost-write  5061 acknowledged message(s) all present after replay
+  · reachable      s1.soak-2 moved, and the ring walk found it — its hash target answers 503 until the idle reaper frees the lock, so a hash-only edge would have had an outage here
+  · no-lost-write  5110 acknowledged message(s) all present after replay
+  · reachable      s1.soak-3 moved, and the ring walk found it — its hash target answers 503 until the idle reaper frees the lock, so a hash-only edge would have had an outage here
+  · no-lost-write  5116 acknowledged message(s) all present after replay
+  · reachable      s1.soak-4 moved, and the ring walk found it — its hash target answers 503 until the idle reaper frees the lock, so a hash-only edge would have had an outage here
+  · no-lost-write  5043 acknowledged message(s) all present after replay
+  · reachable      s1.soak-5 moved, and the ring walk found it — its hash target answers 503 until the idle reaper frees the lock, so a hash-only edge would have had an outage here
+  · no-lost-write  5054 acknowledged message(s) all present after replay
+  · reachable      s1.soak-6 moved, and the ring walk found it — its hash target answers 503 until the idle reaper frees the lock, so a hash-only edge would have had an outage here
+  · no-lost-write  5058 acknowledged message(s) all present after replay
+  · reachable      s1.soak-7 answered on its hash target
+  · no-lost-write  5104 acknowledged message(s) all present after replay
+  · reachable      s1.soak-8 answered on its hash target
+  · no-lost-write  5061 acknowledged message(s) all present after replay
+  · reachable      s1.soak-9 answered on its hash target
+  · no-lost-write  5069 acknowledged message(s) all present after replay
+  · reachable      s1.soak-10 answered on its hash target
+  · no-lost-write  4612 acknowledged message(s) all present after replay
+  · reachable      s1.soak-11 answered on its hash target
+  · no-lost-write  4603 acknowledged message(s) all present after replay
+  · reachable      s1.soak-12 answered on its hash target
+  · no-lost-write  4603 acknowledged message(s) all present after replay
+  · reachable      s1.soak-13 answered on its hash target
+  · no-lost-write  4552 acknowledged message(s) all present after replay
+  · reachable      s1.soak-14 answered on its hash target
+  · no-lost-write  4603 acknowledged message(s) all present after replay
+  · reachable      s1.soak-15 answered on its hash target
+  · no-lost-write  4613 acknowledged message(s) all present after replay
+  · reachable      s1.soak-16 answered on its hash target
+  · no-lost-write  4583 acknowledged message(s) all present after replay
+  · reachable      s1.soak-17 answered on its hash target
+  · no-lost-write  4604 acknowledged message(s) all present after replay
+  · reachable      s1.soak-18 answered on its hash target
+  · no-lost-write  4568 acknowledged message(s) all present after replay
+  · reachable      s1.soak-19 answered on its hash target
+  · no-lost-write  4646 acknowledged message(s) all present after replay
+  · reachable      s1.soak-20 answered on its hash target
+  · no-lost-write  4622 acknowledged message(s) all present after replay
+  · reachable      s1.soak-21 answered on its hash target
+  · no-lost-write  4602 acknowledged message(s) all present after replay
+  · reachable      s1.soak-22 answered on its hash target
+  · no-lost-write  4581 acknowledged message(s) all present after replay
+  · reachable      s1.soak-23 answered on its hash target
+  · no-lost-write  4614 acknowledged message(s) all present after replay
+  · reachable      s1.soak-24 answered on its hash target
+  · no-lost-write  4602 acknowledged message(s) all present after replay
+  · reachable      s1.soak-25 answered on its hash target
+  · no-lost-write  4602 acknowledged message(s) all present after replay
+  · reachable      s1.soak-26 answered on its hash target
+  · no-lost-write  4591 acknowledged message(s) all present after replay
+  · reachable      s1.soak-27 answered on its hash target
+  · no-lost-write  4605 acknowledged message(s) all present after replay
+  · reachable      s1.soak-28 answered on its hash target
+  · no-lost-write  4570 acknowledged message(s) all present after replay
+  · reachable      s1.soak-29 answered on its hash target
+  · no-lost-write  4601 acknowledged message(s) all present after replay
+EXIT 0
