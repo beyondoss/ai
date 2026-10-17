@@ -275,7 +275,7 @@ enum Command {
         /// second is sent only after the first fully completes). An argument starting with `@` is a
         /// file reference instead of a message: its contents are read and wrapped in a
         /// `<file name="...">` block prepended to the *first* message. Stdin is read only when no
-        /// message is given (`cmd | agent run`, `agent run @prompt.md < input`) or the first message
+        /// message is given (`cmd | {PROGRAM} run`, `{PROGRAM} run @prompt.md < input`) or the first message
         /// is `-`, and comes before the `@file` blocks; with a message, an open stdin is never waited
         /// on. At least one of a message, `@file`, or stdin is required.
         tasks: Vec<String>,
@@ -318,7 +318,7 @@ enum Command {
         /// reasoning models via `reasoning_effort`; Anthropic adaptive-thinking models via
         /// `output_config.effort`). One of off/minimal/low/medium/high/xhigh — see `--thinking` for a
         /// raw token-budget override instead. Ignored by models that take neither shape. Falls back to
-        /// `AI_AGENT_REASONING_EFFORT`, then the stored `agent settings --default-reasoning-effort`
+        /// `AI_AGENT_REASONING_EFFORT`, then the stored `{PROGRAM} settings --default-reasoning-effort`
         /// default (Fix 2 — pi-parity gap: previously the only numeric/string CLI tunable with no
         /// persisted-default fallback at all), before finally leaving it unset. Task 2 (pi-parity fix,
         /// pass 19): `off` is now accepted too, explicitly disabling reasoning — previously the only way
@@ -361,13 +361,13 @@ enum Command {
         #[usage(long, env = "AI_AGENT_APPEND_SYSTEM_PROMPT")]
         append_system_prompt: Vec<String>,
         /// Trust `cwd` for this run only, so a project-local `.claude/SYSTEM.md` is honored even if
-        /// `cwd` isn't in the persisted allowlist (`agent trust <path>`). A session-scoped override,
-        /// not a permanent grant — see `agent trust` to record one. `-a` matches pi's own
+        /// `cwd` isn't in the persisted allowlist (`{PROGRAM} trust <path>`). A session-scoped override,
+        /// not a permanent grant — see `{PROGRAM} trust` to record one. `-a` matches pi's own
         /// `--approve`/`-a` (same "trust this project" meaning, different flag name here).
         #[usage(short = 'a', long)]
         trust_project: bool,
         /// Force `cwd` *untrusted* for this run only, overriding both `--trust-project` and the
-        /// persisted allowlist (`agent trust <path>`) — e.g. to test untrusted behavior against a
+        /// persisted allowlist (`{PROGRAM} trust <path>`) — e.g. to test untrusted behavior against a
         /// directory that's otherwise permanently trusted. Wins over `--trust-project` if both are
         /// somehow given. `-na` matches pi's own `--no-approve`/`-na`.
         #[usage(long)]
@@ -479,11 +479,11 @@ enum Command {
         /// already gets, regardless of the active model's real `supports_vision` capability — for an
         /// operator who wants image bytes kept out of the prompt entirely (bandwidth, compliance, a
         /// proxy that strips/rejects multipart image content) even on a vision-capable model. Falls back
-        /// to the persisted `agent settings --block-images` default when not explicitly given (Task #26,
+        /// to the persisted `{PROGRAM} settings --block-images` default when not explicitly given (Task #26,
         /// pi-parity feature).
         #[usage(long, env = "AI_AGENT_BLOCK_IMAGES")]
         block_images: bool,
-        /// Force `--block-images` off for this invocation, even when a persisted `agent settings
+        /// Force `--block-images` off for this invocation, even when a persisted `{PROGRAM} settings
         /// --block-images` default is `true` — `--block-images` above only ever ORs an explicit `true`
         /// in, so previously there was no way to override a persisted `true` default back to `false`
         /// for a single `run` (pass 20, pi-parity fix). Wins outright over both the persisted default
@@ -495,7 +495,7 @@ enum Command {
         /// normalized (format-converted, if needed) bytes as-is regardless of size or pixel
         /// dimensions — pi's `ImageSettings.autoResize` (default enabled) inverted, matching this
         /// codebase's `--no-x` convention for negating an on-by-default behavior (`--no-compaction`,
-        /// `--no-skills`, ...). Falls back to the persisted `agent settings --image-auto-resize`
+        /// `--no-skills`, ...). Falls back to the persisted `{PROGRAM} settings --image-auto-resize`
         /// default when not explicitly given (Task #4, pi-parity feature).
         #[usage(long, env = "AI_AGENT_NO_IMAGE_AUTO_RESIZE")]
         no_image_auto_resize: bool,
@@ -1024,7 +1024,7 @@ enum Command {
         /// reasoning models via `reasoning_effort`; Anthropic adaptive-thinking models via
         /// `output_config.effort`). One of off/minimal/low/medium/high/xhigh — see `--thinking` for a
         /// raw token-budget override instead. Ignored by models that take neither shape. Falls back to
-        /// `AI_AGENT_REASONING_EFFORT`, then the stored `agent settings --default-reasoning-effort`
+        /// `AI_AGENT_REASONING_EFFORT`, then the stored `{PROGRAM} settings --default-reasoning-effort`
         /// default, before finally leaving it unset. Task 2 (pi-parity fix, pass 19): `off` is now
         /// accepted too, explicitly disabling reasoning. `run`'s identical flag.
         #[usage(long, env = "AI_AGENT_REASONING_EFFORT")]
@@ -1049,13 +1049,13 @@ enum Command {
         #[usage(long)]
         temperature: Option<f64>,
         /// Trust `cwd` for this run only, so a project-local `.claude/SYSTEM.md` is honored even if
-        /// `cwd` isn't in the persisted allowlist (`agent trust <path>`). A session-scoped override,
-        /// not a permanent grant — see `agent trust` to record one. `-a` matches pi's own
+        /// `cwd` isn't in the persisted allowlist (`{PROGRAM} trust <path>`). A session-scoped override,
+        /// not a permanent grant — see `{PROGRAM} trust` to record one. `-a` matches pi's own
         /// `--approve`/`-a` (same "trust this project" meaning, different flag name here).
         #[usage(short = 'a', long)]
         trust_project: bool,
         /// Force `cwd` *untrusted* for this session only, overriding both `--trust-project` and the
-        /// persisted allowlist (`agent trust <path>`) — e.g. to test untrusted behavior against a
+        /// persisted allowlist (`{PROGRAM} trust <path>`) — e.g. to test untrusted behavior against a
         /// directory that's otherwise permanently trusted. Wins over `--trust-project` if both are
         /// somehow given. `-na` matches pi's own `--no-approve`/`-na`.
         #[usage(long)]
@@ -1074,7 +1074,7 @@ enum Command {
         #[usage(long, env = "AI_AGENT_BRANCH_SUMMARY_RESERVE_TOKENS")]
         branch_summary_reserve_tokens: Option<u32>,
         /// Disable automatic (threshold-triggered) compaction entirely — `run`'s identical flag. When
-        /// absent (and `AI_AGENT_NO_COMPACTION` unset), falls back to the persisted `agent settings`
+        /// absent (and `AI_AGENT_NO_COMPACTION` unset), falls back to the persisted `{PROGRAM} settings`
         /// `compaction_enabled` override before finally defaulting to enabled — see
         /// `serve::ServeConfig::no_compaction`'s doc comment.
         #[usage(long, env = "AI_AGENT_NO_COMPACTION")]
@@ -1105,18 +1105,18 @@ enum Command {
         idle_timeout_ms: Option<u64>,
         /// Force every image down the same downgrade-to-text-placeholder path a vision-incapable model
         /// already gets, regardless of the active model's real `supports_vision` capability. Falls back
-        /// to the persisted `agent settings --block-images` default when not explicitly given. `run`'s
+        /// to the persisted `{PROGRAM} settings --block-images` default when not explicitly given. `run`'s
         /// identical flag (Task #34, pi-parity fix: `serve` previously had no equivalent at all).
         #[usage(long, env = "AI_AGENT_BLOCK_IMAGES")]
         block_images: bool,
-        /// Force `--block-images` off for this invocation, even when a persisted `agent settings
+        /// Force `--block-images` off for this invocation, even when a persisted `{PROGRAM} settings
         /// --block-images` default is `true` (pass 20, pi-parity fix). `run`'s identical flag — see its
         /// own doc comment.
         #[usage(long, env = "AI_AGENT_NO_BLOCK_IMAGES")]
         no_block_images: bool,
         /// Skip `read`'s resize/downscale path for an oversized image entirely, shipping its
         /// normalized (format-converted, if needed) bytes as-is regardless of size or pixel dimensions.
-        /// Falls back to the persisted `agent settings --image-auto-resize` default when not explicitly
+        /// Falls back to the persisted `{PROGRAM} settings --image-auto-resize` default when not explicitly
         /// given. `run`'s identical flag (Task #34, pi-parity fix: `serve` previously always hardcoded
         /// image auto-resize on, with no way to turn it off).
         #[usage(long, env = "AI_AGENT_NO_IMAGE_AUTO_RESIZE")]
@@ -1356,7 +1356,7 @@ enum Command {
     /// Report stored subscription-login status — `logged_in`/`logged_out`/`needs_reauth` — for
     /// `provider`, or every known provider when omitted. A pure read of the local store; never makes
     /// a network call (so a `needs_reauth` credential still shows as configured until an actual
-    /// request or `agent login` re-establishes it).
+    /// request or `{PROGRAM} login` re-establishes it).
     AuthStatus {
         /// `anthropic`, `github-copilot`, or `openai-codex`. Omit to report every known provider.
         provider: Option<String>,
@@ -1365,10 +1365,10 @@ enum Command {
     /// metadata discovery, dynamic client registration, PKCE) — for an `mcp_servers` entry using the
     /// `http` transport that requires it. `name` must already be configured (global or, if trusted,
     /// project `settings.json` — see `settings::Settings::mcp_servers`); a `stdio` server has no login
-    /// of its own (use its `env` for a static credential instead). Unlike `agent login`'s fixed
+    /// of its own (use its `env` for a static credential instead). Unlike `{PROGRAM} login`'s fixed
     /// per-provider callback ports, this registers its own client against a freshly chosen local port
     /// each run — there's no pre-registered redirect URI to reuse. Overwrites any existing stored
-    /// login for `name` on success only, mirroring `agent login`. See `tools::mcp`'s module doc
+    /// login for `name` on success only, mirroring `{PROGRAM} login`. See `tools::mcp`'s module doc
     /// comment and `mcp_auth_store.rs` for how the resulting credential is used/persisted.
     McpLogin {
         /// The `mcp_servers` entry's own `name`, as configured in `settings.json`.
@@ -1382,8 +1382,8 @@ enum Command {
     /// View or update persisted defaults for `run`/`serve` flags — model, gateway URL, session
     /// directory — stored at `~/.claude/settings.json` (see `settings::SettingsStore`) and consulted as
     /// the last fallback after an explicit `--flag`/environment variable, before this crate's own
-    /// built-in default. With no flags, prints the currently stored values. Mirrors `agent trust`/
-    /// `agent untrust` managing the trust store the same out-of-band way.
+    /// built-in default. With no flags, prints the currently stored values. Mirrors `{PROGRAM} trust`/
+    /// `{PROGRAM} untrust` managing the trust store the same out-of-band way.
     Settings {
         /// Set the stored default model (used when neither `--model` nor `AI_AGENT_MODEL` is given).
         #[usage(long)]
@@ -1745,11 +1745,16 @@ fn expand_short_aliases(args: Vec<String>) -> Vec<String> {
 /// [`DEFAULT_MODEL`] when the help is rendered, so the two can't drift apart.
 const DEFAULT_MODEL_PLACEHOLDER: &str = "{DEFAULT_MODEL}";
 
+/// Written in help text where the program's own name belongs (`{PROGRAM} trust <path>`), and
+/// replaced with [`beyond_ai_agent::PROGRAM`] when the help is rendered.
+const PROGRAM_PLACEHOLDER: &str = "{PROGRAM}";
+
 /// A command's rendered `--help`/`-h` page, with [`DEFAULT_MODEL_PLACEHOLDER`] filled in.
 fn render_help(cmd: &'static usage::Command, long: bool) -> String {
     Cli::render_help(cmd, long)
         .unwrap_or_default()
         .replace(DEFAULT_MODEL_PLACEHOLDER, DEFAULT_MODEL)
+        .replace(PROGRAM_PLACEHOLDER, beyond_ai_agent::PROGRAM)
 }
 
 fn cli() -> Cli {
@@ -4984,11 +4989,12 @@ async fn run_task(
         eprintln!(
             "warning: {} has a project-local SYSTEM.md/APPEND_SYSTEM.md, skills, prompt templates, or a \
              settings.json on disk, but the project isn't trusted, so they were skipped — pass \
-             --trust-project or run `agent trust {}` to enable them (a project's own settings.json \
-             additionally requires a *persisted* `agent trust`, not just a one-off --trust-project — see \
-             `settings::effective_settings_for_cwd`'s doc comment)",
+             --trust-project or run `{program} trust {}` to enable them (a project's own \
+             settings.json additionally requires a *persisted* `{program} trust`, not just a one-off \
+             --trust-project)",
             cwd.display(),
-            cwd.display()
+            cwd.display(),
+            program = beyond_ai_agent::PROGRAM
         );
     }
     // Discovered once, up front: a one-shot `run` has no `reload` to re-discover mid-process, unlike
@@ -6268,6 +6274,25 @@ mod tests {
                     "{sub} --model help must name {DEFAULT_MODEL}: {help}"
                 );
                 assert!(!help.contains(DEFAULT_MODEL_PLACEHOLDER), "{help}");
+            }
+        }
+    }
+
+    #[test]
+    fn help_names_the_program_by_its_real_name() {
+        let mut pages = vec![render_help(Cli::command(), true)];
+        for sub in Cli::command().subcommands.iter().copied() {
+            pages.push(render_help(sub, true));
+            pages.push(render_help(sub, false));
+        }
+        for page in pages {
+            let words: String = page.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(!words.contains(PROGRAM_PLACEHOLDER), "{page}");
+            for wrong in ["`agent ", "| agent "] {
+                assert!(
+                    !words.contains(wrong),
+                    "help names a command that doesn't exist: {page}"
+                );
             }
         }
     }

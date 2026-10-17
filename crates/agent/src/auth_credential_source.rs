@@ -66,8 +66,9 @@ impl agent_core::client::CredentialSource for OAuthCredentialSource {
 
         let credential = refreshed.map_err(|e| {
             agent_core::Error::Transport(format!(
-                "OAuth credential for \"{provider}\" unavailable: {e}. Run `agent login {provider}` \
-                 to re-authenticate."
+                "OAuth credential for \"{provider}\" unavailable: {e}. Run `{} login {provider}` \
+                 to re-authenticate.",
+                crate::PROGRAM
             ))
         })?;
 
@@ -106,7 +107,10 @@ mod tests {
         };
         match err {
             agent_core::Error::Transport(msg) => {
-                assert!(msg.contains("agent login anthropic"), "got: {msg}")
+                assert!(
+                    msg.contains(&format!("`{} login anthropic`", crate::PROGRAM)),
+                    "got: {msg}"
+                )
             }
             other => panic!("expected Transport error, got {other:?}"),
         }

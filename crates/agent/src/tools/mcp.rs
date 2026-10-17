@@ -2765,7 +2765,8 @@ async fn connect_http(
                 // A grant connector has no login to run: its credentials are in the grant.
                 (Some(_), _) | (None, Some(_)) => String::new(),
                 (None, None) => format!(
-                    " (if this server requires login, run `agent mcp-login {}` first)",
+                    " (if this server requires login, run `{} mcp-login {}` first)",
+                    crate::PROGRAM,
                     config.name
                 ),
             };
