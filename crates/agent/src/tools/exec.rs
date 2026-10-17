@@ -821,9 +821,6 @@ impl Capture {
 /// actually waits for the kill to complete before `run()` returns, rather than firing it and hoping it
 /// lands before a caller re-checks side effects).
 ///
-/// Also used by [`crate::tools::mcp`] to sweep a reaped MCP server's group, for the same reason `bash`
-/// needs it: the process that was killed is not necessarily the process holding the memory.
-///
 /// Never once the group's number has been recycled: see [`GroupId`].
 #[cfg(unix)]
 pub(crate) fn kill_process_group(group: GroupId) {
@@ -832,8 +829,10 @@ pub(crate) fn kill_process_group(group: GroupId) {
 
 /// [`kill_process_group`] without its kill-by-pid fallback: only processes that are *in* group
 /// `pgid` are signalled. For a caller whose group leader has already been reaped — its pid is free
-/// to be reused by an unrelated process, which a fallback `kill -KILL <pid>` would then hit.
+/// to be reused by an unrelated process, which a fallback `kill -KILL <pid>` would then hit. The
+/// non-Linux `bash_proc` sweep (Linux tracks processes through `/proc` instead).
 #[cfg(unix)]
+#[cfg_attr(all(target_os = "linux", not(test)), allow(dead_code))]
 pub(crate) fn kill_group_members(group: GroupId) {
     kill_group(group, false);
 }

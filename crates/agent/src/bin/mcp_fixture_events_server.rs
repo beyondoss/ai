@@ -1784,19 +1784,35 @@ async fn main() {
         }
     });
     if stdio {
+        // `MCP_FIXTURE_PIDFILE=<path>`: record our own pid.
+        if let Ok(path) = std::env::var("MCP_FIXTURE_PIDFILE") {
+            write_atomically(&path, &std::process::id().to_string());
+        }
         // `MCP_FIXTURE_ORPHAN_PIDFILE=<path>`: double-fork a grandchild away from ourselves (as a
-        // browser-driving server does) and record its pid; only a process-group sweep reaches it.
+        // browser-driving server does) and record its pid. With `MCP_FIXTURE_ORPHAN_SETSID=1` it
+        // also leaves our process group and session (as a browser's crash handler does), so a group
+        // sweep alone misses it.
         if let Ok(pidfile) = std::env::var("MCP_FIXTURE_ORPHAN_PIDFILE") {
+            // Detached stdio too, so a leaked one holds no test's pipe open.
+            let (setsid, detached) = if std::env::var_os("MCP_FIXTURE_ORPHAN_SETSID").is_some() {
+                ("setsid ", " </dev/null >/dev/null 2>&1")
+            } else {
+                ("", "")
+            };
             let _ = tokio::process::Command::new("sh")
                 .arg("-c")
                 // Written to a temporary name and renamed, so a test never reads a half-written pid.
                 .arg(format!(
-                    "sleep 600 & echo $! > {pidfile}.tmp && mv -f {pidfile}.tmp {pidfile}"
+                    "{setsid}sleep 600{detached} & echo $! > {pidfile}.tmp && mv -f {pidfile}.tmp {pidfile}"
                 ))
                 .status()
                 .await;
         }
         run_stdio(state).await;
+        // `MCP_FIXTURE_IGNORE_EOF=1`: a server that does not exit when its stdin closes.
+        if std::env::var_os("MCP_FIXTURE_IGNORE_EOF").is_some() {
+            tokio::time::sleep(Duration::from_secs(600)).await;
+        }
         // `MCP_FIXTURE_EXIT_MARKER=<path>`: stdin closed — the MCP shutdown signal. Take a moment
         // to "clean up" (as a server closing a browser would), then record that we got to.
         if let Ok(path) = std::env::var("MCP_FIXTURE_EXIT_MARKER") {

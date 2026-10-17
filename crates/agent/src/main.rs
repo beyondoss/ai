@@ -1804,13 +1804,29 @@ fn mcp_manifest_dir() -> Option<tools::mcp_manifest::ManifestDir> {
 /// teardown. Intercepting argv here means the child is one thread that has opened nothing. See
 /// `tools::web::isolate`.
 fn main() -> std::process::ExitCode {
-    if std::env::args_os()
-        .nth(1)
+    let subcommand = std::env::args_os().nth(1);
+    if subcommand
+        .as_ref()
         .is_some_and(|a| a == tools::web::isolate::SUBCOMMAND)
     {
         std::process::exit(tools::web::isolate::child_main());
     }
+    // A stdio MCP server's start: arm its parent-death signal and exec it in place. Nothing of the
+    // agent's is wanted here either.
+    if subcommand
+        .as_ref()
+        .is_some_and(|a| a == beyond_ai_agent::subreaper::TRAMPOLINE)
+    {
+        std::process::exit(beyond_ai_agent::subreaper::trampoline_main());
+    }
+    // Before anything is spawned: the agent becomes a child subreaper, the main thread turns to
+    // reaping the orphans that brings, and the rest runs on a thread of its own.
+    beyond_ai_agent::subreaper::run_main(agent_main)
+}
 
+/// `main`, past the subcommands that must run before anything exists — on its own thread under
+/// [`beyond_ai_agent::subreaper::run_main`]. Returns the exit status.
+fn agent_main() -> u8 {
     #[cfg(unix)]
     raise_open_file_limit();
 
@@ -1828,7 +1844,7 @@ fn main() -> std::process::ExitCode {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         runtime.block_on(run_main())
     })) {
-        Ok(Ok(())) => std::process::ExitCode::SUCCESS,
+        Ok(Ok(())) => 0,
         Ok(Err(e)) => report_error(e.as_ref()),
         // A panic out of `run` (the panic hook has already reported it). Dropping the runtime
         // here would wait for every blocking task — and `serve`'s stdin reader is one, parked on a
@@ -1849,9 +1865,9 @@ fn main() -> std::process::ExitCode {
 /// default for an `Err` out of `main` is the error's `Debug` form (`Error: Os { code: 13, kind:
 /// PermissionDenied, .. }`, `Transport("…")` with every quote escaped), which reads as a crash dump.
 /// A source chain is appended unless the message already says it.
-fn report_error(e: &(dyn std::error::Error + 'static)) -> std::process::ExitCode {
+fn report_error(e: &(dyn std::error::Error + 'static)) -> u8 {
     eprintln!("error: {}", render_error(e));
-    std::process::ExitCode::FAILURE
+    1
 }
 
 fn render_error(e: &(dyn std::error::Error + 'static)) -> String {

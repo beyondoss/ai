@@ -11,10 +11,19 @@
 //!   stdin/stdout and inherited stderr;
 //! - a line that is not UTF-8 is skipped, not fatal (rmcp's codec skipped it too);
 //! - when the transport or the connection goes away, the server's stdin closes (the MCP shutdown
-//!   signal) and it gets [`SHUTDOWN_GRACE`] to exit on its own; then whatever is left of its process
-//!   group is killed, so anything it double-forked goes with it ([`retire`]) — on a reap, a registry
-//!   rebuild, and process exit alike (every exit path of `run` and `serve` calls [`retire_all`] and
-//!   waits for the sweeps).
+//!   signal) and it gets [`SHUTDOWN_GRACE`] to exit on its own; then every process it started is
+//!   killed, wherever it went ([`retire`]) — on a reap, a registry rebuild, and process exit alike
+//!   (every exit path of `run` and `serve` calls [`retire_all`] and waits for the sweeps).
+//!
+//! **What "every process it started" means.** The server is spawned with a tracking tag in its
+//! environment (`bash_proc::TAG_ENV`, the one `bash` jobs use) as its own process-group leader, and
+//! its processes are tracked as a `bash_proc::ProcGroup`: the live ones carrying the tag, in its group,
+//! or descended from one of those. A process group alone missed whatever called `setsid`/`setpgid`
+//! (a browser's crash handler, any daemon); the tag survives that, a double fork and the server
+//! exiting first. The tree is read before stdin closes, while every parent link is intact, so a
+//! descendant that also cleared its environment is still known after its parent exits. Under the
+//! agent binary the server is also started with a parent-death signal and orphans re-parent to the
+//! agent (see [`crate::subreaper`]), so a SIGKILLed agent still takes its servers down.
 //!
 //! **One boundary.** [`rescue`] / [`unwrap_rescued`] are the whole workaround, for events and skills
 //! results alike: this transport applies [`rescue`] to every stdio line, and `tools/mcp_wire.rs`'s
@@ -30,9 +39,9 @@ pub const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(3
 /// synchronous caller (a `Drop`, a thread on the way out of the process) can close stdin and poll
 /// for the exit itself, with no runtime needing to run anything.
 pub struct ServerProcess {
-    /// Its process group, with the leader's identity: the sweep after a reap must not signal the
-    /// number once it has been recycled (see [`crate::tools::exec::GroupId`]).
-    group: Option<crate::tools::exec::GroupId>,
+    /// Everything it started: its process group (signalled as a unit only while the server holds the
+    /// number — see [`crate::tools::exec::GroupId`]), its tag, and their descendants.
+    procs: Option<crate::tools::bash_proc::ProcGroup>,
     child: std::sync::Mutex<tokio::process::Child>,
     stdin: std::sync::Mutex<Option<tokio::process::ChildStdin>>,
     retired: std::sync::atomic::AtomicBool,
@@ -49,7 +58,7 @@ fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 impl ServerProcess {
     /// Its process-group id (its pid: it leads its group).
     pub(crate) fn pgid(&self) -> Option<u32> {
-        self.group.map(|g| g.pgid)
+        self.procs.as_ref().map(|p| p.pgid)
     }
 
     /// Whether the server has exited — a non-blocking wait on the child this process owns, so it
@@ -59,10 +68,13 @@ impl ServerProcess {
     }
 }
 
-/// End a stdio server: close its stdin now (its cue to exit), give it [`SHUTDOWN_GRACE`] to do so,
-/// kill it if it has not, and kill whatever else is left in its process group — a grandchild it
-/// double-forked away (a browser, say) went to init and survives a kill aimed at the server alone.
-/// Idempotent.
+/// End a stdio server: read its process tree, close its stdin (its cue to exit), give it
+/// [`SHUTDOWN_GRACE`] to do so, kill it if it has not, and kill every process it started — a
+/// grandchild that double-forked or `setsid` away (a browser, say) survives a kill aimed at the server
+/// or its group alone. Idempotent.
+///
+/// The tree is read first, while every parent link is intact: a server that exits in its grace
+/// re-parents its children, and a descendant known only by parentage would be lost with the link.
 ///
 /// The waiting and killing run on a tracked OS thread
 /// ([`crate::tools::exec::spawn_tracked_cleanup`]), never a task: this is called from `Drop`, and
@@ -75,11 +87,16 @@ pub(crate) fn retire(server: &std::sync::Arc<ServerProcess>) {
     {
         return;
     }
+    #[cfg(not(unix))]
     drop(lock(&server.stdin).take());
     #[cfg(unix)]
     {
         let server = server.clone();
         crate::tools::exec::spawn_tracked_cleanup(move || {
+            if let Some(procs) = &server.procs {
+                procs.members();
+            }
+            drop(lock(&server.stdin).take());
             let deadline = std::time::Instant::now() + SHUTDOWN_GRACE;
             let mut reaped = server.exited();
             while !reaped && std::time::Instant::now() < deadline {
@@ -90,11 +107,10 @@ pub(crate) fn retire(server: &std::sync::Arc<ServerProcess>) {
                 // Not reaped, so the pid is still this server's: killing it by pid is safe.
                 let _ = lock(&server.child).start_kill();
             }
-            if let Some(group) = server.group {
-                // The rest of the group — by group only: once the leader is reaped its pid may be
-                // reused, so there is no kill-by-pid fallback here, and no group kill at all once
-                // the number has been recycled.
-                crate::tools::exec::kill_group_members(group);
+            if let Some(procs) = &server.procs {
+                // The rest: each process verified by start time before it is signalled, and the
+                // group as a unit only while the server still holds its number.
+                procs.sweep();
             }
             if !reaped {
                 for _ in 0..40 {
@@ -137,8 +153,8 @@ pub fn sweep_before_exit() {
                 // Not reaped, so the pid is still this server's.
                 let _ = lock(&server.child).start_kill();
             }
-            if let Some(group) = server.group {
-                crate::tools::exec::kill_group_members(group);
+            if let Some(procs) = &server.procs {
+                procs.sweep();
             }
         }
     }
@@ -764,12 +780,19 @@ pub(crate) fn stdio_transport(
     (tokio::io::DuplexStream, impl tokio::io::AsyncWrite),
 )> {
     use tokio::io::AsyncWriteExt;
+    let tag = crate::tools::bash_proc::new_tag();
     cmd.stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit())
+        .env(
+            crate::tools::bash_proc::TAG_ENV,
+            crate::tools::bash_proc::tag_value(&tag),
+        )
         .kill_on_drop(true);
-    let mut child = cmd.spawn()?;
-    let group = child.id().map(crate::tools::exec::GroupId::leader);
+    let mut child = crate::subreaper::spawn_lasting(cmd)?;
+    let procs = child
+        .id()
+        .map(|pid| crate::tools::bash_proc::ProcGroup::new(pid, tag));
     let stdout = child
         .stdout
         .take()
@@ -779,7 +802,7 @@ pub(crate) fn stdio_transport(
         .take()
         .ok_or_else(|| std::io::Error::other("no stdin"))?;
     let server = std::sync::Arc::new(ServerProcess {
-        group,
+        procs,
         child: std::sync::Mutex::new(child),
         stdin: std::sync::Mutex::new(Some(stdin)),
         retired: std::sync::atomic::AtomicBool::new(false),
@@ -1301,6 +1324,106 @@ mod tests {
         assert!(
             !alive(orphan),
             "the panic surfaced with the server's grandchild {orphan} still running"
+        );
+    }
+
+    /// Whether `pid` is running and has not been sent SIGKILL. A process that has been sent SIGKILL
+    /// may not have been scheduled to die yet on a loaded host, so "killed" is read from the kernel:
+    /// gone, a zombie, or SIGKILL pending (bit 8 of its pending masks).
+    #[cfg(target_os = "linux")]
+    fn running(pid: u32) -> bool {
+        let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
+            return false;
+        };
+        let field = |name: &str| {
+            status
+                .lines()
+                .find_map(|l| l.strip_prefix(name))
+                .map(|v| v.trim().to_owned())
+                .unwrap_or_default()
+        };
+        let kill_pending = ["SigPnd:", "ShdPnd:"]
+            .iter()
+            .any(|f| u64::from_str_radix(&field(f), 16).is_ok_and(|mask| mask & (1 << 8) != 0));
+        let state = field("State:");
+        !kill_pending && !state.starts_with('Z') && !state.starts_with('X')
+    }
+
+    /// Start `script` as a stdio server (its own group leader, as `connect_stdio` makes it), wait for
+    /// the grandchild pid it writes to `$PIDFILE`, retire it, and wait for the retirement to finish.
+    /// Returns the grandchild's pid and whether it was still running before and after.
+    #[cfg(target_os = "linux")]
+    async fn retire_with_grandchild(script: &str) -> (u32, bool, bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("grandchild.pid");
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.args(["-c", script])
+            .env("PIDFILE", &pidfile)
+            .process_group(0);
+        let (server, transport) = stdio_transport(cmd).unwrap();
+        let grandchild: u32 = loop {
+            if let Some(pid) = std::fs::read_to_string(&pidfile)
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+            {
+                break pid;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+        let before = running(grandchild);
+        retire(&server);
+        drop(transport);
+        tokio::task::spawn_blocking(|| {
+            crate::tools::exec::wait_for_pending_group_kills(
+                SHUTDOWN_GRACE + std::time::Duration::from_secs(10),
+            );
+        })
+        .await
+        .unwrap();
+        let after = running(grandchild);
+        if after {
+            // Don't leak it past a failed assertion.
+            let _ = std::process::Command::new("kill")
+                .args(["-KILL", &grandchild.to_string()])
+                .status();
+        }
+        (grandchild, before, after)
+    }
+
+    /// A grandchild that left the server's process group and session (`setsid` — what a browser's
+    /// crash handler does) is still the server's: it carries the server's tracking tag, and
+    /// retiring the server kills it. A group sweep alone left it running.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn retire_kills_a_grandchild_that_left_the_process_group() {
+        let _serial = PROCESS_WIDE.lock().await;
+        let (pid, before, after) = retire_with_grandchild(
+            "setsid sleep 600 </dev/null >/dev/null 2>&1 & echo $! > \"$PIDFILE\"; exec sleep 600",
+        )
+        .await;
+        assert!(before, "the grandchild {pid} runs before the retire");
+        assert!(
+            !after,
+            "retiring the server left its setsid'd grandchild {pid} running"
+        );
+    }
+
+    /// A grandchild that left the group *and* cleared its environment (so no tag) is still found
+    /// through its parent — and stays found after that parent exits on its own in its grace, because
+    /// the tree is read before the server's stdin closes, while the link is intact.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn retire_kills_an_untagged_grandchild_of_a_server_that_exits_on_its_own() {
+        let _serial = PROCESS_WIDE.lock().await;
+        let (pid, before, after) = retire_with_grandchild(
+            // `cat` returns on stdin EOF — the MCP shutdown signal — and the server exits cleanly.
+            "setsid env -i sleep 600 </dev/null >/dev/null 2>&1 & echo $! > \"$PIDFILE\"; cat >/dev/null; exit 0",
+        )
+        .await;
+        assert!(before, "the grandchild {pid} runs before the retire");
+        assert!(
+            !after,
+            "retiring the server left its untagged, setsid'd grandchild {pid} running"
         );
     }
 
