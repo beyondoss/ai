@@ -59,6 +59,14 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
   `Steering::pending_count` peeks the combined depth of both lanes without draining either — pi's
   `pendingMessageCount` — for a host surface (e.g. `serve`'s `get_state`) that wants to report queue
   depth to a client.
+  The steer lane is drained once more **after a compaction**, just before the next request is built:
+  a host reacting to `Compacted` (the `/session` recall reminder) queues its steer after that turn's
+  tool results already drained the lane, so it is folded onto the trailing user turn (prompt or tool
+  results) of the request about to go out — the first one the model sees post-compaction. Without
+  that, the model acted on the lossy summary first, and when it answered without tools the stranded
+  steer cost a whole extra request. Noticed by `CompactionProvenance::compactions` moving, so all
+  three compaction sites (top-of-loop threshold/overflow, overflow-error recovery, truncation
+  recovery) are covered; checkpointed, then reported by `Steered` like every other delivery.
   A queued message is a `SteeringMessage` (text plus optional image attachments), not a bare `String` —
   the same shape a fresh `prompt` accepts, so `steer`/`follow_up` aren't a lesser channel that silently
   drops attachments a `prompt` would have kept. `From<&str>`/`From<String>` build a text-only message,

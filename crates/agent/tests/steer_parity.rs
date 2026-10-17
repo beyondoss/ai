@@ -210,9 +210,10 @@ fn a_compaction_reminds_the_same_way_in_both_paths() {
         steers_per_request(&serve),
         "run and serve must send the same steers for the same events"
     );
-    assert!(
-        run.iter().any(|b| b.contains(REMINDER)),
-        "the compaction reminder must reach the model: {:?}",
-        steers_per_request(&run)
+    // The summary call, then the answer — which carries the reminder, so no third request.
+    assert_eq!(
+        steers_per_request(&run),
+        [(0, 0), (0, 1)],
+        "the reminder rides the first post-compaction request"
     );
 }

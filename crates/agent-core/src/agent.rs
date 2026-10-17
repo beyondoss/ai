@@ -25,7 +25,7 @@ use crate::message::{
     ContentBlock, ImageSource, Message, Role, StopReason, StreamEvent, TokenUsage, ToolDef,
 };
 use crate::session::Session;
-use crate::steering::Steering;
+use crate::steering::{Steering, SteeringMessage};
 use crate::tool::ToolRegistry;
 use crate::transport::{ModelRequest, ModelTransport, ReasoningEffort};
 
@@ -936,6 +936,9 @@ impl Agent {
         let mut current_tools = self.tools.clone();
         let mut current_tool_defs = self.tool_defs.clone();
         let mut current_deferred_defs = self.deferred_tool_defs.clone();
+        // The compaction count as of the last request built, so a compaction this loop ran since —
+        // top-of-loop, overflow recovery or truncation recovery — is noticed before the next one.
+        let mut compactions_seen = session.compaction.compactions;
         loop {
             if cancel.is_cancelled() {
                 close_out_pending_cancellation(session, &current_model);
@@ -1055,6 +1058,27 @@ impl Agent {
                     .compact_or_report(session, CompactionReason::Overflow, &cancel, &mut sink)
                     .await;
                 finish_compaction(result, session, &current_model, &steering)?;
+            }
+
+            // A compaction just rewrote the history into a lossy summary, and a host reacting to its
+            // `Compacted` event (the `/session` recall reminder) queued a steer *after* this turn's
+            // steer lane was drained. Fold it into the request about to go out — the first one the model
+            // sees post-compaction — rather than strand it until after the model has already acted on
+            // the summary (or, when the model answers without tools, cost a whole extra request).
+            if session.compaction.compactions != compactions_seen {
+                compactions_seen = session.compaction.compactions;
+                let steered = steering.drain_steer();
+                if !steered.is_empty() {
+                    let tags: Vec<u64> = steered.iter().filter_map(|m| m.tag).collect();
+                    let count = steered.len();
+                    fold_steers_into_trailing_user(session, steered);
+                    // Durable before it's reported, as every other steer delivery is.
+                    let _ = self.checkpoint_guarded(session).await;
+                    sink(AgentEvent::Steered {
+                        messages: count,
+                        tags,
+                    });
+                }
             }
 
             sink(AgentEvent::TurnStart {
@@ -3528,6 +3552,38 @@ fn cancel_run(session: &mut Session, model: &str, steering: &Steering) -> Error 
 /// so the caller's `?` can't silently propagate `Error::Cancelled` past the session/steering cleanup
 /// every other cancellation exit in this loop performs. A non-cancellation error passes through
 /// untouched.
+/// Append steer messages to the session's trailing user turn (the prompt or the last tool results) as
+/// trailing blocks — the same shape the mid-run drain folds into a tool-results turn, so role
+/// alternation stays valid. The trailing turn may already be on disk, so the store is told it is being
+/// rewritten. With no trailing user turn, each becomes a user turn of its own.
+fn fold_steers_into_trailing_user(session: &mut Session, steered: Vec<SteeringMessage>) {
+    if session
+        .messages
+        .last()
+        .is_some_and(|m| m.role == Role::User)
+    {
+        session.rewriting_from(session.messages.len() - 1);
+        if let Some(last) = Arc::make_mut(&mut session.messages).last_mut() {
+            for msg in steered {
+                last.content.push(ContentBlock::text(msg.text));
+                last.content.extend(
+                    msg.images
+                        .into_iter()
+                        .map(|source| ContentBlock::Image { source }),
+                );
+            }
+        }
+    } else {
+        for msg in steered {
+            if msg.images.is_empty() {
+                session.user(msg.text);
+            } else {
+                session.push(Message::user_with_images(msg.text, msg.images));
+            }
+        }
+    }
+}
+
 fn finish_compaction<T>(
     result: Result<T>,
     session: &mut Session,
@@ -9172,6 +9228,94 @@ data: {"type":"response.completed","response":{"status":"completed","usage":{"in
             &session.messages[0].content[0],
             ContentBlock::Text { text, .. } if text.contains("compacted")
         ));
+    }
+
+    #[tokio::test]
+    async fn a_steer_queued_on_compacted_rides_the_first_post_compaction_request() {
+        // A host reacting to `Compacted` (the `/session` recall reminder) queues a steer after this
+        // turn's lane was drained. It must ride the very next request — not wait for the next tool
+        // round, and not cost a request of its own when the model answers without tools.
+        fn big_tool_turn(id: &str) -> Vec<StreamEvent> {
+            vec![
+                StreamEvent::MessageStart,
+                StreamEvent::ToolUseStart {
+                    index: 0,
+                    id: id.into(),
+                    name: "echo".into(),
+                },
+                StreamEvent::InputJsonDelta {
+                    index: 0,
+                    partial_json: r#"{"text":"a"}"#.into(),
+                },
+                StreamEvent::ContentBlockStop { index: 0 },
+                StreamEvent::Usage(TokenUsage {
+                    input_tokens: 95,
+                    output_tokens: 5,
+                    ..Default::default()
+                }),
+                StreamEvent::MessageStop {
+                    stop_reason: StopReason::ToolUse,
+                },
+            ]
+        }
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(EchoTool));
+        let mock = Arc::new(MockTransport::new(vec![
+            big_tool_turn("t1"),
+            big_tool_turn("t2"),
+            turn::text("## Goal\nsummary of earlier work"),
+            turn::text("all done"),
+            turn::text("an extra request the stranded reminder used to cost"),
+        ]));
+        let agent = Agent::new(mock.clone(), "claude-opus-4-8")
+            .with_tools(tools)
+            .with_max_steps(12)
+            .with_compaction(CompactionConfig {
+                context_window: 100,
+                input_limit: None,
+                compact_at: None,
+                reserve_tokens: 10,
+                keep_recent_tokens: 1,
+                summary_max_tokens: 256,
+                enabled: true,
+                ..CompactionConfig::default()
+            });
+        let mut session = Session::new();
+        session.user("seed task with enough text to fill several estimated tokens here please");
+        let steering = Steering::new();
+        let on_compact = steering.clone();
+        let mut steered = 0;
+        agent
+            .run_events_steered(
+                &mut session,
+                |ev| match ev {
+                    AgentEvent::Compacted { .. } => {
+                        on_compact.push_steer("REMINDER: read your notes back");
+                    }
+                    AgentEvent::Steered { messages, .. } => steered += messages,
+                    _ => {}
+                },
+                CancellationToken::new(),
+                steering,
+            )
+            .await
+            .unwrap();
+
+        // Two tool turns, the summary, the final turn — and no fifth.
+        assert_eq!(mock.calls(), 4);
+        let requests = mock.requests();
+        let carries = |r: &ModelRequest| {
+            r.messages.iter().any(|m| {
+                m.content.iter().any(
+                    |b| matches!(b, ContentBlock::Text { text, .. } if text.contains("REMINDER")),
+                )
+            })
+        };
+        assert!(
+            carries(&requests[3]),
+            "the first post-compaction request carries the steer"
+        );
+        assert_eq!(steered, 1, "its delivery is reported once");
     }
 
     #[tokio::test]
