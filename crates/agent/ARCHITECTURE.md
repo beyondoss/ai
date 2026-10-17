@@ -3156,6 +3156,12 @@ Two implementation notes worth keeping:
   `ToolExecutionMode::Sequential`. One sequential-requesting call reroutes the loop's _entire_ batch
   through its interleaved dispatch path — a cross-cutting change to execution semantics in service of a
   UI concern. Approved calls still run concurrently afterward.
+- **A queued call re-checks the session memory before it is asked.** Same-key calls dispatched together
+  all miss the memory before any of them is answered, so `ask_gate` checks it again once it holds the
+  `ApprovalRuntime`'s `asking` lock, which spans the question and the remembering of its answer: an
+  `allow_session`/`deny_session` given while a call was queued applies to it, and the user is asked
+  once. The MCP-skill gate (`SkillSession::decide`) does the same with its own lock and memory. (`run`
+  has no interactive gate: nobody can be asked there.)
 - **`approval_resolved` has no OAuth analogue** because a login is a single-client RPC. An approval fans
   out to N attached clients of which exactly one answers; without a resolution frame the others keep a
   dead prompt on screen. The losing client's `approve` returns `accepted:false` — a race it can lose, not
