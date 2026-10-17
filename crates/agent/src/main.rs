@@ -1795,6 +1795,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(tools::web::isolate::child_main());
     }
 
+    #[cfg(unix)]
+    raise_open_file_limit();
+
     // Everything else wants the async runtime. Constructed explicitly so the isolate branch above
     // can run first, before any worker exists. The flavour depends on whether this process is a
     // fleet replica — see [`build_runtime`] — which has to be decided from the raw arguments,
@@ -1819,6 +1822,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             finish_process_cleanup();
             std::process::exit(101);
         }
+    }
+}
+
+/// Raise the soft `RLIMIT_NOFILE` to the hard limit. A `serve` daemon holds one descriptor per
+/// connection, session file and MCP pipe, and the soft limit a shell hands it is often far below
+/// what the hard limit allows (256 on a stock macOS shell, 1024 on most Linux ones) — a limit that
+/// costs nothing to lift and that, once hit, turns every `accept` into `EMFILE`. Best effort: a
+/// failure leaves the inherited limit in place, which is what the process had anyway.
+#[cfg(unix)]
+fn raise_open_file_limit() {
+    use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+    let Rlimit { current, maximum } = getrlimit(Resource::Nofile);
+    // `None` is unlimited. macOS refuses an unlimited soft limit (and anything above `OPEN_MAX`) for
+    // this resource even when the hard limit says unlimited, so the target is capped there; the
+    // hard limit itself is left as it was.
+    #[cfg(target_os = "macos")]
+    let target = Some(maximum.map_or(10_240, |m| m.min(10_240)));
+    #[cfg(not(target_os = "macos"))]
+    let target = maximum;
+    let raise = match (current, target) {
+        (Some(soft), Some(target)) => soft < target,
+        (Some(_), None) => true,
+        (None, _) => false,
+    };
+    if raise {
+        let _ = setrlimit(
+            Resource::Nofile,
+            Rlimit {
+                current: target,
+                maximum,
+            },
+        );
     }
 }
 
@@ -5990,6 +6025,29 @@ mod tests {
     use super::*;
     use agent_core::Error;
     use agent_core::mock::{MockTransport, turn};
+
+    /// A shell's low soft descriptor limit (256 on stock macOS) is lifted to the hard limit.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_soft_open_file_limit_is_raised_to_the_hard_limit() {
+        use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+        let before = getrlimit(Resource::Nofile);
+        if before.maximum.is_some_and(|m| m <= 256) {
+            return; // Nothing to lower from on this host.
+        }
+        setrlimit(
+            Resource::Nofile,
+            Rlimit {
+                current: Some(256),
+                maximum: before.maximum,
+            },
+        )
+        .unwrap();
+        raise_open_file_limit();
+        let after = getrlimit(Resource::Nofile);
+        assert_eq!(after.current, before.maximum);
+        assert_eq!(after.maximum, before.maximum);
+    }
 
     /// The TTL a real command line resolves to, through the same `CacheTtl::resolve` call and mode
     /// default `main` uses for that subcommand.

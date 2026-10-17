@@ -50,6 +50,15 @@ The harness layers several capabilities over the bare tools + loop:
   is also how the test harness's `HeldPort` starts it). Without activation at all, use `--listen` /
   `--listen-uds`.
 
+  **An accept error never ends a listener.** Every accept loop (TCP, UDS, and the `--metrics-listen`
+  scrape listener) goes through `serve_ws::accept_retrying`: a failed `accept` — almost always
+  transient: `EMFILE`/`ENFILE`, `ECONNABORTED`, `ENOBUFS` — is logged and retried after a backoff of
+  10 ms doubling to 1 s, so a persistent `EMFILE` neither spins a core nor leaves the daemon alive but
+  deaf (which, on the UDS, also kept the path from any replacement). At startup the process raises its
+  soft `RLIMIT_NOFILE` to the hard limit (capped at 10240 on macOS, which refuses more), since a
+  shell's default soft limit (256 on macOS, 1024 on most Linux) is the usual way to run out.
+  `tests/serve_accept_error.rs` produces the `EMFILE` for real by `prlimit`-ing a running daemon.
+
   The protocol is byte-identical across all transports;
   all feed the transport-agnostic `serve::serve_session` core, which reads
   commands from an `mpsc` channel and emits frames to whichever connection is currently attached. The
