@@ -259,7 +259,9 @@ impl AuthStore {
         refresh: impl FnOnce(&OAuthCredential) -> std::result::Result<OAuthCredential, String>,
     ) -> std::result::Result<OAuthCredential, AuthError> {
         let _lock = crate::file_lock::lock_store_file(&self.path)?;
-        let mut credentials = read_store_file(&self.path);
+        let mut raw = crate::store_file::read_object_for_write(&self.path)?;
+        let mut credentials = parse_credentials(&raw);
+        let before = view(&credentials)?;
         let Some(stored) = credentials.get(provider) else {
             self.credentials = credentials;
             return Err(AuthError::NotLoggedIn);
@@ -282,7 +284,7 @@ impl AuthStore {
                         last_refresh_error: None,
                     },
                 );
-                write_store_file(&self.path, &credentials)?;
+                write_changes(&self.path, &mut raw, &before, &credentials)?;
                 self.credentials = credentials;
                 Ok(fresh)
             }
@@ -290,7 +292,7 @@ impl AuthStore {
                 if let Some(existing) = credentials.get_mut(provider) {
                     existing.last_refresh_error = Some(message.clone());
                 }
-                write_store_file(&self.path, &credentials)?;
+                write_changes(&self.path, &mut raw, &before, &credentials)?;
                 self.credentials = credentials;
                 Err(AuthError::RefreshFailed(message))
             }
@@ -298,16 +300,19 @@ impl AuthStore {
     }
 
     /// Acquire the lock, re-read fresh, apply `mutate`, and persist only if it reports a change —
-    /// same discipline as `TrustStore`/`SettingsStore`'s own `mutate_locked`.
+    /// same discipline as `TrustStore`/`SettingsStore`'s own `mutate_locked`. The write follows
+    /// [`crate::store_file`]'s rule: entries this binary couldn't parse are written back untouched,
+    /// and a file that can't be read or parsed at all refuses the write rather than being replaced.
     fn mutate_locked(
         &mut self,
         mutate: impl FnOnce(&mut BTreeMap<String, StoredCredential>) -> bool,
     ) -> io::Result<()> {
         let _lock = crate::file_lock::lock_store_file(&self.path)?;
-        let mut credentials = read_store_file(&self.path);
-        let changed = mutate(&mut credentials);
-        if changed {
-            write_store_file(&self.path, &credentials)?;
+        let mut raw = crate::store_file::read_object_for_write(&self.path)?;
+        let mut credentials = parse_credentials(&raw);
+        let before = view(&credentials)?;
+        if mutate(&mut credentials) {
+            write_changes(&self.path, &mut raw, &before, &credentials)?;
         }
         self.credentials = credentials;
         Ok(())
@@ -321,10 +326,11 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// Read and parse the store file at `path`, tolerating a missing file (empty store — nothing logged
-/// in yet), an unreadable/corrupt file (`warn!`s rather than silently discarding), an unrecognized
-/// provider id, or a per-entry parse failure (each entry is decoded independently, so one bad entry
-/// doesn't take down every other stored credential).
+/// Read and parse the store file at `path` for use, tolerating a missing file (empty store — nothing
+/// logged in yet), an unreadable/corrupt file (`warn!`s rather than silently discarding), an
+/// unrecognized provider id, or a per-entry parse failure (each entry is decoded independently, so one
+/// bad entry doesn't take down every other stored credential). Never the basis of a write: a mutation
+/// re-reads the raw file through [`crate::store_file::read_object_for_write`].
 fn read_store_file(path: &Path) -> BTreeMap<String, StoredCredential> {
     let contents = match fs::read_to_string(path) {
         Ok(s) => s,
@@ -338,25 +344,32 @@ fn read_store_file(path: &Path) -> BTreeMap<String, StoredCredential> {
             return BTreeMap::new();
         }
     };
-    let raw: BTreeMap<String, serde_json::Value> = match serde_json::from_str(&contents) {
+    let raw: serde_json::Map<String, serde_json::Value> = match serde_json::from_str(&contents) {
         Ok(v) => v,
         Err(e) => {
             tracing::warn!(
                 path = %path.display(),
                 error = %e,
-                "auth store file is not valid JSON, treating it as empty"
+                "auth store file is not a valid JSON object, treating it as empty"
             );
             return BTreeMap::new();
         }
     };
+    parse_credentials(&raw)
+}
 
+/// Decode every entry this binary understands; the rest are skipped with a warning (and, on a write,
+/// kept on disk as they are).
+fn parse_credentials(
+    raw: &serde_json::Map<String, serde_json::Value>,
+) -> BTreeMap<String, StoredCredential> {
     let mut credentials = BTreeMap::new();
     for (provider_key, value) in raw {
-        let Some(provider) = OAuthProviderId::parse(&provider_key) else {
+        let Some(provider) = OAuthProviderId::parse(provider_key) else {
             tracing::warn!(provider = %provider_key, "unrecognized provider in auth store file, skipping");
             continue;
         };
-        let disk: OnDiskCredential = match serde_json::from_value(value) {
+        let disk: OnDiskCredential = match OnDiskCredential::deserialize(value) {
             Ok(d) => d,
             Err(e) => {
                 tracing::warn!(provider = %provider_key, error = %e, "could not parse stored credential, skipping");
@@ -371,80 +384,38 @@ fn read_store_file(path: &Path) -> BTreeMap<String, StoredCredential> {
             );
             continue;
         }
-        credentials.insert(provider_key, on_disk_to_stored(provider, disk));
+        credentials.insert(provider_key.clone(), on_disk_to_stored(provider, disk));
     }
     credentials
 }
 
-fn write_store_file(
-    path: &Path,
+/// The typed credentials as the JSON object they serialize to — what [`crate::store_file::apply_changes`]
+/// diffs to find the entries a mutation actually changed.
+fn view(
     credentials: &BTreeMap<String, StoredCredential>,
-) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    // `write_atomic` only *preserves* an existing file's permission bits — it doesn't impose one on a
-    // brand-new file, so the very first write here would otherwise land at the umask default
-    // (commonly world-readable). This file holds secrets; `settings.rs`/`trust_store.rs` never had
-    // to care about this because they don't.
-    if !path.exists() {
-        create_private(path)?;
-    }
-    let mut raw = serde_json::Map::new();
+) -> io::Result<serde_json::Map<String, serde_json::Value>> {
+    let mut out = serde_json::Map::new();
     for (provider, stored) in credentials {
         let disk = credential_to_on_disk(&stored.credential, stored.last_refresh_error.clone());
-        raw.insert(
+        out.insert(
             provider.clone(),
             serde_json::to_value(&disk).map_err(io::Error::other)?,
         );
     }
-    let body = serde_json::to_string_pretty(&raw).map_err(io::Error::other)?;
-    let path_str = path
-        .to_str()
-        .ok_or_else(|| io::Error::other(format!("non-UTF-8 path: {}", path.display())))?;
-    crate::tools::write_atomic_durable(path_str, body.as_bytes())?;
-    // Belt-and-suspenders, on top of the atomic-at-creation `0600` above: `write_atomic` only ever
-    // *preserves* whatever permission bits the file already had (it copies an existing file's mode
-    // onto its replacement temp file before the rename), it never asserts one — so a file whose
-    // permissions were loosened out-of-band (a stray `chmod`, a restore from a backup, a filesystem
-    // that doesn't honor the original mode, …) would otherwise stay that way forever. Re-assert
-    // `0600` unconditionally after every single write, not just at creation, so it self-heals on the
-    // very next write. Mirrors pi's `auth-storage.ts`, which calls `chmodSync(this.authPath, 0o600)`
-    // unconditionally after every write for the same reason.
-    set_private(path)
+    Ok(out)
 }
 
-/// Unconditionally re-assert `0600` permissions on an already-written file (Unix only — a no-op
-/// elsewhere, matching this file's other Unix-only permission handling). Distinct from
-/// [`create_private`]: that one sets the mode atomically *at creation*; this one self-heals it on
-/// every subsequent write, closing the gap `write_atomic`'s copy-forward-existing-bits behavior
-/// leaves open.
-fn set_private(path: &Path) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+/// Write the entries that changed since `before` into `raw` and persist it, owner-only (this file
+/// holds secrets). Every entry this binary couldn't parse stays exactly as it was.
+fn write_changes(
+    path: &Path,
+    raw: &mut serde_json::Map<String, serde_json::Value>,
+    before: &serde_json::Map<String, serde_json::Value>,
+    credentials: &BTreeMap<String, StoredCredential>,
+) -> io::Result<()> {
+    if crate::store_file::apply_changes(raw, before, &view(credentials)?) {
+        crate::store_file::write_json(path, &serde_json::Value::Object(raw.clone()), true)?;
     }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-    }
-    Ok(())
-}
-
-/// Create an empty file at `path` with `0600` permissions set atomically at creation (Unix), not via
-/// a `set_permissions` call afterward — closing the window where it would otherwise be
-/// world/group-readable. Mirrors `session_store.rs`'s `create_private` helper (duplicated, not
-/// shared, per this codebase's own small-self-contained-stores convention).
-fn create_private(path: &Path) -> io::Result<()> {
-    let mut opts = fs::OpenOptions::new();
-    opts.write(true).create(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    opts.open(path)?;
     Ok(())
 }
 
@@ -696,5 +667,109 @@ mod tests {
         let mut store = AuthStore::open(store_path);
         store.set("anthropic", anthropic_cred("a", 1)).unwrap();
         assert!(store.get("anthropic").is_some());
+    }
+}
+
+/// A mutation writes back what it couldn't parse, and never overwrites a file it can't read.
+#[cfg(test)]
+mod roundtrip_tests {
+    use super::*;
+    use serde_json::{Value, json};
+
+    fn anthropic(access: &str, expires: i64) -> Value {
+        json!({ "type": "oauth", "access": access, "refresh": "r", "expires": expires })
+    }
+
+    fn foreign_entries() -> Value {
+        json!({
+            // A provider a newer binary knows and this one doesn't.
+            "future-provider": { "type": "oauth", "access": "f", "refresh": "f", "expires": 1 },
+            // A credential type this binary doesn't support.
+            "github-copilot": { "type": "api_key", "key": "k" },
+            // An entry that doesn't parse at all.
+            "openai-codex": "garbage",
+        })
+    }
+
+    fn file_with(entries: Value) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        fs::write(&path, entries.to_string()).unwrap();
+        (dir, path)
+    }
+
+    fn on_disk(path: &Path) -> Value {
+        serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn a_token_refresh_keeps_every_entry_it_does_not_understand() {
+        let mut entries = foreign_entries();
+        entries["anthropic"] = anthropic("old", 1);
+        let (_dir, path) = file_with(entries);
+        let mut store = AuthStore::open(path.clone());
+        let fresh = store
+            .refreshed("anthropic", |_| {
+                Ok(OAuthCredential::Anthropic(AnthropicCredential {
+                    access: "new".into(),
+                    refresh: "r2".into(),
+                    expires_at_ms: i64::MAX,
+                }))
+            })
+            .unwrap();
+        assert_eq!(fresh.access(), "new");
+        let disk = on_disk(&path);
+        assert_eq!(disk["anthropic"]["access"], "new");
+        for (key, value) in foreign_entries().as_object().unwrap() {
+            assert_eq!(&disk[key], value, "{key} must survive the refresh");
+        }
+    }
+
+    #[test]
+    fn a_failed_refresh_and_a_login_keep_every_entry_they_do_not_understand() {
+        let mut entries = foreign_entries();
+        entries["anthropic"] = anthropic("old", 1);
+        let (_dir, path) = file_with(entries);
+        let mut store = AuthStore::open(path.clone());
+        let err = store.refreshed("anthropic", |_| Err("nope".into()));
+        assert!(matches!(err, Err(AuthError::RefreshFailed(_))));
+        store
+            .set(
+                "anthropic",
+                OAuthCredential::Anthropic(AnthropicCredential {
+                    access: "relogin".into(),
+                    refresh: "r".into(),
+                    expires_at_ms: 5,
+                }),
+            )
+            .unwrap();
+        let disk = on_disk(&path);
+        assert_eq!(disk["anthropic"]["access"], "relogin");
+        for (key, value) in foreign_entries().as_object().unwrap() {
+            assert_eq!(&disk[key], value, "{key} must survive");
+        }
+    }
+
+    #[test]
+    fn a_corrupt_file_is_left_byte_identical_and_the_mutation_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let corrupt = b"{\"anthropic\": {\"type\": \"oauth\", truncated";
+        fs::write(&path, corrupt).unwrap();
+        let mut store = AuthStore::open(path.clone());
+        let err = store
+            .set(
+                "anthropic",
+                OAuthCredential::Anthropic(AnthropicCredential {
+                    access: "a".into(),
+                    refresh: "r".into(),
+                    expires_at_ms: 5,
+                }),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("auth.json"), "{err}");
+        assert!(store.remove("anthropic").is_err());
+        assert!(store.refreshed("anthropic", |c| Ok(c.clone())).is_err());
+        assert_eq!(fs::read(&path).unwrap(), corrupt);
     }
 }

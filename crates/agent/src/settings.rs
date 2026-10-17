@@ -664,28 +664,35 @@ impl SettingsStore {
     /// now on disk. Mirrors `trust_store.rs::TrustStore::mutate_locked`'s identical reasoning: two
     /// `agent settings` invocations changing different fields concurrently must not let whichever writes
     /// last silently clobber the other's change.
+    ///
+    /// The write follows [`crate::store_file`]'s rule: only the keys `mutate` changed are written, so
+    /// a key this crate doesn't model (another tool's, or a newer binary's) and a field that failed
+    /// to parse stay on disk exactly as they were, and a file that can't be read or isn't a JSON
+    /// object refuses the write with an error instead of being replaced by the one changed field.
     fn mutate_locked(&mut self, mutate: impl FnOnce(&mut Settings)) -> std::io::Result<()> {
         let _lock = crate::file_lock::lock_store_file(&self.path)?;
-        let mut settings = read_store_file(&self.path);
+        let mut raw = crate::store_file::read_object_for_write(&self.path)?;
+        let (mut settings, _problems) = parse_fields(raw.clone());
+        let before = settings_object(&settings)?;
         mutate(&mut settings);
-        write_store_file(&self.path, &settings)?;
+        if crate::store_file::apply_changes(&mut raw, &before, &settings_object(&settings)?) {
+            crate::store_file::write_json(&self.path, &serde_json::Value::Object(raw), false)?;
+        }
         self.settings = settings;
         Ok(())
     }
 }
 
-/// Read and parse the store file at `path`, tolerating a missing or unparsable file (all-unset) — shared
-/// by [`SettingsStore::open`] and [`SettingsStore::mutate_locked`], which both need "current on-disk
-/// state, gracefully defaulted." A missing file is the ordinary case (no settings configured yet) and
-/// stays silent; a wrongly typed field is dropped alone and the rest kept (see [`parse_lenient`]), and
-/// an existing-but-unparsable file (corrupted, hand-edited into invalid JSON) defaults. Either is
-/// reported on stderr (once per process) as well as `warn!`ed — mirrors
-/// [`ModelOverrides::open`]'s identical "skip and warn, don't silently lose data" convention, which this
-/// function used to be the one exception to: silently resetting to all-unset with no diagnostic at all.
-/// That silence was especially costly here, since [`SettingsStore::mutate_locked`] re-reads through
-/// this same function and then *writes back* whatever it returns — a single transient parse failure
-/// during any `agent settings set-*` call could permanently overwrite every previously-configured field
-/// with no warning before or after.
+/// Read and parse the store file at `path` for use, tolerating a missing or unparsable file
+/// (all-unset). A missing file is the ordinary case (no settings configured yet) and stays silent; a
+/// wrongly typed field is dropped alone and the rest kept (see [`parse_lenient`]), and an
+/// existing-but-unparsable file (corrupted, hand-edited into invalid JSON) defaults. Either is reported
+/// on stderr (once per process) as well as `warn!`ed — mirrors [`ModelOverrides::open`]'s identical
+/// "skip and warn, don't silently lose data" convention.
+///
+/// This lenient view is only ever *used*, never written back: [`SettingsStore::mutate_locked`] works
+/// on the raw file instead, so a dropped field or unknown key survives a write and a corrupt file
+/// refuses one (see [`crate::store_file`]).
 fn read_store_file(path: &Path) -> Settings {
     let contents = match fs::read_to_string(path) {
         Ok(s) => s,
@@ -731,6 +738,11 @@ fn parse_lenient(contents: &str) -> (Settings, Vec<String>) {
             vec!["not a JSON object; ignoring every setting in it".to_string()],
         );
     };
+    parse_fields(fields)
+}
+
+/// [`parse_lenient`]'s per-field half, over an already-parsed object.
+fn parse_fields(fields: serde_json::Map<String, serde_json::Value>) -> (Settings, Vec<String>) {
     let mut kept = serde_json::Map::with_capacity(fields.len());
     let mut problems = Vec::new();
     for (key, value) in fields {
@@ -764,15 +776,17 @@ fn warn_once(message: String) {
     }
 }
 
-fn write_store_file(path: &Path, settings: &Settings) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+/// `settings` as the JSON object it serializes to — what [`crate::store_file::apply_changes`] diffs to
+/// find the keys a mutation changed.
+fn settings_object(
+    settings: &Settings,
+) -> std::io::Result<serde_json::Map<String, serde_json::Value>> {
+    match serde_json::to_value(settings).map_err(std::io::Error::other)? {
+        serde_json::Value::Object(map) => Ok(map),
+        _ => Err(std::io::Error::other(
+            "settings did not serialize to an object",
+        )),
     }
-    let body = serde_json::to_string_pretty(settings).map_err(std::io::Error::other)?;
-    let path_str = path
-        .to_str()
-        .ok_or_else(|| std::io::Error::other(format!("non-UTF-8 path: {}", path.display())))?;
-    crate::tools::write_atomic_durable(path_str, body.as_bytes())
 }
 
 /// The root config directory both this store and `trust_store.rs`'s persist under — `~/.claude` unless
@@ -1703,14 +1717,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(300));
         assert!(!writer.is_finished(), "wrote while the lock was held");
         // What the holder writes under its lock is kept: the waiter re-reads after taking it.
-        write_store_file(
-            &path,
-            &Settings {
-                default_session_dir: Some("/held".to_string()),
-                ..Settings::default()
-            },
-        )
-        .unwrap();
+        fs::write(&path, r#"{"default_session_dir":"/held"}"#).unwrap();
         drop(held);
         writer.join().unwrap().unwrap();
         let after = SettingsStore::open(path);
@@ -3082,5 +3089,58 @@ mod tests {
         };
         let merged = global.merge_over(&Settings::default());
         assert_eq!(merged.mcp_servers.unwrap()[0].name, "global-server");
+    }
+}
+
+/// A mutation writes back what it couldn't parse, and never overwrites a file it can't read.
+#[cfg(test)]
+mod roundtrip_tests {
+    use super::*;
+    use serde_json::{Value, json};
+
+    #[test]
+    fn a_setting_change_keeps_unknown_keys_and_fields_that_failed_to_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let original = json!({
+            "permissions": { "allow": ["Bash(ls:*)"] },
+            "hooks": { "Stop": [] },
+            "block_images": "yes",
+            "default_gateway_url": "http://kept",
+        });
+        fs::write(&path, original.to_string()).unwrap();
+        let mut store = SettingsStore::open(path.clone());
+        store.set_default_model(Some("m".into())).unwrap();
+        store.set_steering_mode(Some("all".into())).unwrap();
+        let disk: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(disk["default_model"], "m");
+        assert_eq!(disk["steering_mode"], "all");
+        for key in [
+            "permissions",
+            "hooks",
+            "block_images",
+            "default_gateway_url",
+        ] {
+            assert_eq!(disk[key], original[key], "{key} must survive the write");
+        }
+        // Clearing a field removes only that key.
+        store.set_default_model(None).unwrap();
+        let disk: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(disk.get("default_model").is_none());
+        assert_eq!(disk["permissions"], original["permissions"]);
+    }
+
+    #[test]
+    fn a_corrupt_file_is_left_byte_identical_and_the_mutation_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        for corrupt in [&b"{\"default_model\": \"m\""[..], b"[1, 2]"] {
+            let path = dir.path().join("settings.json");
+            fs::write(&path, corrupt).unwrap();
+            let mut store = SettingsStore::open(path.clone());
+            let err = store.set_default_model(Some("x".into())).unwrap_err();
+            assert!(err.to_string().contains("settings.json"), "{err}");
+            assert!(err.to_string().contains("fix or remove"), "{err}");
+            assert_eq!(fs::read(&path).unwrap(), corrupt);
+        }
     }
 }

@@ -14,6 +14,7 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use rmcp::transport::auth::{AuthError, CredentialStore, StoredCredentials};
+use serde::Deserialize;
 
 use crate::settings::config_dir_root;
 
@@ -22,7 +23,7 @@ use crate::settings::config_dir_root;
 /// `mcp__<server>__<tool>` registration prefix). A server renamed in `settings.json` loses its stored
 /// login (there's no way to know the old and new names refer to "the same" server) — an accepted,
 /// narrow limitation, not a bug: re-running `agent mcp-login <new-name>` is a one-time cost.
-#[derive(Default, serde::Serialize, serde::Deserialize)]
+#[derive(Default)]
 struct OnDisk(BTreeMap<String, StoredCredentials>);
 
 /// A persisted MCP OAuth credential store, one per machine (`~/.claude/mcp_auth.json`).
@@ -60,9 +61,7 @@ impl McpAuthStore {
 
     /// Remove `server_name`'s stored credential, if any — `agent mcp-logout`.
     pub fn clear(&self, server_name: &str) -> std::io::Result<()> {
-        mutate_locked(&self.path, |store| {
-            store.0.remove(server_name);
-        })
+        mutate_locked(&self.path, |raw| raw.remove(server_name).is_some())
     }
 }
 
@@ -93,8 +92,10 @@ impl CredentialStore for ScopedMcpCredentialStore {
         let path = self.path.clone();
         let server_name = self.server_name.clone();
         tokio::task::spawn_blocking(move || {
-            mutate_locked(&path, |store| {
-                store.0.insert(server_name, credentials);
+            let value = serde_json::to_value(&credentials).map_err(std::io::Error::other)?;
+            mutate_locked(&path, |raw| {
+                raw.insert(server_name, value);
+                true
             })
         })
         .await
@@ -107,9 +108,7 @@ impl CredentialStore for ScopedMcpCredentialStore {
         let path = self.path.clone();
         let server_name = self.server_name.clone();
         tokio::task::spawn_blocking(move || {
-            mutate_locked(&path, |store| {
-                store.0.remove(&server_name);
-            })
+            mutate_locked(&path, |raw| raw.remove(&server_name).is_some())
         })
         .await
         .map_err(|e| AuthError::InternalError(e.to_string()))?
@@ -117,6 +116,9 @@ impl CredentialStore for ScopedMcpCredentialStore {
     }
 }
 
+/// Read the store for use: a missing, unreadable or corrupt file is empty (warned), and an entry that
+/// doesn't parse as a credential is skipped on its own (warned) — one bad entry never hides every
+/// other server's login. Never the basis of a write: see [`mutate_locked`].
 fn read_store_file(path: &Path) -> OnDisk {
     let contents = match fs::read_to_string(path) {
         Ok(s) => s,
@@ -130,82 +132,54 @@ fn read_store_file(path: &Path) -> OnDisk {
             return OnDisk::default();
         }
     };
-    match serde_json::from_str(&contents) {
-        Ok(store) => store,
+    match serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&contents) {
+        Ok(raw) => parse_entries(&raw),
         Err(e) => {
             tracing::warn!(
                 path = %path.display(),
                 error = %e,
-                "mcp auth store is not valid JSON, treating it as empty"
+                "mcp auth store is not a valid JSON object, treating it as empty"
             );
             OnDisk::default()
         }
     }
 }
 
-fn write_store_file(path: &Path, store: &OnDisk) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+fn parse_entries(raw: &serde_json::Map<String, serde_json::Value>) -> OnDisk {
+    let mut store = OnDisk::default();
+    for (name, value) in raw {
+        match StoredCredentials::deserialize(value) {
+            Ok(credential) => {
+                store.0.insert(name.clone(), credential);
+            }
+            Err(e) => {
+                tracing::warn!(server = %name, error = %e, "could not parse a stored MCP credential, skipping");
+            }
+        }
     }
-    // This file holds live MCP OAuth access/refresh tokens. `write_atomic` only *preserves* an
-    // existing file's permission bits — it never imposes one on a brand-new file, so the very first
-    // write would otherwise land at the umask default (commonly world-readable). Create it `0600`
-    // atomically first, exactly as `auth_store.rs` does for `auth.json`.
-    if !path.exists() {
-        create_private(path)?;
-    }
-    let body = serde_json::to_string_pretty(store).map_err(std::io::Error::other)?;
-    let path_str = path
-        .to_str()
-        .ok_or_else(|| std::io::Error::other(format!("non-UTF-8 path: {}", path.display())))?;
-    crate::tools::write_atomic_durable(path_str, body.as_bytes())?;
-    // Belt-and-suspenders on top of the atomic-at-creation `0600`: `write_atomic` only ever copies an
-    // existing file's mode forward, never re-asserts one, so a file loosened out-of-band (a stray
-    // `chmod`, a restore from backup) would stay that way forever. Re-assert `0600` after every write
-    // so it self-heals — mirrors `auth_store.rs::set_private`.
-    set_private(path)
-}
-
-/// Create an empty file at `path` with `0600` permissions set atomically at creation (Unix), closing
-/// the window a `set_permissions`-afterward approach would leave open. Mirrors
-/// `auth_store.rs`/`session_store.rs`'s identical helper (duplicated, not shared, per this codebase's
-/// small-self-contained-stores convention).
-fn create_private(path: &Path) -> std::io::Result<()> {
-    let mut opts = fs::OpenOptions::new();
-    opts.write(true).create(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    opts.open(path)?;
-    Ok(())
-}
-
-/// Unconditionally re-assert `0600` on an already-written file (Unix only — a no-op elsewhere), so a
-/// mode loosened out-of-band self-heals on the next write. Mirrors `auth_store.rs::set_private`.
-fn set_private(path: &Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-    }
-    Ok(())
+    store
 }
 
 /// Acquire the cross-process lock, re-read the store's current on-disk state, apply `mutate`, persist
 /// it — see `settings.rs::SettingsStore::mutate_locked`'s identical reasoning (a login for one server
 /// and a token refresh for another must not race and silently clobber each other).
-fn mutate_locked(path: &Path, mutate: impl FnOnce(&mut OnDisk)) -> std::io::Result<()> {
+///
+/// The write follows [`crate::store_file`]'s rule: `mutate` edits the raw JSON object, so only the
+/// server it names changes and every other entry — including one this binary can't parse — is
+/// written back as it was; a file that can't be read or parsed refuses the write. The file holds
+/// live tokens, so it is written owner-only.
+fn mutate_locked(
+    path: &Path,
+    mutate: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>) -> bool,
+) -> std::io::Result<()> {
     let _lock = crate::file_lock::lock_store_file(path)?;
-    let mut store = read_store_file(path);
-    mutate(&mut store);
-    write_store_file(path, &store)
+    let mut raw = crate::store_file::read_object_for_write(path)?;
+    if mutate(&mut raw) {
+        crate::store_file::write_json(path, &serde_json::Value::Object(raw), true)?;
+    }
+    Ok(())
 }
+
 fn default_path() -> PathBuf {
     config_dir_root().join("mcp_auth.json")
 }
@@ -235,7 +209,9 @@ mod tests {
         fs::write(dir.path().join("mcp_auth.json.beyond-lock"), b"").unwrap();
         let started = std::time::Instant::now();
         mutate_locked(&store.path, |s| {
-            s.0.insert("fixture".to_string(), fake_credential("client-1"));
+            let value = serde_json::to_value(fake_credential("client-1")).unwrap();
+            s.insert("fixture".to_string(), value);
+            true
         })
         .unwrap();
         assert!(store.has_credential("fixture"));
@@ -351,5 +327,48 @@ mod tests {
             "a corrupt store file must be logged, not silently swallowed: {:?}",
             capture.messages()
         );
+    }
+}
+
+/// A mutation writes back what it couldn't parse, and never overwrites a file it can't read.
+#[cfg(test)]
+mod roundtrip_tests {
+    use super::*;
+    use serde_json::{Value, json};
+
+    #[tokio::test]
+    async fn saving_one_server_keeps_an_entry_this_binary_cannot_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp_auth.json");
+        let foreign = json!({ "a-newer-shape": true });
+        fs::write(&path, json!({ "other": foreign }).to_string()).unwrap();
+        let store = McpAuthStore { path: path.clone() };
+        store
+            .scoped("mine")
+            .save(StoredCredentials::new("c".into(), None, vec![], None))
+            .await
+            .unwrap();
+        store.scoped("never-saved").clear().await.unwrap();
+        let disk: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(disk["other"], foreign, "the unparseable entry must survive");
+        assert!(store.has_credential("mine"));
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_file_is_left_byte_identical_and_the_mutation_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp_auth.json");
+        let corrupt = b"{\"other\": {\"client_id\": ";
+        fs::write(&path, corrupt).unwrap();
+        let store = McpAuthStore { path: path.clone() };
+        assert!(
+            store
+                .scoped("mine")
+                .save(StoredCredentials::new("c".into(), None, vec![], None))
+                .await
+                .is_err()
+        );
+        assert!(store.clear("other").is_err());
+        assert_eq!(fs::read(&path).unwrap(), corrupt);
     }
 }
