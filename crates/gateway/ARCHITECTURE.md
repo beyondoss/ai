@@ -1692,7 +1692,9 @@ precisely because of this: a forged-key flood is rejected in tens of nanoseconds
 
 A streaming structural scanner fed body or response chunks as they arrive. Tracks JSON nesting
 depth, string-escape state, and quote boundaries. Captures the **root-level `model` field only**
-(depth 0 in the object), ignoring nested `model` keys in tool calls or message content.
+(depth 0 in the object), ignoring nested `model` keys in tool calls or message content. A key
+spelled with escapes is decoded before the compare, as the provider decodes it (`"model"` is
+`model`); an unescaped key is compared as it stands.
 SIMD-accelerated via `memchr2` to skip over large string values (base64-encoded images, long
 prompts). Root keys and the `model` value are accumulated only up to `MAX_CAPTURE` (256) bytes, so
 a multi-megabyte `model` string is never materialized — past the cap it can only miss the catalog

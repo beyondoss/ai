@@ -2765,3 +2765,17 @@ state = "fixed"
 test = "a_bedrock_failover_strips_eager_input_streaming_where_the_profile_does_not_take_it"
 fix = "234fc382"
 note = "providers::catalog::serves_eager_input_streaming is a per-candidate capability: direct Anthropic always, Bedrock only for the BEDROCK_EAGER_INPUT_STREAMING allowlist (us.anthropic.claude-opus-4-8), so a new Bedrock row starts without it. On any other candidate request_body_filter cuts each root tools element's eager_input_streaming out by span (translate::strip_eager_input_streaming) and retain_managed_client_headers drops the beta; the only cost is that Bedrock buffers each tool parameter. Per attempt on the replayed client body, so direct Anthropic gets the client's exact bytes and its prompt cache key never moves. The test fails over Anthropic 500 onto Bedrock for all three Bedrock rows (and a 100 KiB full-body request) and asserts both bodies and beta headers. Also held by strip_eager_input_streaming_cuts_only_the_tool_field, the_fine_grained_tool_streaming_beta_reaches_only_a_candidate_that_takes_it and eager_input_streaming_is_kept_only_where_a_candidate_is_known_to_accept_it. To widen the allowlist, verify one tool-bearing request with the field on the Bedrock profile."
+
+[[defect]]
+id = "D273"
+severity = "high"
+area = "Routing"
+title = "The streaming model scanner misses a model key spelled with an escape"
+impact = "A managed streamed request whose root key is spelled with an escape (\"mod\\u0065l\") reads as having no model, so it routes on nothing (404 unknown_model) although the provider, and the buffered scan on the same body, read `model`. The two scanners disagree on one body."
+confidence = "high"
+evidence = "peek.rs ModelScanner compared the raw key bytes (\"modu0065l\") with \"model\"; scan_buffered and serde_json decode the escape. Reproduced by an_escaped_model_key_is_found_by_the_streaming_scanner, which failed on main 4513e6f."
+claims = ["SEC-21"]
+state = "fixed"
+test = "an_escaped_model_key_is_found_by_the_streaming_scanner"
+fix = ""
+note = "Fixed in peek.rs: a key that contains a backslash is decoded (capture_text, serde_json, as the provider decodes it) before it is compared with `model` or a kept key; an unescaped key is compared as captured, so it pays nothing new. Also held by props_peek prop_streaming_scanner_agrees_with_buffered_scan, now without its escaped-key exclusion. The plain key case already worked on main."

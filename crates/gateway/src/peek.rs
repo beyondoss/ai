@@ -29,6 +29,34 @@ fn push_capped(buf: &mut Vec<u8>, b: u8) {
     }
 }
 
+/// The text of a captured JSON string, with its escapes as sent: decoded the way a provider's parser
+/// decodes them, so `"gpt-5"` is `gpt-5`. `None` for bytes that are not text. An escaped capture
+/// at the cap is `None` too: its last escape may be cut, and the decoded prefix can then read as a
+/// shorter, real name.
+fn capture_text(raw: Vec<u8>) -> Option<String> {
+    if !raw.contains(&b'\\') {
+        return String::from_utf8(raw).ok();
+    }
+    if raw.len() >= MAX_CAPTURE {
+        return None;
+    }
+    let mut quoted = Vec::with_capacity(raw.len().saturating_add(2));
+    quoted.push(b'"');
+    quoted.extend(raw);
+    quoted.push(b'"');
+    serde_json::from_slice::<String>(&quoted).ok()
+}
+
+/// A captured key's text as [`capture_text`] decodes it. Unescaped keys are compared as captured, so
+/// the common key costs no more than it did before escapes were decoded.
+fn key_bytes(raw: &[u8]) -> Option<std::borrow::Cow<'_, [u8]>> {
+    if raw.contains(&b'\\') {
+        capture_text(raw.to_vec()).map(|s| std::borrow::Cow::Owned(s.into_bytes()))
+    } else {
+        Some(std::borrow::Cow::Borrowed(raw))
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Default)]
 enum Cap {
     #[default]
@@ -273,23 +301,26 @@ impl ModelScanner {
                     }
                 } else if b == b'\\' {
                     self.escaped = true;
+                    if self.cap == Cap::Key {
+                        push_capped(&mut self.cur, b);
+                    }
                 } else if b == b'"' {
                     self.in_string = false;
                     match self.cap {
                         Cap::Key => {
-                            self.last_key_is_model = self.cur == b"model";
+                            let key = key_bytes(&self.cur);
+                            self.last_key_is_model = key.as_deref() == Some(b"model".as_slice());
                             if let Some(k) = kept.as_deref_mut() {
-                                k.last_key_extra = k
-                                    .keys
-                                    .iter()
-                                    .position(|key| *key == self.cur.as_slice())
-                                    .and_then(|i| u8::try_from(i).ok());
+                                let at = key
+                                    .as_deref()
+                                    .and_then(|key| k.keys.iter().position(|want| *want == key));
+                                k.last_key_extra = at.and_then(|i| u8::try_from(i).ok());
                             }
                             // Only a *root* `message` opens the nested scan — a `message` key inside
                             // the message object itself must not re-arm it.
                             if self.accept_message_nesting && self.depth == 1 {
                                 self.last_key_is_message =
-                                    self.cur == b"message" || self.cur == b"response";
+                                    matches!(key.as_deref(), Some(b"message" | b"response"));
                             }
                         }
                         Cap::ModelValue => {
@@ -1645,6 +1676,17 @@ mod tests {
         let key = format!("model{}", "x".repeat(MAX_CAPTURE * 4));
         let body = format!(r#"{{"{key}":"nope","model":"gpt-4o"}}"#);
         assert_eq!(scan(body.as_bytes()).as_deref(), Some("gpt-4o"));
+    }
+
+    /// claim: SEC-21
+    /// defect: D273
+    #[test]
+    fn an_escaped_model_key_is_found_by_the_streaming_scanner() {
+        let body = format!(r#"{{"mod{}u0065l":"x"}}"#, '\\');
+        let oracle: serde_json::Value = serde_json::from_slice(body.as_bytes()).unwrap();
+        assert_eq!(oracle["model"], "x");
+        assert_eq!(scan(body.as_bytes()).as_deref(), Some("x"));
+        assert_eq!(scan_buffered(body.as_bytes()).model.as_deref(), Some("x"));
     }
 
     fn scan(body: &[u8]) -> Option<String> {

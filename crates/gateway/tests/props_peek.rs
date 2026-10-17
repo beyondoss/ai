@@ -354,10 +354,6 @@ fn prop_streaming_scanner_agrees_with_buffered_scan() {
         "prop_streaming_scanner_agrees_with_buffered_scan",
         (body(), prop::collection::vec(any::<usize>(), 0..12)),
         |(b, cuts)| {
-            // `ModelScanner` matches keys raw; `scan_buffered` decodes an escaped `model` key so the
-            // duplicate check cannot be dodged. A body with an escaped `model` key and no plain one
-            // routes on nothing (404) rather than on a misread, so that difference is excluded here.
-            prop_assume!(!b.exotic_key("model"));
             let mut s = ModelScanner::new();
             for c in chunk(b.text.as_bytes(), &cuts) {
                 s.feed(&c);

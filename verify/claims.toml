@@ -1101,8 +1101,9 @@ touches = [
   "crates/gateway/src/cache.rs",
   "crates/gateway/src/control.rs",
   "crates/gateway/src/secret.rs",
+  "crates/gateway/src/peek.rs",
 ]
-defects = ["D34", "D94"]
+defects = ["D34", "D94", "D273"]
 
 [[claim]]
 id = "SEC-22"
