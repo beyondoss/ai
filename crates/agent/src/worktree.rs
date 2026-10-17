@@ -47,6 +47,11 @@
 //! PID liveness is checked via `/proc`, and a *reused* PID makes the sweep skip a directory it could
 //! have reaped. That is the safe direction to be wrong in: a leak, never a deletion.
 //!
+//! A checkout the developer must inspect — a conflicted, refused or failed child's — is moved to a
+//! `kept-` name by [`Worktree::preserve`], which no sweep reaps. And [`Worktree::create`] never
+//! removes an existing path to make room for a new one: each spawn takes a fresh per-process
+//! sequence number, since a daemon's sessions share one PID and a retry spawns the same agent again.
+//!
 //! # Where `git` runs
 //!
 //! Every step above is a `git` invocation, and each one has to happen **where the child's files
@@ -468,7 +473,7 @@ impl Git {
                 // Not a name we wrote — leave it alone.
                 continue;
             };
-            if owner == mine {
+            if owner == mine || owner == KEPT {
                 continue;
             }
             tracing::debug!(
@@ -779,13 +784,26 @@ impl Worktree {
         git.sweep_siblings(repo_root, &base).await;
 
         // The leaf basename becomes git's own name for the worktree, so it must be unique within the
-        // repo. The owner prefix does double duty: uniqueness across concurrent agents, and the key
-        // `sweep` reaps by — a PID locally, this session's incarnation in a sandbox, where a PID would
-        // name a process on the wrong machine.
-        let leaf = format!("{}-{}", git.owner(), sanitize(label));
-        let path = base.join(leaf);
-        // Idempotent per CLAUDE.md: a retry after a crash must not fail on its own leftovers.
-        git.remove_worktree(repo_root, &path).await;
+        // repo. The owner prefix is the key `sweep` reaps by — a PID locally, this session's
+        // incarnation in a sandbox, where a PID would name a process on the wrong machine.
+        //
+        // The owner alone is not unique: every session a daemon hosts shares its PID, and the same
+        // agent is spawned again on a retry. So each spawn also takes a fresh per-process sequence
+        // number, and an existing path is **never** removed to make room — it may be a preserved
+        // checkout holding the only copy of a child's work, or a live sibling's. A path that is
+        // somehow taken (a dead process's leftover under a reused PID) is skipped, not reclaimed;
+        // reclaiming leftovers is `sweep`'s job, which knows whose they are.
+        static SPAWN_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let owner = git.owner();
+        let label = sanitize(label);
+        let path = loop {
+            let seq = SPAWN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = base.join(format!("{owner}-{label}-{seq}"));
+            // A remote owner is unique per incarnation, so only the local arm can collide.
+            if git.is_remote() || !path.exists() {
+                break path;
+            }
+        };
 
         git.run_text(
             repo_root,
@@ -952,10 +970,30 @@ impl Worktree {
     }
 
     /// Give up ownership *without* deleting the checkout — for a child whose patch conflicted, whose
-    /// work the developer now needs to inspect at [`path`](Self::path).
-    pub fn preserve(mut self) -> PathBuf {
+    /// work the developer now needs to inspect — and return where it now lives.
+    ///
+    /// The checkout is moved (`git worktree move`) to a [`KEPT`]-prefixed leaf, which no sweep ever
+    /// reaps: the owner-keyed name it had would be collected by the next process's [`sweep`] as soon
+    /// as this one exited, deleting the only copy of the child's work. If the move fails the checkout
+    /// stays where it was, still intact, and that path is returned.
+    pub async fn preserve(mut self) -> PathBuf {
         self.detached = true;
-        self.path.clone()
+        let (Some(base), Some(leaf)) = (self.path.parent(), self.path.file_name()) else {
+            return self.path.clone();
+        };
+        let kept = base.join(format!("{KEPT}-{}", leaf.to_string_lossy()));
+        let (from, to) = (self.path.display().to_string(), kept.display().to_string());
+        match self
+            .git
+            .run_text(&self.repo_root, &["worktree", "move", &from, &to])
+            .await
+        {
+            Ok(_) => kept,
+            Err(e) => {
+                tracing::warn!(worktree = %from, "could not mark a preserved worktree as kept: {e}");
+                self.path.clone()
+            }
+        }
     }
 }
 
@@ -1259,13 +1297,39 @@ async fn git_stdout_with_stdin(dir: &Path, args: &[&str], stdin: &[u8]) -> Resul
     Ok(out.stdout)
 }
 
+/// The leaf prefix of a preserved worktree (see [`Worktree::preserve`]). Never a PID and never a
+/// remote owner, so neither sweep can mistake it for an orphan: it is the developer's to remove.
+const KEPT: &str = "kept";
+
 /// Reap subagent worktrees left behind by agent processes that are no longer running. Safe to call at
 /// any time, from any number of concurrent agents: a worktree whose owning PID is still alive is never
-/// touched, and `git worktree prune` only drops metadata for checkouts that are already gone.
+/// touched, a preserved ([`KEPT`]) one never is either, and `git worktree prune` only drops metadata
+/// for checkouts that are already gone.
+///
+/// `cwd` may be anywhere inside the repository: the sweep keys on its **top level**, the same root
+/// [`preflight`] hands [`Worktree::create`]. Keyed on the cwd itself, a run from a subdirectory looked
+/// under a base directory no worktree was ever created in and reaped nothing. Outside a repository
+/// it does nothing.
 ///
 /// This — not [`Drop`] — is what actually guarantees cleanup, because a `process::exit` (or a SIGKILL)
 /// runs no destructors.
-pub fn sweep(repo_root: &Path) {
+pub fn sweep(cwd: &Path) {
+    let Ok(out) = std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["rev-parse", "--show-toplevel"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return;
+    };
+    let top = String::from_utf8_lossy(&out.stdout);
+    let top = top.trim();
+    if !out.status.success() || top.is_empty() {
+        return;
+    }
+    let repo_root = Path::new(top);
     // Every candidate base, not just the preferred one: a prior run may have created worktrees under a
     // different root (e.g. `temp_dir` while `$HOME` was briefly unwritable), and those orphans must be
     // reaped too.
@@ -1285,7 +1349,8 @@ pub fn sweep(repo_root: &Path) {
                 .and_then(|n| n.split_once('-'))
                 .and_then(|(pid, _)| pid.parse::<u32>().ok())
             else {
-                // Not one of ours (or a name we didn't write) — leave it alone.
+                // Not one of ours (or a name we didn't write), or a preserved `kept-` checkout —
+                // leave it alone.
                 continue;
             };
             if pid_is_alive(owner) {
@@ -1535,15 +1600,101 @@ mod tests {
                 .await
                 .unwrap();
             std::fs::write(wt.path().join("conflicted.txt"), "x").unwrap();
-            wt.preserve()
+            wt.preserve().await
         };
         assert!(path.exists(), "a preserved worktree survives Drop");
         assert!(path.join("conflicted.txt").exists());
+        assert!(
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("kept-"),
+            "a preserved worktree is marked so no sweep reaps it: {}",
+            path.display()
+        );
         remove_worktree_blocking(&root, &path);
     }
 
     #[tokio::test]
-    async fn create_is_idempotent_over_a_leftover_directory_at_the_same_path() {
+    async fn a_retry_of_the_same_agent_never_deletes_a_preserved_checkout() {
+        // Single mode always spawns index 0, so a retry asked for the very leaf the failed attempt
+        // had — and `create` used to `rm -rf` it first: the only copy of the child's work.
+        let repo = repo().await;
+        let root = preflight(&Git::Local, repo.path()).await.unwrap();
+        let wt = Worktree::create(&Git::Local, &root, "writer-0")
+            .await
+            .unwrap();
+        std::fs::write(wt.path().join("work.txt"), "the only copy\n").unwrap();
+        let kept = wt.preserve().await;
+
+        let again = Worktree::create(&Git::Local, &root, "writer-0")
+            .await
+            .unwrap();
+        assert_ne!(again.path(), kept);
+        assert_eq!(
+            std::fs::read_to_string(kept.join("work.txt")).unwrap(),
+            "the only copy\n"
+        );
+        drop(again);
+        assert!(
+            kept.exists(),
+            "dropping the retry must not touch the kept checkout"
+        );
+        remove_worktree_blocking(&root, &kept);
+    }
+
+    #[tokio::test]
+    async fn two_sessions_in_one_process_never_share_a_checkout() {
+        // A daemon hosts many sessions under one PID; two of them spawning the same agent used to
+        // compute the same `<pid>-<agent>-0` leaf, and the second `create` removed the first's.
+        let repo = repo().await;
+        let root = preflight(&Git::Local, repo.path()).await.unwrap();
+        let (a, b) = tokio::join!(
+            Worktree::create(&Git::Local, &root, "writer-0"),
+            Worktree::create(&Git::Local, &root, "writer-0"),
+        );
+        let (a, b) = (a.unwrap(), b.unwrap());
+        assert_ne!(a.path(), b.path());
+        std::fs::write(a.path().join("a.txt"), "a").unwrap();
+        std::fs::write(b.path().join("b.txt"), "b").unwrap();
+        assert!(a.path().join("a.txt").exists() && b.path().join("b.txt").exists());
+        assert!(!a.child_delta().await.unwrap().is_empty());
+        assert!(!b.child_delta().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn sweep_from_a_subdirectory_reaps_by_the_repository_root() {
+        let repo = repo().await;
+        std::fs::create_dir_all(repo.path().join("sub/dir")).unwrap();
+        let root = preflight(&Git::Local, repo.path()).await.unwrap();
+        let base = ensure_base_dir(&Git::Local, &root).await;
+        // A checkout left by a dead process (PID 0 is never a live userspace process).
+        let orphan = base.join("0-orphan-0");
+        Git::Local
+            .run_text(
+                &root,
+                &[
+                    "worktree",
+                    "add",
+                    "--detach",
+                    "--quiet",
+                    &orphan.display().to_string(),
+                    "HEAD",
+                ],
+            )
+            .await
+            .unwrap();
+
+        sweep(&repo.path().join("sub/dir"));
+        assert!(
+            !orphan.exists(),
+            "a sweep from a subdirectory must reap the repo's orphans"
+        );
+        let _ = std::fs::remove_dir(&base);
+    }
+
+    #[tokio::test]
+    async fn create_never_removes_an_existing_checkout() {
         let repo = repo().await;
         let root = preflight(&Git::Local, repo.path()).await.unwrap();
         let wt = Worktree::create(&Git::Local, &root, "scout-0")
@@ -1552,12 +1703,14 @@ mod tests {
         let path = wt.path().to_path_buf();
         std::mem::forget(wt); // simulate a crash: no Drop, checkout and metadata left behind
 
-        // Same PID, same label ⇒ same path. A retry must reclaim it rather than fail.
+        // A retry gets a checkout of its own and leaves the leftover for `sweep` to judge.
         let wt2 = Worktree::create(&Git::Local, &root, "scout-0")
             .await
             .unwrap();
-        assert_eq!(wt2.path(), path);
+        assert_ne!(wt2.path(), path);
         assert!(path.join("tracked.txt").exists());
+        assert!(wt2.path().join("tracked.txt").exists());
+        remove_worktree_blocking(&root, &path);
     }
 
     /// A throwaway repo path plus its (created) worktree base dir, cleaned up on drop. `sweep` is scoped
@@ -1568,7 +1721,8 @@ mod tests {
     }
     impl SweepFixture {
         async fn new() -> Self {
-            let repo = tempfile::tempdir().unwrap();
+            // A real repository: `sweep` keys on the top level `git` reports for it.
+            let repo = repo().await;
             let base = ensure_base_dir(&Git::Local, repo.path()).await;
             Self { repo, base }
         }
@@ -1817,6 +1971,42 @@ mod tests {
 
         sweep(fx.repo.path());
         assert!(!orphan.exists(), "an orphaned worktree must be reaped");
+    }
+
+    #[tokio::test]
+    async fn sweep_never_reaps_a_preserved_checkout_even_once_its_owner_is_gone() {
+        // A preserved checkout outlives the process that made it by design; the next process's
+        // startup sweep must not collect it as that process's orphan.
+        let fx = SweepFixture::new().await;
+        let kept = fx.base.join("kept-0-writer-0-3");
+        std::fs::create_dir_all(&kept).unwrap();
+
+        sweep(fx.repo.path());
+        assert!(
+            kept.exists(),
+            "a kept checkout is the developer's to remove"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_remote_sweep_never_reaps_a_preserved_checkout() {
+        let git = remote_git();
+        let repo = repo().await;
+        let root = preflight(&git, repo.path()).await.unwrap();
+        let wt = Worktree::create(&git, &root, "writer-0").await.unwrap();
+        std::fs::write(wt.path().join("work.txt"), "keep me").unwrap();
+        let kept = wt.preserve().await;
+        let base = kept.parent().unwrap().to_path_buf();
+        assert!(
+            kept.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("kept-")
+        );
+
+        git.sweep_siblings(&root, &base).await;
+        assert!(kept.join("work.txt").exists());
+        remove_worktree_blocking(&root, &kept);
     }
 
     #[tokio::test]
