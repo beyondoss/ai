@@ -168,6 +168,75 @@ async fn gateway_client_surfaces_http_error() {
     assert!(first.is_err(), "a 403 must surface as a stream error");
 }
 
+/// Serve one canned non-2xx JSON response; return the base URL.
+fn spawn_error_server(status_line: &'static str, body: &'static str) -> String {
+    let listener = beyond_ai_test_support::ports::listener();
+    let addr = listener.local_addr().expect("addr");
+    thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0u8; 8192];
+            let _ = stream.read(&mut buf);
+            let resp = format!(
+                "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(resp.as_bytes());
+        }
+    });
+    format!("http://{addr}")
+}
+
+async fn first_error(base: String) -> agent_core::Error {
+    let client = GatewayClient::new(base, "bai_v1.test").expect("client");
+    let mut stream = client
+        .stream(ModelRequest::new(
+            "claude-opus-4-8",
+            vec![Message::user("hi")],
+            64,
+        ))
+        .await
+        .expect("stream");
+    match stream.next().await {
+        Some(Err(e)) => e,
+        other => panic!("expected an error, got {other:?}"),
+    }
+}
+
+/// A provider's 4xx reaches the user as the status and the provider's own message, not the JSON
+/// envelope around it — and the overflow classifier still recognizes it.
+#[tokio::test]
+async fn a_provider_4xx_shows_its_message_not_its_json() {
+    let err = first_error(spawn_error_server(
+        "400 Bad Request",
+        r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 250000 tokens > 200000 maximum"},"request_id":"req_011"}"#,
+    ))
+    .await;
+    let shown = err.to_string();
+    assert!(
+        shown.ends_with(
+            "returned 400 Bad Request: prompt is too long: 250000 tokens > 200000 maximum \
+             (invalid_request_error)"
+        ),
+        "{shown}"
+    );
+    assert!(!shown.contains('{'), "no JSON in the message: {shown}");
+    assert!(agent_core::agent::is_context_overflow(&err), "{shown}");
+
+    let err = first_error(spawn_error_server(
+        "400 Bad Request",
+        r#"{"error":{"message":"This model's maximum context length is 128000 tokens. However, your messages resulted in 130000 tokens.","type":"invalid_request_error","param":"messages","code":"context_length_exceeded"}}"#,
+    ))
+    .await;
+    let shown = err.to_string();
+    assert!(
+        shown.contains(
+            "returned 400 Bad Request: This model's maximum context length is 128000 tokens."
+        ) && shown.ends_with("(invalid_request_error, context_length_exceeded)"),
+        "{shown}"
+    );
+    assert!(agent_core::agent::is_context_overflow(&err), "{shown}");
+}
+
 #[tokio::test]
 async fn gateway_client_gives_actionable_guidance_on_a_401() {
     // Pi-parity fix: a live 401 (the gateway itself rejecting the key) used to surface as a bare

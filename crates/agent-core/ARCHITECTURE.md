@@ -810,6 +810,17 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
   (default enabled) disables this specific layer — a normally-retried
   failure surfaces on the very first attempt instead — for debugging a flaky connection without several
   silent attempts first; `GatewayClient`'s own pre-first-byte retry of a 5xx is unaffected either way.
+- **Provider errors read as messages, not JSON** — a non-2xx response the client doesn't retry becomes
+  `Error::Transport("{host} returned {status}: {message} ({kind})")`. `client::describe_error_body`
+  pulls the message out of the body (Anthropic `{"type":"error","error":{type,message}}`, OpenAI
+  `{"error":{message,type,code}}`, Google `{"error":{code,message,status}}`, OpenRouter's
+  `metadata.{provider_name,raw}` with the upstream's own error described in turn, a bare
+  `{"error":"…"}`, top-level `message`/`detail`), and anything else is shown as it came, capped at
+  4000 chars. The kind (`type`/`code`/`status`) is kept on purpose: the retry, quota and
+  context-overflow classifiers key on strings like `rate_limit_error`, `insufficient_quota` and
+  `context_length_exceeded`, and they read this same text. The raw body is logged at `debug`
+  (`provider error response`). The gateway's own remedy rewriting runs on upstream bodies inside
+  the gateway, before the client ever sees them, so this rendering doesn't affect it.
 - **Rate limits get a time budget, not a count** (`rate_limit.rs`) — inside that same `run_turn` loop, a
   failure `rate_limit::is_rate_limited` recognizes (a 429, either dialect's in-stream rate-limit error,
   or Anthropic's 529, with or without an `overloaded_error` body; never a quota/billing 429, a context overflow, or OpenAI's
