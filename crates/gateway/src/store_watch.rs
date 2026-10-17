@@ -65,6 +65,23 @@ use store::{
 use tokio::time::Instant;
 use tracing::{error, info, warn};
 
+/// A set watched from the store (deny, allowance, capture): read lock-free by the request path,
+/// and replaced only by its watcher in this module, the one writer the set has. The `ArcSwap` is
+/// private to this module, so no other code can publish a set.
+pub struct Watched<T>(ArcSwap<T>);
+
+impl<T> Watched<T> {
+    /// A set no watcher has published to yet.
+    pub fn new(set: T) -> Self {
+        Self(ArcSwap::from_pointee(set))
+    }
+
+    /// The set as last published.
+    pub fn load(&self) -> arc_swap::Guard<Arc<T>> {
+        self.0.load()
+    }
+}
+
 /// Depth of the channel the watch task feeds, and therefore the most deltas one `recv_many` can
 /// drain into a batch — the queue is the batch, so there's nothing to gain from a second bound.
 const WATCH_CHANNEL_CAPACITY: usize = 256;
@@ -118,7 +135,7 @@ pub trait WatchedSet: Send + Sync + 'static {
     fn len(set: &Self::Set) -> usize;
 
     /// Where the live set is published for the request path to read.
-    fn slot(state: &GatewayState) -> &ArcSwap<Self::Set>;
+    fn slot(state: &GatewayState) -> &Watched<Self::Set>;
 
     /// Publish the current cardinality to this set's own gauge.
     fn record_size(state: &GatewayState, len: usize);
@@ -182,7 +199,7 @@ impl WatchedSet for Deny {
         set.len()
     }
 
-    fn slot(state: &GatewayState) -> &ArcSwap<DenySet> {
+    fn slot(state: &GatewayState) -> &Watched<DenySet> {
         &state.deny
     }
 
@@ -251,7 +268,7 @@ impl WatchedSet for Capture {
         set.len()
     }
 
-    fn slot(state: &GatewayState) -> &ArcSwap<CaptureSet> {
+    fn slot(state: &GatewayState) -> &Watched<CaptureSet> {
         &state.capture
     }
 
@@ -307,7 +324,7 @@ impl WatchedSet for Allowance {
         set.len()
     }
 
-    fn slot(state: &GatewayState) -> &ArcSwap<AllowanceSet> {
+    fn slot(state: &GatewayState) -> &Watched<AllowanceSet> {
         &state.allowance
     }
 
@@ -432,7 +449,7 @@ impl<W: WatchedSet> BackgroundService for WatcherService<W> {
                             count, complete, resumable, "seeded from on-disk snapshot"
                         );
                         W::record_size(&self.state, count);
-                        W::slot(&self.state).store(Arc::new(set));
+                        W::slot(&self.state).0.store(Arc::new(set));
                     } else {
                         warn!(
                             set = W::NOUN,
@@ -766,7 +783,7 @@ async fn watch_set<W: WatchedSet>(
                     "seeded from scan"
                 );
                 W::record_size(state, count);
-                W::slot(state).store(Arc::new(set));
+                W::slot(state).0.store(Arc::new(set));
                 *cursor = WatchCursor::from_u64(baseline_rev);
                 // Persist the freshly-scanned baseline so a later restart can skip the scan. We
                 // *rebuild* the file (not append): this path runs on a cold boot or after a
@@ -846,7 +863,7 @@ async fn watch_set<W: WatchedSet>(
         // what we already hold is wasted work. The closure re-runs on contention, and the run that
         // wins is the last one, so this ends up holding the length actually published.
         let mut count = 0usize;
-        W::slot(state).rcu(|cur| {
+        W::slot(state).0.rcu(|cur| {
             let set = W::apply_batch(state, cur, &batch);
             count = W::len(&set);
             Arc::new(set)

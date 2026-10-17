@@ -2343,7 +2343,9 @@ Two `HashMap<u64, DenyReason>`s — tenants (`blackhole.{tenant}`) and credentia
 request is denied if the tenant is in the set **or** (v2) its `key_id` is. Tenant deny wins when
 both match and kills every key for that tenant. v1 tokens have no `key_id`, so only the tenant
 map can deny them. Both key shapes live under the `blackhole.` prefix; one `WatchedSet` watcher
-applies both. Written exclusively via `ArcSwap`; reads on the hot path are lock-free.
+applies both. Published through a `store_watch::Watched` (an `ArcSwap` only `store_watch` can
+write; the deny, allowance and capture sets each sit behind one), so reads on the hot path are
+lock-free and nothing but the watcher can replace a set.
 
 Reasons: `Spend` (→ 402), `Fraud` (→ 403), `Unknown` (→ 403, fail-safe for unrecognized values).
 Restore = explicit delete from NATS KV or TTL expiry — no gateway-side timer.

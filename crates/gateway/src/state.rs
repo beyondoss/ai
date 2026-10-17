@@ -1,10 +1,11 @@
 //! Shared gateway state.
 //!
-//! The deny-set, capture-set, and allowance-set are dynamic (watched from NATS, behind `ArcSwap`
-//! for lock-free reads). Everything else — the signing keyring and the resolved provider registry
-//! (upstreams + pool auth values) — is built once at boot from config (SSM/env), so the auth +
-//! key paths have **no runtime dependency on NATS**. Allowance is fail-closed until its watcher
-//! stores a snapshot (empty = remaining-ok); deny is fail-open on the same unread store.
+//! The deny-set, capture-set, and allowance-set are dynamic (watched from NATS, behind a
+//! `store_watch::Watched` for lock-free reads, which only their watcher can replace). Everything
+//! else — the signing keyring and the resolved provider registry (upstreams + pool auth values) —
+//! is built once at boot from config (SSM/env), so the auth + key paths have **no runtime
+//! dependency on NATS**. Allowance is fail-closed until its watcher stores a snapshot (empty =
+//! remaining-ok); deny is fail-open on the same unread store.
 
 use crate::allowance::AllowanceSet;
 use crate::cache::{self, ResponseCache};
@@ -17,6 +18,7 @@ use crate::key::Keyring;
 use crate::metrics::{Metrics, ProviderMetrics};
 use crate::ratelimit::RateLimit;
 use crate::route::{self, AuthScheme, Dialect, Provider};
+use crate::store_watch::Watched;
 use arc_swap::ArcSwap;
 use arrayvec::ArrayString;
 use std::collections::HashMap;
@@ -391,16 +393,16 @@ pub struct GatewayState {
     pub models_list: bytes::Bytes,
 
     /// Sparse deny-set — watched from NATS. Default-allow on miss; fail-open.
-    pub deny: ArcSwap<DenySet>,
+    pub deny: Watched<DenySet>,
 
     /// Sparse allowance-set — watched from NATS. Membership = exhausted. Unready until the first
     /// successful scan or snapshot (empty scan is remaining-ok). Fail-closed: a managed request
     /// 402s while unready, unlike deny.
-    pub allowance: ArcSwap<AllowanceSet>,
+    pub allowance: Watched<AllowanceSet>,
 
     /// Sparse capture-set — watched from NATS under its own prefix and its own watcher. Default-off
     /// on miss, so a NATS outage degrades to "capturing nothing", which is the correct thing to lose.
-    pub capture: ArcSwap<CaptureSet>,
+    pub capture: Watched<CaptureSet>,
     /// Per-tenant capture defaults resolved from config once at boot, applied to any control-plane
     /// entry that doesn't override them (and to a capture requested by header, which has no entry).
     pub capture_defaults: CaptureRule,
@@ -584,9 +586,9 @@ impl GatewayState {
             providers,
             by_id,
             models_list,
-            deny: ArcSwap::from_pointee(DenySet::new()),
-            allowance: ArcSwap::from_pointee(AllowanceSet::new()),
-            capture: ArcSwap::from_pointee(CaptureSet::new()),
+            deny: Watched::new(DenySet::new()),
+            allowance: Watched::new(AllowanceSet::new()),
+            capture: Watched::new(CaptureSet::new()),
             capture_defaults,
             cache,
             tenant_slots: TenantSlots::new(config.tenant_max_in_flight()),
