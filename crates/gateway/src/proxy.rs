@@ -1388,6 +1388,30 @@ impl ModelRouting {
 }
 
 impl RequestCtx {
+    /// Take one request-body chunk into this attempt's record: the size count, the capture tap and,
+    /// for a rewrite, the buffer the rewrite reads. `false` once the body has crossed
+    /// `MAX_REQUEST_BODY`. The body filter and the replay tests both feed through here, so a replayed
+    /// prefix is accounted the same way each time.
+    fn take_request_chunk(&mut self, chunk: &[u8]) -> bool {
+        self.body_bytes_fed = self.body_bytes_fed.saturating_add(chunk.len());
+        if self.body_bytes_fed > MAX_REQUEST_BODY {
+            return false;
+        }
+        // Capture tap. Deliberately on the chunk as it *arrives*, which makes the captured bytes
+        // **pre-rewrite** for free: both rewrites happen at end-of-stream over the whole of `req_buf`,
+        // long after this ran. A captured body showing a `stream_options` the client's SDK never sent,
+        // or a `model` re-spelled for whichever failover candidate served, sends an engineer hunting
+        // through their own code for something the gateway put there. What we capture is what the
+        // client sent. Bounded and non-withholding: the chunk is forwarded either way.
+        if let Some(c) = self.control.as_mut().and_then(|c| c.capture.as_mut()) {
+            c.push_req(chunk);
+        }
+        if self.rewrites_body() {
+            self.req_buf.extend_from_slice(chunk);
+        }
+        true
+    }
+
     /// When the current upstream attempt began: the per-attempt stamp for a model-routed request,
     /// and simply the request start for everything else — where the two are always equal anyway,
     /// so the common path stores no second `Instant`.
@@ -6132,8 +6156,7 @@ impl ProxyHttp for AiProxy {
             // Tagged `Downstream` because it is the client's fault: an untagged error counted
             // against the provider's breaker, so one caller sending oversized bodies could open it
             // and 503 every tenant. The status is what pingora answers with.
-            rc.body_bytes_fed = rc.body_bytes_fed.saturating_add(chunk.len());
-            if rc.body_bytes_fed > MAX_REQUEST_BODY {
+            if !rc.take_request_chunk(chunk) {
                 self.state.metrics.rejection(Rejection::BodyTooLarge).inc();
                 return Err(pingora_core::Error::explain(
                     pingora_core::ErrorType::HTTPStatus(413),
@@ -6147,18 +6170,6 @@ impl ProxyHttp for AiProxy {
             // come from one walk of the finished buffer below — the body was previously traversed
             // twice, once here for `model` and once by the injection planner, over the same bytes
             // with the same depth/string/escape bookkeeping.
-            // Capture tap. Deliberately here, on the chunk as it *arrives*, which makes the captured
-            // bytes **pre-rewrite** for free: both of the rewrites below happen at end-of-stream over
-            // the whole of `req_buf`, long after this ran. That matters twice over — a captured body
-            // showing a `stream_options` the client's SDK never sent, or a `model` re-spelled for
-            // whichever failover candidate served, sends an engineer hunting through their own code
-            // for something the gateway put there. What we capture is what the client sent.
-            //
-            // Bounded and non-withholding, exactly like the response tap: the chunk is forwarded
-            // either way, so this costs a memcpy, never latency.
-            if let Some(c) = rc.control.as_mut().and_then(|c| c.capture.as_mut()) {
-                c.push_req(chunk);
-            }
             // Only where no copy of the body will be left for `logging` to read (`tally_eager`):
             // everywhere else the estimate is made there, and only when a row needs one.
             if rc.tally_eager {
@@ -6178,7 +6189,6 @@ impl ProxyHttp for AiProxy {
             }
 
             if rc.rewrites_body() {
-                rc.req_buf.extend_from_slice(chunk);
                 // A large body buffered for a rewrite (the `/{provider}` usage splice; a catalog
                 // walk's large body is a `FullBody` re-run, already reserved) holds budget as it
                 // grows. Tagged downstream: the client's size, not the provider's health.
@@ -8121,10 +8131,10 @@ mod tests {
             br#"{"messages":[{"role":"user","content":"hi"}],"model":"gpt-4o","stream":true}"#;
         let (prefix, rest) = body.split_at(30);
 
-        // Attempt 1: a prefix arrives, then the upstream dies before end-of-stream.
+        // Attempt 1: a prefix arrives, then the upstream dies before end-of-stream. The chunk goes
+        // through the production append step, as `request_body_filter` feeds it.
         let mut rc = test_ctx(true);
-        rc.req_buf.extend_from_slice(prefix);
-        rc.body_bytes_fed += prefix.len();
+        assert!(rc.take_request_chunk(prefix));
         assert!(
             !rc.req_buf.is_empty(),
             "precondition: the partial body is still held, since end_of_stream never came",
@@ -8132,18 +8142,23 @@ mod tests {
 
         // `upstream_peer` runs before any body byte of attempt 2.
         rc.reset_request_body_phase();
+        assert_eq!(
+            rc.body_bytes_fed, 0,
+            "the size guard must not double-count the replayed prefix",
+        );
 
-        // Attempt 2: pingora replays from byte 0, then the remainder streams in.
-        rc.req_buf.extend_from_slice(prefix);
-        rc.req_buf.extend_from_slice(rest);
+        // Attempt 2: pingora replays from byte 0 through the same filter, then the remainder.
+        assert!(rc.take_request_chunk(prefix));
+        assert!(rc.take_request_chunk(rest));
 
         assert_eq!(
             rc.req_buf, body,
             "the retried attempt must send the body exactly once",
         );
         assert_eq!(
-            rc.body_bytes_fed, 0,
-            "the size guard must not double-count the replayed prefix",
+            rc.body_bytes_fed,
+            body.len(),
+            "the replay counts the body once, as the client sent it",
         );
         let scan = peek::scan_buffered(&rc.req_buf);
         assert_eq!(
@@ -8309,10 +8324,11 @@ mod tests {
         );
     }
 
-    /// A model-routed request takes its dialect from **this candidate's path**, not the row and
-    /// not the provider. Mixed-wire rows (Claude → OpenRouter Chat Completions) would otherwise
-    /// parse a Chat Completions reply with the Anthropic extractor — or the reverse — and emit a
-    /// zero-token billing row.
+    /// A model-routed request takes its dialect from **the serving candidate's path**: the row's
+    /// wire is the client's default, and a mixed-wire row (Claude → OpenRouter Chat Completions)
+    /// would otherwise parse a Chat Completions reply with the Anthropic extractor, or the reverse,
+    /// and emit a zero-token billing row. The assertions below check the derivation from the path
+    /// only; the provider's own wire is not what they exercise.
     #[test]
     fn a_model_route_takes_its_dialect_from_the_serving_candidate_path() {
         let openrouter = providers::by_id(providers::ProviderId::OpenRouter);
@@ -8341,6 +8357,38 @@ mod tests {
         // The old derivation (row.wire, or provider.wire) is wrong for this fallback:
         assert_eq!(row.wire, Dialect::Anthropic);
         assert_eq!(openrouter.wire, Dialect::OpenAi);
+
+        // The production derivation: serving the request from each arm sets the dialect from that
+        // arm's path. Both attempts start from the row's wire, as `request_filter` leaves them.
+        let serving = |candidate: usize| {
+            let mut rc = test_ctx(true);
+            rc.auto = Some(Box::new(ModelRouting {
+                route: row,
+                sub: None,
+                candidate: u8::try_from(candidate).unwrap(),
+                usable: 0b11,
+                walk: control::Walk::identity(row.candidates.len()),
+                arms: row.candidates,
+                session_field: None,
+                attempt_start: Instant::now(),
+                cache: None,
+                translate: None,
+                health: None,
+                addrs: 0,
+                attempted: false,
+                open_retry_after: None,
+                priority: false,
+            }));
+            rc.dialect = row.wire;
+            apply_serving_candidate(&mut rc);
+            rc.dialect
+        };
+        assert_eq!(serving(0), Dialect::Anthropic, "the Messages primary");
+        assert_eq!(
+            serving(row.candidates.len() - 1),
+            Dialect::OpenAi,
+            "the OpenRouter Chat arm of a Claude row"
+        );
     }
 
     /// Only a 401 walks and cools a key; 401, 402 and 403 are all catalog refusals. A 403's body
