@@ -3227,6 +3227,19 @@ server fetching URLs the _model_ chose. Because a plain fetch is read-only (in `
   before any DNS; redirects are followed manually (`Policy::none()`, capped at 5) so each hop is
   re-validated, which also blocks an `http → file:` scheme downgrade.
 
+Each followed hop is rewritten the way the fetch spec (and browsers and curl) rewrite it
+(`web::Hop::follow`): a 303, or a 301/302 answering a `POST`, becomes a `GET` with no body and no
+`Content-*` headers, while a 307/308 keeps the method and body. When the scheme, host or port changes,
+every caller-supplied header except `Accept`, `Accept-Language` and `User-Agent` is dropped for the rest
+of the chain — an allow-list, because a header's name (`X-Api-Key`, a bespoke token header) says
+nothing reliable about whether it carries a credential. And a hop that would still send data (a method
+other than `GET`/`HEAD`, or a body) to a different origin is **refused**, with an error naming the new
+URL: approval for a data-sending call is keyed on the origin the model named (`approval::scope_key`),
+so following a cross-origin 307/308 would deliver the approved body somewhere nobody approved. The
+model calls the new URL itself, as its own call, through the gate. (Carrying the approval forward per
+hop was rejected: the tool would need the gate inside it, and a human asked mid-call about a URL the
+model never chose has less to go on than the model's own explicit retry.)
+
 Every blocked range is an explicit octet/segment check rather than a std helper, following the IANA
 IPv4/IPv6 Special-Purpose Address Registries: every block that isn't globally reachable is refused —
 v4 `0.0.0.0/8`, loopback, RFC-1918, link-local incl. `169.254.169.254`, CGNAT `100.64/10`,

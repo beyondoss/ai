@@ -155,6 +155,11 @@ impl Fetched {
 
 impl Web {
     /// Perform the request, following redirects manually with a per-hop SSRF re-check.
+    ///
+    /// Each hop is rewritten the way browsers and curl rewrite it ([`Hop::follow`]): a 303, or a
+    /// 301/302 answering a `POST`, becomes a body-less `GET`; a hop that changes origin drops every
+    /// caller-supplied header but a short safe list; and a hop that would replay a data-sending
+    /// request to a different origin is refused rather than followed.
     async fn fetch(&self, req: &Request) -> Result<Fetched, ToolError> {
         let mut url: reqwest::Url = req
             .url
@@ -164,15 +169,20 @@ impl Web {
 
         let start = Instant::now();
         let mut redirects = 0;
+        let mut hop = Hop {
+            method: req.method.clone(),
+            headers: req.headers.clone(),
+            body: req.body.clone(),
+        };
         loop {
             let mut rb = self
                 .client()
                 .await?
-                .request(req.method.clone(), url.clone());
-            for (k, v) in &req.headers {
+                .request(hop.method.clone(), url.clone());
+            for (k, v) in &hop.headers {
                 rb = rb.header(k, v);
             }
-            if let Some(body) = &req.body {
+            if let Some(body) = &hop.body {
                 rb = rb.body(body.clone());
             }
             let resp = rb.send().await.map_err(fetch_err)?;
@@ -193,14 +203,81 @@ impl Web {
                     ToolError::Execution("redirect Location is not valid text".into())
                 })?;
                 // Resolve relative to the current URL, then re-validate scheme + host before the next hop.
-                url = url.join(location).map_err(|e| {
+                let next = url.join(location).map_err(|e| {
                     ToolError::Execution(format!("bad redirect target `{location}`: {e}"))
                 })?;
-                ssrf::validate_url(&url, &self.policy).map_err(blocked_to_err)?;
+                ssrf::validate_url(&next, &self.policy).map_err(blocked_to_err)?;
+                hop.follow(resp.status(), &url, &next)?;
+                url = next;
                 continue;
             }
             return finish(resp, url, start).await;
         }
+    }
+}
+
+/// Caller-supplied headers that survive a hop to a different origin. Everything else the caller set —
+/// `Authorization`, `Proxy-Authorization`, `Cookie`, an `X-Api-Key`, a bespoke token header — is
+/// dropped: a header's name says nothing reliable about whether it carries a credential, so the rule
+/// is an allow-list of headers that only describe what the client wants back, not a deny-list of
+/// known secrets.
+const CROSS_ORIGIN_SAFE_HEADERS: [&str; 3] = ["accept", "accept-language", "user-agent"];
+
+/// What the next request of a redirect chain sends.
+struct Hop {
+    method: reqwest::Method,
+    headers: Vec<(String, String)>,
+    body: Option<String>,
+}
+
+impl Hop {
+    /// Rewrite this request for the redirect `status` from `from` to `to`, per the fetch spec
+    /// (which browsers and curl follow):
+    ///
+    /// - a 303 (unless the request was a `GET`/`HEAD`), or a 301/302 answering a `POST`, becomes a
+    ///   `GET` with no body and no `Content-*` headers; a 307/308 keeps the method and body;
+    /// - when the scheme, host or port changes, every caller-supplied header outside
+    ///   [`CROSS_ORIGIN_SAFE_HEADERS`] is dropped, and stays dropped for the rest of the chain;
+    /// - a hop that would still send data (a method other than `GET`/`HEAD`, or a body) to a
+    ///   different origin is **refused**. Approval for a data-sending `web` call is keyed on the
+    ///   origin the model named (`approval::scope_key`); following a cross-origin 307/308 would send
+    ///   that approved body somewhere nobody approved. The error names the new URL so the model can
+    ///   call it explicitly — through the gate, as its own call.
+    fn follow(
+        &mut self,
+        status: reqwest::StatusCode,
+        from: &reqwest::Url,
+        to: &reqwest::Url,
+    ) -> Result<(), ToolError> {
+        use reqwest::{Method, StatusCode};
+        let to_get = match status {
+            StatusCode::SEE_OTHER => self.method != Method::GET && self.method != Method::HEAD,
+            StatusCode::MOVED_PERMANENTLY | StatusCode::FOUND => self.method == Method::POST,
+            _ => false,
+        };
+        if to_get {
+            self.method = Method::GET;
+            self.body = None;
+            self.headers
+                .retain(|(k, _)| !k.to_ascii_lowercase().starts_with("content-"));
+        }
+        if from.origin() == to.origin() {
+            return Ok(());
+        }
+        if self.body.is_some() || !matches!(self.method, Method::GET | Method::HEAD) {
+            return Err(ToolError::Execution(format!(
+                "`{from}` answered {status}, redirecting this {} to a different origin, `{to}`; \
+                 it was not resent there. To send it to that URL, call `web` with that URL \
+                 explicitly",
+                self.method
+            )));
+        }
+        self.headers.retain(|(k, _)| {
+            CROSS_ORIGIN_SAFE_HEADERS
+                .iter()
+                .any(|safe| k.eq_ignore_ascii_case(safe))
+        });
+        Ok(())
     }
 }
 
@@ -639,6 +716,206 @@ mod tests {
             web.run(json!({ "url": "file:///etc/passwd" })).await,
             Err(ToolError::InvalidInput(_))
         ));
+    }
+
+    /// A loopback server that answers `responses.len()` connections in order, one response each,
+    /// and returns every raw request it received (head and body).
+    fn serve_seq(responses: Vec<String>) -> (u16, std::thread::JoinHandle<Vec<String>>) {
+        let listener = beyond_ai_test_support::ports::listener();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            responses
+                .into_iter()
+                .map(|response| {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let req = read_request(&mut stream);
+                    stream.write_all(response.as_bytes()).unwrap();
+                    stream.flush().unwrap();
+                    req
+                })
+                .collect()
+        });
+        (port, handle)
+    }
+
+    /// Read one HTTP/1.1 request: the head, then as many body bytes as its Content-Length says.
+    fn read_request(stream: &mut std::net::TcpStream) -> String {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let n = stream.read(&mut chunk).unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            let text = String::from_utf8_lossy(&buf);
+            if let Some(end) = text.find("\r\n\r\n") {
+                let len = text[..end]
+                    .lines()
+                    .find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        k.eq_ignore_ascii_case("content-length")
+                            .then(|| v.trim().parse::<usize>().ok())?
+                    })
+                    .unwrap_or(0);
+                if buf.len() >= end + 4 + len {
+                    break;
+                }
+            }
+        }
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    fn redirect(status: &str, location: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+    }
+
+    const OK_200: &str = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+
+    fn has_header(req: &str, name: &str) -> bool {
+        req.split("\r\n\r\n").next().unwrap_or("").lines().any(|l| {
+            l.split_once(':')
+                .is_some_and(|(k, _)| k.eq_ignore_ascii_case(name))
+        })
+    }
+
+    /// The body part of a raw request.
+    fn body_of(req: &str) -> &str {
+        req.split_once("\r\n\r\n").map_or("", |(_, b)| b)
+    }
+
+    fn credentialed_post(url: String) -> Value {
+        json!({
+            "url": url,
+            "method": "POST",
+            "headers": {
+                "Authorization": "Bearer secret-token",
+                "Cookie": "session=secret-cookie",
+                "X-Api-Key": "secret-key",
+                "Content-Type": "application/json",
+                "Accept": "application/json"
+            },
+            "body": "{\"secret\":\"body\"}"
+        })
+    }
+
+    /// A 303 to another origin arrives there as a plain GET: no body, no credentials, no
+    /// caller header outside the safe list — but the safe `Accept` survives.
+    #[tokio::test]
+    async fn a_cross_origin_303_becomes_a_bare_get_without_credentials() {
+        let (b_port, b) = serve_seq(vec![OK_200.to_string()]);
+        let (a_port, a) = serve_seq(vec![redirect(
+            "303 See Other",
+            &format!("http://127.0.0.1:{b_port}/landing"),
+        )]);
+        let out = tool_allowing_loopback()
+            .run(credentialed_post(format!(
+                "http://127.0.0.1:{a_port}/submit"
+            )))
+            .await
+            .unwrap();
+        assert!(out.text.starts_with("200"), "{}", out.text);
+        let a_req = a.join().unwrap().remove(0);
+        assert!(a_req.starts_with("POST /submit"), "{a_req}");
+        assert!(has_header(&a_req, "authorization"), "{a_req}");
+        let b_req = b.join().unwrap().remove(0);
+        assert!(b_req.starts_with("GET /landing"), "{b_req}");
+        for leaked in ["authorization", "cookie", "x-api-key", "content-type"] {
+            assert!(!has_header(&b_req, leaked), "{leaked} reached B: {b_req}");
+        }
+        assert!(has_header(&b_req, "accept"), "{b_req}");
+        assert!(!b_req.contains("secret"), "{b_req}");
+        assert_eq!(body_of(&b_req), "", "{b_req}");
+    }
+
+    /// 301 and 302 answering a POST switch to GET and drop the body, even on the same origin;
+    /// same-origin hops keep the caller's headers (Content-* aside).
+    #[tokio::test]
+    async fn a_301_or_302_after_a_post_becomes_a_get_and_keeps_same_origin_headers() {
+        for status in ["301 Moved Permanently", "302 Found"] {
+            let (port, h) = serve_seq(vec![redirect(status, "/next"), OK_200.to_string()]);
+            tool_allowing_loopback()
+                .run(credentialed_post(format!("http://127.0.0.1:{port}/submit")))
+                .await
+                .unwrap();
+            let reqs = h.join().unwrap();
+            let second = &reqs[1];
+            assert!(second.starts_with("GET /next"), "{status}: {second}");
+            assert_eq!(body_of(second), "", "{status}: {second}");
+            assert!(!has_header(second, "content-type"), "{status}: {second}");
+            assert!(has_header(second, "authorization"), "{status}: {second}");
+        }
+    }
+
+    /// 307/308 keep the method and body on the same origin.
+    #[tokio::test]
+    async fn a_same_origin_307_or_308_replays_the_method_and_body() {
+        for status in ["307 Temporary Redirect", "308 Permanent Redirect"] {
+            let (port, h) = serve_seq(vec![redirect(status, "/next"), OK_200.to_string()]);
+            tool_allowing_loopback()
+                .run(credentialed_post(format!("http://127.0.0.1:{port}/submit")))
+                .await
+                .unwrap();
+            let reqs = h.join().unwrap();
+            let second = &reqs[1];
+            assert!(second.starts_with("POST /next"), "{status}: {second}");
+            assert_eq!(
+                body_of(second),
+                "{\"secret\":\"body\"}",
+                "{status}: {second}"
+            );
+            assert!(has_header(second, "authorization"), "{status}: {second}");
+        }
+    }
+
+    /// A 307/308 to another origin would send the approved body somewhere nobody approved: it is
+    /// refused, B never sees a request, and the error names the URL to call explicitly.
+    #[tokio::test]
+    async fn a_cross_origin_307_or_308_is_refused_and_names_the_new_url() {
+        for status in ["307 Temporary Redirect", "308 Permanent Redirect"] {
+            let b = beyond_ai_test_support::ports::listener();
+            b.set_nonblocking(true).unwrap();
+            let b_url = format!(
+                "http://127.0.0.1:{}/landing",
+                b.local_addr().unwrap().port()
+            );
+            let (a_port, a) = serve_seq(vec![redirect(status, &b_url)]);
+            let err = tool_allowing_loopback()
+                .run(credentialed_post(format!(
+                    "http://127.0.0.1:{a_port}/submit"
+                )))
+                .await
+                .unwrap_err();
+            a.join().unwrap();
+            assert!(err.to_string().contains(&b_url), "{status}: {err}");
+            assert!(
+                matches!(b.accept(), Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock),
+                "{status}: the body was replayed to a different origin"
+            );
+        }
+    }
+
+    /// A GET carrying a credential, redirected to another origin, follows the redirect without it.
+    #[tokio::test]
+    async fn a_cross_origin_get_redirect_drops_credentials() {
+        let (b_port, b) = serve_seq(vec![OK_200.to_string()]);
+        let (a_port, _a) = serve_seq(vec![redirect(
+            "302 Found",
+            &format!("http://127.0.0.1:{b_port}/"),
+        )]);
+        tool_allowing_loopback()
+            .run(json!({
+                "url": format!("http://127.0.0.1:{a_port}/"),
+                "headers": { "Authorization": "Bearer secret-token", "Proxy-Authorization": "x" }
+            }))
+            .await
+            .unwrap();
+        let b_req = b.join().unwrap().remove(0);
+        assert!(b_req.starts_with("GET /"), "{b_req}");
+        assert!(!has_header(&b_req, "authorization"), "{b_req}");
+        assert!(!has_header(&b_req, "proxy-authorization"), "{b_req}");
     }
 
     #[tokio::test]
