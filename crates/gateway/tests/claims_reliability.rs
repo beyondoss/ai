@@ -1422,7 +1422,8 @@ async fn every_candidate_5xx_ends_in_a_json_error_with_a_request_id() {
 async fn upstream_h2_multiplexes_concurrent_requests() {
     const N: usize = 32;
     let all_in_flight = Arc::new(tokio::sync::Barrier::new(N));
-    let (port, _conns, upstream) = counting_h2_upstream(Duration::ZERO, Some(all_in_flight)).await;
+    let (port, _conns, upstream) =
+        counting_h2_upstream(Duration::ZERO, Some(all_in_flight), None).await;
     let (pubkey, sk) = test_keypair(221);
     let gw = Gateway::builder(
         unused_nats_port(),
@@ -1464,9 +1465,11 @@ async fn upstream_h2_multiplexes_concurrent_requests() {
 
 /// A TLS H2-only upstream that answers every request after `delay` — and, given a barrier, only
 /// once that many requests are waiting at it together — and counts the connections it accepted.
+/// Given `arrivals`, it also sends one `()` per request once that request's body has arrived.
 async fn counting_h2_upstream(
     delay: Duration,
     barrier: Option<Arc<tokio::sync::Barrier>>,
+    arrivals: Option<tokio::sync::mpsc::UnboundedSender<()>>,
 ) -> (u16, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
     use http_body_util::{BodyExt, Full};
     use hyper::service::service_fn;
@@ -1487,15 +1490,19 @@ async fn counting_h2_upstream(
     let task = tokio::spawn(async move {
         while let Ok((s, _)) = listener.accept().await {
             counter.fetch_add(1, Ordering::SeqCst);
-            let (acceptor, barrier) = (acceptor.clone(), barrier.clone());
+            let (acceptor, barrier, arrivals) =
+                (acceptor.clone(), barrier.clone(), arrivals.clone());
             tokio::spawn(async move {
                 let Ok(tls) = acceptor.accept(s).await else {
                     return;
                 };
                 let svc = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
-                    let barrier = barrier.clone();
+                    let (barrier, arrivals) = (barrier.clone(), arrivals.clone());
                     async move {
                         let _ = req.into_body().collect().await;
+                        if let Some(a) = &arrivals {
+                            let _ = a.send(());
+                        }
                         tokio::time::sleep(delay).await;
                         if let Some(b) = barrier {
                             b.wait().await;
@@ -1517,15 +1524,23 @@ async fn counting_h2_upstream(
     (port, conns, task)
 }
 
-/// Concurrent requests to an H2 provider share connections instead of opening one each. Pingora
-/// allows one stream per upstream H2 connection unless told otherwise, so 32 concurrent requests
-/// opened 32 TLS connections to the provider: no multiplexing at all (D160, found live against
-/// OpenAI and Anthropic by `REL-22::raw::*::h2_burst`).
+/// A request to an H2 provider rides the connection already open to it while that connection has
+/// stream room. Pingora allows one stream per upstream H2 connection unless told otherwise, so a
+/// second request during the first opened its own TLS connection (D160, found live against OpenAI
+/// and Anthropic by `REL-22::raw::*::h2_burst`).
+///
+/// The second request starts only once the upstream has the first one's body, so the first
+/// connection is back in pingora's pool with stream room, and the count is exact: zero new
+/// connections. (Requests that arrive in the same instant can race each other, since pingora has no
+/// single-flight for connects and a new connection is pooled only after its handshake. So this
+/// asserts the property, not a burst's count.)
 /// claim: REL-22
 /// defect: D160
 #[tokio::test]
 async fn concurrent_requests_share_an_upstream_h2_connection() {
-    let (port, conns, task) = counting_h2_upstream(Duration::from_millis(400), None).await;
+    let (arrived_tx, mut arrived) = tokio::sync::mpsc::unbounded_channel();
+    let (port, conns, task) =
+        counting_h2_upstream(Duration::from_millis(400), None, Some(arrived_tx)).await;
     let (pubkey, sk) = test_keypair(224);
     let gw = Gateway::builder(
         unused_nats_port(),
@@ -1541,34 +1556,30 @@ async fn concurrent_requests_share_an_upstream_h2_connection() {
     let path = "/openai/v1/chat/completions";
     // One request first: the steady state, where a connection to the provider is already open.
     assert_eq!(status_of(&gw, path, &key, CHAT).await, 200);
+    arrived.recv().await.expect("the upstream is running");
     let before = conns.load(Ordering::SeqCst);
-    let mut tasks = Vec::new();
-    for _ in 0..32 {
-        let (url, key) = (gw.url(), key.clone());
-        tasks.push(tokio::spawn(async move {
-            test_client()
-                .post(format!("{url}{path}"))
-                .header("authorization", format!("Bearer {key}"))
-                .header("content-type", "application/json")
-                .body(CHAT)
-                .send()
-                .await
-                .map(|r| r.status().as_u16())
-                .unwrap_or(0)
-        }));
-    }
-    let mut statuses = Vec::new();
-    for t in tasks {
-        statuses.push(t.await.unwrap());
-    }
+    let post = |url: String, key: String| async move {
+        test_client()
+            .post(format!("{url}{path}"))
+            .header("authorization", format!("Bearer {key}"))
+            .header("content-type", "application/json")
+            .body(CHAT)
+            .send()
+            .await
+            .map(|r| r.status().as_u16())
+            .unwrap_or(0)
+    };
+    let first = tokio::spawn(post(gw.url(), key.clone()));
+    arrived.recv().await.expect("the upstream is running");
+    let second = tokio::spawn(post(gw.url(), key.clone()));
+    let (first, second) = (first.await.unwrap(), second.await.unwrap());
     let opened = conns.load(Ordering::SeqCst) - before;
     task.abort();
-    assert!(statuses.iter().all(|s| *s == 200), "{statuses:?}");
-    // Requests that arrive together, before the open connection is back in pingora's pool as one
-    // with room, each open their own (measured: 0-10 of 32), so this bounds sharing, not a count.
-    assert!(
-        opened <= 16,
-        "32 concurrent requests opened {opened} new upstream H2 connections (plus {before} before)"
+    assert_eq!((first, second), (200, 200), "both requests must be served");
+    assert_eq!(
+        opened, 0,
+        "the second request opened {opened} new upstream H2 connection(s) while the first was \
+         in flight on the open one"
     );
 }
 
