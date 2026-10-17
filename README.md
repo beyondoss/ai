@@ -3,10 +3,10 @@
 Open-source AI at Beyond — a Cargo workspace:
 
 - **`crates/gateway`** (`beyond-ai`) — the LLM egress gateway. Route LLM traffic through one internal proxy; apps use their stock OpenAI or Anthropic SDK unchanged — the gateway authenticates, swaps in the real provider key, and meters every token.
-- **`crates/agent-core`** (`beyond-ai-agent-core`) — the agent harness core: a runtime/network-agnostic tool-calling loop (modeled on [pi](https://github.com/badlogic/pi-mono)), the OpenAI/Anthropic wire dialects, and the `ModelTransport`/`Tool` seams. Routes all model traffic through the gateway.
-- **`crates/agent`** (`beyond-ai-agent`) — the agent CLI: `run` (one-shot coding task) and `serve` (headless control protocol over stdio, for remote control over SSH). Ships the coding tools (read/write/edit/bash/ls/grep/find) plus `todo` and `web`. Vendor-neutral: `--exec-url` points the whole toolset at any remote exec endpoint.
+- **`crates/agent-core`** (`beyond-ai-agent-core`) — the agent harness core: a runtime/network-agnostic tool-calling loop (modeled on [pi](https://github.com/badlogic/pi-mono)), the OpenAI/Anthropic wire dialects, and the `ModelTransport`/`Tool` seams. Routes model traffic through the gateway, or straight to a provider when none is configured.
+- **`crates/agent`** (`beyond-ai-agent`) — the agent CLI: `run` (one-shot coding task) and `serve` (headless control protocol over stdio, for remote control over SSH, or over a WebSocket/HTTP or Unix socket). Ships the coding tools (read/write/edit/bash/ls/grep/find) plus `bash_job`, `todo` and an opt-in `web`. Vendor-neutral: `--exec-url` points the whole toolset at any remote exec endpoint.
 
-The gateway is the unified model API: the agent speaks OpenAI/Anthropic wire to it with a `bai_v1` key and never holds a provider key. See each crate's `ARCHITECTURE.md`.
+The gateway is the unified model API: routed through it, the agent speaks OpenAI/Anthropic wire to it with a `bai_v1` key and never holds a provider key. See each crate's `ARCHITECTURE.md`.
 
 ## Gateway Quick Start
 
@@ -56,7 +56,7 @@ never send references. See `crates/gateway/ARCHITECTURE.md`, "Stored-response re
 ## Agent Quick Start
 
 **The gateway is optional.** Export a provider key and the agent goes straight to that provider — no
-gateway, no extra config. The auth header (`x-api-key` for Anthropic, `Authorization: Bearer` for
+gateway, no extra config. The auth header (`x-api-key` for Anthropic and Bedrock, `Authorization: Bearer` for
 everyone else) comes from the provider table; you never spell it out.
 
 ```sh
@@ -107,14 +107,14 @@ curl -D- -H 'Content-Type: application/json' \
 or `AI_AGENT_KEY` is set — the `http://ai.internal` default is a fallback, not configuration. With one
 configured, the gateway is used (unless `AI_DIRECT=1`). Otherwise, routing is direct, in this order:
 
-1. a `models.json` `base_url` override for the exact model id
+1. a `models.json` `base_url` override for the exact model id (this one bypasses a configured gateway too)
 2. `AI_BASE_URL` + `AI_API_KEY`
 3. `AI_PROVIDER` + that provider's key
 4. a stored OAuth login (`agent login`) — **above** an ambient key, so a stray `ANTHROPIC_API_KEY` in
    your shell never silently moves a subscription onto pay-per-token billing
 5. the provider key for whichever provider natively serves the model id
 
-Tools: `read`, `write`, `edit`, `bash`, `ls`, `grep`, `find` (pi's coding set), plus `todo` and `web`. See [crates/agent-core/ARCHITECTURE.md](crates/agent-core/ARCHITECTURE.md).
+Tools: `read`, `write`, `edit`, `bash`, `ls`, `grep`, `find` (pi's coding set), plus `bash_job` and `todo`; `web` is opt-in (`--tools`). See [crates/agent-core/ARCHITECTURE.md](crates/agent-core/ARCHITECTURE.md).
 
 ### Which session you get
 
@@ -408,7 +408,7 @@ docker run --rm -p 8080:8080 \
 
   ```sh
   curl -fsS http://127.0.0.1:8080/livez   # 200 once the process is serving
-  curl -isS http://127.0.0.1:8080/readyz  # 200 ready, or 503 {"reason":"shard a07-s2: not writable"}
+  curl -isS http://127.0.0.1:8080/readyz  # 200 ready, or 503 {"status":"not ready","reason":"shard a07-s2: not writable"}
   ```
 
   Wire `/readyz` to the readiness probe and `/livez` to the liveness one, never the reverse:
@@ -423,9 +423,9 @@ docker run --rm -p 8080:8080 \
 - **`GET /v1/models` with a managed key lists what this deployment can serve**: the catalog rows with at least one candidate whose provider has a pool key configured. A row whose primary provider is unkeyed but whose fallback is keyed is still listed. The body is built once at boot. A BYO key gets its provider's own list (see above); nothing serves the full, unfiltered catalog.
 - **12 providers, zero config**: openai, anthropic, openrouter, fireworks, groq, deepseek, together, cerebras, mistral, xai, bedrock and openai-codex (BYO only). Add more in `config.toml` under `[provider_authorities]`.
 - **Streams responses**: SSE is relayed event by event and never held whole. A 64 KB tail taps usage. Request bodies are buffered where routing needs them: managed catalog walks (to rewrite `model`), usage injection on managed OpenAI streams, Responses, bodies over 64 KB, and translated non-stream responses (up to 32 MiB).
-- **List prices on the catalog, token facts on the request**: `GET /v1/models` publishes a standard list price for every catalog model (USD per million tokens). `ai.usage` stays token counts (stdout → logfwd/OTLP → ClickHouse). A closed downstream consumer applies that card, or a contract rate. Slipstream (NATS) carries the deny-set, the allowance-set and the capture-set.
+- **List prices on the catalog, token facts on the request**: `GET /v1/models` publishes a standard list price for every catalog model (USD per million tokens). Each `ai.usage` row (stdout → logfwd/OTLP → ClickHouse) carries its token counts and their price, from `providers::pricing`: pass-through at the serving host's card, so `price_micros == cost_micros` (see `crates/providers/ARCHITECTURE.md`). Slipstream (NATS) carries the deny-set, the allowance-set and the capture-set.
 - **Guardrails**: a per-key request ceiling (`rate_limit_rps`), an optional per-tenant concurrency cap, and a per-provider circuit breaker that stops sending traffic to a provider returning 5xx or failing to connect. The deny-set and allowance-set own spend control.
-- **NATS outages**: the deny-set fails open (a NATS outage stales it; existing allows stay allowed). The allowance-set fails closed: until it has been read once, from NATS or an on-disk snapshot, managed requests get 402 `allowance unavailable`. Run NATS (or seed `snapshot_path`) before serving managed traffic.
+- **NATS outages**: the deny-set fails open (a NATS outage stales it; existing allows stay allowed). The allowance-set fails closed: until it has been read once, from NATS or an on-disk snapshot, managed requests get 503 `allowance unavailable` (`Retry-After: 5`). Run NATS (or seed `snapshot_path`) before serving managed traffic.
 
 ## Providers
 
