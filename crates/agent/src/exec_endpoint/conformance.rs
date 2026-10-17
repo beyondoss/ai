@@ -24,6 +24,8 @@
 use std::time::{Duration, Instant};
 
 use super::HttpExecRunner;
+use super::jobs::{JobEvent, JobId, JobScope, JobSpec, JobStatus, SandboxJobs as _};
+use super::jobs_native::NativeJobs;
 use super::stream::{self, Frame, FrameReader, HEARTBEAT_INTERVAL};
 
 /// What the verifier holds the endpoint to. [`Default`] is the spec; a test of the verifier itself
@@ -68,6 +70,8 @@ pub struct Check {
 pub struct Report {
     /// The endpoint answered `"stream": true` with a v1.2 stream.
     pub streams: bool,
+    /// The endpoint offers sandbox jobs natively (v1.3).
+    pub jobs: bool,
     pub checks: Vec<Check>,
 }
 
@@ -86,8 +90,10 @@ impl Report {
     pub fn render(&self) -> String {
         let mut out = format!(
             "exec endpoint: {}\n",
-            if self.streams {
-                "v1.2 (streams)"
+            if self.jobs {
+                "v1.3 (streams, and runs sandbox jobs itself)"
+            } else if self.streams {
+                "v1.2 (streams; sandbox jobs run on plain exec commands)"
             } else {
                 "v1.1 (no streaming: `bash` waits for every command to exit, cannot yield a silent \
                  one, and cannot kill one)"
@@ -116,6 +122,15 @@ pub const TIMEOUT: &str = "timeout kills the process group";
 pub const HEARTBEAT: &str = "heartbeat during silence";
 pub const DISCONNECT: &str = "disconnect kills the process group";
 pub const LEFTOVERS: &str = "leftover processes keep the stream open";
+pub const JOBS: &str = "sandbox jobs offered (v1.3)";
+pub const JOBS_HELD: &str = "a held job streams its output and ends";
+pub const JOBS_HOLD: &str = "a dropped hold kills a job nobody kept";
+pub const JOBS_KEEP: &str = "a kept job outlives its hold and reads back from an offset";
+pub const JOBS_KILL: &str = "kill stops a job's group and removes it";
+pub const JOBS_SCOPE: &str = "list and wipe stay inside their scope";
+
+/// Every v1.3 check after the capability itself.
+const JOB_CHECKS: [&str; 5] = [JOBS_HELD, JOBS_HOLD, JOBS_KEEP, JOBS_KILL, JOBS_SCOPE];
 
 /// Run every check against the endpoint at `url`.
 pub async fn verify(url: &str, headers: &[(String, String)], expect: &Expectations) -> Report {
@@ -124,6 +139,7 @@ pub async fn verify(url: &str, headers: &[(String, String)], expect: &Expectatio
         Err(e) => {
             return Report {
                 streams: false,
+                jobs: false,
                 checks: vec![fail(ENVELOPE, e)],
             };
         }
@@ -176,7 +192,14 @@ pub async fn verify(url: &str, headers: &[(String, String)], expect: &Expectatio
         ] {
             checks.push(skip(name, "not a v1.2 endpoint"));
         }
-        return Report { streams, checks };
+        for name in std::iter::once(JOBS).chain(JOB_CHECKS) {
+            checks.push(skip(name, "not a v1.2 endpoint"));
+        }
+        return Report {
+            streams,
+            jobs: false,
+            checks,
+        };
     }
     checks.push(v.incremental().await);
     checks.push(v.bytes().await);
@@ -186,7 +209,31 @@ pub async fn verify(url: &str, headers: &[(String, String)], expect: &Expectatio
     // The slow checks wait on timers, not on each other.
     let (t, h, d, l) = tokio::join!(v.timeout(), v.heartbeat(), v.disconnect(), v.leftovers());
     checks.extend([t, h, d, l]);
-    Report { streams, checks }
+    let jobs = v.runner.offers_jobs().await;
+    if jobs {
+        checks.push(pass(JOBS, "answered the probe with `{\"jobs\": \"v1.3\"}`"));
+        let (held, hold, keep, kill, scope) = tokio::join!(
+            v.jobs_held(),
+            v.jobs_hold(),
+            v.jobs_keep(),
+            v.jobs_kill(),
+            v.jobs_scope()
+        );
+        checks.extend([held, hold, keep, kill, scope]);
+    } else {
+        checks.push(skip(
+            JOBS,
+            "not offered: the agent runs sandbox jobs with plain exec commands instead",
+        ));
+        for name in JOB_CHECKS {
+            checks.push(skip(name, "sandbox jobs are not offered"));
+        }
+    }
+    Report {
+        streams,
+        jobs,
+        checks,
+    }
 }
 
 fn pass(name: &'static str, detail: impl Into<String>) -> Check {
@@ -771,6 +818,381 @@ impl Verifier {
                  the process group whenever the connection closes before the final frame",
             ),
             Err(e) => fail(LEFTOVERS, e),
+        }
+    }
+}
+
+/// The v1.3 checks: every operation through the agent's own client ([`NativeJobs`]), with the far
+/// side's processes observed by v1.1 requests, never taken on trust.
+impl Verifier {
+    fn scope(&self, which: &str) -> JobScope {
+        JobScope::under(
+            super::jobs::JOBS_ROOT,
+            format!("conformance-{}-{which}", self.nonce),
+        )
+    }
+
+    fn spec(script: &str) -> JobSpec {
+        JobSpec {
+            program: "sh".into(),
+            args: Self::args(script),
+            cwd: None,
+            label: script.into(),
+        }
+    }
+
+    /// Whether group `pgid` has a live (non-zombie) member, asked of the far side.
+    async fn group_alive(&self, pgid: u32) -> Result<bool, String> {
+        let script = format!(
+            "kill -0 -{pgid} 2>/dev/null || exit 1; [ -d /proc/self ] || exit 0; \
+             for f in /proc/[0-9]*/stat; do read -r t <\"$f\" 2>/dev/null || continue; \
+             t=${{t##*) }}; set -- $t; [ \"$3\" = {pgid} ] && [ \"$1\" != Z ] && exit 0; done; exit 1"
+        );
+        Ok(self.sh(&script).await?.exit_code == 0)
+    }
+
+    /// Wait (bounded) for group `pgid` to be gone; how long it took.
+    async fn wait_gone(&self, pgid: u32, within: Duration) -> Result<Option<Duration>, String> {
+        let started = Instant::now();
+        loop {
+            if !self.group_alive(pgid).await? {
+                return Ok(Some(started.elapsed()));
+            }
+            if started.elapsed() > within {
+                return Ok(None);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    async fn jobs_held(&self) -> Check {
+        let jobs = NativeJobs::over(&self.runner);
+        let scope = self.scope("held");
+        let id = JobId::fresh();
+        let heard = std::sync::Mutex::new((None::<u32>, Vec::<u8>::new(), Option::<Instant>::None));
+        let started = Instant::now();
+        let events = |e: JobEvent<'_>| {
+            let mut h = heard.lock().unwrap_or_else(|e| e.into_inner());
+            match e {
+                JobEvent::Started(p) => h.0 = Some(p),
+                JobEvent::Output(b) => {
+                    h.1.extend_from_slice(b);
+                    h.2.get_or_insert_with(Instant::now);
+                }
+                _ => {}
+            }
+        };
+        let r = jobs
+            .run_held(&scope, &id, &Self::spec(stream::PROBE_SCRIPT), &events)
+            .await;
+        let _ = jobs.wipe(&scope).await;
+        let (pgid, out, first) = heard.into_inner().unwrap_or_else(|e| e.into_inner());
+        match r {
+            Ok(0) if pgid.is_some() && out == b"ab" => {
+                let lead =
+                    first.map(|f| started.elapsed().saturating_sub(f.duration_since(started)));
+                match lead {
+                    Some(l) if l >= stream::PROBE_MIN_GAP => pass(
+                        JOBS_HELD,
+                        format!(
+                            "`started`, then `ab` live ({} ms before the end), then exit 0",
+                            l.as_millis()
+                        ),
+                    ),
+                    _ => fail(
+                        JOBS_HELD,
+                        "the output arrived all at once with the end: not live",
+                    ),
+                }
+            }
+            Ok(code) => fail(
+                JOBS_HELD,
+                format!(
+                    "want `started`, output `ab` and exit 0; got started {pgid:?}, output {:?}, exit {code}",
+                    String::from_utf8_lossy(&out)
+                ),
+            ),
+            Err(e) => fail(JOBS_HELD, e.to_string()),
+        }
+    }
+
+    async fn jobs_hold(&self) -> Check {
+        let jobs = NativeJobs::over(&self.runner);
+        let scope = self.scope("hold");
+        let id = JobId::fresh();
+        let started = std::sync::Mutex::new(None::<u32>);
+        let events = |e: JobEvent<'_>| {
+            if let JobEvent::Started(p) = e {
+                *started.lock().unwrap_or_else(|e| e.into_inner()) = Some(p);
+            }
+        };
+        let spec = Self::spec("sleep 60 & sleep 60");
+        let run = jobs.run_held(&scope, &id, &spec, &events);
+        let seen = async {
+            loop {
+                if let Some(p) = *started.lock().unwrap_or_else(|e| e.into_inner()) {
+                    return p;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        let pgid = tokio::select! {
+            r = run => return fail(JOBS_HOLD, format!("the job ended early: {r:?}")),
+            p = tokio::time::timeout(Duration::from_secs(10), seen) => match p {
+                Ok(p) => p,
+                Err(_) => return fail(JOBS_HOLD, "no `started` frame within 10 s"),
+            },
+        };
+        // The hold is dropped with `run`.
+        let check = match self.wait_gone(pgid, self.expect.kill_within).await {
+            Ok(Some(after)) => pass(
+                JOBS_HOLD,
+                format!(
+                    "the group was gone {} ms after the hold closed",
+                    after.as_millis()
+                ),
+            ),
+            Ok(None) => fail(
+                JOBS_HOLD,
+                format!(
+                    "the job still ran {} ms after its hold closed: a held job nobody kept must die \
+                     with its connection",
+                    self.expect.kill_within.as_millis()
+                ),
+            ),
+            Err(e) => fail(JOBS_HOLD, e),
+        };
+        let _ = jobs.wipe(&scope).await;
+        check
+    }
+
+    async fn jobs_keep(&self) -> Check {
+        let check = self.jobs_keep_inner().await;
+        let _ = NativeJobs::over(&self.runner)
+            .wipe(&self.scope("keep"))
+            .await;
+        check
+    }
+
+    async fn jobs_keep_inner(&self) -> Check {
+        let jobs = NativeJobs::over(&self.runner);
+        let scope = self.scope("keep");
+        let id = JobId::fresh();
+        let heard = std::sync::Mutex::new((None::<u32>, Vec::<u8>::new()));
+        let events = |e: JobEvent<'_>| {
+            let mut h = heard.lock().unwrap_or_else(|e| e.into_inner());
+            match e {
+                JobEvent::Started(p) => h.0 = Some(p),
+                JobEvent::Output(b) => h.1.extend_from_slice(b),
+                _ => {}
+            }
+        };
+        let spec = Self::spec("printf one; sleep 1; printf two; sleep 60");
+        let mut run = Box::pin(jobs.run_held(&scope, &id, &spec, &events));
+        // Boxed, not stack-pinned: dropping it below must really close the hold.
+        let ready = async {
+            loop {
+                if heard.lock().unwrap_or_else(|e| e.into_inner()).1 == b"one" {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        tokio::select! {
+            r = &mut run => return fail(JOBS_KEEP, format!("the job ended early: {r:?}")),
+            r = tokio::time::timeout(Duration::from_secs(10), ready) => if r.is_err() {
+                return fail(JOBS_KEEP, "no `one` within 10 s");
+            },
+        }
+        if let Err(e) = jobs.keep(&scope, &id, 7, "background", 3).await {
+            return fail(JOBS_KEEP, format!("keep: {e}"));
+        }
+        drop(run);
+        let Some(pgid) = heard.lock().unwrap_or_else(|e| e.into_inner()).0 else {
+            return fail(JOBS_KEEP, "no `started` frame");
+        };
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        match self.group_alive(pgid).await {
+            Ok(true) => {}
+            Ok(false) => return fail(JOBS_KEEP, "the kept job died when its hold closed"),
+            Err(e) => return fail(JOBS_KEEP, e),
+        }
+        let listed = match jobs.list(&scope).await {
+            Ok(l) => l,
+            Err(e) => return fail(JOBS_KEEP, format!("list: {e}")),
+        };
+        match listed.iter().find(|j| j.id == id) {
+            Some(j)
+                if j.kept
+                    && j.num == Some(7)
+                    && j.kind.as_deref() == Some("background")
+                    && j.seen == 3
+                    && j.status == JobStatus::Running => {}
+            other => {
+                return fail(
+                    JOBS_KEEP,
+                    format!(
+                        "list should show it running, kept as job 7 (background, seen 3): {other:?}"
+                    ),
+                );
+            }
+        }
+        let mut later = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while later != b"two" && Instant::now() < deadline {
+            match jobs.read(&scope, &id, 3, 1024).await {
+                Ok(c) => later = c.data,
+                Err(e) => return fail(JOBS_KEEP, format!("read: {e}")),
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        if later != b"two" {
+            return fail(
+                JOBS_KEEP,
+                format!(
+                    "read from offset 3 gave {:?}, want \"two\"",
+                    String::from_utf8_lossy(&later)
+                ),
+            );
+        }
+        let follow = std::sync::Mutex::new(Vec::new());
+        let events = |e: JobEvent<'_>| {
+            if let JobEvent::Output(b) = e {
+                follow
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .extend_from_slice(b);
+            }
+        };
+        let attach = jobs.follow(&scope, &id, 3, &events);
+        let got_two = async {
+            loop {
+                if follow.lock().unwrap_or_else(|e| e.into_inner()).as_slice() == b"two" {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        tokio::select! {
+            r = attach => return fail(JOBS_KEEP, format!("attach ended early: {r:?}")),
+            r = tokio::time::timeout(Duration::from_secs(5), got_two) => if r.is_err() {
+                return fail(JOBS_KEEP, "attach from offset 3 did not stream \"two\"");
+            },
+        }
+        // Closing an attach must not kill.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        match self.group_alive(pgid).await {
+            Ok(true) => pass(
+                JOBS_KEEP,
+                "survived its hold, listed as kept job 7, read and attached from offset 3, and an \
+                 attach that closed did not kill it",
+            ),
+            Ok(false) => fail(JOBS_KEEP, "closing an attach killed the job"),
+            Err(e) => fail(JOBS_KEEP, e),
+        }
+    }
+
+    async fn jobs_kill(&self) -> Check {
+        let jobs = NativeJobs::over(&self.runner);
+        let scope = self.scope("kill");
+        let id = JobId::fresh();
+        let check = async {
+            let pgid = jobs
+                .start_kept(
+                    &scope,
+                    &id,
+                    &Self::spec("trap '' TERM; sleep 60 & sleep 60 & wait"),
+                )
+                .await
+                .map_err(|e| format!("start: {e}"))?;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            if !self.group_alive(pgid).await? {
+                return Err("the job was not running".to_string());
+            }
+            let survivors = jobs
+                .kill(&scope, std::slice::from_ref(&id), true)
+                .await
+                .map_err(|e| format!("kill: {e}"))?;
+            if !survivors.is_empty() {
+                return Err(format!("survivors reported: {survivors:?}"));
+            }
+            if self.group_alive(pgid).await? {
+                return Err(
+                    "the group still runs after kill answered (a job that ignores SIGTERM \
+                            must get SIGKILL)"
+                        .to_string(),
+                );
+            }
+            let gone = jobs
+                .read(&scope, &id, 0, 1)
+                .await
+                .map_err(|e| format!("read: {e}"))?;
+            if gone.status != JobStatus::Gone {
+                return Err(format!(
+                    "a removed job reads as {:?}, want gone",
+                    gone.status
+                ));
+            }
+            Ok(
+                "SIGTERM ignored, SIGKILL followed; the group was gone when kill answered, and the \
+                job then read as gone",
+            )
+        }
+        .await;
+        let _ = jobs.wipe(&scope).await;
+        match check {
+            Ok(d) => pass(JOBS_KILL, d),
+            Err(e) => fail(JOBS_KILL, e),
+        }
+    }
+
+    async fn jobs_scope(&self) -> Check {
+        let jobs = NativeJobs::over(&self.runner);
+        let (a, b) = (self.scope("scope-a"), self.scope("scope-b"));
+        let check = async {
+            let mut mine = Vec::new();
+            for _ in 0..2 {
+                mine.push(
+                    jobs.start_kept(&a, &JobId::fresh(), &Self::spec("sleep 60"))
+                        .await
+                        .map_err(|e| format!("start: {e}"))?,
+                );
+            }
+            let theirs = jobs
+                .start_kept(&b, &JobId::fresh(), &Self::spec("sleep 60"))
+                .await
+                .map_err(|e| format!("start: {e}"))?;
+            let (la, lb) = (
+                jobs.list(&a).await.map_err(|e| e.to_string())?,
+                jobs.list(&b).await.map_err(|e| e.to_string())?,
+            );
+            if la.len() != 2 || lb.len() != 1 {
+                return Err(format!(
+                    "list gave {} and {} jobs, want 2 and 1",
+                    la.len(),
+                    lb.len()
+                ));
+            }
+            jobs.wipe(&a).await.map_err(|e| format!("wipe: {e}"))?;
+            for g in mine {
+                if self.group_alive(g).await? {
+                    return Err("a wiped scope's job still runs".to_string());
+                }
+            }
+            if !jobs.list(&a).await.map_err(|e| e.to_string())?.is_empty() {
+                return Err("a wiped scope still lists jobs".to_string());
+            }
+            if !self.group_alive(theirs).await? {
+                return Err("wiping one scope killed another's job".to_string());
+            }
+            Ok("two scopes listed apart; wiping one killed its jobs and left the other's running")
+        }
+        .await;
+        let _ = jobs.wipe(&a).await;
+        let _ = jobs.wipe(&b).await;
+        match check {
+            Ok(d) => pass(JOBS_SCOPE, d),
+            Err(e) => fail(JOBS_SCOPE, e),
         }
     }
 }

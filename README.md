@@ -191,8 +191,7 @@ build from a hung one, and can't stop a command it has given up on. Locally, a c
 silent for 60 s (or outlasts the model's `timeout_ms`) returns to the model as a numbered job that
 `bash_job` can wait on or kill, and `run_in_background` starts a server or watcher as one. v1.2
 makes the same true remotely, and keeps your endpoint stateless: **the connection is the command's
-lifetime.** Over v1.1 the agent refuses `run_in_background` rather than start something it could
-never stop.
+lifetime.** (Background jobs outlive connections anyway — see "Sandbox jobs" below.)
 
 When the request carries `"stream": true`, answer `200` with `Content-Type: application/x-ndjson`
 and one JSON frame per line:
@@ -240,6 +239,46 @@ AGENT_CONFORMANCE_EXEC_HEADER='Authorization: Bearer …' \
 ```
 
 The decoding vectors are in `crates/agent/tests/fixtures/exec/v1.2-frames.json`.
+
+#### Sandbox jobs: background work that outlives the agent's replica
+
+A job the model meant to keep — `run_in_background`, or a `server &` its command left running —
+belongs to the **sandbox**, not to whichever agent replica started it: it runs until it exits, the
+model or user kills it, or its session ends. A reaped, redeployed or failed-over replica only lets
+go of it; the next replica to open the session lists the job, reports it still running under its
+number, reads its output from where the model left off, and can kill it. A job that ended while no
+replica was attached is reported once, as an ordinary finish notice.
+
+**Your endpoint needs nothing for this.** The agent builds it out of ordinary commands — a directory
+per job under `/tmp/beyond-jobs/`, a `setsid` supervisor, and a relay that keeps the last 8 MiB of
+output in offset-named chunks — using `sh`, `setsid`, `mkfifo`, `tee`, `dd`, `wc`, `base64` and
+`date`, all of which busybox has. It works over v1.1 too, so `run_in_background` works there (by
+polling). Two things matter: **keep `/tmp` for the life of the sandbox**, and **let a process that
+leaves the command's process group (`setsid`) outlive the request**. When the sandbox's lifetime
+ends (you tear it down), its jobs end with it.
+
+**v1.3 (optional): run jobs yourself.** If you would rather keep jobs your own way — your platform
+has background commands with reconnectable handles, say — answer requests that carry a `"job"`
+object. The agent probes with `{"command": "sh", "args": ["-c", "printf exec-v1.2"], …, "job":
+{"op": "probe"}}`; answer `{"jobs": "v1.3"}`, and every job operation then comes to you:
+
+```jsonc
+// start, held: the job lives as long as this stream unless kept
+{"command": "sh", "args": ["-c", "npm run dev"], "cwd": "/work", "stream": true,
+ "job": {"op": "start", "scope": "9f2c…", "id": "4a7e…", "hold": true, "label": "npm run dev"}}
+// → {"started": 4242} {"stdout": "…"} … {"shell_exit": 0}? … {"exit_code": 0}
+{"command": "true", "args": [], "job": {"op": "keep", "scope": "9f2c…", "id": "4a7e…", "num": 1, "kind": "background", "seen": 120}}
+{"command": "true", "args": [], "stream": true, "job": {"op": "attach", "scope": "9f2c…", "id": "4a7e…", "offset": 120}}
+// → {"gap": n}? {"stdout": "…"} … {"exit_code": 0}
+// read, kill, list, remove, wipe, seen: one JSON answer each
+```
+
+The full table — scopes, states, what `kill` must and must not signal, which frames a job stream
+adds to v1.2's — is the "Sandbox jobs (v1.3)" section of `crates/agent/src/exec_endpoint.rs`. The
+conformance run above checks it when you offer it (a dropped hold must kill an unkept job, a kept one
+must survive and read back from an offset, `kill` must reach a job that ignores `SIGTERM`, and
+`list`/`wipe` must stay inside their scope). The decoding vectors are in
+`crates/agent/tests/fixtures/exec/v1.3-jobs.json`.
 
 #### Multi-tenant `serve`
 

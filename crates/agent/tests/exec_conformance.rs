@@ -13,8 +13,8 @@
 //! checks are then skipped). Skipped when the URL is unset.
 //!
 //! **Against the in-repo mock endpoints**, always: the verifier must pass a conforming endpoint and
-//! fail each of the ways an endpoint gets v1.2 wrong — otherwise a green run against a real endpoint
-//! would mean nothing.
+//! fail each of the ways an endpoint gets v1.2 or v1.3 wrong — otherwise a green run against a real
+//! endpoint would mean nothing.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod common;
@@ -58,13 +58,75 @@ async fn a_conforming_endpoint_passes_every_check() {
     let (opts, expect) = quick();
     let report = verify_mock(opts, &expect).await;
     assert!(report.streams);
+    assert!(report.jobs, "the default mock offers v1.3 jobs");
     assert!(report.passed(), "{}", report.render());
     assert!(
         report.checks.iter().all(|c| c.verdict == Verdict::Pass),
         "{}",
         report.render()
     );
-    assert_eq!(report.checks.len(), 11);
+    assert_eq!(report.checks.len(), 17);
+}
+
+#[tokio::test]
+async fn a_v12_endpoint_passes_with_its_job_checks_skipped() {
+    let (opts, expect) = quick();
+    let report = verify_mock(
+        MockOptions {
+            jobs: false,
+            ..opts
+        },
+        &expect,
+    )
+    .await;
+    assert!(report.streams && !report.jobs);
+    assert!(report.passed(), "{}", report.render());
+    for name in [
+        conformance::JOBS,
+        conformance::JOBS_HOLD,
+        conformance::JOBS_KEEP,
+    ] {
+        assert_eq!(
+            report.check(name).unwrap().verdict,
+            Verdict::Skip,
+            "{name}: {}",
+            report.render()
+        );
+    }
+    assert!(
+        report.render().contains("plain exec commands"),
+        "{}",
+        report.render()
+    );
+}
+
+#[tokio::test]
+async fn an_endpoint_whose_dropped_hold_leaves_the_job_running_fails_the_hold_check() {
+    let (opts, expect) = quick();
+    let report = verify_mock(
+        MockOptions {
+            jobs_hold_kills: false,
+            ..opts
+        },
+        &expect,
+    )
+    .await;
+    let failed: Vec<&str> = report
+        .checks
+        .iter()
+        .filter(|c| c.verdict == Verdict::Fail)
+        .map(|c| c.name)
+        .collect();
+    assert_eq!(failed, vec![conformance::JOBS_HOLD], "{}", report.render());
+    assert!(
+        report
+            .check(conformance::JOBS_HOLD)
+            .unwrap()
+            .detail
+            .contains("die with its connection"),
+        "{}",
+        report.render()
+    );
 }
 
 #[tokio::test]

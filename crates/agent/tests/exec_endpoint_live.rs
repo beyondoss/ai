@@ -501,11 +501,15 @@ async fn a_sandbox_job_lives_in_the_target_and_outlives_its_hold_once_kept() {
     output.lock().unwrap().clear();
     let kept = JobId::fresh();
     let s = spec("echo one; sleep 1; echo two; sleep 300");
+    let mut run = Box::pin(jobs.run_held(&scope, &kept, &s, &events));
+    // Boxed, not stack-pinned: dropping it below must really close the hold.
     tokio::select! {
-        r = jobs.run_held(&scope, &kept, &s, &events) => panic!("ended early: {r:?}"),
+        r = &mut run => panic!("ended early: {r:?}"),
         () = until("kept output", || output.lock().unwrap().as_slice() == b"one\n") => {}
     }
+    // Kept while the hold is up, then the hold goes.
     jobs.keep(&scope, &kept, 1, "background", 4).await.unwrap();
+    drop(run);
     let pgid = started.lock().unwrap().unwrap();
     tokio::time::sleep(Duration::from_secs(2)).await;
     assert!(

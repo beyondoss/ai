@@ -13,7 +13,7 @@ use std::io::Write;
 use std::process::{ChildStdin, Stdio};
 use std::time::{Duration, Instant};
 
-use common::exec_mock::{ExecMock, StreamEnd};
+use common::exec_mock::{ExecMock, MockOptions, StreamEnd};
 use common::{
     SpawnGuarded, read_until_response, run_cmd, serve_cmd, spawn_model_server, turn_text,
     turn_tool_use,
@@ -73,7 +73,14 @@ fn stream_ended(end: Option<(StreamEnd, Instant)>) -> bool {
 fn a_transcript_switch_stops_remote_jobs_promptly_and_says_so() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let dir = tempfile::tempdir().unwrap();
-    let mock = rt.block_on(ExecMock::start(dir.path(), true));
+    // A v1.2-only sandbox: the jobs run on plain exec commands, whose streams the mock records.
+    let mock = rt.block_on(ExecMock::start_with(
+        dir.path(),
+        MockOptions {
+            jobs: false,
+            ..MockOptions::default()
+        },
+    ));
     let (base, _bodies) = spawn_model_server(vec![
         background("t1", "echo switch-tag; sleep 60.21"),
         turn_text("started it"),
@@ -116,7 +123,11 @@ fn a_transcript_switch_stops_remote_jobs_promptly_and_says_so() {
         .find(|r| r.pgid == s.pgid)
         .unwrap();
     assert!(stream_ended(record.end), "{record:?}");
-    assert!(!running("sleep 60.21"), "the job itself is gone");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while running("sleep 60.21") {
+        assert!(Instant::now() < deadline, "the job itself is still running");
+        std::thread::sleep(Duration::from_millis(20));
+    }
     let (_, ended) = mock
         .streams()
         .into_iter()
@@ -138,7 +149,14 @@ fn a_transcript_switch_stops_remote_jobs_promptly_and_says_so() {
 fn the_end_of_a_run_stops_remote_jobs_without_waiting_out_each_kill() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let dir = tempfile::tempdir().unwrap();
-    let mock = rt.block_on(ExecMock::start(dir.path(), true));
+    // A v1.2-only sandbox: the jobs run on plain exec commands, whose streams the mock records.
+    let mock = rt.block_on(ExecMock::start_with(
+        dir.path(),
+        MockOptions {
+            jobs: false,
+            ..MockOptions::default()
+        },
+    ));
     let (base, bodies) = spawn_model_server(vec![
         background("t1", "echo end-a; sleep 60.22"),
         background("t2", "echo end-b; sleep 60.23"),
@@ -191,10 +209,11 @@ fn the_end_of_a_run_stops_remote_jobs_without_waiting_out_each_kill() {
     for s in &jobs {
         assert!(stream_ended(s.end), "{s:?}");
     }
-    assert!(
-        !running("sleep 60.22") && !running("sleep 60.23"),
-        "the jobs are gone"
-    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while running("sleep 60.22") || running("sleep 60.23") {
+        assert!(Instant::now() < deadline, "the jobs are still running");
+        std::thread::sleep(Duration::from_millis(20));
+    }
     // Inline, each v1.2 kill waited out its 2 s bound: two jobs took over 4 s.
     assert!(
         took < Duration::from_millis(2500),
