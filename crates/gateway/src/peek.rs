@@ -32,9 +32,9 @@ fn push_capped(buf: &mut Vec<u8>, b: u8) {
 /// The text of a captured JSON string, with its escapes as sent: decoded the way a provider's parser
 /// decodes them, so `"gpt-5"` is `gpt-5`. `None` for bytes that are not text. An escaped capture
 /// at the cap is `None` too: its last escape may be cut, and the decoded prefix can then read as a
-/// shorter, real name.
-fn capture_text(raw: Vec<u8>) -> Option<String> {
-    if !raw.contains(&b'\\') {
+/// shorter, real name. `escaped` is whether the scan saw a backslash in the capture, so no rescan.
+fn capture_text(raw: Vec<u8>, escaped: bool) -> Option<String> {
+    if !escaped {
         return String::from_utf8(raw).ok();
     }
     if raw.len() >= MAX_CAPTURE {
@@ -49,9 +49,9 @@ fn capture_text(raw: Vec<u8>) -> Option<String> {
 
 /// A captured key's text as [`capture_text`] decodes it. Unescaped keys are compared as captured, so
 /// the common key costs no more than it did before escapes were decoded.
-fn key_bytes(raw: &[u8]) -> Option<std::borrow::Cow<'_, [u8]>> {
-    if raw.contains(&b'\\') {
-        capture_text(raw.to_vec()).map(|s| std::borrow::Cow::Owned(s.into_bytes()))
+fn key_bytes(raw: &[u8], escaped: bool) -> Option<std::borrow::Cow<'_, [u8]>> {
+    if escaped {
+        capture_text(raw.to_vec(), true).map(|s| std::borrow::Cow::Owned(s.into_bytes()))
     } else {
         Some(std::borrow::Cow::Borrowed(raw))
     }
@@ -120,6 +120,8 @@ pub struct ModelScanner {
     /// What (if anything) we're accumulating into `cur` for the current string.
     cap: Cap,
     cur: Vec<u8>,
+    /// The capture in `cur` holds a backslash, so it is decoded when it closes.
+    cur_escaped: bool,
 }
 
 /// What a scan keeps beside `model` ([`ModelScanner::feed_keeping`]): the values of a fixed set of
@@ -301,14 +303,15 @@ impl ModelScanner {
                     }
                 } else if b == b'\\' {
                     self.escaped = true;
-                    if self.cap == Cap::Key {
+                    if self.cap != Cap::No {
                         push_capped(&mut self.cur, b);
+                        self.cur_escaped = true;
                     }
                 } else if b == b'"' {
                     self.in_string = false;
                     match self.cap {
                         Cap::Key => {
-                            let key = key_bytes(&self.cur);
+                            let key = key_bytes(&self.cur, self.cur_escaped);
                             self.last_key_is_model = key.as_deref() == Some(b"model".as_slice());
                             if let Some(k) = kept.as_deref_mut() {
                                 let at = key
@@ -327,8 +330,8 @@ impl ModelScanner {
                             // A valid JSON string value is UTF-8; if a malformed/adversarial body
                             // smuggles non-UTF-8 bytes here we record "unknown" rather than emitting
                             // a `U+FFFD`-corrupted model into the billing log. Either way we're done.
-                            let v = String::from_utf8(std::mem::take(&mut self.cur))
-                                .unwrap_or_else(|_| "unknown".to_string());
+                            let v = capture_text(std::mem::take(&mut self.cur), self.cur_escaped)
+                                .unwrap_or_else(|| "unknown".to_string());
                             match kept.as_deref() {
                                 // A knob scan keeps walking; the first `model` is the one kept.
                                 Some(k) if k.past_model => {
@@ -350,7 +353,9 @@ impl ModelScanner {
                                 && let Some(idx) = k.last_key_extra
                             {
                                 // Not UTF-8: dropped, never written to a row as a corrupted value.
-                                if let Ok(v) = String::from_utf8(std::mem::take(&mut self.cur)) {
+                                if let Some(v) =
+                                    capture_text(std::mem::take(&mut self.cur), self.cur_escaped)
+                                {
                                     k.keep(idx, v);
                                 }
                                 if k.past_model && k.all_found() {
@@ -376,6 +381,7 @@ impl ModelScanner {
                 b'"' => {
                     self.in_string = true;
                     self.cur.clear();
+                    self.cur_escaped = false;
                     // Decide whether this string is worth accumulating — only key-level keys and
                     // the `model` value matter.
                     self.cap = if self.at_key_level() {
@@ -741,6 +747,7 @@ pub fn scan_buffered(body: &[u8]) -> BufferedScan {
     // slice because escapes must be resolved, exactly as `ModelScanner` does.
     let mut capturing_model = false;
     let mut model_buf: Vec<u8> = Vec::new();
+    let mut model_escaped = false;
     let mut model: Option<String> = None;
     // Where the value's raw bytes begin (just past the opening quote), and the finished span.
     let mut model_start = 0usize;
@@ -771,6 +778,10 @@ pub fn scan_buffered(body: &[u8]) -> BufferedScan {
                 }
             } else if b == b'\\' {
                 escaped = true;
+                if capturing_model {
+                    push_capped(&mut model_buf, b);
+                    model_escaped = true;
+                }
             } else if b == b'"' {
                 in_string = false;
                 if capturing_key {
@@ -816,8 +827,8 @@ pub fn scan_buffered(body: &[u8]) -> BufferedScan {
                     // Same non-UTF-8 fallback as `ModelScanner`: record "unknown" rather than emit a
                     // U+FFFD-corrupted model into the billing log.
                     model = Some(
-                        String::from_utf8(std::mem::take(&mut model_buf))
-                            .unwrap_or_else(|_| "unknown".to_string()),
+                        capture_text(std::mem::take(&mut model_buf), model_escaped)
+                            .unwrap_or_else(|| "unknown".to_string()),
                     );
                 }
             } else if capturing_model {
@@ -837,6 +848,7 @@ pub fn scan_buffered(body: &[u8]) -> BufferedScan {
                 } else if depth == 1 && last_key_is_model && model.is_none() {
                     capturing_model = true;
                     model_buf.clear();
+                    model_escaped = false;
                     model_start = j + 1;
                 }
                 in_string = true;
@@ -1687,6 +1699,40 @@ mod tests {
         assert_eq!(oracle["model"], "x");
         assert_eq!(scan(body.as_bytes()).as_deref(), Some("x"));
         assert_eq!(scan_buffered(body.as_bytes()).model.as_deref(), Some("x"));
+    }
+
+    /// claim: SEC-21, BIL-13
+    /// defect: D274
+    #[test]
+    fn a_unicode_escape_in_a_model_value_is_decoded() {
+        let body = format!(r#"{{"model":"gpt-{}u0035"}}"#, '\\');
+        let oracle: serde_json::Value = serde_json::from_slice(body.as_bytes()).unwrap();
+        assert_eq!(oracle["model"], "gpt-5");
+        assert_eq!(scan(body.as_bytes()).as_deref(), Some("gpt-5"));
+        assert_eq!(
+            scan_buffered(body.as_bytes()).model.as_deref(),
+            Some("gpt-5")
+        );
+    }
+
+    /// claim: SEC-21, BIL-13
+    /// defect: D274
+    #[test]
+    fn a_newline_escape_in_a_model_value_is_decoded() {
+        let body = br#"{"model":"a\nb"}"#;
+        let oracle: serde_json::Value = serde_json::from_slice(body).unwrap();
+        assert_eq!(oracle["model"], "a\nb");
+        assert_eq!(scan(body).as_deref(), Some("a\nb"));
+        assert_eq!(scan_buffered(body).model.as_deref(), Some("a\nb"));
+    }
+
+    /// claim: SEC-21, BIL-13
+    /// defect: D274
+    #[test]
+    fn a_slash_escape_in_a_model_value_is_decoded() {
+        let body = br#"{"model":"openai\/gpt-5"}"#;
+        assert_eq!(scan(body).as_deref(), Some("openai/gpt-5"));
+        assert_eq!(scan_buffered(body).model.as_deref(), Some("openai/gpt-5"));
     }
 
     fn scan(body: &[u8]) -> Option<String> {

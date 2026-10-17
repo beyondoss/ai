@@ -2779,3 +2779,17 @@ state = "fixed"
 test = "an_escaped_model_key_is_found_by_the_streaming_scanner"
 fix = ""
 note = "Fixed in peek.rs: a key that contains a backslash is decoded (capture_text, serde_json, as the provider decodes it) before it is compared with `model` or a kept key; an unescaped key is compared as captured, so it pays nothing new. Also held by props_peek prop_streaming_scanner_agrees_with_buffered_scan, now without its escaped-key exclusion. The plain key case already worked on main."
+
+[[defect]]
+id = "D274"
+severity = "med"
+area = "Routing"
+title = "An escaped model value is read without its escapes: \"gpt-\\u0035\" is gpt-u0035"
+impact = "Both scanners kept the letter after each backslash, so a model id spelled with an escape (\"gpt-\\u0035\", or a newline in the value) was read as a different id: gpt-u0035, or anb. A model-routed body then 404s as an unknown model although the provider would read gpt-5, and a managed row logs the mangled id."
+confidence = "high"
+evidence = "peek.rs ModelScanner and scan_buffered pushed the escaped character alone (\"u0035\", \"n\"); serde_json decodes both. Reproduced by a_unicode_escape_in_a_model_value_is_decoded and a_newline_escape_in_a_model_value_is_decoded on main 4513e6f. A slash escape already decoded (a_slash_escape_in_a_model_value_is_decoded passed there, as the control)."
+claims = ["SEC-21", "BIL-13"]
+state = "fixed"
+test = "a_unicode_escape_in_a_model_value_is_decoded"
+fix = ""
+note = "Fixed in peek.rs: a string's escapes are captured with it (the backslash too), and capture_text decodes the capture as serde_json does, at the value's close in ModelScanner and in scan_buffered. A capture at the cap that holds an escape decodes to None (unknown), since its last escape may be cut. Kept request knobs (service_tier, provider, ...) decode the same way. Capture stays bounded by MAX_CAPTURE and an unescaped value costs nothing new. Also held by a_newline_escape_in_a_model_value_is_decoded, a_slash_escape_in_a_model_value_is_decoded and props_peek's model-value property, now without its escaped-value exclusion."

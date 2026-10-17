@@ -320,15 +320,11 @@ fn prop_root_model_and_span_match_serde() {
             }
             return Ok(());
         }
-        let m = b.members.iter().find(|m| m.key == "model").unwrap();
         let Some(id) = root["model"].as_str() else {
             prop_assert_eq!(scan.model, None, "{}", b.text);
             return Ok(());
         };
-        // A value spelled with escapes other than `\"` and `\\` is not decoded (the scanner keeps
-        // the escaped character); no client writes a model id that way and the span rewrite
-        // replaces the raw bytes whole, so the provider never sees the misread. See the report.
-        if !m.value_sp.exotic(id) && id.len() <= peek::MAX_CAPTURE {
+        if id.len() <= peek::MAX_CAPTURE {
             prop_assert_eq!(scan.model.as_deref(), Some(id), "{}", b.text);
         }
         let (s, e) = scan.model_span.expect("a string model has a span");
