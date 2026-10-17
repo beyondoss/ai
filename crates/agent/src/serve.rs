@@ -11812,9 +11812,9 @@ impl crate::oauth::LoginCallbacks for ServeLoginCallbacks {
 }
 
 /// A frame queued for the single stdout writer task (see its own comment, above). Every RPC
-/// `response`/`ack`/progress frame below is low-frequency and already built as a shallow `Map` of
-/// scalar `json!` leaves — for those, `Value` costs nothing extra: the writer's own `serde_json::
-/// to_string` is the only serialize they ever pay. [`event_frame`] is the one high-frequency producer
+/// `response`/`ack`/progress frame below is low-frequency and built as a `Value` — for those, `Value`
+/// costs nothing extra: [`OutFanout::broadcast`] serializes it exactly once, and those bytes are what
+/// is charged against every budget, recorded and sent to every connection. [`event_frame`] is the one high-frequency producer
 /// (once per streamed model delta, far more often than any RPC frame) and carries its own pre-built
 /// `String` instead, serialized straight from the `AgentEvent` in one pass — see its doc comment for
 /// why going through `Value` first would cost a second full serialize on the hottest path this process
@@ -11836,16 +11836,15 @@ impl From<Value> for OutFrame {
 }
 
 impl OutFrame {
-    /// Rough on-the-wire size, for budgeting the in-flight-turn recording against
-    /// [`TURN_REPLAY_MAX_BYTES`]. `Raw` — the hot `event` path, and so very nearly all of what a turn
-    /// emits — is already its final text and reports exactly. `Value` (acks, responses, progress notices:
-    /// a handful per turn, all small) is charged a flat nominal size rather than serialized just to
-    /// measure it, which would cost more than the budget it protects.
-    fn approx_len(&self) -> usize {
-        match self {
-            OutFrame::Raw(s) => s.len(),
-            OutFrame::Value(_) => 256,
-        }
+    /// Whether this frame answers one client's command (a `response` or `ack`) rather than reporting
+    /// the session's turn. A reply belongs to the connection that asked: it is never replayed to one
+    /// that attaches later (see [`OutFanout::turn`]).
+    fn is_reply(&self) -> bool {
+        matches!(
+            self,
+            OutFrame::Value(v)
+                if matches!(v.get("type").and_then(Value::as_str), Some("response" | "ack"))
+        )
     }
 }
 
@@ -11870,13 +11869,13 @@ pub(crate) enum OutSink {
 }
 
 impl OutSink {
-    /// Non-blocking send of a live frame. `Err` means the sink is dead: its receiver is gone, or — for
+    /// Non-blocking send of a live frame, already serialized. `Err` means the sink is dead: its receiver is gone, or — for
     /// a [`ConnTx`] — its backlog passed the cap and the connection is being closed.
     /// [`OutFanout::broadcast`] prunes it either way.
-    fn try_send(&self, frame: OutFrame) -> Result<(), ()> {
+    fn send_line(&self, line: Bytes) -> Result<(), ()> {
         match self {
-            OutSink::Bounded(tx) => tx.try_send(frame),
-            OutSink::Unbounded(tx) => tx.send(frame).map_err(|_| ()),
+            OutSink::Bounded(tx) => tx.send_line(line),
+            OutSink::Unbounded(tx) => tx.send(OutFrame::Raw(line)).map_err(|_| ()),
         }
     }
 
@@ -11958,13 +11957,30 @@ pub(crate) fn conn_channel() -> (ConnTx, ConnRx) {
 impl ConnTx {
     /// Queue a live frame, charged against [`CONN_BACKLOG_MAX_BYTES`]. A frame that does not fit is
     /// refused and the connection dropped ([`Self::dropped`] fires); so is every frame after it.
+    ///
+    /// Charged its real size: a `Value` is serialized here, once, and those bytes are what is queued
+    /// — a `get_messages` reply carries the whole transcript, and charging it a nominal size let a
+    /// client pin many times the cap.
     pub(crate) fn try_send(&self, frame: OutFrame) -> Result<(), ()> {
         if self.dropped.is_cancelled() {
             return Err(());
         }
-        let len = frame.approx_len();
+        let Some(line) = frame_to_line(frame) else {
+            return Ok(());
+        };
+        self.send_line(line)
+    }
+
+    /// [`Self::try_send`] for a frame already serialized.
+    fn send_line(&self, line: Bytes) -> Result<(), ()> {
+        if self.dropped.is_cancelled() {
+            return Err(());
+        }
+        let len = line.len();
         let queued = self.backlog.fetch_add(len, Ordering::Relaxed);
-        if queued + len > CONN_BACKLOG_MAX_BYTES || self.tx.send((frame, len)).is_err() {
+        if queued + len > CONN_BACKLOG_MAX_BYTES
+            || self.tx.send((OutFrame::Raw(line), len)).is_err()
+        {
             self.dropped.cancel();
             return Err(());
         }
@@ -12023,7 +12039,12 @@ pub(crate) struct OutFanout {
     /// of the run's start, and these are every frame since. Were `history` to advance at each mid-run
     /// checkpoint, a message would appear *both* in the catch-up and again in the replayed frames, and
     /// the client would render it twice.
-    turn: Vec<OutFrame>,
+    ///
+    /// Replies are not recorded ([`OutFrame::is_reply`]): a `response` answers the client that sent
+    /// the command, and replaying another client's answer — a `get_messages` reply is a whole
+    /// transcript — to a connection that attaches later is wrong for it and grew this buffer by a
+    /// transcript per call. Each frame is kept as the exact bytes sent, so its size is exact.
+    turn: Vec<Bytes>,
     /// Byte budget already spent on `turn`, against [`TURN_REPLAY_MAX_BYTES`].
     turn_bytes: usize,
     /// `true` only between [`begin_turn`](Self::begin_turn) and [`end_turn`](Self::end_turn) — a run is
@@ -12056,7 +12077,7 @@ struct AppViewFrames {
     app_id: String,
     /// The server whose tool opened the view — what a restored view's bridge requests bind to.
     server: String,
-    /// The frames as sent — final JSON text, so their size is exact ([`OutFrame::approx_len`]) and a
+    /// The frames as sent — final JSON text, so their size is exact and a
     /// replay is a copy, not a re-serialization.
     open: Bytes,
     result: Option<Bytes>,
@@ -12172,10 +12193,9 @@ impl OutFanout {
                     "\"kind\":\"tool_start\",\"id\":{}",
                     serde_json::to_string(&view.app_id).unwrap_or_default()
                 );
-                self.turn.iter().position(|frame| match frame {
-                    OutFrame::Raw(line) => contains_bytes(line, needle.as_bytes()),
-                    OutFrame::Value(_) => false,
-                })
+                self.turn
+                    .iter()
+                    .position(|line| contains_bytes(line, needle.as_bytes()))
             })
             .collect();
         let send_view = |view: &AppViewFrames| {
@@ -12193,8 +12213,8 @@ impl OutFanout {
         // what a client that never dropped has seen. All three inside this one critical section, so a
         // concurrent `broadcast` can neither interleave with the replay nor slip in between it and the
         // registration below.
-        for (index, frame) in self.turn.iter().enumerate() {
-            tx.seed(frame.clone());
+        for (index, line) in self.turn.iter().enumerate() {
+            tx.seed(OutFrame::Raw(line.clone()));
             for (view, anchor) in self.app_views.iter().zip(&anchors) {
                 if *anchor == Some(index) {
                     send_view(view);
@@ -12225,7 +12245,7 @@ impl OutFanout {
         let OutFrame::Raw(bytes_line) = &raw else {
             return;
         };
-        let bytes = raw.approx_len();
+        let bytes = bytes_line.len();
         match kind.as_str() {
             "mcp_app_open" => {
                 self.app_views.retain(|v| v.app_id != app_id);
@@ -12413,8 +12433,14 @@ impl OutFanout {
     }
 
     pub(crate) fn broadcast(&mut self, frame: OutFrame) {
-        if self.recording && !self.turn_truncated {
-            let len = frame.approx_len();
+        let reply = frame.is_reply();
+        // Serialized once, here: these bytes are what every budget is charged, what the recording
+        // keeps and what each connection is sent (a refcount bump per sink, not a copy).
+        let Some(line) = frame_to_line(frame) else {
+            return;
+        };
+        if self.recording && !self.turn_truncated && !reply {
+            let len = line.len();
             if self.turn_bytes + len > TURN_REPLAY_MAX_BYTES {
                 // Past the budget: drop the whole recording (freeing it now, when the memory pressure is
                 // real) and mark the turn truncated. A client attaching from here on is told its view of
@@ -12424,19 +12450,19 @@ impl OutFanout {
                 self.turn_truncated = true;
             } else {
                 self.turn_bytes += len;
-                self.turn.push(frame.clone());
+                self.turn.push(line.clone());
             }
         }
         match self.sinks.as_slice() {
             [] => {}
             [(_, tx)] => {
-                if tx.try_send(frame).is_err() {
+                if tx.send_line(line).is_err() {
                     self.sinks.clear();
                 }
             }
             _ => self
                 .sinks
-                .retain(|(_, tx)| tx.try_send(frame.clone()).is_ok()),
+                .retain(|(_, tx)| tx.send_line(line.clone()).is_ok()),
         }
     }
 }
@@ -13027,6 +13053,61 @@ mod tests {
             }
         }
         assert!(!dropped.is_cancelled() && !fanout.is_empty());
+    }
+
+    /// A client calling `get_messages` on a large transcript during a run: every reply is charged its
+    /// real size against each connection's backlog, and none is recorded for replay — the turn
+    /// recording holds the turn's own frames only. (Replies used to be charged a flat 256 bytes and
+    /// recorded: fifty ~1 MiB replies cost 12,800 bytes of budget, the replay buffer grew by a
+    /// transcript per call, and a stalled connection pinned all of it.)
+    #[test]
+    fn a_large_reply_is_charged_its_size_and_is_not_replayed() {
+        let transcript = "t".repeat(1024 * 1024);
+        let reply = || {
+            response(
+                Some("g".into()),
+                "get_messages",
+                true,
+                Some(json!({ "messages": [transcript] })),
+                None,
+            )
+        };
+        let mut fanout = OutFanout::default();
+        fanout.begin_turn();
+        let (healthy, mut healthy_rx) = conn_channel();
+        let (stalled, _stalled_rx) = conn_channel();
+        let healthy_dropped = healthy.dropped();
+        let stalled_dropped = stalled.dropped();
+        fanout.add(OutSink::Bounded(healthy));
+        fanout.add(OutSink::Bounded(stalled));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        for i in 0..50 {
+            fanout.broadcast(reply());
+            // The healthy client reads each reply as it comes, and is charged all of it.
+            let OutFrame::Raw(line) = rt.block_on(healthy_rx.recv()).unwrap() else {
+                panic!("a live frame is sent as its serialized bytes")
+            };
+            assert!(line.len() > transcript.len());
+            assert_eq!(healthy_rx.backlog.load(Ordering::Relaxed), 0);
+            if i == CONN_BACKLOG_MAX_BYTES / transcript.len() {
+                assert!(
+                    stalled_dropped.is_cancelled(),
+                    "a connection that reads nothing is dropped once the replies pass its cap"
+                );
+            }
+        }
+        assert!(!healthy_dropped.is_cancelled());
+        assert!(stalled_dropped.is_cancelled());
+        assert!(fanout.turn.is_empty(), "no reply is recorded for replay");
+        assert_eq!(fanout.turn_bytes, 0);
+        assert!(!fanout.turn_truncated);
+
+        // The turn's own frames still are, charged exactly.
+        fanout.broadcast(sized_frame(0, 1000));
+        assert_eq!(fanout.turn.len(), 1);
+        assert_eq!(fanout.turn_bytes, 1000);
     }
 
     #[test]
