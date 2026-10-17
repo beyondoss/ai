@@ -344,6 +344,12 @@ async fn run_matrix(kind: Kind, args: &[String]) -> std::process::ExitCode {
             "unmounted-shard-is-misdirected" => {
                 scenarios::unmounted_shard_is_misdirected(kind, &history).await
             }
+            "sandbox-job-survives-its-replica" => {
+                scenarios::sandbox_job_survives_its_replica(kind, &history).await
+            }
+            "sandbox-job-exit-noticed-once" => {
+                scenarios::sandbox_job_exit_noticed_once(kind, &history).await
+            }
             other => scenarios::Outcome::Skipped(format!("no runner for {other:?}")),
         };
         match outcome {

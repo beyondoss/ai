@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use beyond_ai_test_support::exec_mock::ExecMock;
 use beyond_ai_test_support::{
     spawn_model_server, spawn_model_server_routed_unrecorded, stall_prompt, turn_text,
+    turn_tool_use,
 };
 use serde_json::json;
 
@@ -80,6 +81,16 @@ pub const ALL: &[Scenario] = &[
         name: "fenced-owner-stops-and-says-so",
         claims: "C3",
         needs_shared_fs: true,
+    },
+    Scenario {
+        name: "sandbox-job-survives-its-replica",
+        claims: "S1",
+        needs_shared_fs: false,
+    },
+    Scenario {
+        name: "sandbox-job-exit-noticed-once",
+        claims: "S2",
+        needs_shared_fs: false,
     },
 ];
 
@@ -1968,4 +1979,379 @@ pub async fn fenced_owner_stops_and_says_so(kind: Kind, history_path: &std::path
     } else {
         Outcome::Failed
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Sandbox jobs: a background job belongs to the sandbox, not to the replica serving its session.
+// ---------------------------------------------------------------------------------------------
+
+/// The model's side of the sandbox-job scenarios, routed by what each request already holds so the
+/// conversation is the same whichever replica asks and however many title or wake requests come in
+/// between. Checked in order: the latest stage of the conversation first.
+fn sandbox_job_routes() -> Vec<(String, String)> {
+    let tool = |id: &str, name: &str, input: serde_json::Value| {
+        turn_tool_use(id, name, &input.to_string())
+    };
+    vec![
+        // S1: started, then (on the next replica) peeked, then killed.
+        (
+            "\"tool_use_id\":\"sj-kill\"".into(),
+            turn_text("stopped it"),
+        ),
+        (
+            "\"tool_use_id\":\"sj-peek\"".into(),
+            tool("sj-kill", "bash_job", json!({ "job": 1, "kill": true })),
+        ),
+        (
+            "check-the-dev-server".into(),
+            tool("sj-peek", "bash_job", json!({ "job": 1, "timeout_ms": 0 })),
+        ),
+        (
+            "\"tool_use_id\":\"sj-start\"".into(),
+            turn_text("the dev server is up"),
+        ),
+        (
+            "start-the-dev-server".into(),
+            tool(
+                "sj-start",
+                "bash",
+                json!({
+                    "command": "echo \"jobpid=$$\"; i=0; while :; do echo tick-$i; i=$((i+1)); sleep 1; done",
+                    "run_in_background": true,
+                }),
+            ),
+        ),
+        // S2: a build that finishes while no replica serves the session.
+        ("\"tool_use_id\":\"sj-build\"".into(), turn_text("building")),
+        (
+            "start-the-build".into(),
+            tool(
+                "sj-build",
+                "bash",
+                json!({
+                    "command": "echo compiling; sleep 4; echo built-while-away",
+                    "run_in_background": true,
+                }),
+            ),
+        ),
+    ]
+}
+
+/// A two-replica fleet whose model follows [`sandbox_job_routes`], and the requests it was sent.
+/// Two sandboxes beside the fleet's own: the default (v1.3, which runs jobs itself) and a v1.2-only
+/// one, on which the agent runs jobs with plain exec commands — the baseline every endpoint gets.
+async fn sandbox_job_fleet(
+    kind: Kind,
+    history_path: &std::path::Path,
+) -> Result<
+    (
+        Fleet,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        Vec<(&'static str, ExecMock, tempfile::TempDir)>,
+    ),
+    String,
+> {
+    if ATTACHED.get().is_some() {
+        return Err(format!(
+            "{ATTACHED_SKIP}the scenario needs a model that follows its own routes, and an attached \
+             fleet shares one model server; its sandbox is also a process on this host"
+        ));
+    }
+    let (gateway_url, bodies) =
+        beyond_ai_test_support::spawn_model_server_routed(sandbox_job_routes(), turn_text("ok"));
+    let fleet = Fleet::start_against(kind, 2, 1, history_path, None, false, gateway_url).await?;
+    let mut sandboxes = Vec::new();
+    for (name, jobs) in [("native (v1.3)", true), ("baseline (v1.2)", false)] {
+        let dir = tempfile::tempdir().map_err(|e| format!("sandbox: {e}"))?;
+        let mock = ExecMock::start_with(
+            dir.path(),
+            beyond_ai_test_support::exec_mock::MockOptions {
+                jobs,
+                ..Default::default()
+            },
+        )
+        .await;
+        sandboxes.push((name, mock, dir));
+    }
+    Ok((fleet, bodies, sandboxes))
+}
+
+/// The process a transcript (or request) quotes as `jobpid=N`.
+fn quoted_pid(text: &str) -> Option<u32> {
+    text.match_indices("jobpid=").find_map(|(at, _)| {
+        text[at + 7..]
+            .split(|c: char| !c.is_ascii_digit())
+            .next()?
+            .parse()
+            .ok()
+    })
+}
+
+/// Whether process `pid` on this host is alive and not a zombie.
+fn process_alive(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|s| s.rsplit_once(')').map(|(_, r)| r.trim_start().to_string()))
+        .is_some_and(|r| !r.starts_with('Z'))
+}
+
+async fn wait_process_gone(pid: u32, within: Duration) -> bool {
+    let deadline = Instant::now() + within;
+    while process_alive(pid) {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    true
+}
+
+/// The text of tool call `id`'s result in a transcript.
+fn tool_result(messages: &[serde_json::Value], id: &str) -> String {
+    messages
+        .iter()
+        .filter_map(|m| m["content"].as_array())
+        .flatten()
+        .find(|b| b["type"] == "tool_result" && b["tool_use_id"] == id)
+        .map(|b| match &b["content"] {
+            serde_json::Value::String(s) => s.clone(),
+            other => other.to_string(),
+        })
+        .unwrap_or_default()
+}
+
+/// The replica index serving `addr`.
+fn replica_at(fleet: &Fleet, addr: &Addr) -> Option<usize> {
+    fleet.replicas.iter().position(|r| &r.addr == addr)
+}
+
+/// **S1** — a background job outlives the replica that started it. A dev server is started in a
+/// session's sandbox; the owning replica is killed outright; the session reopens on the other
+/// replica, which reports the job **still running** under its number, shows its output from where
+/// the model left off, and kills it. On both kinds of sandbox: one that runs jobs itself (v1.3) and
+/// one that only runs commands (the baseline). Before, the job lived in the dead replica's exec
+/// stream, and the endpoint killed it with the connection.
+pub async fn sandbox_job_survives_its_replica(
+    kind: Kind,
+    history_path: &std::path::Path,
+) -> Outcome {
+    let (mut fleet, bodies, sandboxes) = match sandbox_job_fleet(kind, history_path).await {
+        Ok(x) => x,
+        Err(e) if e.starts_with(ATTACHED_SKIP) => {
+            return Outcome::Skipped(e.trim_start_matches(ATTACHED_SKIP).to_string());
+        }
+        Err(e) => return Outcome::failed_with(e),
+    };
+    let mut findings = Vec::new();
+    for (i, (name, exec, _dir)) in sandboxes.iter().enumerate() {
+        let session = format!("s1.sandbox-job-{i}");
+        let grant = fleet.edge.grant("t1", &session, "s1", "/", &exec.url);
+        match sandbox_job_survives_once(&mut fleet, &session, &grant, &bodies).await {
+            Ok(mut f) => {
+                for x in &mut f {
+                    x.detail = format!("{name}: {}", x.detail);
+                }
+                findings.extend(f);
+            }
+            Err(e) => findings.push(Finding {
+                claim: "S1",
+                ok: false,
+                detail: format!("{name}: {e}"),
+            }),
+        }
+        // The next session starts on whichever replica survives; bring the dead one back so it has
+        // somewhere to move to.
+        for idx in 0..fleet.replicas.len() {
+            if !fleet.replicas[idx].is_running()
+                && let Err(e) = fleet.restart(idx).await
+            {
+                return Outcome::failed_with(format!("restart: {e}"));
+            }
+        }
+    }
+    if check::report("sandbox-job-survives-its-replica", &findings) {
+        Outcome::Passed
+    } else {
+        Outcome::Failed
+    }
+}
+
+async fn sandbox_job_survives_once(
+    fleet: &mut Fleet,
+    session: &str,
+    grant: &str,
+    bodies: &std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+) -> Result<Vec<Finding>, String> {
+    let mut findings = Vec::new();
+    let placed = crate::edge::place(&fleet.edge, session, grant, Duration::from_secs(30)).await;
+    let Placement::Served { addr, .. } = placed else {
+        return Err(format!("could not place the session: {placed:?}"));
+    };
+    let mut ws = workload::connect(&addr, session, grant).await?;
+    workload::prompt(&mut ws, "start-the-dev-server").await?;
+    let text = serde_json::Value::Array(workload::transcript(&mut ws).await?).to_string();
+    let pid = quoted_pid(&text).ok_or_else(|| format!("no jobpid in the transcript: {text}"))?;
+    let told = text.contains("keeps running in the sandbox until it exits");
+    findings.push(Finding {
+        claim: "S1",
+        ok: told,
+        detail: format!("the start told the model the sandbox owns the job (pid {pid})"),
+    });
+    drop(ws);
+
+    let owner = replica_at(fleet, &addr).ok_or("the placed address matches no replica")?;
+    let owner_name = fleet.replicas[owner].name.clone();
+    fleet.kill_hard(owner)?;
+    fleet.history.record(
+        "owner_killed",
+        json!({ "replica": owner_name, "job_pid": pid }),
+    );
+    fleet.retarget_excluding(&owner_name);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    findings.push(Finding {
+        claim: "S1",
+        ok: process_alive(pid),
+        detail: "the job ran on after its replica was killed".into(),
+    });
+
+    let replaced = crate::edge::place(&fleet.edge, session, grant, crate::edge::RETRY_BUDGET).await;
+    let Placement::Served { addr: new_addr, .. } = replaced else {
+        return Err(format!("no replica took the session over: {replaced:?}"));
+    };
+    if new_addr == addr {
+        return Err("the session came back on the replica that was killed".into());
+    }
+    let before = bodies.lock().map(|b| b.len()).unwrap_or(0);
+    let mut ws = workload::connect(&new_addr, session, grant).await?;
+    workload::prompt(&mut ws, "check-the-dev-server").await?;
+    let sent: Vec<String> = bodies
+        .lock()
+        .map(|b| b[before..].to_vec())
+        .unwrap_or_default();
+    let reopened = sent.iter().find(|b| b.contains("check-the-dev-server"));
+    findings.push(Finding {
+        claim: "S1",
+        ok: reopened.is_some_and(|b| b.contains("(still running)") && !b.contains("(stopped)")),
+        detail: "the new replica's first request says job 1 is still running".into(),
+    });
+    let messages = workload::transcript(&mut ws).await?;
+    let transcript = serde_json::Value::Array(messages.clone()).to_string();
+    // The peek's result: output after what the start reported, not from the beginning.
+    let peek = tool_result(&messages, "sj-peek");
+    let peek = peek.as_str();
+    findings.push(Finding {
+        claim: "S1",
+        ok: peek.contains("tick-") && !peek.contains("jobpid=") && !peek.contains("tick-0\n"),
+        detail: format!(
+            "the new replica read the job's output on from where the model left off ({} new \
+             ticks, none of the {} lines the start had shown)",
+            peek.matches("tick-").count(),
+            "jobpid/tick-0"
+        ),
+    });
+    findings.push(Finding {
+        claim: "S1",
+        ok: transcript.contains("Job 1 (`echo") && transcript.contains("killed after"),
+        detail: "the new replica's kill was reported".into(),
+    });
+    findings.push(Finding {
+        claim: "S1",
+        ok: wait_process_gone(pid, Duration::from_secs(10)).await,
+        detail: "and the kill reached the sandbox".into(),
+    });
+    Ok(findings)
+}
+
+/// **S2** — a job that ends while no replica serves its session is reported once, on the next
+/// attach. A build is started; the owning replica is deployed away (`SIGTERM`, drained); the build
+/// finishes; the session reopens on the other replica, whose model hears its finish notice —
+/// exactly once, however many runs follow. On both kinds of sandbox.
+pub async fn sandbox_job_exit_noticed_once(kind: Kind, history_path: &std::path::Path) -> Outcome {
+    let (mut fleet, _bodies, sandboxes) = match sandbox_job_fleet(kind, history_path).await {
+        Ok(x) => x,
+        Err(e) if e.starts_with(ATTACHED_SKIP) => {
+            return Outcome::Skipped(e.trim_start_matches(ATTACHED_SKIP).to_string());
+        }
+        Err(e) => return Outcome::failed_with(e),
+    };
+    let mut findings = Vec::new();
+    for (i, (name, exec, _dir)) in sandboxes.iter().enumerate() {
+        let session = format!("s1.sandbox-build-{i}");
+        let grant = fleet.edge.grant("t1", &session, "s1", "/", &exec.url);
+        match exit_noticed_once(&mut fleet, &session, &grant).await {
+            Ok(mut f) => {
+                for x in &mut f {
+                    x.detail = format!("{name}: {}", x.detail);
+                }
+                findings.extend(f);
+            }
+            Err(e) => findings.push(Finding {
+                claim: "S2",
+                ok: false,
+                detail: format!("{name}: {e}"),
+            }),
+        }
+        for idx in 0..fleet.replicas.len() {
+            if !fleet.replicas[idx].is_running()
+                && let Err(e) = fleet.restart(idx).await
+            {
+                return Outcome::failed_with(format!("restart: {e}"));
+            }
+        }
+    }
+    if check::report("sandbox-job-exit-noticed-once", &findings) {
+        Outcome::Passed
+    } else {
+        Outcome::Failed
+    }
+}
+
+async fn exit_noticed_once(
+    fleet: &mut Fleet,
+    session: &str,
+    grant: &str,
+) -> Result<Vec<Finding>, String> {
+    let placed = crate::edge::place(&fleet.edge, session, grant, Duration::from_secs(30)).await;
+    let Placement::Served { addr, .. } = placed else {
+        return Err(format!("could not place the session: {placed:?}"));
+    };
+    let mut ws = workload::connect(&addr, session, grant).await?;
+    workload::prompt(&mut ws, "start-the-build").await?;
+    drop(ws);
+    let owner = replica_at(fleet, &addr).ok_or("the placed address matches no replica")?;
+    let owner_name = fleet.replicas[owner].name.clone();
+    // A deploy: the replica drains and goes.
+    fleet.stop_gracefully(owner, Duration::from_secs(60))?;
+    fleet
+        .history
+        .record("owner_deployed", json!({ "replica": owner_name }));
+    fleet.retarget_excluding(&owner_name);
+    // The build finishes while nobody serves the session.
+    tokio::time::sleep(Duration::from_secs(6)).await;
+
+    let replaced = crate::edge::place(&fleet.edge, session, grant, crate::edge::RETRY_BUDGET).await;
+    let Placement::Served { addr: new_addr, .. } = replaced else {
+        return Err(format!("no replica took the session over: {replaced:?}"));
+    };
+    let mut ws = workload::connect(&new_addr, session, grant).await?;
+    // Two prompts: the notice is delivered by the first run on the new replica (or by the wake
+    // before it), and must not be delivered again by the second.
+    workload::prompt(&mut ws, "how-did-the-build-go").await?;
+    workload::prompt(&mut ws, "anything-else").await?;
+    let transcript = serde_json::Value::Array(workload::transcript(&mut ws).await?).to_string();
+    let notices = transcript.matches("[job 1 exited with code 0").count();
+    Ok(vec![
+        Finding {
+            claim: "S2",
+            ok: notices == 1,
+            detail: format!(
+                "the build's finish notice is in the transcript {notices} time(s), want 1"
+            ),
+        },
+        Finding {
+            claim: "S2",
+            ok: transcript.contains("built-while-away"),
+            detail: "it quotes what the build printed while no replica was attached".into(),
+        },
+    ])
 }
