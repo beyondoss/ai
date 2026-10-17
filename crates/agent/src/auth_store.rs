@@ -1,4 +1,4 @@
-//! Local storage for OAuth/subscription credentials (`~/.claude/auth.json` by default) — the Rust
+//! Local storage for OAuth/subscription credentials (`~/.beyond/auth.json` by default) — the Rust
 //! analog of pi's own `auth.json`, holding what `crate::oauth`'s login/refresh flows produce.
 //!
 //! Same shape family as [`crate::settings`]/[`crate::trust_store`]: a flat JSON file, the kernel lock
@@ -197,7 +197,7 @@ pub struct AuthStore {
 }
 
 impl AuthStore {
-    /// Open the default store (`~/.claude/auth.json`, or `$AI_AGENT_CONFIG_DIR/auth.json`).
+    /// Open the default store (`~/.beyond/auth.json`, or `$AI_AGENT_CONFIG_DIR/auth.json`).
     pub fn open_default() -> Self {
         Self::open(default_path())
     }
@@ -448,7 +448,7 @@ fn create_private(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// The default store path (`~/.claude/auth.json`, or `$AI_AGENT_CONFIG_DIR/auth.json`) — public so a
+/// The default store path (`~/.beyond/auth.json`, or `$AI_AGENT_CONFIG_DIR/auth.json`) — public so a
 /// `CredentialSource` implementation (`crate::auth_credential_source`) built for a *different*
 /// `AuthStore` handle than the one a caller already has open can still agree on the same file.
 pub fn default_path() -> PathBuf {

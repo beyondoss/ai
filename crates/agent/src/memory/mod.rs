@@ -20,7 +20,7 @@
 //!
 //! # Scope
 //!
-//! Per-project, keyed by cwd, under `~/.claude/projects/<encoded-cwd>/memory/` — the same scoping
+//! Per-project, keyed by cwd, under `~/.beyond/projects/<encoded-cwd>/memory/` — the same scoping
 //! sessions use ([`crate::session_store::encode_cwd`]), so all worktrees of one repo share one memory.
 //! A backend is selected by [`open`], which dispatches on a DSN scheme (bare path / `file://` → files;
 //! `redis://` / `postgres://` are recognized but not yet implemented, so the seam exists without the
@@ -287,7 +287,7 @@ pub trait MemoryBackend: Send + Sync {
 
 /// Open the memory backend named by `dsn` for the project rooted at `cwd`.
 ///
-/// - `None` (the default) → a per-project [`file::FileBackend`] under `~/.claude/projects/<cwd>/memory/`.
+/// - `None` (the default) → a per-project [`file::FileBackend`] under `~/.beyond/projects/<cwd>/memory/`.
 /// - a bare path or `file://<path>` → a [`file::FileBackend`] at that directory.
 /// - `redis://…` / `postgres://…` → recognized, but **not yet implemented**: returns a clear error so
 ///   the seam is real without the impl (the trait makes them a drop-in later).
@@ -361,7 +361,7 @@ pub async fn mount_sections(mounts: &[Mount]) -> Vec<(MountKind, String)> {
 /// memory — at distinct roots at once.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MountKind {
-    /// Durable, cross-session knowledge at [`MEMORY_ROOT`] (`~/.claude/projects/<cwd>/memory/`).
+    /// Durable, cross-session knowledge at [`MEMORY_ROOT`] (`~/.beyond/projects/<cwd>/memory/`).
     Durable,
     /// Per-session working memory at [`SESSION_ROOT`], cleaned up with the session — the scratchpad that
     /// survives compaction.
@@ -833,11 +833,11 @@ mod tests {
     #[test]
     fn session_dir_is_a_sibling_when_persisted_else_a_tempdir() {
         // Persisted: a `.memory` sibling of the session `.jsonl`.
-        let file = std::path::Path::new("/home/u/.claude/sessions/enc/1700_abc.jsonl");
+        let file = std::path::Path::new("/home/u/.beyond/sessions/enc/1700_abc.jsonl");
         let dir = session_dir(Some(file), "abc");
         assert_eq!(
             dir,
-            std::path::Path::new("/home/u/.claude/sessions/enc/1700_abc.memory")
+            std::path::Path::new("/home/u/.beyond/sessions/enc/1700_abc.memory")
         );
         // Ephemeral: keyed by session id under the system temp dir.
         let eph = session_dir(None, "abc");

@@ -4299,26 +4299,25 @@ pub fn canonical_cwd(cwd: &Path) -> PathBuf {
 
 /// Encode `cwd` into a filesystem-safe directory-name component: every path separator becomes `-`, so
 /// `/home/jared/ai` becomes `-home-jared-ai` — the same convention this repo's other per-project state
-/// already uses (`trust_store.rs`'s `~/.claude/trusted-projects.json`, `prompts.rs`'s
-/// `~/.claude/prompts`), extended here to give each project its own session subdirectory.
+/// already uses (`trust_store.rs`'s `trusted-projects.json`, `prompts.rs`'s
+/// `prompts/` directory), extended here to give each project its own session subdirectory.
 pub fn encode_cwd(cwd: &str) -> String {
     cwd.chars()
         .map(|c| if c == '/' || c == '\\' { '-' } else { c })
         .collect()
 }
 
-/// The root every project's own session directory lives under: `~/.claude/sessions/`. Each immediate
-/// subdirectory is one project's `<encoded-cwd>/` (see [`default_session_dir`]) — this is the root
-/// [`SessionRepo::list_all`] scans for pi's cross-project session search (`--fork <id>` when the id
-/// isn't found in the current project — see [`fork_by_arg`]).
+/// The root every project's own session directory lives under: `~/.beyond/sessions/` (the agent's own
+/// state directory, so `$AI_AGENT_CONFIG_DIR/sessions/` when that is set — see
+/// `settings::config_dir_root`). Each immediate subdirectory is one project's `<encoded-cwd>/` (see
+/// [`default_session_dir`]) — this is the root [`SessionRepo::list_all`] scans for pi's cross-project
+/// session search (`--fork <id>` when the id isn't found in the current project — see [`fork_by_arg`]).
+/// Never under `~/.claude`, whose `sessions/` holds Claude Code's own `<pid>.json` files.
 pub fn sessions_root() -> PathBuf {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_default();
-    home.join(".claude/sessions")
+    crate::settings::config_dir_root().join("sessions")
 }
 
-/// The default session directory for `cwd` when nothing more specific was given: `~/.claude/sessions/
+/// The default session directory for `cwd` when nothing more specific was given: `~/.beyond/sessions/
 /// <encoded-cwd>/`, one subdirectory per project so unrelated projects' sessions never mix in the same
 /// listing. Shared by `serve`'s own default (`--session-file`/`--session-dir` absent) and `run
 /// --continue`.
@@ -9371,7 +9370,7 @@ mod tests {
      {
         // Pi-parity fix (`run --session-dir`/`AI_AGENT_SESSION_DIR`): the cross-project fallback used to
         // recompute the source's directory from its own recorded `cwd` via
-        // `default_session_dir`/`encode_cwd`, which only holds for the *default* `~/.claude/sessions/
+        // `default_session_dir`/`encode_cwd`, which only holds for the *default* `~/.beyond/sessions/
         // <encoded-cwd>/` layout. An arbitrarily-named directory (exactly what `--session-dir` lets a
         // caller point at) broke that assumption and the fork would fail with a bogus "not found" even
         // though the session was sitting right there under `sessions_root`.

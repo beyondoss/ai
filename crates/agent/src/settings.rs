@@ -56,7 +56,7 @@ pub struct Settings {
     pub default_session_dir: Option<String>,
     /// The persistent-memory backend DSN, used when neither `--memory` nor `AI_AGENT_MEMORY_URL` is
     /// given. `None` (the default) resolves to a per-project local-file store under
-    /// `~/.claude/projects/<cwd>/memory/`; a bare path or `file://` names a specific directory; a
+    /// `~/.beyond/projects/<cwd>/memory/`; a bare path or `file://` names a specific directory; a
     /// `redis://`/`postgres://` URL selects a networked backend (recognized, not yet implemented). See
     /// [`crate::memory::open`]. Follows `default_session_dir`'s convention exactly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -261,7 +261,7 @@ pub struct Settings {
     /// with an existing server ecosystem, and no `unsafe`/`libloading` plugin-loading needed). No
     /// per-field CLI flag or `agent settings` mutator exists for this (unlike most other fields here) —
     /// configured directly in this file (global tier) or a trusted project's own
-    /// `<cwd>/.claude/settings.json` (project tier, already trust-gated — see
+    /// `<cwd>/.beyond/settings.json` (project tier, already trust-gated — see
     /// [`effective_settings_for_cwd`]), hand-edited like [`ModelOverride`]'s sibling `models.json`. Like
     /// every other `Vec` field here, a project-tier list *replaces* the global one wholesale on merge
     /// (see [`Self::merge_over`]'s doc comment) rather than concatenating — a project wanting the
@@ -281,7 +281,7 @@ impl Settings {
     /// wholesale replacement, never a concat/append — so a project's list here, when set at all,
     /// *replaces* the global list outright rather than appending to it, matching that upstream behavior.
     /// This is also simpler and more predictable on its own merits: a project author reading their own
-    /// `.claude/settings.json` sees exactly the list that applies, with no need to cross-reference the
+    /// `.beyond/settings.json` sees exactly the list that applies, with no need to cross-reference the
     /// global file to reconstruct a merged result.
     ///
     /// Used by [`effective_settings_for_cwd`]'s project-tier resolution — never by [`SettingsStore`]
@@ -441,10 +441,10 @@ pub(crate) fn classify_path_entry(entry: &str) -> PathEntry<'_> {
 }
 
 /// A persisted settings file, one per machine — the *global* tier. A project-level tier also exists now
-/// (Round 3, pi-parity feature: [`effective_settings_for_cwd`], `<cwd>/.claude/settings.json`, deep-merged
+/// (Round 3, pi-parity feature: [`effective_settings_for_cwd`], `<cwd>/.beyond/settings.json`, deep-merged
 /// on top of this one via [`Settings::merge_over`] whenever `cwd` is trusted), matching pi's own two-tier
 /// `settings.json` design — but this type itself remains the global tier only. `agent settings` (the CLI
-/// subcommand) manages only this global tier; a project's own `.claude/settings.json` is hand-edited,
+/// subcommand) manages only this global tier; a project's own `.beyond/settings.json` is hand-edited,
 /// like `models.json`, with no CLI mutation surface of its own.
 pub struct SettingsStore {
     path: PathBuf,
@@ -452,7 +452,7 @@ pub struct SettingsStore {
 }
 
 impl SettingsStore {
-    /// Open the default settings store (`~/.claude/settings.json`). A missing or unparsable file is
+    /// Open the default settings store (`~/.beyond/settings.json`). A missing or unparsable file is
     /// treated as all-defaults-unset, never an error.
     pub fn open_default() -> Self {
         Self::open(default_path())
@@ -712,7 +712,7 @@ fn read_store_file(path: &Path) -> Settings {
 /// all-unset, so a single typo silently discarded the default model, gateway, MCP servers and
 /// everything else — an unattended host quietly changed model and provider. Returns the settings that
 /// did parse, plus one message per field (or whole file) that didn't. Unknown keys are ignored, as
-/// they always were (`~/.claude/settings.json` is shared with other tools).
+/// they always were (a project's `.claude/settings.json`, read for compatibility, is Claude Code's file).
 fn parse_lenient(contents: &str) -> (Settings, Vec<String>) {
     let value: serde_json::Value = match serde_json::from_str(contents) {
         Ok(v) => v,
@@ -775,15 +775,15 @@ fn write_store_file(path: &Path, settings: &Settings) -> std::io::Result<()> {
     crate::tools::write_atomic_durable(path_str, body.as_bytes())
 }
 
-/// The root config directory both this store and `trust_store.rs`'s persist under — `~/.claude` unless
-/// overridden. pi-parity fix: previously hardcoded at each call site (here and in `trust_store.rs`),
-/// with no way to redirect it short of overriding the whole `$HOME` (which also moves every *other*
-/// HOME-relative thing — shells, other tools' own configs). `AI_AGENT_CONFIG_DIR`, when set, names the
-/// config directory itself directly (not a parent to append `.claude` under), so a caller who wants
-/// a wholly separate profile/sandbox doesn't have to also fake up a `.claude` subdirectory inside it.
-/// `session_store.rs` hardcodes the same `~/.claude/sessions` root independently (a separate agent's own
-/// file to update) — this helper is `pub(crate)` specifically so that call site can adopt it too, later,
-/// without needing to duplicate the env-var-vs-`HOME` precedence logic a second time.
+/// The agent's own state directory: `~/.beyond`, or `$AI_AGENT_CONFIG_DIR` when set (naming the
+/// directory itself, not a parent). Everything the agent writes about itself lives here — settings,
+/// credentials (`auth.json`, `mcp_auth.json`), trust grants, `models.json`, durable memory
+/// (`projects/<cwd>/memory`), the MCP manifest cache and the default session root (`sessions/`).
+///
+/// Never `~/.claude`: that is Claude Code's directory. This agent reads Claude Code's skills, agents,
+/// prompts and `CLAUDE.md` from it as compatibility input, but writes nothing there — Claude Code owns
+/// `~/.claude/settings.json` (permissions, hooks, env), and a typed rewrite of it from here would drop
+/// every key this crate doesn't model.
 pub(crate) fn config_dir_root() -> PathBuf {
     if let Some(dir) = std::env::var_os("AI_AGENT_CONFIG_DIR") {
         return PathBuf::from(dir);
@@ -791,30 +791,37 @@ pub(crate) fn config_dir_root() -> PathBuf {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_default();
-    home.join(".claude")
+    home.join(".beyond")
 }
 
 fn default_path() -> PathBuf {
     config_dir_root().join("settings.json")
 }
 
-/// Where a project-level settings tier lives, if trusted: `<cwd>/.claude/settings.json` — a sibling of
-/// the same project's `.claude/SYSTEM.md`/`skills`/`prompts` (see
-/// `trust_store::has_trust_gated_resources`), gated by the exact same persisted-trust mechanism (Round 3,
-/// pi-parity feature).
+/// The project-level settings file this agent owns: `<cwd>/.beyond/settings.json`. Trust-gated like
+/// the rest of a project's configuration (see `trust_store::has_trust_gated_resources`).
 pub fn project_settings_path(cwd: &Path) -> PathBuf {
+    cwd.join(".beyond/settings.json")
+}
+
+/// A project's `<cwd>/.claude/settings.json`, read (never written) as a compatibility tier below
+/// [`project_settings_path`]: only the keys [`Settings`] models are taken from it, Claude Code's own
+/// keys are ignored.
+pub fn claude_project_settings_path(cwd: &Path) -> PathBuf {
     cwd.join(".claude/settings.json")
 }
 
 /// The effective settings for a `run`/`serve` invocation in `cwd`: the global tier
-/// ([`SettingsStore::open_default`]) with a project-level `<cwd>/.claude/settings.json` tier deep-merged
-/// on top ([`Settings::merge_over`]) — but *only* when `cwd` is trusted per the persisted
-/// [`crate::trust_store::TrustStore`] allowlist (`TrustStore::is_trusted`: the exact-path-or-inherited
-/// grant `agent trust`/`agent untrust` manage). An untrusted project's `.claude/settings.json` is
-/// completely ignored — not partially applied — since a hostile untrusted checkout could otherwise use it
-/// to redirect `default_gateway_url`/`default_model` (or any other field) to something
-/// attacker-controlled just by shipping the file; the global tier alone is returned in that case,
-/// identical to `SettingsStore::open_default().get().clone()`.
+/// ([`SettingsStore::open_default`]), then a project's `<cwd>/.claude/settings.json` (compatibility,
+/// read-only), then its `<cwd>/.beyond/settings.json`, each deep-merged over the last
+/// ([`Settings::merge_over`]) — so `.beyond` wins a field both set. The project tiers apply *only* when
+/// `cwd` is trusted per the persisted [`crate::trust_store::TrustStore`] allowlist
+/// (`TrustStore::is_trusted`: the exact-path-or-inherited grant `agent trust`/`agent untrust` manage).
+/// An untrusted project's settings files are completely ignored — not partially applied — since a
+/// hostile untrusted checkout could otherwise use them to redirect `default_gateway_url`/
+/// `default_model` (or any other field) to something attacker-controlled just by shipping the file;
+/// the global tier alone is returned in that case, identical to
+/// `SettingsStore::open_default().get().clone()`.
 ///
 /// Deliberately checks only the persisted allowlist, not the fuller `resolve_project_trust` precedence
 /// `run`/`serve` apply for `SYSTEM.md`/skills/prompts (which also honors a one-shot `--trust-project`
@@ -824,9 +831,8 @@ pub fn project_settings_path(cwd: &Path) -> PathBuf {
 /// `agent trust <path>` grant is trusted enough for that.
 ///
 /// Returns a plain [`Settings`] snapshot, not a [`SettingsStore`] handle: there's no project-tier
-/// mutation surface analogous to `agent settings` for the global tier — a project's
-/// `.claude/settings.json` is hand-edited (matching `models.json`'s own convention), not managed via any
-/// CLI flag here.
+/// mutation surface analogous to `agent settings` for the global tier — a project's settings file is
+/// hand-edited (matching `models.json`'s own convention), not managed via any CLI flag here.
 pub fn effective_settings_for_cwd(cwd: &Path) -> Settings {
     effective_settings_with_stores(
         &SettingsStore::open_default(),
@@ -836,7 +842,7 @@ pub fn effective_settings_for_cwd(cwd: &Path) -> Settings {
 }
 
 /// [`effective_settings_for_cwd`], but against already-open stores — split out so tests can point both
-/// at temporary paths instead of the real `~/.claude` (see `ModelOverride::resolved_api_key_with_env`'s
+/// at temporary paths instead of the real `~/.beyond` (see `ModelOverride::resolved_api_key_with_env`'s
 /// doc comment for why this crate prefers threading test doubles through rather than mutating real,
 /// process-wide state like `$HOME`).
 fn effective_settings_with_stores(
@@ -847,8 +853,9 @@ fn effective_settings_with_stores(
     if !trust.is_trusted(cwd) {
         return global.get().clone();
     }
-    let project = read_store_file(&project_settings_path(cwd));
-    global.get().merge_over(&project)
+    let claude = read_store_file(&claude_project_settings_path(cwd));
+    let beyond = read_store_file(&project_settings_path(cwd));
+    global.get().merge_over(&claude).merge_over(&beyond)
 }
 
 /// A single model's on-disk connection override — pi-parity feature (Fix 9): pi's own
@@ -1208,7 +1215,7 @@ fn run_config_value_command(command: &str) -> Option<String> {
 pub struct ModelOverrides(std::collections::BTreeMap<String, ModelOverride>);
 
 impl ModelOverrides {
-    /// Load the default model-override file (`~/.claude/models.json`, alongside `settings.json`/
+    /// Load the default model-override file (`~/.beyond/models.json`, alongside `settings.json`/
     /// `trusted-projects.json` — see [`config_dir_root`]). A missing file is the ordinary case (no
     /// overrides configured at all) — silent, matching [`SettingsStore::open`]'s own convention. An
     /// existing-but-unparsable file `warn!`s and is treated as empty rather than failing the whole
@@ -1663,8 +1670,8 @@ mod tests {
     fn store_creates_parent_directories() {
         let dir = tempfile::tempdir().unwrap();
         // A nested store path whose parent directory doesn't exist yet — matches the real
-        // `~/.claude/settings.json` layout on a fresh `~/.claude`.
-        let path = dir.path().join("nested/.claude/settings.json");
+        // `~/.beyond/settings.json` layout on a fresh `~/.beyond`.
+        let path = dir.path().join("nested/.beyond/settings.json");
         let mut store = SettingsStore::open(path.clone());
         store.set_default_model(Some("m".to_string())).unwrap();
         assert!(path.exists());
@@ -2871,12 +2878,62 @@ mod tests {
     }
 
     #[test]
-    fn project_settings_path_is_dot_claude_settings_json_under_cwd() {
+    fn project_settings_path_is_dot_beyond_with_dot_claude_read_for_compatibility() {
         let cwd = Path::new("/some/project");
         assert_eq!(
             project_settings_path(cwd),
+            Path::new("/some/project/.beyond/settings.json")
+        );
+        assert_eq!(
+            claude_project_settings_path(cwd),
             Path::new("/some/project/.claude/settings.json")
         );
+    }
+
+    #[test]
+    fn config_dir_root_defaults_to_dot_beyond_never_dot_claude() {
+        // Whatever the environment holds, the default (no override) is `$HOME/.beyond`. Checked
+        // against the string the function builds, since setting env vars in-process is unsafe here.
+        if std::env::var_os("AI_AGENT_CONFIG_DIR").is_none() {
+            let root = config_dir_root();
+            assert_eq!(root.file_name().unwrap(), ".beyond");
+        }
+    }
+
+    #[test]
+    fn a_trusted_projects_dot_beyond_settings_win_over_its_dot_claude_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_dir = dir.path().join("project");
+        fs::create_dir_all(project_dir.join(".claude")).unwrap();
+        fs::create_dir_all(project_dir.join(".beyond")).unwrap();
+        fs::write(
+            project_dir.join(".claude/settings.json"),
+            r#"{"default_model":"claude-tier","default_gateway_url":"http://claude-tier",
+                "permissions":{"allow":["Bash"]}}"#,
+        )
+        .unwrap();
+        fs::write(
+            project_dir.join(".beyond/settings.json"),
+            r#"{"default_model":"beyond-tier"}"#,
+        )
+        .unwrap();
+        let global = SettingsStore::open(dir.path().join("settings.json"));
+        let mut trust =
+            crate::trust_store::TrustStore::open(dir.path().join("trusted-projects.json"));
+        trust.trust(&project_dir).unwrap();
+
+        let effective = effective_settings_with_stores(&global, &project_dir, &trust);
+        assert_eq!(effective.default_model.as_deref(), Some("beyond-tier"));
+        assert_eq!(
+            effective.default_gateway_url.as_deref(),
+            Some("http://claude-tier"),
+            "a field only the .claude tier sets still applies"
+        );
+
+        // Untrusted: neither project tier applies.
+        let untrusted = crate::trust_store::TrustStore::open(dir.path().join("none.json"));
+        let effective = effective_settings_with_stores(&global, &project_dir, &untrusted);
+        assert_eq!(effective.default_model, None);
     }
 
     #[test]

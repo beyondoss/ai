@@ -1,5 +1,5 @@
 //! `agent trust`/`untrust`/`clear-trust`/`trust-status` CLI subcommands: the out-of-band,
-//! `~/.claude/trusted-projects.json`-backed allowlist management surface, exercised directly (not just
+//! `~/.beyond/trusted-projects.json`-backed allowlist management surface, exercised directly (not just
 //! indirectly via `serve`'s own trust-gating tests in `serve_trust_prompts.rs`).
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 

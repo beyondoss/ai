@@ -302,7 +302,7 @@ fn settings_file_never_exists_under_the_isolated_test_home() {
     // identical to before this feature existed.
     assert!(
         !std::path::Path::new(ISOLATED_HOME)
-            .join(".claude/settings.json")
+            .join(".beyond/settings.json")
             .exists()
     );
 }
@@ -483,8 +483,8 @@ fn ai_agent_config_dir_env_var_redirects_settings_and_trust_store_off_of_home() 
         "settings.json must land under AI_AGENT_CONFIG_DIR"
     );
     assert!(
-        !home.path().join(".claude/settings.json").exists(),
-        "settings.json must not also land under $HOME/.claude when AI_AGENT_CONFIG_DIR overrides it"
+        !home.path().join(".beyond/settings.json").exists(),
+        "settings.json must not also land under $HOME/.beyond when AI_AGENT_CONFIG_DIR overrides it"
     );
 
     let trust = Command::new(bin)
@@ -1312,9 +1312,9 @@ fn one_wrongly_typed_field_is_reported_and_every_valid_field_still_applies() {
     // `tracing::warn!` nobody sees: one typo silently discarded the stored model (and gateway, MCP
     // servers, ...), so an unattended host quietly changed model and provider.
     let home = tempfile::tempdir().unwrap();
-    std::fs::create_dir_all(home.path().join(".claude")).unwrap();
+    std::fs::create_dir_all(home.path().join(".beyond")).unwrap();
     std::fs::write(
-        home.path().join(".claude/settings.json"),
+        home.path().join(".beyond/settings.json"),
         r#"{"default_model": "claude-from-settings", "block_images": "yes"}"#,
     )
     .unwrap();

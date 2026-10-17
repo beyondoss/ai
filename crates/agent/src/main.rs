@@ -515,14 +515,14 @@ enum Command {
         /// Continue the most recent session in this directory.
         #[usage(long, short = 'c')]
         r#continue: bool,
-        /// Directory to keep sessions in. Default `~/.claude/sessions/<current directory>`.
+        /// Directory to keep sessions in. Default `~/.beyond/sessions/<current directory>`.
         #[usage(long, env = "AI_AGENT_SESSION_DIR")]
         session_dir: Option<String>,
         /// Don't save the session.
         #[usage(long)]
         no_session_persistence: bool,
         /// Where persistent memory lives: a directory path. Defaults to one per project under
-        /// `~/.claude/projects`.
+        /// `~/.beyond/projects`.
         #[usage(long, env = "AI_AGENT_MEMORY_URL")]
         memory: Option<String>,
         /// Turn persistent memory off.
@@ -625,7 +625,7 @@ enum Command {
         #[usage(long)]
         no_session_persistence: bool,
         /// Where persistent memory lives: a directory path. Defaults to one per project under
-        /// `~/.claude/projects`.
+        /// `~/.beyond/projects`.
         #[usage(long, env = "AI_AGENT_MEMORY_URL")]
         memory: Option<String>,
         /// Turn persistent memory off.
@@ -911,7 +911,7 @@ enum Command {
         /// The server's `name` in `mcp_servers`.
         name: String,
     },
-    /// Show or change stored defaults for `run` and `serve` (in `~/.claude/settings.json`). With no
+    /// Show or change stored defaults for `run` and `serve` (in `~/.beyond/settings.json`). With no
     /// flags, prints them.
     Settings {
         /// Default model.
@@ -2032,11 +2032,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             // A stored `agent settings` default sits between an explicit flag/env var and this crate's
             // own built-in default — same convention `run_task` applies (see its identical comment).
             // Feature 2 (Round 3, pi-parity): merges a trusted project's own
-            // `<cwd>/.claude/settings.json` tier on top of the global one first — see
+            // `<cwd>/.beyond/settings.json` (and `.claude/settings.json`) tier on top of the global one first — see
             // `settings::effective_settings_for_cwd`'s own doc comment for the trust-gating rationale.
             //
             // **Not in service mode.** These are the replica operator's own settings — its
-            // `~/.claude/settings.json` and whatever project happens to be its cwd — and every one
+            // `~/.beyond/settings.json` and whatever project happens to be its cwd — and every one
             // of the defaults below (a shell path, skill and template paths, the memory backend, a
             // session directory, a model, a gateway URL) would otherwise configure someone else's
             // tenant. An empty `Settings` makes every `or_else` fall through to this crate's own
@@ -4066,7 +4066,7 @@ async fn run_task(
     // A stored `agent settings` default sits between an explicit flag/env var and this crate's own
     // built-in default — checked here, once, rather than threading `SettingsStore` through every
     // individual flag's own resolution site. Feature 2 (Round 3, pi-parity): merges a trusted project's
-    // own `<cwd>/.claude/settings.json` tier on top of the global one first — see
+    // own `<cwd>/.beyond/settings.json` (and `.claude/settings.json`) tier on top of the global one first — see
     // `settings::effective_settings_for_cwd`'s own doc comment for the trust-gating rationale.
     //
     // Task #35/#36 (pi-parity fix): `stored_settings`, `block_images`, and `image_auto_resize` are
@@ -4138,7 +4138,7 @@ async fn run_task(
     // arm below).
     let cwd_str = cwd.to_string_lossy().into_owned();
     // `--session-dir` (matching `serve`'s own flag/env var exactly) redirects the repo root that
-    // `--continue` and `--fork` both use, in place of the default `~/.claude/sessions/<encoded-cwd>/`.
+    // `--continue` and `--fork` both use, in place of the default `~/.beyond/sessions/<encoded-cwd>/`.
     // Its parent becomes `--fork`'s cross-project search root too — the same convention `serve`'s own
     // `list_all_sessions` already applies (`Persistence::list_all_with_progress`'s `repo.dir().parent()`)
     // when `--session-dir` is set there, so both binaries scope a cross-project scan identically.
@@ -4522,7 +4522,7 @@ async fn run_task(
     // Fail-soft (Task: MCP client support): a server that fails to connect is skipped with a warning,
     // not a fatal error — matches `has_gated_resources`'s own "warn, don't block the run" convention
     // just above. `stored_settings.mcp_servers` is already trust-gated (a project's own
-    // `.claude/settings.json` — where a project-tier `mcp_servers` entry would live — only merges in at
+    // `.beyond/settings.json` — where a project-tier `mcp_servers` entry would live — only merges in at
     // all when `effective_settings_for_cwd` found `cwd` trusted; the global tier always applies).
     let (mcp_tools, mcp_catalog, mcp_warnings) = tools::mcp::connect_all(
         stored_settings.mcp_servers.as_deref().unwrap_or(&[]),

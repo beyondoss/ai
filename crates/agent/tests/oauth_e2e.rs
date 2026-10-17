@@ -1,5 +1,5 @@
 //! End-to-end proof that a stored OAuth credential actually drives a real `run` invocation: no
-//! `--key`/`AI_AGENT_KEY` at all, just a seeded `~/.claude/auth.json` and an Anthropic-dialect
+//! `--key`/`AI_AGENT_KEY` at all, just a seeded `~/.beyond/auth.json` and an Anthropic-dialect
 //! `--model` — `resolve_gateway_credential` must infer the provider, `OAuthCredentialSource` must
 //! hand a live token to `GatewayClient`, and the request that reaches the wire must carry Anthropic's
 //! OAuth identity headers (the full chain `client.rs`'s own unit tests exercise with a hand-built test
@@ -13,7 +13,7 @@ use std::process::Stdio;
 use common::{run_cmd, spawn_model_server, turn_text};
 
 fn write_auth_json(home: &std::path::Path, body: &str) {
-    let dir = home.join(".claude");
+    let dir = home.join(".beyond");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("auth.json"), body).unwrap();
 }

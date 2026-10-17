@@ -14,7 +14,7 @@ use common::{
 use serde_json::{Value, json};
 
 /// Neither `--session-file` nor `--session-dir` — exercises `Persistence::open`'s default directory
-/// (`~/.claude/sessions/<encoded-cwd>/`) rather than in-memory-only.
+/// (`~/.beyond/sessions/<encoded-cwd>/`) rather than in-memory-only.
 fn serve_default_persistence_cmd(bin: &str, base: &str) -> Command {
     let mut c = Command::new(bin);
     c.args([
@@ -250,7 +250,7 @@ fn serve_export_html_includes_abandoned_branches_not_just_the_active_path() {
 fn serve_defaults_to_home_claude_sessions_when_no_session_flag_given() {
     // Neither --session-file nor --session-dir: must default to a real, cwd-encoded directory under
     // HOME rather than silently running in-memory-only. HOME is overridden to a tempdir so this
-    // neither sees nor pollutes the real developer's `~/.claude/sessions`.
+    // neither sees nor pollutes the real developer's `~/.beyond/sessions`.
     let home = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
     let (base, _bodies) = spawn_model_server(vec![turn_text("ok")]);
@@ -268,7 +268,7 @@ fn serve_defaults_to_home_claude_sessions_when_no_session_flag_given() {
     drop(stdin);
     child.wait().unwrap();
 
-    let sessions_root = home.path().join(".claude/sessions");
+    let sessions_root = home.path().join(".beyond/sessions");
     assert!(
         sessions_root.is_dir(),
         "expected a default sessions directory under HOME at {}",

@@ -17,7 +17,7 @@ fn fixture_bin() -> &'static str {
 }
 
 fn write_global_settings(home: &Path, mcp_servers: Value) {
-    let claude_dir = home.join(".claude");
+    let claude_dir = home.join(".beyond");
     std::fs::create_dir_all(&claude_dir).unwrap();
     std::fs::write(
         claude_dir.join("settings.json"),

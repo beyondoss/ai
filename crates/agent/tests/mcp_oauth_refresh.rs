@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 
 fn stored_access_token(home: &std::path::Path) -> String {
     let store: Value =
-        serde_json::from_str(&std::fs::read_to_string(home.join(".claude/mcp_auth.json")).unwrap())
+        serde_json::from_str(&std::fs::read_to_string(home.join(".beyond/mcp_auth.json")).unwrap())
             .unwrap();
     store["protected"]["token_response"]["access_token"]
         .as_str()

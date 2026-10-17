@@ -243,7 +243,7 @@ fn smoke_tool_round_trip() {
 /// index and/or a live `memory view`. This is the only proof that a *real* model actually drives the
 /// memory tool well (every other memory test scripts the model); it exercises the whole feature end to
 /// end against real Anthropic. `HOME` is pinned to a tempdir so the store never touches the real
-/// `~/.claude`.
+/// `~/.beyond`.
 #[test]
 #[ignore = "live provider smoke; run via `mise run test:smoke:agent` with ANTHROPIC_API_KEY set"]
 fn smoke_memory_persists_and_recalls_across_sessions() {
@@ -295,7 +295,7 @@ fn smoke_memory_persists_and_recalls_across_sessions() {
     );
 
     // The model really wrote a memory file to disk containing the fact.
-    let projects = home.path().join(".claude/projects");
+    let projects = home.path().join(".beyond/projects");
     let proj = std::fs::read_dir(&projects)
         .unwrap_or_else(|e| panic!("no projects dir at {}: {e}", projects.display()))
         .next()

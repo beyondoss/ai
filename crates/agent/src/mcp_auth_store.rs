@@ -1,4 +1,4 @@
-//! Persisted MCP OAuth credentials (`~/.claude/mcp_auth.json`), keyed by MCP server name — the
+//! Persisted MCP OAuth credentials (`~/.beyond/mcp_auth.json`), keyed by MCP server name — the
 //! credential-storage backend `agent mcp-login`/`agent mcp-logout`/`tools::mcp::connect_http` plug
 //! into `rmcp`'s own [`CredentialStore`] trait so a login (and every later token refresh) persists
 //! across process restarts, the same way `AuthStore` (`auth_store.rs`) does for model-provider OAuth.
@@ -25,7 +25,7 @@ use crate::settings::config_dir_root;
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 struct OnDisk(BTreeMap<String, StoredCredentials>);
 
-/// A persisted MCP OAuth credential store, one per machine (`~/.claude/mcp_auth.json`).
+/// A persisted MCP OAuth credential store, one per machine (`~/.beyond/mcp_auth.json`).
 pub struct McpAuthStore {
     path: PathBuf,
 }

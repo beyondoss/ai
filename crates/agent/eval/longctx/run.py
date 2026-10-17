@@ -540,8 +540,8 @@ def _run_one(held: contextlib.ExitStack, binary: Path, task: str, model: str, ar
         prompt, want = mcp_tasks.MCP_TASKS[task](tree)
         server, base = serve_dir(tree / "site")
         prompt = prompt.replace("{base}", base)
-        (home / ".claude").mkdir()
-        (home / ".claude" / "settings.json").write_text(
+        (home / ".beyond").mkdir()
+        (home / ".beyond" / "settings.json").write_text(
             json.dumps(mcp_tasks.settings(tree, tasks.work_dir() / "mcp-cache")))
         env["GH_TOKEN"] = mcp_tasks.gh_token()
         repos = []

@@ -55,9 +55,9 @@ fn run_in(
     (events, bodies, output.status.success())
 }
 
-/// The single per-project memory directory the binary created under `HOME/.claude/projects/*/memory/`.
+/// The single per-project memory directory the binary created under `HOME/.beyond/projects/*/memory/`.
 fn memory_dir(home: &Path) -> PathBuf {
-    let projects = home.join(".claude/projects");
+    let projects = home.join(".beyond/projects");
     let entry = std::fs::read_dir(&projects)
         .unwrap_or_else(|e| panic!("no projects dir at {}: {e}", projects.display()))
         .next()
@@ -248,7 +248,7 @@ fn no_memory_omits_the_tool_and_the_section() {
         "no memory guidance without the tool"
     );
     // And nothing was written to disk.
-    assert!(!home.path().join(".claude/projects").exists());
+    assert!(!home.path().join(".beyond/projects").exists());
 }
 
 #[test]

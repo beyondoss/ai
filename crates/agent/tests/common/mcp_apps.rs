@@ -28,7 +28,7 @@ pub fn home_with_servers(servers: &[&str], env: Value) -> Home {
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path().join("home");
     let log = dir.path().join("fixture.log");
-    std::fs::create_dir_all(home.join(".claude")).unwrap();
+    std::fs::create_dir_all(home.join(".beyond")).unwrap();
     let mut env = env;
     env["MCP_APPS_FIXTURE_LOG"] = json!(log.to_string_lossy());
     let configs: Vec<Value> = servers
@@ -38,7 +38,7 @@ pub fn home_with_servers(servers: &[&str], env: Value) -> Home {
         })
         .collect();
     std::fs::write(
-        home.join(".claude/settings.json"),
+        home.join(".beyond/settings.json"),
         serde_json::to_string_pretty(&json!({ "mcp_servers": configs })).unwrap(),
     )
     .unwrap();

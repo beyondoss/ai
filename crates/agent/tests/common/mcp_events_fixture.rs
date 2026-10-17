@@ -87,9 +87,9 @@ pub fn spawn_http_fixture(envs: &[(&str, &str)]) -> (ChildGuard, String, String)
     )
 }
 
-/// Write `$HOME/.claude/settings.json` with exactly these `mcp_servers`.
+/// Write `$HOME/.beyond/settings.json` with exactly these `mcp_servers`.
 pub fn write_settings(home: &Path, mcp_servers: Value) {
-    let dir = home.join(".claude");
+    let dir = home.join(".beyond");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
         dir.join("settings.json"),

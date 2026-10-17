@@ -77,7 +77,7 @@ def _memory(home: Path, work: Path) -> None:
     """A ~18 KB MEMORY.md (under the old 25 KB read cap, far over the new 4 KB prompt cap) with the
     one fact the task needs near its end."""
     enc = str(work.resolve()).replace("/", "-")
-    mem = home / ".claude" / "projects" / enc / "memory"
+    mem = home / ".beyond" / "projects" / enc / "memory"
     mem.mkdir(parents=True, exist_ok=True)
     rng = random.Random(5)
     topics = ["deploy", "ci", "auth", "billing", "search", "cache", "queue", "metrics", "frontend", "mobile"]

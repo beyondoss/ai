@@ -111,7 +111,7 @@ fn run_binary_persists_but_does_not_resume_by_default_with_no_session_flags_give
     );
     drop(bodies1);
     assert!(
-        home_dir.path().join(".claude/sessions").is_dir(),
+        home_dir.path().join(".beyond/sessions").is_dir(),
         "a plain no-flag run must persist under the default per-cwd sessions repo"
     );
 
@@ -146,7 +146,7 @@ fn run_binary_persists_but_does_not_resume_by_default_with_no_session_flags_give
     );
 
     // Both runs persisted — two separate sessions in the one per-cwd repo, neither discarded.
-    let repo = std::fs::read_dir(home_dir.path().join(".claude/sessions"))
+    let repo = std::fs::read_dir(home_dir.path().join(".beyond/sessions"))
         .expect("sessions root")
         .filter_map(Result::ok)
         .map(|e| e.path())
@@ -198,7 +198,7 @@ fn run_binary_no_session_persistence_flag_opts_out_of_the_default_persistence() 
     );
     drop(bodies1);
     assert!(
-        !home_dir.path().join(".claude/sessions").exists(),
+        !home_dir.path().join(".beyond/sessions").exists(),
         "--no-session-persistence must not create the default sessions repo at all"
     );
 
@@ -727,9 +727,9 @@ fn run_continue_with_name_titles_a_genuinely_fresh_session() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    // `--continue` persists under `$HOME/.claude/sessions/<encoded-cwd>/` — one project subdirectory,
+    // `--continue` persists under `$HOME/.beyond/sessions/<encoded-cwd>/` — one project subdirectory,
     // one session file inside it, for this brand-new project.
-    let project_subdir = std::fs::read_dir(home_dir.path().join(".claude/sessions"))
+    let project_subdir = std::fs::read_dir(home_dir.path().join(".beyond/sessions"))
         .expect("sessions root must exist")
         .next()
         .expect("one project subdirectory")
@@ -807,7 +807,7 @@ fn run_continue_with_name_does_not_rename_an_existing_session_for_this_cwd() {
         String::from_utf8_lossy(&output2.stderr)
     );
 
-    let project_subdir = std::fs::read_dir(home_dir.path().join(".claude/sessions"))
+    let project_subdir = std::fs::read_dir(home_dir.path().join(".beyond/sessions"))
         .expect("sessions root must exist")
         .next()
         .expect("one project subdirectory")
@@ -935,7 +935,7 @@ fn run_session_id_addresses_one_session_rather_than_whatever_matched_the_cwd() {
         "distinct ids must be distinct sessions"
     );
 
-    let repo = std::fs::read_dir(home_dir.path().join(".claude/sessions"))
+    let repo = std::fs::read_dir(home_dir.path().join(".beyond/sessions"))
         .expect("sessions root")
         .filter_map(Result::ok)
         .map(|e| e.path())
@@ -1050,7 +1050,7 @@ fn run_fork_by_path_copies_a_session_file_into_a_new_session_and_continues_from_
     );
 
     // The fork lands under the *current* project's own session directory, not the source's.
-    let project_subdir = std::fs::read_dir(target_home.path().join(".claude/sessions"))
+    let project_subdir = std::fs::read_dir(target_home.path().join(".beyond/sessions"))
         .expect("sessions root must exist")
         .next()
         .expect("one project subdirectory")
@@ -1088,7 +1088,7 @@ fn run_fork_by_path_copies_a_session_file_into_a_new_session_and_continues_from_
 fn run_fork_by_id_finds_a_session_in_a_different_projects_own_directory() {
     // The cross-project half of `--fork <path|id>`: an id not found in the current project's own
     // session directory must fall back to searching every other project's directory under
-    // `~/.claude/sessions/` — matching pi's own `SessionManager.listAll`/`resolveSessionPath` fallback.
+    // `~/.beyond/sessions/` — matching pi's own `SessionManager.listAll`/`resolveSessionPath` fallback.
     let home_dir = tempfile::tempdir().unwrap();
     let project_a = tempfile::tempdir().unwrap();
     let project_b = tempfile::tempdir().unwrap();
@@ -1118,7 +1118,7 @@ fn run_fork_by_id_finds_a_session_in_a_different_projects_own_directory() {
         String::from_utf8_lossy(&output1.stderr)
     );
 
-    let project_a_subdir = std::fs::read_dir(home_dir.path().join(".claude/sessions"))
+    let project_a_subdir = std::fs::read_dir(home_dir.path().join(".beyond/sessions"))
         .unwrap()
         .next()
         .unwrap()
@@ -1161,7 +1161,7 @@ fn run_fork_by_id_finds_a_session_in_a_different_projects_own_directory() {
     );
 
     // The fork must land under project B's own subdirectory, distinct from project A's.
-    let sessions_root = home_dir.path().join(".claude/sessions");
+    let sessions_root = home_dir.path().join(".beyond/sessions");
     let subdirs: Vec<_> = std::fs::read_dir(&sessions_root)
         .unwrap()
         .map(|e| e.unwrap().path())
@@ -1439,7 +1439,7 @@ fn run_session_flag_with_an_unresolvable_bare_id_fails_clearly() {
 #[test]
 fn run_binary_session_dir_flag_redirects_the_continue_repo() {
     // Pi-parity fix: `run` had no `--session-dir` equivalent at all — `--continue` was pinned to the
-    // hardcoded default `~/.claude/sessions/<encoded-cwd>/` with no override, unlike `serve`'s own
+    // hardcoded default `~/.beyond/sessions/<encoded-cwd>/` with no override, unlike `serve`'s own
     // `--session-dir`. The given directory must become the repo root directly (matching `serve`'s own
     // semantics), not a further per-cwd subdirectory nested under it.
     let repo_dir = tempfile::tempdir().unwrap();

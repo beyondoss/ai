@@ -118,7 +118,7 @@ fn a_private_listing_is_never_written_to_the_manifest_cache() {
     let env = Env::new(json!({ "MCP_SKILLS_FIXTURE_CACHE_SCOPE": "private" }));
     env.run("hello", vec![turn_text("ok")]);
     let manifest =
-        std::fs::read_to_string(env.home.join(".claude/mcp-manifest.json")).unwrap_or_default();
+        std::fs::read_to_string(env.home.join(".beyond/mcp-manifest.json")).unwrap_or_default();
     assert!(
         !manifest.contains("skill://"),
         "a private listing must not outlive its authorization context on disk: {manifest}"
@@ -136,7 +136,7 @@ fn a_private_listing_is_never_written_to_the_manifest_cache() {
     // A public one is cached (the control).
     let public = Env::new(json!({}));
     public.run("hello", vec![turn_text("ok")]);
-    let manifest = std::fs::read_to_string(public.home.join(".claude/mcp-manifest.json")).unwrap();
+    let manifest = std::fs::read_to_string(public.home.join(".beyond/mcp-manifest.json")).unwrap();
     assert!(manifest.contains("skill://git-workflow/SKILL.md"));
 }
 
@@ -188,7 +188,7 @@ fn entries_left_out_are_surfaced_in_get_commands_and_run_warnings() {
 }
 
 fn cached_manifest(env: &Env) -> String {
-    std::fs::read_to_string(env.home.join(".claude/mcp-manifest.json")).unwrap_or_default()
+    std::fs::read_to_string(env.home.join(".beyond/mcp-manifest.json")).unwrap_or_default()
 }
 
 /// A listing re-fetched mid-session reaches the on-disk cache then, not at the next live connect:

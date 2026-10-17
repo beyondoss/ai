@@ -18,7 +18,7 @@ use common::{body_json, run_cmd, spawn_model_server, sse, turn_text, turn_tool_u
 use serde_json::{Value, json};
 
 fn write_settings(home: &Path) {
-    let dir = home.join(".claude");
+    let dir = home.join(".beyond");
     std::fs::create_dir_all(&dir).unwrap();
     let server = |name: &str| {
         json!({

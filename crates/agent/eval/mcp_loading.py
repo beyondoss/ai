@@ -95,8 +95,8 @@ def tempdir(prefix):
 
 def home_with(servers):
     home = tempdir("home-")
-    os.makedirs(os.path.join(home, ".claude"))
-    json.dump({"mcp_servers": servers}, open(os.path.join(home, ".claude", "settings.json"), "w"))
+    os.makedirs(os.path.join(home, ".beyond"))
+    json.dump({"mcp_servers": servers}, open(os.path.join(home, ".beyond", "settings.json"), "w"))
     return home
 
 

@@ -454,7 +454,7 @@ async fn a_cached_apps_manifest_starts_nothing_and_a_reaped_connection_redials_w
         let mut ws = daemon.connect("m1").await;
         declare_apps(&mut ws).await;
     }
-    let apps_manifest = home.home.join(".claude/mcp-manifest-apps.json");
+    let apps_manifest = home.home.join(".beyond/mcp-manifest-apps.json");
     let manifest: Value =
         serde_json::from_str(&std::fs::read_to_string(&apps_manifest).unwrap()).unwrap();
     let cached = manifest["wx"]["tools"].as_array().unwrap();

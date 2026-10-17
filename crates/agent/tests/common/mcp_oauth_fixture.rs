@@ -24,9 +24,9 @@ use serde_json::{Value, json};
 
 use super::SpawnGuarded;
 
-/// Write `$HOME/.claude/settings.json` with these `mcp_servers`.
+/// Write `$HOME/.beyond/settings.json` with these `mcp_servers`.
 pub fn write_global_settings(home: &Path, mcp_servers: Value) {
-    let claude_dir = home.join(".claude");
+    let claude_dir = home.join(".beyond");
     std::fs::create_dir_all(&claude_dir).unwrap();
     std::fs::write(
         claude_dir.join("settings.json"),

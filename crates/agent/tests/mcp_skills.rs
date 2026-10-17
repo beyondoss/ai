@@ -437,7 +437,7 @@ fn skills_work_over_streamable_http() {
         .read_line(&mut url)
         .unwrap();
     std::fs::write(
-        env.home.join(".claude/settings.json"),
+        env.home.join(".beyond/settings.json"),
         json!({ "mcp_servers": [{ "name": "docs", "transport": "http", "url": url.trim() }] })
             .to_string(),
     )

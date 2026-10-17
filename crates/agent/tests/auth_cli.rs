@@ -1,4 +1,4 @@
-//! `agent login`/`logout`/`auth-status` CLI subcommands: the out-of-band, `~/.claude/auth.json`-backed
+//! `agent login`/`logout`/`auth-status` CLI subcommands: the out-of-band, `~/.beyond/auth.json`-backed
 //! OAuth/subscription-credential store, exercised directly (not just indirectly via `serve`'s own RPC
 //! surface in `serve_auth.rs`). Follows `trust_cli.rs`'s exact shape — `login` itself needs a live
 //! OAuth provider (or a mock one) to actually complete, so these tests cover everything reachable
@@ -9,7 +9,7 @@
 use std::process::Command;
 
 fn write_auth_json(home: &std::path::Path, body: &str) {
-    let dir = home.join(".claude");
+    let dir = home.join(".beyond");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("auth.json"), body).unwrap();
 }
@@ -161,13 +161,13 @@ fn ai_agent_config_dir_env_var_redirects_the_auth_store_off_of_home() {
     let output = Command::new(bin)
         .args(["auth-status", "anthropic"])
         .env("HOME", home.path())
-        .env("AI_AGENT_CONFIG_DIR", config_dir.path().join(".claude"))
+        .env("AI_AGENT_CONFIG_DIR", config_dir.path().join(".beyond"))
         .output()
         .unwrap();
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.starts_with("anthropic: logged_in"), "{stdout}");
 
-    // And HOME's own `.claude/auth.json` (never written) must NOT have been consulted.
-    assert!(!home.path().join(".claude/auth.json").exists());
+    // And HOME's own `.beyond/auth.json` (never written) must NOT have been consulted.
+    assert!(!home.path().join(".beyond/auth.json").exists());
 }

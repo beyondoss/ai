@@ -609,7 +609,7 @@ async fn a_restarted_daemon_hides_app_only_tools_from_the_cached_manifest() {
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     let manifest: Value = serde_json::from_str(
-        &std::fs::read_to_string(home.home.join(".claude/mcp-manifest.json")).unwrap(),
+        &std::fs::read_to_string(home.home.join(".beyond/mcp-manifest.json")).unwrap(),
     )
     .unwrap();
     assert!(

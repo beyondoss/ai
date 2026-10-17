@@ -62,7 +62,7 @@ fn serve_mem_cmd(
 }
 
 fn memory_dir(home: &Path) -> PathBuf {
-    let projects = home.join(".claude/projects");
+    let projects = home.join(".beyond/projects");
     let entry = std::fs::read_dir(&projects)
         .unwrap_or_else(|e| panic!("no projects dir at {}: {e}", projects.display()))
         .next()
@@ -266,5 +266,5 @@ fn no_memory_omits_the_tool_and_the_section() {
         !first.contains("## Memory"),
         "no memory section without the tool"
     );
-    assert!(!home.path().join(".claude/projects").exists());
+    assert!(!home.path().join(".beyond/projects").exists());
 }

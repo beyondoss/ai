@@ -43,11 +43,11 @@ fn stdio_server_config(name: &str, env: Value) -> Value {
     })
 }
 
-/// Write `~/.claude/settings.json` (the global tier) under `home`, with the given `mcp_servers` array —
+/// Write `~/.beyond/settings.json` (the global tier) under `home`, with the given `mcp_servers` array —
 /// applies regardless of whether the working directory is trusted (only a *project*-tier settings.json
 /// is trust-gated; see `settings::effective_settings_for_cwd`'s doc comment).
 fn write_global_settings(home: &Path, mcp_servers: Value) {
-    let claude_dir = home.join(".claude");
+    let claude_dir = home.join(".beyond");
     std::fs::create_dir_all(&claude_dir).unwrap();
     std::fs::write(
         claude_dir.join("settings.json"),
@@ -86,7 +86,7 @@ fn trust(home: &Path, project: &Path) {
 }
 
 /// Run the real `beyond-ai-agent run` binary against a mock model server, with `home` as `$HOME` (so
-/// `~/.claude/settings.json` resolves there) and `cwd` as the working directory. Returns
+/// `~/.beyond/settings.json` resolves there) and `cwd` as the working directory. Returns
 /// `(exit_success, stdout, stderr, recorded_model_request_bodies)`.
 fn run_against(
     home: &Path,
