@@ -387,39 +387,58 @@ pub fn spawn_gateway(cmd: &mut Command) -> (ChildGuard, GatewayPorts) {
 ///
 /// Allowance is fail-closed until the watcher stores a scan (empty = remaining-ok). A closed NATS
 /// port 402s every managed request, which is why [`wait_for_allowance_ready`] exists alongside this.
+///
+/// It lives in a `static`, whose destructor never runs, and nextest runs every test as its own
+/// process — so a plain child leaked one `nats-server` per test (73 orphans on the homelab after a
+/// day of agent runs). Like the gateway tests' `spawn_reaped`, a shell watchdog polls this test
+/// process and stops the server, and removes its store, within a second of the process exiting,
+/// however it exits.
 struct SharedNats {
     port: u16,
-    _child: ChildGuard,
-    _dir: tempfile::TempDir,
+    _watchdog: ChildGuard,
 }
 
 impl SharedNats {
     /// `-p -1` has the server pick its own port, and `--ports_file_dir` has it write the port it got
     /// to a file once it is listening — so no port is chosen and released for it.
     fn spawn() -> Self {
-        let dir = tempfile::tempdir().unwrap();
-        let ports = dir.path().join("ports");
+        const WATCHDOG: &str = r#"nats-server -js -a 127.0.0.1 -p -1 -sd "$2/store" --ports_file_dir "$2/ports" >/dev/null 2>&1 &
+server=$!
+echo "$server" > "$2/server.pid"
+while kill -0 "$1" 2>/dev/null && kill -0 "$server" 2>/dev/null; do sleep 1; done
+kill "$server" 2>/dev/null
+wait "$server" 2>/dev/null
+rm -rf "$2""#;
+        // Not a `TempDir`: the watchdog removes it after this process is gone.
+        let dir = tempfile::tempdir().unwrap().keep();
+        let ports = dir.join("ports");
         std::fs::create_dir_all(&ports).unwrap();
-        let mut child = Command::new("nats-server")
-            .args(["-js", "-a", "127.0.0.1", "-p", "-1"])
-            .arg("-sd")
-            .arg(dir.path().join("store"))
-            .arg("--ports_file_dir")
-            .arg(&ports)
+        let mut watchdog = Command::new("sh")
+            .args([
+                "-c",
+                WATCHDOG,
+                "nats-watchdog",
+                &std::process::id().to_string(),
+            ])
+            .arg(&dir)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            // Fails naming `nats-server`: it must be on PATH (run via mise).
+            // Fails naming `nats-server` in the watchdog: it must be on PATH (run via mise).
             .spawn_guarded();
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
-            if let Some(port) = beyond_ai_test_support::ports::nats_port_from(&ports, child.id()) {
+            let server = std::fs::read_to_string(dir.join("server.pid"))
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok());
+            if let Some(port) =
+                server.and_then(|pid| beyond_ai_test_support::ports::nats_port_from(&ports, pid))
+            {
                 return Self {
                     port,
-                    _child: child,
-                    _dir: dir,
+                    _watchdog: watchdog,
                 };
             }
-            if let Ok(Some(status)) = child.try_wait() {
+            if let Ok(Some(status)) = watchdog.try_wait() {
                 panic!("the shared nats-server exited ({status}) before listening");
             }
             assert!(
