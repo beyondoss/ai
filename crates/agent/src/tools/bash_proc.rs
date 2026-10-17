@@ -9,15 +9,16 @@
 //! environment a process was *started* with) is readable for our own uid without privilege. A job's
 //! processes are the live ones that carry its tag **or** are still in its process group (which also
 //! covers a process that cleared its environment but stayed in the group) — the group only while its
-//! number is still ours, see [`ProcGroup`]. See "`bash` jobs: what a
-//! command leaves running" in `ARCHITECTURE.md` for the alternatives measured and rejected (cgroup v2
-//! per job, a child subreaper).
+//! number is still ours, see [`ProcGroup`] — **or** descend from one of those, **or** were found by an
+//! earlier scan (by pid and start time: membership lasts a process's life, so a descendant stays the
+//! job's after its parent exits). See "`bash` jobs: what a command leaves running" in
+//! `ARCHITECTURE.md` for the alternatives measured and rejected (cgroup v2 per job). Stdio MCP servers
+//! are tracked the same way (`mcp_stdio`).
 //!
-//! What escapes: a process that both clears its environment (`env -i`) and leaves the group, or one
-//! whose environment we may not read (another uid, a setuid binary, a process that made itself
-//! non-dumpable *and* left the group, e.g. `ssh-agent`). Never a name match: a kill only ever reaches a
-//! pid that carries the tag or the group at the moment of the kill, verified through a pidfd so a
-//! reused pid is never hit.
+//! What escapes: a process that clears its environment (`env -i`) or whose environment we may not
+//! read (another uid, a setuid binary, a non-dumpable process, e.g. `ssh-agent`), that left the group,
+//! and whose parent had exited before any scan saw it. Never a name match: a kill only ever reaches a
+//! process a scan found, verified through a pidfd (same start time) so a reused pid is never hit.
 //!
 //! Linux reads `/proc`; another unix falls back to the process group (`kill(-pgid, 0)` for liveness),
 //! which misses `setsid` and `timeout`.
@@ -71,11 +72,15 @@ pub struct ProcGroup {
     leader: super::exec::GroupId,
     /// Latched once the group can no longer be ours: matched by tag only from then on.
     group_gone: std::sync::Arc<AtomicBool>,
+    /// What the last scan found, by pid and start time: a process once seen as the job's stays the
+    /// job's for life (Linux; see `imp::scan`).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    seen: std::sync::Arc<Mutex<std::collections::HashSet<(u32, u64)>>>,
 }
 
 /// A tag no other job of any process on this host shares: this process's pid, its start time, and a
 /// per-process counter.
-fn new_tag() -> String {
+pub(crate) fn new_tag() -> String {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     static EPOCH: std::sync::OnceLock<u128> = std::sync::OnceLock::new();
     let epoch = EPOCH.get_or_init(|| {
@@ -101,7 +106,7 @@ pub fn own_tags() -> Vec<String> {
 }
 
 /// The [`TAG_ENV`] value a job's shell starts with: any tags this process inherited, then `tag`.
-fn tag_value(tag: &str) -> String {
+pub(crate) fn tag_value(tag: &str) -> String {
     match std::env::var(TAG_ENV) {
         Ok(outer) if !outer.is_empty() => format!("{outer}:{tag}"),
         _ => tag.to_string(),
@@ -117,6 +122,7 @@ impl ProcGroup {
             tag,
             leader: super::exec::GroupId::leader(leader),
             group_gone: std::sync::Arc::new(AtomicBool::new(false)),
+            seen: std::sync::Arc::default(),
         }
     }
 
@@ -130,6 +136,7 @@ impl ProcGroup {
             tag,
             leader: super::exec::GroupId::recorded(pgid, leader_start),
             group_gone: std::sync::Arc::new(AtomicBool::new(leader_start.is_none())),
+            seen: std::sync::Arc::default(),
         }
     }
 
@@ -394,19 +401,53 @@ fn exit_signal(_status: &std::process::ExitStatus) -> Option<i32> {
 mod imp {
     use super::{POLL, ProcGroup, TAG_ENV};
     use rustix::process::{Pid, PidfdFlags, Signal};
+    use std::collections::HashMap;
     use std::time::Duration;
 
     /// Passes of [`kill`] before giving up on a process that keeps forking faster than it is killed.
     const KILL_PASSES: usize = 20;
 
+    /// How far up a parent chain [`scan`] looks for a member. A real tree is a handful deep; the bound
+    /// only keeps a pathological one (or a cycle read across a racing `/proc`) from costing more.
+    const MAX_DEPTH: usize = 64;
+
+    /// One live process, as one pass over `/proc` read it.
+    fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+        m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    struct Proc {
+        ppid: u32,
+        start: u64,
+        /// A member in its own right: in the group (while that is ours), carrying the tag, or seen
+        /// as a member by an earlier scan.
+        direct: bool,
+    }
+
     pub(super) fn members(group: &ProcGroup) -> Vec<u32> {
+        scan(group).into_iter().map(|(pid, _)| pid).collect()
+    }
+
+    /// The job's live processes (zombies excluded, never this process itself), each with its start
+    /// time — the identity [`signal_verified`] checks before it signals. One pass over `/proc`:
+    ///
+    /// - in the process group (while that number is still ours — see [`ProcGroup`]), or
+    /// - carrying the tag, or
+    /// - seen as a member by an earlier scan (same pid **and** start time: membership is for life,
+    ///   so a process stays the job's after its parent dies and it is re-parented), or
+    /// - a descendant of any of those — which is what reaches a process that cleared its
+    ///   environment *and* left the group (`setsid env -i …`) while its parent chain is intact.
+    ///
+    /// Remembers what it found for the next scan.
+    pub(super) fn scan(group: &ProcGroup) -> Vec<(u32, u64)> {
         let me = std::process::id();
         let Ok(dir) = std::fs::read_dir("/proc") else {
             return Vec::new();
         };
         let by_group = group.by_group();
+        let seen = lock(&group.seen).clone();
         let mut in_group = false;
-        let mut out = Vec::new();
+        let mut procs: HashMap<u32, Proc> = HashMap::new();
         for entry in dir.flatten() {
             let Some(pid) = entry
                 .file_name()
@@ -418,19 +459,33 @@ mod imp {
             if pid == me {
                 continue;
             }
-            match classify(group, pid, by_group) {
-                Some(Member::Group) => {
-                    in_group = true;
-                    out.push(pid);
-                }
-                Some(Member::Tag) => out.push(pid),
-                None => {}
-            }
+            let Some(stat) = read_stat(pid) else {
+                continue;
+            };
+            let grouped = by_group && stat.pgrp == group.pgid;
+            in_group |= grouped;
+            let direct = grouped || seen.contains(&(pid, stat.start)) || has_tag(pid, &group.tag);
+            procs.insert(
+                pid,
+                Proc {
+                    ppid: stat.ppid,
+                    start: stat.start,
+                    direct,
+                },
+            );
         }
         if by_group && !in_group {
             group.saw_group_empty();
         }
+        let mut verdict: HashMap<u32, bool> = HashMap::with_capacity(procs.len());
+        let mut out: Vec<(u32, u64)> = Vec::new();
+        for (&pid, p) in &procs {
+            if descends(pid, &procs, &mut verdict, me) {
+                out.push((pid, p.start));
+            }
+        }
         out.sort_unstable();
+        *lock(&group.seen) = out.iter().copied().collect();
         out
     }
 
@@ -460,38 +515,62 @@ mod imp {
         !matches!(rest.split_whitespace().next(), Some("Z" | "X"))
     }
 
-    /// Why a process is one of a job's.
-    enum Member {
-        /// In its process group (while that is still ours).
-        Group,
-        /// Carrying its tag.
-        Tag,
-    }
-
-    /// Whether `pid` is a live (non-zombie) process of `group`: in its process group (while that
-    /// number is still ours — see [`ProcGroup`]), or carrying its tag.
-    fn belongs(group: &ProcGroup, pid: u32) -> bool {
-        classify(group, pid, group.by_group()).is_some()
-    }
-
-    fn classify(group: &ProcGroup, pid: u32, by_group: bool) -> Option<Member> {
-        let Ok(stat) = std::fs::read(format!("/proc/{pid}/stat")) else {
-            return None;
+    /// Whether `pid` is a member or descends from one, memoized in `verdict`. Stops at this process
+    /// (never a member: everything it spawned would otherwise be the job's), at init, at a process
+    /// the scan did not see, and at [`MAX_DEPTH`].
+    fn descends(
+        pid: u32,
+        procs: &HashMap<u32, Proc>,
+        verdict: &mut HashMap<u32, bool>,
+        me: u32,
+    ) -> bool {
+        let mut chain = Vec::new();
+        let mut at = pid;
+        let found = loop {
+            if let Some(&known) = verdict.get(&at) {
+                break known;
+            }
+            let Some(p) = procs.get(&at) else {
+                break false;
+            };
+            chain.push(at);
+            if p.direct {
+                break true;
+            }
+            if p.ppid == me || p.ppid <= 1 || chain.len() >= MAX_DEPTH {
+                break false;
+            }
+            at = p.ppid;
         };
+        for link in chain {
+            verdict.insert(link, found);
+        }
+        found
+    }
+
+    struct Stat {
+        ppid: u32,
+        pgrp: u32,
+        start: u64,
+    }
+
+    /// `/proc/<pid>/stat`'s parent, group and start time; `None` for a zombie or a vanished pid.
+    fn read_stat(pid: u32) -> Option<Stat> {
+        let stat = std::fs::read(format!("/proc/{pid}/stat")).ok()?;
         // `pid (comm) state ppid pgrp …`; `comm` may hold spaces or parens, so read after the last
-        // `)`.
+        // `)`. Field 3 (`state`) is the first after it, so field 22 (`starttime`) is the 20th.
         let close = stat.iter().rposition(|&b| b == b')')?;
-        let rest = String::from_utf8_lossy(&stat[close + 1..]);
-        let mut fields = rest.split_whitespace();
-        let state = fields.next().unwrap_or("");
+        let rest = std::str::from_utf8(&stat[close + 1..]).ok()?;
+        let fields: Vec<&str> = rest.split_whitespace().take(20).collect();
+        let state = *fields.first()?;
         if state == "Z" || state == "X" {
             return None;
         }
-        let pgrp = fields.nth(1).and_then(|s| s.parse::<u32>().ok());
-        if by_group && pgrp == Some(group.pgid) {
-            return Some(Member::Group);
-        }
-        has_tag(pid, &group.tag).then_some(Member::Tag)
+        Some(Stat {
+            ppid: fields.get(1)?.parse().ok()?,
+            pgrp: fields.get(2)?.parse().ok()?,
+            start: fields.get(19)?.parse().ok()?,
+        })
     }
 
     fn has_tag(pid: u32, tag: &str) -> bool {
@@ -510,39 +589,46 @@ mod imp {
     }
 
     pub(super) fn terminate(group: &ProcGroup) {
+        // The scan first, while every parent link is intact: a process that exits on the TERM
+        // re-parents its children, and a descendant matched only through it would be lost.
+        let procs = scan(group);
         if group.may_signal_group()
             && let Some(pgid) = Pid::from_raw(group.pgid as i32)
         {
             let _ = rustix::process::kill_process_group(pgid, Signal::TERM);
         }
-        for pid in members(group) {
-            signal_verified(group, pid, Signal::TERM);
+        for (pid, start) in procs {
+            signal_verified(pid, start, Signal::TERM);
         }
     }
 
     pub(super) fn kill(group: &ProcGroup) -> Vec<u32> {
-        if group.may_signal_group()
-            && let Some(pgid) = Pid::from_raw(group.pgid as i32)
-        {
-            let _ = rustix::process::kill_process_group(pgid, Signal::KILL);
-        }
         for pass in 0..KILL_PASSES {
-            let pids = members(group);
-            if pids.is_empty() {
-                return pids;
+            let procs = scan(group);
+            // After the first scan (see `terminate`), and only once: what the group signal reaches
+            // that the scan missed — a process forked in between — the next pass finds anyway.
+            if pass == 0
+                && group.may_signal_group()
+                && let Some(pgid) = Pid::from_raw(group.pgid as i32)
+            {
+                let _ = rustix::process::kill_process_group(pgid, Signal::KILL);
+            }
+            if procs.is_empty() {
+                return Vec::new();
             }
             // Every one left refused the signal: another pass cannot do better.
             let mut denied = 0;
-            for &pid in &pids {
-                if signal_verified(group, pid, Signal::KILL) {
+            for &(pid, start) in &procs {
+                if signal_verified(pid, start, Signal::KILL) {
                     denied += 1;
                 }
             }
-            if denied == pids.len() {
+            if denied == procs.len() {
+                let pids: Vec<u32> = procs.iter().map(|&(pid, _)| pid).collect();
                 tracing::warn!(
                     pgid = group.pgid,
                     ?pids,
-                    "bash job processes we may not signal survived the kill"
+                    "tracked processes we may not signal survived the kill"
                 );
                 return pids;
             }
@@ -554,29 +640,31 @@ mod imp {
             tracing::warn!(
                 pgid = group.pgid,
                 ?pids,
-                "bash job processes survived repeated kill passes"
+                "tracked processes survived repeated kill passes"
             );
         }
         pids
     }
 
-    /// Send `signal` to `pid` if it still belongs to `group` — checked after opening a pidfd on it,
-    /// and signalled through that pidfd, so a pid reused by an unrelated process in between is
-    /// never hit. Whether the kernel refused it (`EPERM`: a process of another uid).
-    fn signal_verified(group: &ProcGroup, pid: u32, signal: Signal) -> bool {
+    /// Send `signal` to `pid` if it is still the process a scan saw (same start time) — checked
+    /// after opening a pidfd on it, and signalled through that pidfd, so a pid reused by an
+    /// unrelated process in between is never hit. Whether the kernel refused it (`EPERM`: a process
+    /// of another uid).
+    fn signal_verified(pid: u32, start: u64, signal: Signal) -> bool {
         let Some(p) = Pid::from_raw(pid as i32) else {
             return false;
         };
+        let same = || crate::tools::exec::start_time(pid) == Some(start);
         let sent = match rustix::process::pidfd_open(p, PidfdFlags::empty()) {
             Ok(fd) => {
-                if !belongs(group, pid) {
+                if !same() {
                     return false;
                 }
                 rustix::process::pidfd_send_signal(&fd, signal)
             }
             // No pidfd (a kernel before 5.3): the check-then-kill gap is a few microseconds.
             Err(_) => {
-                if !belongs(group, pid) {
+                if !same() {
                     return false;
                 }
                 rustix::process::kill_process(p, signal)
@@ -587,24 +675,24 @@ mod imp {
 
     pub(super) async fn wait_gone(group: &ProcGroup) {
         loop {
-            let pids = {
+            let procs = {
                 let group = group.clone();
-                tokio::task::spawn_blocking(move || members(&group))
+                tokio::task::spawn_blocking(move || scan(&group))
                     .await
                     .unwrap_or_default()
             };
-            if pids.is_empty() {
+            if procs.is_empty() {
                 return;
             }
             // A pidfd turns readable when its process exits: wait on all of them, then look again
             // (a process may have forked meanwhile).
             let mut fds = Vec::new();
-            for pid in pids {
+            for (pid, start) in procs {
                 let Some(p) = Pid::from_raw(pid as i32) else {
                     continue;
                 };
                 if let Ok(fd) = rustix::process::pidfd_open(p, PidfdFlags::NONBLOCK)
-                    && belongs(group, pid)
+                    && crate::tools::exec::start_time(pid) == Some(start)
                     && let Ok(fd) = tokio::io::unix::AsyncFd::new(fd)
                 {
                     fds.push(fd);

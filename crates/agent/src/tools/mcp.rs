@@ -2594,8 +2594,9 @@ async fn connect_one(
 /// second browser beside the first. (`@playwright/mcp` happens not to do this; "happens not to" is not
 /// a property to build a memory budget on.)
 ///
-/// The group is what makes the transport's final sweep (`mcp_stdio::stdio_transport`) able to catch them, and it is why the pid is read
-/// here and carried on the connection.
+/// The group — together with the tracking tag `mcp_stdio::stdio_transport` puts in the server's
+/// environment, which also reaches whatever leaves the group (`setsid`, a crash handler) — is what
+/// makes the transport's final sweep able to catch them.
 ///
 /// Dropping the client is still the primary shutdown, not the kill: the MCP stdio contract is that a
 /// server watches its stdin for EOF, and the OS closes this end of that pipe however this process
@@ -2615,7 +2616,11 @@ async fn connect_stdio(
     args: &[String],
 ) -> Result<(McpClient, ServerProc), String> {
     let env = config.resolved_env();
-    let cmd = tokio::process::Command::new(command).configure(|cmd| {
+    // Under the agent binary, started through the parent-death-signal trampoline (see
+    // `crate::subreaper`): a SIGKILLed agent then takes the server down with it.
+    let cmd = crate::subreaper::server_command(command, env.get("PATH").map(std::ffi::OsStr::new))
+        .map_err(|e| format!("failed to spawn `{command}`: {e}"))?;
+    let cmd = cmd.configure(|cmd| {
         cmd.args(args);
         for (k, v) in &env {
             cmd.env(k, v);
@@ -2627,8 +2632,8 @@ async fn connect_stdio(
         // its browser, which re-parents to init and outlives any kill aimed at the server alone.
         // Measured, killing a `rustwright-mcp` that had opened a page left 16 orphaned Chromium
         // processes holding 322 MB of anonymous memory, indefinitely — a reap that reclaims nothing
-        // while the next call starts a second browser. A group leader here is what makes
-        // [`kill_process_group`] able to catch them.
+        // while the next call starts a second browser. The group, with the tracking tag
+        // `mcp_stdio::stdio_transport` adds, is what lets the sweep catch them.
         cmd.process_group(0);
     });
     // Spawned here rather than by rmcp's `TokioChildProcess` — for every stdio server — so its
@@ -2659,9 +2664,10 @@ async fn connect_stdio(
 /// `mcp_stdio::retire_all`, which every exit path of `run` and `serve` calls before waiting for the
 /// sweeps.
 ///
-/// What this does *not* cover is the agent being hard-killed: a server in its own group no longer
-/// receives the terminal's signals, and nothing then sweeps it. No worse than before — an orphaned
-/// browser already outlived a killed agent — and fixing it properly needs a supervisor.
+/// A hard-killed agent (SIGKILL, the OOM killer) runs none of this. Under the agent binary each
+/// server is started with a parent-death signal (`crate::subreaper`), so the kernel kills the server
+/// itself then; a grandchild that left its tree and ignores its parent dying is beyond in-process
+/// reach.
 impl Drop for McpConnection {
     fn drop(&mut self) {
         // `get_mut` rather than a lock: we hold `&mut self`, so no one else can be holding it.
