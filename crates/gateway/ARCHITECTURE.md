@@ -1857,14 +1857,18 @@ while the provider still bills us for what it generated before it noticed. Emitt
 A managed 2xx stream is **cut short** when its usage never arrived: no parseable usage on the
 OpenAI wire, no parseable usage or no `message_delta` event on the Anthropic wire (`message_start`
 alone parses, so a successful parse is not the same as a finished stream). The event is found
-structurally — an `event: message_delta` line or a `"type":"message_delta"` member — never as the
-bare words, which generated text can contain but cannot forge as a line or an unescaped member.
+structurally — an `event: message_delta` line, or an event whose top-level `type` is
+`message_delta`, read from the JSON so an escaped or spaced spelling of the key still counts. Generated
+text can contain the bare words but cannot forge either: inside a JSON string its quotes are escaped.
 The 2xx head is the provider's word that it took the request, and it bills the prompt from there, so
 a stream that goes silent or dies before its first event is estimated too (D123: it used to need
 `message_start`, a relayed delta or a clean finish, and a provider that answered 200 and stalled
 billed a generation the row wrote as 0/0). The one exception is a 200 stream carrying only an error
-event (`"error":{`, an `overloaded_error` before any output): not work we were billed for. A stream
-that **finished** cleanly without readable usage (a provider shape change, a final event past
+event, an event whose top-level `error` member is an object (an `overloaded_error` before any output):
+not work we were billed for. Read from each event's JSON, so spacing and escapes do not matter. A
+nested error (`response.error` under a `response.failed` event) is not identified, and a stream whose
+error is not identified is billed as cut short: the conservative reading. A stream that **finished**
+cleanly without readable usage (a provider shape change, a final event past
 recovery) is a billed turn too. Its row carries an estimate and `usage_estimated=true`;
 `ai_usage_estimated_total` counts them.
 

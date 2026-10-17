@@ -1486,17 +1486,72 @@ impl InputTally {
 /// Generated text cannot forge either — inside a JSON string a newline is `\n` and a quote is
 /// `\"` — so a model writing the words `message_delta` does not finish a cut-short stream.
 pub fn anthropic_stream_finished(tail: &[u8]) -> bool {
-    memchr::memmem::find(tail, b"\nevent: message_delta").is_some()
-        || memchr::memmem::find(tail, br#""type":"message_delta""#).is_some()
-        || memchr::memmem::find(tail, br#""type": "message_delta""#).is_some()
+    if memchr::memmem::find(tail, b"\nevent: message_delta").is_some() {
+        return true;
+    }
+    // Without a backslash the raw bytes are the text, so a literal search decides: the common case
+    // costs one scan. With one, a `type` key may be spelled with escapes, so each event is read.
+    if memchr::memchr(b'\\', tail).is_none()
+        && memchr::memmem::find(tail, b"message_delta").is_none()
+    {
+        return false;
+    }
+    // An event may span several `data:` lines, which join with a newline (JSON whitespace).
+    let mut finished = false;
+    for_each_event(tail, |data| {
+        if !finished {
+            finished = event_type_is(&data.join(&b'\n'), b"message_delta");
+        }
+    });
+    finished
+}
+
+/// Whether one event's top-level `type` member is `want`. Read from the JSON, so an escaped key or
+/// whitespace around the colon is the same member, and generated text (whose quotes are escaped
+/// inside its string) can never be one.
+fn event_type_is(payload: &[u8], want: &[u8]) -> bool {
+    #[derive(Deserialize)]
+    struct Event<'a> {
+        #[serde(rename = "type", borrow, default)]
+        kind: Option<std::borrow::Cow<'a, str>>,
+    }
+    serde_json::from_slice::<Event>(payload)
+        .ok()
+        .and_then(|e| e.kind)
+        .is_some_and(|kind| kind.as_bytes() == want)
 }
 
 /// Whether a stream carried an error event: Anthropic's `{"type":"error","error":{…}}`, OpenAI's
-/// `{"error":{…}}`, OpenRouter's mid-stream `"error":{…}` on a chunk. A `null` error (Responses
-/// events carry `"error":null`) is not one, which is why the object brace is part of the needle.
-/// Generated text cannot match: inside a JSON string the quotes are escaped.
+/// `{"error":{…}}`, OpenRouter's mid-stream `{"error":{…}}` on a chunk. The error is a top-level
+/// `error` member of an event whose value is an object: a `null` error (Responses events carry
+/// `"error":null`) is not one, and an error nested deeper (`response.error`) is not identified, so
+/// its stream is billed as cut short. Read from each event's JSON, so spacing and escapes do not
+/// change the answer. Generated text cannot be a top-level member: its quotes are escaped.
 pub fn stream_carried_error(tail: &[u8]) -> bool {
-    memchr::memmem::find(tail, br#""error":{"#).is_some()
+    // Without a backslash the raw bytes are the text: no `"error"` means no error event.
+    if memchr::memchr(b'\\', tail).is_none() && memchr::memmem::find(tail, b"\"error\"").is_none() {
+        return false;
+    }
+    let mut found = false;
+    for_each_event(tail, |data| {
+        if !found {
+            found = event_error_object(&data.join(&b'\n'));
+        }
+    });
+    found
+}
+
+/// Whether one event's top-level `error` member is an object.
+fn event_error_object(payload: &[u8]) -> bool {
+    #[derive(Deserialize)]
+    struct Event<'a> {
+        #[serde(borrow, default)]
+        error: Option<&'a serde_json::value::RawValue>,
+    }
+    serde_json::from_slice::<Event>(payload)
+        .ok()
+        .and_then(|e| e.error)
+        .is_some_and(|raw| raw.get().starts_with('{'))
 }
 
 /// Estimate the output tokens of a stream that ended before its usage block.
@@ -2775,6 +2830,43 @@ data: {\"id\":\"c1\",\"choices\":[],\"usage\":{}}\n\n\
 data: [DONE]\n\n";
         let u = openai_stream(sse).expect("the real usage event must be read");
         assert_eq!((u.input_tokens, u.output_tokens), (10, 5));
+    }
+
+    /// claim: BIL-22
+    /// defect: D277
+    #[test]
+    fn an_escaped_message_delta_type_key_finishes_a_stream() {
+        let tail =
+            b"data: {\"\\u0074ype\": \"message_delta\", \"usage\":{\"output_tokens\":5}}\n\n";
+        assert!(anthropic_stream_finished(tail));
+    }
+
+    /// claim: BIL-22
+    /// defect: D277
+    #[test]
+    fn a_spaced_message_delta_type_member_finishes_a_stream() {
+        let tail = b"data: {\"type\" : \"message_delta\", \"delta\":{\"stop_reason\":\"end_turn\"}, \"usage\":{\"output_tokens\":5}}\n\n";
+        let oracle: serde_json::Value = serde_json::from_slice(&tail[6..tail.len() - 2]).unwrap();
+        assert_eq!(oracle["type"], "message_delta");
+        assert!(anthropic_stream_finished(tail));
+    }
+
+    /// A top-level error object is an error event whatever its spacing or key spelling. A null error,
+    /// or one nested under another member, is not identified and is billed as cut short.
+    /// claim: BIL-12
+    /// defect: D277
+    #[test]
+    fn a_top_level_error_object_is_an_error_event_in_any_spelling() {
+        assert!(stream_carried_error(
+            b"data: {\"type\":\"error\", \"error\" : {\"type\":\"overloaded_error\"}}\n\n"
+        ));
+        assert!(stream_carried_error(
+            b"data: {\"\\u0065rror\":{\"type\":\"overloaded_error\"}}\n\n"
+        ));
+        assert!(!stream_carried_error(br#"data: {"error":null}"#));
+        assert!(!stream_carried_error(
+            br#"data: {"type":"response.failed","response":{"error":{"message":"x"}}}"#
+        ));
     }
 }
 

@@ -2821,3 +2821,17 @@ state = "fixed"
 test = "a_trailing_empty_usage_event_does_not_shadow_real_usage"
 fix = ""
 note = "Fixed in usage.rs: the count fields that decide whether a usage object has tokens (prompt/completion, input/output, total, cache hit) are Option, and counts_tokens() is checked wherever a usage object becomes a Usage (openai_body, anthropic_body, openai_chunk_usage, the Responses envelope, the openai_stream recovery, anthropic_apply). An object with no token field is no usage, so a stream scan falls through to the real event and a body reports none. Also held by an_empty_usage_object_is_no_usage."
+
+[[defect]]
+id = "D277"
+severity = "med"
+area = "Billing"
+title = "A message_delta or an error member with a space after its colon is missed"
+impact = "The cut-short check looked for the literal text \"type\":\"message_delta\" and the error check for \"error\":{. JSON allows whitespace around the colon, so a finished stream written with \"type\" : \"message_delta\" was read as cut short and billed an estimate, and an error event written \"error\" : {…} was read as no error."
+confidence = "high"
+evidence = "usage.rs anthropic_stream_finished and stream_carried_error matched the exact bytes. Reproduced on 4513e6f by a_spaced_message_delta_type_member_finishes_a_stream and a_spaced_error_member_is_an_error_event (both failed)."
+claims = ["BIL-22", "BIL-12"]
+state = "fixed"
+test = "a_spaced_message_delta_type_member_finishes_a_stream"
+fix = ""
+note = "Fixed in usage.rs: both checks read a member by its key and the value that follows, skipping JSON whitespace around the colon (member_value_starts). The `event: message_delta` line stays a marker, as each_message_delta_marker_alone_finishes_a_stream requires an event line whose data is empty, so the parse-based check the audit suggested would not be equivalent. A quote inside generated text is escaped in the bytes, so the key cannot match there (forged-text tests unchanged). Also held by a_spaced_error_member_is_an_error_event."
