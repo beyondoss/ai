@@ -4624,6 +4624,21 @@ nothing for it to interrupt. `new_session` keeps its own id (the address a clien
 archives the outgoing conversation into a derived session, exactly as an addressed session does
 anywhere else.
 
+### A dead MCP server is dialed again
+
+A server's connection (`McpConnection`) caches one live client, shared by every tool, resource,
+prompt, skill and events subscription of that server. A server that dies — OOM-killed, crashed,
+`kill -9` — leaves that client cached with its transport closed: rmcp's service loop ends on the
+EOF, and every later request fails "transport closed". So `McpConnection::client` checks
+`is_transport_closed()` before handing the cached client out; a closed one is retired (its process
+group swept) and the server dialed again, under the same lock, so concurrent callers make one
+process. Every path to a server goes through `client()`, so tool calls, reads and the events poll
+loop all recover without retry code of their own (`live_client`, which never dials, reports a closed
+client as none). A call already in flight when the server died still fails: whether it reached the
+server is unknowable, and re-sending a `tools/call` could do its work twice. The next call redials.
+`tests/mcp_redial.rs` (tool, then resource, after `kill -9`) and `tests/mcp_events_redial.rs` (a
+poll subscription resubscribes on the fresh process).
+
 ### Per-session MCP
 
 Outside service mode, MCP is a **process** fact: `main.rs` connects every server in the operator's

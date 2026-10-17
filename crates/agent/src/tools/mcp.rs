@@ -1041,13 +1041,31 @@ impl McpConnection {
         }
     }
 
-    /// The live client, connecting first if the process was reaped.
+    /// The live client, connecting first if the process was reaped — or has died.
+    ///
+    /// A server that crashed (an OOM kill, an unhandled exception, `kill -9`) leaves its client
+    /// cached with the transport closed underneath it: rmcp's service loop ends on the EOF, and every
+    /// request on that client fails "transport closed" forever. So a closed client is retired here
+    /// and dialed again, once per caller — which covers every path that reaches a server (tool calls,
+    /// resource and prompt reads, skills, completions, the events subscriptions) with no
+    /// per-caller retry. A call already in flight when the server died still fails: whether it
+    /// reached the server is unknowable, and re-sending a `tools/call` could do its work twice.
     pub(crate) async fn client(&self) -> Result<Arc<McpClient>, String> {
         self.last_used
             .store(now_secs(), std::sync::atomic::Ordering::Relaxed);
         let mut guard = self.client.lock().await;
         if let Some(live) = guard.as_ref() {
-            return Ok(live.client.clone());
+            if !live.client.is_transport_closed() {
+                return Ok(live.client.clone());
+            }
+            tracing::warn!(
+                server = %self.config.name,
+                "MCP server connection closed (the server exited?); dialing it again"
+            );
+            if let Some(proc) = &live.proc {
+                crate::tools::mcp_stdio::retire(proc);
+            }
+            *guard = None;
         }
         let (client, proc) = connect_one_client(&self.config, &self.dial).await?;
         let client = Arc::new(client);
@@ -1082,6 +1100,7 @@ impl McpConnection {
             .lock()
             .await
             .as_ref()
+            .filter(|live| !live.client.is_transport_closed())
             .map(|live| live.client.clone())
     }
 
