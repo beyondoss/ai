@@ -2188,7 +2188,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 // `Persistence::open` checks `session_dir` before `session_file`, so filling in a
                 // stored session-dir default even when the operator explicitly chose `--session-file`
                 // would silently switch them into repo mode instead of the file mode they asked for.
-                if session_file.is_none() {
+                // Nor under `--no-session-persistence`: a stored default is not an explicit flag,
+                // and the opt-out beats it, exactly as it does in `run`.
+                if session_file.is_none() && !no_session_persistence {
                     stored_settings.default_session_dir.clone()
                 } else {
                     None
