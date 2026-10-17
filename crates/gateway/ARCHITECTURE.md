@@ -1324,7 +1324,8 @@ the provider:
   `claude-opus-4-8` at Anthropic is `anthropic/claude-opus-4.8` at OpenRouter — so the body's `model`
   is spliced to whatever the serving candidate calls it (`peek::scan_buffered` reports the value's
   byte span). Because the body may change length, catalog-walk requests are buffered and re-framed
-  exactly as the injection path is; the two are one predicate (`RequestCtx::rewrites_body`).
+  exactly as the injection path is; the two are one predicate (`BodyPlan::rewrites_body`, decided
+  once per attempt).
 - **OpenRouter is asked not to compress.** OpenRouter's context compression is on by default for
   endpoints of 8K context or less: an over-window prompt has its middle dropped and is answered
   (gpt-4 through OpenRouter returned 200 to a 10,601-word prompt). An attempt on an OpenRouter

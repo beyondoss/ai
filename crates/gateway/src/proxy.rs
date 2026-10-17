@@ -456,21 +456,8 @@ pub struct RequestCtx {
     /// status is `0`: the niche keeps it two bytes beside the other small fields. Read it through
     /// [`RequestCtx::upstream_status`].
     upstream_status: Option<NonZeroU16>,
-    /// Managed OpenAI chat/completions request: buffer the body and inject
-    /// `stream_options.include_usage` if it streams without it, so the usage chunk (hence the
-    /// billable token count) is guaranteed. The single, deliberate exception to "never buffer the
-    /// request body" — scoped to the managed OpenAI chat/completions path (see `is_streamable_path`)
-    /// and bounded by `MAX_REQUEST_BODY`. BYO and every other request still stream straight through.
-    inject_eligible: bool,
-    /// Managed `/{provider}/…` billable call (every allowlisted endpoint but the free token
-    /// counts): buffer the body (as `inject_eligible` does) so a request whose root `model` names
-    /// no catalog row ([`price_row`]) is refused before any byte of it goes upstream, with the
-    /// catalog walk's 404. A managed key runs priced models only (D267). BYO keys never set it.
-    ///
-    /// The same buffer refuses a `/responses` body's `background: true` (D202): that endpoint is
-    /// billable, so it is always checked here (a catalog walk reads its body in `request_filter`
-    /// and refuses there).
-    catalog_check: bool,
+    /// How this attempt's body goes upstream: streamed through, or buffered and rewritten.
+    plan: BodyPlan,
     start: Instant,
     /// When this request must end (`request_max_secs`), in [`crate::deadline`]'s units;
     /// [`crate::deadline::NONE`] when the ceiling is off. A `FullBody` attempt carries its
@@ -533,7 +520,7 @@ pub struct RequestCtx {
 struct Attempt {
     /// How much of the request body this attempt has fed through `request_body_filter`.
     upload: UploadProgress,
-    /// The body, buffered for a rewrite ([`RequestCtx::rewrites_body`]); empty for every request
+    /// The body, buffered for a rewrite ([`BodyPlan::rewrites_body`]); empty for every request
     /// that streams its body through.
     req_buf: Vec<u8>,
     /// Scans a body that streams through (managed only) for its root `model`.
@@ -583,6 +570,66 @@ enum Retry {
     /// owes is that failure (a 5xx, a connect or upstream failure), resolved as the walk moves on.
     /// One already resolved (a refusing 401–403, the success it is) owes nothing more.
     NextCandidate,
+}
+
+/// How a request's body goes upstream on the current attempt: streamed through untouched, or
+/// buffered whole and rewritten. Decided where the route is (`request_filter`) and again per
+/// candidate on a catalog walk (`apply_serving_candidate`), never re-derived where the body is
+/// handled, so the buffering in `request_body_filter` and the re-framing in
+/// `upstream_request_filter` read one answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BodyPlan {
+    /// Make a streaming body ask for its usage chunk ([`stream_options_eligible`]): inject
+    /// `stream_options.include_usage` if it streams without it, or force a client-sent one to ask,
+    /// so the billable token count is guaranteed.
+    stream_options: bool,
+    /// Managed `/{provider}/…` billable call (every allowlisted endpoint but the free token counts):
+    /// held whole so a request whose root `model` names no catalog row ([`price_row`]) is refused
+    /// before any byte of it goes upstream, with the catalog walk's 404. A managed key runs priced
+    /// models only (D267). BYO keys never set it.
+    ///
+    /// The same buffer refuses a `/responses` body's `background: true` (D202): that endpoint is
+    /// billable, so it is always checked here (a catalog walk reads its body in `request_filter`
+    /// and refuses there).
+    catalog_check: bool,
+    /// See [`Self::rewrites_body`].
+    rewrites: bool,
+}
+
+impl BodyPlan {
+    /// The plan for a request whose body the gateway may edit for these reasons: `stream_options`
+    /// and `catalog_check` (see the fields), a catalog walk (`catalog_walk`), and a managed
+    /// Responses relay to a provider's store (`signed`).
+    fn new(stream_options: bool, catalog_check: bool, catalog_walk: bool, signed: bool) -> Self {
+        Self {
+            stream_options,
+            catalog_check,
+            rewrites: stream_options || catalog_check || catalog_walk || signed,
+        }
+    }
+
+    /// Whether this request's body is buffered and may leave with a different length than it
+    /// arrived — which is one question, not two, because the answer drives *both* the buffering in
+    /// `request_body_filter` and the `Content-Length`/`transfer-encoding` re-framing in
+    /// `upstream_request_filter`. Splitting them is how you get a body whose framing disagrees with
+    /// its bytes.
+    ///
+    /// Why a body gets rewritten:
+    /// - `stream_options`: splicing `stream_options` into a managed OpenAI stream.
+    /// - a catalog walk: re-spelling `model` for the candidate serving this attempt, translating
+    ///   between Chat Completions, Messages and Responses when the wires differ, and the same-wire
+    ///   edits a walk makes (the output-limit cap, `max_tokens` respelled for native OpenAI, dropped
+    ///   nulls and unreplayable reasoning).
+    /// - `catalog_check`: a managed `/{provider}/…` billable body is held whole so a model outside
+    ///   the catalog (D267), or a `/responses` body's `background: true` (D202), is refused before
+    ///   any byte goes upstream.
+    /// - `signed`: a managed Responses relay to a provider's store swaps each tenant-signed id for
+    ///   the provider's (`signed_id`, D230).
+    ///
+    /// Several can apply to the same request, in which case every edit is made to the one buffer.
+    fn rewrites_body(self) -> bool {
+        self.rewrites
+    }
 }
 
 /// Who pays for a request, and so whether anything tenant-scoped applies to it.
@@ -1599,7 +1646,7 @@ impl RequestCtx {
         if let Some(c) = self.control.as_mut().and_then(|c| c.capture.as_mut()) {
             c.push_req(chunk);
         }
-        if self.rewrites_body() {
+        if self.plan.rewrites_body() {
             self.attempt.req_buf.extend_from_slice(chunk);
         }
         true
@@ -1617,29 +1664,6 @@ impl RequestCtx {
         if let Some(a) = self.auto.as_mut() {
             a.candidate = i.saturating_add(1);
         }
-    }
-
-    /// Whether this request's body is buffered and may leave with a different length than it
-    /// arrived — which is one question, not two, because the answer drives *both* the buffering in
-    /// `request_body_filter` and the `Content-Length`/`transfer-encoding` re-framing in
-    /// `upstream_request_filter`. Splitting them is how you get a body whose framing disagrees with
-    /// its bytes.
-    ///
-    /// Why a body gets rewritten:
-    /// - `inject_eligible`: splicing `stream_options` into a managed OpenAI stream.
-    /// - a catalog walk (`auto`): re-spelling `model` for the candidate serving this attempt,
-    ///   translating between Chat Completions, Messages and Responses when the wires differ, and
-    ///   the same-wire edits a walk makes (the output-limit cap, `max_tokens` respelled for native
-    ///   OpenAI, dropped nulls and unreplayable reasoning).
-    /// - `catalog_check`: a managed `/{provider}/…` billable body is held whole so a model outside
-    ///   the catalog (D267), or a `/responses` body's `background: true` (D202), is refused before
-    ///   any byte goes upstream.
-    /// - `signed`: a managed Responses relay to a provider's store swaps each tenant-signed id for
-    ///   the provider's (`signed_id`, D230).
-    ///
-    /// Several can apply to the same request, in which case every edit is made to the one buffer.
-    fn rewrites_body(&self) -> bool {
-        self.inject_eligible || self.catalog_check || self.auto.is_some() || self.signed.is_some()
     }
 
     /// Whether the bytes sent to the client are watched for the stream's terminal event
@@ -2846,7 +2870,7 @@ fn price_model(billed: &str, requested: &str) -> Option<&'static str> {
 
 /// The catalog row one model id prices at: as spelled (a catalog name, or any candidate's
 /// provider-specific spelling of it), then with a dated snapshot suffix removed. The one lookup
-/// both [`price_model`] and the managed `/{provider}` refusal ([`RequestCtx::catalog_check`])
+/// both [`price_model`] and the managed `/{provider}` refusal ([`BodyPlan::catalog_check`])
 /// make on the requested model, so a managed `/{provider}` request is refused exactly when its
 /// requested model would leave its billing row without a `price_model`.
 fn price_row(m: &str) -> Option<&'static route::ModelRoute> {
@@ -3813,16 +3837,36 @@ fn is_streamable_path(forward_path: &str) -> bool {
         .is_some_and(|e| e.endpoint == route::Endpoint::ChatCompletions && e.sub.is_none())
 }
 
-/// Overwrite dialect + `stream_options` eligibility from **this** catalog candidate's path.
-/// Injection follows the upstream candidate, not the client: a Messages body must not grow
-/// `stream_options`, and a Chat Completions failover of a Messages client must.
+/// Overwrite dialect and the body plan from **this** catalog candidate's path. Injection follows
+/// the upstream candidate, not the client: a Messages body must not grow `stream_options`, and a
+/// Chat Completions failover of a Messages client must.
 fn apply_serving_candidate(rc: &mut RequestCtx) {
     let Some(c) = rc.auto.as_ref().and_then(|a| a.candidate_at(a.candidate)) else {
         return;
     };
-    let ep = route::Endpoint::of_upstream_path(c.path);
-    rc.dialect = ep.wire();
-    rc.inject_eligible = rc.managed() && is_streamable_path(c.path);
+    rc.dialect = route::Endpoint::of_upstream_path(c.path).wire();
+    rc.plan = BodyPlan::new(
+        stream_options_eligible(rc.managed(), rc.dialect, c.path),
+        false,
+        true,
+        rc.signed.is_some(),
+    );
+}
+
+/// Whether a body sent on `wire` to `forward_path` (query allowed) must ask for its usage chunk:
+/// a managed OpenAI Chat Completions request, which OpenAI meters only when it streams with
+/// `stream_options.include_usage`. The one copy of the rule, for a `/{provider}` route, a catalog
+/// walk's first arm, and each candidate it then serves from. BYO and every other endpoint stream
+/// straight through. The query is stripped here, so no caller can hand `is_streamable_path` one
+/// (Azure's `?api-version=` would silently disable injection).
+fn stream_options_eligible(managed: bool, wire: Dialect, forward_path: &str) -> bool {
+    managed
+        && wire == Dialect::OpenAi
+        && is_streamable_path(
+            forward_path
+                .split_once('?')
+                .map_or(forward_path, |(p, _)| p),
+        )
 }
 
 fn catalog_serving_endpoint(auto: &ModelRouting) -> Option<route::Endpoint> {
@@ -4124,13 +4168,9 @@ enum Routed {
         provider: Arc<Provider>,
         /// Always `Some`: the inbound path with the `/{provider}` segment stripped.
         forward_path: Option<String>,
-        streamable: bool,
     },
     /// Bare `/v1` default. BYO keeps the dialect-picked provider; managed becomes a catalog walk.
-    BareDefault {
-        provider: Arc<Provider>,
-        streamable: bool,
-    },
+    BareDefault { provider: Arc<Provider> },
     /// `/auto/…`. `header` is the catalog row if `x-beyond-model` resolved; `None` means peek the
     /// body's root `model` after identity is known. An *unknown* header is [`Routed::UnknownModel`],
     /// not this — the header wins, and a catalog miss is the allowlist.
@@ -4241,11 +4281,6 @@ impl ProxyHttp for AiProxy {
         // else → unknown provider (404). We resolve before auth (an unknown route is cheap) and
         // compute owned values inside the block so the session borrow ends before any `&mut session`
         // reject below.
-        // `forward_streamable` is computed here, on the forwarded **path**, deliberately *before* the
-        // query string is appended: `is_streamable_path` matches by suffix, so testing it against a
-        // path+query would fail for every provider that requires a query parameter — Azure OpenAI
-        // mandates `?api-version=…`, so its managed streams would silently skip `stream_options`
-        // injection, emit no usage chunk, and bill zero tokens.
         let routed = {
             let req = session.req_header();
             let uri = &req.uri;
@@ -4275,7 +4310,6 @@ impl ProxyHttp for AiProxy {
                 Routed::Provider {
                     provider: p.clone(),
                     forward_path: Some(with_query(rest)),
-                    streamable: is_streamable_path(rest),
                 }
             } else if route::is_default_prefix(path) {
                 // Bare default: the BYO credential, else the path's dialect, picks the provider;
@@ -4292,7 +4326,6 @@ impl ProxyHttp for AiProxy {
                     {
                         Some(p) => Routed::BareDefault {
                             provider: p.clone(),
-                            streamable: is_streamable_path(path),
                         },
                         None => Routed::UnknownProvider,
                     },
@@ -4323,7 +4356,6 @@ impl ProxyHttp for AiProxy {
         // `RequestCtx` is built.
         let provider: Option<Arc<Provider>>;
         let forward_path: Option<String>;
-        let mut forward_streamable: bool;
         let mut model_route: Option<&'static route::ModelRoute>;
         // Peek the body's root `model` after identity (managed `/v1`, headerless `/auto`).
         let resolve_from_body: bool;
@@ -4335,22 +4367,16 @@ impl ProxyHttp for AiProxy {
             Routed::Provider {
                 provider: p,
                 forward_path: fp,
-                streamable,
             } => {
                 provider = Some(p);
                 forward_path = fp;
-                forward_streamable = streamable;
                 model_route = None;
                 resolve_from_body = false;
                 managed_only = false;
             }
-            Routed::BareDefault {
-                provider: p,
-                streamable,
-            } => {
+            Routed::BareDefault { provider: p } => {
                 provider = Some(p);
                 forward_path = None;
-                forward_streamable = streamable;
                 model_route = None;
                 resolve_from_body = true;
                 managed_only = false;
@@ -4358,13 +4384,6 @@ impl ProxyHttp for AiProxy {
             Routed::Auto {
                 header: Some(route),
             } => {
-                // Streamability is a property of the *row*: its candidates all serve one wire at
-                // matching endpoints (a catalog invariant), so the first candidate's path answers it
-                // for all of them.
-                let streamable = route
-                    .candidates
-                    .first()
-                    .is_some_and(|c| is_streamable_path(c.path));
                 let first = route
                     .candidates
                     .first()
@@ -4373,7 +4392,6 @@ impl ProxyHttp for AiProxy {
                     Some(p) => {
                         provider = Some(p);
                         forward_path = None;
-                        forward_streamable = streamable;
                         model_route = Some(route);
                         resolve_from_body = false;
                         managed_only = true;
@@ -4396,7 +4414,6 @@ impl ProxyHttp for AiProxy {
             Routed::Auto { header: None } => {
                 provider = None;
                 forward_path = None;
-                forward_streamable = false;
                 model_route = None;
                 resolve_from_body = true;
                 managed_only = true;
@@ -5344,19 +5361,18 @@ impl ProxyHttp for AiProxy {
                 .map_or(provider.dialect, wire_of_forward_path),
             None => provider.dialect,
         };
-        if model_route.is_some() {
-            // From the arm this request will actually walk, not the row's Chat Completions primary:
-            // a Responses walk must not inherit `stream_options` injection.
-            forward_streamable = walk_arms
-                .first()
-                .is_some_and(|c| is_streamable_path(c.path));
-        }
-
         // Mark OpenAI managed chat/completions streams for body buffering + `stream_options` injection
-        // (handled in `request_body_filter`). Scoped tight: managed only (BYO stays pure
-        // passthrough), OpenAI dialect only, streaming-capable paths only — so everything else still
-        // streams through untouched. Checked on the forwarded path (suffix), so it's prefix-agnostic.
-        let inject_eligible = managed && dialect == Dialect::OpenAi && forward_streamable;
+        // (handled in `request_body_filter`). A catalog walk asks of the arm this request will
+        // actually walk, not the row's Chat Completions primary: a Responses walk must not inherit
+        // `stream_options` injection (each candidate re-decides in `apply_serving_candidate`).
+        let stream_options = match model_route {
+            Some(_) => walk_arms
+                .first()
+                .is_some_and(|c| stream_options_eligible(managed, dialect, c.path)),
+            None => forward_path
+                .as_deref()
+                .is_some_and(|p| stream_options_eligible(managed, dialect, p)),
+        };
         // Every billable managed `/{provider}/…` body is buffered too, so a model outside the
         // catalog is refused before a byte of it goes upstream: a managed key runs only what its
         // billing row can price (D267). So is a `/responses` body's `background: true` (a
@@ -5372,7 +5388,7 @@ impl ProxyHttp for AiProxy {
         // That buffer counts against the body budget. A declared large body reserves up front,
         // before the tenant slot and the breaker permit, so a refusal holds neither; a chunked one
         // reserves as it grows (`request_body_filter`).
-        if (inject_eligible || catalog_check)
+        if (stream_options || catalog_check)
             && model_route.is_none()
             && let Some(n) = declared_len.filter(|&n| past_replay_buffer(n))
             && !ctx.held.reserve_body(n)
@@ -5462,8 +5478,7 @@ impl ProxyHttp for AiProxy {
                     // Not an upstream stream — `response_filter` never ran, so `active_streams`
                     // was never incremented. The stored `hit.streaming` is emitted on `ai.usage`.
                     streaming: false,
-                    inject_eligible: false,
-                    catalog_check: false,
+                    plan: BodyPlan::new(false, false, model_route.is_some(), false),
                     resp_tail: UsageTail::default(),
                     resp_head: Vec::new(),
                     upstream_status: held_status(hit.status),
@@ -5591,8 +5606,12 @@ impl ProxyHttp for AiProxy {
             // stop looking. See `ModelScanner::for_response`.
             resp_model_scanner: peek::ModelScanner::for_response(),
             streaming: false,
-            inject_eligible,
-            catalog_check,
+            plan: BodyPlan::new(
+                stream_options,
+                catalog_check,
+                model_route.is_some(),
+                signed.is_some(),
+            ),
             // Grown lazily by the response tap (`response_body_filter`), not pre-reserved: a
             // non-streaming response — the common case — is a few hundred bytes, so reserving the
             // full 64KB cap up front would waste an allocation on every request to hold ~200B. A
@@ -5636,7 +5655,7 @@ impl ProxyHttp for AiProxy {
             terminal: TerminalTracker::default(),
             signed,
         });
-        // A body buffered for a rewrite (`RequestCtx::rewrites_body`) is pre-sized from the
+        // A body buffered for a rewrite (`BodyPlan::rewrites_body`) is pre-sized from the
         // declared Content-Length, so accumulation is a single allocation instead of a geometric
         // realloc chain; capped at `MAX_REQUEST_BODY` so a lying header can't pre-allocate
         // unbounded memory. Every other request leaves it empty and never buffers.
@@ -5645,7 +5664,7 @@ impl ProxyHttp for AiProxy {
         // `apply_stream_usage_injection` performs *in place*: with it the injection never
         // reallocates, so a body arrives, is spliced, and goes upstream on one allocation.
         if let Some(rc) = ctx.rc.as_mut()
-            && rc.rewrites_body()
+            && rc.plan.rewrites_body()
             && let Some(len) = declared_len
         {
             rc.attempt.req_buf =
@@ -6251,10 +6270,10 @@ impl ProxyHttp for AiProxy {
         //     (`UserError::MalformedHeaders`) if it's present. So we must NOT set it; removing
         //     `content-length` is sufficient and correct.
         //
-        // Keyed on `rewrites_body`, not `inject_eligible`, so the model rewrite gets the same
+        // Keyed on `rewrites_body`, not `stream_options`, so the model rewrite gets the same
         // treatment: `openai/gpt-4o-mini` is longer than `gpt-4o-mini`, and forwarding the client's
         // original `Content-Length` alongside a longer body truncates it at the upstream.
-        if rc.rewrites_body() {
+        if rc.plan.rewrites_body() {
             upstream_request.remove_header("content-length");
             if upstream_request.version != http::Version::HTTP_2 {
                 upstream_request.insert_header("transfer-encoding", "chunked")?;
@@ -6323,7 +6342,7 @@ impl ProxyHttp for AiProxy {
                 }
             }
 
-            if rc.rewrites_body() {
+            if rc.plan.rewrites_body() {
                 // A large body buffered for a rewrite (the `/{provider}` usage splice; a catalog
                 // walk's large body is a `FullBody` re-run, already reserved) holds budget as it
                 // grows. Tagged downstream: the client's size, not the provider's health.
@@ -6339,7 +6358,7 @@ impl ProxyHttp for AiProxy {
             }
         }
 
-        if rc.rewrites_body() {
+        if rc.plan.rewrites_body() {
             if end_of_stream {
                 // One structural walk for every answer (see `peek::scan_buffered`).
                 let mut buf = std::mem::take(&mut rc.attempt.req_buf);
@@ -6367,7 +6386,7 @@ impl ProxyHttp for AiProxy {
                 // body, ahead of translation, which re-serializes and would hide it.
                 // A managed `/{provider}` body is relayed as sent, so the provider serves whichever
                 // copy its parser keeps while the billing row names the first: refused the same way.
-                if (rc.auto.is_some() || rc.catalog_check) && scan.duplicate_model {
+                if (rc.auto.is_some() || rc.plan.catalog_check) && scan.duplicate_model {
                     self.state
                         .metrics
                         .rejection(Rejection::DuplicateModel)
@@ -6424,7 +6443,7 @@ impl ProxyHttp for AiProxy {
                 // Managed `/{provider}/…` billable call naming no catalog row (D267): its billing
                 // row would carry no `price_model`. The client's id is kept for the error and the
                 // row, then the request ends before a byte of the body goes upstream.
-                if rc.catalog_check && scan.model.as_deref().and_then(price_row).is_none() {
+                if rc.plan.catalog_check && scan.model.as_deref().and_then(price_row).is_none() {
                     if rc.model.is_empty()
                         && let Some(m) = scan.model.take()
                     {
@@ -6434,7 +6453,7 @@ impl ProxyHttp for AiProxy {
                     return Err(gateway_error(404, CATALOG_MISS).into_down());
                 }
                 // Managed `/{provider}/…/responses` asking for `background: true` (D202).
-                if rc.catalog_check
+                if rc.plan.catalog_check
                     && rc.forward_path.as_deref().is_some_and(|p| {
                         route::forward_is_responses(p.split_once('?').map_or(p, |(p, _)| p))
                     })
@@ -6590,14 +6609,16 @@ impl ProxyHttp for AiProxy {
                 // may have shifted.
                 // A duplicate or escaped `stream_options` (OpenAI takes the last, decoded): drop
                 // them all, so the injection below adds the one that counts (D88).
-                if rc.inject_eligible
+                if rc.plan.stream_options
                     && scan.stream_options_ambiguous
                     && peek::remove_root_members(&mut buf, "stream_options")
                 {
                     scan = peek::scan_buffered(&buf);
                 }
                 let (buf, model_span) = match scan.stream_options_at {
-                    Some(at) if rc.inject_eligible => force_include_usage(buf, at, scan.model_span),
+                    Some(at) if rc.plan.stream_options => {
+                        force_include_usage(buf, at, scan.model_span)
+                    }
                     _ => (buf, scan.model_span),
                 };
                 let buf = match (rc.auto.as_ref(), model_span) {
@@ -6609,10 +6630,10 @@ impl ProxyHttp for AiProxy {
                 };
                 // Emit the whole (possibly rewritten) body in one shot; `transfer-encoding: chunked`
                 // (set in `upstream_request_filter`) makes the changed length fine.
-                // `inject_eligible` is the OpenAI-upstream gate: a translated Anthropic body also
+                // `plan.stream_options` is the OpenAI-upstream gate: a translated Anthropic body also
                 // carries `"stream":true`, and splicing `stream_options` into it would be a field
                 // that API does not recognize.
-                let buf = if rc.inject_eligible {
+                let buf = if rc.plan.stream_options {
                     apply_stream_usage_injection(buf, scan.inject_at)
                 } else {
                     buf
@@ -6637,7 +6658,7 @@ impl ProxyHttp for AiProxy {
         // fused walk, and its scanner was never fed.
         if end_of_stream
             && rc.managed()
-            && !rc.inject_eligible
+            && !rc.plan.stream_options
             && rc.model.is_empty()
             && let Some(m) = rc.attempt.model_scanner.take_model()
         {
@@ -8197,7 +8218,7 @@ mod tests {
     }
 
     /// A minimal `RequestCtx` for exercising the body-phase logic without a running proxy.
-    pub(super) fn test_ctx(inject_eligible: bool) -> RequestCtx {
+    pub(super) fn test_ctx(stream_options: bool) -> RequestCtx {
         let provider = Provider::resolve(
             "openai",
             "api.openai.com:443".to_string(),
@@ -8219,8 +8240,7 @@ mod tests {
             resp_tail: UsageTail::default(),
             resp_head: Vec::new(),
             upstream_status: None,
-            inject_eligible,
-            catalog_check: false,
+            plan: BodyPlan::new(stream_options, false, false, false),
             start: Instant::now(),
             deadline: crate::deadline::NONE,
             auto: None,
@@ -10014,8 +10034,8 @@ mod tests {
 
     #[test]
     fn is_streamable_path_must_be_given_the_path_without_the_query() {
-        // The suffix match cannot see past a query string. This locks in *why* `request_filter`
-        // computes `forward_streamable` before appending the query: Azure OpenAI requires
+        // The suffix match cannot see past a query string. This locks in *why*
+        // `stream_options_eligible` strips the query before asking it: Azure OpenAI requires
         // `?api-version=…` on every request, and testing the path+query here returned `false` for a
         // genuine chat/completions call — so managed Azure streams skipped `stream_options`
         // injection, got no usage chunk back, and billed zero tokens with nothing logged.
