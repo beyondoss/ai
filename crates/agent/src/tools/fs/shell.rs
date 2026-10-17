@@ -201,20 +201,22 @@ impl ShellFs {
     /// through.
     async fn write_slice(&self, path: &Path, bytes: &[u8]) -> Result<(), FsError> {
         let target = path.to_string_lossy().into_owned();
-        // Chosen here rather than by the script's `$$` because the chunked path spans several shells,
-        // and unpredictable for the reason `LocalFs`'s is: a preplanted name cannot redirect the write.
-        let tmp = format!("{target}.tmp.{}", crate::tools::temp_suffix());
+        // The temp's suffix. Chosen here rather than by the script's `$$` because the chunked path
+        // spans several shells, and unpredictable for the reason `LocalFs`'s is: a preplanted name
+        // cannot redirect the write. Every script resolves the target the same way (`RESOLVE_TARGET`)
+        // and names the temp beside the file it resolves to.
+        let suffix = crate::tools::temp_suffix();
         let outcome = if self.caps.stdin {
             let args = sh_script(
                 WRITE_STDIN_SCRIPT,
-                &[target, tmp.clone(), bytes.len().to_string()],
+                &[target.clone(), suffix.clone(), bytes.len().to_string()],
             );
             self.runner
                 .run_with_stdin("sh", &args, None, self.timeout, bytes)
                 .await
                 .map_err(|e| FsError::Backend(format!("sh: {e}")))
         } else {
-            self.write_chunks(&target, &tmp, bytes).await
+            self.write_chunks(&target, &suffix, bytes).await
         };
         match outcome {
             Ok(result) if result.code == Some(0) => Ok(()),
@@ -222,7 +224,7 @@ impl ShellFs {
                 // The compensating action. The scripts remove the temp on every failure *they* see;
                 // this covers the ones they cannot — a transport error or a timeout between chunks.
                 let _ = self
-                    .exec("rm", &["-f".to_string(), "--".to_string(), tmp])
+                    .exec("sh", &sh_script(REMOVE_TEMP_SCRIPT, &[target, suffix]))
                     .await;
                 Err(match failed {
                     Ok(result) => FsError::Backend(format!(
@@ -385,7 +387,11 @@ impl FsBackend for ShellFs {
     }
 
     /// Write-temp-then-`mv`, the same shape [`crate::tools::write_atomic`] uses locally, so a reader or
-    /// a crash sees the old file or the new one and never a partial. The content travels on stdin when
+    /// a crash sees the old file or the new one and never a partial. The scripts keep the rest of the
+    /// [`FsBackend::write_bytes`] contract too: the target is resolved through a symlink first
+    /// (`resolve_target!`), and the temp is given the existing file's mode before content goes in
+    /// (`new_temp!`). A bare `mv` would replace a link with a regular file and give the file the temp's
+    /// default mode — 0600 became 0644, 0755 lost its execute bits. The content travels on stdin when
     /// the target has proven it delivers stdin ([`Capabilities::stdin`]) and as argv-sized base64
     /// chunks otherwise — never as one argv entry, which Linux caps at 128 KiB.
     ///
@@ -781,15 +787,15 @@ impl ShellFs {
             .map_err(|e| FsError::Backend(format!("{program}: {e}")))
     }
 
-    /// Assemble `bytes` into `tmp` one argv-sized chunk per command, committing to `target` with the
-    /// last. Returns the first failed command's result, or the committing one's.
+    /// Assemble `bytes` into the temp named by `suffix` one argv-sized chunk per command, committing
+    /// to `target` with the last. Returns the first failed command's result, or the committing one's.
     ///
     /// The fallback for a target without stdin: `WRITE_CHUNK` raw bytes per round trip, so a file
     /// costs one command per 48 KiB — the same single command as before for anything smaller.
     async fn write_chunks(
         &self,
         target: &str,
-        tmp: &str,
+        suffix: &str,
         bytes: &[u8],
     ) -> Result<ExecResult, FsError> {
         let size = bytes.len().to_string();
@@ -802,10 +808,11 @@ impl ShellFs {
             let args = sh_script(
                 WRITE_CHUNK_SCRIPT,
                 &[
-                    tmp.to_string(),
+                    target.to_string(),
+                    suffix.to_string(),
                     encode_base64(chunk),
                     if first { "new" } else { "append" }.to_string(),
-                    if last { target } else { "" }.to_string(),
+                    if last { "commit" } else { "" }.to_string(),
                     size.clone(),
                 ],
             );
@@ -1146,46 +1153,109 @@ if [ ! -r "$1" ]; then
 fi
 exec dd if="$1" iflag=skip_bytes,count_bytes skip="$2" count="$3" status=none | base64 -w0"#;
 
-/// Write stdin to the temp `$2`, check it holds exactly `$3` bytes, and `mv` it over the target `$1`.
-/// The temp is removed on any failure.
+/// The opening of every write script: resolve the target `$1` to the file a write lands in, as `$t`,
+/// and name the temp `$tmp` beside it with the host's unpredictable suffix `$2`. The shell spelling of
+/// `LocalFs`'s `resolve_symlink_target`, so both backends write through a symlink rather than replacing
+/// it: `readlink -f` resolves the whole chain, and for a dangling link, which `readlink -f` may refuse,
+/// one `readlink` hop is joined to the link's directory. The temp sits beside the resolved file, so the
+/// final `mv` is a rename within one filesystem.
+///
+/// A path starting with `-` is prefixed with `./` so no command reads it as an option; `--` would do
+/// the same, but not every busybox applet takes it.
+macro_rules! resolve_target {
+    () => {
+        r#"t="$1"
+case "$t" in -*) t="./$t" ;; esac
+if [ -L "$t" ]; then
+  r=$(readlink -f "$t" 2>/dev/null) || r=
+  if [ -z "$r" ]; then
+    r=$(readlink "$t") || exit 1
+    case "$r" in
+      /*) ;;
+      *) case "$t" in */*) r="${t%/*}/$r" ;; esac ;;
+    esac
+  fi
+  t="$r"
+  case "$t" in -*) t="./$t" ;; esac
+fi
+tmp="$t.tmp.$2"
+"#
+    };
+}
+
+/// Create the empty temp `$tmp`, with `$t`'s mode when `$t` exists, before any content goes in, so
+/// the replacement keeps the file's mode and a 0600 file's bytes are never in a world-readable temp.
+/// `chmod --reference` is GNU; busybox, which Alpine ships, has no `--reference`, so its fallback is
+/// the octal mode from `stat -L -c %a`. A mode that cannot be copied fails the write: committing would
+/// change the file's permissions, which is exactly what this exists to prevent.
+///
+/// `set -C` is the shell's `create_new`: the temp is refused, not followed, if anything was preplanted
+/// at its name.
+macro_rules! new_temp {
+    () => {
+        r#"set -C
+: > "$tmp" || exit 1
+set +C
+if [ -e "$t" ]; then
+  chmod --reference="$t" "$tmp" 2>/dev/null || chmod "$(stat -L -c %a "$t")" "$tmp" || {
+    echo "cannot give the new file the mode of $t" >&2
+    rm -f "$tmp"
+    exit 1
+  }
+fi
+"#
+    };
+}
+
+/// Write stdin into a temp, check it holds exactly `$3` bytes, and `mv` it over the target. `$1` is the
+/// target and `$2` the temp's suffix (see [`resolve_target!`]). The temp is removed on any failure.
 ///
 /// **The size check is what makes a lost stdin a failed write rather than an empty file.** The probe
 /// already refuses this path to a transport that drops stdin, but a probe is one sample: an endpoint
 /// behind a load balancer mid-rollout can pass it on one replica and answer the write from another.
-/// `set -C` is the shell's `create_new` — it refuses to follow anything preplanted at the temp name.
 /// `$n` is unquoted on purpose: some `wc` implementations pad the count with spaces.
-const WRITE_STDIN_SCRIPT: &str = r#"set -C
-if cat > "$2"; then
-  n=$(wc -c < "$2")
+const WRITE_STDIN_SCRIPT: &str = concat!(
+    resolve_target!(),
+    new_temp!(),
+    r#"if cat >> "$tmp"; then
+  n=$(wc -c < "$tmp")
   if [ $n -eq "$3" ]; then
-    mv -f "$2" "$1" && exit 0
+    mv -f "$tmp" "$t" && exit 0
   else
     echo "short write: $n of $3 bytes arrived on stdin" >&2
   fi
 fi
-rm -f "$2"
-exit 1"#;
+rm -f "$tmp"
+exit 1"#
+);
 
-/// One argv-sized piece of a write, for a target without stdin: decode base64 `$2` into the temp `$1`
-/// (`new` in `$3` creates it, anything else appends). When `$4` names the target this is the last
-/// piece: check the temp holds exactly `$5` bytes and `mv` it into place. The temp is removed on any
-/// failure; the target is untouched until the `mv`, so a reader never sees a partial file.
-/// POSIX `sh` and busybox alike — this is the path Alpine targets without `-i` take.
-const WRITE_CHUNK_SCRIPT: &str = r#"if [ "$3" = new ]; then
-  set -C
-  printf %s "$2" | base64 -d > "$1"
+/// One argv-sized piece of a write, for a target without stdin: decode base64 `$3` onto the temp (`new`
+/// in `$4` creates it first). `$1` is the target and `$2` the temp's suffix (see
+/// [`resolve_target!`]). When `$5` is set this is the last piece: check the temp holds exactly `$6`
+/// bytes and `mv` it into place. The temp is removed on any failure; the target is untouched until the
+/// `mv`, so a reader never sees a partial file. POSIX `sh` and busybox alike — this is the path Alpine
+/// targets without `-i` take.
+const WRITE_CHUNK_SCRIPT: &str = concat!(
+    resolve_target!(),
+    r#"if [ "$4" = new ]; then
+"#,
+    new_temp!(),
+    r#"fi
+printf %s "$3" | base64 -d >> "$tmp" || { rm -f "$tmp"; exit 1; }
+[ -z "$5" ] && exit 0
+n=$(wc -c < "$tmp")
+if [ $n -eq "$6" ]; then
+  mv -f "$tmp" "$t" && exit 0
 else
-  printf %s "$2" | base64 -d >> "$1"
-fi || { rm -f "$1"; exit 1; }
-[ -z "$4" ] && exit 0
-n=$(wc -c < "$1")
-if [ $n -eq "$5" ]; then
-  mv -f "$1" "$4" && exit 0
-else
-  echo "short write: $n of $5 bytes assembled" >&2
+  echo "short write: $n of $6 bytes assembled" >&2
 fi
-rm -f "$1"
-exit 1"#;
+rm -f "$tmp"
+exit 1"#
+);
+
+/// The host's compensating action for a write that failed where the scripts could not clean up (a
+/// transport error, a timeout between chunks): remove the temp, found the way the write named it.
+const REMOVE_TEMP_SCRIPT: &str = concat!(resolve_target!(), r#"rm -f "$tmp""#);
 
 /// stderr from a *successful* search — an unreadable path, typically. Empty stderr means nothing to
 /// report, which is the common case.

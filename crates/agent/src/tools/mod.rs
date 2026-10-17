@@ -175,7 +175,9 @@ pub fn expand_tilde(path: &str, home: Option<&str>) -> String {
 /// If `path` already exists, the temp file is created with its permission bits rather than the process
 /// umask default — `rename(2)` swaps the whole directory entry, mode included, so a freshly-created
 /// temp file would otherwise silently downgrade e.g. a `chmod 600` file to world-readable on every
-/// edit.
+/// edit. The bits are then set again on the open descriptor, because `open`'s mode passes through the
+/// umask. This is [`FsBackend::write_bytes`](crate::tools::fs::FsBackend::write_bytes)'s contract,
+/// which `ShellFs` keeps the same way.
 ///
 /// Shared by `write` and `edit`: both replace whole files and must not leave a corrupt intermediate
 /// state that a later read (or `serve` reattach) would observe.
@@ -220,16 +222,24 @@ fn write_atomic_with(path: &str, content: &[u8], durable: bool) -> std::io::Resu
 
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);
+    let existing = std::fs::metadata(p).ok().map(|m| m.permissions());
     #[cfg(unix)]
-    {
+    if let Some(perms) = &existing {
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        if let Ok(meta) = std::fs::metadata(p) {
-            opts.mode(meta.permissions().mode());
-        }
+        opts.mode(perms.mode());
     }
 
     let tmp = p.with_file_name(format!(".{}.tmp.{}", name.to_string_lossy(), temp_suffix()));
     let mut f = opts.open(&tmp)?;
+    // `open`'s mode is filtered through the umask, so a 0664 file would come back 0644 under the usual
+    // 022. Setting it on the open descriptor makes it exact, before any content is written.
+    if let Some(perms) = existing
+        && let Err(e) = f.set_permissions(perms)
+    {
+        drop(f);
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
     // Durable: the bytes are on disk before the rename can be (see `write_atomic_durable`).
     let written = f.write_all(content).and_then(|()| {
         if !durable {

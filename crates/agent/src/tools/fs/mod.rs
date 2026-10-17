@@ -299,15 +299,25 @@ pub trait FsBackend: Send + Sync {
     /// bounded chunks (`read` counts a huge file's total lines this way) without ever holding it whole.
     async fn read_bytes(&self, path: &Path, offset: u64, max: usize) -> Result<Vec<u8>, FsError>;
 
-    /// Replace a file's entire contents atomically — a concurrent reader, or a crash mid-write, must
-    /// observe either the old file or the complete new one, never a partial. The bytes are taken by
-    /// value: a backend that hands them to a blocking thread moves them there instead of copying a
-    /// whole file on the async executor.
+    /// Replace a file's entire contents. Every backend keeps the same contract, and
+    /// `tests/fs_backend_parity.rs` checks each clause on each of them:
+    ///
+    /// - **Atomic.** A concurrent reader, or a crash mid-write, sees the old file or the complete new
+    ///   one, never a partial. Both backends write a temp file beside the target and rename it over.
+    /// - **Mode preserved.** An existing file keeps its permission bits exactly: a 0600 secret stays
+    ///   0600, a 0755 script stays executable. The temp gets them before any content goes in, so the
+    ///   new bytes are never more readable than the old ones were. A new file gets the default mode.
+    /// - **Symlinks written through.** When `path` is a symlink, its target gets the bytes and the link
+    ///   stays a link, as `open(2)` would behave. A dangling link's target is created.
+    ///
+    /// The bytes are taken by value: a backend that hands them to a blocking thread moves them there
+    /// instead of copying a whole file on the async executor.
     async fn write_bytes(&self, path: &Path, bytes: Vec<u8>) -> Result<(), FsError>;
 
     /// Replace a file's contents **only if** its mtime still equals `expected` — `edit`'s guard against
     /// clobbering a change made between reading the file and writing it back. Returns `false` when the
-    /// file moved on and nothing was written.
+    /// file moved on and nothing was written. A write that does happen keeps
+    /// [`write_bytes`](Self::write_bytes)'s contract: atomic, mode preserved, symlinks written through.
     ///
     /// This is one method rather than a stat-then-write by the caller because the check and the write
     /// have to be as close together as the backend can make them; splitting it across the trait would
