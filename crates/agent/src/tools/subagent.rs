@@ -251,6 +251,9 @@ struct ChildOutcome {
     /// Set when a worktree child's changes did not land cleanly: conflict markers, a policy refusal, or
     /// a preserved checkout the developer needs to look at.
     note: Option<String>,
+    /// `text` is the child's `structured_output` value, serialized: a note must then travel *beside*
+    /// it in a JSON envelope, never be appended to it (see [`render_outcome`]).
+    structured: bool,
 }
 
 impl ChildOutcome {
@@ -261,6 +264,7 @@ impl ChildOutcome {
             text: message.into(),
             ok: false,
             note: None,
+            structured: false,
         }
     }
 }
@@ -655,10 +659,12 @@ impl Subagent {
         let shared = self.shared_child_setup().await;
         let outcome = self.run_child(&spec, 0, &board, Some(&shared)).await;
         board.emit();
+        // The note rides a failure too: a failed worktree child's preserved checkout is the only copy of
+        // its work, and the parent cannot point anyone at it without the path.
         if !outcome.ok {
-            return Err(ToolError::Execution(outcome.text));
+            return Err(ToolError::Execution(render_outcome(outcome)));
         }
-        Ok(ToolOutput::text(with_note(outcome.text, outcome.note)))
+        Ok(ToolOutput::text(render_outcome(outcome)))
     }
 
     /// Sequential. Each step's `{previous}` becomes the prior child's final assistant text — its
@@ -685,11 +691,11 @@ impl Subagent {
             if !outcome.ok {
                 board.emit();
                 let partials = render_parallel(&done);
+                let agent = outcome.agent.clone();
                 return Err(ToolError::Execution(format!(
-                    "chain stopped at step {} ({}): {}\n\n--- completed steps ---\n{partials}",
+                    "chain stopped at step {} ({agent}): {}\n\n--- completed steps ---\n{partials}",
                     index + 1,
-                    outcome.agent,
-                    outcome.text
+                    render_outcome(outcome)
                 )));
             }
             previous = outcome.text.clone();
@@ -700,7 +706,7 @@ impl Subagent {
         let last = done.pop().ok_or_else(|| {
             ToolError::InvalidInput("`chain` must contain at least one task".to_string())
         })?;
-        Ok(ToolOutput::text(with_note(last.text, last.note)))
+        Ok(ToolOutput::text(render_outcome(last)))
     }
 
     /// Bounded fan-out. `buffered` (not `buffer_unordered`) runs up to [`MAX_CONCURRENCY`] at a time
@@ -934,6 +940,7 @@ impl Subagent {
                         text: value.to_string(),
                         ok: true,
                         note: None,
+                        structured: true,
                     },
                     None => ChildOutcome::failed(
                         spec,
@@ -949,6 +956,7 @@ impl Subagent {
                     text: nonempty(last_assistant_text(&session)),
                     ok: true,
                     note: None,
+                    structured: false,
                 },
             },
             Err(e) => ChildOutcome::failed(spec, format!("agent run failed: {e}")),
@@ -1252,11 +1260,22 @@ fn nonempty(text: String) -> String {
     }
 }
 
-fn with_note(text: String, note: Option<String>) -> String {
-    match note {
-        Some(note) => format!("{text}\n\n[{note}]"),
-        None => text,
+/// One child's result as the model reads it: its text, plus its worktree note when there is one.
+///
+/// A structured result stays valid JSON. Appending `[note]` after the payload — what a prose result
+/// gets — would hand a parent that asked for typed data something no JSON parser accepts, so the note
+/// goes beside the payload instead: `{"output": <payload>, "note": "..."}`. Without a note the payload
+/// is returned exactly as the child produced it.
+fn render_outcome(outcome: ChildOutcome) -> String {
+    let Some(note) = outcome.note else {
+        return outcome.text;
+    };
+    if outcome.structured
+        && let Ok(value) = serde_json::from_str::<serde_json::Value>(&outcome.text)
+    {
+        return json!({ "output": value, "note": note }).to_string();
     }
+    format!("{}\n\n[{note}]", outcome.text)
 }
 
 /// Truncate on a char boundary, appending a marker that names how much was cut and where to find it.
