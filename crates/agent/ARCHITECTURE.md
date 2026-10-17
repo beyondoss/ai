@@ -2130,7 +2130,17 @@ absurdly long line can't blow the model's context — a character count, matchin
 `truncateLine`/`GREP_MAX_LINE_LENGTH` (UTF-16 code units, effectively chars for all BMP text), not a byte
 count: the previous byte-based cap never produced invalid UTF-8 (it already backed off to the nearest
 char boundary), but still truncated a CJK/Cyrillic/accented-Latin line to far fewer visible characters
-than an ASCII line under the same nominal cap, for no reason. It also takes
+than an ASCII line under the same nominal cap, for no reason. **A match line is clipped around its
+match, not at its head** (`fs::clip_match`): when the first match ends past character 500, the
+500-character window is centered on it and both cuts are marked — `… <window> … [truncated; columns
+A-B of N]`, 1-based character columns, the trailing `…` dropped when the window reaches the line's end.
+A head clip hid a match at column 100,000 of a minified bundle, lockfile or SVG entirely, and `read`
+(which caps a line at 4,000 bytes) could not show it either. The match is found with a lazily
+compiled `regex::Regex` from the query (`fs::MatchFinder`, built only when a long match line appears
+and shared by the walk's workers), so `LocalFs` and `ShellFs` window identically; `ShellFs` parses
+whole lines and clips afterwards (`fs::clip_hits`). A pattern the `regex` dialect rejects (a
+POSIX-`grep`-only construct), or a context line, keeps the head clip. A line longer than a remote
+runner's 128 KiB capture arrives already cut and is flagged as a truncated result. It also takes
 context-line params — `context` (both sides, like ripgrep's `-C`) or `before`/`after` per side, each
 clamped to `MAX_CONTEXT` (100) — emitting surrounding lines flagged as context vs match; only matches
 count toward `limit` and `HARD_CAP`. A large `before`/`after` window on a match-dense file can still
@@ -2140,7 +2150,9 @@ marker; the byte cap is checked _before_ any count/line marker is appended and w
 would fire (appending a marker first and then truncating could otherwise slice through, and silently
 corrupt, the marker just added). When the byte cap doesn't fire, a trailing `[...]` marker still names
 whatever _did_ happen — `match limit N reached; …` and/or, when any individual line was clipped, `some
-lines truncated; use the read tool to see them in full`, joined with `.` when both co-occur — matching
+lines truncated; use the read tool to see them in full` (head clips) and/or `some long lines show only
+the 500 characters around their first match …` (windows, which `read` cannot show), joined with `.` when
+several co-occur — matching
 pi's own grep, which surfaces per-line truncation as an aggregate, actionable notice rather than relying
 on the inline `"… [truncated]"` markers scattered through the output to be noticed on their own.
 

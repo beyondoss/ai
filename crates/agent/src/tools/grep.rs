@@ -76,7 +76,8 @@ impl Tool for Grep {
                 "Search file contents by regular expression, honoring .gitignore and skipping .git \
                  (pass a path inside it to search it). Optionally restrict to a `path`, a `glob` (e.g. \"*.rs\"), case-insensitive with `ignore_case`. Results \
                  are sorted by path and truncated to at most {DEFAULT_LIMIT} matches or {}, whichever \
-                 is hit first, with individual lines truncated to {MAX_LINE} characters; when \
+                 is hit first, with individual lines truncated to {MAX_LINE} characters (centered \
+                 on the match when it is further in); when \
                  truncated, the lexicographically-smallest matches are reported.",
                 super::output::format_size(super::output::MAX_LISTING_BYTES as u64)
             )
@@ -195,6 +196,7 @@ impl Tool for Grep {
             (matches.len().saturating_mul(64)).min(super::output::MAX_LISTING_BYTES),
         );
         let mut lines_truncated = false;
+        let mut lines_windowed = false;
         // Whether the search root is a directory, decided from the hits themselves rather than with a
         // host `is_dir` that would be answering about the wrong filesystem for a remote backend — and
         // without the round trip a backend `stat` would cost (`grep` is deliberately one operation per
@@ -213,6 +215,8 @@ impl Tool for Grep {
             // `Result` is discarded.
             if text.ends_with(LINE_TRUNCATED_SUFFIX) {
                 lines_truncated = true;
+            } else if super::fs::is_windowed(text) {
+                lines_windowed = true;
             }
             let display_path = format_path(path, &root, root_is_dir);
             let _ = if is_match {
@@ -246,6 +250,12 @@ impl Tool for Grep {
             }
             if lines_truncated {
                 notices.push("some lines truncated; use the read tool to see them in full".into());
+            }
+            if lines_windowed {
+                notices.push(format!(
+                    "some long lines show only the {MAX_LINE} characters around their first match \
+                     (columns given); narrow the pattern to see other parts"
+                ));
             }
             if let Some(err) = &walk_error {
                 notices.push(format!(
@@ -684,6 +694,30 @@ mod tests {
             "the aggregate line-truncation notice must not survive the byte cap either — same \
              precedence as the match-count marker, and for the same reason (it could be sliced \
              through by the truncation it would be describing)"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_match_at_column_100k_of_a_minified_line_is_visible() {
+        // `read` caps a line at 4,000 bytes, so if grep showed only the head, nothing could show this.
+        let dir = tempfile::tempdir().unwrap();
+        let line = format!(
+            "var a={};findMe(1);{}",
+            "x".repeat(100_000),
+            "y".repeat(20_000)
+        );
+        std::fs::write(dir.path().join("bundle.min.js"), format!("{line}\n")).unwrap();
+        let out = Grep::default()
+            .run(json!({ "pattern": "findMe\\(", "path": dir.path().to_str().unwrap() }))
+            .await
+            .unwrap()
+            .text;
+        assert!(out.contains("findMe(1)"), "the match must be shown: {out}");
+        assert!(out.contains("bundle.min.js:1: … x"), "{out}");
+        assert!(out.contains(" … [truncated; columns "), "{out}");
+        assert!(
+            out.contains("around their first match") && !out.contains("use the read tool"),
+            "the notice must not send the model to `read`, which cannot show column 100k: {out}"
         );
     }
 

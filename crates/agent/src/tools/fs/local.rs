@@ -22,8 +22,8 @@ use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkContex
 use ignore::{WalkBuilder, WalkState};
 
 use super::{
-    DirEntry, FileKind, FsBackend, FsError, GlobOutcome, GlobQuery, Hit, MAX_CONTEXT, Meta,
-    SearchOutcome, SearchQuery, clip, finalize, trim_eol,
+    DirEntry, FileKind, FsBackend, FsError, GlobOutcome, GlobQuery, Hit, MAX_CONTEXT, MatchFinder,
+    Meta, SearchOutcome, SearchQuery, clip, clip_match, finalize, trim_eol,
 };
 
 /// The host filesystem.
@@ -57,8 +57,10 @@ impl LocalFs {
         // would silently change which message the model gets.
         let glob = compile_glob(q.glob.as_ref())?;
         let matcher = compile_matcher(q)?;
+        let finder = MatchFinder::new(q);
         Ok(walk(
             &matcher,
+            &finder,
             glob.as_ref(),
             &q.root,
             q.stop_at(),
@@ -359,6 +361,7 @@ fn compile_matcher(q: &SearchQuery) -> Result<RegexMatcher, FsError> {
 #[allow(clippy::too_many_arguments)]
 fn walk(
     matcher: &RegexMatcher,
+    finder: &MatchFinder,
     glob: Option<&(GlobMatcher, bool)>,
     root: &Path,
     stop_at: usize,
@@ -442,6 +445,7 @@ fn walk(
             // bump), so a match-dense file no longer pays a `PathBuf` per hit.
             let mut sink = Collector {
                 path: Arc::from(path),
+                finder,
                 hits: Vec::new(),
                 matches: 0,
                 total: Arc::clone(&total),
@@ -487,8 +491,10 @@ fn walk(
 /// A [`Sink`] that gathers one file's matches and context lines. `matched`/`context` are called by the
 /// searcher with byte-accurate line numbers; bytes are decoded lossily so non-UTF-8 files still yield
 /// readable, matchable text instead of being dropped.
-struct Collector {
+struct Collector<'f> {
     path: Arc<Path>,
+    /// Finds the match inside a long match line, so its clip is a window around the match.
+    finder: &'f MatchFinder,
     hits: Vec<Hit>,
     matches: usize,
     /// The walk's shared match counter and its stop threshold — so a single match-dense file (an
@@ -500,7 +506,7 @@ struct Collector {
     stop_at: usize,
 }
 
-impl Collector {
+impl Collector<'_> {
     /// This file's own matches so far, added to every earlier file's already-flushed count — the same
     /// running total the per-entry closure checks between files, just readable mid-file too.
     fn running_total(&self) -> usize {
@@ -508,7 +514,7 @@ impl Collector {
     }
 }
 
-impl Sink for Collector {
+impl Sink for Collector<'_> {
     type Error = std::io::Error;
 
     fn matched(&mut self, _searcher: &Searcher, m: &SinkMatch<'_>) -> std::io::Result<bool> {
@@ -517,7 +523,7 @@ impl Sink for Collector {
         self.hits.push(Hit {
             path: self.path.clone(),
             line,
-            text: clip(&trim_eol(&text)),
+            text: clip_match(&trim_eol(&text), self.finder),
             is_match: true,
         });
         self.matches += 1;
@@ -572,8 +578,10 @@ mod tests {
             .unwrap();
         let mut searcher = SearcherBuilder::new().line_number(true).build();
         let total = Arc::new(AtomicUsize::new(0));
+        let finder = MatchFinder::new(&query("needle", PathBuf::from("."), 3));
         let mut sink = Collector {
             path: Arc::from(Path::new("f.txt")),
+            finder: &finder,
             hits: Vec::new(),
             matches: 0,
             total: Arc::clone(&total),

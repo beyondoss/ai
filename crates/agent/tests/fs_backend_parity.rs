@@ -685,6 +685,30 @@ async fn all_backends() -> Vec<(&'static str, Arc<dyn FsBackend>)> {
 }
 
 #[tokio::test]
+async fn a_match_deep_in_a_long_line_is_windowed_identically_on_every_backend() {
+    // A lockfile/SVG-shaped single line, with the match far past the 500-character head and a
+    // multi-byte neighbourhood, plus a context line that stays head-clipped.
+    let dir = tempfile::tempdir().unwrap();
+    let line = format!("{}é NEEDLE ü{}", "a".repeat(20_000), "b".repeat(5_000));
+    let ctx = "c".repeat(900);
+    std::fs::write(dir.path().join("long.txt"), format!("{ctx}\n{line}\n")).unwrap();
+    let input = json!({ "pattern": "NEEDLE", "path": dir.path().to_str().unwrap(), "before": 1 });
+    let mut outs = Vec::new();
+    for (name, backend) in all_backends().await {
+        let out = run_tool(Some(backend), "grep", input.clone()).await;
+        assert!(out.contains("é NEEDLE ü"), "{name}: {out}");
+        assert!(
+            out.contains("columns 19756-20255 of 25010]"),
+            "{name}: {out}"
+        );
+        outs.push((name, out));
+    }
+    for (name, out) in &outs[1..] {
+        assert_eq!(&outs[0].1, out, "local vs {name} disagreed");
+    }
+}
+
+#[tokio::test]
 async fn grep_and_find_skip_git_metadata_on_every_backend() {
     let dir = git_fixture();
     let root = dir.path().to_str().unwrap();
