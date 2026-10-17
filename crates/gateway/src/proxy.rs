@@ -8594,9 +8594,9 @@ mod tests {
     fn request_ctx_stays_small_enough_to_be_cheap_per_chunk() {
         let size = std::mem::size_of::<RequestCtx>();
         assert!(
-            // 432: + the boxed `signed` (8 bytes, `None` off the managed Responses relay).
-            // 440: + `deadline` (8 bytes; every request has one, and the per-chunk check reads it).
-            // 448: + the boxed `taps` (8 bytes, `None` on BYO): the billing facts beside usage.
+            // 448: the verified identity is held inline in `Billing::Managed` beside one lazily
+            // boxed set of billing taps (`None` on BYO and until a tap first fires), and the
+            // per-attempt and per-leg state packs into `Attempt` and `Leg` with the small fields.
             size <= 448,
             "RequestCtx grew to {size} bytes (ceiling 448). It is touched once per response chunk \
              on a stream — if the new state is only needed on one route, box it the way \
