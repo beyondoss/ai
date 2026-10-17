@@ -246,6 +246,42 @@ pub trait CommandRunner: Send + Sync {
         false
     }
 
+    /// Run a command with its stdout and stderr streamed to **separate** sinks as they arrive, for
+    /// as long as it runs: no deadline, and dropping the future stops it (closes the v1.2 stream,
+    /// kills the template transport's far side, kills the local child). The held start of a
+    /// sandbox job ([`crate::exec_endpoint::jobs`]) is the one caller: its output is the job's and
+    /// its stderr carries the supervisor's markers, so the two must never be merged.
+    ///
+    /// Defaults to [`std::io::ErrorKind::Unsupported`]; [`Self::attaches`] says whether it works.
+    async fn run_attached(
+        &self,
+        program: &str,
+        args: &[String],
+        cwd: Option<&str>,
+        on_stdout: ChunkSink<'_>,
+        on_stderr: ChunkSink<'_>,
+    ) -> std::io::Result<ExecResult> {
+        let _ = (program, args, cwd, on_stdout, on_stderr);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "this command runner cannot stream a command's output as it runs",
+        ))
+    }
+
+    /// Whether [`Self::run_attached`] works here: the output streams, and dropping the call stops
+    /// the command.
+    async fn attaches(&self) -> bool {
+        false
+    }
+
+    /// The jobs the target this runner reaches can own — [`crate::exec_endpoint::jobs`] — or `None`
+    /// when commands run on this host, whose jobs are this process's own.
+    fn sandbox_jobs(
+        self: std::sync::Arc<Self>,
+    ) -> Option<std::sync::Arc<dyn crate::exec_endpoint::jobs::SandboxJobs>> {
+        None
+    }
+
     /// Like [`run`](CommandRunner::run), but with `stdin` written to the command's standard input and
     /// then closed.
     ///
@@ -282,7 +318,9 @@ impl RealRunner {
     /// it streams (live progress); `run`, `run_streaming` and `run_with_stdin` all funnel through here.
     /// `stdin` is `None` for everything a model runs — see the `.stdin(..)` comment below.
     /// `bash`'s jobs go through [`super::bash_proc::run_tracked`] instead
-    /// ([`CommandRunner::run_streaming_tracked`]).
+    /// ([`CommandRunner::run_streaming_tracked`]). `on_stderr`, when present, takes stderr's chunks
+    /// instead of `on_chunk` (`run_attached`, whose two streams must stay apart).
+    #[allow(clippy::too_many_arguments)]
     async fn exec(
         &self,
         program: &str,
@@ -290,6 +328,7 @@ impl RealRunner {
         cwd: Option<&str>,
         timeout: Duration,
         on_chunk: Option<ChunkSink<'_>>,
+        on_stderr: Option<ChunkSink<'_>>,
         stdin: Option<&[u8]>,
     ) -> std::io::Result<ExecResult> {
         // No `PATH` manipulation here — `Command` inherits the parent process's environment
@@ -340,7 +379,7 @@ impl RealRunner {
         // So when streaming we skip the ≤256 KiB head/tail `Capture` *and* the final `from_utf8_lossy`
         // allocations below — they'd only be produced to be discarded. The non-streaming `run` path
         // (the `beyond` CLI tools) keeps full capture, since it *does* read these fields.
-        let streaming = on_chunk.is_some();
+        let streaming = on_chunk.is_some() || on_stderr.is_some();
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
         // Fed concurrently with the drains, not before them — see `feed_stdin`.
@@ -370,7 +409,7 @@ impl RealRunner {
                     stderr,
                     STREAM_HEAD,
                     STREAM_TAIL,
-                    on_chunk,
+                    on_stderr.or(on_chunk),
                     exited_rx.clone()
                 ),
                 feed,
@@ -558,7 +597,8 @@ impl CommandRunner for RealRunner {
         cwd: Option<&str>,
         timeout: Duration,
     ) -> std::io::Result<ExecResult> {
-        self.exec(program, args, cwd, timeout, None, None).await
+        self.exec(program, args, cwd, timeout, None, None, None)
+            .await
     }
 
     async fn run_streaming(
@@ -569,7 +609,7 @@ impl CommandRunner for RealRunner {
         timeout: Duration,
         on_chunk: ChunkSink<'_>,
     ) -> std::io::Result<ExecResult> {
-        self.exec(program, args, cwd, timeout, Some(on_chunk), None)
+        self.exec(program, args, cwd, timeout, Some(on_chunk), None, None)
             .await
     }
 
@@ -587,6 +627,32 @@ impl CommandRunner for RealRunner {
         true
     }
 
+    /// For tests of the sandbox-job scripts, which run them on this host. No deadline beyond
+    /// `STREAM_DEADLINE`'s; dropping the call kills the child's process group.
+    async fn run_attached(
+        &self,
+        program: &str,
+        args: &[String],
+        cwd: Option<&str>,
+        on_stdout: ChunkSink<'_>,
+        on_stderr: ChunkSink<'_>,
+    ) -> std::io::Result<ExecResult> {
+        self.exec(
+            program,
+            args,
+            cwd,
+            crate::exec_endpoint::STREAM_DEADLINE,
+            Some(on_stdout),
+            Some(on_stderr),
+            None,
+        )
+        .await
+    }
+
+    async fn attaches(&self) -> bool {
+        true
+    }
+
     async fn run_with_stdin(
         &self,
         program: &str,
@@ -595,7 +661,7 @@ impl CommandRunner for RealRunner {
         timeout: Duration,
         stdin: &[u8],
     ) -> std::io::Result<ExecResult> {
-        self.exec(program, args, cwd, timeout, None, Some(stdin))
+        self.exec(program, args, cwd, timeout, None, None, Some(stdin))
             .await
     }
 }

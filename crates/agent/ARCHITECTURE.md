@@ -2274,6 +2274,58 @@ are `tests/fixtures/exec/v1.2-frames.json`. The shared mock (`beyond-ai-test-sup
 is a conforming v1.2 endpoint by default, so every service-mode suite now drives the streaming path;
 `MockOptions` selects v1.1, buffered, no-kill-on-disconnect, or no-`shell_exit`.
 
+#### Sandbox jobs — owned by the sandbox, not the connection
+
+A v1.2 stream makes the connection a command's lifetime. That is right for a command someone is
+waiting on and wrong for a job: a replica that is reaped, deployed or failed over closes every
+stream it holds, so every background job died with whichever replica was serving its session —
+every routine deploy killed every user's dev server. `exec_endpoint::jobs` gives jobs an owner that
+outlives replicas: the sandbox. The contract is the `SandboxJobs` trait (start held or kept, follow,
+read from an offset, keep, kill, list, remove, wipe); `ShellJobs` implements it over plain exec
+commands, so it works on v1.1 and v1.2 and on every vendor with no change on their side.
+
+**Layout.** `/tmp/beyond-jobs/<scope>/<id>/`, where the scope is the first 16 bytes of
+`sha256("beyond-jobs\0" tenant "\0" session)` in hex (mode 0700, so neither another session nor
+another uid can name or read it; the root is 1777 like `/tmp`) and the id is 16 random hex digits
+the agent chooses. A job directory holds `cmd` (the label notices quote), `started`, `sup` (the
+supervisor's pid), `pgid`, the output as `out.<offset>` chunks, `exit` (the shell's status, once it
+exits), `end` (the same status once the group is empty — the job is over), `keep` (`<number>
+<kind>`: the sandbox owns it) and `seen` (the offset of the output the model has been shown).
+Anything a reader could catch half-written goes through a temp file and `mv`.
+
+**Processes.** `start` runs the supervisor under `setsid`; the supervisor starts the command in a
+session of its own (so its process group is exactly the job's processes), waits for it, and writes
+`exit` and `end`. Beside it, never in the job's group: the **relay**, a loop of `dd bs=4096
+count=256` that cuts the output into chunks of at most 1 MiB named by their first byte's offset, and
+the **keeper**, which kills the job if its holder is gone and it is not kept, and deletes the oldest
+chunks beyond the output cap (8 MiB). `head -c` would have been simpler and is wrong on busybox: it
+reads a pipe through a 4 KiB stdio buffer and loses the bytes past its count — measured, 4096 bytes
+lost per chunk. Readers compute where any offset lives from the chunk names, so a deleted chunk is a
+gap of known size (`JobEvent::Gap`), never a misread. Zombies never count as alive (`/proc` state),
+for the same reason as `far_kill`'s wrapper: a sandbox whose pid 1 is not an init never reaps.
+
+**Held, then kept.** A job starts **held**: the held start waits for the supervisor, and a `tee`
+between the job and the relay copies every byte to the start's own stdout, so the stream that
+started it — v1.2 frames, a template transport's pipes — carries its output live, and the
+supervisor's markers (`job-start`, `job-shell-exit`, `job-end`) arrive on its stderr. When that
+stream's process dies (the endpoint kills it on disconnect; a dropped template call far-kills it),
+the keeper kills the job within half a second, so a foreground command still dies with its caller.
+**Keeping** it records the job number and hands it to the sandbox: a dropped stream then costs only
+the live copy (`tee` ignores `SIGPIPE` and keeps feeding the relay). Over v1.1 nothing streams, so a
+job starts kept and is followed by polling `read` (every 250 ms while output arrives, backing off to
+2 s) — which is also how any replica follows a job it did not start.
+
+**Kill** is `SIGTERM` to each group, up to 300 ms (the local `TERM_GRACE`), `SIGKILL`, then up to a
+second for the groups to empty; what is still alive (a process the sandbox user may not signal) is
+reported per job. A job whose `end` exists is never signalled again, so a recycled group number is
+not a target. Not covered, exactly as over v1.2: a process that leaves the job's session.
+
+Tests: `tests/sandbox_jobs.rs` runs every operation over this host's `sh`, the v1.2 mock, the v1.1
+mock and a template transport whose far side lives in its own session (held streaming, a hold
+dropped before and after `keep`, leftovers, polling, a `SIGTERM`-ignoring kill, the cap's gap,
+`wipe` scoped to one session, `remove` refusing a running job); `exec_endpoint_live.rs` repeats the
+lifecycle inside CI's busybox container.
+
 #### Which endpoint a session gets
 
 Resolved once at session start, most specific first:
