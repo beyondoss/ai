@@ -2798,6 +2798,82 @@ fn resolve_startup_model_and_level(
 /// touches it, shallow enough that a flood can't grow memory without limit.
 pub(crate) const IN_CHANNEL_BOUND: usize = 256;
 
+/// The largest single command `serve` takes, on any transport: a stdin line here, a WebSocket message
+/// in [`crate::serve_ws`]. Every transport feeds the same queue, and this is what bounds the cost of
+/// any one queued command. Generous enough for a `prompt` carrying a large pasted body.
+pub(crate) const MAX_COMMAND_BYTES: usize = 8 * 1024 * 1024;
+
+/// One line read from stdin by [`next_stdin_line`].
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum StdinLine {
+    /// A complete line, without its `\n` (or `\r\n`).
+    Text(String),
+    /// A line whose bytes are not UTF-8 — answered with an error, never taken for the end of input.
+    NotUtf8(std::str::Utf8Error),
+    /// A line longer than the cap; it was read and discarded up to its end. Carries its length.
+    TooLong(usize),
+}
+
+/// Read the next line from `reader`, holding at most `max` bytes of it: `Ok(None)` at end of input.
+///
+/// `AsyncBufReadExt::lines` did two wrong things here. A line that isn't UTF-8 comes back as an
+/// `Err`, which the read loop could only take for the end of input, so one bad byte ended the
+/// session with exit 0 and nothing said; and a line is buffered whole however long it is, so one
+/// unterminated 300 MB line costs that much (and more) in memory. This one reads bytes, reports an
+/// undecodable line as such, and stops buffering an oversized one at `max`, discarding the rest of
+/// it as it streams past.
+pub(crate) async fn next_stdin_line<R>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    max: usize,
+) -> std::io::Result<Option<StdinLine>>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    buf.clear();
+    // `Some(n)` once the line has passed `max`: `n` bytes seen so far, none of them kept.
+    let mut discarded: Option<usize> = None;
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            // End of input: a final line without a `\n` is still a line.
+            return Ok(match discarded {
+                Some(n) => Some(StdinLine::TooLong(n)),
+                None if buf.is_empty() => None,
+                None => Some(decode_stdin_line(buf)),
+            });
+        }
+        let (chunk, newline) = match available.iter().position(|&b| b == b'\n') {
+            Some(i) => (&available[..i], true),
+            None => (available, false),
+        };
+        let taken = chunk.len() + usize::from(newline);
+        match discarded.as_mut() {
+            Some(n) => *n += chunk.len(),
+            None if buf.len() + chunk.len() > max => {
+                discarded = Some(buf.len() + chunk.len());
+                *buf = Vec::new(); // give the memory back now, not at the next line
+            }
+            None => buf.extend_from_slice(chunk),
+        }
+        reader.consume(taken);
+        if newline {
+            return Ok(Some(match discarded {
+                Some(n) => StdinLine::TooLong(n),
+                None => decode_stdin_line(buf),
+            }));
+        }
+    }
+}
+
+fn decode_stdin_line(buf: &[u8]) -> StdinLine {
+    let line = buf.strip_suffix(b"\r").unwrap_or(buf);
+    match std::str::from_utf8(line) {
+        Ok(s) => StdinLine::Text(s.to_owned()),
+        Err(e) => StdinLine::NotUtf8(e),
+    }
+}
+
 /// Run the control loop until stdin closes.
 /// Headless `serve` over **stdio** — the default transport. A thin wrapper over the transport-
 /// agnostic [`serve_session`]: pump stdin lines into its input channel (EOF drops the sender, which
@@ -2807,27 +2883,54 @@ pub(crate) const IN_CHANNEL_BOUND: usize = 256;
 /// entry point that reuses the same [`serve_session`] core.
 pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::error::Error>> {
     let (input_tx, input_rx) = mpsc::channel::<String>(IN_CHANNEL_BOUND);
-    tokio::spawn(async move {
-        let mut lines = BufReader::new(tokio::io::stdin()).lines();
-        // A malformed-UTF-8 read error is treated as a clean EOF, matching the pre-refactor idle/busy
-        // read loops (killing a long-running process over one bad stdin byte is far more disruptive).
-        while let Ok(Some(line)) = lines.next_line().await {
-            // Awaits rather than dropping when the queue is full: a command the session never sees is a
-            // correctness bug (the client waits on a response that never comes), so the right answer to
-            // a producer outrunning the loop is to stop reading it, not to shed it. Here that simply
-            // pauses the stdin reader.
-            if input_tx.send(line).await.is_err() {
-                break; // the session ended; nothing left to feed
-            }
-        }
-        // Dropping `input_tx` closes `input_rx` → the session observes EOF and shuts down.
-    });
-
     let (conn_tx, mut conn_rx) = mpsc::unbounded_channel::<OutFrame>();
     // stdio has exactly one permanent "connection": stdout. Register it in the fanout as the sole sink.
     let out_conn: SharedOutConn =
         Arc::new(std::sync::Mutex::new(crate::serve::OutFanout::default()));
     lock_ignoring_poison(&out_conn).add(crate::serve::OutSink::Unbounded(conn_tx));
+
+    // Weak: the stdout task ends when the last strong handle to its sink goes, at session end, and a
+    // reader parked on a stdin that never closes (a signal exit) must not hold it open.
+    let reader_out = Arc::downgrade(&out_conn);
+    tokio::spawn(async move {
+        let mut stdin = BufReader::new(tokio::io::stdin());
+        let mut buf = Vec::new();
+        // Only end of input (or a read error, which leaves nothing more to read) ends the session. A
+        // line that can't be taken as a command is answered and skipped, like invalid JSON is: one
+        // bad byte from a client must not end a session silently, with exit 0 and nothing said.
+        while let Ok(Some(line)) = next_stdin_line(&mut stdin, &mut buf, MAX_COMMAND_BYTES).await {
+            let error = match line {
+                StdinLine::Text(line) => {
+                    // Awaits rather than dropping when the queue is full: a command the session never
+                    // sees is a correctness bug (the client waits on a response that never comes), so
+                    // the right answer to a producer outrunning the loop is to stop reading it, not to
+                    // shed it. Here that simply pauses the stdin reader.
+                    if input_tx.send(line).await.is_err() {
+                        break; // the session ended; nothing left to feed
+                    }
+                    continue;
+                }
+                StdinLine::NotUtf8(e) => format!("stdin line is not valid UTF-8: {e}"),
+                StdinLine::TooLong(n) => format!(
+                    "stdin line of {n} bytes exceeds the {MAX_COMMAND_BYTES}-byte limit; discarded"
+                ),
+            };
+            // Answered from here, as the session answers a line that isn't JSON (`command: "parse"`,
+            // no id — there is no command to take one from). Sent straight to stdout's sink rather
+            // than through the session, so it can land ahead of replies to commands still queued.
+            let Some(out) = reader_out.upgrade() else {
+                break; // the session ended
+            };
+            lock_ignoring_poison(&out).broadcast(response(
+                None,
+                "parse",
+                false,
+                None,
+                Some(&error),
+            ));
+        }
+        // Dropping `input_tx` closes `input_rx` → the session observes EOF and shuts down.
+    });
     let stdout_task = tokio::spawn(async move {
         let mut out = tokio::io::stdout();
         // Reused across frames: the `Bytes` line plus its `\n` terminator, assembled once so the frame
@@ -12713,6 +12816,37 @@ async fn write_frame(out: &mut tokio::io::Stdout, line: &[u8]) -> std::io::Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every line `next_stdin_line` reads from `input`, through a 4-byte buffer so lines and the cap
+    /// both straddle reads.
+    async fn stdin_lines(input: &[u8], max: usize) -> Vec<StdinLine> {
+        let mut reader = tokio::io::BufReader::with_capacity(4, input);
+        let mut buf = Vec::new();
+        let mut out = Vec::new();
+        while let Some(line) = next_stdin_line(&mut reader, &mut buf, max).await.unwrap() {
+            out.push(line);
+        }
+        out
+    }
+
+    /// An undecodable line and an oversized one are reported as such and reading goes on; only the
+    /// end of input ends it.
+    #[tokio::test]
+    async fn a_bad_stdin_line_is_reported_and_reading_continues() {
+        let text = |s: &str| StdinLine::Text(s.to_string());
+        let lines = stdin_lines(b"one\r\nb\xffd\n0123456789abc\n\ntwo\nlast", 10).await;
+        assert_eq!(lines[0], text("one"));
+        assert!(matches!(lines[1], StdinLine::NotUtf8(_)), "{:?}", lines[1]);
+        assert_eq!(lines[2], StdinLine::TooLong(13));
+        assert_eq!(lines[3..], [text(""), text("two"), text("last")]);
+        // A line exactly at the cap is still a line; an unterminated oversized tail is reported.
+        assert_eq!(stdin_lines(b"0123456789\n", 10).await, [text("0123456789")]);
+        assert_eq!(
+            stdin_lines(b"ok\n0123456789abc", 10).await,
+            [text("ok"), StdinLine::TooLong(13)]
+        );
+        assert!(stdin_lines(b"", 10).await.is_empty());
+    }
 
     #[test]
     fn a_host_bash_record_is_recognized_under_either_label() {

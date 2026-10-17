@@ -60,6 +60,17 @@ The harness layers several capabilities over the bare tools + loop:
   shell's default soft limit (256 on macOS, 1024 on most Linux) is the usual way to run out.
   `tests/serve_accept_error.rs` produces the `EMFILE` for real by `prlimit`-ing a running daemon.
 
+  **One command is at most `serve::MAX_COMMAND_BYTES` (8 MiB) on every transport.** Over a WebSocket
+  a bigger message is a protocol error that closes the connection. Over stdio, which has no connection
+  to close, stdin is read as bytes (`serve::next_stdin_line`), never as text: a line that is not UTF-8
+  is answered `{"type":"response","command":"parse","success":false,"error":"stdin line is not valid UTF-8: …"}`
+  and skipped, and a line past the cap gets the same kind of answer and is discarded as it streams in,
+  holding no more than the cap in memory. Only end of input ends the session. (Read as text, one bad
+  byte used to look like end of input — the session ended with exit 0 and nothing said — and an
+  unterminated line was buffered whole, however long.) These answers come from the stdin reader
+  itself, so one can land ahead of replies to commands still queued; like every `parse` error it
+  carries no `id`.
+
   The protocol is byte-identical across all transports;
   all feed the transport-agnostic `serve::serve_session` core, which reads
   commands from an `mpsc` channel and emits frames to whichever connection is currently attached. The
