@@ -670,7 +670,7 @@ touches = [
   "crates/gateway/src/admin.rs",
   "crates/gateway/src/doctor.rs",
 ]
-defects = []
+defects = ["D285"]
 
 [[claim]]
 id = "O3"

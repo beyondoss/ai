@@ -2933,3 +2933,17 @@ state = "fixed"
 test = "every_refusal_before_the_upstream_is_counted"
 fix = ""
 note = "Fixed in proxy.rs request_filter and metrics.rs: the 404 counts Rejection::UnknownProvider and the 401 Rejection::MissingKey (both new, labels unknown_provider and missing_key); the declared-length 413 counts the existing BodyTooLarge (the same refusal as the peek path's reject_too_large) and the no-pool-key 503 counts the existing NoCandidate (none of the candidates has a pool key). The integration test is in tests/claims_reliability.rs and compiles here; it runs on Linux."
+
+[[defect]]
+id = "D285"
+severity = "low"
+area = "Observability"
+title = "A retried attempt captured the request body's replayed prefix twice"
+impact = "Capture is fed the client's body as it arrives. When pingora retried an attempt, reset_request_body_phase cleared the buffer and the size count but not the capture, so the replayed prefix was captured again, and the captured request body was no longer the client's bytes."
+confidence = "high"
+evidence = "proxy.rs reset_request_body_phase cleared req_buf and body_bytes_fed but left control.capture.req. Reproduced on 4513e6f by a_retried_attempt_captures_the_request_body_once (the capture read the prefix twice)."
+claims = ["O2"]
+state = "fixed"
+test = "a_retried_attempt_captures_the_request_body_once"
+fix = ""
+note = "Fixed in proxy.rs reset_request_body_phase: after the zero-bytes witness returns early, the capture's request side is cleared (CaptureBufs::clear_req, which keeps the capacity), so a replay is captured once as the client sent it. The witness stays exact because the capture is fed only on the same path as body_bytes_fed."

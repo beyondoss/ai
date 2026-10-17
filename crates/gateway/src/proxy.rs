@@ -1521,6 +1521,10 @@ impl RequestCtx {
         if self.body_bytes_fed == 0 {
             return;
         }
+        // The capture tap is fed the same chunks, so it holds the replayed prefix too.
+        if let Some(c) = self.control.as_mut().and_then(|c| c.capture.as_mut()) {
+            c.clear_req();
+        }
         // `clear` keeps the capacity, which was pre-sized from `Content-Length` in `request_filter`
         // and which the in-place splice relies on to stay realloc-free.
         self.req_buf.clear();
@@ -8170,6 +8174,38 @@ mod tests {
         assert!(
             scan.inject_at.is_some(),
             "the stream_options splice must still be planned against a well-formed root object",
+        );
+    }
+
+    /// A retried attempt replays the body prefix through the capture tap, so the reset must clear
+    /// the capture as well, or the captured request holds the prefix twice.
+    /// claim: O2
+    /// defect: D285
+    #[test]
+    fn a_retried_attempt_captures_the_request_body_once() {
+        let body =
+            br#"{"messages":[{"role":"user","content":"hi"}],"model":"gpt-4o","stream":true}"#;
+        let (prefix, rest) = body.split_at(30);
+
+        let mut rc = test_ctx(true);
+        rc.control = Some(Box::new(RequestControl {
+            metadata: None,
+            capture: Some(CaptureBufs::new(4096)),
+        }));
+
+        // Attempt 1: a prefix arrives through the production append step (captured and buffered),
+        // then the upstream dies.
+        assert!(rc.take_request_chunk(prefix));
+        rc.reset_request_body_phase();
+
+        // Attempt 2: pingora replays from byte 0 through the same step, then the remainder.
+        assert!(rc.take_request_chunk(prefix));
+        assert!(rc.take_request_chunk(rest));
+        let captured = rc.control.as_ref().unwrap().capture.as_ref().unwrap();
+        assert_eq!(
+            captured.req_str(),
+            std::str::from_utf8(body).ok(),
+            "the capture holds the replayed prefix twice"
         );
     }
 
