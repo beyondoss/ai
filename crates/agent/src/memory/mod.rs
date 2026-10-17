@@ -512,6 +512,71 @@ pub fn live_prompt_tokens(usage: &agent_core::message::TokenUsage) -> u32 {
         .saturating_add(usage.cache_write_tokens)
 }
 
+/// The host-side steer observer, the one place `run` and `serve` decide which `/session` steers a run's
+/// events inject: the pre-compaction [`PRESSURE_NUDGE`] and the post-compaction
+/// [`COMPACTION_REMINDER`]. Both paths feed every [`agent_core::AgentEvent`] of a prompt through
+/// [`SessionSteers::observe`] — the auto-compaction in a run, a manual `compact`, a whole-run retry —
+/// so the two cannot drift: same events in, same steers out.
+///
+/// One `SessionSteers` spans one prompt, *including its whole-run retries*: the pressure nudge fires at
+/// most once per fill cycle (disarmed on fire, re-armed on `Compacted`), and a retry is the same fill
+/// cycle, not a new one. Inert without a `/session` mount (nowhere to checkpoint or read back).
+pub struct SessionSteers {
+    active: bool,
+    pressure_point: std::sync::atomic::AtomicU32,
+    pressure_armed: std::sync::atomic::AtomicBool,
+}
+
+impl SessionSteers {
+    /// `active`: whether a `/session` working-memory mount is live. `pressure_point`: the live-prompt
+    /// size to warn past ([`compaction_pressure_point`]).
+    pub fn new(active: bool, pressure_point: u32) -> Self {
+        Self {
+            active,
+            pressure_point: std::sync::atomic::AtomicU32::new(pressure_point),
+            pressure_armed: std::sync::atomic::AtomicBool::new(true),
+        }
+    }
+
+    /// Re-point the pressure threshold — `serve`'s model (and so its compaction trigger) can change
+    /// between attempts of one prompt. The arm state is kept.
+    pub fn set_pressure_point(&self, pressure_point: u32) {
+        self.pressure_point
+            .store(pressure_point, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// React to one run event: push whatever steer it calls for onto `steering`.
+    pub fn observe(&self, ev: &agent_core::AgentEvent, steering: &agent_core::Steering) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if !self.active {
+            return;
+        }
+        match ev {
+            agent_core::AgentEvent::Compacted { .. } => {
+                // The context just dropped: a later re-fill should warn again, and the model should read
+                // back what the lossy summary lost.
+                self.pressure_armed.store(true, Relaxed);
+                steering.push_steer(agent_core::SteeringMessage::new(
+                    COMPACTION_REMINDER.to_string(),
+                    Vec::new(),
+                ));
+            }
+            agent_core::AgentEvent::Stream(agent_core::StreamEvent::Usage(usage)) => {
+                // `swap` only runs when actually over the point, so below it the flag stays armed.
+                if live_prompt_tokens(usage) > self.pressure_point.load(Relaxed)
+                    && self.pressure_armed.swap(false, Relaxed)
+                {
+                    steering.push_steer(agent_core::SteeringMessage::new(
+                        PRESSURE_NUDGE.to_string(),
+                        Vec::new(),
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Resolve the on-disk directory for a session's working memory.
 ///
 /// - With a persisted session file, a sibling of the `<created_at>_<id>.jsonl` — `<...>.memory/` — in
@@ -538,6 +603,61 @@ pub fn session_dir(session_file: Option<&Path>, session_id: &str) -> std::path::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn usage_event(input_tokens: u32) -> agent_core::AgentEvent {
+        agent_core::AgentEvent::Stream(agent_core::StreamEvent::Usage(
+            agent_core::message::TokenUsage {
+                input_tokens,
+                ..Default::default()
+            },
+        ))
+    }
+
+    fn compacted_event() -> agent_core::AgentEvent {
+        agent_core::AgentEvent::Compacted {
+            messages_before: 4,
+            messages_after: 2,
+            reason: agent_core::CompactionReason::Threshold,
+            tokens_before: 9000,
+            summary: "s".into(),
+            tokens_after: 100,
+            first_kept: 2,
+            usage: agent_core::message::TokenUsage::default(),
+            summary_source: agent_core::SummarySource::Cached,
+        }
+    }
+
+    #[test]
+    fn session_steers_nudge_once_per_fill_cycle_and_remind_on_every_compaction() {
+        let steers = SessionSteers::new(true, 1000);
+        let steering = agent_core::Steering::new();
+        // Below the point: nothing. Past it: one nudge, and a second crossing in the same cycle (a
+        // whole-run retry re-reports usage) stays quiet.
+        for ev in [usage_event(10), usage_event(2000), usage_event(3000)] {
+            steers.observe(&ev, &steering);
+        }
+        assert_eq!(steering.steer_texts(), vec![PRESSURE_NUDGE.to_string()]);
+        // A compaction reminds and re-arms the nudge for the next cycle.
+        steers.observe(&compacted_event(), &steering);
+        steers.observe(&usage_event(2000), &steering);
+        assert_eq!(
+            steering.steer_texts(),
+            vec![
+                PRESSURE_NUDGE.to_string(),
+                COMPACTION_REMINDER.to_string(),
+                PRESSURE_NUDGE.to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn session_steers_are_inert_without_a_session_mount() {
+        let steers = SessionSteers::new(false, 1000);
+        let steering = agent_core::Steering::new();
+        steers.observe(&usage_event(2000), &steering);
+        steers.observe(&compacted_event(), &steering);
+        assert!(steering.steer_texts().is_empty());
+    }
 
     #[test]
     fn parse_accepts_the_canonical_and_lenient_spellings() {

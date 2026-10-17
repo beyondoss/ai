@@ -634,7 +634,11 @@ The harness layers several capabilities over the bare tools + loop:
   `/session` while it still has full detail; and a **post-compaction recall reminder**
   (`memory::COMPACTION_REMINDER`) fires on the cut, telling it to read `/session` back. Both are computed
   host-side from the `Usage` events the observer already sees (no agent-core change), gated on a session
-  mount, and pushed as mid-run steers. Backing the reminder, the paths the model writes via the `memory`
+  mount, and pushed as mid-run steers. One observer decides them for every path —
+  `memory::SessionSteers`, fed each event by `run`, `serve`'s prompt run and `serve`'s manual `compact` —
+  so the paths cannot drift (`tests/steer_parity.rs` drives both binaries through the same script). It
+  lives for one prompt _including its whole-run retries_: a retry is the same fill cycle, so it does not
+  re-arm the nudge. Backing the reminder, the paths the model writes via the `memory`
   tool ride the **deterministic-carry channel** (`agent_core::CompactionProvenance::memory_notes`,
   parallel to the read/modified-file and `todo` lists): every summary carries a `<memory-notes>` block
   naming them, so a summarizing model that never mentions a note can't erase the model's awareness that it
