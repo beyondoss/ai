@@ -974,14 +974,14 @@ impl Subagent {
     ) {
         if !outcome.ok {
             // A failed child's half-finished edits are not worth merging, but they are worth keeping.
-            let path = wt.preserve();
+            let path = wt.preserve().await;
             outcome.note = Some(format!("worktree preserved at {}", path.display()));
             return;
         }
         let delta = match wt.child_delta().await {
             Ok(delta) => delta,
             Err(e) => {
-                let path = wt.preserve();
+                let path = wt.preserve().await;
                 outcome.note = Some(format!(
                     "could not read changes ({e}); worktree preserved at {}",
                     path.display()
@@ -1005,7 +1005,7 @@ impl Subagent {
                 let _ = wt.remove().await;
             }
             Ok(ApplyOutcome::Conflicted { files }) => {
-                let path = wt.preserve();
+                let path = wt.preserve().await;
                 outcome.note = Some(format!(
                     "changes merged WITH CONFLICTS in: {}. Conflict markers are in the working tree; \
                      resolve them. The agent's own version is at {}",
@@ -1014,7 +1014,7 @@ impl Subagent {
                 ));
             }
             Err(e) => {
-                let path = wt.preserve();
+                let path = wt.preserve().await;
                 outcome.ok = false;
                 outcome.text = format!("{}\n\n{e}", outcome.text);
                 outcome.note = Some(format!(

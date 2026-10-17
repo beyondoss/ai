@@ -3409,9 +3409,17 @@ other.
   markers in the main tree, preserves the worktree, and names it in the tool result for the parent (or
   the user) to resolve; a policy refusal rejects the whole patch (all-or-nothing).
 - **Cleanup.** `Drop` removes a worktree best-effort, but a `process::exit`/SIGKILL runs no destructors,
-  so worktrees live under `$XDG_CACHE_HOME/beyond-agent/worktrees/<repo-id>/<pid>-<label>` (on disk, not
-  tmpfs — a checkout in RAM would exhaust it) and a startup `sweep` reaps any whose owning PID is gone.
-  Keyed by PID so a sweep never deletes a concurrently-running session's work.
+  so worktrees live under `$XDG_CACHE_HOME/beyond-agent/worktrees/<repo-id>/<pid>-<label>-<seq>` (on
+  disk, not tmpfs — a checkout in RAM would exhaust it) and a startup `sweep` reaps any whose owning PID
+  is gone. Keyed by PID so a sweep never deletes a concurrently-running session's work; `<seq>` is a
+  per-process spawn counter, because a daemon's sessions share one PID and a retry re-spawns the same
+  agent at the same index. `create` never removes an existing path (it skips to the next `<seq>`): that
+  path may be a live sibling's, or a preserved checkout holding the only copy of a child's work.
+  `sweep` takes any directory in the repo and keys on `rev-parse --show-toplevel`, so a run from a
+  subdirectory reaps the same base `create` writes to.
+- **Preserved worktrees are kept.** A conflicted, refused or failed child's checkout is moved
+  (`git worktree move`) to a `kept-<leaf>` name and that path is reported. Neither the local PID sweep
+  nor the sandbox's owner sweep ever reaps a `kept-` entry: it is the developer's to remove.
 
 ---
 
