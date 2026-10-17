@@ -557,6 +557,26 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn a_new_file_through_a_symlinked_directory_has_one_scope_key_not_two() {
+        // `sl -> real`; `real/new.md` doesn't exist yet. The typed fallback gave `sl/new.md` and
+        // `real/new.md` two keys — an "always allow" for one re-prompted for the other.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("real")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("real"), dir.path().join("sl")).unwrap();
+        let key = |p: &str| {
+            scope_key(
+                "write",
+                &json!({ "path": p }),
+                dir.path(),
+                &PathWorld::Local,
+            )
+        };
+        assert_eq!(key("sl/new.md"), key("real/new.md"));
+        assert_eq!(key("sl/sub/new.md"), key("real/sub/new.md"));
+    }
+
+    #[test]
     fn a_multi_file_edit_keys_on_its_whole_sorted_set_of_files() {
         // An "always allow a.md" must not approve a call that also writes b.md, and the key must not
         // depend on which file the model happened to put first.

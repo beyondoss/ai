@@ -1120,7 +1120,7 @@ impl Subagent {
         // succeeded (or conflicted cleanly). The shared `WriteLockRegistry` (the same one every child's file writes
         // key on) serializes them on a sentinel key that no real path can collide with.
         let _merge_guard = self.ctx.write_locks.lock("\0subagent-merge-back").await;
-        match worktree::apply_patch(wt.git(), repo_root, &delta, policy.denied_paths()).await {
+        match worktree::apply_patch(wt.git(), repo_root, &delta, &policy.denied_paths()).await {
             Ok(ApplyOutcome::Clean) => {
                 let _ = wt.remove().await;
             }

@@ -108,12 +108,22 @@ impl TrustStore {
     /// same-level conflict favors denying). No entry anywhere in the chain means [`Trust::Unknown`].
     pub fn lookup(&self, dir: &Path) -> Trust {
         let canonical = resolved_key_path(dir);
+        // On a case-insensitive volume `~/Proj` and `~/proj` are one directory, so a grant stored
+        // under either spelling must answer for both (probed per volume, not assumed per OS).
+        let ci = crate::path_utils::is_case_insensitive_at(&canonical);
+        let holds = |set: &BTreeSet<String>, key: &str| {
+            set.contains(key)
+                || (ci && {
+                    let folded = key.to_lowercase();
+                    set.iter().any(|k| k.to_lowercase() == folded)
+                })
+        };
         for ancestor in canonical.ancestors() {
             let key = ancestor.display().to_string();
-            if self.untrusted.contains(&key) {
+            if holds(&self.untrusted, &key) {
                 return Trust::Untrusted;
             }
-            if self.trusted.contains(&key) {
+            if holds(&self.trusted, &key) {
                 return Trust::Trusted;
             }
         }
@@ -450,6 +460,30 @@ mod tests {
             "a directory pre-trusted via a noisy (trailing-slash/`./`) path, before it existed, must \
              still be recognized as trusted once it exists and is looked up via its canonical form"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn pre_trusting_a_not_yet_created_directory_under_a_symlinked_parent_takes_effect_once_it_exists()
+     {
+        // macOS's `/tmp` is a symlink to `/private/tmp`. `trust /tmp/newproj/` before `mkdir`
+        // used to store the typed spelling (canonicalize fails on a missing path), while the later
+        // lookup uses the canonical cwd `/private/tmp/newproj` — so the grant never took effect.
+        let store_dir = tempfile::tempdir().unwrap();
+        let mut trust_store = TrustStore::open(store_dir.path().join("trusted-projects.json"));
+
+        let parent = tempfile::tempdir().unwrap();
+        let real = parent.path().canonicalize().unwrap().join("private-tmp");
+        fs::create_dir(&real).unwrap();
+        let link = parent.path().join("tmp");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        trust_store.trust(&link.join("newproj/")).unwrap();
+        fs::create_dir(real.join("newproj")).unwrap();
+
+        let cwd = link.join("newproj").canonicalize().unwrap();
+        assert_eq!(cwd, real.join("newproj"));
+        assert_eq!(trust_store.lookup(&cwd), Trust::Trusted);
     }
 
     #[test]
