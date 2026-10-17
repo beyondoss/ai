@@ -14,7 +14,7 @@
 
 use agent_core::{AgentHooks, CancellationToken};
 use async_trait::async_trait;
-use globset::{Glob, GlobMatcher};
+use globset::{Glob, GlobBuilder, GlobMatcher};
 use serde_json::Value;
 use std::collections::HashSet;
 
@@ -29,8 +29,8 @@ pub struct ToolPolicy {
     /// on every single call — only the (much shorter-lived) command string gets lowercased per call.
     denied_bash_patterns: Vec<String>,
     /// Compiled once at construction (same reasoning as `denied_bash_patterns`'s one-time lowercasing)
-    /// rather than re-parsing the same glob source on every `write`/`edit` call.
-    denied_paths: Vec<GlobMatcher>,
+    /// rather than re-parsing the same glob source on every `write`/`edit` call. See [`DenyRule`].
+    denied_paths: Vec<DenyRule>,
     /// The same root the gated agent's filesystem tools resolve relative paths against (see
     /// [`crate::tools::resolve_against`]). Empty = the process cwd, which is every non-subagent case.
     ///
@@ -58,6 +58,78 @@ pub struct ToolPolicy {
     /// target whose home we don't know is still remote, and collapsing the two would silently drop
     /// such a policy back onto host resolution.
     remote: bool,
+}
+
+/// One compiled `--deny-path` glob.
+#[derive(Debug, Clone)]
+struct DenyRule {
+    exact: GlobMatcher,
+    /// The same glob matched ignoring case — used when the target sits on a case-insensitive volume,
+    /// where `SECRETS/x` *is* `secrets/x` and a case-sensitive match would be a bypass.
+    folded: GlobMatcher,
+    /// Derived from this host's filesystem: an absolute pattern whose fixed prefix runs through a
+    /// symlink (macOS's `/tmp -> /private/tmp`) gets a second rule with that prefix resolved, because
+    /// targets are keyed on their resolved path and would otherwise never match the pattern as
+    /// typed. Meaningless for a remote filesystem, so [`ToolPolicy::with_remote`] drops these.
+    host_derived: bool,
+}
+
+impl DenyRule {
+    fn compile(pattern: &str, host_derived: bool) -> Result<Self, globset::Error> {
+        Ok(Self {
+            exact: Glob::new(pattern)?.compile_matcher(),
+            folded: GlobBuilder::new(pattern)
+                .case_insensitive(true)
+                .build()?
+                .compile_matcher(),
+            host_derived,
+        })
+    }
+
+    fn matches(&self, target: &str, case_insensitive: bool) -> bool {
+        if case_insensitive {
+            self.folded.is_match(target)
+        } else {
+            self.exact.is_match(target)
+        }
+    }
+}
+
+/// An absolute deny pattern with its fixed (glob-free) leading components resolved against this
+/// host — or `None` when resolving changes nothing, or the pattern is relative (`**/secrets/**`
+/// matches anywhere and needs no prefix).
+///
+/// Targets are keyed on their resolved path ([`crate::tools::write_key`]), so `--deny-path
+/// '/tmp/proj/secrets/**'` on macOS, where every target under it keys as `/private/tmp/...`, would
+/// otherwise never fire.
+fn host_resolved_pattern(pattern: &str) -> Option<String> {
+    let path = std::path::Path::new(pattern);
+    if !path.is_absolute() {
+        return None;
+    }
+    // Split at the first component carrying glob syntax; everything before it is a literal path.
+    let mut prefix = std::path::PathBuf::new();
+    let mut rest: Vec<&str> = Vec::new();
+    for component in path.components() {
+        let s = component.as_os_str().to_str()?;
+        if rest.is_empty() && !s.contains(['*', '?', '[', ']', '{', '}', '\\']) {
+            prefix.push(component.as_os_str());
+        } else {
+            rest.push(s);
+        }
+    }
+    let real = crate::path_utils::resolve_nearest(&prefix);
+    if real == prefix {
+        return None;
+    }
+    let mut out = globset::escape(real.to_str()?);
+    for part in rest {
+        if !out.ends_with('/') {
+            out.push('/');
+        }
+        out.push_str(part);
+    }
+    Some(out)
 }
 
 impl ToolPolicy {
@@ -102,6 +174,7 @@ impl ToolPolicy {
     /// the deny-list evaluates a host-resolved spelling of a path that isn't on this host.
     pub fn with_remote(mut self, home: Option<String>) -> Self {
         self.remote = true;
+        self.denied_paths.retain(|rule| !rule.host_derived);
         self.remote_home = home;
         self
     }
@@ -130,9 +203,10 @@ impl ToolPolicy {
         }
     }
 
-    /// The compiled deny-path globs, for the merge-back re-check described on [`ToolPolicy::root`].
-    pub fn denied_paths(&self) -> &[GlobMatcher] {
-        &self.denied_paths
+    /// The compiled deny-path globs, for the merge-back re-check described on [`ToolPolicy::root`] —
+    /// each as written, plus any host-resolved twin (see `host_resolved_pattern`).
+    pub fn denied_paths(&self) -> Vec<GlobMatcher> {
+        self.denied_paths.iter().map(|r| r.exact.clone()).collect()
     }
 
     /// The filesystem root this policy resolves relative paths against — see [`ToolPolicy::root`].
@@ -171,9 +245,18 @@ impl ToolPolicy {
     /// `main.rs` does for both `run` and `serve` before ever reaching this builder.
     pub fn deny_path(mut self, pattern: impl AsRef<str>) -> Self {
         let pattern = pattern.as_ref();
-        match Glob::new(pattern) {
-            Ok(glob) => self.denied_paths.push(glob.compile_matcher()),
-            Err(e) => eprintln!("policy: ignoring invalid --deny-path glob {pattern:?}: {e}"),
+        match DenyRule::compile(pattern, false) {
+            Ok(rule) => self.denied_paths.push(rule),
+            Err(e) => {
+                eprintln!("policy: ignoring invalid --deny-path glob {pattern:?}: {e}");
+                return self;
+            }
+        }
+        if !self.remote
+            && let Some(resolved) = host_resolved_pattern(pattern)
+            && let Ok(rule) = DenyRule::compile(&resolved, true)
+        {
+            self.denied_paths.push(rule);
         }
         self
     }
@@ -245,11 +328,26 @@ impl ToolPolicy {
         // a pattern like `--deny-path '/etc/**'` can't be sidestepped with a `./`/`..`-laden or
         // relative spelling of the same path. Resolving against a different root than the tools use
         // would check a path that is not the one about to be written.
-        let target = crate::tools::write_key(&self.root, path, &self.world());
-        let m = self.denied_paths.iter().find(|m| m.is_match(&target))?;
+        //
+        // A target that doesn't exist yet still has its nearest existing ancestor resolved, so a
+        // symlinked parent (`sl/new.env`, `sl -> secrets`) can't hide it; on a case-insensitive
+        // volume the key is case-folded and matched case-insensitively, so `SECRETS/new.env` can't
+        // either. The typed spelling is checked too: denying a path because of how it was *named*
+        // is the fail-safe direction for a deny-list.
+        let world = self.world();
+        let (target, ci) = crate::tools::write_key_ci(&self.root, path, &world);
+        let typed = crate::tools::lexical_write_target(
+            &self.root,
+            &crate::tools::resolve_against_in(&self.root, path, &world),
+            &world,
+        );
+        let rule = self
+            .denied_paths
+            .iter()
+            .find(|r| r.matches(&target, ci) || r.matches(&typed, ci))?;
         Some(format!(
             "path '{target}' is denied by policy (matches {:?})",
-            m.glob().glob()
+            rule.exact.glob().glob()
         ))
     }
 }
@@ -475,6 +573,111 @@ mod tests {
             )
             .await;
         assert!(reason.is_some_and(|r| r.contains("denied by policy")));
+    }
+
+    async fn deny_reason(policy: &ToolPolicy, path: &std::path::Path) -> Option<String> {
+        policy
+            .before_tool_call(
+                "write",
+                &json!({"path": path.to_str().unwrap(), "content": "x"}),
+                &agent_core::Session::new(),
+                &CancellationToken::new(),
+            )
+            .await
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_new_file_under_a_symlinked_directory_cannot_dodge_a_deny_glob() {
+        // `sl -> secrets`; `sl/new.env` doesn't exist yet, so canonicalize failed and the
+        // typed spelling `.../sl/new.env` was matched — never `**/secrets/**`.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("secrets")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("secrets"), dir.path().join("sl")).unwrap();
+        let policy = ToolPolicy::new().deny_path("**/secrets/**");
+
+        let reason = deny_reason(&policy, &dir.path().join("sl/new.env")).await;
+        assert!(
+            reason
+                .as_deref()
+                .is_some_and(|r| r.contains("denied by policy")),
+            "got {reason:?}"
+        );
+        // Also through a not-yet-created subdirectory, and through `..` after the link.
+        assert!(
+            deny_reason(&policy, &dir.path().join("sl/deeper/new.env"))
+                .await
+                .is_some()
+        );
+        assert!(
+            deny_reason(&policy, &dir.path().join("sl/../secrets/x.env"))
+                .await
+                .is_some()
+        );
+        // A sibling that really is outside stays allowed.
+        assert!(
+            deny_reason(&policy, &dir.path().join("public/new.env"))
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn an_absolute_deny_pattern_through_a_symlinked_prefix_still_fires() {
+        // macOS: `--deny-path /tmp/proj/secrets/**` while every target keys as `/private/tmp/...`.
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().canonicalize().unwrap().join("private-tmp");
+        std::fs::create_dir_all(real.join("proj/secrets")).unwrap();
+        let link = dir.path().join("tmp");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let pattern = format!("{}/proj/secrets/**", link.display());
+        let policy = ToolPolicy::new().deny_path(&pattern);
+
+        for target in [
+            real.join("proj/secrets/a.env"),
+            link.join("proj/secrets/b.env"),
+        ] {
+            assert!(
+                deny_reason(&policy, &target).await.is_some(),
+                "{} must be denied by {pattern}",
+                target.display()
+            );
+        }
+        // Remote policing never uses a host-resolved twin.
+        let remote = ToolPolicy::new()
+            .deny_path(&pattern)
+            .with_remote(None)
+            .denied_paths();
+        assert_eq!(remote.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_case_variant_cannot_dodge_a_deny_glob_on_a_case_insensitive_volume() {
+        // `SECRETS/new2.env` *is* `secrets/new2.env` on APFS/NTFS. Only meaningful where the
+        // volume really ignores case, so it's skipped elsewhere; the comparison itself is unit-tested
+        // below regardless.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("secrets")).unwrap();
+        if !dir.path().join("SECRETS").exists() {
+            eprintln!("skipping: {} is case-sensitive", dir.path().display());
+            return;
+        }
+        let policy = ToolPolicy::new().deny_path("**/secrets/**");
+        assert!(
+            deny_reason(&policy, &dir.path().join("SECRETS/new2.env"))
+                .await
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn a_deny_rule_matches_case_insensitively_only_when_the_volume_does() {
+        let rule = DenyRule::compile("**/Secrets/**", false).unwrap();
+        assert!(rule.matches("/repo/secrets/new2.env", true));
+        assert!(rule.matches("/repo/SECRETS/new2.env", true));
+        assert!(!rule.matches("/repo/secrets/new2.env", false));
+        assert!(rule.matches("/repo/Secrets/new2.env", false));
     }
 
     #[test]

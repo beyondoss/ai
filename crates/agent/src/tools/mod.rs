@@ -287,13 +287,16 @@ pub(crate) fn temp_suffix() -> String {
 ///
 /// Real canonicalization (`std::fs::canonicalize`) resolves symlinks and `.`/`..` against the actual
 /// filesystem, but fails with `NotFound` for a path that doesn't exist yet — exactly `write`'s common
-/// case (creating a new file). The fallback below only resolves `.`/`..` *lexically* and makes the
-/// result absolute (joined against the process cwd), so differently-spelled references to a
-/// not-yet-created file still normalize to the same key; it just can't resolve a symlink it can't stat.
+/// case (creating a new file). For that case it does **not** fall back to the typed spelling: the
+/// nearest existing ancestor is canonicalized and the missing tail appended
+/// ([`resolve_nearest`](crate::path_utils::resolve_nearest)), so `sl/new.env` with `sl -> secrets`
+/// keys as `secrets/new.env` — the key the file will have once it exists. On a case-insensitive
+/// volume (probed, not assumed — [`is_case_insensitive_at`](crate::path_utils::is_case_insensitive_at))
+/// the key is lowercased, so `SECRETS/new.env` and `secrets/new.env` are one file to the deny-list,
+/// the approval memory and the write locks, as they are to the filesystem. The returned `bool` says
+/// whether that folding happened, which a deny glob needs to know to match case-insensitively too.
 ///
-/// Never fails outright: a pathological input (e.g. one that can't even be joined) falls back to the
-/// original string unchanged, which only degrades grouping (calls that should serialize might not) —
-/// strictly no worse than today's un-canonicalized behavior, never a new correctness hazard.
+/// Never fails outright.
 ///
 /// `root` is the tool's configured root (see [`resolve_against`]); a relative `path` is keyed against it
 /// rather than against the *process* cwd. This is what makes two subagents running in separate git
@@ -301,20 +304,28 @@ pub(crate) fn temp_suffix() -> String {
 /// two different files. Keying both against one process-wide cwd would serialize them against each other
 /// for no reason, and (worse) a shared `WriteLockRegistry` would report them as the same file. An empty
 /// `root` means "the process cwd", preserving the pre-root behavior exactly.
-pub(crate) fn canonical_write_target(root: &Path, path: &str) -> String {
-    if let Ok(real) = std::fs::canonicalize(path) {
-        return real.display().to_string();
-    }
-    // `canonicalize` is a host syscall, so reaching here at all means the path is being keyed against
-    // this host — the only world in which joining the process cwd is a true answer.
-    lexical_write_target(root, path, &fs::PathWorld::Local)
+pub(crate) fn canonical_write_target_ci(root: &Path, path: &str) -> (String, bool) {
+    let p = Path::new(path);
+    let joined = if p.is_relative() && !root.as_os_str().is_empty() {
+        root.join(p)
+    } else {
+        p.to_path_buf()
+    };
+    // `resolve_nearest` is host syscalls, so reaching here at all means the path is being keyed
+    // against this host — the only world in which joining the process cwd is a true answer.
+    let real = crate::path_utils::resolve_nearest(&joined);
+    let ci = crate::path_utils::is_case_insensitive_at(&real);
+    (crate::path_utils::comparison_key(&real, ci), ci)
 }
 
-/// The purely lexical half of [`canonical_write_target`]: fold away `.` and `..` and join a relative
-/// path onto `root`, touching no filesystem at all.
-///
-/// This is the *entire* body [`canonical_write_target`] already fell back to when `canonicalize`
-/// failed — extracted rather than rewritten, so the local behavior is byte-identical.
+/// [`canonical_write_target_ci`]'s key alone.
+#[cfg(test)]
+pub(crate) fn canonical_write_target(root: &Path, path: &str) -> String {
+    canonical_write_target_ci(root, path).0
+}
+
+/// The purely lexical counterpart of [`canonical_write_target_ci`]: fold away `.` and `..` and join a
+/// relative path onto `root`, touching no filesystem at all.
 ///
 /// It exists as its own function because `canonicalize` is a **host** syscall, and calling it for a
 /// path that isn't on this host is worse than useless. With a sandbox mounted at the same absolute
@@ -367,14 +378,20 @@ pub(crate) fn lexical_write_target(root: &Path, path: &str, world: &fs::PathWorl
 /// long as all three copies stayed in step — and a deny-list that resolves a path differently from the
 /// tool that writes it is a bypass, not a bug. One definition, three callers, no drift.
 pub(crate) fn write_key(root: &Path, path: &str, world: &fs::PathWorld) -> String {
+    write_key_ci(root, path, world).0
+}
+
+/// [`write_key`], plus whether the key was case-folded (see [`canonical_write_target_ci`]). Only
+/// ever `true` locally: a remote volume's case rules can't be probed from here.
+pub(crate) fn write_key_ci(root: &Path, path: &str, world: &fs::PathWorld) -> (String, bool) {
     let resolved = resolve_against_in(root, path, world);
     match world {
         // On this host, `canonicalize` is meaningful and valuable: it unifies `./x`, `../dir/x` and a
-        // symlink to `x` into one key, which is what stops a same-turn `edit(real)` + `write(alias)`
-        // from racing on one file.
-        fs::PathWorld::Local => canonical_write_target(root, &resolved),
+        // symlink to `x` (or through a symlinked parent of a not-yet-created `x`) into one key, which
+        // is what stops a same-turn `edit(real)` + `write(alias)` from racing on one file.
+        fs::PathWorld::Local => canonical_write_target_ci(root, &resolved),
         // Elsewhere, it can only lie. See [`lexical_write_target`].
-        fs::PathWorld::Remote { .. } => lexical_write_target(root, &resolved, world),
+        fs::PathWorld::Remote { .. } => (lexical_write_target(root, &resolved, world), false),
     }
 }
 
@@ -1257,6 +1274,21 @@ mod tests {
         assert!(
             std::path::Path::new(&a).is_absolute(),
             "fallback must still produce an absolute key: {a}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_new_file_through_a_symlinked_parent_shares_one_write_lock_key() {
+        // two same-turn writes creating one file — one via `sl/`, one via the real directory —
+        // must serialize. Falling back to the typed spelling gave them two keys.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("real")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("real"), dir.path().join("sl")).unwrap();
+        let world = fs::PathWorld::Local;
+        assert_eq!(
+            write_key(dir.path(), "sl/new.rs", &world),
+            write_key(dir.path(), "real/new.rs", &world)
         );
     }
 
