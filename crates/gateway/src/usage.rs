@@ -206,9 +206,9 @@ vendor_fields! {
 #[derive(Deserialize, Default)]
 struct OpenAiUsage {
     #[serde(default)]
-    prompt_tokens: u64,
+    prompt_tokens: Option<u64>,
     #[serde(default)]
-    completion_tokens: u64,
+    completion_tokens: Option<u64>,
     #[serde(default)]
     prompt_tokens_details: OpenAiPromptDetails,
     #[serde(default)]
@@ -260,6 +260,19 @@ struct OpenAiCompletionDetails {
 }
 
 impl OpenAiUsage {
+    /// Whether the object names a token count at all. `"usage": {}` names none: it is no usage to
+    /// meter, and it must not stand in for a real usage event (a trailing empty one would otherwise
+    /// win a stream scan and bill zeros).
+    fn counts_tokens(&self) -> bool {
+        self.prompt_tokens.is_some()
+            || self.completion_tokens.is_some()
+            || self.input_tokens.is_some()
+            || self.output_tokens.is_some()
+            || self.total_tokens.is_some()
+            || self.prompt_cache_hit_tokens.is_some()
+            || self.prompt_tokens_details.cached_tokens.is_some()
+    }
+
     /// `input_tokens`/`output_tokens` plus `total_tokens`: a non-stream Responses body.
     fn is_responses_shaped(&self) -> bool {
         self.input_tokens.is_some() && self.output_tokens.is_some() && self.total_tokens.is_some()
@@ -287,8 +300,8 @@ impl Usage {
     fn from_chat(u: OpenAiUsage) -> Self {
         if u.is_responses_shaped() {
             return Usage::from(OpenAiResponsesUsage {
-                input_tokens: u.input_tokens.unwrap_or(0),
-                output_tokens: u.output_tokens.unwrap_or(0),
+                input_tokens: u.input_tokens,
+                output_tokens: u.output_tokens,
                 total_tokens: u.total_tokens,
                 input_tokens_details: u.input_tokens_details,
                 output_tokens_details: u.output_tokens_details,
@@ -304,17 +317,17 @@ impl Usage {
             && u.total_tokens
                 == Some(
                     u.prompt_tokens
-                        .saturating_add(u.completion_tokens)
+                        .unwrap_or(0)
+                        .saturating_add(u.completion_tokens.unwrap_or(0))
                         .saturating_add(reasoning),
                 );
         Usage {
-            input_tokens: u.prompt_tokens,
+            input_tokens: u.prompt_tokens.unwrap_or(0),
             // Provider numbers are untrusted: saturate rather than panic (overflow-checks are on).
-            output_tokens: u.completion_tokens.saturating_add(if reasoning_outside {
-                reasoning
-            } else {
-                0
-            }),
+            output_tokens: u
+                .completion_tokens
+                .unwrap_or(0)
+                .saturating_add(if reasoning_outside { reasoning } else { 0 }),
             // `prompt_tokens_details.cached_tokens` (real OpenAI, and OpenAI-compatible providers that
             // populate it) wins when present; DeepSeek's flat `prompt_cache_hit_tokens` is the fallback
             // for when it's entirely absent. Mirrors pi's
@@ -341,9 +354,9 @@ vendor_fields! {
 #[derive(Deserialize, Default)]
 struct OpenAiResponsesUsage {
     #[serde(default)]
-    input_tokens: u64,
+    input_tokens: Option<u64>,
     #[serde(default)]
-    output_tokens: u64,
+    output_tokens: Option<u64>,
     #[serde(default)]
     total_tokens: Option<u64>,
     #[serde(default)]
@@ -368,6 +381,13 @@ struct OpenAiResponsesOutputDetails {
     reasoning_tokens: Option<u64>,
 }
 
+impl OpenAiResponsesUsage {
+    /// See [`OpenAiUsage::counts_tokens`].
+    fn counts_tokens(&self) -> bool {
+        self.input_tokens.is_some() || self.output_tokens.is_some() || self.total_tokens.is_some()
+    }
+}
+
 impl From<OpenAiResponsesUsage> for Usage {
     fn from(mut u: OpenAiResponsesUsage) -> Self {
         let vendor = u.vendor();
@@ -387,16 +407,16 @@ impl Usage {
             && u.total_tokens
                 == Some(
                     u.input_tokens
-                        .saturating_add(u.output_tokens)
+                        .unwrap_or(0)
+                        .saturating_add(u.output_tokens.unwrap_or(0))
                         .saturating_add(reasoning),
                 );
         Usage {
-            input_tokens: u.input_tokens,
-            output_tokens: u.output_tokens.saturating_add(if reasoning_outside {
-                reasoning
-            } else {
-                0
-            }),
+            input_tokens: u.input_tokens.unwrap_or(0),
+            output_tokens: u
+                .output_tokens
+                .unwrap_or(0)
+                .saturating_add(if reasoning_outside { reasoning } else { 0 }),
             cache_read_tokens: u.input_tokens_details.cached_tokens,
             cache_write_tokens: u.input_tokens_details.cache_write_tokens,
             reasoning_tokens: u.output_tokens_details.reasoning_tokens,
@@ -413,13 +433,13 @@ vendor_fields! {
 #[derive(Deserialize, Default)]
 struct AnthropicUsage {
     #[serde(default)]
-    input_tokens: u64,
+    input_tokens: Option<u64>,
     #[serde(default)]
-    output_tokens: u64,
+    output_tokens: Option<u64>,
     #[serde(default)]
-    cache_read_input_tokens: u64,
+    cache_read_input_tokens: Option<u64>,
     #[serde(default)]
-    cache_creation_input_tokens: u64,
+    cache_creation_input_tokens: Option<u64>,
     #[serde(default)]
     output_tokens_details: AnthropicOutputDetails,
     #[serde(default)]
@@ -450,6 +470,14 @@ struct AnthropicCacheCreation {
 }
 
 impl AnthropicUsage {
+    /// See [`OpenAiUsage::counts_tokens`].
+    fn counts_tokens(&self) -> bool {
+        self.input_tokens.is_some()
+            || self.output_tokens.is_some()
+            || self.cache_read_input_tokens.is_some()
+            || self.cache_creation_input_tokens.is_some()
+    }
+
     fn looks_openai_shaped(&self) -> bool {
         self.prompt_tokens.is_some() && self.completion_tokens.is_some()
     }
@@ -459,10 +487,10 @@ impl From<AnthropicUsage> for Usage {
     fn from(mut u: AnthropicUsage) -> Self {
         let vendor = u.vendor();
         let mut usage = Usage {
-            input_tokens: u.input_tokens,
-            output_tokens: u.output_tokens,
-            cache_read_tokens: u.cache_read_input_tokens,
-            cache_write_tokens: u.cache_creation_input_tokens,
+            input_tokens: u.input_tokens.unwrap_or(0),
+            output_tokens: u.output_tokens.unwrap_or(0),
+            cache_read_tokens: u.cache_read_input_tokens.unwrap_or(0),
+            cache_write_tokens: u.cache_creation_input_tokens.unwrap_or(0),
             reasoning_tokens: u.output_tokens_details.thinking_tokens,
             cache_write_1h_tokens: u.cache_creation.ephemeral_1h_input_tokens,
             service_tier: u.service_tier,
@@ -527,7 +555,7 @@ pub fn openai_body(body: &[u8]) -> Option<Usage> {
             None,
         ),
     };
-    if usage.looks_anthropic_shaped() {
+    if !usage.counts_tokens() || usage.looks_anthropic_shaped() {
         return None;
     }
     let mut u = Usage {
@@ -561,7 +589,7 @@ pub fn anthropic_body(body: &[u8]) -> Option<Usage> {
             None,
         ),
     };
-    if u.looks_openai_shaped() {
+    if !u.counts_tokens() || u.looks_openai_shaped() {
         return None;
     }
     let mut u = Usage::from(u);
@@ -740,7 +768,7 @@ pub fn openai_stream(sse: &[u8]) -> Option<Usage> {
     // is the last thing in that event, so recover it the way a front-truncated body is recovered.
     let first = &sse[..memchr::memchr(b'\n', sse).unwrap_or(sse.len())];
     recover_trailing_usage::<OpenAiUsage>(first)
-        .filter(|u| !u.looks_anthropic_shaped())
+        .filter(|u| u.counts_tokens() && !u.looks_anthropic_shaped())
         .map(Usage::from)
 }
 
@@ -770,7 +798,7 @@ fn openai_chunk_usage(payload: &[u8]) -> Option<Option<Usage>> {
     }
     let chunk = serde_json::from_slice::<Chunk>(payload).ok()?;
     Some(if let Some(u) = chunk.usage {
-        (!u.looks_anthropic_shaped()).then(|| {
+        (u.counts_tokens() && !u.looks_anthropic_shaped()).then(|| {
             let mut u = Usage {
                 service_tier: chunk.service_tier,
                 ..Usage::from(u)
@@ -781,7 +809,7 @@ fn openai_chunk_usage(payload: &[u8]) -> Option<Option<Usage>> {
         })
     } else {
         chunk.response.and_then(|r| {
-            r.usage.map(|u| {
+            r.usage.filter(|u| u.counts_tokens()).map(|u| {
                 let mut u = Usage {
                     service_tier: r.service_tier,
                     ..Usage::from(u)
@@ -933,35 +961,42 @@ fn anthropic_apply(usage: &mut Usage, saw_any: &mut bool, payload: &[u8]) -> boo
         && let Some(mut u) = m.usage.take()
         && !u.looks_openai_shaped()
     {
-        usage.input_tokens = u.input_tokens;
-        usage.cache_read_tokens = u.cache_read_input_tokens;
-        usage.cache_write_tokens = u.cache_creation_input_tokens;
+        // Only a block that names a token count is a usage (`saw_any`); the fields and the server
+        // tool count are taken from whatever it carries.
+        let counted = u.counts_tokens();
+        usage.input_tokens = u.input_tokens.unwrap_or(0);
+        usage.cache_read_tokens = u.cache_read_input_tokens.unwrap_or(0);
+        usage.cache_write_tokens = u.cache_creation_input_tokens.unwrap_or(0);
         usage.cache_write_1h_tokens = u.cache_creation.ephemeral_1h_input_tokens;
         usage.service_tier = u.service_tier;
         if m.id.is_some() {
             usage.upstream.generation_id = m.id;
         }
         u.vendor().apply(usage);
-        *saw_any = true;
+        usage.server_tool_calls = u64::from(usage.server_tools.web_search);
+        *saw_any |= counted;
     }
     if let Some(mut u) = chunk.usage
         && !u.looks_openai_shaped()
     {
+        // A delta that carries only a server tool count (a search with no token change) still
+        // counts that search; only the token-less object is not a usage of its own.
+        let counted = u.counts_tokens();
         // message_delta carries the running output token count — and, cumulatively, input
         // and cache counts too, which grow past `message_start`'s when a server tool (web
         // search) feeds results back mid-turn. Present wins; absent (zero, by
         // `serde(default)`) keeps what `message_start` said.
-        if u.output_tokens > 0 {
-            usage.output_tokens = u.output_tokens;
+        if let Some(n) = u.output_tokens.filter(|&n| n > 0) {
+            usage.output_tokens = n;
         }
-        if u.input_tokens > 0 {
-            usage.input_tokens = u.input_tokens;
+        if let Some(n) = u.input_tokens.filter(|&n| n > 0) {
+            usage.input_tokens = n;
         }
-        if u.cache_read_input_tokens > 0 {
-            usage.cache_read_tokens = u.cache_read_input_tokens;
+        if let Some(n) = u.cache_read_input_tokens.filter(|&n| n > 0) {
+            usage.cache_read_tokens = n;
         }
-        if u.cache_creation_input_tokens > 0 {
-            usage.cache_write_tokens = u.cache_creation_input_tokens;
+        if let Some(n) = u.cache_creation_input_tokens.filter(|&n| n > 0) {
+            usage.cache_write_tokens = n;
         }
         if u.cache_creation.ephemeral_1h_input_tokens > 0 {
             usage.cache_write_1h_tokens = u.cache_creation.ephemeral_1h_input_tokens;
@@ -976,7 +1011,10 @@ fn anthropic_apply(usage: &mut Usage, saw_any: &mut bool, payload: &[u8]) -> boo
         if let Some(rt) = u.output_tokens_details.thinking_tokens {
             usage.reasoning_tokens = Some(rt);
         }
-        *saw_any = true;
+        // A server tool count is usage in its own right: it is kept, and the token counts it lacks
+        // are estimated by the caller (a stream with no token counts is treated as cut short).
+        let server_counted = usage.server_tools != ServerTools::default();
+        *saw_any |= counted || server_counted;
     }
     true
 }
@@ -2674,6 +2712,69 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":4,\"server_tool_u
         // Absent ⇒ None, not Some(0).
         let no_reasoning = br#"{"usage":{"input_tokens":100,"output_tokens":50}}"#;
         assert_eq!(anthropic_body(no_reasoning).unwrap().reasoning_tokens, None);
+    }
+
+    /// A message_delta that only counts a server tool keeps that count, and the token counts of
+    /// the message_start it follows.
+    /// A message_start's server tool count is kept, as a delta's is.
+    /// claim: BIL-10
+    /// defect: D276
+    #[test]
+    fn a_message_start_keeps_its_server_tool_count() {
+        let sse = b"event: message_start\n\
+                    data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":0,\"server_tool_use\":{\"web_search_requests\":3}}}}\n\n";
+        let u = anthropic_stream(sse).expect("message_start carries a usage");
+        assert_eq!((u.input_tokens, u.server_tool_calls), (10, 3));
+    }
+
+    /// A delta that only counts a server tool, with no message_start before it, is still a usage: its
+    /// count is kept, and the token counts are left at zero for the caller to estimate.
+    /// claim: BIL-10
+    /// defect: D276
+    #[test]
+    fn a_server_tool_only_delta_without_a_message_start_keeps_its_count() {
+        let sse = b"event: message_delta\n\
+                    data: {\"type\":\"message_delta\",\"usage\":{\"server_tool_use\":{\"web_search_requests\":2}}}\n\n";
+        let u = anthropic_stream(sse).expect("the count is a usage");
+        assert_eq!(
+            (u.input_tokens, u.output_tokens, u.server_tool_calls),
+            (0, 0, 2)
+        );
+    }
+
+    /// claim: BIL-10
+    /// defect: D276
+    #[test]
+    fn a_server_tool_only_delta_keeps_its_search_count() {
+        let sse = b"event: message_start\n\
+                    data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n\n\
+                    event: message_delta\n\
+                    data: {\"type\":\"message_delta\",\"usage\":{\"server_tool_use\":{\"web_search_requests\":2}}}\n\n";
+        let u = anthropic_stream(sse).expect("message_start carries a usage");
+        assert_eq!(u.input_tokens, 10);
+        assert_eq!(
+            u.server_tool_calls, 2,
+            "the delta's search count was dropped"
+        );
+    }
+
+    /// claim: BIL-6
+    /// defect: D276
+    #[test]
+    fn an_empty_usage_object_is_no_usage() {
+        assert!(openai_body(br#"{"id":"x","usage":{}}"#).is_none());
+        assert!(anthropic_body(br#"{"usage":{}}"#).is_none());
+    }
+
+    /// claim: BIL-6
+    /// defect: D276
+    #[test]
+    fn a_trailing_empty_usage_event_does_not_shadow_real_usage() {
+        let sse = b"data: {\"id\":\"c1\",\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\n\
+data: {\"id\":\"c1\",\"choices\":[],\"usage\":{}}\n\n\
+data: [DONE]\n\n";
+        let u = openai_stream(sse).expect("the real usage event must be read");
+        assert_eq!((u.input_tokens, u.output_tokens), (10, 5));
     }
 }
 

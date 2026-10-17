@@ -7455,9 +7455,13 @@ impl ProxyHttp for AiProxy {
                 && match rc.dialect {
                     Dialect::OpenAi => parsed.is_none(),
                     // A `message_delta` that arrived but did not parse is as missing as one that
-                    // never came.
+                    // never came. A usage with no token count (only a server tool's count, from a
+                    // stream whose message_start was lost) is missing its tokens too: estimated.
                     Dialect::Anthropic => {
-                        parsed.is_none() || !usage::anthropic_stream_finished(tail)
+                        parsed
+                            .as_ref()
+                            .is_none_or(|u| u.input_tokens == 0 && u.output_tokens == 0)
+                            || !usage::anthropic_stream_finished(tail)
                     }
                 };
             // A non-stream 2xx that died before its `usage` (the body is last): the provider

@@ -2807,3 +2807,17 @@ state = "fixed"
 test = "an_exponent_output_limit_has_no_span"
 fix = ""
 note = "Fixed in peek.rs: a root limit's digits are a span only when the member ends after them (`,` or `}`, past whitespace). Any other value that is present and not null is flagged as inexact_limit: strings, bools, objects, arrays, negatives, fractions, exponents. A catalog walk on a row with a published cap refuses a flagged body with a 400 before the upstream (proxy request_body_filter, Rejection::OutputLimit, reason output_limit), so a limit is never sent on uncapped. A row with no published cap has nothing to hold it to and forwards it as before. Also held by a_non_integer_output_limit_is_refused_before_the_upstream (catalog_body.rs, compile-only here) and only_a_non_integer_output_limit_is_inexact."
+
+[[defect]]
+id = "D276"
+severity = "high"
+area = "Billing"
+title = "An empty usage object is read as zero tokens, and a trailing one overwrites real usage"
+impact = "A usage object that names no token count (\"usage\": {}) parsed as a zero usage. On a stream, a final empty usage event won the reverse scan over the real one, so the row billed zero tokens for an answer that was metered. On a body, an empty usage made a zero row where no usage was reported."
+confidence = "high"
+evidence = "usage.rs: every count field was #[serde(default)] u64, so {} deserialized to Some(zeros). Reproduced on 4513e6f by a_trailing_empty_usage_event_does_not_shadow_real_usage (openai_stream returned 0 input tokens, not 10) and an_empty_usage_object_is_no_usage."
+claims = ["BIL-6"]
+state = "fixed"
+test = "a_trailing_empty_usage_event_does_not_shadow_real_usage"
+fix = ""
+note = "Fixed in usage.rs: the count fields that decide whether a usage object has tokens (prompt/completion, input/output, total, cache hit) are Option, and counts_tokens() is checked wherever a usage object becomes a Usage (openai_body, anthropic_body, openai_chunk_usage, the Responses envelope, the openai_stream recovery, anthropic_apply). An object with no token field is no usage, so a stream scan falls through to the real event and a body reports none. Also held by an_empty_usage_object_is_no_usage."
