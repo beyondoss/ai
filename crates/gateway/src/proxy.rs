@@ -68,7 +68,7 @@ use crate::cache;
 use crate::capture::CaptureBufs;
 use crate::circuit_breaker::Permit;
 use crate::drain::{self, Drain};
-use crate::key;
+use crate::key::{self, Identity};
 use crate::metrics::{DrainEnd, KeyCooled, Rejection};
 use crate::route::{self, Dialect, Provider, ProviderId};
 use crate::signed_id;
@@ -419,10 +419,8 @@ impl Drop for Ctx {
 /// Per-request context. `None` until `request_filter` admits the request; short-circuited
 /// requests (auth/deny failures) leave it `None`, so later filters no-op.
 pub struct RequestCtx {
-    tenant_id: u64,
-    vpc_id: u64,
-    /// `bai_v2` credential id. `None` for v1 (and BYO). Emitted on `ai.usage`; used with the deny-set.
-    key_id: Option<u64>,
+    /// Who pays: a verified Beyond identity, or the caller's own provider key.
+    billing: Billing,
     dialect: Dialect,
     /// The resolved upstream provider (authority/host + precomputed managed auth value), shared from
     /// the boot-time registry — a cheap `Arc` clone, nothing re-allocated per request.
@@ -435,9 +433,6 @@ pub struct RequestCtx {
     /// distinction is in the type rather than discovered by rebuilding the path and comparing it,
     /// so the common route allocates nothing.
     forward_path: Option<String>,
-    /// Whether this is a **managed** request (`bai_v1…` / `bai_v2…` key → swap to the pool key). `false` for
-    /// **BYO** — we leave the user's own auth header untouched (passthrough).
-    managed: bool,
     /// Model the client *requested*, extracted from the request body. This is the billing-log
     /// **fallback** — the authoritative value is the model the provider echoes in its response (see
     /// `resp_model_scanner`), because a client may send an alias (`gpt-4o`) that the provider resolves
@@ -569,9 +564,70 @@ pub struct RequestCtx {
     /// for this tenant, and the ids the client sent were verified and are stripped back in
     /// `request_body_filter`. Boxed: `None` on every other request.
     signed: Option<Box<signed_id::Relay>>,
-    /// Billing facts tapped beside the usage block ([`BillingTaps`]): managed only, created at the
-    /// first fact. Boxed for [`ModelRouting`]'s reason; `None` on every BYO request.
+}
+
+/// Who pays for a request, and so whether anything tenant-scoped applies to it.
+///
+/// The only way to a tenant id is `Billing::Managed`, built from what `Keyring::verify` proved
+/// (an [`Identity`]), so no unverified id can reach the deny set, a capture rule or a billing row,
+/// and a BYO request has no tenant id at all rather than a zero one.
+enum Billing {
+    /// A Beyond virtual key: the pool key is swapped in, and the request writes a billing row.
+    Managed(Managed),
+    /// The caller's own provider key, passed through untouched: no identity, no billing row.
+    Byo,
+}
+
+/// A managed request's verified identity, and the billing facts its row reads.
+struct Managed {
+    identity: Identity,
+    /// Billing facts tapped beside the usage block ([`BillingTaps`]), made at the first one.
+    /// Boxed for [`ModelRouting`]'s reason; `None` until a fact is tapped (a cache hit taps none).
     taps: Option<Box<BillingTaps>>,
+}
+
+impl Billing {
+    /// Managed for a verified identity, BYO without one.
+    fn of(identity: Option<Identity>) -> Self {
+        match identity {
+            Some(identity) => Billing::Managed(Managed {
+                identity,
+                taps: None,
+            }),
+            None => Billing::Byo,
+        }
+    }
+
+    fn identity(&self) -> Option<&Identity> {
+        match self {
+            Billing::Managed(m) => Some(&m.identity),
+            Billing::Byo => None,
+        }
+    }
+
+    /// The facts tapped so far; `None` on BYO and before the first.
+    fn taps(&self) -> Option<&BillingTaps> {
+        match self {
+            Billing::Managed(m) => m.taps.as_deref(),
+            Billing::Byo => None,
+        }
+    }
+
+    /// See [`Self::taps`].
+    fn taps_mut(&mut self) -> Option<&mut BillingTaps> {
+        match self {
+            Billing::Managed(m) => m.taps.as_deref_mut(),
+            Billing::Byo => None,
+        }
+    }
+
+    /// A managed request's taps, made here at its first fact; `None` on BYO, which taps nothing.
+    fn tap(&mut self) -> Option<&mut BillingTaps> {
+        match self {
+            Billing::Managed(m) => Some(m.taps.get_or_insert_with(Box::default)),
+            Billing::Byo => None,
+        }
+    }
 }
 
 /// Billing facts a managed request taps beside its usage block, for the `ai.usage` row.
@@ -629,7 +685,7 @@ impl RequestedKnobs {
 /// the body `logging` still holds — the `FullBody` parent's copy or pingora's retry buffer, the
 /// copies [`input_estimate`] reads. That is the client's body, before any rewrite.
 fn requested_knobs(session: &Session, rc: &mut RequestCtx) -> RequestedKnobs {
-    if let Some((_, k)) = rc.taps.as_mut().and_then(|t| t.knobs.take()) {
+    if let Some((_, k)) = rc.billing.taps_mut().and_then(|t| t.knobs.take()) {
         return RequestedKnobs::from_scan(k);
     }
     let mut kept = peek::Kept::request_knobs();
@@ -739,7 +795,7 @@ fn drain_end(drain: Drain, client_left: bool, e: Option<&pingora_core::Error>) -
 /// managed 2xx stream from a provider in [`MAY_CONTINUE`]. BYO writes no billing row, and a
 /// provider that stops generating when the client leaves bills only what it relayed.
 fn drains_on_cancel(rc: &RequestCtx, status: u16) -> bool {
-    rc.managed
+    rc.managed()
         && rc.streaming
         && (200..300).contains(&status)
         && rc.provider.id.is_some_and(|id| MAY_CONTINUE.contains(&id))
@@ -771,7 +827,9 @@ fn tap_response_head(rc: &mut RequestCtx, resp: &ResponseHeader) {
         }
     };
     // Always made on a managed response: `resp_model_scanner` keeps the response's id in it.
-    let taps = rc.taps.get_or_insert_with(Box::default);
+    let Some(taps) = rc.billing.tap() else {
+        return;
+    };
     taps.generation_id = generation_id;
     taps.request_id = request_id;
     taps.tools = responses.then(|| usage::ToolTally::new(rc.streaming));
@@ -781,7 +839,9 @@ fn tap_response_head(rc: &mut RequestCtx, resp: &ResponseHeader) {
 /// response scanner's, from the head, over the usage block's), the serving host the head named,
 /// and the Responses tool items.
 fn merge_taps(rc: &mut RequestCtx, usage: &mut usage::Usage) {
-    let Some(t) = rc.taps.as_mut() else { return };
+    let Some(t) = rc.billing.taps_mut() else {
+        return;
+    };
     let head_id = t
         .resp_kept
         .as_ref()
@@ -1405,6 +1465,12 @@ impl ModelRouting {
 }
 
 impl RequestCtx {
+    /// Whether this is a **managed** request (`bai_v1…` / `bai_v2…` key → swap to the pool key).
+    /// `false` for **BYO** — we leave the user's own auth header untouched (passthrough).
+    fn managed(&self) -> bool {
+        matches!(self.billing, Billing::Managed(_))
+    }
+
     /// Take one request-body chunk into this attempt's record: the size count, the capture tap and,
     /// for a rewrite, the buffer the rewrite reads. `false` once the body has crossed
     /// `MAX_REQUEST_BODY`. The body filter and the replay tests both feed through here, so a replayed
@@ -1471,7 +1537,9 @@ impl RequestCtx {
     /// The verdict is read only on a managed request's billing row, and a JSON body has no
     /// terminal event, so watching anything else would scan every chunk for nothing.
     fn tracks_terminal(&self) -> bool {
-        self.managed && self.streaming && !self.auto.as_ref().is_some_and(|a| catalog_assembling(a))
+        self.managed()
+            && self.streaming
+            && !self.auto.as_ref().is_some_and(|a| catalog_assembling(a))
     }
 
     /// Anthropic SSE only: keep a bounded head of the upstream response so `message_start`'s input
@@ -1548,7 +1616,7 @@ impl RequestCtx {
         self.body_bytes_fed = 0;
         self.model_scanner = peek::ModelScanner::new();
         self.input_tally = usage::InputTally::default();
-        if let Some(k) = self.taps.as_mut().and_then(|t| t.knobs.as_mut()) {
+        if let Some(k) = self.billing.taps_mut().and_then(|t| t.knobs.as_mut()) {
             *k = (peek::ModelScanner::new(), peek::Kept::request_knobs());
         }
     }
@@ -3664,7 +3732,7 @@ fn apply_serving_candidate(rc: &mut RequestCtx) {
     };
     let ep = route::Endpoint::of_upstream_path(c.path);
     rc.dialect = ep.wire();
-    rc.inject_eligible = rc.managed && is_streamable_path(c.path);
+    rc.inject_eligible = rc.managed() && is_streamable_path(c.path);
 }
 
 fn catalog_serving_endpoint(auto: &ModelRouting) -> Option<route::Endpoint> {
@@ -4354,7 +4422,7 @@ impl ProxyHttp for AiProxy {
         // allowance, and no per-tenant attribution). A public listener without this split would
         // forward a forged virtual key as BYO — junk-auth egress, and the rate guard already
         // exempted it from the BYO aggregate.
-        let (tenant_id, vpc_id, key_id, managed) = if managed_key {
+        let identity: Option<Identity> = if managed_key {
             let Ok(identity) = self.state.keyring.verify(raw_key) else {
                 self.state.metrics.rejection(Rejection::Auth).inc();
                 return Self::reject_boxed(
@@ -4452,10 +4520,11 @@ impl ProxyHttp for AiProxy {
                 )
                 .await;
             }
-            (identity.tenant_id, identity.vpc_id, identity.key_id, true)
+            Some(identity)
         } else {
-            (0, 0, None, false)
+            None
         };
+        let managed = identity.is_some();
         // A managed `?key=` is the virtual key: never forward it. Catalog walks already send the
         // candidate's own path with no query, so only `/{provider}/…` carries one.
         let forward_path = match forward_path {
@@ -4560,7 +4629,10 @@ impl ProxyHttp for AiProxy {
         let mut peeked = false;
         // Taken before any full read (see `SlotGuard`), handed to the request context below.
         let mut early_slot: Option<SlotGuard<'_>> = None;
-        if managed && model_route.is_none() && resolve_from_body {
+        if let Some(id) = identity
+            && model_route.is_none()
+            && resolve_from_body
+        {
             // Header wins if present (unknown → 404, no fall-through to the body). Absent → peek.
             match catalog_from_header(session) {
                 CatalogHeader::Known(route) => model_route = Some(route),
@@ -4576,7 +4648,7 @@ impl ProxyHttp for AiProxy {
                 }
                 CatalogHeader::Absent => {
                     if full_body.is_none() {
-                        match self.take_slot_before_read(tenant_id) {
+                        match self.take_slot_before_read(id.tenant_id) {
                             Ok(guard) => early_slot = guard,
                             Err(()) => return self.reject_tenant_busy(session, &request_id).await,
                         }
@@ -4616,7 +4688,7 @@ impl ProxyHttp for AiProxy {
                         let body = peek.complete.unwrap_or_default();
                         // --- signed ids (`signed_id`) ---
                         if let Some(done) = self
-                            .refuse_foreign_ids(session, &request_id, route, &body, tenant_id)
+                            .refuse_foreign_ids(session, &request_id, route, &body, id.tenant_id)
                             .await
                         {
                             return done;
@@ -4646,7 +4718,7 @@ impl ProxyHttp for AiProxy {
 
         // Header-won catalog walks skip the body peek above. The same reasons to read the whole
         // body apply (Responses session state, a body pingora could not replay for failover).
-        if managed
+        if let Some(id) = identity
             && full_body.is_none()
             && !peeked
             && let Some(route) = model_route
@@ -4655,7 +4727,7 @@ impl ProxyHttp for AiProxy {
                 || route::walk_reads_body(route)
                 || route::walk_reads_tools(route, session.req_header().uri.path()))
         {
-            match self.take_slot_before_read(tenant_id) {
+            match self.take_slot_before_read(id.tenant_id) {
                 Ok(guard) => early_slot = guard,
                 Err(()) => return self.reject_tenant_busy(session, &request_id).await,
             }
@@ -4683,7 +4755,7 @@ impl ProxyHttp for AiProxy {
                 let body = peek.complete.unwrap_or_default();
                 // --- signed ids (`signed_id`) ---
                 if let Some(done) = self
-                    .refuse_foreign_ids(session, &request_id, route, &body, tenant_id)
+                    .refuse_foreign_ids(session, &request_id, route, &body, id.tenant_id)
                     .await
                 {
                     return done;
@@ -4814,7 +4886,7 @@ impl ProxyHttp for AiProxy {
                 // over would send the caller's key for one vendor to a different vendor, which is a
                 // credential disclosure, not a degraded experience. 400 rather than 401: their key
                 // may be perfectly valid, it is the endpoint that is wrong for it.
-                if !managed {
+                let Some(id) = identity else {
                     self.state
                         .metrics
                         .rejection(Rejection::ByoOnModelRoute)
@@ -4827,7 +4899,7 @@ impl ProxyHttp for AiProxy {
                         "model routing requires a managed key",
                     )
                     .await;
-                }
+                };
                 if let Some(kind) = body_complete
                     .as_deref()
                     .and_then(|b| route::refused_input(row, b))
@@ -4988,7 +5060,7 @@ impl ProxyHttp for AiProxy {
                         .as_ref()
                         .is_some_and(control::Control::pins_walk)
                 {
-                    let affinity = pin::affinity(tenant_id, vpc_id, key_id);
+                    let affinity = pin::affinity(id.tenant_id, id.vpc_id, id.key_id);
                     if let Some(pinned) = pin::order(walk, row, affinity, dispatchable) {
                         walk = pinned;
                         self.state.metrics.session_pinned_total.inc();
@@ -5081,7 +5153,7 @@ impl ProxyHttp for AiProxy {
         // must not carry an id another tenant could resolve. The ids the client sent back are
         // checked here, before connecting, wherever the body is in hand (every catalog walk); a
         // `/{provider}` body streams, and is checked as it is stripped in `request_body_filter`.
-        let signed = if managed
+        let signed = if let Some(id) = identity
             && match model_route {
                 Some(row) => signed_id::catalog_applies(session.req_header().uri.path(), row),
                 None => {
@@ -5108,7 +5180,7 @@ impl ProxyHttp for AiProxy {
             };
             if let Some(Err(refusal)) = body_complete
                 .as_deref()
-                .map(|b| signer.unsign_request(tenant_id, b, model_route.is_some()))
+                .map(|b| signer.unsign_request(id.tenant_id, b, model_route.is_some()))
             {
                 self.state.metrics.rejection(Rejection::ForeignId).inc();
                 return Self::reject_message_boxed(
@@ -5120,7 +5192,7 @@ impl ProxyHttp for AiProxy {
                 )
                 .await;
             }
-            Some(Box::new(signed_id::Relay::new(tenant_id)))
+            Some(Box::new(signed_id::Relay::new(id.tenant_id)))
         } else {
             None
         };
@@ -5222,7 +5294,9 @@ impl ProxyHttp for AiProxy {
         // semantics), and the two enablers serve different people: the control plane is the
         // operator's, works retroactively, and needs no cooperation from a client we don't control;
         // the header is the caller's, for per-request precision.
-        let control = if let Some(parsed) = parsed_control {
+        let control = if let Some(parsed) = parsed_control
+            && let Some(id) = identity
+        {
             let capture = match parsed.capture {
                 // Explicit suppression always wins — "not this one, it has PII".
                 Some(false) => None,
@@ -5236,7 +5310,7 @@ impl ProxyHttp for AiProxy {
                     .state
                     .capture
                     .load()
-                    .rule_for(tenant_id)
+                    .rule_for(id.tenant_id)
                     .filter(|rule| rule.samples(request_seq))
                     .map(|rule| CaptureBufs::new(rule.max_bytes)),
             };
@@ -5256,13 +5330,16 @@ impl ProxyHttp for AiProxy {
         // Exact-match cache: lookup only when the pre-rewrite body is already in hand (headerless
         // managed catalog walk). A hit writes the stored 2xx and returns before the breaker, the
         // key-walk, and `upstream_peer`. A miss stays an unbuffered relay; the fill is a tap.
-        let cache_look = if !cache_bypass && model_route.is_some() {
+        let cache_look = if let Some(id) = identity
+            && !cache_bypass
+            && model_route.is_some()
+        {
             body_complete.as_deref().and_then(|body| {
                 let store = self.state.cache.as_ref()?;
                 let req = session.req_header();
                 let (ids, n) = walk.provider_ids(walk_arms);
                 let ck = cache::key(&cache::KeyParts {
-                    tenant_id,
+                    tenant_id: id.tenant_id,
                     method: req.method.as_str(),
                     inbound_path: req.uri.path(),
                     model: model_route.map_or("", |r| r.model),
@@ -5283,13 +5360,10 @@ impl ProxyHttp for AiProxy {
             Some(Err(hit)) => {
                 Self::reply_cache_hit_boxed(session, &request_id, &hit).await?;
                 ctx.rc = Some(RequestCtx {
-                    tenant_id,
-                    vpc_id,
-                    key_id,
+                    billing: Billing::of(identity),
                     dialect,
                     provider,
                     forward_path,
-                    managed,
                     control,
                     model: String::new(),
                     model_scanner: peek::ModelScanner::new(),
@@ -5340,7 +5414,6 @@ impl ProxyHttp for AiProxy {
                     redact: None,
                     terminal: TerminalTracker::default(),
                     signed: None,
-                    taps: None,
                 });
                 ctx.held.admit();
                 return Ok(true);
@@ -5359,7 +5432,7 @@ impl ProxyHttp for AiProxy {
         // `concurrency`). After the cache (a hit costs no provider spend) and before the breaker,
         // so a refused request never holds a half-open probe permit.
         let parent_holds_slot = full_body.as_ref().is_some_and(|fb| fb.slot_held);
-        let tenant_slot = match self.state.tenant_slots.as_ref() {
+        let tenant_slot = match (self.state.tenant_slots.as_ref(), identity) {
             // A `FullBody` attempt whose parent holds the slot: neither take nor release one.
             _ if parent_holds_slot => false,
             // Taken before the body was read; `logging` releases it from here on.
@@ -5369,8 +5442,8 @@ impl ProxyHttp for AiProxy {
                 }
                 true
             }
-            Some(slots) if managed => {
-                if !slots.try_acquire(tenant_id) {
+            (Some(slots), Some(id)) => {
+                if !slots.try_acquire(id.tenant_id) {
                     self.state
                         .metrics
                         .rejection(Rejection::TenantConcurrency)
@@ -5406,8 +5479,11 @@ impl ProxyHttp for AiProxy {
             _ => Ok(None),
         };
         if let Err(breaker) = breaker_permit {
-            if tenant_slot && let Some(slots) = self.state.tenant_slots.as_ref() {
-                slots.release(tenant_id);
+            if tenant_slot
+                && let Some(slots) = self.state.tenant_slots.as_ref()
+                && let Some(id) = identity
+            {
+                slots.release(id.tenant_id);
             }
             self.state.metrics.rejection(Rejection::CircuitOpen).inc();
             let retry_after = Some(breaker.retry_after_secs());
@@ -5428,17 +5504,14 @@ impl ProxyHttp for AiProxy {
         // Past any key cooling off from a 401 (D71); a catalog walk picks per candidate.
         let pool_key = provider.first_key();
         if tenant_slot {
-            ctx.held.tenant = Some(tenant_id);
+            ctx.held.tenant = identity.map(|id| id.tenant_id);
         }
 
         ctx.rc = Some(RequestCtx {
-            tenant_id,
-            vpc_id,
-            key_id,
+            billing: Billing::of(identity),
             dialect,
             provider,
             forward_path,
-            managed,
             control,
             model: String::new(),
             model_scanner: peek::ModelScanner::new(),
@@ -5502,7 +5575,6 @@ impl ProxyHttp for AiProxy {
             redact: None,
             terminal: TerminalTracker::default(),
             signed,
-            taps: None,
         });
         // A body buffered for a rewrite (`RequestCtx::rewrites_body`) is pre-sized from the
         // declared Content-Length, so accumulation is a single allocation instead of a geometric
@@ -5791,14 +5863,14 @@ impl ProxyHttp for AiProxy {
         };
         let status = upstream_response.status.as_u16();
         // A 2xx says this key's account pays: forget its unread OpenRouter 402s (D261).
-        if rc.managed && (200..300).contains(&status) {
+        if rc.managed() && (200..300).contains(&status) {
             rc.provider.key_served(rc.pool_key);
         }
 
         // Managed 401: this pool key is revoked (D71). Never the caller's fault. Cool it off so
         // later requests start on a good key, then walk like a 429. Not a 403 (D84, see
         // `is_pool_key_failure`).
-        let key_auth = rc.managed && is_pool_key_failure(status);
+        let key_auth = rc.managed() && is_pool_key_failure(status);
         if key_auth {
             self.state.metrics.key_cooled(KeyCooled::Revoked);
             rc.provider.mark_key_bad(rc.pool_key);
@@ -5809,7 +5881,7 @@ impl ProxyHttp for AiProxy {
         // below) and not a breaker failure (the provider answered). A 401 is the provider refusing
         // the credential before it processed anything, so resending the body under the next key
         // is as safe as after a 429.
-        if rc.managed && (status == 429 || key_auth) {
+        if rc.managed() && (status == 429 || key_auth) {
             let next = usize::from(rc.pool_key).saturating_add(1);
             if next < rc.provider.pool_auth.len()
                 && let Ok(next) = u8::try_from(next)
@@ -5874,7 +5946,7 @@ impl ProxyHttp for AiProxy {
         // different key, so it is a candidate failure for this request like a 5xx. Unlike a 5xx
         // it says nothing about the provider's health, so it never opens the breaker (resolved
         // as a success below).
-        let key_failure = rc.managed && is_candidate_refusal(status);
+        let key_failure = rc.managed() && is_candidate_refusal(status);
         if status < 500 && !key_failure {
             return Ok(());
         }
@@ -5986,7 +6058,7 @@ impl ProxyHttp for AiProxy {
         // auth header (e.g. Azure's `api-key` — Task #8) happens to be the same header the client
         // presented its virtual key in doesn't end up with two stacked values. BYO (`!managed`):
         // leave the user's own auth header exactly as presented.
-        if rc.managed {
+        if rc.managed() {
             // Strip **unconditionally**, before deciding whether there is a pool key to insert.
             //
             // These two used to sit inside the `if let Some(av)` below, which was safe only because
@@ -6052,7 +6124,7 @@ impl ProxyHttp for AiProxy {
 
         // Dashboard-attribution headers (OpenRouter, managed traffic only — Task #22, see
         // `apply_provider_attribution`).
-        apply_provider_attribution(upstream_request, rc.provider.id, rc.managed)?;
+        apply_provider_attribution(upstream_request, rc.provider.id, rc.managed())?;
 
         // A stock OpenAI SDK does not send `anthropic-version`. Anthropic (and Bedrock Messages)
         // require it; inject the current version when we translated Chat Completions or Responses
@@ -6110,7 +6182,7 @@ impl ProxyHttp for AiProxy {
             && let Ok(uri) = forward_path.parse()
         {
             upstream_request.set_uri(uri);
-        } else if rc.managed
+        } else if rc.managed()
             && let Some(stripped) = upstream_request
                 .uri
                 .path_and_query()
@@ -6169,7 +6241,7 @@ impl ProxyHttp for AiProxy {
         // Feed the body through the structural scanner as it passes (never withheld, never
         // buffered) to extract the exact root-level `model` — but only for **managed** traffic,
         // which is the only path that reads it. `rc.model` is used at exactly two places, both
-        // inside the `if rc.managed` block in `logging` (the billing-log fallback and
+        // inside the managed (`Billing::Managed`) block in `logging` (the billing-log fallback and
         // `requested_model`). Scanning it for BYO meant walking the whole request body — a
         // structural, depth- and escape-aware pass — to produce a value guaranteed to be discarded.
         if let Some(chunk) = body.as_ref() {
@@ -6202,14 +6274,10 @@ impl ProxyHttp for AiProxy {
                 rc.input_tally.feed(chunk);
                 // The price knobs, for the same reason: no copy of this body is left for
                 // `logging` to read (see `requested_knobs`).
-                if rc.managed {
-                    let (scan, kept) = rc
-                        .taps
-                        .get_or_insert_with(Box::default)
-                        .knobs
-                        .get_or_insert_with(|| {
-                            (peek::ModelScanner::new(), peek::Kept::request_knobs())
-                        });
+                if let Some(taps) = rc.billing.tap() {
+                    let (scan, kept) = taps.knobs.get_or_insert_with(|| {
+                        (peek::ModelScanner::new(), peek::Kept::request_knobs())
+                    });
                     scan.feed_keeping(chunk, kept);
                 }
             }
@@ -6224,7 +6292,7 @@ impl ProxyHttp for AiProxy {
                         gateway_error(503, "too many large request bodies in flight").into_down(),
                     );
                 }
-            } else if rc.managed {
+            } else if rc.managed() {
                 rc.model_scanner.feed(chunk);
             }
         }
@@ -6238,8 +6306,9 @@ impl ProxyHttp for AiProxy {
                 // `/{provider}` body is refused here, before a byte of it goes upstream.
                 if rc.signed.is_some()
                     && let Some(signer) = self.state.id_signer.as_ref()
+                    && let Some(id) = rc.billing.identity()
                 {
-                    match signer.unsign_request(rc.tenant_id, &buf, rc.auto.is_some()) {
+                    match signer.unsign_request(id.tenant_id, &buf, rc.auto.is_some()) {
                         Ok(Some(raw)) => buf = raw,
                         Ok(None) => {}
                         Err(_) => {
@@ -6288,7 +6357,7 @@ impl ProxyHttp for AiProxy {
                 // byte of the body goes upstream, so nothing runs unpriced (D268). Read on the
                 // client's body, ahead of any rewrite and of the catalog check (an `:online` model is named
                 // for what it is). Every body buffered here is managed.
-                if rc.managed {
+                if rc.managed() {
                     let model = rc
                         .auto
                         .as_ref()
@@ -6304,8 +6373,10 @@ impl ProxyHttp for AiProxy {
                             .inc();
                         return Err(gateway_error(400, why).into_down());
                     }
-                    if found.web_search_preview {
-                        rc.taps.get_or_insert_with(Box::default).web_search_preview = true;
+                    if found.web_search_preview
+                        && let Some(taps) = rc.billing.tap()
+                    {
+                        taps.web_search_preview = true;
                     }
                 }
                 // Managed `/{provider}/…` billable call naming no catalog row (D267): its billing
@@ -6523,7 +6594,7 @@ impl ProxyHttp for AiProxy {
         // The streamed (non-buffered) path; the buffered one resolved `model` above from its single
         // fused walk, and its scanner was never fed.
         if end_of_stream
-            && rc.managed
+            && rc.managed()
             && !rc.inject_eligible
             && rc.model.is_empty()
             && let Some(m) = rc.model_scanner.take_model()
@@ -6598,7 +6669,7 @@ impl ProxyHttp for AiProxy {
             if rc.streaming {
                 held.open_stream();
             }
-            if rc.managed {
+            if rc.managed() {
                 tap_response_head(rc, upstream_response);
             }
             // Drain-on-cancel, decided per head (a walk's next attempt may be another provider).
@@ -6635,7 +6706,7 @@ impl ProxyHttp for AiProxy {
             // lives: "Incorrect API key provided: …") is scrubbed as it streams (`Redact`). A 2xx
             // body is an answer and is not scanned; a streamed answer would pay for it per chunk.
             rc.redact = None;
-            if rc.managed
+            if rc.managed()
                 && let Some(finder) = rc
                     .provider
                     .pool_auth
@@ -6657,7 +6728,7 @@ impl ProxyHttp for AiProxy {
             // A managed JSON error is held whole and checked for a provider-account remedy (D174):
             // the rewrite changes its length, so it loses its `Content-Length` here, on the error
             // path only. A BYO error is the caller's own account talking and is relayed as sent.
-            if rc.managed && status >= 400 {
+            if rc.managed() && status >= 400 {
                 let whole = !rc.streaming
                     && upstream_response
                         .headers
@@ -6805,12 +6876,12 @@ impl ProxyHttp for AiProxy {
             // is at the start of the response while the usage event is at the end.
             //
             // Managed only, for the same reason as the request-side scanner: the extracted value is
-            // read at exactly one place, inside the `if rc.managed` block in `logging`. A BYO
+            // read at exactly one place, inside the managed (`Billing::Managed`) block in `logging`. A BYO
             // request has no Beyond identity and emits no billing row, so scanning its response was
             // pure waste — and *unbounded* waste on any response with no root-level `model`, since
             // the scanner never reaches its `done` short-circuit and walks every byte.
-            if rc.managed {
-                match rc.taps.as_mut() {
+            if rc.managed() {
+                match rc.billing.taps_mut() {
                     Some(t) => {
                         let kept = t.resp_kept.get_or_insert_with(peek::Kept::response);
                         rc.resp_model_scanner.feed_keeping(chunk, kept);
@@ -6827,7 +6898,7 @@ impl ProxyHttp for AiProxy {
 
             rc.resp_tail.push(chunk);
             // Managed only. Counts *upstream* bytes (pre-translate), like the tail.
-            if rc.managed {
+            if rc.managed() {
                 rc.resp_bytes = rc
                     .resp_bytes
                     .saturating_add(u32::try_from(chunk.len()).unwrap_or(u32::MAX));
@@ -7343,6 +7414,7 @@ impl ProxyHttp for AiProxy {
         held.release_in_flight();
         held.release_tenant();
         let Some(rc) = rc.as_mut() else { return };
+        let managed = rc.managed();
         // A client that closed after its stream's terminal event reached it has the whole answer:
         // the request completed, whatever the provider's end of stream was still doing.
         let e = e.filter(|e| !closed_after_terminal(rc, e));
@@ -7364,8 +7436,8 @@ impl ProxyHttp for AiProxy {
         if let Some(e) = e {
             warn!(
                 request_id = %rc.request_id,
-                tenant_id = rc.tenant_id,
-                vpc_id = rc.vpc_id,
+                tenant_id = rc.billing.identity().map_or(0, |id| id.tenant_id),
+                vpc_id = rc.billing.identity().map_or(0, |id| id.vpc_id),
                 provider = rc.provider.name.as_str(),
                 error = %e,
                 "upstream request errored",
@@ -7456,7 +7528,7 @@ impl ProxyHttp for AiProxy {
         // prompt either way. A request that never reached it (every breaker open, a connect
         // failure) costs nothing and stays 0, and so does a peer that closed or reset the
         // connection before answering: that is a refusal, not a wait (see `gave_up_waiting`).
-        let no_head = rc.managed
+        let no_head = managed
             && cache_hit.is_none()
             && rc.upstream_status.is_none()
             && e.is_some_and(gave_up_waiting)
@@ -7468,7 +7540,7 @@ impl ProxyHttp for AiProxy {
             // A relayed managed 403 whose body names the key (not the request) is that key being
             // refused: cool it so later requests start past it, as a 401 does at the head (D84).
             // This request already answered; it does not walk.
-            if rc.managed && rc.upstream_status == Some(403) && body_names_the_key(tail) {
+            if managed && rc.upstream_status == Some(403) && body_names_the_key(tail) {
                 self.state.metrics.key_cooled(KeyCooled::KeyNamed403);
                 rc.provider.mark_key_bad(rc.pool_key);
             }
@@ -7479,7 +7551,7 @@ impl ProxyHttp for AiProxy {
             // once all its keys cool (D180). This request already answered. Not an abandoned
             // `FullBody` attempt: its body never reaches the client and is read only if it raced
             // the parent's drop, and a walk's 402 was already judged at the head (D258).
-            if rc.managed && !rc.relay_abandoned && rc.redact.as_ref().is_some_and(|r| r.unfunded) {
+            if managed && !rc.relay_abandoned && rc.redact.as_ref().is_some_and(|r| r.unfunded) {
                 let status = rc.upstream_status.unwrap_or(0);
                 self.cool_unfunded_key(&rc.request_id, &rc.provider, rc.pool_key, status);
             }
@@ -7501,7 +7573,7 @@ impl ProxyHttp for AiProxy {
             // side is estimated. See `usage`'s estimate section: input is a pre-token lower bound,
             // output a measured divisor; both err low.
             let ok_2xx = rc.upstream_status.is_some_and(|s| (200..300).contains(&s));
-            let cut_short = rc.managed
+            let cut_short = managed
                 && rc.streaming
                 && ok_2xx
                 && match rc.dialect {
@@ -7519,7 +7591,7 @@ impl ProxyHttp for AiProxy {
             // A non-stream 2xx that died before its `usage` (the body is last): the provider
             // generated, and bills, the whole answer; we relayed part of it. Always estimated —
             // the 2xx is the proof the provider took the request.
-            let body_cut = rc.managed && !rc.streaming && ok_2xx && parsed.is_none() && e.is_some();
+            let body_cut = managed && !rc.streaming && ok_2xx && parsed.is_none() && e.is_some();
             // A non-stream 2xx that ended cleanly with no usage (OpenRouter's `"usage": null` on
             // an answer that failed mid-generation, a shape change) is a turn the provider took
             // and may bill, as a finished stream without usage is: estimated, never 0/0 (D195).
@@ -7532,7 +7604,7 @@ impl ProxyHttp for AiProxy {
                 && parsed.is_none()
                 && u64::from(rc.resp_bytes) <= tail.len() as u64
                 && json_is_error_only(tail);
-            let body_unmetered = rc.managed
+            let body_unmetered = managed
                 && !free
                 && !rc.streaming
                 && ok_2xx
@@ -7582,7 +7654,7 @@ impl ProxyHttp for AiProxy {
         // A stream that ended *cleanly* without usage is that same shape-change signal even though
         // it is now billed an estimate, so it still counts here; one cut short by an error does not.
         if (parsed.is_none() || (usage_estimated && e.is_none()))
-            && rc.managed
+            && let Some(id) = rc.billing.identity()
             && !free
             && cache_hit.is_none()
             && let Some(s) = rc.upstream_status
@@ -7591,7 +7663,7 @@ impl ProxyHttp for AiProxy {
             self.state.metrics.usage_parse_errors_total.inc();
             warn!(
                 request_id = %rc.request_id,
-                tenant_id = rc.tenant_id,
+                tenant_id = id.tenant_id,
                 provider = rc.provider.name.as_str(),
                 dialect = ?rc.dialect,
                 stream = rc.streaming,
@@ -7663,7 +7735,11 @@ impl ProxyHttp for AiProxy {
         // other rejection.
         let refused =
             cache_hit.is_none() && rc.upstream_status.is_none() && e.is_some_and(gateway_refusal);
-        if rc.managed && !rc.relay_abandoned && !free && !refused {
+        if let Some(&id) = rc.billing.identity()
+            && !rc.relay_abandoned
+            && !free
+            && !refused
+        {
             // What the client asked for that changes the price (read before the borrows below).
             let requested = requested_knobs(session, rc);
             // Emit BOTH models. `model` is the one the *provider* resolved + billed (echoed in its
@@ -7758,8 +7834,8 @@ impl ProxyHttp for AiProxy {
                 _ => None,
             };
             let upstream_request_id = rc
-                .taps
-                .as_ref()
+                .billing
+                .taps()
                 .and_then(|t| t.request_id)
                 .filter(|_| called);
             let server_tools = usage.server_tools.to_row();
@@ -7818,9 +7894,9 @@ impl ProxyHttp for AiProxy {
             info!(
                 target: "ai.usage",
                 request_id = %rc.request_id,
-                tenant_id = rc.tenant_id,
-                vpc_id = rc.vpc_id,
-                key_id = rc.key_id,
+                tenant_id = id.tenant_id,
+                vpc_id = id.vpc_id,
+                key_id = id.key_id,
                 provider = usage_provider,
                 model = billed_model,
                 requested_model,
@@ -7930,7 +8006,7 @@ impl ProxyHttp for AiProxy {
                 info!(
                     target: "ai.payload",
                     request_id = %rc.request_id,
-                    tenant_id = rc.tenant_id,
+                    tenant_id = id.tenant_id,
                     provider = rc.provider.name.as_str(),
                     model = billed_model,
                     stream = rc.streaming,
@@ -8081,13 +8157,10 @@ mod tests {
             None,
         );
         RequestCtx {
-            tenant_id: 42,
-            vpc_id: 7,
-            key_id: None,
+            billing: Billing::of(Some(Identity::unverified_for_test(42, 7, None))),
             dialect: Dialect::OpenAi,
             provider: Arc::new(provider),
             forward_path: None,
-            managed: true,
             model: String::new(),
             model_scanner: peek::ModelScanner::new(),
             resp_model_scanner: peek::ModelScanner::for_response(),
@@ -8118,7 +8191,6 @@ mod tests {
             redact: None,
             terminal: TerminalTracker::default(),
             signed: None,
-            taps: None,
         }
     }
 

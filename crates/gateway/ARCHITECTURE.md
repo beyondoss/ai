@@ -1690,6 +1690,13 @@ bucket.
 `vpc_id` is still not an access check — decoded and emitted on `ai.usage` only. `key_id` is
 emitted on `ai.usage` (`None` for v1).
 
+`Keyring::verify` returns an `Identity`, which nothing else can construct, and an admitted request
+carries `Billing::Managed` (the identity, beside the billing facts its row reads) or
+`Billing::Byo` (no identity at all, never a zero tenant). Every tenant-scoped step (the deny and
+allowance checks, the concurrency slot, capture, the session pin, signed ids, the cache key, the
+`ai.usage` and `ai.payload` rows) reads its tenant from that identity, so an unverified id cannot
+reach one.
+
 Verification cost ≈ 28µs per request — this is the gateway's only meaningful per-request CPU cost
 (everything else runs in nanoseconds; see Benchmarking). The rate guardrails sit **before** verify
 precisely because of this: a forged-key flood is rejected in tens of nanoseconds, not 28µs each.
