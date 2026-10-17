@@ -83,6 +83,10 @@ pub fn is_rate_limited(e: &Error) -> bool {
         return false;
     }
     let m = msg.to_ascii_lowercase();
+    // A bare 529 (no `overloaded_error` body) is still Anthropic's overload status.
+    if m.contains(" returned 529") {
+        return true;
+    }
     if ["request too large", "must be reduced", "will not succeed"]
         .iter()
         .any(|p| m.contains(p))
@@ -203,6 +207,7 @@ mod tests {
             r#"api.openai.com returned 429 Too Many Requests (retry-after-ms: 2000): {"error":{"type":"requests","code":"rate_limit_exceeded","message":"Rate limit reached"}}"#,
             r#"api.anthropic.com returned 429 Too Many Requests: {"type":"error","error":{"type":"rate_limit_error","message":"This request would exceed your rate limit"}}"#,
             r#"api.anthropic.com returned 529 <unknown status code>: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#,
+            "api.anthropic.com returned 529 <unknown status code>: ",
             // The gateway's rewrite of a managed key's upstream rate limit (`remedy::RATE_LIMITED`).
             r#"gateway.example returned 429 Too Many Requests: {"error":{"type":"rate_limit_error","message":"The provider is rate-limited upstream; retry later."}}"#,
             // The gateway's own tenant limit.

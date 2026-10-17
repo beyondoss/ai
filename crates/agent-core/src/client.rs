@@ -19,7 +19,7 @@ use crate::agent::catch_tool_panic;
 use crate::dialect::{Dialect, SseEventBuffer, push_sse_line};
 use crate::error::{Error, MID_STREAM_NETWORK_ERROR, Result};
 use crate::hooks::AgentHooks;
-use crate::transport::{EventStream, ModelRequest, ModelTransport};
+use crate::transport::{EventStream, ModelRequest, ModelTransport, RetryReporter, TransportRetry};
 
 /// Anthropic's Messages API requires this header; the gateway relays it to the upstream verbatim.
 const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -459,7 +459,25 @@ impl GatewayClient {
 
 #[async_trait]
 impl ModelTransport for GatewayClient {
-    async fn stream(&self, mut req: ModelRequest) -> Result<EventStream> {
+    async fn stream(&self, req: ModelRequest) -> Result<EventStream> {
+        self.stream_with(req, None).await
+    }
+
+    async fn stream_reporting_retries(
+        &self,
+        req: ModelRequest,
+        retries: RetryReporter,
+    ) -> Result<EventStream> {
+        self.stream_with(req, Some(retries)).await
+    }
+}
+
+impl GatewayClient {
+    async fn stream_with(
+        &self,
+        mut req: ModelRequest,
+        retries: Option<RetryReporter>,
+    ) -> Result<EventStream> {
         // These two repairs are ORDER-DEPENDENT and must stay in this order.
         //
         // `ensure_non_empty_content` runs first because it *removes* content: it drops every block from
@@ -809,8 +827,8 @@ impl ModelTransport for GatewayClient {
         // second, independent "is this Codex" check drifting from the first.
         let is_codex_sse_fallback = req.is_codex && dialect == Dialect::OpenAiResponses;
         let stream = async_stream::try_stream! {
-            // Retry the request up to the first byte: a transient failure (refused connection, 429,
-            // 503) is re-issued with backoff. We do *not* retry once events have started flowing — a
+            // Retry the request up to the first byte: a transient failure (refused connection, 503)
+            // is re-issued with backoff, each retry reported to `retries`. We do *not* retry once events have started flowing — a
             // mid-stream drop would replay partial output — so that surfaces as a transport error the
             // loop handles instead (see `Agent::run_events`).
             let resp = send_with_retry(
@@ -833,6 +851,7 @@ impl ModelTransport for GatewayClient {
                 base_backoff,
                 max_backoff,
                 &extra_headers,
+                retries.as_ref(),
             )
             .await?;
 
@@ -1102,8 +1121,10 @@ fn copilot_has_images(messages: &[crate::message::Message]) -> bool {
     })
 }
 
-/// POST the request body, retrying transient failures with exponential backoff until a successful
-/// response or the retry budget is exhausted. Honors a `Retry-After` header when the server sends one.
+/// POST the request body, retrying transient failures (a 5xx, a refused or timed-out connection) with
+/// exponential backoff until a successful response or `max_retries` is spent, honoring a `Retry-After`
+/// header when the server sends one. Each retry is reported to `retries` as its wait starts. A rate
+/// limit or overload (429/529) is returned at once for the agent loop's budgeted retry to handle.
 // 11 arguments, all independent inputs a single call site (`GatewayClient::stream`) already has in
 // scope from `self`/the request — bundling them into a struct would just be a second place those same
 // fields live, not a reduction in what the function needs to know. Private, single-caller helper, not
@@ -1151,7 +1172,19 @@ async fn send_with_retry(
     // collision (e.g. overriding `anthropic-version`, or adding a reverse-proxy auth header a
     // self-hosted endpoint needs).
     extra_headers: &HashMap<String, String>,
+    // Where each retry made here is reported as it starts its wait, so the agent loop can show it.
+    retries: Option<&RetryReporter>,
 ) -> Result<reqwest::Response> {
+    let report = |attempt: u32, delay: Duration, message: String| {
+        if let Some(tx) = retries {
+            // The receiver is gone only when the caller stopped listening; the retry goes ahead.
+            let _ = tx.unbounded_send(TransportRetry {
+                attempt,
+                delay,
+                message,
+            });
+        }
+    };
     let mut attempt = 0u32;
     loop {
         // Body bytes were serialized once, above `try_stream`, so a retry is a `Bytes` refcount bump
@@ -1270,58 +1303,47 @@ async fn send_with_retry(
             Ok(resp) => {
                 let status = resp.status();
                 let hint = retry_after(&resp, max_backoff);
-                if is_retryable_status(status.as_u16()) && attempt < max_retries {
-                    // A 429 needs a quick body peek before committing to a retry: some providers use it
-                    // for genuine rate limiting (worth retrying — the request will likely succeed once
-                    // the window resets) and others for quota/billing exhaustion (retrying only delays
-                    // an unavoidable failure while burning the retry budget on it). The status code
-                    // alone can't tell the two apart. Every other retryable status (5xx/529) is a pure
-                    // infra hiccup, never a billing signal, so it skips this check.
-                    if status.as_u16() == 429 {
-                        let detail = read_error_body_capped(resp).await;
-                        if is_quota_exhausted(&detail) {
-                            // Codex/ChatGPT's own usage-limit body carries a machine code and (often)
-                            // a reset time — surface a friendly, human-readable sentence ahead of the
-                            // raw upstream detail when it's actually present, rather than only ever
-                            // showing the bare JSON. Pure UX polish: the raw detail stays visible
-                            // either way.
-                            let msg = match codex_friendly_usage_limit_message(&detail) {
-                                Some(friendly) => format!(
-                                    "{friendly} (gateway returned {status}: {})",
-                                    truncate_error_body(detail.trim())
-                                ),
-                                None => format!(
-                                    "gateway returned {status}: {}",
-                                    truncate_error_body(detail.trim())
-                                ),
-                            };
-                            return Err(Error::Transport(msg));
-                        }
-                    }
+                let who = url_host(url);
+                // A rate limit or overload (429/529) is never retried here: the agent loop's
+                // time-budgeted retry (`rate_limit`) owns that class, so its clock starts at the first
+                // rejection and every wait is announced. Retrying here first stacked up to
+                // `max_retries` silent waits of up to a minute each in front of that budget.
+                if is_retryable_status(status.as_u16())
+                    && !is_rate_limit_status(status.as_u16())
+                    && attempt < max_retries
+                {
                     let wait = backoff(attempt, hint, base_backoff, max_backoff);
                     attempt += 1;
+                    report(attempt, wait, format!("{who} returned {status}"));
                     futures_timer::Delay::new(wait).await;
                     continue;
                 }
-                // Non-retryable, or out of retries: surface the body so the caller sees *why* — capped,
-                // since an upstream can return an arbitrarily large error page (an HTML error document
-                // from a misconfigured proxy, say) and this ends up in logs and `AgentEvent::Error`.
+                // Not retried here: surface the body so the caller sees *why* — capped, since an
+                // upstream can return an arbitrarily large error page (an HTML error document from a
+                // misconfigured proxy, say) and this ends up in logs and `AgentEvent::Error`.
                 let detail = read_error_body_capped(resp).await;
+                // A 429 is either genuine rate limiting (the loop waits it out) or quota/billing
+                // exhaustion, which no wait fixes. Codex/ChatGPT's own usage-limit body carries a
+                // machine code and (often) a reset time — lead with a readable sentence when it does.
+                if status.as_u16() == 429 && is_quota_exhausted(&detail) {
+                    let msg = match codex_friendly_usage_limit_message(&detail) {
+                        Some(friendly) => format!(
+                            "{friendly} (gateway returned {status}: {})",
+                            truncate_error_body(detail.trim())
+                        ),
+                        None => format!(
+                            "gateway returned {status}: {}",
+                            truncate_error_body(detail.trim())
+                        ),
+                    };
+                    return Err(Error::Transport(msg));
+                }
                 // A live 401 (the key was rejected, as opposed to `run`/`serve`'s own preflight "no key
                 // given at all" check, which this can't be — a request only reaches here with *some* key
                 // attached) gets a pointed, actionable message naming the actual cause instead of a bare
-                // status code: this crate has no CLI-flag names of its own to reference (agent-core is
-                // layered under any consumer's own `--key`/`AI_AGENT_KEY`-style flag), so this stays in
-                // terms of "the API key" generically, distinct from — and more specific than — the
-                // upstream body alone, which for a 401 is often just `{"error":
-                // {"type":"authentication_error"}}` with no hint at what to actually do about it.
-                //
-                // "gateway" is deliberately absent from both messages: this request may well not have gone
-                // through one (a direct provider route — `crates/agent::gateway_credential` — dials the
-                // provider itself), and telling someone with no gateway deployed that "the gateway
-                // rejected" their key sends them hunting for a component that isn't there. `who` names
-                // whichever host actually answered.
-                let who = url_host(url);
+                // status code. "gateway" is deliberately absent: this request may not have gone through
+                // one (a direct provider route dials the provider itself); `who` names whichever host
+                // actually answered.
                 if status.as_u16() == 401 {
                     return Err(Error::Transport(format!(
                         "{who} rejected the request as unauthorized (401) — the API key being used \
@@ -1348,6 +1370,7 @@ async fn send_with_retry(
                 if is_retryable_send_error(&e) && attempt < max_retries {
                     let wait = backoff(attempt, None, base_backoff, max_backoff);
                     attempt += 1;
+                    report(attempt, wait, e.to_string());
                     futures_timer::Delay::new(wait).await;
                     continue;
                 }
@@ -1355,6 +1378,13 @@ async fn send_with_retry(
             }
         }
     }
+}
+
+/// The statuses that mean "slow down" rather than "something broke": 429 and Anthropic's 529
+/// `overloaded_error`. [`send_with_retry`] leaves these to the agent loop's time-budgeted retry
+/// ([`crate::rate_limit`]), which also recognizes a bare 529 by its status.
+fn is_rate_limit_status(status: u16) -> bool {
+    matches!(status, 429 | 529)
 }
 
 /// Status codes worth retrying: rate limiting, the Anthropic-specific `529 overloaded`, the transient
@@ -2703,43 +2733,30 @@ mod tests {
         );
     }
 
-    /// A real TCP peer that answers 429 with an ordinary rate-limit body (no quota/billing phrase) on
-    /// the first request, then succeeds on the retry — proves ordinary rate limiting still gets the
-    /// normal retry treatment `is_quota_exhausted` doesn't touch.
+    /// An ordinary rate-limit 429 is not retried by the client at all: it comes straight back, with
+    /// its rate-limit classification intact, for the agent loop's time-budgeted retry to wait out
+    /// (visibly, on one clock). Retrying here as well used to stack silent waits in front of that budget.
     #[tokio::test]
-    async fn a_429_with_a_plain_rate_limit_body_is_retried() {
+    async fn a_429_with_a_plain_rate_limit_body_is_left_to_the_loop() {
         let listener = beyond_ai_test_support::ports::listener();
         let addr = listener.local_addr().unwrap();
         let request_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let count = request_count.clone();
         let server = std::thread::spawn(move || {
             use std::io::{Read, Write};
-            for attempt in 0..2 {
-                let Ok((mut stream, _)) = listener.accept() else {
-                    break;
-                };
-                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let mut buf = [0u8; 4096];
-                let _ = stream.read(&mut buf);
-                if attempt == 0 {
-                    let body =
-                        r#"{"error":{"type":"rate_limit_error","message":"Too many requests"}}"#;
-                    let resp = format!(
-                        "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        body.len(),
-                        body
-                    );
-                    let _ = stream.write_all(resp.as_bytes());
-                } else {
-                    let sse = "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1}}}\n\ndata: {\"type\":\"message_stop\"}\n\n";
-                    let resp = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        sse.len(),
-                        sse
-                    );
-                    let _ = stream.write_all(resp.as_bytes());
-                }
-            }
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let body = r#"{"error":{"type":"rate_limit_error","message":"Too many requests"}}"#;
+            let resp = format!(
+                "HTTP/1.1 429 Too Many Requests\r\nretry-after: 2\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(resp.as_bytes());
         });
 
         let client = GatewayClient::new(format!("http://{addr}"), "test-key")
@@ -2747,13 +2764,18 @@ mod tests {
             .with_retry(3, Duration::from_millis(10));
         let req = ModelRequest::new("claude-test", Vec::new(), 100);
         let mut events = client.stream(req).await.unwrap();
-        let _ = events.next().await; // drive the stream far enough to trigger the retry + second request
+        let err = match events.next().await {
+            Some(Err(e)) => e,
+            other => panic!("expected the 429 as an error, got {other:?}"),
+        };
         server.join().unwrap();
 
+        assert_eq!(request_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(crate::rate_limit::is_rate_limited(&err), "{err}");
         assert_eq!(
-            request_count.load(std::sync::atomic::Ordering::SeqCst),
-            2,
-            "an ordinary rate-limit 429 must still be retried"
+            crate::rate_limit::retry_hint(&err.to_string()),
+            Some(Duration::from_secs(2)),
+            "the server's wait hint survives into the error: {err}"
         );
     }
 

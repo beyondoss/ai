@@ -501,4 +501,31 @@ pub trait ModelTransport: Send + Sync {
     /// Issue the request and return its event stream. Errors here are connection/setup failures;
     /// per-event failures surface as `Err` items within the stream.
     async fn stream(&self, req: ModelRequest) -> Result<EventStream>;
+
+    /// [`stream`](Self::stream), reporting each retry the transport makes on its own (a 5xx or a
+    /// refused connection before the first byte) to `retries` as it starts its wait, so the loop can
+    /// show it as an [`AgentEvent::Retry`](crate::AgentEvent::Retry). A transport that never retries
+    /// keeps this default.
+    async fn stream_reporting_retries(
+        &self,
+        req: ModelRequest,
+        retries: RetryReporter,
+    ) -> Result<EventStream> {
+        drop(retries);
+        self.stream(req).await
+    }
 }
+
+/// One retry a transport made on its own before the response's first byte (see
+/// [`ModelTransport::stream_reporting_retries`]). `attempt` counts from 1; `delay` is the wait it is
+/// about to start; `message` is the failure being retried.
+#[derive(Debug, Clone)]
+pub struct TransportRetry {
+    pub attempt: u32,
+    pub delay: std::time::Duration,
+    pub message: String,
+}
+
+/// Where a transport reports its own retries. Unbounded: a transport makes at most a handful per
+/// request, and the loop drains them as they arrive.
+pub type RetryReporter = futures::channel::mpsc::UnboundedSender<TransportRetry>;
