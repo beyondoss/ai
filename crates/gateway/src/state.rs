@@ -10,7 +10,7 @@ use crate::allowance::AllowanceSet;
 use crate::cache::{self, ResponseCache};
 use crate::capture::{CaptureRule, CaptureSet};
 use crate::concurrency::{BodyBudget, TenantSlots};
-use crate::config::AiConfig;
+use crate::config::{UpstreamTls, ValidConfig};
 use crate::deny::DenySet;
 use crate::error::{GatewayError, Result};
 use crate::key::Keyring;
@@ -231,20 +231,22 @@ fn push_lower_hex(out: &mut RequestId, mut v: u64) {
 /// Each provider's pool key (if any) is looked up by name and its managed auth header value
 /// precomputed. An unrecognized dialect/auth-scheme string is a hard boot failure (`Err`) rather than
 /// a silent default — see `Dialect::parse_config`/`AuthScheme::parse_config`.
-fn build_providers(config: &AiConfig, metrics: &Metrics) -> Result<HashMap<String, Arc<Provider>>> {
+fn build_providers(
+    config: &ValidConfig,
+    metrics: &Metrics,
+) -> Result<HashMap<String, Arc<Provider>>> {
     // One independent breaker per provider, all built from the same config (the breaker holds
     // atomics so it can't be cloned — we mint a fresh one per provider). `None` ⇒ breaker disabled.
-    let cb_config = config.circuit_breaker_config();
     let breaker = || {
-        cb_config
-            .clone()
-            .map(crate::circuit_breaker::CircuitBreaker::new)
+        config
+            .circuit_breaker()
+            .map(|b| crate::circuit_breaker::CircuitBreaker::new(b.circuit_breaker()))
     };
 
     // `/auto` is the model-routed segment (`route::AUTO_SEGMENT`). Provider lookup runs *first* in
     // `request_filter`, so a provider registered under that name would shadow the whole feature —
     // silently, and only for requests that were meant to be model-routed. Refuse to boot instead.
-    if let Some(authority) = config.provider_authorities.get(route::AUTO_SEGMENT) {
+    if let Some(authority) = config.provider_authorities().get(route::AUTO_SEGMENT) {
         return Err(GatewayError::Config(format!(
             "provider_authorities.{} = {authority:?} uses a reserved name: {}/… is the \
              model-routed route, which a provider of that name would shadow",
@@ -256,13 +258,13 @@ fn build_providers(config: &AiConfig, metrics: &Metrics) -> Result<HashMap<Strin
     let mut providers = HashMap::new();
     for spec in route::known_providers() {
         let authority = config
-            .provider_authorities
+            .provider_authorities()
             .get(spec.name)
             .cloned()
             .unwrap_or_else(|| spec.authority.to_string());
         // A row that takes no pool key ignores one configured for it, so it cannot reach managed traffic.
         let pool_keys: Vec<&str> = config
-            .pool_keys
+            .pool_keys()
             .get(spec.name)
             .filter(|_| spec.id.takes_pool_key())
             .map(|k| k.iter().map(|s| s.expose()).collect())
@@ -288,14 +290,15 @@ fn build_providers(config: &AiConfig, metrics: &Metrics) -> Result<HashMap<Strin
     // code change. A value that doesn't parse is a boot failure, not a silent fallback: silently
     // defaulting a typo'd "anthropic" to "openai" is exactly the zero-billing bug this field exists to
     // prevent (see `usage::openai_body`'s dialect-mismatch guard for the runtime backstop).
-    for (name, authority) in &config.provider_authorities {
+    for (name, authority) in config.provider_authorities() {
+        let name = name.as_str();
         if !providers.contains_key(name) {
             let pool_keys: Vec<&str> = config
-                .pool_keys
+                .pool_keys()
                 .get(name)
                 .map(|k| k.iter().map(|s| s.expose()).collect())
                 .unwrap_or_default();
-            let dialect = match config.provider_dialects.get(name) {
+            let dialect = match config.provider_dialects().get(name) {
                 Some(s) => Dialect::parse_config(s).ok_or_else(|| {
                     GatewayError::Config(format!(
                         "provider_dialects.{name} = {s:?} is not a recognized dialect \
@@ -304,7 +307,7 @@ fn build_providers(config: &AiConfig, metrics: &Metrics) -> Result<HashMap<Strin
                 })?,
                 None => Dialect::OpenAi,
             };
-            let auth = match config.provider_auth_schemes.get(name) {
+            let auth = match config.provider_auth_schemes().get(name) {
                 Some(s) => AuthScheme::parse_config(s).ok_or_else(|| {
                     GatewayError::Config(format!(
                         "provider_auth_schemes.{name} = {s:?} is not a recognized auth scheme \
@@ -314,7 +317,7 @@ fn build_providers(config: &AiConfig, metrics: &Metrics) -> Result<HashMap<Strin
                 None => AuthScheme::Bearer,
             };
             providers.insert(
-                name.clone(),
+                name.to_string(),
                 Arc::new(Provider::resolve(
                     name,
                     authority.clone(),
@@ -364,7 +367,7 @@ pub(crate) fn models_list_body(
 }
 
 pub struct GatewayState {
-    pub config: AiConfig,
+    pub config: ValidConfig,
     pub metrics: Arc<Metrics>,
 
     /// Trusted Ed25519 public keys by kid — from config (rotate via redeploy). Static for life.
@@ -472,14 +475,14 @@ impl FaultPanic {
 }
 
 impl GatewayState {
-    pub fn new(config: AiConfig, metrics: Arc<Metrics>) -> Result<Arc<Self>> {
+    pub fn new(config: ValidConfig, metrics: Arc<Metrics>) -> Result<Arc<Self>> {
         let keyring = config.build_keyring()?;
         let id_signer = config.build_id_signer()?;
         // A deployment that verifies `bai_` keys serves managed traffic, and managed Responses ids
         // sit in one provider org every tenant shares (`signed_id.rs`): without an id signing key
         // they can't be tenant-bound, so this is a hard boot failure, not a warning. A BYO-only
         // deployment (no `signing_keys`) stores nothing on Beyond's accounts and needs none.
-        if id_signer.is_none() && !config.signing_keys.is_empty() {
+        if id_signer.is_none() && !config.signing_keys().is_empty() {
             return Err(GatewayError::Config(
                 "signing_keys are configured (managed traffic) but no id_signing_keys are — refusing \
                  to boot: managed Responses ids would be resolvable by every tenant. Set \
@@ -494,8 +497,8 @@ impl GatewayState {
         // managed deployment sets `require_signing_keys = true` so this mis-deploy is a hard,
         // visible boot failure; otherwise we warn loudly and continue (BYO-only is legitimate and
         // the test/e2e harnesses run keyless).
-        if config.signing_keys.is_empty() {
-            if config.require_signing_keys {
+        if config.signing_keys().is_empty() {
+            if config.require_signing_keys() {
                 return Err(GatewayError::Config(
                     "require_signing_keys is set but no signing_keys are configured — refusing to \
                      boot into a mode where every bai_v1 token 401s. Check the signing_keys \
@@ -512,7 +515,7 @@ impl GatewayState {
         // channel — a transparent-MitM opening. It's legitimate *only* for the local self-signed TLS
         // mock (e2e/bench). Warn loudly at boot so it can never be a silent production misconfig (an
         // `AI_UPSTREAM_VERIFY_CERT=false` copied out of a bench env) that looks healthy.
-        if config.upstream_tls && !config.upstream_verify_cert {
+        if config.upstream_tls() == UpstreamTls::UnverifiedTest {
             warn!(
                 "upstream TLS certificate verification is DISABLED — connections to providers are \
                  unauthenticated and vulnerable to interception. This is valid ONLY for a local \
@@ -523,7 +526,7 @@ impl GatewayState {
         let providers = build_providers(&config, &metrics)?;
         // Pool keys over cleartext: every managed request would carry Beyond's provider key across
         // the network unencrypted. Legitimate only against the local plaintext mock (e2e/bench).
-        if !config.upstream_tls && providers.values().any(|p| p.has_pool_key()) {
+        if !config.upstream_tls().tls() && providers.values().any(|p| p.has_pool_key()) {
             warn!(
                 "upstream_tls is DISABLED while pool keys are configured — Beyond's provider keys \
                  are sent in cleartext on every managed request. Valid ONLY for a local test/bench \
@@ -532,7 +535,7 @@ impl GatewayState {
         }
         let by_id = index_by_id(&providers);
         let models_list = models_list_body(&by_id);
-        let rate_limit = RateLimit::new(config.rate_limit_rps, config.byo_rate_limit_rps);
+        let rate_limit = RateLimit::new(config.rate_limit_rps(), config.byo_rate_limit_rps());
 
         // 8 OS-random bytes as the instance token, so two gateways' request_ids never collide when
         // aggregated — including when a rapid scale-up boots several instances within the same
@@ -552,25 +555,25 @@ impl GatewayState {
 
         // Resolved once here rather than read per-request: these are boot config, and the capture
         // decision runs on every managed request.
-        if config.capture_max_bytes > crate::capture::MAX_CAPTURE_BYTES {
+        if config.capture_max_bytes() > crate::capture::MAX_CAPTURE_BYTES {
             warn!(
-                configured = config.capture_max_bytes,
+                configured = config.capture_max_bytes(),
                 ceiling = crate::capture::MAX_CAPTURE_BYTES,
                 "capture_max_bytes exceeds the ceiling; clamping",
             );
         }
         let capture_defaults = CaptureRule {
-            sample_n: config.capture_default_sample_n.max(1),
+            sample_n: config.capture_default_sample_n().max(1),
             max_bytes: config
-                .capture_max_bytes
+                .capture_max_bytes()
                 .min(crate::capture::MAX_CAPTURE_BYTES),
         };
 
-        let cache = (config.cache_ttl_secs > 0).then(|| {
+        let cache = (config.cache_ttl_secs() > 0).then(|| {
             cache::ResponseCache::new(
-                Duration::from_secs(config.cache_ttl_secs),
-                config.cache_max_entries,
-                config.cache_max_bytes,
+                Duration::from_secs(config.cache_ttl_secs()),
+                config.cache_max_entries(),
+                config.cache_max_bytes(),
             )
         });
 
@@ -586,8 +589,8 @@ impl GatewayState {
             capture: ArcSwap::from_pointee(CaptureSet::new()),
             capture_defaults,
             cache,
-            tenant_slots: TenantSlots::new(config.tenant_max_in_flight),
-            body_budget: BodyBudget::new(config.max_buffered_body_bytes),
+            tenant_slots: TenantSlots::new(config.tenant_max_in_flight()),
+            body_budget: BodyBudget::new(config.max_buffered_body_bytes()),
             rate_limit,
             dns_cache: Arc::new(DnsCache::default()),
             instance_prefix: {
@@ -724,6 +727,7 @@ pub(crate) fn test_metrics() -> Arc<Metrics> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::AiConfig;
     use crate::route::AuthScheme;
 
     /// `openai-codex` takes only a client's own ChatGPT bearer, so a pool key configured for it never
@@ -739,7 +743,7 @@ mod tests {
             )]),
             ..Default::default()
         };
-        let providers = build_providers(&config, &test_metrics()).unwrap();
+        let providers = build_providers(&config.validate().unwrap(), &test_metrics()).unwrap();
         assert!(
             !providers["openai-codex"].has_pool_key(),
             "openai-codex accepted a pool key"
@@ -757,7 +761,7 @@ mod tests {
             )]),
             ..Default::default()
         };
-        let err = build_providers(&config, &test_metrics())
+        let err = build_providers(&config.validate().unwrap(), &test_metrics())
             .err()
             .map(|e| e.to_string())
             .unwrap_or_default();
@@ -779,7 +783,7 @@ mod tests {
             )]),
             ..Default::default()
         };
-        let resolved = build_providers(&config, &test_metrics()).unwrap();
+        let resolved = build_providers(&config.validate().unwrap(), &test_metrics()).unwrap();
         let by_id = index_by_id(&resolved);
 
         for spec in route::known_providers() {
@@ -822,7 +826,7 @@ mod tests {
             ]),
             ..Default::default()
         };
-        let providers = build_providers(&config, &test_metrics()).unwrap();
+        let providers = build_providers(&config.validate().unwrap(), &test_metrics()).unwrap();
 
         // Known provider: authority overridden, pool auth precomputed in the right scheme.
         let openai = providers.get("openai").unwrap();
@@ -869,7 +873,7 @@ mod tests {
             pool_keys: HashMap::from([("minimax".to_string(), "mm-key".into())]),
             ..Default::default()
         };
-        let providers = build_providers(&config, &test_metrics()).unwrap();
+        let providers = build_providers(&config.validate().unwrap(), &test_metrics()).unwrap();
         let minimax = providers.get("minimax").unwrap();
         assert_eq!(minimax.dialect, Dialect::Anthropic);
         assert_eq!(minimax.auth, AuthScheme::XApiKey);
@@ -883,7 +887,8 @@ mod tests {
             )]),
             ..Default::default()
         };
-        let providers = build_providers(&default_config, &test_metrics()).unwrap();
+        let providers =
+            build_providers(&default_config.validate().unwrap(), &test_metrics()).unwrap();
         let custom = providers.get("custom").unwrap();
         assert_eq!(custom.dialect, Dialect::OpenAi);
         assert_eq!(custom.auth, AuthScheme::Bearer);
@@ -902,7 +907,7 @@ mod tests {
             ..Default::default()
         };
         assert!(matches!(
-            build_providers(&bad_dialect, &test_metrics()),
+            build_providers(&bad_dialect.validate().unwrap(), &test_metrics()),
             Err(GatewayError::Config(_))
         ));
 
@@ -915,7 +920,7 @@ mod tests {
             ..Default::default()
         };
         assert!(matches!(
-            build_providers(&bad_auth, &test_metrics()),
+            build_providers(&bad_auth.validate().unwrap(), &test_metrics()),
             Err(GatewayError::Config(_))
         ));
     }
@@ -943,7 +948,8 @@ mod tests {
 
     #[test]
     fn request_ids_are_unique_and_fit_the_buffer() {
-        let state = GatewayState::new(AiConfig::default(), test_metrics()).unwrap();
+        let state =
+            GatewayState::new(AiConfig::default().validate().unwrap(), test_metrics()).unwrap();
         let mut seen = std::collections::HashSet::new();
         for _ in 0..10_000 {
             let id = state.next_request_id();
@@ -963,7 +969,7 @@ mod tests {
         // the three outcomes: a successful resolve, a cache hit returning the same address without a
         // fresh lookup, and a lookup failure surfacing as `GatewayError::Dns` (not a panic/hang).
         let config = AiConfig::default();
-        let state = GatewayState::new(config, test_metrics()).unwrap();
+        let state = GatewayState::new(config.validate().unwrap(), test_metrics()).unwrap();
 
         // An IP literal resolves through `lookup_host` without real DNS — deterministic, offline-safe.
         let (addr, n) = state.resolve("127.0.0.1:9", 0).await.unwrap();
@@ -988,7 +994,8 @@ mod tests {
     /// Every address is kept, in the lookup's order, and connect attempts walk them.
     #[tokio::test]
     async fn resolve_keeps_every_address_in_order() {
-        let state = GatewayState::new(AiConfig::default(), test_metrics()).unwrap();
+        let state =
+            GatewayState::new(AiConfig::default().validate().unwrap(), test_metrics()).unwrap();
         let got = state
             .resolve_all("multi.test:443", |_| async {
                 Ok(addrs(&["[::1]:443", "127.0.0.1:443"]))
@@ -1001,7 +1008,8 @@ mod tests {
     /// A lookup that hangs is cut at `DNS_TIMEOUT`, and with no earlier answer it is an error.
     #[tokio::test(start_paused = true)]
     async fn a_hung_lookup_times_out() {
-        let state = GatewayState::new(AiConfig::default(), test_metrics()).unwrap();
+        let state =
+            GatewayState::new(AiConfig::default().validate().unwrap(), test_metrics()).unwrap();
         let start = tokio::time::Instant::now();
         let got = state
             .resolve_all("hang.test:443", |_| std::future::pending())
@@ -1013,7 +1021,8 @@ mod tests {
     /// When re-resolution fails or hangs, the last good answer is served, within `DNS_STALE_MAX`.
     #[tokio::test]
     async fn a_failed_re_resolution_serves_the_last_good_answer() {
-        let state = GatewayState::new(AiConfig::default(), test_metrics()).unwrap();
+        let state =
+            GatewayState::new(AiConfig::default().validate().unwrap(), test_metrics()).unwrap();
         let good = addrs(&["10.0.0.1:443"]);
         let primed = good.clone();
         let first = state
@@ -1092,7 +1101,8 @@ mod tests {
     /// defect: D89
     #[tokio::test(start_paused = true)]
     async fn a_due_refresh_is_one_background_lookup() {
-        let state = GatewayState::new(AiConfig::default(), test_metrics()).unwrap();
+        let state =
+            GatewayState::new(AiConfig::default().validate().unwrap(), test_metrics()).unwrap();
         let good = addrs(&["10.0.0.1:443"]);
         let primed = good.clone();
         state
@@ -1119,7 +1129,8 @@ mod tests {
     /// defect: D89
     #[tokio::test(start_paused = true)]
     async fn concurrent_cold_resolves_share_one_lookup() {
-        let state = GatewayState::new(AiConfig::default(), test_metrics()).unwrap();
+        let state =
+            GatewayState::new(AiConfig::default().validate().unwrap(), test_metrics()).unwrap();
         let (answers, lookups) = hung_resolves(&state, "cold.test:443", 16).await;
         for (got, waited) in answers {
             assert_eq!(got, None);
@@ -1132,7 +1143,8 @@ mod tests {
     /// once instead of starting another `getaddrinfo` beside the hung one.
     #[tokio::test(start_paused = true)]
     async fn a_hung_lookup_is_never_joined_by_a_second() {
-        let state = GatewayState::new(AiConfig::default(), test_metrics()).unwrap();
+        let state =
+            GatewayState::new(AiConfig::default().validate().unwrap(), test_metrics()).unwrap();
         let (_, lookups) = hung_resolves(&state, "hung.test:443", 1).await;
         assert_eq!(lookups, 1);
         let (answers, lookups) = hung_resolves(&state, "hung.test:443", 4).await;

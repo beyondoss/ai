@@ -238,7 +238,7 @@ impl AiProxy {
     /// A proxy over `state` for the rest of the process. Keeps one reference to it forever (the
     /// gateway builds one proxy at boot, and its state is never torn down before exit).
     pub fn new(state: Arc<GatewayState>) -> Self {
-        if state.config.request_max_secs > 0 {
+        if state.config.request_max_secs() > 0 {
             crate::deadline::start();
         }
         let state: &'static Arc<GatewayState> = Box::leak(Box::new(state));
@@ -1856,7 +1856,7 @@ impl AiProxy {
     /// where the session has no read timeout of its own (HTTP/2; HTTP/1.1 enforces it inside
     /// pingora, so a second timer would be waste).
     fn up_front_read_timeout(&self, session: &Session) -> Option<Duration> {
-        let secs = self.state.config.client_read_timeout_secs;
+        let secs = self.state.config.client_read_timeout_secs();
         (secs > 0 && session.as_ref().get_read_timeout().is_none())
             .then(|| Duration::from_secs(secs))
     }
@@ -1870,7 +1870,7 @@ impl AiProxy {
             .inc();
         warn!(
             request_id,
-            limit_secs = self.state.config.request_max_secs,
+            limit_secs = self.state.config.request_max_secs(),
             "request reached request_max_secs; ending it",
         );
         gateway_error(504, REQUEST_DEADLINE)
@@ -1914,7 +1914,7 @@ impl AiProxy {
     ) -> HttpPeer {
         let mut peer = HttpPeer::new(
             addr,
-            self.state.config.upstream_tls,
+            self.state.config.upstream_tls().tls(),
             provider.sni().to_string(),
         );
         // Prefer HTTP/2 to the provider (config `upstream_http2`, default on), fall back to
@@ -1928,7 +1928,7 @@ impl AiProxy {
         // `upstream_request_filter`), which is what lets the body-injection path frame correctly.
         // The knob lets an operator force all-H1 without a code redeploy, and lets the e2e bench
         // compare the two head-to-head.
-        peer.options.alpn = if self.state.config.upstream_http2 {
+        peer.options.alpn = if self.state.config.upstream_http2() {
             ALPN::H2H1
         } else {
             ALPN::H1
@@ -1939,12 +1939,13 @@ impl AiProxy {
         // lower), and a full connection makes the next request open another.
         peer.options.max_h2_streams = UPSTREAM_H2_MAX_STREAMS;
         // Cert verification is on everywhere except the bench's self-signed TLS mock (see config).
-        if !self.state.config.upstream_verify_cert {
+        if !self.state.config.upstream_tls().verifies() {
             peer.options.verify_cert = false;
             peer.options.verify_hostname = false;
         }
-        peer.options.connection_timeout =
-            Some(Duration::from_secs(self.state.config.connect_timeout_secs));
+        peer.options.connection_timeout = Some(Duration::from_secs(
+            self.state.config.connect_timeout_secs(),
+        ));
         // Silence is not a failure signal: a model thinking without emitting is indistinguishable
         // from a stuck provider, so the per-read bound (the wait for the head, and each gap between
         // body reads) is the clients' own: `read_timeout_secs`, 600s, the OpenAI and Anthropic
@@ -1956,12 +1957,13 @@ impl AiProxy {
         // end is the client's own timeout (a cancel the gateway sees and bills, D130) or a dead
         // transport.
         peer.options.read_timeout = (!row.is_some_and(providers::catalog::long_running))
-            .then(|| Duration::from_secs(self.state.config.read_timeout_secs));
+            .then(|| Duration::from_secs(self.state.config.read_timeout_secs()));
         peer.options.h2_ping_interval = self.state.config.h2_ping_interval();
         peer.options.tcp_keepalive = self.state.config.upstream_tcp_keepalive();
         peer.options.write_timeout =
-            Some(Duration::from_secs(self.state.config.write_timeout_secs));
-        peer.options.idle_timeout = Some(Duration::from_secs(self.state.config.idle_timeout_secs));
+            Some(Duration::from_secs(self.state.config.write_timeout_secs()));
+        peer.options.idle_timeout =
+            Some(Duration::from_secs(self.state.config.idle_timeout_secs()));
         peer
     }
 
@@ -4329,7 +4331,7 @@ impl ProxyHttp for AiProxy {
             self.state.metrics.requests_total.inc();
             // A client that stops reading is cut off after this long rather than holding its slot,
             // its upstream connection and any breaker permit forever (see the config field).
-            let secs = self.state.config.client_write_timeout_secs;
+            let secs = self.state.config.client_write_timeout_secs();
             if secs > 0 {
                 session
                     .downstream_session
@@ -4337,7 +4339,7 @@ impl ProxyHttp for AiProxy {
             }
             // A client that stops sending its body is bounded the same way: per read, pingora's
             // own timeout on HTTP/1.1 (a no-op on HTTP/2, which `peek_body_model` bounds itself).
-            let secs = self.state.config.client_read_timeout_secs;
+            let secs = self.state.config.client_read_timeout_secs();
             session
                 .downstream_session
                 .set_read_timeout((secs > 0).then(|| Duration::from_secs(secs)));
@@ -4345,7 +4347,7 @@ impl ProxyHttp for AiProxy {
         let start = Instant::now();
         let deadline = match &full_body {
             Some(fb) => fb.deadline,
-            None => crate::deadline::at(start, self.state.config.request_max_secs),
+            None => crate::deadline::at(start, self.state.config.request_max_secs()),
         };
         // One id per request, generated before any reject path so even a 400/401 carries it (in the
         // log line and the `x-beyond-request-id` header). Moved into `ctx` at the end for the
@@ -5185,7 +5187,7 @@ impl ProxyHttp for AiProxy {
                 if dispatchable & walked & !cooling != 0 {
                     dispatchable &= !cooling;
                 }
-                if self.state.config.session_pins
+                if self.state.config.session_pins()
                     && sub.is_none()
                     && std::ptr::eq(arms, row.candidates)
                     && !parsed_control
@@ -8431,7 +8433,7 @@ mod tests {
         }));
         let state: &'static Arc<crate::state::GatewayState> = Box::leak(Box::new(
             crate::state::GatewayState::new(
-                crate::config::AiConfig::default(),
+                crate::config::AiConfig::default().validate().unwrap(),
                 crate::state::test_metrics(),
             )
             .unwrap(),
@@ -8533,7 +8535,7 @@ mod tests {
     #[test]
     fn new_ctx_pays_no_arc_clone() {
         let state = GatewayState::new(
-            crate::config::AiConfig::default(),
+            crate::config::AiConfig::default().validate().unwrap(),
             crate::state::test_metrics(),
         )
         .unwrap();

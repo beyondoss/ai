@@ -13,6 +13,7 @@ use pingora_core::protocols::TcpKeepalive;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::ops::Deref;
 use std::path::Path;
 use std::time::Duration;
@@ -534,7 +535,288 @@ impl Default for AiConfig {
     }
 }
 
+/// An [`AiConfig`] that [`AiConfig::validate`] accepted, with every setting code branches on parsed
+/// into a type that cannot hold a value it would have to re-check: the only input
+/// [`GatewayState::new`](crate::state::GatewayState::new) takes, so no gateway runs on a config
+/// that was never validated.
+///
+/// Read-only: every field is private, behind a getter. The per-provider tables are moved out of the
+/// raw config, keyed by [`ProviderName`], so a pool key is held once; the raw config itself is never
+/// handed out, since its tables are empty once moved.
+pub struct ValidConfig {
+    raw: AiConfig,
+    worker_threads: Workers,
+    upstream_tls: UpstreamTls,
+    circuit_breaker: Option<BreakerConfig>,
+    pool_keys: HashMap<ProviderName, PoolKeyList>,
+    provider_authorities: HashMap<ProviderName, String>,
+    provider_dialects: HashMap<ProviderName, String>,
+    provider_auth_schemes: HashMap<ProviderName, String>,
+}
+
+impl fmt::Debug for ValidConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Not the raw config: its provider tables are moved into the typed ones below.
+        f.debug_struct("ValidConfig")
+            .field("worker_threads", &self.worker_threads)
+            .field("upstream_tls", &self.upstream_tls)
+            .field("circuit_breaker", &self.circuit_breaker)
+            .field("pool_keys", &self.pool_keys)
+            .field("provider_authorities", &self.provider_authorities)
+            .field("provider_dialects", &self.provider_dialects)
+            .field("provider_auth_schemes", &self.provider_auth_schemes)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A getter per raw setting the gateway reads once the config is valid: `Copy` ones by value, the
+/// rest by reference. Each documents itself on [`AiConfig`].
+macro_rules! settings {
+    (copy { $($copy:ident: $cty:ty,)* } refs { $($r:ident: $rty:ty,)* }) => {
+        impl ValidConfig {
+            $(
+                #[doc = concat!("See [`AiConfig::", stringify!($copy), "`].")]
+                pub fn $copy(&self) -> $cty {
+                    self.raw.$copy
+                }
+            )*
+            $(
+                #[doc = concat!("See [`AiConfig::", stringify!($r), "`].")]
+                pub fn $r(&self) -> &$rty {
+                    &self.raw.$r
+                }
+            )*
+        }
+    };
+}
+
+settings! {
+    copy {
+        downstream_h2c: bool,
+        require_signing_keys: bool,
+        connect_timeout_secs: u64,
+        read_timeout_secs: u64,
+        write_timeout_secs: u64,
+        idle_timeout_secs: u64,
+        client_write_timeout_secs: u64,
+        client_read_timeout_secs: u64,
+        request_max_secs: u64,
+        max_buffered_body_bytes: usize,
+        shutdown_grace_period_secs: u64,
+        shutdown_runtime_timeout_secs: u64,
+        upstream_http2: bool,
+        rate_limit_rps: u32,
+        byo_rate_limit_rps: u32,
+        capture_max_bytes: u32,
+        capture_default_sample_n: u32,
+        capture_queue_depth: usize,
+        capture_queue_bytes: usize,
+        cache_ttl_secs: u64,
+        cache_max_entries: usize,
+        cache_max_bytes: usize,
+        session_pins: bool,
+        tenant_max_in_flight: u32,
+    }
+    refs {
+        listen: String,
+        metrics_listen: String,
+        nats_url: String,
+        nats_creds: Option<Secret>,
+        nats_creds_file: Option<String>,
+        config_bucket: String,
+        snapshot_path: Option<String>,
+        signing_keys: HashMap<String, String>,
+    }
+}
+
+impl ValidConfig {
+    /// See [`AiConfig::worker_threads`].
+    pub fn worker_threads(&self) -> Workers {
+        self.worker_threads
+    }
+
+    /// See [`AiConfig::upstream_tls`] and [`AiConfig::upstream_verify_cert`].
+    pub fn upstream_tls(&self) -> UpstreamTls {
+        self.upstream_tls
+    }
+
+    /// The per-provider circuit breaker, `None` when `circuit_breaker_threshold = 0`.
+    pub fn circuit_breaker(&self) -> Option<BreakerConfig> {
+        self.circuit_breaker
+    }
+
+    /// See [`AiConfig::pool_keys`].
+    pub fn pool_keys(&self) -> &HashMap<ProviderName, PoolKeyList> {
+        &self.pool_keys
+    }
+
+    /// See [`AiConfig::provider_authorities`].
+    pub fn provider_authorities(&self) -> &HashMap<ProviderName, String> {
+        &self.provider_authorities
+    }
+
+    /// See [`AiConfig::provider_dialects`].
+    pub fn provider_dialects(&self) -> &HashMap<ProviderName, String> {
+        &self.provider_dialects
+    }
+
+    /// See [`AiConfig::provider_auth_schemes`].
+    pub fn provider_auth_schemes(&self) -> &HashMap<ProviderName, String> {
+        &self.provider_auth_schemes
+    }
+
+    /// See [`AiConfig::build_keyring`].
+    pub fn build_keyring(&self) -> Result<Keyring> {
+        self.raw.build_keyring()
+    }
+
+    /// See [`AiConfig::build_id_signer`].
+    pub fn build_id_signer(&self) -> Result<Option<crate::signed_id::Signer>> {
+        self.raw.build_id_signer()
+    }
+
+    /// See [`AiConfig::h2_ping_interval`].
+    pub fn h2_ping_interval(&self) -> Option<Duration> {
+        self.raw.h2_ping_interval()
+    }
+
+    /// See [`AiConfig::upstream_tcp_keepalive`].
+    pub fn upstream_tcp_keepalive(&self) -> Option<TcpKeepalive> {
+        self.raw.upstream_tcp_keepalive()
+    }
+
+    /// See [`AiConfig::downstream_tcp_keepalive`].
+    pub fn downstream_tcp_keepalive(&self) -> Option<TcpKeepalive> {
+        self.raw.downstream_tcp_keepalive()
+    }
+}
+
+/// How many proxy worker threads to run ([`AiConfig::worker_threads`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Workers {
+    /// One per available core (`worker_threads = 0`).
+    Auto,
+    Fixed(NonZeroUsize),
+}
+
+impl Workers {
+    /// The thread count to hand pingora.
+    pub fn threads(self) -> usize {
+        match self {
+            Workers::Auto => std::thread::available_parallelism().map_or(1, NonZeroUsize::get),
+            Workers::Fixed(n) => n.get(),
+        }
+    }
+}
+
+/// How the gateway connects to providers ([`AiConfig::upstream_tls`],
+/// [`AiConfig::upstream_verify_cert`]). Every mode but `Verified` exists for a local mock only;
+/// booting into one warns, loudly, and boots (see `GatewayState::new`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpstreamTls {
+    /// TLS, certificate and hostname verified: every real provider.
+    Verified,
+    /// TLS without verification: the e2e bench's self-signed mock.
+    UnverifiedTest,
+    /// Plaintext: the e2e harness's mock. `verify_cert` is the file's flag, which no plaintext
+    /// connection reads but pingora folds into its connection pool's reuse hash: kept, so a
+    /// plaintext peer is configured exactly as the flag says.
+    PlaintextTest { verify_cert: bool },
+}
+
+impl UpstreamTls {
+    fn of(tls: bool, verify_cert: bool) -> Self {
+        match (tls, verify_cert) {
+            (true, true) => UpstreamTls::Verified,
+            (true, false) => UpstreamTls::UnverifiedTest,
+            (false, verify_cert) => UpstreamTls::PlaintextTest { verify_cert },
+        }
+    }
+
+    /// Whether connections are TLS at all.
+    pub fn tls(self) -> bool {
+        !matches!(self, UpstreamTls::PlaintextTest { .. })
+    }
+
+    /// Whether a peer is built to check the provider's certificate and hostname.
+    pub fn verifies(self) -> bool {
+        matches!(
+            self,
+            UpstreamTls::Verified | UpstreamTls::PlaintextTest { verify_cert: true }
+        )
+    }
+}
+
+/// An enabled per-provider circuit breaker's settings, as [`AiConfig::validate`] accepted them: a
+/// threshold that can trip, and a window and reset that make it mean something.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BreakerConfig {
+    threshold: NonZeroU32,
+    window: Duration,
+    reset: Duration,
+}
+
+impl BreakerConfig {
+    /// The breaker each provider gets (see `state::build_providers`). Windowed policy: a degrading
+    /// backend trips on a *burst* of failures, not a slow trickle (see `circuit_breaker`).
+    pub fn circuit_breaker(&self) -> crate::circuit_breaker::CircuitBreakerConfig {
+        crate::circuit_breaker::CircuitBreakerConfig::windowed(self.threshold.get(), self.window)
+            .reset_timeout(self.reset)
+            // Admit exactly **one** half-open probe (matching ARCHITECTURE.md: "a probe is
+            // admitted"). The library default is 3, but for an egress breaker a single probe is the
+            // conservative choice — one request tests a possibly-still-broken provider, and a success
+            // closes it immediately for full traffic; 3 concurrent probes would send 3× the load at a
+            // provider we believe is down. Deliberately not a config knob: minimum effective surface.
+            .half_open_permits(1)
+    }
+}
+
+/// A provider's name as every per-provider table keys it, in one spelling: the env fold lowercases
+/// `AI_POOL_KEY_<NAME>`, so a TOML `MiniMax` has to meet its key as `minimax`.
+///
+/// The loader applies [`Self::parse`] to the file's tables (lowercase ASCII letters, digits, `-` or
+/// `_`, never empty: anything else does not boot) before the env fold, which lowercases the names
+/// it adds and checks nothing more; [`AiConfig::validate`] keys the tables by those names as they
+/// stand, so the rule runs once and an env-added name boots exactly as it always has.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ProviderName(String);
+
+impl ProviderName {
+    /// `name`, lowercased, or `None` when it holds anything outside the charset.
+    pub fn parse(name: &str) -> Option<Self> {
+        let lower = name.to_ascii_lowercase();
+        let valid = !lower.is_empty()
+            && lower
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_');
+        valid.then_some(Self(lower))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::borrow::Borrow<str> for ProviderName {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ProviderName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 impl AiConfig {
+    /// The gateway's config, as the file and the environment say it, [validated](Self::validate).
+    pub fn load(path: Option<&Path>) -> Result<ValidConfig> {
+        Self::load_with_path(path)?.validate()
+    }
+
+    /// The file and the environment merged, provider names normalized: the raw form, before
+    /// [`Self::validate`].
     pub fn load_with_path(path: Option<&Path>) -> Result<Self> {
         let toml_path = path.unwrap_or_else(|| Path::new("config.toml"));
 
@@ -569,7 +851,6 @@ impl AiConfig {
         // `std::env::vars()` *panics* on a variable that isn't valid UTF-8 — a hostile or merely odd
         // environment should not be able to kill the boot before it starts.
         cfg.merge_secret_env(env_pairs());
-        cfg.validate()?;
         Ok(cfg)
     }
 
@@ -599,7 +880,7 @@ impl AiConfig {
     /// upstream call immediately — surfacing only as a 502 cascade, not a loud boot failure. Catch it
     /// here so a mis-deploy fails fast and visibly. Write/idle are not load-bearing for correctness
     /// (Pingora treats them as best-effort), so they're left unconstrained.
-    fn validate(&self) -> Result<()> {
+    pub fn check(&self) -> Result<()> {
         if self.connect_timeout_secs == 0 {
             return Err(GatewayError::Config(
                 "connect_timeout_secs must be > 0 (a 0 connect timeout fails every upstream connect)"
@@ -652,36 +933,34 @@ impl AiConfig {
         Ok(())
     }
 
+    /// [`Self::check`] the config, then parse it into the [`ValidConfig`] a gateway boots on.
+    pub fn validate(mut self) -> Result<ValidConfig> {
+        self.check()?;
+        let worker_threads =
+            NonZeroUsize::new(self.worker_threads).map_or(Workers::Auto, Workers::Fixed);
+        let circuit_breaker =
+            NonZeroU32::new(self.circuit_breaker_threshold).map(|threshold| BreakerConfig {
+                threshold,
+                window: Duration::from_secs(self.circuit_breaker_window_secs),
+                reset: Duration::from_secs(self.circuit_breaker_reset_secs),
+            });
+        Ok(ValidConfig {
+            worker_threads,
+            upstream_tls: UpstreamTls::of(self.upstream_tls, self.upstream_verify_cert),
+            circuit_breaker,
+            pool_keys: keyed(std::mem::take(&mut self.pool_keys)),
+            provider_authorities: keyed(std::mem::take(&mut self.provider_authorities)),
+            provider_dialects: keyed(std::mem::take(&mut self.provider_dialects)),
+            provider_auth_schemes: keyed(std::mem::take(&mut self.provider_auth_schemes)),
+            raw: self,
+        })
+    }
+
     /// The signer for tenant-bound Responses ids (`signed_id.rs`), or `None` when no
     /// `id_signing_keys` are set.
     pub fn build_id_signer(&self) -> Result<Option<crate::signed_id::Signer>> {
         crate::signed_id::Signer::from_config(&self.id_signing_keys, &self.id_signing_kid)
             .map_err(GatewayError::Config)
-    }
-
-    /// The per-provider circuit-breaker config, or `None` when disabled (`circuit_breaker_threshold
-    /// == 0`). Windowed policy: a degrading backend trips on a *burst* of failures, not a slow
-    /// trickle (see `circuit_breaker` crate docs). Each provider gets its own breaker built from this
-    /// (see `state::build_providers`).
-    pub fn circuit_breaker_config(&self) -> Option<crate::circuit_breaker::CircuitBreakerConfig> {
-        if self.circuit_breaker_threshold == 0 {
-            return None;
-        }
-        Some(
-            crate::circuit_breaker::CircuitBreakerConfig::windowed(
-                self.circuit_breaker_threshold,
-                std::time::Duration::from_secs(self.circuit_breaker_window_secs),
-            )
-            .reset_timeout(std::time::Duration::from_secs(
-                self.circuit_breaker_reset_secs,
-            ))
-            // Admit exactly **one** half-open probe (matching ARCHITECTURE.md: "a probe is
-            // admitted"). The library default is 3, but for an egress breaker a single probe is the
-            // conservative choice — one request tests a possibly-still-broken provider, and a success
-            // closes it immediately for full traffic; 3 concurrent probes would send 3× the load at a
-            // provider we believe is down. Deliberately not a config knob: minimum effective surface.
-            .half_open_permits(1),
-        )
     }
 
     /// Fold the secret-carrying env prefixes into the config, in a single pass.
@@ -749,19 +1028,17 @@ impl AiConfig {
 
 /// `names` with every key lowercased, for the table `table` (named in the error). See
 /// [`AiConfig::normalize_provider_names`].
+/// A name outside the charset ([`ProviderName::parse`]), or two names that are one once lowercased,
+/// is a boot failure, not a provider that silently has no key.
 fn lowercase_names<V>(table: &str, names: HashMap<String, V>) -> Result<HashMap<String, V>> {
     let mut out = HashMap::with_capacity(names.len());
     for (name, value) in names {
-        let lower = name.to_ascii_lowercase();
-        let valid = !lower.is_empty()
-            && lower
-                .bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_');
-        if !valid {
+        let Some(parsed) = ProviderName::parse(&name) else {
             return Err(GatewayError::Config(format!(
                 "[{table}] provider name {name:?} must be letters, digits, '-' or '_'"
             )));
-        }
+        };
+        let lower = parsed.0;
         if out.insert(lower.clone(), value).is_some() {
             return Err(GatewayError::Config(format!(
                 "[{table}] provider name {name:?} is {lower:?} once lowercased, which another name already is"
@@ -769,6 +1046,14 @@ fn lowercase_names<V>(table: &str, names: HashMap<String, V>) -> Result<HashMap<
         }
     }
     Ok(out)
+}
+
+/// A table keyed by its names as they stand: see [`ProviderName`] for where they were checked.
+fn keyed<V>(names: HashMap<String, V>) -> HashMap<ProviderName, V> {
+    names
+        .into_iter()
+        .map(|(name, v)| (ProviderName(name), v))
+        .collect()
 }
 
 /// Environment variables as `(String, String)`, skipping any that aren't valid UTF-8.
@@ -1144,6 +1429,24 @@ mod tests {
         assert!(c.provider_authorities.contains_key("minimax"));
         assert_eq!(c.pool_keys.len(), 1, "{:?}", c.pool_keys.keys());
         assert_eq!(c.pool_keys["minimax"][0].expose(), "mm-key");
+    }
+
+    /// An `AI_POOL_KEY_<NAME>` name is lowercased and nothing more: the file's charset rule never
+    /// covered env-added names, so one outside it (or an empty one) still boots, as it always has.
+    #[test]
+    fn env_pool_key_names_are_not_held_to_the_file_charset() {
+        let mut c = AiConfig::default();
+        c.normalize_provider_names().unwrap();
+        c.merge_secret_env(
+            [
+                ("AI_POOL_KEY_FOO.BAR".to_string(), "a".to_string()),
+                ("AI_POOL_KEY_".to_string(), "b".to_string()),
+            ]
+            .into_iter(),
+        );
+        let valid = c.validate().expect("env-added names boot");
+        assert_eq!(valid.pool_keys()["foo.bar"][0].expose(), "a");
+        assert_eq!(valid.pool_keys()[""][0].expose(), "b");
     }
 
     /// A name outside the charset, or two names that are one once lowercased, does not load.

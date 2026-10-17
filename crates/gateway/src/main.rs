@@ -11,7 +11,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use beyond_ai::admin::AdminApp;
 use beyond_ai::capture_sink::{CaptureDrain, CaptureSink};
-use beyond_ai::config::AiConfig;
+use beyond_ai::config::{AiConfig, ValidConfig};
 use beyond_ai::doctor;
 use beyond_ai::metrics::Metrics;
 use beyond_ai::proxy::{AiProxy, LIVE_REQUESTS};
@@ -62,8 +62,8 @@ enum Commands {
     Run,
 }
 
-fn load_config(path: Option<&Path>) -> AiConfig {
-    match AiConfig::load_with_path(path) {
+fn load_config(path: Option<&Path>) -> ValidConfig {
+    match AiConfig::load(path) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("failed to load config: {e}");
@@ -306,7 +306,16 @@ fn main() {
             .enable_all()
             .build()
             .expect("runtime");
-        let config = load_config(cli.config.as_deref());
+        // The raw config, checked as a boot would check it: doctor reads its provider tables.
+        let config = match AiConfig::load_with_path(cli.config.as_deref())
+            .and_then(|c| c.check().map(|()| c))
+        {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("failed to load config: {e}");
+                exit(1);
+            }
+        };
         let results = rt.block_on(doctor::run_checks(&config));
         doctor::print_results("Beyond AI Gateway Doctor", &results);
         exit(if results.iter().all(|r| r.passed) {
@@ -317,19 +326,16 @@ fn main() {
     }
 
     let config = load_config(cli.config.as_deref());
-    let listen = config.listen.clone();
-    let metrics_listen = config.metrics_listen.clone();
-    let downstream_h2c = config.downstream_h2c;
-    // `0` ⇒ one worker per core. Resolved here, before `config` moves into the gateway state.
-    let worker_threads = match config.worker_threads {
-        0 => std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
-        n => n,
-    };
+    let listen = config.listen().clone();
+    let metrics_listen = config.metrics_listen().clone();
+    let downstream_h2c = config.downstream_h2c();
+    // Resolved here, before `config` moves into the gateway state.
+    let worker_threads = config.worker_threads().threads();
     // Capture the shutdown knobs before `config` is moved into the gateway state below.
-    let grace_period_secs = config.shutdown_grace_period_secs;
-    let runtime_timeout_secs = config.shutdown_runtime_timeout_secs;
-    let capture_queue_depth = config.capture_queue_depth;
-    let capture_queue_bytes = config.capture_queue_bytes;
+    let grace_period_secs = config.shutdown_grace_period_secs();
+    let runtime_timeout_secs = config.shutdown_runtime_timeout_secs();
+    let capture_queue_depth = config.capture_queue_depth();
+    let capture_queue_bytes = config.capture_queue_bytes();
     let metrics = match Metrics::new() {
         Ok(m) => m,
         Err(e) => {
@@ -419,7 +425,7 @@ fn main() {
         "ai-admin".to_string(),
         HttpServer::new_app(AdminApp {
             metrics: state.metrics.clone(),
-            managed: !state.config.signing_keys.is_empty(),
+            managed: !state.config.signing_keys().is_empty(),
         }),
     );
     admin.add_tcp(&metrics_listen);

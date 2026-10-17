@@ -195,7 +195,7 @@ impl WatchedSet for Deny {
     }
 
     fn snapshot_path(state: &GatewayState) -> Option<String> {
-        state.config.snapshot_path.clone()
+        state.config.snapshot_path().clone()
     }
 }
 
@@ -328,7 +328,7 @@ impl WatchedSet for Allowance {
         // Own file so a deny-set snapshot cannot be loaded as allowance (or vice versa).
         state
             .config
-            .snapshot_path
+            .snapshot_path()
             .as_ref()
             .map(|p| format!("{p}.allowance"))
     }
@@ -721,14 +721,14 @@ async fn connect(state: &GatewayState) -> crate::error::Result<Arc<dyn KvStore>>
     // keys make once they reach Pingora's headers (see `secret`). Redaction, not zeroization, is the
     // control here.
     let conn = NatsConnection::new(NatsConnectionConfig {
-        url: cfg.nats_url.clone(),
-        creds: cfg.nats_creds.as_ref().map(|s| s.expose().to_string()),
-        creds_file: cfg.nats_creds_file.clone(),
+        url: cfg.nats_url().clone(),
+        creds: cfg.nats_creds().as_ref().map(|s| s.expose().to_string()),
+        creds_file: cfg.nats_creds_file().clone(),
     });
     conn.connect().await?;
     let store = conn
         .store_with_config(StoreConfig {
-            name: cfg.config_bucket.clone(),
+            name: cfg.config_bucket().clone(),
             ..Default::default()
         })
         .await?;

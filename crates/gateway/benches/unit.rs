@@ -348,7 +348,11 @@ mod state {
     fn state() -> &'static Arc<GatewayState> {
         static S: OnceLock<Arc<GatewayState>> = OnceLock::new();
         S.get_or_init(|| {
-            GatewayState::new(AiConfig::default(), bench_metrics().clone()).expect("build state")
+            GatewayState::new(
+                AiConfig::default().validate().expect("valid"),
+                bench_metrics().clone(),
+            )
+            .expect("build state")
         })
     }
 
