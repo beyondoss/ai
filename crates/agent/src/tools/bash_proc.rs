@@ -88,6 +88,18 @@ fn new_tag() -> String {
     format!("{}.{epoch:x}.{seq}", std::process::id())
 }
 
+/// The tags this process itself carries: it runs inside those jobs, so it must never stop them.
+pub fn own_tags() -> Vec<String> {
+    std::env::var(TAG_ENV)
+        .map(|v| {
+            v.split(':')
+                .filter(|t| !t.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// The [`TAG_ENV`] value a job's shell starts with: any tags this process inherited, then `tag`.
 fn tag_value(tag: &str) -> String {
     match std::env::var(TAG_ENV) {
@@ -106,6 +118,30 @@ impl ProcGroup {
             leader: super::exec::GroupId::leader(leader),
             group_gone: std::sync::Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// A job's processes as a session recorded them — `pgid`, the leader's start time, the tag — for
+    /// a later process to find what an earlier one, killed before it could stop them, left behind.
+    /// Without a start time (no `/proc` when recorded) the group number cannot be told from a
+    /// recycled one, so only the tag counts.
+    pub fn recorded(pgid: u32, leader_start: Option<u64>, tag: String) -> Self {
+        Self {
+            pgid,
+            tag,
+            leader: super::exec::GroupId::recorded(pgid, leader_start),
+            group_gone: std::sync::Arc::new(AtomicBool::new(leader_start.is_none())),
+        }
+    }
+
+    /// The group leader's start time, as read when it was spawned — what [`Self::recorded`] takes.
+    pub fn leader_start(&self) -> Option<u64> {
+        self.leader.start()
+    }
+
+    /// Whether a live process carries this job's tag. Only the tag proves a process is a job's: a
+    /// recorded group number alone is no evidence that its members are ours.
+    pub fn tag_alive(&self) -> bool {
+        imp::tag_alive(self)
     }
 
     /// Whether a process in group `pgid` is still one of ours — see the type's doc. Latches `false`.
@@ -398,6 +434,32 @@ mod imp {
         out
     }
 
+    pub(super) fn tag_alive(group: &ProcGroup) -> bool {
+        let me = std::process::id();
+        let Ok(dir) = std::fs::read_dir("/proc") else {
+            return false;
+        };
+        dir.flatten().any(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .and_then(|s| s.parse::<u32>().ok())
+                .is_some_and(|pid| pid != me && is_live(pid) && has_tag(pid, &group.tag))
+        })
+    }
+
+    /// Whether `pid` exists and is not a zombie.
+    fn is_live(pid: u32) -> bool {
+        let Ok(stat) = std::fs::read(format!("/proc/{pid}/stat")) else {
+            return false;
+        };
+        let Some(close) = stat.iter().rposition(|&b| b == b')') else {
+            return false;
+        };
+        let rest = String::from_utf8_lossy(&stat[close + 1..]);
+        !matches!(rest.split_whitespace().next(), Some("Z" | "X"))
+    }
+
     /// Why a process is one of a job's.
     enum Member {
         /// In its process group (while that is still ours).
@@ -585,6 +647,11 @@ mod imp {
         }
     }
 
+    /// No environment to read: a recorded group is never proven ours.
+    pub(super) fn tag_alive(_group: &ProcGroup) -> bool {
+        false
+    }
+
     pub(super) fn terminate(group: &ProcGroup) {
         if let Some(p) = Pid::from_raw(group.pgid as i32) {
             let _ = rustix::process::kill_process_group(p, rustix::process::Signal::TERM);
@@ -613,6 +680,10 @@ mod imp {
 
     pub(super) fn members(_group: &ProcGroup) -> Vec<u32> {
         Vec::new()
+    }
+
+    pub(super) fn tag_alive(_group: &ProcGroup) -> bool {
+        false
     }
 
     pub(super) fn terminate(_group: &ProcGroup) {}

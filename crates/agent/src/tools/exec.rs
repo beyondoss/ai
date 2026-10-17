@@ -865,6 +865,16 @@ impl GroupId {
         }
     }
 
+    /// The group as a session recorded it — see [`super::bash_proc::ProcGroup::recorded`].
+    pub(crate) fn recorded(pgid: u32, start: Option<u64>) -> Self {
+        Self { pgid, start }
+    }
+
+    /// The leader's start time, read while it was ours.
+    pub(crate) fn start(&self) -> Option<u64> {
+        self.start
+    }
+
     /// Whether our leader still holds the number (alive or a zombie): a group signal can reach only
     /// our group.
     pub(crate) fn leader_holds(&self) -> bool {
