@@ -243,6 +243,19 @@ async fn gitignored_matches_are_excluded_by_both_backends_outside_a_repo() {
 }
 
 #[tokio::test]
+async fn a_single_file_root_is_searched_identically_on_every_rung() {
+    // Both `rg` and `grep` omit the path when handed one file, and the record parser needs it — so a
+    // file-path search came back "no matches" on both shell rungs until `-H`/`--with-filename`.
+    let dir = fixture();
+    let file = dir.path().join("gamma.txt");
+    let input = json!({ "pattern": "NEEDLE", "path": file.to_str().unwrap() });
+    let out = assert_parity(&dir, input.clone()).await;
+    assert!(out.contains("NEEDLE in text"), "{out}");
+    let posix = run_tool(Some(shell_posix_backend()), "grep", input).await;
+    assert_eq!(out, posix);
+}
+
+#[tokio::test]
 async fn dotfiles_are_searched_by_both_backends() {
     let dir = fixture();
     let out = assert_parity(&dir, json!({ "pattern": "NEEDLE" })).await;
@@ -505,6 +518,108 @@ async fn find_reports_no_match_identically() {
     let dir = fixture();
     let out = assert_tool_parity("find", json!({ "pattern": "*.nosuchext" }), &dir).await;
     assert!(out.starts_with("no files matching"), "{out}");
+}
+
+// ------------------------------------------------------------- .git
+
+/// A repository's metadata, plus a worktree checkout whose `.git` is a *file* — each holding a
+/// `NEEDLE`, so a search that walks into them shows it. The real thing: `packed-refs`, a reflog, a
+/// worktree `HEAD`, the paths that filled a repository-root search before `.git` was skipped.
+fn git_fixture() -> TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let p = dir.path();
+    std::fs::create_dir_all(p.join(".git/logs")).unwrap();
+    std::fs::create_dir_all(p.join(".git/worktrees/wt")).unwrap();
+    std::fs::write(p.join(".git/packed-refs"), "abc refs/heads/NEEDLE\n").unwrap();
+    std::fs::write(p.join(".git/logs/HEAD"), "commit: NEEDLE\n").unwrap();
+    std::fs::write(p.join(".git/worktrees/wt/HEAD"), "ref: NEEDLE\n").unwrap();
+    std::fs::create_dir(p.join("wt")).unwrap();
+    std::fs::write(p.join("wt/.git"), "gitdir: NEEDLE\n").unwrap();
+    std::fs::write(p.join("wt/lib.rs"), "fn NEEDLE() {}\n").unwrap();
+    std::fs::write(p.join("main.rs"), "NEEDLE\n").unwrap();
+    // Look-alikes that are *not* `.git` and must still be searched.
+    std::fs::create_dir(p.join(".github")).unwrap();
+    std::fs::write(p.join(".github/ci.yml"), "NEEDLE\n").unwrap();
+    dir
+}
+
+/// Every backend this suite has — `LocalFs`, the `rg` rung when present, and the POSIX rung.
+async fn all_backends() -> Vec<(&'static str, Arc<dyn FsBackend>)> {
+    let mut v = vec![("local", local_backend()), ("posix", shell_posix_backend())];
+    if let Some(rg) = rg_backend().await {
+        v.push(("rg", rg));
+    }
+    v
+}
+
+#[tokio::test]
+async fn grep_and_find_skip_git_metadata_on_every_backend() {
+    let dir = git_fixture();
+    let root = dir.path().to_str().unwrap();
+    for (name, backend) in all_backends().await {
+        let grep = run_tool(
+            Some(backend.clone()),
+            "grep",
+            json!({ "pattern": "NEEDLE", "path": root }),
+        )
+        .await;
+        assert!(!grep.contains(".git/"), "{name} grep entered .git: {grep}");
+        assert!(
+            !grep.contains("wt/.git"),
+            "{name} grep read a worktree's .git file: {grep}"
+        );
+        for kept in ["main.rs", "wt/lib.rs", ".github/ci.yml"] {
+            assert!(grep.contains(kept), "{name} grep lost {kept}: {grep}");
+        }
+
+        for pattern in ["HEAD", "*", ".git"] {
+            let find = run_tool(
+                Some(backend.clone()),
+                "find",
+                json!({ "pattern": pattern, "path": root }),
+            )
+            .await;
+            assert!(
+                !find.lines().any(|l| l.split('/').any(|c| c == ".git")),
+                "{name} find {pattern:?} listed .git: {find}"
+            );
+        }
+    }
+    // And the strict rung agrees with `LocalFs` byte for byte.
+    assert_parity(&dir, json!({ "pattern": "NEEDLE" })).await;
+    assert_tool_parity("find", json!({ "pattern": "*" }), &dir).await;
+}
+
+#[tokio::test]
+async fn an_explicit_search_inside_git_metadata_still_searches_it() {
+    let dir = git_fixture();
+    let git = dir.path().join(".git");
+    for (name, backend) in all_backends().await {
+        let grep = run_tool(
+            Some(backend.clone()),
+            "grep",
+            json!({ "pattern": "NEEDLE", "path": git.to_str().unwrap() }),
+        )
+        .await;
+        assert!(grep.contains("packed-refs"), "{name}: {grep}");
+        assert!(grep.contains("worktrees/wt/HEAD"), "{name}: {grep}");
+
+        let find = run_tool(
+            Some(backend.clone()),
+            "find",
+            json!({ "pattern": "HEAD", "path": git.to_str().unwrap() }),
+        )
+        .await;
+        assert!(find.contains("logs/HEAD"), "{name}: {find}");
+
+        let file = run_tool(
+            Some(backend.clone()),
+            "grep",
+            json!({ "pattern": "NEEDLE", "path": dir.path().join("wt/.git").to_str().unwrap() }),
+        )
+        .await;
+        assert!(file.contains("gitdir: NEEDLE"), "{name}: {file}");
+    }
 }
 
 // ------------------------------------------------------- write / edit

@@ -248,9 +248,18 @@ fn stat_blocking(path: &Path) -> Option<Meta> {
     })
 }
 
+/// Prune a `.git` directory (or a worktree's `.git` file) from both walks — the walk-time half of
+/// [`super::is_under_git_dir`]. `filter_entry` runs before the walker descends, so the subtree is
+/// never read, not merely filtered out of the results. The root itself (depth 0) always passes, so an
+/// explicit search *of* `repo/.git` still works.
+fn not_git_dir(entry: &ignore::DirEntry) -> bool {
+    entry.depth() == 0 || entry.file_name() != super::GIT_DIR
+}
+
 /// The blocking glob walk, moved from `find`. Shares `LocalFs`'s `.gitignore` policy with
-/// [`walk`] — `hidden(false)` to include dotfiles, and `require_git(false)` only outside a real
-/// repository so a nested repo's own ignores can't leak across its boundary.
+/// [`walk`] — `hidden(false)` to include dotfiles except `.git` ([`not_git_dir`]), and
+/// `require_git(false)` only outside a real repository so a nested repo's own ignores can't leak
+/// across its boundary.
 fn glob_blocking(q: &GlobQuery) -> Result<GlobOutcome, FsError> {
     use globset::GlobBuilder;
 
@@ -264,7 +273,7 @@ fn glob_blocking(q: &GlobQuery) -> Result<GlobOutcome, FsError> {
         .compile_matcher();
 
     let mut builder = WalkBuilder::new(&q.root);
-    builder.hidden(false);
+    builder.hidden(false).filter_entry(not_git_dir);
     if !crate::tools::root_is_inside_git_repo(&q.root) {
         builder.require_git(false);
     }
@@ -377,8 +386,10 @@ fn walk(
     // extends the identical policy to grep too, for consistency between the two search tools and
     // because it's strictly more useful (a plain checkout with no `.git` still gets its `.gitignore`
     // honored) — kept rather than narrowed to match grep.ts's behavior here.
+    //
+    // `filter_entry(not_git_dir)`: dotfiles are in, but `.git` is not — see [`not_git_dir`].
     let mut builder = WalkBuilder::new(root);
-    builder.hidden(false);
+    builder.hidden(false).filter_entry(not_git_dir);
     if !crate::tools::root_is_inside_git_repo(root) {
         builder.require_git(false);
     }

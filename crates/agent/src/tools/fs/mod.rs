@@ -234,6 +234,26 @@ pub struct GlobOutcome {
     pub first_error: Option<String>,
 }
 
+/// The VCS metadata entry `grep` and `find` never descend into: a repository's `.git` directory, or
+/// the `.git` *file* a worktree or submodule checkout carries instead.
+pub const GIT_DIR: &str = ".git";
+
+/// Whether `path` is, or lies inside, a `.git` entry **below** `root`.
+///
+/// `hidden(false)` makes the walks include dotfiles, and `.git` is a dotfile nobody ever ignores in
+/// a `.gitignore` — so without this, a search fills with `packed-refs`, reflogs and worktree `HEAD`s.
+/// Only components *after* `root` count, which is what keeps an explicit search inside `.git` (a
+/// root of `repo/.git` or `repo/.git/refs`) working: the caller asked for that tree by name.
+///
+/// [`local::LocalFs`] applies the same rule at walk time (an entry named `.git` below depth 0 is
+/// pruned, so its subtree is never read); [`shell::ShellFs`] asks its engine to skip `.git` where the
+/// engine can, and applies this to every path it gets back, so a rung with no such flag (POSIX
+/// `grep`, `find`) still cannot leak one.
+pub fn is_under_git_dir(root: &Path, path: &Path) -> bool {
+    path.strip_prefix(root)
+        .is_ok_and(|rel| rel.components().any(|c| c.as_os_str() == GIT_DIR))
+}
+
 /// Sort, decide truncation, and trim — [`finalize`]'s counterpart for globbing, shared for the same
 /// reason: the ordering and the "was this cut short" rule must not depend on which backend walked.
 pub fn finalize_glob(
@@ -542,6 +562,24 @@ mod tests {
                 "漢"
             )
         );
+    }
+
+    #[test]
+    fn is_under_git_dir_counts_only_components_below_the_root() {
+        let root = Path::new("/repo");
+        assert!(is_under_git_dir(root, Path::new("/repo/.git")));
+        assert!(is_under_git_dir(root, Path::new("/repo/.git/packed-refs")));
+        assert!(is_under_git_dir(root, Path::new("/repo/sub/.git"))); // a worktree's `.git` file
+        assert!(!is_under_git_dir(root, Path::new("/repo/src/main.rs")));
+        assert!(!is_under_git_dir(root, Path::new("/repo/.github/ci.yml")));
+        assert!(!is_under_git_dir(root, Path::new("/repo/.gitignore")));
+        // An explicit root inside `.git` searches that tree.
+        let inside = Path::new("/repo/.git");
+        assert!(!is_under_git_dir(
+            inside,
+            Path::new("/repo/.git/refs/heads/main")
+        ));
+        assert!(!is_under_git_dir(inside, inside));
     }
 
     // ---- finalize: new coverage for the shared tail, since it is now the single definition both
