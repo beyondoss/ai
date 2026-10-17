@@ -25,6 +25,15 @@ env:
 # The four checks below run on separate runners *in parallel*, so wall-clock is ~the slowest one
 # (the release build) instead of the sum of all of them, and one hung/slow check can no longer
 # starve the others of their signal. `Check` is the single required gate that fans them back in.
+#
+# Linux only, and deliberately: there is no macOS (or Windows) lane because nothing here ships or is
+# supported off Linux. release-agent.yml publishes linux-musl amd64/arm64 binaries only, the gateway
+# ships as a Linux image (publish.yml), and mise.toml installs only Linux Rust targets. The agent does
+# not even compile for macOS: its unconditional `seccompiler` dependency (the `web` tool's parse
+# sandbox, tools/web/isolate.rs) calls `libc::prctl` and `SYS_seccomp`, which libc has no Apple
+# binding for. The `cfg(not(target_os = "linux"))` fallbacks in the tree keep single modules honest
+# for "another unix"; they are not a supported build. A macOS lane needs a macOS build first (seccomp
+# made Linux-only) and a reason to keep it green (a shipped macOS artifact) — add all three or none.
 jobs:
   # Formatting compiles none of the project, so it returns in well under a minute — kept separate so
   # a formatting nit fails fast without waiting behind a compile.
@@ -210,6 +219,12 @@ jobs:
           tail -200 "$LOG"
           exit $status
         timeout-minutes: 12
+      # The ci profile retries a failed test once, so a green shard can hide a test that failed and
+      # then passed. Each such FLAKY test becomes a warning annotation and a count in the job summary
+      # (from nextest's JUnit report); it does not fail the job.
+      - name: report flaky tests
+        if: always()
+        run: python3 -I .github/scripts/flaky-report.py "${{ matrix.name }}" target/nextest/ci/junit.xml
       # Belt and braces: runs even if the step above somehow does not, and names anything still alive.
       - name: what was left running
         if: always()
@@ -228,6 +243,7 @@ jobs:
           path: |
             ${{ runner.temp }}/nextest.log
             ${{ runner.temp }}/resources.log
+            target/nextest/ci/junit.xml
           if-no-files-found: ignore
   # The gateway's concurrency-sensitive hermetic tests (reliability, billing, streaming,
   # cancellation, capture), run repeatedly with every core saturated by a CPU hog. Two real races
@@ -281,8 +297,11 @@ jobs:
           for i in $(seq "$STRESS_RUNS"); do
             echo "=== run $i/$STRESS_RUNS ===" >> "$LOG"
             start=$SECONDS
+            rm -f target/nextest/ci/junit.xml
             cargo nextest run --color never --profile ci -p beyond-ai -E "$STRESS_FILTER" >> "$LOG" 2>&1 </dev/null
             rc=$?
+            # Each run overwrites the JUnit report; keep one per run for the flaky report below.
+            cp target/nextest/ci/junit.xml "$RUNNER_TEMP/junit-$i.xml" 2>/dev/null
             echo "run $i/$STRESS_RUNS: exit $rc in $((SECONDS - start))s"
             [ "$rc" -ne 0 ] && status=$rc
           done
@@ -294,6 +313,13 @@ jobs:
           tail -100 "$LOG"
           exit $status
         timeout-minutes: 15
+      # As in `test`: a pass only on the retry is a warning annotation and a summary count, per run.
+      - name: report flaky tests
+        if: always()
+        run: |
+          reports=()
+          for i in $(seq "$STRESS_RUNS"); do reports+=("$RUNNER_TEMP/junit-$i.xml"); done
+          python3 -I .github/scripts/flaky-report.py "gateway-stress (${STRESS_RUNS} runs)" "${reports[@]}"
   # The release build is the long pole; running it alongside the others (not after them) is most of
   # the wall-clock win.
   build:

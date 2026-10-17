@@ -16,8 +16,10 @@ slow-timeout = { period = "60s", terminate-after = 3 }
 # instead of sitting on GitHub's pipe until the ~30m cancel that fails the required Check gate.
 global-timeout = "10m"
 # One retry absorbs a genuine one-off timing blip on a shared runner without reding the PR; a test that
-# fails (or hangs) on *every* attempt still fails, and nextest prints the retried test's name either
-# way — so a flaky hang is surfaced, not silently masked.
+# fails (or hangs) on *every* attempt still fails. A pass on the retry is FLAKY, and it must not read
+# as plain green: nextest records each failed attempt in the JUnit report below, and CI's
+# `.github/scripts/flaky-report.py` turns every one into a warning annotation and a count in the job
+# summary.
 retries = 1
 fail-fast = false
 # Cap concurrency. nextest defaults to one test thread per core, and an *agent* test is not one
@@ -30,6 +32,10 @@ fail-fast = false
 # ~0.3 GB and ~80 tasks on a 16 GB runner, so memory does not explain the wedge; CI's `test` step now
 # runs nextest in a systemd unit with MemoryMax/TasksMax/RuntimeMaxSec (see ci.yml).
 test-threads = 4
+
+[profile.ci.junit]
+# target/nextest/ci/junit.xml — read by `.github/scripts/flaky-report.py` (see `retries` above).
+path = "junit.xml"
 
 [profile.deep]
 # The weekly property run (.github/workflows/deep.yml) at PROPTEST_CASES=100000 with PROPS_SECS=5400:

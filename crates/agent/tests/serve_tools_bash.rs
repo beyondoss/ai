@@ -379,8 +379,17 @@ fn serve_bash_rpc_command_is_blocked_by_deny_bash_pattern() {
 #[test]
 #[cfg(unix)]
 fn serve_bash_shell_path_overrides_the_auto_resolved_shell() {
-    if !std::path::Path::new("/bin/sh").exists() {
+    // The proof is that `/bin/sh` is *not* bash. That holds where it is dash (Debian, Ubuntu) or
+    // busybox (Alpine), but on Fedora and Arch `/bin/sh` is bash itself, which sets `$BASH_VERSION`
+    // even when invoked as `sh` — there it proves nothing, so skip rather than fail.
+    let Ok(sh) = std::fs::canonicalize("/bin/sh") else {
         return; // no alternate shell on this host to prove the override actually took effect
+    };
+    if sh
+        .file_name()
+        .is_some_and(|n| n.to_string_lossy().contains("bash"))
+    {
+        return;
     }
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
@@ -392,7 +401,7 @@ fn serve_bash_shell_path_overrides_the_auto_resolved_shell() {
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = common::child_frames(&mut child);
 
-    // `$BASH_VERSION` is set only by bash itself; `/bin/sh` on this host is dash, which leaves it
+    // `$BASH_VERSION` is set only by bash itself; `/bin/sh` here is not bash (checked above), so it is
     // unset — the POSIX `${VAR:-default}` expansion below works identically under both, so the
     // *value* it prints is the only thing that can differ.
     writeln!(
