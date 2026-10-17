@@ -3,18 +3,15 @@
 //! into `rmcp`'s own [`CredentialStore`] trait so a login (and every later token refresh) persists
 //! across process restarts, the same way `AuthStore` (`auth_store.rs`) does for model-provider OAuth.
 //!
-//! Same on-disk pattern as `auth_store.rs`/`trust_store.rs`/`settings.rs`: own small [`FileLock`],
-//! atomic writes (`crate::tools::write_atomic`), re-read-under-lock-before-mutate so two concurrent
-//! writers (an `agent mcp-login` for one server racing a token refresh for another, say) can't clobber
-//! each other — deliberately not sharing code with any of the other three stores, matching their own
-//! stated convention (each is small and self-contained; there's no shared abstraction worth extracting
-//! for a handful of lines of file-locking boilerplate).
+//! Same on-disk pattern as `auth_store.rs`/`trust_store.rs`/`settings.rs`: the kernel lock all four
+//! share (`crate::file_lock::lock_store_file`), atomic writes (`crate::tools::write_atomic`),
+//! re-read-under-lock-before-mutate so two concurrent writers (an `agent mcp-login` for one server
+//! racing a token refresh for another, say) can't clobber each other.
 
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime};
 
 use rmcp::transport::auth::{AuthError, CredentialStore, StoredCredentials};
 
@@ -161,7 +158,7 @@ fn write_store_file(path: &Path, store: &OnDisk) -> std::io::Result<()> {
     let path_str = path
         .to_str()
         .ok_or_else(|| std::io::Error::other(format!("non-UTF-8 path: {}", path.display())))?;
-    crate::tools::write_atomic(path_str, body.as_bytes())?;
+    crate::tools::write_atomic_durable(path_str, body.as_bytes())?;
     // Belt-and-suspenders on top of the atomic-at-creation `0600`: `write_atomic` only ever copies an
     // existing file's mode forward, never re-asserts one, so a file loosened out-of-band (a stray
     // `chmod`, a restore from backup) would stay that way forever. Re-assert `0600` after every write
@@ -204,82 +201,11 @@ fn set_private(path: &Path) -> std::io::Result<()> {
 /// it — see `settings.rs::SettingsStore::mutate_locked`'s identical reasoning (a login for one server
 /// and a token refresh for another must not race and silently clobber each other).
 fn mutate_locked(path: &Path, mutate: impl FnOnce(&mut OnDisk)) -> std::io::Result<()> {
-    let _lock = FileLock::acquire(path)?;
+    let _lock = crate::file_lock::lock_store_file(path)?;
     let mut store = read_store_file(path);
     mutate(&mut store);
     write_store_file(path, &store)
 }
-
-const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
-const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(20);
-const STALE_LOCK_AGE: Duration = Duration::from_secs(10);
-
-/// A cross-process advisory lock via atomic lockfile creation — see
-/// `trust_store.rs::FileLock`/`settings.rs::FileLock`'s identical pattern, duplicated here rather than
-/// shared (see this module's own doc comment for why).
-struct FileLock {
-    path: PathBuf,
-}
-
-impl FileLock {
-    fn acquire(store_path: &Path) -> std::io::Result<Self> {
-        let lock_path = lock_path_for(store_path);
-        if let Some(parent) = lock_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let deadline = Instant::now() + LOCK_TIMEOUT;
-        loop {
-            match fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&lock_path)
-            {
-                Ok(_) => return Ok(Self { path: lock_path }),
-                Err(e) if e.kind() == ErrorKind::AlreadyExists => {
-                    if is_stale(&lock_path) {
-                        let _ = fs::remove_file(&lock_path);
-                        continue;
-                    }
-                    if Instant::now() >= deadline {
-                        return Err(std::io::Error::new(
-                            ErrorKind::TimedOut,
-                            format!(
-                                "timed out waiting for mcp auth store lock at {}",
-                                lock_path.display()
-                            ),
-                        ));
-                    }
-                    std::thread::sleep(LOCK_RETRY_INTERVAL);
-                }
-                Err(e) => return Err(e),
-            }
-        }
-    }
-}
-
-impl Drop for FileLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
-}
-
-fn is_stale(lock_path: &Path) -> bool {
-    fs::metadata(lock_path)
-        .and_then(|m| m.modified())
-        .and_then(|modified| {
-            SystemTime::now()
-                .duration_since(modified)
-                .map_err(std::io::Error::other)
-        })
-        .is_ok_and(|age| age > STALE_LOCK_AGE)
-}
-
-fn lock_path_for(store_path: &Path) -> PathBuf {
-    let mut os = store_path.as_os_str().to_owned();
-    os.push(".lock");
-    PathBuf::from(os)
-}
-
 fn default_path() -> PathBuf {
     config_dir_root().join("mcp_auth.json")
 }
@@ -296,6 +222,24 @@ mod tests {
 
     fn fake_credential(client_id: &str) -> StoredCredentials {
         StoredCredentials::new(client_id.to_string(), None, vec![], None)
+    }
+
+    /// What a writer that crashed while holding the lock leaves behind — the old protocol's
+    /// `<file>.lock`, fresh, and an unheld lock file of the current one — does not block the next
+    /// write. (The old lock made every write fail with `TimedOut` until that file aged out.)
+    #[test]
+    fn a_lock_left_by_a_crashed_writer_does_not_block_the_next_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_at(dir.path());
+        fs::write(dir.path().join("mcp_auth.json.lock"), b"").unwrap();
+        fs::write(dir.path().join("mcp_auth.json.beyond-lock"), b"").unwrap();
+        let started = std::time::Instant::now();
+        mutate_locked(&store.path, |s| {
+            s.0.insert("fixture".to_string(), fake_credential("client-1"));
+        })
+        .unwrap();
+        assert!(store.has_credential("fixture"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 
     #[tokio::test]

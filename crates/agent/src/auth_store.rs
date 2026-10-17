@@ -1,9 +1,8 @@
 //! Local storage for OAuth/subscription credentials (`~/.claude/auth.json` by default) — the Rust
 //! analog of pi's own `auth.json`, holding what `crate::oauth`'s login/refresh flows produce.
 //!
-//! Same shape family as [`crate::settings`]/[`crate::trust_store`]: a flat JSON file, a hand-rolled
-//! cross-process [`FileLock`] duplicated (not shared) into this file — matching this codebase's own
-//! established convention that each store is small and self-contained — and a `mutate_locked`
+//! Same shape family as [`crate::settings`]/[`crate::trust_store`]: a flat JSON file, the kernel lock
+//! all the stores share ([`crate::file_lock::lock_store_file`]), and a `mutate_locked`
 //! re-read-fresh-under-lock discipline so two concurrent `agent` processes (a real, common pattern
 //! for this tool) never silently clobber each other's write.
 //!
@@ -16,7 +15,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroize;
@@ -42,8 +41,8 @@ pub struct StoredCredential {
 /// drop — but, unlike `agent_core::client::ApiKey` (never serialized) or `beyond-gateway::Secret`
 /// (redacts on serialize), round-trips its real value through `serde`. This store's whole job is to
 /// persist the real value to disk; a redacting `Serialize` would defeat that, and duplicating either
-/// existing type doesn't fit either shape. Same duplication convention as `FileLock` below: a small,
-/// self-contained type for the one field shape that needs it here.
+/// existing type doesn't fit either shape: a small, self-contained type for the one field shape that
+/// needs it here.
 #[derive(Clone)]
 pub struct Secret(String);
 
@@ -259,7 +258,7 @@ impl AuthStore {
         provider: &str,
         refresh: impl FnOnce(&OAuthCredential) -> std::result::Result<OAuthCredential, String>,
     ) -> std::result::Result<OAuthCredential, AuthError> {
-        let _lock = FileLock::acquire(&self.path)?;
+        let _lock = crate::file_lock::lock_store_file(&self.path)?;
         let mut credentials = read_store_file(&self.path);
         let Some(stored) = credentials.get(provider) else {
             self.credentials = credentials;
@@ -304,7 +303,7 @@ impl AuthStore {
         &mut self,
         mutate: impl FnOnce(&mut BTreeMap<String, StoredCredential>) -> bool,
     ) -> io::Result<()> {
-        let _lock = FileLock::acquire(&self.path)?;
+        let _lock = crate::file_lock::lock_store_file(&self.path)?;
         let mut credentials = read_store_file(&self.path);
         let changed = mutate(&mut credentials);
         if changed {
@@ -403,7 +402,7 @@ fn write_store_file(
     let path_str = path
         .to_str()
         .ok_or_else(|| io::Error::other(format!("non-UTF-8 path: {}", path.display())))?;
-    crate::tools::write_atomic(path_str, body.as_bytes())?;
+    crate::tools::write_atomic_durable(path_str, body.as_bytes())?;
     // Belt-and-suspenders, on top of the atomic-at-creation `0600` above: `write_atomic` only ever
     // *preserves* whatever permission bits the file already had (it copies an existing file's mode
     // onto its replacement temp file before the rename), it never asserts one — so a file whose
@@ -447,81 +446,6 @@ fn create_private(path: &Path) -> io::Result<()> {
     }
     opts.open(path)?;
     Ok(())
-}
-
-/// How long [`FileLock::acquire`] retries before giving up.
-const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
-/// How long between retries while waiting for another process's lock.
-const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(20);
-/// A lock file older than this is assumed abandoned and is forcibly reclaimed instead of blocking
-/// every future auth operation indefinitely.
-const STALE_LOCK_AGE: Duration = Duration::from_secs(10);
-
-/// A cross-process advisory lock via atomic lockfile creation — duplicated from
-/// `trust_store.rs`/`settings.rs` rather than shared, matching this codebase's own established
-/// convention that each store's lock is small and self-contained. Released by deleting the lock file
-/// on `Drop`, so a panicked or early-returning holder still releases it.
-struct FileLock {
-    path: PathBuf,
-}
-
-impl FileLock {
-    fn acquire(store_path: &Path) -> io::Result<Self> {
-        let lock_path = lock_path_for(store_path);
-        if let Some(parent) = lock_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let deadline = Instant::now() + LOCK_TIMEOUT;
-        loop {
-            match fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&lock_path)
-            {
-                Ok(_) => return Ok(Self { path: lock_path }),
-                Err(e) if e.kind() == ErrorKind::AlreadyExists => {
-                    if is_stale(&lock_path) {
-                        let _ = fs::remove_file(&lock_path);
-                        continue;
-                    }
-                    if Instant::now() >= deadline {
-                        return Err(io::Error::new(
-                            ErrorKind::TimedOut,
-                            format!(
-                                "timed out waiting for auth store lock at {}",
-                                lock_path.display()
-                            ),
-                        ));
-                    }
-                    std::thread::sleep(LOCK_RETRY_INTERVAL);
-                }
-                Err(e) => return Err(e),
-            }
-        }
-    }
-}
-
-impl Drop for FileLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
-}
-
-fn is_stale(lock_path: &Path) -> bool {
-    fs::metadata(lock_path)
-        .and_then(|m| m.modified())
-        .and_then(|modified| {
-            SystemTime::now()
-                .duration_since(modified)
-                .map_err(io::Error::other)
-        })
-        .is_ok_and(|age| age > STALE_LOCK_AGE)
-}
-
-fn lock_path_for(store_path: &Path) -> PathBuf {
-    let mut os = store_path.as_os_str().to_owned();
-    os.push(".lock");
-    PathBuf::from(os)
 }
 
 /// The default store path (`~/.claude/auth.json`, or `$AI_AGENT_CONFIG_DIR/auth.json`) — public so a
@@ -759,17 +683,15 @@ mod tests {
         }
     }
 
+    /// What a writer that crashed while holding the lock leaves behind — the old protocol's
+    /// `<file>.lock`, fresh, and an unheld lock file of the current one — does not block the next
+    /// write. (The old lock made every write fail with `TimedOut` until that file aged out.)
     #[test]
-    fn a_stale_lock_file_is_reclaimed_rather_than_blocking_forever() {
+    fn a_lock_left_by_a_crashed_writer_does_not_block_the_next_write() {
         let dir = tempfile::tempdir().unwrap();
         let store_path = dir.path().join("auth.json");
-        let lock_path = lock_path_for(&store_path);
-        fs::write(&lock_path, b"").unwrap();
-        let stale = SystemTime::now() - (STALE_LOCK_AGE + Duration::from_secs(1));
-        fs::File::open(&lock_path)
-            .unwrap()
-            .set_modified(stale)
-            .unwrap();
+        fs::write(dir.path().join("auth.json.lock"), b"").unwrap();
+        fs::write(dir.path().join("auth.json.beyond-lock"), b"").unwrap();
 
         let mut store = AuthStore::open(store_path);
         store.set("anthropic", anthropic_cred("a", 1)).unwrap();
