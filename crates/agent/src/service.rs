@@ -212,7 +212,11 @@ pub fn authorize(
             "the session grant's workspace root must be absolute",
         ));
     }
-    if !grant.mcp.iter().all(|c| is_safe_segment(&c.name)) {
+    // A connector name is the `<server>` in `mcp__<server>__<tool>`: one that can't be split back out
+    // of it (`a__b`) would credit its tools to another connector.
+    if !grant.mcp.iter().all(|c| {
+        is_safe_segment(&c.name) && crate::tools::mcp::server_name_error(&c.name).is_none()
+    }) {
         return Err(Refusal::BadRequest(
             "a session grant connector name is invalid",
         ));

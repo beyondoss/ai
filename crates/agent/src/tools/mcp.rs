@@ -623,16 +623,119 @@ impl McpEnabledSet {
 /// The prefix every MCP-discovered tool's registered name carries — `mcp__<server>__<tool>` — so it
 /// can never collide with a built-in tool. Matches the convention Claude Code itself uses for the
 /// identical problem.
+///
+/// The name is what the model sees and calls, so it must be one every provider accepts: Anthropic and
+/// OpenAI both require `^[a-zA-Z0-9_-]{1,64}$`, and one bad name in the tool list fails *every* turn.
+/// Servers name things freely (`Resource 1`, `README.md`, `"users" database schema`), so each
+/// character outside that set becomes `_`, and a name past [`MAX_TOOL_NAME`] keeps its
+/// `mcp__<server>__` prefix and is cut short with a hash of the remote name, so it stays stable and
+/// distinct. The remote name the server knows is kept beside the registered one
+/// (`McpTool::remote_name`, `McpResourceTool::uri`, `McpPromptTool::prompt_name`) — a call never
+/// parses it back out of the registered name. Two remote names that normalise alike are a
+/// collision: the second is skipped with a warning ([`RegisteredNames`]).
 pub(crate) fn registered_name(server: &str, remote_tool: &str) -> String {
-    format!("mcp__{server}__{remote_tool}")
+    registered(server, "", remote_tool)
 }
 
 fn registered_resource_name(server: &str, resource_name: &str) -> String {
-    format!("mcp__{server}__resource__{resource_name}")
+    registered(server, "resource__", resource_name)
 }
 
 fn registered_prompt_name(server: &str, prompt_name: &str) -> String {
-    format!("mcp__{server}__prompt__{prompt_name}")
+    registered(server, "prompt__", prompt_name)
+}
+
+/// The longest tool name Anthropic and OpenAI accept.
+const MAX_TOOL_NAME: usize = 64;
+
+/// The longest server name accepted: `mcp__` + 32 + `__` + `resource__` still leaves room for a few
+/// characters of the remote name and its hash suffix inside [`MAX_TOOL_NAME`].
+const MAX_SERVER_NAME: usize = 32;
+
+/// `_` and eight hex digits.
+const HASH_SUFFIX: usize = 9;
+
+fn registered(server: &str, kind: &str, remote: &str) -> String {
+    let valid = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-';
+    let mut name = String::with_capacity(MAX_TOOL_NAME);
+    name.push_str("mcp__");
+    // A configured server's name is already valid ([`server_name_error`]); mapping it anyway keeps
+    // the name ASCII, so the byte-indexed cut below can never split a character.
+    name.extend(server.chars().map(|c| if valid(c) { c } else { '_' }));
+    name.push_str("__");
+    name.push_str(kind);
+    name.extend(remote.chars().map(|c| if valid(c) { c } else { '_' }));
+    if name.len() > MAX_TOOL_NAME {
+        name.truncate(MAX_TOOL_NAME - HASH_SUFFIX);
+        name.push_str(&format!("_{:08x}", fnv1a(remote.as_bytes())));
+    }
+    name
+}
+
+/// FNV-1a (32-bit): a hash fixed by its definition, so a registered name is the same in every build
+/// and every process — a transcript written by one names the tools the next registers.
+fn fnv1a(bytes: &[u8]) -> u32 {
+    bytes.iter().fold(0x811c_9dc5_u32, |h, &b| {
+        (h ^ u32::from(b)).wrapping_mul(0x0100_0193)
+    })
+}
+
+/// Why `name` cannot name an MCP server, or `None` if it can.
+///
+/// A server's name is the `<server>` in `mcp__<server>__<tool>`, read back by splitting on the first
+/// `__` ([`server_name_from_registered`]), so it must not contain `__` or start or end with `_` —
+/// otherwise server `a__b`'s tool `c` and server `a`'s tool `b__c` are one name, and the enable
+/// switches and the skills gate credit the wrong server. It must also be a valid tool-name fragment,
+/// and short enough to leave the tool's own name room ([`MAX_SERVER_NAME`]).
+pub fn server_name_error(name: &str) -> Option<&'static str> {
+    if name.is_empty() {
+        Some("an MCP server name must not be empty")
+    } else if name.len() > MAX_SERVER_NAME {
+        Some("an MCP server name must be at most 32 characters")
+    } else if !name
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        Some("an MCP server name may contain only ASCII letters, digits, `_` and `-`")
+    } else if name.contains("__") || name.starts_with('_') || name.ends_with('_') {
+        Some("an MCP server name must not contain `__` or start or end with `_`")
+    } else {
+        None
+    }
+}
+
+/// The registered names one server has handed out, so two remote names that normalise to the same
+/// registered name ([`registered_name`]) never shadow each other: the first keeps it, every later
+/// one is skipped with a warning.
+struct RegisteredNames<'a> {
+    server: &'a str,
+    taken: std::collections::HashSet<String>,
+}
+
+impl<'a> RegisteredNames<'a> {
+    /// `skills`: the server serves skills, so its skill-loading tool's name is taken before any
+    /// remote name can claim it.
+    fn new(server: &'a str, skills: bool) -> Self {
+        let mut taken = std::collections::HashSet::new();
+        if skills {
+            taken.insert(crate::tools::mcp_skills::tool_name(server));
+        }
+        Self { server, taken }
+    }
+
+    /// `name`, unless an earlier entry took it.
+    fn claim(&mut self, name: String, remote: &str) -> Option<String> {
+        if self.taken.insert(name.clone()) {
+            return Some(name);
+        }
+        tracing::warn!(
+            server = %self.server,
+            remote = %remote,
+            registered = %name,
+            "two MCP names normalise to the same tool name; skipping the later one"
+        );
+        None
+    }
 }
 
 /// Inverse of [`registered_name`]: `mcp__filesystem__read_file` → `Some("filesystem")`.
@@ -2202,7 +2305,9 @@ async fn connect_many(
                     "failed to connect to MCP server; its tools will not be available"
                 );
                 warnings.push(format!("mcp server `{name}`: {e}"));
-                if let Some((config, dial)) = jobs.iter().find(|(c, _)| c.name == name) {
+                if server_name_error(&name).is_none()
+                    && let Some((config, dial)) = jobs.iter().find(|(c, _)| c.name == name)
+                {
                     unconnected.insert(
                         name.clone(),
                         Arc::new(McpConnection::dormant(
@@ -2228,10 +2333,14 @@ async fn connect_each(
     idle_reap_after: Duration,
     manifest_dir: Option<&crate::tools::mcp_manifest::ManifestDir>,
 ) -> Vec<ServerConnect> {
-    let results = futures::future::join_all(
-        jobs.iter()
-            .map(|(config, dial)| connect_one(config, dial, idle_reap_after, manifest_dir)),
-    )
+    let results = futures::future::join_all(jobs.iter().map(|(config, dial)| async move {
+        // A name that can't be split back out of `mcp__<server>__<tool>` is refused before anything
+        // is dialed: its tools would be misattributed, or rejected by the provider on every turn.
+        if let Some(why) = server_name_error(&config.name) {
+            return Err(why.to_string());
+        }
+        connect_one(config, dial, idle_reap_after, manifest_dir).await
+    }))
     .await;
     jobs.iter()
         .map(|(config, _)| config.name.clone())
@@ -2314,19 +2423,23 @@ fn tools_from_manifest(
                 .filter_map(|r| r.size.map(|size| (r.uri.clone(), size))),
         )
     });
+    let mut names = RegisteredNames::new(&config.name, manifest.skills.is_some());
     let mut tools: Vec<Arc<dyn Tool>> = manifest
         .tools
         .into_iter()
         .filter(|t| t.ui.as_ref().is_none_or(|ui| ui.model_visible()))
-        .map(|t| {
-            Arc::new(McpTool {
-                name: registered_name(&config.name, &t.remote_name),
+        .filter_map(|t| {
+            Some(Arc::new(McpTool {
+                name: names.claim(
+                    registered_name(&config.name, &t.remote_name),
+                    &t.remote_name,
+                )?,
                 description: t.description,
                 input_schema: t.input_schema,
                 remote_name: t.remote_name,
                 server_name: config.name.clone(),
                 conn: conn.clone(),
-            }) as Arc<dyn Tool>
+            }) as Arc<dyn Tool>)
         })
         .collect();
 
@@ -2336,7 +2449,12 @@ fn tools_from_manifest(
         if crate::tools::mcp_apps::is_ui_uri(&resource.uri) {
             continue;
         }
-        let tool_name = registered_resource_name(&config.name, &resource.name);
+        let Some(tool_name) = names.claim(
+            registered_resource_name(&config.name, &resource.name),
+            &resource.name,
+        ) else {
+            continue;
+        };
         resource_infos.push(McpResourceInfo {
             uri: resource.uri.clone(),
             name: resource.name.clone(),
@@ -2354,7 +2472,12 @@ fn tools_from_manifest(
 
     let mut prompt_infos = Vec::with_capacity(manifest.prompts.len());
     for prompt in manifest.prompts {
-        let tool_name = registered_prompt_name(&config.name, &prompt.name);
+        let Some(tool_name) = names.claim(
+            registered_prompt_name(&config.name, &prompt.name),
+            &prompt.name,
+        ) else {
+            continue;
+        };
         prompt_infos.push(McpPromptInfo {
             name: prompt.name.clone(),
             description: Some(prompt.description.clone()).filter(|d| !d.is_empty()),
@@ -3270,6 +3393,7 @@ async fn tools_from_client(
                 .filter_map(|r| r.size.map(|size| (r.uri.clone(), size))),
         )
     });
+    let mut names = RegisteredNames::new(&config.name, skill_listing.is_some());
     let mut tools: Vec<Arc<dyn Tool>> = remote_tools
         .into_iter()
         // Spec: "Host MUST NOT include tools in the agent's tool list when their visibility does not
@@ -3278,7 +3402,11 @@ async fn tools_from_client(
             crate::tools::mcp_apps::ToolUi::from_meta(t.meta.as_deref())
                 .is_none_or(|ui| ui.model_visible())
         })
-        .map(|remote_tool| {
+        .filter_map(|remote_tool| {
+            let name = names.claim(
+                registered_name(&config.name, &remote_tool.name),
+                &remote_tool.name,
+            )?;
             let description = remote_tool
                 .description
                 .as_deref()
@@ -3290,14 +3418,14 @@ async fn tools_from_client(
                         remote_tool.name, config.name
                     )
                 });
-            Arc::new(McpTool {
-                name: registered_name(&config.name, &remote_tool.name),
+            Some(Arc::new(McpTool {
+                name,
                 description,
                 input_schema: remote_tool.schema_as_json_value(),
                 remote_name: remote_tool.name.into_owned(),
                 server_name: config.name.clone(),
                 conn: conn.clone(),
-            }) as Arc<dyn Tool>
+            }) as Arc<dyn Tool>)
         })
         .collect();
 
@@ -3307,7 +3435,12 @@ async fn tools_from_client(
         if crate::tools::mcp_apps::is_ui_uri(&resource.uri) {
             continue;
         }
-        let tool_name = registered_resource_name(&config.name, &resource.name);
+        let Some(tool_name) = names.claim(
+            registered_resource_name(&config.name, &resource.name),
+            &resource.name,
+        ) else {
+            continue;
+        };
         let description = resource
             .description
             .clone()
@@ -3335,7 +3468,12 @@ async fn tools_from_client(
 
     let mut prompt_infos = Vec::new();
     for prompt in &remote_prompts {
-        let tool_name = registered_prompt_name(&config.name, &prompt.name);
+        let Some(tool_name) = names.claim(
+            registered_prompt_name(&config.name, &prompt.name),
+            &prompt.name,
+        ) else {
+            continue;
+        };
         let description = prompt
             .description
             .clone()
@@ -3455,6 +3593,131 @@ mod tests {
         assert_eq!(server_name_from_registered("bash"), None);
         assert_eq!(server_name_from_registered("mcp__"), None);
         assert_eq!(server_name_from_registered("mcp__only"), None);
+    }
+
+    /// What Anthropic and OpenAI accept for a tool name: `^[a-zA-Z0-9_-]{1,64}$`.
+    fn provider_valid(name: &str) -> bool {
+        (1..=64).contains(&name.len())
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    }
+
+    /// Names real servers advertise: server-postgres's schema resources, server-everything's
+    /// `Resource 1`, the TypeScript SDK's `README.md`, and a 47-character Atlassian tool.
+    #[test]
+    fn real_world_names_normalise_to_names_every_provider_accepts() {
+        let cases = [
+            registered_resource_name("postgres", "\"users\" database schema"),
+            registered_resource_name("everything", "Resource 1"),
+            registered_resource_name("docs", "README.md"),
+            registered_resource_name("docs", "Project README.md"),
+            registered_prompt_name("everything", "complex prompt"),
+            registered_name("atlassian", "getConfluencePageDescendantsWithMetadata"),
+            registered_name(
+                "atlassian-confluence",
+                "getConfluencePageDescendantsWithMetadata",
+            ),
+            registered_resource_name(
+                "a-thirty-two-character-server-n",
+                "a very long resource name that runs well past the limit",
+            ),
+            registered_name("s", "ünïcödé/tool"),
+        ];
+        for name in &cases {
+            assert!(provider_valid(name), "{name:?} ({} bytes)", name.len());
+        }
+        assert_eq!(cases[0], "mcp__postgres__resource___users__database_schema");
+        assert_eq!(cases[2], "mcp__docs__resource__README_md");
+        // Valid names are left exactly as they were.
+        assert_eq!(
+            registered_name("github", "list_issues"),
+            "mcp__github__list_issues"
+        );
+    }
+
+    /// A name past 64 keeps its server prefix (so the enable switches still find it) and is told
+    /// apart from its neighbours by a stable hash of the remote name.
+    #[test]
+    fn a_long_name_is_cut_with_a_stable_hash_that_keeps_neighbours_apart() {
+        let long = "x".repeat(80);
+        let a = registered_name("atlassian-confluence", &format!("{long}A"));
+        let b = registered_name("atlassian-confluence", &format!("{long}B"));
+        assert_eq!(a.len(), 64);
+        assert_ne!(a, b, "two long names sharing a prefix must not collide");
+        assert_eq!(
+            server_name_from_registered(&a),
+            Some("atlassian-confluence")
+        );
+        assert_eq!(
+            a,
+            registered_name("atlassian-confluence", &format!("{long}A"))
+        );
+        let r = registered_resource_name("a-thirty-two-character-server-n", &long);
+        assert!(
+            r.starts_with("mcp__a-thirty-two-character-server-n__resource__"),
+            "{r}"
+        );
+        // Pinned: a transcript written today names the tool the next build registers.
+        assert_eq!(
+            registered_name("s", &"y".repeat(70)),
+            format!(
+                "mcp__s__{}_{:08x}",
+                "y".repeat(47),
+                fnv1a("y".repeat(70).as_bytes())
+            )
+        );
+        assert_eq!(fnv1a(b"a"), 0xe40c_292c);
+    }
+
+    /// `a__b`'s `c` and `a`'s `b__c` would be one registered name: a server name that can't be split
+    /// back out is refused.
+    #[test]
+    fn a_server_name_that_cannot_be_split_back_out_is_refused() {
+        for bad in [
+            "a__b",
+            "a_",
+            "_a",
+            "",
+            "my.server",
+            "my server",
+            &"s".repeat(33),
+        ] {
+            assert!(
+                server_name_error(bad).is_some(),
+                "{bad:?} should be refused"
+            );
+        }
+        for good in [
+            "github",
+            "atlassian-confluence",
+            "a_b",
+            "a-b-c",
+            &"s".repeat(32),
+        ] {
+            assert_eq!(server_name_error(good), None, "{good:?}");
+        }
+    }
+
+    /// Two remote names that normalise alike: the first listed keeps the name, the second is
+    /// skipped — never silently registered over the first. A skill server's loading tool is taken
+    /// before any remote name can claim it.
+    #[test]
+    fn colliding_normalised_names_keep_the_first_and_skip_the_rest() {
+        let mut names = RegisteredNames::new("s", true);
+        assert_eq!(
+            names.claim(registered_resource_name("s", "a b"), "a b"),
+            Some("mcp__s__resource__a_b".to_string())
+        );
+        assert_eq!(
+            names.claim(registered_resource_name("s", "a.b"), "a.b"),
+            None
+        );
+        assert_eq!(
+            names.claim(registered_name("s", "skill__read"), "skill__read"),
+            None
+        );
+        assert!(names.claim(registered_name("s", "a.b"), "a.b").is_some());
     }
 
     #[test]

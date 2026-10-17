@@ -230,6 +230,19 @@ async fn claims_that_are_not_the_right_shape_are_a_bad_request() {
                 c.mcp = vec![("../evil".into(), "https://example.invalid/mcp".into())]
             }),
         ),
+        (
+            // `mcp__a__b__c` would be both `a__b`'s tool `c` and `a`'s tool `b__c`.
+            "a connector name with a double underscore",
+            Box::new(|c: &mut Claims| {
+                c.mcp = vec![("a__b".into(), "https://example.invalid/mcp".into())]
+            }),
+        ),
+        (
+            "a connector name that is not a tool-name fragment",
+            Box::new(|c: &mut Claims| {
+                c.mcp = vec![("my.server".into(), "https://example.invalid/mcp".into())]
+            }),
+        ),
     ];
     for (what, edit) in cases {
         let token = svc.token_with("t1", "s1.alpha", edit);

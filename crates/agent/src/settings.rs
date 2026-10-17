@@ -1363,7 +1363,9 @@ pub fn model_overrides_path() -> PathBuf {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct McpServerConfig {
     /// This server's name. Local-only (the registration prefix, and any connect-failure warning) —
-    /// never sent over the wire to the server itself.
+    /// never sent over the wire to the server itself. 1–32 of `[A-Za-z0-9_-]`, with no `__` and no
+    /// leading or trailing `_` (`tools::mcp::server_name_error`): anything else is skipped with a
+    /// warning, since the server must split back out of `mcp__<name>__<tool>`.
     pub name: String,
     #[serde(flatten)]
     pub transport: McpTransport,

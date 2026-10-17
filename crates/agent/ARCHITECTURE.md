@@ -2986,6 +2986,33 @@ Deferred (not v1): a disk/parse cache (ax's ~2 min) — the registry is rebuilt 
 tool-held cache would reset mid-session, the same gotcha `todo`/`structured_output` documented; revisit
 as host-owned. And JS rendering — ax doesn't either; static DOM only.
 
+## MCP tool names
+
+Every MCP tool, resource and prompt is registered as `mcp__<server>__<name>`,
+`mcp__<server>__resource__<name>` or `mcp__<server>__prompt__<name>` (`tools::mcp::registered_name`).
+That name is what the model sees and calls, and Anthropic and OpenAI both require
+`^[a-zA-Z0-9_-]{1,64}$` of it: one bad name in the tool list fails every turn, deferred or not (native
+deferred loading still sends the definition). Servers name things freely — server-postgres's
+`"users" database schema`, server-everything's `Resource 1`, the TypeScript SDK's `README.md` — so:
+
+- **Normalised.** Each character outside the set becomes `_`; valid names are untouched. A name past
+  64 keeps its `mcp__<server>__[kind__]` prefix, is cut to 55, and gets `_` plus an FNV-1a hash of the
+  remote name — fixed by definition, so a transcript names the same tool in every build.
+- **Never parsed back.** Each tool keeps the name the server knows beside the registered one
+  (`McpTool::remote_name`, the resource's URI, `McpPromptTool::prompt_name`; MCP Apps keeps a
+  registered → remote map), and calls go out under that.
+- **Collisions are skipped.** Two remote names that normalise alike (`get.file`, `get file`): the first
+  listed keeps the name, the rest are skipped with a warning; a skills server's
+  `mcp__<server>__skill__read` is taken first.
+- **Server names are checked** (`tools::mcp::server_name_error`): 1–32 of `[A-Za-z0-9_-]`, no `__`, not
+  starting or ending in `_`. The server is read back by splitting on the first `__`
+  (`server_name_from_registered`, used by the enable switches, tool search, Apps and the skills gate),
+  so `a__b`'s `c` and `a`'s `b__c` would otherwise be one name credited to the wrong server. A
+  configured server with a bad name is skipped with a warning before anything is dialed; a grant
+  connector with one is a 400.
+
+`tests/mcp_names.rs` drives the real names through `run`.
+
 ## Deferred MCP tools — tool search, no interpreter
 
 By default MCP tools are not sent to the model up front. Three typical servers (playwright 25 tools,
