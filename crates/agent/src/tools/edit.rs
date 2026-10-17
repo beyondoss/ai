@@ -1830,14 +1830,14 @@ mod tests {
     #[tokio::test]
     async fn a_syntactically_invalid_edits_json_string_falls_through_to_requiring_top_level_fields()
     {
-        // pi: edit-tool-legacy-input.test.ts, "leaves edits alone when the string is not valid JSON" —
-        // pi's `prepareArguments` passes a non-JSON `edits` string through unchanged, letting the
-        // ordinary schema validation reject it downstream. Ours parses inline (`parse_edits`): the
-        // `serde_json::from_str::<Value>(s).ok()` on a malformed string yields `None`, so `edits_value`
-        // is `None` too — the `arr` branch is skipped entirely, and (with no top-level `old_string`/
-        // `new_string` given either) this must fall through to the same generic "provide `edits`, or
-        // `old_string` and `new_string`" error as an outright missing `edits`, not a JSON-parse-error
-        // message that would leak `serde_json`'s own wording to the model.
+        // pi: edit-tool-legacy-input.test.ts, "leaves edits alone when the string is not valid
+        // JSON" — pi's `prepareArguments` passes a non-JSON `edits` string through unchanged,
+        // letting the ordinary schema validation reject it downstream. Ours parses inline
+        // (`agent_core::tool::edit_entries`): a malformed string yields `None` — the `arr` branch
+        // is skipped entirely, and (with no top-level `old_string`/`new_string` given either) this
+        // must fall through to the same generic "provide `edits`, or `old_string` and `new_string`"
+        // error as an outright missing `edits`, not a JSON-parse-error message that would leak
+        // `serde_json`'s own wording to the model.
         let f = write_tmp("foo and bar");
         let p = f.path().to_str().unwrap();
         let err = Edit::default()
@@ -2240,13 +2240,12 @@ mod tests {
 
     #[tokio::test]
     async fn a_fifo_is_rejected_immediately_instead_of_hanging_the_tool_call_forever() {
-        // Regression (pi-parity pass 20): `read_with_mtime`'s `std::fs::File::open(path)` (read-only)
-        // blocks forever on an existing FIFO with no writer on the other end — symmetric to the
-        // pre-fix `read` tool bug (see `reject_non_regular_file` in `tools/mod.rs`), and it runs
-        // *before* `run`'s own `is_writable` pre-check is even reached, so that check alone couldn't
-        // have caught it. `mkfifo x` then `edit path=x ...` reproduced this with two ordinary tool
-        // calls. `tokio::time::timeout` here is a *test* safety net, not the fix itself: if the gate
-        // ever regresses, this test fails fast in seconds instead of hanging CI indefinitely.
+        // Opening an existing FIFO with no writer on the other end blocks forever, so `edit` must
+        // refuse it on the kind its `stat` reports (`non_regular_file_error` in `tools/mod.rs`)
+        // before reading it — a writability check alone would come too late. `mkfifo x` then `edit
+        // path=x ...` reproduces the hang with two ordinary tool calls. `tokio::time::timeout` here
+        // is a *test* safety net, not the fix itself: if the gate ever regresses, this test fails
+        // fast in seconds instead of hanging CI indefinitely.
         let dir = tempfile::tempdir().unwrap();
         let fifo_path = dir.path().join("a.fifo");
         let status = std::process::Command::new("mkfifo")

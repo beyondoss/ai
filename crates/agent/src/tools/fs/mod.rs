@@ -1,7 +1,7 @@
 //! `FsBackend` — the seam between a filesystem tool and where its I/O actually lands.
 //!
 //! The tools in this crate were welded to the host: `read`/`write`/`edit`/`ls`/`grep`/`find` called
-//! `std::fs` directly, while `bash` and the `beyond` tools already went through
+//! `std::fs` directly, while `bash` already went through
 //! [`CommandRunner`](super::exec::CommandRunner) — the one place the crate admitted that "where does
 //! this run" is a decision worth naming. This module is that same admission for the other half.
 //!

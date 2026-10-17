@@ -2,7 +2,7 @@
 //!
 //! A [`Tool`] is a value; the agent is configured by registering tools in a [`ToolRegistry`]. This
 //! is the harness's primary extensibility point (Pi's Extensions/Skills/Tools): the core four
-//! (Read/Write/Edit/Bash) and the Beyond primitives (fork/sync/logs) are all just registered tools,
+//! (Read/Write/Edit/Bash) and everything else the harness offers are all just registered tools,
 //! and tests register a mock tool to exercise the loop without a real capability.
 
 use std::collections::{HashMap, HashSet};

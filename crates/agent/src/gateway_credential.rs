@@ -569,7 +569,7 @@ fn resolve_with(
         && store.get("anthropic").is_some()
     {
         // Gateway mode: no route override at all — relayed through the gateway, which knows Anthropic as
-        // a `KNOWN_PROVIDERS` row. Direct mode: the same OAuth token, sent straight to
+        // a `known_providers()` row. Direct mode: the same OAuth token, sent straight to
         // `api.anthropic.com`. The identity headers Anthropic's OAuth endpoint requires
         // (`claude-code`/`oauth` betas, the CLI user-agent) survive the route override because
         // `GatewayClient::stream` asks the routing *which provider it points at* rather than assuming
@@ -655,7 +655,7 @@ fn resolve_with(
     {
         // Bypasses the gateway entirely: GitHub hands back a *different* proxy host per
         // account/enterprise, embedded in the access token itself (`proxy-ep=…`) — not a
-        // static host the gateway's `KNOWN_PROVIDERS` table could ever hold as a row. See
+        // static host the gateway's `known_providers()` table could ever hold as a row. See
         // `RouteOverride::Direct`. Re-derived from the CURRENT token on every request by
         // `CopilotRoutedCredentialSource` itself (not computed here and frozen) — see that
         // type's own doc comment for why.
@@ -957,7 +957,7 @@ fn oauth_fallback_provider(
 ///
 /// **This only ever covers a `base_url`-carrying override.** A plain gateway-routed request (a
 /// `bai_v1…` virtual key, no override) genuinely has no client-visible signal of which
-/// `crates/gateway::route::KNOWN_PROVIDERS` row will actually serve it: the request forwards the model id
+/// `providers::gateway_providers()` row will actually serve it: the request forwards the model id
 /// verbatim to the gateway's bare-path default route (dialect-keyed, not provider-keyed —
 /// `agent_core::client::GatewayClient::stream`'s `None => format!("{}{}", self.base_url,
 /// dialect.endpoint_path())` branch), with no explicit `/{provider}/…` path segment, no `--provider`

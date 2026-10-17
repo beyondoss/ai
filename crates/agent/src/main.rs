@@ -573,7 +573,8 @@ enum Command {
         /// Permissions for the --listen-uds socket, in octal. Default `600`.
         #[usage(long, env = "AI_AGENT_LISTEN_UDS_MODE")]
         listen_uds_mode: Option<String>,
-        /// Stop a session with no client attached after this many seconds. Default 3600; `0` never.
+        /// Stop a session with no client attached after this many seconds. Default 3600 (60 with
+        /// --service); `0` never.
         #[usage(long, env = "AI_AGENT_SESSION_IDLE_TIMEOUT")]
         session_idle_timeout: Option<u64>,
         /// How sessions share connections to the gateway: `auto` (default), `off`, or `h2c`.
@@ -1969,8 +1970,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 //
                 // Worktree isolation isn't in this table because it isn't a flag: a subagent asks
                 // for it in its own `.claude/agents/*.md` (`isolation: worktree`). Service mode
-                // discovers no agent definitions at all, so nothing can request it, and the
-                // subagent PR refuses it explicitly when discovery lands.
+                // discovers those definitions in the sandbox and runs the worktree's `git` there
+                // (`worktree::Git::Remote`), so there is nothing to refuse.
                 let refused: [(&str, bool); 19] = [
                     ("--key", key.is_some()),
                     ("--session-file", session_file.is_some()),
@@ -3147,8 +3148,8 @@ fn looks_like_image(path: &Path) -> bool {
 /// `--block-images`/`--no-image-auto-resize` flags — explicit flag, then stored `agent settings`
 /// default, then built-in default, exactly like every other such flag) are threaded down to the
 /// `read` tool's own image pipeline for a CLI `@file` attachment, the same way `Agent::block_images`'s
-/// tool-dispatch gate and `default_registry_with_prefix_and_image_auto_resize` already do for a
-/// model-issued `read` tool call. Previously neither flag had any effect at all here: this call site
+/// tool-dispatch gate and `ToolConfig::image_auto_resize` already do for a model-issued `read` tool
+/// call. Previously neither flag had any effect at all here: this call site
 /// built a bare `tools::read::Read::default()` with no awareness of either, so a CLI attachment's
 /// images spliced straight into the first `Message` regardless of `--block-images`, at their original
 /// size regardless of `--no-image-auto-resize`.
@@ -3216,7 +3217,7 @@ async fn read_file_refs_with_home(
         if looks_like_image(&path) {
             let path_str = path.to_string_lossy().into_owned();
             // Tasks #35/#36: `with_image_auto_resize` matches the registry's own construction
-            // (`tools::default_registry_with_prefix_and_image_auto_resize`); `_model_supports_vision` is
+            // (`ToolConfig::image_auto_resize`); `_model_supports_vision` is
             // the same schema-undocumented input field `agent_core::agent`'s tool-dispatch loop injects
             // before a model-issued `read` call (see `Read::run`'s own doc comment) — reused here so
             // `--block-images` downgrades a CLI attachment through the exact same path (image dropped,
@@ -4931,10 +4932,11 @@ async fn run_task(
     timing.mark("build system prompt");
 
     // `--name`, applied uniformly across every path above (mirrors `serve`'s own startup check) —
-    // only for a genuinely fresh session (no messages, no title yet). `--continue`'s `resume_or_create`
-    // branch above mints its own fresh `SessionMeta` internally when no cwd match exists, bypassing the
-    // `fresh_meta` closure other branches use, so this was previously the one path `--name` silently
-    // never reached even when it *did* open a brand-new session.
+    // only for a genuinely fresh session (no messages, no title yet). `--continue`'s
+    // `resume_latest_or_create` branch above mints its own fresh `SessionMeta` internally when no
+    // cwd match exists, bypassing the `fresh_meta` closure other branches use, so this was
+    // previously the one path `--name` silently never reached even when it *did* open a brand-new
+    // session.
     if let Some(name) = &name
         && session.messages.is_empty()
         && let Some(store) = &mut store
@@ -5798,8 +5800,7 @@ mod tests {
     }
 
     /// `--help` is for someone running the command: what each flag does, in a line or two. Design
-    /// history and rationale belong in `crates/agent/ARCHITECTURE.md` ("CLI flags: rationale and
-    /// history"), not here.
+    /// rationale belongs in `crates/agent/ARCHITECTURE.md` ("CLI flags: rationale"), not here.
     #[test]
     fn help_is_short_user_facing_text() {
         let top = render_help(Cli::command(), true);

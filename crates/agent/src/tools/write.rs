@@ -263,12 +263,13 @@ mod tests {
     #[tokio::test]
     async fn a_fifo_is_rejected_immediately_instead_of_hanging_the_tool_call_forever() {
         // Regression (pi-parity pass 20): `is_writable`'s own `OpenOptions::write(true).open(path)`
-        // blocks forever on an existing FIFO with no reader on the other end — reproduced hanging 30+
-        // seconds in the original audit, with no timeout able to preempt it (the blocking syscall runs
-        // inline in the future's own `poll()`, not behind an `await` point). `mkfifo x` then `write
-        // path=x ...` reproduced this with two ordinary tool calls. `tokio::time::timeout` here is a
-        // *test* safety net, not the fix itself (see `reject_non_regular_file` in `tools/mod.rs`): if
-        // the gate ever regresses, this test fails fast in seconds instead of hanging CI indefinitely.
+        // blocks forever on an existing FIFO with no reader on the other end — reproduced hanging
+        // 30+ seconds, with no timeout able to preempt it (the blocking
+        // syscall runs inline in the future's own `poll()`, not behind an `await` point). `mkfifo
+        // x` then `write path=x ...` reproduced this with two ordinary tool calls.
+        // `tokio::time::timeout` here is a *test* safety net, not the fix itself (see
+        // `non_regular_file_error` in `tools/mod.rs`): if the gate ever regresses, this test fails
+        // fast in seconds instead of hanging CI indefinitely.
         let dir = tempfile::tempdir().unwrap();
         let fifo_path = dir.path().join("a.fifo");
         let status = std::process::Command::new("mkfifo")

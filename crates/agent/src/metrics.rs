@@ -141,8 +141,8 @@ pub struct Metrics {
     /// the count rather than on this. An operator sizing a task, or explaining an OOM, needs both
     /// numbers and previously had only one.
     pub runs_in_flight: IntGauge,
-    /// Sessions spawned since boot. With `sessions_ended_total` this gives churn, which is what
-    /// separates "20,000 steady sessions" from "20,000 sessions a minute".
+    /// Sessions spawned since boot. With `agent_sessions_ended_total` this gives churn, which is
+    /// what separates "20,000 steady sessions" from "20,000 sessions a minute".
     pub sessions_spawned: IntCounter,
     sessions_ended: IntCounterVec,
 

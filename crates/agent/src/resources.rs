@@ -15,10 +15,10 @@ use crate::skills::{self, Skill};
 
 /// The agent's base identity/instructions. The tool list is generated from `registry` — the tools this
 /// process actually registered, after any `--tools`/`--exclude-tools`/`--no-tools` filtering — rather
-/// than hand-listed as a static string or assumed to be the full default set. A prior hardcoded version
-/// silently omitted the Beyond platform tools (fork/sync/logs) entirely, and a version that always
-/// listed `default_registry()` regardless of filtering would claim tools a restricted agent doesn't
-/// actually have, inviting the model to call one that gets rejected.
+/// than hand-listed as a static string or assumed to be the full default set. A hardcoded list
+/// drifts from what is registered, and one that always listed `default_registry()` regardless of
+/// filtering would claim tools a restricted agent doesn't actually have, inviting the model to call
+/// one that gets rejected.
 ///
 /// `extra_guidelines` are operator-supplied bullets (`--prompt-guideline`, repeatable) appended after
 /// the built-in ones — pi's own `promptGuidelines` (deduplicated and trimmed, matching pi's

@@ -639,18 +639,13 @@ pub struct ServeConfig {
     /// `build_gateway_client` never called `GatewayClient::with_idle_timeout`.
     pub idle_timeout_ms: Option<u64>,
     /// Force every image down the same downgrade-to-text-placeholder path a vision-incapable model
-    /// already gets, regardless of the active model's real `supports_vision` capability — Task #34
-    /// (pi-parity fix): `run`'s identical `--block-images`/`agent settings --block-images` (see
-    /// `main.rs::run_task`'s own `Agent::with_block_images` call site) previously had no `serve`
-    /// counterpart at all. Threaded to `Agent::with_block_images` in `build_agent`.
+    /// already gets, regardless of the active model's real `supports_vision` capability — `run`'s
+    /// identical `--block-images`/`settings --block-images`. Threaded to `Agent::with_block_images`
+    /// in `build_agent`.
     pub block_images: bool,
-    /// Whether `read` downscales/re-encodes an oversized image to fit the inline size budget — Task #34
-    /// (pi-parity fix): `run`'s identical `--image-auto-resize`/`agent settings --image-auto-resize`
-    /// (see `main.rs::run_task`'s own `default_registry_with_prefix_and_image_auto_resize` call site)
-    /// previously had no `serve` counterpart at all — `build_tools` always called the `image_auto_resize`
-    /// registry constructor with a hardcoded `true`, so `--no-image-auto-resize`/`agent settings
-    /// --image-auto-resize false` had no effect on a `serve` process. Threaded to
-    /// `tools::default_registry_with_prefix_and_image_auto_resize` in `build_tools`.
+    /// Whether `read` downscales/re-encodes an oversized image to fit the inline size budget —
+    /// `run`'s identical `--no-image-auto-resize`/`settings --image-auto-resize`. Threaded to
+    /// `ToolConfig::image_auto_resize` in `build_tools`.
     pub image_auto_resize: bool,
     /// Run `bash` commands through this shell instead of the auto-resolved one (`/bin/bash`, else
     /// `bash` on `$PATH`, else `sh`). Already validated to exist by the time it reaches here (see
@@ -2028,12 +2023,13 @@ impl Persistence {
     /// `on_progress(scanned, total)` is invoked once per file as the scan completes it — see
     /// [`SessionRepo::list_with_progress`](crate::session_store::SessionRepo::list_with_progress).
     ///
-    /// Filtered to `self.meta.cwd` — the exact match [`SessionRepo::resume_or_create`] already applies
-    /// when reattaching at startup. A no-op under the default per-cwd repo directory (every session
-    /// there already shares this cwd, by construction — see `default_session_dir`), but load-bearing
-    /// under an explicit `--session-dir` shared across projects: Track L28 (pi-parity fix) — this used
-    /// to return every session in the directory unfiltered, so a shared `--session-dir` leaked another
-    /// project's sessions into this one's `list_sessions` response.
+    /// Filtered to `self.meta.cwd` — the exact match [`SessionRepo::resume_latest_or_create`]
+    /// already applies when reattaching at startup. A no-op under the default per-cwd repo
+    /// directory (every session there already shares this cwd, by construction — see
+    /// `default_session_dir`), but load-bearing under an explicit `--session-dir` shared across
+    /// projects: Track L28 (pi-parity fix) — this used to return every session in the directory
+    /// unfiltered, so a shared `--session-dir` leaked another project's sessions into this one's
+    /// `list_sessions` response.
     ///
     /// Runs the scan on `spawn_blocking` (like [`persist_blocking`]) rather than directly on the
     /// caller's own task — `SessionRepo::list_with_progress`'s underlying `scan_listings` does
@@ -2612,8 +2608,8 @@ pub(crate) async fn scan_session_dirs(
     .await
     {
         Ok(metas) => metas,
-        // Neither `scan_session_dir` nor `scan_listings` panics, and this task is never cancelled —
-        // same re-raise as every other `spawn_blocking` in this file.
+        // Neither `scan_session_dir_in` nor `scan_listings` panics, and this task is never
+        // cancelled — same re-raise as every other `spawn_blocking` in this file.
         Err(e) => std::panic::resume_unwind(e.into_panic()),
     }
 }
@@ -5232,7 +5228,7 @@ pub(crate) async fn serve_session(
                 let mut pending_deferred: Vec<(Option<String>, Value)> = Vec::new();
                 // MCP Events injection batches this run carries: its own prompt's, and each one
                 // steered in while it runs (with the text the model would receive). Settled once
-                // the run is over — see `mcp_events_finish` below.
+                // the run is over — see "A batch is delivered only once" below.
                 let own_injection = crate::tools::mcp_events::injection_batch(&cmd);
                 let mut steered_injections: Vec<u64> = Vec::new();
                 let result = 'retry: loop {
@@ -6220,9 +6216,9 @@ pub(crate) async fn serve_session(
                 // A batch is delivered only once the model has it in a transcript that persisted:
                 // the run's own prompt when the run did not fail (an abort still leaves the prompt
                 // in the transcript the next run reads); a steered one exactly when the run's
-                // `Steered` event reported it (already recorded then — see `steered_received`) — an
-                // abort clears the steer lane (`clear_run_scoped`) before the model sees what is
-                // queued there. Everything else goes back to pending, to be injected again.
+                // `Steered` event reported it (already recorded then — see the `Steered` arm above)
+                // — an abort clears the steer lane (`clear_run_scoped`) before the model sees what
+                // is queued there. Everything else goes back to pending, to be injected again.
                 if let Some(hub) = &mcp_events
                     && (own_injection.is_some() || !steered_injections.is_empty())
                 {
@@ -9717,11 +9713,6 @@ fn build_tools(
     skills: &[crate::skills::Skill],
     host_bash_jobs: Option<&Arc<crate::tools::bash_jobs::BashJobs>>,
 ) -> agent_core::ToolRegistry {
-    // Task #34 (pi-parity fix): previously always called the plain `default_registry_with_prefix`,
-    // hardcoding `image_auto_resize: true` regardless of `cfg.image_auto_resize` — `run`'s identical
-    // `default_registry_with_prefix_and_image_auto_resize` call site (`main.rs::run_task`) is the one
-    // this should have matched all along.
-    //
     // `cfg.mcp_tools` (already-connected, namespaced `mcp__<server>__<tool>` entries — see
     // `tools::mcp`'s module doc comment) is merged in *before* `apply_filter` below, not after: an
     // operator's `--tools`/`--exclude-tools` allow/deny-list is meant to scope the *whole* tool set the
