@@ -843,4 +843,13 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn every_rejection_is_counted_in_its_own_index_of_all() {
+        // `Metrics::rejection` reads the counter at `as_index`, and the array is built from `ALL`,
+        // so a misordered entry would route one reason's count into another's series.
+        for (i, r) in Rejection::ALL.iter().enumerate() {
+            assert_eq!(r.as_index(), i, "{r:?} is at {i} in ALL");
+        }
+    }
 }
