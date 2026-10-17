@@ -367,9 +367,12 @@ pub fn parse_listen_addr(s: &str) -> Result<SocketAddr, String> {
 /// process it is reporting on.
 pub async fn serve_metrics(listener: TcpListener, metrics: Arc<Metrics>) {
     loop {
-        let Ok((mut stream, _)) = listener.accept().await else {
-            continue;
-        };
+        // Backed off rather than retried at once: an `EMFILE` leaves the connection queued, so a bare
+        // `continue` would spin a core until a descriptor freed.
+        let mut stream = crate::serve_ws::accept_retrying("metrics", || async {
+            listener.accept().await.map(|(s, _)| s)
+        })
+        .await;
         let mut buf = Vec::new();
         let mut chunk = [0u8; 1024];
         let head = loop {

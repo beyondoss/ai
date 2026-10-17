@@ -1609,17 +1609,50 @@ pub struct ServeListeners {
 }
 
 /// Await the next TCP connection, or `pending()` forever when there's no TCP listener — so this can
-/// sit in a `select!` arm unconditionally without `select!` needing to branch on the `Option`.
-async fn accept_tcp(listener: &Option<TcpListener>) -> Option<TcpStream> {
+/// sit in a `select!` arm unconditionally without `select!` needing to branch on the `Option`. Never
+/// gives up on a failed accept: see [`accept_retrying`].
+async fn accept_tcp(listener: &Option<TcpListener>) -> TcpStream {
     match listener {
-        Some(l) => match l.accept().await {
-            Ok((stream, _peer)) => Some(stream),
-            Err(e) => {
-                eprintln!("serve: websocket accept failed: {e}");
-                None
-            }
-        },
+        Some(l) => {
+            accept_retrying("websocket", || async { l.accept().await.map(|(s, _)| s) }).await
+        }
         None => std::future::pending().await,
+    }
+}
+
+/// The first wait after a failed accept, doubled per consecutive failure up to [`ACCEPT_BACKOFF_MAX`].
+const ACCEPT_BACKOFF_MIN: Duration = Duration::from_millis(10);
+/// The longest wait between accept attempts while they keep failing.
+const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(1);
+
+/// Run `accept` until it yields a connection, logging each failure and backing off
+/// ([`ACCEPT_BACKOFF_MIN`] doubling to [`ACCEPT_BACKOFF_MAX`]) between attempts.
+///
+/// An accept error is almost always transient — `EMFILE`/`ENFILE` (out of descriptors until some
+/// connection closes), `ECONNABORTED` (the peer left before we took it), `ENOBUFS`. Treating it as
+/// the end of the listener, which returning `None` into a `Some(stream) = …` `select!` arm did, left
+/// the daemon alive but deaf: the arm stayed disabled until some *other* arm fired, which with one
+/// listener and no shutdown is never — and on the Unix socket the deaf daemon still held the path, so
+/// no replacement could bind it either. The backoff is what keeps a persistent `EMFILE` from spinning
+/// a core: the failing connection stays in the kernel's queue, so an immediate retry fails again.
+pub(crate) async fn accept_retrying<S, F, Fut>(transport: &str, mut accept: F) -> S
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<S>>,
+{
+    let mut backoff = ACCEPT_BACKOFF_MIN;
+    loop {
+        match accept().await {
+            Ok(stream) => return stream,
+            Err(e) => {
+                eprintln!(
+                    "serve: {transport} accept failed: {e} (retrying in {}ms)",
+                    backoff.as_millis()
+                );
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(ACCEPT_BACKOFF_MAX);
+            }
+        }
     }
 }
 
@@ -2091,7 +2124,7 @@ pub async fn serve_ws(
                     return Ok(Some(sig));
                 }
             }
-            Some(stream) = accept_tcp(&tcp_listener) => {
+            stream = accept_tcp(&tcp_listener) => {
                 let supervisor = supervisor.clone();
                 tokio::spawn(async move {
                     if let Err(e) = handle_connection(&supervisor, stream, Transport::Tcp).await {
@@ -2099,7 +2132,7 @@ pub async fn serve_ws(
                     }
                 });
             }
-            Some(stream) = accept_uds_arm(&uds_listener) => {
+            stream = accept_uds_arm(&uds_listener) => {
                 let supervisor = supervisor.clone();
                 tokio::spawn(async move {
                     if let Err(e) = handle_connection(&supervisor, stream, Transport::Unix).await {
@@ -2116,20 +2149,16 @@ pub async fn serve_ws(
 // listener); elsewhere it's a listener-less `pending()` forever (there's no UDS to bind, and
 // `--listen-uds` errors before we ever reach here).
 #[cfg(unix)]
-async fn accept_uds_arm(listener: &Option<UnixListener>) -> Option<UnixStream> {
+async fn accept_uds_arm(listener: &Option<UnixListener>) -> UnixStream {
     match listener {
-        Some(l) => match l.accept().await {
-            Ok((stream, _addr)) => Some(stream),
-            Err(e) => {
-                eprintln!("serve: unix socket accept failed: {e}");
-                None
-            }
-        },
+        Some(l) => {
+            accept_retrying("unix socket", || async { l.accept().await.map(|(s, _)| s) }).await
+        }
         None => std::future::pending().await,
     }
 }
 #[cfg(not(unix))]
-async fn accept_uds_arm(_listener: &Option<()>) -> Option<TcpStream> {
+async fn accept_uds_arm(_listener: &Option<()>) -> TcpStream {
     std::future::pending().await
 }
 
@@ -3127,6 +3156,29 @@ async fn write_http_err<S: AsyncWrite + Unpin>(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    /// A failed accept is retried after a backoff that grows per consecutive failure, and the next
+    /// connection is still handed back — the listener is not given up on.
+    #[tokio::test]
+    async fn an_accept_error_is_retried_with_backoff_not_fatal() {
+        let mut attempts = 0u32;
+        let started = Instant::now();
+        let got = accept_retrying("test", || {
+            attempts += 1;
+            let n = attempts;
+            async move {
+                if n <= 3 {
+                    Err(std::io::Error::from_raw_os_error(libc::EMFILE))
+                } else {
+                    Ok(n)
+                }
+            }
+        })
+        .await;
+        assert_eq!(got, 4, "the fourth attempt's connection is returned");
+        // 10 + 20 + 40 ms of backoff: retried, but not in a hot loop.
+        assert!(started.elapsed() >= Duration::from_millis(70));
+    }
 
     /// Passed sockets are this process's only when `LISTEN_PID` says so — unset is not "anyone's".
     #[cfg(unix)]
