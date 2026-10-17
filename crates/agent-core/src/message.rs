@@ -212,6 +212,13 @@ pub struct Message {
     /// before this field existed. Persisted, so a reopened session keeps every measured turn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prior_turn_tokens: Option<u32>,
+    /// Tokens this turn's tools spent on model calls of their own — a `subagent`'s child runs — on
+    /// the tool-results message that carries their results. Kept apart from [`usage`](Self::usage),
+    /// which is *this conversation's* request size and anchors context sizing; a child's prompt is not
+    /// this conversation's. Persisted, so a reopened session's totals still include what its
+    /// delegated work cost. `None` everywhere else, and on messages persisted before it existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegated_usage: Option<TokenUsage>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -230,6 +237,7 @@ impl Message {
             usage: None,
             stop_reason: None,
             prior_turn_tokens: None,
+            delegated_usage: None,
         }
     }
 
@@ -244,6 +252,7 @@ impl Message {
             usage: None,
             stop_reason: None,
             prior_turn_tokens: None,
+            delegated_usage: None,
         }
     }
 
@@ -263,6 +272,7 @@ impl Message {
             usage: None,
             stop_reason: None,
             prior_turn_tokens: None,
+            delegated_usage: None,
         }
     }
 
@@ -286,6 +296,7 @@ impl Message {
             usage: None,
             stop_reason: None,
             prior_turn_tokens: None,
+            delegated_usage: None,
         }
     }
 
@@ -309,6 +320,7 @@ impl Message {
             usage: None,
             stop_reason: None,
             prior_turn_tokens: None,
+            delegated_usage: None,
         }
     }
 
@@ -326,6 +338,7 @@ impl Message {
             usage: None,
             stop_reason: None,
             prior_turn_tokens: None,
+            delegated_usage: None,
         }
     }
 

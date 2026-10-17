@@ -950,6 +950,12 @@ impl Subagent {
 
         let run = agent.run_events(&mut session, |event| {
             match event {
+                // Every request the child makes — and, through its own `subagent`, every grandchild's —
+                // is reported up as this call's spend, so the parent's totals are the tree's, not just
+                // its own turns'. Per request rather than once at the end, so a failed or cancelled
+                // child's tokens still count.
+                AgentEvent::Stream(agent_core::StreamEvent::Usage(usage))
+                | AgentEvent::ToolUsage { usage, .. } => board.progress.report_usage(usage),
                 AgentEvent::TurnStart { step } => board.update(index, |s| s.step = step, false),
                 AgentEvent::ToolStart { name, .. } => {
                     board.update(index, |s| s.last_tool = Some(name), false);
