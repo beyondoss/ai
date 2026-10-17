@@ -43,6 +43,7 @@ pub mod session_store;
 pub mod settings;
 pub mod shard_mount;
 pub mod skills;
+pub(crate) mod store_file;
 pub mod subreaper;
 #[cfg(test)]
 pub(crate) mod test_support;

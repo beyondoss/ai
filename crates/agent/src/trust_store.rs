@@ -20,6 +20,7 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
+#[cfg(test)]
 use serde::{Deserialize, Serialize};
 
 use crate::path_utils::resolved_path as resolved_key_path;
@@ -75,7 +76,10 @@ pub struct TrustStore {
 }
 
 /// On-disk shape once the store has been written by this version. Older files are a bare
-/// `Vec<String>` (trusted-only) — see [`TrustStore::open`].
+/// `Vec<String>` (trusted-only) — see [`TrustStore::open`]. The store itself reads and edits the raw
+/// JSON (see [`TrustStore::mutate_locked`]); this typed shape is what tests check a written file
+/// against.
+#[cfg(test)]
 #[derive(Serialize, Deserialize, Default)]
 struct StoreFile {
     #[serde(default)]
@@ -141,9 +145,9 @@ impl TrustStore {
     /// takes effect rather than being shadowed by its own stale entry.
     pub fn trust(&mut self, dir: &Path) -> std::io::Result<()> {
         let key = canonical_key(dir);
-        self.mutate_locked(|trusted, untrusted| {
-            let removed_untrusted = untrusted.remove(&key);
-            let inserted = trusted.insert(key.clone());
+        self.mutate_locked(|l| {
+            let removed_untrusted = remove_key(l.untrusted, &key);
+            let inserted = insert_key(l.trusted, &key);
             inserted || removed_untrusted
         })
     }
@@ -152,9 +156,9 @@ impl TrustStore {
     /// `trusted` entry for `dir` first (a directory can't be both).
     pub fn distrust(&mut self, dir: &Path) -> std::io::Result<()> {
         let key = canonical_key(dir);
-        self.mutate_locked(|trusted, untrusted| {
-            let removed_trusted = trusted.remove(&key);
-            let inserted = untrusted.insert(key.clone());
+        self.mutate_locked(|l| {
+            let removed_trusted = remove_key(l.trusted, &key);
+            let inserted = insert_key(l.untrusted, &key);
             inserted || removed_trusted
         })
     }
@@ -167,9 +171,9 @@ impl TrustStore {
     /// `ProjectTrustStore::setMany` accepting a `null` decision to delete an entry.
     pub fn clear(&mut self, dir: &Path) -> std::io::Result<()> {
         let key = canonical_key(dir);
-        self.mutate_locked(|trusted, untrusted| {
-            let removed_trusted = trusted.remove(&key);
-            let removed_untrusted = untrusted.remove(&key);
+        self.mutate_locked(|l| {
+            let removed_trusted = remove_key(l.trusted, &key);
+            let removed_untrusted = remove_key(l.untrusted, &key);
             removed_trusted || removed_untrusted
         })
     }
@@ -187,32 +191,99 @@ impl TrustStore {
     /// writes last wins outright and the other's grant is gone from disk despite both calls returning
     /// `Ok`. With the lock, B's write waits for A's to land, then B re-reads and re-applies its own
     /// change on top of A's — both grants survive.
+    ///
+    /// The write follows [`crate::store_file`]'s rule. `mutate` edits the two lists in the raw JSON,
+    /// so a list element that isn't a path string and any key this binary doesn't know are written
+    /// back as they were, and a file that can't be read or parsed refuses the write instead of being
+    /// replaced by an allowlist holding only this one change.
     fn mutate_locked(
         &mut self,
-        mutate: impl FnOnce(&mut BTreeSet<String>, &mut BTreeSet<String>) -> bool,
+        mutate: impl FnOnce(&mut Lists<'_>) -> bool,
     ) -> std::io::Result<()> {
         let _lock = crate::file_lock::lock_store_file(&self.path)?;
-        let (mut trusted, mut untrusted) = read_store_file(&self.path);
-        let changed = mutate(&mut trusted, &mut untrusted);
+        let mut raw = match crate::store_file::read_value_for_write(&self.path)? {
+            None => serde_json::Map::new(),
+            Some(serde_json::Value::Object(map)) => map,
+            // The legacy bare-array shape: trusted-only. Rewritten in the current shape.
+            Some(serde_json::Value::Array(trusted)) => {
+                serde_json::Map::from_iter([("trusted".to_string(), trusted.into())])
+            }
+            Some(_) => return Err(crate::store_file::not_an_object(&self.path)),
+        };
+        let mut trusted = take_list(&mut raw, "trusted", &self.path)?;
+        let mut untrusted = take_list(&mut raw, "untrusted", &self.path)?;
+        let changed = mutate(&mut Lists {
+            trusted: &mut trusted,
+            untrusted: &mut untrusted,
+        });
+        let (t, u) = (strings(&trusted), strings(&untrusted));
+        raw.insert("trusted".to_string(), trusted.into());
+        raw.insert("untrusted".to_string(), untrusted.into());
         if changed {
-            write_store_file(&self.path, &trusted, &untrusted)?;
+            crate::store_file::write_json(&self.path, &serde_json::Value::Object(raw), false)?;
         }
-        self.trusted = trusted;
-        self.untrusted = untrusted;
+        self.trusted = t;
+        self.untrusted = u;
         Ok(())
     }
 }
 
-/// Read and parse the store file at `path`, tolerating a missing/unparsable file (empty allowlist) and
-/// the legacy bare `Vec<String>` shape (trusted-only) — shared by [`TrustStore::open`] and
-/// [`TrustStore::mutate_locked`], which both need "current on-disk state, gracefully defaulted."
+/// The two raw lists a trust mutation edits, element by element. Elements that aren't strings are
+/// never touched.
+struct Lists<'a> {
+    trusted: &'a mut Vec<serde_json::Value>,
+    untrusted: &'a mut Vec<serde_json::Value>,
+}
+
+/// Remove every string element equal to `key`; whether one was there.
+fn remove_key(list: &mut Vec<serde_json::Value>, key: &str) -> bool {
+    let before = list.len();
+    list.retain(|v| v.as_str() != Some(key));
+    list.len() != before
+}
+
+/// Append `key` unless it is already there; whether it was added.
+fn insert_key(list: &mut Vec<serde_json::Value>, key: &str) -> bool {
+    if list.iter().any(|v| v.as_str() == Some(key)) {
+        return false;
+    }
+    list.push(serde_json::Value::String(key.to_string()));
+    true
+}
+
+/// Take `name`'s list out of the raw object for editing. Absent is empty; present but not a list
+/// refuses the write, since rewriting it would discard what it holds.
+fn take_list(
+    raw: &mut serde_json::Map<String, serde_json::Value>,
+    name: &str,
+    path: &Path,
+) -> std::io::Result<Vec<serde_json::Value>> {
+    match raw.remove(name) {
+        None => Ok(Vec::new()),
+        Some(serde_json::Value::Array(list)) => Ok(list),
+        Some(_) => Err(crate::store_file::refuse(
+            path,
+            &format!("its `{name}` is not a list"),
+        )),
+    }
+}
+
+/// The path strings in a raw list; anything else is ignored (and warned about on read).
+fn strings(list: &[serde_json::Value]) -> BTreeSet<String> {
+    list.iter()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect()
+}
+
+/// Read and parse the store file at `path` for use, tolerating a missing/unparsable file (empty
+/// allowlist) and the legacy bare `Vec<String>` shape (trusted-only). Each list is read on its own,
+/// and an element that isn't a path string is skipped, so one bad value never empties the allowlist.
 ///
 /// A missing file is the ordinary, silent case (nothing has ever been trusted yet). Anything else that
 /// falls back to an empty allowlist — an existing-but-unreadable file (permission denied, a directory
 /// where a file was expected) or one that parses as neither the current tri-state shape nor the legacy
 /// bare-array shape (corrupted/hand-edited JSON) — `warn!`s instead of silently discarding every
-/// persisted trust/untrust decision, matching `session_store.rs`'s own "skip and warn, don't silently
-/// lose data" precedent for a corrupt entry.
+/// persisted trust/untrust decision. Never the basis of a write: see [`TrustStore::mutate_locked`].
 fn read_store_file(path: &Path) -> (BTreeSet<String>, BTreeSet<String>) {
     let contents = match fs::read_to_string(path) {
         Ok(s) => s,
@@ -226,37 +297,36 @@ fn read_store_file(path: &Path) -> (BTreeSet<String>, BTreeSet<String>) {
             return Default::default();
         }
     };
-    if let Ok(f) = serde_json::from_str::<StoreFile>(&contents) {
-        return (f.trusted, f.untrusted);
-    }
-    if let Ok(v) = serde_json::from_str::<Vec<String>>(&contents) {
-        return (v.into_iter().collect(), BTreeSet::new());
-    }
-    tracing::warn!(
-        path = %path.display(),
-        "trust store file is not valid JSON in either the current or legacy shape, treating it as an \
-         empty allowlist"
-    );
-    Default::default()
-}
-
-fn write_store_file(
-    path: &Path,
-    trusted: &BTreeSet<String>,
-    untrusted: &BTreeSet<String>,
-) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let file = StoreFile {
-        trusted: trusted.clone(),
-        untrusted: untrusted.clone(),
+    let list = |v: Option<&serde_json::Value>, name: &str| match v {
+        None => BTreeSet::new(),
+        Some(serde_json::Value::Array(items)) => {
+            if items.iter().any(|i| !i.is_string()) {
+                tracing::warn!(path = %path.display(), list = name, "trust store list holds a value that isn't a path, skipping it");
+            }
+            strings(items)
+        }
+        Some(_) => {
+            tracing::warn!(path = %path.display(), list = name, "trust store list is not a list, ignoring it");
+            BTreeSet::new()
+        }
     };
-    let body = serde_json::to_string_pretty(&file).map_err(std::io::Error::other)?;
-    let path_str = path
-        .to_str()
-        .ok_or_else(|| std::io::Error::other(format!("non-UTF-8 path: {}", path.display())))?;
-    crate::tools::write_atomic_durable(path_str, body.as_bytes())
+    match serde_json::from_str::<serde_json::Value>(&contents) {
+        Ok(serde_json::Value::Object(map)) => (
+            list(map.get("trusted"), "trusted"),
+            list(map.get("untrusted"), "untrusted"),
+        ),
+        Ok(legacy @ serde_json::Value::Array(_)) => {
+            (list(Some(&legacy), "trusted"), BTreeSet::new())
+        }
+        _ => {
+            tracing::warn!(
+                path = %path.display(),
+                "trust store file is not valid JSON in either the current or legacy shape, treating it as an \
+                 empty allowlist"
+            );
+            Default::default()
+        }
+    }
 }
 
 /// Canonicalize `path` for allowlist comparison, falling back to the path as given when it doesn't
@@ -741,5 +811,59 @@ mod tests {
         let mut store = TrustStore::open(store_path.clone());
         store.trust(&project).unwrap();
         assert!(store.is_trusted(&project));
+    }
+}
+
+/// A mutation writes back what it couldn't parse, and never overwrites a file it can't read.
+#[cfg(test)]
+mod roundtrip_tests {
+    use super::*;
+    use serde_json::{Value, json};
+
+    #[test]
+    fn a_grant_keeps_unknown_keys_and_values_that_are_not_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trusted-projects.json");
+        let project = tempfile::tempdir().unwrap();
+        fs::write(
+            &path,
+            json!({ "trusted": ["/kept", 7], "untrusted": [], "future": { "x": 1 } }).to_string(),
+        )
+        .unwrap();
+        let mut store = TrustStore::open(path.clone());
+        assert!(
+            store.is_trusted(Path::new("/kept")),
+            "a bad element doesn't empty the list"
+        );
+        store.trust(project.path()).unwrap();
+        let disk: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let trusted = disk["trusted"].as_array().unwrap();
+        assert!(trusted.contains(&json!("/kept")));
+        assert!(
+            trusted.contains(&json!(7)),
+            "a value that isn't a path survives"
+        );
+        assert_eq!(disk["future"], json!({ "x": 1 }), "an unknown key survives");
+        assert!(TrustStore::open(path).is_trusted(project.path()));
+    }
+
+    #[test]
+    fn a_corrupt_file_is_left_byte_identical_and_the_mutation_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        for corrupt in [
+            &b"{\"trusted\": [\"/a\""[..],
+            b"\"a string\"",
+            b"{\"trusted\": 5}",
+        ] {
+            let path = dir.path().join("trusted-projects.json");
+            fs::write(&path, corrupt).unwrap();
+            let mut store = TrustStore::open(path.clone());
+            let err = store.trust(project.path()).unwrap_err();
+            assert!(err.to_string().contains("trusted-projects.json"), "{err}");
+            assert!(store.distrust(project.path()).is_err());
+            assert!(store.clear(project.path()).is_err());
+            assert_eq!(fs::read(&path).unwrap(), corrupt);
+        }
     }
 }
