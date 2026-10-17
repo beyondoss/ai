@@ -70,7 +70,7 @@ use crate::circuit_breaker::Permit;
 use crate::drain::{self, Drain};
 use crate::key;
 use crate::metrics::{DrainEnd, KeyCooled, Rejection};
-use crate::route::{self, Dialect, Provider};
+use crate::route::{self, Dialect, Provider, ProviderId};
 use crate::signed_id;
 use crate::state::{GatewayState, RequestId};
 use crate::terminal::TerminalTracker;
@@ -86,6 +86,7 @@ use pingora_core::protocols::http::subrequest::server::SubrequestHandle;
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_proxy::subrequest::{BodyMode, Ctx as SubrequestCtx};
 use pingora_proxy::{FailToProxy, ProxyHttp, ProxyWarnLogContext, Session};
+use providers::catalog::Caps;
 use providers::catalog::strip_snapshot_date;
 use std::borrow::Cow;
 use std::fmt::Write as _;
@@ -662,7 +663,19 @@ fn price_variant(provider: &str, upstream_model: &str, host: &str) -> Option<&'s
 
 /// Providers documented to keep generating, and billing, after the client disconnects
 /// mid-stream: a cancelled row's tokens are what was relayed, not what was billed.
-const MAY_CONTINUE_PROVIDERS: [&str; 3] = ["openrouter", "bedrock", "groq"];
+const MAY_CONTINUE: [ProviderId; 3] = [
+    ProviderId::OpenRouter,
+    ProviderId::Bedrock,
+    ProviderId::Groq,
+];
+
+/// [`MAY_CONTINUE`] by name: a billing row names its provider, and its facts are derived from the
+/// row's own fields (as its price is).
+const MAY_CONTINUE_PROVIDERS: [&str; 3] = [
+    MAY_CONTINUE[0].name(),
+    MAY_CONTINUE[1].name(),
+    MAY_CONTINUE[2].name(),
+];
 
 /// Whether this row's provider may have generated (and billed) past the point the row counts:
 /// a stream the client cancelled, or one cut short, on a provider in [`MAY_CONTINUE_PROVIDERS`],
@@ -723,13 +736,13 @@ fn drain_end(drain: Drain, client_left: bool, e: Option<&pingora_core::Error>) -
 }
 
 /// Whether a response head starts a stream to drain if the client hangs up ([`crate::drain`]): a
-/// managed 2xx stream from a provider in [`MAY_CONTINUE_PROVIDERS`]. BYO writes no billing row,
-/// and a provider that stops generating when the client leaves bills only what it relayed.
+/// managed 2xx stream from a provider in [`MAY_CONTINUE`]. BYO writes no billing row, and a
+/// provider that stops generating when the client leaves bills only what it relayed.
 fn drains_on_cancel(rc: &RequestCtx, status: u16) -> bool {
     rc.managed
         && rc.streaming
         && (200..300).contains(&status)
-        && MAY_CONTINUE_PROVIDERS.contains(&rc.provider.name.as_str())
+        && rc.provider.id.is_some_and(|id| MAY_CONTINUE.contains(&id))
 }
 
 /// The upstream response header carrying the vendor's request id, in the order they are tried.
@@ -2681,7 +2694,7 @@ fn price_row(m: &str) -> Option<&'static route::ModelRoute> {
     route::model_route(m).or_else(|| strip_snapshot_date(m).and_then(route::model_route))
 }
 
-/// Set OpenRouter's attribution headers when (and only when) `provider_name` is `"openrouter"`
+/// Set OpenRouter's attribution headers when (and only when) the provider is OpenRouter
 /// **and** the request is managed — every other provider, and every BYO request regardless of
 /// provider, is untouched. Task #22 (pi-parity, Medium): pi gates this dashboard-attribution
 /// behind a user-controllable telemetry setting (`isInstallTelemetryEnabled`,
@@ -2694,10 +2707,10 @@ fn price_row(m: &str) -> Option<&'static route::ModelRoute> {
 /// these headers describe accurately.
 fn apply_provider_attribution(
     upstream_request: &mut pingora::http::RequestHeader,
-    provider_name: &str,
+    provider: Option<ProviderId>,
     managed: bool,
 ) -> Result<()> {
-    if provider_name == "openrouter" && managed {
+    if provider == Some(ProviderId::OpenRouter) && managed {
         upstream_request.insert_header("HTTP-Referer", OPENROUTER_REFERER)?;
         upstream_request.insert_header("X-OpenRouter-Title", OPENROUTER_TITLE)?;
         upstream_request.insert_header("X-OpenRouter-Categories", OPENROUTER_CATEGORY)?;
@@ -5992,7 +6005,7 @@ impl ProxyHttp for AiProxy {
                 .is_none_or(providers::catalog::serves_eager_input_streaming);
             retain_managed_client_headers(
                 upstream_request,
-                rc.provider.name == "anthropic",
+                rc.provider.id == Some(ProviderId::Anthropic),
                 eager_tool_streaming,
             )?;
             upstream_request.remove_header("authorization");
@@ -6039,7 +6052,7 @@ impl ProxyHttp for AiProxy {
 
         // Dashboard-attribution headers (OpenRouter, managed traffic only — Task #22, see
         // `apply_provider_attribution`).
-        apply_provider_attribution(upstream_request, rc.provider.name.as_str(), rc.managed)?;
+        apply_provider_attribution(upstream_request, rc.provider.id, rc.managed)?;
 
         // A stock OpenAI SDK does not send `anthropic-version`. Anthropic (and Bedrock Messages)
         // require it; inject the current version when we translated Chat Completions or Responses
@@ -6342,16 +6355,18 @@ impl ProxyHttp for AiProxy {
                     let upstream_model = candidate.map_or("", |c| c.upstream_model);
                     let openai_host =
                         candidate.is_some_and(|c| c.provider == providers::ProviderId::OpenAi);
-                    let stream_only = candidate.is_some_and(providers::catalog::stream_only);
+                    // Read once: this attempt's body edits ask the candidate several questions.
+                    let caps = candidate.map(route::Candidate::caps);
+                    let has = |flag| caps.is_some_and(|c: Caps| c.contains(flag));
+                    let stream_only = has(Caps::STREAM_ONLY);
                     let fast = candidate.is_some_and(|c| translated_fast(a, c));
-                    let reads_developer =
-                        candidate.is_none_or(providers::catalog::reads_developer_role);
-                    let tool_thinking = candidate
-                        .map_or(providers::catalog::ToolThinking::Free, |c| {
-                            providers::catalog::tool_thinking(c)
-                        });
-                    let eager_tool_streaming =
-                        candidate.is_none_or(providers::catalog::serves_eager_input_streaming);
+                    let reads_developer = caps.is_none() || has(Caps::DEVELOPER_ROLE);
+                    let tool_thinking = candidate.map_or(
+                        providers::catalog::ToolThinking::Free,
+                        providers::catalog::tool_thinking,
+                    );
+                    let eager_tool_streaming = caps.is_none() || has(Caps::EAGER_INPUT_STREAMING);
+                    let claude = has(Caps::CLAUDE);
                     if let Some(t) = a.translate.as_mut()
                         && let Some(to) = serving
                     {
@@ -6387,9 +6402,7 @@ impl ProxyHttp for AiProxy {
                                 changed |= translate::store_false(&mut buf);
                                 changed |= translate::strip_item_references(&mut buf);
                             }
-                        } else if to == route::Endpoint::ChatCompletions
-                            && upstream_model.contains("claude")
-                        {
+                        } else if to == route::Endpoint::ChatCompletions && claude {
                             // A Claude model behind Chat Completions (OpenRouter): a tool turn
                             // with no thinking to replay goes without reasoning (D14's rule).
                             let len = buf.len();
@@ -9912,7 +9925,12 @@ mod tests {
             None,
         )
         .unwrap();
-        apply_provider_attribution(&mut openrouter_req, "openrouter", true).unwrap();
+        apply_provider_attribution(
+            &mut openrouter_req,
+            Some(providers::ProviderId::OpenRouter),
+            true,
+        )
+        .unwrap();
         assert_eq!(
             openrouter_req.headers.get("HTTP-Referer").unwrap(),
             OPENROUTER_REFERER
@@ -9936,7 +9954,12 @@ mod tests {
                 None,
             )
             .unwrap();
-            apply_provider_attribution(&mut req, other, true).unwrap();
+            apply_provider_attribution(
+                &mut req,
+                Some(providers::by_name(other).expect("a built-in provider").id),
+                true,
+            )
+            .unwrap();
             assert!(
                 req.headers.get("HTTP-Referer").is_none(),
                 "{other} should not get HTTP-Referer"
@@ -9965,7 +9988,8 @@ mod tests {
             None,
         )
         .unwrap();
-        apply_provider_attribution(&mut byo_req, "openrouter", false).unwrap();
+        apply_provider_attribution(&mut byo_req, Some(providers::ProviderId::OpenRouter), false)
+            .unwrap();
         assert!(
             byo_req.headers.get("HTTP-Referer").is_none(),
             "BYO OpenRouter traffic must not get HTTP-Referer"

@@ -32,7 +32,7 @@ use std::time::{Duration, Instant};
 /// The shared provider table. `known_providers()` is the gateway-routable subset — the BYO-only
 /// rows (HuggingFace, NVIDIA, Kimi-Coding, OpenCode) have no `/{name}/…` mount and no pool key, so
 /// minting a [`Provider`] for them at boot would only create dead upstreams.
-pub use providers::{AuthScheme, ProviderSpec, gateway_providers as known_providers};
+pub use providers::{AuthScheme, ProviderId, ProviderSpec, gateway_providers as known_providers};
 
 /// The provider's wire format. Aliased to the shared crate's [`providers::WireFormat`] — same two
 /// variants, and the agent needs the identical fact to pick a request dialect.
@@ -740,6 +740,10 @@ fn clock_ms() -> u64 {
 /// borrows these fields, so nothing is re-allocated or re-formatted per request.
 pub struct Provider {
     pub name: String,
+    /// The provider table's row of this name ([`providers::by_name`]), which is what code branches
+    /// on (never `name`). `None` for a config-added provider with a name of its own: it has no row,
+    /// so no built-in behaviour of one applies to it.
+    pub id: Option<ProviderId>,
     /// Upstream `host:port`.
     pub authority: String,
     /// Bare upstream host (SNI / `Host` header) = authority without the port.
@@ -889,6 +893,10 @@ impl Provider {
         let name_header = http::HeaderValue::from_str(name).ok();
         Provider {
             name_header,
+            // A name that matches a row is that row: `build_providers` registers a routable row's
+            // name for the built-in, and a config-added provider under a BYO-only row's name is the
+            // upstream that row describes.
+            id: providers::by_name(name).map(|p| p.id),
             name: name.to_string(),
             authority,
             host,
