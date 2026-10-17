@@ -5,7 +5,7 @@
 mod common;
 
 use std::io::Write;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::Duration;
 
 use agent_core::{ContentBlock, Message, Role, Session};
@@ -63,8 +63,7 @@ fn a_crash_after_a_mid_run_compaction_reloads_the_compacted_session() {
     fast.extend((0..5).map(|i| turn_tool_use(&format!("r{i}"), "read", &args)));
     let base = spawn_model_server_with_stalled_response(fast, Duration::from_secs(60), vec![]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
-    let mut child = Command::new(bin)
+    let mut child = crate::common::agent_cmd()
         .args([
             "serve",
             "--gateway-url",

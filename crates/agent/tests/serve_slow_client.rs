@@ -15,7 +15,7 @@
 
 mod common;
 
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::Duration;
 
 use common::{
@@ -27,7 +27,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 fn serve_ws_child(base: &str, session_dir: &str) -> (ChildGuard, u16) {
     spawn_listening(
-        Command::new(env!("CARGO_BIN_EXE_beyond-ai-agent"))
+        crate::common::agent_cmd()
             .args([
                 "serve",
                 "--gateway-url",

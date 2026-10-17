@@ -9,7 +9,7 @@
 
 mod common;
 
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use common::{
     ChildGuard, ISOLATED_HOME, spawn_listening, spawn_model_server, spawn_model_server_routed,
@@ -17,11 +17,9 @@ use common::{
 };
 use serde_json::{Value, json};
 
-const BIN: &str = env!("CARGO_BIN_EXE_beyond-ai-agent");
-
 fn serve_ws(base: &str, session_dir: &str, extra: &[&str]) -> (ChildGuard, u16) {
     spawn_listening(
-        Command::new(BIN)
+        crate::common::agent_cmd()
             .args([
                 "serve",
                 "--gateway-url",
@@ -541,7 +539,7 @@ async fn an_injected_checkpoint_failure_counts_each_sessions_writes() {
     let (base, _requests) = spawn_model_server(vec![touch("alpha"), touch("bravo")]);
     let sessions = tempfile::tempdir().unwrap();
     let (_daemon, port) = spawn_listening(
-        Command::new(BIN)
+        crate::common::agent_cmd()
             .args([
                 "serve",
                 "--gateway-url",

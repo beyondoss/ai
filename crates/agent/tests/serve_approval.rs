@@ -9,7 +9,7 @@
 mod common;
 
 use std::io::{BufRead, Write};
-use std::process::{ChildStdin, Command, Stdio};
+use std::process::{ChildStdin, Stdio};
 use std::time::Duration;
 
 use common::{
@@ -18,13 +18,11 @@ use common::{
 };
 use serde_json::{Value, json};
 
-const BIN: &str = env!("CARGO_BIN_EXE_beyond-ai-agent");
-
 // ---- harness ---------------------------------------------------------------------------------------
 
 /// A stdio `serve` child with an approval gate installed.
 fn serve_approving(base: &str, session_file: &str, extra: &[&str]) -> ChildGuard {
-    Command::new(BIN)
+    crate::common::agent_cmd()
         .args([
             "serve",
             "--gateway-url",
@@ -589,7 +587,7 @@ fn two_gated_calls_in_one_turn_are_asked_about_one_at_a_time() {
 
 fn serve_ws_approving(base: &str, session_dir: &str, extra: &[&str]) -> (ChildGuard, u16) {
     spawn_listening(
-        Command::new(BIN)
+        crate::common::agent_cmd()
             .args([
                 "serve",
                 "--gateway-url",
@@ -873,7 +871,7 @@ fn an_always_allow_does_not_survive_a_new_session() {
         turn_text("wrote it again"),
     ]);
 
-    let mut child = Command::new(BIN)
+    let mut child = crate::common::agent_cmd()
         .args([
             "serve",
             "--gateway-url",

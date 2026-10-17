@@ -5,7 +5,7 @@
 mod common;
 
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use common::{body_json, run_cmd, spawn_model_server, turn_text, turn_tool_use};
 use serde_json::Value;
@@ -147,7 +147,7 @@ fn live(prompt: &str) -> (bool, String, String) {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("SKILL.md"), manifest).unwrap();
     }
-    let output = Command::new(env!("CARGO_BIN_EXE_beyond-ai-agent"))
+    let output = crate::common::agent_cmd()
         .env("HOME", home.path())
         .env("AI_PROVIDER", "anthropic")
         .env("AI_DIRECT", "1")

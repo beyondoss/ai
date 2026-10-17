@@ -5,7 +5,7 @@
 mod common;
 
 use std::io::Write;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use agent_core::compaction::MASKED_PREFIX;
 use agent_core::{ContentBlock, Message, Session};
@@ -142,8 +142,7 @@ fn serve_persists_a_masking_pass_for_the_next_process() {
     let dir = tempfile::tempdir().unwrap();
     let session_file = seeded_session(dir.path());
     let (base, bodies) = spawn_model_server(vec![turn_text("done")]);
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
-    let mut child = Command::new(bin)
+    let mut child = crate::common::agent_cmd()
         .args([
             "serve",
             "--gateway-url",

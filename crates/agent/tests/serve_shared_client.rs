@@ -10,7 +10,7 @@
 
 mod common;
 
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use common::{
     ChildGuard, ISOLATED_HOME, spawn_listening, spawn_model_server, turn_text, ws_connect,
@@ -21,7 +21,7 @@ use serde_json::json;
 /// Spawn a `serve --listen` child with a shared upstream client in `--upstream-http2 <mode>`.
 fn serve_ws_child_shared(base: &str, session_dir: &str, http2_mode: &str) -> (ChildGuard, u16) {
     spawn_listening(
-        Command::new(env!("CARGO_BIN_EXE_beyond-ai-agent"))
+        crate::common::agent_cmd()
             .args([
                 "serve",
                 "--upstream-http2",

@@ -226,7 +226,7 @@ async fn a_connector_named_like_an_operator_login_gets_no_bearer_token() {
 
     // The credential really was there to be found — otherwise the assertion above would hold for
     // the wrong reason. `mcp-logout` reports exactly what the connect path's `has_credential` sees.
-    let logout = std::process::Command::new(common::BIN)
+    let logout = crate::common::agent_cmd()
         .args(["mcp-logout", "linear"])
         .env("HOME", host_home.path())
         .output()
