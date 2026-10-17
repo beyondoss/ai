@@ -447,9 +447,8 @@ pub struct RequestCtx {
     /// `resp_tail`. See [`USAGE_HEAD_CAP`]. Empty for every other dialect and for non-streaming
     /// responses, which carry everything the tail already holds.
     resp_head: Vec<u8>,
-    /// Running total of request-body bytes seen, to enforce `MAX_REQUEST_BODY` even when the client
-    /// uses chunked transfer encoding (no `Content-Length` to check up front).
-    body_bytes_fed: usize,
+    /// How much of the request body this attempt has fed through `request_body_filter`.
+    upload: UploadProgress,
     /// Upstream HTTP status, set in `response_filter` once the response head arrives, which is
     /// also where the breaker permit is resolved (`5xx` → failure, any other response → success:
     /// the provider answered, and a `429` is a healthy throttle). A `None` here at `logging` with an
@@ -1518,8 +1517,7 @@ impl RequestCtx {
     /// `MAX_REQUEST_BODY`. The body filter and the replay tests both feed through here, so a replayed
     /// prefix is accounted the same way each time.
     fn take_request_chunk(&mut self, chunk: &[u8]) -> bool {
-        self.body_bytes_fed = self.body_bytes_fed.saturating_add(chunk.len());
-        if self.body_bytes_fed > MAX_REQUEST_BODY {
+        if !self.upload.feed(chunk.len()) {
             return false;
         }
         // Capture tap. Deliberately on the chunk as it *arrives*, which makes the captured bytes
@@ -1622,7 +1620,7 @@ impl RequestCtx {
     ///   a breaker *success* (the provider answered), so nothing surfaces it as our fault.
     /// - `model_scanner`'s brace depth would be permanently offset by the extra `{`, so
     ///   `at_key_level` never matches again and the billing row ships `requested_model = ""`.
-    /// - `body_bytes_fed` would double-count the prefix against `MAX_REQUEST_BODY`.
+    /// - `upload` would double-count the prefix against `MAX_REQUEST_BODY`.
     ///
     /// Called from `upstream_peer`, which pingora invokes exactly once per attempt and always before
     /// any body byte moves — it is the first statement of `proxy_to_upstream`.
@@ -1641,11 +1639,8 @@ impl RequestCtx {
             t.assemble = false;
         }
         // The first attempt has nothing to undo, and that is the only attempt the vast majority of
-        // requests ever make — so pay one compare rather than three stores on the hot path. A zero
-        // `body_bytes_fed` is an exact witness for "no chunk was ever fed": it is incremented for
-        // every chunk that reaches `request_body_filter`, on the same branch that appends to
-        // `req_buf` and feeds `model_scanner`, so neither can hold state while it reads zero.
-        if self.body_bytes_fed == 0 {
+        // requests ever make — so pay one compare rather than three stores on the hot path.
+        if !self.upload.started() {
             return;
         }
         // The capture tap is fed the same chunks, so it holds the replayed prefix too.
@@ -1655,7 +1650,7 @@ impl RequestCtx {
         // `clear` keeps the capacity, which was pre-sized from `Content-Length` in `request_filter`
         // and which the in-place splice relies on to stay realloc-free.
         self.req_buf.clear();
-        self.body_bytes_fed = 0;
+        self.upload = UploadProgress::default();
         self.model_scanner = peek::ModelScanner::new();
         self.input_tally = usage::InputTally::default();
         if let Some(k) = self.billing.taps_mut().and_then(|t| t.knobs.as_mut()) {
@@ -2834,11 +2829,33 @@ fn is_upstream_failure(e: Option<&pingora_core::Error>) -> bool {
     })
 }
 
+/// How much of the request body one attempt has fed through `request_body_filter`: one count, read
+/// by name for what each reader asks of it.
+#[derive(Debug, Default)]
+struct UploadProgress(usize);
+
+impl UploadProgress {
+    /// Count a chunk of `n` bytes. `false` once the body has crossed [`MAX_REQUEST_BODY`]: the cap
+    /// holds on the streamed size too, which a chunked body declares nowhere up front.
+    fn feed(&mut self, n: usize) -> bool {
+        self.0 = self.0.saturating_add(n);
+        self.0 <= MAX_REQUEST_BODY
+    }
+
+    /// Whether any chunk has reached `request_body_filter` this attempt: what blames a stalled
+    /// upload on the client (`client_still_uploading`; none fed means the attempt never got past
+    /// connecting), and, false, what tells a retry there is nothing to undo, since every
+    /// body-phase accumulator is fed on the branch that counts here.
+    fn started(&self) -> bool {
+        self.0 > 0
+    }
+}
+
 /// Whether this attempt had started sending the client's body upstream and the client had not
 /// finished it. An upstream error then reflects the client (a stalled or abandoned upload), not the
 /// provider. Zero bytes fed means the attempt never got past connecting.
 fn client_still_uploading(session: &mut Session, rc: &RequestCtx) -> bool {
-    rc.body_bytes_fed > 0 && !session.as_mut().is_body_done()
+    rc.upload.started() && !session.as_mut().is_body_done()
 }
 
 /// Whether the upstream's read timeout fired while the client still owed body bytes (D260): the
@@ -5386,7 +5403,7 @@ impl ProxyHttp for AiProxy {
                     req_buf: Vec::new(),
                     resp_tail: UsageTail::default(),
                     resp_head: Vec::new(),
-                    body_bytes_fed: 0,
+                    upload: UploadProgress::default(),
                     upstream_status: Some(hit.status),
                     start,
                     deadline,
@@ -5527,7 +5544,7 @@ impl ProxyHttp for AiProxy {
             // Grown lazily, and only on the one path that needs it (Anthropic SSE) — see
             // `response_body_filter`. Every other response leaves this empty and never allocates.
             resp_head: Vec::new(),
-            body_bytes_fed: 0,
+            upload: UploadProgress::default(),
             upstream_status: None,
             start,
             deadline,
@@ -8155,7 +8172,7 @@ mod tests {
             streaming: false,
             resp_tail: UsageTail::default(),
             resp_head: Vec::new(),
-            body_bytes_fed: 0,
+            upload: UploadProgress::default(),
             upstream_status: None,
             inject_eligible,
             catalog_check: false,
@@ -8228,7 +8245,7 @@ mod tests {
         // `upstream_peer` runs before any body byte of attempt 2.
         rc.reset_request_body_phase();
         assert_eq!(
-            rc.body_bytes_fed, 0,
+            rc.upload.0, 0,
             "the size guard must not double-count the replayed prefix",
         );
 
@@ -8241,7 +8258,7 @@ mod tests {
             "the retried attempt must send the body exactly once",
         );
         assert_eq!(
-            rc.body_bytes_fed,
+            rc.upload.0,
             body.len(),
             "the replay counts the body once, as the client sent it",
         );
@@ -8374,7 +8391,7 @@ mod tests {
 
         let mut rc = test_ctx(true);
         rc.req_buf.extend_from_slice(prefix);
-        rc.body_bytes_fed += prefix.len();
+        rc.upload.feed(prefix.len());
         // ...no reset...
         rc.req_buf.extend_from_slice(prefix);
         rc.req_buf.extend_from_slice(rest);
@@ -8385,7 +8402,7 @@ mod tests {
             "and the result is not valid JSON — this is the 400 the provider returns",
         );
         assert_eq!(
-            rc.body_bytes_fed,
+            rc.upload.0,
             prefix.len(),
             "and the size guard has double-counted",
         );
