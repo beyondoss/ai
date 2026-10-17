@@ -86,6 +86,7 @@ use pingora_core::protocols::http::subrequest::server::SubrequestHandle;
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_proxy::subrequest::{BodyMode, Ctx as SubrequestCtx};
 use pingora_proxy::{FailToProxy, ProxyHttp, ProxyWarnLogContext, Session};
+use providers::catalog::strip_snapshot_date;
 use std::borrow::Cow;
 use std::fmt::Write as _;
 use std::sync::Arc;
@@ -1246,6 +1247,10 @@ struct ModelRouting {
 struct PendingHealth {
     /// The body's first bytes, up to [`HEALTH_PREFIX_CAP`].
     prefix: Vec<u8>,
+    /// The breaker permit the head resolved as a success. The body's verdict is recorded against it,
+    /// never unscoped: a permit is copied, so a later failure cannot reopen a probe that another
+    /// request owns by then.
+    permit: Option<Permit>,
 }
 
 impl PendingHealth {
@@ -1387,6 +1392,30 @@ impl ModelRouting {
 }
 
 impl RequestCtx {
+    /// Take one request-body chunk into this attempt's record: the size count, the capture tap and,
+    /// for a rewrite, the buffer the rewrite reads. `false` once the body has crossed
+    /// `MAX_REQUEST_BODY`. The body filter and the replay tests both feed through here, so a replayed
+    /// prefix is accounted the same way each time.
+    fn take_request_chunk(&mut self, chunk: &[u8]) -> bool {
+        self.body_bytes_fed = self.body_bytes_fed.saturating_add(chunk.len());
+        if self.body_bytes_fed > MAX_REQUEST_BODY {
+            return false;
+        }
+        // Capture tap. Deliberately on the chunk as it *arrives*, which makes the captured bytes
+        // **pre-rewrite** for free: both rewrites happen at end-of-stream over the whole of `req_buf`,
+        // long after this ran. A captured body showing a `stream_options` the client's SDK never sent,
+        // or a `model` re-spelled for whichever failover candidate served, sends an engineer hunting
+        // through their own code for something the gateway put there. What we capture is what the
+        // client sent. Bounded and non-withholding: the chunk is forwarded either way.
+        if let Some(c) = self.control.as_mut().and_then(|c| c.capture.as_mut()) {
+            c.push_req(chunk);
+        }
+        if self.rewrites_body() {
+            self.req_buf.extend_from_slice(chunk);
+        }
+        true
+    }
+
     /// When the current upstream attempt began: the per-attempt stamp for a model-routed request,
     /// and simply the request start for everything else — where the two are always equal anyway,
     /// so the common path stores no second `Instant`.
@@ -1495,6 +1524,10 @@ impl RequestCtx {
         // `req_buf` and feeds `model_scanner`, so neither can hold state while it reads zero.
         if self.body_bytes_fed == 0 {
             return;
+        }
+        // The capture tap is fed the same chunks, so it holds the replayed prefix too.
+        if let Some(c) = self.control.as_mut().and_then(|c| c.capture.as_mut()) {
+            c.clear_req();
         }
         // `clear` keeps the capacity, which was pre-sized from `Content-Length` in `request_filter`
         // and which the in-place splice relies on to stay realloc-free.
@@ -1676,7 +1709,11 @@ impl AiProxy {
         provider: &Provider,
         row: Option<&route::ModelRoute>,
     ) -> HttpPeer {
-        let mut peer = HttpPeer::new(addr, self.state.config.upstream_tls, provider.host.clone());
+        let mut peer = HttpPeer::new(
+            addr,
+            self.state.config.upstream_tls,
+            provider.sni().to_string(),
+        );
         // Prefer HTTP/2 to the provider (config `upstream_http2`, default on), fall back to
         // HTTP/1.1. Every provider in `known_providers()` negotiates `h2` over TLS (verified by
         // handshake), and H2 multiplexes many concurrent requests/streams over one connection —
@@ -2203,14 +2240,18 @@ impl AiProxy {
             None if end_of_stream || pending.prefix.len() >= HEALTH_PREFIX_CAP => false,
             None => return,
         };
+        let permit = pending.permit;
         a.health = None;
         // The head resolved this attempt's breaker permit as a success (see `response_filter`):
         // only the body shows the provider is broken. Count it as the failure it is, so a host that
         // keeps answering errors in 200s opens its breaker and every walk, session pins included,
         // skips it. The windowed rule trips once failures reach the threshold and match the
         // successes, which one success plus one failure per such answer does.
-        if verdict && let Some(b) = rc.provider.breaker.as_ref() {
-            b.record_failure();
+        if verdict
+            && let Some(b) = rc.provider.breaker.as_ref()
+            && let Some(permit) = permit
+        {
+            b.record_failure_for(permit);
         }
     }
 
@@ -2638,21 +2679,6 @@ fn price_model(billed: &str, requested: &str) -> Option<&'static str> {
 /// requested model would leave its billing row without a `price_model`.
 fn price_row(m: &str) -> Option<&'static route::ModelRoute> {
     route::model_route(m).or_else(|| strip_snapshot_date(m).and_then(route::model_route))
-}
-
-/// `m` without a trailing `-YYYY-MM-DD` (OpenAI) or `-YYYYMMDD` (Anthropic) snapshot date.
-fn strip_snapshot_date(m: &str) -> Option<&str> {
-    let digits = |s: &str, n: usize| s.len() == n && s.bytes().all(|b| b.is_ascii_digit());
-    let (head, last) = m.rsplit_once('-')?;
-    if digits(last, 8) {
-        return Some(head);
-    }
-    if !digits(last, 2) {
-        return None;
-    }
-    let (head, month) = head.rsplit_once('-')?;
-    let (head, year) = head.rsplit_once('-')?;
-    (digits(month, 2) && digits(year, 4)).then_some(head)
 }
 
 /// Set OpenRouter's attribution headers when (and only when) `provider_name` is `"openrouter"`
@@ -4060,7 +4086,16 @@ impl ProxyHttp for AiProxy {
                 Some(q) => format!("{p}?{q}"),
                 None => p.to_string(),
             };
-            if let Some(p) = self.state.provider(first) {
+            // A config-added provider written with capitals (`MiniMax`) is served at its name, and at
+            // `/minimax/…`: the table is lowercase, since config names are lowercased at load. A
+            // built-in name is exact (`/OpenAI/…` is no route). The retry runs on a miss only.
+            let provider = self.state.provider(first).or_else(|| {
+                let lower = first.to_ascii_lowercase();
+                (lower != first && providers::by_name(&lower).is_none())
+                    .then(|| self.state.provider(&lower))
+                    .flatten()
+            });
+            if let Some(p) = provider {
                 // Provider-prefixed: strip the leading `/{first}` segment, forward the remainder.
                 // `first` is non-empty here (an empty first segment matches no provider), so this
                 // always differs from the inbound path and always needs the URI rewritten.
@@ -4206,6 +4241,10 @@ impl ProxyHttp for AiProxy {
                 return Self::reject_catalog_miss(session, &request_id, name.as_deref()).await;
             }
             Routed::UnknownProvider => {
+                self.state
+                    .metrics
+                    .rejection(Rejection::UnknownProvider)
+                    .inc();
                 return Self::reject_boxed(
                     session,
                     &request_id,
@@ -4216,6 +4255,10 @@ impl ProxyHttp for AiProxy {
                 .await;
             }
             Routed::AmbiguousCredential => {
+                self.state
+                    .metrics
+                    .rejection(Rejection::AmbiguousCredential)
+                    .inc();
                 // Rare and never a flood path, so not in `REJECT_BODIES`.
                 return Self::reject_message_boxed(
                     session,
@@ -4237,6 +4280,7 @@ impl ProxyHttp for AiProxy {
             managed: managed_key,
         }) = extract_virtual_key(session.req_header())
         else {
+            self.state.metrics.rejection(Rejection::MissingKey).inc();
             return Self::reject_boxed(
                 session,
                 &request_id,
@@ -4280,6 +4324,7 @@ impl ProxyHttp for AiProxy {
         if let Some(len) = declared_len
             && len > MAX_REQUEST_BODY
         {
+            self.state.metrics.rejection(Rejection::BodyTooLarge).inc();
             return Self::reject_boxed(
                 session,
                 &request_id,
@@ -4384,6 +4429,7 @@ impl ProxyHttp for AiProxy {
                 && !resolve_from_body
                 && !provider.as_ref().is_some_and(|p| p.has_pool_key())
             {
+                self.state.metrics.rejection(Rejection::NoPoolKey).inc();
                 return Self::reject_boxed(
                     session,
                     &request_id,
@@ -4652,11 +4698,12 @@ impl ProxyHttp for AiProxy {
         // Two root `model` keys (D34), refused before connecting wherever the body is already in
         // hand, with a JSON 400 and the request id (D94). A body streamed through is still refused
         // in `request_body_filter`, after the request headers went upstream.
-        if model_route.is_some()
-            && body_complete
-                .as_deref()
-                .is_some_and(|b| peek::scan_buffered(b).duplicate_model)
-        {
+        // One walk of the body serves both checks below.
+        let scan = body_complete
+            .as_deref()
+            .filter(|_| model_route.is_some())
+            .map(peek::scan_buffered);
+        if scan.as_ref().is_some_and(|s| s.duplicate_model) {
             self.state
                 .metrics
                 .rejection(Rejection::DuplicateModel)
@@ -4668,6 +4715,22 @@ impl ProxyHttp for AiProxy {
                 "invalid_request_error",
                 "the request body has more than one root \"model\" key; send exactly one"
                     .to_owned(),
+            )
+            .await;
+        }
+
+        // An output limit that is not a whole number on a row with a published cap: refused here, with
+        // a JSON 400, when the body is in hand (see `request_body_filter` for the streamed case).
+        if model_route.is_some_and(|r| r.card.output_cap().is_some())
+            && scan.as_ref().is_some_and(|s| s.inexact_limit)
+        {
+            self.state.metrics.rejection(Rejection::OutputLimit).inc();
+            return Self::reject_message_boxed(
+                session,
+                &request_id,
+                400,
+                "invalid_request_error",
+                "an output limit must be a whole number of tokens".to_owned(),
             )
             .await;
         }
@@ -4687,6 +4750,9 @@ impl ProxyHttp for AiProxy {
             let parsed = control::Control::parse(session.req_header());
             if parsed.malformed {
                 self.state.metrics.control_header_errors_total.inc();
+            }
+            if parsed.unknown_provider {
+                self.state.metrics.control_unknown_provider_total.inc();
             }
             Some(parsed)
         } else {
@@ -6103,8 +6169,7 @@ impl ProxyHttp for AiProxy {
             // Tagged `Downstream` because it is the client's fault: an untagged error counted
             // against the provider's breaker, so one caller sending oversized bodies could open it
             // and 503 every tenant. The status is what pingora answers with.
-            rc.body_bytes_fed = rc.body_bytes_fed.saturating_add(chunk.len());
-            if rc.body_bytes_fed > MAX_REQUEST_BODY {
+            if !rc.take_request_chunk(chunk) {
                 self.state.metrics.rejection(Rejection::BodyTooLarge).inc();
                 return Err(pingora_core::Error::explain(
                     pingora_core::ErrorType::HTTPStatus(413),
@@ -6118,18 +6183,6 @@ impl ProxyHttp for AiProxy {
             // come from one walk of the finished buffer below — the body was previously traversed
             // twice, once here for `model` and once by the injection planner, over the same bytes
             // with the same depth/string/escape bookkeeping.
-            // Capture tap. Deliberately here, on the chunk as it *arrives*, which makes the captured
-            // bytes **pre-rewrite** for free: both of the rewrites below happen at end-of-stream over
-            // the whole of `req_buf`, long after this ran. That matters twice over — a captured body
-            // showing a `stream_options` the client's SDK never sent, or a `model` re-spelled for
-            // whichever failover candidate served, sends an engineer hunting through their own code
-            // for something the gateway put there. What we capture is what the client sent.
-            //
-            // Bounded and non-withholding, exactly like the response tap: the chunk is forwarded
-            // either way, so this costs a memcpy, never latency.
-            if let Some(c) = rc.control.as_mut().and_then(|c| c.capture.as_mut()) {
-                c.push_req(chunk);
-            }
             // Only where no copy of the body will be left for `logging` to read (`tally_eager`):
             // everywhere else the estimate is made there, and only when a row needs one.
             if rc.tally_eager {
@@ -6149,7 +6202,6 @@ impl ProxyHttp for AiProxy {
             }
 
             if rc.rewrites_body() {
-                rc.req_buf.extend_from_slice(chunk);
                 // A large body buffered for a rewrite (the `/{provider}` usage splice; a catalog
                 // walk's large body is a `FullBody` re-run, already reserved) holds budget as it
                 // grows. Tagged downstream: the client's size, not the provider's health.
@@ -6199,6 +6251,22 @@ impl ProxyHttp for AiProxy {
                     return Err(pingora_core::Error::explain(
                         pingora_core::ErrorType::HTTPStatus(400),
                         "duplicate root model key",
+                    )
+                    .into_down());
+                }
+                // An output limit that is not a whole number (a string, a fraction, a negative) has no
+                // span, so the clamp below cannot hold it to the row's maximum. Refused before a byte
+                // goes upstream, where the provider would otherwise be the one to read it.
+                if scan.inexact_limit
+                    && rc
+                        .auto
+                        .as_ref()
+                        .is_some_and(|a| a.route.card.output_cap().is_some())
+                {
+                    self.state.metrics.rejection(Rejection::OutputLimit).inc();
+                    return Err(gateway_error(
+                        400,
+                        "an output limit must be a whole number of tokens",
                     )
                     .into_down());
                 }
@@ -6482,7 +6550,10 @@ impl ProxyHttp for AiProxy {
             if (200..300).contains(&status)
                 && let Some(a) = rc.auto.as_mut()
             {
-                a.health = Some(PendingHealth { prefix: Vec::new() });
+                a.health = Some(PendingHealth {
+                    prefix: Vec::new(),
+                    permit: rc.breaker_pending,
+                });
             }
             rc.provider.metrics.record_response(status);
             rc.upstream_status = Some(status);
@@ -7423,9 +7494,13 @@ impl ProxyHttp for AiProxy {
                 && match rc.dialect {
                     Dialect::OpenAi => parsed.is_none(),
                     // A `message_delta` that arrived but did not parse is as missing as one that
-                    // never came.
+                    // never came. A usage with no token count (only a server tool's count, from a
+                    // stream whose message_start was lost) is missing its tokens too: estimated.
                     Dialect::Anthropic => {
-                        parsed.is_none() || !usage::anthropic_stream_finished(tail)
+                        parsed
+                            .as_ref()
+                            .is_none_or(|u| u.input_tokens == 0 && u.output_tokens == 0)
+                            || !usage::anthropic_stream_finished(tail)
                     }
                 };
             // A non-stream 2xx that died before its `usage` (the body is last): the provider
@@ -8072,10 +8147,10 @@ mod tests {
             br#"{"messages":[{"role":"user","content":"hi"}],"model":"gpt-4o","stream":true}"#;
         let (prefix, rest) = body.split_at(30);
 
-        // Attempt 1: a prefix arrives, then the upstream dies before end-of-stream.
+        // Attempt 1: a prefix arrives, then the upstream dies before end-of-stream. The chunk goes
+        // through the production append step, as `request_body_filter` feeds it.
         let mut rc = test_ctx(true);
-        rc.req_buf.extend_from_slice(prefix);
-        rc.body_bytes_fed += prefix.len();
+        assert!(rc.take_request_chunk(prefix));
         assert!(
             !rc.req_buf.is_empty(),
             "precondition: the partial body is still held, since end_of_stream never came",
@@ -8083,18 +8158,23 @@ mod tests {
 
         // `upstream_peer` runs before any body byte of attempt 2.
         rc.reset_request_body_phase();
+        assert_eq!(
+            rc.body_bytes_fed, 0,
+            "the size guard must not double-count the replayed prefix",
+        );
 
-        // Attempt 2: pingora replays from byte 0, then the remainder streams in.
-        rc.req_buf.extend_from_slice(prefix);
-        rc.req_buf.extend_from_slice(rest);
+        // Attempt 2: pingora replays from byte 0 through the same filter, then the remainder.
+        assert!(rc.take_request_chunk(prefix));
+        assert!(rc.take_request_chunk(rest));
 
         assert_eq!(
             rc.req_buf, body,
             "the retried attempt must send the body exactly once",
         );
         assert_eq!(
-            rc.body_bytes_fed, 0,
-            "the size guard must not double-count the replayed prefix",
+            rc.body_bytes_fed,
+            body.len(),
+            "the replay counts the body once, as the client sent it",
         );
         let scan = peek::scan_buffered(&rc.req_buf);
         assert_eq!(
@@ -8106,6 +8186,113 @@ mod tests {
         assert!(
             scan.inject_at.is_some(),
             "the stream_options splice must still be planned against a well-formed root object",
+        );
+    }
+
+    /// A retried attempt replays the body prefix through the capture tap, so the reset must clear
+    /// the capture as well, or the captured request holds the prefix twice.
+    /// claim: O2
+    /// defect: D285
+    #[test]
+    fn a_retried_attempt_captures_the_request_body_once() {
+        let body =
+            br#"{"messages":[{"role":"user","content":"hi"}],"model":"gpt-4o","stream":true}"#;
+        let (prefix, rest) = body.split_at(30);
+
+        let mut rc = test_ctx(true);
+        rc.control = Some(Box::new(RequestControl {
+            metadata: None,
+            capture: Some(CaptureBufs::new(4096)),
+        }));
+
+        // Attempt 1: a prefix arrives through the production append step (captured and buffered),
+        // then the upstream dies.
+        assert!(rc.take_request_chunk(prefix));
+        rc.reset_request_body_phase();
+
+        // Attempt 2: pingora replays from byte 0 through the same step, then the remainder.
+        assert!(rc.take_request_chunk(prefix));
+        assert!(rc.take_request_chunk(rest));
+        let captured = rc.control.as_ref().unwrap().capture.as_ref().unwrap();
+        assert_eq!(
+            captured.req_str(),
+            std::str::from_utf8(body).ok(),
+            "the capture holds the replayed prefix twice"
+        );
+    }
+
+    /// A 2xx whose body turns out to be an error is counted against the breaker permit the head
+    /// resolved, so a late verdict cannot reopen a breaker that another request's probe owns by then.
+    /// claim: REL-6
+    /// defect: D286
+    #[test]
+    fn a_late_body_verdict_cannot_reopen_a_breaker_another_probe_owns() {
+        static NOW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1_000);
+        fn clock() -> u64 {
+            NOW.load(std::sync::atomic::Ordering::Relaxed)
+        }
+        let breaker = crate::circuit_breaker::CircuitBreaker::with_clock(
+            crate::circuit_breaker::CircuitBreakerConfig::consecutive(1)
+                .reset_timeout(std::time::Duration::from_secs(30))
+                .half_open_permits(1),
+            clock,
+        );
+        // This request was admitted while the breaker was closed, and its head was a 200.
+        let admitted = breaker.allow().expect("a closed breaker admits");
+        breaker.record_success_for(admitted);
+        // Another request trips the breaker; after the reset timeout its probe owns the breaker.
+        let trip = breaker.allow().expect("a closed breaker admits");
+        breaker.record_failure_for(trip);
+        NOW.store(1_030, std::sync::atomic::Ordering::Relaxed);
+        let _probe = breaker.allow().expect("the reset timeout admits one probe");
+
+        let mut rc = test_ctx(true);
+        rc.provider = Arc::new(Provider::resolve(
+            "openai",
+            "api.openai.com:443".to_string(),
+            Dialect::OpenAi,
+            AuthScheme::Bearer,
+            &["sk-pool"],
+            ProviderMetrics::disconnected(),
+            Some(breaker),
+        ));
+        let row = route::model_route("gpt-4o").expect("a catalog row");
+        rc.auto = Some(Box::new(ModelRouting {
+            route: row,
+            sub: None,
+            candidate: 0,
+            usable: 1,
+            walk: control::Walk::identity(row.candidates.len()),
+            arms: row.candidates,
+            session_field: None,
+            attempt_start: Instant::now(),
+            cache: None,
+            translate: None,
+            health: Some(PendingHealth {
+                prefix: Vec::new(),
+                permit: Some(admitted),
+            }),
+            addrs: 0,
+            attempted: true,
+            open_retry_after: None,
+            priority: false,
+        }));
+        let state: &'static Arc<crate::state::GatewayState> = Box::leak(Box::new(
+            crate::state::GatewayState::new(
+                crate::config::AiConfig::default(),
+                crate::state::test_metrics(),
+            )
+            .unwrap(),
+        ));
+
+        AiProxy { state }.settle_health(&mut rc, br#"{"error":{"message":"overloaded"}}"#, true);
+
+        assert!(
+            matches!(
+                rc.provider.breaker.as_ref().unwrap().state(),
+                crate::circuit_breaker::CircuitState::HalfOpen { .. }
+            ),
+            "a late body verdict reopened a breaker owned by another request's probe"
         );
     }
 
@@ -8260,10 +8447,11 @@ mod tests {
         );
     }
 
-    /// A model-routed request takes its dialect from **this candidate's path**, not the row and
-    /// not the provider. Mixed-wire rows (Claude → OpenRouter Chat Completions) would otherwise
-    /// parse a Chat Completions reply with the Anthropic extractor — or the reverse — and emit a
-    /// zero-token billing row.
+    /// A model-routed request takes its dialect from **the serving candidate's path**: the row's
+    /// wire is the client's default, and a mixed-wire row (Claude → OpenRouter Chat Completions)
+    /// would otherwise parse a Chat Completions reply with the Anthropic extractor, or the reverse,
+    /// and emit a zero-token billing row. The assertions below check the derivation from the path
+    /// only; the provider's own wire is not what they exercise.
     #[test]
     fn a_model_route_takes_its_dialect_from_the_serving_candidate_path() {
         let openrouter = providers::by_id(providers::ProviderId::OpenRouter);
@@ -8292,6 +8480,38 @@ mod tests {
         // The old derivation (row.wire, or provider.wire) is wrong for this fallback:
         assert_eq!(row.wire, Dialect::Anthropic);
         assert_eq!(openrouter.wire, Dialect::OpenAi);
+
+        // The production derivation: serving the request from each arm sets the dialect from that
+        // arm's path. Both attempts start from the row's wire, as `request_filter` leaves them.
+        let serving = |candidate: usize| {
+            let mut rc = test_ctx(true);
+            rc.auto = Some(Box::new(ModelRouting {
+                route: row,
+                sub: None,
+                candidate: u8::try_from(candidate).unwrap(),
+                usable: 0b11,
+                walk: control::Walk::identity(row.candidates.len()),
+                arms: row.candidates,
+                session_field: None,
+                attempt_start: Instant::now(),
+                cache: None,
+                translate: None,
+                health: None,
+                addrs: 0,
+                attempted: false,
+                open_retry_after: None,
+                priority: false,
+            }));
+            rc.dialect = row.wire;
+            apply_serving_candidate(&mut rc);
+            rc.dialect
+        };
+        assert_eq!(serving(0), Dialect::Anthropic, "the Messages primary");
+        assert_eq!(
+            serving(row.candidates.len() - 1),
+            Dialect::OpenAi,
+            "the OpenRouter Chat arm of a Claude row"
+        );
     }
 
     /// Only a 401 walks and cools a key; 401, 402 and 403 are all catalog refusals. A 403's body
@@ -9845,6 +10065,16 @@ mod mutation_gaps {
     fn a_model_id_with_a_space_is_kept() {
         assert_eq!(sanitize_model("my model".to_owned()), "my model");
         assert_eq!(sanitize_model("bad\u{1f}model".to_owned()), "unknown");
+    }
+
+    /// A dated snapshot prices as its base model, in either spelling the vendors use.
+    /// claim: BIL-13, BIL-24
+    /// defect: D278
+    #[test]
+    fn a_dated_snapshot_prices_as_its_base_model() {
+        for id in ["gpt-4o-mini-2024-07-18", "gpt-4o-mini-20240718"] {
+            assert_eq!(price_row(id).map(|r| r.model), Some("gpt-4o-mini"), "{id}");
+        }
     }
 
     /// Only an eight-digit or `YYYY-MM-DD` suffix is a snapshot date; an all-digit suffix of

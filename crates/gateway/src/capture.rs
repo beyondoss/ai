@@ -143,6 +143,13 @@ impl CaptureBufs {
         );
     }
 
+    /// Forget the request body captured so far, keeping the buffer's capacity. A retried attempt
+    /// replays the body through the tap, so the captured request must restart with it.
+    pub fn clear_req(&mut self) {
+        self.req.clear();
+        self.req_truncated = false;
+    }
+
     pub fn push_resp(&mut self, chunk: &[u8]) {
         Self::push(
             &mut self.resp,

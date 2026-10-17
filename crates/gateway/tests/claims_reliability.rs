@@ -425,6 +425,72 @@ async fn h1_keep_alive_stays_in_sync_after_rejects() {
     }
 }
 
+/// Every refusal `request_filter` makes before the upstream is counted on `ai_rejections_total`, so
+/// a flood of any of them shows on the dashboard.
+/// claim: O3
+/// defect: D284
+#[tokio::test]
+async fn every_refusal_before_the_upstream_is_counted() {
+    let (pubkey, sk) = test_keypair(112);
+    let mock = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::builder(unused_nats_port(), &mock.authority(), &b64(&pubkey))
+        .providers(&["openai"])
+        .start()
+        .await;
+    let key = billing_vkey(&sk, 112);
+    let reasons = [
+        "unknown_provider",
+        "missing_key",
+        "no_pool_key",
+        "ambiguous_credential",
+        "body_too_large",
+    ];
+    let mut before = Vec::new();
+    for reason in reasons {
+        before.push(gw.metric("ai_rejections_total", reason).await);
+    }
+
+    // An unknown provider segment: 404.
+    let resp = post(&gw, "/nope/v1/chat/completions", &key, CHAT).await;
+    assert_eq!(resp.status().as_u16(), 404);
+    // No credential at all: 401.
+    let resp = test_client()
+        .post(format!("{}/openai/v1/chat/completions", gw.url()))
+        .header("content-type", "application/json")
+        .body(CHAT)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 401);
+    // Two BYO keys for two providers, on the default path: refused before any connect.
+    let resp = test_client()
+        .post(format!("{}/v1/chat/completions", gw.url()))
+        .header("authorization", "Bearer sk-openai-byo")
+        .header("x-api-key", "sk-ant-byo")
+        .header("content-type", "application/json")
+        .body(CHAT)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 400);
+    // A known provider with no pool key configured: 503 before any connect.
+    let resp = post(&gw, "/fireworks/v1/chat/completions", &key, CHAT).await;
+    assert_eq!(resp.status().as_u16(), 503);
+    // A declared body past the cap: 413, refused on the header alone.
+    let mut s = TcpStream::connect(("127.0.0.1", gw.port)).await.unwrap();
+    let head = format!(
+        "POST /openai/v1/chat/completions HTTP/1.1\r\nhost: x\r\nauthorization: Bearer {key}\r\ncontent-length: 104857601\r\n\r\n"
+    );
+    s.write_all(head.as_bytes()).await.unwrap();
+    let first = read_response(&mut s).await.expect("the reject is answered");
+    assert_eq!(first.status, 413, "{first:?}");
+
+    for (reason, was) in reasons.into_iter().zip(before) {
+        let now = gw.metric("ai_rejections_total", reason).await;
+        assert_eq!(now - was, 1.0, "{reason} was not counted once");
+    }
+}
+
 /// One h2c connection carries a stream that is cancelled, a request that is rejected, a slow
 /// request in flight the whole time, and a fresh request afterwards. Only the cancelled stream is
 /// affected.

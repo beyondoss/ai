@@ -134,6 +134,38 @@ async fn a_duplicate_model_is_refused_before_the_upstream_with_a_json_400() {
     assert_eq!(mock.hits(), 0, "the upstream got the request");
 }
 
+/// An output limit that is not a whole number has no span for the cap to edit, so a catalog walk
+/// refuses it with the gateway's 400 before the upstream sees it. A whole number over the cap is
+/// still capped, as before.
+/// claim: TRN-5
+/// defect: D275
+#[tokio::test]
+async fn a_non_integer_output_limit_is_refused_before_the_upstream() {
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::builder(unused_nats_port(), &mock.authority(), &b64(&pubkey))
+        .providers(&["openai"])
+        .start()
+        .await;
+    for body in [
+        r#"{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}],"max_tokens":1e5}"#,
+        r#"{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}],"max_tokens":"99999"}"#,
+    ] {
+        assert_eq!(
+            send_raw(&gw, &sk, "/v1/chat/completions", body).await,
+            400,
+            "{body}"
+        );
+    }
+    assert_eq!(mock.hits(), 0, "a non-integer limit reached the upstream");
+    wait_for_metric(&gw, "ai_rejections_total", "output_limit", 2.0).await;
+
+    let body =
+        r#"{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}],"max_tokens":64000}"#;
+    assert_eq!(send_raw(&gw, &sk, "/v1/chat/completions", body).await, 200);
+    assert_eq!(sent(&mock)["max_completion_tokens"], 16384);
+}
+
 /// POST `body` (sent as written) to `path` with a managed key; the status.
 async fn send_raw(gw: &Gateway, sk: &ed25519_dalek::SigningKey, path: &str, body: &str) -> u16 {
     let resp = test_client()

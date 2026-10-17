@@ -2765,3 +2765,199 @@ state = "fixed"
 test = "a_bedrock_failover_strips_eager_input_streaming_where_the_profile_does_not_take_it"
 fix = "234fc382"
 note = "providers::catalog::serves_eager_input_streaming is a per-candidate capability: direct Anthropic always, Bedrock only for the BEDROCK_EAGER_INPUT_STREAMING allowlist (us.anthropic.claude-opus-4-8), so a new Bedrock row starts without it. On any other candidate request_body_filter cuts each root tools element's eager_input_streaming out by span (translate::strip_eager_input_streaming) and retain_managed_client_headers drops the beta; the only cost is that Bedrock buffers each tool parameter. Per attempt on the replayed client body, so direct Anthropic gets the client's exact bytes and its prompt cache key never moves. The test fails over Anthropic 500 onto Bedrock for all three Bedrock rows (and a 100 KiB full-body request) and asserts both bodies and beta headers. Also held by strip_eager_input_streaming_cuts_only_the_tool_field, the_fine_grained_tool_streaming_beta_reaches_only_a_candidate_that_takes_it and eager_input_streaming_is_kept_only_where_a_candidate_is_known_to_accept_it. To widen the allowlist, verify one tool-bearing request with the field on the Bedrock profile."
+
+[[defect]]
+id = "D273"
+severity = "high"
+area = "Routing"
+title = "The streaming model scanner misses a model key spelled with an escape"
+impact = "A managed streamed request whose root key is spelled with an escape (\"mod\\u0065l\") reads as having no model, so it routes on nothing (404 unknown_model) although the provider, and the buffered scan on the same body, read `model`. The two scanners disagree on one body."
+confidence = "high"
+evidence = "peek.rs ModelScanner compared the raw key bytes (\"modu0065l\") with \"model\"; scan_buffered and serde_json decode the escape. Reproduced by an_escaped_model_key_is_found_by_the_streaming_scanner, which failed on main 4513e6f."
+claims = ["SEC-21"]
+state = "fixed"
+test = "an_escaped_model_key_is_found_by_the_streaming_scanner"
+fix = "f3e92d8"
+note = "Fixed in peek.rs: a key that contains a backslash is decoded (capture_text, serde_json, as the provider decodes it) before it is compared with `model` or a kept key; an unescaped key is compared as captured, so it pays nothing new. Also held by props_peek prop_streaming_scanner_agrees_with_buffered_scan, now without its escaped-key exclusion. The plain key case already worked on main."
+
+[[defect]]
+id = "D274"
+severity = "med"
+area = "Routing"
+title = "An escaped model value is read without its escapes: \"gpt-\\u0035\" is gpt-u0035"
+impact = "Both scanners kept the letter after each backslash, so a model id spelled with an escape (\"gpt-\\u0035\", or a newline in the value) was read as a different id: gpt-u0035, or anb. A model-routed body then 404s as an unknown model although the provider would read gpt-5, and a managed row logs the mangled id."
+confidence = "high"
+evidence = "peek.rs ModelScanner and scan_buffered pushed the escaped character alone (\"u0035\", \"n\"); serde_json decodes both. Reproduced by a_unicode_escape_in_a_model_value_is_decoded and a_newline_escape_in_a_model_value_is_decoded on main 4513e6f. A slash escape already decoded (a_slash_escape_in_a_model_value_is_decoded passed there, as the control)."
+claims = ["SEC-21", "BIL-13"]
+state = "fixed"
+test = "a_unicode_escape_in_a_model_value_is_decoded"
+fix = "f05c73b"
+note = "Fixed in peek.rs: a string's escapes are captured with it (the backslash too), and capture_text decodes the capture as serde_json does, at the value's close in ModelScanner and in scan_buffered. A capture at the cap that holds an escape decodes to None (unknown), since its last escape may be cut. Kept request knobs (service_tier, provider, ...) decode the same way. Capture stays bounded by MAX_CAPTURE and an unescaped value costs nothing new. Also held by a_newline_escape_in_a_model_value_is_decoded, a_slash_escape_in_a_model_value_is_decoded and props_peek's model-value property, now without its escaped-value exclusion."
+
+[[defect]]
+id = "D275"
+severity = "med"
+area = "Translation"
+title = "An output limit written as a fraction or an exponent escapes the row's cap"
+impact = "The catalog walk caps a root output limit by its span, and the span was the leading digit run. 1e5 spanned `1`, which is under any cap, so a value over the row's published maximum went upstream uncapped, to the provider's own 400 the cap exists to prevent. 99999.5 spanned `99999`, and the splice produced 16384.5, a fraction the provider refuses."
+confidence = "high"
+evidence = "peek.rs scan_buffered recorded (j, end) for the digits before any `.` or `e`. Reproduced on 4513e6f by a_fractional_output_limit_has_no_span and an_exponent_output_limit_has_no_span (the limit's span was Some(1))."
+claims = ["TRN-5"]
+state = "fixed"
+test = "an_exponent_output_limit_has_no_span"
+fix = "8e46d0b"
+note = "Fixed in peek.rs: a root limit's digits are a span only when the member ends after them (`,` or `}`, past whitespace). Any other value that is present and not null is flagged as inexact_limit: strings, bools, objects, arrays, negatives, fractions, exponents. A catalog walk on a row with a published cap refuses a flagged body with a 400 before the upstream (proxy request_body_filter, Rejection::OutputLimit, reason output_limit), so a limit is never sent on uncapped. A row with no published cap has nothing to hold it to and forwards it as before. Also held by a_non_integer_output_limit_is_refused_before_the_upstream (catalog_body.rs, compile-only here) and only_a_non_integer_output_limit_is_inexact."
+
+[[defect]]
+id = "D276"
+severity = "high"
+area = "Billing"
+title = "An empty usage object is read as zero tokens, and a trailing one overwrites real usage"
+impact = "A usage object that names no token count (\"usage\": {}) parsed as a zero usage. On a stream, a final empty usage event won the reverse scan over the real one, so the row billed zero tokens for an answer that was metered. On a body, an empty usage made a zero row where no usage was reported."
+confidence = "high"
+evidence = "usage.rs: every count field was #[serde(default)] u64, so {} deserialized to Some(zeros). Reproduced on 4513e6f by a_trailing_empty_usage_event_does_not_shadow_real_usage (openai_stream returned 0 input tokens, not 10) and an_empty_usage_object_is_no_usage."
+claims = ["BIL-6"]
+state = "fixed"
+test = "a_trailing_empty_usage_event_does_not_shadow_real_usage"
+fix = "85d5fa0"
+note = "Fixed in usage.rs: the count fields that decide whether a usage object has tokens (prompt/completion, input/output, total, cache hit) are Option, and counts_tokens() is checked wherever a usage object becomes a Usage (openai_body, anthropic_body, openai_chunk_usage, the Responses envelope, the openai_stream recovery, anthropic_apply). An object with no token field is no usage, so a stream scan falls through to the real event and a body reports none. Also held by an_empty_usage_object_is_no_usage."
+
+[[defect]]
+id = "D277"
+severity = "med"
+area = "Billing"
+title = "A message_delta or an error member with a space after its colon is missed"
+impact = "The cut-short check looked for the literal text \"type\":\"message_delta\" and the error check for \"error\":{. JSON allows whitespace around the colon, so a finished stream written with \"type\" : \"message_delta\" was read as cut short and billed an estimate, and an error event written \"error\" : {…} was read as no error."
+confidence = "high"
+evidence = "usage.rs anthropic_stream_finished and stream_carried_error matched the exact bytes. Reproduced on 4513e6f by a_spaced_message_delta_type_member_finishes_a_stream (not finished) and by the spaced error form of a_top_level_error_object_is_an_error_event_in_any_spelling (not identified)."
+claims = ["BIL-22", "BIL-12"]
+state = "fixed"
+test = "a_spaced_message_delta_type_member_finishes_a_stream"
+fix = "8dd1e3a"
+note = "Fixed in usage.rs: anthropic_stream_finished reads each event's top-level `type` from its JSON (a literal search decides when the tail has no backslash), so a spaced or escaped key is found. The `event: message_delta` line stays a marker, as each_message_delta_marker_alone_finishes_a_stream requires. stream_carried_error reads each event's top-level `error` member and counts it only when it is an object (event_error_object), so spacing and escapes name the same error. A nested error is not identified, and its stream is billed as cut short. Also held by a_top_level_error_object_is_an_error_event_in_any_spelling."
+
+[[defect]]
+id = "D278"
+severity = "med"
+area = "Billing"
+title = "A compact-dated gpt-4o-mini snapshot escapes the mini web_search refusal"
+impact = "The price lookup strips both dated snapshot forms (-YYYY-MM-DD and -YYYYMMDD), but the unpriced gate's base_model stripped only the dashed one. So gpt-4o-mini-20240718 with a web_search tool was not refused as the mini web search that bills a fixed content block the gateway cannot meter, and it ran unpriced."
+confidence = "high"
+evidence = "unpriced.rs base_model matched only -YYYY-MM-DD; proxy.rs strip_snapshot_date matched both. Reproduced on 4513e6f by a_dated_snapshot_names_its_base_model_to_the_refusal (base_model(\"gpt-4o-mini-20240718\") returned the id unchanged)."
+claims = ["BIL-10"]
+state = "fixed"
+test = "a_dated_snapshot_names_its_base_model_to_the_refusal"
+fix = "8aacacd"
+note = "Fixed by one shared stripper: providers::catalog::strip_snapshot_date, used by the price lookup (proxy::price_row) and by unpriced::base_model, which now strips the vendor prefix and then the shared snapshot date. Also held by a_dated_snapshot_prices_as_its_base_model (proxy) for the price side, which already worked, so the two callers cannot drift apart again."
+
+[[defect]]
+id = "D279"
+severity = "high"
+area = "Billing"
+title = "A tool type the gateway does not meter passed the unpriced gate on a managed key"
+impact = "unpriced::tools refused the tool types it named and passed every other. A managed request with a billed tool the gateway does not know (or a family added by a provider later) reached the provider and ran outside the usage a row can meter."
+confidence = "high"
+evidence = "unpriced.rs tools was a denylist. Reproduced on 4513e6f by an_unlisted_tool_type_is_refused: {\"tools\":[{\"type\":\"some_new_billed_tool\"}]} was not refused."
+claims = ["BIL-10"]
+state = "fixed"
+test = "an_unlisted_tool_type_is_refused"
+fix = "cdf8b4b"
+note = "Decided by the owner: an allowlist by family. unpriced::allowed_tool accepts the client-run families (function, custom, namespace, apply_patch, local_shell, bash, text_editor, computer, memory) and the server families the usage meter counts (web_search, web_fetch, file_search, tool_search, x_search, mcp, computer), dated versions included. Every existing specific refusal (containers, image generation, browser_search, OpenRouter web, mini web_search, code_execution, advisor) is checked first with its message; any other type, or a tool with no string type, is refused with UNLISTED_TOOL. every_kind_the_meter_counts_is_allowed_or_named keeps the list and the meter together. Also held by every_unpriced_feature_is_refused and priced_features_and_lookalikes_pass, unchanged."
+
+[[defect]]
+id = "D280"
+severity = "med"
+area = "Config"
+title = "A provider written with capitals in the TOML silently loses its env pool key"
+impact = "The env fold lowercases AI_POOL_KEY_<NAME>, but TOML provider names kept their case. A config that writes [provider_authorities] MiniMax with AI_POOL_KEY_MINIMAX gave the provider no key, so every managed request to it returned 503 with a healthy-looking boot."
+confidence = "high"
+evidence = "config.rs merge_secret_env stored the env key as `minimax`; the TOML table kept `MiniMax`, and build_providers looks the key up by the provider's name. Reproduced on 4513e6f by provider_names_are_lowercased_at_the_config_boundary (the authority stayed under MiniMax, and the env key sat under minimax with no provider to match)."
+claims = ["REL-15"]
+state = "fixed"
+test = "provider_names_are_lowercased_at_the_config_boundary"
+fix = "fe3e9c0"
+note = "Fixed at the config boundary: AiConfig::normalize_provider_names lowercases the keys of pool_keys, provider_authorities, provider_dialects and provider_auth_schemes right after the TOML/flat extract and before the env fold, so the env fold's name matching sees the same names. A name outside [a-z0-9_-], or two names equal once lowercased, is a boot failure. Also held by a_provider_name_outside_the_charset_or_repeated_in_case_is_refused. The typed ProviderName newtype is left to PR 1."
+
+[[defect]]
+id = "D281"
+severity = "med"
+area = "Security"
+title = "A pool key configured for openai-codex is attached to it"
+impact = "openai-codex is served only with a client's own ChatGPT bearer, and providers/src/lib.rs says it takes no pool key. build_providers attached any AI_POOL_KEY_OPENAI_CODEX or [pool_keys] openai-codex to the row, so a managed request to /openai-codex/ would have been served on a pool key the row was never meant to hold."
+confidence = "high"
+evidence = "state.rs build_providers read config.pool_keys for every known row, codex included. Reproduced on 4513e6f by openai_codex_never_takes_a_pool_key (has_pool_key was true)."
+claims = ["SEC-5"]
+state = "fixed"
+test = "openai_codex_never_takes_a_pool_key"
+fix = "d431d26"
+note = "Fixed by data on the provider id: ProviderId::takes_pool_key is false for OpenAiCodex, and build_providers only passes a configured pool key to a row that takes one. The env fold (config.rs) and its test are unchanged: the key is still read, and it is then not attached."
+
+[[defect]]
+id = "D282"
+severity = "low"
+area = "Routing"
+title = "A walk header that names no provider at all is dropped with no signal"
+impact = "A caller who typed a provider name that exists nowhere (x-beyond-only: opnai) got the default walk and no sign of it: the name was dropped, and nothing counted it, so the tags or the steering they meant silently never applied."
+confidence = "high"
+evidence = "control.rs parse_name_list kept every well-formed name, and the walk dropped any name the row did not list, so an unknown name left no trace. Reproduced on 4513e6f by a_name_that_matches_no_provider_is_flagged_as_unknown (the signal did not exist)."
+claims = ["R3"]
+state = "fixed"
+test = "a_name_that_matches_no_provider_is_flagged_as_unknown"
+fix = "31136b5"
+note = "Decided by the owner: the header stays well formed and malformed is unchanged (the existing unknown-name test still asserts !malformed). Control::unknown_provider is set only when a name in order, only or split matches no ProviderSpec (providers::by_name). It is counted on the new ai_control_unknown_provider_total in proxy request_filter, beside the malformed count. A real provider merely off the row is not flagged: a_real_provider_off_the_row_is_not_flagged."
+
+[[defect]]
+id = "D283"
+severity = "med"
+area = "Routing"
+title = "A provider configured with an IPv6 literal authority gets the host [2001 for SNI and Host"
+impact = "Provider::resolve took the host as the text before the first colon, so [2001:db8::1]:443 became the host [2001. A provider configured with an IPv6 literal upstream sent that as its Host header and SNI, so its TLS handshake and routing failed on every request."
+confidence = "high"
+evidence = "route.rs Provider::resolve split the authority on ':'. Reproduced on 4513e6f by an_ipv6_authority_keeps_its_brackets_in_the_host_header_and_not_in_sni (host was \"[2001\")."
+claims = ["R1"]
+state = "fixed"
+test = "an_ipv6_authority_keeps_its_brackets_in_the_host_header_and_not_in_sni"
+fix = "7b56ba5"
+note = "Fixed in route.rs: the host is http::uri::Authority::host(), which keeps the brackets of an IPv6 literal, so the Host header carries them (RFC 9110). Provider::sni() strips them for the TLS server name, which proxy's peer uses. A string that is no authority keeps the old first-colon fallback."
+
+[[defect]]
+id = "D284"
+severity = "low"
+area = "Observability"
+title = "Four refusals in request_filter were not counted on ai_rejections_total"
+impact = "An unknown provider segment (404), a request with no credential (401), a known provider with no pool key (503), and a declared body past the cap (413) were refused before the upstream but incremented no Rejection counter, so a flood of them was invisible on the dashboard, against ARCHITECTURE's statement that every rejection is counted."
+confidence = "high"
+evidence = "proxy.rs request_filter returned these four refusals with no metrics call. Reproduced on 4513e6f by every_refusal_before_the_upstream_is_counted, which needs the four counted (the reasons were absent from the scrape)."
+claims = ["O3"]
+state = "fixed"
+test = "every_refusal_before_the_upstream_is_counted"
+fix = "c23ba7c"
+note = "Fixed in proxy.rs request_filter and metrics.rs: the 404 counts Rejection::UnknownProvider and the 401 Rejection::MissingKey (labels unknown_provider and missing_key); the no-pool-key 503 counts Rejection::NoPoolKey (no_pool_key), a variant of its own, so no_candidate keeps the model-routed meaning its doc gives; the declared-length 413 counts the existing BodyTooLarge, whose doc now covers a declared length as well as a streamed one. AmbiguousCredential (ambiguous_credential) counts the two-BYO-credentials 400. The integration test is in tests/claims_reliability.rs; it ran on Linux."
+
+[[defect]]
+id = "D285"
+severity = "low"
+area = "Observability"
+title = "A retried attempt captured the request body's replayed prefix twice"
+impact = "Capture is fed the client's body as it arrives. When pingora retried an attempt, reset_request_body_phase cleared the buffer and the size count but not the capture, so the replayed prefix was captured again, and the captured request body was no longer the client's bytes."
+confidence = "high"
+evidence = "proxy.rs reset_request_body_phase cleared req_buf and body_bytes_fed but left control.capture.req. Reproduced on 4513e6f by a_retried_attempt_captures_the_request_body_once (the capture read the prefix twice)."
+claims = ["O2"]
+state = "fixed"
+test = "a_retried_attempt_captures_the_request_body_once"
+fix = "ccc017c"
+note = "Fixed in proxy.rs reset_request_body_phase: after the zero-bytes witness returns early, the capture's request side is cleared (CaptureBufs::clear_req, which keeps the capacity), so a replay is captured once as the client sent it. The witness stays exact because the capture is fed only on the same path as body_bytes_fed."
+
+[[defect]]
+id = "D286"
+severity = "med"
+area = "Reliability"
+title = "A late error-in-200 verdict could reopen a half-open breaker that another request's probe owned"
+impact = "settle_health counted a 2xx's body verdict with the unscoped record_failure(). The head had already resolved the attempt's permit as a success, so the verdict arrived after the permit was spent. If by then another request's probe owned the half-open breaker, the unscoped failure reopened it, failing that probe's request and every request behind it."
+confidence = "medium"
+evidence = "proxy.rs settle_health called record_failure(); the only unscoped production call. Reproduced on 4513e6f by a_late_body_verdict_cannot_reopen_a_breaker_another_probe_owns, which fails with the unscoped call restored (the breaker went OPEN) and passes with the fix."
+claims = ["REL-6"]
+state = "fixed"
+test = "a_late_body_verdict_cannot_reopen_a_breaker_another_probe_owns"
+fix = "b20832b"
+note = "Fixed in proxy.rs: PendingHealth keeps a copy of the breaker permit the head resolved (Permit is Copy), and settle_health records the verdict with record_failure_for(permit). A permit claimed while CLOSED decides nothing in HALF_OPEN, so the other probe keeps the breaker. The unscoped record_success and record_failure have no other production caller; removing them is PR 1. Also held by a_late_failure_from_a_closed_permit_cannot_reopen_another_probes_breaker (circuit_breaker.rs), the breaker rule the fix relies on. Behaviour in CLOSED is unchanged: stale() is consulted only in the HALF_OPEN arms, so a late failure in CLOSED still counts toward the threshold. Only a permit from an earlier or other probe is ignored, in HALF_OPEN."

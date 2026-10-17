@@ -29,7 +29,8 @@ pub enum Rejection {
     DenyUnknown,
     /// Provider's circuit breaker is open.
     CircuitOpen,
-    /// Streamed request body crossed `MAX_REQUEST_BODY`.
+    /// The request body crossed `MAX_REQUEST_BODY`: declared by `Content-Length` up front, or
+    /// streamed past it.
     BodyTooLarge,
     /// Per-credential rate ceiling.
     RateLimit,
@@ -97,12 +98,26 @@ pub enum Rejection {
     /// meter (a container, the image generation tool, an OpenRouter plugin, Anthropic Priority
     /// Tier: `unpriced::feature`). 400 before any upstream, so nothing runs unpriced.
     UnpricedFeature,
+    /// A catalog-walk output limit that is not a whole number (a string, a fraction, a negative):
+    /// no span to cap it by, so the body is refused. 400 before any upstream.
+    OutputLimit,
+    /// `/{name}/…` names no provider the gateway routes to. 404 before any upstream.
+    UnknownProvider,
+    /// A request presented no credential at all (neither `Authorization` nor `x-api-key`), on any
+    /// route. 401.
+    MissingKey,
+    /// The request presents a BYO key for one provider in one header and another in a second one.
+    /// 400, since neither key can be chosen. Before any upstream.
+    AmbiguousCredential,
+    /// A `/{name}/…` route whose provider has no pool key configured: nothing to send on a managed
+    /// key. 503 before any upstream.
+    NoPoolKey,
 }
 
 impl Rejection {
     /// Every variant, in `as_index` order. The array in `Metrics` is built from this, so adding a
     /// variant without adding it here fails the exhaustive `match` in `as_index`.
-    pub(crate) const ALL: [Rejection; 25] = [
+    pub(crate) const ALL: [Rejection; 30] = [
         Rejection::Auth,
         Rejection::DenySpend,
         Rejection::DenyFraud,
@@ -128,6 +143,11 @@ impl Rejection {
         Rejection::TranslateTooLarge,
         Rejection::RequestDeadline,
         Rejection::UnpricedFeature,
+        Rejection::OutputLimit,
+        Rejection::UnknownProvider,
+        Rejection::MissingKey,
+        Rejection::AmbiguousCredential,
+        Rejection::NoPoolKey,
     ];
 
     /// The `reason=` label value. `RateLimit` keeps the original `"rate_limit"` string so existing
@@ -159,6 +179,11 @@ impl Rejection {
             Rejection::TranslateTooLarge => "translate_too_large",
             Rejection::RequestDeadline => "request_deadline",
             Rejection::UnpricedFeature => "unpriced_feature",
+            Rejection::OutputLimit => "output_limit",
+            Rejection::UnknownProvider => "unknown_provider",
+            Rejection::MissingKey => "missing_key",
+            Rejection::AmbiguousCredential => "ambiguous_credential",
+            Rejection::NoPoolKey => "no_pool_key",
         }
     }
 
@@ -189,6 +214,11 @@ impl Rejection {
             Rejection::TranslateTooLarge => 22,
             Rejection::RequestDeadline => 23,
             Rejection::UnpricedFeature => 24,
+            Rejection::OutputLimit => 25,
+            Rejection::UnknownProvider => 26,
+            Rejection::MissingKey => 27,
+            Rejection::AmbiguousCredential => 28,
+            Rejection::NoPoolKey => 29,
         }
     }
 }
@@ -372,6 +402,8 @@ pub struct Metrics {
     /// value). These are dropped rather than rejected, so a client whose tags silently never show up
     /// has no other signal to debug against.
     pub control_header_errors_total: IntCounter,
+    /// `x-beyond-order` / `only` / `split` named a provider that exists nowhere (a typo).
+    pub control_unknown_provider_total: IntCounter,
     /// Managed `2xx` responses that carried no parseable usage block. Such a response still emits a
     /// zero-token `ai.usage` row, which is indistinguishable downstream from a (non-existent)
     /// legitimate zero-token generation — so a provider changing its usage wire shape would silently
@@ -563,6 +595,10 @@ impl Metrics {
             "ai_control_header_errors_total",
             "x-beyond-* headers present but unusable (dropped, request still served)",
         ))?;
+        let control_unknown_provider_total = IntCounter::with_opts(Opts::new(
+            "ai_control_unknown_provider_total",
+            "x-beyond-order/only/split naming no catalog provider (dropped; request still served)",
+        ))?;
         let usage_parse_errors_total = IntCounter::with_opts(Opts::new(
             "ai_usage_parse_errors_total",
             "Managed 2xx responses with no parseable usage (emitted as a zero-token billing row)",
@@ -636,6 +672,7 @@ impl Metrics {
         r.register(Box::new(capture_bytes_total.clone()))?;
         r.register(Box::new(capture_dropped_total.clone()))?;
         r.register(Box::new(control_header_errors_total.clone()))?;
+        r.register(Box::new(control_unknown_provider_total.clone()))?;
         r.register(Box::new(usage_parse_errors_total.clone()))?;
         r.register(Box::new(usage_estimated_total.clone()))?;
         r.register(Box::new(usage_drains_in_flight.clone()))?;
@@ -680,6 +717,7 @@ impl Metrics {
             capture_bytes_total,
             capture_dropped_total,
             control_header_errors_total,
+            control_unknown_provider_total,
             usage_parse_errors_total,
             usage_estimated_total,
             usage_drains_in_flight,
@@ -841,6 +879,15 @@ mod tests {
                 1,
                 "status {status} landed in the wrong class bucket"
             );
+        }
+    }
+
+    #[test]
+    fn every_rejection_is_counted_in_its_own_index_of_all() {
+        // `Metrics::rejection` reads the counter at `as_index`, and the array is built from `ALL`,
+        // so a misordered entry would route one reason's count into another's series.
+        for (i, r) in Rejection::ALL.iter().enumerate() {
+            assert_eq!(r.as_index(), i, "{r:?} is at {i} in ALL");
         }
     }
 }

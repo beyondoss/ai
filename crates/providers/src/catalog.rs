@@ -2555,6 +2555,23 @@ pub fn for_model(name: &str) -> Option<&'static ModelRoute> {
     }
 }
 
+/// `name` without a trailing dated snapshot: `-YYYY-MM-DD` (OpenAI's) or `-YYYYMMDD` (Anthropic's).
+/// `None` when `name` ends in no snapshot date. The price lookup and the managed-feature gate both
+/// read a dated id through this, so the two agree on which row a snapshot is.
+pub fn strip_snapshot_date(name: &str) -> Option<&str> {
+    let digits = |s: &str, n: usize| s.len() == n && s.bytes().all(|b| b.is_ascii_digit());
+    let (head, last) = name.rsplit_once('-')?;
+    if digits(last, 8) {
+        return Some(head);
+    }
+    if !digits(last, 2) {
+        return None;
+    }
+    let (head, month) = head.rsplit_once('-')?;
+    let (head, year) = head.rsplit_once('-')?;
+    (digits(month, 2) && digits(year, 4)).then_some(head)
+}
+
 /// OpenAI-shaped `GET /v1/models` body over the catalog rows `keep` accepts, in catalog order,
 /// readable by the Anthropic SDK too (`display_name`, `has_more`). Beyond OpenAI's fields each model
 /// carries `wire` (`"openai"` / `"anthropic"`, so a caller can pick the matching SDK), its

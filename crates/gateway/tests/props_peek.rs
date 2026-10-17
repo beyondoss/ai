@@ -320,15 +320,11 @@ fn prop_root_model_and_span_match_serde() {
             }
             return Ok(());
         }
-        let m = b.members.iter().find(|m| m.key == "model").unwrap();
         let Some(id) = root["model"].as_str() else {
             prop_assert_eq!(scan.model, None, "{}", b.text);
             return Ok(());
         };
-        // A value spelled with escapes other than `\"` and `\\` is not decoded (the scanner keeps
-        // the escaped character); no client writes a model id that way and the span rewrite
-        // replaces the raw bytes whole, so the provider never sees the misread. See the report.
-        if !m.value_sp.exotic(id) && id.len() <= peek::MAX_CAPTURE {
+        if id.len() <= peek::MAX_CAPTURE {
             prop_assert_eq!(scan.model.as_deref(), Some(id), "{}", b.text);
         }
         let (s, e) = scan.model_span.expect("a string model has a span");
@@ -354,10 +350,6 @@ fn prop_streaming_scanner_agrees_with_buffered_scan() {
         "prop_streaming_scanner_agrees_with_buffered_scan",
         (body(), prop::collection::vec(any::<usize>(), 0..12)),
         |(b, cuts)| {
-            // `ModelScanner` matches keys raw; `scan_buffered` decodes an escaped `model` key so the
-            // duplicate check cannot be dodged. A body with an escaped `model` key and no plain one
-            // routes on nothing (404) rather than on a misread, so that difference is excluded here.
-            prop_assume!(!b.exotic_key("model"));
             let mut s = ModelScanner::new();
             for c in chunk(b.text.as_bytes(), &cuts) {
                 s.feed(&c);

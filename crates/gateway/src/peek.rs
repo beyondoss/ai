@@ -29,6 +29,34 @@ fn push_capped(buf: &mut Vec<u8>, b: u8) {
     }
 }
 
+/// The text of a captured JSON string, with its escapes as sent: decoded the way a provider's parser
+/// decodes them, so `"gpt-5"` is `gpt-5`. `None` for bytes that are not text. An escaped capture
+/// at the cap is `None` too: its last escape may be cut, and the decoded prefix can then read as a
+/// shorter, real name. `escaped` is whether the scan saw a backslash in the capture, so no rescan.
+fn capture_text(raw: Vec<u8>, escaped: bool) -> Option<String> {
+    if !escaped {
+        return String::from_utf8(raw).ok();
+    }
+    if raw.len() >= MAX_CAPTURE {
+        return None;
+    }
+    let mut quoted = Vec::with_capacity(raw.len().saturating_add(2));
+    quoted.push(b'"');
+    quoted.extend(raw);
+    quoted.push(b'"');
+    serde_json::from_slice::<String>(&quoted).ok()
+}
+
+/// A captured key's text as [`capture_text`] decodes it. Unescaped keys are compared as captured, so
+/// the common key costs no more than it did before escapes were decoded.
+fn key_bytes(raw: &[u8], escaped: bool) -> Option<std::borrow::Cow<'_, [u8]>> {
+    if escaped {
+        capture_text(raw.to_vec(), true).map(|s| std::borrow::Cow::Owned(s.into_bytes()))
+    } else {
+        Some(std::borrow::Cow::Borrowed(raw))
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Default)]
 enum Cap {
     #[default]
@@ -92,6 +120,8 @@ pub struct ModelScanner {
     /// What (if anything) we're accumulating into `cur` for the current string.
     cap: Cap,
     cur: Vec<u8>,
+    /// The capture in `cur` holds a backslash, so it is decoded when it closes.
+    cur_escaped: bool,
 }
 
 /// What a scan keeps beside `model` ([`ModelScanner::feed_keeping`]): the values of a fixed set of
@@ -273,31 +303,35 @@ impl ModelScanner {
                     }
                 } else if b == b'\\' {
                     self.escaped = true;
+                    if self.cap != Cap::No {
+                        push_capped(&mut self.cur, b);
+                        self.cur_escaped = true;
+                    }
                 } else if b == b'"' {
                     self.in_string = false;
                     match self.cap {
                         Cap::Key => {
-                            self.last_key_is_model = self.cur == b"model";
+                            let key = key_bytes(&self.cur, self.cur_escaped);
+                            self.last_key_is_model = key.as_deref() == Some(b"model".as_slice());
                             if let Some(k) = kept.as_deref_mut() {
-                                k.last_key_extra = k
-                                    .keys
-                                    .iter()
-                                    .position(|key| *key == self.cur.as_slice())
-                                    .and_then(|i| u8::try_from(i).ok());
+                                let at = key
+                                    .as_deref()
+                                    .and_then(|key| k.keys.iter().position(|want| *want == key));
+                                k.last_key_extra = at.and_then(|i| u8::try_from(i).ok());
                             }
                             // Only a *root* `message` opens the nested scan — a `message` key inside
                             // the message object itself must not re-arm it.
                             if self.accept_message_nesting && self.depth == 1 {
                                 self.last_key_is_message =
-                                    self.cur == b"message" || self.cur == b"response";
+                                    matches!(key.as_deref(), Some(b"message" | b"response"));
                             }
                         }
                         Cap::ModelValue => {
                             // A valid JSON string value is UTF-8; if a malformed/adversarial body
                             // smuggles non-UTF-8 bytes here we record "unknown" rather than emitting
                             // a `U+FFFD`-corrupted model into the billing log. Either way we're done.
-                            let v = String::from_utf8(std::mem::take(&mut self.cur))
-                                .unwrap_or_else(|_| "unknown".to_string());
+                            let v = capture_text(std::mem::take(&mut self.cur), self.cur_escaped)
+                                .unwrap_or_else(|| "unknown".to_string());
                             match kept.as_deref() {
                                 // A knob scan keeps walking; the first `model` is the one kept.
                                 Some(k) if k.past_model => {
@@ -319,7 +353,9 @@ impl ModelScanner {
                                 && let Some(idx) = k.last_key_extra
                             {
                                 // Not UTF-8: dropped, never written to a row as a corrupted value.
-                                if let Ok(v) = String::from_utf8(std::mem::take(&mut self.cur)) {
+                                if let Some(v) =
+                                    capture_text(std::mem::take(&mut self.cur), self.cur_escaped)
+                                {
                                     k.keep(idx, v);
                                 }
                                 if k.past_model && k.all_found() {
@@ -345,6 +381,7 @@ impl ModelScanner {
                 b'"' => {
                     self.in_string = true;
                     self.cur.clear();
+                    self.cur_escaped = false;
                     // Decide whether this string is worth accumulating — only key-level keys and
                     // the `model` value matter.
                     self.cap = if self.at_key_level() {
@@ -631,6 +668,10 @@ pub struct BufferedScan {
     /// (first occurrence of each): the span a catalog walk caps at the serving model's maximum.
     /// A value that is not a plain non-negative integer is not recorded.
     pub limit_spans: [Option<(usize, usize)>; 3],
+    /// A root output limit is present with a value that is no plain integer and not `null`: a
+    /// string, a fraction, an exponent, a negative, an object. It has no span, so a clamp cannot
+    /// cap it, and a catalog walk refuses the body rather than send it on.
+    pub inexact_limit: bool,
     /// Offset of each root-level output limit key's opening quote, indexed like
     /// [`OUTPUT_LIMIT_KEYS`] (first occurrence of each, whatever its value): where a walk onto
     /// native OpenAI Chat Completions renames `max_tokens`.
@@ -687,6 +728,7 @@ pub fn scan_buffered(body: &[u8]) -> BufferedScan {
             model_span: None,
             duplicate_model: false,
             limit_spans: [None; 3],
+            inexact_limit: false,
             limit_keys: [None; 3],
             stream_options_ambiguous: false,
         };
@@ -710,6 +752,7 @@ pub fn scan_buffered(body: &[u8]) -> BufferedScan {
     // slice because escapes must be resolved, exactly as `ModelScanner` does.
     let mut capturing_model = false;
     let mut model_buf: Vec<u8> = Vec::new();
+    let mut model_escaped = false;
     let mut model: Option<String> = None;
     // Where the value's raw bytes begin (just past the opening quote), and the finished span.
     let mut model_start = 0usize;
@@ -718,6 +761,9 @@ pub fn scan_buffered(body: &[u8]) -> BufferedScan {
     // The output limit whose value comes next, as an index into `OUTPUT_LIMIT_KEYS`.
     let mut limit_key: Option<usize> = None;
     let mut limit_spans: [Option<(usize, usize)>; 3] = [None; 3];
+    let mut inexact_limit = false;
+    // The byte after a limit key's colon is still to come.
+    let mut limit_value_next = false;
     let mut limit_keys: [Option<usize>; 3] = [None; 3];
 
     let mut j = i;
@@ -740,6 +786,10 @@ pub fn scan_buffered(body: &[u8]) -> BufferedScan {
                 }
             } else if b == b'\\' {
                 escaped = true;
+                if capturing_model {
+                    push_capped(&mut model_buf, b);
+                    model_escaped = true;
+                }
             } else if b == b'"' {
                 in_string = false;
                 if capturing_key {
@@ -771,9 +821,22 @@ pub fn scan_buffered(body: &[u8]) -> BufferedScan {
                             || (key.contains(&b'\\')
                                 && escaped_key_is(&body[key_start - 1..=j], "model"));
                         model_keys += u32::from(last_key_is_model);
-                        limit_key = OUTPUT_LIMIT_KEYS.iter().position(|k| *k == key);
+                        // A key spelled with escapes names the limit it decodes to (`"max\u005ftokens"`).
+                        let quoted = &body[key_start - 1..=j];
+                        limit_key = OUTPUT_LIMIT_KEYS.iter().position(|k| {
+                            *k == key
+                                || (key.contains(&b'\\')
+                                    && std::str::from_utf8(k)
+                                        .is_ok_and(|want| escaped_key_is(quoted, want)))
+                        });
                         if let Some(k) = limit_key {
+                            // A second root spelling of the same limit: a parser keeps one of them, and
+                            // only the first is spanned, so it cannot be capped reliably. Refused.
+                            if limit_keys[k].is_some() {
+                                inexact_limit = true;
+                            }
                             limit_keys[k].get_or_insert(key_start - 1);
+                            limit_value_next = true;
                         }
                     }
                 } else if capturing_model {
@@ -785,8 +848,8 @@ pub fn scan_buffered(body: &[u8]) -> BufferedScan {
                     // Same non-UTF-8 fallback as `ModelScanner`: record "unknown" rather than emit a
                     // U+FFFD-corrupted model into the billing log.
                     model = Some(
-                        String::from_utf8(std::mem::take(&mut model_buf))
-                            .unwrap_or_else(|_| "unknown".to_string()),
+                        capture_text(std::mem::take(&mut model_buf), model_escaped)
+                            .unwrap_or_else(|| "unknown".to_string()),
                     );
                 }
             } else if capturing_model {
@@ -796,6 +859,15 @@ pub fn scan_buffered(body: &[u8]) -> BufferedScan {
             continue;
         }
         let b = body[j];
+        // The first byte of a limit's value decides it: a digit starts a plain integer, the literal
+        // `null` is no value, and whitespace or the colon before the value is skipped. Anything else
+        // (an `n` that is not `null`, a string, a fraction) is inexact.
+        if limit_value_next && !(b.is_ascii_whitespace() || b == b':') {
+            limit_value_next = false;
+            if !(b.is_ascii_digit() || body[j..].starts_with(b"null")) {
+                inexact_limit = true;
+            }
+        }
         match b {
             b'"' => {
                 capturing_key = false;
@@ -806,6 +878,7 @@ pub fn scan_buffered(body: &[u8]) -> BufferedScan {
                 } else if depth == 1 && last_key_is_model && model.is_none() {
                     capturing_model = true;
                     model_buf.clear();
+                    model_escaped = false;
                     model_start = j + 1;
                 }
                 in_string = true;
@@ -832,10 +905,18 @@ pub fn scan_buffered(body: &[u8]) -> BufferedScan {
                     .iter()
                     .position(|c| !c.is_ascii_digit())
                     .map_or(n, |rel| j + rel);
-                if let Some(k) = limit_key.take()
-                    && limit_spans[k].is_none()
-                {
-                    limit_spans[k] = Some((j, end));
+                // A plain integer ends its member: `,` or `}`, past any whitespace. A fraction or an
+                // exponent ends in `.`, `e` or `E` instead, and is no integer.
+                let ends_member = body[end..]
+                    .iter()
+                    .find(|c| !c.is_ascii_whitespace())
+                    .is_some_and(|c| matches!(c, b',' | b'}'));
+                if let Some(k) = limit_key.take() {
+                    if !ends_member {
+                        inexact_limit = true;
+                    } else if limit_spans[k].is_none() {
+                        limit_spans[k] = Some((j, end));
+                    }
                 }
                 j = end;
                 continue;
@@ -873,6 +954,7 @@ pub fn scan_buffered(body: &[u8]) -> BufferedScan {
         model_span,
         duplicate_model: model_keys > 1,
         limit_spans,
+        inexact_limit,
         limit_keys,
         stream_options_ambiguous,
     }
@@ -1645,6 +1727,153 @@ mod tests {
         let key = format!("model{}", "x".repeat(MAX_CAPTURE * 4));
         let body = format!(r#"{{"{key}":"nope","model":"gpt-4o"}}"#);
         assert_eq!(scan(body.as_bytes()).as_deref(), Some("gpt-4o"));
+    }
+
+    /// claim: SEC-21
+    /// defect: D273
+    #[test]
+    fn an_escaped_model_key_is_found_by_the_streaming_scanner() {
+        let body = format!(r#"{{"mod{}u0065l":"x"}}"#, '\\');
+        let oracle: serde_json::Value = serde_json::from_slice(body.as_bytes()).unwrap();
+        assert_eq!(oracle["model"], "x");
+        assert_eq!(scan(body.as_bytes()).as_deref(), Some("x"));
+        assert_eq!(scan_buffered(body.as_bytes()).model.as_deref(), Some("x"));
+    }
+
+    /// claim: SEC-21, BIL-13
+    /// defect: D274
+    #[test]
+    fn a_unicode_escape_in_a_model_value_is_decoded() {
+        let body = format!(r#"{{"model":"gpt-{}u0035"}}"#, '\\');
+        let oracle: serde_json::Value = serde_json::from_slice(body.as_bytes()).unwrap();
+        assert_eq!(oracle["model"], "gpt-5");
+        assert_eq!(scan(body.as_bytes()).as_deref(), Some("gpt-5"));
+        assert_eq!(
+            scan_buffered(body.as_bytes()).model.as_deref(),
+            Some("gpt-5")
+        );
+    }
+
+    /// claim: SEC-21, BIL-13
+    /// defect: D274
+    #[test]
+    fn a_newline_escape_in_a_model_value_is_decoded() {
+        let body = br#"{"model":"a\nb"}"#;
+        let oracle: serde_json::Value = serde_json::from_slice(body).unwrap();
+        assert_eq!(oracle["model"], "a\nb");
+        assert_eq!(scan(body).as_deref(), Some("a\nb"));
+        assert_eq!(scan_buffered(body).model.as_deref(), Some("a\nb"));
+    }
+
+    /// claim: SEC-21, BIL-13
+    /// defect: D274
+    #[test]
+    fn a_slash_escape_in_a_model_value_is_decoded() {
+        let body = br#"{"model":"openai\/gpt-5"}"#;
+        assert_eq!(scan(body).as_deref(), Some("openai/gpt-5"));
+        assert_eq!(scan_buffered(body).model.as_deref(), Some("openai/gpt-5"));
+    }
+
+    /// claim: TRN-5
+    /// defect: D275
+    #[test]
+    fn a_fractional_output_limit_has_no_span() {
+        let body = br#"{"max_tokens":1.5,"model":"m"}"#;
+        let scan = scan_buffered(body);
+        assert_eq!(scan.limit_spans[0], None);
+        assert!(scan.inexact_limit);
+    }
+
+    /// claim: TRN-5
+    /// defect: D275
+    #[test]
+    fn an_exponent_output_limit_has_no_span() {
+        let body = br#"{"max_tokens":1e5,"model":"m"}"#;
+        let scan = scan_buffered(body);
+        assert_eq!(scan.limit_spans[0], None);
+        assert!(scan.inexact_limit);
+    }
+
+    /// A limit key spelled with escapes is the limit it decodes to, so it is spanned and capped.
+    /// claim: TRN-5
+    /// defect: D275
+    #[test]
+    fn an_escaped_output_limit_key_is_spanned() {
+        let bs = '\\';
+        let body = format!(r#"{{"max{bs}u005ftokens":99999,"model":"m"}}"#);
+        let oracle: serde_json::Value = serde_json::from_slice(body.as_bytes()).unwrap();
+        assert_eq!(oracle["max_tokens"], 99999);
+        let scan = scan_buffered(body.as_bytes());
+        let (a, b) = scan.limit_spans[0].expect("the escaped key is max_tokens");
+        assert_eq!(&body.as_bytes()[a..b], b"99999");
+        assert!(!scan.inexact_limit);
+    }
+
+    /// A second root spelling of one limit cannot be capped reliably (a parser keeps one of them), so
+    /// it is inexact, whatever its values.
+    /// claim: TRN-5
+    /// defect: D275
+    #[test]
+    fn a_duplicate_output_limit_key_is_inexact() {
+        let scan = scan_buffered(br#"{"max_tokens":8,"max_tokens":99999,"model":"m"}"#);
+        assert!(scan.inexact_limit);
+        let other = scan_buffered(br#"{"max_tokens":8,"max_completion_tokens":9,"model":"m"}"#);
+        assert!(
+            !other.inexact_limit,
+            "two different limits are not a duplicate"
+        );
+    }
+
+    /// Any first byte that is not a digit, `null` or whitespace makes the limit inexact: a leading
+    /// `+` or `.` is no integer either.
+    /// claim: TRN-5
+    /// defect: D275
+    #[test]
+    fn a_limit_starting_with_plus_or_dot_is_inexact() {
+        for body in [
+            r#"{"max_tokens":+5,"model":"m"}"#,
+            r#"{"max_tokens":.5,"model":"m"}"#,
+        ] {
+            assert!(scan_buffered(body.as_bytes()).inexact_limit, "{body}");
+        }
+        assert!(!scan_buffered(br#"{"max_tokens": null ,"model":"m"}"#).inexact_limit);
+        // An `n` that is not the literal `null` is no null: inexact.
+        for body in [
+            r#"{"max_tokens":nope,"model":"m"}"#,
+            r#"{"max_tokens":nul,"model":"m"}"#,
+        ] {
+            assert!(scan_buffered(body.as_bytes()).inexact_limit, "{body}");
+        }
+    }
+
+    /// claim: TRN-5
+    /// defect: D275
+    #[test]
+    fn only_a_non_integer_output_limit_is_inexact() {
+        let flagged = |body: &str| scan_buffered(body.as_bytes()).inexact_limit;
+        assert!(flagged(r#"{"max_tokens":"100","model":"m"}"#), "a string");
+        assert!(flagged(r#"{"max_tokens":-1,"model":"m"}"#), "a negative");
+        assert!(flagged(r#"{"max_tokens":true,"model":"m"}"#), "a bool");
+        assert!(
+            flagged(r#"{"max_tokens":{"n":1},"model":"m"}"#),
+            "an object"
+        );
+        assert!(
+            flagged(r#"{"max_tokens":1 .5,"model":"m"}"#),
+            "a fraction past whitespace"
+        );
+        assert!(
+            !flagged(r#"{"max_tokens":null,"model":"m"}"#),
+            "null is no value"
+        );
+        assert!(
+            !flagged(r#"{"max_tokens" : 64000 ,"model":"m"}"#),
+            "a plain integer"
+        );
+        assert!(
+            !flagged(r#"{"messages":[{"max_tokens":"x"}],"max_tokens":8}"#),
+            "a nested one"
+        );
     }
 
     fn scan(body: &[u8]) -> Option<String> {

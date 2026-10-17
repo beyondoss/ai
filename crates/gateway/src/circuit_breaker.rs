@@ -1023,6 +1023,40 @@ mod tests {
         assert_eq!(cb.state(), CircuitState::Closed { failure_count: 0 });
     }
 
+    /// A request admitted while the breaker was closed, whose failure arrives after another request's
+    /// probe owns the half-open breaker, must not reopen it. Its failure is recorded against its own
+    /// permit, which decides nothing in HALF_OPEN.
+    /// claim: REL-6
+    /// defect: D286
+    #[test]
+    fn a_late_failure_from_a_closed_permit_cannot_reopen_another_probes_breaker() {
+        static NOW: AtomicU64 = AtomicU64::new(1_000);
+        fn clock() -> u64 {
+            NOW.load(Ordering::Relaxed)
+        }
+        let cb = CircuitBreaker::with_clock(
+            CircuitBreakerConfig::consecutive(1)
+                .reset_timeout(Duration::from_secs(30))
+                .half_open_permits(1),
+            clock,
+        );
+        let admitted_while_closed = cb.allow().expect("a closed breaker admits");
+        let trip = cb.allow().expect("a closed breaker admits");
+        cb.record_failure_for(trip);
+        assert_eq!(cb.state(), CircuitState::Open);
+
+        NOW.store(1_030, Ordering::Relaxed);
+        let _probe = cb.allow().expect("the reset timeout admits one probe");
+        assert!(matches!(cb.state(), CircuitState::HalfOpen { .. }));
+
+        cb.record_failure_for(admitted_while_closed);
+        assert!(
+            matches!(cb.state(), CircuitState::HalfOpen { .. }),
+            "a closed-admitted failure reopened a breaker owned by another probe: {:?}",
+            cb.state()
+        );
+    }
+
     /// D256: a permit claimed in an earlier half-open, or while CLOSED, is not this half-open's
     /// probe: it can neither release a probe permit nor decide the probe.
     /// claim: REL-6
