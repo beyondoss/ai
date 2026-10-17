@@ -1247,6 +1247,10 @@ struct ModelRouting {
 struct PendingHealth {
     /// The body's first bytes, up to [`HEALTH_PREFIX_CAP`].
     prefix: Vec<u8>,
+    /// The breaker permit the head resolved as a success. The body's verdict is recorded against it,
+    /// never unscoped: a permit is copied, so a later failure cannot reopen a probe that another
+    /// request owns by then.
+    permit: Option<Permit>,
 }
 
 impl PendingHealth {
@@ -2235,14 +2239,18 @@ impl AiProxy {
             None if end_of_stream || pending.prefix.len() >= HEALTH_PREFIX_CAP => false,
             None => return,
         };
+        let permit = pending.permit;
         a.health = None;
         // The head resolved this attempt's breaker permit as a success (see `response_filter`):
         // only the body shows the provider is broken. Count it as the failure it is, so a host that
         // keeps answering errors in 200s opens its breaker and every walk, session pins included,
         // skips it. The windowed rule trips once failures reach the threshold and match the
         // successes, which one success plus one failure per such answer does.
-        if verdict && let Some(b) = rc.provider.breaker.as_ref() {
-            b.record_failure();
+        if verdict
+            && let Some(b) = rc.provider.breaker.as_ref()
+            && let Some(permit) = permit
+        {
+            b.record_failure_for(permit);
         }
     }
 
@@ -6541,7 +6549,10 @@ impl ProxyHttp for AiProxy {
             if (200..300).contains(&status)
                 && let Some(a) = rc.auto.as_mut()
             {
-                a.health = Some(PendingHealth { prefix: Vec::new() });
+                a.health = Some(PendingHealth {
+                    prefix: Vec::new(),
+                    permit: rc.breaker_pending,
+                });
             }
             rc.provider.metrics.record_response(status);
             rc.upstream_status = Some(status);
@@ -8206,6 +8217,81 @@ mod tests {
             captured.req_str(),
             std::str::from_utf8(body).ok(),
             "the capture holds the replayed prefix twice"
+        );
+    }
+
+    /// A 2xx whose body turns out to be an error is counted against the breaker permit the head
+    /// resolved, so a late verdict cannot reopen a breaker that another request's probe owns by then.
+    /// claim: REL-6
+    /// defect: D286
+    #[test]
+    fn a_late_body_verdict_cannot_reopen_a_breaker_another_probe_owns() {
+        static NOW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1_000);
+        fn clock() -> u64 {
+            NOW.load(std::sync::atomic::Ordering::Relaxed)
+        }
+        let breaker = crate::circuit_breaker::CircuitBreaker::with_clock(
+            crate::circuit_breaker::CircuitBreakerConfig::consecutive(1)
+                .reset_timeout(std::time::Duration::from_secs(30))
+                .half_open_permits(1),
+            clock,
+        );
+        // This request was admitted while the breaker was closed, and its head was a 200.
+        let admitted = breaker.allow().expect("a closed breaker admits");
+        breaker.record_success_for(admitted);
+        // Another request trips the breaker; after the reset timeout its probe owns the breaker.
+        let trip = breaker.allow().expect("a closed breaker admits");
+        breaker.record_failure_for(trip);
+        NOW.store(1_030, std::sync::atomic::Ordering::Relaxed);
+        let _probe = breaker.allow().expect("the reset timeout admits one probe");
+
+        let mut rc = test_ctx(true);
+        rc.provider = Arc::new(Provider::resolve(
+            "openai",
+            "api.openai.com:443".to_string(),
+            Dialect::OpenAi,
+            AuthScheme::Bearer,
+            &["sk-pool"],
+            ProviderMetrics::disconnected(),
+            Some(breaker),
+        ));
+        let row = route::model_route("gpt-4o").expect("a catalog row");
+        rc.auto = Some(Box::new(ModelRouting {
+            route: row,
+            sub: None,
+            candidate: 0,
+            usable: 1,
+            walk: control::Walk::identity(row.candidates.len()),
+            arms: row.candidates,
+            session_field: None,
+            attempt_start: Instant::now(),
+            cache: None,
+            translate: None,
+            health: Some(PendingHealth {
+                prefix: Vec::new(),
+                permit: Some(admitted),
+            }),
+            addrs: 0,
+            attempted: true,
+            open_retry_after: None,
+            priority: false,
+        }));
+        let state: &'static Arc<crate::state::GatewayState> = Box::leak(Box::new(
+            crate::state::GatewayState::new(
+                crate::config::AiConfig::default(),
+                crate::state::test_metrics(),
+            )
+            .unwrap(),
+        ));
+
+        AiProxy { state }.settle_health(&mut rc, br#"{"error":{"message":"overloaded"}}"#, true);
+
+        assert!(
+            matches!(
+                rc.provider.breaker.as_ref().unwrap().state(),
+                crate::circuit_breaker::CircuitState::HalfOpen { .. }
+            ),
+            "a late body verdict reopened a breaker owned by another request's probe"
         );
     }
 

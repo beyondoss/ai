@@ -358,6 +358,8 @@ A `200` whose body is an error object (OpenRouter's error-in-200: a root `error`
 candidate's breaker (`settle_health`, at most 1 KiB read): the head already resolved the permit as a
 success, so `settle_health` records the failure the body showed. Without that a host that keeps
 answering errors in 200s would never be routed around, since the pin does not learn from failures.
+The verdict is recorded against the permit the head resolved, never unscoped: a probe that another
+request owns by the time the body is read is not reopened by it (D286).
 
 A managed request may also permute that list with headers, still on the same wire, without adding a
 provider the row does not already name (`ProviderSpec::name` on that row). Parsed in `control.rs`,

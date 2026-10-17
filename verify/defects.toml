@@ -2947,3 +2947,17 @@ state = "fixed"
 test = "a_retried_attempt_captures_the_request_body_once"
 fix = ""
 note = "Fixed in proxy.rs reset_request_body_phase: after the zero-bytes witness returns early, the capture's request side is cleared (CaptureBufs::clear_req, which keeps the capacity), so a replay is captured once as the client sent it. The witness stays exact because the capture is fed only on the same path as body_bytes_fed."
+
+[[defect]]
+id = "D286"
+severity = "med"
+area = "Reliability"
+title = "A late error-in-200 verdict could reopen a half-open breaker that another request's probe owned"
+impact = "settle_health counted a 2xx's body verdict with the unscoped record_failure(). The head had already resolved the attempt's permit as a success, so the verdict arrived after the permit was spent. If by then another request's probe owned the half-open breaker, the unscoped failure reopened it, failing that probe's request and every request behind it."
+confidence = "medium"
+evidence = "proxy.rs settle_health called record_failure(); the only unscoped production call. Reproduced on 4513e6f by a_late_body_verdict_cannot_reopen_a_breaker_another_probe_owns, which fails with the unscoped call restored (the breaker went OPEN) and passes with the fix."
+claims = ["REL-6"]
+state = "fixed"
+test = "a_late_body_verdict_cannot_reopen_a_breaker_another_probe_owns"
+fix = ""
+note = "Fixed in proxy.rs: PendingHealth keeps a copy of the breaker permit the head resolved (Permit is Copy), and settle_health records the verdict with record_failure_for(permit). A permit claimed while CLOSED decides nothing in HALF_OPEN, so the other probe keeps the breaker. The unscoped record_success and record_failure have no other production caller; removing them is PR 1. Also held by a_late_failure_from_a_closed_permit_cannot_reopen_another_probes_breaker (circuit_breaker.rs), the breaker rule the fix relies on. Behaviour in CLOSED is unchanged: stale() is consulted only in the HALF_OPEN arms, so a late failure in CLOSED still counts toward the threshold. Only a permit from an earlier or other probe is ignored, in HALF_OPEN."
