@@ -2372,41 +2372,62 @@ async fn connect_each(
 /// not drift from the original connect.
 /// A live client, plus the process group to sweep when it is dropped. HTTP servers have no group —
 /// there is no process of ours to reap.
+///
+/// Bounded by [`handshake_timeout`], whichever transport and whoever dials: servers connect
+/// concurrently but startup waits for all of them, so one that starts (or accepts the connection)
+/// and then says nothing would hold `run`/`serve` startup — every other server's tools with it —
+/// forever, and on a redial after a reap it would hold the connection's lock, and with it every
+/// call to that server. On timeout the dial is dropped (a stdio child is retired with its
+/// transport) and the caller treats it as any failed dial: warned about, the server left dormant.
 async fn connect_one_client(
     config: &McpServerConfig,
     dial: &Dial,
 ) -> Result<(McpClient, ServerProc), String> {
-    match &config.transport {
-        McpTransport::Stdio { command, args, .. } => {
-            connect_stdio(config, dial, command, args).await
+    let limit = handshake_timeout(dial);
+    let dialing = async {
+        match &config.transport {
+            McpTransport::Stdio { command, args, .. } => {
+                connect_stdio(config, dial, command, args).await
+            }
+            McpTransport::Http { url, .. } => {
+                connect_http(config, dial, url).await.map(|c| (c, None))
+            }
         }
-        McpTransport::Http { url, .. } => {
-            let dialing = connect_http(config, dial, url);
-            let client = match dial.http.is_some() {
-                // A grant connector is a third-party endpoint on a replica that serves everyone:
-                // one that accepts a connection and then says nothing must not hold a session start
-                // — or, on a redial after a reap, a tool call — open forever. An operator's own
-                // configured server keeps the unbounded wait it always had.
-                true => tokio::time::timeout(GRANT_HANDSHAKE_TIMEOUT, dialing)
-                    .await
-                    .map_err(|_| {
-                        format!(
-                            "MCP handshake to {} timed out after {}s",
-                            redact_url(url),
-                            GRANT_HANDSHAKE_TIMEOUT.as_secs()
-                        )
-                    })?,
-                false => dialing.await,
-            }?;
-            Ok((client, None))
-        }
-    }
+    };
+    tokio::time::timeout(limit, dialing).await.map_err(|_| {
+        let target = match &config.transport {
+            McpTransport::Stdio { command, .. } => format!("`{command}`"),
+            McpTransport::Http { url, .. } => redact_url(url),
+        };
+        format!(
+            "MCP handshake to {target} timed out after {}s",
+            limit.as_secs()
+        )
+    })?
 }
 
 /// How long a grant connector gets to finish a handshake. Generous for a round trip to a service
 /// that has to be awake anyway, short enough that a dead one fails its own tools rather than the
 /// session.
 const GRANT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// How long an operator's own configured server gets, by default. Longer than a grant connector's:
+/// a stdio server is often `npx -y …`/`uvx …`, whose first start downloads the package.
+const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The handshake bound for one dial: [`GRANT_HANDSHAKE_TIMEOUT`] for a grant connector, else
+/// [`DEFAULT_HANDSHAKE_TIMEOUT`] or whatever `BEYOND_AI_AGENT_MCP_HANDSHAKE_SECS` says (a positive
+/// number of seconds; anything else is ignored). A grant's bound is not the operator's to loosen.
+fn handshake_timeout(dial: &Dial) -> Duration {
+    if dial.http.is_some() {
+        return GRANT_HANDSHAKE_TIMEOUT;
+    }
+    std::env::var("BEYOND_AI_AGENT_MCP_HANDSHAKE_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&secs| secs > 0)
+        .map_or(DEFAULT_HANDSHAKE_TIMEOUT, Duration::from_secs)
+}
 
 /// Rebuild a server's tools from its cached manifest, starting nothing.
 ///

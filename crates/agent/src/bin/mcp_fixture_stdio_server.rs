@@ -24,7 +24,7 @@
 //!
 //! Env: `MCP_FIXTURE_STARTUP_BARRIER` (`<dir>:<n>`: serve nothing until `n` fixtures have started; see
 //! `main`), `MCP_FIXTURE_STARTUP_BARRIER_SECS`, `MCP_FIXTURE_ORPHAN_PIDFILE` (unchanged),
-//! `MCP_FIXTURE_ODD_NAMES` (see [`odd_names`]).
+//! `MCP_FIXTURE_ODD_NAMES` (see [`odd_names`]), `MCP_FIXTURE_SILENT` (never answers anything).
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -139,6 +139,11 @@ async fn main() {
 
     let stdin = tokio::io::stdin();
     let mut lines = BufReader::new(stdin).lines();
+    // `MCP_FIXTURE_SILENT`: read everything, answer nothing — a server wedged before its handshake.
+    if std::env::var_os("MCP_FIXTURE_SILENT").is_some() {
+        while let Ok(Some(_)) = lines.next_line().await {}
+        return;
+    }
     let mut stdout = tokio::io::stdout();
     let late_discover = std::env::var_os("MCP_FIXTURE_LATE_DISCOVER").is_some();
     let mut held_discover: Option<Value> = None;
