@@ -91,6 +91,7 @@ use providers::catalog::Caps;
 use providers::catalog::strip_snapshot_date;
 use std::borrow::Cow;
 use std::fmt::Write as _;
+use std::num::NonZeroU16;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -430,7 +431,8 @@ pub struct RequestCtx {
     /// `resp_model_scanner`), because a client may send an alias (`gpt-4o`) that the provider resolves
     /// to and bills under a pinned id (`gpt-4o-2024-08-06`).
     model: String,
-    model_scanner: peek::ModelScanner,
+    /// What this attempt has made of the request body so far. Rebuilt for every attempt.
+    attempt: Attempt,
     /// Extracts the model the **provider** reports in its response (the resolved/billed id), fed the
     /// response stream in `response_body_filter`. Preferred over `model` in the `ai.usage` event so
     /// the billed model is authoritative, not the requested alias. Works for SSE too: the scanner
@@ -447,13 +449,13 @@ pub struct RequestCtx {
     /// `resp_tail`. See [`USAGE_HEAD_CAP`]. Empty for every other dialect and for non-streaming
     /// responses, which carry everything the tail already holds.
     resp_head: Vec<u8>,
-    /// How much of the request body this attempt has fed through `request_body_filter`.
-    upload: UploadProgress,
     /// Upstream HTTP status, set in `response_filter` once the response head arrives, which is
     /// also where the breaker permit is resolved (`5xx` → failure, any other response → success:
     /// the provider answered, and a `429` is a healthy throttle). A `None` here at `logging` with an
-    /// upstream error → failure (connect/read failed before any response).
-    upstream_status: Option<u16>,
+    /// upstream error → failure (connect/read failed before any response). A `NonZeroU16`, as no
+    /// status is `0`: the niche keeps it two bytes beside the other small fields. Read it through
+    /// [`RequestCtx::upstream_status`].
+    upstream_status: Option<NonZeroU16>,
     /// Managed OpenAI chat/completions request: buffer the body and inject
     /// `stream_options.include_usage` if it streams without it, so the usage chunk (hence the
     /// billable token count) is guaranteed. The single, deliberate exception to "never buffer the
@@ -469,25 +471,11 @@ pub struct RequestCtx {
     /// billable, so it is always checked here (a catalog walk reads its body in `request_filter`
     /// and refuses there).
     catalog_check: bool,
-    /// Accumulated request body — populated only when `inject_eligible`; otherwise stays empty and
-    /// the body is never buffered.
-    req_buf: Vec<u8>,
     start: Instant,
     /// When this request must end (`request_max_secs`), in [`crate::deadline`]'s units;
     /// [`crate::deadline::NONE`] when the ceiling is off. A `FullBody` attempt carries its
     /// parent's, so a re-run does not restart the clock.
     deadline: u64,
-    /// The previous attempt was a same-provider key walk. `upstream_peer` must not treat that as a
-    /// candidate/breaker failure (a 429 is a healthy throttle) and must not pick a new vendor.
-    same_provider_retry: bool,
-    /// This is a [`FullBody`] attempt that recorded a [`RelayRetry`]: the parent is discarding its
-    /// response and re-running. It still feeds the breaker; it writes no `ai.usage`
-    /// or `ai.payload` row (the attempt that serves does).
-    relay_abandoned: bool,
-    /// This attempt's upstream read timeout is the time left before `deadline` (shorter than the
-    /// silence bound, see `cap_read_at_deadline`), so a read timeout on it is the deadline passing,
-    /// not the provider going quiet.
-    read_capped: bool,
     /// Model-routing state — `Some` for `/auto` and for a managed bare `/v1` catalog walk. `None`
     /// keeps every provider-routed request on exactly the code it ran before model routing existed.
     /// See [`ModelRouting`] for why it is boxed rather than inline.
@@ -501,13 +489,7 @@ pub struct RequestCtx {
     /// Process-unique id for this request (`{instance}-{seq}`), echoed in the `x-beyond-request-id`
     /// response header and the `ai.usage` event so a client report ties back to a log line.
     request_id: RequestId,
-    /// Text bytes of the request body (base64 payloads excluded): the input-token estimate for a
-    /// billing row the provider's usage did not fill (a stream cut short before its usage block, on
-    /// a wire that reports input only at the end). See `usage::InputTally`. Fed as the body streams
-    /// past only when `tally_eager`; otherwise `logging` reads the body itself, and only when it
-    /// needs an estimate ([`input_estimate`]).
-    input_tally: usage::InputTally,
-    /// The body is fed to `input_tally` as it streams: a managed provider-routed body that may
+    /// The body is fed to the attempt's `input_tally` as it streams: a managed provider-routed body that may
     /// outgrow pingora's 64 KiB retry buffer (a declared length past it, or none), the one case
     /// where no copy of the body is left to read in `logging`. A catalog walk's body is in the
     /// retry buffer or, past it, held by the `FullBody` parent.
@@ -530,6 +512,77 @@ pub struct RequestCtx {
     /// for this tenant, and the ids the client sent were verified and are stripped back in
     /// `request_body_filter`. Boxed: `None` on every other request.
     signed: Option<Box<signed_id::Relay>>,
+}
+
+/// What one upstream attempt has made of the request body as `request_body_filter` streams it past.
+///
+/// `upstream_peer` builds a fresh one for every attempt ([`RequestCtx::begin_attempt`]), because
+/// pingora replays its buffered request body through `request_body_filter` on a retry
+/// (`proxy_h1.rs`'s `send_body_to_pipe`, and the h2 twin): anything an earlier attempt accumulated
+/// would otherwise have the replayed prefix appended to it.
+///
+/// - `req_buf` would hold the prefix twice, and `peek::scan_buffered` would then plan the splice
+///   against the **first** copy — handing the upstream a body with a duplicated fragment, which it
+///   rejects with a `400` that reads like a client error. `logging` even records that `400` as a
+///   breaker *success* (the provider answered), so nothing surfaces it as our fault.
+/// - `model_scanner`'s brace depth would be permanently offset by the extra `{`, so `at_key_level`
+///   never matches again and the billing row ships `requested_model = ""`.
+/// - `upload` would double-count the prefix against `MAX_REQUEST_BODY`.
+///
+/// A whole new value per attempt has no field a reset could forget.
+struct Attempt {
+    /// How much of the request body this attempt has fed through `request_body_filter`.
+    upload: UploadProgress,
+    /// The body, buffered for a rewrite ([`RequestCtx::rewrites_body`]); empty for every request
+    /// that streams its body through.
+    req_buf: Vec<u8>,
+    /// Scans a body that streams through (managed only) for its root `model`.
+    model_scanner: peek::ModelScanner,
+    /// Text bytes of the request body (base64 payloads excluded): the input-token estimate for a
+    /// billing row the provider's usage did not fill (a stream cut short before its usage block, on
+    /// a wire that reports input only at the end). See `usage::InputTally`. Fed as the body streams
+    /// past only when `tally_eager`; otherwise `logging` reads the body itself, and only when it
+    /// needs an estimate ([`input_estimate`]).
+    input_tally: usage::InputTally,
+    /// This attempt's upstream read timeout is the time left before `deadline` (shorter than the
+    /// silence bound, see `cap_read_at_deadline`), so a read timeout on it is the deadline passing,
+    /// not the provider going quiet.
+    read_capped: bool,
+    /// This is a [`FullBody`] attempt that recorded a [`RelayRetry`]: the parent is discarding its
+    /// response and re-running. It still feeds the breaker; it writes no `ai.usage` or
+    /// `ai.payload` row (the attempt that serves does). An abandoned attempt is the subrequest's
+    /// last: it never asks pingora for another.
+    relay_abandoned: bool,
+}
+
+impl Attempt {
+    /// An attempt that has seen nothing yet, buffering into `req_buf` (empty, perhaps pre-sized).
+    fn new(req_buf: Vec<u8>) -> Self {
+        Self {
+            upload: UploadProgress::default(),
+            req_buf,
+            model_scanner: peek::ModelScanner::new(),
+            input_tally: usage::InputTally::default(),
+            read_capped: false,
+            relay_abandoned: false,
+        }
+    }
+}
+
+/// What the next attempt is, as the hook that asked pingora for it declared: every hook that marks
+/// an error retryable declares one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Retry {
+    /// The same leg again: a managed 429 or 401 key walk, a stale pooled connection, a refused
+    /// stream's one resend, or the candidate's next address. Its breaker permit carries over (a
+    /// 429 is a healthy throttle, and a dead connection is not the provider failing), and the
+    /// catalog walk is not entered: that would send this provider's remaining keys to another
+    /// vendor.
+    SameLeg,
+    /// A catalog walk's next candidate. The outgoing leg failed this attempt: a permit it still
+    /// owes is that failure (a 5xx, a connect or upstream failure), resolved as the walk moves on.
+    /// One already resolved (a refusing 401–403, the success it is) owes nothing more.
+    NextCandidate,
 }
 
 /// Who pays for a request, and so whether anything tenant-scoped applies to it.
@@ -616,12 +669,15 @@ struct Leg {
     /// `Provider::first_key` (past keys cooling off from a 401) unless a `FullBody` re-run resumes
     /// a key walk; advanced on a managed 429 or 401 when another unused key remains.
     pool_key: u8,
-    /// Connect-retry counter, and on a catalog walk the index of the candidate's resolved address
-    /// this attempt dials (see `fail_to_connect`).
-    attempt: u8,
+    /// Which of the provider's resolved addresses this attempt dials: advanced by each connect
+    /// retry (see `fail_to_connect`).
+    addr: u8,
     /// This attempt is the one resend a refused H2 stream gets on its candidate (D72, D91). A
     /// second refusal there is a provider failure: fail over, or end the request.
     refused_resent: bool,
+    /// The retry the hook that asked pingora for another attempt declared, read by `upstream_peer`
+    /// when that attempt starts. `None` before the first attempt.
+    retry: Option<Retry>,
 }
 
 impl Leg {
@@ -630,8 +686,9 @@ impl Leg {
             provider,
             permit,
             pool_key,
-            attempt: 0,
+            addr: 0,
             refused_resent: false,
+            retry: None,
         }
     }
 
@@ -1260,7 +1317,7 @@ fn outcome(
     if cache_hit {
         return "ok";
     }
-    if rc.upstream_status.is_some_and(|s| s >= 400) {
+    if rc.upstream_status().is_some_and(|s| s >= 400) {
         return "upstream_error";
     }
     if client_left || e.is_some_and(|e| e.esource() == &pingora_core::ErrorSource::Downstream) {
@@ -1269,7 +1326,7 @@ fn outcome(
     if rc.upstream_phase == UpstreamPhase::None {
         return "no_candidate";
     }
-    match (e, rc.upstream_status) {
+    match (e, rc.upstream_status()) {
         // Failed before any response head: a connect, read-timeout or reset failure upstream.
         (Some(_), None) => "upstream_error",
         // A response that started and then died.
@@ -1505,7 +1562,20 @@ impl ModelRouting {
     }
 }
 
+/// An HTTP status as [`RequestCtx::upstream_status`] holds it. Every status reaching it was parsed
+/// by `http::StatusCode` (100-999) or stored from one, so the `0` that `NonZeroU16` cannot hold
+/// never arrives; were one to, it would read as "no response head", hence the assertion.
+fn held_status(status: u16) -> Option<NonZeroU16> {
+    debug_assert!(status != 0, "an HTTP status is never 0");
+    NonZeroU16::new(status)
+}
+
 impl RequestCtx {
+    /// The upstream HTTP status, once the response head has arrived.
+    fn upstream_status(&self) -> Option<u16> {
+        self.upstream_status.map(NonZeroU16::get)
+    }
+
     /// Whether this is a **managed** request (`bai_v1…` / `bai_v2…` key → swap to the pool key).
     /// `false` for **BYO** — we leave the user's own auth header untouched (passthrough).
     fn managed(&self) -> bool {
@@ -1517,7 +1587,7 @@ impl RequestCtx {
     /// `MAX_REQUEST_BODY`. The body filter and the replay tests both feed through here, so a replayed
     /// prefix is accounted the same way each time.
     fn take_request_chunk(&mut self, chunk: &[u8]) -> bool {
-        if !self.upload.feed(chunk.len()) {
+        if !self.attempt.upload.feed(chunk.len()) {
             return false;
         }
         // Capture tap. Deliberately on the chunk as it *arrives*, which makes the captured bytes
@@ -1530,7 +1600,7 @@ impl RequestCtx {
             c.push_req(chunk);
         }
         if self.rewrites_body() {
-            self.req_buf.extend_from_slice(chunk);
+            self.attempt.req_buf.extend_from_slice(chunk);
         }
         true
     }
@@ -1607,55 +1677,49 @@ impl RequestCtx {
         buf.push_str(path);
     }
 
-    /// Clear the state the request-body phase accumulates, so a **retried** attempt starts from the
-    /// same slate as the first one.
+    /// Clear the state one attempt accumulated, so a **retried** attempt starts from the same slate
+    /// as the first: a fresh [`Attempt`]. Called from `upstream_peer`, which pingora invokes exactly
+    /// once per attempt and always before any body byte moves — it is the first statement of
+    /// `proxy_to_upstream`.
     ///
-    /// Pingora replays its buffered request body through `request_body_filter` on a retry
-    /// (`proxy_h1.rs`'s `send_body_to_pipe`, and the h2 twin), so without this the replayed prefix is
-    /// *appended* to whatever the previous attempt already accumulated:
+    /// The per-attempt state boxed elsewhere, to keep this struct small, starts over with it: the
+    /// captured request (the tap is fed the same replayed chunks), the price-knob scan, and a
+    /// translated walk's response state. A 5xx vendor walk aborts in `upstream_response_filter`
+    /// before `response_filter` runs, so that last is empty in practice; it is still cleared, so a
+    /// retry cannot append a leftover JSON/SSE buffer onto the candidate that actually serves.
     ///
-    /// - `req_buf` would hold the prefix twice, and `peek::scan_buffered` would then plan the splice
-    ///   against the **first** copy — handing the upstream a body with a duplicated fragment, which
-    ///   it rejects with a `400` that reads like a client error. `logging` even records that `400` as
-    ///   a breaker *success* (the provider answered), so nothing surfaces it as our fault.
-    /// - `model_scanner`'s brace depth would be permanently offset by the extra `{`, so
-    ///   `at_key_level` never matches again and the billing row ships `requested_model = ""`.
-    /// - `upload` would double-count the prefix against `MAX_REQUEST_BODY`.
-    ///
-    /// Called from `upstream_peer`, which pingora invokes exactly once per attempt and always before
-    /// any body byte moves — it is the first statement of `proxy_to_upstream`.
-    ///
-    /// `model` is deliberately **not** cleared: once a complete body has yielded it the value is
+    /// `model` is deliberately request-level: once a complete body has yielded it the value is
     /// correct, and pingora's replay buffer is capped at 64 KiB, so a larger body could not
     /// re-derive it on the next attempt.
-    fn reset_request_body_phase(&mut self) {
-        // Translate response state belongs to *this* attempt. 5xx vendor-walk aborts in
-        // `upstream_response_filter` before `response_filter` runs, so these are empty in
-        // practice — still clear them so a retry cannot append a leftover JSON/SSE buffer
-        // onto the candidate that actually serves.
+    fn begin_attempt(&mut self) {
         if let Some(t) = self.auto.as_mut().and_then(|a| a.translate.as_mut()) {
             t.sse = None;
             t.json_buf.clear();
             t.assemble = false;
         }
-        // The first attempt has nothing to undo, and that is the only attempt the vast majority of
-        // requests ever make — so pay one compare rather than three stores on the hot path.
-        if !self.upload.started() {
+        // An attempt that fed no body chunk is still as `Attempt::new` made it: every body-phase
+        // accumulator is fed on the branch that counts the chunk. The first attempt, the only one
+        // most requests make, keeps the one `request_filter` built.
+        if !self.attempt.upload.started() {
             return;
         }
-        // The capture tap is fed the same chunks, so it holds the replayed prefix too.
         if let Some(c) = self.control.as_mut().and_then(|c| c.capture.as_mut()) {
             c.clear_req();
         }
-        // `clear` keeps the capacity, which was pre-sized from `Content-Length` in `request_filter`
-        // and which the in-place splice relies on to stay realloc-free.
-        self.req_buf.clear();
-        self.upload = UploadProgress::default();
-        self.model_scanner = peek::ModelScanner::new();
-        self.input_tally = usage::InputTally::default();
         if let Some(k) = self.billing.taps_mut().and_then(|t| t.knobs.as_mut()) {
             *k = (peek::ModelScanner::new(), peek::Kept::request_knobs());
         }
+        // Nothing carried over but the body buffer's allocation, which `request_filter` pre-sized
+        // from `Content-Length` and the in-place splice relies on to stay realloc-free.
+        let mut req_buf = std::mem::take(&mut self.attempt.req_buf);
+        req_buf.clear();
+        self.attempt = Attempt::new(req_buf);
+    }
+
+    /// Move the walk past candidate `at`, and declare the next attempt its next candidate.
+    fn fail_over(&mut self, at: u8) {
+        self.advance_candidate(at);
+        self.leg.retry = Some(Retry::NextCandidate);
     }
 }
 
@@ -1803,14 +1867,14 @@ impl AiProxy {
         rc: &mut RequestCtx,
         mut peer: HttpPeer,
     ) -> Result<Box<HttpPeer>> {
-        rc.read_capped = false;
+        rc.attempt.read_capped = false;
         if let Some(left) = crate::deadline::remaining(rc.deadline) {
             if left.is_zero() {
                 return Err(self.deadline_cut(&rc.request_id));
             }
             if peer.options.read_timeout.is_none_or(|t| left < t) {
                 peer.options.read_timeout = Some(left);
-                rc.read_capped = true;
+                rc.attempt.read_capped = true;
             }
         }
         Ok(Box::new(peer))
@@ -2855,7 +2919,7 @@ impl UploadProgress {
 /// finished it. An upstream error then reflects the client (a stalled or abandoned upload), not the
 /// provider. Zero bytes fed means the attempt never got past connecting.
 fn client_still_uploading(session: &mut Session, rc: &RequestCtx) -> bool {
-    rc.upload.started() && !session.as_mut().is_body_done()
+    rc.attempt.upload.started() && !session.as_mut().is_body_done()
 }
 
 /// Whether the upstream's read timeout fired while the client still owed body bytes (D260): the
@@ -3165,7 +3229,7 @@ impl FullBody {
 /// for them at all.
 fn input_estimate(session: &Session, rc: &RequestCtx) -> u64 {
     if rc.tally_eager {
-        return rc.input_tally.estimate_tokens();
+        return rc.attempt.input_tally.estimate_tokens();
     }
     let body = full_body_ctx(session)
         .map(|fb| fb.body)
@@ -5393,23 +5457,18 @@ impl ProxyHttp for AiProxy {
                     forward_path,
                     control,
                     model: String::new(),
-                    model_scanner: peek::ModelScanner::new(),
+                    attempt: Attempt::new(Vec::new()),
                     resp_model_scanner: peek::ModelScanner::for_response(),
                     // Not an upstream stream — `response_filter` never ran, so `active_streams`
                     // was never incremented. The stored `hit.streaming` is emitted on `ai.usage`.
                     streaming: false,
                     inject_eligible: false,
                     catalog_check: false,
-                    req_buf: Vec::new(),
                     resp_tail: UsageTail::default(),
                     resp_head: Vec::new(),
-                    upload: UploadProgress::default(),
-                    upstream_status: Some(hit.status),
+                    upstream_status: held_status(hit.status),
                     start,
                     deadline,
-                    same_provider_retry: false,
-                    relay_abandoned: false,
-                    read_capped: false,
                     auto: model_route.map(|route| {
                         Box::new(ModelRouting {
                             route,
@@ -5430,7 +5489,6 @@ impl ProxyHttp for AiProxy {
                         })
                     }),
                     request_id,
-                    input_tally: usage::InputTally::default(),
                     tally_eager: false,
                     resp_bytes: 0,
                     upstream_phase: UpstreamPhase::None,
@@ -5525,7 +5583,9 @@ impl ProxyHttp for AiProxy {
             forward_path,
             control,
             model: String::new(),
-            model_scanner: peek::ModelScanner::new(),
+            // Its body buffer is pre-sized below, once the context says whether this request
+            // rewrites its body.
+            attempt: Attempt::new(Vec::new()),
             // `for_response`, not `new`: a response may carry the model nested under `message`
             // (Anthropic's `message_start`), and a root-only scanner would neither find it nor ever
             // stop looking. See `ModelScanner::for_response`.
@@ -5533,8 +5593,6 @@ impl ProxyHttp for AiProxy {
             streaming: false,
             inject_eligible,
             catalog_check,
-            // Pre-sized below, once the context says whether this request rewrites its body.
-            req_buf: Vec::new(),
             // Grown lazily by the response tap (`response_body_filter`), not pre-reserved: a
             // non-streaming response — the common case — is a few hundred bytes, so reserving the
             // full 64KB cap up front would waste an allocation on every request to hold ~200B. A
@@ -5544,13 +5602,9 @@ impl ProxyHttp for AiProxy {
             // Grown lazily, and only on the one path that needs it (Anthropic SSE) — see
             // `response_body_filter`. Every other response leaves this empty and never allocates.
             resp_head: Vec::new(),
-            upload: UploadProgress::default(),
             upstream_status: None,
             start,
             deadline,
-            same_provider_retry: false,
-            relay_abandoned: false,
-            read_capped: false,
             auto: model_route.map(|route| {
                 Box::new(ModelRouting {
                     route,
@@ -5575,7 +5629,6 @@ impl ProxyHttp for AiProxy {
                 })
             }),
             request_id,
-            input_tally: usage::InputTally::default(),
             tally_eager: tally_eager(managed, model_route.is_some(), declared_len),
             resp_bytes: 0,
             upstream_phase: UpstreamPhase::None,
@@ -5595,7 +5648,8 @@ impl ProxyHttp for AiProxy {
             && rc.rewrites_body()
             && let Some(len) = declared_len
         {
-            rc.req_buf = Vec::with_capacity(len.min(MAX_REQUEST_BODY) + STREAM_OPTIONS_FRAG.len());
+            rc.attempt.req_buf =
+                Vec::with_capacity(len.min(MAX_REQUEST_BODY) + STREAM_OPTIONS_FRAG.len());
         }
         // Admitted: count it in-flight. Released in `logging`, or by `Ctx`'s drop if a panic
         // skipped `logging`, so the gauge cannot leak. `active_streams` only covers SSE; this
@@ -5620,58 +5674,34 @@ impl ProxyHttp for AiProxy {
         };
         self.state.fault_point("upstream_peer");
 
-        // Pingora calls this once per attempt, always before a body byte moves, so it is the one
-        // place a retry's leftover request-body state can be cleared. No-op on the first attempt.
-        rc.reset_request_body_phase();
-
-        // Same-provider key walk after a managed 429, a stale pooled connection, or the next
-        // address of a candidate whose first one refused the connection. Stay on this provider,
-        // keep the outstanding breaker permit (429 is a success, not a failure), and do not enter
-        // the candidate walk — that walk would send this provider's remaining keys to a different
-        // vendor.
-        if rc.same_provider_retry {
-            rc.same_provider_retry = false;
-            if let Some(a) = rc.auto.as_mut() {
-                a.attempt_start = Instant::now();
-            }
-            let addr = match self
-                .state
-                .resolve(&rc.leg.provider.authority, rc.leg.attempt)
-                .await
-            {
-                Ok((a, _)) => a,
-                Err(e) => {
-                    warn!(
-                        request_id = %rc.request_id,
-                        provider = rc.leg.provider.name.as_str(),
-                        authority = rc.leg.provider.authority.as_str(),
-                        error = %e,
-                        "upstream dns resolution failed",
-                    );
-                    return Err(pingora_core::Error::because(
-                        pingora_core::ErrorType::ConnectError,
-                        "upstream dns resolution failed",
-                        e,
-                    ));
-                }
-            };
-            rc.upstream_phase = UpstreamPhase::Attempted;
-            let peer = self.build_peer(addr, &rc.leg.provider, rc.auto.as_ref().map(|a| a.route));
-            return self.cap_read_at_deadline(rc, peer);
-        }
+        // Pingora calls this once per attempt, always before a body byte moves, so it is where each
+        // attempt starts on a fresh body record.
+        rc.begin_attempt();
+        let retry = rc.leg.retry.take();
 
         // Model-routed: this hook owns the candidate walk *and* the breaker ledger.
         //
-        // It is the only place `rc.leg.provider` changes, which is what makes double-recording
-        // structurally impossible — and it is the only hook that runs on every attempt, including
-        // the ones pingora starts without consulting `fail_to_connect` (its default
-        // `error_while_proxy` marks a reused-connection failure retryable on its own). A design that
-        // recorded in `fail_to_connect` would miss exactly those.
-        if rc.auto.is_some() {
-            // Reaching here with a permit outstanding means the previous attempt failed before any
-            // response arrived, so the candidate we were on earned the failure. Resolve it before
-            // touching anything else; `logging` then only ever sees the final candidate's permit.
-            rc.leg.fail();
+        // It is the only place `rc.leg` changes, which is what makes double-recording structurally
+        // impossible — and it is the only hook that runs on every attempt, including the ones
+        // pingora starts without consulting `fail_to_connect` (its default `error_while_proxy`
+        // marks a reused-connection failure retryable on its own). A design that recorded in
+        // `fail_to_connect` would miss exactly those.
+        //
+        // Not for the same leg again (see `Retry::SameLeg`): that stays on this provider, keeps
+        // its outstanding breaker permit, and must not enter the walk.
+        if retry != Some(Retry::SameLeg) && rc.auto.is_some() {
+            // The hook that moved the walk on declared the outgoing candidate failed (see
+            // `Retry::NextCandidate`): resolve its permit before touching anything else, so
+            // `logging` only ever sees the final candidate's. A first attempt owes nothing yet.
+            // A permit still pending on any other entry is a retry that did not declare itself:
+            // its leg would be released here rather than failed.
+            debug_assert!(
+                rc.leg.permit.is_none() || retry == Some(Retry::NextCandidate),
+                "an undeclared retry entered the walk owing a permit ({retry:?})",
+            );
+            if retry == Some(Retry::NextCandidate) {
+                rc.leg.fail();
+            }
 
             loop {
                 // Read the cursor out of the boxed state; `rc` stays mutably borrowable below.
@@ -5795,6 +5825,10 @@ impl ProxyHttp for AiProxy {
             }
         }
 
+        // A provider-routed attempt, or a walk's same leg again, which is timed from here.
+        if let Some(a) = rc.auto.as_mut() {
+            a.attempt_start = Instant::now();
+        }
         // Resolve via the TTL cache (async, non-blocking) rather than `HttpPeer::new`'s eager
         // blocking `getaddrinfo`. SNI/Host = the configured host; TLS on for real providers (the
         // e2e harness flips `upstream_tls=false` for a plaintext mock).
@@ -5802,7 +5836,7 @@ impl ProxyHttp for AiProxy {
         // first address is dead (`localhost` → `::1` first) still connects.
         let addr = match self
             .state
-            .resolve(&rc.leg.provider.authority, rc.leg.attempt)
+            .resolve(&rc.leg.provider.authority, rc.leg.addr)
             .await
         {
             Ok((a, _)) => a,
@@ -5905,7 +5939,7 @@ impl ProxyHttp for AiProxy {
                         "upstream returned {status}; trying the next pool key",
                     );
                     rc.leg.pool_key = next;
-                    rc.same_provider_retry = true;
+                    rc.leg.retry = Some(Retry::SameLeg);
                     let mut e =
                         pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(status));
                     e.set_retry(true);
@@ -5926,7 +5960,7 @@ impl ProxyHttp for AiProxy {
                         status,
                         "upstream returned {status}; re-running the full body on the next pool key",
                     );
-                    rc.relay_abandoned = fb.record(RelayRetry::Key {
+                    rc.attempt.relay_abandoned = fb.record(RelayRetry::Key {
                         candidate: orig,
                         key: next,
                     });
@@ -6004,9 +6038,9 @@ impl ProxyHttp for AiProxy {
                 status,
                 "upstream returned {status}; re-running the full body on the next candidate",
             );
-            rc.relay_abandoned = fb.record(RelayRetry::Candidate(orig));
+            rc.attempt.relay_abandoned = fb.record(RelayRetry::Candidate(orig));
             // Not recorded (the final attempt): this answer is relayed and `logging` reads it.
-            if rc.relay_abandoned {
+            if rc.attempt.relay_abandoned {
                 self.abandon_402(rc, unfunded_402, status);
             }
             return Ok(());
@@ -6040,7 +6074,7 @@ impl ProxyHttp for AiProxy {
             rc.leg.succeed();
         }
         self.abandon_402(rc, unfunded_402, status);
-        rc.advance_candidate(at);
+        rc.fail_over(at);
         let mut e = pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(status));
         e.set_retry(true);
         Err(e)
@@ -6278,7 +6312,7 @@ impl ProxyHttp for AiProxy {
             // Only where no copy of the body will be left for `logging` to read (`tally_eager`):
             // everywhere else the estimate is made there, and only when a row needs one.
             if rc.tally_eager {
-                rc.input_tally.feed(chunk);
+                rc.attempt.input_tally.feed(chunk);
                 // The price knobs, for the same reason: no copy of this body is left for
                 // `logging` to read (see `requested_knobs`).
                 if let Some(taps) = rc.billing.tap() {
@@ -6293,21 +6327,22 @@ impl ProxyHttp for AiProxy {
                 // A large body buffered for a rewrite (the `/{provider}` usage splice; a catalog
                 // walk's large body is a `FullBody` re-run, already reserved) holds budget as it
                 // grows. Tagged downstream: the client's size, not the provider's health.
-                if past_replay_buffer(rc.req_buf.len()) && !held.reserve_body(rc.req_buf.len()) {
+                let held_len = rc.attempt.req_buf.len();
+                if past_replay_buffer(held_len) && !held.reserve_body(held_len) {
                     self.state.metrics.rejection(Rejection::BodyMemory).inc();
                     return Err(
                         gateway_error(503, "too many large request bodies in flight").into_down(),
                     );
                 }
             } else if rc.managed() {
-                rc.model_scanner.feed(chunk);
+                rc.attempt.model_scanner.feed(chunk);
             }
         }
 
         if rc.rewrites_body() {
             if end_of_stream {
                 // One structural walk for every answer (see `peek::scan_buffered`).
-                let mut buf = std::mem::take(&mut rc.req_buf);
+                let mut buf = std::mem::take(&mut rc.attempt.req_buf);
                 // --- signed ids (`signed_id`): the provider gets its own ids back ---
                 // The client's body, per attempt. A catalog walk was checked before connecting; a
                 // `/{provider}` body is refused here, before a byte of it goes upstream.
@@ -6604,7 +6639,7 @@ impl ProxyHttp for AiProxy {
             && rc.managed()
             && !rc.inject_eligible
             && rc.model.is_empty()
-            && let Some(m) = rc.model_scanner.take_model()
+            && let Some(m) = rc.attempt.model_scanner.take_model()
         {
             rc.model = sanitize_model(m).into_owned();
         }
@@ -6637,7 +6672,7 @@ impl ProxyHttp for AiProxy {
                 .ttft_seconds
                 .observe(rc.attempt_start().elapsed().as_secs_f64());
             rc.leg.provider.metrics.record_response(status);
-            rc.upstream_status = Some(status);
+            rc.upstream_status = held_status(status);
             // Resolve the breaker permit here, at the head, not at the end of the body: the head
             // is the provider's answer (a 5xx is broken, anything else is reachable), and a
             // half-open probe resolved only at end of stream let one long or stalled stream 503
@@ -6795,7 +6830,7 @@ impl ProxyHttp for AiProxy {
             if rc.auto.as_ref().is_some_and(|a| {
                 catalog_translating(a)
                     || (rc.streaming && (catalog_chat_relay(a) || catalog_assembling(a)))
-                    || catalog_error_relay(a, rc.upstream_status, rc.streaming)
+                    || catalog_error_relay(a, rc.upstream_status(), rc.streaming)
             }) {
                 let streaming = rc.streaming;
                 let upstream = rc
@@ -6938,12 +6973,12 @@ impl ProxyHttp for AiProxy {
         let translating = rc.auto.as_ref().is_some_and(|a| {
             catalog_translating(a)
                 || a.translate.as_ref().is_some_and(|t| t.sse.is_some())
-                || catalog_error_relay(a, rc.upstream_status, rc.streaming)
+                || catalog_error_relay(a, rc.upstream_status(), rc.streaming)
         });
         if translating {
             let streaming = rc.streaming;
             let dialect = rc.dialect;
-            let status = rc.upstream_status.unwrap_or(200);
+            let status = rc.upstream_status().unwrap_or(200);
             let upstream = rc
                 .auto
                 .as_ref()
@@ -7072,7 +7107,7 @@ impl ProxyHttp for AiProxy {
         // provider going quiet: the gateway's own decision, like those below.
         if e.etype() == &T::ReadTimedout
             && let Some(rc) = ctx.rc.as_ref()
-            && rc.read_capped
+            && rc.attempt.read_capped
         {
             return self.deadline_cut(&rc.request_id);
         }
@@ -7173,7 +7208,7 @@ impl ProxyHttp for AiProxy {
                     rc.leg.release();
                 }
                 if let Some(retry) = retry {
-                    rc.relay_abandoned = fb.record(retry);
+                    rc.attempt.relay_abandoned = fb.record(retry);
                 }
             }
             return e;
@@ -7189,12 +7224,12 @@ impl ProxyHttp for AiProxy {
             // not the provider).
             Some(_) if resend_refused || (client_reused && !refused) => {
                 rc.leg.refused_resent |= refused && !drained;
-                rc.same_provider_retry = true;
+                rc.leg.retry = Some(Retry::SameLeg);
                 e.set_retry(true);
             }
             Some((_, at, usable)) if first_usable(usable, at.saturating_add(1)).is_some() => {
                 self.state.metrics.candidate_failovers_total.inc();
-                rc.advance_candidate(at);
+                rc.fail_over(at);
                 e.set_retry(true);
             }
             Some(_) => e.set_retry(false),
@@ -7213,6 +7248,10 @@ impl ProxyHttp for AiProxy {
                 e.retry.decide_reuse(client_reused);
             }
             None => e.retry.decide_reuse(client_reused),
+        }
+        // A provider-routed retry is its one leg again.
+        if walk.is_none() && e.retry.retry() {
+            rc.leg.retry = Some(Retry::SameLeg);
         }
         e
     }
@@ -7348,15 +7387,15 @@ impl ProxyHttp for AiProxy {
                 // This candidate resolved to more than one address and an untried one remains:
                 // try it before giving up on the candidate. Same provider, same breaker permit
                 // (one address refusing is not the provider failing).
-                if rc.leg.attempt.saturating_add(1) < addrs {
-                    rc.leg.attempt += 1;
-                    rc.same_provider_retry = true;
+                if rc.leg.addr.saturating_add(1) < addrs {
+                    rc.leg.addr += 1;
+                    rc.leg.retry = Some(Retry::SameLeg);
                     rc.leg.provider.metrics.connect_retries_total.inc();
                     warn!(
                         request_id = %rc.request_id,
                         provider = rc.leg.provider.name.as_str(),
                         candidate = at,
-                        address = rc.leg.attempt,
+                        address = rc.leg.addr,
                         error = %e,
                         "upstream connect failed; trying the candidate's next address",
                     );
@@ -7381,14 +7420,14 @@ impl ProxyHttp for AiProxy {
                 // the last candidate.
                 if first_usable(usable, at.saturating_add(1)).is_some() {
                     self.state.metrics.candidate_failovers_total.inc();
-                    rc.advance_candidate(at);
+                    rc.fail_over(at);
                     e.set_retry(true);
                 }
                 return e;
             }
             // Retry transient connect failures a couple of times (Pingora re-invokes upstream_peer).
-            if rc.leg.attempt < MAX_CONNECT_RETRIES {
-                rc.leg.attempt += 1;
+            if rc.leg.addr < MAX_CONNECT_RETRIES {
+                rc.leg.addr += 1;
                 // Surface the retry. Without this, a partially-down provider TCP layer (or an
                 // egress-IP ban — connect is where that first bites) shows up only as extra latency
                 // on `upstream_latency_seconds`, indistinguishable from a slow model. The counter is
@@ -7397,10 +7436,11 @@ impl ProxyHttp for AiProxy {
                 warn!(
                     request_id = %rc.request_id,
                     provider = rc.leg.provider.name.as_str(),
-                    attempt = rc.leg.attempt,
+                    attempt = rc.leg.addr,
                     error = %e,
                     "upstream connect failed; retrying",
                 );
+                rc.leg.retry = Some(Retry::SameLeg);
                 e.set_retry(true);
             }
         }
@@ -7420,6 +7460,9 @@ impl ProxyHttp for AiProxy {
         held.release_tenant();
         let Some(rc) = rc.as_mut() else { return };
         let managed = rc.managed();
+        // Set once the response head arrived (or from the cache hit) and never after, so one read
+        // serves the whole hook.
+        let upstream_status = rc.upstream_status();
         // A client that closed after its stream's terminal event reached it has the whole answer:
         // the request completed, whatever the provider's end of stream was still doing.
         let e = e.filter(|e| !closed_after_terminal(rc, e));
@@ -7462,7 +7505,7 @@ impl ProxyHttp for AiProxy {
         // deliberately **4xx/429 too**: a 429 is a healthy provider throttling our pool key, which the
         // rate limiter and the client's `Retry-After` own, NOT a reason to cut all traffic to it.
         if rc.leg.permit.is_some() {
-            match rc.upstream_status {
+            match upstream_status {
                 // Defensive only, so its mutants are equivalent (excluded in .cargo/mutants.toml):
                 // `response_filter` sets `upstream_status` and takes the permit in the same step,
                 // and nothing else sets it on a request that holds a permit (a cache hit never
@@ -7535,7 +7578,7 @@ impl ProxyHttp for AiProxy {
         // connection before answering: that is a refusal, not a wait (see `gave_up_waiting`).
         let no_head = managed
             && cache_hit.is_none()
-            && rc.upstream_status.is_none()
+            && upstream_status.is_none()
             && e.is_some_and(gave_up_waiting)
             && body_delivered(session, rc, e);
         let parsed = if cache_hit.is_some() {
@@ -7545,7 +7588,7 @@ impl ProxyHttp for AiProxy {
             // A relayed managed 403 whose body names the key (not the request) is that key being
             // refused: cool it so later requests start past it, as a 401 does at the head (D84).
             // This request already answered; it does not walk.
-            if managed && rc.upstream_status == Some(403) && body_names_the_key(tail) {
+            if managed && upstream_status == Some(403) && body_names_the_key(tail) {
                 self.state.metrics.key_cooled(KeyCooled::KeyNamed403);
                 rc.leg.provider.mark_key_bad(rc.leg.pool_key);
             }
@@ -7556,8 +7599,11 @@ impl ProxyHttp for AiProxy {
             // once all its keys cool (D180). This request already answered. Not an abandoned
             // `FullBody` attempt: its body never reaches the client and is read only if it raced
             // the parent's drop, and a walk's 402 was already judged at the head (D258).
-            if managed && !rc.relay_abandoned && rc.redact.as_ref().is_some_and(|r| r.unfunded) {
-                let status = rc.upstream_status.unwrap_or(0);
+            if managed
+                && !rc.attempt.relay_abandoned
+                && rc.redact.as_ref().is_some_and(|r| r.unfunded)
+            {
+                let status = upstream_status.unwrap_or(0);
                 self.cool_unfunded_key(&rc.request_id, &rc.leg.provider, rc.leg.pool_key, status);
             }
             // Extract usage facts (shape depends on dialect + streaming). Every case reads the tail;
@@ -7577,7 +7623,7 @@ impl ProxyHttp for AiProxy {
             // `message_start` already carries exact input and cache counts, so only the missing
             // side is estimated. See `usage`'s estimate section: input is a pre-token lower bound,
             // output a measured divisor; both err low.
-            let ok_2xx = rc.upstream_status.is_some_and(|s| (200..300).contains(&s));
+            let ok_2xx = upstream_status.is_some_and(|s| (200..300).contains(&s));
             let cut_short = managed
                 && rc.streaming
                 && ok_2xx
@@ -7662,7 +7708,7 @@ impl ProxyHttp for AiProxy {
             && let Some(id) = rc.billing.identity()
             && !free
             && cache_hit.is_none()
-            && let Some(s) = rc.upstream_status
+            && let Some(s) = upstream_status
             && (200..300).contains(&s)
         {
             self.state.metrics.usage_parse_errors_total.inc();
@@ -7740,9 +7786,9 @@ impl ProxyHttp for AiProxy {
         // duplicate `model`, `background`): no provider had the request, so no row, as for every
         // other rejection.
         let refused =
-            cache_hit.is_none() && rc.upstream_status.is_none() && e.is_some_and(gateway_refusal);
+            cache_hit.is_none() && upstream_status.is_none() && e.is_some_and(gateway_refusal);
         if let Some(&id) = rc.billing.identity()
-            && !rc.relay_abandoned
+            && !rc.attempt.relay_abandoned
             && !free
             && !refused
         {
@@ -7916,7 +7962,7 @@ impl ProxyHttp for AiProxy {
                 cache_hit = cache_hit.is_some(),
                 // The provider's HTTP status, absent when no response head arrived (and on a cache
                 // hit, which made no call); and what became of the request (see `outcome`).
-                upstream_status = cache_hit.is_none().then_some(rc.upstream_status).flatten(),
+                upstream_status = cache_hit.is_none().then_some(upstream_status).flatten(),
                 outcome,
                 // True when the stream was cut short before its usage block and the token counts
                 // below are the gateway's estimate, not the provider's report. Estimates err low.
@@ -8015,7 +8061,7 @@ impl ProxyHttp for AiProxy {
                     provider = rc.leg.provider.name.as_str(),
                     model = billed_model,
                     stream = rc.streaming,
-                    status = rc.upstream_status,
+                    status = upstream_status,
                     metadata = rc.control.as_ref().and_then(|c| c.metadata.as_deref()),
                     // What the client sent, before either body rewrite (see `request_body_filter`).
                     request_body = cap.req_str(),
@@ -8036,7 +8082,7 @@ impl ProxyHttp for AiProxy {
             // partial or error body must never be replayed as a success.
             if e.is_none()
                 && !usage_estimated
-                && rc.upstream_status.is_some_and(|s| (200..300).contains(&s))
+                && upstream_status.is_some_and(|s| (200..300).contains(&s))
                 && let Some(cache::Pending::Fill {
                     key,
                     tap,
@@ -8049,7 +8095,7 @@ impl ProxyHttp for AiProxy {
                 store.insert(
                     key,
                     cache::CachedResponse {
-                        status: rc.upstream_status.unwrap_or(200),
+                        status: upstream_status.unwrap_or(200),
                         content_type: content_type.unwrap_or_else(|| "application/json".into()),
                         body: Bytes::copy_from_slice(body),
                         usage: usage.for_cache(),
@@ -8167,25 +8213,19 @@ mod tests {
             leg: Leg::new(Arc::new(provider), None, 0),
             forward_path: None,
             model: String::new(),
-            model_scanner: peek::ModelScanner::new(),
+            attempt: Attempt::new(Vec::new()),
             resp_model_scanner: peek::ModelScanner::for_response(),
             streaming: false,
             resp_tail: UsageTail::default(),
             resp_head: Vec::new(),
-            upload: UploadProgress::default(),
             upstream_status: None,
             inject_eligible,
             catalog_check: false,
-            req_buf: Vec::new(),
             start: Instant::now(),
             deadline: crate::deadline::NONE,
-            same_provider_retry: false,
-            relay_abandoned: false,
-            read_capped: false,
             auto: None,
             control: None,
             request_id: RequestId::new(),
-            input_tally: usage::InputTally::default(),
             tally_eager: false,
             resp_bytes: 0,
             upstream_phase: UpstreamPhase::None,
@@ -8214,7 +8254,7 @@ mod tests {
         assert_eq!(rc.resp_head.len(), USAGE_HEAD_CAP);
     }
 
-    /// The replay contract, exercised directly: `upstream_peer` resets the body phase before pingora
+    /// The replay contract, exercised directly: `upstream_peer` starts a fresh attempt before pingora
     /// re-feeds the buffered prefix through `request_body_filter`, so attempt 2 sees the body once.
     ///
     /// This is the bug in miniature. Attempt 1 buffers a prefix and is cut off before end-of-stream,
@@ -8238,14 +8278,14 @@ mod tests {
         let mut rc = test_ctx(true);
         assert!(rc.take_request_chunk(prefix));
         assert!(
-            !rc.req_buf.is_empty(),
+            !rc.attempt.req_buf.is_empty(),
             "precondition: the partial body is still held, since end_of_stream never came",
         );
 
         // `upstream_peer` runs before any body byte of attempt 2.
-        rc.reset_request_body_phase();
+        rc.begin_attempt();
         assert_eq!(
-            rc.upload.0, 0,
+            rc.attempt.upload.0, 0,
             "the size guard must not double-count the replayed prefix",
         );
 
@@ -8254,15 +8294,15 @@ mod tests {
         assert!(rc.take_request_chunk(rest));
 
         assert_eq!(
-            rc.req_buf, body,
+            rc.attempt.req_buf, body,
             "the retried attempt must send the body exactly once",
         );
         assert_eq!(
-            rc.upload.0,
+            rc.attempt.upload.0,
             body.len(),
             "the replay counts the body once, as the client sent it",
         );
-        let scan = peek::scan_buffered(&rc.req_buf);
+        let scan = peek::scan_buffered(&rc.attempt.req_buf);
         assert_eq!(
             scan.model.as_deref(),
             Some("gpt-4o"),
@@ -8294,7 +8334,7 @@ mod tests {
         // Attempt 1: a prefix arrives through the production append step (captured and buffered),
         // then the upstream dies.
         assert!(rc.take_request_chunk(prefix));
-        rc.reset_request_body_phase();
+        rc.begin_attempt();
 
         // Attempt 2: pingora replays from byte 0 through the same step, then the remainder.
         assert!(rc.take_request_chunk(prefix));
@@ -8390,19 +8430,22 @@ mod tests {
         let (prefix, rest) = body.split_at(30);
 
         let mut rc = test_ctx(true);
-        rc.req_buf.extend_from_slice(prefix);
-        rc.upload.feed(prefix.len());
+        rc.attempt.req_buf.extend_from_slice(prefix);
+        rc.attempt.upload.feed(prefix.len());
         // ...no reset...
-        rc.req_buf.extend_from_slice(prefix);
-        rc.req_buf.extend_from_slice(rest);
+        rc.attempt.req_buf.extend_from_slice(prefix);
+        rc.attempt.req_buf.extend_from_slice(rest);
 
-        assert_ne!(rc.req_buf, body, "the duplicated prefix must be observable");
+        assert_ne!(
+            rc.attempt.req_buf, body,
+            "the duplicated prefix must be observable"
+        );
         assert!(
-            serde_json::from_slice::<serde_json::Value>(&rc.req_buf).is_err(),
+            serde_json::from_slice::<serde_json::Value>(&rc.attempt.req_buf).is_err(),
             "and the result is not valid JSON — this is the 400 the provider returns",
         );
         assert_eq!(
-            rc.upload.0,
+            rc.attempt.upload.0,
             prefix.len(),
             "and the size guard has double-counted",
         );
@@ -8743,7 +8786,7 @@ mod tests {
         }
     }
 
-    /// The premise behind `RequestCtx::reset_request_body_phase`: a scanner fed a duplicated body
+    /// The premise behind `RequestCtx::begin_attempt`: a scanner fed a duplicated body
     /// prefix is permanently broken, because the extra `{` offsets its brace depth so the root-level
     /// key check never matches again.
     ///
@@ -10102,14 +10145,14 @@ mod mutation_gaps {
         let down = Error::new_down(T::ReadError);
         assert_eq!(outcome(&rc, Some(&down), false, false), "client_cancelled");
         rc.upstream_phase = UpstreamPhase::Connected;
-        rc.upstream_status = Some(200);
+        rc.upstream_status = NonZeroU16::new(200);
         assert_eq!(outcome(&rc, None, false, false), "ok");
         assert_eq!(outcome(&rc, Some(&up), false, false), "cut_short");
         assert_eq!(outcome(&rc, Some(&down), false, false), "client_cancelled");
         // A drained stream (the client left first) is a cancel however the request then ended.
         assert_eq!(outcome(&rc, None, false, true), "client_cancelled");
         assert_eq!(outcome(&rc, Some(&up), false, true), "client_cancelled");
-        rc.upstream_status = Some(400);
+        rc.upstream_status = NonZeroU16::new(400);
         assert_eq!(outcome(&rc, None, false, false), "upstream_error");
         assert_eq!(outcome(&rc, Some(&down), false, false), "upstream_error");
     }

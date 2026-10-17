@@ -100,8 +100,10 @@ Client (stock OpenAI/Anthropic SDK)
   │       (claims a half-open probe permit only on an actual attempt)
   │
   ▼  upstream_peer (proxy.rs)   — runs once per attempt, before any body byte
-  │  Reset request-body phase state (a retry replays bytes through the body filter)
-  │  Model-routed: resolve the outgoing candidate's breaker permit, then walk candidates —
+  │  Start a fresh `Attempt` (a retry replays bytes through the body filter)
+  │  The retry the triggering hook declared: `SameLeg` stays on this provider, keeping its
+  │    permit; `NextCandidate` resolves the outgoing candidate's permit as a failure
+  │  Model-routed: walk candidates —
   │    skip any whose breaker is OPEN, allow() the one chosen, set forward_path to that
   │    candidate's own catalog path; DNS failure advances rather than ending the request
   │  TTL-cached DNS resolve (60s, every address, 5s lookup bound, serve-stale ≤10 min;
