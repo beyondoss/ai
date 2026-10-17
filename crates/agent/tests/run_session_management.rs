@@ -689,10 +689,11 @@ fn run_session_flag_prefers_an_explicit_model_flag_over_the_sessions_own_model()
 
 #[test]
 fn run_continue_with_name_titles_a_genuinely_fresh_session() {
-    // pi-parity fix (H6): `--continue`'s fresh-session path (`resume_or_create` finding no existing
-    // session for this cwd) minted its own `SessionMeta` internally, bypassing the `fresh_meta` closure
-    // every other startup path used to apply `--name` — a brand-new session created this way was
-    // silently left untitled no matter what `--name` was passed, with no error.
+    // pi-parity fix (H6): `--continue`'s fresh-session path (`resume_latest_or_create` finding no
+    // existing session for this cwd) minted its own `SessionMeta` internally, bypassing the
+    // `fresh_meta` closure every other startup path used to apply `--name` — a brand-new session
+    // created this way was silently left untitled no matter what `--name` was passed, with no
+    // error.
     let home_dir = tempfile::tempdir().unwrap();
     let project_dir = tempfile::tempdir().unwrap();
 
@@ -1482,8 +1483,8 @@ fn run_binary_session_dir_flag_redirects_the_continue_repo() {
         "the session file must be created directly under --session-dir: {entries:?}"
     );
 
-    // A second `--continue --session-dir` run must reopen the same session (proving `resume_or_create`
-    // actually used the overridden directory, not the default one).
+    // A second `--continue --session-dir` run must reopen the same session (proving
+    // `resume_latest_or_create` actually used the overridden directory, not the default one).
     let (base2, bodies2) = spawn_model_server(vec![turn_text("second answer")]);
     let output2 = run_cmd(bin)
         .args([

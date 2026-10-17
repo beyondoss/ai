@@ -1,7 +1,7 @@
 //! The agent's coding tools — pi's tool set, ported.
 //!
 //! Each tool implements [`agent_core::Tool`]; [`default_registry`] assembles the set the agent
-//! advertises to the model. The Beyond platform tools (fork/sync/logs) register here too once added.
+//! advertises to the model.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -14,6 +14,7 @@ pub mod bash_proc;
 pub mod bash_sandbox;
 pub mod code_mode;
 pub mod edit;
+pub mod encoding;
 pub mod exec;
 pub(crate) mod fence_tables;
 pub mod find;
@@ -35,6 +36,7 @@ pub(crate) mod mcp_wire;
 pub mod memory;
 pub mod output;
 pub mod read;
+pub mod selection;
 pub mod structured_output;
 pub mod subagent;
 pub mod todo;
@@ -177,7 +179,25 @@ pub fn expand_tilde(path: &str, home: Option<&str>) -> String {
 ///
 /// Shared by `write` and `edit`: both replace whole files and must not leave a corrupt intermediate
 /// state that a later read (or `serve` reattach) would observe.
+///
+/// **Not synced to disk**: a crash leaves the old file or the new one, but a power loss can still
+/// lose the write. That is the right trade for the model's file edits, which an `fsync` would make
+/// cost milliseconds each (about 9 ms on macOS) for no benefit. State that must survive a power loss
+/// uses [`write_atomic_durable`].
 pub(crate) fn write_atomic(path: &str, content: &[u8]) -> std::io::Result<()> {
+    write_atomic_with(path, content, false)
+}
+
+/// [`write_atomic`], and durable: the temp file is `fsync`ed before the rename and the directory
+/// after it, so a power loss leaves the old file or the new one, never a path naming an empty or
+/// partial file. A filesystem may commit the rename (metadata) ahead of the data, which without the
+/// first sync is exactly how `auth.json` or `settings.json` comes back empty. For the settings, trust,
+/// auth and MCP-auth stores — small, rarely written, and costly to lose.
+pub(crate) fn write_atomic_durable(path: &str, content: &[u8]) -> std::io::Result<()> {
+    write_atomic_with(path, content, true)
+}
+
+fn write_atomic_with(path: &str, content: &[u8], durable: bool) -> std::io::Result<()> {
     use std::io::Write as _;
 
     let p = std::path::Path::new(path);
@@ -210,20 +230,95 @@ pub(crate) fn write_atomic(path: &str, content: &[u8]) -> std::io::Result<()> {
 
     let tmp = p.with_file_name(format!(".{}.tmp.{}", name.to_string_lossy(), temp_suffix()));
     let mut f = opts.open(&tmp)?;
-    if let Err(e) = f.write_all(content) {
+    // Durable: the bytes are on disk before the rename can be (see `write_atomic_durable`).
+    let written = f.write_all(content).and_then(|()| {
+        if !durable {
+            return Ok(());
+        }
+        durability_step(p, DurabilityStep::SyncTemp);
+        f.sync_all()
+    });
+    if let Err(e) = written {
         drop(f);
         let _ = std::fs::remove_file(&tmp); // don't leave the temp behind on a mid-write failure
         return Err(e);
     }
     drop(f);
 
+    durability_step(p, DurabilityStep::Rename);
     match std::fs::rename(&tmp, p) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            if durable {
+                sync_parent_dir(p);
+            }
+            Ok(())
+        }
         Err(e) => {
             let _ = std::fs::remove_file(&tmp); // don't leave the temp behind on failure
             Err(e)
         }
     }
+}
+
+/// Make a rename in `path`'s directory durable: until the directory itself is synced, a power loss
+/// can bring back the entry as it was before. Best effort, because the rename has already happened —
+/// the new content is in place and readable, and reporting the write failed would be wrong. Some
+/// filesystems refuse `fsync` on a directory, and off unix a directory cannot be opened to sync.
+fn sync_parent_dir(path: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        let dir = match path.parent() {
+            Some(d) if !d.as_os_str().is_empty() => d,
+            _ => std::path::Path::new("."),
+        };
+        durability_step(path, DurabilityStep::SyncDir);
+        if let Ok(d) = std::fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
+/// The durability-relevant steps of [`write_atomic_durable`] (and of [`write_atomic`]), recorded in
+/// order under test, with the path written, so their order can be asserted without tracing syscalls.
+/// Process-wide rather than per-thread: the file tools write on the blocking pool.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DurabilityStep {
+    SyncTemp,
+    Rename,
+    SyncDir,
+}
+
+#[cfg(test)]
+static DURABILITY_STEPS: std::sync::Mutex<Vec<(std::path::PathBuf, DurabilityStep)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[inline]
+fn durability_step(path: &std::path::Path, step: DurabilityStep) {
+    #[cfg(test)]
+    DURABILITY_STEPS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((path.to_path_buf(), step));
+    #[cfg(not(test))]
+    let _ = (path, step);
+}
+
+/// Take the steps recorded for writes to `path` (other tests' writes are left alone).
+#[cfg(test)]
+fn take_durability_steps(path: &std::path::Path) -> Vec<DurabilityStep> {
+    let mut all = DURABILITY_STEPS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut mine = Vec::new();
+    all.retain(|(p, step)| {
+        if p == path {
+            mine.push(*step);
+            false
+        } else {
+            true
+        }
+    });
+    mine
 }
 
 /// Resolve `path` to its real target when it's a symlink, so [`write_atomic`] writes through it
@@ -441,42 +536,23 @@ fn join_against(root: &Path, normalized: String) -> String {
     root.join(&normalized).display().to_string()
 }
 
-/// Reject any resolved path that isn't a regular file or a directory, *before* a caller ever opens it —
-/// shared by `read` (image-sniffing/content), `write` (the overwrite-open path, via [`is_writable`]),
-/// and `edit` (`read_with_mtime`'s initial open). Originally lived only in `read.rs`; hoisted here once
-/// the same hang class was found in `write`/`edit` too (pi-parity pass 20) — each of those blocks on a
-/// syscall no timeout/kill-on-drop can preempt, exactly like `read`'s own pre-fix bug below, so one
-/// shared gate closes all three rather than three independently-maintained copies.
+/// The refusal `read`, `write` and `edit` return for a path that is neither a regular file nor a
+/// directory (a FIFO, socket or device), decided from the [`FileKind`](fs::FileKind) the backend's
+/// `stat` already reported, before anything opens the path. Asking the host's `std::fs::metadata`
+/// instead would answer about the wrong machine for a remote path.
 ///
-/// That gap is a real hang, not just a theoretical one: opening a FIFO for reading blocks until a
-/// writer shows up on the other end (a bare `mkfifo` with no writer wedges the very first read), opening
-/// one for *writing* (`write`'s overwrite path, `OpenOptions::write(true)`) equally blocks until a
-/// *reader* shows up, and a character device like `/dev/zero` opens and reads immediately but never
-/// signals EOF or contains a newline byte — a line-scanning read loop spins forever waiting for either.
-/// None of this has a timeout or kill-on-drop the way `bash`'s child processes do, so any one of them
-/// wedges the whole tool call — and, since dispatch awaits each call in turn, the entire turn — forever;
-/// worse, because it's a blocking syscall inline in the future's own `poll()` rather than behind an
-/// `await` point, dropping/cancelling the enclosing future can't recover it either — only killing the
-/// whole process can, which in `serve` pins a tokio worker thread shared by other concurrent sessions.
+/// The gate exists because opening one of these is a real hang: a FIFO opened for reading blocks
+/// until a writer shows up (and for writing, until a reader does), and a character device like
+/// `/dev/zero` opens and reads immediately but never signals EOF or contains a newline byte, so a
+/// line-scanning read loop spins forever. None of this has a timeout or kill-on-drop the way
+/// `bash`'s child processes do, and because it is a blocking syscall inside the future's own
+/// `poll()`, cancelling the enclosing future cannot recover it — in `serve` it pins a tokio worker
+/// thread shared by other sessions. There is no legitimate use for reading or writing one through
+/// these tools, so all of them are refused with one clear error. A directory needs no gate: opening
+/// one already fails cleanly a moment later.
 ///
-/// There's no legitimate use for reading/writing a FIFO/socket/device through these tools (a named
-/// pipe's "content" isn't a stable, replayable value the way a regular file's bytes are, and images are
-/// never any of these), so this simply refuses all of them with one clear error rather than trying to
-/// special-case any as safe. A directory is let through unmolested — opening one for reading or writing
-/// already fails cleanly a moment later (an `EISDIR`-style OS error) — so it needs no separate gate here.
-///
-/// Uses `std::fs::metadata` (follows symlinks) rather than `symlink_metadata`, so a symlink pointing
-/// *at* a FIFO/device is caught too, not just a bare one. A path whose metadata can't be read at all
-/// (most commonly: doesn't exist) is let through here — that already has its own clear "missing
-/// file"/"not writable" error at the real open call below, and duplicating it here under a different
-/// wording would just be a second, inconsistent failure mode for the same cause.
-///
-/// `tool` names the caller in the error message (`"read"`/`"write"`/`"edit"`) so the model sees which
-/// tool actually refused the path, not a generic one-size-fits-all wording.
-/// The same refusal, phrased identically, for a caller that already has the path's
-/// [`FileKind`](fs::FileKind) from a backend `stat` and must not pay a second, host-only
-/// `std::fs::metadata` to rediscover it — which for a remote path would be answering the question
-/// about the wrong machine.
+/// `tool` names the caller in the message (`"read"`/`"write"`/`"edit"`) so the model sees which
+/// tool refused the path.
 pub(crate) fn non_regular_file_error(path: &str, tool: &str) -> ToolError {
     ToolError::Execution(format!(
         "{path} is not a regular file (it's a FIFO, socket, or device); `{tool}` can only operate on \
@@ -667,9 +743,10 @@ impl<'a> ToolConfig<'a> {
 /// TB polyglot run burned most of its `$` fetching pages. `grep`/`find`/`ls`/`todo` stay advertised.
 pub const OPTIONAL_BUILTINS: &[&str] = &["web"];
 
-/// The constructed tool set: Pi's seven coding tools (read, write, edit, bash, ls, grep, find), the
-/// `todo` task list, and `web`. Advertised default is those eight minus `web`; `web` stays registered
-/// so `--tools web` can opt it in. No vendor-specific platform tools, no root (process cwd).
+/// The constructed tool set: Pi's seven coding tools (read, write, edit, bash, ls, grep, find),
+/// `bash_job` (whenever `bash` can leave a command running), the `todo` task list, and `web`. The
+/// advertised default is all of them minus `web`, which stays registered so `--tools web` can opt
+/// it in. No vendor-specific platform tools, no root (process cwd).
 pub fn default_registry() -> ToolRegistry {
     default_registry_with_config(&ToolConfig::new())
 }
@@ -782,9 +859,9 @@ pub fn default_registry_with_config(cfg: &ToolConfig<'_>) -> ToolRegistry {
 /// otherwise has no way to run with less than the full default tool set. `no_tools` wins outright
 /// (checked first); otherwise `tools` (if given) narrows to exactly those names, and `exclude` (if
 /// given) drops names from whatever remains — so `tools` + `exclude` can combine to carve one tool out
-/// of an allow-list, though picking just one of the three is the common case. Unknown names in either
-/// list are silently ignored (there's nothing to remove/keep that isn't already there), matching
-/// `ToolRegistry::retain`'s set semantics rather than erroring on a typo.
+/// of an allow-list, though picking just one of the three is the common case. Names match exactly;
+/// `run`/`serve` refuse an unknown one at startup ([`selection::check_tool_flags`]), so by the time a
+/// list reaches here every name is a built-in or an `mcp__` name.
 ///
 /// With no `--tools` allow-list, [`OPTIONAL_BUILTINS`] (`web`) is dropped so a bare invocation does
 /// not advertise `web`. Pass `--tools web` to opt it in; it stays constructed in [`default_registry`]
@@ -947,6 +1024,60 @@ mod tests {
         assert_eq!(
             normalize_path("file:///home/jared/~weird@name.txt"),
             "/home/jared/~weird@name.txt"
+        );
+    }
+
+    /// The durable write syncs the new content before the rename publishes it, and the directory
+    /// after: a power loss can leave the old file or the new one, never a path naming an empty or
+    /// partial file. A failed rename syncs no directory.
+    #[test]
+    fn write_atomic_durable_syncs_the_temp_before_the_rename_and_the_directory_after() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("auth.json");
+        let steps = || take_durability_steps(&target);
+        write_atomic_durable(target.to_str().unwrap(), b"{}").unwrap();
+        #[cfg(unix)]
+        let expected = [
+            DurabilityStep::SyncTemp,
+            DurabilityStep::Rename,
+            DurabilityStep::SyncDir,
+        ];
+        #[cfg(not(unix))]
+        let expected = [DurabilityStep::SyncTemp, DurabilityStep::Rename];
+        assert_eq!(steps(), expected);
+        assert_eq!(std::fs::read(&target).unwrap(), b"{}");
+
+        let blocked = dir.path().join("a-directory");
+        std::fs::create_dir(&blocked).unwrap();
+        assert!(write_atomic_durable(blocked.to_str().unwrap(), b"x").is_err());
+        assert_eq!(
+            take_durability_steps(&blocked),
+            [DurabilityStep::SyncTemp, DurabilityStep::Rename],
+            "a rename that failed published nothing to sync"
+        );
+    }
+
+    /// The `write` and `edit` tools never pay for an `fsync`: their path (`LocalFs` → `write_atomic`)
+    /// renames without syncing anything.
+    #[tokio::test]
+    async fn the_write_and_edit_tools_do_not_fsync() {
+        use crate::tools::fs::FsBackend as _;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("main.rs");
+        let fs = crate::tools::fs::local::LocalFs::new();
+        fs.write_bytes(&target, b"fn main() {}".to_vec())
+            .await
+            .unwrap();
+        let mtime = std::fs::metadata(&target).unwrap().modified().unwrap();
+        assert!(
+            fs.write_if_unchanged(&target, b"fn main() { }".to_vec(), Some(mtime))
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            take_durability_steps(&target),
+            [DurabilityStep::Rename, DurabilityStep::Rename],
+            "a tool write renamed into place and synced nothing"
         );
     }
 
@@ -1427,9 +1558,9 @@ mod tests {
     }
 
     /// A trivial stand-in for an [`mcp::McpTool`] — that type is crate-private and always backed by a
-    /// live connection, so tests exercising `default_registry_with_prefix_image_auto_resize_and_mcp_tools`
-    /// (which only cares that *some* `Arc<dyn Tool>` merges in under its own name) use this instead of
-    /// standing up a real MCP server.
+    /// live connection, so tests exercising `ToolConfig::mcp_tools` (which only care that *some*
+    /// `Arc<dyn Tool>` merges in under its own name) use this instead of standing up a real MCP
+    /// server.
     struct FakeMcpTool(&'static str);
     #[async_trait::async_trait]
     impl Tool for FakeMcpTool {
@@ -1838,8 +1969,8 @@ mod tests {
     }
 
     /// `LocalFs::stat` is what every tool's "is this safe to open" branch reads, so its classification
-    /// of the three ordinary cases is pinned here — the coverage `reject_non_regular_file`'s own tests
-    /// used to provide before the check moved behind the backend.
+    /// of the three ordinary cases is pinned here — the FIFO gate decides on that
+    /// classification.
     fn stat_kind(path: &std::path::Path) -> Option<fs::FileKind> {
         tokio::runtime::Builder::new_current_thread()
             .build()

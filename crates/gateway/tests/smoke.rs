@@ -174,7 +174,7 @@ async fn smoke_bedrock() {
 }
 
 // --- OpenAI-wire providers. Same code path; testing more than one confirms each host/base-path/auth
-// row in `route::KNOWN_PROVIDERS` against the real endpoint. ---
+// row in `route::known_providers()` against the real endpoint. ---
 
 #[tokio::test]
 #[ignore = "live provider smoke; run via `mise run test:smoke` with API keys set"]

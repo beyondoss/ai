@@ -867,8 +867,7 @@ fn serve_block_images_flag_forces_a_read_tool_image_to_a_text_placeholder() {
 #[test]
 fn serve_no_image_auto_resize_flag_skips_downscaling_an_oversized_image() {
     // Task #34 (pi-parity fix): `--no-image-auto-resize` reached `run` but `serve`'s `build_tools`
-    // always called `tools::default_registry_with_prefix` (hardcoding `image_auto_resize: true`),
-    // never the `_and_image_auto_resize` variant `run` uses — so the flag had no effect on a `serve`
+    // hardcoded `image_auto_resize: true` — so the flag had no effect on a `serve`
     // process at all. An oversized image (bigger than `read`'s `MAX_IMAGE_DIMENSION`, 2000px) read via
     // a model-issued `read` call must ship at its original pixel dimensions once this is wired,
     // matching `tools::read`'s own

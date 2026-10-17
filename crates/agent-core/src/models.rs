@@ -341,8 +341,8 @@ fn openai_family_caps_for_vendor_slug(mut caps: ModelCaps, is_vendor_slug: bool)
 /// Every id in pi's Mistral catalogue (`packages/ai/src/providers/mistral.models.ts`) starts with one
 /// of these — there's no single common prefix for the whole provider the way there is for e.g.
 /// DeepSeek: codestral/devstral/ministral/magistral/mistral itself/pixtral/open-mistral/open-mixtral are
-/// all separate id families under this one native `KNOWN_PROVIDERS` gateway route
-/// (`crates/gateway/src/route.rs`). `m` must already be lowercased (every caller below goes through
+/// all separate id families under this one native gateway route (`providers::gateway_providers()`).
+/// `m` must already be lowercased (every caller below goes through
 /// [`is_mistral_model`], the public, self-lowercasing wrapper).
 const MISTRAL_ID_PREFIXES: &[&str] = &[
     "mistral",
@@ -654,11 +654,12 @@ fn nvidia_caps(m: &str) -> Option<ModelCaps> {
 /// invented — re-check that catalogue when adding a new model family, since it's regenerated upstream
 /// and may have moved on by the time you read this.
 ///
-/// A thin wrapper around [`capabilities_impl`] (which does the actual per-family lookup, unchanged):
-/// applies the one post-hoc override every one of that function's ~30 return sites would otherwise
-/// need to remember individually — [`ModelCaps::supports_cache_control_on_tools`] is `false` for the 14
-/// Fireworks ids [`crate::dialect::is_fireworks_anthropic_wire_model`] routes through the Anthropic
-/// dialect (pi's `fireworks.models.ts` sets `supportsCacheControlOnTools: false` on all of them).
+/// A thin wrapper around `capabilities_impl_lc` (which does the actual per-family lookup,
+/// unchanged): applies the one post-hoc override every one of that function's ~30 return sites
+/// would otherwise need to remember individually — [`ModelCaps::supports_cache_control_on_tools`]
+/// is `false` for the 14 Fireworks ids [`crate::dialect::is_fireworks_anthropic_wire_model`] routes
+/// through the Anthropic dialect (pi's `fireworks.models.ts` sets `supportsCacheControlOnTools:
+/// false` on all of them).
 pub fn capabilities(model: &str) -> ModelCaps {
     capabilities_lc(&model.to_ascii_lowercase())
 }
@@ -1363,7 +1364,7 @@ fn capabilities_impl_lc(m: &str) -> ModelCaps {
 
     // ---- Third-party OpenAI-compatible providers ----
     //
-    // The gateway's own provider table (`crates/gateway/src/route.rs::KNOWN_PROVIDERS`, plus several
+    // The gateway's own provider table (`providers::gateway_providers()`, plus several
     // Anthropic-wire vendors reachable only via config) actively routes to every family below; without
     // an entry here each one silently fell through to `ModelCaps::unknown()` — 128k context, a 4096
     // output ceiling regardless of the model's real one (`Agent::new` seeds `max_tokens` from
@@ -1600,7 +1601,7 @@ fn capabilities_impl_lc(m: &str) -> ModelCaps {
         };
     }
 
-    // Mistral: a native `KNOWN_PROVIDERS` gateway route (`crates/gateway/src/route.rs`) whose 30-id
+    // Mistral: a native gateway route (`providers::gateway_providers()`) whose 30-id
     // catalogue (`packages/ai/src/providers/mistral.models.ts`) has no shared prefix and enough per-id
     // variance (bare "mistral-large-2411" is 131_072/16_384 while "mistral-large-2512" two generations
     // later is 262_144/262_144) that a family-level default would still misreport several ids by a wide

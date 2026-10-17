@@ -1474,7 +1474,12 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(e.message.contains("agent mcp-login"), "{}", e.message);
+        assert!(
+            e.message
+                .contains(&format!("`{} mcp-login", crate::PROGRAM)),
+            "{}",
+            e.message
+        );
         assert_eq!(seen.lock().unwrap().len(), 1);
     }
 

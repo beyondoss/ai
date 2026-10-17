@@ -8,6 +8,14 @@
 // `.unwrap()` *is* the assertion — allow it under `test`, matching the binary and agent-core roots.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
+/// The installed command's name — what every error, warning and hint tells a user to type
+/// (`beyond-ai-agent login anthropic`). One place, so a hint can't name a command that doesn't
+/// exist; `program_name_tests` fails on a string that spells another name.
+pub const PROGRAM: &str = env!("CARGO_PKG_NAME");
+
+#[cfg(test)]
+mod program_name_tests;
+
 pub mod agents;
 pub mod approval;
 pub mod auth_credential_source;
@@ -35,6 +43,7 @@ pub mod session_store;
 pub mod settings;
 pub mod shard_mount;
 pub mod skills;
+pub mod subreaper;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod timing;

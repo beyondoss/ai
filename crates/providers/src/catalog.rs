@@ -13,7 +13,7 @@
 //! A row carries routing facts — provider, the id that provider spells it with, and the path to
 //! send it to — plus one published list price ([`ListPrice`]). Model *capability* facts (context
 //! window, thinking shape) stay in `agent_core::models`; a test keeps a [`Candidate`] from growing
-//! them. The price is the public standard card: the customer card's standard tier in
+//! them. The price is the public standard card: the standard tier of the primary vendor's card in
 //! [`crate::rates`], whose other dimensions (long context, fast mode, 1-hour writes, tool fees) and
 //! per-candidate costs [`crate::pricing::price`] applies. See `crates/providers/ARCHITECTURE.md`.
 //!

@@ -1,7 +1,7 @@
 //! `FsBackend` — the seam between a filesystem tool and where its I/O actually lands.
 //!
 //! The tools in this crate were welded to the host: `read`/`write`/`edit`/`ls`/`grep`/`find` called
-//! `std::fs` directly, while `bash` and the `beyond` tools already went through
+//! `std::fs` directly, while `bash` already went through
 //! [`CommandRunner`](super::exec::CommandRunner) — the one place the crate admitted that "where does
 //! this run" is a decision worth naming. This module is that same admission for the other half.
 //!
@@ -22,6 +22,7 @@
 pub mod local;
 pub mod shell;
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -49,6 +50,11 @@ pub const MAX_CONTEXT: usize = 100;
 /// single source of truth instead of threading a separate "was this line clipped" flag through
 /// [`Hit`] just for one summary line.
 pub const LINE_TRUNCATED_SUFFIX: &str = "… [truncated]";
+
+/// How [`clip_match`] marks a window cut from the middle of a line: `… <window> … [truncated;
+/// columns A-B of N]`.
+const WINDOW_PREFIX: &str = "… ";
+const WINDOW_MARK: &str = " [truncated; columns ";
 
 /// Which filesystem a path belongs to — and therefore whether host syscalls may be used to reason
 /// about it.
@@ -427,6 +433,114 @@ pub fn clip(line: &str) -> String {
     }
 }
 
+/// Finds a query's first match within one line, for [`clip_match`] — compiled lazily, on the first
+/// match line long enough to need it, and then shared by every worker of the search.
+///
+/// Its own `regex::Regex` rather than the backend's matcher, so both backends window a line the same
+/// way: `LocalFs` has a ripgrep matcher, `ShellFs` has only `rg`/`grep`'s text output. Built from the
+/// same pattern, `literal` and `ignore_case` the search ran with; a pattern this dialect rejects (a
+/// POSIX-`grep`-only construct) yields no finder, and such a line falls back to its head.
+#[derive(Debug)]
+pub struct MatchFinder {
+    pattern: String,
+    literal: bool,
+    ignore_case: bool,
+    regex: std::sync::OnceLock<Option<regex::Regex>>,
+}
+
+impl MatchFinder {
+    pub fn new(q: &SearchQuery) -> Self {
+        Self {
+            pattern: q.pattern.clone(),
+            literal: q.literal,
+            ignore_case: q.ignore_case,
+            regex: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// The byte range of the first match in `line`, if any.
+    fn find(&self, line: &str) -> Option<(usize, usize)> {
+        let regex = self.regex.get_or_init(|| {
+            let escaped;
+            let pattern = if self.literal {
+                escaped = regex::escape(&self.pattern);
+                escaped.as_str()
+            } else {
+                self.pattern.as_str()
+            };
+            regex::RegexBuilder::new(pattern)
+                .case_insensitive(self.ignore_case)
+                .build()
+                .ok()
+        });
+        regex.as_ref()?.find(line).map(|m| (m.start(), m.end()))
+    }
+}
+
+/// Clip a *matched* line to [`MAX_LINE`] characters **around its first match**, not just its head.
+///
+/// A line under the cap, or one whose match ends inside the first [`MAX_LINE`] characters, is clipped
+/// exactly as [`clip`] does. Otherwise the window is centered on the match and both cuts are marked:
+/// `… <window> … [truncated; columns A-B of N]` (columns are 1-based characters). Without this a match
+/// at column 100,000 of a minified bundle, a lockfile or an SVG was never visible: `grep` showed the
+/// first 500 characters, and `read` caps a line at 4,000 bytes, so neither tool could show it.
+pub fn clip_match(line: &str, finder: &MatchFinder) -> String {
+    // Fast path: most lines are short, and only a long one pays for the regex.
+    if line.char_indices().nth(MAX_LINE).is_none() {
+        return line.to_string();
+    }
+    let Some((m_start, m_end)) = finder.find(line) else {
+        return clip(line);
+    };
+    let char_at = |byte: usize| line[..byte].chars().count();
+    let (cs, ce) = (char_at(m_start), char_at(m_end));
+    if ce <= MAX_LINE {
+        return clip(line);
+    }
+    let total = cs + line[m_start..].chars().count();
+    // Center the match; a match wider than the window starts at the match.
+    let pad = MAX_LINE.saturating_sub(ce - cs) / 2;
+    let mut start = cs.saturating_sub(pad);
+    let mut end = start + MAX_LINE;
+    if end > total {
+        end = total;
+        start = total - MAX_LINE;
+    }
+    // Byte offsets of the window's char bounds, from the start char onward in one pass.
+    let mut idx = line.char_indices().map(|(i, _)| i).skip(start);
+    let b_start = idx.next().unwrap_or(line.len());
+    let b_end = idx.nth(end - start - 1).unwrap_or(line.len());
+    let mut out = String::with_capacity(b_end - b_start + 48);
+    out.push_str(WINDOW_PREFIX);
+    out.push_str(&line[b_start..b_end]);
+    if end < total {
+        out.push_str(" …");
+    }
+    let _ = write!(out, "{WINDOW_MARK}{}-{end} of {total}]", start + 1);
+    out
+}
+
+/// Clip a hit's text in place, if it is over the cap: a match line around its match, a context line
+/// at its head. For a backend that parses whole lines first (`ShellFs`); short lines are untouched
+/// and cost no copy.
+pub fn clip_hits(hits: &mut [Hit], finder: &MatchFinder) {
+    for h in hits {
+        if h.text.char_indices().nth(MAX_LINE).is_some() {
+            h.text = if h.is_match {
+                clip_match(&h.text, finder)
+            } else {
+                clip(&h.text)
+            };
+        }
+    }
+}
+
+/// Whether [`clip_match`] showed this line as a window from its middle — `grep`'s cue for a notice
+/// that does *not* point at `read`, which caps a line at 4,000 bytes and so cannot show it either.
+pub fn is_windowed(text: &str) -> bool {
+    text.starts_with(WINDOW_PREFIX) && text.ends_with(']') && text.contains(WINDOW_MARK)
+}
+
 /// Sort, decide truncation, and trim to `limit` — the impl-independent tail of every search.
 ///
 /// This is the largest single reason the two backends agree: sorting by `(path, line)`, counting only
@@ -580,6 +694,113 @@ mod tests {
             Path::new("/repo/.git/refs/heads/main")
         ));
         assert!(!is_under_git_dir(inside, inside));
+    }
+
+    // ---- clip_match: a long match line shows the text around its match.
+
+    fn finder(pattern: &str) -> MatchFinder {
+        MatchFinder::new(&SearchQuery {
+            pattern: pattern.into(),
+            literal: false,
+            ignore_case: false,
+            glob: None,
+            root: PathBuf::from("."),
+            limit: 10,
+            before: 0,
+            after: 0,
+        })
+    }
+
+    #[test]
+    fn a_match_deep_in_a_long_line_is_shown_centered_with_both_cuts_marked() {
+        // A minified bundle: the match sits at column 100,001.
+        let line = format!("{}NEEDLE{}", "a".repeat(100_000), "b".repeat(50_000));
+        let out = clip_match(&line, &finder("NEEDLE"));
+        assert!(out.contains("NEEDLE"), "the match must be visible: {out}");
+        assert!(out.starts_with("… a"), "{out}");
+        let window: String = out
+            .strip_prefix(WINDOW_PREFIX)
+            .unwrap()
+            .split(" …")
+            .next()
+            .unwrap()
+            .into();
+        assert_eq!(window.chars().count(), MAX_LINE);
+        let at = window.find("NEEDLE").unwrap();
+        assert!((240..=260).contains(&at), "centered, not at an edge: {at}");
+        assert!(
+            out.ends_with(" … [truncated; columns 99754-100253 of 150006]"),
+            "{out}"
+        );
+        assert!(is_windowed(&out));
+    }
+
+    #[test]
+    fn a_match_near_the_end_shows_the_last_window_with_no_trailing_cut() {
+        let line = format!("{}NEEDLE!", "a".repeat(2_000));
+        let out = clip_match(&line, &finder("NEEDLE"));
+        assert!(
+            out.ends_with("NEEDLE! [truncated; columns 1508-2007 of 2007]"),
+            "{out}"
+        );
+        assert!(out.starts_with(WINDOW_PREFIX));
+    }
+
+    #[test]
+    fn a_match_inside_the_first_window_keeps_the_head_clip() {
+        let line = format!("x NEEDLE {}", "a".repeat(2_000));
+        assert_eq!(clip_match(&line, &finder("NEEDLE")), clip(&line));
+        // No match found (a context line, or a pattern this dialect rejects): the head too.
+        assert_eq!(clip_match(&line, &finder("(unclosed")), clip(&line));
+        assert_eq!(
+            clip_match("short NEEDLE", &finder("NEEDLE")),
+            "short NEEDLE"
+        );
+    }
+
+    #[test]
+    fn the_window_is_counted_in_characters_and_never_splits_one() {
+        let line = format!("{}NEEDLE{}", "漢".repeat(3_000), "é".repeat(3_000));
+        let out = clip_match(&line, &finder("NEEDLE"));
+        assert!(out.contains("NEEDLE"), "{out}");
+        let window = out
+            .strip_prefix(WINDOW_PREFIX)
+            .unwrap()
+            .split(" …")
+            .next()
+            .unwrap();
+        assert_eq!(window.chars().count(), MAX_LINE);
+        assert!(out.contains("columns 2754-3253 of 6006"), "{out}");
+    }
+
+    #[test]
+    fn a_match_wider_than_the_window_starts_at_the_match() {
+        let line = format!("{}<{}>", "a".repeat(1_000), "z".repeat(800));
+        let out = clip_match(&line, &finder("<z+>"));
+        assert!(out.starts_with("… <zzz"), "{out}");
+        assert!(out.contains("columns 1001-1500 of 1802"), "{out}");
+    }
+
+    #[test]
+    fn clip_hits_windows_matches_and_heads_context() {
+        let long = format!("{}NEEDLE", "a".repeat(1_000));
+        let mut hits = vec![
+            Hit {
+                path: Arc::from(Path::new("f")),
+                line: 1,
+                text: long.clone(),
+                is_match: true,
+            },
+            Hit {
+                path: Arc::from(Path::new("f")),
+                line: 2,
+                text: long.clone(),
+                is_match: false,
+            },
+        ];
+        clip_hits(&mut hits, &finder("NEEDLE"));
+        assert!(hits[0].text.contains("NEEDLE"));
+        assert_eq!(hits[1].text, clip(&long));
     }
 
     // ---- finalize: new coverage for the shared tail, since it is now the single definition both

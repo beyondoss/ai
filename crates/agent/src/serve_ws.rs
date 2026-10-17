@@ -1590,7 +1590,7 @@ fn resolve_idle_timeout(configured: Option<Duration>, service_mode: bool) -> Opt
 /// Which transports [`serve_ws`] should bind, on **one** shared supervisor. Loopback TCP
 /// ([`Self::tcp`]) and a Unix-domain socket ([`Self::uds`]) can both be on: a session created over
 /// either is reachable over the other by the same `?session_id=` (they share the session map). Shaped
-/// so a future systemd socket-activation arm (`systemd_fd`) is a one-field add.
+/// so systemd socket activation ([`Self::systemd`]) is one more field, not another code path.
 pub struct ServeListeners {
     /// Loopback/internal TCP address to bind, if any. The agent authenticates no caller over TCP.
     pub tcp: Option<SocketAddr>,

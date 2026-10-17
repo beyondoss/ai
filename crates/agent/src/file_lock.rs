@@ -58,11 +58,16 @@ const LEGACY_RETRY_INTERVAL: Duration = Duration::from_millis(2);
 /// What is being locked: a directory (its lock files live inside it), a file (they sit beside it), or
 /// a file locked **itself** — a small file whose holder writes its content through the locked
 /// descriptor ([`FileLock::file`]), as the MCP task journal key is made: lock it, re-read it, write it.
+///
+/// [`Target::Beside`] is a file whose lock sits beside it like [`Target::File`]'s, with no legacy
+/// half: no released binary ever took an `flock` for it (the stores [`lock_store_file`] serves locked
+/// with a create-new `<file>.lock`, which this neither takes nor deletes).
 #[derive(Clone, Copy, Debug)]
 pub enum Target<'a> {
     Dir(&'a Path),
     File(&'a Path),
     Itself(&'a Path),
+    Beside(&'a Path),
 }
 
 impl Target<'_> {
@@ -70,7 +75,7 @@ impl Target<'_> {
     fn record_path(&self) -> PathBuf {
         match self {
             Target::Dir(dir) => dir.join(RECORD_SUFFIX),
-            Target::File(file) => with_suffix(file, RECORD_SUFFIX),
+            Target::File(file) | Target::Beside(file) => with_suffix(file, RECORD_SUFFIX),
             Target::Itself(file) => file.to_path_buf(),
         }
     }
@@ -83,7 +88,7 @@ impl Target<'_> {
         match self {
             Target::Dir(dir) => Some(dir.join("lock")),
             Target::File(file) => Some(with_suffix(file, ".lock")),
-            Target::Itself(_) => None,
+            Target::Itself(_) | Target::Beside(_) => None,
         }
     }
 }
@@ -326,6 +331,51 @@ pub fn try_lock(target: Target<'_>) -> std::io::Result<Option<FileLock>> {
         }));
     }
     Ok(None)
+}
+
+/// How long [`lock_store_file`] waits for another holder before giving up. A store's
+/// read-modify-write is a handful of milliseconds, so a wait this long means a live holder is stuck,
+/// never a dead one: a dead holder's lock is already gone.
+pub const STORE_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+const STORE_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(20);
+
+/// Take the lock on a small store file replaced whole by `tools::write_atomic` — the settings, trust,
+/// auth and MCP-auth stores — waiting up to [`STORE_LOCK_TIMEOUT`] for another holder (in any process,
+/// this one included) and failing with [`std::io::ErrorKind::TimedOut`] after that. Creates the
+/// store's directory if needed. Blocking: call it off the async runtime.
+///
+/// These stores used to lock with a create-new `<file>.lock` that a holder deleted on its way out,
+/// broken by age after ten seconds. A holder that crashed left the file behind, and every write to the
+/// store failed until it aged out; this lock is the kernel's, so a dead holder has released it. The
+/// old `<file>.lock` is neither taken nor deleted: one left by a crash is simply ignored.
+pub fn lock_store_file(path: &Path) -> std::io::Result<FileLock> {
+    lock_waiting(Target::Beside(path), STORE_LOCK_TIMEOUT)
+}
+
+/// [`try_lock`], retried until `timeout`; then [`std::io::ErrorKind::TimedOut`]. Creates the directory
+/// the lock file goes in.
+pub fn lock_waiting(target: Target<'_>, timeout: Duration) -> std::io::Result<FileLock> {
+    let record_path = target.record_path();
+    if let Some(parent) = record_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(lock) = try_lock(target)? {
+            return Ok(lock);
+        }
+        if Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "timed out after {}ms waiting for the lock on {}",
+                    timeout.as_millis(),
+                    record_path.display()
+                ),
+            ));
+        }
+        std::thread::sleep(STORE_LOCK_RETRY_INTERVAL);
+    }
 }
 
 fn open_lock_file(path: &Path) -> std::io::Result<File> {
@@ -853,5 +903,60 @@ pub(crate) mod tests {
             try_lock(target).unwrap().is_some(),
             "free once the old binary lets go"
         );
+    }
+
+    /// A store lock waits for its holder, and gives up with `TimedOut` rather than hanging. It takes
+    /// no legacy `<file>.lock`, so an old binary's leftover one is not in its way.
+    #[test]
+    fn a_store_lock_waits_for_its_holder_then_times_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("nested/settings.json");
+        let held = lock_store_file(&store).unwrap();
+        assert!(!dir.path().join("nested/settings.json.lock").exists());
+        let started = Instant::now();
+        let err = lock_waiting(Target::Beside(&store), Duration::from_millis(100))
+            .err()
+            .expect("held elsewhere");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "{err}");
+        assert!(started.elapsed() >= Duration::from_millis(100));
+        drop(held);
+        drop(lock_store_file(&store).unwrap());
+    }
+
+    /// A holder that dies — killed, with no chance to clean up — has released the lock: the next
+    /// writer takes it at once, with no age to wait out.
+    #[cfg(unix)]
+    #[test]
+    fn a_killed_holders_store_lock_is_free_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("auth.json");
+        let record = Target::Beside(&store).record_path();
+        std::fs::write(&record, b"").unwrap();
+        let Ok(mut holder) = Command::new("python3")
+            .args([
+                "-c",
+                "import fcntl,sys,time\nf=open(sys.argv[1],'r+')\nfcntl.lockf(f,fcntl.LOCK_EX)\nprint('locked',flush=True)\ntime.sleep(60)",
+            ])
+            .arg(&record)
+            .stdout(Stdio::piped())
+            .spawn()
+        else {
+            eprintln!("no python3: skipping the dead-holder check");
+            return;
+        };
+        let mut line = String::new();
+        BufReader::new(holder.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        assert_eq!(line.trim(), "locked");
+        assert!(
+            try_lock(Target::Beside(&store)).unwrap().is_none(),
+            "held while the holder lives"
+        );
+        holder.kill().unwrap();
+        holder.wait().unwrap();
+        let started = Instant::now();
+        drop(lock_store_file(&store).unwrap());
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 }

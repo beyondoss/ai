@@ -389,10 +389,142 @@ async fn read_handles_crlf_and_non_utf8_identically() {
 
 #[tokio::test]
 async fn read_of_a_binary_file_is_identical() {
-    // Not an image and not valid UTF-8 — the lossy-decode path, which must agree byte for byte.
+    // A NUL in the first 8 KB: reported by size on every backend, never decoded.
     let dir = fixture();
     let p = dir.path().join("blob.bin");
-    assert_tool_parity("read", json!({ "path": p.to_str().unwrap() }), &dir).await;
+    let out = assert_tool_parity("read", json!({ "path": p.to_str().unwrap() }), &dir).await;
+    assert_eq!(out, "binary file, 17 bytes — not shown");
+}
+
+fn utf16(text: &str, big_endian: bool) -> Vec<u8> {
+    text.encode_utf16()
+        .flat_map(|u| {
+            if big_endian {
+                u.to_be_bytes()
+            } else {
+                u.to_le_bytes()
+            }
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn read_of_an_executable_is_one_line_even_with_a_small_limit() {
+    // An ELF: a header, then long runs of NULs. Decoded line by line, `limit: 5` still returned
+    // kilobytes, because a binary's "lines" are arbitrarily long.
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("prog");
+    let mut elf = b"\x7fELF\x02\x01\x01\0".to_vec();
+    elf.extend(std::iter::repeat_n(0u8, 6000));
+    elf.extend(b"\n.text\n.data\n");
+    std::fs::write(&p, &elf).unwrap();
+    for (name, backend) in all_backends().await {
+        let out = run_tool(
+            Some(backend),
+            "read",
+            json!({ "path": p.to_str().unwrap(), "limit": 5 }),
+        )
+        .await;
+        assert_eq!(
+            out,
+            format!("binary file, {} bytes — not shown", elf.len()),
+            "{name}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn read_decodes_utf16_with_and_without_a_bom_on_every_backend() {
+    let dir = tempfile::tempdir().unwrap();
+    let cases = [
+        (
+            "le-bom.txt",
+            utf16("\u{feff}hello\r\nwörld\r\n", false),
+            "UTF-16LE",
+        ),
+        (
+            "be-bom.txt",
+            utf16("\u{feff}hello\r\nwörld\r\n", true),
+            "UTF-16BE",
+        ),
+        (
+            "le-bare.txt",
+            utf16("hello\r\nwörld\r\n", false),
+            "UTF-16LE",
+        ),
+    ];
+    for (file, bytes, label) in &cases {
+        let p = dir.path().join(file);
+        std::fs::write(&p, bytes).unwrap();
+        for (name, backend) in all_backends().await {
+            let out = run_tool(
+                Some(backend),
+                "read",
+                json!({ "path": p.to_str().unwrap() }),
+            )
+            .await;
+            assert!(
+                out.starts_with("     1\thello\n     2\twörld\n"),
+                "{name} {file}: {out:?}"
+            );
+            assert!(out.contains(label), "{name} {file}: {out:?}");
+            assert!(
+                !out.contains('\u{feff}'),
+                "{name} {file}: BOM shown: {out:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn edit_and_write_keep_a_utf16_file_utf16_on_every_backend() {
+    for (name, backend) in all_backends().await {
+        let dir = tempfile::tempdir().unwrap();
+        for big_endian in [false, true] {
+            let p = dir.path().join(format!("f-{big_endian}.ps1"));
+            std::fs::write(
+                &p,
+                utf16("\u{feff}Write-Host one\r\nexit 0\r\n", big_endian),
+            )
+            .unwrap();
+            let path = p.to_str().unwrap();
+
+            run_tool(
+                Some(backend.clone()),
+                "edit",
+                json!({ "path": path, "old_string": "one", "new_string": "two" }),
+            )
+            .await;
+            assert_eq!(
+                std::fs::read(&p).unwrap(),
+                utf16("\u{feff}Write-Host two\r\nexit 0\r\n", big_endian),
+                "{name} edit (big_endian={big_endian})"
+            );
+
+            // What `read` showed (no BOM) written back: still UTF-16, BOM restored.
+            let out = run_tool(
+                Some(backend.clone()),
+                "write",
+                json!({ "path": path, "content": "Write-Host three\r\n" }),
+            )
+            .await;
+            assert!(out.contains("kept the file's UTF-16"), "{name}: {out}");
+            assert_eq!(
+                std::fs::read(&p).unwrap(),
+                utf16("\u{feff}Write-Host three\r\n", big_endian),
+                "{name} write (big_endian={big_endian})"
+            );
+        }
+        // A new file is still plain UTF-8.
+        let fresh = dir.path().join("new.txt");
+        run_tool(
+            Some(backend.clone()),
+            "write",
+            json!({ "path": fresh.to_str().unwrap(), "content": "hi" }),
+        )
+        .await;
+        assert_eq!(std::fs::read(&fresh).unwrap(), b"hi", "{name}");
+    }
 }
 
 #[tokio::test]
@@ -550,6 +682,104 @@ async fn all_backends() -> Vec<(&'static str, Arc<dyn FsBackend>)> {
         v.push(("rg", rg));
     }
     v
+}
+
+#[tokio::test]
+async fn a_match_deep_in_a_long_line_is_windowed_identically_on_every_backend() {
+    // A lockfile/SVG-shaped single line, with the match far past the 500-character head and a
+    // multi-byte neighbourhood, plus a context line that stays head-clipped.
+    let dir = tempfile::tempdir().unwrap();
+    let line = format!("{}é NEEDLE ü{}", "a".repeat(20_000), "b".repeat(5_000));
+    let ctx = "c".repeat(900);
+    std::fs::write(dir.path().join("long.txt"), format!("{ctx}\n{line}\n")).unwrap();
+    let input = json!({ "pattern": "NEEDLE", "path": dir.path().to_str().unwrap(), "before": 1 });
+    let mut outs = Vec::new();
+    for (name, backend) in all_backends().await {
+        let out = run_tool(Some(backend), "grep", input.clone()).await;
+        assert!(out.contains("é NEEDLE ü"), "{name}: {out}");
+        assert!(
+            out.contains("columns 19756-20255 of 25010]"),
+            "{name}: {out}"
+        );
+        outs.push((name, out));
+    }
+    for (name, out) in &outs[1..] {
+        assert_eq!(&outs[0].1, out, "local vs {name} disagreed");
+    }
+}
+
+#[tokio::test]
+async fn grep_and_find_print_paths_read_can_open_on_every_backend() {
+    // Relative to the tool root, not the search root: `path: "sub"` must print `sub/inner/b.txt`,
+    // and `read` (same root, same backend) must open exactly that.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("sub/inner")).unwrap();
+    std::fs::write(dir.path().join("sub/inner/b.txt"), "NEEDLE\n").unwrap();
+    for (name, backend) in all_backends().await {
+        let reg = default_registry_with_config(&ToolConfig {
+            fs_backend: Some(backend),
+            root: dir.path().to_path_buf(),
+            ..ToolConfig::new()
+        });
+        let run = |tool: &'static str, input: Value| {
+            let t = tool_of(&reg, tool);
+            async move { t.run(input).await.unwrap().text }
+        };
+        let grep = run("grep", json!({ "pattern": "NEEDLE", "path": "sub" })).await;
+        assert_eq!(grep.trim_end(), "sub/inner/b.txt:1: NEEDLE", "{name}");
+        let single = run(
+            "grep",
+            json!({ "pattern": "NEEDLE", "path": "sub/inner/b.txt" }),
+        )
+        .await;
+        assert_eq!(single.trim_end(), "sub/inner/b.txt:1: NEEDLE", "{name}");
+        let find = run("find", json!({ "pattern": "*.txt", "path": "sub" })).await;
+        assert_eq!(find.trim_end(), "sub/inner/b.txt", "{name}");
+        let read = run("read", json!({ "path": "sub/inner/b.txt" })).await;
+        assert!(read.contains("NEEDLE"), "{name}: {read}");
+    }
+}
+
+#[tokio::test]
+async fn an_end_anchor_matches_crlf_lines_identically_on_every_backend() {
+    // Every line of a CRLF file ends in `\r`, which sat between the text and `$`: `end$` matched
+    // only the LF line. The POSIX rung runs the system `grep` (GNU here), which has no CRLF mode.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("win.txt"),
+        "alpha end\r\nbeta\r\ncost $5\r\ngamma end\n",
+    )
+    .unwrap();
+    let root = dir.path().to_str().unwrap();
+    let cases = [
+        ("end$", vec!["alpha end", "gamma end"]),
+        ("(beta|nothing)$", vec!["beta"]),
+        ("^beta$", vec!["beta"]),
+        // An escaped `$` is a literal, never an anchor.
+        ("\\$5$", vec!["cost $5"]),
+    ];
+    for (pattern, want) in cases {
+        let mut outs = Vec::new();
+        for (name, backend) in all_backends().await {
+            let out = run_tool(
+                Some(backend),
+                "grep",
+                json!({ "pattern": pattern, "path": root }),
+            )
+            .await;
+            for w in &want {
+                assert!(
+                    out.contains(&format!(": {w}\n")),
+                    "{name} {pattern:?}: {out:?}"
+                );
+            }
+            assert_eq!(match_lines(&out), want.len(), "{name} {pattern:?}: {out:?}");
+            outs.push((name, out));
+        }
+        for (name, out) in &outs[1..] {
+            assert_eq!(&outs[0].1, out, "{pattern:?}: local vs {name} disagreed");
+        }
+    }
 }
 
 #[tokio::test]

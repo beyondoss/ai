@@ -639,18 +639,13 @@ pub struct ServeConfig {
     /// `build_gateway_client` never called `GatewayClient::with_idle_timeout`.
     pub idle_timeout_ms: Option<u64>,
     /// Force every image down the same downgrade-to-text-placeholder path a vision-incapable model
-    /// already gets, regardless of the active model's real `supports_vision` capability — Task #34
-    /// (pi-parity fix): `run`'s identical `--block-images`/`agent settings --block-images` (see
-    /// `main.rs::run_task`'s own `Agent::with_block_images` call site) previously had no `serve`
-    /// counterpart at all. Threaded to `Agent::with_block_images` in `build_agent`.
+    /// already gets, regardless of the active model's real `supports_vision` capability — `run`'s
+    /// identical `--block-images`/`settings --block-images`. Threaded to `Agent::with_block_images`
+    /// in `build_agent`.
     pub block_images: bool,
-    /// Whether `read` downscales/re-encodes an oversized image to fit the inline size budget — Task #34
-    /// (pi-parity fix): `run`'s identical `--image-auto-resize`/`agent settings --image-auto-resize`
-    /// (see `main.rs::run_task`'s own `default_registry_with_prefix_and_image_auto_resize` call site)
-    /// previously had no `serve` counterpart at all — `build_tools` always called the `image_auto_resize`
-    /// registry constructor with a hardcoded `true`, so `--no-image-auto-resize`/`agent settings
-    /// --image-auto-resize false` had no effect on a `serve` process. Threaded to
-    /// `tools::default_registry_with_prefix_and_image_auto_resize` in `build_tools`.
+    /// Whether `read` downscales/re-encodes an oversized image to fit the inline size budget —
+    /// `run`'s identical `--no-image-auto-resize`/`settings --image-auto-resize`. Threaded to
+    /// `ToolConfig::image_auto_resize` in `build_tools`.
     pub image_auto_resize: bool,
     /// Run `bash` commands through this shell instead of the auto-resolved one (`/bin/bash`, else
     /// `bash` on `$PATH`, else `sh`). Already validated to exist by the time it reaches here (see
@@ -753,7 +748,8 @@ pub struct ServeConfig {
     /// Block a `bash` call whenever its command contains this substring, case-insensitively. Combines
     /// with `deny_tool` under the same policy hook.
     pub deny_bash_pattern: Vec<String>,
-    /// Block a `write`/`edit` call whenever its `path` argument matches this glob. Combines with
+    /// Block a `write`/`edit` call whenever its `path` argument matches this glob, with gitignore
+    /// semantics anchored to the tool root (see `policy::anchored_globs`). Combines with
     /// `deny_tool`/`deny_bash_pattern` under the same policy hook.
     pub deny_path: Vec<String>,
     /// Which tools require a human's approval before they run (`--approve off|writes|all|tools:a,b`). The
@@ -2027,12 +2023,13 @@ impl Persistence {
     /// `on_progress(scanned, total)` is invoked once per file as the scan completes it — see
     /// [`SessionRepo::list_with_progress`](crate::session_store::SessionRepo::list_with_progress).
     ///
-    /// Filtered to `self.meta.cwd` — the exact match [`SessionRepo::resume_or_create`] already applies
-    /// when reattaching at startup. A no-op under the default per-cwd repo directory (every session
-    /// there already shares this cwd, by construction — see `default_session_dir`), but load-bearing
-    /// under an explicit `--session-dir` shared across projects: Track L28 (pi-parity fix) — this used
-    /// to return every session in the directory unfiltered, so a shared `--session-dir` leaked another
-    /// project's sessions into this one's `list_sessions` response.
+    /// Filtered to `self.meta.cwd` — the exact match [`SessionRepo::resume_latest_or_create`]
+    /// already applies when reattaching at startup. A no-op under the default per-cwd repo
+    /// directory (every session there already shares this cwd, by construction — see
+    /// `default_session_dir`), but load-bearing under an explicit `--session-dir` shared across
+    /// projects: Track L28 (pi-parity fix) — this used to return every session in the directory
+    /// unfiltered, so a shared `--session-dir` leaked another project's sessions into this one's
+    /// `list_sessions` response.
     ///
     /// Runs the scan on `spawn_blocking` (like [`persist_blocking`]) rather than directly on the
     /// caller's own task — `SessionRepo::list_with_progress`'s underlying `scan_listings` does
@@ -2611,8 +2608,8 @@ pub(crate) async fn scan_session_dirs(
     .await
     {
         Ok(metas) => metas,
-        // Neither `scan_session_dir` nor `scan_listings` panics, and this task is never cancelled —
-        // same re-raise as every other `spawn_blocking` in this file.
+        // Neither `scan_session_dir_in` nor `scan_listings` panics, and this task is never
+        // cancelled — same re-raise as every other `spawn_blocking` in this file.
         Err(e) => std::panic::resume_unwind(e.into_panic()),
     }
 }
@@ -3070,11 +3067,11 @@ pub(crate) async fn serve_session(
         eprintln!(
             "warning: {} has a project-local SYSTEM.md/APPEND_SYSTEM.md, skills, prompt templates, or a \
              settings.json on disk, but the project isn't trusted, so they were skipped — pass \
-             --trust-project or run `agent trust {}` to enable them (a project's own settings.json \
-             additionally requires a *persisted* `agent trust`, not just a one-off --trust-project — see \
-             `settings::effective_settings_for_cwd`'s doc comment)",
+             --trust-project or run `{program} trust {}` to enable them (a project's own settings.json \
+             additionally requires a *persisted* `{program} trust`, not just a one-off --trust-project)",
             cwd.display(),
-            cwd.display()
+            cwd.display(),
+            program = crate::PROGRAM
         );
     }
 
@@ -3247,6 +3244,7 @@ pub(crate) async fn serve_session(
     if reattached != Default::default() {
         tracing::info!(session = %persistence.session_id(), ?reattached, "reattached the session's sandbox jobs");
     }
+    stop_survivors(&bash_jobs, &persistence).await;
 
     // Slash-command prompt templates (`/name args`), discoverable skills, agent definitions and this
     // project's own instruction files — for `get_commands`, for expanding a `/name`/`/skill:name`
@@ -3770,6 +3768,9 @@ pub(crate) async fn serve_session(
     // run's event sink and from the background resumer, results from the resumer. Drained by the
     // idle loop, the busy loop and at run end; `data.sessionId` must match the session persisted to.
     let (mcp_task_tx, mut mcp_task_rx) = mpsc::unbounded_channel::<(String, Value)>();
+    // Each local `bash` job's processes are journaled through the same channel, stamped with the
+    // session they belong to (re-pointed on a transcript change below).
+    bash_jobs.set_recorder(Some(procs_recorder(&mcp_task_tx, persistence.session_id())));
     macro_rules! journal_mcp {
         ($kind:expr, $data:expr) => {{
             let data: Value = $data;
@@ -4812,6 +4813,8 @@ pub(crate) async fn serve_session(
                 persistence.session_id(),
             )));
             crate::tools::bash_sandbox::reattach(&bash_jobs, exec_cell.runner()).await;
+            stop_survivors(&bash_jobs, &persistence).await;
+            bash_jobs.set_recorder(Some(procs_recorder(&mcp_task_tx, persistence.session_id())));
             if !stopped_jobs.is_empty() {
                 emit!(OutFrame::Value(json!({
                     "type": "bash_jobs_stopped",
@@ -5225,7 +5228,7 @@ pub(crate) async fn serve_session(
                 let mut pending_deferred: Vec<(Option<String>, Value)> = Vec::new();
                 // MCP Events injection batches this run carries: its own prompt's, and each one
                 // steered in while it runs (with the text the model would receive). Settled once
-                // the run is over — see `mcp_events_finish` below.
+                // the run is over — see "A batch is delivered only once" below.
                 let own_injection = crate::tools::mcp_events::injection_batch(&cmd);
                 let mut steered_injections: Vec<u64> = Vec::new();
                 let result = 'retry: loop {
@@ -6213,9 +6216,9 @@ pub(crate) async fn serve_session(
                 // A batch is delivered only once the model has it in a transcript that persisted:
                 // the run's own prompt when the run did not fail (an abort still leaves the prompt
                 // in the transcript the next run reads); a steered one exactly when the run's
-                // `Steered` event reported it (already recorded then — see `steered_received`) — an
-                // abort clears the steer lane (`clear_run_scoped`) before the model sees what is
-                // queued there. Everything else goes back to pending, to be injected again.
+                // `Steered` event reported it (already recorded then — see the `Steered` arm above)
+                // — an abort clears the steer lane (`clear_run_scoped`) before the model sees what
+                // is queued there. Everything else goes back to pending, to be injected again.
                 if let Some(hub) = &mcp_events
                     && (own_injection.is_some() || !steered_injections.is_empty())
                 {
@@ -7394,11 +7397,13 @@ pub(crate) async fn serve_session(
                         eprintln!(
                             "warning: {} has a project-local SYSTEM.md/APPEND_SYSTEM.md, skills, \
                              prompt templates, or a settings.json on disk, but the project isn't \
-                             trusted, so they were skipped — pass --trust-project or run `agent trust \
-                             {}` to enable them (a project's own settings.json additionally requires a \
-                             *persisted* `agent trust`, not just a one-off --trust-project)",
+                             trusted, so they were skipped — pass --trust-project or run `{program} \
+                             trust {}` to enable them (a project's own settings.json additionally \
+                             requires a *persisted* `{program} trust`, not just a one-off \
+                             --trust-project)",
                             cwd.display(),
-                            cwd.display()
+                            cwd.display(),
+                            program = crate::PROGRAM
                         );
                     }
                 }
@@ -9708,11 +9713,6 @@ fn build_tools(
     skills: &[crate::skills::Skill],
     host_bash_jobs: Option<&Arc<crate::tools::bash_jobs::BashJobs>>,
 ) -> agent_core::ToolRegistry {
-    // Task #34 (pi-parity fix): previously always called the plain `default_registry_with_prefix`,
-    // hardcoding `image_auto_resize: true` regardless of `cfg.image_auto_resize` — `run`'s identical
-    // `default_registry_with_prefix_and_image_auto_resize` call site (`main.rs::run_task`) is the one
-    // this should have matched all along.
-    //
     // `cfg.mcp_tools` (already-connected, namespaced `mcp__<server>__<tool>` entries — see
     // `tools::mcp`'s module doc comment) is merged in *before* `apply_filter` below, not after: an
     // operator's `--tools`/`--exclude-tools` allow/deny-list is meant to scope the *whole* tool set the
@@ -12766,6 +12766,38 @@ fn ack(id: Option<String>, command: &str) -> OutFrame {
 /// together (a `make -j` fan-out, a server and its watcher) then fold into one turn rather than one
 /// turn each.
 const BASH_JOBS_WAKE_SETTLE: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Stop the local `bash` jobs a killed process left running on the session `persistence` just
+/// opened — see [`crate::tools::bash_jobs::BashJobs::stop_survivors`]. Off the runtime thread: each
+/// stop blocks until its processes are gone.
+async fn stop_survivors(jobs: &Arc<crate::tools::bash_jobs::BashJobs>, persistence: &Persistence) {
+    let records = persistence.active_journal(crate::tools::bash_jobs::PROCS_ENTRY_KIND);
+    if records.is_empty() {
+        return;
+    }
+    let session = persistence.session_id().to_string();
+    let jobs = jobs.clone();
+    let fates = tokio::task::spawn_blocking(move || jobs.stop_survivors(&records))
+        .await
+        .unwrap_or_default();
+    if !fates.is_empty() {
+        tracing::info!(%session, ?fates, "stopped bash jobs a killed process left running");
+    }
+}
+
+/// Where a session's `bash` jobs journal their processes: the session loop's journal channel,
+/// stamped with `session` (the loop drops an entry for any other session).
+fn procs_recorder(
+    tx: &mpsc::UnboundedSender<(String, Value)>,
+    session: &str,
+) -> crate::tools::bash_jobs::ProcRecorder {
+    let tx = tx.clone();
+    let session = session.to_string();
+    Arc::new(move |mut data: Value| {
+        data["sessionId"] = Value::String(session.clone());
+        let _ = tx.send((crate::tools::bash_jobs::PROCS_ENTRY_KIND.to_string(), data));
+    })
+}
 
 /// Resolves once a parked `bash` job's finish notice is due, after [`BASH_JOBS_WAKE_SETTLE`].
 /// Level-triggered: the state is re-checked every time this future is created and after every

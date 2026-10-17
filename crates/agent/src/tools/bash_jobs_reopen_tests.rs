@@ -99,8 +99,14 @@ fn a_reopened_transcript_lists_what_it_left_running_as_stopped() {
         note.starts_with(agent_core::background::REMINDER_PREFIX),
         "a harness note: {note}"
     );
-    assert!(note.contains("- job 1: `npm run dev` (stopped)"), "{note}");
-    assert!(note.contains("- job 5: `./serve.sh` (stopped)"), "{note}");
+    assert!(
+        note.contains("- job 1: `npm run dev` (not running)"),
+        "{note}"
+    );
+    assert!(
+        note.contains("- job 5: `./serve.sh` (not running)"),
+        "{note}"
+    );
     for gone in ["job 2", "job 3", "job 4"] {
         assert!(!note.contains(gone), "{gone} had already ended: {note}");
     }
@@ -153,7 +159,10 @@ fn a_transcript_switch_reads_the_new_transcript() {
     let note = jobs
         .resume(&transcript())
         .expect("read again after a switch");
-    assert!(note.contains("- job 1: `npm run dev` (stopped)"), "{note}");
+    assert!(
+        note.contains("- job 1: `npm run dev` (not running)"),
+        "{note}"
+    );
 }
 
 #[tokio::test]
@@ -180,5 +189,64 @@ async fn a_new_job_after_a_reopen_takes_a_fresh_id_and_a_kill_names_its_command(
     assert!(
         killed.contains("Job 6 (`sleep 60`) killed after"),
         "{killed}"
+    );
+}
+
+/// A process carrying a job tag, as a killed agent's job leaves one: the reopen finds it by its tag.
+fn tagged_sleep(tag: &str) -> std::process::Child {
+    std::process::Command::new("sleep")
+        .arg("60")
+        .env(super::super::bash_proc::TAG_ENV, tag)
+        .spawn()
+        .unwrap()
+}
+
+#[test]
+fn a_job_a_killed_process_left_running_is_stopped_on_reopen_and_reported_so() {
+    let jobs = BashJobs::default();
+    let tag = format!("reopen-test.{}", std::process::id());
+    let mut survivor = tagged_sleep(&tag);
+    let pid = survivor.id();
+    let fates = jobs.stop_survivors(&[
+        // As journaled at spawn, then again with its job number once parked.
+        json!({ "tag": tag, "pgid": pid, "start": null, "command": "npm run dev" }),
+        json!({ "tag": tag, "pgid": pid, "job": 1 }),
+        // A job whose processes are all gone: nothing to stop, and its group number proves nothing.
+        json!({ "tag": "gone-tag", "pgid": 1, "start": null, "job": 5 }),
+    ]);
+    assert_eq!(fates.len(), 1, "{fates:?}");
+    assert_eq!(fates[0].job, Some(1));
+    assert_eq!(fates[0].survived, None);
+    let status = survivor.wait().unwrap();
+    assert!(!status.success(), "the survivor was signalled: {status:?}");
+
+    let note = jobs.resume(&transcript()).expect("jobs were left running");
+    assert!(
+        note.contains("- job 1: `npm run dev` (stopped now)"),
+        "{note}"
+    );
+    assert!(
+        note.contains("- job 5: `./serve.sh` (not running)"),
+        "{note}"
+    );
+    assert!(note.contains("killed before it could stop"), "{note}");
+}
+
+#[test]
+fn a_foreground_command_a_killed_process_left_running_is_named_by_its_command() {
+    let jobs = BashJobs::default();
+    let tag = format!("reopen-fg-test.{}", std::process::id());
+    let mut survivor = tagged_sleep(&tag);
+    jobs.stop_survivors(&[json!({
+        "tag": tag, "pgid": survivor.id(), "start": null, "command": "cargo test"
+    })]);
+    let _ = survivor.wait();
+    // A transcript that left no job running still gets the note: the command was running.
+    let note = jobs
+        .resume(&[Message::user("next")])
+        .expect("a survivor was stopped");
+    assert!(
+        note.contains("- `cargo test` (a command still running when it closed; stopped now)"),
+        "{note}"
     );
 }

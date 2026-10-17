@@ -263,7 +263,7 @@ fn build_input<I: Items>(
 
 /// Every key below is emitted in sorted order, because that is what the `Value` path produced:
 /// `serde_json::Map` is a `BTreeMap`. The two paths must agree byte for byte — see
-/// `streamed_input_is_byte_identical_to_the_tree` — so this is a correctness requirement, not style.
+/// `streamed_body_is_byte_identical_to_the_tree` — so this is a correctness requirement, not style.
 mod wire {
     use super::{Map, Value};
     use serde::ser::{SerializeMap, SerializeSeq};

@@ -110,7 +110,7 @@ configured, the gateway is used (unless `AI_DIRECT=1`). Otherwise, routing is di
 1. a `models.json` `base_url` override for the exact model id (this one bypasses a configured gateway too)
 2. `AI_BASE_URL` + `AI_API_KEY`
 3. `AI_PROVIDER` + that provider's key
-4. a stored OAuth login (`agent login`) — **above** an ambient key, so a stray `ANTHROPIC_API_KEY` in
+4. a stored OAuth login (`beyond-ai-agent login`) — **above** an ambient key, so a stray `ANTHROPIC_API_KEY` in
    your shell never silently moves a subscription onto pay-per-token billing
 5. the provider key for whichever provider natively serves the model id
 
@@ -122,9 +122,9 @@ A session id is an **address**, and it's the only thing that names a session out
 `serve` take the same three:
 
 ```sh
-agent run "..."                      # a new session, persisted under ~/.claude/sessions/<cwd>/
-agent run --continue "..."           # reattach to this directory's most recent session
-agent run --session-id build-42 "…"  # open session build-42, or create it — same session every time
+beyond-ai-agent run "..."                      # a new session, persisted under ~/.claude/sessions/<cwd>/
+beyond-ai-agent run --continue "..."           # reattach to this directory's most recent session
+beyond-ai-agent run --session-id build-42 "…"  # open session build-42, or create it — same session every time
 ```
 
 `--session-id` outranks `--continue`, never resolves to a session it wasn't given, and is idempotent, so
@@ -368,7 +368,7 @@ docker run --rm -p 8080:8080 \
   beyond-ai-agent \
   --listen 0.0.0.0:8080 \
   --gateway-url https://gateway.internal \
-  --grant-key k1=/etc/beyond/grant/k1.pub \
+  --grant-key "1=$(cat /etc/beyond/grant/k1.pub)" \
   --seal-key /etc/beyond/grant/seal.key \
   --shard a07-s1=/mnt/efs/a07-s1 \
   --shard a07-s2=/mnt/efs/a07-s2

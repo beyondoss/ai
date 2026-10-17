@@ -373,7 +373,7 @@ pub struct GatewayState {
     /// `id_signing_keys`: a managed Responses relay to a store is then a 503.
     pub id_signer: Option<crate::signed_id::Signer>,
     /// Resolved providers by name (upstream authority/host + precomputed managed auth value). Built
-    /// once at boot from `route::KNOWN_PROVIDERS` + config; the request path clones the `Arc`.
+    /// once at boot from `route::known_providers()` + config; the request path clones the `Arc`.
     providers: HashMap<String, Arc<Provider>>,
     /// The same providers, indexed by [`providers::ProviderId`] — the model-routed path switches
     /// candidates between connect attempts and holds ids, not names, so this makes that an array

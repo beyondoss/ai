@@ -196,21 +196,22 @@ pub struct AiConfig {
     pub pool_keys: HashMap<String, PoolKeyList>,
 
     /// Per-provider upstream authority (`host:port`), **by provider name**. For a known provider
-    /// (see `route::KNOWN_PROVIDERS`) this *overrides* its default; for an unknown name it *adds* a
-    /// new provider, then reachable at `/{name}/…` (the provider is the request's first path
+    /// (see `route::known_providers()`) this *overrides* its default; for an unknown name it *adds*
+    /// a new provider, then reachable at `/{name}/…` (the provider is the request's first path
     /// segment). Empty = every known provider uses its built-in default. (The e2e harness points
     /// providers at a mock here.)
     pub provider_authorities: HashMap<String, String>,
 
-    /// Wire dialect for a **config-added** provider (a `provider_authorities` entry whose name isn't
-    /// in `route::KNOWN_PROVIDERS`), by provider name: `"openai"` or `"anthropic"` (case-insensitive;
-    /// see `Dialect::parse_config`). Has no effect on a known provider — its dialect is fixed in code.
-    /// Missing ⇒ `"openai"` (the long-standing default, kept for backward compatibility). Real pi
-    /// vendors like MiniMax, MiniMax-CN, and Kimi-Coding speak the **Anthropic** wire (`x-api-key`,
-    /// `usage.input_tokens`/`output_tokens`) — defaulting them to OpenAI-wire silently zero-bills
-    /// every request (`usage::openai_body` deserializes the mismatched shape into all-zero fields
-    /// instead of failing). An unrecognized value is a **hard boot failure**, not a silent fallback to
-    /// `"openai"` — that fallback is exactly the bug this field exists to let an operator opt out of.
+    /// Wire dialect for a **config-added** provider (a `provider_authorities` entry whose name
+    /// isn't in `route::known_providers()`), by provider name: `"openai"` or `"anthropic"`
+    /// (case-insensitive; see `Dialect::parse_config`). Has no effect on a known provider — its
+    /// dialect is fixed in code. Missing ⇒ `"openai"` (the long-standing default, kept for backward
+    /// compatibility). Real pi vendors like MiniMax, MiniMax-CN, and Kimi-Coding speak the
+    /// **Anthropic** wire (`x-api-key`, `usage.input_tokens`/`output_tokens`) — defaulting them to
+    /// OpenAI-wire silently zero-bills every request (`usage::openai_body` deserializes the
+    /// mismatched shape into all-zero fields instead of failing). An unrecognized value is a **hard
+    /// boot failure**, not a silent fallback to `"openai"` — that fallback is exactly the bug this
+    /// field exists to let an operator opt out of.
     pub provider_dialects: HashMap<String, String>,
 
     /// Managed auth scheme for a **config-added** provider, by provider name: `"bearer"`,
@@ -486,8 +487,8 @@ impl Default for AiConfig {
             shutdown_grace_period_secs: 600,
             shutdown_runtime_timeout_secs: 10,
             upstream_tls: true,
-            // Prefer H2 to providers by default (all of `KNOWN_PROVIDERS` offer it; H1 fallback is
-            // automatic). Flip to false for an all-H1 upstream without recompiling.
+            // Prefer H2 to providers by default (all of `known_providers()` offer it; H1 fallback
+            // is automatic). Flip to false for an all-H1 upstream without recompiling.
             upstream_http2: true,
             // Verify upstream certs by default; only the bench's self-signed TLS mock turns this off.
             upstream_verify_cert: true,

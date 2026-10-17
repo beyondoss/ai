@@ -531,7 +531,8 @@ fn answered(messages: &[Message], i: usize, tool_use_id: &str) -> bool {
 ///   resends the same dangling block and fails identically. `Message::with_error`'s own doc comment
 ///   already promised this ("Not replayed on the wire either way") — this is where that promise is
 ///   actually kept for the block *content*, not just the `error_message`/`aborted` marker fields
-///   themselves (`anthropic::strip_model_id` already scrubs those).
+///   themselves (every dialect builds its wire messages from `role`/`content` only, so those never
+///   reach the wire).
 ///
 /// Unlike pi, a message left with zero content after either fixup is NOT dropped from the list: this
 /// codebase relies on that record staying present to keep role alternation valid for whatever prompt
@@ -539,7 +540,7 @@ fn answered(messages: &[Message], i: usize, tool_use_id: &str) -> bool {
 /// `assistant(error)` from `[user, assistant(error), user]` would leave two consecutive `user` turns,
 /// a shape no dialect accepts either). Instead, an otherwise-empty message is padded with a single
 /// placeholder text block. Session storage is untouched — this only shapes the wire copy, mirroring
-/// `strip_model_id`/`downgrade_unsigned_thinking`. Called once, generically, right before any
+/// `downgrade_unsigned_thinking`. Called once, generically, right before any
 /// dialect's `build_body`, alongside `repair_orphaned_tool_use`.
 ///
 /// Cheap when nothing needs fixing (the overwhelmingly common case): a first read-only pass decides

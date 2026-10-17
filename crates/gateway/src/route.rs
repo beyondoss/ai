@@ -29,9 +29,9 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-/// The shared provider table. `KNOWN_PROVIDERS` is the gateway-routable subset — the BYO-only rows
-/// (HuggingFace, NVIDIA, Kimi-Coding, OpenCode) have no `/{name}/…` mount and no pool key, so minting
-/// a [`Provider`] for them at boot would only create dead upstreams.
+/// The shared provider table. `known_providers()` is the gateway-routable subset — the BYO-only
+/// rows (HuggingFace, NVIDIA, Kimi-Coding, OpenCode) have no `/{name}/…` mount and no pool key, so
+/// minting a [`Provider`] for them at boot would only create dead upstreams.
 pub use providers::{AuthScheme, ProviderSpec, gateway_providers as known_providers};
 
 /// The provider's wire format. Aliased to the shared crate's [`providers::WireFormat`] — same two

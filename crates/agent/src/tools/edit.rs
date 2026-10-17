@@ -77,7 +77,8 @@ impl Tool for Edit {
          (each `old_string` must match exactly once), or a single old_string/new_string. With \
          `replace_all`, a single edit replaces every occurrence. An entry's own `path` sends it to \
          another file. Each file applies on its own (all of its edits or none); the result lists \
-         which files were edited and which FAILED, so resend only the failed ones."
+         which files were edited and which FAILED, so resend only the failed ones. A UTF-16 file \
+         keeps its encoding."
     }
     fn input_schema(&self) -> Value {
         json!({
@@ -443,13 +444,34 @@ impl Edit {
         // session's event pump and abort/steer loop. See `tests/tool_reactor_stall.rs`.
         // So is validating the bytes as UTF-8 — a pass over every byte of the file.
         let plan_path = path.clone();
+        //
+        // A UTF-16 file (the same classifier `read` uses) is decoded, edited as text, and encoded back
+        // in its own byte order — a BOM decodes to a leading U+FEFF, which `plan_edits` already keeps,
+        // so it round-trips too. Without this, `edit` refused every UTF-16 file as "not valid UTF-8".
         let (text, result) = match tokio::task::spawn_blocking(move || {
-            let Ok(raw) = String::from_utf8(raw_bytes) else {
-                let err =
-                    ToolError::Execution(format!("read {plan_path}: file is not valid UTF-8"));
-                return (None, Err(PlanError::from(err)));
+            let utf16 = match super::encoding::sniff(&raw_bytes) {
+                super::encoding::Encoding::Utf16 { big_endian } => Some(big_endian),
+                _ => None,
             };
-            let result = plan_edits(&plan_path, &raw, &edits, replace_all, total_edits);
+            let decoded = match utf16 {
+                Some(be) => super::encoding::decode_utf16(&raw_bytes, be).ok_or_else(|| {
+                    let label = super::encoding::utf16_label(be);
+                    format!("read {plan_path}: file is not valid {label}")
+                }),
+                None => String::from_utf8(raw_bytes)
+                    .map_err(|_| format!("read {plan_path}: file is not valid UTF-8")),
+            };
+            let raw = match decoded {
+                Ok(raw) => raw,
+                Err(msg) => return (None, Err(PlanError::from(ToolError::Execution(msg)))),
+            };
+            let mut result = plan_edits(&plan_path, &raw, &edits, replace_all, total_edits);
+            if let (Some(be), Ok((bytes, _))) = (utf16, &mut result) {
+                // `plan_edits` builds its output from a `String`, so this is always valid UTF-8.
+                if let Ok(text) = std::str::from_utf8(bytes) {
+                    *bytes = super::encoding::encode_utf16(text, be);
+                }
+            }
             // A file that will be written is searched in its new bytes (see `explain_failures`).
             ((keep_text && result.is_err()).then_some(raw), result)
         })
@@ -1808,14 +1830,14 @@ mod tests {
     #[tokio::test]
     async fn a_syntactically_invalid_edits_json_string_falls_through_to_requiring_top_level_fields()
     {
-        // pi: edit-tool-legacy-input.test.ts, "leaves edits alone when the string is not valid JSON" —
-        // pi's `prepareArguments` passes a non-JSON `edits` string through unchanged, letting the
-        // ordinary schema validation reject it downstream. Ours parses inline (`parse_edits`): the
-        // `serde_json::from_str::<Value>(s).ok()` on a malformed string yields `None`, so `edits_value`
-        // is `None` too — the `arr` branch is skipped entirely, and (with no top-level `old_string`/
-        // `new_string` given either) this must fall through to the same generic "provide `edits`, or
-        // `old_string` and `new_string`" error as an outright missing `edits`, not a JSON-parse-error
-        // message that would leak `serde_json`'s own wording to the model.
+        // pi: edit-tool-legacy-input.test.ts, "leaves edits alone when the string is not valid
+        // JSON" — pi's `prepareArguments` passes a non-JSON `edits` string through unchanged,
+        // letting the ordinary schema validation reject it downstream. Ours parses inline
+        // (`agent_core::tool::edit_entries`): a malformed string yields `None` — the `arr` branch
+        // is skipped entirely, and (with no top-level `old_string`/`new_string` given either) this
+        // must fall through to the same generic "provide `edits`, or `old_string` and `new_string`"
+        // error as an outright missing `edits`, not a JSON-parse-error message that would leak
+        // `serde_json`'s own wording to the model.
         let f = write_tmp("foo and bar");
         let p = f.path().to_str().unwrap();
         let err = Edit::default()
@@ -2218,13 +2240,12 @@ mod tests {
 
     #[tokio::test]
     async fn a_fifo_is_rejected_immediately_instead_of_hanging_the_tool_call_forever() {
-        // Regression (pi-parity pass 20): `read_with_mtime`'s `std::fs::File::open(path)` (read-only)
-        // blocks forever on an existing FIFO with no writer on the other end — symmetric to the
-        // pre-fix `read` tool bug (see `reject_non_regular_file` in `tools/mod.rs`), and it runs
-        // *before* `run`'s own `is_writable` pre-check is even reached, so that check alone couldn't
-        // have caught it. `mkfifo x` then `edit path=x ...` reproduced this with two ordinary tool
-        // calls. `tokio::time::timeout` here is a *test* safety net, not the fix itself: if the gate
-        // ever regresses, this test fails fast in seconds instead of hanging CI indefinitely.
+        // Opening an existing FIFO with no writer on the other end blocks forever, so `edit` must
+        // refuse it on the kind its `stat` reports (`non_regular_file_error` in `tools/mod.rs`)
+        // before reading it — a writability check alone would come too late. `mkfifo x` then `edit
+        // path=x ...` reproduces the hang with two ordinary tool calls. `tokio::time::timeout` here
+        // is a *test* safety net, not the fix itself: if the gate ever regresses, this test fails
+        // fast in seconds instead of hanging CI indefinitely.
         let dir = tempfile::tempdir().unwrap();
         let fifo_path = dir.path().join("a.fifo");
         let status = std::process::Command::new("mkfifo")

@@ -967,12 +967,14 @@ fn serve_list_all_sessions_spans_every_project_under_the_shared_root() {
 
 #[test]
 fn serve_list_sessions_filters_by_cwd_under_one_shared_session_dir() {
-    // Track L28 (pi-parity fix): unlike `serve_list_all_sessions_spans_every_project_under_the_shared_root`
-    // (above), which uses one subdirectory *per* project — so `list_sessions` there was only ever
-    // "correct" by construction (each repo directory physically holds just one project's sessions) —
-    // this drives two `serve` processes at *one* literal `--session-dir`, from two different cwds. Only
-    // `resume_or_create` (at startup) used to filter by cwd; `list_sessions` returned every session in
-    // the shared directory unfiltered, leaking another project's sessions into this one's listing.
+    // Track L28 (pi-parity fix): unlike
+    // `serve_list_all_sessions_spans_every_project_under_the_shared_root` (above), which uses one
+    // subdirectory *per* project — so `list_sessions` there was only ever "correct" by construction
+    // (each repo directory physically holds just one project's sessions) — this drives two `serve`
+    // processes at *one* literal `--session-dir`, from two different cwds. Only
+    // `resume_latest_or_create` (at startup) used to filter by cwd; `list_sessions` returned every
+    // session in the shared directory unfiltered, leaking another project's sessions into this
+    // one's listing.
     let shared_dir = tempfile::tempdir().unwrap();
     let cwd_a = tempfile::tempdir().unwrap();
     let cwd_b = tempfile::tempdir().unwrap();

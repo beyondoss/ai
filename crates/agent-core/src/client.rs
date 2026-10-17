@@ -119,19 +119,20 @@ impl Drop for ApiKey {
 /// How a [`DirectRouting`]-carrying credential's request must reach its upstream when the default
 /// `{GatewayClient::base_url}{dialect.endpoint_path()}` composition is wrong for this provider.
 ///
-/// Both GitHub Copilot and OpenAI Codex OAuth logins hand back a bearer token that's useless against
-/// the gateway's *default* provider (bare `/v1/…` always means "whichever provider the gateway's
-/// dialect default points at" — Anthropic or OpenAI direct, never Copilot/Codex): the gateway's
-/// `route.rs` `KNOWN_PROVIDERS` table is a set of **static** `(name, authority, dialect, auth)` rows,
-/// which fits Codex fine (`chatgpt.com` is a fixed host) but cannot express Copilot's endpoint at
-/// all — GitHub hands back a *different* proxy host per account/enterprise, embedded in the access
-/// token itself (`proxy-ep=…`), not knowable at gateway-boot time. So the two providers need two
-/// different fixes, both applied client-side rather than in the gateway's routing table:
+/// Both GitHub Copilot and OpenAI Codex OAuth logins hand back a bearer token that's useless
+/// against the gateway's *default* provider (bare `/v1/…` always means "whichever provider the
+/// gateway's dialect default points at" — Anthropic or OpenAI direct, never Copilot/Codex): the
+/// gateway's provider table (`providers::gateway_providers()`) is a set of **static** `(name,
+/// authority, dialect, auth)` rows, which fits Codex fine (`chatgpt.com` is a fixed host) but
+/// cannot express Copilot's endpoint at all — GitHub hands back a *different* proxy host per
+/// account/enterprise, embedded in the access token itself (`proxy-ep=…`), not knowable at
+/// gateway-boot time. So the two providers need two different fixes, both applied client-side
+/// rather than in the gateway's routing table:
 #[derive(Debug, Clone)]
 pub enum RouteOverride {
     /// Still relayed through the gateway (`GatewayClient::base_url` unchanged) under a
-    /// `route::KNOWN_PROVIDERS` row's name as the first path segment (e.g. `"/openai-codex"`), with
-    /// `path` appended in place of the dialect's own default endpoint path — Codex's real path
+    /// `route::known_providers()` row's name as the first path segment (e.g. `"/openai-codex"`),
+    /// with `path` appended in place of the dialect's own default endpoint path — Codex's real path
     /// (`/backend-api/codex/responses`) differs from the OpenAI-Responses dialect's usual
     /// `/v1/responses`. Fits because Codex's host (`chatgpt.com`) is genuinely static.
     Prefixed {
@@ -1322,6 +1323,9 @@ async fn send_with_retry(
                 // upstream can return an arbitrarily large error page (an HTML error document from a
                 // misconfigured proxy, say) and this ends up in logs and `AgentEvent::Error`.
                 let detail = read_error_body_capped(resp).await;
+                // The raw body stays available to an operator; the error carries only its readable
+                // part (see `describe_error_body`).
+                tracing::debug!(host = who, status = status.as_u16(), body = %detail, "provider error response");
                 // A 429 is either genuine rate limiting (the loop waits it out) or quota/billing
                 // exhaustion, which no wait fixes. Codex/ChatGPT's own usage-limit body carries a
                 // machine code and (often) a reset time — lead with a readable sentence when it does.
@@ -1329,11 +1333,11 @@ async fn send_with_retry(
                     let msg = match codex_friendly_usage_limit_message(&detail) {
                         Some(friendly) => format!(
                             "{friendly} (gateway returned {status}: {})",
-                            truncate_error_body(detail.trim())
+                            describe_error_body(&detail)
                         ),
                         None => format!(
                             "gateway returned {status}: {}",
-                            truncate_error_body(detail.trim())
+                            describe_error_body(&detail)
                         ),
                     };
                     return Err(Error::Transport(msg));
@@ -1349,7 +1353,7 @@ async fn send_with_retry(
                         "{who} rejected the request as unauthorized (401) — the API key being used \
                          is missing, invalid, expired, or lacks permission for this model; check the \
                          key and try again. Upstream detail: {}",
-                        truncate_error_body(detail.trim())
+                        describe_error_body(&detail)
                     )));
                 }
                 // The server's wait hint dies with the response headers, so write it into the error:
@@ -1361,7 +1365,7 @@ async fn send_with_retry(
                 };
                 return Err(Error::Transport(format!(
                     "{who} returned {status}{hint}: {}",
-                    truncate_error_body(detail.trim())
+                    describe_error_body(&detail)
                 )));
             }
             Err(e) => {
@@ -1548,6 +1552,79 @@ fn truncate_error_body(s: &str) -> String {
     format!("{kept}... [truncated {omitted} chars]")
 }
 
+/// The readable part of a provider's error body: its message, followed by the machine-readable kind
+/// (`type`/`code`/`status`) in parentheses — `prompt is too long: 250000 tokens > 200000 maximum
+/// (invalid_request_error)` instead of the whole JSON envelope. The kind stays because the retry and
+/// overflow classifiers key on it (`rate_limit_error`, `insufficient_quota`,
+/// `context_length_exceeded`). Understands Anthropic's `{"type":"error","error":{type,message}}`,
+/// OpenAI's `{"error":{message,type,code}}`, Google's `{"error":{code,message,status}}` (also inside a
+/// one-element array), OpenRouter's `{"error":{message,code,metadata:{provider_name,raw}}}` (the
+/// upstream's own error, in `raw`, is described too), a bare `{"error":"…"}`, and a top-level
+/// `{"message":…}`/`{"detail":"…"}`. Anything else — an HTML page, plain text — is shown as it came,
+/// capped at [`MAX_ERROR_BODY_CHARS`].
+pub(crate) fn describe_error_body(body: &str) -> String {
+    let body = body.trim();
+    let described = serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|v| describe_error_value(&v, 0));
+    truncate_error_body(described.as_deref().unwrap_or(body))
+}
+
+fn describe_error_value(v: &Value, depth: u8) -> Option<String> {
+    if depth > 2 {
+        return None;
+    }
+    let v = match v {
+        Value::Array(items) => items.first()?,
+        v => v,
+    };
+    let obj = v.as_object()?;
+    let err = match obj.get("error") {
+        Some(Value::String(s)) if !s.trim().is_empty() => return Some(s.trim().to_string()),
+        Some(Value::Object(e)) => e,
+        _ => obj,
+    };
+    let text = |k: &str| {
+        err.get(k)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    };
+    let message = text("message").or_else(|| text("detail"))?;
+    let mut out = message.to_string();
+    if let Some(meta) = err.get("metadata").and_then(Value::as_object) {
+        if let Some(provider) = meta.get("provider_name").and_then(Value::as_str) {
+            out.push_str(&format!(" (via {provider})"));
+        }
+        let inner = match meta.get("raw") {
+            Some(Value::String(raw)) => serde_json::from_str::<Value>(raw)
+                .ok()
+                .and_then(|v| describe_error_value(&v, depth + 1))
+                .or_else(|| Some(raw.trim().to_string())),
+            Some(raw) => describe_error_value(raw, depth + 1),
+            None => None,
+        };
+        if let Some(inner) = inner.filter(|i| !i.is_empty() && *i != message) {
+            out.push_str(": ");
+            out.push_str(&inner);
+        }
+    }
+    let mut kinds: Vec<&str> = Vec::new();
+    for k in ["type", "code", "status"] {
+        if let Some(kind) = text(k)
+            && kind != "error"
+            && !kinds.contains(&kind)
+            && !out.contains(kind)
+        {
+            kinds.push(kind);
+        }
+    }
+    if !kinds.is_empty() {
+        out.push_str(&format!(" ({})", kinds.join(", ")));
+    }
+    Some(out)
+}
+
 /// Ceiling on bytes read from a non-2xx response body before giving up on it — the same defensive
 /// bound [`crate::dialect::LineFramer`]'s buffer cap applies to the 2xx SSE path, but for the
 /// error-body read: an error page (a misconfigured proxy's HTML, a hostile `Direct`-routed third
@@ -1651,7 +1728,7 @@ fn parse_retry_after(raw: &str, max_backoff: Duration) -> Option<Duration> {
 /// attempt inputs, not the hasher itself) and mapped onto `[0.8, 1.2]`. Salt gives cross-process
 /// variance (two fleet processes at the same attempt number don't jitter identically); the counter
 /// gives cross-call variance (the *same* attempt number, computed twice in one process, doesn't
-/// jitter identically either — see `backoff_jitter_varies_across_calls` below).
+/// jitter identically either — see `backoff_jitter_varies_across_calls_but_stays_in_range` below).
 ///
 /// `pub(crate)`: also reused by `agent::mid_stream_backoff`, this crate's other inner retry layer.
 pub(crate) fn jitter(d: Duration, attempt: u32) -> Duration {
@@ -2043,6 +2120,64 @@ mod tests {
         // (`openai-codex-responses.ts`'s `DEFAULT_MAX_RETRY_DELAY_MS`) — a 429 with a `Retry-After: 30`
         // hint used to get retried back into the very rate-limit window it named.
         assert_eq!(MAX_BACKOFF, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn describe_error_body_shows_the_message_and_keeps_the_kind() {
+        for (body, want) in [
+            // Anthropic
+            (
+                r#"{"type":"error","error":{"type":"invalid_request_error","message":"max_tokens: 100000 > 64000, which is the maximum allowed"}}"#,
+                "max_tokens: 100000 > 64000, which is the maximum allowed (invalid_request_error)",
+            ),
+            // OpenAI: type and code both kept
+            (
+                r#"{"error":{"message":"This model's maximum context length is 128000 tokens.","type":"invalid_request_error","param":"messages","code":"context_length_exceeded"}}"#,
+                "This model's maximum context length is 128000 tokens. (invalid_request_error, context_length_exceeded)",
+            ),
+            // OpenAI with a null code
+            (
+                r#"{"error":{"message":"You exceeded your current quota","type":"insufficient_quota","param":null,"code":null}}"#,
+                "You exceeded your current quota (insufficient_quota)",
+            ),
+            // Google, inside a one-element array
+            (
+                r#"[{"error":{"code":400,"message":"API key not valid.","status":"INVALID_ARGUMENT"}}]"#,
+                "API key not valid. (INVALID_ARGUMENT)",
+            ),
+            // OpenRouter: the upstream's own error, from `metadata.raw`
+            (
+                r#"{"error":{"message":"Provider returned error","code":400,"metadata":{"raw":"{\"error\":{\"message\":\"prompt is too long\",\"type\":\"invalid_request_error\"}}","provider_name":"Anthropic"}}}"#,
+                "Provider returned error (via Anthropic): prompt is too long (invalid_request_error)",
+            ),
+            (
+                r#"{"error":{"message":"Provider returned error","code":502,"metadata":{"raw":"upstream connect error","provider_name":"Fireworks"}}}"#,
+                "Provider returned error (via Fireworks): upstream connect error",
+            ),
+            // The gateway's own rewrite
+            (
+                r#"{"error":{"type":"rate_limit_error","message":"The provider is rate-limited upstream; retry later."}}"#,
+                "The provider is rate-limited upstream; retry later. (rate_limit_error)",
+            ),
+            (r#"{"error":"Unauthorized"}"#, "Unauthorized"),
+            (r#"{"detail":"Model not found"}"#, "Model not found"),
+            (
+                r#"{"message":"Forbidden","type":"forbidden"}"#,
+                "Forbidden (forbidden)",
+            ),
+            // Not an error envelope we know: shown as it came.
+            (
+                "<html><body>502 Bad Gateway</body></html>",
+                "<html><body>502 Bad Gateway</body></html>",
+            ),
+            (
+                r#"{"detail":[{"loc":["body"],"msg":"field required"}]}"#,
+                r#"{"detail":[{"loc":["body"],"msg":"field required"}]}"#,
+            ),
+            ("  plain text  ", "plain text"),
+        ] {
+            assert_eq!(describe_error_body(body), want, "for {body}");
+        }
     }
 
     #[test]
@@ -3257,7 +3392,7 @@ mod tests {
     }
 
     /// A Claude-family model routed through a Copilot credential is `is_anthropic` but not
-    /// `is_oauth` (see `has_direct_override`'s doc comment in `stream()`): it must still get
+    /// `is_oauth` (see `routed_to_anthropic_natively` in `stream()`): it must still get
     /// `anthropic-dangerous-direct-browser-access` (pi sends that header in every Anthropic auth
     /// branch, Copilot included — Task 3, pi-parity), but none of Anthropic's own OAuth-only identity
     /// headers, which would misrepresent this as a direct-to-Anthropic Claude Code request instead of
