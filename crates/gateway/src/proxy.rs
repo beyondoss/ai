@@ -4699,6 +4699,9 @@ impl ProxyHttp for AiProxy {
             if parsed.malformed {
                 self.state.metrics.control_header_errors_total.inc();
             }
+            if parsed.unknown_provider {
+                self.state.metrics.control_unknown_provider_total.inc();
+            }
             Some(parsed)
         } else {
             None

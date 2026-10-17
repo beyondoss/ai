@@ -370,8 +370,9 @@ not run); `only` filters, then the pin applies:
 | `x-beyond-only`  | `bedrock,openrouter`      | drop anyone not named                                                                                                                                                                                                                                                              |
 | `x-beyond-split` | `anthropic=70,bedrock=30` | pick the primary with those weights (hash of the request counter, not `rand` per replica); leftover stay failover in the current order. A weight above `control::MAX_SPLIT_WEIGHT` (`u32::MAX / MAX_CANDIDATES`, so the sum always fits a `u32`) makes the header malformed (D201) |
 
-Unknown names are dropped. Unparseable values are dropped, counted on
-`ai_control_header_errors_total`, and the request uses the default walk (the session pin, or catalog
+Unknown names are dropped. A name that names no catalog provider at all is also counted on
+`ai_control_unknown_provider_total` (a typo); a real provider that is off the row is dropped silently.
+Unparseable values are dropped, counted on `ai_control_header_errors_total`, and the request uses the default walk (the session pin, or catalog
 order when `session_pins = false`). If nothing usable remains (an `only` of an unkeyed or off-row name,
 or every remaining candidate unkeyed) → 503, the same as no pool-keyed candidate. Applied
 **before** `first_usable` / breaker skip, so failover, breakers, and the 429 key-walk see the
@@ -2391,8 +2392,8 @@ unattributable row, the same reason `ai.usage` is managed-only.
 | `x-beyond-split`    | `name=weight` pairs, each weight <= `u32::MAX / MAX_CANDIDATES` | weighted primary; leftover stay failover        |
 
 **Nothing here can fail a request with a 4xx.** Malformed, oversize, or unrecognized values are
-dropped and counted on `ai_control_header_errors_total`; the request proceeds as if the header were
-absent. An observability header that can 400 a customer's inference call is a worse bug than the
+dropped and counted on `ai_control_header_errors_total`, and a name that names no catalog provider is counted
+on `ai_control_unknown_provider_total`; the request proceeds as if that value were absent. An observability header that can 400 a customer's inference call is a worse bug than the
 missing observability — and on a proxy, the header we would be rejecting was written by _their_
 SDK. An `only` filter that leaves no pool-keyed candidate is a routing 503, the same as a row with
 no keyed provider — not a parse rejection.
@@ -3592,6 +3593,7 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
 | `ai_capture_bytes_total`              | Counter   | —                    | Payload bytes handed to the sink — the cost signal, ahead of the storage bill                                                                                                                                              |
 | `ai_capture_dropped_total`            | Counter   | —                    | Captures lost: dropped on a full sink queue (lines or bytes), refused by stdout, or enqueued after shutdown — distinguishes "lost it" from "capture was off"                                                               |
 | `ai_control_header_errors_total`      | Counter   | —                    | `x-beyond-*` headers present but unusable (dropped; request still served)                                                                                                                                                  |
+| `ai_control_unknown_provider_total`   | Counter   | —                    | `x-beyond-order` / `only` / `split` naming no catalog provider (dropped; request still served)                                                                                                                             |
 | `ai_usage_parse_errors_total`         | Counter   | —                    | Managed 2xx responses that ended cleanly without parseable usage (billed an estimate or zero; free token counts excluded)                                                                                                  |
 | `ai_cache_hits_total`                 | Counter   | —                    | Exact-match cache hits that replayed a stored 2xx and skipped the provider                                                                                                                                                 |
 | `ai_cache_scope`                      | Gauge     | `kind`               | Constant `1` with `kind="process"`: this pod's cache table, not a fleet store                                                                                                                                              |

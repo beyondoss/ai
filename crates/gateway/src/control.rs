@@ -23,11 +23,13 @@
 //! `order` and `split` **fix** the walk: the computed session pin in [`crate::pin`] does not run.
 //! `only` is a filter, then the pin orders what is left. No walk header at all is also pinned.
 //!
-//! **Nothing here can fail a request.** Every malformed, oversize, or unrecognized value is dropped
-//! and counted, and the request proceeds exactly as if the header were absent. An observability
-//! header that can 400 a customer's inference call is a worse bug than the missing observability —
-//! and this is a *proxy*, where the client's own SDK is what generated the header we'd be rejecting.
-//! Unparseable walk headers are that case: default catalog order, plus the error counter.
+//! **Nothing here can fail a request.** A malformed or oversize value is dropped and counted on
+//! `ai_control_header_errors_total`. A name that names no catalog provider at all is dropped and
+//! counted on `ai_control_unknown_provider_total`. The request proceeds exactly as if that value
+//! were absent. A real provider off the row is dropped without a count: the row has no such arm. An
+//! observability header that can 400 a customer's inference call is a worse bug than the missing
+//! observability: this is a *proxy*, and the header we would reject was written by the client's own
+//! SDK. Unparseable walk headers are that case: default catalog order, plus the error counter.
 //!
 //! **Metadata is re-serialized, never passed through.** We parse the client's JSON, validate it, and
 //! emit JSON we build ourselves from the parsed values. That makes log injection structurally
@@ -114,6 +116,10 @@ pub struct Control {
     /// A header was present but unusable. Drives `control_header_errors_total` — without it a
     /// client whose tags silently never appear has no signal to debug against.
     pub malformed: bool,
+    /// A name in `order`, `only` or `split` names no catalog provider at all, not even one off the
+    /// row: a likely typo. Drives `control_unknown_provider_total`. A real provider that is merely
+    /// not on this row is dropped without a count, since its absence from the row is expected.
+    pub unknown_provider: bool,
 }
 
 /// Catalog indices in the order this request will walk them.
@@ -213,6 +219,15 @@ impl Control {
             }
         }
 
+        out.unknown_provider = out
+            .order
+            .iter()
+            .chain(out.only.iter())
+            .flatten()
+            .map(String::as_str)
+            .chain(out.split.iter().flatten().map(|(name, _)| name.as_str()))
+            .any(|name| providers::by_name(name).is_none());
+
         out
     }
 
@@ -260,7 +275,7 @@ fn parse_name_list(raw: &str) -> Option<Vec<String>> {
         if names.len() == MAX_CANDIDATES {
             break;
         }
-        names.push(name.to_string());
+        names.push(name.to_ascii_lowercase());
     }
     (!names.is_empty()).then_some(names)
 }
@@ -291,7 +306,7 @@ fn parse_split(raw: &str) -> Option<Vec<(String, u32)>> {
         if out.len() == MAX_CANDIDATES {
             break;
         }
-        out.push((name.to_string(), w));
+        out.push((name.to_ascii_lowercase(), w));
     }
     out.iter().any(|(_, w)| *w > 0).then_some(out)
 }
@@ -765,6 +780,45 @@ mod tests {
             ["bedrock", "anthropic", "openrouter"]
         );
         assert!(!c.malformed);
+    }
+
+    /// A walk name matches in any case, so the walk and the unknown-provider counter read the same
+    /// name: `ANTHROPIC` and `Bedrock` are the row's `anthropic` and `bedrock`, and neither is counted.
+    /// claim: R3
+    /// defect: D282
+    #[test]
+    fn a_walk_name_matches_in_any_case() {
+        let row = claude_row();
+        let c = Control::parse(&req(&[(ONLY_HEADER, "ANTHROPIC, Bedrock")]));
+        assert!(!c.unknown_provider);
+        let names = walk_names(c.catalog_walk(row.candidates, 0), row.candidates);
+        assert_eq!(names.len(), 2, "{names:?}");
+        assert!(
+            names.contains(&"anthropic") && names.contains(&"bedrock"),
+            "{names:?}"
+        );
+    }
+
+    /// A name that names no catalog provider is a likely typo, so it is flagged for the counter, though
+    /// the header is well formed and only its name is dropped.
+    /// claim: R3
+    /// defect: D282
+    #[test]
+    fn a_name_that_matches_no_provider_is_flagged_as_unknown() {
+        let c = Control::parse(&req(&[(ONLY_HEADER, "not-a-provider")]));
+        assert!(
+            c.unknown_provider,
+            "an unknown provider in x-beyond-only must be counted"
+        );
+        assert!(!c.malformed);
+    }
+
+    /// A real provider that is merely not on the row is expected, so it is dropped silently.
+    /// claim: R3
+    #[test]
+    fn a_real_provider_off_the_row_is_not_flagged() {
+        let c = Control::parse(&req(&[(ORDER_HEADER, "openai")]));
+        assert!(!c.unknown_provider);
     }
 
     #[test]

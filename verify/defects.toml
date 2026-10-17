@@ -2891,3 +2891,17 @@ state = "fixed"
 test = "openai_codex_never_takes_a_pool_key"
 fix = ""
 note = "Fixed by data on the provider id: ProviderId::takes_pool_key is false for OpenAiCodex, and build_providers only passes a configured pool key to a row that takes one. The env fold (config.rs) and its test are unchanged: the key is still read, and it is then not attached."
+
+[[defect]]
+id = "D282"
+severity = "low"
+area = "Routing"
+title = "A walk header that names no provider at all is dropped with no signal"
+impact = "A caller who typed a provider name that exists nowhere (x-beyond-only: opnai) got the default walk and no sign of it: the name was dropped, and nothing counted it, so the tags or the steering they meant silently never applied."
+confidence = "high"
+evidence = "control.rs parse_name_list kept every well-formed name, and the walk dropped any name the row did not list, so an unknown name left no trace. Reproduced on 4513e6f by a_name_that_matches_no_provider_is_flagged_as_unknown (the signal did not exist)."
+claims = ["R3"]
+state = "fixed"
+test = "a_name_that_matches_no_provider_is_flagged_as_unknown"
+fix = ""
+note = "Decided by the owner: the header stays well formed and malformed is unchanged (the existing unknown-name test still asserts !malformed). Control::unknown_provider is set only when a name in order, only or split matches no ProviderSpec (providers::by_name). It is counted on the new ai_control_unknown_provider_total in proxy request_filter, beside the malformed count. A real provider merely off the row is not flagged: a_real_provider_off_the_row_is_not_flagged."

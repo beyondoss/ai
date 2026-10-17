@@ -378,6 +378,8 @@ pub struct Metrics {
     /// value). These are dropped rather than rejected, so a client whose tags silently never show up
     /// has no other signal to debug against.
     pub control_header_errors_total: IntCounter,
+    /// `x-beyond-order` / `only` / `split` named a provider that exists nowhere (a typo).
+    pub control_unknown_provider_total: IntCounter,
     /// Managed `2xx` responses that carried no parseable usage block. Such a response still emits a
     /// zero-token `ai.usage` row, which is indistinguishable downstream from a (non-existent)
     /// legitimate zero-token generation — so a provider changing its usage wire shape would silently
@@ -569,6 +571,10 @@ impl Metrics {
             "ai_control_header_errors_total",
             "x-beyond-* headers present but unusable (dropped, request still served)",
         ))?;
+        let control_unknown_provider_total = IntCounter::with_opts(Opts::new(
+            "ai_control_unknown_provider_total",
+            "x-beyond-order/only/split naming no catalog provider (dropped; request still served)",
+        ))?;
         let usage_parse_errors_total = IntCounter::with_opts(Opts::new(
             "ai_usage_parse_errors_total",
             "Managed 2xx responses with no parseable usage (emitted as a zero-token billing row)",
@@ -642,6 +648,7 @@ impl Metrics {
         r.register(Box::new(capture_bytes_total.clone()))?;
         r.register(Box::new(capture_dropped_total.clone()))?;
         r.register(Box::new(control_header_errors_total.clone()))?;
+        r.register(Box::new(control_unknown_provider_total.clone()))?;
         r.register(Box::new(usage_parse_errors_total.clone()))?;
         r.register(Box::new(usage_estimated_total.clone()))?;
         r.register(Box::new(usage_drains_in_flight.clone()))?;
@@ -686,6 +693,7 @@ impl Metrics {
             capture_bytes_total,
             capture_dropped_total,
             control_header_errors_total,
+            control_unknown_provider_total,
             usage_parse_errors_total,
             usage_estimated_total,
             usage_drains_in_flight,
