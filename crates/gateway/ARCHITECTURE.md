@@ -191,7 +191,7 @@ Client (stock OpenAI/Anthropic SDK)
   │    mapped in place and the buffer compacted once per chunk; a delta finds its tool call in O(1).
   │  Managed only: feed *upstream* chunks → ModelScanner::for_response → billed model
   │    (accepts Anthropic's nested message.model, so it stops in the first chunk for both dialects)
-  │  Append *upstream* bytes to bounded 64KB tail (copy_within compaction once tail > 128KB)
+  │  Append *upstream* bytes to bounded 64KB tail (a ring once it outgrows 64KB; no compaction)
   │  Anthropic SSE only: also keep a bounded 8KB head — message_start carries input + cache
   │    tokens and would otherwise be compacted out of the tail
   │  Capturing: copy chunk into the head-bounded response buffer (same passive-tap contract
@@ -280,17 +280,17 @@ disconnected).
 
 ### Routing (`route.rs`)
 
-Providers are **data rows**, not code paths. `KNOWN_PROVIDERS` in `route.rs` lists 12 built-in
-providers (openai, anthropic, openrouter, fireworks, groq, deepseek, together, cerebras, mistral,
+Providers are **data rows**, not code paths. `route::known_providers` (the gateway rows of the
+shared `providers::PROVIDERS` table, `providers::gateway_providers`) lists 12 built-in providers (openai, anthropic, openrouter, fireworks, groq, deepseek, together, cerebras, mistral,
 xai, openai-codex, bedrock); each row carries its authority (host:port), dialect (OpenAI-wire vs
 Anthropic-wire), and auth scheme (`Bearer`, `x-api-key`, or `api-key`). The `provider_authorities`
 config key adds or overrides rows at boot with zero code change; `provider_dialects`/
 `provider_auth_schemes` set the dialect/auth scheme for a **config-added** provider (default
 OpenAI/Bearer for backward compatibility — see Configuration). A known provider's dialect/scheme is
-always fixed in `KNOWN_PROVIDERS`, never overridable from config. This is how Azure OpenAI is
+always fixed in `providers::PROVIDERS`, never overridable from config. This is how Azure OpenAI is
 supported: its per-resource host isn't knowable at compile time, so it's always config-added
 (`provider_authorities.azure = "..."` + `provider_auth_schemes.azure = "api-key"`), never a
-`KNOWN_PROVIDERS` row — see `config.example.toml`. Bedrock is the opposite case: it has a real
+`providers::PROVIDERS` row — see `config.example.toml`. Bedrock is the opposite case: it has a real
 default host (`bedrock-runtime.us-east-1.amazonaws.com`) and a static API key, so it _is_ a
 built-in row; override the region with `provider_authorities.bedrock` if you need another one.
 
@@ -1466,7 +1466,7 @@ merges itself once CI is green. Anything a rule cannot settle (a new family or h
 or pricing-tier difference, a retiring primary, a failed live test) is listed in the open
 `catalog-drift` issue. The rules are `crates/providers/ARCHITECTURE.md`, "Catalog maintenance".
 
-**What that failover does and does not cover.** On the two Bedrock-backed rows, Bedrock is the
+**What that failover does and does not cover.** On the three Bedrock-backed rows, Bedrock is the
 independent second source: a different account, a different network path, and AWS's own serving of
 Claude. OpenRouter is the last candidate and covers failures that are on our side of the wire
 (egress blocked, our Anthropic or Bedrock key throttled) but is not independently guaranteed — it
@@ -1753,8 +1753,8 @@ saturated value instead.
 Missing or zero usage fields deserialize to zero (safe default) — **except** `reasoning_tokens`
 (`Usage::reasoning_tokens: Option<u64>`), which stays `None` when the provider didn't report it at
 all, distinct from `Some(0)` when it reported a real zero; that distinction is unrecoverable once the
-request completes, so it's never collapsed to a bare zero. If the tail is truncated by the compaction
-drain, the usage chunk is still present because SSE usage is always the final `data:` line and the
+request completes, so it's never collapsed to a bare zero. If the tail has dropped the stream's
+earlier bytes, the usage chunk is still present because SSE usage is always the final `data:` line and the
 tail keeps the last 64KB. OpenAI's parser walks those lines backwards and stops at the first usage
 block; the split is `memrchr`, the same reason the forward Anthropic walk uses `memchr` — a tail
 with no usage block still has to scan all 64 KiB.
@@ -1836,7 +1836,7 @@ its `usage` block parsed by the wrong dialect's parser. Because both parsers' fi
 zero-usage response. `openai_body`/`openai_stream` and `anthropic_body`/`anthropic_stream` now check
 for the _other_ dialect's characteristic field names (Anthropic's `input_tokens`/`output_tokens` vs
 OpenAI's `prompt_tokens`/`completion_tokens`) before accepting a parse, and return `None` on a match —
-tripping `usage_parse_errors_total` (see Metrics) instead of a silent zero-billing row. A non-stream
+tripping `ai_usage_parse_errors_total` (see Metrics) instead of a silent zero-billing row. A non-stream
 Responses body (`/v1/responses`, `/v1/responses/compact`) uses Anthropic's key names too; its
 `total_tokens`, which Anthropic never sends, is what tells it apart. Before that check, every
 non-stream `/v1/responses` call billed zero.
@@ -2426,10 +2426,10 @@ The namespace is the gateway's. Any `x-beyond-*` header on the upstream response
 the gateway adds its own, so a provider (or anything between us and it) cannot tell the client who
 served a request or that it was a cache replay.
 
-Cost is deliberately **not** returned. The gateway never prices a request (see "Why the catalog has
-a list price and the request does not"): the billed amount is decided downstream and can differ
-from list price, so a gateway-computed figure could disagree with the invoice. A per-request cost
-lookup belongs to the control plane, keyed by `x-beyond-request-id`. The provider header value is
+Cost is deliberately **not** returned. The gateway prices the row in `logging` (see "The price
+(authoritative)"), after the response head has gone and, on a stream, once the final usage is in,
+so no response header could carry it. A per-request cost lookup belongs to the control plane,
+keyed by `x-beyond-request-id`. The provider header value is
 precomputed per provider at boot (`Provider::name_header`), so it is a refcount bump per response.
 
 ### Capture is a tap, not a buffer
@@ -2714,7 +2714,7 @@ to ever close.
 ### Why rate guardrails sit before Ed25519 verify
 
 Ed25519 verify is ~26µs — roughly 300–1000× more expensive than every other **always-on**
-per-request operation (deny, allowance, rank, the rate-limit check). A flood of forged `bai_v1`
+per-request operation (deny, allowance, the pin, the rate-limit check). A flood of forged `bai_v1`
 tokens could drive unbounded crypto work if the rate limit came after verify. By checking the
 per-credential bucket first (keyed on the raw token, no crypto), a forged-key flood is rejected in
 tens of nanoseconds per request. Legit traffic is unaffected: the rate guard passes through, then
@@ -2800,7 +2800,8 @@ key.** AWS now serves Claude on the same `/anthropic/v1/messages` wire Anthropic
 `https://bedrock-runtime.{region}.amazonaws.com/anthropic/v1/messages`, authenticated with
 `x-api-key: $AWS_BEARER_TOKEN_BEDROCK` (see the Messages API and API-keys docs). That is exactly a
 data row: static host (default `us-east-1`, overridable), Anthropic dialect, `XApiKey` scheme, pool
-key from `AI_POOL_KEY_BEDROCK` / `AWS_BEARER_TOKEN_BEDROCK`. The catalog puts it second on the
+key from `AI_POOL_KEY_BEDROCK` (an `AWS_BEARER_TOKEN_BEDROCK` value; the gateway does not read
+that variable itself). The catalog puts it second on the
 Claude rows whose Bedrock inference-profile ids were live-verified (`claude-haiku-4-5`,
 `claude-haiku-5-5`, `claude-opus-4-8`), so a 5xx from `api.anthropic.com` on those models fails over to a genuinely
 independent supply. Other Claude rows stay Anthropic → OpenRouter until those ids are checked.
@@ -2820,11 +2821,12 @@ built-in. See `config.example.toml`.
 pi's own Codex client (`openai-codex-responses.ts`) defaults `transport` to `"auto"`, which _prefers_ a
 persistent WebSocket connection and only falls back to HTTP+SSE on a connection-limit error or a
 transport failure — pi treats WebSocket as its primary, tested path, not a fallback. Beyond's agent-core
-client only ever speaks HTTP+SSE to Codex (`GatewayClient::send_with_retry`); there is no WebSocket
-transport at all.
+client now does the same (`agent-core/src/codex_websocket.rs`, on by default via
+`GatewayClient::with_codex_websocket`), but through this gateway the attempt ends at the gateway: a
+managed `Upgrade` request is a 400, and the client falls back to HTTP+SSE (`send_with_retry`).
 
-This was evaluated and deliberately deferred, not overlooked. Two independent reasons, either one
-sufficient on its own:
+Relaying it was evaluated and deliberately deferred, not overlooked. Two independent reasons, either
+one sufficient on its own (the first was since paid on the client):
 
 - **Client-side**: pi's WebSocket path is a substantial subsystem (~1000+ lines in
   `openai-codex-responses.ts` alone) — per-session connection caching and reuse, reconnect/continuation
@@ -2842,9 +2844,8 @@ sufficient on its own:
   to `chatgpt.com`'s WebSocket endpoint), sidestepping this gateway's pooling, metering, and rate-limiting
   for that traffic, which is a real behavior change beyond just "add a transport option."
 
-Net: HTTP+SSE is a real, working, tested path (pi's own fallback, not a hack), and building the
-WebSocket path properly requires both a nontrivial client-side subsystem and a gateway-side proxying
-capability that doesn't exist. Revisit if Codex's HTTP+SSE path is ever observed to hit the
+Net: HTTP+SSE is a real, working, tested path (pi's own fallback, not a hack), and relaying the
+WebSocket path properly requires a gateway-side proxying capability that doesn't exist. Revisit if Codex's HTTP+SSE path is ever observed to hit the
 connection-limit ceiling pi's WebSocket path exists to avoid.
 
 ### Status-based failover, and where it stops
@@ -3248,7 +3249,8 @@ to serve.
   name, which is what was actually asked for. Header still wins.
 - **Which pool key a model-routed request draws on.** The header or body selects the catalog row,
   and there is no per-tenant entitlement check on rows — any managed tenant can route to any row. Not
-  price-gameable (billing uses the id the provider echoes back), but worth knowing before rows are
+  price-gameable (the row is priced pass-through, on the serving host's card for the row it routed
+  on), but worth knowing before rows are
   added whose pool keys differ in cost or contract.
 - Provider response content — relayed byte-for-byte on a same-endpoint walk (a managed error:
   verbatim except provider-account remedies, below); Chat Completions ↔
@@ -3363,7 +3365,7 @@ there is a boot failure). Scalar fields are also overridable by `AI_`-prefixed e
 …), pool, signing and id signing keys by `AI_POOL_KEY_<NAME>` / `AI_SIGNING_KEY_<KID>` /
 `AI_ID_SIGNING_KEY_<KID>`; the provider map fields
 (`provider_authorities.*`, `provider_dialects.*`, `provider_auth_schemes.*`) are file-only.
-Secret-bearing fields (`pool_keys`, `nats_creds`) are held as `Secret<T>` — stray `Debug` or
+Secret-bearing fields (`pool_keys`, `id_signing_keys`, `nats_creds`) are held as `Secret<T>` — stray `Debug` or
 `Serialize` output redacts to `"***"` and the value is zeroized on drop (`secret.rs`). The
 pool key's precomputed `HeaderValue` is marked sensitive, so HPACK never indexes it and its `Debug`
 prints `Sensitive`. Booting with pool keys and `upstream_tls = false` logs a loud warning: every
@@ -3530,7 +3532,7 @@ already gone gets nothing, and a response that has started cannot be replaced.
 | Provider throttles (429 storm)                                                             | Walk the next unused pool key on the same provider when the body is replayable; the last 429 is relayed with `Retry-After` if the upstream sent one. Does **not** trip the breaker (provider is healthy). Does **not** fail over to another vendor.                                                                                                                                                                                                                                                                                                                                                                                                                                                                | Client `Retry-After` backoff after keys are exhausted; no gateway-side circuit action.                                                                                                                                                                                                                                   |
 | Pool key out of credit (a credit-balance 400, `insufficient_quota`)                        | Relayed with a neutral message (the head is relayed before the body says why), the key cooled off for 60s (`ai_key_auth_failures_total{reason="unfunded"}`); a catalog walk leaves the provider out while all its keys cool, so later requests go to the row's next candidate (D180). A `402` a catalog walk fails over on is served by the next candidate and cools the key at the head (D258); OpenRouter's cools it on the third in a row with no 2xx between (D261). Not a breaker failure.                                                                                                                                                                                                                    | Fund the account or replace the key; the warn line `pool key is out of credit` names provider and key index.                                                                                                                                                                                                             |
 | Pool key revoked (401)                                                                     | Walk the next pool key on the same provider when the body is replayable, and cool the refused key off for 60s so later requests start on a good one (`ai_key_auth_failures_total{reason="revoked"}`; a 403 naming the key counts as `key_named_403`). The last key's 401 is relayed on a provider route, a candidate failure on a catalog walk. A 403 never walks or cools (a catalog walk fails over on it), except that one whose body names the key cools it. Not a breaker failure.                                                                                                                                                                                                                            | Replace the key in config; the metric says which provider (log line names the key index).                                                                                                                                                                                                                                |
-| Response body > 128KB before usage chunk                                                   | Tail compaction fires: `drain(..half)` discards first half, keeps tail. Usage extracted from retained tail.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        | No action — SSE usage is always in the final `data:` line, which always lands in the tail.                                                                                                                                                                                                                               |
+| Response body > 64 KiB before usage chunk                                                  | The usage tail (`UsageTail`) becomes a 64 KiB ring (`USAGE_TAIL_CAP`): older bytes are overwritten, each byte copied once. Usage extracted from the retained tail.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 | No action — SSE usage is always in the final `data:` line, which always lands in the tail.                                                                                                                                                                                                                               |
 | Client cancels mid-request (ESC on a slow turn)                                            | Relayed as a downstream abort. **Not** counted against the provider's breaker — pingora tags it `ErrorSource::Downstream`. A streaming 2xx cut short this way is billed an estimate (`usage_estimated=true`), not zero. The tenant slot is released.                                                                                                                                                                                                                                                                                                                                                                                                                                                               | None. `tests/cancellation.rs` pins the breaker halves; `tests/cut_short.rs` the billing.                                                                                                                                                                                                                                 |
 | Retry replays a partially-read request body                                                | `upstream_peer` resets the body-phase state each attempt, so the replayed prefix replaces rather than appends. Previously it was appended, producing a duplicated JSON fragment the provider rejected with a `400` that `logging` recorded as a breaker _success_.                                                                                                                                                                                                                                                                                                                                                                                                                                                 | None — the reset is unconditional and O(1) on the first attempt.                                                                                                                                                                                                                                                         |
 | Provider drops the connection without answering                                            | Before the whole body went out (a reset mid-upload, a failed write): a catalog walk fails over to the next candidate, any body size (a reused connection first gets one more try on the same candidate). After it went out: not resent anywhere, reused connection or not (it may be generating and billing); a JSON 502, or 504 on a timeout. Except an H2 stream the provider refused (REFUSED_STREAM, or above a GOAWAY's last stream id), or a reused H1 connection reset before any response byte: resent once on a fresh connection, since it was not processed (a GOAWAY on a connection it found open does not count); refused again, a provider failure (failover, or a 502 saying it was not processed). | Client retry, which is a fresh request. `tests/reliability_large_body.rs` pins both halves for small and large bodies.                                                                                                                                                                                                   |
@@ -3552,8 +3554,9 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
 | `ai_requests_total`                   | Counter   | —                    | Every client request received, rejected ones included (a `FullBody` re-run is not counted again)                                                                                                                           |
 | `ai_rejections_total`                 | Counter   | `reason`             | Rejected requests by cause (auth, deny_spend, quota, allowance_unavailable, deny_fraud, rate_limit, tenant_concurrency, managed_endpoint, duplicate_model, modality, request_deadline, unpriced_feature, etc.)             |
 | `ai_upstream_responses_total`         | Counter   | `provider`, `status` | Upstream responses by provider and status class                                                                                                                                                                            |
+| `ai_connect_retries_total`            | Counter   | `provider`           | Upstream connect retries by provider (on a catalog walk, labelled with the candidate left behind)                                                                                                                          |
 | `ai_tokens_total`                     | Counter   | `kind`               | input / output / cache_read / cache_write token counts                                                                                                                                                                     |
-| `ai_ttft_seconds`                     | Histogram | `provider`           | Time to first token (50ms–30s buckets)                                                                                                                                                                                     |
+| `ai_ttft_seconds`                     | Histogram | `provider`           | Time to first byte from upstream (50ms–30s buckets)                                                                                                                                                                        |
 | `ai_upstream_latency_seconds`         | Histogram | `provider`           | Full request latency (100ms–600s buckets)                                                                                                                                                                                  |
 | `ai_active_streams`                   | Gauge     | —                    | Open SSE streams                                                                                                                                                                                                           |
 | `ai_requests_in_flight`               | Gauge     | —                    | All in-flight requests (streaming + non-streaming)                                                                                                                                                                         |
@@ -3589,37 +3592,42 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
 
 ## Modules
 
-| Module            | Role                                                                                                                                                               | Tested         |
-| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------- |
-| `proxy`           | `ProxyHttp` impl — request/response pipeline (request_filter through logging)                                                                                      | e2e ✓          |
-| `key`             | `bai_v1` parse + Ed25519 verify + mint; keyring with multi-kid rotation support                                                                                    | unit ✓         |
-| `route`           | Data-driven provider table (name / authority / auth) + dialect default + model-route re-exports                                                                    | unit ✓         |
-| `peek`            | `ModelScanner` — streaming structural scan for the root-level `model`; O(1) memory                                                                                 | unit ✓         |
-| `usage`           | Token extraction (OpenAI / Anthropic, body + SSE)                                                                                                                  | unit ✓         |
-| `terminal`        | Whether the bytes sent to a client end with the stream's terminal event (`[DONE]`, `message_stop`, `response.completed`)                                           | unit ✓ + e2e ✓ |
-| `deny`            | Sparse deny-set, default-allow, reason → HTTP status                                                                                                               | unit ✓         |
-| `allowance`       | Sparse remaining-ok / exhausted set; fail-closed until seeded (503); 402 when exhausted                                                                            | unit ✓ + e2e ✓ |
-| `capture`         | Sparse capture-set (default-off) + head-bounded `CaptureBufs` and 1-in-N sampling                                                                                  | unit ✓ + e2e ✓ |
-| `remedy`          | Provider-account remedies in a managed error: the neutral rewrite (D174, D196) and the structured out-of-credit verdict that cools a key (D180, D200)              | unit ✓ + e2e ✓ |
-| `capture_sink`    | Bounded (lines and bytes), lossy writer for `ai.payload` and diagnostics — drops on a full queue so a stalled log sink can't backpressure                          | unit ✓, e2e ✓  |
-| `control`         | `x-beyond-*` header parse/validate; metadata canonicalized and re-serialized; catalog walk permute (`order` / `only` / `split`)                                    | unit ✓ + e2e ✓ |
-| `translate`       | Chat Completions ↔ Messages ↔ Responses mapping for a catalog endpoint mismatch; SSE event-by-event                                                                | unit ✓ + e2e ✓ |
-| `pin`             | Computed session pin: the order of a managed default walk; a pure function of the caller and the row                                                               | unit ✓ + e2e ✓ |
-| `cache`           | Per-pod exact-match response store (TTL + max entries + max bytes/entry); tap, never a buffer; miss does not consult Redis                                         | unit ✓ + e2e ✓ |
-| `concurrency`     | Per-tenant in-flight cap (`tenant_max_in_flight`): sharded, sparse, exact counters; the overspend bound                                                            | unit ✓ + e2e ✓ |
-| `deadline`        | Request deadline clock (`request_max_secs`): a coarse clock a ticker thread advances each second; a per-chunk check is one atomic load                             | unit ✓ + e2e ✓ |
-| `drain`           | Drain-on-cancel: arms pingora's keep-reading-after-a-downstream-error path (cache `Bypass` on a no-op storage) so a cancelled stream settles to the vendor's usage | unit ✓ + e2e ✓ |
-| `ratelimit`       | Two-tier guardrail: per-credential (count-min sketch, fixed memory, no GC) + global BYO (one atomic)                                                               | unit ✓         |
-| `circuit_breaker` | Per-provider lock-free breaker (packed `AtomicU64`, windowed policy) — trips on 5xx/connect, not 429                                                               | unit ✓ + e2e ✓ |
-| `state`           | Keyring + provider registry + watched deny-/allowance-/capture-sets (ArcSwap) + TTL DNS cache (all addresses, serve-stale)                                         | unit ✓         |
-| `store_watch`     | Generic `WatchedSet` driver — gap-free seeding + delta watch, instantiated per set                                                                                 | e2e ✓          |
-| `config`          | Figment config; build keyring; pool keys / authorities by provider name                                                                                            | unit ✓         |
-| `secret`          | Redacting, zeroize-on-drop `Secret<T>` newtype for pool keys and NATS creds                                                                                        | unit ✓         |
-| `signed_id`       | Tenant-bound Responses ids: provider ids HMAC-signed for the tenant out, verified and stripped in; no state                                                        | unit ✓ + e2e ✓ |
-| `admin`           | `ServeHttp` on the metrics listener: `/livez`, `/readyz`, `/metrics`                                                                                               | e2e ✓          |
-| `metrics`         | Prometheus counter/histogram/gauge registration and update helpers                                                                                                 | compile ✓      |
-| `doctor`          | Boot-time diagnostics (`beyond-ai doctor`)                                                                                                                         | compile ✓      |
-| `main`            | CLI (`run` / `doctor`), rustls init, config load, Pingora server + proxy/watchers/admin bootstrap                                                                  | compile ✓      |
+| Module            | Role                                                                                                                                                                           | Tested         |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------- |
+| `proxy`           | `ProxyHttp` impl — request/response pipeline (request_filter through logging)                                                                                                  | e2e ✓          |
+| `key`             | `bai_v1` / `bai_v2` (explicit `key_id`) parse + Ed25519 verify + mint; keyring with multi-kid rotation support                                                                 | unit ✓         |
+| `route`           | Data-driven provider table (name / authority / auth) + dialect default + model-route re-exports                                                                                | unit ✓         |
+| `peek`            | `ModelScanner` — streaming structural scan for the root-level `model`; O(1) memory                                                                                             | unit ✓         |
+| `usage`           | Token extraction (OpenAI / Anthropic, body + SSE)                                                                                                                              | unit ✓         |
+| `usage/vendor`    | Billing facts beyond tokens: `ServerTools` (server-side tool use by kind), served speed and geography, `Upstream` (the vendor's own ids and price); lenient per value          | unit ✓ + e2e ✓ |
+| `usage/tools`     | `ToolTally`: hosted-tool calls in an OpenAI Responses answer, counted chunk by chunk (`memmem` for `_call"` + structural check, bounded carry), since `usage` has none         | unit ✓ + e2e ✓ |
+| `unpriced`        | Managed-request refusal (400, before the body goes upstream) of features a provider bills outside metered usage (`code_interpreter`, `image_generation`, …); BYO never checked | unit ✓ + e2e ✓ |
+| `terminal`        | Whether the bytes sent to a client end with the stream's terminal event (`[DONE]`, `message_stop`, `response.completed`)                                                       | unit ✓ + e2e ✓ |
+| `deny`            | Sparse deny-set, default-allow, reason → HTTP status                                                                                                                           | unit ✓         |
+| `allowance`       | Sparse remaining-ok / exhausted set; fail-closed until seeded (503); 402 when exhausted                                                                                        | unit ✓ + e2e ✓ |
+| `capture`         | Sparse capture-set (default-off) + head-bounded `CaptureBufs` and 1-in-N sampling                                                                                              | unit ✓ + e2e ✓ |
+| `remedy`          | Provider-account remedies in a managed error: the neutral rewrite (D174, D196) and the structured out-of-credit verdict that cools a key (D180, D200)                          | unit ✓ + e2e ✓ |
+| `capture_sink`    | Bounded (lines and bytes), lossy writer for `ai.payload` and diagnostics — drops on a full queue so a stalled log sink can't backpressure                                      | unit ✓, e2e ✓  |
+| `control`         | `x-beyond-*` header parse/validate; metadata canonicalized and re-serialized; catalog walk permute (`order` / `only` / `split`)                                                | unit ✓ + e2e ✓ |
+| `translate`       | Chat Completions ↔ Messages ↔ Responses mapping for a catalog endpoint mismatch; SSE event-by-event                                                                            | unit ✓ + e2e ✓ |
+| `pin`             | Computed session pin: the order of a managed default walk; a pure function of the caller and the row                                                                           | unit ✓ + e2e ✓ |
+| `cache`           | Per-pod exact-match response store (TTL + max entries + max bytes/entry); tap, never a buffer; miss does not consult Redis                                                     | unit ✓ + e2e ✓ |
+| `concurrency`     | Per-tenant in-flight cap (`tenant_max_in_flight`): sharded, sparse, exact counters; the overspend bound                                                                        | unit ✓ + e2e ✓ |
+| `deadline`        | Request deadline clock (`request_max_secs`): a coarse clock a ticker thread advances each second; a per-chunk check is one atomic load                                         | unit ✓ + e2e ✓ |
+| `drain`           | Drain-on-cancel: arms pingora's keep-reading-after-a-downstream-error path (cache `Bypass` on a no-op storage) so a cancelled stream settles to the vendor's usage             | unit ✓ + e2e ✓ |
+| `ratelimit`       | Two-tier guardrail: per-credential (count-min sketch, fixed memory, no GC) + global BYO (one atomic)                                                                           | unit ✓         |
+| `circuit_breaker` | Per-provider lock-free breaker (packed `AtomicU64`, windowed policy) — trips on 5xx/connect, not 429                                                                           | unit ✓ + e2e ✓ |
+| `state`           | Keyring + provider registry + watched deny-/allowance-/capture-sets (ArcSwap) + TTL DNS cache (all addresses, serve-stale)                                                     | unit ✓         |
+| `store_watch`     | Generic `WatchedSet` driver — gap-free seeding + delta watch, instantiated per set                                                                                             | unit ✓ + e2e ✓ |
+| `config`          | Figment config; build keyring; pool keys / authorities by provider name                                                                                                        | unit ✓         |
+| `secret`          | Redacting, zeroize-on-drop `Secret<T>` newtype for pool keys and NATS creds                                                                                                    | unit ✓         |
+| `signed_id`       | Tenant-bound Responses ids: provider ids HMAC-signed for the tenant out, verified and stripped in; no state                                                                    | unit ✓ + e2e ✓ |
+| `admin`           | `ServeHttp` on the metrics listener: `/livez`, `/readyz`, `/metrics`                                                                                                           | unit ✓ + e2e ✓ |
+| `metrics`         | Prometheus counter/histogram/gauge registration and update helpers                                                                                                             | unit ✓         |
+| `doctor`          | Boot-time diagnostics (`beyond-ai doctor`)                                                                                                                                     | unit ✓         |
+| `error`           | `GatewayError` (`Config` / `Store` / `Dns`) `thiserror` enum and `Result` alias                                                                                                | compile ✓      |
+| `lib`             | Library root: declares the modules `main` wires into the Pingora service; test-only clippy allowances                                                                          | compile ✓      |
+| `main`            | CLI (`run` / `doctor`), rustls init, config load, Pingora server + proxy/watchers/admin bootstrap                                                                              | compile ✓      |
 
 ---
 
@@ -3683,8 +3691,8 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
   Error/edge paths: **missing key → 401**, **oversized `Content-Length` →
   413**, **managed key for an unconfigured provider → 503**, **managed 429 key-walk** (two keys,
   first throttled, second serves; one key and an unreplayable body still relay 429 with
-  `Retry-After`; BYO does not walk), **streaming tail compaction** (>128KB
-  before the usage chunk still meters), **deny-set fail-open** (kill NATS → stale set retained,
+  `Retry-After`; BYO does not walk), **streaming tail wrap** (130 KiB, past
+  the 64 KiB usage ring, before the usage chunk still meters), **deny-set fail-open** (kill NATS → stale set retained,
   auth still works), and **on-disk snapshot survival** (blackhole a tenant, restart with NATS down
   → the hold is still enforced from disk).
 - **Model routing (`tests/model_routing.rs`):** the `/auto` route and managed `/v1` catalog walk
@@ -3785,7 +3793,7 @@ gateway's added cost is negligible and bounded** — i.e. it never becomes the c
   | `pin::order`                       | ~130–140ns                          | 0                             | No state, no lock                |
   | `ratelimit::check`                 | ~70ns; ~130–190ns at 16 threads     | 0                             | Fixed-memory, no per-key state   |
   | `ratelimit` rotation               | ~81µs                               | 0                             | Once per window, not per request |
-  | `cache::key` (cache on)            | ~9µs at 64 KiB, ~35µs at 256 KiB    | 0                             | Two SipHash passes, ~7 GB/s      |
+  | `cache::key` (cache on)            | ~9µs at 64 KiB, ~35µs at 256 KiB    | 0                             | Two ahash passes, ~7 GB/s        |
   | `ResponseCache::get` hit           | ~130ns; ~450ns median at 16 threads | 4 × 55 B, flat at 64 KiB body | `Bytes` clone, not a body copy   |
   | `translate` request, chat→messages | ~2µs small, ~34µs at 64 KiB         | ~46 allocs (serde DOM, freed) | Once per cross-wire request      |
   | `translate` SSE `text_delta`       | ~1.4µs                              | ~38 allocs / ~6 KiB           | Per event, not per request       |
@@ -3797,7 +3805,7 @@ gateway's added cost is negligible and bounded** — i.e. it never becomes the c
   Fastest sample from one full `divan` run. Ratios against `key/verify` on that run are the claim;
   absolute µs move with the host.
 
-  **Headline: on the always-on path, `key/verify` ≈ 26µs is still ~100–1000× deny, allowance, rank,
+  **Headline: on the always-on path, `key/verify` ≈ 26µs is still ~100–1000× deny, allowance, the pin,
   and the rate-limit check.** That is why the rate guardrail sits before verify in
   `proxy::request_filter`. Cross-wire translate and an enabled response-cache fingerprint are the
   exceptions, and both are off the path a same-wire request with the default config pays. The SSE

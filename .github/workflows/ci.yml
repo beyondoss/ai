@@ -50,6 +50,9 @@ jobs:
       - run: rustup component add rustfmt
       - run: mise check:fmt
       - run: cargo fmt --all --check
+      # Every crate's ARCHITECTURE.md module table names every one of its src files, so a new module
+      # cannot land undocumented and the table cannot silently read as complete. No build; stdlib only.
+      - run: mise check:module-tables
   clippy:
     name: clippy
     runs-on: ubuntu-latest
