@@ -1004,7 +1004,13 @@ impl Agent {
             // A pending mid-run tool-set switch (`Steering::request_tool_set`, pi's `setTools`/
             // `setActiveTools` equivalent, Task #13) is applied at this same turn boundary, before the
             // next request is built — so it takes effect starting the very next turn, never mid-turn.
-            if let Some(new_tools) = steering.take_tool_switch() {
+            // A host's tool source (`Steering::set_tool_source`) is asked at the same boundary when
+            // no explicit switch is pending: its tools changed underneath the run (an MCP server
+            // re-listed its own), and the next request should offer what exists now.
+            if let Some(new_tools) = steering
+                .take_tool_switch()
+                .or_else(|| steering.pull_tool_source(&current_tools))
+            {
                 current_tool_defs = new_tools.definitions().into();
                 current_deferred_defs = new_tools.deferred_definitions().into();
                 current_tools = new_tools;

@@ -71,6 +71,7 @@ async fn a_killed_server_is_redialed_on_the_next_call() {
     assert!(warnings.is_empty(), "{warnings:?}");
     let tool = |name: &str| {
         tools
+            .snapshot()
             .iter()
             .find(|t| t.name() == name)
             .unwrap_or_else(|| panic!("{name} not advertised"))

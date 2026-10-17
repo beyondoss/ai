@@ -19,11 +19,17 @@
 //! it, so a stale manifest cannot outlive the server it described.
 //!
 //! What the key deliberately does *not* cover is a server whose tool list changes without its
-//! invocation changing — a server that advertises different tools on different days. That is why a
-//! mismatch is repaired rather than trusted blindly: the first real `tools/call` connects, and if the
-//! tool it is calling is gone the call fails loudly with the server's own error, which is exactly
-//! what would have happened without a cache. The cache can make the agent advertise a tool that no
-//! longer exists; it cannot make a call silently do the wrong thing.
+//! invocation changing — an unpinned `npx -y some-server` that upgraded itself, or a server that
+//! adds tools as it is used. So the manifest is only ever a hint for boot, and the live server is the
+//! authority whenever there is one: each time a server's process actually starts (its first call
+//! after a cache-hit boot, or a redial after a reap or a crash) its `tools/list` is read again and
+//! compared with what is advertised, and so is every `notifications/tools/list_changed` it sends. A
+//! listing that differs replaces the advertised tools and is written back here ([`store_tools`]); one
+//! that matches changes nothing, not even the file.
+//!
+//! The comparison is the listing itself, not the server's reported version: a version string can
+//! stay put while the tools change (a dev build, a feature flag), and the listing is what the model
+//! is shown. It costs one `tools/list` per server start, which is noise beside the start.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -277,6 +283,27 @@ pub async fn store_skills(
     .await;
 }
 
+/// Replace only the tools in `config`'s cached manifest, when they differ from `tools` — for a
+/// server re-listed after connect (a `notifications/tools/list_changed`, or a start that found a
+/// different listing than the cache had). Without a manifest already recorded for this exact
+/// invocation there is nothing to amend (the cache is off for it, or its skills listing is private):
+/// the next live connect writes a whole one. Best-effort, like [`store`].
+pub async fn store_tools(dir: &ManifestDir, config: &McpServerConfig, tools: Vec<CachedTool>) {
+    let key = invocation_key(config);
+    let name = config.name.clone();
+    update_store_off_runtime(dir, move |all| {
+        let Some(manifest) = all.get_mut(&name).filter(|m| m.key == key) else {
+            return false;
+        };
+        if manifest.tools == tools {
+            return false;
+        }
+        manifest.tools = tools;
+        true
+    })
+    .await;
+}
+
 /// Record what `config`'s server advertises. Best-effort: a cache that cannot be written costs a
 /// server spawn on the next boot, which is the behavior without it.
 pub async fn store(
@@ -405,6 +432,61 @@ mod tests {
             leftovers.is_empty(),
             "no temporary file is left: {leftovers:?}"
         );
+    }
+
+    /// A re-listing amends only the tools of the entry recorded for this exact invocation, and a
+    /// listing that matches writes nothing at all.
+    #[test]
+    fn store_tools_amends_a_matching_entry_and_only_when_it_differs() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = ManifestDir::at(dir.path());
+        let config = stdio("s", "npx", &["server"]);
+        let tool = |name: &str| CachedTool {
+            remote_name: name.into(),
+            description: String::new(),
+            input_schema: serde_json::json!({ "type": "object" }),
+            ui: None,
+        };
+        let prompt = CachedPrompt {
+            name: "p".into(),
+            description: String::new(),
+            input_schema: serde_json::json!({ "type": "object" }),
+        };
+        // Nothing recorded: nothing to amend.
+        block_on(store_tools(&manifest, &config, vec![tool("a")]));
+        assert!(load(&manifest, &config).is_none());
+
+        block_on(store(
+            &manifest,
+            &config,
+            vec![tool("a")],
+            vec![],
+            vec![prompt.clone()],
+            None,
+            vec![],
+        ));
+        block_on(store_tools(&manifest, &config, vec![tool("a"), tool("b")]));
+        let amended = load(&manifest, &config).unwrap();
+        assert_eq!(amended.tools, [tool("a"), tool("b")]);
+        assert_eq!(amended.prompts, [prompt], "the rest of the entry is kept");
+
+        // The same listing again: the file is not rewritten.
+        let before = std::fs::metadata(dir.path().join(FILE))
+            .unwrap()
+            .modified()
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        block_on(store_tools(&manifest, &config, vec![tool("a"), tool("b")]));
+        let after = std::fs::metadata(dir.path().join(FILE))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_eq!(before, after);
+
+        // Another invocation of the same server name is not this entry.
+        let other = stdio("s", "npx", &["server@2"]);
+        block_on(store_tools(&manifest, &other, vec![tool("c")]));
+        assert_eq!(load(&manifest, &config).unwrap().tools.len(), 2);
     }
 
     /// A write that panics is reported at warn — not discarded — and leaves the cache untouched.

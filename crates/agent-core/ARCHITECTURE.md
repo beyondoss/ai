@@ -111,7 +111,12 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
   very next turn, never mid-turn. A `ToolsUpdated { tool_names }` event fires when it's applied — pi's
   own `setActiveToolsByName` has no discrete event of its own; this is this crate's own addition for a
   streaming client to observe the change. Before this, the tool set really was fixed for the whole run,
-  not just the `Agent`'s own configured baseline.
+  not just the `Agent`'s own configured baseline. The pull counterpart is
+  `Steering::set_tool_source(source)`: a host callback handed the run's current registry at every turn
+  boundary (the first included) when no explicit switch is pending, answering with a replacement only
+  when the host's tools changed underneath the run — how an MCP server's re-listed tools reach a run
+  already in flight without the host having to push at the right moment. Applied, it fires the same
+  `ToolsUpdated`.
 - **Per-turn system prompt** — `Agent::with_system_fn(|| String)` installs a callback re-evaluated
   fresh every turn, at the same point the static `with_system` string would otherwise be read — takes
   priority over `with_system` when both are set (mirrors pi's function-valued `systemPrompt`,

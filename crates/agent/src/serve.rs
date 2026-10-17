@@ -480,8 +480,8 @@ impl std::str::FromStr for UpstreamHttp2 {
 /// Options for the headless server (mirrors `run`, plus persistence).
 ///
 /// `Clone` so a WebSocket supervisor ([`crate::serve_ws`]) can hand each per-session task its own
-/// copy with a distinct [`Self::session_id`] pinned in — `mcp_tools` clones the `Arc`s (shared live
-/// connections), `shared_http` clones the daemon-wide pool, every other field is a plain owned value.
+/// copy with a distinct [`Self::session_id`] pinned in — `mcp_tools` clones the `Arc` (one live tool
+/// set and its connections, shared), `shared_http` clones the daemon-wide pool, every other field is a plain owned value.
 /// Tenant-private state (credentials on the per-session [`GatewayClient`], transcript, `/session`
 /// memory, persistence, tools/`ExecCell`, approvals) is **not** in this struct; each `serve_session`
 /// task builds those itself.
@@ -698,9 +698,11 @@ pub struct ServeConfig {
     /// constructed — connecting is inherently async and this struct is a plain, synchronous value.
     /// `build_tools` merges these into every registry rebuild (`set_model`/`set_thinking`/...) without
     /// reconnecting to any server: the live connection (and its spawned child process, for a stdio
-    /// server) lives as long as this `Vec`'s `Arc<dyn Tool>` entries do, i.e. for the whole `serve`
-    /// session.
-    pub mcp_tools: Vec<Arc<dyn agent_core::Tool>>,
+    /// server) lives as long as the set's `Arc<dyn Tool>` entries do, i.e. for the whole `serve`
+    /// session. Live: a server that changes its tools (`notifications/tools/list_changed`, or a start
+    /// that lists something new) changes this set, and every session picks the change up — mid-run
+    /// through the loop's tool source, and by an agent rebuild before the next `prompt`.
+    pub mcp_tools: crate::tools::mcp::McpTools,
     /// Catalog of connected MCP servers (resources/prompts metadata + live handles for
     /// `mcp_complete`). Built alongside `mcp_tools` by `connect_all`.
     pub mcp_catalog: crate::tools::mcp::McpCatalog,
@@ -3510,6 +3512,18 @@ pub(crate) async fn serve_session(
     // The pool generation this session's agent was last built against (`None`: not declared). A
     // prompt rebuilds when it moved — an apps dial landed, or went into backoff.
     let mut apps_generation: Option<u64> = None;
+    // The MCP tool set's generation this session's agent was last built against. A prompt rebuilds
+    // when it moved (a server re-listed its tools); a run already in flight picks the change up
+    // through the tool source each prompt installs (`tools::mcp::tool_source`). Read before the first
+    // build, so a change racing it is rebuilt for rather than missed.
+    let mut mcp_tools_generation = cfg.mcp_tools.generation();
+    let mcp_filter = crate::tools::McpFilter {
+        loading: cfg.mcp_loading,
+        tools: cfg.tools.clone(),
+        exclude: cfg.exclude_tools.clone(),
+        no_tools: cfg.no_tools,
+        code_mode: cfg.code_mode,
+    };
     // `mcp_app_request` proxies a view's call to its server, which may take as long as any tool
     // call. Spawned, so neither command loop (busy or idle) waits on it.
     macro_rules! spawn_app_request {
@@ -5027,8 +5041,11 @@ pub(crate) async fn serve_session(
                 // The session's MCP Apps connections moved since the agent was built (an apps dial
                 // landed, or went into backoff): rebuild, so this turn advertises what is up now.
                 let apps_generation_now = mcp_enabled.apps().map(|view| view.generation());
-                if apps_generation_now != apps_generation {
+                // Likewise a server re-listed its tools since then.
+                let mcp_tools_now = cfg.mcp_tools.generation();
+                if apps_generation_now != apps_generation || mcp_tools_now != mcp_tools_generation {
                     apps_generation = apps_generation_now;
+                    mcp_tools_generation = mcp_tools_now;
                     agent = build_agent(
                         &exec_cell,
                         client.clone(),
@@ -5052,6 +5069,13 @@ pub(crate) async fn serve_session(
                         &skills,
                     );
                 }
+                // And one that changes them during this run reaches it at the next turn boundary.
+                steering.set_tool_source(Some(crate::tools::mcp::tool_source(
+                    cfg.mcp_tools.clone(),
+                    mcp_enabled.clone(),
+                    mcp_tools_generation,
+                    mcp_filter.clone(),
+                )));
                 agent.set_system(full_system(&static_system, &cwd, &mcp_skills));
                 // A `prompt` with no (or non-string) `message` is a malformed command: running an
                 // empty user turn would spend a model call on nothing and still report success.
@@ -6409,7 +6433,8 @@ pub(crate) async fn serve_session(
                 //
                 // Unknown names are rejected so a typo cannot silently empty the kit. Takes effect on
                 // the next model turn via an `Agent` rebuild (idle) — same shape as `set_model`.
-                let configured = crate::tools::mcp::server_names_from_tools(&cfg.mcp_tools);
+                let configured =
+                    crate::tools::mcp::server_names_from_tools(&cfg.mcp_tools.snapshot());
                 let outcome = match cmd.get("servers") {
                     None | Some(Value::Null) => {
                         mcp_enabled.set(None);
@@ -6492,7 +6517,8 @@ pub(crate) async fn serve_session(
                 }
             }
             "get_mcp" => {
-                let configured = crate::tools::mcp::server_names_from_tools(&cfg.mcp_tools);
+                let configured =
+                    crate::tools::mcp::server_names_from_tools(&cfg.mcp_tools.snapshot());
                 let snapshot = mcp_enabled.snapshot();
                 let (mode, enabled) = match &snapshot {
                     None => ("all".to_string(), configured.clone()),
@@ -9719,7 +9745,7 @@ fn build_tools(
     // model sees, MCP-discovered tools included (e.g. excluding a misbehaving MCP tool by name), not
     // just the built-ins. Session-scoped [`McpEnabledSet`] further drops tools from disabled servers
     // before that merge — kit shaping without reconnecting.
-    let mcp_tools = crate::tools::mcp::filter_by_enabled(&cfg.mcp_tools, mcp_enabled);
+    let mcp_tools = crate::tools::mcp::filter_by_enabled(&cfg.mcp_tools.snapshot(), mcp_enabled);
     let empty: &[String] = &[];
     let nested_exclude = cfg.exclude_tools.as_deref().unwrap_or(empty);
     let mut registry = tools::default_registry_with_config(&tools::ToolConfig {

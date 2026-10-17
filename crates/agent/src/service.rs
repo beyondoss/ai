@@ -498,11 +498,16 @@ impl ServiceSession {
         egress: Option<&crate::tools::mcp::McpEgress>,
         host: Arc<crate::tools::mcp_host::McpHost>,
     ) -> (
-        Vec<Arc<dyn agent_core::Tool>>,
+        crate::tools::mcp::McpTools,
         crate::tools::mcp::McpCatalog,
         Vec<String>,
     ) {
-        let empty = || (Vec::new(), crate::tools::mcp::McpCatalog::default());
+        let empty = || {
+            (
+                crate::tools::mcp::McpTools::default(),
+                crate::tools::mcp::McpCatalog::default(),
+            )
+        };
         if self.grant.mcp.is_empty() {
             let (tools, catalog) = empty();
             return (tools, catalog, Vec::new());
