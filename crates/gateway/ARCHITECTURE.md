@@ -313,6 +313,15 @@ key). A BYO `x-api-key` on a gateway with no Anthropic provider configured is a 
 call. A lookalike like Google Gemini's `/v1beta/…` does **not** qualify and 404s as an
 unknown provider instead of being silently absorbed into the OpenAI default. Unknown segment → 404.
 
+In `request_filter` the first segment resolves to a `Route` (`/{provider}`, the bare default, or
+`/auto`) or a `RouteMiss` (each its own 4xx). Once the key is known the route becomes one `Plan`,
+kept whole through admission: `Plan::Provider` (a named provider, or BYO on the bare default) or
+`Plan::Catalog(Walk)` (a managed walk over a resolved row, holding its `Identity` and, for a body
+past the replay buffer, the body its `FullBody` re-run carries). A managed walk still to read its
+row from `x-beyond-model` or the body is `Admission::NeedsRow` until it does. Which route a request
+is on is never re-derived from which locals happen to be set, so a BYO catalog walk, or a walk with
+no first candidate, cannot arise to need a fallback answer.
+
 ### Model routing (`/auto`, managed `/v1`, `providers::catalog`)
 
 One reserved first segment — and the managed bare `/v1` default — routes by **model** instead of
@@ -1318,8 +1327,10 @@ the provider:
 - **The upstream path comes from the catalog, per candidate.** Providers disagree on where an
   endpoint lives and the disagreement is _not_ a prefix: Anthropic serves Messages at `/v1/messages`
   from a base carrying no path, OpenRouter serves Claude at `/api/v1/chat/completions`. No client
-  suffix is correct for both, so each candidate states its path outright and `forward_path` is set
-  from it per attempt. The client points its SDK at `/v1` (or `…/auto`) and the row decides.
+  suffix is correct for both, so each candidate states its path outright and the request's
+  `ForwardPath::Catalog` is set from it per attempt (a `/{provider}` route sends
+  `ForwardPath::Stripped`, its own path less the segment; the bare default
+  `ForwardPath::Inbound`). The client points its SDK at `/v1` (or `…/auto`) and the row decides.
 - **The model id is rewritten per attempt.** Providers essentially never share a string —
   `claude-opus-4-8` at Anthropic is `anthropic/claude-opus-4.8` at OpenRouter — so the body's `model`
   is spliced to whatever the serving candidate calls it (`peek::scan_buffered` reports the value's

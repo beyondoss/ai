@@ -418,14 +418,10 @@ pub struct RequestCtx {
     dialect: Dialect,
     /// The provider this attempt goes to, the pool key it sends, and the breaker permit it owes.
     leg: Leg,
-    /// The path (+ query) to send upstream, when it differs from the inbound one: the client path
-    /// with the `/{provider}` segment stripped. Forwarded **verbatim** — the gateway does no
-    /// per-provider path rewriting. Applied as the upstream URI in `upstream_request_filter`.
-    ///
-    /// `None` for the bare-path default, whose path already *is* what the upstream should see. The
-    /// distinction is in the type rather than discovered by rebuilding the path and comparing it,
-    /// so the common route allocates nothing.
-    forward_path: Option<String>,
+    /// The path (+ query) this attempt sends upstream, applied as the upstream URI in
+    /// `upstream_request_filter`. A catalog walk's is set per attempt in `upstream_peer`; before
+    /// its first it is `Inbound`, and nothing reads it until a provider was called.
+    forward_path: ForwardPath,
     /// Model the client *requested*, extracted from the request body. This is the billing-log
     /// **fallback** — the authoritative value is the model the provider echoes in its response (see
     /// `resp_model_scanner`), because a client may send an alias (`gpt-4o`) that the provider resolves
@@ -965,7 +961,7 @@ fn tap_response_head(rc: &mut RequestCtx, resp: &ResponseHeader) {
         Some(a) => catalog_serving_endpoint(a) == Some(route::Endpoint::Responses),
         None => {
             rc.dialect == Dialect::OpenAi
-                && rc.forward_path.as_deref().is_some_and(|p| {
+                && rc.forward_path.as_str().is_some_and(|p| {
                     let p = p.split_once('?').map_or(p, |(path, _)| path);
                     p.ends_with("/responses") || p.ends_with("/responses/compact")
                 })
@@ -1695,10 +1691,16 @@ impl RequestCtx {
     /// providers disagree on where an endpoint lives and the disagreement is not a prefix, so there
     /// is no client suffix that is correct for every candidate in a row. Rewritten in place, so a
     /// failover costs no allocation after the first attempt.
-    fn set_forward_path(&mut self, path: &str) {
-        let buf = self.forward_path.get_or_insert_with(String::new);
-        buf.clear();
-        buf.push_str(path);
+    fn set_forward_path(&mut self, path: &str, sub: Option<route::SubResource>) {
+        let suffix = sub.map_or("", route::SubResource::suffix);
+        match &mut self.forward_path {
+            ForwardPath::Catalog(buf) => {
+                buf.clear();
+                buf.push_str(path);
+                buf.push_str(suffix);
+            }
+            other => *other = ForwardPath::Catalog([path, suffix].concat()),
+        }
     }
 
     /// Clear the state one attempt accumulated, so a **retried** attempt starts from the same slate
@@ -1754,7 +1756,7 @@ impl RequestCtx {
 /// Kept as a table so `reject_bodies_are_valid_json` can walk it and assert each entry parses,
 /// carries the `type` and `message` it claims, and is reachable — a hand-written JSON literal is
 /// exactly the thing that rots silently otherwise.
-pub static REJECT_BODIES: [(&str, &str, &str); 16] = [
+pub static REJECT_BODIES: [(&str, &str, &str); 15] = [
     (
         "invalid_request_error",
         "unknown provider",
@@ -1799,11 +1801,6 @@ pub static REJECT_BODIES: [(&str, &str, &str); 16] = [
         "invalid_request_error",
         "model routing requires a managed key",
         r#"{"error":{"message":"model routing requires a managed key","type":"invalid_request_error"}}"#,
-    ),
-    (
-        "api_error",
-        "no provider available for model",
-        r#"{"error":{"message":"no provider available for model","type":"api_error"}}"#,
     ),
     (
         "insufficient_quota",
@@ -4156,27 +4153,32 @@ fn apply_stream_usage_injection(mut body: Vec<u8>, at: Option<usize>) -> Vec<u8>
     body
 }
 
-/// What the first path segment resolved to.
+/// What the first path segment resolved to, before the key says whether the request may walk the
+/// catalog.
 ///
-/// An enum rather than a wider tuple because the failure shapes need *different* rejections
-/// (404 unknown provider, 404 unknown model, and — later, once identity is known — 400 for a BYO key
-/// on a catalog walk), and a tuple of `Option`s would encode that in which fields happened to be
-/// `None`.
-enum Routed {
+/// Holds only routes that go somewhere: a path that resolves to nothing is a [`RouteMiss`], so no
+/// later step has to wonder whether it is looking at one.
+enum Route {
     /// `/{provider}/…`. The provider is named by the request. Not a catalog walk — the escape hatch.
     Provider {
-        provider: Arc<Provider>,
-        /// Always `Some`: the inbound path with the `/{provider}` segment stripped.
-        forward_path: Option<String>,
+        provider: &'static Arc<Provider>,
+        /// The inbound path with the `/{provider}` segment stripped, query kept.
+        forward_path: String,
     },
     /// Bare `/v1` default. BYO keeps the dialect-picked provider; managed becomes a catalog walk.
-    BareDefault { provider: Arc<Provider> },
+    BareDefault { provider: &'static Arc<Provider> },
     /// `/auto/…`. `header` is the catalog row if `x-beyond-model` resolved; `None` means peek the
-    /// body's root `model` after identity is known. An *unknown* header is [`Routed::UnknownModel`],
+    /// body's root `model` after identity is known. An *unknown* header is [`RouteMiss::UnknownModel`],
     /// not this — the header wins, and a catalog miss is the allowlist.
     Auto {
         header: Option<&'static route::ModelRoute>,
     },
+}
+
+/// A path that resolves to nothing the gateway serves. Each shape gets its own rejection (404
+/// unknown provider, 404 unknown model, 400 ambiguous credential), which is why it is a sum type and
+/// not an `Option`.
+enum RouteMiss {
     /// A routing header (on `/auto`) naming a model we do not serve. Collapsed with a missing body
     /// model into one 404: a value we cannot match is a value we do not serve.
     UnknownModel,
@@ -4184,6 +4186,88 @@ enum Routed {
     UnknownProvider,
     /// Bare `/v1` with BYO keys for two different providers (D82): a 400, never a guess.
     AmbiguousCredential,
+}
+
+/// What `request_filter` decided a request is, once its key is known: carried whole through
+/// admission, so the route is never re-derived from which of several locals happen to be set.
+enum Plan {
+    /// `/{provider}/…`, or a BYO bare `/v1` on its dialect-default provider.
+    Provider {
+        provider: &'static Arc<Provider>,
+        /// [`ForwardPath::Stripped`] on `/{provider}/…`, [`ForwardPath::Inbound`] on the bare
+        /// default.
+        forward: ForwardPath,
+    },
+    /// A managed catalog walk (`/auto`, or a managed bare `/v1`) over a resolved row. Only a
+    /// verified key gets one, so it carries the identity it was admitted on.
+    Catalog(Walk),
+}
+
+/// A request on its way to a [`Plan`] once its key is known: ready, or a managed catalog walk that
+/// still has to read its row from `x-beyond-model` or the body's root `model`.
+enum Admission {
+    Ready(Plan),
+    NeedsRow(Identity),
+}
+
+/// A catalog walk as `request_filter` admits it.
+struct Walk {
+    id: Identity,
+    row: &'static route::ModelRoute,
+    /// The body, read in full, when it outgrew pingora's retry buffer: the request is re-run as a
+    /// [`FullBody`] subrequest carrying it rather than proxied here.
+    relay: Option<Vec<u8>>,
+}
+
+impl Plan {
+    /// The catalog row this request walks; `None` on a provider route.
+    fn row(&self) -> Option<&'static route::ModelRoute> {
+        match self {
+            Plan::Catalog(w) => Some(w.row),
+            Plan::Provider { .. } => None,
+        }
+    }
+
+    /// The forwarded `/{provider}` path (query included), when the client named the provider.
+    fn stripped(&self) -> Option<&str> {
+        match self {
+            Plan::Provider {
+                forward: ForwardPath::Stripped(p),
+                ..
+            } => Some(p),
+            _ => None,
+        }
+    }
+}
+
+/// What path an attempt sends upstream.
+#[derive(Debug)]
+enum ForwardPath {
+    /// The inbound path and query, as the client sent them (the bare `/v1` default). The common
+    /// route builds nothing, so it allocates nothing. On a managed request its `key` params are the
+    /// virtual key, stripped as the head goes out.
+    Inbound,
+    /// The client's path with the `/{provider}` segment stripped, its query kept (minus a managed
+    /// request's `key` params). Forwarded **verbatim** — the gateway does no per-provider path
+    /// rewriting. Built once, so held as a `Box<str>`: beside `Catalog`'s `String` that keeps the
+    /// enum at a `String`'s size.
+    Stripped(Box<str>),
+    /// The serving candidate's own catalog path (plus a sub-resource's suffix), set as each
+    /// attempt dials it; rewritten in place, so a failover allocates nothing after the first.
+    /// Taken wholesale from the catalog rather than composed from a mount and the client's suffix:
+    /// providers disagree on where an endpoint lives and the disagreement is not a prefix.
+    Catalog(String),
+}
+
+impl ForwardPath {
+    /// The path (and query) to set on the upstream request; `None` keeps the inbound one.
+    fn as_str(&self) -> Option<&str> {
+        match self {
+            ForwardPath::Inbound => None,
+            ForwardPath::Stripped(p) => Some(p),
+            ForwardPath::Catalog(p) => Some(p),
+        }
+    }
 }
 
 #[async_trait]
@@ -4281,7 +4365,7 @@ impl ProxyHttp for AiProxy {
         // else → unknown provider (404). We resolve before auth (an unknown route is cheap) and
         // compute owned values inside the block so the session borrow ends before any `&mut session`
         // reject below.
-        let routed = {
+        let route = {
             let req = session.req_header();
             let uri = &req.uri;
             let path = uri.path();
@@ -4289,7 +4373,8 @@ impl ProxyHttp for AiProxy {
             // `nth(1)`: `/openai/v1/…` → "openai"; `/v1/…` → "v1"; "/" or "" → "".
             let first = path.split('/').nth(1).unwrap_or("");
             let with_query = |p: &str| match query {
-                Some(q) => format!("{p}?{q}"),
+                // Sized exactly, so the `Box<str>` it becomes keeps the allocation.
+                Some(q) => [p, "?", q].concat(),
                 None => p.to_string(),
             };
             // A config-added provider written with capitals (`MiniMax`) is served at its name, and at
@@ -4307,10 +4392,10 @@ impl ProxyHttp for AiProxy {
                 // always differs from the inbound path and always needs the URI rewritten.
                 let rest = &path[1 + first.len()..];
                 let rest = if rest.is_empty() { "/" } else { rest };
-                Routed::Provider {
-                    provider: p.clone(),
-                    forward_path: Some(with_query(rest)),
-                }
+                Ok(Route::Provider {
+                    provider: p,
+                    forward_path: with_query(rest),
+                })
             } else if route::is_default_prefix(path) {
                 // Bare default: the BYO credential, else the path's dialect, picks the provider;
                 // managed traffic becomes a catalog walk after identity. Path is forwarded
@@ -4319,15 +4404,13 @@ impl ProxyHttp for AiProxy {
                     // BYO keys for two providers. A managed key anywhere makes the request managed
                     // (every credential location is stripped), so only BYO is ambiguous.
                     Err(()) if !extract_virtual_key(req).is_some_and(|p| p.managed) => {
-                        Routed::AmbiguousCredential
+                        Err(RouteMiss::AmbiguousCredential)
                     }
                     credential => match bare_default_provider_name(path, credential.ok().flatten())
                         .and_then(|name| self.state.provider(name))
                     {
-                        Some(p) => Routed::BareDefault {
-                            provider: p.clone(),
-                        },
-                        None => Routed::UnknownProvider,
+                        Some(p) => Ok(Route::BareDefault { provider: p }),
+                        None => Err(RouteMiss::UnknownProvider),
                     },
                 }
             } else if first == route::AUTO_SEGMENT {
@@ -4338,87 +4421,24 @@ impl ProxyHttp for AiProxy {
                 // *absent* header waits until after identity so a managed caller can put `model` in
                 // the body the way a stock SDK does.
                 match catalog_from_header(session) {
-                    CatalogHeader::Known(route) => Routed::Auto {
+                    CatalogHeader::Known(route) => Ok(Route::Auto {
                         header: Some(route),
-                    },
-                    CatalogHeader::Absent => Routed::Auto { header: None },
-                    CatalogHeader::Unknown => Routed::UnknownModel,
+                    }),
+                    CatalogHeader::Absent => Ok(Route::Auto { header: None }),
+                    CatalogHeader::Unknown => Err(RouteMiss::UnknownModel),
                 }
             } else {
-                Routed::UnknownProvider
+                Err(RouteMiss::UnknownProvider)
             }
         };
 
         // Catalog resolution needs identity: `/auto` is managed-only, a candidate is only usable if
         // we hold a pool key for it, and managed `/v1` peeks the body only after the key is known
-        // (BYO `/v1` stays dialect-default passthrough and must not drain the body). `provider` is
-        // `None` only for headerless `/auto` — there is no dialect default, and BYO 400s before
-        // `RequestCtx` is built.
-        let provider: Option<Arc<Provider>>;
-        let forward_path: Option<String>;
-        let mut model_route: Option<&'static route::ModelRoute>;
-        // Peek the body's root `model` after identity (managed `/v1`, headerless `/auto`).
-        let resolve_from_body: bool;
-        // BYO is 400 — the `/auto` path, with or without a routing header.
-        let managed_only: bool;
-        // Checked against the managed endpoint allowlist once the key is known to be managed.
-        let provider_route = matches!(routed, Routed::Provider { .. });
-        match routed {
-            Routed::Provider {
-                provider: p,
-                forward_path: fp,
-            } => {
-                provider = Some(p);
-                forward_path = fp;
-                model_route = None;
-                resolve_from_body = false;
-                managed_only = false;
-            }
-            Routed::BareDefault { provider: p } => {
-                provider = Some(p);
-                forward_path = None;
-                model_route = None;
-                resolve_from_body = true;
-                managed_only = false;
-            }
-            Routed::Auto {
-                header: Some(route),
-            } => {
-                let first = route
-                    .candidates
-                    .first()
-                    .and_then(|c| self.state.provider_by_id(c.provider).cloned());
-                match first {
-                    Some(p) => {
-                        provider = Some(p);
-                        forward_path = None;
-                        model_route = Some(route);
-                        resolve_from_body = false;
-                        managed_only = true;
-                    }
-                    // Unreachable in practice: `every_catalog_candidate_is_a_known_provider` proves
-                    // every row names a provider the gateway registers. Answer rather than panic.
-                    None => {
-                        self.state.metrics.rejection(Rejection::NoCandidate).inc();
-                        return Self::reject_boxed(
-                            session,
-                            &request_id,
-                            503,
-                            "api_error",
-                            "no provider available for model",
-                        )
-                        .await;
-                    }
-                }
-            }
-            Routed::Auto { header: None } => {
-                provider = None;
-                forward_path = None;
-                model_route = None;
-                resolve_from_body = true;
-                managed_only = true;
-            }
-            Routed::UnknownModel => {
+        // (BYO `/v1` stays dialect-default passthrough and must not drain the body). The route is
+        // kept whole until then, and becomes a [`Plan`] once the key says which it is.
+        let route = match route {
+            Ok(route) => route,
+            Err(RouteMiss::UnknownModel) => {
                 self.state.metrics.rejection(Rejection::UnknownModel).inc();
                 let name = session
                     .req_header()
@@ -4428,7 +4448,7 @@ impl ProxyHttp for AiProxy {
                     .map(str::to_owned);
                 return Self::reject_catalog_miss(session, &request_id, name.as_deref()).await;
             }
-            Routed::UnknownProvider => {
+            Err(RouteMiss::UnknownProvider) => {
                 self.state
                     .metrics
                     .rejection(Rejection::UnknownProvider)
@@ -4442,7 +4462,7 @@ impl ProxyHttp for AiProxy {
                 )
                 .await;
             }
-            Routed::AmbiguousCredential => {
+            Err(RouteMiss::AmbiguousCredential) => {
                 self.state
                     .metrics
                     .rejection(Rejection::AmbiguousCredential)
@@ -4460,7 +4480,7 @@ impl ProxyHttp for AiProxy {
                 )
                 .await;
             }
-        }
+        };
 
         // 2. Extract the presented key — a managed virtual key (`bai_v1…`) or a raw BYO provider token.
         let Some(Presented {
@@ -4613,9 +4633,8 @@ impl ProxyHttp for AiProxy {
             // and the first one lacking a key is a reason to try the next, not to fail the request.
             // The equivalent gate is the usable-candidate check below. Also skipped for managed
             // `/v1` before the body peek — the dialect-default provider is not the allowlist.
-            if model_route.is_none()
-                && !resolve_from_body
-                && !provider.as_ref().is_some_and(|p| p.has_pool_key())
+            if let Route::Provider { provider, .. } = &route
+                && !provider.has_pool_key()
             {
                 self.state.metrics.rejection(Rejection::NoPoolKey).inc();
                 return Self::reject_boxed(
@@ -4632,31 +4651,58 @@ impl ProxyHttp for AiProxy {
             None
         };
         let managed = identity.is_some();
-        // A managed `?key=` is the virtual key: never forward it. Catalog walks already send the
-        // candidate's own path with no query, so only `/{provider}/…` carries one.
-        let forward_path = match forward_path {
-            Some(fp) if managed => Some(strip_key_param(&fp).unwrap_or(fp)),
-            fp => fp,
+        let mut admission = match (route, identity) {
+            // A managed `?key=` is the virtual key: never forward it. Catalog walks send the
+            // candidate's own path with no query, so only `/{provider}/…` carries one.
+            (
+                Route::Provider {
+                    provider,
+                    forward_path,
+                },
+                _,
+            ) => Admission::Ready(Plan::Provider {
+                provider,
+                forward: ForwardPath::Stripped(
+                    match managed {
+                        true => strip_key_param(&forward_path).unwrap_or(forward_path),
+                        false => forward_path,
+                    }
+                    .into_boxed_str(),
+                ),
+            }),
+            (Route::BareDefault { provider }, None) => Admission::Ready(Plan::Provider {
+                provider,
+                forward: ForwardPath::Inbound,
+            }),
+            // Catalog walk is **managed-only**. BYO on `/auto` 400s before any peek — a BYO token
+            // belongs to one vendor, and reading the body to pick among candidates would still be
+            // a guess (and a failover would send that key to a different vendor). BYO on `/v1`
+            // keeps the dialect-default provider (above) and never consults the catalog.
+            (Route::Auto { .. }, None) => {
+                self.state
+                    .metrics
+                    .rejection(Rejection::ByoOnModelRoute)
+                    .inc();
+                return Self::reject_boxed(
+                    session,
+                    &request_id,
+                    400,
+                    "invalid_request_error",
+                    "model routing requires a managed key",
+                )
+                .await;
+            }
+            (Route::Auto { header: Some(row) }, Some(id)) => {
+                Admission::Ready(Plan::Catalog(Walk {
+                    id,
+                    row,
+                    relay: None,
+                }))
+            }
+            (Route::BareDefault { .. } | Route::Auto { header: None }, Some(id)) => {
+                Admission::NeedsRow(id)
+            }
         };
-
-        // Catalog walk is **managed-only**. BYO on `/auto` 400s before any peek — a BYO token
-        // belongs to one vendor, and reading the body to pick among candidates would still be a
-        // guess (and a failover would send that key to a different vendor). BYO on `/v1` does not
-        // enter this block: it keeps the dialect-default provider and never consults the catalog.
-        if !managed && managed_only {
-            self.state
-                .metrics
-                .rejection(Rejection::ByoOnModelRoute)
-                .inc();
-            return Self::reject_boxed(
-                session,
-                &request_id,
-                400,
-                "invalid_request_error",
-                "model routing requires a managed key",
-            )
-            .await;
-        }
 
         // Stock SDKs list models at GET /v1/models. A managed caller is answered here, from the
         // catalog rows this deployment's pool keys can serve (built once at boot), so an empty GET
@@ -4692,11 +4738,14 @@ impl ProxyHttp for AiProxy {
                 .await;
             }
             let method_ok = req.method == http::Method::POST;
-            let endpoint_ok = !provider_route
-                || forward_path
-                    .as_deref()
-                    .map(|p| p.split_once('?').map_or(p, |(path, _)| path))
-                    .is_some_and(is_managed_provider_endpoint);
+            // Only a request that names its provider is held to the allowlist; a catalog walk's
+            // paths are the catalog's own.
+            let endpoint_ok = match &admission {
+                Admission::Ready(plan) => plan.stripped().is_none_or(|p| {
+                    is_managed_provider_endpoint(p.split_once('?').map_or(p, |(path, _)| path))
+                }),
+                Admission::NeedsRow(_) => true,
+            };
             if !(method_ok && endpoint_ok) {
                 let msg = format!(
                     "{} {} is not available with a managed key; managed keys reach POST generation endpoints only (chat/completions, messages, responses, embeddings, count_tokens)",
@@ -4723,8 +4772,19 @@ impl ProxyHttp for AiProxy {
 
         let mut body_complete: Option<Vec<u8>> = None;
         let cache_bypass = !managed || cache::request_bypasses(session.req_header());
+        // A `FullBody` re-run walks the row its parent chose.
         if let Some(fb) = &full_body {
-            model_route = Some(fb.route);
+            admission = match admission {
+                Admission::NeedsRow(id) => Admission::Ready(Plan::Catalog(Walk {
+                    id,
+                    row: fb.route,
+                    relay: None,
+                })),
+                Admission::Ready(Plan::Catalog(w)) => {
+                    Admission::Ready(Plan::Catalog(Walk { row: fb.route, ..w }))
+                }
+                ready => ready,
+            };
         }
         // A headerless catalog walk reads the whole body before choosing a row, rather than
         // stopping at `model`: a large body can only fail over once fully read (see `FullBody`), a
@@ -4737,105 +4797,87 @@ impl ProxyHttp for AiProxy {
         // The tenant slot, taken before any full read so `tenant_max_in_flight` bounds the bodies held
         // in memory and not only the requests in flight; moved into the request context below.
         let mut early_slot: Option<TenantSlot<'static>> = None;
-        if let Some(id) = identity
-            && model_route.is_none()
-            && resolve_from_body
-        {
-            // Header wins if present (unknown → 404, no fall-through to the body). Absent → peek.
-            match catalog_from_header(session) {
-                CatalogHeader::Known(route) => model_route = Some(route),
-                CatalogHeader::Unknown => {
-                    self.state.metrics.rejection(Rejection::UnknownModel).inc();
-                    let name = session
-                        .req_header()
-                        .headers
-                        .get(route::MODEL_HEADER)
-                        .and_then(|v| v.to_str().ok())
-                        .map(str::to_owned);
-                    return Self::reject_catalog_miss(session, &request_id, name.as_deref()).await;
-                }
-                CatalogHeader::Absent => {
-                    if full_body.is_none() {
-                        match self.take_slot(&id) {
-                            Ok(guard) => early_slot = guard,
-                            Err(()) => return self.reject_tenant_busy(session, &request_id).await,
-                        }
-                    }
-                    // A large body is held twice (here and in its `FullBody` re-run): reserve
-                    // both before reading a byte of it.
-                    if let Some(n) = declared_len.filter(|&n| past_replay_buffer(n))
-                        && !ctx.held.reserve_body(n.saturating_mul(2))
-                    {
-                        return self.reject_body_memory(session, &request_id).await;
-                    }
-                    let reserve = declared_len.unwrap_or(0).min(MAX_REQUEST_BODY);
-                    let peek = Box::pin(peek_body_model(
-                        session,
-                        reserve,
-                        &mut ctx.held,
-                        self.up_front_read_timeout(session),
-                        deadline,
-                    ))
-                    .await?;
-                    peeked = true;
-                    if peek.over_cap {
-                        return self.reject_too_large(session, &request_id).await;
-                    }
-                    if peek.over_budget {
-                        return self.reject_body_memory(session, &request_id).await;
-                    }
-                    let Some(name) = peek.model.filter(|n| !n.is_empty()) else {
+        let mut plan = match admission {
+            Admission::Ready(plan) => plan,
+            Admission::NeedsRow(id) => {
+                // Header wins if present (unknown → 404, no fall-through to the body). Absent → peek.
+                let (row, relay) = match catalog_from_header(session) {
+                    CatalogHeader::Known(route) => (route, None),
+                    CatalogHeader::Unknown => {
                         self.state.metrics.rejection(Rejection::UnknownModel).inc();
-                        return Self::reject_catalog_miss(session, &request_id, None).await;
-                    };
-                    let Some(route) = route::model_route(&name) else {
-                        self.state.metrics.rejection(Rejection::UnknownModel).inc();
-                        return Self::reject_catalog_miss(session, &request_id, Some(&name)).await;
-                    };
-                    if peek.relay {
-                        let body = peek.complete.unwrap_or_default();
-                        // --- signed ids (`signed_id`) ---
-                        if let Some(done) = self
-                            .refuse_foreign_ids(session, &request_id, route, &body, id.tenant_id)
-                            .await
-                        {
-                            return done;
-                        }
-                        let slot_held = early_slot.is_some();
-                        let relayed = self
-                            .relay_full_body(
-                                session,
-                                Parent {
-                                    request_id,
-                                    request_seq,
-                                    deadline,
-                                },
-                                route,
-                                body,
-                                slot_held,
-                            )
+                        let name = session
+                            .req_header()
+                            .headers
+                            .get(route::MODEL_HEADER)
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_owned);
+                        return Self::reject_catalog_miss(session, &request_id, name.as_deref())
                             .await;
-                        drop(early_slot);
-                        return relayed;
                     }
-                    model_route = Some(route);
-                    body_complete = peek.complete;
-                }
+                    CatalogHeader::Absent => {
+                        if full_body.is_none() {
+                            match self.take_slot(&id) {
+                                Ok(guard) => early_slot = guard,
+                                Err(()) => {
+                                    return self.reject_tenant_busy(session, &request_id).await;
+                                }
+                            }
+                        }
+                        // A large body is held twice (here and in its `FullBody` re-run): reserve
+                        // both before reading a byte of it.
+                        if let Some(n) = declared_len.filter(|&n| past_replay_buffer(n))
+                            && !ctx.held.reserve_body(n.saturating_mul(2))
+                        {
+                            return self.reject_body_memory(session, &request_id).await;
+                        }
+                        let reserve = declared_len.unwrap_or(0).min(MAX_REQUEST_BODY);
+                        let peek = Box::pin(peek_body_model(
+                            session,
+                            reserve,
+                            &mut ctx.held,
+                            self.up_front_read_timeout(session),
+                            deadline,
+                        ))
+                        .await?;
+                        peeked = true;
+                        if peek.over_cap {
+                            return self.reject_too_large(session, &request_id).await;
+                        }
+                        if peek.over_budget {
+                            return self.reject_body_memory(session, &request_id).await;
+                        }
+                        let Some(name) = peek.model.filter(|n| !n.is_empty()) else {
+                            self.state.metrics.rejection(Rejection::UnknownModel).inc();
+                            return Self::reject_catalog_miss(session, &request_id, None).await;
+                        };
+                        let Some(route) = route::model_route(&name) else {
+                            self.state.metrics.rejection(Rejection::UnknownModel).inc();
+                            return Self::reject_catalog_miss(session, &request_id, Some(&name))
+                                .await;
+                        };
+                        if peek.relay {
+                            (route, Some(peek.complete.unwrap_or_default()))
+                        } else {
+                            body_complete = peek.complete;
+                            (route, None)
+                        }
+                    }
+                };
+                Plan::Catalog(Walk { id, row, relay })
             }
-        }
+        };
 
         // Header-won catalog walks skip the body peek above. The same reasons to read the whole
         // body apply (Responses session state, a body pingora could not replay for failover).
-        if let Some(id) = identity
+        if let Plan::Catalog(w) = &mut plan
             && full_body.is_none()
             && !peeked
-            && let Some(route) = model_route
             && (responses
                 || large
-                || route::walk_reads_body(route)
-                || route::walk_reads_tools(route, session.req_header().uri.path()))
+                || route::walk_reads_body(w.row)
+                || route::walk_reads_tools(w.row, session.req_header().uri.path()))
         {
-            match self.take_slot(&id) {
+            match self.take_slot(&w.id) {
                 Ok(guard) => early_slot = guard,
                 Err(()) => return self.reject_tenant_busy(session, &request_id).await,
             }
@@ -4860,33 +4902,42 @@ impl ProxyHttp for AiProxy {
                 return self.reject_body_memory(session, &request_id).await;
             }
             if peek.relay {
-                let body = peek.complete.unwrap_or_default();
-                // --- signed ids (`signed_id`) ---
-                if let Some(done) = self
-                    .refuse_foreign_ids(session, &request_id, route, &body, id.tenant_id)
-                    .await
-                {
-                    return done;
-                }
-                let slot_held = early_slot.is_some();
-                let relayed = self
-                    .relay_full_body(
-                        session,
-                        Parent {
-                            request_id,
-                            request_seq,
-                            deadline,
-                        },
-                        route,
-                        body,
-                        slot_held,
-                    )
-                    .await;
-                drop(early_slot);
-                return relayed;
+                w.relay = Some(peek.complete.unwrap_or_default());
+            } else {
+                body_complete = peek.complete;
             }
-            body_complete = peek.complete;
         }
+
+        // A body read in full past pingora's retry buffer: re-run the request as a `FullBody`
+        // subrequest that carries it, rather than proxy it here.
+        if let Plan::Catalog(w) = &mut plan
+            && let Some(body) = w.relay.take()
+        {
+            // --- signed ids (`signed_id`) ---
+            if let Some(done) = self
+                .refuse_foreign_ids(session, &request_id, w.row, &body, w.id.tenant_id)
+                .await
+            {
+                return done;
+            }
+            let slot_held = early_slot.is_some();
+            let relayed = self
+                .relay_full_body(
+                    session,
+                    Parent {
+                        request_id,
+                        request_seq,
+                        deadline,
+                    },
+                    w.row,
+                    body,
+                    slot_held,
+                )
+                .await;
+            drop(early_slot);
+            return relayed;
+        }
+        let model_route = plan.row();
 
         // Two root `model` keys (D34), refused before connecting wherever the body is already in
         // hand, with a JSON 400 and the request id (D94). A body streamed through is still refused
@@ -4969,45 +5020,14 @@ impl ProxyHttp for AiProxy {
         };
         // `/v1/messages/count_tokens`, `/v1/responses/compact`, … (see `route::SubResource`).
         let sub = model_route.and(route::SubResource::of_path(session.req_header().uri.path()));
-        let (provider, usable) = match model_route {
-            None => {
-                // Provider-routed, or BYO `/v1` dialect default. Headerless `/auto` always set
-                // `model_route` above (or 400/404'd).
-                match provider {
-                    Some(p) => (p, 0u8),
-                    None => {
-                        self.state.metrics.rejection(Rejection::NoCandidate).inc();
-                        return Self::reject_boxed(
-                            session,
-                            &request_id,
-                            503,
-                            "api_error",
-                            "no provider available for model",
-                        )
-                        .await;
-                    }
-                }
-            }
-            Some(row) => {
-                // A BYO token belongs to exactly one provider. Selecting among candidates would be a
-                // guess about which — the guess the `providers` crate exists to refuse — and failing
-                // over would send the caller's key for one vendor to a different vendor, which is a
-                // credential disclosure, not a degraded experience. 400 rather than 401: their key
-                // may be perfectly valid, it is the endpoint that is wrong for it.
-                let Some(id) = identity else {
-                    self.state
-                        .metrics
-                        .rejection(Rejection::ByoOnModelRoute)
-                        .inc();
-                    return Self::reject_boxed(
-                        session,
-                        &request_id,
-                        400,
-                        "invalid_request_error",
-                        "model routing requires a managed key",
-                    )
-                    .await;
-                };
+        let (provider, usable) = match &plan {
+            // Provider-routed, or BYO `/v1` dialect default.
+            Plan::Provider { provider, .. } => (Arc::clone(provider), 0u8),
+            // Only a managed key walks the catalog (a BYO token belongs to exactly one provider, so
+            // selecting among candidates would be a guess, and failing over would send its key to
+            // another vendor): BYO was refused before a `Walk` could be made.
+            Plan::Catalog(w) => {
+                let (row, id) = (w.row, w.id);
                 if let Some(kind) = body_complete
                     .as_deref()
                     .and_then(|b| route::refused_input(row, b))
@@ -5097,9 +5117,13 @@ impl ProxyHttp for AiProxy {
                 // Bit `orig` ⇒ every pool key of that arm's provider is cooling off from a refusal
                 // (a 401, an out-of-credit answer): left out below while another arm can serve.
                 let mut cooling = 0u8;
+                // Each arm's provider, as resolved here: a dispatchable arm has one.
+                let mut resolved: [Option<&'static Arc<Provider>>; route::MAX_CANDIDATES] =
+                    [None; route::MAX_CANDIDATES];
                 for (orig, c) in arms.iter().enumerate().take(route::MAX_CANDIDATES) {
-                    let orig = orig as u8;
                     let provider = self.state.provider_by_id(c.provider);
+                    resolved[orig] = provider;
+                    let orig = orig as u8;
                     let keyed = provider.is_some_and(|p| p.has_pool_key());
                     if provider.is_some_and(|p| p.cooling()) {
                         cooling |= 1 << orig;
@@ -5219,7 +5243,12 @@ impl ProxyHttp for AiProxy {
                     )
                     .await;
                 }
-                let Some(first) = first_usable(usable, 0) else {
+                // The first usable slot's provider: a usable slot is a dispatchable arm, which
+                // resolved one.
+                let first = first_usable(usable, 0)
+                    .and_then(|i| walk.catalog_index(i))
+                    .and_then(|orig| resolved.get(usize::from(orig)).copied().flatten());
+                let Some(first) = first else {
                     // Every remaining candidate is unkeyed. Distinct from `circuit_open`, which
                     // means the candidates exist and are being skipped while they recover —
                     // `doctor`'s `model_catalog` check exists to catch this configuration at boot
@@ -5234,25 +5263,7 @@ impl ProxyHttp for AiProxy {
                     )
                     .await;
                 };
-                match walk
-                    .catalog_index(first)
-                    .and_then(|orig| arms.get(usize::from(orig)))
-                    .and_then(|c| self.state.provider_by_id(c.provider))
-                {
-                    Some(p) => (p.clone(), usable),
-                    // Unreachable: the bit is only set when `provider_by_id` resolved above.
-                    None => {
-                        self.state.metrics.rejection(Rejection::NoCandidate).inc();
-                        return Self::reject_boxed(
-                            session,
-                            &request_id,
-                            503,
-                            "api_error",
-                            "no provider key available",
-                        )
-                        .await;
-                    }
-                }
+                (Arc::clone(first), usable)
             }
         };
 
@@ -5264,12 +5275,9 @@ impl ProxyHttp for AiProxy {
         let signed = if let Some(id) = identity
             && match model_route {
                 Some(row) => signed_id::catalog_applies(session.req_header().uri.path(), row),
-                None => {
-                    provider_route
-                        && forward_path
-                            .as_deref()
-                            .is_some_and(signed_id::provider_route_applies)
-                }
+                None => plan
+                    .stripped()
+                    .is_some_and(signed_id::provider_route_applies),
             } {
             let Some(signer) = self.state.id_signer.as_ref() else {
                 self.state
@@ -5356,10 +5364,9 @@ impl ProxyHttp for AiProxy {
         // `/v1/chat/completions`, so the provider's default dialect metered both as zero.
         let dialect = match model_route {
             Some(r) => r.wire,
-            None if provider_route => forward_path
-                .as_deref()
+            None => plan
+                .stripped()
                 .map_or(provider.dialect, wire_of_forward_path),
-            None => provider.dialect,
         };
         // Mark OpenAI managed chat/completions streams for body buffering + `stream_options` injection
         // (handled in `request_body_filter`). A catalog walk asks of the arm this request will
@@ -5369,8 +5376,8 @@ impl ProxyHttp for AiProxy {
             Some(_) => walk_arms
                 .first()
                 .is_some_and(|c| stream_options_eligible(managed, dialect, c.path)),
-            None => forward_path
-                .as_deref()
+            None => plan
+                .stripped()
                 .is_some_and(|p| stream_options_eligible(managed, dialect, p)),
         };
         // Every billable managed `/{provider}/…` body is buffered too, so a model outside the
@@ -5380,9 +5387,8 @@ impl ProxyHttp for AiProxy {
         // D202). The free token counts are left to stream: nothing there bills. A catalog walk
         // checked its body above.
         let catalog_check = managed
-            && provider_route
-            && forward_path
-                .as_deref()
+            && plan
+                .stripped()
                 .and_then(route::forward_endpoint)
                 .is_some_and(|e| e.sub.is_none_or(route::SubResource::billed));
         // That buffer counts against the body budget. A declared large body reserves up front,
@@ -5461,6 +5467,10 @@ impl ProxyHttp for AiProxy {
             })
         } else {
             None
+        };
+        let forward_path = match plan {
+            Plan::Provider { forward, .. } => forward,
+            Plan::Catalog(_) => ForwardPath::Inbound,
         };
         let mut pending_cache: Option<cache::Pending> = None;
         match cache_look {
@@ -5812,12 +5822,8 @@ impl ProxyHttp for AiProxy {
                             a.attempt_start = Instant::now();
                             a.addrs = u8::try_from(addrs).unwrap_or(u8::MAX);
                         }
-                        rc.set_forward_path(candidate.path);
-                        if let Some(sub) = rc.auto.as_ref().and_then(|a| a.sub)
-                            && let Some(path) = rc.forward_path.as_mut()
-                        {
-                            path.push_str(sub.suffix());
-                        }
+                        let sub = rc.auto.as_ref().and_then(|a| a.sub);
+                        rc.set_forward_path(candidate.path, sub);
                         rc.upstream_phase = UpstreamPhase::Attempted;
                         let peer = self.build_peer(addr, &p, rc.auto.as_ref().map(|a| a.route));
                         return self.cap_read_at_deadline(rc, peer);
@@ -6238,7 +6244,7 @@ impl ProxyHttp for AiProxy {
         // reconstructing the path anyway and comparing it against the inbound `path_and_query`;
         // encoding it in the type instead skips the allocation rather than detecting it after
         // the fact.
-        if let Some(forward_path) = &rc.forward_path
+        if let Some(forward_path) = rc.forward_path.as_str()
             && let Ok(uri) = forward_path.parse()
         {
             upstream_request.set_uri(uri);
@@ -6454,7 +6460,7 @@ impl ProxyHttp for AiProxy {
                 }
                 // Managed `/{provider}/…/responses` asking for `background: true` (D202).
                 if rc.plan.catalog_check
-                    && rc.forward_path.as_deref().is_some_and(|p| {
+                    && rc.forward_path.as_str().is_some_and(|p| {
                         route::forward_is_responses(p.split_once('?').map_or(p, |(p, _)| p))
                     })
                     && requests_background(&buf)
@@ -7587,7 +7593,7 @@ impl ProxyHttp for AiProxy {
             .and_then(|a| a.sub)
             .or_else(|| {
                 rc.forward_path
-                    .as_deref()
+                    .as_str()
                     .and_then(route::SubResource::of_forward_path)
             })
             .is_some_and(|sub| !sub.billed());
@@ -7897,7 +7903,7 @@ impl ProxyHttp for AiProxy {
             let upstream_path = called.then(|| {
                 let p = rc
                     .forward_path
-                    .as_deref()
+                    .as_str()
                     .unwrap_or_else(|| session.req_header().uri.path());
                 p.split_once('?').map_or(p, |(path, _)| path)
             });
@@ -8232,7 +8238,7 @@ mod tests {
             billing: Billing::of(Some(Identity::unverified_for_test(42, 7, None))),
             dialect: Dialect::OpenAi,
             leg: Leg::new(Arc::new(provider), None, 0),
-            forward_path: None,
+            forward_path: ForwardPath::Inbound,
             model: String::new(),
             attempt: Attempt::new(Vec::new()),
             resp_model_scanner: peek::ModelScanner::for_response(),
@@ -9960,6 +9966,7 @@ mod tests {
         // rustfmt keeps them one per line, so scanning forward for the first two quoted literals is
         // stable.
         let mut sites = 0usize;
+        let mut called = Vec::new();
         for (i, _) in src.match_indices("Self::reject_boxed(") {
             sites += 1;
             let tail = &src[i..];
@@ -9981,18 +9988,62 @@ mod tests {
                 "reject_boxed({typ:?}, {msg:?}) has no REJECT_BODIES entry — it would take \
                  `error_body`'s allocating fallback on every hit",
             );
+            called.push((*typ, *msg));
         }
         assert!(
             sites >= REJECT_BODIES.len(),
             "{sites} call sites but {} table entries — an entry has no caller",
             REJECT_BODIES.len(),
         );
-        // Every tabulated message must also appear at a call site, catching the reverse drift (a
-        // table entry left behind after its rejection was removed). Twice: the table and the caller.
-        for &(_, msg, _) in &REJECT_BODIES {
+        // Every tabulated pair must also have a caller, catching the reverse drift (a table entry
+        // left behind after its rejection was removed): a `reject_boxed` or `reject_retry_after`
+        // site passing that `(type, message)`, or `fail_to_proxy` answering it.
+        for (i, _) in src.match_indices("Self::reject_retry_after(") {
+            let tail = &src[i..];
+            let end = tail.find(")\n").map_or(tail.len(), |e| e + 1);
+            let literals: Vec<&str> = tail[..end]
+                .match_indices('"')
+                .collect::<Vec<_>>()
+                .chunks(2)
+                .filter_map(|c| match c {
+                    [(a, _), (b, _)] => Some(&tail[a + 1..*b]),
+                    _ => None,
+                })
+                .collect();
+            if let (Some(typ), Some(msg)) = (literals.first(), literals.get(1)) {
+                called.push((*typ, *msg));
+            }
+        }
+        // `fail_to_proxy` answers an upstream that failed after it had the whole request with its
+        // own message, under the type `failure_response` gives the error class reaching that arm:
+        // the message is read from its source and the type from the mapping, so either drifting
+        // from the table fails here.
+        let ftp = src
+            .find("async fn fail_to_proxy(")
+            .expect("fail_to_proxy is in the production half");
+        let ftp = &src[ftp..ftp + src[ftp..].find("\n    }\n").expect("fail_to_proxy ends")];
+        for (class, msg) in [
+            (
+                pingora_core::ErrorType::ReadTimedout,
+                "upstream timed out after receiving the request",
+            ),
+            (
+                pingora_core::ErrorType::ConnectionClosed,
+                "upstream failed after receiving the request",
+            ),
+        ] {
             assert!(
-                src.matches(&format!("\"{msg}\"")).count() >= 2,
-                "REJECT_BODIES entry {msg:?} has no reject_boxed call site"
+                ftp.contains(&format!("msg = \"{msg}\";")),
+                "fail_to_proxy no longer answers {msg:?}"
+            );
+            let (_, typ, _) = failure_response(&pingora_core::Error::new_up(class))
+                .expect("an upstream error is answered");
+            called.push((typ, msg));
+        }
+        for &(typ, msg, _) in &REJECT_BODIES {
+            assert!(
+                called.contains(&(typ, msg)),
+                "REJECT_BODIES entry ({typ:?}, {msg:?}) has no caller"
             );
         }
     }
