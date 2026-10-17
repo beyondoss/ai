@@ -176,8 +176,8 @@ const CTRL_CHANNEL_BOUND: usize = 8;
 /// per frame — far past anything this protocol needs). Every inbound message is one command line that
 /// gets queued for the session, so this is what bounds the cost of any one queued command; a client that
 /// exceeds it gets a protocol error and its connection closed, never a silently truncated command.
-/// Generous enough for a `prompt` carrying a large pasted body.
-const MAX_INBOUND_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
+/// The same cap as a stdin line ([`crate::serve::MAX_COMMAND_BYTES`]).
+const MAX_INBOUND_MESSAGE_BYTES: usize = crate::serve::MAX_COMMAND_BYTES;
 
 /// Cap on HTTP/1.1 request headers (the POST path reads these itself; the WebSocket upgrade does too
 /// once we peek the request-line). Far above any legitimate `Host` + `Content-Length` + a handful of
