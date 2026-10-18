@@ -71,10 +71,10 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.00001065",
-          "discount": 0.29,
-          "input_cache_read": "0.000000213",
-          "prompt": "0.00000213"
+          "completion": "0.00000825",
+          "discount": 0.45,
+          "input_cache_read": "0.000000165",
+          "prompt": "0.00000165"
         },
         "provider_name": "Decart",
         "quantization": "mxfp4",
@@ -162,10 +162,10 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.000015",
+          "completion": "0.000011936",
           "discount": 0,
-          "input_cache_read": "0.00000028",
-          "prompt": "0.00000045"
+          "input_cache_read": "0.00000021",
+          "prompt": "0.000000249"
         },
         "provider_name": "InferenceNet",
         "quantization": "fp4",
@@ -216,8 +216,8 @@
         "pricing": {
           "completion": "0.0000149",
           "discount": 0,
-          "input_cache_read": "0.00000029",
-          "prompt": "0.0000008"
+          "input_cache_read": "0.000000238",
+          "prompt": "0.0000003"
         },
         "provider_name": "Morph",
         "quantization": "fp8",
@@ -240,10 +240,10 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.000013",
+          "completion": "0.000015",
           "discount": 0,
-          "input_cache_read": "0.00000026",
-          "prompt": "0.0000026"
+          "input_cache_read": "0.0000003",
+          "prompt": "0.000003"
         },
         "provider_name": "Parasail",
         "quantization": "fp4",
@@ -268,12 +268,25 @@
         "pricing": {
           "completion": "0.000014",
           "discount": 0,
-          "input_cache_read": "0.0000003",
-          "prompt": "0.00000032"
+          "input_cache_read": "0.00000021",
+          "prompt": "0.00000025"
         },
         "provider_name": "Relace",
         "quantization": "fp4",
         "tag": "relace/fp4"
+      },
+      {
+        "context_length": 1048576,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.0000081",
+          "discount": 0,
+          "input_cache_read": "0.00000018",
+          "prompt": "0.000000504"
+        },
+        "provider_name": "Sail Research",
+        "quantization": "fp4",
+        "tag": "sail-research/fp4"
       },
       {
         "context_length": 1048576,
@@ -286,7 +299,7 @@
         },
         "provider_name": "Sail Research",
         "quantization": "fp4",
-        "tag": "sail-research/fp4"
+        "tag": "sail-research/fp4/us"
       },
       {
         "context_length": 1048576,
@@ -305,26 +318,26 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.000024",
+          "completion": "0.000016",
           "discount": 0,
-          "input_cache_read": "0.0000003",
-          "prompt": "0.00000031"
+          "input_cache_read": "0.00000027",
+          "prompt": "0.00000028"
         },
         "provider_name": "Wafer",
-        "quantization": "unknown",
+        "quantization": "mxfp4",
         "tag": "wafer"
       },
       {
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.0000149",
+          "completion": "0.0000119",
           "discount": 0,
-          "input_cache_read": "0.00000032",
-          "prompt": "0.00000033"
+          "input_cache_read": "0.000000359",
+          "prompt": "0.00000036"
         },
         "provider_name": "Wafer",
-        "quantization": "unknown",
+        "quantization": "mxfp4",
         "tag": "wafer/us"
       }
     ],

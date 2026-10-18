@@ -41,6 +41,19 @@
         "tag": "deepinfra/fp8"
       },
       {
+        "context_length": 524288,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.00000088",
+          "discount": 0,
+          "input_cache_read": "0.0000000448",
+          "prompt": "0.000000224"
+        },
+        "provider_name": "DeepInfra",
+        "quantization": "fp8",
+        "tag": "deepinfra/fp8/flex"
+      },
+      {
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {

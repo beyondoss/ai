@@ -257,8 +257,8 @@
           "prompt": "0.00000004"
         },
         "provider_name": "Wafer",
-        "quantization": "unknown",
-        "tag": "wafer"
+        "quantization": "fp8",
+        "tag": "wafer/fp8"
       }
     ],
     "id": "qwen/qwen3.8-27b"

@@ -70,10 +70,10 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.0000019448",
-          "discount": 0.558,
-          "input_cache_read": "0.00000011492",
-          "prompt": "0.0000006188"
+          "completion": "0.000000594",
+          "discount": 0.865,
+          "input_cache_read": "0.0000000351",
+          "prompt": "0.000000189"
         },
         "provider_name": "Baidu",
         "quantization": "fp8",
@@ -187,6 +187,19 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
+          "completion": "0.00000144",
+          "discount": 0.25,
+          "input_cache_read": "0.000000084",
+          "prompt": "0.00000045"
+        },
+        "provider_name": "DeepInfra",
+        "quantization": "fp4",
+        "tag": "deepinfra/fp4/flex"
+      },
+      {
+        "context_length": 1048576,
+        "max_prompt_tokens": null,
+        "pricing": {
           "completion": "0.0000022",
           "discount": 0,
           "input_cache_read": "0.000000105",
@@ -226,7 +239,7 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.00000315",
+          "completion": "0.0000010395",
           "discount": 0,
           "input_cache_read": "0.00000014",
           "prompt": "0.00000069"
@@ -267,8 +280,8 @@
         "pricing": {
           "completion": "0.000006",
           "discount": 0,
-          "input_cache_read": "0.000000079",
-          "prompt": "0.000000079"
+          "input_cache_read": "0.000000056",
+          "prompt": "0.000000089"
         },
         "provider_name": "Morph",
         "quantization": "fp8",
@@ -329,10 +342,10 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.000004",
+          "completion": "0.000006",
           "discount": 0,
-          "input_cache_read": "0.000000019",
-          "prompt": "0.000000019"
+          "input_cache_read": "0.0000000845",
+          "prompt": "0.0000000845"
         },
         "provider_name": "Relace",
         "quantization": "unknown",
@@ -355,10 +368,10 @@
         "context_length": 1024000,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.00000192676",
-          "discount": 0.5621,
-          "input_cache_read": "0.000000113854",
-          "prompt": "0.00000061306"
+          "completion": "0.00000174592",
+          "discount": 0.6032,
+          "input_cache_read": "0.000000103168",
+          "prompt": "0.00000055552"
         },
         "provider_name": "StreamLake",
         "quantization": "fp8",
@@ -394,13 +407,13 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.000008",
+          "completion": "0.00001",
           "discount": 0,
           "input_cache_read": "0.00000018",
           "prompt": "0.00000019"
         },
         "provider_name": "Wafer",
-        "quantization": "unknown",
+        "quantization": "fp4",
         "tag": "wafer"
       },
       {
@@ -409,11 +422,11 @@
         "pricing": {
           "completion": "0.000007",
           "discount": 0,
-          "input_cache_read": "0.000000019",
-          "prompt": "0.00000002"
+          "input_cache_read": "0.000000033",
+          "prompt": "0.0000000341"
         },
         "provider_name": "Wafer",
-        "quantization": "unknown",
+        "quantization": "fp4",
         "tag": "wafer/us"
       },
       {

@@ -56,10 +56,34 @@
         "context_length": 262144,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.00000034",
+          "completion": "0.00000032",
           "discount": 0,
-          "input_cache_read": "0.00000005",
-          "prompt": "0.00000009"
+          "prompt": "0.00000016"
+        },
+        "provider_name": "DeepInfra",
+        "quantization": "fp8",
+        "tag": "deepinfra/fp8/flex"
+      },
+      {
+        "context_length": 262144,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.0000006",
+          "discount": 0,
+          "prompt": "0.0000003"
+        },
+        "provider_name": "DeepInfra",
+        "quantization": "fp8",
+        "tag": "deepinfra/fp8/priority"
+      },
+      {
+        "context_length": 262144,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.00000051",
+          "discount": 0,
+          "input_cache_read": "0.000000075",
+          "prompt": "0.000000135"
         },
         "provider_name": "DeepInfra",
         "quantization": "fp4",

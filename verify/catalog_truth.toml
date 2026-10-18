@@ -1436,6 +1436,45 @@ source = "https://developers.openai.com/api/docs/deprecations"
 retires = "2026-12-11"
 note = "o3-pro-2025-06-10: shutdown 2026-12-11, replacement gpt-5.6-sol with reasoning.mode pro. The row is OpenRouter-only (openai/o3-pro, OpenAI-hosted) (D181)."
 
+[[retired]]
+model = "gpt-4o"
+provider = "openai"
+id = "gpt-4o-2024-08-06"
+source = "https://developers.openai.com/api/docs/deprecations"
+retires = "2027-01-14"
+note = "\"GPT-4 series model deprecations\" (announced 2026-10-14, read by the live CAT-16 cell 2026-10-18): GPT-4o (gpt-4o-2024-08-06, gpt-4o-2024-11-20) shuts down 2027-01-14, replacement gpt-6-luna. Every gpt-4o snapshot goes that day, so the row (and its OpenRouter candidate) is held to it."
+
+[[retired]]
+provider = "openai"
+id = "gpt-4o-2024-11-20"
+source = "https://developers.openai.com/api/docs/deprecations"
+retires = "2027-01-14"
+note = "The other gpt-4o snapshot in the same notice; the row is held to the date by gpt-4o-2024-08-06's entry."
+
+[[retired]]
+model = "gpt-4o-mini"
+provider = "openai"
+id = "gpt-4o-mini-2024-07-18"
+source = "https://developers.openai.com/api/docs/deprecations"
+retires = "2027-01-14"
+note = "gpt-4o-mini-2024-07-18, the only snapshot behind gpt-4o-mini: shutdown 2027-01-14, replacement gpt-6-luna (notice of 2026-10-14)."
+
+[[retired]]
+model = "gpt-4.1"
+provider = "openai"
+id = "gpt-4.1-2025-04-14"
+source = "https://developers.openai.com/api/docs/deprecations"
+retires = "2027-01-14"
+note = "gpt-4.1-2025-04-14, the only snapshot behind gpt-4.1: shutdown 2027-01-14, replacement gpt-6-luna (notice of 2026-10-14)."
+
+[[retired]]
+model = "gpt-4.1-mini"
+provider = "openai"
+id = "gpt-4.1-mini-2025-04-14"
+source = "https://developers.openai.com/api/docs/deprecations"
+retires = "2027-01-14"
+note = "gpt-4.1-mini-2025-04-14, the only snapshot behind gpt-4.1-mini: shutdown 2027-01-14, replacement gpt-6-luna (notice of 2026-10-14). The BIL-5 OpenAI reconciliation batch runs on gpt-4.1-mini and must move before then."
+
 [[not_serverless]]
 provider = "fireworks"
 id = "accounts/fireworks/models/llama4-maverick-instruct-basic"

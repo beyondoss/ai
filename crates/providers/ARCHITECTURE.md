@@ -180,7 +180,7 @@ vendor bills them as **5-minute writes**, and pass-through bills them the same.
 
    | Row says                                                                            | Class           |
    | ----------------------------------------------------------------------------------- | --------------- |
-   | none, `default`, `standard`, `on_demand` (Groq), `auto` (unresolved, e.g. Meta)     | standard        |
+   | none, `default`, `standard`, `on_demand` (Groq), `auto` (unresolved, e.g. Meta), `asap` (Sail Research) | standard |
    | `priority` or `fast` (OpenAI, xAI, Fireworks, OpenRouter)                           | fast            |
    | `speed: fast` (Anthropic; with `service_tier: priority` on OpenRouter)              | fast            |
    | `ultrafast`                                                                         | ultrafast       |

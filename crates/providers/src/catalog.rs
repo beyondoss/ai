@@ -1409,7 +1409,7 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         wire: WireFormat::OpenAi,
         candidates: &openrouter_only("google/gemma-4-31b-it"), // Together: not serverless
         responses: &[],
-        price: price("0.09", "0.34", "0.05", "0.09"), // cache_write unpublished; equals input
+        price: price("0.2", "0.4", "0.2", "0.2"), // cache rates unpublished; equal input
         card: card(
             "Gemma 4 31B",
             "google",
@@ -2092,7 +2092,7 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         wire: WireFormat::OpenAi,
         candidates: &openrouter_only("meta-llama/llama-3.3-70b-instruct"),
         responses: &[],
-        price: price("0.22", "0.5", "0.11", "0.22"), // cache_write unpublished; equals input
+        price: price("0.1", "0.32", "0.1", "0.1"), // cache rates unpublished; equal input
         card: card(
             "Llama 3.3 70B Instruct",
             "meta-llama",
