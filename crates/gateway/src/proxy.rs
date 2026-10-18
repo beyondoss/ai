@@ -72,6 +72,7 @@ use crate::drain::{self, Drain};
 use crate::key::{self, Identity};
 use crate::metrics::{DrainEnd, KeyCooled, Rejection};
 use crate::refusal::{self, Refusal, clip_catalog_name};
+use crate::retry::{self, Decision, RelayRetry, Retry};
 use crate::route::{self, Dialect, Provider, ProviderId};
 use crate::signed_id;
 use crate::state::{GatewayState, RequestId};
@@ -96,7 +97,7 @@ use std::num::NonZeroU16;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
@@ -247,13 +248,6 @@ impl AiProxy {
         Self { state }
     }
 }
-
-/// Requests that exist right now: incremented when pingora builds a request's context
-/// (`new_ctx`, once the request header has been read) and decremented when that context drops,
-/// after `logging` has written its billing row. `main`'s shutdown drain exits once this reaches 0.
-/// One atomic add and one sub per request, the only shared write `new_ctx` and the context's drop
-/// make.
-pub static LIVE_REQUESTS: AtomicUsize = AtomicUsize::new(0);
 
 /// Pingora's per-request context: the admitted request's state, plus what it holds that must be
 /// given back however the request ends.
@@ -408,7 +402,7 @@ impl Drop for Ctx {
         self.held.close_drain(DrainEnd::Error);
         // An unresolved breaker permit is given back by its `Leg` as the context goes.
         drop(self.rc.take());
-        LIVE_REQUESTS.fetch_sub(1, Ordering::AcqRel);
+        self.held.state.request_ended();
     }
 }
 
@@ -552,22 +546,6 @@ impl Attempt {
             relay_abandoned: false,
         }
     }
-}
-
-/// What the next attempt is, as the hook that asked pingora for it declared: every hook that marks
-/// an error retryable declares one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Retry {
-    /// The same leg again: a managed 429 or 401 key walk, a stale pooled connection, a refused
-    /// stream's one resend, or the candidate's next address. Its breaker permit carries over (a
-    /// 429 is a healthy throttle, and a dead connection is not the provider failing), and the
-    /// catalog walk is not entered: that would send this provider's remaining keys to another
-    /// vendor.
-    SameLeg,
-    /// A catalog walk's next candidate. The outgoing leg failed this attempt: a permit it still
-    /// owes is that failure (a 5xx, a connect or upstream failure), resolved as the walk moves on.
-    /// One already resolved (a refusing 401–403, the success it is) owes nothing more.
-    NextCandidate,
 }
 
 /// How a request's body goes upstream on the current attempt: streamed through untouched, or
@@ -735,6 +713,14 @@ impl Leg {
             refused_resent: false,
             retry: None,
         }
+    }
+
+    /// The provider's pool key after this one, when it has another.
+    fn next_key(&self) -> Option<u8> {
+        let next = usize::from(self.pool_key).saturating_add(1);
+        (next < self.provider.pool_auth.len())
+            .then(|| u8::try_from(next).ok())
+            .flatten()
     }
 
     /// The permit, with the breaker it is owed to.
@@ -1347,36 +1333,201 @@ fn closed_after_terminal(rc: &RequestCtx, e: &pingora_core::Error) -> bool {
         && !matches!(e.etype(), T::WriteError | T::WriteTimedout)
 }
 
-/// What became of a request, on its billing row: a consumer must be able to tell a zero-token row
-/// for an upstream error or a cancel from a real zero-token generation.
-///
-/// `client_left`: the client hung up on a drained stream ([`crate::drain`]) before its terminal
-/// event. The request may then end with no error (the drain settled) or an upstream one (it did
-/// not), and is a cancel either way.
-fn outcome(
-    rc: &RequestCtx,
-    e: Option<&pingora_core::Error>,
+/// Who a request's error says ended it, as its billing row reads it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Fault {
+    /// The client went away: any downstream error but the gateway's own answer.
+    Client,
+    /// The gateway's own answer to the client ([`gateway_refusal`]). Downstream-tagged, so a
+    /// cancel once a response head arrived, and no row at all before one.
+    Refusal,
+    /// The upstream, or anything else not tagged downstream.
+    Upstream,
+}
+
+impl Fault {
+    fn of(e: &pingora_core::Error) -> Self {
+        if gateway_refusal(e) {
+            Self::Refusal
+        } else if e.esource() == &pingora_core::ErrorSource::Downstream {
+            Self::Client
+        } else {
+            Self::Upstream
+        }
+    }
+}
+
+/// Whose word a billing row's token counts are.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Count {
+    /// The provider's own report (or none at all, on an error body).
+    #[default]
+    Reported,
+    /// The gateway's estimate of what the provider bills, and which counts it replaced (none
+    /// when the provider's partial report already covered what the estimate saw).
+    Estimated(EstimatedParts),
+}
+
+impl Count {
+    fn estimated(self) -> bool {
+        matches!(self, Self::Estimated(_))
+    }
+
+    /// What the estimate replaced: nothing, for a reported count.
+    fn parts(self) -> EstimatedParts {
+        match self {
+            Self::Reported => EstimatedParts::default(),
+            Self::Estimated(p) => p,
+        }
+    }
+}
+
+/// The facts `logging` reads about how a request ended, before it decides how the request bills.
+#[derive(Clone, Copy, Debug, Default)]
+struct EndFacts {
+    /// An abandoned `FullBody` attempt ([`Attempt::relay_abandoned`]).
+    relay_abandoned: bool,
+    /// A free sub-resource (a token count).
+    free: bool,
+    /// Answered from the exact-match cache.
     cache_hit: bool,
+    /// The provider's status; absent when no response head arrived.
+    status: Option<u16>,
+    /// Whom the request's error blames; absent when it ended without one.
+    fault: Option<Fault>,
+    /// The client hung up on a drained stream ([`crate::drain`]) before its terminal event.
     client_left: bool,
-) -> &'static str {
-    if cache_hit {
-        return "ok";
+    /// A provider was handed the request (`UpstreamPhase` past `None`).
+    called: bool,
+    /// The drain read the stream to its end after the client left.
+    drained: bool,
+    /// Whose word the counts are.
+    count: Count,
+}
+
+/// Every way a request can end, as billing sees it. `logging` builds one from its [`EndFacts`],
+/// and [`Ending::row`] is a total match on it, so a new ending does not compile until someone
+/// decides how it bills.
+///
+/// Every ending that writes a row carries its [`Count`], and the row logs it as it is, so an
+/// estimate is never written as the provider's word. An estimate needs a 2xx head, or a connected
+/// attempt that delivered the whole body ([`gave_up_waiting`]), so a cache hit, an error status
+/// and a request no provider was handed carry `Reported`: [`Ending::of`] asserts it in debug
+/// builds, where a producer that broke it would show. Only a cancel can be drained: a drain arms
+/// only on a managed 2xx stream's head ([`drains_on_cancel`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Ending {
+    /// An abandoned `FullBody` attempt: not the answer the client got. The attempt that serves
+    /// writes the one row.
+    RelayAbandoned,
+    /// A free sub-resource (a token count): not a billable call.
+    Free,
+    /// Answered from the exact-match cache: the usage stored at fill, no provider called.
+    CacheHit(Count),
+    /// The gateway's own refusal before any response head (D267): no provider had the request
+    /// whole, so it writes no row, as every other rejection writes none.
+    Refused,
+    /// The provider answered with an error status (4xx/5xx).
+    UpstreamStatus(Count),
+    /// The client left before the answer was whole, or left a drained stream however the request
+    /// then ended. `drained`: the gateway then read the stream to its end.
+    ClientCancelled { count: Count, drained: bool },
+    /// No provider was called (every candidate's breaker open).
+    NoCandidate(Count),
+    /// The upstream failed before any response head: a connect, read-timeout or reset failure.
+    UpstreamFailed(Count),
+    /// A response that started and then died upstream.
+    CutShort(Count),
+    /// The request completed.
+    Completed(Count),
+}
+
+/// The fields of an `ai.usage` row its [`Ending`] decides, as logged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct EndRow {
+    /// What became of the request: a consumer must be able to tell a zero-token row for an
+    /// upstream error or a cancel from a real zero-token generation.
+    outcome: &'static str,
+    /// Whose word the counts are (`usage_estimated`, `usage_estimated_parts`).
+    count: Count,
+    /// The counts are the cache entry's, stored at fill: no call was made.
+    cache_hit: bool,
+    /// The client cancelled and the gateway read the stream to its end ([`crate::drain`]).
+    drained: bool,
+}
+
+impl EndRow {
+    /// The row's `usage_settled`: `drained` when the counts after a cancel are the vendor's own.
+    fn usage_settled(self) -> Option<&'static str> {
+        (self.drained && !self.count.estimated()).then_some("drained")
     }
-    if rc.upstream_status().is_some_and(|s| s >= 400) {
-        return "upstream_error";
+}
+
+impl Ending {
+    /// The ending these facts describe. The order is the precedence: a row-less ending over any
+    /// other, an error status over a cancel, a cancel over a missing call.
+    fn of(f: &EndFacts) -> Self {
+        let count = f.count;
+        if f.relay_abandoned {
+            return Self::RelayAbandoned;
+        }
+        if f.free {
+            return Self::Free;
+        }
+        // These three never see an estimate (see `Ending`): one here is a producer's bug.
+        let reported = |ending: Self| {
+            debug_assert!(!count.estimated(), "{ending:?} carries an estimate");
+            ending
+        };
+        if f.cache_hit {
+            return reported(Self::CacheHit(count));
+        }
+        if f.status.is_none() && f.fault == Some(Fault::Refusal) {
+            return Self::Refused;
+        }
+        if f.status.is_some_and(|s| s >= 400) {
+            return reported(Self::UpstreamStatus(count));
+        }
+        if f.client_left || matches!(f.fault, Some(Fault::Client | Fault::Refusal)) {
+            return Self::ClientCancelled {
+                count,
+                drained: f.drained,
+            };
+        }
+        if !f.called {
+            return reported(Self::NoCandidate(count));
+        }
+        match (f.fault, f.status) {
+            (Some(_), None) => Self::UpstreamFailed(count),
+            (Some(_), Some(_)) => Self::CutShort(count),
+            (None, _) => Self::Completed(count),
+        }
     }
-    if client_left || e.is_some_and(|e| e.esource() == &pingora_core::ErrorSource::Downstream) {
-        return "client_cancelled";
-    }
-    if rc.upstream_phase == UpstreamPhase::None {
-        return "no_candidate";
-    }
-    match (e, rc.upstream_status()) {
-        // Failed before any response head: a connect, read-timeout or reset failure upstream.
-        (Some(_), None) => "upstream_error",
-        // A response that started and then died.
-        (Some(_), Some(_)) => "cut_short",
-        (None, _) => "ok",
+
+    /// How this ending bills; `None` writes no row.
+    fn row(self) -> Option<EndRow> {
+        let row = |outcome, count| EndRow {
+            outcome,
+            count,
+            cache_hit: false,
+            drained: false,
+        };
+        Some(match self {
+            Self::RelayAbandoned | Self::Free | Self::Refused => return None,
+            Self::CacheHit(count) => EndRow {
+                cache_hit: true,
+                ..row("ok", count)
+            },
+            Self::UpstreamStatus(count) => row("upstream_error", count),
+            Self::ClientCancelled { count, drained } => EndRow {
+                drained,
+                ..row("client_cancelled", count)
+            },
+            Self::NoCandidate(count) => row("no_candidate", count),
+            Self::UpstreamFailed(count) => row("upstream_error", count),
+            Self::CutShort(count) => row("cut_short", count),
+            Self::Completed(count) => row("ok", count),
+        })
     }
 }
 
@@ -1484,7 +1635,7 @@ const HEALTH_PREFIX_CAP: usize = 1024;
 /// A 403 is not: it is usually about the request (moderation, a model the key's project may not
 /// use, Anthropic's `permission_error`), so one tenant's 403 must not move the shared pool off a
 /// key (D84). A 403 whose body names the key is cooled from the body ([`body_names_the_key`]).
-fn is_pool_key_failure(status: u16) -> bool {
+pub(crate) fn is_pool_key_failure(status: u16) -> bool {
     status == 401
 }
 
@@ -1498,7 +1649,7 @@ fn is_pool_key_failure(status: u16) -> bool {
 /// the walk fails over on is abandoned at its head, body unread, so its key is cooled there when
 /// the status alone says out of credit (`remedy::unfunded_402`, D258). Each is counted on
 /// `ai_key_auth_failures_total` by reason (`metrics::KeyCooled`).
-fn is_candidate_refusal(status: u16) -> bool {
+pub(crate) fn is_candidate_refusal(status: u16) -> bool {
     (401..=403).contains(&status)
 }
 
@@ -1748,6 +1899,32 @@ impl RequestCtx {
     fn fail_over(&mut self, at: u8) {
         self.advance_candidate(at);
         self.leg.retry = Some(Retry::NextCandidate);
+    }
+
+    /// Where the catalog walk can go from the candidate this attempt is on, for
+    /// [`retry::decide`]; `None` for a provider-routed request.
+    fn walk_facts(&self) -> Option<retry::Walk> {
+        let a = self.auto.as_ref()?;
+        Some(retry::Walk {
+            orig: a.walk.catalog_index(a.candidate),
+            next: first_usable(a.usable, a.candidate.saturating_add(1)).is_some(),
+            next_addr: self.leg.addr.saturating_add(1) < a.addrs,
+        })
+    }
+}
+
+/// Where a failed attempt's body can be resent from, for [`retry::decide`]. Reads the `FullBody`
+/// parent in place: a clone of it is taken only to record a re-run.
+fn body_facts(session: &mut Session, walk: Option<retry::Walk>) -> retry::Body {
+    let parent = full_body(session).map(|fb| retry::Parent {
+        reset_spent: walk
+            .and_then(|w| w.orig)
+            .is_some_and(|orig| fb.reset & (1 << orig) != 0),
+    });
+    retry::Body {
+        replayable: body_replayable(session),
+        truncated: session.as_ref().retry_buffer_truncated(),
+        parent,
     }
 }
 
@@ -2945,19 +3122,6 @@ fn walk_front(walk: &mut control::Walk, orig: u8) {
     }
 }
 
-/// A retry a [`FullBody`] subrequest hands back to its parent.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RelayRetry {
-    /// A candidate failure (a 5xx, a pool-key 401/402/403, or a connection that failed before the
-    /// upstream had the whole body) from this catalog index with another candidate left: skip it.
-    Candidate(u8),
-    /// A 429 from this catalog index with another pool key left: resume there.
-    Key { candidate: u8, key: u8 },
-    /// A reused connection failed before the upstream had the whole body (a pooled connection
-    /// the provider had already closed): try this candidate once more on a fresh connection.
-    Reset(u8),
-}
-
 impl FullBody {
     /// Hand a retry back to the parent. Returns whether it was recorded: never on the final
     /// attempt, whose answer is relayed whatever it is.
@@ -2993,12 +3157,16 @@ fn input_estimate(session: &Session, rc: &RequestCtx) -> u64 {
 }
 
 fn full_body_ctx(session: &Session) -> Option<FullBody> {
+    full_body(session).cloned()
+}
+
+/// This attempt's [`FullBody`] context, in place: `None` unless it is a `FullBody` re-run.
+fn full_body(session: &Session) -> Option<&FullBody> {
     session
         .subrequest_ctx
         .as_ref()
         .and_then(|c| c.user_ctx())
         .and_then(|u| u.downcast_ref::<FullBody>())
-        .cloned()
 }
 
 /// How long [`AiProxy::relay_full_body`] waits for an abandoned attempt to wind down before it
@@ -3210,6 +3378,7 @@ async fn pipe_full_body(
 /// `ai_rejections_total` still counts every one.
 const REJECT_LOG_PER_SEC: u64 = 100;
 
+/// Process-wide, as the log it protects is: every gateway in the process writes the one stdout.
 static REJECT_LOG: LogRate = LogRate::new(REJECT_LOG_PER_SEC);
 
 /// A per-second allowance of log lines shared by every worker: relaxed atomics, no lock. Approximate
@@ -4003,7 +4172,7 @@ impl ProxyHttp for AiProxy {
     type CTX = Ctx;
 
     fn new_ctx(&self) -> Self::CTX {
-        LIVE_REQUESTS.fetch_add(1, Ordering::AcqRel);
+        self.state.request_began();
         Ctx {
             rc: None,
             held: Held {
@@ -5446,7 +5615,8 @@ impl ProxyHttp for AiProxy {
     ///
     /// Both require a **replayable** body. Pingora's replay buffer is a private 64 KiB constant;
     /// past it a retry would send headers describing a body it then never writes. That case is
-    /// relayed, not attempted.
+    /// relayed, not attempted. [`retry::decide`] makes the call; this hook reports the status and
+    /// acts on the answer.
     async fn upstream_response_filter(
         &self,
         session: &mut Session,
@@ -5471,165 +5641,133 @@ impl ProxyHttp for AiProxy {
             rc.leg.provider.mark_key_bad(rc.leg.pool_key);
         }
 
-        // Managed 429 or 401: walk the next unused key on *this* provider. Not a vendor failover
-        // (those rules stay — `/auto` 5xx owns that, and a 401 on the last key falls through to it
-        // below) and not a breaker failure (the provider answered). A 401 is the provider refusing
-        // the credential before it processed anything, so resending the body under the next key
-        // is as safe as after a 429.
-        if rc.managed() && (status == 429 || key_auth) {
-            let next = usize::from(rc.leg.pool_key).saturating_add(1);
-            if next < rc.leg.provider.pool_auth.len()
-                && let Ok(next) = u8::try_from(next)
-            {
-                if body_replayable(session) {
-                    self.state.metrics.key_walks_total.inc();
-                    warn!(
-                        request_id = %rc.request_id,
-                        provider = rc.leg.provider.name.as_str(),
-                        key = rc.leg.pool_key,
-                        status,
-                        "upstream returned {status}; trying the next pool key",
-                    );
-                    rc.leg.pool_key = next;
-                    rc.leg.retry = Some(Retry::SameLeg);
-                    let mut e =
-                        pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(status));
-                    e.set_retry(true);
-                    return Err(e);
-                }
-                if let Some(fb) = full_body_ctx(session)
-                    && let Some(orig) = rc
-                        .auto
-                        .as_ref()
-                        .and_then(|a| a.walk.catalog_index(a.candidate))
-                {
-                    // The parent holds the body: it drops this response and re-runs on the next key.
-                    self.state.metrics.key_walks_total.inc();
-                    warn!(
-                        request_id = %rc.request_id,
-                        provider = rc.leg.provider.name.as_str(),
-                        key = rc.leg.pool_key,
-                        status,
-                        "upstream returned {status}; re-running the full body on the next pool key",
-                    );
-                    rc.attempt.relay_abandoned = fb.record(RelayRetry::Key {
-                        candidate: orig,
-                        key: next,
-                    });
-                    return Ok(());
-                }
-                warn!(
-                    request_id = %rc.request_id,
-                    provider = rc.leg.provider.name.as_str(),
-                    status,
-                    body_done = session.as_mut().is_body_done(),
-                    "upstream returned {status} but the request body is not provably replayable; not walking keys",
-                );
-            }
-            // Last key, or unreplayable: relay this 429, Retry-After included. A 401 goes on to
-            // the catalog walk's key-failure rule (next candidate), or is relayed.
-            if status == 429 {
-                return Ok(());
-            }
-        }
-
-        let Some((usable, at)) = rc.auto.as_ref().map(|a| (a.usable, a.candidate)) else {
+        // Below 400 nothing walks: the decision is always to relay, so the hot path reads no
+        // further fact.
+        if status < 400 {
             return Ok(());
-        };
-        // A managed walk's 401/402/403 is this candidate refusing (a revoked or unfunded key, a
-        // 403 its vendor may not share), not a provider failure: the next candidate holds a
-        // different key, so it is a candidate failure for this request like a 5xx. Unlike a 5xx
-        // it says nothing about the provider's health, so it never opens the breaker (resolved
-        // as a success below).
+        }
+        let walk = rc.walk_facts();
+        let decision = retry::decide(&retry::Failed {
+            failure: retry::Failure::Status {
+                status,
+                managed: rc.managed(),
+                next_key: rc.leg.next_key(),
+            },
+            walk,
+            body: body_facts(session, walk),
+        });
+        let at = rc.auto.as_ref().map_or(0, |a| a.candidate);
+        // A walk's 401–403 resolves its breaker permit as the success it is (the provider
+        // answered); a 5xx's failure is recorded by `upstream_peer`'s prologue, which still sees
+        // the permit outstanding, so recording it here as well would double-count.
         let key_failure = rc.managed() && is_candidate_refusal(status);
-        if status < 500 && !key_failure {
-            return Ok(());
-        }
-        if first_usable(usable, at.saturating_add(1)).is_none() {
-            return Ok(());
-        }
         // Failing over abandons this response at its head, so `Redact` never reads the body that
         // tells `logging` an account is out of credit (D180), and every later request would pay a
         // round trip to it first. A 402 says so by its status alone except on OpenRouter, whose
         // 402 may be one request too large for the balance (`remedy::unfunded_402`): cool that key
         // here, as `logging` would have, on either abandoning path below (D258). OpenRouter's
         // unread 402 is a strike against its key instead, and enough in a row cool it (D261).
-        let unfunded_402 = (key_failure && status == 402)
-            .then(|| rc.auto.as_ref().and_then(|a| a.candidate_at(at)))
-            .flatten()
-            .map(|c| remedy::unfunded_402(c.provider));
-        // Fail over only when the body is **provably** replayable: fully read, and small enough
-        // that pingora buffered all of it.
-        //
-        // `retry_buffer_truncated()` alone is not enough, and the reason is subtler than it looks.
-        // It reports on what has been buffered *so far*, so a provider that 5xxes fast — which is
-        // what a failing provider does — answers before a large body has finished streaming in, and
-        // the check reads `false` simply because the bytes that would truncate it have not arrived.
-        //
-        // Retrying there is not *unsafe*: pingora replays the buffered prefix with
-        // `end_of_body = is_body_done()` and the duplex loop reads the remainder straight from the
-        // socket (`proxy_h1.rs`'s retry block), so the next candidate does receive the whole body.
-        // What it is, is **timing-dependent** — the same request fails over or does not depending on
-        // how quickly the upstream rejected it. For a path that decides which vendor gets billed,
-        // a deterministic rule is worth more than the extra failovers the loose one would win.
-        //
-        // The cost is real and worth naming: a 5xx that arrives while the client is still uploading
-        // is relayed rather than retried, even when it would have replayed fine. That is what
-        // `ai_failover_unreplayable_total` counts.
-        if !body_replayable(session)
-            && let Some(fb) = full_body_ctx(session)
-            && let Some(orig) = rc.auto.as_ref().and_then(|a| a.walk.catalog_index(at))
-        {
-            // The parent holds the body: it drops this response and re-runs on the next candidate.
-            // `response_filter` still runs for it, so the breaker sees the failure.
-            self.state.metrics.candidate_failovers_total.inc();
-            warn!(
-                request_id = %rc.request_id,
-                provider = rc.leg.provider.name.as_str(),
-                candidate = at,
-                status,
-                "upstream returned {status}; re-running the full body on the next candidate",
-            );
-            rc.attempt.relay_abandoned = fb.record(RelayRetry::Candidate(orig));
-            // Not recorded (the final attempt): this answer is relayed and `logging` reads it.
-            if rc.attempt.relay_abandoned {
-                self.abandon_402(rc, unfunded_402, status);
+        let unfunded_402 = || {
+            (key_failure && status == 402)
+                .then(|| rc.auto.as_ref().and_then(|a| a.candidate_at(at)))
+                .flatten()
+                .map(|c| remedy::unfunded_402(c.provider))
+        };
+        match decision {
+            // The next pool key on this provider.
+            Decision::Resend(Retry::SameLeg) => {
+                self.state.metrics.key_walks_total.inc();
+                warn!(
+                    request_id = %rc.request_id,
+                    provider = rc.leg.provider.name.as_str(),
+                    key = rc.leg.pool_key,
+                    status,
+                    "upstream returned {status}; trying the next pool key",
+                );
+                if let Some(next) = rc.leg.next_key() {
+                    rc.leg.pool_key = next;
+                }
+                rc.leg.retry = Some(Retry::SameLeg);
+                let mut e = pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(status));
+                e.set_retry(true);
+                Err(e)
             }
-            return Ok(());
+            Decision::Resend(Retry::NextCandidate) => {
+                self.state.metrics.candidate_failovers_total.inc();
+                warn!(
+                    request_id = %rc.request_id,
+                    provider = rc.leg.provider.name.as_str(),
+                    candidate = at,
+                    status,
+                    "upstream returned {status}; trying the next candidate",
+                );
+                let unfunded_402 = unfunded_402();
+                if key_failure {
+                    rc.leg.succeed();
+                }
+                self.abandon_402(rc, unfunded_402, status);
+                rc.fail_over(at);
+                let mut e = pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(status));
+                e.set_retry(true);
+                Err(e)
+            }
+            // The parent holds the body: it drops this response and re-runs.
+            Decision::Rerun(retry @ RelayRetry::Key { .. }) => {
+                self.state.metrics.key_walks_total.inc();
+                warn!(
+                    request_id = %rc.request_id,
+                    provider = rc.leg.provider.name.as_str(),
+                    key = rc.leg.pool_key,
+                    status,
+                    "upstream returned {status}; re-running the full body on the next pool key",
+                );
+                rc.attempt.relay_abandoned =
+                    full_body_ctx(session).is_some_and(|fb| fb.record(retry));
+                Ok(())
+            }
+            Decision::Rerun(retry) => {
+                // `response_filter` still runs for it, so the breaker sees the failure.
+                self.state.metrics.candidate_failovers_total.inc();
+                warn!(
+                    request_id = %rc.request_id,
+                    provider = rc.leg.provider.name.as_str(),
+                    candidate = at,
+                    status,
+                    "upstream returned {status}; re-running the full body on the next candidate",
+                );
+                let unfunded_402 = unfunded_402();
+                rc.attempt.relay_abandoned =
+                    full_body_ctx(session).is_some_and(|fb| fb.record(retry));
+                // Not recorded (the final attempt): this answer is relayed and `logging` reads it.
+                if rc.attempt.relay_abandoned {
+                    self.abandon_402(rc, unfunded_402, status);
+                }
+                Ok(())
+            }
+            // Relayed, `Retry-After` included.
+            Decision::Stand(stand) => {
+                if stand.key_walk_unreplayable {
+                    warn!(
+                        request_id = %rc.request_id,
+                        provider = rc.leg.provider.name.as_str(),
+                        status,
+                        body_done = session.as_mut().is_body_done(),
+                        "upstream returned {status} but the request body is not provably replayable; not walking keys",
+                    );
+                }
+                if stand.failover_unreplayable {
+                    self.state.metrics.failover_unreplayable_total.inc();
+                    warn!(
+                        request_id = %rc.request_id,
+                        provider = rc.leg.provider.name.as_str(),
+                        status,
+                        body_done = session.as_mut().is_body_done(),
+                        "upstream failed but the request body is not provably replayable; relaying the error",
+                    );
+                }
+                Ok(())
+            }
         }
-        if !body_replayable(session) {
-            self.state.metrics.failover_unreplayable_total.inc();
-            warn!(
-                request_id = %rc.request_id,
-                provider = rc.leg.provider.name.as_str(),
-                status,
-                body_done = session.as_mut().is_body_done(),
-                "upstream failed but the request body is not provably replayable; relaying the error",
-            );
-            return Ok(());
-        }
-
-        self.state.metrics.candidate_failovers_total.inc();
-        warn!(
-            request_id = %rc.request_id,
-            provider = rc.leg.provider.name.as_str(),
-            candidate = at,
-            status,
-            "upstream returned {status}; trying the next candidate",
-        );
-        // The outgoing candidate's breaker failure is recorded by `upstream_peer`'s prologue, which
-        // still sees the leg's permit outstanding. A 5xx is a failure by the breaker's own
-        // definition, so that is the right outcome — and recording it here as well would
-        // double-count. A key failure is not one: resolve its permit as the success it is (the
-        // provider answered).
-        if key_failure {
-            rc.leg.succeed();
-        }
-        self.abandon_402(rc, unfunded_402, status);
-        rc.fail_over(at);
-        let mut e = pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(status));
-        e.set_retry(true);
-        Err(e)
     }
 
     async fn upstream_request_filter(
@@ -6611,6 +6749,9 @@ impl ProxyHttp for AiProxy {
     /// the provider's guarantee it processed none of the request, so it is resent — on a fresh
     /// connection to the same candidate — however much of the body went out. Routine H2
     /// connection recycling at a provider would otherwise surface as client 502s.
+    ///
+    /// [`retry::decide`] makes every one of these calls; this hook reports what the error says
+    /// about the body and acts on the answer.
     fn error_while_proxy(
         &self,
         peer: &HttpPeer,
@@ -6644,132 +6785,87 @@ impl ProxyHttp for AiProxy {
         {
             e.as_down();
         }
-        // One rule for every body size (D09, D51): a connection failure is retried only when the
-        // upstream cannot have the whole request (`body_delivered` is false: the connection never
-        // came up, the body was not read to its end, or writing it failed), and never once the
-        // response has started or the client is gone. A provider that received the whole body may
-        // be generating, and billing, already; resending it — to the same candidate or the next,
-        // pingora's reused-connection retry included — risks running the request twice, so that
-        // failure ends the request (`fail_to_proxy` answers it).
-        // Except when the provider demonstrably never processed it: an HTTP/2 refusal, or a pooled
-        // HTTP/1.1 connection it closed with the request unread. Having the body is not having
-        // taken the request.
-        let refused = upstream_refused_stream(&e);
-        let delivered = !refused
-            && !reset_before_reading(&e, client_reused)
-            && ctx
-                .rc
-                .as_ref()
-                .is_some_and(|rc| body_delivered(session, rc, Some(&*e)));
-        if *e.esource() == pingora_core::ErrorSource::Downstream
-            || session.as_downstream().response_written().is_some()
-            || delivered
-        {
-            e.set_retry(false);
-            return e;
-        }
         let Some(rc) = ctx.rc.as_mut() else {
             e.set_retry(false);
             return e;
         };
-        // A refused stream gets one resend on its candidate (D72). Refused again there, the
-        // provider is failing to take work (its stream limit, a drain that never ends): a provider
-        // failure like any other, so the walk fails over and the breaker hears of it (D91), rather
-        // than a tight loop of resends up to pingora's retry limit.
+        // What this failure says about the body (see `retry::decide`): whether the provider may
+        // have all of it, or proved it took none (an HTTP/2 refusal, a pooled HTTP/1.1 connection
+        // it closed with the request unread).
         //
-        // Except a GOAWAY on a connection this request found already open (D248): that is the
-        // provider draining a connection that carried other streams, one GOAWAY refusing every
-        // multiplexed stream above its last id at once (D160), and it retires the connection, so
-        // the resend lands on another. Not the provider refusing work, so it does not spend the
-        // one resend. A GOAWAY on a connection the request opened itself refused its first stream:
-        // that one counts. Each drain resend needs a live connection that served before, and
-        // pingora's retry limit bounds them all.
-        let drained = refused && client_reused && upstream_goaway(&e);
-        let resend_refused = refused && (drained || !rc.leg.refused_resent);
-        if resend_refused {
-            warn!(
-                request_id = %rc.request_id,
-                provider = rc.leg.provider.name.as_str(),
-                error = %e,
-                "upstream refused the stream unprocessed (GOAWAY / REFUSED_STREAM); resending once",
-            );
-        } else if refused {
-            warn!(
-                request_id = %rc.request_id,
-                provider = rc.leg.provider.name.as_str(),
-                error = %e,
-                "upstream refused the stream again; treating it as a provider failure",
-            );
-        }
-        let walk = rc
-            .auto
-            .as_ref()
-            .and_then(|a| Some((a.walk.catalog_index(a.candidate)?, a.candidate, a.usable)));
-        // A large body: pingora cannot resend it, but the parent holds it, so hand the retry back:
-        // a reused connection (a pooled one the provider had closed) gets one more try on the same
-        // candidate, otherwise the walk moves to the next candidate, if there is one. With nowhere
-        // to go the error stands.
-        if let Some(fb) = full_body_ctx(session) {
-            e.set_retry(false);
-            if let Some((orig, at, usable)) = walk {
-                let retry = if (client_reused || refused) && fb.reset & (1 << orig) == 0 {
-                    Some(RelayRetry::Reset(orig))
-                } else if first_usable(usable, at.saturating_add(1)).is_some() {
-                    Some(RelayRetry::Candidate(orig))
-                } else {
-                    None
-                };
-                // A same-candidate retry is the connection's fault (or a stream refused before
-                // any processing), not the provider's: give the permit back without an outcome,
-                // as a small body keeps it for its own same-candidate retry.
-                if retry == Some(RelayRetry::Reset(orig)) {
-                    rc.leg.release();
-                }
-                if let Some(retry) = retry {
-                    rc.attempt.relay_abandoned = fb.record(retry);
-                }
+        // A fact `decide` cannot read past an earlier one is not computed: the delivery check
+        // only matters while the client is there, nothing reached it and nothing proved the body
+        // unprocessed; a GOAWAY only for a refusal; an unsent HTTP/2 body only for one that is not.
+        let downstream = *e.esource() == pingora_core::ErrorSource::Downstream;
+        let responded = session.as_downstream().response_written().is_some();
+        let refused = upstream_refused_stream(&e);
+        let reset_unread = reset_before_reading(&e, client_reused);
+        let open = !downstream && !responded;
+        let lost = retry::Lost {
+            downstream,
+            responded,
+            delivered: open && !refused && !reset_unread && body_delivered(session, rc, Some(&*e)),
+            refused,
+            goaway: refused && upstream_goaway(&e),
+            reset_unread,
+            reused: client_reused,
+            refused_resent: rc.leg.refused_resent,
+            h2_body_unsent: open && !refused && h2_body_unsent(&e),
+            pingora_retries: {
+                let mut verdict = e.retry;
+                verdict.decide_reuse(client_reused);
+                verdict.retry()
+            },
+        };
+        let walk = rc.walk_facts();
+        let decision = retry::decide(&retry::Failed {
+            failure: retry::Failure::Lost(lost),
+            walk,
+            body: body_facts(session, walk),
+        });
+        if lost.may_resend() && refused {
+            if lost.resends_refusal() {
+                warn!(
+                    request_id = %rc.request_id,
+                    provider = rc.leg.provider.name.as_str(),
+                    error = %e,
+                    "upstream refused the stream unprocessed (GOAWAY / REFUSED_STREAM); resending once",
+                );
+            } else {
+                warn!(
+                    request_id = %rc.request_id,
+                    provider = rc.leg.provider.name.as_str(),
+                    error = %e,
+                    "upstream refused the stream again; treating it as a provider failure",
+                );
             }
-            return e;
         }
-        // A small body pingora can replay from its buffer.
-        if session.as_ref().retry_buffer_truncated() {
-            e.set_retry(false);
-            return e;
-        }
-        match walk {
-            // A reused connection, or a stream the provider refused for the first time: the same
-            // candidate again on a fresh one, keeping its breaker permit (it was the connection,
-            // not the provider).
-            Some(_) if resend_refused || (client_reused && !refused) => {
-                rc.leg.refused_resent |= refused && !drained;
+        match decision {
+            // The same candidate on a fresh connection, keeping its breaker permit: it was the
+            // connection, not the provider.
+            Decision::Resend(Retry::SameLeg) => {
+                rc.leg.refused_resent |= lost.spends_resend();
                 rc.leg.retry = Some(Retry::SameLeg);
                 e.set_retry(true);
             }
-            Some((_, at, usable)) if first_usable(usable, at.saturating_add(1)).is_some() => {
+            Decision::Resend(Retry::NextCandidate) => {
                 self.state.metrics.candidate_failovers_total.inc();
-                rc.fail_over(at);
+                rc.fail_over(rc.auto.as_ref().map_or(0, |a| a.candidate));
                 e.set_retry(true);
             }
-            Some(_) => e.set_retry(false),
-            // Provider-routed: there is no next candidate. A refused stream is resent once; refused
-            // again, the error stands (`logging` records it against the breaker). Otherwise
-            // pingora's rule: a reused connection is retried once.
-            None if resend_refused => {
-                rc.leg.refused_resent |= !drained;
-                e.set_retry(true);
+            // A large body: pingora cannot resend it, but the parent holds it.
+            Decision::Rerun(retry) => {
+                e.set_retry(false);
+                // A same-candidate retry is the connection's fault (or a stream refused before
+                // any processing), not the provider's: give the permit back without an outcome,
+                // as a small body keeps it for its own same-candidate retry.
+                if matches!(retry, RelayRetry::Reset(_)) {
+                    rc.leg.release();
+                }
+                rc.attempt.relay_abandoned =
+                    full_body_ctx(session).is_some_and(|fb| fb.record(retry));
             }
-            None if refused => e.set_retry(false),
-            // A body write that met a stream already closed (D248) is a reused connection's
-            // failure before delivery, like pingora's own `ReusedOnly` errors.
-            None if h2_body_unsent(&e) => {
-                e.retry = pingora_core::RetryType::ReusedOnly;
-                e.retry.decide_reuse(client_reused);
-            }
-            None => e.retry.decide_reuse(client_reused),
-        }
-        // A provider-routed retry is its one leg again.
-        if walk.is_none() && e.retry.retry() {
-            rc.leg.retry = Some(Retry::SameLeg);
+            Decision::Stand(_) => e.set_retry(false),
         }
         e
     }
@@ -6894,26 +6990,25 @@ impl ProxyHttp for AiProxy {
         ctx: &mut Self::CTX,
         mut e: Box<pingora_core::Error>,
     ) -> Box<pingora_core::Error> {
-        if let Some(rc) = ctx.as_mut() {
-            // Model-routed: one attempt per candidate, in preference order.
-            //
-            // No same-peer retry here, unlike the provider-routed path below. A *different* provider
-            // is strictly a superset of retrying the same one — it recovers from the transient blip
-            // the retry exists for and from a provider that is simply down, which the retry cannot.
-            // It also bounds the dead air: each attempt can burn `connect_timeout_secs`, so
-            // `MAX_CONNECT_RETRIES` attempts per candidate would multiply the client's worst case by
-            // three for no additional coverage. And it keeps the ledger trivial — exactly one
-            // `allow()`, one attempt, and one `record_*` per candidate.
-            if let Some((usable, at, addrs)) =
-                rc.auto.as_ref().map(|a| (a.usable, a.candidate, a.addrs))
-            {
-                // This candidate resolved to more than one address and an untried one remains:
-                // try it before giving up on the candidate. Same provider, same breaker permit
-                // (one address refusing is not the provider failing).
-                if rc.leg.addr.saturating_add(1) < addrs {
-                    rc.leg.addr += 1;
-                    rc.leg.retry = Some(Retry::SameLeg);
-                    rc.leg.provider.metrics.connect_retries_total.inc();
+        let Some(rc) = ctx.as_mut() else { return e };
+        let walk = rc.walk_facts();
+        // A connect failure moves no body byte, so the body it would resend is never a question.
+        let decision = retry::decide(&retry::Failed {
+            failure: retry::Failure::Connect {
+                retries_left: rc.leg.addr < MAX_CONNECT_RETRIES,
+            },
+            walk,
+            body: retry::Body::default(),
+        });
+        let at = rc.auto.as_ref().map_or(0, |a| a.candidate);
+        match (walk, decision) {
+            // The candidate's next address, or a provider-routed request's peer again: same
+            // provider, same breaker permit (one address refusing is not the provider failing).
+            (_, Decision::Resend(Retry::SameLeg)) => {
+                rc.leg.provider.metrics.connect_retries_total.inc();
+                rc.leg.addr += 1;
+                rc.leg.retry = Some(Retry::SameLeg);
+                if walk.is_some() {
                     warn!(
                         request_id = %rc.request_id,
                         provider = rc.leg.provider.name.as_str(),
@@ -6922,14 +7017,26 @@ impl ProxyHttp for AiProxy {
                         error = %e,
                         "upstream connect failed; trying the candidate's next address",
                     );
-                    e.set_retry(true);
-                    return e;
+                } else {
+                    // Without this, a partially-down provider TCP layer (or an egress-IP ban —
+                    // connect is where that first bites) shows up only as extra latency on
+                    // `upstream_latency_seconds`, indistinguishable from a slow model.
+                    warn!(
+                        request_id = %rc.request_id,
+                        provider = rc.leg.provider.name.as_str(),
+                        attempt = rc.leg.addr,
+                        error = %e,
+                        "upstream connect failed; retrying",
+                    );
                 }
-                // The failure itself is recorded by `upstream_peer`'s prologue, when it moves off
-                // this candidate. Recording here as well would double-count whenever there is no
-                // next candidate, since `logging` would then also resolve the still-pending permit —
-                // which would trip the breaker at half its configured threshold on the last
-                // candidate, exactly where everything lands once the primaries are sick.
+                e.set_retry(true);
+            }
+            // The failure itself is recorded by `upstream_peer`'s prologue, when it moves off this
+            // candidate. Recording here as well would double-count whenever there is no next
+            // candidate, since `logging` would then also resolve the still-pending permit — which
+            // would trip the breaker at half its configured threshold on the last candidate,
+            // exactly where everything lands once the primaries are sick.
+            (Some(_), decision) => {
                 rc.leg.provider.metrics.connect_retries_total.inc();
                 warn!(
                     request_id = %rc.request_id,
@@ -6938,34 +7045,16 @@ impl ProxyHttp for AiProxy {
                     error = %e,
                     "upstream connect failed; trying the next candidate",
                 );
-                // Only signal a retry if there is somewhere to go. Otherwise leave `retry` false so
-                // the proxy loop stops and `logging` resolves the outstanding permit against this,
-                // the last candidate.
-                if first_usable(usable, at.saturating_add(1)).is_some() {
+                // With nowhere to go `retry` stays false, so the proxy loop stops and `logging`
+                // resolves the outstanding permit against this, the last candidate.
+                if decision == Decision::Resend(Retry::NextCandidate) {
                     self.state.metrics.candidate_failovers_total.inc();
                     rc.fail_over(at);
                     e.set_retry(true);
                 }
-                return e;
             }
-            // Retry transient connect failures a couple of times (Pingora re-invokes upstream_peer).
-            if rc.leg.addr < MAX_CONNECT_RETRIES {
-                rc.leg.addr += 1;
-                // Surface the retry. Without this, a partially-down provider TCP layer (or an
-                // egress-IP ban — connect is where that first bites) shows up only as extra latency
-                // on `upstream_latency_seconds`, indistinguishable from a slow model. The counter is
-                // the dashboard signal; the `warn!` carries the request_id to grep.
-                rc.leg.provider.metrics.connect_retries_total.inc();
-                warn!(
-                    request_id = %rc.request_id,
-                    provider = rc.leg.provider.name.as_str(),
-                    attempt = rc.leg.addr,
-                    error = %e,
-                    "upstream connect failed; retrying",
-                );
-                rc.leg.retry = Some(Retry::SameLeg);
-                e.set_retry(true);
-            }
+            // A provider-routed peer out of retries: the error stands, uncounted as a retry.
+            (None, _) => {}
         }
         e
     }
@@ -7077,9 +7166,6 @@ impl ProxyHttp for AiProxy {
         // The last `USAGE_TAIL_CAP` bytes of the response, oldest first (see `UsageTail`). Short
         // responses are the whole body; long ones are rotated into order here, once. Skipped on a
         // cache hit — there is no tail; tokens come from the stored entry.
-        let mut usage_estimated = false;
-        // Which counts an estimate replaced (see `EstimatedParts`).
-        let mut estimated = EstimatedParts::default();
         // A free sub-resource (a token count) is not a billable call: it carries no usage block,
         // writes no billing row, and is not a usage-shape regression. On every route: a catalog
         // walk records it, a `/{provider}` route names it in the forwarded path.
@@ -7104,8 +7190,8 @@ impl ProxyHttp for AiProxy {
             && upstream_status.is_none()
             && e.is_some_and(gave_up_waiting)
             && body_delivered(session, rc, e);
-        let parsed = if cache_hit.is_some() {
-            cache_hit.as_ref().map(|h| h.usage)
+        let (parsed, count) = if let Some(h) = cache_hit.as_ref() {
+            (Some(h.usage), Count::Reported)
         } else {
             let tail = rc.resp_tail.contiguous();
             // A relayed managed 403 whose body names the key (not the request) is that key being
@@ -7200,22 +7286,22 @@ impl ProxyHttp for AiProxy {
             // we could not recover) is a turn the provider billed, never a silent 0/0.
             let started = parsed.is_some() || output > 0 || !usage::stream_carried_error(tail);
             if (cut_short && started) || body_cut || body_unmetered || no_head {
-                usage_estimated = true;
                 let mut u = parsed.unwrap_or_default();
+                let mut parts = EstimatedParts::default();
                 if u.input_tokens == 0 {
                     u.input_tokens = input_estimate(session, rc);
-                    estimated.input = true;
+                    parts.input = true;
                 }
                 if output > u.output_tokens {
                     u.output_tokens = output;
-                    estimated.output = true;
+                    parts.output = true;
                 }
-                Some(u)
+                (Some(u), Count::Estimated(parts))
             } else {
-                parsed
+                (parsed, Count::Reported)
             }
         };
-        if usage_estimated {
+        if count.estimated() {
             self.state.metrics.usage_estimated_total.inc();
         }
         // A managed 2xx response is *expected* to carry usage; `None` there means the provider's
@@ -7227,7 +7313,7 @@ impl ProxyHttp for AiProxy {
         //
         // A stream that ended *cleanly* without usage is that same shape-change signal even though
         // it is now billed an estimate, so it still counts here; one cut short by an error does not.
-        if (parsed.is_none() || (usage_estimated && e.is_none()))
+        if (parsed.is_none() || (count.estimated() && e.is_none()))
             && let Some(id) = rc.billing.identity()
             && !free
             && cache_hit.is_none()
@@ -7303,17 +7389,21 @@ impl ProxyHttp for AiProxy {
         // with `tenant_id=0` — unbillable, unattributable, and a footgun for any consumer that sums
         // without filtering it out. Aggregate gateway throughput (incl. BYO) is already covered by
         // the Prometheus metrics above, which is the right tool for non-billing observability.
-        // An abandoned `FullBody` attempt is not the request the client got: the attempt that
-        // serves writes the one row (and the one capture).
-        // The gateway's own refusal before any response head (a catalog miss on `/{provider}`, a
-        // duplicate `model`, `background`): no provider had the request, so no row, as for every
-        // other rejection.
-        let refused =
-            cache_hit.is_none() && upstream_status.is_none() && e.is_some_and(gateway_refusal);
+        // Whether the request writes a row at all, and what the row says of how it ended, is its
+        // `Ending`'s (see `Ending::row`).
         if let Some(&id) = rc.billing.identity()
-            && !rc.attempt.relay_abandoned
-            && !free
-            && !refused
+            && let Some(end) = Ending::of(&EndFacts {
+                relay_abandoned: rc.attempt.relay_abandoned,
+                free,
+                cache_hit: cache_hit.is_some(),
+                status: upstream_status,
+                fault: e.map(Fault::of),
+                client_left,
+                called: rc.upstream_phase != UpstreamPhase::None,
+                drained,
+                count,
+            })
+            .row()
         {
             // What the client asked for that changes the price (read before the borrows below).
             let requested = requested_knobs(session, rc);
@@ -7379,7 +7469,6 @@ impl ProxyHttp for AiProxy {
                 None => (rc.upstream_phase != UpstreamPhase::None)
                     .then_some(rc.leg.provider.name.as_str()),
             };
-            let outcome = outcome(rc, e, cache_hit.is_some(), client_left);
             let usage_stream = cache_hit
                 .as_ref()
                 .map(|h| h.streaming)
@@ -7414,8 +7503,8 @@ impl ProxyHttp for AiProxy {
                 .filter(|_| called);
             let server_tools = usage.server_tools.to_row();
             let upstream_may_continue =
-                upstream_may_continue(usage_provider, outcome, usage_stream, drained);
-            let estimate_excludes = estimated.excludes(&usage);
+                upstream_may_continue(usage_provider, end.outcome, usage_stream, end.drained);
+            let estimate_excludes = end.count.parts().excludes(&usage);
             let upstream_cost_usd = usage.upstream.cost_e10.map(usage::e10_to_usd);
             let upstream_inference_cost_usd =
                 usage.upstream.inference_cost_e10.map(usage::e10_to_usd);
@@ -7435,9 +7524,9 @@ impl ProxyHttp for AiProxy {
                 price_model,
                 provider: usage_provider,
                 price_variant,
-                usage_estimated,
+                usage_estimated: end.count.estimated(),
                 upstream_may_continue,
-                cache_hit: cache_hit.is_some(),
+                cache_hit: end.cache_hit,
                 unix_secs: start_unix_secs,
                 ..usage.pricer_row(rc.dialect)
             });
@@ -7466,18 +7555,18 @@ impl ProxyHttp for AiProxy {
                 // The catalog row id the row prices at (see `price_model`); absent when unpriced.
                 price_model,
                 stream = usage_stream,
-                cache_hit = cache_hit.is_some(),
+                cache_hit = end.cache_hit,
                 // The provider's HTTP status, absent when no response head arrived (and on a cache
-                // hit, which made no call); and what became of the request (see `outcome`).
+                // hit, which made no call); and what became of the request (see `Ending`).
                 upstream_status = cache_hit.is_none().then_some(upstream_status).flatten(),
-                outcome,
+                outcome = end.outcome,
                 // True when the stream was cut short before its usage block and the token counts
                 // below are the gateway's estimate, not the provider's report. Estimates err low.
-                usage_estimated,
+                usage_estimated = end.count.estimated(),
                 // `drained`: the client cancelled and the counts are still the provider's own,
                 // read from the stream the gateway finished after it left (`crate::drain`).
                 // Absent otherwise.
-                usage_settled = (drained && !usage_estimated).then_some("drained"),
+                usage_settled = end.usage_settled(),
                 input_tokens = usage.input_tokens,
                 output_tokens = usage.output_tokens,
                 cache_read_tokens = usage.cache_read_tokens,
@@ -7536,7 +7625,7 @@ impl ProxyHttp for AiProxy {
                 price_detail = priced.map(|p| tracing::field::display(p.price)),
                 start_unix_secs,
                 // Which counts are the gateway's estimate, and what the estimate cannot see.
-                usage_estimated_parts = estimated.parts(),
+                usage_estimated_parts = end.count.parts().parts(),
                 usage_estimate_excludes = estimate_excludes,
                 // `Some(0)` (reported, none used) vs `None` (not reported at all — an unreasoning
                 // model, or a provider that doesn't surface it) matters and is unrecoverable once this
@@ -7588,7 +7677,7 @@ impl ProxyHttp for AiProxy {
             // Fill: complete 2xx only. Client abort, 4xx/5xx, and truncation are all skips — a
             // partial or error body must never be replayed as a success.
             if e.is_none()
-                && !usage_estimated
+                && !end.count.estimated()
                 && upstream_status.is_some_and(|s| (200..300).contains(&s))
                 && let Some(cache::Pending::Fill {
                     key,
@@ -7621,6 +7710,26 @@ impl ProxyHttp for AiProxy {
 #[cfg(test)]
 #[path = "proxy_row_tests.rs"]
 mod row_tests;
+
+/// The `outcome` a request with these facts logs, for the tests that pin each one; `logging`
+/// builds its [`Ending`] from every fact at once.
+#[cfg(test)]
+fn outcome(
+    rc: &RequestCtx,
+    e: Option<&pingora_core::Error>,
+    cache_hit: bool,
+    client_left: bool,
+) -> &'static str {
+    let ending = Ending::of(&EndFacts {
+        cache_hit,
+        status: rc.upstream_status(),
+        fault: e.map(Fault::of),
+        client_left,
+        called: rc.upstream_phase != UpstreamPhase::None,
+        ..EndFacts::default()
+    });
+    ending.row().map_or("", |r| r.outcome)
+}
 
 #[cfg(test)]
 mod tests {

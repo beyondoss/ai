@@ -14,7 +14,7 @@ use beyond_ai::capture_sink::{CaptureDrain, CaptureSink};
 use beyond_ai::config::{AiConfig, ValidConfig};
 use beyond_ai::doctor;
 use beyond_ai::metrics::Metrics;
-use beyond_ai::proxy::{AiProxy, LIVE_REQUESTS};
+use beyond_ai::proxy::AiProxy;
 use beyond_ai::state::GatewayState;
 use beyond_ai::store_watch::{Allowance, Capture, Deny, WatcherService};
 use beyond_ai::usage::{USAGE_TARGET, usage_log_filter};
@@ -35,7 +35,6 @@ use pingora_proxy::ProxyServiceBuilder;
 use std::io::Write as _;
 use std::path::Path;
 use std::process::exit;
-use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tracing_subscriber::EnvFilter;
@@ -80,14 +79,16 @@ fn load_config(path: Option<&Path>) -> ValidConfig {
 /// On SIGTERM pingora stops accepting and then sleeps the whole `grace_period_seconds` before it
 /// tears the runtimes down, whether or not anything is still running: an idle gateway took the full
 /// 600 s to stop, so every deploy on a platform with a shorter stop timeout (ECS Fargate: 120 s)
-/// ended in SIGKILL. The drain watches [`LIVE_REQUESTS`] (every request context, dropped only after
-/// its `logging`, billing row included) and exits the moment it reaches zero. Pingora's sleep stays
-/// the upper bound: a request still running when the grace ends is cut as before.
+/// ended in SIGKILL. The drain watches [`GatewayState::live_requests`] (every request context,
+/// dropped only after its `logging`, billing row included) and exits the moment it reaches zero.
+/// Pingora's sleep stays the upper bound: a request still running when the grace ends is cut as
+/// before.
 ///
 /// Before it exits, the drain writes out the `ai.payload` and diagnostic lines still queued
 /// ([`LogDrains`], D208, D263): `exit` does not wait for the sinks' threads, so a capture of the last
 /// requests was lost silently. `ai.usage` rows need no such step: they are written synchronously.
 struct DrainOnTerm {
+    state: Arc<GatewayState>,
     grace: Duration,
     logs: Arc<Mutex<Option<LogDrains>>>,
 }
@@ -132,11 +133,12 @@ impl ShutdownSignalWatch for DrainOnTerm {
         if matches!(signal, ShutdownSignal::GracefulTerminate) {
             let grace = self.grace;
             let logs = Arc::clone(&self.logs);
+            let state = Arc::clone(&self.state);
             // A plain thread: pingora's main thread is about to block in its grace sleep, and the
             // service runtimes are what is being drained.
             let spawned = std::thread::Builder::new()
                 .name("ai-drain".into())
-                .spawn(move || drain_then_exit(grace, &logs));
+                .spawn(move || drain_then_exit(&state, grace, &logs));
             if let Err(e) = spawned {
                 tracing::warn!(error = %e, "could not start the shutdown drain; waiting out the grace period");
             }
@@ -146,7 +148,7 @@ impl ShutdownSignalWatch for DrainOnTerm {
 }
 
 /// How long the drain lets pingora's shutdown broadcast land (listeners stop accepting, idle
-/// keep-alive connections drop) before it trusts a zero [`LIVE_REQUESTS`].
+/// keep-alive connections drop) before it trusts a zero [`GatewayState::live_requests`].
 const DRAIN_SETTLE: Duration = Duration::from_millis(200);
 
 /// The longest the drain waits for queued `ai.payload` and diagnostic lines to be written before it
@@ -160,11 +162,11 @@ const LOG_FLUSH: Duration = Duration::from_secs(5);
 const DIAG_QUEUE_DEPTH: usize = 8192;
 const DIAG_QUEUE_BYTES: usize = 16 * 1024 * 1024;
 
-fn drain_then_exit(grace: Duration, logs: &Mutex<Option<LogDrains>>) {
+fn drain_then_exit(state: &GatewayState, grace: Duration, logs: &Mutex<Option<LogDrains>>) {
     let start = Instant::now();
     std::thread::sleep(DRAIN_SETTLE);
     while start.elapsed() < grace {
-        let live = LIVE_REQUESTS.load(Ordering::Acquire);
+        let live = state.live_requests();
         if live == 0 {
             tracing::info!(
                 after_ms = start.elapsed().as_millis() as u64,
@@ -524,6 +526,7 @@ fn main() {
     );
     server.run(RunArgs {
         shutdown_signal: Box::new(DrainOnTerm {
+            state: Arc::clone(&state),
             grace: Duration::from_secs(grace_period_secs),
             logs: Arc::clone(&logs),
         }),

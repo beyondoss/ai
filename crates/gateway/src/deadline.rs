@@ -25,8 +25,13 @@ pub const NONE: u64 = u64::MAX;
 /// How often the coarse clock advances: the lateness bound of a per-chunk cut.
 const TICK: Duration = Duration::from_secs(1);
 
+/// The clock's origin. Process-wide: a deadline is a number on this one clock, so every proxy in
+/// the process must read the same origin.
 static BASE: OnceLock<Instant> = OnceLock::new();
+/// The coarse clock itself: one relaxed load on the per-chunk path, where `Instant::now()` would be
+/// a clock read per chunk.
 static NOW_MS: AtomicU64 = AtomicU64::new(0);
+/// The one ticker thread that advances [`NOW_MS`], started at most once per process.
 static TICKER: OnceLock<()> = OnceLock::new();
 
 fn base() -> Instant {

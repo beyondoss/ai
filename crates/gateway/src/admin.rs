@@ -65,7 +65,8 @@ pub const HEALTH_ALLOWANCE_UNSEEDED: &str = concat!(
 /// *cold* scrape depends on it being in the right ballpark — see [`AdminApp::metrics`].
 const MIN_SCRAPE_BUF: usize = 8 * 1024;
 
-/// Encoded length of the last scrape (plus headroom), used to pre-size the next one.
+/// Encoded length of the last scrape (plus headroom), used to pre-size the next one. Process-wide,
+/// as the default Prometheus registry it measures is.
 static LAST_SCRAPE: AtomicUsize = AtomicUsize::new(MIN_SCRAPE_BUF);
 
 pub struct AdminApp {

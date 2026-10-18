@@ -1830,6 +1830,26 @@ an estimate with nothing parsed takes the request's wire.
 | `no_candidate`     | No provider was called — every candidate's breaker was open                          |
 | `cut_short`        | A response started and then died upstream                                            |
 
+**How a request ended is one type.** `logging` reads the hook's facts once (`proxy::EndFacts`: the
+status, whom the error blames, a cache hit, a free sub-resource, an abandoned `FullBody` attempt,
+the drain, whether the counts are an estimate) and builds a `proxy::Ending`. The row is then a
+total match on it (`Ending::row`): whether one is written, its `outcome`, `cache_hit`,
+`usage_estimated` and its parts, `usage_settled`. A new ending does not compile until it is decided
+how it bills. In order of precedence:
+
+| `Ending`          | Row                                                                              |
+| ----------------- | -------------------------------------------------------------------------------- |
+| `RelayAbandoned`  | none: the `FullBody` attempt that serves writes it                               |
+| `Free`            | none: a free sub-resource (a token count)                                        |
+| `CacheHit`        | `ok`, `cache_hit`, the fill's stored counts                                      |
+| `Refused`         | none: the gateway refused it before any response head (D267)                     |
+| `UpstreamStatus`  | `upstream_error`, the provider's counts (an error status is never estimated)     |
+| `ClientCancelled` | `client_cancelled`, reported or estimated; `drained` when the drain settled      |
+| `NoCandidate`     | `no_candidate`, no counts (nothing was called, so nothing to estimate)           |
+| `UpstreamFailed`  | `upstream_error`, estimated when the gateway gave up waiting on a delivered body |
+| `CutShort`        | `cut_short`, reported or estimated                                               |
+| `Completed`       | `ok`, reported or estimated (D195)                                               |
+
 **A stream is complete when its protocol says so.** Chat Completions ends at `data: [DONE]`,
 Messages at `message_stop`, Responses at `response.completed` (or `response.incomplete`). Stock
 clients close as soon as they have it: openai-python breaks out at `[DONE]`, Codex closes at
@@ -2866,6 +2886,46 @@ verifying them also rewrites the body, and a store relay checks them where it ho
 (first on `Relay` and `Buffered`, after the walk on `Connect`). `tests/refusal_precedence.rs` pins
 which refusal answers each pair at each point, end to end, a foreign id's place included.
 
+### Retries (`retry.rs`)
+
+Whether a failed attempt is retried, and how, is one function, `retry::decide`. The hooks that can
+ask pingora for another attempt (`upstream_response_filter`, `fail_to_connect`,
+`error_while_proxy`) report what they saw as a `retry::Failed`: the failure (a connect, an error
+status at the head, a connection lost once it was up), the walk (the failing slot's catalog index,
+whether another candidate or address remains), and the body (replayable by pingora, past its
+buffer, or held by a `FullBody` parent). They act on the `Decision` it returns: move the key, the
+address or the walk, count it, log it. None decides inline.
+
+| `Decision`              | Next attempt                                                                                    |
+| ----------------------- | ----------------------------------------------------------------------------------------------- |
+| `Resend(SameLeg)`       | pingora resends on this leg: the next pool key, the next address, a fresh connection, a refusal |
+| `Resend(NextCandidate)` | pingora resends to the walk's next candidate                                                    |
+| `Rerun(RelayRetry)`     | the `FullBody` parent drops this attempt and re-runs: a candidate, a key, or a reset            |
+| `Stand(Stand)`          | none; `Stand` names a key walk or failover the body could not take, which the hook counts       |
+
+It keeps one rule for all of them: **a body the provider may already have is never sent again,
+unless the provider proved it unprocessed** (`Lost::may_resend`: an HTTP/2 refusal, or a pooled
+HTTP/1.1 connection it reset with the request unread). An error status is the provider's answer, so
+it may walk to another key or candidate whenever pingora still holds the whole body. A connect
+failure moved no body byte. `retry_tests.rs` holds the function to the rules the hooks ran inline
+over every combination of facts they can report, and names each outcome.
+
+### What is process-wide
+
+Mutable state belongs to the gateway (`GatewayState`), so two gateways in one process (as the unit
+tests build them) never share it: the count of live requests the shutdown drain waits on
+(`GatewayState::live_requests`) is one. What stays a `static` is process-wide by nature:
+
+| Static                                    | Why                                                                      |
+| ----------------------------------------- | ------------------------------------------------------------------------ |
+| `deadline::{BASE, NOW_MS, TICKER}`        | one coarse clock and its one ticker thread; a per-chunk read is one load |
+| `circuit_breaker::MONOTONIC_BASE`         | every breaker's packed timestamps count from one origin                  |
+| `proxy::REJECT_LOG`, `log_second`         | the rejection-line cap guards the process's one stdout                   |
+| `admin::LAST_SCRAPE`                      | sizes the scrape of the default Prometheus registry, itself process-wide |
+| `cache::KEY_HASHER`                       | a per-process secret, immutable once made                                |
+| `control::*_NAME`, `signed_id::ID_KEY`, … | immutable lookups built once (the header names at compile time)          |
+| `translate::fresh_id`'s counter           | ids unique across the process                                            |
+
 ---
 
 ## Why It Behaves This Way
@@ -3137,7 +3197,7 @@ was not yet delivered.
 reused connection closed — after the upstream had the whole request means the provider may already
 be generating, and billing, the answer. Resending it, to the same candidate or the next, duplicates
 that spend (a 200 KiB body with a silent upstream used to reach each of two candidates twice, with
-waits up to 2 × `read_timeout_secs`). So `error_while_proxy` resends — pingora's reused-connection
+waits up to 2 × `read_timeout_secs`). So a lost connection (`retry::decide`) resends — pingora's reused-connection
 retry, or a `FullBody` reset retry — only when `body_delivered` is false: the connection never came
 up, the client's body was not read to its end, or writing it upstream failed (a reset mid-upload
 surfaces as a write error). Otherwise the walk ends, and `fail_to_proxy` answers with the gateway's
@@ -3795,6 +3855,7 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
 | `deny`            | Sparse deny-set, default-allow, reason → HTTP status                                                                                                                           | unit ✓         |
 | `allowance`       | Sparse remaining-ok / exhausted set; fail-closed until seeded (503); 402 when exhausted                                                                                        | unit ✓ + e2e ✓ |
 | `capture`         | Sparse capture-set (default-off) + head-bounded `CaptureBufs` and 1-in-N sampling                                                                                              | unit ✓ + e2e ✓ |
+| `retry`           | `retry::decide`: whether a failed attempt is retried and how (`Retry`, `RelayRetry`); never resends a body the provider may have unless it proved it unprocessed               | unit ✓ + e2e ✓ |
 | `remedy`          | Provider-account remedies in a managed error: the neutral rewrite (D174, D196) and the structured out-of-credit verdict that cools a key (D180, D200)                          | unit ✓ + e2e ✓ |
 | `capture_sink`    | Bounded (lines and bytes), lossy writer for `ai.payload` and diagnostics — drops on a full queue so a stalled log sink can't backpressure                                      | unit ✓, e2e ✓  |
 | `usage_file`      | Blocking, lossless `ai.usage` writer to hourly `.jsonl` files (`AI_USAGE_DIR`): rotation, 48 h retention, 1 s fdatasync, one writer per file                                   | unit ✓, e2e ✓  |

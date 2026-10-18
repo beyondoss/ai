@@ -538,7 +538,7 @@ claims = ["REL-16", "BIL-21"]
 state = "fixed"
 test = "an_idle_gateway_exits_promptly_on_sigterm"
 fix = "7010389"
-note = "A custom ShutdownSignalWatch starts a drain on SIGTERM that exits once LIVE_REQUESTS (request contexts, dropped after logging) is 0; pingora's grace sleep stays the upper bound. Idle exit ~0.3s; sigterm_drains_an_in_flight_request_then_exits shows an in-flight request finishes with its billing row first."
+note = "A custom ShutdownSignalWatch starts a drain on SIGTERM that exits once GatewayState::live_requests (request contexts, dropped after logging) is 0; pingora's grace sleep stays the upper bound. Idle exit ~0.3s; sigterm_drains_an_in_flight_request_then_exits shows an in-flight request finishes with its billing row first."
 
 [[defect]]
 id = "D39"
@@ -1294,7 +1294,7 @@ claims = ["S1"]
 state = "fixed"
 test = "new_ctx_pays_no_arc_clone"
 fix = "3d44c35"
-note = "Found by the independent branch review (2026-10-01) of a54c22c. Fixed: AiProxy and the request context hold a &'static GatewayState (no per-request Arc clone; LIVE_REQUESTS stays for D38); remove_headers_where sweeps headers via stack batches (no Vec); each PoolAuth carries a boot-built memmem Finder used by response_filter and Redact. Structure pinned by remove_headers_where_removes_every_match_in_stack_batches and a_pool_key_carries_its_boot_built_searcher."
+note = "Found by the independent branch review (2026-10-01) of a54c22c. Fixed: AiProxy and the request context hold a &'static GatewayState (no per-request Arc clone; the live-request count for D38 is GatewayState::live_requests, reached through that same reference); remove_headers_where sweeps headers via stack batches (no Vec); each PoolAuth carries a boot-built memmem Finder used by response_filter and Redact. Structure pinned by remove_headers_where_removes_every_match_in_stack_batches and a_pool_key_carries_its_boot_built_searcher."
 
 [[defect]]
 id = "D93"

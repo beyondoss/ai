@@ -71,6 +71,7 @@ pub(crate) enum Drain {
 /// these; each one refuses rather than pretending to succeed, in case a future pingora does.
 pub(crate) struct NoStore;
 
+/// The one [`NoStore`]: pingora takes its storage as `&'static`.
 static NO_STORE: NoStore = NoStore;
 
 fn refused() -> Box<Error> {
