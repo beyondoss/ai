@@ -332,7 +332,13 @@ fn a_cached_manifest_lists_skills_without_a_server_and_a_stale_one_is_refreshed(
     let log: Vec<String> = env
         .log()
         .into_iter()
-        .filter(|l| !l.starts_with("server/discover") && !l.starts_with("initialize"))
+        // A started server's tools are listed again in the background (the cache is only a hint
+        // for boot), concurrently with the load: it is in the log, but not in a fixed place.
+        .filter(|l| {
+            !l.starts_with("server/discover")
+                && !l.starts_with("initialize")
+                && !l.starts_with("tools/list")
+        })
         .collect();
     assert_eq!(
         log,

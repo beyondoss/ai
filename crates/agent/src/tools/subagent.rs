@@ -184,9 +184,10 @@ pub struct SubagentCtx {
     /// The **parent's** registry. Passed to every child via `Agent::with_write_locks`, because
     /// `Agent::new`'s default is a fresh *private* one — leave it and N children editing one file race.
     pub write_locks: Arc<WriteLockRegistry>,
-    /// Already-connected MCP tools. `Arc` clones share the live stdio child / HTTP connection, which is
-    /// the entire reason an in-process child beats a subprocess.
-    pub mcp_tools: Vec<Arc<dyn Tool>>,
+    /// Already-connected MCP tools, live: a child dispatched after a server changed its tools gets
+    /// the new list. `Arc` clones share the live stdio child / HTTP connection, which is the entire
+    /// reason an in-process child beats a subprocess.
+    pub mcp_tools: crate::tools::mcp::McpTools,
     /// The parent session's **live** MCP kit gate, not a filtered snapshot of [`Self::mcp_tools`].
     /// The ctx is built once per session and reused by every child after it, so a list filtered at
     /// build time would go stale the moment `set_mcp_enabled` ran — and a server the operator
@@ -1165,7 +1166,7 @@ impl Subagent {
         // session command, and a child must see the kit its parent has at this moment. Its skill
         // tools are bound in its own name, so a load it makes asks the user as this child.
         let mcp_tools = crate::tools::mcp::filter_by_enabled_as(
-            &self.ctx.mcp_tools,
+            &self.ctx.mcp_tools.snapshot(),
             &self.ctx.mcp_enabled,
             origin,
         );

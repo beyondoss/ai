@@ -115,7 +115,7 @@ fn ctx_with(
         agents: Arc::new(defs),
         skills: Arc::new(skills),
         write_locks: Arc::new(agent_core::WriteLockRegistry::new()),
-        mcp_tools: Vec::new(),
+        mcp_tools: Default::default(),
         mcp_enabled: Default::default(),
         memory_mounts,
         tool_cfg: ChildToolConfig {
@@ -708,7 +708,7 @@ fn ctx_with_gate_call(
         agents: Arc::new(defs),
         skills: Arc::new(Vec::new()),
         write_locks: Arc::new(agent_core::WriteLockRegistry::new()),
-        mcp_tools: Vec::new(),
+        mcp_tools: Default::default(),
         mcp_enabled: Default::default(),
         memory_mounts: Vec::new(),
         tool_cfg: ChildToolConfig {
