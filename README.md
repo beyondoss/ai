@@ -369,7 +369,9 @@ costs against the alternatives. Every number there was measured; `deploy/efs-pro
 the run they came from.
 
 `Dockerfile.agent` builds it — a static musl binary in an Alpine runtime, entrypoint
-`serve --service`, non-root (uid 10001):
+`serve --service`, non-root (uid 10001). Published as a multi-arch (`linux/amd64`, `linux/arm64`)
+image at `ghcr.io/beyondoss/ai-agent`, tagged `latest` and by commit SHA; the gateway is
+`ghcr.io/beyondoss/ai` the same way. To build it yourself:
 
 ```sh
 docker build -f Dockerfile.agent -t beyond-ai-agent .
