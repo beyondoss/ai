@@ -168,14 +168,23 @@ fn anthropic_fast_mode_cells_may_name_usd() {
         assert!(want.is_some(), "{name}");
         assert_eq!(fast(&usd, name).unwrap(), want, "{name}");
     }
-    for bad in [
-        "$10 EUR / MTok",
-        "$10 USD/MTok",
-        "$10 USD USD / MTok",
-        "10 USD / MTok",
+    // Every cell, input and output on both rows, is held to the same spelling.
+    for (cell, name) in [
+        ("$8 USD / MTok", "Claude Opus 5.5"),
+        ("$40 USD / MTok", "Claude Opus 5.5"),
+        ("$10 USD / MTok", "Claude Opus 4.8"),
+        ("$50 USD / MTok", "Claude Opus 4.8"),
     ] {
-        let md = usd.replace("$10 USD / MTok", bad);
-        assert!(fast(&md, "Claude Opus 4.8").is_err(), "{bad:?}");
+        let n = cell.trim_end_matches(" USD / MTok").trim_start_matches('$');
+        for bad in [
+            format!("${n} EUR / MTok"),
+            format!("${n} USD/MTok"),
+            format!("${n} USD USD / MTok"),
+            format!("{n} USD / MTok"),
+        ] {
+            let md = usd.replace(cell, &bad);
+            assert!(fast(&md, name).is_err(), "{cell:?} as {bad:?}");
+        }
     }
 }
 
