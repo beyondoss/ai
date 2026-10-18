@@ -211,7 +211,8 @@
 //!     a normally-retried transient failure immediately, for debugging a flaky connection rather than
 //!     waiting through several silent attempts. Gates *two* layers as one user-facing concept: the
 //!     mid-stream retry inside a single model turn (`agent_core::Agent::with_auto_retry`; each of its
-//!     retries streams an `event` with `kind:"retry"`, and a rate limit is waited out there for up to
+//!     retries streams an `event` with `kind:"retry"` (`rate_limited` is true for the time-budgeted class; an
+//!     overload adds `overloaded:true` beside it, absent otherwise), and a rate limit is waited out there for up to
 //!     `--retry-rate-limit-secs`), and, once that's exhausted, automatically re-invoking the *whole*
 //!     `prompt` run against the same session up to 3 more times without progress, with backoff
 //!     (2/4/8s) — pi's `agent-session.ts` auto-retry. Each whole-run retry

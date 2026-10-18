@@ -1074,7 +1074,7 @@ The harness layers several capabilities over the bare tools + loop:
   waits them out inside the turn under a time budget (`--retry-rate-limit-secs` /
   `AI_AGENT_RETRY_RATE_LIMIT_SECS`, default 300, `retry::rate_limit_policy`, see `agent_core`'s
   `rate_limit.rs`), announcing each wait as an `AgentEvent::Retry` (`run` text mode prints
-  `[rate limited, retrying in Ns (attempt n): …]` to stderr; `--json` and `serve` stream the event). A
+  `[rate limited, retrying in Ns (attempt n): …]` to stderr, or `[provider overloaded, retrying …]` for a 529 / `overloaded_error`, whose spent-budget message likewise says "provider still overloaded"; `--json` and `serve` stream the event). A
   transport retry inside the turn (a 5xx or connection failure before the first byte, a broken stream)
   is announced the same way, as `AgentEvent::Retry { rate_limited: false }` (`[stream error, retrying
   …]`), so no retry is silent. An

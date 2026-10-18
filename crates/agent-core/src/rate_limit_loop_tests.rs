@@ -60,6 +60,26 @@ async fn run(agent: &Agent) -> (Result<()>, Vec<(u32, bool)>, Session) {
     (result, retries, session)
 }
 
+#[test]
+fn the_retry_frame_adds_overloaded_only_for_an_overload() {
+    let frame = |overloaded| {
+        serde_json::to_value(AgentEvent::Retry {
+            attempt: 1,
+            delay_ms: 5,
+            rate_limited: true,
+            overloaded,
+            message: "m".into(),
+        })
+        .unwrap()
+    };
+    let overload = frame(true);
+    assert_eq!(overload["rate_limited"], true);
+    assert_eq!(overload["overloaded"], true);
+    let limit = frame(false);
+    assert_eq!(limit["rate_limited"], true);
+    assert!(limit.get("overloaded").is_none(), "{limit}");
+}
+
 #[tokio::test]
 async fn anthropic_rate_limit_and_overload_shapes_retry_past_the_transient_count() {
     // Six in-stream failures, alternating Anthropic's two capacity errors — twice the 3 retries any
