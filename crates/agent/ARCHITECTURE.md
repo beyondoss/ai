@@ -332,7 +332,7 @@ The harness layers several capabilities over the bare tools + loop:
   every valid field still applies. A strict parse used to discard the whole file on one typo, with
   only a `tracing::warn!`, so an unattended host silently lost its stored model and gateway. Read-only: there's no CLI mutation surface for the project
   tier (unlike the global one, no `beyond-ai-agent settings --project` flag) — a project's `settings.json` is
-  hand-edited, matching `models.json`'s own convention. Threaded into `run_task`/`Command::Serve` in
+  hand-edited, matching `models.json`'s own convention. `beyond-ai-agent settings` (every write and the plain show) prints the global store, then one `key: <global> — overridden by <file>: <value>` line per field a trusted project's `.beyond/settings.json` or `.claude/settings.json` changes for the current directory (`settings::project_override_notes`). Threaded into `run_task`/`Command::Serve` in
   place of the bare `SettingsStore::open_default()` both used before this feature; a project settings file
   is itself now one of the resources `trust_store::has_trust_gated_resources` checks for (see "Trust"
   above), so a project with _only_ a settings.json (no `SYSTEM.md`/skills/prompts) still requires trust

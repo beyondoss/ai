@@ -872,6 +872,63 @@ fn effective_settings_with_stores(
     global.get().merge_over(&claude).merge_over(&beyond)
 }
 
+/// Notes for `agent settings`: one line per field whose value `run`/`serve` would use in `cwd`
+/// (global merged with a trusted project's `.claude/settings.json` then `.beyond/settings.json`)
+/// differs from the global store's own, naming the file that sets it.
+/// Empty when the project is untrusted or overrides nothing.
+pub fn project_override_notes(cwd: &Path) -> Vec<String> {
+    project_override_notes_with_stores(
+        &SettingsStore::open_default(),
+        cwd,
+        &crate::trust_store::TrustStore::open_default(),
+    )
+}
+
+fn project_override_notes_with_stores(
+    global: &SettingsStore,
+    cwd: &Path,
+    trust: &crate::trust_store::TrustStore,
+) -> Vec<String> {
+    if !trust.is_trusted(cwd) {
+        return Vec::new();
+    }
+    let to_map = |s: &Settings| match serde_json::to_value(s) {
+        Ok(serde_json::Value::Object(m)) => m,
+        _ => serde_json::Map::new(),
+    };
+    let render = |v: Option<&serde_json::Value>| match v {
+        None => "(not set)".to_string(),
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(v) => v.to_string(),
+    };
+    let beyond_path = project_settings_path(cwd);
+    let claude_path = claude_project_settings_path(cwd);
+    let beyond = read_store_file(&beyond_path);
+    let claude = read_store_file(&claude_path);
+    let effective = global.get().merge_over(&claude).merge_over(&beyond);
+    let (g, e) = (to_map(global.get()), to_map(&effective));
+    let b = to_map(&beyond);
+    let mut keys: Vec<&String> = g.keys().chain(e.keys()).collect();
+    keys.sort();
+    keys.dedup();
+    keys.into_iter()
+        .filter(|k| g.get(*k) != e.get(*k))
+        .map(|k| {
+            let from = if b.contains_key(k) {
+                &beyond_path
+            } else {
+                &claude_path
+            };
+            format!(
+                "{k}: {} \u{2014} overridden by {}: {}",
+                render(g.get(k)),
+                from.display(),
+                render(e.get(k))
+            )
+        })
+        .collect()
+}
+
 /// A single model's on-disk connection override — pi-parity feature (Fix 9): pi's own
 /// `model-registry.ts` lets an operator override a model's base URL/auth/routing preferences via a
 /// `models.json`, merged over its built-in provider catalog. This crate holds no catalog of its own to

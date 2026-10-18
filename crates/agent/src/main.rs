@@ -3062,6 +3062,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     .map(|n| n.to_string())
                     .unwrap_or_else(|| "(not set)".to_string())
             );
+            // The values above are the global store alone; `run`/`serve` also merge a trusted
+            // project's settings files over it, so say where that changes what they will use.
+            if let Ok(cwd) = std::env::current_dir() {
+                for note in beyond_ai_agent::settings::project_override_notes(&cwd) {
+                    println!("{note}");
+                }
+            }
             // Fix 9's "CLI-visible" requirement: this file is entirely hand-edited (like pi's own
             // `models.json`), with no `--set`/`--clear` flags of its own here — just enough surface so
             // an operator debugging "why is this model still hitting the gateway" can confirm the file
