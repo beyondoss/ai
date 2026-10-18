@@ -1409,10 +1409,12 @@ struct EndFacts {
 /// and [`Ending::row`] is a total match on it, so a new ending does not compile until someone
 /// decides how it bills.
 ///
-/// Only a variant an estimate can reach carries a [`Count`]. An estimate needs a 2xx head, or a
-/// connected attempt that delivered the whole body ([`gave_up_waiting`]), so an error status, a
-/// cache hit and a request no provider was handed are always the provider's word. Only a cancel
-/// can be drained: a drain arms only on a managed 2xx stream's head ([`drains_on_cancel`]).
+/// Every ending that writes a row carries its [`Count`], and the row logs it as it is, so an
+/// estimate is never written as the provider's word. An estimate needs a 2xx head, or a connected
+/// attempt that delivered the whole body ([`gave_up_waiting`]), so a cache hit, an error status
+/// and a request no provider was handed carry `Reported`: [`Ending::of`] asserts it in debug
+/// builds, where a producer that broke it would show. Only a cancel can be drained: a drain arms
+/// only on a managed 2xx stream's head ([`drains_on_cancel`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Ending {
     /// An abandoned `FullBody` attempt: not the answer the client got. The attempt that serves
@@ -1421,17 +1423,17 @@ enum Ending {
     /// A free sub-resource (a token count): not a billable call.
     Free,
     /// Answered from the exact-match cache: the usage stored at fill, no provider called.
-    CacheHit,
+    CacheHit(Count),
     /// The gateway's own refusal before any response head (D267): no provider had the request
     /// whole, so it writes no row, as every other rejection writes none.
     Refused,
     /// The provider answered with an error status (4xx/5xx).
-    UpstreamStatus,
+    UpstreamStatus(Count),
     /// The client left before the answer was whole, or left a drained stream however the request
     /// then ended. `drained`: the gateway then read the stream to its end.
     ClientCancelled { count: Count, drained: bool },
     /// No provider was called (every candidate's breaker open).
-    NoCandidate,
+    NoCandidate(Count),
     /// The upstream failed before any response head: a connect, read-timeout or reset failure.
     UpstreamFailed(Count),
     /// A response that started and then died upstream.
@@ -1472,14 +1474,19 @@ impl Ending {
         if f.free {
             return Self::Free;
         }
+        // These three never see an estimate (see `Ending`): one here is a producer's bug.
+        let reported = |ending: Self| {
+            debug_assert!(!count.estimated(), "{ending:?} carries an estimate");
+            ending
+        };
         if f.cache_hit {
-            return Self::CacheHit;
+            return reported(Self::CacheHit(count));
         }
         if f.status.is_none() && f.fault == Some(Fault::Refusal) {
             return Self::Refused;
         }
         if f.status.is_some_and(|s| s >= 400) {
-            return Self::UpstreamStatus;
+            return reported(Self::UpstreamStatus(count));
         }
         if f.client_left || matches!(f.fault, Some(Fault::Client | Fault::Refusal)) {
             return Self::ClientCancelled {
@@ -1488,7 +1495,7 @@ impl Ending {
             };
         }
         if !f.called {
-            return Self::NoCandidate;
+            return reported(Self::NoCandidate(count));
         }
         match (f.fault, f.status) {
             (Some(_), None) => Self::UpstreamFailed(count),
@@ -1507,16 +1514,16 @@ impl Ending {
         };
         Some(match self {
             Self::RelayAbandoned | Self::Free | Self::Refused => return None,
-            Self::CacheHit => EndRow {
+            Self::CacheHit(count) => EndRow {
                 cache_hit: true,
-                ..row("ok", Count::Reported)
+                ..row("ok", count)
             },
-            Self::UpstreamStatus => row("upstream_error", Count::Reported),
+            Self::UpstreamStatus(count) => row("upstream_error", count),
             Self::ClientCancelled { count, drained } => EndRow {
                 drained,
                 ..row("client_cancelled", count)
             },
-            Self::NoCandidate => row("no_candidate", Count::Reported),
+            Self::NoCandidate(count) => row("no_candidate", count),
             Self::UpstreamFailed(count) => row("upstream_error", count),
             Self::CutShort(count) => row("cut_short", count),
             Self::Completed(count) => row("ok", count),
@@ -7376,19 +7383,19 @@ impl ProxyHttp for AiProxy {
         // the Prometheus metrics above, which is the right tool for non-billing observability.
         // Whether the request writes a row at all, and what the row says of how it ended, is its
         // `Ending`'s (see `Ending::row`).
-        let ending = Ending::of(&EndFacts {
-            relay_abandoned: rc.attempt.relay_abandoned,
-            free,
-            cache_hit: cache_hit.is_some(),
-            status: upstream_status,
-            fault: e.map(Fault::of),
-            client_left,
-            called: rc.upstream_phase != UpstreamPhase::None,
-            drained,
-            count,
-        });
         if let Some(&id) = rc.billing.identity()
-            && let Some(end) = ending.row()
+            && let Some(end) = Ending::of(&EndFacts {
+                relay_abandoned: rc.attempt.relay_abandoned,
+                free,
+                cache_hit: cache_hit.is_some(),
+                status: upstream_status,
+                fault: e.map(Fault::of),
+                client_left,
+                called: rc.upstream_phase != UpstreamPhase::None,
+                drained,
+                count,
+            })
+            .row()
         {
             // What the client asked for that changes the price (read before the borrows below).
             let requested = requested_knobs(session, rc);

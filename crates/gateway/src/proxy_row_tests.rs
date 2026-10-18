@@ -134,6 +134,12 @@ type Fields = (
     bool,
 );
 
+/// The row's `provider`, as `logging` names it: the cache entry's, or the leg's once a provider
+/// was handed the request, and absent before any call.
+fn named<'a>(f: &EndFacts, provider: &'a str) -> Option<&'a str> {
+    (f.cache_hit || f.called).then_some(provider)
+}
+
 fn fields(f: &EndFacts, provider: &str, stream: bool) -> Option<Fields> {
     Ending::of(f).row().map(|end| {
         (
@@ -142,7 +148,7 @@ fn fields(f: &EndFacts, provider: &str, stream: bool) -> Option<Fields> {
             end.cache_hit,
             end.usage_settled(),
             end.count.parts().parts(),
-            upstream_may_continue(Some(provider), end.outcome, stream, end.drained),
+            upstream_may_continue(named(f, provider), end.outcome, stream, end.drained),
         )
     })
 }
@@ -177,7 +183,7 @@ fn fields_before(f: &EndFacts, provider: &str, stream: bool) -> Option<Fields> {
         f.cache_hit,
         (f.drained && !usage_estimated).then_some("drained"),
         f.count.parts().parts(),
-        upstream_may_continue(Some(provider), outcome, stream, f.drained),
+        upstream_may_continue(named(f, provider), outcome, stream, f.drained),
     ))
 }
 
@@ -218,7 +224,16 @@ fn every_ending_bills_as_before() {
     let mut checked = 0;
     for bits in 0u8..64 {
         let bit = |i: u8| bits & (1 << i) != 0;
-        for status in [None, Some(200), Some(206), Some(404), Some(429), Some(503)] {
+        for status in [
+            None,
+            Some(101),
+            Some(200),
+            Some(206),
+            Some(304),
+            Some(404),
+            Some(429),
+            Some(503),
+        ] {
             for fault in faults {
                 for count in counts {
                     let f = EndFacts {
@@ -249,7 +264,7 @@ fn every_ending_bills_as_before() {
             }
         }
     }
-    assert_eq!(checked, 4608, "the reachable space shrank");
+    assert_eq!(checked, 5376, "the reachable space shrank");
 }
 
 /// Each ending's row, pinned: what it writes, or that it writes none.
@@ -290,7 +305,7 @@ fn each_ending_has_its_row() {
                 status: Some(200),
                 ..EndFacts::default()
             },
-            Ending::CacheHit,
+            Ending::CacheHit(Count::Reported),
             Some(("ok", false, true, None, None, false)),
         ),
         (
@@ -303,7 +318,7 @@ fn each_ending_has_its_row() {
         ),
         (
             at(429),
-            Ending::UpstreamStatus,
+            Ending::UpstreamStatus(Count::Reported),
             Some(("upstream_error", false, false, None, None, false)),
         ),
         (
@@ -311,7 +326,7 @@ fn each_ending_has_its_row() {
                 fault: Some(Fault::Client),
                 ..at(503)
             },
-            Ending::UpstreamStatus,
+            Ending::UpstreamStatus(Count::Reported),
             Some(("upstream_error", false, false, None, None, false)),
         ),
         (
@@ -374,7 +389,7 @@ fn each_ending_has_its_row() {
         ),
         (
             EndFacts::default(),
-            Ending::NoCandidate,
+            Ending::NoCandidate(Count::Reported),
             Some(("no_candidate", false, false, None, None, false)),
         ),
         (
