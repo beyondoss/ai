@@ -21,6 +21,7 @@ use proptest::test_runner::{
 use serde_json::{Map, Value, json};
 use std::time::{Duration, Instant};
 
+pub mod old_peek;
 pub mod requests;
 pub mod script;
 
