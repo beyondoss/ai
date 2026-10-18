@@ -779,10 +779,10 @@ impl Bash {
     async fn detach(&self, mut job: Job, reason: Yield) -> Result<ToolOutput, ToolError> {
         let why = match reason {
             Yield::Settled => return self.start_background(job).await,
-            Yield::Quiet(quiet) => format!("No output for {} s. ", quiet.as_secs()),
+            Yield::Quiet(quiet) => format!("No output for {}. ", super::format_duration(quiet)),
             Yield::Ceiling(waited) => format!(
-                "Still printing after {} s, so this call returned with the output so far. ",
-                waited.as_secs()
+                "Still printing after {}, so this call returned with the output so far. ",
+                super::format_duration(waited)
             ),
             // A peek: nothing to explain.
             Yield::Timeout(0) => String::new(),
@@ -792,20 +792,20 @@ impl Bash {
         let id = self.jobs.assign_id(&mut job);
         let snap = job.shared.take_segment();
         let text = clean(format_output(&snap, ""));
-        let running = job.started.elapsed().as_secs();
+        let running = super::format_duration(job.started.elapsed());
         let lifetime = self.jobs.lifetime(job.kind, job.shared.sandbox().is_some());
         // What the model has seen of a job the sandbox owns: where a replica that reattaches it
         // picks up.
         super::bash_sandbox::spawn_seen(&job.shared);
         let status = if reattached {
             format!(
-                "{why}Job {id} is still running ({running} s so far; {lifetime}). You will be told \
+                "{why}Job {id} is still running ({running} so far; {lifetime}). You will be told \
                  when it exits, so do not poll it. bash_job {{\"job\": {id}, \"kill\": true}} stops \
                  it."
             )
         } else {
             format!(
-                "{why}The command is still running as job {id} ({running} s so far; {lifetime}). \
+                "{why}The command is still running as job {id} ({running} so far; {lifetime}). \
                  You will be told when it exits, so do not poll it or sleep: keep working, or, if \
                  you need its result, wait for it with bash_job {{\"job\": {id}}}. bash_job \
                  {{\"job\": {id}, \"kill\": true}} stops it (not `pkill`, which can match unrelated \
@@ -879,7 +879,7 @@ impl Bash {
             emit_update(p, &snap);
         }
         let text = clean(format_output(&snap, ""));
-        let shell_status = exit_status_line(shell, job.started.elapsed().as_secs());
+        let shell_status = exit_status_line(shell, job.started.elapsed());
         job.kind = JobKind::Adopted;
         let shared = job.shared.clone();
         let lifetime = self.jobs.lifetime(job.kind, shared.sandbox().is_some());
@@ -976,7 +976,7 @@ impl Bash {
         if let Some(p) = progress {
             emit_update(p, &snap);
         }
-        let secs = end.at.duration_since(job.started).as_secs();
+        let secs = end.at.duration_since(job.started);
         // The shell's own exit was reported when its leftover processes were adopted; this is
         // their end.
         if job.shared.orphans().is_some() && !result.timed_out {
@@ -985,7 +985,8 @@ impl Bash {
             return Ok(append_status(
                 &text,
                 &format!(
-                    "The processes job {id} left running have exited ({secs} s after it started)."
+                    "The processes job {id} left running have exited ({} after it started).",
+                    super::format_duration(secs)
                 ),
             )
             .into());
@@ -1051,7 +1052,7 @@ impl Bash {
         job.handle.abort();
         let _ = tokio::time::timeout(Duration::from_secs(5), &mut job.handle).await;
         let snap = job.shared.take_segment();
-        let running = job.started.elapsed().as_secs();
+        let running = super::format_duration(job.started.elapsed());
         // Named, so a kill is never ambiguous about which process it hit.
         let command = std::mem::take(&mut job.command);
         drop(job);
@@ -1059,14 +1060,14 @@ impl Bash {
         match survived {
             None => Ok(append_status(
                 &text,
-                &format!("Job {id} (`{command}`) killed after {running} s."),
+                &format!("Job {id} (`{command}`) killed after {running}."),
             )
             .into()),
             // Not "killed": they still run, and nothing tracks them any more.
             Some(left) => Err(ToolError::Execution(append_status(
                 &text,
                 &format!(
-                    "Job {id} (`{command}`) was sent SIGTERM and then SIGKILL after {running} s, \
+                    "Job {id} (`{command}`) was sent SIGTERM and then SIGKILL after {running}, \
                      but {}",
                     survived_note(&left)
                 ),
@@ -1153,7 +1154,7 @@ pub use super::bash_jobs::kill_live_jobs;
 fn finish_result(
     snap: &OutputSnapshot,
     result: &ExecResult,
-    secs: u64,
+    secs: Duration,
 ) -> Result<ToolOutput, ToolError> {
     // No "(no output)" placeholder on a timeout: an empty-output timeout should read as just the
     // status line ("Command timed out after Ns"), not "(no output)" glued in front of it — matching
@@ -1170,12 +1171,13 @@ fn finish_result(
 
 /// The status line for a command that did not succeed, or `None` for one that did. Only an exit code
 /// of literally `0` is success. `secs` is how long it ran.
-fn exit_status_line(result: &ExecResult, secs: u64) -> Option<String> {
+fn exit_status_line(result: &ExecResult, secs: Duration) -> Option<String> {
     // `bash` sets no deadline of its own, so a timeout is the runner's: an exec endpoint enforcing
     // the `timeout_ms` on the wire (see `exec_endpoint`'s "Timeouts").
     if result.timed_out {
         return Some(format!(
-            "Command timed out after {secs} seconds: the sandbox's exec endpoint stopped it."
+            "Command timed out after {}: the sandbox's exec endpoint stopped it.",
+            super::format_duration(secs)
         ));
     }
     match (result.code, result.signal) {
