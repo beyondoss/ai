@@ -47,7 +47,7 @@ published `beyond-slipstream` — clones, CI-builds, and publishes anywhere.
 ```
 Client (stock OpenAI/Anthropic SDK)
   │
-  ▼  request_filter (proxy.rs)
+  ▼  request_filter (proxy/hooks.rs)
   │  ├─ Route: first segment → provider row (authority, dialect, auth scheme)
   │  │    `/{provider}/…` is the escape hatch (no walk; a managed key: catalog models only, D267)
   │  │    …or `/auto` / managed `/v1` → x-beyond-model if present, else body's root `model`
@@ -99,7 +99,7 @@ Client (stock OpenAI/Anthropic SDK)
   │  └─ Circuit breaker (per provider, all traffic): if OPEN ─────► 503
   │       (claims a half-open probe permit only on an actual attempt)
   │
-  ▼  upstream_peer (proxy.rs)   — runs once per attempt, before any body byte
+  ▼  upstream_peer (proxy/hooks.rs)   — runs once per attempt, before any body byte
   │  Start a fresh `Attempt` (a retry replays bytes through the body filter)
   │  The retry the triggering hook declared: `SameLeg` stays on this provider, keeping its
   │    permit; `NextCandidate` resolves the outgoing candidate's permit as a failure
@@ -112,7 +112,7 @@ Client (stock OpenAI/Anthropic SDK)
   │  DNS fail ──────────────────────────────────────────────────── 502
   │  TCP connect fail (retry 2× same peer, or next candidate) ──── 502
   │
-  ▼  upstream_request_filter (proxy.rs)
+  ▼  upstream_request_filter (proxy/hooks.rs)
   │  Managed: remove every static-key header (authorization, x-api-key, api-key,
   │    x-goog-api-key; every repeat) UNCONDITIONALLY → inject the pool key in the
   │    provider's own scheme (never provider A's key on provider B); every `key` query
@@ -128,7 +128,7 @@ Client (stock OpenAI/Anthropic SDK)
   │    own catalog path for a catalog walk (`/auto`, managed `/v1`)
   │  OpenRouter + managed only: dashboard-attribution headers (HTTP-Referer, X-OpenRouter-*)
   │
-  ▼  request_body_filter (proxy.rs)  — streamed through, except where a rewrite or a refusal check
+  ▼  request_body_filter (proxy/hooks.rs)  — streamed through, except where a rewrite or a refusal check
   │    needs the whole body
   │  Enforce running size cap (chunked-safe) ──────────────────── 413
   │  Capturing: copy chunk into the head-bounded request buffer — PRE-rewrite, so the
@@ -161,7 +161,7 @@ Client (stock OpenAI/Anthropic SDK)
   │
   ▼  Provider upstream  (OpenAI / Anthropic / Groq / DeepSeek / …)
   │
-  ▼  response_filter (proxy.rs)
+  ▼  response_filter (proxy/hooks.rs)
   │  Record TTFT; detect streaming (Content-Type: text/event-stream)
   │  Count upstream response by provider + status class
   │  Drop any upstream x-beyond-* header, then set x-beyond-request-id, x-beyond-provider,
@@ -172,7 +172,7 @@ Client (stock OpenAI/Anthropic SDK)
   │  Translate walk, or a same-endpoint catalog error (re-encoded into the client's
   │    envelope when it is another vendor's shape): drop Content-Length (body length will change)
   │
-  ▼  response_body_filter (proxy.rs)  — response relayed chunk-by-chunk; SSE is never fully buffered
+  ▼  response_body_filter (proxy/hooks.rs)  — response relayed chunk-by-chunk; SSE is never fully buffered
   │  Managed >= 400, first (`Redact`): overwrite the pool key with `[redacted]***` (same
   │    length), holding back a key-sized tail per chunk to catch a split key. A JSON error
   │    (<= 64 KiB) is held whole instead and, once masked, has any provider-account remedy
@@ -202,7 +202,7 @@ Client (stock OpenAI/Anthropic SDK)
   │    only on a complete 2xx; client abort, 4xx/5xx, truncation → do not store.
   │    On a translate walk the tap is the *client* bytes (post-translate).
   │
-  ▼  logging (proxy.rs)
+  ▼  logging (proxy/hooks.rs)
      Parse usage from tail: usage::body / usage::stream on (dialect, framing)
      Managed 2xx stream cut short before its usage block (client cancel / upstream death), or a
        non-stream 2xx without usage that is not an error object (D195):
@@ -3571,7 +3571,7 @@ long-context pricing, `mcp-client-*`, `code-execution-*` and `files-api-*` reach
 and storage on Beyond's account, and `oauth-*` means nothing beside a pool API key. The gateway's
 own beta for a translated walk (block binding, or fast mode for a priority request) is merged in
 after the filter, so it is never dropped. Adding a token is a one-line change to
-`MANAGED_ANTHROPIC_BETAS` in `proxy.rs`.
+`MANAGED_ANTHROPIC_BETAS` in `proxy/headers.rs`.
 
 Dropped, among others: `openai-organization` and `openai-project` (they switch the org or project the
 pool key bills to, and an SDK user with `OPENAI_ORG_ID` set got a 401), `cookie`,
@@ -3893,7 +3893,16 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
 
 | Module            | Role                                                                                                                                                                           | Tested         |
 | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------- |
-| `proxy`           | `ProxyHttp` impl — request/response pipeline (request_filter through logging)                                                                                                  | e2e ✓          |
+| `proxy`           | Module root: the request context (`RequestCtx`, `Ctx`/`Held`, `Leg`, `Attempt`, `ModelRouting`) and the path helpers every phase reads                                         | e2e ✓          |
+| `proxy/hooks`     | `ProxyHttp` impl: the pipeline from `request_filter` through `logging`, in pingora's call order                                                                                | e2e ✓          |
+| `proxy/phases`    | What `request_filter` decides a request is: `Route` → `Admission` → `Plan` (a provider route or a catalog `Walk`), and its `ForwardPath`                                       | unit ✓ + e2e ✓ |
+| `proxy/billing`   | Who pays (`Billing`), the facts a row is built from (`EndFacts` → `Ending`), and the price model the `ai.usage` row names                                                      | unit ✓ + e2e ✓ |
+| `proxy/full_body` | The up-front body read (`peek_body_model`) and the `FullBody` subrequest that re-runs a body past pingora's retry buffer                                                       | unit ✓ + e2e ✓ |
+| `proxy/headers`   | Credential extraction (`extract_virtual_key`, `?key=`), BYO credential dialect, and the managed header allowlists                                                              | unit ✓ + e2e ✓ |
+| `proxy/relay`     | Response relay helpers: the pool-key scrub (`Redact`) and drain-on-cancel bookkeeping                                                                                          | unit ✓ + e2e ✓ |
+| `proxy/replies`   | Bodies the gateway writes itself: refusals (`refuse`, rate-capped log line), failures (`FAILURES`), the models list, a cache hit                                               | unit ✓ + e2e ✓ |
+| `proxy/serving`   | What a catalog walk's serving candidate changes: dialect, `stream_options` eligibility, translation and relay predicates                                                       | unit ✓ + e2e ✓ |
+| `proxy/upstream`  | The upstream attempt: peer build, deadline cap, how an attempt failed, a pool key's health and cooling                                                                         | unit ✓ + e2e ✓ |
 | `key`             | `bai_v1` / `bai_v2` (explicit `key_id`) parse + Ed25519 verify; multi-kid keyring, built whole; reference `mint` only under the `mint` feature (dev targets only)              | unit ✓         |
 | `route`           | Data-driven provider table (name / authority / auth) + dialect default + model-route re-exports                                                                                | unit ✓         |
 | `peek`            | `ModelScanner` — streaming structural scan for the root-level `model`; O(1) memory                                                                                             | unit ✓         |

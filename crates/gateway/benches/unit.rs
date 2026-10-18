@@ -1349,9 +1349,23 @@ mod input_tally {
     use super::*;
     use beyond_ai::__bench::usage::InputTally;
 
+    /// The proxy module's source, one text: the kind of file a coding agent sends.
+    const PROXY_SRC: [&str; 10] = [
+        include_str!("../src/proxy.rs"),
+        include_str!("../src/proxy/hooks.rs"),
+        include_str!("../src/proxy/phases.rs"),
+        include_str!("../src/proxy/billing.rs"),
+        include_str!("../src/proxy/full_body.rs"),
+        include_str!("../src/proxy/headers.rs"),
+        include_str!("../src/proxy/relay.rs"),
+        include_str!("../src/proxy/replies.rs"),
+        include_str!("../src/proxy/serving.rs"),
+        include_str!("../src/proxy/upstream.rs"),
+    ];
+
     /// A coding agent's prompt: ~100 KiB of source as message content.
     fn code_body() -> Vec<u8> {
-        let src = include_str!("../src/proxy.rs");
+        let src = PROXY_SRC.concat();
         let mut end = src.len().min(100 * 1024);
         while !src.is_char_boundary(end) {
             end -= 1;
@@ -1390,7 +1404,7 @@ mod input_tally {
     #[divan::bench]
     fn code_1mb(bencher: Bencher) {
         let src = [
-            include_str!("../src/proxy.rs"),
+            PROXY_SRC.concat().as_str(),
             include_str!("../src/translate.rs"),
         ]
         .concat();
