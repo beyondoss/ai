@@ -2558,6 +2558,14 @@ killing an unkept job (measured on the far side), a kept job surviving its hold 
 `SIGTERM`-ignoring job and removing it, and `list`/`wipe` staying in their scope. The decoding
 vectors are `tests/fixtures/exec/v1.3-jobs.json` (`tests/exec_jobs_vectors.rs`).
 
+**Job-end notify (v1.4): specified, not built yet.** A replica holds a v1.2 stream to every kept
+job, and that stream's heartbeat keeps an idle sandbox awake for as long as the job runs. The module
+doc's "Sandbox job notify (v1.4)" specifies the fix: `keep` gains an optional `notify` (a URL and an
+opaque `bjn_v1` token), the sandbox POSTs a `job_ended` hint to the session's own address when a kept
+job changes state, the replica reconciles through `list`/`read`, and it releases the stream only
+after the first callback arrives. FLEET.md's "Job-end callbacks" is the edge's half. Nothing in
+the code implements it yet: every replica holds its streams as described above.
+
 Tests: `tests/sandbox_jobs.rs` runs every operation over this host's `sh`, the v1.2 mock, the v1.1
 mock, a template transport whose far side lives in its own session, and the v1.3 mock natively
 (held streaming, a hold dropped before and after `keep`, leftovers, polling, a `SIGTERM`-ignoring
