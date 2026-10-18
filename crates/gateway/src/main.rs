@@ -79,9 +79,10 @@ fn load_config(path: Option<&Path>) -> ValidConfig {
 /// On SIGTERM pingora stops accepting and then sleeps the whole `grace_period_seconds` before it
 /// tears the runtimes down, whether or not anything is still running: an idle gateway took the full
 /// 600 s to stop, so every deploy on a platform with a shorter stop timeout (ECS Fargate: 120 s)
-/// ended in SIGKILL. The drain watches [`GatewayState::live_requests`] (every request context, dropped only after
-/// its `logging`, billing row included) and exits the moment it reaches zero. Pingora's sleep stays
-/// the upper bound: a request still running when the grace ends is cut as before.
+/// ended in SIGKILL. The drain watches [`GatewayState::live_requests`] (every request context,
+/// dropped only after its `logging`, billing row included) and exits the moment it reaches zero.
+/// Pingora's sleep stays the upper bound: a request still running when the grace ends is cut as
+/// before.
 ///
 /// Before it exits, the drain writes out the `ai.payload` and diagnostic lines still queued
 /// ([`LogDrains`], D208, D263): `exit` does not wait for the sinks' threads, so a capture of the last
