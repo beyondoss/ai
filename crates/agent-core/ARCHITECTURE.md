@@ -840,8 +840,8 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
   `(retry-after-ms: N)`, so both paths reach the same parser. A run that outlasts the budget fails with
   `rate_limit::BUDGET_EXHAUSTED` leading the message, which `is_retryable_mid_stream` (and so the
   `agent` crate's whole-run retry) refuses, so the wait is never restarted. Every retry in this loop,
-  either class, is announced as `AgentEvent::Retry { attempt, delay_ms, rate_limited, message }` before
-  its wait, and the wait races cancellation. Retrying after partial output is safe by construction: a
+  either class, is announced as `AgentEvent::Retry { attempt, delay_ms, rate_limited, overloaded, message }` before
+  its wait (`rate_limit::classify` tells a 429 / rate-limit error from a 529 / `overloaded`; both share the budget, and `rate_limited` stays true for both while `overloaded: true` — serialized only when true — marks the overload, so a client can label it "provider overloaded" instead of "rate limited"), and the wait races cancellation. Retrying after partial output is safe by construction: a
   retried attempt starts a fresh `Accumulator`, and tools only run on a `Turn` that completed, so a
   tool call streamed before the failure is neither executed nor kept. `Agent::with_rate_limit_retry`
   sets the policy. Defaults, for comparison: Claude Code retries 10 times (500ms base) by default,

@@ -77,3 +77,41 @@ fn run_fails_clearly_once_the_rate_limit_budget_is_spent() {
     );
     assert_eq!(requests.lock().unwrap().len(), 1);
 }
+
+/// Anthropic's in-stream overload error: the provider is busy, not throttling this caller.
+const OVERLOADED: &str = "event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n\
+event: error\n\
+data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n";
+
+#[test]
+fn run_labels_an_overload_as_an_overload_not_a_rate_limit() {
+    let mut responses = vec![OVERLOADED.to_string(); 2];
+    responses.push(turn_text("made it"));
+    let (base, _requests) = spawn_model_server(responses);
+
+    let output = run(&base, &["--retry-max-retries", "0"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert_eq!(
+        stderr.matches("[provider overloaded, retrying in").count(),
+        2,
+        "{stderr}"
+    );
+    assert!(!stderr.contains("rate limited"), "{stderr}");
+}
+
+#[test]
+fn run_names_an_overload_when_its_budget_is_spent() {
+    let (base, _requests) = spawn_model_server(vec![OVERLOADED.to_string(); 4]);
+
+    let output = run(&base, &["--retry-rate-limit-secs", "0"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(stderr.contains("provider still overloaded"), "{stderr}");
+    assert!(!stderr.contains("rate limited"), "{stderr}");
+}

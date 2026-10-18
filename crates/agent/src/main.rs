@@ -3730,11 +3730,14 @@ async fn run_turn_once(
                         attempt,
                         delay_ms,
                         rate_limited,
+                        overloaded,
                         message,
                     } = &ev
                     {
                         // A rate-limit wait can run for minutes; say so rather than look hung.
-                        let what = if *rate_limited {
+                        let what = if *overloaded {
+                            "provider overloaded"
+                        } else if *rate_limited {
                             "rate limited"
                         } else {
                             "stream error"

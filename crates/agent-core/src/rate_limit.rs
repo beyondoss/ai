@@ -66,42 +66,62 @@ impl RateLimitRetry {
     }
 }
 
-/// Whether `e` is the provider (or the gateway) saying "slow down": a 429 or an in-stream rate-limit
-/// error from either dialect (Anthropic `rate_limit_error`, OpenAI `rate_limit_exceeded`), or an
-/// overload (Anthropic's 529 `overloaded_error`) — the same 429-and-529 pair Claude Code's retry
-/// watchdog waits out. Never a quota/billing 429 (retrying can't fix an empty account), a context
-/// overflow, a request too large for the limit itself (OpenAI's TPM "Request too large … must be
-/// reduced", which no wait admits), or an error that already spent its budget.
+/// Why the provider asked us to wait. Both kinds get the same time budget and backoff; only the
+/// label differs, so a person reading "rate limited" is not sent off to check their quota when the
+/// provider is simply busy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Throttle {
+    /// A 429 or an in-stream rate-limit error: this caller (or its shared window) is over a limit.
+    RateLimited,
+    /// A 529 or `overloaded_error`: the provider is out of capacity, whoever is asking.
+    Overloaded,
+}
+
+/// Whether `e` is the provider (or the gateway) saying "slow down" ([`classify`] is `Some`).
 pub fn is_rate_limited(e: &Error) -> bool {
+    classify(e).is_some()
+}
+
+/// Which kind of "slow down" `e` is, if it is one: a 429 or an in-stream rate-limit error from either
+/// dialect (Anthropic `rate_limit_error`, OpenAI `rate_limit_exceeded`) is [`Throttle::RateLimited`];
+/// an overload (Anthropic's 529 `overloaded_error`, a bare 529) is [`Throttle::Overloaded`] -- the
+/// same 429-and-529 pair Claude Code's retry watchdog waits out. Never a quota/billing 429 (retrying
+/// can't fix an empty account), a context overflow, a request too large for the limit itself
+/// (OpenAI's TPM "Request too large ... must be reduced", which no wait admits), or an error that
+/// already spent its budget.
+pub fn classify(e: &Error) -> Option<Throttle> {
     let Error::Transport(msg) = e else {
-        return false;
+        return None;
     };
     if msg.contains(BUDGET_EXHAUSTED)
         || crate::client::is_quota_exhausted(msg)
         || crate::agent::is_context_overflow(e)
     {
-        return false;
+        return None;
     }
     let m = msg.to_ascii_lowercase();
     // A bare 529 (no `overloaded_error` body) is still Anthropic's overload status.
     if m.contains(" returned 529") {
-        return true;
+        return Some(Throttle::Overloaded);
     }
     if ["request too large", "must be reduced", "will not succeed"]
         .iter()
         .any(|p| m.contains(p))
     {
-        return false;
+        return None;
     }
-    [
+    if [
         "rate_limit",
         "rate limit",
         "rate-limit",
         "too many requests",
-        "overloaded",
     ]
     .iter()
     .any(|p| m.contains(p))
+    {
+        return Some(Throttle::RateLimited);
+    }
+    m.contains("overloaded").then_some(Throttle::Overloaded)
 }
 
 /// The wait the server asked for, read out of an error message, in order of precision:
@@ -217,6 +237,24 @@ mod tests {
                 is_rate_limited(&Error::Transport(msg.into())),
                 "should be a rate limit: {msg}"
             );
+        }
+    }
+
+    #[test]
+    fn an_overload_is_told_apart_from_a_rate_limit() {
+        let kind = |m: &str| classify(&Error::Transport(m.into()));
+        for m in [
+            "provider stream error: overloaded_error: Overloaded",
+            r#"api.anthropic.com returned 529 <unknown status code>: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#,
+            "api.anthropic.com returned 529 <unknown status code>: ",
+        ] {
+            assert_eq!(kind(m), Some(Throttle::Overloaded), "{m}");
+        }
+        for m in [
+            OPENAI_IN_STREAM,
+            r#"api.anthropic.com returned 429 Too Many Requests: {"type":"error","error":{"type":"rate_limit_error","message":"This request would exceed your rate limit"}}"#,
+        ] {
+            assert_eq!(kind(m), Some(Throttle::RateLimited), "{m}");
         }
     }
 

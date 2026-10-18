@@ -156,12 +156,15 @@ pub enum AgentEvent {
     },
     /// A model request failed transiently and is re-sent after `delay_ms`. The retry starts the
     /// turn's stream over — nothing from the failed attempt is kept or executed. `rate_limited`
-    /// marks the time-budgeted class (429/overload, see [`crate::rate_limit`]); `attempt` counts
-    /// within that class, from 1.
+    /// marks the time-budgeted class (429/overload, see [`crate::rate_limit`]); `overloaded` says
+    /// that class member is an overload (529) rather than a rate limit, and is serialized only when
+    /// true. `attempt` counts within that class, from 1.
     Retry {
         attempt: u32,
         delay_ms: u64,
         rate_limited: bool,
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        overloaded: bool,
         message: String,
     },
     /// The run is ending abnormally (transport failure after retries, malformed SSE, or the step
@@ -2397,7 +2400,7 @@ impl Agent {
         cancel: &CancellationToken,
         partial_out: &mut Option<Turn>,
     ) -> Result<Turn> {
-        use crate::rate_limit::{BUDGET_EXHAUSTED, is_rate_limited, retry_hint};
+        use crate::rate_limit::{BUDGET_EXHAUSTED, Throttle, classify, retry_hint};
         let mut attempt = 0u32;
         // When this turn was first rate limited, and how many rate-limit retries it has made since.
         let mut throttled: Option<(std::time::Instant, u32)> = None;
@@ -2410,7 +2413,7 @@ impl Agent {
                 Err(e) if self.auto_retry && is_retryable_mid_stream(&e) => e,
                 Err(e) => return Err(e),
             };
-            let (n, delay, rate_limited) = if is_rate_limited(&e) {
+            let (n, delay, rate_limited, overloaded) = if let Some(kind) = classify(&e) {
                 let policy = &self.rate_limit_retry;
                 let (since, n) = throttled.get_or_insert((std::time::Instant::now(), 0));
                 let delay = policy.wait(*n + 1, retry_hint(&e.to_string()));
@@ -2422,16 +2425,20 @@ impl Agent {
                     };
                     let waited = Duration::from_millis(waited.as_millis() as u64);
                     return Err(Error::Transport(format!(
-                        "{BUDGET_EXHAUSTED}: still rate limited after {n} retries over {waited:?} \
+                        "{BUDGET_EXHAUSTED}: {} after {n} retries over {waited:?} \
                          (budget {:?}); last error: {msg}",
+                        match kind {
+                            Throttle::RateLimited => "still rate limited",
+                            Throttle::Overloaded => "provider still overloaded",
+                        },
                         policy.budget,
                     )));
                 }
                 *n += 1;
-                (*n, delay, true)
+                (*n, delay, true, kind == Throttle::Overloaded)
             } else if attempt < MAX_MID_STREAM_RETRIES {
                 attempt += 1;
-                (attempt, mid_stream_backoff(attempt), false)
+                (attempt, mid_stream_backoff(attempt), false, false)
             } else {
                 return Err(e);
             };
@@ -2439,6 +2446,7 @@ impl Agent {
                 attempt: n,
                 delay_ms: u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
                 rate_limited,
+                overloaded,
                 message: e.to_string(),
             });
             // Race the backoff sleep against cancellation too — left unraced, a tripped token during
@@ -2518,6 +2526,7 @@ impl Agent {
                         attempt: r.attempt,
                         delay_ms: u64::try_from(r.delay.as_millis()).unwrap_or(u64::MAX),
                         rate_limited: false,
+                        overloaded: false,
                         message: r.message,
                     }),
                     // The transport dropped its reporter: wait on the stream alone.
