@@ -44,6 +44,24 @@ pub mod tool_search;
 pub mod web;
 pub mod write;
 
+/// A duration for a message a person or the model reads: whole seconds when it is (to the tenth)
+/// whole ("1 second", "2 seconds", "90 seconds"), one decimal otherwise ("1.5 seconds"), and
+/// "N ms" under a second. Truncating to whole seconds showed 1500 ms as "1 seconds" and 500 ms as
+/// "0 seconds".
+pub(crate) fn format_duration(d: std::time::Duration) -> String {
+    let ms = d.as_millis();
+    if ms < 1000 && ms != 0 {
+        return format!("{ms} ms");
+    }
+    let tenths = (ms + 50) / 100;
+    if tenths.is_multiple_of(10) {
+        let s = tenths / 10;
+        format!("{s} second{}", if s == 1 { "" } else { "s" })
+    } else {
+        format!("{}.{} seconds", tenths / 10, tenths % 10)
+    }
+}
+
 /// Normalize a filesystem tool's `path` argument the way `bash` gets for free from the real shell it
 /// spawns: expand a leading `~` or `~/` to the user's home directory, fold non-ASCII Unicode space
 /// characters (a pasted non-breaking space, common when a path is copied from a terminal or rich-text
@@ -978,6 +996,24 @@ mod tests {
     use crate::tools::fs::FsBackend as _;
 
     use super::*;
+
+    #[test]
+    fn format_duration_is_exact_about_fractions() {
+        use std::time::Duration as D;
+        for (d, want) in [
+            (D::from_millis(0), "0 seconds"),
+            (D::from_millis(500), "500 ms"),
+            (D::from_millis(900), "900 ms"),
+            (D::from_secs(1), "1 second"),
+            (D::from_millis(1500), "1.5 seconds"),
+            (D::from_secs(2), "2 seconds"),
+            (D::from_secs(90), "90 seconds"),
+            (D::from_millis(1960), "2 seconds"),
+            (D::from_millis(90_500), "90.5 seconds"),
+        ] {
+            assert_eq!(format_duration(d), want, "{d:?}");
+        }
+    }
 
     #[test]
     fn root_is_inside_git_repo_detects_a_git_dir_at_the_root_itself() {

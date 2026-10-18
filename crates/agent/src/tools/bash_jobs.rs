@@ -1414,11 +1414,11 @@ impl TranscriptJobs {
 
 /// "running 45 s" plus why it is a job.
 fn describe_running(job: &Job) -> String {
-    let secs = job.started.elapsed().as_secs();
+    let secs = super::format_duration(job.started.elapsed());
     match job.kind {
-        JobKind::Yielded => format!("running {secs} s; its call returned early"),
-        JobKind::Background => format!("running {secs} s; started in the background"),
-        JobKind::Adopted => format!("running {secs} s; left running by its command"),
+        JobKind::Yielded => format!("running {secs}; its call returned early"),
+        JobKind::Background => format!("running {secs}; started in the background"),
+        JobKind::Adopted => format!("running {secs}; left running by its command"),
     }
 }
 
@@ -1433,42 +1433,42 @@ fn running_intended(table: &BTreeMap<u64, Parked>) -> Vec<String> {
 
 /// The first line of an ended job's notice.
 fn ended_header(id: u64, job: &Job, end: &JobEnd, orphaned: bool) -> String {
-    let secs = end.at.duration_since(job.started).as_secs();
+    let secs = super::format_duration(end.at.duration_since(job.started));
     let cmd = &job.command;
     match &end.result {
-        Err(e) => format!("{NOTICE_PREFIX}{id} failed after {secs} s: `{cmd}`: {e}]"),
+        Err(e) => format!("{NOTICE_PREFIX}{id} failed after {secs}: `{cmd}`: {e}]"),
         // `bash` sets no deadline; this is an exec endpoint enforcing the one on the wire.
         Ok(r) if r.timed_out => format!(
-            "{NOTICE_PREFIX}{id} timed out after {secs} s (the sandbox's exec endpoint stopped it): \
+            "{NOTICE_PREFIX}{id} timed out after {secs} (the sandbox's exec endpoint stopped it): \
              `{cmd}`]"
         ),
         Ok(_) if orphaned => format!(
-            "{NOTICE_PREFIX}{id} ended after {secs} s: `{cmd}` (the processes its command left \
+            "{NOTICE_PREFIX}{id} ended after {secs}: `{cmd}` (the processes its command left \
              running have exited)]"
         ),
         Ok(r) => match (r.code, r.signal) {
             (Some(code), _) => {
-                format!("{NOTICE_PREFIX}{id} exited with code {code} after {secs} s: `{cmd}`]")
+                format!("{NOTICE_PREFIX}{id} exited with code {code} after {secs}: `{cmd}`]")
             }
             (None, Some(signal)) => format!(
-                "{NOTICE_PREFIX}{id} was killed by {} after {secs} s: `{cmd}`]",
+                "{NOTICE_PREFIX}{id} was killed by {} after {secs}: `{cmd}`]",
                 signal_text(signal)
             ),
-            (None, None) => format!("{NOTICE_PREFIX}{id} exited after {secs} s: `{cmd}`]"),
+            (None, None) => format!("{NOTICE_PREFIX}{id} exited after {secs}: `{cmd}`]"),
         },
     }
 }
 
 /// A parked job's shell exited, leaving processes running.
 fn orphan_notice(id: u64, job: &Job, shell: &ExecResult, left: &str) -> String {
-    let secs = job.started.elapsed().as_secs();
+    let secs = super::format_duration(job.started.elapsed());
     let how = match (shell.code, shell.signal) {
         (Some(code), _) => format!("exited with code {code}"),
         (None, Some(signal)) => format!("was killed by {}", signal_text(signal)),
         (None, None) => "exited".to_string(),
     };
     format!(
-        "{NOTICE_PREFIX}{id}'s command {how} after {secs} s but left {left} running: `{}`] That is \
+        "{NOTICE_PREFIX}{id}'s command {how} after {secs} but left {left} running: `{}`] That is \
          still job {id}: you will be told when it exits. bash_job {{\"job\": {id}, \"kill\": true}} \
          stops it.",
         job.command

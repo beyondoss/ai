@@ -2950,7 +2950,7 @@ separate host `bash` instance (`build_tools` with `bash_waits_for_exit`) over th
     `Bash::with_idle_yield(None)`): it has no `bash_job` to come back with. What its command leaves
     running is still adopted into the session's table, so the model sees it. Its wire `timeout_ms` is
     the client's own deadline: the `serve` handler cancels the call at it (the same cancel as
-    `abort_bash`) and reports "Command timed out after N seconds"; it is never handed to the tool.
+    `abort_bash`) and reports "Command timed out after 1.5 seconds" (`tools::format_duration`: whole seconds when exact, one decimal otherwise, `N ms` under a second; every duration the `bash` family, serve and `mcp_apps` show uses it); it is never handed to the tool.
   - A `Job` owns its task and its processes. Dropping it kills the command: a call whose future is
     dropped, a cancelled call, or a dropped table leaves nothing behind. `kill_live_jobs` runs in
     `finish_process_cleanup` before every `process::exit`, which runs no destructors. How to stop the
@@ -3057,7 +3057,7 @@ separate host `bash` instance (`build_tools` with `bash_waits_for_exit`) over th
     prefix), never persisted, never saved by the MCP App context sidecar
     (`background::is_process_state`), so each later reopen re-reads the transcript and says it
     again. Summarized or not; a summarized session also still gets its `<background-jobs>` block. A
-    kill result names the command it killed (``Job 3 (`npm run dev`) killed after 4 s.``). Tests:
+    kill result names the command it killed (``Job 3 (`npm run dev`) killed after 4 seconds.``). Tests:
     `tools/bash_jobs_reopen_tests.rs` (the reader, seeding, a kill), `tests/bash_jobs_reopen.rs`
     (a `serve` restart and `run --continue`). A remote job the sandbox kept (next item) is not
     gone: it is in the table again by the first run, and the note lists it as "(still running)"
@@ -3191,7 +3191,7 @@ separate host `bash` instance (`build_tools` with `bash_waits_for_exit`) over th
     (`i32::MAX` ms, ~24.8 days — the longest a Node endpoint's `setTimeout` holds): the connection is
     the job's lifetime, and the deadline only bounds one that outlives every session.
 
-  A runner's own deadline still surfaces honestly ("Command timed out after N seconds: the sandbox's
+  A runner's own deadline still surfaces honestly ("Command timed out after <duration>: the sandbox's
   exec endpoint stopped it.", with N measured). `serve`'s host `bash` command keeps its wire
   `timeout_ms` as the client's deadline, enforced by the handler as a cancel (see above). Tests:
   `tools/bash_background_tests.rs` (settle, immediate failure, eviction, the shared cap, timeout

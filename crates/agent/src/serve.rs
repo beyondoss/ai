@@ -270,7 +270,7 @@
 //!     currently active
 //!   - `{type:"bash", command, cwd?, timeout_ms?, exclude_from_context?}` run a shell command directly
 //!     — independent of the model's own tool-call loop; `timeout_ms` cancels it at that deadline
-//!     ("Command timed out after N seconds"), and without one it runs until it exits or `abort_bash`
+//!     ("Command timed out after 1.5 seconds"), and without one it runs until it exits or `abort_bash`
 //!     — streaming `tool_progress`/`tool_end` events
 //!     exactly like a model-invoked `bash` call, then a terminal `response` whose `data` carries
 //!     `{result, is_error, exit_code, cancelled, truncated, full_output_path}` (Fix 7, pi-parity gap: the
@@ -8788,7 +8788,10 @@ pub(crate) async fn serve_session(
                     Some(d) if deadline_hit && is_error => {
                         match result_text.strip_suffix("Command cancelled") {
                             Some(head) => {
-                                format!("{head}Command timed out after {} seconds", d.as_secs())
+                                format!(
+                                    "{head}Command timed out after {}",
+                                    crate::tools::format_duration(d)
+                                )
                             }
                             None => result_text,
                         }

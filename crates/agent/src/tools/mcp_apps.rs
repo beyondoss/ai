@@ -736,7 +736,7 @@ pub async fn handle_request(
         () = cancel.cancelled() => Err("cancelled: the request was aborted".into()),
         () = watch_detached => Err("cancelled: no client is attached to receive the answer".into()),
         () = tokio::time::sleep(request_timeout()) => Err(format!(
-            "timed out after {}s", request_timeout().as_secs()
+            "timed out after {}", super::format_duration(request_timeout())
         )),
     }
 }

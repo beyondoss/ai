@@ -213,7 +213,8 @@ async fn every_wait_on_a_silent_job_gets_the_same_silence_window() {
         );
         // A wait's report is short: the model was told how to use the job when it started.
         assert!(
-            waited.starts_with("No output for 0 s. Job 1 is still running ("),
+            waited.starts_with("No output for 5")
+                && waited.contains(" ms. Job 1 is still running ("),
             "{waited}"
         );
         assert!(!waited.contains("pkill"), "{waited}");
