@@ -121,3 +121,319 @@ fn merge_anthropic_beta_adds_a_beta_once() {
         Some(format!("prompt-caching-2024-07-31,{beta}"))
     );
 }
+
+/// The row fields an ending decides, built as `logging` builds them: `outcome`,
+/// `usage_estimated`, `cache_hit`, `usage_settled`, `usage_estimated_parts` and
+/// `upstream_may_continue`. `None` writes no row.
+type Fields = (
+    &'static str,
+    bool,
+    bool,
+    Option<&'static str>,
+    Option<&'static str>,
+    bool,
+);
+
+fn fields(f: &EndFacts, provider: &str, stream: bool) -> Option<Fields> {
+    Ending::of(f).row().map(|end| {
+        (
+            end.outcome,
+            end.count.estimated(),
+            end.cache_hit,
+            end.usage_settled(),
+            end.count.parts().parts(),
+            upstream_may_continue(Some(provider), end.outcome, stream, end.drained),
+        )
+    })
+}
+
+/// The row gate, `outcome` and flag logic `logging` ran before [`Ending`], transcribed as it was:
+/// the reference the new path is held to.
+fn fields_before(f: &EndFacts, provider: &str, stream: bool) -> Option<Fields> {
+    let refused = !f.cache_hit && f.status.is_none() && f.fault == Some(Fault::Refusal);
+    if f.relay_abandoned || f.free || refused {
+        return None;
+    }
+    let downstream = matches!(f.fault, Some(Fault::Client | Fault::Refusal));
+    let outcome = if f.cache_hit {
+        "ok"
+    } else if f.status.is_some_and(|s| s >= 400) {
+        "upstream_error"
+    } else if f.client_left || downstream {
+        "client_cancelled"
+    } else if !f.called {
+        "no_candidate"
+    } else {
+        match (f.fault, f.status) {
+            (Some(_), None) => "upstream_error",
+            (Some(_), Some(_)) => "cut_short",
+            (None, _) => "ok",
+        }
+    };
+    let usage_estimated = f.count.estimated();
+    Some((
+        outcome,
+        usage_estimated,
+        f.cache_hit,
+        (f.drained && !usage_estimated).then_some("drained"),
+        f.count.parts().parts(),
+        upstream_may_continue(Some(provider), outcome, stream, f.drained),
+    ))
+}
+
+/// Facts `logging` can see. An estimate needs a 2xx head, or a connected attempt with no head
+/// (`gave_up_waiting` on a delivered body), and never comes from the cache. A drain arms only on
+/// a managed 2xx stream's head, and only the client leaving starts it. A response head comes from
+/// a provider the request was handed, unless it is the cache's.
+fn reachable(f: &EndFacts) -> bool {
+    if f.status.is_some() && !f.cache_hit && !f.called {
+        return false;
+    }
+    let ok_2xx = f.status.is_some_and(|s| (200..300).contains(&s));
+    let estimate_ok =
+        !f.count.estimated() || (!f.cache_hit && (ok_2xx || (f.status.is_none() && f.called)));
+    let drain_ok = !f.drained || (f.client_left && ok_2xx && !f.cache_hit);
+    estimate_ok && drain_ok
+}
+
+/// Every reachable combination of the facts bills exactly as it did before [`Ending`]: the same
+/// row or none, with the same `outcome`, estimate flags, `usage_settled` and
+/// `upstream_may_continue`.
+#[test]
+fn every_ending_bills_as_before() {
+    let parts = |input, output| EstimatedParts { input, output };
+    let counts = [
+        Count::Reported,
+        Count::Estimated(parts(false, false)),
+        Count::Estimated(parts(true, false)),
+        Count::Estimated(parts(false, true)),
+        Count::Estimated(parts(true, true)),
+    ];
+    let faults = [
+        None,
+        Some(Fault::Client),
+        Some(Fault::Refusal),
+        Some(Fault::Upstream),
+    ];
+    let mut checked = 0;
+    for bits in 0u8..64 {
+        let bit = |i: u8| bits & (1 << i) != 0;
+        for status in [None, Some(200), Some(206), Some(404), Some(429), Some(503)] {
+            for fault in faults {
+                for count in counts {
+                    let f = EndFacts {
+                        relay_abandoned: bit(0),
+                        free: bit(1),
+                        cache_hit: bit(2),
+                        client_left: bit(3),
+                        called: bit(4),
+                        drained: bit(5),
+                        status,
+                        fault,
+                        count,
+                    };
+                    if !reachable(&f) {
+                        continue;
+                    }
+                    for provider in ["openrouter", "anthropic"] {
+                        for stream in [false, true] {
+                            assert_eq!(
+                                fields(&f, provider, stream),
+                                fields_before(&f, provider, stream),
+                                "{f:?} {provider} stream={stream}"
+                            );
+                            checked += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(checked, 4608, "the reachable space shrank");
+}
+
+/// Each ending's row, pinned: what it writes, or that it writes none.
+#[test]
+fn each_ending_has_its_row() {
+    let est = Count::Estimated(EstimatedParts {
+        input: true,
+        output: true,
+    });
+    let called = EndFacts {
+        called: true,
+        ..EndFacts::default()
+    };
+    let at = |status| EndFacts {
+        status: Some(status),
+        ..called
+    };
+    let cases: [(EndFacts, Ending, Option<Fields>); 14] = [
+        (
+            EndFacts {
+                relay_abandoned: true,
+                ..at(503)
+            },
+            Ending::RelayAbandoned,
+            None,
+        ),
+        (
+            EndFacts {
+                free: true,
+                ..at(200)
+            },
+            Ending::Free,
+            None,
+        ),
+        (
+            EndFacts {
+                cache_hit: true,
+                status: Some(200),
+                ..EndFacts::default()
+            },
+            Ending::CacheHit,
+            Some(("ok", false, true, None, None, false)),
+        ),
+        (
+            EndFacts {
+                fault: Some(Fault::Refusal),
+                ..called
+            },
+            Ending::Refused,
+            None,
+        ),
+        (
+            at(429),
+            Ending::UpstreamStatus,
+            Some(("upstream_error", false, false, None, None, false)),
+        ),
+        (
+            EndFacts {
+                fault: Some(Fault::Client),
+                ..at(503)
+            },
+            Ending::UpstreamStatus,
+            Some(("upstream_error", false, false, None, None, false)),
+        ),
+        (
+            EndFacts {
+                fault: Some(Fault::Client),
+                count: est,
+                ..at(200)
+            },
+            Ending::ClientCancelled {
+                count: est,
+                drained: false,
+            },
+            Some((
+                "client_cancelled",
+                true,
+                false,
+                None,
+                Some("input,output"),
+                true,
+            )),
+        ),
+        (
+            EndFacts {
+                client_left: true,
+                drained: true,
+                ..at(200)
+            },
+            Ending::ClientCancelled {
+                count: Count::Reported,
+                drained: true,
+            },
+            Some((
+                "client_cancelled",
+                false,
+                false,
+                Some("drained"),
+                None,
+                false,
+            )),
+        ),
+        (
+            EndFacts {
+                client_left: true,
+                drained: true,
+                count: est,
+                ..at(200)
+            },
+            Ending::ClientCancelled {
+                count: est,
+                drained: true,
+            },
+            Some((
+                "client_cancelled",
+                true,
+                false,
+                None,
+                Some("input,output"),
+                false,
+            )),
+        ),
+        (
+            EndFacts::default(),
+            Ending::NoCandidate,
+            Some(("no_candidate", false, false, None, None, false)),
+        ),
+        (
+            EndFacts {
+                fault: Some(Fault::Upstream),
+                count: est,
+                ..called
+            },
+            Ending::UpstreamFailed(est),
+            Some((
+                "upstream_error",
+                true,
+                false,
+                None,
+                Some("input,output"),
+                false,
+            )),
+        ),
+        (
+            EndFacts {
+                fault: Some(Fault::Upstream),
+                ..at(200)
+            },
+            Ending::CutShort(Count::Reported),
+            Some(("cut_short", false, false, None, None, true)),
+        ),
+        (
+            at(200),
+            Ending::Completed(Count::Reported),
+            Some(("ok", false, false, None, None, false)),
+        ),
+        (
+            EndFacts {
+                count: est,
+                ..at(200)
+            },
+            Ending::Completed(est),
+            Some(("ok", true, false, None, Some("input,output"), false)),
+        ),
+    ];
+    for (facts, ending, row) in cases {
+        assert_eq!(Ending::of(&facts), ending, "{facts:?}");
+        assert_eq!(fields(&facts, "openrouter", true), row, "{ending:?}");
+        assert_eq!(fields_before(&facts, "openrouter", true), row, "{ending:?}");
+    }
+}
+
+/// The error a request ended with blames the client, the gateway's own answer, or the upstream.
+#[test]
+fn a_fault_is_read_from_the_error_source() {
+    use pingora_core::{Error, ErrorType as T};
+    assert_eq!(Fault::of(&Error::new_down(T::ReadError)), Fault::Client);
+    assert_eq!(
+        Fault::of(&Error::new_down(T::CustomCode("x", 400))),
+        Fault::Refusal
+    );
+    assert_eq!(
+        Fault::of(&Error::new_up(T::ConnectRefused)),
+        Fault::Upstream
+    );
+    assert_eq!(Fault::of(&Error::new(T::ReadTimedout)), Fault::Upstream);
+}

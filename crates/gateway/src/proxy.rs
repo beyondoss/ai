@@ -1347,36 +1347,194 @@ fn closed_after_terminal(rc: &RequestCtx, e: &pingora_core::Error) -> bool {
         && !matches!(e.etype(), T::WriteError | T::WriteTimedout)
 }
 
-/// What became of a request, on its billing row: a consumer must be able to tell a zero-token row
-/// for an upstream error or a cancel from a real zero-token generation.
-///
-/// `client_left`: the client hung up on a drained stream ([`crate::drain`]) before its terminal
-/// event. The request may then end with no error (the drain settled) or an upstream one (it did
-/// not), and is a cancel either way.
-fn outcome(
-    rc: &RequestCtx,
-    e: Option<&pingora_core::Error>,
+/// Who a request's error says ended it, as its billing row reads it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Fault {
+    /// The client went away: any downstream error but the gateway's own answer.
+    Client,
+    /// The gateway's own answer to the client ([`gateway_refusal`]). Downstream-tagged, so a
+    /// cancel once a response head arrived, and no row at all before one.
+    Refusal,
+    /// The upstream, or anything else not tagged downstream.
+    Upstream,
+}
+
+impl Fault {
+    fn of(e: &pingora_core::Error) -> Self {
+        if gateway_refusal(e) {
+            Self::Refusal
+        } else if e.esource() == &pingora_core::ErrorSource::Downstream {
+            Self::Client
+        } else {
+            Self::Upstream
+        }
+    }
+}
+
+/// Whose word a billing row's token counts are.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Count {
+    /// The provider's own report (or none at all, on an error body).
+    #[default]
+    Reported,
+    /// The gateway's estimate of what the provider bills, and which counts it replaced (none
+    /// when the provider's partial report already covered what the estimate saw).
+    Estimated(EstimatedParts),
+}
+
+impl Count {
+    fn estimated(self) -> bool {
+        matches!(self, Self::Estimated(_))
+    }
+
+    /// What the estimate replaced: nothing, for a reported count.
+    fn parts(self) -> EstimatedParts {
+        match self {
+            Self::Reported => EstimatedParts::default(),
+            Self::Estimated(p) => p,
+        }
+    }
+}
+
+/// The facts `logging` reads about how a request ended, before it decides how the request bills.
+#[derive(Clone, Copy, Debug, Default)]
+struct EndFacts {
+    /// An abandoned `FullBody` attempt ([`Attempt::relay_abandoned`]).
+    relay_abandoned: bool,
+    /// A free sub-resource (a token count).
+    free: bool,
+    /// Answered from the exact-match cache.
     cache_hit: bool,
+    /// The provider's status; absent when no response head arrived.
+    status: Option<u16>,
+    /// Whom the request's error blames; absent when it ended without one.
+    fault: Option<Fault>,
+    /// The client hung up on a drained stream ([`crate::drain`]) before its terminal event.
     client_left: bool,
-) -> &'static str {
-    if cache_hit {
-        return "ok";
+    /// A provider was handed the request (`UpstreamPhase` past `None`).
+    called: bool,
+    /// The drain read the stream to its end after the client left.
+    drained: bool,
+    /// Whose word the counts are.
+    count: Count,
+}
+
+/// Every way a request can end, as billing sees it. `logging` builds one from its [`EndFacts`],
+/// and [`Ending::row`] is a total match on it, so a new ending does not compile until someone
+/// decides how it bills.
+///
+/// Only a variant an estimate can reach carries a [`Count`]. An estimate needs a 2xx head, or a
+/// connected attempt that delivered the whole body ([`gave_up_waiting`]), so an error status, a
+/// cache hit and a request no provider was handed are always the provider's word. Only a cancel
+/// can be drained: a drain arms only on a managed 2xx stream's head ([`drains_on_cancel`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Ending {
+    /// An abandoned `FullBody` attempt: not the answer the client got. The attempt that serves
+    /// writes the one row.
+    RelayAbandoned,
+    /// A free sub-resource (a token count): not a billable call.
+    Free,
+    /// Answered from the exact-match cache: the usage stored at fill, no provider called.
+    CacheHit,
+    /// The gateway's own refusal before any response head (D267): no provider had the request
+    /// whole, so it writes no row, as every other rejection writes none.
+    Refused,
+    /// The provider answered with an error status (4xx/5xx).
+    UpstreamStatus,
+    /// The client left before the answer was whole, or left a drained stream however the request
+    /// then ended. `drained`: the gateway then read the stream to its end.
+    ClientCancelled { count: Count, drained: bool },
+    /// No provider was called (every candidate's breaker open).
+    NoCandidate,
+    /// The upstream failed before any response head: a connect, read-timeout or reset failure.
+    UpstreamFailed(Count),
+    /// A response that started and then died upstream.
+    CutShort(Count),
+    /// The request completed.
+    Completed(Count),
+}
+
+/// The fields of an `ai.usage` row its [`Ending`] decides, as logged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct EndRow {
+    /// What became of the request: a consumer must be able to tell a zero-token row for an
+    /// upstream error or a cancel from a real zero-token generation.
+    outcome: &'static str,
+    /// Whose word the counts are (`usage_estimated`, `usage_estimated_parts`).
+    count: Count,
+    /// The counts are the cache entry's, stored at fill: no call was made.
+    cache_hit: bool,
+    /// The client cancelled and the gateway read the stream to its end ([`crate::drain`]).
+    drained: bool,
+}
+
+impl EndRow {
+    /// The row's `usage_settled`: `drained` when the counts after a cancel are the vendor's own.
+    fn usage_settled(self) -> Option<&'static str> {
+        (self.drained && !self.count.estimated()).then_some("drained")
     }
-    if rc.upstream_status().is_some_and(|s| s >= 400) {
-        return "upstream_error";
+}
+
+impl Ending {
+    /// The ending these facts describe. The order is the precedence: a row-less ending over any
+    /// other, an error status over a cancel, a cancel over a missing call.
+    fn of(f: &EndFacts) -> Self {
+        let count = f.count;
+        if f.relay_abandoned {
+            return Self::RelayAbandoned;
+        }
+        if f.free {
+            return Self::Free;
+        }
+        if f.cache_hit {
+            return Self::CacheHit;
+        }
+        if f.status.is_none() && f.fault == Some(Fault::Refusal) {
+            return Self::Refused;
+        }
+        if f.status.is_some_and(|s| s >= 400) {
+            return Self::UpstreamStatus;
+        }
+        if f.client_left || matches!(f.fault, Some(Fault::Client | Fault::Refusal)) {
+            return Self::ClientCancelled {
+                count,
+                drained: f.drained,
+            };
+        }
+        if !f.called {
+            return Self::NoCandidate;
+        }
+        match (f.fault, f.status) {
+            (Some(_), None) => Self::UpstreamFailed(count),
+            (Some(_), Some(_)) => Self::CutShort(count),
+            (None, _) => Self::Completed(count),
+        }
     }
-    if client_left || e.is_some_and(|e| e.esource() == &pingora_core::ErrorSource::Downstream) {
-        return "client_cancelled";
-    }
-    if rc.upstream_phase == UpstreamPhase::None {
-        return "no_candidate";
-    }
-    match (e, rc.upstream_status()) {
-        // Failed before any response head: a connect, read-timeout or reset failure upstream.
-        (Some(_), None) => "upstream_error",
-        // A response that started and then died.
-        (Some(_), Some(_)) => "cut_short",
-        (None, _) => "ok",
+
+    /// How this ending bills; `None` writes no row.
+    fn row(self) -> Option<EndRow> {
+        let row = |outcome, count| EndRow {
+            outcome,
+            count,
+            cache_hit: false,
+            drained: false,
+        };
+        Some(match self {
+            Self::RelayAbandoned | Self::Free | Self::Refused => return None,
+            Self::CacheHit => EndRow {
+                cache_hit: true,
+                ..row("ok", Count::Reported)
+            },
+            Self::UpstreamStatus => row("upstream_error", Count::Reported),
+            Self::ClientCancelled { count, drained } => EndRow {
+                drained,
+                ..row("client_cancelled", count)
+            },
+            Self::NoCandidate => row("no_candidate", Count::Reported),
+            Self::UpstreamFailed(count) => row("upstream_error", count),
+            Self::CutShort(count) => row("cut_short", count),
+            Self::Completed(count) => row("ok", count),
+        })
     }
 }
 
@@ -7077,9 +7235,6 @@ impl ProxyHttp for AiProxy {
         // The last `USAGE_TAIL_CAP` bytes of the response, oldest first (see `UsageTail`). Short
         // responses are the whole body; long ones are rotated into order here, once. Skipped on a
         // cache hit — there is no tail; tokens come from the stored entry.
-        let mut usage_estimated = false;
-        // Which counts an estimate replaced (see `EstimatedParts`).
-        let mut estimated = EstimatedParts::default();
         // A free sub-resource (a token count) is not a billable call: it carries no usage block,
         // writes no billing row, and is not a usage-shape regression. On every route: a catalog
         // walk records it, a `/{provider}` route names it in the forwarded path.
@@ -7104,8 +7259,8 @@ impl ProxyHttp for AiProxy {
             && upstream_status.is_none()
             && e.is_some_and(gave_up_waiting)
             && body_delivered(session, rc, e);
-        let parsed = if cache_hit.is_some() {
-            cache_hit.as_ref().map(|h| h.usage)
+        let (parsed, count) = if let Some(h) = cache_hit.as_ref() {
+            (Some(h.usage), Count::Reported)
         } else {
             let tail = rc.resp_tail.contiguous();
             // A relayed managed 403 whose body names the key (not the request) is that key being
@@ -7200,22 +7355,22 @@ impl ProxyHttp for AiProxy {
             // we could not recover) is a turn the provider billed, never a silent 0/0.
             let started = parsed.is_some() || output > 0 || !usage::stream_carried_error(tail);
             if (cut_short && started) || body_cut || body_unmetered || no_head {
-                usage_estimated = true;
                 let mut u = parsed.unwrap_or_default();
+                let mut parts = EstimatedParts::default();
                 if u.input_tokens == 0 {
                     u.input_tokens = input_estimate(session, rc);
-                    estimated.input = true;
+                    parts.input = true;
                 }
                 if output > u.output_tokens {
                     u.output_tokens = output;
-                    estimated.output = true;
+                    parts.output = true;
                 }
-                Some(u)
+                (Some(u), Count::Estimated(parts))
             } else {
-                parsed
+                (parsed, Count::Reported)
             }
         };
-        if usage_estimated {
+        if count.estimated() {
             self.state.metrics.usage_estimated_total.inc();
         }
         // A managed 2xx response is *expected* to carry usage; `None` there means the provider's
@@ -7227,7 +7382,7 @@ impl ProxyHttp for AiProxy {
         //
         // A stream that ended *cleanly* without usage is that same shape-change signal even though
         // it is now billed an estimate, so it still counts here; one cut short by an error does not.
-        if (parsed.is_none() || (usage_estimated && e.is_none()))
+        if (parsed.is_none() || (count.estimated() && e.is_none()))
             && let Some(id) = rc.billing.identity()
             && !free
             && cache_hit.is_none()
@@ -7303,17 +7458,21 @@ impl ProxyHttp for AiProxy {
         // with `tenant_id=0` — unbillable, unattributable, and a footgun for any consumer that sums
         // without filtering it out. Aggregate gateway throughput (incl. BYO) is already covered by
         // the Prometheus metrics above, which is the right tool for non-billing observability.
-        // An abandoned `FullBody` attempt is not the request the client got: the attempt that
-        // serves writes the one row (and the one capture).
-        // The gateway's own refusal before any response head (a catalog miss on `/{provider}`, a
-        // duplicate `model`, `background`): no provider had the request, so no row, as for every
-        // other rejection.
-        let refused =
-            cache_hit.is_none() && upstream_status.is_none() && e.is_some_and(gateway_refusal);
+        // Whether the request writes a row at all, and what the row says of how it ended, is its
+        // `Ending`'s (see `Ending::row`).
+        let ending = Ending::of(&EndFacts {
+            relay_abandoned: rc.attempt.relay_abandoned,
+            free,
+            cache_hit: cache_hit.is_some(),
+            status: upstream_status,
+            fault: e.map(Fault::of),
+            client_left,
+            called: rc.upstream_phase != UpstreamPhase::None,
+            drained,
+            count,
+        });
         if let Some(&id) = rc.billing.identity()
-            && !rc.attempt.relay_abandoned
-            && !free
-            && !refused
+            && let Some(end) = ending.row()
         {
             // What the client asked for that changes the price (read before the borrows below).
             let requested = requested_knobs(session, rc);
@@ -7379,7 +7538,6 @@ impl ProxyHttp for AiProxy {
                 None => (rc.upstream_phase != UpstreamPhase::None)
                     .then_some(rc.leg.provider.name.as_str()),
             };
-            let outcome = outcome(rc, e, cache_hit.is_some(), client_left);
             let usage_stream = cache_hit
                 .as_ref()
                 .map(|h| h.streaming)
@@ -7414,8 +7572,8 @@ impl ProxyHttp for AiProxy {
                 .filter(|_| called);
             let server_tools = usage.server_tools.to_row();
             let upstream_may_continue =
-                upstream_may_continue(usage_provider, outcome, usage_stream, drained);
-            let estimate_excludes = estimated.excludes(&usage);
+                upstream_may_continue(usage_provider, end.outcome, usage_stream, end.drained);
+            let estimate_excludes = end.count.parts().excludes(&usage);
             let upstream_cost_usd = usage.upstream.cost_e10.map(usage::e10_to_usd);
             let upstream_inference_cost_usd =
                 usage.upstream.inference_cost_e10.map(usage::e10_to_usd);
@@ -7435,9 +7593,9 @@ impl ProxyHttp for AiProxy {
                 price_model,
                 provider: usage_provider,
                 price_variant,
-                usage_estimated,
+                usage_estimated: end.count.estimated(),
                 upstream_may_continue,
-                cache_hit: cache_hit.is_some(),
+                cache_hit: end.cache_hit,
                 unix_secs: start_unix_secs,
                 ..usage.pricer_row(rc.dialect)
             });
@@ -7466,18 +7624,18 @@ impl ProxyHttp for AiProxy {
                 // The catalog row id the row prices at (see `price_model`); absent when unpriced.
                 price_model,
                 stream = usage_stream,
-                cache_hit = cache_hit.is_some(),
+                cache_hit = end.cache_hit,
                 // The provider's HTTP status, absent when no response head arrived (and on a cache
-                // hit, which made no call); and what became of the request (see `outcome`).
+                // hit, which made no call); and what became of the request (see `Ending`).
                 upstream_status = cache_hit.is_none().then_some(upstream_status).flatten(),
-                outcome,
+                outcome = end.outcome,
                 // True when the stream was cut short before its usage block and the token counts
                 // below are the gateway's estimate, not the provider's report. Estimates err low.
-                usage_estimated,
+                usage_estimated = end.count.estimated(),
                 // `drained`: the client cancelled and the counts are still the provider's own,
                 // read from the stream the gateway finished after it left (`crate::drain`).
                 // Absent otherwise.
-                usage_settled = (drained && !usage_estimated).then_some("drained"),
+                usage_settled = end.usage_settled(),
                 input_tokens = usage.input_tokens,
                 output_tokens = usage.output_tokens,
                 cache_read_tokens = usage.cache_read_tokens,
@@ -7536,7 +7694,7 @@ impl ProxyHttp for AiProxy {
                 price_detail = priced.map(|p| tracing::field::display(p.price)),
                 start_unix_secs,
                 // Which counts are the gateway's estimate, and what the estimate cannot see.
-                usage_estimated_parts = estimated.parts(),
+                usage_estimated_parts = end.count.parts().parts(),
                 usage_estimate_excludes = estimate_excludes,
                 // `Some(0)` (reported, none used) vs `None` (not reported at all — an unreasoning
                 // model, or a provider that doesn't surface it) matters and is unrecoverable once this
@@ -7588,7 +7746,7 @@ impl ProxyHttp for AiProxy {
             // Fill: complete 2xx only. Client abort, 4xx/5xx, and truncation are all skips — a
             // partial or error body must never be replayed as a success.
             if e.is_none()
-                && !usage_estimated
+                && !end.count.estimated()
                 && upstream_status.is_some_and(|s| (200..300).contains(&s))
                 && let Some(cache::Pending::Fill {
                     key,
@@ -7621,6 +7779,26 @@ impl ProxyHttp for AiProxy {
 #[cfg(test)]
 #[path = "proxy_row_tests.rs"]
 mod row_tests;
+
+/// The `outcome` a request with these facts logs, for the tests that pin each one; `logging`
+/// builds its [`Ending`] from every fact at once.
+#[cfg(test)]
+fn outcome(
+    rc: &RequestCtx,
+    e: Option<&pingora_core::Error>,
+    cache_hit: bool,
+    client_left: bool,
+) -> &'static str {
+    let ending = Ending::of(&EndFacts {
+        cache_hit,
+        status: rc.upstream_status(),
+        fault: e.map(Fault::of),
+        client_left,
+        called: rc.upstream_phase != UpstreamPhase::None,
+        ..EndFacts::default()
+    });
+    ending.row().map_or("", |r| r.outcome)
+}
 
 #[cfg(test)]
 mod tests {

@@ -1830,6 +1830,26 @@ an estimate with nothing parsed takes the request's wire.
 | `no_candidate`     | No provider was called — every candidate's breaker was open                          |
 | `cut_short`        | A response started and then died upstream                                            |
 
+**How a request ended is one type.** `logging` reads the hook's facts once (`proxy::EndFacts`: the
+status, whom the error blames, a cache hit, a free sub-resource, an abandoned `FullBody` attempt,
+the drain, whether the counts are an estimate) and builds a `proxy::Ending`. The row is then a
+total match on it (`Ending::row`): whether one is written, its `outcome`, `cache_hit`,
+`usage_estimated` and its parts, `usage_settled`. A new ending does not compile until it is decided
+how it bills. In order of precedence:
+
+| `Ending`          | Row                                                                              |
+| ----------------- | -------------------------------------------------------------------------------- |
+| `RelayAbandoned`  | none: the `FullBody` attempt that serves writes it                               |
+| `Free`            | none: a free sub-resource (a token count)                                        |
+| `CacheHit`        | `ok`, `cache_hit`, the fill's stored counts                                      |
+| `Refused`         | none: the gateway refused it before any response head (D267)                     |
+| `UpstreamStatus`  | `upstream_error`, the provider's counts (an error status is never estimated)     |
+| `ClientCancelled` | `client_cancelled`, reported or estimated; `drained` when the drain settled      |
+| `NoCandidate`     | `no_candidate`, no counts (nothing was called, so nothing to estimate)           |
+| `UpstreamFailed`  | `upstream_error`, estimated when the gateway gave up waiting on a delivered body |
+| `CutShort`        | `cut_short`, reported or estimated                                               |
+| `Completed`       | `ok`, reported or estimated (D195)                                               |
+
 **A stream is complete when its protocol says so.** Chat Completions ends at `data: [DONE]`,
 Messages at `message_stop`, Responses at `response.completed` (or `response.incomplete`). Stock
 clients close as soon as they have it: openai-python breaks out at `[DONE]`, Codex closes at
