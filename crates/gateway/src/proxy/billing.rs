@@ -558,3 +558,281 @@ pub(super) fn input_estimate(session: &Session, rc: &RequestCtx) -> u64 {
     }
     tally.estimate_tokens()
 }
+
+/// The model names a row carries, from the cache entry on a hit and from the request otherwise.
+#[derive(Clone, Copy)]
+pub(super) struct Models<'a> {
+    /// The id the provider echoed (the pinned snapshot it actually billed), else what was asked.
+    pub(super) billed: &'a str,
+    /// What the client *asked for*.
+    pub(super) requested: &'a str,
+    /// The catalog name this request routed on — `None` for a provider-routed request.
+    pub(super) routed: Option<&'static str>,
+    /// A model-routed request whose body named another model than the route.
+    pub(super) header_disagrees: bool,
+}
+
+impl<'a> Models<'a> {
+    /// `routed` is the walk's catalog row name, `body_model` the body's root `model` as the
+    /// request sent it, `billed` the sanitized model the response named.
+    pub(super) fn of(
+        cache_hit: Option<&'a cache::CachedResponse>,
+        routed: Option<&'static str>,
+        body_model: &'a str,
+        billed: Option<&'a str>,
+    ) -> Self {
+        // The catalog name is derived rather than stored: it is the catalog row's own
+        // `&'static` name.
+        let routed_model = match cache_hit {
+            Some(h) => h.routed_model,
+            None => routed,
+        };
+
+        // On the model-routed path what was asked for is the catalog name from `x-beyond-model` if
+        // present, else the body's root `model` — **not** the id we splice for the serving
+        // candidate. The body's value is overwritten with that candidate's id before the request
+        // leaves, so a discarded spelling determines nothing. On the provider-routed path the
+        // body is untouched and is exactly what was asked for, so it stays the answer there.
+        let requested_model = match cache_hit {
+            Some(h) => h.requested_model.as_ref(),
+            None => routed_model.unwrap_or(body_model),
+        };
+
+        // A model-routed client should send the same id in the header (when they send one) and
+        // the body; nothing enforces it, because the route is chosen from the header before the
+        // body is rewritten. It is harmless — the body is overwritten either way — but it means
+        // the client believes it asked for something it did not get, which is a client bug
+        // worth being able to see. Counted rather than logged per request: a client that always
+        // disagrees would otherwise produce one warn line per request forever. Header still
+        // wins; a headerless walk has nothing to disagree with.
+        let header_disagrees = cache_hit.is_none()
+            && routed_model.is_some_and(|r| !body_model.is_empty() && body_model != r);
+
+        // Fall back to what was asked for when the response carried no model — an error body,
+        // say.
+        let billed_model = match cache_hit {
+            Some(h) => h.billed_model.as_ref(),
+            None => billed.filter(|m| !m.is_empty()).unwrap_or(requested_model),
+        };
+        Models {
+            billed: billed_model,
+            requested: requested_model,
+            routed: routed_model,
+            header_disagrees,
+        }
+    }
+}
+
+/// What `logging` settled about a finished managed request, beyond its context: the row's
+/// inputs.
+pub(super) struct Row<'a> {
+    pub(super) id: Identity,
+    /// How the request ended, as the row reports it ([`Ending::row`]).
+    pub(super) end: &'a EndRow,
+    pub(super) usage: &'a usage::Usage,
+    pub(super) models: &'a Models<'a>,
+    pub(super) requested: &'a RequestedKnobs,
+    pub(super) cache_hit: Option<&'a cache::CachedResponse>,
+    pub(super) upstream_status: Option<u16>,
+    /// Read once by `logging`, so the latency histogram and the row report one duration.
+    pub(super) elapsed: Duration,
+}
+
+/// Price and emit the `ai.usage` row (the billing contract: ARCHITECTURE.md, "The `ai.usage`
+/// row") on its own target, which `main::init_tracing` writes losslessly.
+pub(super) fn emit(state: &GatewayState, session: &Session, rc: &RequestCtx, row: &Row<'_>) {
+    let &Row {
+        id,
+        end,
+        usage,
+        models,
+        requested,
+        cache_hit,
+        upstream_status,
+        elapsed,
+    } = row;
+    let &Models {
+        billed: billed_model,
+        requested: requested_model,
+        routed: routed_model,
+        ..
+    } = models;
+    // The catalog row to price this row at. A model-routed row already names it; a
+    // provider-routed one resolves it from what the provider echoed or the client asked for.
+    let price_model = routed_model.or_else(|| price_model(billed_model, requested_model));
+    // Absent when no provider was called (every candidate's breaker open): `rc.leg.provider`
+    // is then just the walk's seed, and naming it would bill a call that never happened.
+    let usage_provider = match cache_hit {
+        Some(h) => Some(h.provider.as_ref()),
+        None => (rc.upstream_phase != UpstreamPhase::None).then_some(rc.leg.provider.name.as_str()),
+    };
+    let usage_stream = cache_hit
+        .as_ref()
+        .map(|h| h.streaming)
+        .unwrap_or(rc.streaming);
+    // The endpoint that served: absent on a cache hit and when no provider was called.
+    let called = cache_hit.is_none() && usage_provider.is_some();
+    let upstream_model = called
+        .then(|| {
+            rc.auto
+                .as_ref()
+                .and_then(|a| a.candidate_at(a.candidate))
+                .map_or(rc.model.as_str(), |c| c.upstream_model)
+        })
+        .filter(|m| !m.is_empty())
+        .map(|m| sanitize_model(m.to_owned()));
+    let upstream_host = called.then_some(rc.leg.provider.host.as_str());
+    let upstream_path = called.then(|| {
+        let p = rc
+            .forward_path
+            .as_str()
+            .unwrap_or_else(|| session.req_header().uri.path());
+        p.split_once('?').map_or(p, |(path, _)| path)
+    });
+    let price_variant = match (usage_provider, upstream_model.as_deref(), upstream_host) {
+        (Some(p), Some(m), Some(h)) if called => price_variant(p, m, h),
+        _ => None,
+    };
+    let upstream_request_id = rc
+        .billing
+        .taps()
+        .and_then(|t| t.request_id)
+        .filter(|_| called);
+    let server_tools = usage.server_tools.to_row();
+    let upstream_may_continue =
+        upstream_may_continue(usage_provider, end.outcome, usage_stream, end.drained);
+    let estimate_excludes = end.count.parts().excludes(usage);
+    let upstream_cost_usd = usage.upstream.cost_e10.map(usage::e10_to_usd);
+    let upstream_inference_cost_usd = usage.upstream.inference_cost_e10.map(usage::e10_to_usd);
+    let upstream_tool_cost_usd = usage.upstream.tool_cost_e10.map(usage::e10_to_usd);
+    // The request's start, whole seconds UTC: what time-of-day tiers (DeepSeek's off-peak)
+    // are decided on. Logged, so a repricer reads the same second.
+    let start_unix_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+        .saturating_sub(elapsed.as_secs());
+    // Price the row from the very facts it logs (the contract is `providers::pricing`;
+    // `crates/providers/ARCHITECTURE.md`, "Pricing contract"), typed: the numbers, not
+    // their log text, which a repricer parses back to the same inputs (`usage::vendor`
+    // tests hold the two equal). Pure and allocation-free: a few hundred nanoseconds,
+    // after the response.
+    let priced = providers::pricing::price(&providers::pricing::UsageRow {
+        price_model,
+        provider: usage_provider,
+        price_variant,
+        usage_estimated: end.count.estimated(),
+        upstream_may_continue,
+        cache_hit: end.cache_hit,
+        unix_secs: start_unix_secs,
+        ..usage.pricer_row(rc.dialect)
+    });
+    let (price_status, price_reason) = match &priced {
+        Ok(p) => (p.status.as_str(), None),
+        Err(reason) => {
+            state.metrics.usage_unpriced_total.inc();
+            ("unpriced", Some(reason.as_str()))
+        }
+    };
+    let priced = priced.ok();
+    info!(
+        target: "ai.usage",
+        request_id = %rc.request_id,
+        tenant_id = id.tenant_id,
+        vpc_id = id.vpc_id,
+        key_id = id.key_id,
+        provider = usage_provider,
+        model = billed_model,
+        requested_model,
+        // Present only for a model-routed request, so the billing row says *how* it was
+        // routed as well as what ran. Equal to `requested_model` by construction on that
+        // path; its value is marking the route, not carrying a second id. `&'static` from
+        // the catalog and charset-checked by a catalog test, so it needs no `sanitize_model`.
+        routed_model,
+        // The catalog row id the row prices at (see `price_model`); absent when unpriced.
+        price_model,
+        stream = usage_stream,
+        cache_hit = end.cache_hit,
+        // The provider's HTTP status, absent when no response head arrived (and on a cache
+        // hit, which made no call); and what became of the request (see `Ending`).
+        upstream_status = cache_hit.is_none().then_some(upstream_status).flatten(),
+        outcome = end.outcome,
+        // True when the stream was cut short before its usage block and the token counts
+        // below are the gateway's estimate, not the provider's report. Estimates err low.
+        usage_estimated = end.count.estimated(),
+        // `drained`: the client cancelled and the counts are still the provider's own,
+        // read from the stream the gateway finished after it left (`crate::drain`).
+        // Absent otherwise.
+        usage_settled = end.usage_settled(),
+        input_tokens = usage.input_tokens,
+        output_tokens = usage.output_tokens,
+        cache_read_tokens = usage.cache_read_tokens,
+        cache_write_tokens = usage.cache_write_tokens,
+        // Which convention `input_tokens` follows: `openai` includes cache reads (and
+        // OpenRouter's cache writes), `anthropic` excludes both. The same prompt for the same
+        // catalog row reports different `input_tokens` on the two wires; a consumer
+        // normalizes with this, and the existing fields keep their meaning.
+        usage_wire = usage.wire.unwrap_or(rc.dialect).as_str(),
+        // Priced variants and per-call fees (see `usage::Usage`). The 1-hour writes are a
+        // subset of `cache_write_tokens`, not additional to them.
+        cache_write_1h_tokens = usage.cache_write_1h_tokens,
+        // Cache writes from breakpoints the gateway added, already in `input_tokens` and
+        // not in `cache_write_tokens` (the pricer bills them as the 5-minute writes the vendor charges).
+        // For reconciling against the provider's usage, which calls them cache writes.
+        gateway_cache_write_tokens = usage.gateway_cache_write_tokens,
+        server_tool_calls = usage.server_tool_calls,
+        service_tier = usage.service_tier.as_deref(),
+        // --- The row contract's additions (ARCHITECTURE.md, "The `ai.usage` row"). ---
+        // What the client asked for that changes the price, beside what was served.
+        requested_service_tier = requested.service_tier.as_deref(),
+        speed = usage.speed.as_deref(),
+        requested_speed = requested.speed.as_deref(),
+        inference_geo = usage.inference_geo.as_deref(),
+        requested_inference_geo = requested.inference_geo.as_deref(),
+        requested_provider_routing = requested.provider_routing.as_deref(),
+        requested_plugins = requested.plugins.as_deref(),
+        requested_container = requested.container.as_deref(),
+        // Every server-side tool by kind, `kind=count,…` (nonzero only).
+        server_tools = server_tools.as_deref(),
+        container_id = usage.upstream.container_id.as_deref(),
+        // The concrete endpoint that served, and which of its prices applies.
+        upstream_model = upstream_model.as_deref(),
+        upstream_host,
+        upstream_path,
+        price_variant,
+        served_by = usage.upstream.served_by.as_deref(),
+        // The vendor's own ids and price, for reconciling the row against it.
+        upstream_generation_id = usage.upstream.generation_id.as_deref(),
+        upstream_request_id = upstream_request_id.as_deref(),
+        upstream_cost_usd = upstream_cost_usd.as_deref(),
+        upstream_inference_cost_usd = upstream_inference_cost_usd.as_deref(),
+        upstream_tool_cost_usd = upstream_tool_cost_usd.as_deref(),
+        upstream_byok = usage.upstream.byok,
+        upstream_may_continue,
+        // --- The price: authoritative (crates/providers/ARCHITECTURE.md, "Pricing
+        // contract"). The facts above are kept for audit and repricing. An unpriced row
+        // carries `price_status=unpriced` and its reason, never a zero.
+        rate_version = providers::rates::RATE_VERSION,
+        price_status,
+        price_reason,
+        cost_micros = priced.map(|p| p.cost.micros),
+        price_micros = priced.map(|p| p.price.micros),
+        cost_basis = priced.map(|p| p.basis.as_str()),
+        cost_detail = priced.map(|p| tracing::field::display(p.cost)),
+        price_detail = priced.map(|p| tracing::field::display(p.price)),
+        start_unix_secs,
+        // Which counts are the gateway's estimate, and what the estimate cannot see.
+        usage_estimated_parts = end.count.parts().parts(),
+        usage_estimate_excludes = estimate_excludes,
+        // `Some(0)` (reported, none used) vs `None` (not reported at all — an unreasoning
+        // model, or a provider that doesn't surface it) matters and is unrecoverable once this
+        // line ships, so it's logged as `?` (Debug) rather than collapsed to a bare `0`.
+        reasoning_tokens = ?usage.reasoning_tokens,
+        latency_ms = elapsed.as_millis() as u64,
+        // Caller-supplied tags from `x-beyond-metadata`, already validated and canonically
+        // re-serialized by `control` — a JSON object, so `GROUP BY metadata['feature']`
+        // downstream answers "which feature is burning money" against the same row that
+        // carries the tokens. Absent (not `null`) when the caller sent none.
+        metadata = rc.control.as_ref().and_then(|c| c.metadata.as_deref()),
+        "usage"
+    );
+}

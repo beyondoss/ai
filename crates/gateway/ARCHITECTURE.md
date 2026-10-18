@@ -207,7 +207,7 @@ Client (stock OpenAI/Anthropic SDK)
      Managed 2xx stream cut short before its usage block (client cancel / upstream death), or a
        non-stream 2xx without usage that is not an error object (D195):
        estimate the missing side from the request tally + relayed events → usage_estimated
-     Emit ai.usage fact: tenant, vpc, key_id, model, requested_model, routed_model, price_model,
+     Emit ai.usage fact (`billing::emit`, from the finished `Ending`): tenant, vpc, key_id, model, requested_model, routed_model, price_model,
        token counts + usage_wire + reasoning / 1h-cache-write / server-tool / service-tier
        breakouts, requested vs served tier / speed / geo, server tools by kind, the serving
        endpoint and its price variant, the vendor's ids and own cost, estimate parts,
@@ -2071,7 +2071,7 @@ target `ai.usage`, written as one JSON line whose fields are under `fields`. A f
 value is **absent**, never `null`. Types below are JSON types. Token counts are integers.
 
 The pricer reads the same facts as typed values at emission (`usage::Usage::pricer_row`, and the
-locals `logging` names), so a pricer called in the gateway gets the numbers, not their log text:
+locals `billing::emit` names), so a pricer called in the gateway gets the numbers, not their log text:
 `server_tools` as counts (`ToolCounts` from `ServerTools`), the reported costs as exact
 attodollars from their 1e-10 USD integers, and `service_tier`, `speed` and `inference_geo` read
 once into `pricing::Tier`, `Speed` and `Geo`. The logged fields are written from the same values,
@@ -3896,7 +3896,7 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
 | `proxy`           | Module root: the request context (`RequestCtx`, `Ctx`/`Held`, `Leg`, `Attempt`, `ModelRouting`) and the path helpers every phase reads                                                                                                                       | e2e ✓          |
 | `proxy/hooks`     | `ProxyHttp` impl: the pipeline from `request_filter` through `logging`, in pingora's call order                                                                                                                                                              | e2e ✓          |
 | `proxy/phases`    | `request_filter` as named phases in precedence order (`route` → `authenticate` → `admit` → `managed_endpoint` → `read_body` → `dispatch`), each returning its decision (`Route`, `Admission`, `Plan`/`Walk`, `Admitted`) or a `Refusal` that one site writes | unit ✓ + e2e ✓ |
-| `proxy/billing`   | Who pays (`Billing`), the facts a row is built from (`EndFacts` → `Ending`), and the price model the `ai.usage` row names                                                                                                                                    | unit ✓ + e2e ✓ |
+| `proxy/billing`   | Who pays (`Billing`), the facts a row is built from (`EndFacts` → `Ending`), its model names (`Models`), and `emit`: prices and writes the `ai.usage` row `logging` hands it                                                                                 | unit ✓ + e2e ✓ |
 | `proxy/full_body` | The up-front body read (`peek_body_model`) and the `FullBody` subrequest that re-runs a body past pingora's retry buffer                                                                                                                                     | unit ✓ + e2e ✓ |
 | `proxy/headers`   | Credential extraction (`extract_virtual_key`, `?key=`), BYO credential dialect, and the managed header allowlists                                                                                                                                            | unit ✓ + e2e ✓ |
 | `proxy/relay`     | Response relay helpers: the pool-key scrub (`Redact`) and drain-on-cancel bookkeeping                                                                                                                                                                        | unit ✓ + e2e ✓ |
